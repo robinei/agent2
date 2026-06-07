@@ -330,10 +330,8 @@ impl<'src> Compiler<'src> {
                 }
             }
             Op::UnaryPlus => {
-                // ToNumber: `x - 0` coerces (Sub is numeric) without concat.
                 self.compile_expr(&un.argument);
-                self.emit(Instr::Push(StackValue::PosInt(0)), span);
-                self.emit(Instr::Sub, span);
+                self.emit(Instr::ToNum, span);
             }
             Op::LogicalNot => {
                 self.compile_expr(&un.argument);
@@ -879,22 +877,18 @@ impl<'src> Compiler<'src> {
                 self.emit(Instr::ToStr, span);
             }
             "Number" => {
-                // ToNumber via `x - 0` (Sub is numeric, no string concat).
                 if !self.arity(argv, 1, span, "Number") {
                     return;
                 }
                 self.compile_args(argv);
-                self.emit(Instr::Push(StackValue::PosInt(0)), span);
-                self.emit(Instr::Sub, span);
+                self.emit(Instr::ToNum, span);
             }
             "Boolean" => {
-                // Truthiness via double negation.
                 if !self.arity(argv, 1, span, "Boolean") {
                     return;
                 }
                 self.compile_args(argv);
-                self.emit(Instr::Not, span);
-                self.emit(Instr::Not, span);
+                self.emit(Instr::ToBool, span);
             }
             "raise" => self.error(span, "`raise` is not supported until Phase 4"),
             _ => self.error(

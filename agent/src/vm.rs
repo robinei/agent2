@@ -409,6 +409,15 @@ pub enum Instr {
     // objects → "[object Object]", null/undefined → "null"/"undefined".
     ToStr, // any -> str
 
+    // JS `Number(x)` / ToNumber: pops any value, pushes its numeric form
+    // (null→0, undefined→NaN, bool→0/1, strings parse, unparseable→NaN). The
+    // coercion target for unary `+x`, mirroring the arithmetic operators'
+    // implicit ToNumber. An array/object/function is a TypeError (no ToPrimitive).
+    ToNum, // any -> num
+    // JS `Boolean(x)` / ToBoolean: pops any value, pushes its truthiness as a
+    // bool. The coercion target for `Boolean(x)` and `!!x`.
+    ToBool, // any -> bool
+
     // unary operators. pops the topmost value from the stack,
     // operates on it and then pushed the result to the stack
     Abs,    // num -> num
@@ -2122,6 +2131,23 @@ impl VM {
                     self.ip += 1;
                 }
 
+                Instr::ToNum => {
+                    // ToNumber, matching the arithmetic operators' coercion: an
+                    // array/object/function has no numeric form (TypeError).
+                    let val = self.stack.pop().ok_or(VMError::StackUnderflow)?;
+                    match self.to_number(&val) {
+                        Some(num) => self.stack.push(StackValue::Number(num)),
+                        None => return Err(VMError::TypeError),
+                    }
+                    self.ip += 1;
+                }
+
+                Instr::ToBool => {
+                    let val = self.stack.pop().ok_or(VMError::StackUnderflow)?;
+                    self.stack.push(StackValue::Bool(self.is_truthy(&val)));
+                    self.ip += 1;
+                }
+
                 // ── external effects ───────────────────────────
                 Instr::Invoke(..) => {
                     // Gather the run of consecutive Invoke instructions into one
@@ -2598,6 +2624,32 @@ mod tests {
         assert_eq!(run(vec![Push(n(0.0)), JFalse(3), Push(n(9.0))]), vec![]);
         // || picks the second operand when the first is 0 (falsy).
         assert_eq!(run(vec![Push(n(0.0)), Push(n(7.0)), Or]), vec![n(7.0)]);
+    }
+
+    #[test]
+    fn to_num_instruction() {
+        // JS ToNumber: strings parse, bools→0/1, null→0, undefined/garbage→NaN.
+        assert_eq!(run_heap(vec![Push(s(0)), ToNum], &["42"]), vec![n(42.0)]);
+        assert_eq!(run(vec![Push(b(true)), ToNum]), vec![n(1.0)]);
+        assert_eq!(run(vec![Push(null()), ToNum]), vec![n(0.0)]);
+        assert!(matches!(
+            run(vec![Push(undef()), ToNum]).as_slice(),
+            [StackValue::Number(x)] if x.is_nan()
+        ));
+        // An array/object has no numeric form.
+        assert!(matches!(
+            run_err(vec![ArrNew(0), ToNum]),
+            VMError::TypeError
+        ));
+    }
+
+    #[test]
+    fn to_bool_instruction() {
+        assert_eq!(run(vec![Push(n(0.0)), ToBool]), vec![b(false)]);
+        assert_eq!(run(vec![Push(n(1.0)), ToBool]), vec![b(true)]);
+        assert_eq!(run(vec![Push(null()), ToBool]), vec![b(false)]);
+        assert_eq!(run_heap(vec![Push(s(0)), ToBool], &[""]), vec![b(false)]);
+        assert_eq!(run(vec![ArrNew(0), ToBool]), vec![b(true)]); // [] is truthy
     }
 
     #[test]
