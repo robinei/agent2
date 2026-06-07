@@ -1,5 +1,7 @@
 use indexmap::IndexMap;
 
+use crate::builtin::Builtin;
+
 /*
 JS semantic compatibility — known divergences
 =============================================
@@ -94,6 +96,12 @@ pub enum StackValue {
     /// `Local`/`SetLocal` dereference it transparently, so the marker never
     /// surfaces in expression temporaries, heap collections, or variables.
     Upval(CellIndex),
+    /// A builtin stdlib function as a first-class value (`Math.max`, `arr.push`
+    /// passed as a callback). Like `Fn`, it is callable (via `CallDyn`), is a
+    /// "function" under `typeof`, compares by identity, and has no JSON form.
+    /// The compiler's common path uses the static `Instr::CallBuiltin` instead;
+    /// this variant exists for the rarer higher-order/callback use.
+    Builtin(Builtin),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -286,6 +294,12 @@ pub enum Instr {
     // top value is neither a Fn nor a closure.
     CallDyn(u32), // any, ..., fn -> [any]
 
+    // static call to a known builtin (the compiler's fast path, analogous to
+    // Call for user functions). The N arguments sit on the stack left-to-right
+    // (arg 0 deepest; receiver is arg 0 for methods); the builtin pops them and
+    // pushes exactly one result. No call frame is created. See builtin.rs.
+    CallBuiltin(Builtin, u32), // any, ... -> any
+
     // build a closure over the listed local slots of the current frame and push
     // a Ptr to the resulting HeapValue::Closure. Each captured slot is copied
     // verbatim: a Boxed slot yields its Upval handle (shared, by-reference), a
@@ -319,11 +333,9 @@ pub enum Instr {
     // type predicates
     IsNull,  // any -> bool
     IsBool,  // any -> bool
-    IsInt,   // any -> bool
     IsFloat, // any -> bool
     IsNum,   // any -> bool
     IsStr,   // any -> bool
-    IsArr,   // any -> bool
     IsObj,   // any -> bool
 
     // temporary block markers. initially Jump and JFalse Addr refer to specific Label Addr(id),
@@ -339,6 +351,12 @@ pub enum Instr {
     // pops the topmost value from the stack. jumps to the address if truthy.
     // The truthy-mirror of JFalse, so `||` lowers without an extra Jump.
     JTrue(CodeAddr), // () -> ()
+
+    // PEEKS (does NOT pop) the topmost value; jumps to the address when it is
+    // neither null nor undefined, leaving the value in place. The "not nullish"
+    // jump that lowers `??`, optional chaining (`?.`), and optional calls in one
+    // instruction, instead of a Dup + Push(Null) + LooseEq + branch per check.
+    JNotNullish(CodeAddr), // any -> any (peek)
 
     // EFFECT: invokes the named tool or function.
     // pops N arguments off the stack; args are taken in push order, so with
@@ -377,8 +395,6 @@ pub enum Instr {
     // object enumeration / membership (JS Object.keys / Object.values,
     // `key in obj`, `delete obj[key]`). Keys/values are returned in insertion
     // order (IndexMap-backed). ObjDelete pushes whether the key was present.
-    ObjKeys,   // obj -> arr(str)
-    ObjValues, // obj -> arr(any)
     ObjHas,    // obj, str -> bool
     ObjDelete, // obj, str -> bool
 
@@ -386,24 +402,6 @@ pub enum Instr {
     // Left-to-right: the first/deepest pushed becomes element 0.
     ArrNew(u32), // [any, ...] -> arr
     ArrLength,   // arr|str -> int
-    ArrPush,     // arr, any -> ()    (append to end)
-    ArrPop,      // arr -> any        (remove & return end)
-    ArrShift,    // arr -> any        (remove & return front, like JS)
-    ArrUnshift,  // arr, any -> ()    (prepend to front, like JS)
-    ArrJoin,     // arr, str -> str
-
-    StrSplit(ArgCount),       // str, str[, int] -> arr(str)
-    StrIncludes(ArgCount),    // str, str[, int] -> bool
-    StrStartsWith,            // str, str -> bool
-    StrEndsWith,              // str, str -> bool
-    StrIndexOf(ArgCount),     // str, str[, int] -> int
-    StrLastIndexOf(ArgCount), // str, str[, int] -> int
-    StrSlice,                 // str, int, int -> str
-    StrTrim,                  // str -> str
-    StrToInt,                 // str -> int
-    StrToFloat,               // str -> float
-    StrToJson,                // str -> any
-    StrFromJson,              // any -> str
 
     // JS `String(x)` / ToString: pops any value, pushes its string form. Unlike
     // StrFromJson (which emits JSON, and rejects non-JSON values), this matches
@@ -423,13 +421,7 @@ pub enum Instr {
 
     // unary operators. pops the topmost value from the stack,
     // operates on it and then pushed the result to the stack
-    Abs,    // num -> num
     Neg,    // num -> num
-    Sqrt,   // num -> num
-    Ceil,   // num -> int
-    Floor,  // num -> int
-    Round,  // num -> int
-    Sign,   // num -> int
     Not,    // any -> bool
     BitNot, // int -> int
 
@@ -455,8 +447,6 @@ pub enum Instr {
     BitXor,   // int, int -> int
     BitLhs,   // int, int -> int
     BitRhs,   // int, int -> int
-    Min,      // num, num -> num
-    Max,      // num, num -> num
     Pow,      // num, num -> num
 }
 
@@ -529,7 +519,7 @@ fn js_number_to_string(n: f64) -> String {
     }
 }
 
-fn float_is_int(n: f64) -> bool {
+pub(crate) fn float_is_int(n: f64) -> bool {
     n.fract() == 0.0
 }
 
@@ -549,7 +539,7 @@ fn as_f64(val: &StackValue) -> Option<f64> {
 /// Coerce a numeric value to i64 for integer-only ops (mod, bitwise, shifts,
 /// indices). `NegInt` is taken directly; a `PosInt` must fit in i64; a
 /// `Number` must be integer-valued. Returns None otherwise.
-fn as_i64(val: &StackValue) -> Option<i64> {
+pub(crate) fn as_i64(val: &StackValue) -> Option<i64> {
     match val {
         StackValue::NegInt(i) => Some(*i),
         StackValue::PosInt(u) => i64::try_from(*u).ok(),
@@ -626,6 +616,13 @@ impl VM {
         Ok(vm)
     }
 
+    /// Extract the blessed `state` object (heap[0]) as a JSON value. This is the
+    /// persistence boundary the host uses to save/restore durable state between
+    /// runs.
+    pub fn state_to_json(&self) -> Result<serde_json::Value, VMError> {
+        self.stack_value_to_json(&StackValue::Ptr(0), 0)
+    }
+
     // ── heap access helpers ──────────────────────────────────────────
 
     /// Lowest stack index the current frame's expression temporaries may
@@ -662,21 +659,21 @@ impl VM {
         }
     }
 
-    fn heap_arr(&self, ptr: HeapAddr) -> Option<&Vec<StackValue>> {
+    pub(crate) fn heap_arr(&self, ptr: HeapAddr) -> Option<&Vec<StackValue>> {
         match self.heap.get(ptr as usize) {
             Some(HeapValue::Array(a)) => Some(a),
             _ => None,
         }
     }
 
-    fn heap_arr_mut(&mut self, ptr: HeapAddr) -> Option<&mut Vec<StackValue>> {
+    pub(crate) fn heap_arr_mut(&mut self, ptr: HeapAddr) -> Option<&mut Vec<StackValue>> {
         match self.heap.get_mut(ptr as usize) {
             Some(HeapValue::Array(a)) => Some(a),
             _ => None,
         }
     }
 
-    fn heap_obj(&self, ptr: HeapAddr) -> Option<&IndexMap<String, StackValue>> {
+    pub(crate) fn heap_obj(&self, ptr: HeapAddr) -> Option<&IndexMap<String, StackValue>> {
         match self.heap.get(ptr as usize) {
             Some(HeapValue::Object(o)) => Some(o),
             _ => None,
@@ -690,13 +687,13 @@ impl VM {
         }
     }
 
-    fn alloc_string(&mut self, s: String) -> StackValue {
+    pub(crate) fn alloc_string(&mut self, s: String) -> StackValue {
         let addr = self.heap.len() as HeapAddr;
         self.heap.push(HeapValue::String(s));
         StackValue::Ptr(addr)
     }
 
-    fn alloc_array(&mut self, arr: Vec<StackValue>) -> StackValue {
+    pub(crate) fn alloc_array(&mut self, arr: Vec<StackValue>) -> StackValue {
         let addr = self.heap.len() as HeapAddr;
         self.heap.push(HeapValue::Array(arr));
         StackValue::Ptr(addr)
@@ -729,7 +726,7 @@ impl VM {
             // Empty string is falsy; any other string and all arrays/objects/
             // closures/functions are truthy.
             StackValue::Ptr(p) => !matches!(self.heap_str(*p), Some("")),
-            StackValue::Fn(_) => true,
+            StackValue::Fn(_) | StackValue::Builtin(_) => true,
             // Internal indirection; never a legitimate operand.
             StackValue::Upval(_) => false,
         }
@@ -741,7 +738,7 @@ impl VM {
     /// first — arrays, objects, closures, functions — which this VM deliberately
     /// does not coerce (see the divergence note on `loose_equal`); arithmetic on
     /// those is a TypeError.
-    fn to_number(&self, val: &StackValue) -> Option<f64> {
+    pub(crate) fn to_number(&self, val: &StackValue) -> Option<f64> {
         match val {
             StackValue::Number(n) => Some(*n),
             StackValue::PosInt(u) => Some(*u as f64),
@@ -750,7 +747,7 @@ impl VM {
             StackValue::Null => Some(0.0),
             StackValue::Undefined => Some(f64::NAN),
             StackValue::Ptr(p) => self.heap_str(*p).map(js_str_to_number),
-            StackValue::Fn(_) | StackValue::Upval(_) => None,
+            StackValue::Fn(_) | StackValue::Builtin(_) | StackValue::Upval(_) => None,
         }
     }
 
@@ -763,7 +760,7 @@ impl VM {
     /// (null/undefined elements → ""), plain objects → "[object Object]", and
     /// functions/closures → a generic function tag. `depth` bounds recursion
     /// through nested arrays so adversarial nesting can't overflow the stack.
-    fn to_js_string(&self, val: &StackValue, depth: usize) -> String {
+    pub(crate) fn to_js_string(&self, val: &StackValue, depth: usize) -> String {
         if depth > MAX_JSON_DEPTH {
             return String::new();
         }
@@ -774,7 +771,9 @@ impl VM {
             StackValue::PosInt(u) => u.to_string(),
             StackValue::NegInt(i) => i.to_string(),
             StackValue::Number(n) => js_number_to_string(*n),
-            StackValue::Fn(_) => "function () { [native code] }".to_string(),
+            StackValue::Fn(_) | StackValue::Builtin(_) => {
+                "function () { [native code] }".to_string()
+            }
             StackValue::Upval(_) => String::new(),
             StackValue::Ptr(p) => match self.heap.get(*p as usize) {
                 Some(HeapValue::String(s)) => s.clone(),
@@ -826,6 +825,8 @@ impl VM {
             (StackValue::Number(a), StackValue::NegInt(b)) => !a.is_nan() && *a == (*b as f64),
             // Function values are equal iff they point at the same code address.
             (StackValue::Fn(a), StackValue::Fn(b)) => a == b,
+            // Builtins compare by identity, like Fn.
+            (StackValue::Builtin(a), StackValue::Builtin(b)) => a == b,
             (StackValue::Ptr(p), StackValue::Ptr(q)) => {
                 match (self.heap.get(*p as usize), self.heap.get(*q as usize)) {
                     // Same heap address is the same object (JS reference identity
@@ -920,7 +921,7 @@ impl VM {
     }
 
     /// Pop a value and require it to be a heap pointer.
-    fn pop_ptr(&mut self) -> Result<HeapAddr, VMError> {
+    pub(crate) fn pop_ptr(&mut self) -> Result<HeapAddr, VMError> {
         match self.stack.pop().ok_or(VMError::StackUnderflow)? {
             StackValue::Ptr(p) => Ok(p),
             _ => Err(VMError::TypeError),
@@ -944,9 +945,20 @@ impl VM {
         }
     }
 
+    /// Extract a string from a StackValue that has already been popped.
+    pub(crate) fn pop_string_from(&self, val: &StackValue) -> Result<String, VMError> {
+        match val {
+            StackValue::Ptr(p) => match self.heap_str(*p) {
+                Some(s) => Ok(s.to_string()),
+                None => Err(VMError::TypeError),
+            },
+            _ => Err(VMError::TypeError),
+        }
+    }
+
     // ── JSON conversion helpers ──────────────────────────────────────
 
-    fn stack_value_to_json(
+    pub(crate) fn stack_value_to_json(
         &self,
         val: &StackValue,
         depth: usize,
@@ -964,7 +976,9 @@ impl VM {
             // A function/closure has no JSON representation, and an Upval marker
             // is an internal indirection that should never reach here: fail
             // loudly rather than silently dropping it.
-            StackValue::Fn(_) | StackValue::Upval(_) => return Err(VMError::ValueError),
+            StackValue::Fn(_) | StackValue::Builtin(_) | StackValue::Upval(_) => {
+                return Err(VMError::ValueError);
+            }
             // `undefined` has no JSON form. Like JS `JSON.stringify`, it is
             // *dropped* in an object and coerced to *null* in an array (handled
             // at those parent sites below); reaching here means it is the root
@@ -1013,7 +1027,7 @@ impl VM {
         })
     }
 
-    fn json_to_stack_value(
+    pub(crate) fn json_to_stack_value(
         &mut self,
         json: &serde_json::Value,
         depth: usize,
@@ -1262,42 +1276,72 @@ impl VM {
                 Instr::CallDyn(nargs) => {
                     let nargs = *nargs;
                     // The callable is on top, above its args; pop it, then the
-                    // args sit exactly where a static Call expects them. It is
-                    // either a bare Fn or a Ptr to a Closure (code + captures).
+                    // args sit exactly where a static Call expects them. The
+                    // callable is either a bare Fn, a Builtin, or a Ptr to a
+                    // Closure (code + captures).
                     let callable = self.stack.pop().ok_or(VMError::StackUnderflow)?;
-                    let (addr, upvals) = match callable {
-                        StackValue::Fn(addr) => (addr, None),
-                        StackValue::Ptr(p) => match self.heap_get(p)? {
-                            HeapValue::Closure { addr, upvals } => (*addr, Some(upvals.clone())),
-                            _ => return Err(VMError::TypeError),
-                        },
-                        _ => return Err(VMError::TypeError),
-                    };
-                    if addr as usize >= self.code.len() {
-                        return Err(VMError::BadCall);
-                    }
-                    if nargs as usize > self.stack.len() {
-                        return Err(VMError::StackUnderflow);
-                    }
-                    self.callstack.push(CallFrame {
-                        arg_count: nargs,
-                        local_count: 0,
-                        return_addr: self.ip + 1,
-                        prev_fp: self.fp,
-                    });
-                    self.fp = self.stack.len() as StackAddr;
-                    // A closure's captured environment becomes the callee's
-                    // leading locals (slots 0..K), so the body reaches them via
-                    // the same Local/SetLocal indirection as any other local;
-                    // its own Allocs append after these.
-                    if let Some(upvals) = upvals {
-                        let k = upvals.len() as u32;
-                        for uv in upvals {
-                            self.stack.push(uv);
+                    match callable {
+                        StackValue::Builtin(b) => {
+                            // No-frame call: pop args, push result, advance ip.
+                            b.call(self, nargs)?;
+                            self.ip += 1;
                         }
-                        self.callstack.last_mut().unwrap().local_count = k;
+                        StackValue::Fn(addr) => {
+                            if addr as usize >= self.code.len() {
+                                return Err(VMError::BadCall);
+                            }
+                            if nargs as usize > self.stack.len() {
+                                return Err(VMError::StackUnderflow);
+                            }
+                            self.callstack.push(CallFrame {
+                                arg_count: nargs,
+                                local_count: 0,
+                                return_addr: self.ip + 1,
+                                prev_fp: self.fp,
+                            });
+                            self.fp = self.stack.len() as StackAddr;
+                            self.ip = addr;
+                        }
+                        StackValue::Ptr(p) => {
+                            let (addr, upvals) = match self.heap_get(p)? {
+                                HeapValue::Closure { addr, upvals } => {
+                                    (*addr, Some(upvals.clone()))
+                                }
+                                _ => return Err(VMError::TypeError),
+                            };
+                            if addr as usize >= self.code.len() {
+                                return Err(VMError::BadCall);
+                            }
+                            if nargs as usize > self.stack.len() {
+                                return Err(VMError::StackUnderflow);
+                            }
+                            self.callstack.push(CallFrame {
+                                arg_count: nargs,
+                                local_count: 0,
+                                return_addr: self.ip + 1,
+                                prev_fp: self.fp,
+                            });
+                            self.fp = self.stack.len() as StackAddr;
+                            // A closure's captured environment becomes the callee's
+                            // leading locals (slots 0..K).
+                            if let Some(upvals) = upvals {
+                                let k = upvals.len() as u32;
+                                for uv in upvals {
+                                    self.stack.push(uv);
+                                }
+                                self.callstack.last_mut().unwrap().local_count = k;
+                            }
+                            self.ip = addr;
+                        }
+                        _ => return Err(VMError::TypeError),
                     }
-                    self.ip = addr;
+                }
+
+                Instr::CallBuiltin(b, argc) => {
+                    let b = *b;
+                    let argc = *argc;
+                    b.call(self, argc)?;
+                    self.ip += 1;
                 }
 
                 Instr::MakeClosure(addr, captures) => {
@@ -1375,6 +1419,19 @@ impl VM {
                     }
                 }
 
+                Instr::JNotNullish(addr) => {
+                    if *addr as usize > self.code.len() {
+                        return Err(VMError::BadCall);
+                    }
+                    // Peek: leave the value for the branch that proceeds with it.
+                    let val = self.stack.last().ok_or(VMError::StackUnderflow)?;
+                    if !matches!(val, StackValue::Null | StackValue::Undefined) {
+                        self.ip = *addr;
+                    } else {
+                        self.ip += 1;
+                    }
+                }
+
                 Instr::Label(_) => {
                     // Eliminated in a pre-pass; no-op at runtime.
                     self.ip += 1;
@@ -1440,7 +1497,7 @@ impl VM {
                         StackValue::Number(_) | StackValue::PosInt(_) | StackValue::NegInt(_) => {
                             "number"
                         }
-                        StackValue::Fn(_) => "function",
+                        StackValue::Fn(_) | StackValue::Builtin(_) => "function",
                         StackValue::Ptr(p) => match self.heap_get(p)? {
                             HeapValue::String(_) => "string",
                             HeapValue::Array(_) | HeapValue::Object(_) => "object",
@@ -1465,14 +1522,6 @@ impl VM {
                     let val = self.stack.pop().ok_or(VMError::StackUnderflow)?;
                     self.stack
                         .push(StackValue::Bool(matches!(val, StackValue::Bool(_))));
-                    self.ip += 1;
-                }
-                Instr::IsInt => {
-                    // True for an integer value, or an integer-valued Number.
-                    let val = self.stack.pop().ok_or(VMError::StackUnderflow)?;
-                    let is_int = matches!(val, StackValue::PosInt(_) | StackValue::NegInt(_))
-                        || matches!(val, StackValue::Number(n) if float_is_int(n));
-                    self.stack.push(StackValue::Bool(is_int));
                     self.ip += 1;
                 }
                 Instr::IsFloat => {
@@ -1501,16 +1550,6 @@ impl VM {
                     self.stack.push(StackValue::Bool(is_str));
                     self.ip += 1;
                 }
-                Instr::IsArr => {
-                    let val = self.stack.pop().ok_or(VMError::StackUnderflow)?;
-                    let is_arr = matches!(
-                        val,
-                        StackValue::Ptr(p)
-                            if matches!(self.heap.get(p as usize), Some(HeapValue::Array(_)))
-                    );
-                    self.stack.push(StackValue::Bool(is_arr));
-                    self.ip += 1;
-                }
                 Instr::IsObj => {
                     let val = self.stack.pop().ok_or(VMError::StackUnderflow)?;
                     let is_obj = matches!(
@@ -1523,16 +1562,7 @@ impl VM {
                 }
 
                 // ── unary operators ─────────────────────────────
-                Instr::Abs => unary_num!(|n: f64| n.abs()),
                 Instr::Neg => unary_num!(|n: f64| -n),
-                // JS Math.sqrt: a negative operand yields NaN, not an error.
-                Instr::Sqrt => unary_num!(|n: f64| n.sqrt()),
-                Instr::Ceil => unary_num!(|n: f64| n.ceil()),
-                Instr::Floor => unary_num!(|n: f64| n.floor()),
-                Instr::Round => unary_num!(|n: f64| n.round()),
-                // NOTE: f64::signum returns ±1 for ±0, unlike JS Math.sign (which
-                // returns ±0 for ±0); this is a pre-existing, intentional choice.
-                Instr::Sign => unary_num!(|n: f64| n.signum()),
 
                 Instr::Not => {
                     let val = self.stack.pop().ok_or(VMError::StackUnderflow)?;
@@ -1585,9 +1615,6 @@ impl VM {
                 // NaN. Rust's f64 `%` matches this exactly.
                 Instr::Mod => binary_num!(|a: f64, b: f64| a % b),
                 Instr::Pow => binary_num!(|a: f64, b: f64| a.powf(b)),
-
-                Instr::Min => binary_num!(|a: f64, b: f64| a.min(b)),
-                Instr::Max => binary_num!(|a: f64, b: f64| a.max(b)),
 
                 Instr::Eq => {
                     let rhs = self.stack.pop().ok_or(VMError::StackUnderflow)?;
@@ -1814,36 +1841,6 @@ impl VM {
                     self.ip += 1;
                 }
 
-                Instr::ObjKeys => {
-                    let obj_ptr = self.pop_ptr()?;
-                    // Clone keys out first (releasing the heap borrow) so we can
-                    // allocate a heap string per key.
-                    let keys: Vec<String> = self
-                        .heap_obj(obj_ptr)
-                        .ok_or(VMError::TypeError)?
-                        .keys()
-                        .cloned()
-                        .collect();
-                    let strs: Vec<StackValue> =
-                        keys.into_iter().map(|k| self.alloc_string(k)).collect();
-                    let arr = self.alloc_array(strs);
-                    self.stack.push(arr);
-                    self.ip += 1;
-                }
-
-                Instr::ObjValues => {
-                    let obj_ptr = self.pop_ptr()?;
-                    let vals: Vec<StackValue> = self
-                        .heap_obj(obj_ptr)
-                        .ok_or(VMError::TypeError)?
-                        .values()
-                        .copied()
-                        .collect();
-                    let arr = self.alloc_array(vals);
-                    self.stack.push(arr);
-                    self.ip += 1;
-                }
-
                 Instr::ObjHas => {
                     let field = self.pop_string()?;
                     let obj_ptr = self.pop_ptr()?;
@@ -1895,241 +1892,6 @@ impl VM {
                         _ => return Err(VMError::TypeError),
                     };
                     self.stack.push(StackValue::Number(len as f64));
-                    self.ip += 1;
-                }
-
-                Instr::ArrPush => {
-                    let val = self.stack.pop().ok_or(VMError::StackUnderflow)?;
-                    let arr_ptr = self.pop_ptr()?;
-                    let arr = self.heap_arr_mut(arr_ptr).ok_or(VMError::TypeError)?;
-                    arr.push(val);
-                    self.ip += 1;
-                }
-
-                Instr::ArrPop => {
-                    let arr_ptr = self.pop_ptr()?;
-                    let arr = self.heap_arr_mut(arr_ptr).ok_or(VMError::TypeError)?;
-                    let val = arr.pop().ok_or(VMError::ValueError)?;
-                    self.stack.push(val);
-                    self.ip += 1;
-                }
-
-                // JS semantics: shift removes & returns the front element.
-                Instr::ArrShift => {
-                    let arr_ptr = self.pop_ptr()?;
-                    let arr = self.heap_arr_mut(arr_ptr).ok_or(VMError::TypeError)?;
-                    if arr.is_empty() {
-                        return Err(VMError::ValueError);
-                    }
-                    let val = arr.remove(0);
-                    self.stack.push(val);
-                    self.ip += 1;
-                }
-
-                // JS semantics: unshift prepends an element to the front.
-                Instr::ArrUnshift => {
-                    let val = self.stack.pop().ok_or(VMError::StackUnderflow)?;
-                    let arr_ptr = self.pop_ptr()?;
-                    let arr = self.heap_arr_mut(arr_ptr).ok_or(VMError::TypeError)?;
-                    arr.insert(0, val);
-                    self.ip += 1;
-                }
-
-                Instr::ArrJoin => {
-                    let sep = self.pop_string()?;
-                    let arr_ptr = self.pop_ptr()?;
-                    let arr = self.heap_arr(arr_ptr).ok_or(VMError::TypeError)?;
-                    // JS join: null/undefined elements render as "", everything
-                    // else via ToString (so nested arrays join recursively).
-                    let parts: Vec<String> = arr
-                        .iter()
-                        .map(|v| match v {
-                            StackValue::Null | StackValue::Undefined => String::new(),
-                            _ => self.to_js_string(v, 0),
-                        })
-                        .collect();
-                    let s = self.alloc_string(parts.join(&sep));
-                    self.stack.push(s);
-                    self.ip += 1;
-                }
-
-                // ── string operations ───────────────────────────
-                //
-                // All character offsets/indices below are UTF-8 *byte*
-                // offsets (as in Rust/Go), and lengths are byte lengths. Any
-                // offset that is out of range or lands in the middle of a
-                // multi-byte codepoint yields a ValueError rather than
-                // panicking. (ASCII text behaves exactly as expected.)
-                Instr::StrSplit(n) => {
-                    let limit = if *n >= 1 {
-                        let lim = self.pop_int()?;
-                        if lim < 0 {
-                            return Err(VMError::ValueError);
-                        }
-                        Some(lim as usize)
-                    } else {
-                        None
-                    };
-                    let delim = self.pop_string()?;
-                    let s = self.pop_string()?;
-                    let mut parts = Vec::new();
-                    match limit {
-                        Some(lim) => {
-                            for p in s.splitn(lim, &delim) {
-                                parts.push(self.alloc_string(p.to_string()));
-                            }
-                        }
-                        None => {
-                            for p in s.split(&delim) {
-                                parts.push(self.alloc_string(p.to_string()));
-                            }
-                        }
-                    }
-                    let arr_ptr = self.alloc_array(parts);
-                    self.stack.push(arr_ptr);
-                    self.ip += 1;
-                }
-
-                Instr::StrIncludes(n) => {
-                    let start = if *n >= 1 { Some(self.pop_int()?) } else { None };
-                    let needle = self.pop_string()?;
-                    let haystack = self.pop_string()?;
-                    let found = match start {
-                        Some(s) if s >= 0 => {
-                            let start = s as usize;
-                            start <= haystack.len()
-                                && haystack.is_char_boundary(start)
-                                && haystack[start..].contains(&needle)
-                        }
-                        Some(_) => false,
-                        None => haystack.contains(&needle),
-                    };
-                    self.stack.push(StackValue::Bool(found));
-                    self.ip += 1;
-                }
-
-                Instr::StrStartsWith => {
-                    let prefix = self.pop_string()?;
-                    let s = self.pop_string()?;
-                    self.stack.push(StackValue::Bool(s.starts_with(&prefix)));
-                    self.ip += 1;
-                }
-
-                Instr::StrEndsWith => {
-                    let suffix = self.pop_string()?;
-                    let s = self.pop_string()?;
-                    self.stack.push(StackValue::Bool(s.ends_with(&suffix)));
-                    self.ip += 1;
-                }
-
-                Instr::StrIndexOf(n) => {
-                    let start = if *n >= 1 { Some(self.pop_int()?) } else { None };
-                    let needle = self.pop_string()?;
-                    let haystack = self.pop_string()?;
-                    let pos = match start {
-                        Some(s) if s >= 0 => {
-                            let start = s as usize;
-                            if start <= haystack.len() && haystack.is_char_boundary(start) {
-                                haystack[start..].find(&needle).map(|p| (p + start) as f64)
-                            } else {
-                                None
-                            }
-                        }
-                        Some(_) => None,
-                        None => haystack.find(&needle).map(|p| p as f64),
-                    };
-                    self.stack.push(StackValue::Number(pos.unwrap_or(-1.0)));
-                    self.ip += 1;
-                }
-
-                Instr::StrLastIndexOf(n) => {
-                    let start = if *n >= 1 { Some(self.pop_int()?) } else { None };
-                    let needle = self.pop_string()?;
-                    let haystack = self.pop_string()?;
-                    let pos = match start {
-                        Some(s) if s >= 0 => {
-                            // Search the prefix up to `start + needle.len()`,
-                            // clamped to a valid char boundary so slicing can't
-                            // panic.
-                            let mut end = haystack.len().min(s as usize + needle.len());
-                            while end > 0 && !haystack.is_char_boundary(end) {
-                                end -= 1;
-                            }
-                            haystack[..end].rfind(&needle).map(|p| p as f64)
-                        }
-                        Some(_) => None,
-                        None => haystack.rfind(&needle).map(|p| p as f64),
-                    };
-                    self.stack.push(StackValue::Number(pos.unwrap_or(-1.0)));
-                    self.ip += 1;
-                }
-
-                Instr::StrSlice => {
-                    let end = self.pop_int()?;
-                    let start = self.pop_int()?;
-                    let s = self.pop_string()?;
-                    if start < 0 || end < 0 || start > end {
-                        return Err(VMError::ValueError);
-                    }
-                    let start = start as usize;
-                    let end = end as usize;
-                    if start > s.len()
-                        || end > s.len()
-                        || !s.is_char_boundary(start)
-                        || !s.is_char_boundary(end)
-                    {
-                        return Err(VMError::ValueError);
-                    }
-                    let sliced = self.alloc_string(s[start..end].to_string());
-                    self.stack.push(sliced);
-                    self.ip += 1;
-                }
-
-                Instr::StrTrim => {
-                    let s = self.pop_string()?;
-                    let trimmed = self.alloc_string(s.trim().to_string());
-                    self.stack.push(trimmed);
-                    self.ip += 1;
-                }
-
-                Instr::StrToInt => {
-                    // Parse losslessly into the canonical variant: non-negative
-                    // (up to u64::MAX) -> PosInt, negative -> NegInt.
-                    let s = self.pop_string()?;
-                    let t = s.trim();
-                    let val = if let Ok(u) = t.parse::<u64>() {
-                        StackValue::PosInt(u)
-                    } else if let Ok(i) = t.parse::<i64>() {
-                        StackValue::NegInt(i)
-                    } else {
-                        return Err(VMError::ValueError);
-                    };
-                    self.stack.push(val);
-                    self.ip += 1;
-                }
-
-                Instr::StrToFloat => {
-                    let s = self.pop_string()?;
-                    let n: f64 = s.trim().parse().map_err(|_| VMError::ValueError)?;
-                    self.stack.push(StackValue::Number(n));
-                    self.ip += 1;
-                }
-
-                Instr::StrToJson => {
-                    let s = self.pop_string()?;
-                    let json: serde_json::Value =
-                        serde_json::from_str(&s).map_err(|_| VMError::ValueError)?;
-                    let converted = self.json_to_stack_value(&json, 0)?;
-                    self.stack.push(converted);
-                    self.ip += 1;
-                }
-
-                Instr::StrFromJson => {
-                    let val = self.stack.pop().ok_or(VMError::StackUnderflow)?;
-                    let json = self.stack_value_to_json(&val, 0)?;
-                    let s = serde_json::to_string(&json).map_err(|_| VMError::ValueError)?;
-                    let ptr = self.alloc_string(s);
-                    self.stack.push(ptr);
                     self.ip += 1;
                 }
 
@@ -2380,6 +2142,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn jnotnullish() {
+        // Not nullish: takes the jump and LEAVES the value (peek, no pop).
+        assert_eq!(
+            run(vec![Push(n(5.0)), JNotNullish(3), Push(n(9.0))]),
+            vec![n(5.0)]
+        );
+        // null / undefined: fall through; the value stays for the short-circuit.
+        assert_eq!(
+            run(vec![Push(null()), JNotNullish(3), Push(n(9.0))]),
+            vec![null(), n(9.0)]
+        );
+        assert_eq!(
+            run(vec![Push(undef()), JNotNullish(3), Push(n(9.0))]),
+            vec![undef(), n(9.0)]
+        );
+    }
+
     // ── type predicates ───────────────────────────────────────────
 
     #[test]
@@ -2394,82 +2174,7 @@ mod tests {
         assert_eq!(run(vec![Push(n(0.0)), IsBool]), vec![b(false)]);
     }
 
-    #[test]
-    fn is_int_float_num() {
-        assert_eq!(run(vec![Push(n(3.0)), IsInt]), vec![b(true)]);
-        assert_eq!(run(vec![Push(n(3.14)), IsInt]), vec![b(false)]);
-        // IsFloat is true only for numbers with a fractional part.
-        assert_eq!(run(vec![Push(n(3.14)), IsFloat]), vec![b(true)]);
-        assert_eq!(run(vec![Push(n(3.0)), IsFloat]), vec![b(false)]);
-        assert_eq!(run(vec![Push(null()), IsFloat]), vec![b(false)]);
-        // IsNum is true for any number, integer-valued or not.
-        assert_eq!(run(vec![Push(n(3.0)), IsNum]), vec![b(true)]);
-        assert_eq!(run(vec![Push(n(3.14)), IsNum]), vec![b(true)]);
-        assert_eq!(run(vec![Push(null()), IsNum]), vec![b(false)]);
-    }
-
-    #[test]
-    fn is_str_arr_obj() {
-        // IsStr with a string
-        assert_eq!(run_heap(vec![Push(s(0)), IsStr], &["hi"]), vec![b(true)]);
-        // IsStr with a number
-        assert_eq!(run(vec![Push(n(0.0)), IsStr]), vec![b(false)]);
-        // IsArr
-        let mut vm = VM::new(vec![IsArr]);
-        vm.heap.push(HeapValue::Array(vec![]));
-        vm.stack.push(s(0));
-        match vm.step().unwrap() {
-            StepResult::Done => {}
-            _ => panic!(),
-        }
-        assert_eq!(vm.stack, vec![b(true)]);
-        // IsObj
-        let mut vm = VM::new(vec![IsObj]);
-        vm.heap.push(HeapValue::Object(IndexMap::new()));
-        vm.stack.push(s(0));
-        match vm.step().unwrap() {
-            StepResult::Done => {}
-            _ => panic!(),
-        }
-        assert_eq!(vm.stack, vec![b(true)]);
-    }
-
     // ── unary operators ───────────────────────────────────────────
-
-    #[test]
-    fn abs_neg() {
-        assert_eq!(run(vec![Push(n(-3.0)), Abs]), vec![n(3.0)]);
-        assert_eq!(run(vec![Push(n(3.0)), Neg]), vec![n(-3.0)]);
-        // Arithmetic coerces ToNumber: null -> 0, "-3" -> -3.
-        assert_eq!(run(vec![Push(null()), Abs]), vec![n(0.0)]);
-        assert_eq!(run_heap(vec![Push(s(0)), Neg], &["-3"]), vec![n(3.0)]);
-        // A non-coercible operand (array/object/function) is a TypeError.
-        assert!(matches!(
-            run_err(vec![Push(n(1.0)), ArrNew(1), Abs]),
-            VMError::TypeError
-        ));
-    }
-
-    #[test]
-    fn ceil_floor_round() {
-        assert_eq!(run(vec![Push(n(3.14)), Ceil]), vec![n(4.0)]);
-        assert_eq!(run(vec![Push(n(3.14)), Floor]), vec![n(3.0)]);
-        assert_eq!(run(vec![Push(n(3.6)), Round]), vec![n(4.0)]);
-    }
-
-    #[test]
-    fn sqrt_sign() {
-        assert_eq!(run(vec![Push(n(9.0)), Sqrt]), vec![n(3.0)]);
-        // f64::signum: 1.0 for positive/+0, -1.0 for negative/-0, self for NaN
-        assert_eq!(run(vec![Push(n(5.0)), Sign]), vec![n(1.0)]);
-        assert_eq!(run(vec![Push(n(-5.0)), Sign]), vec![n(-1.0)]);
-        assert_eq!(run(vec![Push(n(0.0)), Sign]), vec![n(1.0)]);
-        // JS Math.sqrt(-1) is NaN, not an error.
-        assert!(matches!(
-            run(vec![Push(n(-1.0)), Sqrt]).as_slice(),
-            [StackValue::Number(x)] if x.is_nan()
-        ));
-    }
 
     #[test]
     fn not_bitnot() {
@@ -2513,13 +2218,6 @@ mod tests {
             run(vec![Push(n(1.0)), Push(n(0.0)), Mod]).as_slice(),
             [StackValue::Number(x)] if x.is_nan()
         ));
-    }
-
-    #[test]
-    fn min_max_pow() {
-        assert_eq!(run(vec![Push(n(3.0)), Push(n(7.0)), Min]), vec![n(3.0)]);
-        assert_eq!(run(vec![Push(n(3.0)), Push(n(7.0)), Max]), vec![n(7.0)]);
-        assert_eq!(run(vec![Push(n(2.0)), Push(n(3.0)), Pow]), vec![n(8.0)]);
     }
 
     #[test]
@@ -2997,90 +2695,6 @@ mod tests {
         // Same address -> equal; different -> not.
         assert_eq!(run(vec![Push(f(3)), Push(f(3)), Eq]), vec![b(true)]);
         assert_eq!(run(vec![Push(f(3)), Push(f(4)), Eq]), vec![b(false)]);
-        // A Fn has no JSON representation.
-        let mut vm = VM::new(vec![Push(f(0)), StrFromJson]);
-        assert!(matches!(vm.step().unwrap_err(), VMError::ValueError));
-    }
-
-    #[test]
-    fn map_as_bytecode_library_fn() {
-        // `map(arr, fn)` written in the DSL itself: loop over the array, call
-        // `fn` on each element via CallDyn, collect into a new array. Proves
-        // first-class Fns work end-to-end with no special opcode and no
-        // closures. Here map([1,2,3], double) -> [2, 4, 6].
-        //
-        // main:  build [1,2,3], push Fn(double), Call(map, 2), Return(1)
-        // double(x):     Arg(0) * 2
-        // map(arr, fn):  out=[]; i=0; while i<len: out.push(fn(arr[i])); i++
-        let mut code: Vec<Instr> = Vec::new();
-
-        // main
-        code.push(Push(n(1.0)));
-        code.push(Push(n(2.0)));
-        code.push(Push(n(3.0)));
-        code.push(ArrNew(3));
-        let push_fn_idx = code.len();
-        code.push(Push(f(0))); // patched -> double
-        let call_map_idx = code.len();
-        code.push(Call(0, 2)); // patched -> map
-        code.push(Return(1));
-
-        // double(x) = x * 2
-        let double_addr = code.len() as u32;
-        code.push(Arg(0));
-        code.push(Push(n(2.0)));
-        code.push(Mul);
-        code.push(Return(1));
-
-        // map(arr, fn)
-        let map_addr = code.len() as u32;
-        code.push(Alloc(plain(2))); // local 0 = out, local 1 = i
-        code.push(ArrNew(0));
-        code.push(SetLocal(0)); // out = []
-        code.push(Push(n(0.0)));
-        code.push(SetLocal(1)); // i = 0
-        let loop_addr = code.len() as u32;
-        code.push(Local(1));
-        code.push(Arg(0));
-        code.push(ArrLength);
-        code.push(Lt); // i < len(arr)
-        let jfalse_idx = code.len();
-        code.push(JFalse(0)); // patched -> end
-        code.push(Local(0)); // out (ArrPush receiver)
-        code.push(Arg(0));
-        code.push(Local(1));
-        code.push(IndexGet); // arr[i]
-        code.push(Arg(1));
-        code.push(CallDyn(1)); // fn(arr[i])
-        code.push(ArrPush); // out.push(...)
-        code.push(Local(1));
-        code.push(Push(n(1.0)));
-        code.push(Add);
-        code.push(SetLocal(1)); // i++
-        code.push(Jump(loop_addr));
-        let end_addr = code.len() as u32;
-        code.push(Local(0));
-        code.push(Return(1));
-
-        code[push_fn_idx] = Push(f(double_addr));
-        code[call_map_idx] = Call(map_addr, 2);
-        code[jfalse_idx] = JFalse(end_addr);
-
-        let mut vm = VM::new(code);
-        loop {
-            match vm.step().unwrap() {
-                StepResult::Done => break,
-                other => panic!("unexpected effect: {other:?}"),
-            }
-        }
-        assert_eq!(vm.stack.len(), 1);
-        let StackValue::Ptr(p) = vm.stack[0] else {
-            panic!("expected array pointer");
-        };
-        assert_eq!(
-            vm.heap[p as usize],
-            HeapValue::Array(vec![n(2.0), n(4.0), n(6.0)])
-        );
     }
 
     // ── closures ──────────────────────────────────────────────────
@@ -3303,20 +2917,6 @@ mod tests {
     }
 
     #[test]
-    fn closure_has_no_json_representation() {
-        // Serializing a closure fails loudly, like a bare Fn.
-        let code = vec![
-            Alloc(vec![SlotKind::Boxed]),
-            Push(n(1.0)),
-            SetLocal(0),
-            MakeClosure(5, vec![0]),
-            StrFromJson,
-            Return(1), // addr 5
-        ];
-        assert!(matches!(run_err(code), VMError::ValueError));
-    }
-
-    #[test]
     fn make_closure_rejects_out_of_range_capture() {
         // Capturing a slot the frame doesn't have is a compiler bug → BadLocal.
         let code = vec![
@@ -3466,82 +3066,6 @@ mod tests {
     }
 
     #[test]
-    fn arr_push_pop() {
-        // Create [10], push 20, pop back.
-        let code = vec![
-            Push(n(10.0)),
-            ArrNew(1), // [10], stack: [ptr]
-            Push(n(20.0)),
-            ArrPush, // [10, 20], stack: []
-        ];
-        assert!(run(code).is_empty());
-    }
-
-    #[test]
-    fn arr_pop_returns_last() {
-        // Left-to-right: first pushed = arr[0]. Push 10, 20 → arr = [10, 20].
-        let code = vec![
-            Push(n(10.0)),
-            Push(n(20.0)),
-            ArrNew(2),
-            ArrPop, // → 20 (last element)
-        ];
-        assert_eq!(run(code), vec![n(20.0)]);
-    }
-
-    #[test]
-    fn arr_shift_unshift() {
-        // JS semantics: unshift prepends, shift removes the front.
-        // Push 30, Push 20, ArrNew(2) → arr = [30, 20] (left-to-right)
-        // Dup ptr, Push 10, ArrUnshift → [10, 30, 20]
-        // ArrShift → removes & returns front (10)
-        let code = vec![
-            Push(n(30.0)),
-            Push(n(20.0)),
-            ArrNew(2),
-            Dup, // ptr for later
-            Push(n(10.0)),
-            ArrUnshift, // [10, 30, 20], ptr consumed
-            ArrShift,   // → 10 (front of the Dup'd ptr)
-        ];
-        assert_eq!(run(code), vec![n(10.0)]);
-    }
-
-    #[test]
-    fn arr_shift_empty_errors() {
-        let code = vec![ArrNew(0), ArrShift];
-        assert!(matches!(run_err(code), VMError::ValueError));
-    }
-
-    #[test]
-    fn arr_join() {
-        // Left-to-right: push 1, 2, 3 → arr = [1, 2, 3]
-        let code = vec![
-            Push(n(1.0)),
-            Push(n(2.0)),
-            Push(n(3.0)),
-            ArrNew(3),
-            Push(s(0)), // separator ", " at heap[0]
-            ArrJoin,
-        ];
-        let strings = &[", "];
-        let mut vm = VM::new(code);
-        for s in strings {
-            vm.alloc_string(s.to_string());
-        }
-        loop {
-            match vm.step().unwrap() {
-                StepResult::Done => break,
-                _ => {}
-            }
-        }
-        assert_eq!(
-            vm.heap.last().unwrap(),
-            &HeapValue::String("1, 2, 3".into())
-        );
-    }
-
-    #[test]
     fn arr_get_oob() {
         let code = vec![
             Push(n(10.0)),
@@ -3656,56 +3180,6 @@ mod tests {
         assert_eq!(run(code), vec![undef()]);
     }
 
-    #[test]
-    fn object_enumeration() {
-        // Build {a:1, b:2}; keys -> ["a","b"], values -> [1,2] (insertion order).
-        let build = || {
-            vec![
-                Push(n(1.0)),
-                Push(n(2.0)),
-                ObjNew(vec!["a".into(), "b".into()]),
-            ]
-        };
-
-        let mut keys = build();
-        keys.extend([ObjKeys, ArrLength]);
-        assert_eq!(run(keys), vec![n(2.0)]);
-        // First key is "a".
-        let mut first_key = build();
-        first_key.extend([ObjKeys, Push(n(0.0)), IndexGet, ToStr]);
-        assert_eq!(run_last_str(first_key, &[]), "a");
-
-        // values -> [1,2], summed.
-        let mut vals = build();
-        vals.extend([
-            ObjValues,
-            Dup,
-            Push(n(0.0)),
-            IndexGet,
-            Swap,
-            Push(n(1.0)),
-            IndexGet,
-            Add,
-        ]);
-        assert_eq!(run(vals), vec![n(3.0)]);
-
-        // has: "a" present, "z" absent.
-        let mut has = build();
-        has.extend([Push(s(0)), ObjHas]);
-        assert_eq!(run_heap(has, &["a"]), vec![b(true)]);
-        let mut hasnt = build();
-        hasnt.extend([Push(s(0)), ObjHas]);
-        assert_eq!(run_heap(hasnt, &["z"]), vec![b(false)]);
-
-        // delete: returns whether the key existed, and removes it.
-        let mut del = build();
-        del.extend([Push(s(0)), ObjDelete]);
-        assert_eq!(run_heap(del, &["a"]), vec![b(true)]);
-        let mut del_keys = build();
-        del_keys.extend([Dup, Push(s(0)), ObjDelete, Pop(1), ObjKeys, ArrLength]);
-        assert_eq!(run_heap(del_keys, &["a"]), vec![n(1.0)]);
-    }
-
     // ── undefined & typeof ────────────────────────────────────────
 
     #[test]
@@ -3792,255 +3266,6 @@ mod tests {
             &["undefined"],
         );
         assert_eq!(miss_tag, vec![b(true)]);
-    }
-
-    #[test]
-    fn undefined_json_in_object_is_dropped() {
-        // JSON.stringify({a:1, b:undefined}) === '{"a":1}'
-        let code = vec![
-            Push(n(1.0)),
-            Push(undef()),
-            ObjNew(vec!["a".into(), "b".into()]),
-            StrFromJson,
-            Return(1),
-        ];
-        let mut vm = VM::new(code);
-        while !matches!(vm.step().unwrap(), StepResult::Done) {}
-        assert_eq!(
-            vm.heap.last().unwrap(),
-            &HeapValue::String(r#"{"a":1}"#.into())
-        );
-    }
-
-    #[test]
-    fn undefined_json_in_array_is_null() {
-        // JSON.stringify([undefined]) === '[null]'
-        let code = vec![Push(undef()), ArrNew(1), StrFromJson, Return(1)];
-        let mut vm = VM::new(code);
-        while !matches!(vm.step().unwrap(), StepResult::Done) {}
-        assert_eq!(vm.heap.last().unwrap(), &HeapValue::String("[null]".into()));
-    }
-
-    #[test]
-    fn undefined_json_at_root_errors() {
-        // JSON.stringify(undefined) has no JSON form -> surface an error.
-        assert!(matches!(
-            run_err(vec![Push(undef()), StrFromJson]),
-            VMError::ValueError
-        ));
-    }
-
-    #[test]
-    fn undefined_joins_as_empty_string() {
-        // JS [1, undefined, 2].join(",") === "1,,2"
-        let mut vm = VM::new(vec![
-            Push(n(1.0)),
-            Push(undef()),
-            Push(n(2.0)),
-            ArrNew(3),
-            Push(s(0)),
-            ArrJoin,
-            Return(1),
-        ]);
-        vm.alloc_string(",".into());
-        while !matches!(vm.step().unwrap(), StepResult::Done) {}
-        assert_eq!(vm.heap.last().unwrap(), &HeapValue::String("1,,2".into()));
-    }
-
-    // ── string operations ─────────────────────────────────────────
-
-    #[test]
-    fn str_split() {
-        // Verify split produces correct array contents.
-        let mut vm = VM::new(vec![Push(s(0)), Push(s(1)), StrSplit(0)]);
-        vm.alloc_string("a,b,c".to_string());
-        vm.alloc_string(",".to_string());
-        loop {
-            match vm.step().unwrap() {
-                StepResult::Done => break,
-                _ => {}
-            }
-        }
-        assert_eq!(vm.stack.len(), 1);
-        if let StackValue::Ptr(p) = vm.stack[0] {
-            match &vm.heap[p as usize] {
-                HeapValue::Array(arr) => assert_eq!(arr.len(), 3),
-                _ => panic!("expected array"),
-            }
-        } else {
-            panic!("expected pointer");
-        }
-    }
-
-    #[test]
-    fn str_split_with_limit() {
-        let code = vec![Push(s(0)), Push(s(1)), Push(n(2.0)), StrSplit(1)];
-        let mut vm = VM::new(code);
-        vm.alloc_string("a,b,c".to_string());
-        vm.alloc_string(",".to_string());
-        loop {
-            match vm.step().unwrap() {
-                StepResult::Done => break,
-                _ => {}
-            }
-        }
-        // Should split into at most 2 parts
-        if let StackValue::Ptr(p) = vm.stack[0] {
-            if let HeapValue::Array(arr) = &vm.heap[p as usize] {
-                assert_eq!(arr.len(), 2);
-            } else {
-                panic!("expected array");
-            }
-        } else {
-            panic!("expected pointer");
-        }
-    }
-
-    #[test]
-    fn str_includes_starts_ends() {
-        assert_eq!(
-            run_heap(
-                vec![Push(s(0)), Push(s(1)), StrIncludes(0)],
-                &["hello world", "world"]
-            ),
-            vec![b(true)]
-        );
-        assert_eq!(
-            run_heap(
-                vec![Push(s(0)), Push(s(1)), StrStartsWith],
-                &["hello world", "hello"]
-            ),
-            vec![b(true)]
-        );
-        assert_eq!(
-            run_heap(
-                vec![Push(s(0)), Push(s(1)), StrEndsWith],
-                &["hello world", "world"]
-            ),
-            vec![b(true)]
-        );
-    }
-
-    #[test]
-    fn str_index_of() {
-        // "hello hello" — first "hello" at 0
-        assert_eq!(
-            run_heap(
-                vec![Push(s(0)), Push(s(1)), StrIndexOf(0)],
-                &["hello hello", "hello"]
-            ),
-            vec![n(0.0)]
-        );
-        // "hello hello" with start=1 — second "hello" at 6
-        assert_eq!(
-            run_heap(
-                vec![Push(s(0)), Push(s(1)), Push(n(1.0)), StrIndexOf(1)],
-                &["hello hello", "hello"]
-            ),
-            vec![n(6.0)]
-        );
-        // Not found
-        assert_eq!(
-            run_heap(vec![Push(s(0)), Push(s(1)), StrIndexOf(0)], &["abc", "xyz"]),
-            vec![n(-1.0)]
-        );
-    }
-
-    #[test]
-    fn str_last_index_of() {
-        // "hello hello" — last "hello" at 6
-        assert_eq!(
-            run_heap(
-                vec![Push(s(0)), Push(s(1)), StrLastIndexOf(0)],
-                &["hello hello", "hello"]
-            ),
-            vec![n(6.0)]
-        );
-        // "hello hello" with start=5 — search backwards from index 5, finds at 0
-        assert_eq!(
-            run_heap(
-                vec![Push(s(0)), Push(s(1)), Push(n(5.0)), StrLastIndexOf(1)],
-                &["hello hello", "hello"]
-            ),
-            vec![n(0.0)]
-        );
-        // Not found
-        assert_eq!(
-            run_heap(
-                vec![Push(s(0)), Push(s(1)), StrLastIndexOf(0)],
-                &["abc", "xyz"]
-            ),
-            vec![n(-1.0)]
-        );
-    }
-
-    #[test]
-    fn str_slice() {
-        assert_eq!(
-            run_heap(
-                vec![Push(s(0)), Push(n(0.0)), Push(n(5.0)), StrSlice],
-                &["hello world"]
-            ),
-            vec![s(1)] // "hello" at heap[1]
-        );
-        // Verify the sliced string
-        let mut vm = VM::new(vec![StrSlice]);
-        vm.heap.push(HeapValue::String("hello world".into()));
-        vm.stack.push(s(0));
-        vm.stack.push(n(0.0));
-        vm.stack.push(n(5.0));
-        match vm.step().unwrap() {
-            StepResult::Done => {}
-            _ => panic!(),
-        }
-        assert_eq!(vm.heap[1], HeapValue::String("hello".into()));
-    }
-
-    #[test]
-    fn str_slice_bounds_error() {
-        let mut vm = VM::new(vec![Push(s(0)), Push(n(0.0)), Push(n(999.0)), StrSlice]);
-        vm.alloc_string("hi".to_string());
-        assert!(matches!(vm.step().unwrap_err(), VMError::ValueError));
-    }
-
-    #[test]
-    fn str_trim() {
-        assert_eq!(run_heap(vec![Push(s(0)), StrTrim], &["  hi  "]), vec![s(1)]);
-    }
-
-    #[test]
-    fn str_to_int_float() {
-        // StrToInt yields a lossless Int; StrToFloat yields a Number.
-        assert_eq!(run_heap(vec![Push(s(0)), StrToInt], &["42"]), vec![i(42)]);
-        assert_eq!(
-            run_heap(vec![Push(s(0)), StrToFloat], &["3.14"]),
-            vec![n(3.14)]
-        );
-    }
-
-    #[test]
-    fn str_to_int_error() {
-        let mut vm = VM::new(vec![Push(s(0)), StrToInt]);
-        vm.alloc_string("abc".to_string());
-        assert!(matches!(vm.step().unwrap_err(), VMError::ValueError));
-    }
-
-    #[test]
-    fn str_to_json_from_json() {
-        // Parse JSON string, then serialize back
-        let code = vec![Push(s(0)), StrToJson, StrFromJson];
-        let mut vm = VM::new(code);
-        vm.alloc_string(r#"{"a":1,"b":[2,3]}"#.to_string());
-        loop {
-            match vm.step().unwrap() {
-                StepResult::Done => break,
-                _ => {}
-            }
-        }
-        assert_eq!(
-            vm.heap.last().unwrap(),
-            &HeapValue::String(r#"{"a":1,"b":[2,3]}"#.into())
-        );
     }
 
     // ── effects ───────────────────────────────────────────────────
@@ -4201,29 +3426,8 @@ mod tests {
         ));
         // Type predicates stay total (false) on a dangling pointer.
         assert_eq!(run(vec![Push(s(99)), IsStr]), vec![b(false)]);
-        assert_eq!(run(vec![Push(s(99)), IsArr]), vec![b(false)]);
         // Equality with a dangling pointer is simply not-equal, no panic.
         assert_eq!(run(vec![Push(s(99)), Push(s(99)), Eq]), vec![b(false)]);
-    }
-
-    #[test]
-    fn str_slice_rejects_non_char_boundary() {
-        // "é" is two UTF-8 bytes; slicing at byte 1 splits the codepoint.
-        let mut vm = VM::new(vec![Push(s(0)), Push(n(0.0)), Push(n(1.0)), StrSlice]);
-        vm.alloc_string("é".to_string());
-        assert!(matches!(vm.step().unwrap_err(), VMError::ValueError));
-    }
-
-    #[test]
-    fn str_includes_non_ascii_no_panic() {
-        // start offset in the middle of a codepoint -> false, not a panic.
-        assert_eq!(
-            run_heap(
-                vec![Push(s(0)), Push(s(1)), Push(n(1.0)), StrIncludes(1)],
-                &["é", "x"]
-            ),
-            vec![b(false)]
-        );
     }
 
     #[test]
@@ -4275,28 +3479,6 @@ mod tests {
         ));
         // Valid shifts still work.
         assert_eq!(run(vec![Push(n(1.0)), Push(n(3.0)), BitLhs]), vec![n(8.0)]);
-    }
-
-    #[test]
-    fn json_depth_is_bounded() {
-        // Build JSON nested deeper than MAX_JSON_DEPTH; parsing must error
-        // rather than overflow the native stack.
-        let deep = format!("{}{}", "[".repeat(200), "]".repeat(200));
-        let mut vm = VM::new(vec![Push(s(0)), StrToJson]);
-        vm.alloc_string(deep);
-        assert!(matches!(vm.step().unwrap_err(), VMError::ValueError));
-    }
-
-    #[test]
-    fn nan_serializes_as_null() {
-        let mut vm = VM::new(vec![Push(n(f64::NAN)), StrFromJson]);
-        loop {
-            match vm.step().unwrap() {
-                StepResult::Done => break,
-                _ => panic!(),
-            }
-        }
-        assert_eq!(vm.heap.last().unwrap(), &HeapValue::String("null".into()));
     }
 
     #[test]
@@ -4382,75 +3564,7 @@ mod tests {
     // ── Int transport type ────────────────────────────────────────
 
     #[test]
-    fn int_survives_json_roundtrip() {
-        // A 2^60 id exceeds f64's 53-bit mantissa; it must round-trip exactly.
-        let big = 1i64 << 60; // 1152921504606846976
-        let json = format!(r#"{{"id":{big}}}"#);
-        let mut vm = VM::new(vec![
-            Push(s(0)),
-            StrToJson,
-            ObjGet("id".into()),
-            // round-trip back out and confirm the textual form is preserved
-            Dup,
-            StrFromJson,
-        ]);
-        vm.alloc_string(json);
-        loop {
-            match vm.step().unwrap() {
-                StepResult::Done => break,
-                _ => panic!(),
-            }
-        }
-        // stack: [PosInt(big), Ptr(serialized)]
-        assert_eq!(vm.stack[0], i(big));
-        if let StackValue::Ptr(p) = vm.stack[1] {
-            assert_eq!(vm.heap[p as usize], HeapValue::String(big.to_string()));
-        } else {
-            panic!("expected serialized string");
-        }
-    }
-
-    #[test]
-    fn u64_above_i64_max_survives_roundtrip() {
-        // Values in the 2^63..2^64 band would corrupt as f64 or fail to fit
-        // i64; PosInt carries them exactly. u64::MAX = 18446744073709551615.
-        let big = u64::MAX;
-        let json = format!(r#"{{"hash":{big}}}"#);
-        let mut vm = VM::new(vec![
-            Push(s(0)),
-            StrToJson,
-            ObjGet("hash".into()),
-            Dup,
-            StrFromJson,
-        ]);
-        vm.alloc_string(json);
-        loop {
-            match vm.step().unwrap() {
-                StepResult::Done => break,
-                _ => panic!(),
-            }
-        }
-        assert_eq!(vm.stack[0], u(big));
-        if let StackValue::Ptr(p) = vm.stack[1] {
-            assert_eq!(vm.heap[p as usize], HeapValue::String(big.to_string()));
-        } else {
-            panic!("expected serialized string");
-        }
-    }
-
-    #[test]
     fn negative_integers_are_negint_and_roundtrip() {
-        // Negative JSON integers map to NegInt and serialize back exactly.
-        let mut vm = VM::new(vec![Push(s(0)), StrToJson, ObjGet("x".into())]);
-        vm.alloc_string(r#"{"x":-42}"#.to_string());
-        loop {
-            match vm.step().unwrap() {
-                StepResult::Done => break,
-                _ => panic!(),
-            }
-        }
-        assert_eq!(vm.stack, vec![i(-42)]);
-        assert_eq!(vm.stack, vec![StackValue::NegInt(-42)]);
         // PosInt and NegInt never compare equal even at the boundary value 0
         // representations (different sign domains).
         assert_eq!(run(vec![Push(u(5)), Push(i(-5)), Eq]), vec![b(false)]);
@@ -4463,29 +3577,6 @@ mod tests {
         // A PosInt beyond i64::MAX can't be an array index -> error, no panic.
         let code = vec![Push(n(1.0)), ArrNew(1), Push(u(u64::MAX)), IndexGet];
         assert!(matches!(run_err(code), VMError::TypeError));
-    }
-
-    #[test]
-    fn json_parses_integers_as_int_and_fractions_as_number() {
-        let mut vm = VM::new(vec![Push(s(0)), StrToJson, ObjGet("a".into())]);
-        vm.alloc_string(r#"{"a":7,"b":7.5}"#.to_string());
-        loop {
-            match vm.step().unwrap() {
-                StepResult::Done => break,
-                _ => panic!(),
-            }
-        }
-        assert_eq!(vm.stack, vec![i(7)]);
-
-        let mut vm = VM::new(vec![Push(s(0)), StrToJson, ObjGet("b".into())]);
-        vm.alloc_string(r#"{"a":7,"b":7.5}"#.to_string());
-        loop {
-            match vm.step().unwrap() {
-                StepResult::Done => break,
-                _ => panic!(),
-            }
-        }
-        assert_eq!(vm.stack, vec![n(7.5)]);
     }
 
     #[test]
@@ -4508,16 +3599,6 @@ mod tests {
     }
 
     #[test]
-    fn int_type_predicates() {
-        assert_eq!(run(vec![Push(i(5)), IsInt]), vec![b(true)]);
-        assert_eq!(run(vec![Push(i(5)), IsNum]), vec![b(true)]);
-        assert_eq!(run(vec![Push(i(5)), IsFloat]), vec![b(false)]);
-        // integer-valued Number is still "int"; fractional Number is "float"
-        assert_eq!(run(vec![Push(n(5.0)), IsInt]), vec![b(true)]);
-        assert_eq!(run(vec![Push(n(5.5)), IsFloat]), vec![b(true)]);
-    }
-
-    #[test]
     fn int_indices_and_bitops() {
         // Int works directly as an array index (left-to-right: first = arr[0]).
         let code = vec![
@@ -4530,13 +3611,5 @@ mod tests {
         assert_eq!(run(code), vec![n(20.0)]);
         // ...and as a bitwise operand.
         assert_eq!(run(vec![Push(i(10)), Push(i(12)), BitAnd]), vec![n(8.0)]);
-    }
-
-    #[test]
-    fn str_split_negative_limit_errors() {
-        let mut vm = VM::new(vec![Push(s(0)), Push(s(1)), Push(n(-1.0)), StrSplit(1)]);
-        vm.alloc_string("a,b,c".to_string());
-        vm.alloc_string(",".to_string());
-        assert!(matches!(vm.step().unwrap_err(), VMError::ValueError));
     }
 }

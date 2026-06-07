@@ -1,3 +1,4 @@
+mod builtin;
 mod compiler;
 mod tree;
 mod types;

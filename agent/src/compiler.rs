@@ -14,6 +14,7 @@ use oxc_ast::ast;
 use oxc_parser::Parser;
 use oxc_span::{GetSpan, SourceType};
 
+use crate::builtin::Builtin;
 use crate::vm::{Instr, StackValue};
 
 /// A compiled program: the flat instruction stream, a parallel span table
@@ -175,10 +176,16 @@ impl<'src> Compiler<'src> {
         match expr {
             // ── literals ──────────────────────────────────────────────
             ast::Expression::NumericLiteral(lit) => {
-                self.emit(Instr::Push(number_literal_to_value(lit.value)), lit.span.start);
+                self.emit(
+                    Instr::Push(number_literal_to_value(lit.value)),
+                    lit.span.start,
+                );
             }
             ast::Expression::StringLiteral(lit) => {
-                self.emit(Instr::PushStr(lit.value.as_str().to_string()), lit.span.start);
+                self.emit(
+                    Instr::PushStr(lit.value.as_str().to_string()),
+                    lit.span.start,
+                );
             }
             ast::Expression::BooleanLiteral(lit) => {
                 self.emit(Instr::Push(StackValue::Bool(lit.value)), lit.span.start);
@@ -218,7 +225,9 @@ impl<'src> Compiler<'src> {
             ast::Expression::StaticMemberExpression(m) => self.compile_static_member(m),
             ast::Expression::ComputedMemberExpression(m) => self.compile_computed_member(m),
             ast::Expression::CallExpression(c) => self.compile_call(c),
-            ast::Expression::ChainExpression(chain) => self.compile_chain_element(&chain.expression),
+            ast::Expression::ChainExpression(chain) => {
+                self.compile_chain_element(&chain.expression)
+            }
 
             ast::Expression::ParenthesizedExpression(p) => self.compile_expr(&p.expression),
 
@@ -226,17 +235,23 @@ impl<'src> Compiler<'src> {
             ast::Expression::UpdateExpression(u) => {
                 self.error(u.span.start, "`++`/`--` are not supported until Phase 2")
             }
-            ast::Expression::FunctionExpression(f) => {
-                self.error(f.span.start, "function expressions are not supported until Phase 3")
+            ast::Expression::FunctionExpression(f) => self.error(
+                f.span.start,
+                "function expressions are not supported until Phase 3",
+            ),
+            ast::Expression::ArrowFunctionExpression(f) => self.error(
+                f.span.start,
+                "arrow functions are not supported until Phase 3",
+            ),
+            ast::Expression::BigIntLiteral(b) => {
+                self.error(b.span.start, "BigInt is not supported")
             }
-            ast::Expression::ArrowFunctionExpression(f) => {
-                self.error(f.span.start, "arrow functions are not supported until Phase 3")
-            }
-            ast::Expression::BigIntLiteral(b) => self.error(b.span.start, "BigInt is not supported"),
             ast::Expression::RegExpLiteral(r) => {
                 self.error(r.span.start, "regular expressions are not supported")
             }
-            ast::Expression::ThisExpression(t) => self.error(t.span.start, "`this` is not supported"),
+            ast::Expression::ThisExpression(t) => {
+                self.error(t.span.start, "`this` is not supported")
+            }
             ast::Expression::NewExpression(n) => self.error(n.span.start, "`new` is not supported"),
             other => self.error(other.span().start, "unsupported expression"),
         }
@@ -427,18 +442,12 @@ impl<'src> Compiler<'src> {
                 self.emit(Instr::Label(end), span);
             }
             Op::Coalesce => {
-                // nullish (== null, which is true only for null/undefined): eval
-                // rhs; otherwise keep lhs.
-                let keep = self.new_label();
+                // not nullish: keep lhs (the peeking jump leaves it); nullish:
+                // drop lhs and evaluate rhs.
                 let end = self.new_label();
-                self.emit(Instr::Dup, span);
-                self.emit(Instr::Push(StackValue::Null), span);
-                self.emit(Instr::LooseEq, span);
-                self.emit(Instr::JFalse(keep), span);
+                self.emit(Instr::JNotNullish(end), span);
                 self.emit(Instr::Pop(1), span);
                 self.compile_expr(&log.right);
-                self.emit(Instr::Jump(end), span);
-                self.emit(Instr::Label(keep), span);
                 self.emit(Instr::Label(end), span);
             }
         }
@@ -547,6 +556,15 @@ impl<'src> Compiler<'src> {
     /// property literally named `length` reached via `.length`); anything else
     /// is `ObjGet`.
     fn compile_static_member(&mut self, m: &ast::StaticMemberExpression) {
+        // First-class reference to a namespaced builtin used as a *value* (e.g.
+        // `Math.sqrt` passed as a callback or invoked via `?.()`): push the
+        // `Builtin`. `?.` here is a no-op — a namespace is never nullish.
+        if let ast::Expression::Identifier(obj) = &m.object {
+            if let Some(builtin) = namespace_builtin(obj.name.as_str(), m.property.name.as_str()) {
+                self.emit(Instr::Push(StackValue::Builtin(builtin)), m.span.start);
+                return;
+            }
+        }
         self.compile_expr(&m.object);
         if m.optional {
             let end = self.begin_optional(m.span.start);
@@ -581,10 +599,13 @@ impl<'src> Compiler<'src> {
         }
     }
 
-    /// Optional-chaining (`?.`) prologue. With the object value already on the
-    /// stack, short-circuit to `undefined` when it is nullish (`== null`, i.e.
-    /// null or undefined); otherwise leave the object for the access that the
-    /// caller emits next. Returns the `end` label to place after that access.
+    /// Optional-chaining (`?.`) prologue. With the guarded value already on the
+    /// stack, short-circuit to `undefined` when it is nullish (null or
+    /// undefined); otherwise leave the value for the access/call that the caller
+    /// emits next. Returns the `end` label to place after that access.
+    ///
+    /// The peeking `JNotNullish` keeps the value on the not-nullish path with no
+    /// `Dup`, so the whole guard is one branch plus the short-circuit tail.
     ///
     /// Per-link: a fully-`?.` chain (`a?.b?.c`) short-circuits correctly because
     /// each link re-checks; mixing `?.` then a plain `.` on a nullish base
@@ -592,10 +613,7 @@ impl<'src> Compiler<'src> {
     fn begin_optional(&mut self, span: u32) -> u32 {
         let cont = self.new_label();
         let end = self.new_label();
-        self.emit(Instr::Dup, span);
-        self.emit(Instr::Push(StackValue::Null), span);
-        self.emit(Instr::LooseEq, span);
-        self.emit(Instr::JFalse(cont), span);
+        self.emit(Instr::JNotNullish(cont), span);
         self.emit(Instr::Pop(1), span);
         self.emit(Instr::Push(StackValue::Undefined), span);
         self.emit(Instr::Jump(end), span);
@@ -611,9 +629,10 @@ impl<'src> Compiler<'src> {
             ast::ChainElement::PrivateFieldExpression(m) => {
                 self.error(m.span.start, "private fields are not supported")
             }
-            ast::ChainElement::TSNonNullExpression(e) => {
-                self.error(e.span.start, "TypeScript non-null assertions are not supported")
-            }
+            ast::ChainElement::TSNonNullExpression(e) => self.error(
+                e.span.start,
+                "TypeScript non-null assertions are not supported",
+            ),
         }
     }
 
@@ -670,10 +689,6 @@ impl<'src> Compiler<'src> {
     /// later phases.
     fn compile_call(&mut self, call: &ast::CallExpression) {
         let span = call.span.start;
-        if call.optional {
-            self.error(span, "optional calls (`?.()`) are not supported");
-            return;
-        }
         // Collect non-spread argument expressions (spread clashes with the VM's
         // strict arity).
         let mut argv: Vec<&ast::Expression> = Vec::with_capacity(call.arguments.len());
@@ -687,22 +702,58 @@ impl<'src> Compiler<'src> {
             }
         }
 
+        // `call.optional` is the `?.()` token *on the callee value* (`f?.()`,
+        // `state.fn?.()`, `Math.max?.(…)`) — distinct from `obj?.method()`
+        // (handled below as an optional member).
+        if call.optional {
+            // Static-call reclaim: a constant, non-nullish callee makes the `?.`
+            // guard provably dead — `Math.max?.(a, b)` is identical to
+            // `Math.max(a, b)`. Emit the static `CallBuiltin` and skip the
+            // guard/`CallDyn`. (First-class builtin refs are the only constant
+            // callables today; named function refs join them in Phase 3.)
+            if let ast::Expression::StaticMemberExpression(m) = &call.callee {
+                if let ast::Expression::Identifier(obj) = &m.object {
+                    if namespace_builtin(obj.name.as_str(), m.property.name.as_str()).is_some() {
+                        return self.compile_namespace_call(
+                            obj.name.as_str(),
+                            m.property.name.as_str(),
+                            &argv,
+                            span,
+                        );
+                    }
+                }
+            }
+            // Otherwise the callee is a genuine runtime value: evaluate it,
+            // short-circuit to undefined when nullish (args skipped), else
+            // dynamically invoke it.
+            self.compile_expr(&call.callee);
+            let end = self.begin_optional(span);
+            self.compile_args(&argv);
+            if !argv.is_empty() {
+                // The callee sits below its args; bring it back to the top where
+                // `CallDyn` expects it.
+                self.emit(Instr::Dig(argv.len()), span);
+            }
+            self.emit(Instr::CallDyn(argv.len() as u32), span);
+            self.emit(Instr::Label(end), span);
+            return;
+        }
+
         match &call.callee {
             ast::Expression::StaticMemberExpression(m) => {
-                if m.optional {
-                    self.error(span, "optional calls (`?.()`) are not supported");
-                    return;
-                }
                 let method = m.property.name.as_str();
                 // A leading identifier matching a reserved namespace is a static
                 // intrinsic; otherwise it is a method on the receiver value.
                 if let ast::Expression::Identifier(obj) = &m.object {
                     match obj.name.as_str() {
-                        "Math" => return self.compile_math_call(method, &argv, span),
-                        "Object" => return self.compile_object_static_call(method, &argv, span),
-                        "JSON" => return self.compile_json_call(method, &argv, span),
-                        "Number" => return self.compile_number_static_call(method, &argv, span),
-                        "Array" => return self.compile_array_static_call(method, &argv, span),
+                        "Math" | "Object" | "JSON" | "Number" | "Array" => {
+                            return self.compile_namespace_call(
+                                obj.name.as_str(),
+                                method,
+                                &argv,
+                                span,
+                            );
+                        }
                         "tools" => {
                             self.error(span, "`tools.*` calls are not supported until Phase 4");
                             return;
@@ -710,12 +761,15 @@ impl<'src> Compiler<'src> {
                         _ => {}
                     }
                 }
-                self.compile_method_call(&m.object, method, &argv, span);
+                self.compile_method_call(&m.object, method, &argv, span, m.optional);
             }
-            ast::Expression::ComputedMemberExpression(_) => {
-                self.error(span, "computed method calls (`obj[expr](...)`) are not supported")
+            ast::Expression::ComputedMemberExpression(_) => self.error(
+                span,
+                "computed method calls (`obj[expr](...)`) are not supported",
+            ),
+            ast::Expression::Identifier(id) => {
+                self.compile_global_call(id.name.as_str(), &argv, span)
             }
-            ast::Expression::Identifier(id) => self.compile_global_call(id.name.as_str(), &argv, span),
             other => self.error(other.span().start, "unsupported call target"),
         }
     }
@@ -740,120 +794,88 @@ impl<'src> Compiler<'src> {
         }
     }
 
-    /// Validate an inclusive arity range.
-    fn arity_range(
+    /// Compile a call to `builtin`: evaluate the receiver (if any) and the
+    /// arguments, then emit `CallBuiltin` — but only after validating the
+    /// argument count against `Builtin::meta()`, which is the single source of
+    /// truth for both the accepted arity and the builtin's display name.
+    ///
+    /// `recv` is the method receiver (`None` for free/static builtins); it is
+    /// arg 0 and counts toward `meta()`'s bounds. On an arity mismatch a
+    /// diagnostic is recorded and nothing is emitted.
+    ///
+    /// `optional` lowers `recv?.method(args)`: when the receiver is nullish the
+    /// whole call short-circuits to `undefined` and the arguments are **not**
+    /// evaluated (the guard sits between the receiver and the arguments). Only
+    /// meaningful with a receiver.
+    fn compile_builtin_call(
         &mut self,
+        builtin: Builtin,
+        recv: Option<&ast::Expression>,
         argv: &[&ast::Expression],
-        min: usize,
-        max: usize,
         span: u32,
-        name: &str,
-    ) -> bool {
-        if (min..=max).contains(&argv.len()) {
-            true
-        } else {
+        optional: bool,
+    ) {
+        let base = recv.is_some() as u32; // the receiver occupies one arity slot
+        let argc = base + argv.len() as u32;
+        let meta = builtin.meta();
+        if argc < meta.min_args || argc > meta.max_args {
+            // Report the bounds without the implicit receiver, so the message
+            // matches how the call is written in source.
+            let lo = meta.min_args.saturating_sub(base);
+            let want = if meta.max_args == u32::MAX {
+                format!("at least {lo}")
+            } else {
+                let hi = meta.max_args - base;
+                if lo == hi {
+                    format!("{lo}")
+                } else {
+                    format!("{lo} to {hi}")
+                }
+            };
             self.error(
                 span,
                 format!(
-                    "`{name}` expects {min}..={max} argument(s), got {}",
+                    "`{}` expects {want} argument(s), got {}",
+                    meta.name,
                     argv.len()
                 ),
             );
-            false
-        }
-    }
-
-    fn compile_math_call(&mut self, method: &str, argv: &[&ast::Expression], span: u32) {
-        // Binary first (max/min/pow); the rest are unary.
-        let binary = match method {
-            "max" => Some(Instr::Max),
-            "min" => Some(Instr::Min),
-            "pow" => Some(Instr::Pow),
-            _ => None,
-        };
-        if let Some(instr) = binary {
-            if !self.arity(argv, 2, span, &format!("Math.{method}")) {
-                return;
-            }
-            self.compile_args(argv);
-            self.emit(instr, span);
             return;
         }
-        let unary = match method {
-            "abs" => Instr::Abs,
-            "sqrt" => Instr::Sqrt,
-            "floor" => Instr::Floor,
-            "ceil" => Instr::Ceil,
-            "round" => Instr::Round,
-            "sign" => Instr::Sign,
-            _ => {
-                self.error(span, format!("unsupported `Math.{method}`"));
-                return;
+        // Optional method call: guard on the receiver before the args/call. The
+        // peeking `JNotNullish` (via `begin_optional`) keeps the receiver on the
+        // not-nullish path for the call to consume.
+        let end = match (recv, optional) {
+            (Some(recv), true) => {
+                self.compile_expr(recv);
+                Some(self.begin_optional(span))
             }
+            (Some(recv), false) => {
+                self.compile_expr(recv);
+                None
+            }
+            (None, _) => None,
         };
-        if !self.arity(argv, 1, span, &format!("Math.{method}")) {
-            return;
-        }
         self.compile_args(argv);
-        self.emit(unary, span);
-    }
-
-    fn compile_object_static_call(&mut self, method: &str, argv: &[&ast::Expression], span: u32) {
-        let instr = match method {
-            "keys" => Instr::ObjKeys,
-            "values" => Instr::ObjValues,
-            _ => {
-                self.error(span, format!("unsupported `Object.{method}`"));
-                return;
-            }
-        };
-        if !self.arity(argv, 1, span, &format!("Object.{method}")) {
-            return;
-        }
-        self.compile_args(argv);
-        self.emit(instr, span);
-    }
-
-    fn compile_json_call(&mut self, method: &str, argv: &[&ast::Expression], span: u32) {
-        let instr = match method {
-            "parse" => Instr::StrToJson,
-            "stringify" => Instr::StrFromJson,
-            _ => {
-                self.error(span, format!("unsupported `JSON.{method}`"));
-                return;
-            }
-        };
-        // JSON.stringify's indent argument is deferred (single-arg only).
-        if !self.arity(argv, 1, span, &format!("JSON.{method}")) {
-            return;
-        }
-        self.compile_args(argv);
-        self.emit(instr, span);
-    }
-
-    fn compile_number_static_call(&mut self, method: &str, argv: &[&ast::Expression], span: u32) {
-        match method {
-            "isInteger" => {
-                if !self.arity(argv, 1, span, "Number.isInteger") {
-                    return;
-                }
-                self.compile_args(argv);
-                self.emit(Instr::IsInt, span);
-            }
-            _ => self.error(span, format!("unsupported `Number.{method}`")),
+        self.emit(Instr::CallBuiltin(builtin, argc), span);
+        if let Some(end) = end {
+            self.emit(Instr::Label(end), span);
         }
     }
 
-    fn compile_array_static_call(&mut self, method: &str, argv: &[&ast::Expression], span: u32) {
-        match method {
-            "isArray" => {
-                if !self.arity(argv, 1, span, "Array.isArray") {
-                    return;
-                }
-                self.compile_args(argv);
-                self.emit(Instr::IsArr, span);
-            }
-            _ => self.error(span, format!("unsupported `Array.{method}`")),
+    /// Compile a namespaced static call (`Math.max(…)`, `JSON.parse(…)`, …) by
+    /// looking the receiver-less builtin up in [`namespace_builtin`] — the same
+    /// map that backs first-class references like `Math.sqrt` used as a value.
+    fn compile_namespace_call(
+        &mut self,
+        ns: &str,
+        method: &str,
+        argv: &[&ast::Expression],
+        span: u32,
+    ) {
+        match namespace_builtin(ns, method) {
+            Some(builtin) => self.compile_builtin_call(builtin, None, argv, span, false),
+            None => self.error(span, format!("unsupported `{ns}.{method}`")),
         }
     }
 
@@ -891,122 +913,70 @@ impl<'src> Compiler<'src> {
 
     /// Array/string methods on a receiver value. Dispatch is purely syntactic
     /// (name + arity) and assumes the conventional receiver type; a mismatch is
-    /// a runtime `TypeError`.
+    /// a runtime `TypeError`. `optional` is the `recv?.method(...)` case: a
+    /// nullish receiver short-circuits the call to `undefined`.
     fn compile_method_call(
         &mut self,
         recv: &ast::Expression,
         method: &str,
         argv: &[&ast::Expression],
         span: u32,
+        optional: bool,
     ) {
-        match method {
+        let builtin = match method {
             // ── array methods ─────────────────────────────────────────
-            "push" => {
-                if !self.arity(argv, 1, span, "push") {
-                    return;
-                }
-                self.compile_expr(recv);
-                self.compile_args(argv);
-                self.emit(Instr::ArrPush, span);
-                // JS push returns the new length; the VM op yields nothing, so
-                // synthesize a result (accepted divergence: `undefined`).
-                self.emit(Instr::Push(StackValue::Undefined), span);
-            }
-            "unshift" => {
-                if !self.arity(argv, 1, span, "unshift") {
-                    return;
-                }
-                self.compile_expr(recv);
-                self.compile_args(argv);
-                self.emit(Instr::ArrUnshift, span);
-                self.emit(Instr::Push(StackValue::Undefined), span);
-            }
-            "pop" => {
-                if !self.arity(argv, 0, span, "pop") {
-                    return;
-                }
-                self.compile_expr(recv);
-                self.emit(Instr::ArrPop, span);
-            }
-            "shift" => {
-                if !self.arity(argv, 0, span, "shift") {
-                    return;
-                }
-                self.compile_expr(recv);
-                self.emit(Instr::ArrShift, span);
-            }
-            "join" => {
-                if !self.arity_range(argv, 0, 1, span, "join") {
-                    return;
-                }
-                self.compile_expr(recv);
-                if argv.len() == 1 {
-                    self.compile_expr(argv[0]);
-                } else {
-                    self.emit(Instr::PushStr(",".to_string()), span); // JS default separator
-                }
-                self.emit(Instr::ArrJoin, span);
-            }
+            "push" => Builtin::ArrayPush,
+            "unshift" => Builtin::ArrayUnshift,
+            "pop" => Builtin::ArrayPop,
+            "shift" => Builtin::ArrayShift,
+            "join" => Builtin::ArrayJoin,
             // ── string methods ────────────────────────────────────────
-            "split" => self.compile_str_optarg(recv, argv, span, "split", Instr::StrSplit),
-            "includes" => self.compile_str_optarg(recv, argv, span, "includes", Instr::StrIncludes),
-            "indexOf" => self.compile_str_optarg(recv, argv, span, "indexOf", Instr::StrIndexOf),
-            "lastIndexOf" => {
-                self.compile_str_optarg(recv, argv, span, "lastIndexOf", Instr::StrLastIndexOf)
+            "split" => Builtin::StrSplit,
+            "includes" => Builtin::StrIncludes,
+            "indexOf" => Builtin::StrIndexOf,
+            "lastIndexOf" => Builtin::StrLastIndexOf,
+            "startsWith" => Builtin::StrStartsWith,
+            "endsWith" => Builtin::StrEndsWith,
+            "slice" => Builtin::StrSlice,
+            "trim" => Builtin::StrTrim,
+            _ => {
+                self.error(span, format!("unsupported method `{method}`"));
+                return;
             }
-            "startsWith" => {
-                if !self.arity(argv, 1, span, "startsWith") {
-                    return;
-                }
-                self.compile_expr(recv);
-                self.compile_args(argv);
-                self.emit(Instr::StrStartsWith, span);
-            }
-            "endsWith" => {
-                if !self.arity(argv, 1, span, "endsWith") {
-                    return;
-                }
-                self.compile_expr(recv);
-                self.compile_args(argv);
-                self.emit(Instr::StrEndsWith, span);
-            }
-            "slice" => {
-                if !self.arity(argv, 2, span, "slice") {
-                    return;
-                }
-                self.compile_expr(recv);
-                self.compile_args(argv);
-                self.emit(Instr::StrSlice, span);
-            }
-            "trim" => {
-                if !self.arity(argv, 0, span, "trim") {
-                    return;
-                }
-                self.compile_expr(recv);
-                self.emit(Instr::StrTrim, span);
-            }
-            _ => self.error(span, format!("unsupported method `{method}`")),
-        }
+        };
+        // The receiver is arg 0 and counts toward arity; bounds come from
+        // `meta()`. The variadic-default cases (e.g. `join` with no separator)
+        // are handled by the builtin itself based on the received `argc`.
+        self.compile_builtin_call(builtin, Some(recv), argv, span, optional);
     }
+}
 
-    /// Shared lowering for string methods with one required arg and one optional
-    /// arg (`split`/`includes`/`indexOf`/`lastIndexOf`). The instruction carries
-    /// the optional-arg count (0 or 1), which is `argv.len() - 1`.
-    fn compile_str_optarg(
-        &mut self,
-        recv: &ast::Expression,
-        argv: &[&ast::Expression],
-        span: u32,
-        name: &str,
-        make: fn(u32) -> Instr,
-    ) {
-        if !self.arity_range(argv, 1, 2, span, name) {
-            return;
-        }
-        self.compile_expr(recv);
-        self.compile_args(argv);
-        self.emit(make((argv.len() - 1) as u32), span);
-    }
+/// Map a reserved namespace + method to its receiver-less `Builtin`, if any.
+/// Single source of truth for both static calls (`Math.max(…)`) and first-class
+/// references (`Math.sqrt` used as a value / callback). Method builtins that
+/// need a receiver (`push`, `slice`, …) are intentionally absent — they are not
+/// first-class without binding.
+fn namespace_builtin(ns: &str, method: &str) -> Option<Builtin> {
+    Some(match (ns, method) {
+        ("Math", "max") => Builtin::MathMax,
+        ("Math", "min") => Builtin::MathMin,
+        ("Math", "pow") => Builtin::MathPow,
+        ("Math", "abs") => Builtin::MathAbs,
+        ("Math", "sqrt") => Builtin::MathSqrt,
+        ("Math", "floor") => Builtin::MathFloor,
+        ("Math", "ceil") => Builtin::MathCeil,
+        ("Math", "round") => Builtin::MathRound,
+        ("Math", "sign") => Builtin::MathSign,
+        ("Object", "keys") => Builtin::ObjKeys,
+        ("Object", "values") => Builtin::ObjValues,
+        ("JSON", "parse") => Builtin::JSONParse,
+        ("JSON", "stringify") => Builtin::JSONStringify,
+        ("Number", "isInteger") => Builtin::NumberIsInteger,
+        ("Number", "parseInt") => Builtin::NumberParseInt,
+        ("Number", "parseFloat") => Builtin::NumberParseFloat,
+        ("Array", "isArray") => Builtin::ArrayIsArray,
+        _ => return None,
+    })
 }
 
 /// Canonicalize a non-negative numeric literal: an integer in `u64` range
@@ -1069,6 +1039,7 @@ fn backpatch(code: Vec<Instr>, spans: Vec<u32>, next_label: u32) -> (Vec<Instr>,
             Instr::Jump(l) => Instr::Jump(label_offset[l as usize]),
             Instr::JFalse(l) => Instr::JFalse(label_offset[l as usize]),
             Instr::JTrue(l) => Instr::JTrue(label_offset[l as usize]),
+            Instr::JNotNullish(l) => Instr::JNotNullish(label_offset[l as usize]),
             Instr::Call(l, n) => Instr::Call(label_offset[l as usize], n),
             Instr::MakeClosure(l, caps) => Instr::MakeClosure(label_offset[l as usize], caps),
             Instr::Push(StackValue::Fn(l)) => Instr::Push(StackValue::Fn(label_offset[l as usize])),
@@ -1339,13 +1310,99 @@ mod tests {
     }
 
     #[test]
+    fn optional_method_calls() {
+        // Present receiver: the method runs normally (push returns new length).
+        let vm = run_vm("state.arr = [1]; state.r = state.arr?.push(2);");
+        assert_eq!(state_val(&vm, "r"), num(2.0));
+        let vm = run_vm("state.arr = [1]; state.arr?.push(2); state.r = state.arr.length;");
+        assert_eq!(state_val(&vm, "r"), num(2.0));
+
+        // Nullish receiver: the whole call short-circuits to undefined.
+        let vm = run_vm("state.r = state.nope?.push(2);");
+        assert_eq!(state_val(&vm, "r"), StackValue::Undefined);
+
+        // Short-circuit must NOT evaluate the arguments.
+        let vm = run_vm("state.hit = 0; state.r = state.nope?.push(state.hit = 1);");
+        assert_eq!(state_val(&vm, "r"), StackValue::Undefined);
+        assert_eq!(state_val(&vm, "hit"), StackValue::PosInt(0));
+
+        // String methods take the same optional path.
+        let vm = run_vm("state.s = \"a,b,c\"; state.r = state.s?.split(\",\").length;");
+        assert_eq!(state_val(&vm, "r"), num(3.0));
+    }
+
+    #[test]
+    fn first_class_builtin_refs() {
+        // A namespaced builtin used as a value is a callable `Builtin`.
+        assert_eq!(eval_str("typeof Math.sqrt"), "function");
+    }
+
+    #[test]
+    fn optional_invocation_calls() {
+        // `?.()` on a real callable invokes it (via first-class builtin ref).
+        assert_eq!(eval("Math.max?.(3, 7)"), num(7.0));
+        assert_eq!(eval("Math.sqrt?.(9)"), num(3.0));
+
+        // Stored builtin value, retrieved and optionally invoked.
+        let vm = run_vm("state.f = Math.sqrt; state.r = state.f?.(16);");
+        assert_eq!(state_val(&vm, "r"), num(4.0));
+
+        // Nullish callee short-circuits to undefined.
+        assert_eq!(eval("state.nope?.()"), StackValue::Undefined);
+
+        // Short-circuit must NOT evaluate the arguments.
+        let vm = run_vm("state.hit = 0; state.r = state.nope?.(state.hit = 1);");
+        assert_eq!(state_val(&vm, "r"), StackValue::Undefined);
+        assert_eq!(state_val(&vm, "hit"), StackValue::PosInt(0));
+
+        // A present-but-non-callable callee is a runtime TypeError, like JS.
+        let prog = compile("state.x = 5; state.x?.();").expect("compiles");
+        let mut vm = VM::for_program(prog.code, serde_json::Value::Null).unwrap();
+        let err = loop {
+            match vm.step() {
+                Ok(StepResult::Done) => panic!("expected a runtime error"),
+                Ok(_) => continue,
+                Err(e) => break e,
+            }
+        };
+        assert!(matches!(err, crate::vm::VMError::TypeError), "got: {err:?}");
+    }
+
+    #[test]
+    fn optional_call_reclaims_static_builtin() {
+        // A constant non-nullish callee makes the `?.` guard dead, so
+        // `Math.max?.(…)` reclaims the static `CallBuiltin` — identical to
+        // `Math.max(…)`, with no `JNotNullish`/`CallDyn`.
+        let prog = compile("Math.max?.(3, 7);").expect("compiles");
+        assert!(
+            prog.code
+                .iter()
+                .any(|i| matches!(i, Instr::CallBuiltin(Builtin::MathMax, 2))),
+            "expected CallBuiltin(MathMax, 2), got {:?}",
+            prog.code
+        );
+        assert!(
+            !prog
+                .code
+                .iter()
+                .any(|i| matches!(i, Instr::CallDyn(_) | Instr::JNotNullish(_))),
+            "guard/CallDyn should have been reclaimed: {:?}",
+            prog.code
+        );
+        // It still computes the right answer.
+        assert_eq!(eval("Math.max?.(3, 7)"), num(7.0));
+    }
+
+    #[test]
     fn in_and_delete() {
         let vm = run_vm("state.o = { a: 1 }; state.r = (\"a\" in state.o);");
         assert_eq!(state_val(&vm, "r"), StackValue::Bool(true));
         let vm = run_vm("state.o = { a: 1 }; state.r = (\"b\" in state.o);");
         assert_eq!(state_val(&vm, "r"), StackValue::Bool(false));
         // delete removes the key and returns whether it existed.
-        let vm = run_vm("state.o = { a: 1 }; state.r = delete state.o.a; state.had = (\"a\" in state.o);");
+        let vm = run_vm(
+            "state.o = { a: 1 }; state.r = delete state.o.a; state.had = (\"a\" in state.o);",
+        );
         assert_eq!(state_val(&vm, "r"), StackValue::Bool(true));
         assert_eq!(state_val(&vm, "had"), StackValue::Bool(false));
     }
@@ -1397,25 +1454,54 @@ mod tests {
     fn diagnostics_for_unsupported() {
         // These all live in later phases / out of scope and must error cleanly.
         for src in [
-            "x;",                 // undeclared variable
-            "x = 1;",             // identifier assignment (no declarations yet)
-            "state.x += 1;",      // compound assignment (Phase 2)
-            "i++;",               // update (Phase 2)
-            "foo(1);",            // undeclared function (Phase 3)
-            "tools.send(1);",     // tools (Phase 4)
-            "raise(\"x\");",      // raise (Phase 4)
-            "Math.tan(1);",       // unsupported intrinsic
-            "[1, 2].zap();",      // unknown method
-            "Math.max(1);",       // wrong arity
-            "f(...args);",        // spread arg
-            "new Foo();",         // new
-            "class C {}",         // class statement
+            "x;",             // undeclared variable
+            "x = 1;",         // identifier assignment (no declarations yet)
+            "state.x += 1;",  // compound assignment (Phase 2)
+            "i++;",           // update (Phase 2)
+            "foo(1);",        // undeclared function (Phase 3)
+            "tools.send(1);", // tools (Phase 4)
+            "raise(\"x\");",  // raise (Phase 4)
+            "Math.tan(1);",   // unsupported intrinsic
+            "[1, 2].zap();",  // unknown method
+            "Math.pow(1);",   // wrong arity (needs exactly 2)
+            "f(...args);",    // spread arg
+            "new Foo();",     // new
+            "class C {}",     // class statement
+        ] {
+            assert!(compile(src).is_err(), "expected `{src}` to fail to compile");
+        }
+    }
+
+    #[test]
+    fn builtin_arity_is_enforced_from_meta() {
+        // Wrong arities are rejected at compile time, with the accepted range
+        // and the builtin name sourced from `Builtin::meta()`.
+        for src in [
+            "Math.pow(1);",              // needs exactly 2
+            "Math.pow(1, 2, 3);",        // too many
+            "Math.abs();",               // needs 1
+            "\"x\".slice();",            // needs 1..2 args after receiver
+            "\"x\".slice(1, 2, 3);",     // too many
+            "[1].push();",               // needs 1
+            "[1].pop(2);",               // needs 0
+            "Object.keys();",            // needs 1
+            "Number.parseInt(1, 2, 3);", // needs 1..2
         ] {
             assert!(
                 compile(src).is_err(),
-                "expected `{src}` to fail to compile"
+                "expected `{src}` to fail arity check"
             );
         }
+
+        // The diagnostic names the builtin and reports the receiver-free bounds.
+        let errs = compile("\"x\".slice(1, 2, 3);").expect_err("too many args");
+        let msg = &errs[0].message;
+        assert!(msg.contains("`slice`"), "got: {msg}");
+        assert!(msg.contains("1 to 2"), "got: {msg}");
+
+        // Variadic `min`/`max` accept any count, including zero.
+        assert_eq!(eval("Math.max()"), num(f64::NEG_INFINITY));
+        assert_eq!(eval("Math.max(1, 2, 3, 4, 5)"), num(5.0));
     }
 
     #[test]

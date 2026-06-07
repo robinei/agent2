@@ -127,6 +127,34 @@ expensive/effectful **tool calls**, whose results are already in `state`.
    go through `for_program`.
 4. **Remove** `Read`, `Write`, `VarName`, and the `variables` HashMap (superseded
    by blessed `state`).
+5. **Add `Pick`/`Dig`/`JTrue`/`JNotNullish`** for assignment lowering and
+   short-circuit operators. `Pick(n)` duplicates the n-th-from-top value
+   (workhorse for read-then-write lvalue lowering); `Dig(n)` reorders it without
+   copying. `JTrue` is the truthy-branch mirror of `JFalse`, letting `||` lower
+   without an extra `Jump`. `JNotNullish` **peeks** (does not pop) the top value
+   and jumps when it is neither null nor undefined, leaving it in place — the
+   single-instruction nullish test that lowers `??`, optional chaining (`?.`),
+   and optional method calls without a `Dup`+`Push(Null)`+`LooseEq` per check.
+6. **Add `ToNum`/`ToBool` coercion instructions** — `+x` emits `ToNum`;
+   `Boolean(x)` emits `ToBool`. Keep `ToStr` (was already present).
+7. **Store-returns-value:** `ObjSet`/`IndexSet` now leave the assigned value (the
+   RHS) on the stack, so assignment is a well-formed expression without extra
+   stack shuffling. Statement callers follow with `Pop(1)`.
+8. **Builtin infrastructure** (`builtin.rs`, `Builtin` enum, `CallBuiltin` instr,
+   `StackValue::Builtin`). Call-shaped intrinsics (`arr.push(x)`, `s.split(",")`,
+   `Math.max(a,b)`, `Object.keys(o)`, `JSON.parse(s)`, …) are now lowered to
+   `Instr::CallBuiltin(Builtin, argc)`. The `Builtin` enum is the id + registry:
+   `meta()` provides arity bounds (compiler reads for arity checks/errors),
+   `call()` does the dispatch. Builtins are also first-class values
+   (`StackValue::Builtin`) for passing as callbacks (`arr.map(Math.sqrt)`).
+   Calling convention: `argc` args on stack L→R (arg 0 deepest; receiver is arg 0
+   for methods); builtin pops exactly `argc` and pushes exactly one result.
+   **Removed instructions** (superseded by builtins): `ArrPush`, `ArrPop`,
+   `ArrShift`, `ArrUnshift`, `ArrJoin`, `StrSplit`, `StrIncludes`,
+   `StrStartsWith`, `StrEndsWith`, `StrIndexOf`, `StrLastIndexOf`, `StrSlice`,
+   `StrTrim`, `StrToInt`, `StrToFloat`, `StrToJson`, `StrFromJson`, `ObjKeys`,
+   `ObjValues`, `IsArr`, `IsInt`, `Abs`, `Sqrt`, `Ceil`, `Floor`, `Round`,
+   `Sign`, `Min`, `Max`.
 
 ## Pipeline
 
@@ -191,24 +219,49 @@ Storing the **byte offset** (not a precomputed line) keeps it flexible and cheap
 - Intrinsic methods, `tools.*`, and `raise` are recognized **structurally** and
   lowered to their dedicated Instrs, never `CallDyn`.
 
+### Reclaiming static calls (`CallDyn` → `Call`/`CallBuiltin`)
+
+The reclaim is **codegen-directed, not a peephole pass** — the callee shape is
+known syntactically, which is exactly the information a flat-stream peephole
+lacks. Two cases:
+
+- **Directly-named callees** (`f(x)`, `Math.max(x)`): emit the static form at
+  codegen. Builtins already do (`CallBuiltin`); named user functions will emit
+  `Call(addr, n)` in Phase 3. No `CallDyn` is produced in the first place.
+- **Constant callee through the value path** (what `?.()` produces): a
+  `Builtin`/`Fn` constant is never nullish, so the `?.` guard is provably dead —
+  `Math.max?.(a, b)` is identical to `Math.max(a, b)`. Codegen detects a constant
+  non-nullish callee (today: a `namespace_builtin` reference; Phase 3: named
+  function refs) and emits the static `CallBuiltin`/`Call`, skipping the guard,
+  `Dig`, and `CallDyn` entirely. **Done** for builtin refs.
+
+`CallDyn` therefore survives only for genuinely dynamic callees (`state.fn?.(x)`
+— value not statically known, guard genuinely needed). A small adjacent-pattern
+peephole (`Push(Fn|Builtin)` immediately before `CallDyn` → static form) is a
+*possible* later supplement, but it can't see the args-then-`Dig` shape, so it
+adds little over the codegen path.
+
 ## Intrinsics (method / static-call recognition)
 
 The VM has no prototype/method objects, so calls like `arr.push(x)`,
-`s.split(",")`, `Math.max(a,b)`, `Object.keys(o)`, `JSON.parse(s)`, `arr.length`,
-`String(x)` are matched by **callee shape + arity** and lowered to
-`ArrPush`/`StrSplit`/`Max`/`ObjKeys`/`StrToJson`/`ArrLength`/`ToStr`, etc.
+`s.split(",")`, `Math.max(a,b)`, `Object.keys(o)`, `JSON.parse(s)` are matched
+by **callee shape + arity** and lowered to `Instr::CallBuiltin(Builtin, argc)`.
+The `Builtin` enum (in `builtin.rs`) is the single registry: `meta()` provides
+arity bounds the compiler reads for arity checks and error messages; `call()`
+handles the runtime dispatch. This replaces the old one-instruction-per-method
+approach — the instruction set is now true VM primitives, and the builtin
+registry gives variadic/optional-argument support for free.
 
 Consequences:
 - Those method names are effectively reserved.
-- A method cannot be passed as a value (no bound-method objects) → explicit error.
-- Built as one dispatch table: `(receiver-pattern, name, argc) → Instr`.
+- A builtin can be passed as a first-class value (`StackValue::Builtin`) for
+  callback use (`arr.map(Math.sqrt)`).
 - **Dispatch is purely syntactic and assumes the conventional receiver type**
   (no static types). `.length` → `ArrLength` (arrays/strings); an object property
   literally named `length` accessed via `.length` is an accepted divergence.
   Method names like `.push`/`.split` assume array/string receivers; a mismatch
   is a runtime `TypeError`. Computed `x[i]` (non-literal key) lowers to the
-  polymorphic `IndexGet`/`IndexSet`; a literal key may be specialized to
-  `ArrGet`/`ObjGet`.
+  polymorphic `IndexGet`/`IndexSet`.
 
 ## Stack-discipline invariants
 
@@ -219,22 +272,59 @@ Consequences:
   expression temporaries: hoist every `let`/`const`/`var`/function-decl binding
   in a function into one prologue `Alloc`, with per-slot `Plain`/`Boxed` chosen
   by capture analysis. Lexical block scoping is enforced in the resolver (name
-  visibility); slots are function-wide.
+  visibility); slots are function-wide. Slots are **not** reused across exited
+  scopes — one slot per unique binding. Reuse is a possible later size
+  optimization, but is constrained by each slot's fixed `Plain`/`Boxed` storage
+  kind (a slot could only be shared between same-kind bindings), so it is
+  deliberately skipped for now; it is never a correctness concern.
 - Captured/reassigned **parameters** are copied in the prologue from `Arg(i)`
   into a `Boxed` local (VM closure contract, point 6).
 
 ### Accepted divergences (initial)
 - TDZ (temporal dead zone) is not enforced.
-- Per-iteration loop bindings (`for (let i…)` capturing a fresh `i` each
-  iteration) are not modelled — one slot per binding, function-wide.
+- Per-iteration loop bindings (`for (let i…)` where the body captures a fresh
+  `i` each iteration) are **deferred, not precluded** by the slot model. The
+  up-front single-slot `Alloc` reserves a stack *position*; it does not force
+  shared bindings. Per-iteration freshness is a matter of allocating a fresh
+  `Boxed` *cell* at each iteration boundary (copying the prior value in, per the
+  spec's per-iteration environment) and having body-created closures capture
+  that cell — the slot is unchanged. It only matters when a `let`/`const` loop
+  variable is captured by a closure created in the body; for non-captured loop
+  vars, function-wide single-slot is observationally identical. Until
+  implemented, closures over a loop var share one binding (last-value
+  semantics).
+- `Math.max`/`Math.min` are variadic builtins (0..N args), matching JS spec.
+- `f64::max`/`f64::min` semantics: a NaN operand is ignored (divergence from
+  JS `Math.max`/`Math.min` which return NaN if any arg is NaN).
+- `s.slice(start[, end])` operates on a half-open byte range and rejects
+  negative indices (`ValueError`) instead of counting them from the end.
+  `s.indexOf`/`includes`/`lastIndexOf` and `Number.parseInt` (incl. radix and
+  `0x` prefix) otherwise follow JS semantics.
 
 ## Codegen correctness notes
 
 - **Short-circuit `&&` / `||` / `??` / `?.` are branch-compiled, NOT the
   `And`/`Or` instructions.** `And`/`Or` pop *both* operands (already evaluated),
   so they do not short-circuit — using them for JS `cond && tools.x()` would run
-  the tool unconditionally. Lower with `Dup` + `JFalse`/null-check + `Jump`.
-  `And`/`Or` are usable only when the RHS is provably side-effect-free.
+  the tool unconditionally. `&&`/`||` lower with `Dup` + `JFalse`/`JTrue` +
+  `Jump`; `??` and `?.` lower with the peeking `JNotNullish` (no `Dup`/`LooseEq`
+  needed — it keeps the value on the not-nullish path and falls through to the
+  short-circuit tail when nullish). `And`/`Or` are usable only when the RHS is
+  provably side-effect-free.
+- **Optional method calls (`recv?.method(args)`)** guard the receiver with the
+  same `JNotNullish`: a nullish receiver short-circuits the whole call to
+  `undefined` and the arguments are *not* evaluated (the guard sits between the
+  receiver and the args). Per-link, consistent with `?.` member access.
+- **Optional invocation (`callee?.(args)`)** lowers generically: evaluate the
+  callee as a *value*, `JNotNullish`-guard it (nullish → `undefined`, args
+  skipped), then `Dig(argc)` to put the callee back above its args and `CallDyn`.
+  A non-nullish non-callable callee is a runtime `TypeError`, as in JS. This is
+  the first compiler use of `CallDyn`; non-optional dynamic calls (`f(x)` on a
+  value) still await user functions in Phase 3. The callable values that exist
+  today are **first-class builtin references**: a namespaced builtin named but
+  not called (`Math.sqrt`, `JSON.parse`) lowers to `Push(StackValue::Builtin)`
+  via the shared `namespace_builtin` map, so `Math.max?.(a, b)` and
+  `state.fn?.(x)` (after `state.fn = Math.sqrt`) both work end-to-end.
 - **Assignment is an expression.** `a = b`, `obj.f = v`, `arr[i] = v`, compound
   `+=` etc., and logical-assignment `??=`/`&&=`/`||=` (short-circuiting) must
   leave the correct value on the stack (`Dup` before the storing op, which
@@ -281,17 +371,22 @@ program, so there is no chicken-and-egg problem — `arr.map(cb)` lowers to a
 
 ## Deferred built-ins (add as demand shows; compile-error meanwhile)
 
-Additive later via new intrinsic instrs or prelude — not blocking:
+Additive later via new `Builtin` variants or prelude — not blocking:
 - **String:** `toLowerCase`/`toUpperCase`, `replace`/`replaceAll`, `repeat`,
   `padStart`/`padEnd`, `substring`, `charAt`/`charCodeAt`, `at`.
 - **Array:** `sort`, `reverse`, `splice`, `flat`, `concat`, `slice`,
-  `indexOf`/`includes`, `find`/`findIndex`, `entries`, `Array.from`/`of`,
-  `Array.isArray` (→ `IsArr`).
+  `indexOf`/`includes` (on arrays), `find`/`findIndex`, `entries`, `Array.from`/`of`.
 - **Object:** `entries`, `assign`, `fromEntries`, spread `{...o}`.
 - **Math/Number:** `trunc`/`log`/`exp`/`hypot`/trig/`PI`/`E`, `isNaN`/`isFinite`,
-  `toFixed`; `Number.parseInt`/`parseFloat`.
+  `toFixed`.
 - **Misc:** `JSON.stringify` pretty-print (indent arg); a `console.log` output
   channel (likely an `Invoke`/effect — decide when needed).
+
+Now implemented as builtins (`CallBuiltin`): `arr.push`/`pop`/`shift`/`unshift`
+(ret length/element), `arr.join`, `s.split`/`includes`/`startsWith`/`endsWith`/
+`indexOf`/`lastIndexOf`/`slice`/`trim`, `Object.keys`/`values`,
+`JSON.parse`/`stringify`, `Math.abs`/`sqrt`/`ceil`/`floor`/`round`/`sign`/
+`min`/`max`/`pow`, `Number.isInteger`/`parseInt`/`parseFloat`, `Array.isArray`.
 
 ## Out of scope (intentional, informative errors)
 
