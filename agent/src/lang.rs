@@ -9,6 +9,8 @@ pub type StackAddr = u32;
 pub type ArgIndex = u32;
 pub type LocalIndex = u32;
 pub type ArgCount = u32;
+/// Index into the VM's `cells` side table (the store of captured bindings).
+pub type CellIndex = u32;
 
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum StackValue {
@@ -32,11 +34,17 @@ pub enum StackValue {
     /// A first-class function value: just a code address, with no captured
     /// environment. Covers non-capturing lambdas and named functions passed as
     /// values (dispatch tables, `map`/`filter` callbacks, etc.). Capturing
-    /// lambdas need an outer variable, which must come from the global
-    /// `Read`/`Write` namespace or a future `HeapValue::Closure`; `CallDyn`
-    /// already accepts "a callable", so adding closures later won't disturb it.
+    /// lambdas instead become a `HeapValue::Closure` (a code address plus a
+    /// captured environment), built by `MakeClosure` and likewise called
+    /// through `CallDyn`.
     Fn(CodeAddr),
     Ptr(HeapAddr),
+    /// Internal indirection for a captured *by-reference* binding: indexes the
+    /// VM's `cells` side table, which has identity and outlives stack frames.
+    /// Only ever stored in a frame's local (or captured-arg) slots;
+    /// `Local`/`SetLocal` dereference it transparently, so the marker never
+    /// surfaces in expression temporaries, heap collections, or variables.
+    Upval(CellIndex),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -44,6 +52,24 @@ pub enum HeapValue {
     String(String),
     Array(Vec<StackValue>),
     Object(IndexMap<String, StackValue>),
+    /// A closure: a code address plus its captured environment. Each upval is
+    /// either a plain value (an immutable / by-value capture) or an `Upval`
+    /// handle (a shared, mutable by-reference capture). Built by `MakeClosure`,
+    /// called via `CallDyn`, which installs `upvals` as the callee's leading
+    /// locals. Like `Fn`, it has no JSON form and compares by identity.
+    Closure {
+        addr: CodeAddr,
+        upvals: Vec<StackValue>,
+    },
+}
+
+/// Storage class for a local slot declared by `Alloc`. A `Plain` slot is an
+/// ordinary stack local; a `Boxed` slot is captured by reference, so it is
+/// backed by a `cells` entry and addressed through an `Upval` marker.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum SlotKind {
+    Plain,
+    Boxed,
 }
 
 pub struct CallFrame {
@@ -78,10 +104,76 @@ Args follow the uniform left-to-right convention: the caller pushes them
 left-to-right, so arg_0 (the first argument) is pushed first and sits deepest
 (fp - N), and arg_N-1 is on top (fp - 1).
 
+
+Closures — the compiler contract
+================================
+
+The VM gives you capture-by-reference (JS `let`/`var` semantics) via three
+moving parts: `Boxed` local slots, the `cells` side table, and `MakeClosure` /
+`CallDyn`. The runtime stays dumb; the analysis and slot bookkeeping below are
+the compiler's job. A future codegen MUST uphold all of this:
+
+1. Capture analysis (who gets boxed).
+   A variable that is captured by any nested function AND is ever reassigned
+   (by its owner or any closure) must be `Boxed` in its OWNING frame's `Alloc`.
+   Everything else stays `Plain`. A captured-but-never-reassigned variable may
+   stay `Plain` and be captured by value — see point 4.
+
+2. Boxing is per-binding and eager.
+   `Alloc(Vec<SlotKind>)` declares each new slot's storage class. A `Boxed`
+   slot is backed by a fresh `cells` entry from birth; `Local`/`SetLocal`
+   transparently route through it. There is no "open upvalue" / close step —
+   the cell already has identity and outlives the frame, so a returned closure
+   keeps working after its defining frame is gone. (Cost: one indirection per
+   access and a permanent cell. Acceptable under this VM's no-GC, short-program
+   design.)
+
+3. Closure-frame slot layout (the ABI).
+   `CallDyn` installs a closure's captured environment as the callee's LEADING
+   locals: captured upvals occupy slots 0..K (in `MakeClosure`'s capture
+   order), and `local_count` is preset to K. Therefore, when compiling a
+   function that will be reached as a closure, lay out:
+       slot 0 .. K-1  = captured upvals  (DO NOT re-`Alloc` these)
+       slot K, K+1 .. = the body's own locals (its first `Alloc` starts here)
+   and emit `MakeClosure(addr, captures)` at the definition site with `captures`
+   ordered to match exactly the slot order the body expects.
+
+4. `MakeClosure(addr, captures)` capture kinds, by value vs by reference.
+   Each entry of `captures` is a slot index in the ENCLOSING frame; the slot is
+   copied verbatim into the new closure. A `Boxed` slot copies its `Upval`
+   handle → shared, by-reference (mutations are mutually visible). A `Plain`
+   slot copies its value → an immutable by-value snapshot. Only capture a
+   `Plain` slot when the analysis in point 1 proved the binding is effectively
+   `const` (assigned once, before every capturing `MakeClosure`, and never
+   after). A `Plain` capture of a `Ptr` still shares the heap object — it
+   freezes the binding, not the object, which is correct JS semantics.
+
+5. Transitive / nested capture is free.
+   A closure capturing a variable owned several scopes up just lists its own
+   (installed-upval) slot; copying that slot forwards the SAME cell handle. The
+   flat `cells` index threads through every intermediate closure unchanged.
+
+6. Captured parameters.
+   `Arg` reads plain values below `fp` and there is no `SetArg`. To capture (or
+   reassign) a parameter, the prologue must copy it into a `Boxed` local
+   (`Arg(i)` then `SetLocal(boxed_slot)`); capture that local, not the arg.
+
+7. Non-capturing functions stay cheap.
+   A lambda/function with no captures should remain a bare `StackValue::Fn`
+   (zero heap allocation). Only emit `MakeClosure` when there is something to
+   capture.
+
+Closure values are first-class: callable via `CallDyn`, compared by reference
+identity, and (like `Fn`) have no JSON representation.
+
 */
 pub struct VM {
     pub code: Vec<Instr>,
     pub heap: Vec<HeapValue>,
+    /// Side table of captured bindings (cells). A `Boxed` local lives here so
+    /// it has identity and outlives its frame; `StackValue::Upval` indexes it.
+    /// Grows monotonically (no reclamation), like `heap`.
+    pub cells: Vec<StackValue>,
     pub stack: Vec<StackValue>, // sp == stack.len()
     pub variables: HashMap<VarName, StackValue>,
     pub callstack: Vec<CallFrame>,
@@ -98,7 +190,14 @@ pub struct VM {
 // Instructions for a stack based language used for LLM composition of complex tool flows.
 pub enum Instr {
     Push(StackValue), // () -> any
-    Alloc(usize),
+
+    // Grow the current frame's locals region by one slot per kind. A `Plain`
+    // slot is initialized to Null (an ordinary local); a `Boxed` slot allocates
+    // a fresh cell (init Null) in the `cells` side table and stores an `Upval`
+    // marker, so that binding is captured by reference — every Local/SetLocal
+    // routes through the shared cell. Successive Allocs each append more slots,
+    // but only when no expression temporaries sit above the locals.
+    Alloc(Vec<SlotKind>),
     Pop(usize),
     Dup,
     Swap, // any, any -> any, any
@@ -110,10 +209,21 @@ pub enum Instr {
     // on stack after it returns.
     Call(CodeAddr, u32), // any, ... -> [any]
 
-    // indirect call: the callable (a Fn value) sits on top, above its N args
-    // (left-to-right, so arg 0 is deepest). Pops the callable and calls it with
-    // the same convention as Call. Errors if the top value is not a Fn.
+    // indirect call: the callable sits on top, above its N args (left-to-right,
+    // so arg 0 is deepest). The callable is either a bare `Fn` value or a `Ptr`
+    // to a `HeapValue::Closure`; pops it and calls with the same convention as
+    // Call. For a closure, its captured environment is installed as the
+    // callee's leading locals (slots 0..K) before the body runs. Errors if the
+    // top value is neither a Fn nor a closure.
     CallDyn(u32), // any, ..., fn -> [any]
+
+    // build a closure over the listed local slots of the current frame and push
+    // a Ptr to the resulting HeapValue::Closure. Each captured slot is copied
+    // verbatim: a Boxed slot yields its Upval handle (shared, by-reference), a
+    // Plain slot yields its current value (a by-value snapshot — which the
+    // compiler only emits when the binding is provably never reassigned). The
+    // captures are listed in the order the target body expects its upvals.
+    MakeClosure(CodeAddr, Vec<LocalIndex>), // () -> fn
 
     // return from in-program function Call, returning the top N values (in
     // push order, so the first-pushed return value stays first).
@@ -331,6 +441,7 @@ impl VM {
         VM {
             code,
             heap: Vec::new(),
+            cells: Vec::new(),
             stack: Vec::new(),
             variables: HashMap::new(),
             // Root frame so that Arg/Local/Alloc are valid from the start.
@@ -428,6 +539,12 @@ impl VM {
         StackValue::Ptr(addr)
     }
 
+    fn alloc_closure(&mut self, addr: CodeAddr, upvals: Vec<StackValue>) -> StackValue {
+        let heap_addr = self.heap.len() as HeapAddr;
+        self.heap.push(HeapValue::Closure { addr, upvals });
+        StackValue::Ptr(heap_addr)
+    }
+
     /// Structural comparison of two stack values, recursing through the heap
     /// so that equality is by *content* at every level. (The derived
     /// `PartialEq` on `HeapValue` would compare nested `Ptr`s by address, so
@@ -459,7 +576,10 @@ impl VM {
             (StackValue::Fn(a), StackValue::Fn(b)) => a == b,
             (StackValue::Ptr(p), StackValue::Ptr(q)) => {
                 match (self.heap.get(*p as usize), self.heap.get(*q as usize)) {
-                    (Some(a), Some(b)) => self.heap_values_equal(a, b),
+                    // Same live heap object is always equal (this also gives
+                    // closures reference identity, as they have no content
+                    // equality of their own).
+                    (Some(a), Some(b)) => p == q || self.heap_values_equal(a, b),
                     _ => false, // dangling pointer: treat as not-equal rather than panic
                 }
             }
@@ -550,9 +670,10 @@ impl VM {
             // serde_json::Number (this is the whole point of mirroring it).
             StackValue::PosInt(u) => serde_json::Value::Number(serde_json::Number::from(*u)),
             StackValue::NegInt(i) => serde_json::Value::Number(serde_json::Number::from(*i)),
-            // A function has no JSON representation: fail loudly rather than
-            // silently dropping it.
-            StackValue::Fn(_) => return Err(VMError::ValueError),
+            // A function/closure has no JSON representation, and an Upval marker
+            // is an internal indirection that should never reach here: fail
+            // loudly rather than silently dropping it.
+            StackValue::Fn(_) | StackValue::Upval(_) => return Err(VMError::ValueError),
             StackValue::Number(n) => {
                 // Preserve integer formatting when possible (f64-only VM
                 // internals, but JSON consumers care about int vs float).
@@ -581,6 +702,8 @@ impl VM {
                     }
                     serde_json::Value::Object(map)
                 }
+                // A closure has no JSON representation (see Fn above).
+                HeapValue::Closure { .. } => return Err(VMError::ValueError),
             },
         })
     }
@@ -708,20 +831,34 @@ impl VM {
                     self.ip += 1;
                 }
 
-                Instr::Alloc(n) => {
+                Instr::Alloc(kinds) => {
                     // Locals occupy [fp, fp + local_count). Allocation is only
                     // valid when no expression temporaries sit above them, i.e.
                     // sp == fp + local_count. This permits multiple successive
                     // Alloc instructions (each grows the locals region) while
                     // still rejecting an Alloc issued mid-expression.
+                    let kinds = kinds.clone(); // release the borrow on self.code
                     let frame = self.callstack.last().ok_or(VMError::BadAlloc)?;
                     let locals_top = self.fp as usize + frame.local_count as usize;
                     if self.stack.len() != locals_top {
                         return Err(VMError::BadAlloc);
                     }
+                    // A Plain slot is just Null; a Boxed slot allocates a fresh
+                    // cell and stores an Upval marker pointing at it, so the
+                    // binding is captured by reference.
+                    for kind in &kinds {
+                        let slot = match kind {
+                            SlotKind::Plain => StackValue::Null,
+                            SlotKind::Boxed => {
+                                let idx = self.cells.len() as CellIndex;
+                                self.cells.push(StackValue::Null);
+                                StackValue::Upval(idx)
+                            }
+                        };
+                        self.stack.push(slot);
+                    }
                     let frame = self.callstack.last_mut().ok_or(VMError::BadAlloc)?;
-                    frame.local_count += *n as u32;
-                    self.stack.resize(self.stack.len() + n, StackValue::Null);
+                    frame.local_count += kinds.len() as u32;
                     self.ip += 1;
                 }
 
@@ -782,26 +919,66 @@ impl VM {
                 }
 
                 Instr::CallDyn(nargs) => {
+                    let nargs = *nargs;
                     // The callable is on top, above its args; pop it, then the
-                    // args sit exactly where a static Call expects them.
-                    let addr = match self.stack.pop().ok_or(VMError::StackUnderflow)? {
-                        StackValue::Fn(addr) => addr,
+                    // args sit exactly where a static Call expects them. It is
+                    // either a bare Fn or a Ptr to a Closure (code + captures).
+                    let callable = self.stack.pop().ok_or(VMError::StackUnderflow)?;
+                    let (addr, upvals) = match callable {
+                        StackValue::Fn(addr) => (addr, None),
+                        StackValue::Ptr(p) => match self.heap_get(p)? {
+                            HeapValue::Closure { addr, upvals } => (*addr, Some(upvals.clone())),
+                            _ => return Err(VMError::TypeError),
+                        },
                         _ => return Err(VMError::TypeError),
                     };
                     if addr as usize >= self.code.len() {
                         return Err(VMError::BadCall);
                     }
-                    if *nargs as usize > self.stack.len() {
+                    if nargs as usize > self.stack.len() {
                         return Err(VMError::StackUnderflow);
                     }
                     self.callstack.push(CallFrame {
-                        arg_count: *nargs,
+                        arg_count: nargs,
                         local_count: 0,
                         return_addr: self.ip + 1,
                         prev_fp: self.fp,
                     });
-                    self.ip = addr;
                     self.fp = self.stack.len() as StackAddr;
+                    // A closure's captured environment becomes the callee's
+                    // leading locals (slots 0..K), so the body reaches them via
+                    // the same Local/SetLocal indirection as any other local;
+                    // its own Allocs append after these.
+                    if let Some(upvals) = upvals {
+                        let k = upvals.len() as u32;
+                        for uv in upvals {
+                            self.stack.push(uv);
+                        }
+                        self.callstack.last_mut().unwrap().local_count = k;
+                    }
+                    self.ip = addr;
+                }
+
+                Instr::MakeClosure(addr, captures) => {
+                    let addr = *addr;
+                    if addr as usize >= self.code.len() {
+                        return Err(VMError::BadCall);
+                    }
+                    let captures = captures.clone(); // release the borrow on self.code
+                    let local_count = self.callstack.last().ok_or(VMError::BadLocal)?.local_count;
+                    let mut upvals = Vec::with_capacity(captures.len());
+                    for slot in captures {
+                        if slot >= local_count {
+                            return Err(VMError::BadLocal);
+                        }
+                        // Copy the slot verbatim: a Boxed slot carries its Upval
+                        // handle (shared, by-reference), a Plain slot its value
+                        // (a by-value snapshot).
+                        upvals.push(self.stack[(self.fp + slot) as usize]);
+                    }
+                    let closure = self.alloc_closure(addr, upvals);
+                    self.stack.push(closure);
+                    self.ip += 1;
                 }
 
                 Instr::Return(nrets) => {
@@ -868,7 +1045,15 @@ impl VM {
                     if *local >= frame.local_count {
                         return Err(VMError::BadLocal);
                     }
-                    self.stack.push(self.stack[(self.fp + local) as usize]);
+                    // A Boxed slot holds an Upval marker; dereference it so the
+                    // value — never the marker — reaches the expression stack.
+                    let val = match self.stack[(self.fp + local) as usize] {
+                        StackValue::Upval(c) => {
+                            *self.cells.get(c as usize).ok_or(VMError::ValueError)?
+                        }
+                        other => other,
+                    };
+                    self.stack.push(val);
                     self.ip += 1;
                 }
 
@@ -878,7 +1063,15 @@ impl VM {
                         return Err(VMError::BadLocal);
                     }
                     let val = self.stack.pop().ok_or(VMError::StackUnderflow)?;
-                    self.stack[(self.fp + local) as usize] = val;
+                    let slot = (self.fp + local) as usize;
+                    // Write through a Boxed slot to its shared cell; a Plain slot
+                    // is overwritten in place.
+                    match self.stack[slot] {
+                        StackValue::Upval(c) => {
+                            *self.cells.get_mut(c as usize).ok_or(VMError::ValueError)? = val;
+                        }
+                        _ => self.stack[slot] = val,
+                    }
                     self.ip += 1;
                 }
 
@@ -1561,6 +1754,8 @@ impl VM {
             StackValue::PosInt(u) => u.to_string(),
             StackValue::NegInt(i) => i.to_string(),
             StackValue::Fn(addr) => format!("[function@{addr}]"),
+            // Internal indirection; should not normally reach here.
+            StackValue::Upval(c) => format!("[upval@{c}]"),
             StackValue::Number(n) => {
                 if float_is_int(*n) {
                     format!("{}", *n as i64)
@@ -1572,6 +1767,7 @@ impl VM {
                 Some(HeapValue::String(s)) => s.clone(),
                 Some(HeapValue::Array(_)) => "[array]".to_string(),
                 Some(HeapValue::Object(_)) => "[object]".to_string(),
+                Some(HeapValue::Closure { addr, .. }) => format!("[closure@{addr}]"),
                 None => "null".to_string(), // dangling pointer
             },
         }
@@ -1665,6 +1861,10 @@ mod tests {
     /// Heap pointer to string at the given index (pre-loaded via run_heap).
     fn s(addr: u32) -> StackValue {
         StackValue::Ptr(addr)
+    }
+    /// `n` plain (unboxed) local slots, for `Alloc`.
+    fn plain(n: usize) -> Vec<SlotKind> {
+        vec![SlotKind::Plain; n]
     }
 
     // ── stack manipulation ────────────────────────────────────────
@@ -2079,7 +2279,7 @@ mod tests {
 
         // map(arr, fn)
         let map_addr = code.len() as u32;
-        code.push(Alloc(2)); // local 0 = out, local 1 = i
+        code.push(Alloc(plain(2))); // local 0 = out, local 1 = i
         code.push(ArrNew(0));
         code.push(SetLocal(0)); // out = []
         code.push(Push(n(0.0)));
@@ -2128,6 +2328,259 @@ mod tests {
         );
     }
 
+    // ── closures ──────────────────────────────────────────────────
+
+    /// Append a `makeCounter` to `code`: a function that boxes a `count` local
+    /// (slot 0), initializes it to 0, and returns a closure that increments and
+    /// returns `count`. Returns makeCounter's code address.
+    fn append_counter(code: &mut Vec<Instr>) -> u32 {
+        let mc = code.len() as u32;
+        code.push(Alloc(vec![SlotKind::Boxed])); // slot 0 = count (by-ref)
+        code.push(Push(n(0.0)));
+        code.push(SetLocal(0)); // count = 0 (writes through the cell)
+        let mk = code.len();
+        code.push(MakeClosure(0, vec![0])); // patched: capture count
+        code.push(Return(1));
+        let inner = code.len() as u32;
+        code.push(Local(0)); // count  (slot 0 = captured upval)
+        code.push(Push(n(1.0)));
+        code.push(Add);
+        code.push(SetLocal(0)); // count = count + 1 (through the shared cell)
+        code.push(Local(0));
+        code.push(Return(1)); // return count
+        code[mk] = MakeClosure(inner, vec![0]);
+        mc
+    }
+
+    /// Run to completion and return the finished VM (to inspect heap/cells).
+    fn run_vm(code: Vec<Instr>) -> VM {
+        let mut vm = VM::new(code);
+        loop {
+            match vm.step().unwrap() {
+                StepResult::Done => return vm,
+                other => panic!("unexpected effect: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn closure_captures_by_reference_across_calls() {
+        // c = makeCounter(); c() + c()  →  1 + 2 = 3. The captured cell
+        // persists between calls (and outlives makeCounter's frame), so the
+        // count is not reset — that's capture by reference.
+        let mut code: Vec<Instr> = Vec::new();
+        let call_mc = code.len();
+        code.push(Call(0, 0)); // patched → makeCounter; leaves a closure
+        code.push(Dup);
+        code.push(CallDyn(0)); // first call → 1
+        code.push(Swap);
+        code.push(CallDyn(0)); // second call → 2
+        code.push(Add);
+        code.push(Return(1));
+        let mc = append_counter(&mut code);
+        code[call_mc] = Call(mc, 0);
+        assert_eq!(run(code), vec![n(3.0)]);
+    }
+
+    #[test]
+    fn closures_have_independent_cells() {
+        // Two makeCounter() results must not share state: c1(), c1(), c2()
+        // → [1, 2, 1].
+        let mut code: Vec<Instr> = Vec::new();
+        code.push(Alloc(plain(2))); // local 0 = c1, local 1 = c2
+        let call1 = code.len();
+        code.push(Call(0, 0));
+        code.push(SetLocal(0));
+        let call2 = code.len();
+        code.push(Call(0, 0));
+        code.push(SetLocal(1));
+        code.push(Local(0));
+        code.push(CallDyn(0)); // c1() → 1
+        code.push(Local(0));
+        code.push(CallDyn(0)); // c1() → 2
+        code.push(Local(1));
+        code.push(CallDyn(0)); // c2() → 1
+        code.push(ArrNew(3));
+        code.push(Return(1));
+        let mc = append_counter(&mut code);
+        code[call1] = Call(mc, 0);
+        code[call2] = Call(mc, 0);
+
+        let vm = run_vm(code);
+        let StackValue::Ptr(p) = vm.stack[0] else {
+            panic!("expected array pointer");
+        };
+        assert_eq!(
+            vm.heap[p as usize],
+            HeapValue::Array(vec![n(1.0), n(2.0), n(1.0)])
+        );
+    }
+
+    #[test]
+    fn closure_captures_plain_slot_by_value() {
+        // A Plain (unboxed) slot is captured by *value*: the closure snapshots
+        // the value at capture time, so mutating the local afterward is not
+        // observed. maker(): x=5; f=closure-over-x; x=99; return f. f() → 5.
+        let mut code: Vec<Instr> = Vec::new();
+        let call = code.len();
+        code.push(Call(0, 0)); // patched → maker; leaves a closure
+        code.push(CallDyn(0));
+        code.push(Return(1));
+        // maker
+        let maker = code.len() as u32;
+        code.push(Alloc(plain(1))); // slot 0 = x (NOT boxed)
+        code.push(Push(n(5.0)));
+        code.push(SetLocal(0));
+        let mk = code.len();
+        code.push(MakeClosure(0, vec![0])); // snapshot x = 5
+        code.push(Push(n(99.0)));
+        code.push(SetLocal(0)); // x = 99 AFTER capture (must not be seen)
+        code.push(Return(1));
+        let inner = code.len() as u32;
+        code.push(Local(0)); // return captured snapshot
+        code.push(Return(1));
+        code[call] = Call(maker, 0);
+        code[mk] = MakeClosure(inner, vec![0]);
+        assert_eq!(run(code), vec![n(5.0)]);
+    }
+
+    #[test]
+    fn two_closures_share_one_cell() {
+        // A getter and a setter closing over the same boxed `x` must see each
+        // other's writes. setter(42) then getter() → 42.
+        let mut code: Vec<Instr> = Vec::new();
+        // main: arr = maker(); setter = arr[1]; setter(42); getter = arr[0]; getter()
+        code.push(Alloc(plain(1))); // local 0 = [getter, setter]
+        let call = code.len();
+        code.push(Call(0, 0));
+        code.push(SetLocal(0));
+        code.push(Push(n(42.0))); // setter's arg
+        code.push(Local(0));
+        code.push(Push(n(1.0)));
+        code.push(ArrGet); // setter
+        code.push(CallDyn(1)); // setter(42) → (no result)
+        code.push(Local(0));
+        code.push(Push(n(0.0)));
+        code.push(ArrGet); // getter
+        code.push(CallDyn(0)); // getter() → 42
+        code.push(Return(1));
+        // maker
+        let maker = code.len() as u32;
+        code.push(Alloc(vec![SlotKind::Boxed])); // slot 0 = x (by-ref)
+        code.push(Push(n(0.0)));
+        code.push(SetLocal(0));
+        let mk_get = code.len();
+        code.push(MakeClosure(0, vec![0]));
+        let mk_set = code.len();
+        code.push(MakeClosure(0, vec![0]));
+        code.push(ArrNew(2)); // [getter, setter]
+        code.push(Return(1));
+        let getter = code.len() as u32;
+        code.push(Local(0));
+        code.push(Return(1));
+        let setter = code.len() as u32;
+        code.push(Arg(0));
+        code.push(SetLocal(0)); // x = arg (through the shared cell)
+        code.push(Return(0));
+        code[call] = Call(maker, 0);
+        code[mk_get] = MakeClosure(getter, vec![0]);
+        code[mk_set] = MakeClosure(setter, vec![0]);
+        assert_eq!(run(code), vec![n(42.0)]);
+    }
+
+    #[test]
+    fn nested_capture_forwards_same_cell() {
+        // outer boxes x=7 and returns `middle`; middle returns `inner`; inner
+        // reads x. The cell threads through both closure levels unchanged.
+        // outer()()() → 7.
+        let mut code: Vec<Instr> = Vec::new();
+        let call = code.len();
+        code.push(Call(0, 0)); // → middle closure
+        code.push(CallDyn(0)); // → inner closure
+        code.push(CallDyn(0)); // → 7
+        code.push(Return(1));
+        let outer = code.len() as u32;
+        code.push(Alloc(vec![SlotKind::Boxed]));
+        code.push(Push(n(7.0)));
+        code.push(SetLocal(0));
+        let mk_mid = code.len();
+        code.push(MakeClosure(0, vec![0]));
+        code.push(Return(1));
+        let middle = code.len() as u32;
+        // middle's slot 0 is x (installed upval); forward it to inner.
+        let mk_in = code.len();
+        code.push(MakeClosure(0, vec![0]));
+        code.push(Return(1));
+        let inner = code.len() as u32;
+        code.push(Local(0));
+        code.push(Return(1));
+        code[call] = Call(outer, 0);
+        code[mk_mid] = MakeClosure(middle, vec![0]);
+        code[mk_in] = MakeClosure(inner, vec![0]);
+        assert_eq!(run(code), vec![n(7.0)]);
+    }
+
+    #[test]
+    fn closure_identity_equality() {
+        // The same closure object equals itself (reference identity)…
+        let same = vec![
+            Alloc(vec![SlotKind::Boxed]),
+            Push(n(1.0)),
+            SetLocal(0),
+            MakeClosure(6, vec![0]),
+            Dup,
+            Eq,
+            Return(1), // addr 6: also a valid (never-called) closure target
+        ];
+        assert_eq!(run(same), vec![b(true)]);
+        // …but two distinct closure objects do not (no content equality).
+        let distinct = vec![
+            Alloc(vec![SlotKind::Boxed]),
+            Push(n(1.0)),
+            SetLocal(0),
+            MakeClosure(7, vec![0]),
+            MakeClosure(7, vec![0]),
+            Eq,
+            Return(1),
+            Return(1), // addr 7
+        ];
+        assert_eq!(run(distinct), vec![b(false)]);
+    }
+
+    #[test]
+    fn closure_has_no_json_representation() {
+        // Serializing a closure fails loudly, like a bare Fn.
+        let code = vec![
+            Alloc(vec![SlotKind::Boxed]),
+            Push(n(1.0)),
+            SetLocal(0),
+            MakeClosure(5, vec![0]),
+            StrFromJson,
+            Return(1), // addr 5
+        ];
+        assert!(matches!(run_err(code), VMError::ValueError));
+    }
+
+    #[test]
+    fn make_closure_rejects_out_of_range_capture() {
+        // Capturing a slot the frame doesn't have is a compiler bug → BadLocal.
+        let code = vec![
+            Call(2, 0),
+            Return(0),
+            Alloc(plain(1)),
+            MakeClosure(0, vec![5]), // only slot 0 exists
+            Return(1),
+        ];
+        assert!(matches!(run_err(code), VMError::BadLocal));
+    }
+
+    #[test]
+    fn call_dyn_rejects_non_closure_pointer() {
+        // A Ptr to a non-closure heap value (here an array) is not callable.
+        let code = vec![ArrNew(0), CallDyn(0)];
+        assert!(matches!(run_err(code), VMError::TypeError));
+    }
+
     #[test]
     fn call_with_locals() {
         // Function allocates a local, stores arg+arg in it, returns it.
@@ -2135,7 +2588,7 @@ mod tests {
         // [1] Push(8)
         // [2] Call(4, 2)
         // [3] Return(1)
-        // [4] Alloc(1)
+        // [4] Alloc(plain(1))
         // [5] Arg(0)
         // [6] Arg(1)
         // [7] Add
@@ -2148,7 +2601,7 @@ mod tests {
                 Push(n(8.0)),
                 Call(4, 2),
                 Return(1),
-                Alloc(1),
+                Alloc(plain(1)),
                 Arg(0),
                 Arg(1),
                 Add,
@@ -2169,7 +2622,7 @@ mod tests {
             Call(4, 2), // call fn
             Return(0),
             Push(n(99.0)), // fn pushes a temp FIRST (sp > fp)
-            Alloc(1),      // should fail
+            Alloc(plain(1)),      // should fail
             Return(0),
         ];
         assert!(matches!(run_err(code), VMError::BadAlloc));
@@ -2875,8 +3328,8 @@ mod tests {
         let code = vec![
             Call(2, 0),
             Return(1), // propagate the function's result to the final stack
-            Alloc(1),  // local 0
-            Alloc(1),  // local 1 (was previously rejected)
+            Alloc(plain(1)),  // local 0
+            Alloc(plain(1)),  // local 1 (was previously rejected)
             Push(n(7.0)),
             SetLocal(0),
             Push(n(8.0)),
@@ -2932,7 +3385,7 @@ mod tests {
             Push(n(1.0)),
             Call(3, 1),
             Return(0),
-            Alloc(1), // local 0; sp == frame floor
+            Alloc(plain(1)), // local 0; sp == frame floor
             Pop(1),   // nothing above the floor -> underflow
             Return(0),
         ];
@@ -2945,7 +3398,7 @@ mod tests {
             Push(n(1.0)),
             Call(3, 1),
             Return(0),
-            Alloc(1), // local 0; sp == floor
+            Alloc(plain(1)), // local 0; sp == floor
             Dup,      // nothing above the floor -> underflow
             Return(0),
         ];
@@ -2960,7 +3413,7 @@ mod tests {
             Push(n(1.0)),
             Call(3, 1),
             Return(0),
-            Alloc(1),     // local 0
+            Alloc(plain(1)),     // local 0
             Push(n(9.0)), // single temporary
             Swap,         // would swap the temp with the local -> underflow
             Return(0),
@@ -2974,7 +3427,7 @@ mod tests {
             Push(n(1.0)),
             Call(3, 1),
             Return(0),
-            Alloc(1),     // local 0
+            Alloc(plain(1)),     // local 0
             Push(n(8.0)), // two temporaries (need three for Rot)
             Push(n(9.0)),
             Rot,
@@ -2991,7 +3444,7 @@ mod tests {
             Push(n(5.0)),
             Call(3, 1),
             Return(1),
-            Alloc(1), // local 0
+            Alloc(plain(1)), // local 0
             Push(n(10.0)),
             SetLocal(0),  // local 0 = 10
             Push(n(1.0)), // temporaries: [1, 2]
