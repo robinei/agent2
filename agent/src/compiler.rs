@@ -7,6 +7,7 @@
 //! `Program` / `Diagnostic` types, a label allocator, the backpatch pass, the
 //! span table, and codegen for literal + arithmetic expressions.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use oxc_allocator::Allocator;
@@ -15,7 +16,7 @@ use oxc_parser::Parser;
 use oxc_span::{GetSpan, SourceType};
 
 use crate::builtin::Builtin;
-use crate::vm::{Instr, StackValue};
+use crate::vm::{Instr, SlotKind, StackValue};
 
 /// A compiled program: the flat instruction stream, a parallel span table
 /// (`spans[ip]` = source byte offset of the instruction at `ip`), and the
@@ -99,6 +100,33 @@ pub fn compile(source: &str) -> Result<Program, Vec<Diagnostic>> {
     })
 }
 
+/// A resolved local-variable binding: its frame slot plus whether it was
+/// declared `const` (so writes can be rejected at compile time).
+#[derive(Copy, Clone)]
+struct SlotInfo {
+    slot: u32,
+    is_const: bool,
+}
+
+/// One entry of the loop-context stack: where `break` and `continue` jump for
+/// the innermost enclosing loop. Both carry a label id (resolved in backpatch).
+struct LoopCtx {
+    break_label: u32,
+    continue_label: u32,
+}
+
+/// An assignment/update target resolved to its storage shape, so that `=`,
+/// compound (`+=`), logical (`??=`), and `++`/`--` can share one read/write
+/// lowering. `'r` is the borrow of the AST nodes, `'a` the arena they live in.
+enum LValue<'r, 'a> {
+    /// A frame-local variable slot.
+    Local(u32),
+    /// `obj.field` — the object expression plus the static field name.
+    Member(&'r ast::Expression<'a>, String),
+    /// `obj[key]` — the object expression plus the computed key expression.
+    Index(&'r ast::Expression<'a>, &'r ast::Expression<'a>),
+}
+
 /// Codegen state for one compilation unit.
 struct Compiler<'src> {
     source: &'src str,
@@ -109,6 +137,16 @@ struct Compiler<'src> {
     spans: Vec<u32>,
     /// Monotonic label-id allocator.
     next_label: u32,
+    /// Lexical scope stack (innermost last). `scopes[0]` is the function/program
+    /// scope where `var`s and top-level bindings live; blocks and loop heads push
+    /// their own scopes. Block scoping affects *visibility* only — slots are
+    /// function-wide and never reused (see the stack-discipline invariants in
+    /// COMPILER_PLAN). Phase 2 has no nested functions, so every slot is `Plain`.
+    scopes: Vec<HashMap<String, SlotInfo>>,
+    /// Monotonic local-slot allocator for the current function.
+    next_slot: u32,
+    /// Loop-context stack for `break`/`continue` (innermost loop last).
+    loops: Vec<LoopCtx>,
     diagnostics: Vec<Diagnostic>,
 }
 
@@ -119,6 +157,9 @@ impl<'src> Compiler<'src> {
             code: Vec::new(),
             spans: Vec::new(),
             next_label: 0,
+            scopes: Vec::new(),
+            next_slot: 0,
+            loops: Vec::new(),
             diagnostics: Vec::new(),
         }
     }
@@ -146,10 +187,28 @@ impl<'src> Compiler<'src> {
 
     // ── codegen ──────────────────────────────────────────────────────
 
-    /// The whole program is the root frame's body: lower each top-level
-    /// statement, then `Return(0)` to pop the root frame (→ `StepResult::Done`)
-    /// and stop execution falling into any appended function bodies.
+    /// The whole program is the root frame's body. First reserve all of the
+    /// frame's locals in one prologue `Alloc` (the stack-discipline invariant:
+    /// no temporaries above the locals when `Alloc` runs), with `var`s hoisted
+    /// so forward references resolve; then lower each top-level statement; then
+    /// `Return(0)` to pop the root frame (→ `StepResult::Done`) and stop
+    /// execution falling into any appended function bodies.
     fn compile_program(&mut self, program: &ast::Program) {
+        // The program is the sole function scope (Phase 2 has no nested
+        // functions). Reserve its locals up front: count every binding (an
+        // over-estimate is harmless — extra slots are unused `Undefined`s), emit
+        // one `Alloc`, then hoist `var` names so their slots precede the
+        // lexical ones and references anywhere in the body resolve.
+        self.scopes.push(HashMap::new());
+        let slot_count = count_decls_in_stmts(&program.body);
+        if slot_count > 0 {
+            self.emit(
+                Instr::Alloc(vec![SlotKind::Plain; slot_count as usize]),
+                program.span.start,
+            );
+        }
+        self.hoist_vars_in_stmts(&program.body);
+
         for stmt in &program.body {
             self.compile_stmt(stmt);
         }
@@ -164,7 +223,466 @@ impl<'src> Compiler<'src> {
                 self.compile_expr(&es.expression);
                 self.emit(Instr::Pop(1), es.span.start);
             }
+            ast::Statement::VariableDeclaration(decl) => self.compile_var_decl(decl),
+            ast::Statement::BlockStatement(block) => {
+                // A block is a fresh lexical scope; slots are function-wide so
+                // there is no per-block `Alloc` (only name visibility changes).
+                self.scopes.push(HashMap::new());
+                for s in &block.body {
+                    self.compile_stmt(s);
+                }
+                self.scopes.pop();
+            }
+            ast::Statement::EmptyStatement(_) => {}
+            ast::Statement::IfStatement(s) => self.compile_if(s),
+            ast::Statement::WhileStatement(s) => self.compile_while(s),
+            ast::Statement::DoWhileStatement(s) => self.compile_do_while(s),
+            ast::Statement::ForStatement(s) => self.compile_for(s),
+            ast::Statement::BreakStatement(s) => self.compile_break(s),
+            ast::Statement::ContinueStatement(s) => self.compile_continue(s),
+
+            // Later phases / out of scope — informative errors.
+            ast::Statement::FunctionDeclaration(f) => self.error(
+                f.span.start,
+                "function declarations are not supported until Phase 3",
+            ),
+            ast::Statement::ReturnStatement(r) => self.error(
+                r.span.start,
+                "`return` outside a function is not supported until Phase 3",
+            ),
+            ast::Statement::ForOfStatement(s) => {
+                self.error(s.span.start, "`for...of` is not supported until Phase 4")
+            }
+            ast::Statement::ForInStatement(s) => {
+                self.error(s.span.start, "`for...in` is not supported until Phase 4")
+            }
+            ast::Statement::SwitchStatement(s) => {
+                self.error(s.span.start, "`switch` is not supported until Phase 4")
+            }
+            ast::Statement::ThrowStatement(s) => {
+                self.error(s.span.start, "`throw` is not supported (use `raise`)")
+            }
+            ast::Statement::TryStatement(s) => {
+                self.error(s.span.start, "`try`/`catch` is not supported (use `raise`)")
+            }
+            ast::Statement::ClassDeclaration(s) => {
+                self.error(s.span.start, "`class` is not supported")
+            }
+            ast::Statement::LabeledStatement(s) => {
+                self.error(s.span.start, "labeled statements are not supported")
+            }
             other => self.error(other.span().start, "unsupported statement"),
+        }
+    }
+
+    // ── declarations ─────────────────────────────────────────────────────
+
+    /// `let`/`const`/`var` declarations. `var` slots were hoisted in the
+    /// prologue (so only the initializer runs here); `let`/`const` slots are
+    /// allocated as the declaration is reached. A declaration is a statement, so
+    /// nothing is left on the stack.
+    fn compile_var_decl(&mut self, decl: &ast::VariableDeclaration) {
+        use ast::VariableDeclarationKind as Kind;
+        let is_const = decl.kind == Kind::Const;
+        let is_var = decl.kind == Kind::Var;
+        if matches!(decl.kind, Kind::Using | Kind::AwaitUsing) {
+            self.error(decl.span.start, "`using` declarations are not supported");
+            return;
+        }
+        for d in &decl.declarations {
+            // Bind names first so a destructuring pattern's slots exist before
+            // its extraction code runs (and so `let x = x` resolves `x` to the
+            // new binding, matching JS scoping — TDZ aside).
+            self.declare_pattern(&d.id, is_const, is_var);
+            match &d.id {
+                ast::BindingPattern::BindingIdentifier(id) => {
+                    let slot = self.resolve_local(id.name.as_str()).map(|i| i.slot);
+                    match (&d.init, slot) {
+                        (Some(init), Some(slot)) => {
+                            self.compile_expr(init);
+                            self.emit(Instr::SetLocal(slot), d.span.start);
+                        }
+                        (None, Some(slot)) if !is_var => {
+                            // `let x;` re-initializes to `undefined` each time the
+                            // declaration executes (e.g. per loop iteration); a
+                            // bare `var x;` is a no-op (already hoisted).
+                            self.emit(Instr::Push(StackValue::Undefined), d.span.start);
+                            self.emit(Instr::SetLocal(slot), d.span.start);
+                        }
+                        _ => {}
+                    }
+                }
+                pattern => match &d.init {
+                    Some(init) => {
+                        // Evaluate the source once, then destructure it (the
+                        // helper consumes the source value).
+                        self.compile_expr(init);
+                        self.destructure_binding(pattern, d.span.start);
+                    }
+                    None => self.error(
+                        d.span.start,
+                        "destructuring declaration requires an initializer",
+                    ),
+                },
+            }
+        }
+    }
+
+    /// Declare every binding identifier introduced by a pattern. `let`/`const`
+    /// get fresh slots in the current scope here; `var` names were already
+    /// hoisted into the function scope, so they are left untouched.
+    fn declare_pattern(&mut self, pat: &ast::BindingPattern, is_const: bool, is_var: bool) {
+        match pat {
+            ast::BindingPattern::BindingIdentifier(id) => {
+                if !is_var {
+                    self.declare_lexical(id.name.as_str(), id.span.start, is_const);
+                }
+            }
+            ast::BindingPattern::AssignmentPattern(ap) => {
+                self.declare_pattern(&ap.left, is_const, is_var)
+            }
+            ast::BindingPattern::ArrayPattern(arr) => {
+                for el in arr.elements.iter().flatten() {
+                    self.declare_pattern(el, is_const, is_var);
+                }
+                if let Some(rest) = &arr.rest {
+                    self.declare_pattern(&rest.argument, is_const, is_var);
+                }
+            }
+            ast::BindingPattern::ObjectPattern(obj) => {
+                for prop in &obj.properties {
+                    self.declare_pattern(&prop.value, is_const, is_var);
+                }
+                if let Some(rest) = &obj.rest {
+                    self.declare_pattern(&rest.argument, is_const, is_var);
+                }
+            }
+        }
+    }
+
+    /// Destructure the source value already on top of the stack into a binding
+    /// pattern, **consuming** that value. Used by declarations; every leaf is a
+    /// (already-declared) binding identifier, so leaves lower to `SetLocal`.
+    fn destructure_binding(&mut self, pat: &ast::BindingPattern, span: u32) {
+        match pat {
+            ast::BindingPattern::BindingIdentifier(id) => {
+                match self.resolve_local(id.name.as_str()) {
+                    Some(info) => self.emit(Instr::SetLocal(info.slot), span),
+                    None => {
+                        // Declared moments ago; a miss means an earlier error.
+                        self.emit(Instr::Pop(1), span);
+                    }
+                }
+            }
+            ast::BindingPattern::AssignmentPattern(ap) => {
+                self.emit_default(&ap.right, span);
+                self.destructure_binding(&ap.left, span);
+            }
+            ast::BindingPattern::ArrayPattern(arr) => {
+                if arr.rest.is_some() {
+                    self.error(arr.span.start, "rest elements in destructuring are not supported");
+                }
+                for (i, el) in arr.elements.iter().enumerate() {
+                    if let Some(el) = el {
+                        self.emit(Instr::Dup, span);
+                        self.emit(Instr::Push(StackValue::PosInt(i as u64)), span);
+                        self.emit(Instr::IndexGet, span);
+                        self.destructure_binding(el, span);
+                    }
+                }
+                self.emit(Instr::Pop(1), span); // drop the source
+            }
+            ast::BindingPattern::ObjectPattern(obj) => {
+                if obj.rest.is_some() {
+                    self.error(obj.span.start, "rest elements in destructuring are not supported");
+                }
+                for prop in &obj.properties {
+                    self.emit(Instr::Dup, span);
+                    self.emit_property_key_access(&prop.key, prop.computed, span);
+                    self.destructure_binding(&prop.value, span);
+                }
+                self.emit(Instr::Pop(1), span); // drop the source
+            }
+        }
+    }
+
+    /// With an object on top of the stack, read the property named by a pattern
+    /// key, leaving its value on top (consuming the object copy). A static key
+    /// uses the fast `ObjGet`; a computed key evaluates the expression and uses
+    /// the polymorphic `IndexGet`.
+    fn emit_property_key_access(&mut self, key: &ast::PropertyKey, computed: bool, span: u32) {
+        if computed {
+            if let Some(expr) = key.as_expression() {
+                self.compile_expr(expr);
+                self.emit(Instr::IndexGet, span);
+                return;
+            }
+        }
+        let name = match key {
+            ast::PropertyKey::StaticIdentifier(id) => id.name.as_str().to_string(),
+            ast::PropertyKey::StringLiteral(s) => s.value.as_str().to_string(),
+            ast::PropertyKey::NumericLiteral(n) => number_key_to_string(n.value),
+            _ => {
+                if let Some(expr) = key.as_expression() {
+                    self.compile_expr(expr);
+                    self.emit(Instr::IndexGet, span);
+                    return;
+                }
+                self.error(key.span().start, "unsupported destructuring key");
+                return;
+            }
+        };
+        self.emit(Instr::ObjGet(name), span);
+    }
+
+    /// Apply a destructuring/parameter default to the value on top of the stack:
+    /// if it is `undefined`, replace it with the default expression's value;
+    /// otherwise leave it. (JS applies defaults only for `undefined`, not
+    /// `null`.) Leaves exactly one value either way.
+    fn emit_default(&mut self, default: &ast::Expression, span: u32) {
+        let have = self.new_label();
+        self.emit(Instr::Dup, span);
+        self.emit(Instr::Push(StackValue::Undefined), span);
+        self.emit(Instr::Eq, span);
+        self.emit(Instr::JFalse(have), span); // not undefined → keep the value
+        self.emit(Instr::Pop(1), span); // undefined → drop and use the default
+        self.compile_expr(default);
+        self.emit(Instr::Label(have), span);
+    }
+
+    // ── scope / binding helpers ──────────────────────────────────────────
+
+    /// Declare a `let`/`const` binding in the current (innermost) scope, giving
+    /// it a fresh function-wide slot. `state` is blessed and cannot be shadowed.
+    fn declare_lexical(&mut self, name: &str, span: u32, is_const: bool) -> u32 {
+        if name == "state" {
+            self.error(span, "cannot shadow the blessed `state` object");
+        }
+        let slot = self.next_slot;
+        self.next_slot += 1;
+        self.scopes
+            .last_mut()
+            .expect("a scope is always open during codegen")
+            .insert(name.to_string(), SlotInfo { slot, is_const });
+        slot
+    }
+
+    /// Hoist every `var` binding into the function scope (`scopes[0]`), assigning
+    /// each distinct name one slot. Recurses through nested blocks/conditionals/
+    /// loops but not into nested functions (there are none in Phase 2). The
+    /// initializer assignment itself is emitted later, at the declaration site.
+    fn hoist_vars_in_stmts(&mut self, stmts: &[ast::Statement]) {
+        for stmt in stmts {
+            self.hoist_vars_in_stmt(stmt);
+        }
+    }
+
+    fn hoist_vars_in_stmt(&mut self, stmt: &ast::Statement) {
+        match stmt {
+            ast::Statement::VariableDeclaration(decl) => {
+                if decl.kind == ast::VariableDeclarationKind::Var {
+                    for d in &decl.declarations {
+                        self.hoist_var_pattern(&d.id);
+                    }
+                }
+            }
+            ast::Statement::BlockStatement(b) => self.hoist_vars_in_stmts(&b.body),
+            ast::Statement::IfStatement(s) => {
+                self.hoist_vars_in_stmt(&s.consequent);
+                if let Some(alt) = &s.alternate {
+                    self.hoist_vars_in_stmt(alt);
+                }
+            }
+            ast::Statement::WhileStatement(s) => self.hoist_vars_in_stmt(&s.body),
+            ast::Statement::DoWhileStatement(s) => self.hoist_vars_in_stmt(&s.body),
+            ast::Statement::ForStatement(s) => {
+                if let Some(ast::ForStatementInit::VariableDeclaration(decl)) = &s.init {
+                    if decl.kind == ast::VariableDeclarationKind::Var {
+                        for d in &decl.declarations {
+                            self.hoist_var_pattern(&d.id);
+                        }
+                    }
+                }
+                self.hoist_vars_in_stmt(&s.body);
+            }
+            _ => {}
+        }
+    }
+
+    fn hoist_var_pattern(&mut self, pat: &ast::BindingPattern) {
+        match pat {
+            ast::BindingPattern::BindingIdentifier(id) => {
+                let name = id.name.as_str();
+                if name == "state" {
+                    self.error(id.span.start, "cannot shadow the blessed `state` object");
+                    return;
+                }
+                // A `var` name maps to a single slot even if redeclared.
+                if self.scopes[0].contains_key(name) {
+                    return;
+                }
+                let slot = self.next_slot;
+                self.next_slot += 1;
+                self.scopes[0].insert(
+                    name.to_string(),
+                    SlotInfo {
+                        slot,
+                        is_const: false,
+                    },
+                );
+            }
+            ast::BindingPattern::AssignmentPattern(ap) => self.hoist_var_pattern(&ap.left),
+            ast::BindingPattern::ArrayPattern(arr) => {
+                for el in arr.elements.iter().flatten() {
+                    self.hoist_var_pattern(el);
+                }
+                if let Some(rest) = &arr.rest {
+                    self.hoist_var_pattern(&rest.argument);
+                }
+            }
+            ast::BindingPattern::ObjectPattern(obj) => {
+                for prop in &obj.properties {
+                    self.hoist_var_pattern(&prop.value);
+                }
+                if let Some(rest) = &obj.rest {
+                    self.hoist_var_pattern(&rest.argument);
+                }
+            }
+        }
+    }
+
+    /// Resolve a name to its local binding by searching scopes innermost-first.
+    fn resolve_local(&self, name: &str) -> Option<SlotInfo> {
+        self.scopes.iter().rev().find_map(|s| s.get(name).copied())
+    }
+
+    // ── control flow ─────────────────────────────────────────────────────
+
+    fn compile_if(&mut self, s: &ast::IfStatement) {
+        let span = s.span.start;
+        self.compile_expr(&s.test);
+        match &s.alternate {
+            Some(alt) => {
+                let els = self.new_label();
+                let end = self.new_label();
+                self.emit(Instr::JFalse(els), span);
+                self.compile_stmt(&s.consequent);
+                self.emit(Instr::Jump(end), span);
+                self.emit(Instr::Label(els), span);
+                self.compile_stmt(alt);
+                self.emit(Instr::Label(end), span);
+            }
+            None => {
+                let end = self.new_label();
+                self.emit(Instr::JFalse(end), span);
+                self.compile_stmt(&s.consequent);
+                self.emit(Instr::Label(end), span);
+            }
+        }
+    }
+
+    fn compile_while(&mut self, s: &ast::WhileStatement) {
+        let span = s.span.start;
+        let top = self.new_label();
+        let end = self.new_label();
+        self.emit(Instr::Label(top), span);
+        self.compile_expr(&s.test);
+        self.emit(Instr::JFalse(end), span);
+        self.loops.push(LoopCtx {
+            break_label: end,
+            continue_label: top,
+        });
+        self.compile_stmt(&s.body);
+        self.loops.pop();
+        self.emit(Instr::Jump(top), span);
+        self.emit(Instr::Label(end), span);
+    }
+
+    fn compile_do_while(&mut self, s: &ast::DoWhileStatement) {
+        let span = s.span.start;
+        let top = self.new_label();
+        let cont = self.new_label();
+        let end = self.new_label();
+        self.emit(Instr::Label(top), span);
+        self.loops.push(LoopCtx {
+            break_label: end,
+            continue_label: cont,
+        });
+        self.compile_stmt(&s.body);
+        self.loops.pop();
+        // `continue` lands here, at the loop test.
+        self.emit(Instr::Label(cont), span);
+        self.compile_expr(&s.test);
+        self.emit(Instr::JTrue(top), span);
+        self.emit(Instr::Label(end), span);
+    }
+
+    fn compile_for(&mut self, s: &ast::ForStatement) {
+        let span = s.span.start;
+        // The loop head (`for (let i …)`) is its own scope.
+        self.scopes.push(HashMap::new());
+        match &s.init {
+            Some(ast::ForStatementInit::VariableDeclaration(decl)) => self.compile_var_decl(decl),
+            Some(other) => {
+                // An expression initializer (it inherits the `Expression`
+                // variants): evaluate and discard.
+                if let Some(expr) = other.as_expression() {
+                    self.compile_expr(expr);
+                    self.emit(Instr::Pop(1), span);
+                }
+            }
+            None => {}
+        }
+        let top = self.new_label();
+        let cont = self.new_label();
+        let end = self.new_label();
+        self.emit(Instr::Label(top), span);
+        if let Some(test) = &s.test {
+            self.compile_expr(test);
+            self.emit(Instr::JFalse(end), span);
+        }
+        self.loops.push(LoopCtx {
+            break_label: end,
+            continue_label: cont,
+        });
+        self.compile_stmt(&s.body);
+        self.loops.pop();
+        // `continue` runs the update, then re-tests.
+        self.emit(Instr::Label(cont), span);
+        if let Some(update) = &s.update {
+            self.compile_expr(update);
+            self.emit(Instr::Pop(1), span);
+        }
+        self.emit(Instr::Jump(top), span);
+        self.emit(Instr::Label(end), span);
+        self.scopes.pop();
+    }
+
+    fn compile_break(&mut self, s: &ast::BreakStatement) {
+        if s.label.is_some() {
+            self.error(s.span.start, "labeled `break` is not supported");
+            return;
+        }
+        match self.loops.last() {
+            Some(ctx) => {
+                let target = ctx.break_label;
+                self.emit(Instr::Jump(target), s.span.start);
+            }
+            None => self.error(s.span.start, "`break` outside a loop"),
+        }
+    }
+
+    fn compile_continue(&mut self, s: &ast::ContinueStatement) {
+        if s.label.is_some() {
+            self.error(s.span.start, "labeled `continue` is not supported");
+            return;
+        }
+        match self.loops.last() {
+            Some(ctx) => {
+                let target = ctx.continue_label;
+                self.emit(Instr::Jump(target), s.span.start);
+            }
+            None => self.error(s.span.start, "`continue` outside a loop"),
         }
     }
 
@@ -231,10 +749,9 @@ impl<'src> Compiler<'src> {
 
             ast::Expression::ParenthesizedExpression(p) => self.compile_expr(&p.expression),
 
+            ast::Expression::UpdateExpression(u) => self.compile_update(u),
+
             // ── informative errors for out-of-scope nodes ─────────────
-            ast::Expression::UpdateExpression(u) => {
-                self.error(u.span.start, "`++`/`--` are not supported until Phase 2")
-            }
             ast::Expression::FunctionExpression(f) => self.error(
                 f.span.start,
                 "function expressions are not supported until Phase 3",
@@ -263,6 +780,12 @@ impl<'src> Compiler<'src> {
     /// variables arrive in Phase 2/3; namespace names like `Math`/`Object` are
     /// recognized structurally as call/member receivers, never as bare values.)
     fn compile_identifier(&mut self, name: &str, span: u32) {
+        // A local variable resolves to its frame slot; `Local` dereferences a
+        // boxed slot transparently.
+        if let Some(info) = self.resolve_local(name) {
+            self.emit(Instr::Local(info.slot), span);
+            return;
+        }
         let value = match name {
             "state" => StackValue::Ptr(0),
             "undefined" => StackValue::Undefined,
@@ -638,45 +1161,392 @@ impl<'src> Compiler<'src> {
 
     // ── assignment ───────────────────────────────────────────────────────
 
-    /// Assignment is an expression: it leaves the assigned value on the stack
-    /// (the store instructions push it back), so lowering is just the operands
-    /// in source order followed by the store — no shuffling, correct eval order.
-    ///
-    /// Phase 1 supports plain `=` to a member/index/`state` target. Compound
-    /// (`+=`), logical (`??=`), and identifier targets (which need local
-    /// declarations) arrive in Phase 2.
+    /// Assignment is an expression: it leaves the assigned value on the stack.
+    /// Plain `=`, compound (`+=` …), and short-circuiting logical (`&&=`/`||=`/
+    /// `??=`) assignment all share the [`LValue`] read/write lowering. Array/
+    /// object destructuring targets are handled separately.
     fn compile_assignment(&mut self, a: &ast::AssignmentExpression) {
         use ast::AssignmentOperator as Op;
         let span = a.span.start;
-        if a.operator != Op::Assign {
-            self.error(
-                span,
-                "compound and logical assignment are not supported until Phase 2",
-            );
-            return;
-        }
+
+        // Destructuring assignment (`[a, b] = …`, `({a} = …)`). These leave the
+        // RHS value as the expression result, so keep an extra copy.
         match &a.left {
-            ast::AssignmentTarget::StaticMemberExpression(m) => {
-                let field = m.property.name.as_str().to_string();
-                self.compile_expr(&m.object);
+            ast::AssignmentTarget::ArrayAssignmentTarget(_)
+            | ast::AssignmentTarget::ObjectAssignmentTarget(_) => {
+                if a.operator != Op::Assign {
+                    self.error(span, "destructuring targets only allow plain `=`");
+                    return;
+                }
                 self.compile_expr(&a.right);
-                self.emit(Instr::ObjSet(field), span); // leaves the value
+                self.emit(Instr::Dup, span); // one copy is the expression result
+                self.destructure_assign(&a.left, span);
+                return;
+            }
+            _ => {}
+        }
+
+        let lv = match self.lvalue_from_target(&a.left) {
+            Some(lv) => lv,
+            None => return,
+        };
+
+        match a.operator {
+            Op::Assign => {
+                self.lvalue_emit_addr(&lv, span);
+                self.compile_expr(&a.right);
+                self.lvalue_emit_store(&lv, span);
+            }
+            Op::LogicalAnd | Op::LogicalOr | Op::LogicalNullish => {
+                self.compile_logical_assign(&lv, a.operator, &a.right, span);
+            }
+            _ => {
+                let op = match self.compound_binary_instr(a.operator, span) {
+                    Some(op) => op,
+                    None => return,
+                };
+                self.lvalue_emit_addr(&lv, span);
+                self.lvalue_emit_load(&lv, span);
+                self.compile_expr(&a.right);
+                self.emit(op, span);
+                self.lvalue_emit_store(&lv, span);
+            }
+        }
+    }
+
+    /// Map a compound assignment operator to its binary instruction. (`=` and
+    /// the logical operators are handled by their own paths.)
+    fn compound_binary_instr(&mut self, op: ast::AssignmentOperator, span: u32) -> Option<Instr> {
+        use ast::AssignmentOperator as Op;
+        Some(match op {
+            Op::Addition => Instr::Add,
+            Op::Subtraction => Instr::Sub,
+            Op::Multiplication => Instr::Mul,
+            Op::Division => Instr::Div,
+            Op::Remainder => Instr::Mod,
+            Op::Exponential => Instr::Pow,
+            Op::ShiftLeft => Instr::BitLhs,
+            Op::ShiftRight => Instr::BitRhs,
+            Op::BitwiseOR => Instr::BitOr,
+            Op::BitwiseXOR => Instr::BitXor,
+            Op::BitwiseAnd => Instr::BitAnd,
+            Op::ShiftRightZeroFill => {
+                self.error(span, "unsigned right shift (`>>>=`) is not supported");
+                return None;
+            }
+            Op::Assign | Op::LogicalAnd | Op::LogicalOr | Op::LogicalNullish => {
+                unreachable!("handled by dedicated paths")
+            }
+        })
+    }
+
+    /// Short-circuiting logical assignment: `x &&= v` ≡ `x && (x = v)`,
+    /// `x ||= v` ≡ `x || (x = v)`, `x ??= v` ≡ `x ?? (x = v)`. The RHS — and the
+    /// store — run only on the non-short-circuit path; the lvalue's address is
+    /// evaluated once. Leaves the resulting value (old on short-circuit, else v).
+    fn compile_logical_assign(
+        &mut self,
+        lv: &LValue<'_, '_>,
+        op: ast::AssignmentOperator,
+        rhs: &ast::Expression,
+        span: u32,
+    ) {
+        use ast::AssignmentOperator as Op;
+        let keep = self.new_label();
+        let end = self.new_label();
+        let depth = self.lvalue_addr_depth(lv);
+        self.lvalue_emit_addr(lv, span);
+        self.lvalue_emit_load(lv, span); // [addr…, old]
+        match op {
+            Op::LogicalNullish => self.emit(Instr::JNotNullish(keep), span),
+            Op::LogicalAnd => {
+                self.emit(Instr::Dup, span);
+                self.emit(Instr::JFalse(keep), span); // falsy → keep old
+            }
+            Op::LogicalOr => {
+                self.emit(Instr::Dup, span);
+                self.emit(Instr::JTrue(keep), span); // truthy → keep old
+            }
+            _ => unreachable!("only logical operators reach here"),
+        }
+        // Store path: discard old, evaluate the RHS, store it.
+        self.emit(Instr::Pop(1), span);
+        self.compile_expr(rhs);
+        self.lvalue_emit_store(lv, span);
+        self.emit(Instr::Jump(end), span);
+        // Keep path: old is on top, above any address values — drop those.
+        self.emit(Instr::Label(keep), span);
+        self.emit_drop_below_top(depth, span);
+        self.emit(Instr::Label(end), span);
+    }
+
+    /// `++x` / `x++` / `--x` / `x--`. Numeric (forces `ToNumber` via `Sub`): the
+    /// new value is `old − p` where `p = -1` for `++` and `+1` for `--`. Prefix
+    /// leaves the new value; postfix recovers and leaves the old value as
+    /// `new + p` (exact for the integers loop counters use).
+    fn compile_update(&mut self, u: &ast::UpdateExpression) {
+        let span = u.span.start;
+        let lv = match self.lvalue_from_simple_target(&u.argument) {
+            Some(lv) => lv,
+            None => return,
+        };
+        // `p`: ++ subtracts -1 (i.e. adds 1); -- subtracts +1.
+        let p = match u.operator {
+            ast::UpdateOperator::Increment => StackValue::NegInt(-1),
+            ast::UpdateOperator::Decrement => StackValue::PosInt(1),
+        };
+        self.lvalue_emit_addr(&lv, span);
+        self.lvalue_emit_load(&lv, span);
+        self.emit(Instr::Push(p), span);
+        self.emit(Instr::Sub, span);
+        self.lvalue_emit_store(&lv, span); // leaves the new value
+        if !u.prefix {
+            // Postfix: recover the old value (new + p).
+            self.emit(Instr::Push(p), span);
+            self.emit(Instr::Add, span);
+        }
+    }
+
+    // ── lvalue infrastructure ────────────────────────────────────────────
+
+    /// Resolve a (non-destructuring) assignment target to an [`LValue`], or emit
+    /// an error and return `None`. A `const`/`state` write is rejected here.
+    fn lvalue_from_target<'r, 'a>(
+        &mut self,
+        target: &'r ast::AssignmentTarget<'a>,
+    ) -> Option<LValue<'r, 'a>> {
+        match target {
+            ast::AssignmentTarget::AssignmentTargetIdentifier(id) => {
+                self.lvalue_for_identifier(id.name.as_str(), id.span.start)
+            }
+            ast::AssignmentTarget::StaticMemberExpression(m) => {
+                Some(LValue::Member(&m.object, m.property.name.as_str().to_string()))
             }
             ast::AssignmentTarget::ComputedMemberExpression(m) => {
-                self.compile_expr(&m.object);
-                self.compile_expr(&m.expression);
-                self.compile_expr(&a.right);
-                self.emit(Instr::IndexSet, span); // leaves the value
+                Some(LValue::Index(&m.object, &m.expression))
             }
-            ast::AssignmentTarget::AssignmentTargetIdentifier(id) => self.error(
-                id.span.start,
-                format!(
-                    "cannot assign to `{}`: variables are not declarable until Phase 2 \
-                     (and `state` cannot be rebound)",
-                    id.name.as_str()
-                ),
+            other => {
+                self.error(other.span().start, "unsupported assignment target");
+                None
+            }
+        }
+    }
+
+    /// Like [`lvalue_from_target`], but for the `SimpleAssignmentTarget` of an
+    /// update expression (`++`/`--`).
+    fn lvalue_from_simple_target<'r, 'a>(
+        &mut self,
+        target: &'r ast::SimpleAssignmentTarget<'a>,
+    ) -> Option<LValue<'r, 'a>> {
+        match target {
+            ast::SimpleAssignmentTarget::AssignmentTargetIdentifier(id) => {
+                self.lvalue_for_identifier(id.name.as_str(), id.span.start)
+            }
+            ast::SimpleAssignmentTarget::StaticMemberExpression(m) => {
+                Some(LValue::Member(&m.object, m.property.name.as_str().to_string()))
+            }
+            ast::SimpleAssignmentTarget::ComputedMemberExpression(m) => {
+                Some(LValue::Index(&m.object, &m.expression))
+            }
+            other => {
+                self.error(other.span().start, "unsupported assignment target");
+                None
+            }
+        }
+    }
+
+    /// Resolve an identifier write target: a local slot, or an error for
+    /// `const`/`state`/undeclared names.
+    fn lvalue_for_identifier<'r, 'a>(
+        &mut self,
+        name: &str,
+        span: u32,
+    ) -> Option<LValue<'r, 'a>> {
+        match self.resolve_local(name) {
+            Some(info) => {
+                if info.is_const {
+                    self.error(span, format!("assignment to constant `{name}`"));
+                }
+                Some(LValue::Local(info.slot))
+            }
+            None if name == "state" => {
+                self.error(span, "cannot reassign the blessed `state` object");
+                None
+            }
+            None => {
+                self.error(span, format!("assignment to undeclared variable `{name}`"));
+                None
+            }
+        }
+    }
+
+    /// Number of address values an lvalue pushes before its value (`Local` 0,
+    /// `Member` 1, `Index` 2). Used to clean up after a short-circuit.
+    fn lvalue_addr_depth(&self, lv: &LValue<'_, '_>) -> usize {
+        match lv {
+            LValue::Local(_) => 0,
+            LValue::Member(..) => 1,
+            LValue::Index(..) => 2,
+        }
+    }
+
+    /// Push the lvalue's address operands (the object, and key for an index) in
+    /// JS evaluation order. A local has no address.
+    fn lvalue_emit_addr(&mut self, lv: &LValue<'_, '_>, _span: u32) {
+        match lv {
+            LValue::Local(_) => {}
+            LValue::Member(obj, _) => self.compile_expr(obj),
+            LValue::Index(obj, key) => {
+                self.compile_expr(obj);
+                self.compile_expr(key);
+            }
+        }
+    }
+
+    /// With the address already on the stack, push the lvalue's current value
+    /// **without** consuming the address (so a store can follow). Uses `Pick` to
+    /// copy the buried object/key for the read.
+    fn lvalue_emit_load(&mut self, lv: &LValue<'_, '_>, span: u32) {
+        match lv {
+            LValue::Local(slot) => self.emit(Instr::Local(*slot), span),
+            LValue::Member(_, field) => {
+                self.emit(Instr::Dup, span); // copy the object
+                self.emit(Instr::ObjGet(field.clone()), span);
+            }
+            LValue::Index(..) => {
+                self.emit(Instr::Pick(1), span); // copy the object
+                self.emit(Instr::Pick(1), span); // copy the key
+                self.emit(Instr::IndexGet, span);
+            }
+        }
+    }
+
+    /// With `[address…, value]` on the stack, store `value` into the lvalue and
+    /// leave it on the stack (assignment is an expression).
+    fn lvalue_emit_store(&mut self, lv: &LValue<'_, '_>, span: u32) {
+        match lv {
+            LValue::Local(slot) => {
+                self.emit(Instr::Dup, span); // keep a copy as the result
+                self.emit(Instr::SetLocal(*slot), span);
+            }
+            LValue::Member(_, field) => self.emit(Instr::ObjSet(field.clone()), span),
+            LValue::Index(..) => self.emit(Instr::IndexSet, span),
+        }
+    }
+
+    /// Remove `n` values sitting directly below the top of the stack, leaving the
+    /// top in place. (`Swap`+`Pop` peels one at a time.)
+    fn emit_drop_below_top(&mut self, n: usize, span: u32) {
+        for _ in 0..n {
+            self.emit(Instr::Swap, span);
+            self.emit(Instr::Pop(1), span);
+        }
+    }
+
+    // ── destructuring assignment ─────────────────────────────────────────
+
+    /// Destructure the source value on top of the stack into an assignment
+    /// pattern, **consuming** it. Leaves are existing assignment targets; Phase 2
+    /// supports identifier leaves (member/index leaves and rest are errors).
+    fn destructure_assign(&mut self, target: &ast::AssignmentTarget, span: u32) {
+        match target {
+            ast::AssignmentTarget::ArrayAssignmentTarget(arr) => {
+                if arr.rest.is_some() {
+                    self.error(arr.span.start, "rest elements in destructuring are not supported");
+                }
+                for (i, el) in arr.elements.iter().enumerate() {
+                    if let Some(el) = el {
+                        self.emit(Instr::Dup, span);
+                        self.emit(Instr::Push(StackValue::PosInt(i as u64)), span);
+                        self.emit(Instr::IndexGet, span);
+                        self.assign_maybe_default(el, span);
+                    }
+                }
+                self.emit(Instr::Pop(1), span);
+            }
+            ast::AssignmentTarget::ObjectAssignmentTarget(obj) => {
+                if obj.rest.is_some() {
+                    self.error(obj.span.start, "rest elements in destructuring are not supported");
+                }
+                for prop in &obj.properties {
+                    match prop {
+                        ast::AssignmentTargetProperty::AssignmentTargetPropertyIdentifier(p) => {
+                            // Shorthand `{a}` / `{a = d}`: the key and the target
+                            // are the same identifier.
+                            self.emit(Instr::Dup, span);
+                            self.emit(Instr::ObjGet(p.binding.name.as_str().to_string()), span);
+                            if let Some(default) = &p.init {
+                                self.emit_default(default, span);
+                            }
+                            self.assign_to_identifier(p.binding.name.as_str(), p.binding.span.start, span);
+                        }
+                        ast::AssignmentTargetProperty::AssignmentTargetPropertyProperty(p) => {
+                            self.emit(Instr::Dup, span);
+                            self.emit_property_key_access(&p.name, p.computed, span);
+                            self.assign_maybe_default(&p.binding, span);
+                        }
+                    }
+                }
+                self.emit(Instr::Pop(1), span);
+            }
+            other => self.error(other.span().start, "unsupported destructuring target"),
+        }
+    }
+
+    /// Destructure-assign a single element, applying its default (if any) to the
+    /// value already on top of the stack.
+    fn assign_maybe_default(&mut self, m: &ast::AssignmentTargetMaybeDefault, span: u32) {
+        match m {
+            ast::AssignmentTargetMaybeDefault::AssignmentTargetWithDefault(wd) => {
+                self.emit_default(&wd.init, span);
+                self.assign_target_leaf(&wd.binding, span);
+            }
+            other => {
+                // Inherits the `AssignmentTarget` variants.
+                if let Some(t) = other.as_assignment_target() {
+                    self.assign_target_leaf(t, span);
+                } else {
+                    self.error(other.span().start, "unsupported destructuring target");
+                }
+            }
+        }
+    }
+
+    /// Store the value on top of the stack into a destructuring leaf, consuming
+    /// it. Identifier leaves lower to `SetLocal`; nested patterns recurse;
+    /// member/index leaves are not supported in Phase 2.
+    fn assign_target_leaf(&mut self, target: &ast::AssignmentTarget, span: u32) {
+        match target {
+            ast::AssignmentTarget::AssignmentTargetIdentifier(id) => {
+                self.assign_to_identifier(id.name.as_str(), id.span.start, span)
+            }
+            ast::AssignmentTarget::ArrayAssignmentTarget(_)
+            | ast::AssignmentTarget::ObjectAssignmentTarget(_) => {
+                self.destructure_assign(target, span)
+            }
+            other => self.error(
+                other.span().start,
+                "only variable targets are supported inside destructuring assignment",
             ),
-            other => self.error(other.span().start, "unsupported assignment target"),
+        }
+    }
+
+    /// Store the value on top of the stack into a named local, consuming it.
+    fn assign_to_identifier(&mut self, name: &str, id_span: u32, span: u32) {
+        match self.resolve_local(name) {
+            Some(info) => {
+                if info.is_const {
+                    self.error(id_span, format!("assignment to constant `{name}`"));
+                }
+                self.emit(Instr::SetLocal(info.slot), span);
+            }
+            None => {
+                self.error(
+                    id_span,
+                    format!("assignment to undeclared variable `{name}`"),
+                );
+                self.emit(Instr::Pop(1), span);
+            }
         }
     }
 
@@ -1013,6 +1883,64 @@ fn number_key_to_string(value: f64) -> String {
     }
 }
 
+/// Count an upper bound on the local slots a function body needs: one per
+/// binding identifier in every `var`/`let`/`const` (and `for`-init)
+/// declaration, recursing through nested blocks/conditionals/loops but not into
+/// nested functions. Over-counting is harmless — the prologue `Alloc` just
+/// reserves a few unused `Undefined` slots — while codegen assigns the actual
+/// (deduplicated, ≤ this) slots, so every slot index stays in range.
+fn count_decls_in_stmts(stmts: &[ast::Statement]) -> u32 {
+    stmts.iter().map(count_decls_in_stmt).sum()
+}
+
+fn count_decls_in_stmt(stmt: &ast::Statement) -> u32 {
+    match stmt {
+        ast::Statement::VariableDeclaration(decl) => {
+            decl.declarations.iter().map(|d| count_pattern(&d.id)).sum()
+        }
+        ast::Statement::BlockStatement(b) => count_decls_in_stmts(&b.body),
+        ast::Statement::IfStatement(s) => {
+            count_decls_in_stmt(&s.consequent)
+                + s.alternate.as_ref().map_or(0, count_decls_in_stmt)
+        }
+        ast::Statement::WhileStatement(s) => count_decls_in_stmt(&s.body),
+        ast::Statement::DoWhileStatement(s) => count_decls_in_stmt(&s.body),
+        ast::Statement::ForStatement(s) => {
+            let init = match &s.init {
+                Some(ast::ForStatementInit::VariableDeclaration(decl)) => {
+                    decl.declarations.iter().map(|d| count_pattern(&d.id)).sum()
+                }
+                _ => 0,
+            };
+            init + count_decls_in_stmt(&s.body)
+        }
+        _ => 0,
+    }
+}
+
+/// Count the binding identifiers a pattern introduces (see [`count_decls_in_stmts`]).
+fn count_pattern(pat: &ast::BindingPattern) -> u32 {
+    match pat {
+        ast::BindingPattern::BindingIdentifier(_) => 1,
+        ast::BindingPattern::AssignmentPattern(ap) => count_pattern(&ap.left),
+        ast::BindingPattern::ArrayPattern(arr) => {
+            arr.elements
+                .iter()
+                .flatten()
+                .map(count_pattern)
+                .sum::<u32>()
+                + arr.rest.as_ref().map_or(0, |r| count_pattern(&r.argument))
+        }
+        ast::BindingPattern::ObjectPattern(obj) => {
+            obj.properties
+                .iter()
+                .map(|p| count_pattern(&p.value))
+                .sum::<u32>()
+                + obj.rest.as_ref().map_or(0, |r| count_pattern(&r.argument))
+        }
+    }
+}
+
 /// Strip `Label` markers and rewrite every label-id address into a real code
 /// offset, copying spans in lockstep so the table stays aligned with the
 /// compacted code. Single linear pass after a first scan that records each
@@ -1112,11 +2040,11 @@ mod tests {
 
     #[test]
     fn unsupported_statement_errors() {
-        // A bare declaration is not handled until Phase 2 → a diagnostic.
-        let errs = compile("let x = 1;").expect_err("should not compile yet");
+        // An out-of-scope statement still produces a rendered diagnostic.
+        let errs = compile("class C {}").expect_err("should not compile");
         assert_eq!(errs.len(), 1);
         // Renders as line:col with a caret.
-        let rendered = errs[0].render("let x = 1;");
+        let rendered = errs[0].render("class C {}");
         assert!(rendered.starts_with("1:1: "), "got: {rendered}");
     }
 
@@ -1455,9 +2383,8 @@ mod tests {
         // These all live in later phases / out of scope and must error cleanly.
         for src in [
             "x;",             // undeclared variable
-            "x = 1;",         // identifier assignment (no declarations yet)
-            "state.x += 1;",  // compound assignment (Phase 2)
-            "i++;",           // update (Phase 2)
+            "x = 1;",         // assignment to undeclared variable
+            "i++;",           // update of undeclared variable
             "foo(1);",        // undeclared function (Phase 3)
             "tools.send(1);", // tools (Phase 4)
             "raise(\"x\");",  // raise (Phase 4)
@@ -1515,6 +2442,312 @@ mod tests {
                 other => panic!("{other:?}"),
             },
             other => panic!("{other:?}"),
+        }
+    }
+
+    // ── Phase 2: statements / control flow ──────────────────────────────
+
+    #[test]
+    fn local_declarations_and_reassignment() {
+        assert_eq!(eval_phase2("let x = 5; return x;"), StackValue::PosInt(5));
+        assert_eq!(eval_phase2("const x = 7; return x;"), StackValue::PosInt(7));
+        assert_eq!(eval_phase2("let x = 1; x = 2; return x;"), StackValue::PosInt(2));
+        // Uninitialized local is `undefined`.
+        assert_eq!(eval_phase2("let x; return x;"), StackValue::Undefined);
+        // Multiple declarators in one statement.
+        assert_eq!(eval_phase2("let a = 1, b = 2; return a + b;"), num(3.0));
+    }
+
+    #[test]
+    fn block_scoping() {
+        // An inner block shadows; the outer binding is restored after.
+        let vm = run_vm(
+            "let x = 1; { let x = 2; state.inner = x; } state.outer = x;",
+        );
+        assert_eq!(state_val(&vm, "inner"), StackValue::PosInt(2));
+        assert_eq!(state_val(&vm, "outer"), StackValue::PosInt(1));
+    }
+
+    #[test]
+    fn var_is_function_scoped_and_hoisted() {
+        // `var` is visible (as undefined) before its declaration runs.
+        let vm = run_vm("state.before = typeof x; var x = 5; state.after = x;");
+        assert_eq!(eval_str_in(&vm, "before"), "undefined");
+        assert_eq!(state_val(&vm, "after"), StackValue::PosInt(5));
+        // A `var` in a block belongs to the function scope.
+        assert_eq!(
+            eval_phase2("{ var y = 9; } return y;"),
+            StackValue::PosInt(9)
+        );
+    }
+
+    #[test]
+    fn if_else() {
+        assert_eq!(eval_phase2("let r; if (1 > 0) r = 10; else r = 20; return r;"), StackValue::PosInt(10));
+        assert_eq!(eval_phase2("let r; if (0) r = 10; else r = 20; return r;"), StackValue::PosInt(20));
+        // Dangling-if with no else leaves the prior value.
+        assert_eq!(eval_phase2("let r = 3; if (false) r = 9; return r;"), StackValue::PosInt(3));
+        // else-if chains.
+        assert_eq!(
+            eval_phase2("let x = 2, r; if (x === 1) r = 1; else if (x === 2) r = 2; else r = 3; return r;"),
+            StackValue::PosInt(2)
+        );
+    }
+
+    #[test]
+    fn while_loop() {
+        assert_eq!(
+            eval_phase2("let i = 0, s = 0; while (i < 5) { s += i; i += 1; } return s;"),
+            num(10.0)
+        );
+    }
+
+    #[test]
+    fn while_continue_retests() {
+        // `continue` in a `while` jumps back to the test (no update clause), so a
+        // manual increment before it avoids an infinite loop and `i === 3` skips.
+        assert_eq!(
+            eval_phase2(
+                "let i = 0, s = 0; while (i < 5) { i++; if (i === 3) continue; s += i; } return s;"
+            ),
+            num(12.0)
+        );
+    }
+
+    #[test]
+    fn for_with_expression_initializer() {
+        // The `for` init may be a plain expression (no declaration); `i` is an
+        // outer local that the loop mutates.
+        assert_eq!(
+            eval_phase2("let i, s = 0; for (i = 0; i < 4; i++) { s += i; } return s;"),
+            num(6.0)
+        );
+    }
+
+    #[test]
+    fn do_while_loop() {
+        // Body always runs at least once, even with a false test.
+        assert_eq!(
+            eval_phase2("let n = 0; do { n += 1; } while (n < 3); return n;"),
+            num(3.0)
+        );
+        assert_eq!(
+            eval_phase2("let n = 0; do { n += 1; } while (false); return n;"),
+            num(1.0)
+        );
+    }
+
+    #[test]
+    fn for_loop() {
+        assert_eq!(
+            eval_phase2("let s = 0; for (let i = 0; i < 5; i++) { s += i; } return s;"),
+            num(10.0)
+        );
+        // Empty clauses: `for (;;)` with an internal break.
+        assert_eq!(
+            eval_phase2("let i = 0; for (;;) { if (i >= 3) break; i++; } return i;"),
+            num(3.0)
+        );
+    }
+
+    #[test]
+    fn break_and_continue() {
+        // break stops the loop early.
+        assert_eq!(
+            eval_phase2("let s = 0; for (let i = 0; i < 10; i++) { if (i === 3) break; s += i; } return s;"),
+            num(3.0)
+        );
+        // continue skips the rest of the body (the for-update still runs).
+        assert_eq!(
+            eval_phase2("let s = 0; for (let i = 0; i < 5; i++) { if (i % 2 === 0) continue; s += i; } return s;"),
+            num(4.0)
+        );
+        // break only exits the innermost loop.
+        assert_eq!(
+            eval_phase2(
+                "let c = 0; for (let i = 0; i < 3; i++) { for (let j = 0; j < 3; j++) { if (j === 1) break; c++; } } return c;"
+            ),
+            num(3.0)
+        );
+    }
+
+    #[test]
+    fn compound_assignment() {
+        // Local targets.
+        assert_eq!(eval_phase2("let x = 5; x += 3; return x;"), num(8.0));
+        assert_eq!(eval_phase2("let x = 5; x -= 2; return x;"), num(3.0));
+        assert_eq!(eval_phase2("let x = 5; x *= 2; return x;"), num(10.0));
+        assert_eq!(eval_phase2("let x = 2; x **= 3; return x;"), num(8.0));
+        assert_eq!(eval_phase2("let x = 7; x %= 3; return x;"), num(1.0));
+        assert_eq!(eval_phase2("let x = 1; x <<= 3; return x;"), num(8.0));
+        // String `+=` concatenates.
+        assert_eq!(
+            eval_str_phase2("let s = \"a\"; s += \"b\"; return s;"),
+            "ab"
+        );
+        // Member target.
+        let vm = run_vm("state.o = { a: 1 }; state.o.a += 4; state.r = state.o.a;");
+        assert_eq!(state_val(&vm, "r"), num(5.0));
+        // Index target (key evaluated once).
+        let vm = run_vm("state.arr = [1, 2]; state.arr[0] += 10; state.r = state.arr[0];");
+        assert_eq!(state_val(&vm, "r"), num(11.0));
+        // Compound assignment is an expression yielding the new value.
+        assert_eq!(eval_phase2("let x = 5; return (x += 5);"), num(10.0));
+    }
+
+    #[test]
+    fn logical_assignment() {
+        assert_eq!(eval_phase2("let x = 0; x ||= 5; return x;"), StackValue::PosInt(5));
+        assert_eq!(eval_phase2("let x = 3; x ||= 5; return x;"), StackValue::PosInt(3));
+        assert_eq!(eval_phase2("let x = 3; x &&= 7; return x;"), StackValue::PosInt(7));
+        assert_eq!(eval_phase2("let x = 0; x &&= 7; return x;"), StackValue::PosInt(0));
+        assert_eq!(eval_phase2("let x = null; x ??= 9; return x;"), StackValue::PosInt(9));
+        assert_eq!(eval_phase2("let x = 0; x ??= 9; return x;"), StackValue::PosInt(0));
+
+        // Short-circuit must NOT evaluate the RHS (nor store).
+        let vm = run_vm("state.hit = 0; let x = 3; x ||= (state.hit = 1); state.r = x;");
+        assert_eq!(state_val(&vm, "hit"), StackValue::PosInt(0));
+        assert_eq!(state_val(&vm, "r"), StackValue::PosInt(3));
+
+        // Member target, store path.
+        let vm = run_vm("state.o = { a: null }; state.o.a ??= 5; state.r = state.o.a;");
+        assert_eq!(state_val(&vm, "r"), StackValue::PosInt(5));
+        // Member target, keep path (address values cleaned up).
+        let vm = run_vm("state.o = { a: 2 }; state.r = (state.o.a ??= 99);");
+        assert_eq!(state_val(&vm, "r"), StackValue::PosInt(2));
+        // Index target, keep path.
+        let vm = run_vm("state.arr = [7]; state.r = (state.arr[0] ||= 1);");
+        assert_eq!(state_val(&vm, "r"), StackValue::PosInt(7));
+    }
+
+    #[test]
+    fn increment_decrement() {
+        // Postfix returns the old value, prefix the new.
+        let vm = run_vm("let x = 5; state.a = x++; state.b = x;");
+        assert_eq!(state_val(&vm, "a"), num(5.0));
+        assert_eq!(state_val(&vm, "b"), num(6.0));
+        let vm = run_vm("let y = 5; state.a = ++y; state.b = y;");
+        assert_eq!(state_val(&vm, "a"), num(6.0));
+        assert_eq!(state_val(&vm, "b"), num(6.0));
+        // Decrement.
+        assert_eq!(eval_phase2("let x = 5; x--; return x;"), num(4.0));
+        assert_eq!(eval_phase2("let x = 5; return --x;"), num(4.0));
+        // `++` coerces like ToNumber (string "5" → 6, not "51").
+        assert_eq!(eval_phase2("let x = \"5\"; x++; return x;"), num(6.0));
+        // Member / index targets.
+        let vm = run_vm("state.o = { n: 1 }; state.r = state.o.n++; state.after = state.o.n;");
+        assert_eq!(state_val(&vm, "r"), num(1.0));
+        assert_eq!(state_val(&vm, "after"), num(2.0));
+        let vm = run_vm("state.arr = [10]; state.r = ++state.arr[0]; state.after = state.arr[0];");
+        assert_eq!(state_val(&vm, "r"), num(11.0));
+        assert_eq!(state_val(&vm, "after"), num(11.0));
+    }
+
+    #[test]
+    fn array_destructuring_declaration() {
+        let vm = run_vm("let [a, b] = [10, 20]; state.a = a; state.b = b;");
+        assert_eq!(state_val(&vm, "a"), StackValue::PosInt(10));
+        assert_eq!(state_val(&vm, "b"), StackValue::PosInt(20));
+        // Holes skip elements.
+        assert_eq!(eval_phase2("let [, b] = [1, 2]; return b;"), StackValue::PosInt(2));
+        // Defaults apply only when the element is undefined.
+        assert_eq!(eval_phase2("let [a = 5] = []; return a;"), StackValue::PosInt(5));
+        assert_eq!(eval_phase2("let [a = 5] = [1]; return a;"), StackValue::PosInt(1));
+        // Nested.
+        let vm = run_vm("let [[a], { b }] = [[1], { b: 2 }]; state.a = a; state.b = b;");
+        assert_eq!(state_val(&vm, "a"), StackValue::PosInt(1));
+        assert_eq!(state_val(&vm, "b"), StackValue::PosInt(2));
+    }
+
+    #[test]
+    fn object_destructuring_declaration() {
+        let vm = run_vm("let { x, y } = { x: 1, y: 2 }; state.x = x; state.y = y;");
+        assert_eq!(state_val(&vm, "x"), StackValue::PosInt(1));
+        assert_eq!(state_val(&vm, "y"), StackValue::PosInt(2));
+        // Renaming and defaults.
+        assert_eq!(eval_phase2("let { a: aa } = { a: 7 }; return aa;"), StackValue::PosInt(7));
+        assert_eq!(eval_phase2("let { b = 3 } = {}; return b;"), StackValue::PosInt(3));
+        assert_eq!(eval_phase2("let { b = 3 } = { b: 9 }; return b;"), StackValue::PosInt(9));
+    }
+
+    #[test]
+    fn destructuring_assignment() {
+        let vm = run_vm("let a, b; [a, b] = [3, 4]; state.a = a; state.b = b;");
+        assert_eq!(state_val(&vm, "a"), StackValue::PosInt(3));
+        assert_eq!(state_val(&vm, "b"), StackValue::PosInt(4));
+        // Object destructuring assignment needs parens.
+        let vm = run_vm("let x, y; ({ x, y } = { x: 5, y: 6 }); state.x = x; state.y = y;");
+        assert_eq!(state_val(&vm, "x"), StackValue::PosInt(5));
+        assert_eq!(state_val(&vm, "y"), StackValue::PosInt(6));
+        // Renamed object target.
+        let vm = run_vm("let z; ({ a: z } = { a: 8 }); state.z = z;");
+        assert_eq!(state_val(&vm, "z"), StackValue::PosInt(8));
+    }
+
+    #[test]
+    fn let_without_init_resets_each_iteration() {
+        // A bare `let x;` re-initializes to undefined on each loop entry, so a
+        // value set only on the first iteration does not leak into the next.
+        let vm = run_vm(
+            "let last; for (let i = 0; i < 2; i++) { let x; if (i === 0) x = 5; last = x; } state.r = last;",
+        );
+        assert_eq!(state_val(&vm, "r"), StackValue::Undefined);
+    }
+
+    #[test]
+    fn phase2_diagnostics() {
+        for src in [
+            "const x = 1; x = 2;",               // const reassignment
+            "const x = 1; x += 1;",              // const compound
+            "const x = 1; x++;",                 // const update
+            "let state = 1;",                    // shadowing blessed `state`
+            "y = 1;",                            // assignment to undeclared
+            "break;",                            // break outside a loop
+            "continue;",                         // continue outside a loop
+            "let [a, ...rest] = [1, 2];",        // rest in destructuring
+            "outer: while (true) break outer;",  // labeled statements
+        ] {
+            assert!(compile(src).is_err(), "expected `{src}` to fail to compile");
+        }
+        // Spot-check messages.
+        let errs = compile("const x = 1; x = 2;").expect_err("const");
+        assert!(errs[0].message.contains("constant"), "got: {}", errs[0].message);
+        let errs = compile("let [a, ...rest] = [1, 2];").expect_err("rest");
+        assert!(errs[0].message.contains("rest"), "got: {}", errs[0].message);
+    }
+
+    // ── Phase 2 test helpers ────────────────────────────────────────────
+
+    /// Run a statement sequence ending in `return <expr>;`, rewritten as the
+    /// final expression assigned to `state.__ret`, and return that value. Lets
+    /// tests read the result of code that uses locals/control flow.
+    fn eval_phase2(src: &str) -> StackValue {
+        let rewritten = src.replacen("return ", "state.__ret = ", 1);
+        let vm = run_vm(&rewritten);
+        state_val(&vm, "__ret")
+    }
+
+    /// Like [`eval_phase2`], but resolves the heap string result.
+    fn eval_str_phase2(src: &str) -> String {
+        let rewritten = src.replacen("return ", "state.__ret = ", 1);
+        let vm = run_vm(&rewritten);
+        match state_val(&vm, "__ret") {
+            StackValue::Ptr(p) => match &vm.heap[p as usize] {
+                HeapValue::String(s) => s.clone(),
+                other => panic!("not a string: {other:?}"),
+            },
+            other => panic!("not a pointer: {other:?}"),
+        }
+    }
+
+    /// Read `state.<key>` as an owned string from a finished VM.
+    fn eval_str_in(vm: &VM, key: &str) -> String {
+        match state_val(vm, key) {
+            StackValue::Ptr(p) => match &vm.heap[p as usize] {
+                HeapValue::String(s) => s.clone(),
+                other => panic!("not a string: {other:?}"),
+            },
+            other => panic!("not a pointer: {other:?}"),
         }
     }
 }
