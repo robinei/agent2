@@ -1,6 +1,49 @@
 use indexmap::IndexMap;
 use std::collections::HashMap;
 
+/*
+JS semantic compatibility — known divergences
+=============================================
+
+This VM models JS runtime semantics closely so that LLM-written JS lowers to it
+without surprises. The following behaviors are JS-faithful and worth keeping in
+mind: `undefined` is distinct from `null` (property/index/var misses yield
+`undefined`); `==`/`!=` (LooseEq/LooseNeq) coerce while `===`/`!==` (Eq/Neq) are
+strict; truthiness uses the JS falsy set (`false`, `0`, `NaN`, `""`, `null`,
+`undefined`); `+` concatenates when either operand is a string and otherwise
+adds with ToNumber coercion; `-`/`*`/`/`/`%` coerce ToNumber; division/modulo by
+zero yield `Infinity`/`NaN` rather than erroring; objects/arrays compare by
+reference identity under `===`.
+
+The remaining intentional divergences from JS — deferred or accepted, NOT bugs:
+
+  • Relational operators (`<` `>` `<=` `>=`) do NOT coerce across types: a
+    number-vs-string or null-vs-number comparison is `false` (JS would coerce,
+    e.g. `1 < "2"` is `true` in JS). String-vs-string and number-vs-number work.
+  • `ToPrimitive` on objects is never performed. Arithmetic/`==` against a plain
+    object or array is a TypeError / `false` (JS would call `toString`/`valueOf`,
+    so `[5] == 5` and `[] + 1` differ here). `+` against a string still works,
+    because that path uses ToString, which IS implemented.
+  • Array bounds: an out-of-range read yields `undefined` (JS-faithful), but a
+    negative index errors and an out-of-range *write* (`arr[len+k] = x`) errors
+    rather than growing the array with holes as JS does.
+  • Function arity is strict: reading an argument past those passed is an error,
+    not `undefined`. The compiler is expected to pass exact arity (no implicit
+    `arguments`, default, or rest-param holes).
+  • Strings are UTF-8 byte sequences: `.length` and all index/offset string ops
+    count/use UTF-8 *bytes*, not UTF-16 code units (`"é".length` is 2 here, 1 in
+    JS; "😀" is 4 here, 2 in JS). ASCII text is identical.
+  • Bitwise ops (`& | ^ << >> ~`) operate on full i64, not JS's 32-bit ToInt32
+    semantics, and there is no unsigned right shift (`>>>`). Shift counts must be
+    0..63 (JS masks to 0..31).
+  • `Math.min`/`Math.max` (Min/Max) follow Rust's `f64::min`/`max`, which ignore
+    a NaN operand; JS propagates NaN. `Math.sign` of ±0 is ±1 here (JS gives ±0).
+  • Number→string uses Rust's float formatting for the non-integer path, so very
+    large/small magnitudes are not rendered in JS's exponential form (`1e21`).
+  • No exceptions/try/catch/throw: the `Raise` condition mechanism is for host
+    (LLM) intervention, not JS error handling.
+*/
+
 pub type VarName = String;
 pub type FieldName = String;
 pub type CodeAddr = u32;
@@ -15,6 +58,14 @@ pub type CellIndex = u32;
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum StackValue {
     Null,
+    /// JS `undefined`: the value of an absent thing, as distinct from `null`
+    /// (a present, intentionally-empty value). Produced internally — never by
+    /// JSON, which only yields `Null` — by a missing object property, an
+    /// out-of-bounds array index, a read of an unset variable, and an
+    /// uninitialized local. `null`/`undefined` thus mirror JS's data-vs-absence
+    /// split. Falsy, has no JSON form of its own (see `stack_value_to_json`),
+    /// and `=== undefined` only (strict): `undefined !== null`.
+    Undefined,
     Bool(bool),
     Number(f64),
     /// A non-negative integer (0 ..= u64::MAX) and a negative integer
@@ -192,11 +243,12 @@ pub enum Instr {
     Push(StackValue), // () -> any
 
     // Grow the current frame's locals region by one slot per kind. A `Plain`
-    // slot is initialized to Null (an ordinary local); a `Boxed` slot allocates
-    // a fresh cell (init Null) in the `cells` side table and stores an `Upval`
-    // marker, so that binding is captured by reference — every Local/SetLocal
-    // routes through the shared cell. Successive Allocs each append more slots,
-    // but only when no expression temporaries sit above the locals.
+    // slot is initialized to Undefined (an ordinary local, like JS `let x;`); a
+    // `Boxed` slot allocates a fresh cell (init Undefined) in the `cells` side
+    // table and stores an `Upval` marker, so that binding is captured by
+    // reference — every Local/SetLocal routes through the shared cell. Successive
+    // Allocs each append more slots, but only when no expression temporaries sit
+    // above the locals.
     Alloc(Vec<SlotKind>),
     Pop(usize),
     Dup,
@@ -238,6 +290,14 @@ pub enum Instr {
 
     // pops the topmost value from the stack and writes to the local at the given index
     SetLocal(LocalIndex), // any -> ()
+
+    // JS `typeof`: pops a value and pushes its type tag as a string. Tags match
+    // JS exactly, so they are coarse: "undefined", "object" (covers Null, arrays
+    // AND plain objects), "boolean", "number" (int or float), "string",
+    // "function" (Fn or Closure). The fine-grained Is* predicates below stay for
+    // the distinctions typeof erases (array-vs-object, int-vs-float, null) — they
+    // are the lowering targets for Array.isArray, Number.isInteger, x === null.
+    TypeOf, // any -> str
 
     // type predicates
     IsNull,  // any -> bool
@@ -286,6 +346,13 @@ pub enum Instr {
     ObjSetDyn,              // obj, str, any -> ()
     ObjGet(FieldName),      // obj -> any
     ObjSet(FieldName),      // obj, any -> ()
+    // object enumeration / membership (JS Object.keys / Object.values,
+    // `key in obj`, `delete obj[key]`). Keys/values are returned in insertion
+    // order (IndexMap-backed). ObjDelete pushes whether the key was present.
+    ObjKeys,   // obj -> arr(str)
+    ObjValues, // obj -> arr(any)
+    ObjHas,    // obj, str -> bool
+    ObjDelete, // obj, str -> bool
 
     // pops N values and pushes an array with them as initial values.
     // Left-to-right: the first/deepest pushed becomes element 0.
@@ -312,6 +379,13 @@ pub enum Instr {
     StrToJson,                // str -> any
     StrFromJson,              // any -> str
 
+    // JS `String(x)` / ToString: pops any value, pushes its string form. Unlike
+    // StrFromJson (which emits JSON, and rejects non-JSON values), this matches
+    // template-literal / string-coercion semantics: numbers print without a
+    // trailing ".0", arrays join with "," (null/undefined holes → ""), plain
+    // objects → "[object Object]", null/undefined → "null"/"undefined".
+    ToStr, // any -> str
+
     // unary operators. pops the topmost value from the stack,
     // operates on it and then pushed the result to the stack
     Abs,    // num -> num
@@ -331,8 +405,10 @@ pub enum Instr {
     Mul,    // num, num -> num
     Div,    // num, num -> num
     Mod,    // int, int -> int
-    Eq,     // any, any -> bool
-    Neq,    // any, any -> bool
+    Eq,       // any, any -> bool  (JS `===`: strict, structural, no coercion)
+    Neq,      // any, any -> bool  (JS `!==`)
+    LooseEq,  // any, any -> bool  (JS `==`:  coercing — see VM::loose_equal)
+    LooseNeq, // any, any -> bool  (JS `!=`)
     Lt,     // any, any -> bool
     Gt,     // any, any -> bool
     LtEq,   // any, any -> bool
@@ -401,8 +477,21 @@ pub enum StepResult {
 
 // ── free helper functions ─────────────────────────────────────────────
 
-fn is_truthy(val: &StackValue) -> bool {
-    !matches!(val, StackValue::Bool(false) | StackValue::Null)
+/// JS `Number.prototype.toString` for a finite-or-not f64. Integers print
+/// without a decimal point; NaN/±Infinity get their JS spellings (Rust's
+/// `Display` would otherwise emit "NaN"/"inf"). Diverges from JS only for the
+/// very large/small magnitudes JS renders in exponential form (e.g. `1e+21`),
+/// which don't arise from tool/JSON data here.
+fn js_number_to_string(n: f64) -> String {
+    if n.is_nan() {
+        "NaN".to_string()
+    } else if n.is_infinite() {
+        if n > 0.0 { "Infinity" } else { "-Infinity" }.to_string()
+    } else if float_is_int(n) && n >= (i64::MIN as f64) && n <= (i64::MAX as f64) {
+        (n as i64).to_string()
+    } else {
+        format!("{n}")
+    }
 }
 
 fn float_is_int(n: f64) -> bool {
@@ -431,6 +520,27 @@ fn as_i64(val: &StackValue) -> Option<i64> {
         StackValue::PosInt(u) => i64::try_from(*u).ok(),
         StackValue::Number(n) if float_is_int(*n) => Some(*n as i64),
         _ => None,
+    }
+}
+
+fn is_number(val: &StackValue) -> bool {
+    matches!(
+        val,
+        StackValue::Number(_) | StackValue::PosInt(_) | StackValue::NegInt(_)
+    )
+}
+
+/// JS `ToNumber` applied to a string, as used when a loose `==` compares a
+/// number to a string. Trims whitespace, treats the empty string as 0, and
+/// otherwise parses as f64 — yielding NaN (which is never equal to anything)
+/// when unparseable. Diverges from spec ToNumber on a few literal forms it
+/// would accept (hex `0x…`, etc.), which don't arise from tool/JSON data here.
+fn js_str_to_number(s: &str) -> f64 {
+    let t = s.trim();
+    if t.is_empty() {
+        0.0
+    } else {
+        t.parse::<f64>().unwrap_or(f64::NAN)
     }
 }
 
@@ -545,13 +655,96 @@ impl VM {
         StackValue::Ptr(heap_addr)
     }
 
-    /// Structural comparison of two stack values, recursing through the heap
-    /// so that equality is by *content* at every level. (The derived
-    /// `PartialEq` on `HeapValue` would compare nested `Ptr`s by address, so
-    /// `["a"] == ["a"]` with distinct inner strings would wrongly be false.)
+    /// JS truthiness. The falsy set is exactly `false`, `0`/`-0`, `NaN`, `""`,
+    /// `null`, and `undefined`; everything else (incl. empty arrays/objects and
+    /// the string "0") is truthy. Needs heap access to detect the empty string,
+    /// hence a method.
+    fn is_truthy(&self, val: &StackValue) -> bool {
+        match val {
+            StackValue::Bool(b) => *b,
+            StackValue::Null | StackValue::Undefined => false,
+            StackValue::Number(n) => *n != 0.0 && !n.is_nan(),
+            StackValue::PosInt(u) => *u != 0,
+            // NegInt is always negative (i64::MIN..=-1), hence never zero.
+            StackValue::NegInt(_) => true,
+            // Empty string is falsy; any other string and all arrays/objects/
+            // closures/functions are truthy.
+            StackValue::Ptr(p) => !matches!(self.heap_str(*p), Some("")),
+            StackValue::Fn(_) => true,
+            // Internal indirection; never a legitimate operand.
+            StackValue::Upval(_) => false,
+        }
+    }
+
+    /// JS `ToNumber` for the arithmetic operators. `null`→0, `undefined`→NaN,
+    /// booleans→0/1, numbers pass through, strings parse (`ToNumber`, NaN when
+    /// unparseable). Returns None for values JS would route through `ToPrimitive`
+    /// first — arrays, objects, closures, functions — which this VM deliberately
+    /// does not coerce (see the divergence note on `loose_equal`); arithmetic on
+    /// those is a TypeError.
+    fn to_number(&self, val: &StackValue) -> Option<f64> {
+        match val {
+            StackValue::Number(n) => Some(*n),
+            StackValue::PosInt(u) => Some(*u as f64),
+            StackValue::NegInt(i) => Some(*i as f64),
+            StackValue::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
+            StackValue::Null => Some(0.0),
+            StackValue::Undefined => Some(f64::NAN),
+            StackValue::Ptr(p) => self.heap_str(*p).map(js_str_to_number),
+            StackValue::Fn(_) | StackValue::Upval(_) => None,
+        }
+    }
+
+    /// Whether a value is a heap string (used to pick `+`'s concat vs add path).
+    fn is_string(&self, val: &StackValue) -> bool {
+        matches!(val, StackValue::Ptr(p) if self.heap_str(*p).is_some())
+    }
+
+    /// JS `String(x)` / `ToString`. Arrays stringify like `Array.prototype.join(",")`
+    /// (null/undefined elements → ""), plain objects → "[object Object]", and
+    /// functions/closures → a generic function tag. `depth` bounds recursion
+    /// through nested arrays so adversarial nesting can't overflow the stack.
+    fn to_js_string(&self, val: &StackValue, depth: usize) -> String {
+        if depth > MAX_JSON_DEPTH {
+            return String::new();
+        }
+        match val {
+            StackValue::Undefined => "undefined".to_string(),
+            StackValue::Null => "null".to_string(),
+            StackValue::Bool(b) => b.to_string(),
+            StackValue::PosInt(u) => u.to_string(),
+            StackValue::NegInt(i) => i.to_string(),
+            StackValue::Number(n) => js_number_to_string(*n),
+            StackValue::Fn(_) => "function () { [native code] }".to_string(),
+            StackValue::Upval(_) => String::new(),
+            StackValue::Ptr(p) => match self.heap.get(*p as usize) {
+                Some(HeapValue::String(s)) => s.clone(),
+                Some(HeapValue::Array(arr)) => arr
+                    .iter()
+                    .map(|v| match v {
+                        // join renders null/undefined holes as the empty string.
+                        StackValue::Null | StackValue::Undefined => String::new(),
+                        _ => self.to_js_string(v, depth + 1),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(","),
+                Some(HeapValue::Object(_)) => "[object Object]".to_string(),
+                Some(HeapValue::Closure { .. }) => "function () { [native code] }".to_string(),
+                None => "null".to_string(), // dangling pointer
+            },
+        }
+    }
+
+    /// Reference/value equality matching JS `===`. Primitives compare by value;
+    /// strings, though heap-allocated here, are primitives and so compare by
+    /// *content*. Arrays, objects, and closures compare by *reference identity*
+    /// (same heap address) — `{a:1} === {a:1}` is false, as in JS.
     fn values_equal(&self, lhs: &StackValue, rhs: &StackValue) -> bool {
         match (lhs, rhs) {
             (StackValue::Null, StackValue::Null) => true,
+            // Strict (===): undefined equals only itself; undefined !== null.
+            // (Loose `null == undefined` would need a separate op; Eq is ===.)
+            (StackValue::Undefined, StackValue::Undefined) => true,
             (StackValue::Bool(a), StackValue::Bool(b)) => a == b,
             (StackValue::Number(a), StackValue::Number(b)) => {
                 if a.is_nan() && b.is_nan() {
@@ -576,29 +769,68 @@ impl VM {
             (StackValue::Fn(a), StackValue::Fn(b)) => a == b,
             (StackValue::Ptr(p), StackValue::Ptr(q)) => {
                 match (self.heap.get(*p as usize), self.heap.get(*q as usize)) {
-                    // Same live heap object is always equal (this also gives
-                    // closures reference identity, as they have no content
-                    // equality of their own).
-                    (Some(a), Some(b)) => p == q || self.heap_values_equal(a, b),
-                    _ => false, // dangling pointer: treat as not-equal rather than panic
+                    // Same heap address is the same object (JS reference identity
+                    // — the only equality arrays/objects/closures get). Distinct
+                    // pointers are equal only when both are strings with equal
+                    // content, since strings are primitives despite being heap-
+                    // allocated. A dangling pointer matches nothing (no panic).
+                    (Some(a), Some(b)) => {
+                        p == q
+                            || matches!(
+                                (a, b),
+                                (HeapValue::String(x), HeapValue::String(y)) if x == y
+                            )
+                    }
+                    _ => false,
                 }
             }
             _ => false,
         }
     }
 
-    fn heap_values_equal(&self, a: &HeapValue, b: &HeapValue) -> bool {
-        match (a, b) {
-            (HeapValue::String(x), HeapValue::String(y)) => x == y,
-            (HeapValue::Array(x), HeapValue::Array(y)) => {
-                x.len() == y.len() && x.iter().zip(y.iter()).all(|(u, v)| self.values_equal(u, v))
-            }
-            (HeapValue::Object(x), HeapValue::Object(y)) => {
-                // Order-independent: same keys, recursively equal values.
-                x.len() == y.len()
-                    && x.iter()
-                        .all(|(k, v)| y.get(k).is_some_and(|w| self.values_equal(v, w)))
-            }
+    /// JS Abstract Equality Comparison (`==`). Differs from `values_equal`
+    /// (`===`) only by coercion, applied in spec order:
+    ///   • `null` and `undefined` are loosely equal to each other and to
+    ///     nothing else;
+    ///   • a boolean coerces to a number (false→0, true→1) and the comparison
+    ///     re-runs;
+    ///   • a number vs a string coerces the string with `ToNumber`;
+    ///   • any other pairing falls through to the strict structural compare
+    ///     (so two numbers, two strings, or two heap collections behave exactly
+    ///     as `===` does here).
+    ///
+    /// One deliberate divergence: an object/array vs a primitive is NOT coerced
+    /// via `ToPrimitive` (so `[5] == 5` is false here, true in JS). Loose
+    /// object↔primitive equality is never an intentional pattern in this DSL,
+    /// where heap values are data containers; skipping it avoids the
+    /// `toString`/`valueOf` machinery and the footguns it brings.
+    fn loose_equal(&self, lhs: &StackValue, rhs: &StackValue) -> bool {
+        use StackValue::*;
+        // null / undefined: loosely equal to each other, to nothing else.
+        let l_nullish = matches!(lhs, Null | Undefined);
+        let r_nullish = matches!(rhs, Null | Undefined);
+        if l_nullish || r_nullish {
+            return l_nullish && r_nullish;
+        }
+        match (lhs, rhs) {
+            // Boolean → number, then re-run the comparison.
+            (Bool(b), _) => self.loose_equal(&Number(if *b { 1.0 } else { 0.0 }), rhs),
+            (_, Bool(b)) => self.loose_equal(lhs, &Number(if *b { 1.0 } else { 0.0 })),
+            // Number vs string (either order): coerce the string with ToNumber.
+            (l, Ptr(p)) if is_number(l) => self.num_loose_eq_str(l, *p),
+            (Ptr(p), r) if is_number(r) => self.num_loose_eq_str(r, *p),
+            // No further coercion: same-type primitives and heap-vs-heap defer
+            // to the strict structural comparison.
+            _ => self.values_equal(lhs, rhs),
+        }
+    }
+
+    /// Helper for `loose_equal`: a numeric value vs a heap pointer. Coerces the
+    /// pointee only if it is a string (`ToNumber`); arrays/objects/closures are
+    /// not coerced (see the divergence note on `loose_equal`).
+    fn num_loose_eq_str(&self, num: &StackValue, ptr: HeapAddr) -> bool {
+        match (as_f64(num), self.heap_str(ptr)) {
+            (Some(a), Some(s)) => a == js_str_to_number(s),
             _ => false,
         }
     }
@@ -674,6 +906,12 @@ impl VM {
             // is an internal indirection that should never reach here: fail
             // loudly rather than silently dropping it.
             StackValue::Fn(_) | StackValue::Upval(_) => return Err(VMError::ValueError),
+            // `undefined` has no JSON form. Like JS `JSON.stringify`, it is
+            // *dropped* in an object and coerced to *null* in an array (handled
+            // at those parent sites below); reaching here means it is the root
+            // value, where JS.stringify returns the JS value `undefined` — no
+            // JSON — so we surface an error rather than inventing one.
+            StackValue::Undefined => return Err(VMError::ValueError),
             StackValue::Number(n) => {
                 // Preserve integer formatting when possible (f64-only VM
                 // internals, but JSON consumers care about int vs float).
@@ -692,12 +930,20 @@ impl VM {
                 HeapValue::String(s) => serde_json::Value::String(s.clone()),
                 HeapValue::Array(arr) => serde_json::Value::Array(
                     arr.iter()
-                        .map(|v| self.stack_value_to_json(v, depth + 1))
+                        .map(|v| match v {
+                            // JS: `undefined` array slots stringify to `null`.
+                            StackValue::Undefined => Ok(serde_json::Value::Null),
+                            _ => self.stack_value_to_json(v, depth + 1),
+                        })
                         .collect::<Result<_, _>>()?,
                 ),
                 HeapValue::Object(obj) => {
                     let mut map = serde_json::Map::new();
                     for (k, v) in obj {
+                        // JS: properties whose value is `undefined` are omitted.
+                        if matches!(v, StackValue::Undefined) {
+                            continue;
+                        }
                         map.insert(k.clone(), self.stack_value_to_json(v, depth + 1)?);
                     }
                     serde_json::Value::Object(map)
@@ -754,11 +1000,13 @@ impl VM {
     pub fn step(&mut self) -> Result<StepResult, VMError> {
         // ── macros for repetitive instruction shapes ─────────────────
 
-        /// Pop one Number, apply f64→f64, push Number.
+        /// Pop one operand, coerce ToNumber (JS), apply f64→f64, push Number.
+        /// A non-coercible operand (array/object/function) is a TypeError; an
+        /// `undefined` or unparseable string coerces to NaN and propagates.
         macro_rules! unary_num {
             ($op:expr) => {{
                 let val = self.stack.pop().ok_or(VMError::StackUnderflow)?;
-                match as_f64(&val) {
+                match self.to_number(&val) {
                     Some(n) => {
                         self.stack.push(StackValue::Number($op(n)));
                         self.ip += 1;
@@ -768,13 +1016,14 @@ impl VM {
             }};
         }
 
-        /// Pop rhs then lhs (numeric: Number or Int), apply f64→f64→f64, push
-        /// Number. `Int` operands promote to f64 (arithmetic degrades Int).
+        /// Pop rhs then lhs, coerce both ToNumber (JS), apply f64→f64→f64, push
+        /// Number. Strings/booleans/null coerce; arrays/objects/functions are a
+        /// TypeError; undefined/unparseable strings become NaN.
         macro_rules! binary_num {
             ($op:expr) => {{
                 let rhs = self.stack.pop().ok_or(VMError::StackUnderflow)?;
                 let lhs = self.stack.pop().ok_or(VMError::StackUnderflow)?;
-                match (as_f64(&lhs), as_f64(&rhs)) {
+                match (self.to_number(&lhs), self.to_number(&rhs)) {
                     (Some(a), Some(b)) => {
                         self.stack.push(StackValue::Number($op(a, b)));
                         self.ip += 1;
@@ -843,15 +1092,16 @@ impl VM {
                     if self.stack.len() != locals_top {
                         return Err(VMError::BadAlloc);
                     }
-                    // A Plain slot is just Null; a Boxed slot allocates a fresh
-                    // cell and stores an Upval marker pointing at it, so the
-                    // binding is captured by reference.
+                    // A Plain slot is just Undefined (a declared-but-unassigned
+                    // local, as in JS `let x;`); a Boxed slot allocates a fresh
+                    // cell (also Undefined) and stores an Upval marker pointing at
+                    // it, so the binding is captured by reference.
                     for kind in &kinds {
                         let slot = match kind {
-                            SlotKind::Plain => StackValue::Null,
+                            SlotKind::Plain => StackValue::Undefined,
                             SlotKind::Boxed => {
                                 let idx = self.cells.len() as CellIndex;
-                                self.cells.push(StackValue::Null);
+                                self.cells.push(StackValue::Undefined);
                                 StackValue::Upval(idx)
                             }
                         };
@@ -1015,7 +1265,7 @@ impl VM {
                         return Err(VMError::BadCall);
                     }
                     let val = self.stack.pop().ok_or(VMError::StackUnderflow)?;
-                    if !is_truthy(&val) {
+                    if !self.is_truthy(&val) {
                         self.ip = *addr;
                     } else {
                         self.ip += 1;
@@ -1077,11 +1327,12 @@ impl VM {
 
                 // ── variables ───────────────────────────────────
                 Instr::Read(name) => {
+                    // JS: an unset binding reads as `undefined`, not `null`.
                     let val = self
                         .variables
                         .get(name)
                         .copied()
-                        .unwrap_or(StackValue::Null);
+                        .unwrap_or(StackValue::Undefined);
                     self.stack.push(val);
                     self.ip += 1;
                 }
@@ -1089,6 +1340,32 @@ impl VM {
                 Instr::Write(name) => {
                     let val = self.stack.pop().ok_or(VMError::StackUnderflow)?;
                     self.variables.insert(name.clone(), val);
+                    self.ip += 1;
+                }
+
+                // ── type queries ────────────────────────────────
+                Instr::TypeOf => {
+                    let val = self.stack.pop().ok_or(VMError::StackUnderflow)?;
+                    // JS typeof tags. Note the coarseness: null/array/object all
+                    // report "object"; int and float both "number".
+                    let tag = match val {
+                        StackValue::Undefined => "undefined",
+                        StackValue::Null => "object",
+                        StackValue::Bool(_) => "boolean",
+                        StackValue::Number(_) | StackValue::PosInt(_) | StackValue::NegInt(_) => {
+                            "number"
+                        }
+                        StackValue::Fn(_) => "function",
+                        StackValue::Ptr(p) => match self.heap_get(p)? {
+                            HeapValue::String(_) => "string",
+                            HeapValue::Array(_) | HeapValue::Object(_) => "object",
+                            HeapValue::Closure { .. } => "function",
+                        },
+                        // Internal indirection; never a legitimate operand.
+                        StackValue::Upval(_) => return Err(VMError::ValueError),
+                    };
+                    let s = self.alloc_string(tag.to_string());
+                    self.stack.push(s);
                     self.ip += 1;
                 }
 
@@ -1163,34 +1440,18 @@ impl VM {
                 // ── unary operators ─────────────────────────────
                 Instr::Abs => unary_num!(|n: f64| n.abs()),
                 Instr::Neg => unary_num!(|n: f64| -n),
-                Instr::Sqrt => {
-                    let val = self.stack.pop().ok_or(VMError::StackUnderflow)?;
-                    match as_f64(&val) {
-                        Some(n) if n >= 0.0 => {
-                            self.stack.push(StackValue::Number(n.sqrt()));
-                            self.ip += 1;
-                        }
-                        Some(_) => return Err(VMError::ValueError),
-                        None => return Err(VMError::TypeError),
-                    }
-                }
+                // JS Math.sqrt: a negative operand yields NaN, not an error.
+                Instr::Sqrt => unary_num!(|n: f64| n.sqrt()),
                 Instr::Ceil => unary_num!(|n: f64| n.ceil()),
                 Instr::Floor => unary_num!(|n: f64| n.floor()),
                 Instr::Round => unary_num!(|n: f64| n.round()),
-                Instr::Sign => {
-                    let val = self.stack.pop().ok_or(VMError::StackUnderflow)?;
-                    match as_f64(&val) {
-                        Some(n) => {
-                            self.stack.push(StackValue::Number(n.signum()));
-                            self.ip += 1;
-                        }
-                        None => return Err(VMError::TypeError),
-                    }
-                }
+                // NOTE: f64::signum returns ±1 for ±0, unlike JS Math.sign (which
+                // returns ±0 for ±0); this is a pre-existing, intentional choice.
+                Instr::Sign => unary_num!(|n: f64| n.signum()),
 
                 Instr::Not => {
                     let val = self.stack.pop().ok_or(VMError::StackUnderflow)?;
-                    self.stack.push(StackValue::Bool(!is_truthy(&val)));
+                    self.stack.push(StackValue::Bool(!self.is_truthy(&val)));
                     self.ip += 1;
                 }
 
@@ -1209,18 +1470,18 @@ impl VM {
                 Instr::Add => {
                     let rhs = self.stack.pop().ok_or(VMError::StackUnderflow)?;
                     let lhs = self.stack.pop().ok_or(VMError::StackUnderflow)?;
-                    // Numeric add (Int promotes to f64) or string concatenation.
-                    let result = if let (Some(a), Some(b)) = (as_f64(&lhs), as_f64(&rhs)) {
-                        StackValue::Number(a + b)
-                    } else if let (StackValue::Ptr(p), StackValue::Ptr(q)) = (lhs, rhs) {
-                        match (self.heap_get(p)?, self.heap_get(q)?) {
-                            (HeapValue::String(a), HeapValue::String(b)) => {
-                                self.alloc_string(format!("{}{}", a, b))
-                            }
+                    // JS `+`: if either operand is a string, concatenate (ToString
+                    // both); otherwise add numerically (ToNumber both). An
+                    // array/object/function in the numeric path is a TypeError
+                    // (we do not ToPrimitive it — see the note on `loose_equal`).
+                    let result = if self.is_string(&lhs) || self.is_string(&rhs) {
+                        let s = format!("{}{}", self.to_js_string(&lhs, 0), self.to_js_string(&rhs, 0));
+                        self.alloc_string(s)
+                    } else {
+                        match (self.to_number(&lhs), self.to_number(&rhs)) {
+                            (Some(a), Some(b)) => StackValue::Number(a + b),
                             _ => return Err(VMError::TypeError),
                         }
-                    } else {
-                        return Err(VMError::TypeError);
                     };
                     self.stack.push(result);
                     self.ip += 1;
@@ -1228,43 +1489,13 @@ impl VM {
 
                 Instr::Sub => binary_num!(|a: f64, b: f64| a - b),
                 Instr::Mul => binary_num!(|a: f64, b: f64| a * b),
-                Instr::Div => {
-                    let rhs = self.stack.pop().ok_or(VMError::StackUnderflow)?;
-                    let lhs = self.stack.pop().ok_or(VMError::StackUnderflow)?;
-                    match (as_f64(&lhs), as_f64(&rhs)) {
-                        (Some(_), Some(b)) if b == 0.0 => {
-                            return Err(VMError::ValueError);
-                        }
-                        (Some(a), Some(b)) => {
-                            self.stack.push(StackValue::Number(a / b));
-                            self.ip += 1;
-                        }
-                        _ => return Err(VMError::TypeError),
-                    }
-                }
-                Instr::Mod => {
-                    let rhs = self.stack.pop().ok_or(VMError::StackUnderflow)?;
-                    let lhs = self.stack.pop().ok_or(VMError::StackUnderflow)?;
-                    match (as_i64(&lhs), as_i64(&rhs)) {
-                        (Some(_), Some(0)) => return Err(VMError::ValueError),
-                        (Some(a), Some(b)) => {
-                            self.stack.push(StackValue::Number((a % b) as f64));
-                            self.ip += 1;
-                        }
-                        _ => return Err(VMError::TypeError),
-                    }
-                }
-                Instr::Pow => {
-                    let rhs = self.stack.pop().ok_or(VMError::StackUnderflow)?;
-                    let lhs = self.stack.pop().ok_or(VMError::StackUnderflow)?;
-                    match (as_f64(&lhs), as_f64(&rhs)) {
-                        (Some(a), Some(b)) => {
-                            self.stack.push(StackValue::Number(a.powf(b)));
-                            self.ip += 1;
-                        }
-                        _ => return Err(VMError::TypeError),
-                    }
-                }
+                // JS `/`: never throws — a zero divisor yields ±Infinity (or NaN
+                // for 0/0), which f64 division produces directly.
+                Instr::Div => binary_num!(|a: f64, b: f64| a / b),
+                // JS `%`: float remainder with the dividend's sign; `x % 0` is
+                // NaN. Rust's f64 `%` matches this exactly.
+                Instr::Mod => binary_num!(|a: f64, b: f64| a % b),
+                Instr::Pow => binary_num!(|a: f64, b: f64| a.powf(b)),
 
                 Instr::Min => binary_num!(|a: f64, b: f64| a.min(b)),
                 Instr::Max => binary_num!(|a: f64, b: f64| a.max(b)),
@@ -1281,6 +1512,20 @@ impl VM {
                     let lhs = self.stack.pop().ok_or(VMError::StackUnderflow)?;
                     self.stack
                         .push(StackValue::Bool(!self.values_equal(&lhs, &rhs)));
+                    self.ip += 1;
+                }
+                Instr::LooseEq => {
+                    let rhs = self.stack.pop().ok_or(VMError::StackUnderflow)?;
+                    let lhs = self.stack.pop().ok_or(VMError::StackUnderflow)?;
+                    self.stack
+                        .push(StackValue::Bool(self.loose_equal(&lhs, &rhs)));
+                    self.ip += 1;
+                }
+                Instr::LooseNeq => {
+                    let rhs = self.stack.pop().ok_or(VMError::StackUnderflow)?;
+                    let lhs = self.stack.pop().ok_or(VMError::StackUnderflow)?;
+                    self.stack
+                        .push(StackValue::Bool(!self.loose_equal(&lhs, &rhs)));
                     self.ip += 1;
                 }
 
@@ -1310,13 +1555,13 @@ impl VM {
                 Instr::And => {
                     let rhs = self.stack.pop().ok_or(VMError::StackUnderflow)?;
                     let lhs = self.stack.pop().ok_or(VMError::StackUnderflow)?;
-                    self.stack.push(if is_truthy(&lhs) { rhs } else { lhs });
+                    self.stack.push(if self.is_truthy(&lhs) { rhs } else { lhs });
                     self.ip += 1;
                 }
                 Instr::Or => {
                     let rhs = self.stack.pop().ok_or(VMError::StackUnderflow)?;
                     let lhs = self.stack.pop().ok_or(VMError::StackUnderflow)?;
-                    self.stack.push(if is_truthy(&lhs) { lhs } else { rhs });
+                    self.stack.push(if self.is_truthy(&lhs) { lhs } else { rhs });
                     self.ip += 1;
                 }
 
@@ -1370,10 +1615,11 @@ impl VM {
                         .ok_or(VMError::TypeError)?
                         .to_string();
                     let obj_ptr = self.pop_ptr()?;
+                    // JS: a missing property reads as `undefined`, not `null`.
                     let val = self
                         .heap_obj(obj_ptr)
                         .and_then(|obj| obj.get(&*field).copied())
-                        .unwrap_or(StackValue::Null);
+                        .unwrap_or(StackValue::Undefined);
                     self.stack.push(val);
                     self.ip += 1;
                 }
@@ -1394,10 +1640,11 @@ impl VM {
                 Instr::ObjGet(field) => {
                     let field = field.clone();
                     let obj_ptr = self.pop_ptr()?;
+                    // JS: a missing property reads as `undefined`, not `null`.
                     let val = self
                         .heap_obj(obj_ptr)
                         .and_then(|obj| obj.get(&field).copied())
-                        .unwrap_or(StackValue::Null);
+                        .unwrap_or(StackValue::Undefined);
                     self.stack.push(val);
                     self.ip += 1;
                 }
@@ -1408,6 +1655,60 @@ impl VM {
                     let obj_ptr = self.pop_ptr()?;
                     let obj = self.heap_obj_mut(obj_ptr).ok_or(VMError::TypeError)?;
                     obj.insert(field, val);
+                    self.ip += 1;
+                }
+
+                Instr::ObjKeys => {
+                    let obj_ptr = self.pop_ptr()?;
+                    // Clone keys out first (releasing the heap borrow) so we can
+                    // allocate a heap string per key.
+                    let keys: Vec<String> = self
+                        .heap_obj(obj_ptr)
+                        .ok_or(VMError::TypeError)?
+                        .keys()
+                        .cloned()
+                        .collect();
+                    let strs: Vec<StackValue> =
+                        keys.into_iter().map(|k| self.alloc_string(k)).collect();
+                    let arr = self.alloc_array(strs);
+                    self.stack.push(arr);
+                    self.ip += 1;
+                }
+
+                Instr::ObjValues => {
+                    let obj_ptr = self.pop_ptr()?;
+                    let vals: Vec<StackValue> = self
+                        .heap_obj(obj_ptr)
+                        .ok_or(VMError::TypeError)?
+                        .values()
+                        .copied()
+                        .collect();
+                    let arr = self.alloc_array(vals);
+                    self.stack.push(arr);
+                    self.ip += 1;
+                }
+
+                Instr::ObjHas => {
+                    let field = self.pop_string()?;
+                    let obj_ptr = self.pop_ptr()?;
+                    let has = self
+                        .heap_obj(obj_ptr)
+                        .ok_or(VMError::TypeError)?
+                        .contains_key(&field);
+                    self.stack.push(StackValue::Bool(has));
+                    self.ip += 1;
+                }
+
+                Instr::ObjDelete => {
+                    let field = self.pop_string()?;
+                    let obj_ptr = self.pop_ptr()?;
+                    // shift_remove keeps the remaining keys in insertion order.
+                    let existed = self
+                        .heap_obj_mut(obj_ptr)
+                        .ok_or(VMError::TypeError)?
+                        .shift_remove(&field)
+                        .is_some();
+                    self.stack.push(StackValue::Bool(existed));
                     self.ip += 1;
                 }
 
@@ -1448,7 +1749,11 @@ impl VM {
                     if index < 0 {
                         return Err(VMError::ValueError);
                     }
-                    let val = arr.get(index as usize).copied().unwrap_or(StackValue::Null);
+                    // JS: an out-of-bounds index reads as `undefined`, not `null`.
+                    let val = arr
+                        .get(index as usize)
+                        .copied()
+                        .unwrap_or(StackValue::Undefined);
                     self.stack.push(val);
                     self.ip += 1;
                 }
@@ -1506,7 +1811,15 @@ impl VM {
                     let sep = self.pop_string()?;
                     let arr_ptr = self.pop_ptr()?;
                     let arr = self.heap_arr(arr_ptr).ok_or(VMError::TypeError)?;
-                    let parts: Vec<String> = arr.iter().map(|v| self.stringify_value(v)).collect();
+                    // JS join: null/undefined elements render as "", everything
+                    // else via ToString (so nested arrays join recursively).
+                    let parts: Vec<String> = arr
+                        .iter()
+                        .map(|v| match v {
+                            StackValue::Null | StackValue::Undefined => String::new(),
+                            _ => self.to_js_string(v, 0),
+                        })
+                        .collect();
                     let s = self.alloc_string(parts.join(&sep));
                     self.stack.push(s);
                     self.ip += 1;
@@ -1692,6 +2005,14 @@ impl VM {
                     self.ip += 1;
                 }
 
+                Instr::ToStr => {
+                    let val = self.stack.pop().ok_or(VMError::StackUnderflow)?;
+                    let s = self.to_js_string(&val, 0);
+                    let ptr = self.alloc_string(s);
+                    self.stack.push(ptr);
+                    self.ip += 1;
+                }
+
                 // ── external effects ───────────────────────────
                 Instr::Invoke(..) => {
                     // Gather the run of consecutive Invoke instructions into one
@@ -1746,32 +2067,6 @@ impl VM {
         }
     }
 
-    /// Best-effort string representation of a value (for ArrJoin).
-    fn stringify_value(&self, val: &StackValue) -> String {
-        match val {
-            StackValue::Null => "null".to_string(),
-            StackValue::Bool(b) => b.to_string(),
-            StackValue::PosInt(u) => u.to_string(),
-            StackValue::NegInt(i) => i.to_string(),
-            StackValue::Fn(addr) => format!("[function@{addr}]"),
-            // Internal indirection; should not normally reach here.
-            StackValue::Upval(c) => format!("[upval@{c}]"),
-            StackValue::Number(n) => {
-                if float_is_int(*n) {
-                    format!("{}", *n as i64)
-                } else {
-                    format!("{}", n)
-                }
-            }
-            StackValue::Ptr(p) => match self.heap.get(*p as usize) {
-                Some(HeapValue::String(s)) => s.clone(),
-                Some(HeapValue::Array(_)) => "[array]".to_string(),
-                Some(HeapValue::Object(_)) => "[object]".to_string(),
-                Some(HeapValue::Closure { addr, .. }) => format!("[closure@{addr}]"),
-                None => "null".to_string(), // dangling pointer
-            },
-        }
-    }
 }
 
 // ── tests ────────────────────────────────────────────────────────────
@@ -1857,6 +2152,9 @@ mod tests {
     }
     fn null() -> StackValue {
         StackValue::Null
+    }
+    fn undef() -> StackValue {
+        StackValue::Undefined
     }
     /// Heap pointer to string at the given index (pre-loaded via run_heap).
     fn s(addr: u32) -> StackValue {
@@ -1951,8 +2249,12 @@ mod tests {
     fn abs_neg() {
         assert_eq!(run(vec![Push(n(-3.0)), Abs]), vec![n(3.0)]);
         assert_eq!(run(vec![Push(n(3.0)), Neg]), vec![n(-3.0)]);
+        // Arithmetic coerces ToNumber: null -> 0, "-3" -> -3.
+        assert_eq!(run(vec![Push(null()), Abs]), vec![n(0.0)]);
+        assert_eq!(run_heap(vec![Push(s(0)), Neg], &["-3"]), vec![n(3.0)]);
+        // A non-coercible operand (array/object/function) is a TypeError.
         assert!(matches!(
-            run_err(vec![Push(null()), Abs]),
+            run_err(vec![Push(n(1.0)), ArrNew(1), Abs]),
             VMError::TypeError
         ));
     }
@@ -1971,9 +2273,10 @@ mod tests {
         assert_eq!(run(vec![Push(n(5.0)), Sign]), vec![n(1.0)]);
         assert_eq!(run(vec![Push(n(-5.0)), Sign]), vec![n(-1.0)]);
         assert_eq!(run(vec![Push(n(0.0)), Sign]), vec![n(1.0)]);
+        // JS Math.sqrt(-1) is NaN, not an error.
         assert!(matches!(
-            run_err(vec![Push(n(-1.0)), Sqrt]),
-            VMError::ValueError
+            run(vec![Push(n(-1.0)), Sqrt]).as_slice(),
+            [StackValue::Number(x)] if x.is_nan()
         ));
     }
 
@@ -1997,18 +2300,27 @@ mod tests {
         assert_eq!(run(vec![Push(n(10.0)), Push(n(3.0)), Sub]), vec![n(7.0)]);
         assert_eq!(run(vec![Push(n(4.0)), Push(n(5.0)), Mul]), vec![n(20.0)]);
         assert_eq!(run(vec![Push(n(10.0)), Push(n(4.0)), Div]), vec![n(2.5)]);
+        // JS: x/0 -> ±Infinity, 0/0 -> NaN (never an error).
         assert!(matches!(
-            run_err(vec![Push(n(1.0)), Push(n(0.0)), Div]),
-            VMError::ValueError
+            run(vec![Push(n(1.0)), Push(n(0.0)), Div]).as_slice(),
+            [StackValue::Number(x)] if x.is_infinite() && *x > 0.0
+        ));
+        assert!(matches!(
+            run(vec![Push(n(0.0)), Push(n(0.0)), Div]).as_slice(),
+            [StackValue::Number(x)] if x.is_nan()
         ));
     }
 
     #[test]
     fn mod_op() {
         assert_eq!(run(vec![Push(n(10.0)), Push(n(3.0)), Mod]), vec![n(1.0)]);
+        // JS %: float remainder (5.5 % 2 == 1.5), dividend's sign (-5 % 3 == -2).
+        assert_eq!(run(vec![Push(n(5.5)), Push(n(2.0)), Mod]), vec![n(1.5)]);
+        assert_eq!(run(vec![Push(n(-5.0)), Push(n(3.0)), Mod]), vec![n(-2.0)]);
+        // x % 0 -> NaN, not an error.
         assert!(matches!(
-            run_err(vec![Push(n(1.0)), Push(n(0.0)), Mod]),
-            VMError::ValueError
+            run(vec![Push(n(1.0)), Push(n(0.0)), Mod]).as_slice(),
+            [StackValue::Number(x)] if x.is_nan()
         ));
     }
 
@@ -2039,6 +2351,113 @@ mod tests {
         assert_eq!(vm.heap[2], HeapValue::String("hello world".into()));
     }
 
+    /// Run `code` (with preloaded heap strings) and return the last heap value
+    /// as a String, panicking if it isn't one. Handy for ops that allocate a
+    /// result string (Add concat, ToStr, ArrJoin).
+    fn run_last_str(code: Vec<Instr>, strings: &[&str]) -> String {
+        let mut vm = VM::new(code);
+        for s in strings {
+            vm.alloc_string(s.to_string());
+        }
+        while !matches!(vm.step().unwrap(), StepResult::Done) {}
+        match vm.heap.last() {
+            Some(HeapValue::String(s)) => s.clone(),
+            other => panic!("expected a string result, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn add_concat_coerces() {
+        // `+` concatenates when either side is a string, coercing the other.
+        assert_eq!(run_last_str(vec![Push(s(0)), Push(n(5.0)), Add], &["x="]), "x=5");
+        assert_eq!(run_last_str(vec![Push(n(5.0)), Push(s(0)), Add], &["!"]), "5!");
+        assert_eq!(
+            run_last_str(vec![Push(s(0)), Push(null()), Add], &["v="]),
+            "v=null"
+        );
+        assert_eq!(
+            run_last_str(vec![Push(s(0)), Push(b(true)), Add], &["b="]),
+            "b=true"
+        );
+        // An array operand stringifies like join(",") on the concat path.
+        assert_eq!(
+            run_last_str(
+                vec![Push(n(1.0)), Push(n(2.0)), ArrNew(2), Push(s(0)), Add],
+                &["!"]
+            ),
+            "1,2!"
+        );
+    }
+
+    #[test]
+    fn arithmetic_coerces() {
+        // ToNumber coercion on -, *, /, % (strings, bools, null).
+        assert_eq!(run_heap(vec![Push(s(0)), Push(n(1.0)), Sub], &["6"]), vec![n(5.0)]);
+        assert_eq!(run(vec![Push(b(true)), Push(n(2.0)), Mul]), vec![n(2.0)]);
+        assert_eq!(run(vec![Push(null()), Push(n(1.0)), Add]), vec![n(1.0)]);
+        assert_eq!(run_heap(vec![Push(s(0)), Push(s(1)), Mul], &["6", "2"]), vec![n(12.0)]);
+        // undefined -> NaN propagates.
+        assert!(matches!(
+            run(vec![Push(undef()), Push(n(1.0)), Sub]).as_slice(),
+            [StackValue::Number(x)] if x.is_nan()
+        ));
+        // An unparseable string -> NaN.
+        assert!(matches!(
+            run_heap(vec![Push(s(0)), Push(n(1.0)), Mul], &["abc"]).as_slice(),
+            [StackValue::Number(x)] if x.is_nan()
+        ));
+    }
+
+    #[test]
+    fn truthiness_matches_js() {
+        // Falsy: false, 0, NaN, "", null, undefined.
+        for code in [
+            vec![Push(b(false)), Not],
+            vec![Push(n(0.0)), Not],
+            vec![Push(u(0)), Not],
+            vec![Push(n(f64::NAN)), Not],
+            vec![Push(null()), Not],
+            vec![Push(undef()), Not],
+        ] {
+            assert_eq!(run(code), vec![b(true)], "expected falsy");
+        }
+        assert_eq!(run_heap(vec![Push(s(0)), Not], &[""]), vec![b(true)]); // "" falsy
+        // Truthy: nonzero, "0", non-empty string, [], {}.
+        assert_eq!(run(vec![Push(n(1.0)), Not]), vec![b(false)]);
+        assert_eq!(run_heap(vec![Push(s(0)), Not], &["0"]), vec![b(false)]); // "0" truthy
+        assert_eq!(run(vec![ArrNew(0), Not]), vec![b(false)]); // [] truthy
+        assert_eq!(run(vec![ObjNew(vec![]), Not]), vec![b(false)]); // {} truthy
+        // And JFalse on 0 takes the branch (0 is falsy).
+        assert_eq!(run(vec![Push(n(0.0)), JFalse(3), Push(n(9.0))]), vec![]);
+        // || picks the second operand when the first is 0 (falsy).
+        assert_eq!(run(vec![Push(n(0.0)), Push(n(7.0)), Or]), vec![n(7.0)]);
+    }
+
+    #[test]
+    fn to_str_instruction() {
+        assert_eq!(run_last_str(vec![Push(n(5.0)), ToStr], &[]), "5");
+        assert_eq!(run_last_str(vec![Push(n(1.5)), ToStr], &[]), "1.5");
+        assert_eq!(run_last_str(vec![Push(i(-3)), ToStr], &[]), "-3");
+        assert_eq!(run_last_str(vec![Push(null()), ToStr], &[]), "null");
+        assert_eq!(run_last_str(vec![Push(undef()), ToStr], &[]), "undefined");
+        assert_eq!(run_last_str(vec![Push(b(true)), ToStr], &[]), "true");
+        // NaN / Infinity get JS spellings.
+        assert_eq!(run_last_str(vec![Push(n(f64::NAN)), ToStr], &[]), "NaN");
+        assert_eq!(
+            run_last_str(vec![Push(n(f64::INFINITY)), ToStr], &[]),
+            "Infinity"
+        );
+        // Array -> join(","), object -> "[object Object]".
+        assert_eq!(
+            run_last_str(vec![Push(n(1.0)), Push(n(2.0)), ArrNew(2), ToStr], &[]),
+            "1,2"
+        );
+        assert_eq!(
+            run_last_str(vec![Push(n(1.0)), ObjNew(vec!["a".into()]), ToStr], &[]),
+            "[object Object]"
+        );
+    }
+
     // ── comparisons ───────────────────────────────────────────────
 
     #[test]
@@ -2053,6 +2472,95 @@ mod tests {
         );
         // different types are not equal
         assert_eq!(run(vec![Push(n(0.0)), Push(null()), Eq]), vec![b(false)]);
+    }
+
+    #[test]
+    fn loose_eq_nullish() {
+        // null == undefined (and reflexively), but neither == anything else.
+        assert_eq!(run(vec![Push(null()), Push(undef()), LooseEq]), vec![b(true)]);
+        assert_eq!(run(vec![Push(undef()), Push(null()), LooseEq]), vec![b(true)]);
+        assert_eq!(run(vec![Push(null()), Push(null()), LooseEq]), vec![b(true)]);
+        assert_eq!(run(vec![Push(null()), Push(n(0.0)), LooseEq]), vec![b(false)]);
+        assert_eq!(
+            run(vec![Push(undef()), Push(b(false)), LooseEq]),
+            vec![b(false)]
+        );
+        // strict still distinguishes them
+        assert_eq!(run(vec![Push(null()), Push(undef()), Eq]), vec![b(false)]);
+        // LooseNeq is the negation
+        assert_eq!(
+            run(vec![Push(null()), Push(undef()), LooseNeq]),
+            vec![b(false)]
+        );
+        assert_eq!(run(vec![Push(null()), Push(n(0.0)), LooseNeq]), vec![b(true)]);
+    }
+
+    #[test]
+    fn loose_eq_boolean_coercion() {
+        // booleans coerce to 0/1.
+        assert_eq!(run(vec![Push(b(true)), Push(n(1.0)), LooseEq]), vec![b(true)]);
+        assert_eq!(
+            run(vec![Push(b(false)), Push(n(0.0)), LooseEq]),
+            vec![b(true)]
+        );
+        assert_eq!(
+            run(vec![Push(b(true)), Push(n(2.0)), LooseEq]),
+            vec![b(false)]
+        );
+    }
+
+    #[test]
+    fn loose_eq_number_string_coercion() {
+        // heap[0]="1", [1]="", [2]="abc", [3]="1.5"
+        let strings = ["1", "", "abc", "1.5"];
+        // 1 == "1"
+        assert_eq!(
+            run_heap(vec![Push(n(1.0)), Push(s(0)), LooseEq], &strings),
+            vec![b(true)]
+        );
+        // "1" == 1 (other order)
+        assert_eq!(
+            run_heap(vec![Push(s(0)), Push(n(1.0)), LooseEq], &strings),
+            vec![b(true)]
+        );
+        // 0 == "" (empty string ToNumber is 0)
+        assert_eq!(
+            run_heap(vec![Push(n(0.0)), Push(s(1)), LooseEq], &strings),
+            vec![b(true)]
+        );
+        // false == "" via double coercion
+        assert_eq!(
+            run_heap(vec![Push(b(false)), Push(s(1)), LooseEq], &strings),
+            vec![b(true)]
+        );
+        // 1 == "abc" -> NaN -> false
+        assert_eq!(
+            run_heap(vec![Push(n(1.0)), Push(s(2)), LooseEq], &strings),
+            vec![b(false)]
+        );
+        // 1.5 == "1.5"
+        assert_eq!(
+            run_heap(vec![Push(n(1.5)), Push(s(3)), LooseEq], &strings),
+            vec![b(true)]
+        );
+    }
+
+    #[test]
+    fn loose_eq_strings_not_coerced_to_each_other() {
+        // Two strings still compare as strings (no numeric coercion): "1" vs "1.0".
+        assert_eq!(
+            run_heap(vec![Push(s(0)), Push(s(1)), LooseEq], &["1", "1.0"]),
+            vec![b(false)]
+        );
+    }
+
+    #[test]
+    fn loose_eq_object_vs_primitive_not_coerced() {
+        // Documented divergence: [5] == 5 is false here (true in JS).
+        assert_eq!(
+            run(vec![Push(n(5.0)), ArrNew(1), Push(n(5.0)), LooseEq]),
+            vec![b(false)]
+        );
     }
 
     #[test]
@@ -2650,8 +3158,9 @@ mod tests {
     }
 
     #[test]
-    fn read_unset_variable_is_null() {
-        assert_eq!(run(vec![Read("nonexistent".into())]), vec![null()]);
+    fn read_unset_variable_is_undefined() {
+        // JS: an unset binding reads as `undefined`, not `null`.
+        assert_eq!(run(vec![Read("nonexistent".into())]), vec![undef()]);
     }
 
     // ── frame access validation ───────────────────────────────────
@@ -2817,9 +3326,9 @@ mod tests {
             Push(n(10.0)),
             ArrNew(1),
             Push(n(5.0)), // index 5, out of bounds
-            ArrGet,       // returns Null
+            ArrGet,       // JS: out-of-bounds reads as undefined
         ];
-        assert_eq!(run(code), vec![null()]);
+        assert_eq!(run(code), vec![undef()]);
     }
 
     #[test]
@@ -2920,9 +3429,176 @@ mod tests {
         let code = vec![
             Push(n(1.0)),
             ObjNew(vec!["x".into()]),
-            ObjGet("no_such_key".into()), // returns Null, ptr consumed
+            ObjGet("no_such_key".into()), // JS: missing key reads as undefined
         ];
-        assert_eq!(run(code), vec![null()]);
+        assert_eq!(run(code), vec![undef()]);
+    }
+
+    #[test]
+    fn object_enumeration() {
+        // Build {a:1, b:2}; keys -> ["a","b"], values -> [1,2] (insertion order).
+        let build = || vec![Push(n(1.0)), Push(n(2.0)), ObjNew(vec!["a".into(), "b".into()])];
+
+        let mut keys = build();
+        keys.extend([ObjKeys, ArrLength]);
+        assert_eq!(run(keys), vec![n(2.0)]);
+        // First key is "a".
+        let mut first_key = build();
+        first_key.extend([ObjKeys, Push(n(0.0)), ArrGet, ToStr]);
+        assert_eq!(run_last_str(first_key, &[]), "a");
+
+        // values -> [1,2], summed.
+        let mut vals = build();
+        vals.extend([ObjValues, Dup, Push(n(0.0)), ArrGet, Swap, Push(n(1.0)), ArrGet, Add]);
+        assert_eq!(run(vals), vec![n(3.0)]);
+
+        // has: "a" present, "z" absent.
+        let mut has = build();
+        has.extend([Push(s(0)), ObjHas]);
+        assert_eq!(run_heap(has, &["a"]), vec![b(true)]);
+        let mut hasnt = build();
+        hasnt.extend([Push(s(0)), ObjHas]);
+        assert_eq!(run_heap(hasnt, &["z"]), vec![b(false)]);
+
+        // delete: returns whether the key existed, and removes it.
+        let mut del = build();
+        del.extend([Push(s(0)), ObjDelete]);
+        assert_eq!(run_heap(del, &["a"]), vec![b(true)]);
+        let mut del_keys = build();
+        del_keys.extend([Dup, Push(s(0)), ObjDelete, Pop(1), ObjKeys, ArrLength]);
+        assert_eq!(run_heap(del_keys, &["a"]), vec![n(1.0)]);
+    }
+
+    // ── undefined & typeof ────────────────────────────────────────
+
+    #[test]
+    fn undefined_is_falsy() {
+        assert_eq!(run(vec![Push(undef()), Not]), vec![b(true)]);
+        // Branches like null: JFalse on undefined takes the jump.
+        assert_eq!(run(vec![Push(undef()), JFalse(3), Push(n(9.0))]), vec![]);
+    }
+
+    #[test]
+    fn undefined_strict_equality() {
+        // undefined === undefined, but undefined !== null (Eq is strict ===).
+        assert_eq!(run(vec![Push(undef()), Push(undef()), Eq]), vec![b(true)]);
+        assert_eq!(run(vec![Push(undef()), Push(null()), Eq]), vec![b(false)]);
+        assert_eq!(run(vec![Push(null()), Push(undef()), Neq]), vec![b(true)]);
+    }
+
+    #[test]
+    fn undefined_is_not_comparable() {
+        // Relational ops on undefined are all false (compare() yields None),
+        // matching JS `undefined < 1 === false`, `undefined >= undefined === false`.
+        assert_eq!(run(vec![Push(undef()), Push(n(1.0)), Lt]), vec![b(false)]);
+        assert_eq!(run(vec![Push(undef()), Push(undef()), GtEq]), vec![b(false)]);
+    }
+
+    #[test]
+    fn uninitialized_local_is_undefined() {
+        // `let x;` then read x -> undefined.
+        let code = vec![Alloc(vec![SlotKind::Plain]), Local(0), Return(1)];
+        assert_eq!(run(code), vec![undef()]);
+    }
+
+    #[test]
+    fn typeof_tags() {
+        // typeof returns JS strings; check each via a heap-string comparison.
+        let cases: &[(StackValue, &str)] = &[
+            (undef(), "undefined"),
+            (null(), "object"),
+            (b(true), "boolean"),
+            (n(3.5), "number"),
+            (i(7), "number"),
+            (f(0), "function"),
+        ];
+        for (val, tag) in cases {
+            let out = run_heap(vec![Push(*val), TypeOf, Push(s(0)), Eq], &[tag]);
+            assert_eq!(out, vec![b(true)], "typeof {val:?} should be {tag:?}");
+        }
+    }
+
+    #[test]
+    fn typeof_heap_values() {
+        // string -> "string", array/object -> "object", closure -> "function".
+        let str_tag = run_heap(vec![Push(s(0)), TypeOf, Push(s(1)), Eq], &["hi", "string"]);
+        assert_eq!(str_tag, vec![b(true)]);
+        let arr_tag = run_heap(
+            vec![Push(n(1.0)), ArrNew(1), TypeOf, Push(s(0)), Eq],
+            &["object"],
+        );
+        assert_eq!(arr_tag, vec![b(true)]);
+        let obj_tag = run_heap(
+            vec![Push(n(1.0)), ObjNew(vec!["a".into()]), TypeOf, Push(s(0)), Eq],
+            &["object"],
+        );
+        assert_eq!(obj_tag, vec![b(true)]);
+        // typeof a missing property is "undefined".
+        let miss_tag = run_heap(
+            vec![
+                Push(n(1.0)),
+                ObjNew(vec!["a".into()]),
+                ObjGet("b".into()),
+                TypeOf,
+                Push(s(0)),
+                Eq,
+            ],
+            &["undefined"],
+        );
+        assert_eq!(miss_tag, vec![b(true)]);
+    }
+
+    #[test]
+    fn undefined_json_in_object_is_dropped() {
+        // JSON.stringify({a:1, b:undefined}) === '{"a":1}'
+        let code = vec![
+            Push(n(1.0)),
+            Push(undef()),
+            ObjNew(vec!["a".into(), "b".into()]),
+            StrFromJson,
+            Return(1),
+        ];
+        let mut vm = VM::new(code);
+        while !matches!(vm.step().unwrap(), StepResult::Done) {}
+        assert_eq!(
+            vm.heap.last().unwrap(),
+            &HeapValue::String(r#"{"a":1}"#.into())
+        );
+    }
+
+    #[test]
+    fn undefined_json_in_array_is_null() {
+        // JSON.stringify([undefined]) === '[null]'
+        let code = vec![Push(undef()), ArrNew(1), StrFromJson, Return(1)];
+        let mut vm = VM::new(code);
+        while !matches!(vm.step().unwrap(), StepResult::Done) {}
+        assert_eq!(vm.heap.last().unwrap(), &HeapValue::String("[null]".into()));
+    }
+
+    #[test]
+    fn undefined_json_at_root_errors() {
+        // JSON.stringify(undefined) has no JSON form -> surface an error.
+        assert!(matches!(
+            run_err(vec![Push(undef()), StrFromJson]),
+            VMError::ValueError
+        ));
+    }
+
+    #[test]
+    fn undefined_joins_as_empty_string() {
+        // JS [1, undefined, 2].join(",") === "1,,2"
+        let mut vm = VM::new(vec![
+            Push(n(1.0)),
+            Push(undef()),
+            Push(n(2.0)),
+            ArrNew(3),
+            Push(s(0)),
+            ArrJoin,
+            Return(1),
+        ]);
+        vm.alloc_string(",".into());
+        while !matches!(vm.step().unwrap(), StepResult::Done) {}
+        assert_eq!(vm.heap.last().unwrap(), &HeapValue::String("1,,2".into()));
     }
 
     // ── string operations ─────────────────────────────────────────
@@ -3305,20 +3981,16 @@ mod tests {
     }
 
     #[test]
-    fn values_equal_is_deep() {
-        // Two arrays built from independently-allocated strings must compare
-        // equal by content (regression: derived PartialEq compared Ptrs).
-        let code = vec![
-            Push(s(0)),
-            ArrNew(1),
-            Push(s(1)),
-            ArrNew(1),
-            Eq, // ["abc"] == ["abc"] with distinct heap addresses
-        ];
-        assert_eq!(run_heap(code, &["abc", "abc"]), vec![b(true)]);
-        // Differing content compares unequal.
+    fn object_array_equality_is_by_reference() {
+        // JS ===: two distinct arrays/objects are never equal, even with
+        // identical content.
         let code = vec![Push(s(0)), ArrNew(1), Push(s(1)), ArrNew(1), Eq];
-        assert_eq!(run_heap(code, &["abc", "xyz"]), vec![b(false)]);
+        assert_eq!(run_heap(code, &["abc", "abc"]), vec![b(false)]);
+        // But the SAME array (one allocation, duplicated handle) is equal.
+        let code = vec![Push(s(0)), ArrNew(1), Dup, Eq];
+        assert_eq!(run_heap(code, &["abc"]), vec![b(true)]);
+        // Strings remain primitives: distinct heap strings compare by content.
+        assert_eq!(run_heap(vec![Push(s(0)), Push(s(1)), Eq], &["abc", "abc"]), vec![b(true)]);
     }
 
     #[test]
