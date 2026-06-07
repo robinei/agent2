@@ -1,6 +1,6 @@
-mod lang;
 mod tree;
 mod types;
+mod vm;
 
 pub use types::*;
 
