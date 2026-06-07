@@ -1,3 +1,4 @@
+mod compiler;
 mod tree;
 mod types;
 mod vm;

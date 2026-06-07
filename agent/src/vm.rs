@@ -1,5 +1,4 @@
 use indexmap::IndexMap;
-use std::collections::HashMap;
 
 /*
 JS semantic compatibility — known divergences
@@ -44,7 +43,6 @@ The remaining intentional divergences from JS — deferred or accepted, NOT bugs
     (LLM) intervention, not JS error handling.
 */
 
-pub type VarName = String;
 pub type FieldName = String;
 pub type CodeAddr = u32;
 pub type HeapAddr = u32;
@@ -226,7 +224,6 @@ pub struct VM {
     /// Grows monotonically (no reclamation), like `heap`.
     pub cells: Vec<StackValue>,
     pub stack: Vec<StackValue>, // sp == stack.len()
-    pub variables: HashMap<VarName, StackValue>,
     pub callstack: Vec<CallFrame>,
     pub ip: CodeAddr,
     pub fp: StackAddr,
@@ -239,8 +236,17 @@ pub struct VM {
 }
 
 // Instructions for a stack based language used for LLM composition of complex tool flows.
+#[derive(Clone, Debug, PartialEq)]
 pub enum Instr {
     Push(StackValue), // () -> any
+
+    // Allocate a heap string at runtime and push its Ptr. `Push` carries a
+    // `Copy` StackValue and so cannot introduce a String constant; PushStr is
+    // the lowering target for string literals, string-valued keys, and
+    // template-literal fragments. Like ArrNew/ObjNew it builds fresh each
+    // execution (re-alloc per run, no constant pool), landing at heap[1+] so
+    // the blessed `state` at Ptr(0) stays stable.
+    PushStr(String), // () -> str
 
     // Grow the current frame's locals region by one slot per kind. A `Plain`
     // slot is initialized to Undefined (an ordinary local, like JS `let x;`); a
@@ -309,12 +315,6 @@ pub enum Instr {
     IsArr,   // any -> bool
     IsObj,   // any -> bool
 
-    // reads variable and pushes the contained value to the stack
-    Read(VarName), // () -> any
-
-    // pops the topmost value from the stack and writes to the variable
-    Write(VarName), // any -> ()
-
     // temporary block markers. initially Jump and JFalse Addr refer to specific Label Addr(id),
     // but will get rewritten as code offset in a pass which eliminates Label instructions
     Label(CodeAddr), // () -> ()
@@ -342,10 +342,20 @@ pub enum Instr {
     // object with each field set to its corresponding value. Left-to-right:
     // field 0's value is the first/deepest pushed.
     ObjNew(Vec<FieldName>), // [any, ...] -> obj
-    ObjGetDyn,              // obj, str -> any
-    ObjSetDyn,              // obj, str, any -> ()
     ObjGet(FieldName),      // obj -> any
     ObjSet(FieldName),      // obj, any -> ()
+
+    // Runtime-polymorphic computed access `x[k]` / `x[k] = v`. A variable-keyed
+    // index has no static type to choose array/object/string access, so these
+    // inspect the container at runtime: array+int -> element (OOB read ->
+    // undefined, OOB write -> error, negative -> error); object -> string-key
+    // property (ToString the key; missing -> undefined); string+int -> the
+    // character at that UTF-8 byte offset as a 1-char string (OOB -> undefined,
+    // mid-codepoint -> error). They supersede the old type-specific
+    // ArrGet/ArrSet/ObjGetDyn/ObjSetDyn. The static-name ObjGet/ObjSet remain
+    // the fast path for `obj.foo`/`state.foo` (no per-access heap-string alloc).
+    IndexGet, // container, key -> any
+    IndexSet, // container, key, value -> ()
     // object enumeration / membership (JS Object.keys / Object.values,
     // `key in obj`, `delete obj[key]`). Keys/values are returned in insertion
     // order (IndexMap-backed). ObjDelete pushes whether the key was present.
@@ -358,8 +368,6 @@ pub enum Instr {
     // Left-to-right: the first/deepest pushed becomes element 0.
     ArrNew(u32), // [any, ...] -> arr
     ArrLength,   // arr|str -> int
-    ArrGet,      // arr, int -> any
-    ArrSet,      // arr, int, any -> ()
     ArrPush,     // arr, any -> ()    (append to end)
     ArrPop,      // arr -> any        (remove & return end)
     ArrShift,    // arr -> any        (remove & return front, like JS)
@@ -400,29 +408,29 @@ pub enum Instr {
 
     // binary operators. first pops rhs then lhs off the stack,
     // then operates on them pushing result to stack
-    Add,    // num|str, num|str -> num|str
-    Sub,    // num, num -> num
-    Mul,    // num, num -> num
-    Div,    // num, num -> num
-    Mod,    // int, int -> int
+    Add,      // num|str, num|str -> num|str
+    Sub,      // num, num -> num
+    Mul,      // num, num -> num
+    Div,      // num, num -> num
+    Mod,      // int, int -> int
     Eq,       // any, any -> bool  (JS `===`: strict, structural, no coercion)
     Neq,      // any, any -> bool  (JS `!==`)
     LooseEq,  // any, any -> bool  (JS `==`:  coercing — see VM::loose_equal)
     LooseNeq, // any, any -> bool  (JS `!=`)
-    Lt,     // any, any -> bool
-    Gt,     // any, any -> bool
-    LtEq,   // any, any -> bool
-    GtEq,   // any, any -> bool
-    And,    // any, any -> any
-    Or,     // any, any -> any
-    BitAnd, // int, int -> int
-    BitOr,  // int, int -> int
-    BitXor, // int, int -> int
-    BitLhs, // int, int -> int
-    BitRhs, // int, int -> int
-    Min,    // num, num -> num
-    Max,    // num, num -> num
-    Pow,    // num, num -> num
+    Lt,       // any, any -> bool
+    Gt,       // any, any -> bool
+    LtEq,     // any, any -> bool
+    GtEq,     // any, any -> bool
+    And,      // any, any -> any
+    Or,       // any, any -> any
+    BitAnd,   // int, int -> int
+    BitOr,    // int, int -> int
+    BitXor,   // int, int -> int
+    BitLhs,   // int, int -> int
+    BitRhs,   // int, int -> int
+    Min,      // num, num -> num
+    Max,      // num, num -> num
+    Pow,      // num, num -> num
 }
 
 #[derive(Debug)]
@@ -553,7 +561,6 @@ impl VM {
             heap: Vec::new(),
             cells: Vec::new(),
             stack: Vec::new(),
-            variables: HashMap::new(),
             // Root frame so that Arg/Local/Alloc are valid from the start.
             callstack: vec![CallFrame {
                 arg_count: 0,
@@ -565,6 +572,31 @@ impl VM {
             fp: 0,
             fuel: DEFAULT_FUEL,
         }
+    }
+
+    /// Construct a VM to run a compiled `Program`, with the blessed `state`
+    /// object installed at `heap[0]`. `state` is seeded from the prior run's
+    /// durable JSON (an object); `Null`/non-object seeds yield an empty `state`.
+    /// All durable/host-context access lowers to ordinary object ops on
+    /// `Ptr(0)`, so the host persists by extracting `heap[0]` after the run and
+    /// re-seeding it here next time. `PushStr`/literals alloc at `heap[1+]`, so
+    /// `Ptr(0)` stays stable for the whole program.
+    pub fn for_program(code: Vec<Instr>, state: serde_json::Value) -> Result<Self, VMError> {
+        let mut vm = VM::new(code);
+        // Claim heap[0] for `state` before anything else allocates, so its
+        // address is fixed. Nested values seed into heap[1+].
+        vm.heap.push(HeapValue::Object(IndexMap::new()));
+        if let serde_json::Value::Object(map) = state {
+            let mut entries = IndexMap::with_capacity(map.len());
+            for (k, v) in &map {
+                let sv = vm.json_to_stack_value(v, 0)?;
+                entries.insert(k.clone(), sv);
+            }
+            if let Some(HeapValue::Object(o)) = vm.heap.get_mut(0) {
+                *o = entries;
+            }
+        }
+        Ok(vm)
     }
 
     // ── heap access helpers ──────────────────────────────────────────
@@ -1080,6 +1112,13 @@ impl VM {
                     self.ip += 1;
                 }
 
+                Instr::PushStr(s) => {
+                    let s = s.clone(); // release the borrow on self.code
+                    let ptr = self.alloc_string(s);
+                    self.stack.push(ptr);
+                    self.ip += 1;
+                }
+
                 Instr::Alloc(kinds) => {
                     // Locals occupy [fp, fp + local_count). Allocation is only
                     // valid when no expression temporaries sit above them, i.e.
@@ -1325,24 +1364,6 @@ impl VM {
                     self.ip += 1;
                 }
 
-                // ── variables ───────────────────────────────────
-                Instr::Read(name) => {
-                    // JS: an unset binding reads as `undefined`, not `null`.
-                    let val = self
-                        .variables
-                        .get(name)
-                        .copied()
-                        .unwrap_or(StackValue::Undefined);
-                    self.stack.push(val);
-                    self.ip += 1;
-                }
-
-                Instr::Write(name) => {
-                    let val = self.stack.pop().ok_or(VMError::StackUnderflow)?;
-                    self.variables.insert(name.clone(), val);
-                    self.ip += 1;
-                }
-
                 // ── type queries ────────────────────────────────
                 Instr::TypeOf => {
                     let val = self.stack.pop().ok_or(VMError::StackUnderflow)?;
@@ -1475,7 +1496,11 @@ impl VM {
                     // array/object/function in the numeric path is a TypeError
                     // (we do not ToPrimitive it — see the note on `loose_equal`).
                     let result = if self.is_string(&lhs) || self.is_string(&rhs) {
-                        let s = format!("{}{}", self.to_js_string(&lhs, 0), self.to_js_string(&rhs, 0));
+                        let s = format!(
+                            "{}{}",
+                            self.to_js_string(&lhs, 0),
+                            self.to_js_string(&rhs, 0)
+                        );
                         self.alloc_string(s)
                     } else {
                         match (self.to_number(&lhs), self.to_number(&rhs)) {
@@ -1555,13 +1580,15 @@ impl VM {
                 Instr::And => {
                     let rhs = self.stack.pop().ok_or(VMError::StackUnderflow)?;
                     let lhs = self.stack.pop().ok_or(VMError::StackUnderflow)?;
-                    self.stack.push(if self.is_truthy(&lhs) { rhs } else { lhs });
+                    self.stack
+                        .push(if self.is_truthy(&lhs) { rhs } else { lhs });
                     self.ip += 1;
                 }
                 Instr::Or => {
                     let rhs = self.stack.pop().ok_or(VMError::StackUnderflow)?;
                     let lhs = self.stack.pop().ok_or(VMError::StackUnderflow)?;
-                    self.stack.push(if self.is_truthy(&lhs) { lhs } else { rhs });
+                    self.stack
+                        .push(if self.is_truthy(&lhs) { lhs } else { rhs });
                     self.ip += 1;
                 }
 
@@ -1608,35 +1635,6 @@ impl VM {
                     self.ip += 1;
                 }
 
-                Instr::ObjGetDyn => {
-                    let field_ptr = self.pop_ptr()?;
-                    let field = self
-                        .heap_str(field_ptr)
-                        .ok_or(VMError::TypeError)?
-                        .to_string();
-                    let obj_ptr = self.pop_ptr()?;
-                    // JS: a missing property reads as `undefined`, not `null`.
-                    let val = self
-                        .heap_obj(obj_ptr)
-                        .and_then(|obj| obj.get(&*field).copied())
-                        .unwrap_or(StackValue::Undefined);
-                    self.stack.push(val);
-                    self.ip += 1;
-                }
-
-                Instr::ObjSetDyn => {
-                    let val = self.stack.pop().ok_or(VMError::StackUnderflow)?;
-                    let field_ptr = self.pop_ptr()?;
-                    let field = self
-                        .heap_str(field_ptr)
-                        .ok_or(VMError::TypeError)?
-                        .to_string();
-                    let obj_ptr = self.pop_ptr()?;
-                    let obj = self.heap_obj_mut(obj_ptr).ok_or(VMError::TypeError)?;
-                    obj.insert(field, val);
-                    self.ip += 1;
-                }
-
                 Instr::ObjGet(field) => {
                     let field = field.clone();
                     let obj_ptr = self.pop_ptr()?;
@@ -1655,6 +1653,93 @@ impl VM {
                     let obj_ptr = self.pop_ptr()?;
                     let obj = self.heap_obj_mut(obj_ptr).ok_or(VMError::TypeError)?;
                     obj.insert(field, val);
+                    self.ip += 1;
+                }
+
+                // Runtime-polymorphic computed read. Dispatch on the container
+                // type: array (int index), object (ToString key), or string
+                // (byte-offset char). A char result needs a fresh allocation, so
+                // it is computed under the heap borrow and allocated after.
+                Instr::IndexGet => {
+                    let key = self.stack.pop().ok_or(VMError::StackUnderflow)?;
+                    let container = self.pop_ptr()?;
+                    let mut to_alloc: Option<String> = None;
+                    let val = match self.heap_get(container)? {
+                        HeapValue::Array(arr) => {
+                            let idx = as_i64(&key).ok_or(VMError::TypeError)?;
+                            if idx < 0 {
+                                return Err(VMError::ValueError);
+                            }
+                            // JS: an out-of-bounds index reads as `undefined`.
+                            arr.get(idx as usize)
+                                .copied()
+                                .unwrap_or(StackValue::Undefined)
+                        }
+                        HeapValue::Object(obj) => {
+                            // JS coerces a computed key with ToString.
+                            let field = self.to_js_string(&key, 0);
+                            // JS: a missing property reads as `undefined`.
+                            obj.get(&field).copied().unwrap_or(StackValue::Undefined)
+                        }
+                        HeapValue::String(s) => {
+                            let idx = as_i64(&key).ok_or(VMError::TypeError)?;
+                            if idx < 0 {
+                                return Err(VMError::ValueError);
+                            }
+                            let idx = idx as usize;
+                            if idx >= s.len() {
+                                // JS: an out-of-range char index is `undefined`.
+                                StackValue::Undefined
+                            } else if !s.is_char_boundary(idx) {
+                                return Err(VMError::ValueError);
+                            } else {
+                                // The codepoint starting at this byte, as a
+                                // 1-char string (built after the borrow ends).
+                                to_alloc = Some(s[idx..].chars().next().unwrap().to_string());
+                                StackValue::Undefined // placeholder, replaced below
+                            }
+                        }
+                        _ => return Err(VMError::TypeError),
+                    };
+                    let result = match to_alloc {
+                        Some(s) => self.alloc_string(s),
+                        None => val,
+                    };
+                    self.stack.push(result);
+                    self.ip += 1;
+                }
+
+                // Runtime-polymorphic computed write. Arrays index by int (OOB or
+                // negative is an error — no hole-growing); objects key by the
+                // ToString'd key; strings are immutable (TypeError).
+                Instr::IndexSet => {
+                    let val = self.stack.pop().ok_or(VMError::StackUnderflow)?;
+                    let key = self.stack.pop().ok_or(VMError::StackUnderflow)?;
+                    let container = self.pop_ptr()?;
+                    // Determine the container kind, releasing the borrow before
+                    // taking the mutable one below.
+                    let is_array = match self.heap_get(container)? {
+                        HeapValue::Array(_) => true,
+                        HeapValue::Object(_) => false,
+                        // Strings are immutable; closures aren't indexable.
+                        _ => return Err(VMError::TypeError),
+                    };
+                    if is_array {
+                        let idx = as_i64(&key).ok_or(VMError::TypeError)?;
+                        if idx < 0 {
+                            return Err(VMError::ValueError);
+                        }
+                        let idx = idx as usize;
+                        let arr = self.heap_arr_mut(container).ok_or(VMError::TypeError)?;
+                        if idx >= arr.len() {
+                            return Err(VMError::ValueError);
+                        }
+                        arr[idx] = val;
+                    } else {
+                        let field = self.to_js_string(&key, 0);
+                        let obj = self.heap_obj_mut(container).ok_or(VMError::TypeError)?;
+                        obj.insert(field, val);
+                    }
                     self.ip += 1;
                 }
 
@@ -1739,34 +1824,6 @@ impl VM {
                         _ => return Err(VMError::TypeError),
                     };
                     self.stack.push(StackValue::Number(len as f64));
-                    self.ip += 1;
-                }
-
-                Instr::ArrGet => {
-                    let index = self.pop_int()?;
-                    let arr_ptr = self.pop_ptr()?;
-                    let arr = self.heap_arr(arr_ptr).ok_or(VMError::TypeError)?;
-                    if index < 0 {
-                        return Err(VMError::ValueError);
-                    }
-                    // JS: an out-of-bounds index reads as `undefined`, not `null`.
-                    let val = arr
-                        .get(index as usize)
-                        .copied()
-                        .unwrap_or(StackValue::Undefined);
-                    self.stack.push(val);
-                    self.ip += 1;
-                }
-
-                Instr::ArrSet => {
-                    let val = self.stack.pop().ok_or(VMError::StackUnderflow)?;
-                    let index = self.pop_int()?;
-                    let arr_ptr = self.pop_ptr()?;
-                    let arr = self.heap_arr_mut(arr_ptr).ok_or(VMError::TypeError)?;
-                    if index < 0 || index as usize >= arr.len() {
-                        return Err(VMError::ValueError);
-                    }
-                    arr[index as usize] = val;
                     self.ip += 1;
                 }
 
@@ -2066,7 +2123,6 @@ impl VM {
             }
         }
     }
-
 }
 
 // ── tests ────────────────────────────────────────────────────────────
@@ -2369,8 +2425,14 @@ mod tests {
     #[test]
     fn add_concat_coerces() {
         // `+` concatenates when either side is a string, coercing the other.
-        assert_eq!(run_last_str(vec![Push(s(0)), Push(n(5.0)), Add], &["x="]), "x=5");
-        assert_eq!(run_last_str(vec![Push(n(5.0)), Push(s(0)), Add], &["!"]), "5!");
+        assert_eq!(
+            run_last_str(vec![Push(s(0)), Push(n(5.0)), Add], &["x="]),
+            "x=5"
+        );
+        assert_eq!(
+            run_last_str(vec![Push(n(5.0)), Push(s(0)), Add], &["!"]),
+            "5!"
+        );
         assert_eq!(
             run_last_str(vec![Push(s(0)), Push(null()), Add], &["v="]),
             "v=null"
@@ -2392,10 +2454,16 @@ mod tests {
     #[test]
     fn arithmetic_coerces() {
         // ToNumber coercion on -, *, /, % (strings, bools, null).
-        assert_eq!(run_heap(vec![Push(s(0)), Push(n(1.0)), Sub], &["6"]), vec![n(5.0)]);
+        assert_eq!(
+            run_heap(vec![Push(s(0)), Push(n(1.0)), Sub], &["6"]),
+            vec![n(5.0)]
+        );
         assert_eq!(run(vec![Push(b(true)), Push(n(2.0)), Mul]), vec![n(2.0)]);
         assert_eq!(run(vec![Push(null()), Push(n(1.0)), Add]), vec![n(1.0)]);
-        assert_eq!(run_heap(vec![Push(s(0)), Push(s(1)), Mul], &["6", "2"]), vec![n(12.0)]);
+        assert_eq!(
+            run_heap(vec![Push(s(0)), Push(s(1)), Mul], &["6", "2"]),
+            vec![n(12.0)]
+        );
         // undefined -> NaN propagates.
         assert!(matches!(
             run(vec![Push(undef()), Push(n(1.0)), Sub]).as_slice(),
@@ -2477,10 +2545,22 @@ mod tests {
     #[test]
     fn loose_eq_nullish() {
         // null == undefined (and reflexively), but neither == anything else.
-        assert_eq!(run(vec![Push(null()), Push(undef()), LooseEq]), vec![b(true)]);
-        assert_eq!(run(vec![Push(undef()), Push(null()), LooseEq]), vec![b(true)]);
-        assert_eq!(run(vec![Push(null()), Push(null()), LooseEq]), vec![b(true)]);
-        assert_eq!(run(vec![Push(null()), Push(n(0.0)), LooseEq]), vec![b(false)]);
+        assert_eq!(
+            run(vec![Push(null()), Push(undef()), LooseEq]),
+            vec![b(true)]
+        );
+        assert_eq!(
+            run(vec![Push(undef()), Push(null()), LooseEq]),
+            vec![b(true)]
+        );
+        assert_eq!(
+            run(vec![Push(null()), Push(null()), LooseEq]),
+            vec![b(true)]
+        );
+        assert_eq!(
+            run(vec![Push(null()), Push(n(0.0)), LooseEq]),
+            vec![b(false)]
+        );
         assert_eq!(
             run(vec![Push(undef()), Push(b(false)), LooseEq]),
             vec![b(false)]
@@ -2492,13 +2572,19 @@ mod tests {
             run(vec![Push(null()), Push(undef()), LooseNeq]),
             vec![b(false)]
         );
-        assert_eq!(run(vec![Push(null()), Push(n(0.0)), LooseNeq]), vec![b(true)]);
+        assert_eq!(
+            run(vec![Push(null()), Push(n(0.0)), LooseNeq]),
+            vec![b(true)]
+        );
     }
 
     #[test]
     fn loose_eq_boolean_coercion() {
         // booleans coerce to 0/1.
-        assert_eq!(run(vec![Push(b(true)), Push(n(1.0)), LooseEq]), vec![b(true)]);
+        assert_eq!(
+            run(vec![Push(b(true)), Push(n(1.0)), LooseEq]),
+            vec![b(true)]
+        );
         assert_eq!(
             run(vec![Push(b(false)), Push(n(0.0)), LooseEq]),
             vec![b(true)]
@@ -2802,7 +2888,7 @@ mod tests {
         code.push(Local(0)); // out (ArrPush receiver)
         code.push(Arg(0));
         code.push(Local(1));
-        code.push(ArrGet); // arr[i]
+        code.push(IndexGet); // arr[i]
         code.push(Arg(1));
         code.push(CallDyn(1)); // fn(arr[i])
         code.push(ArrPush); // out.push(...)
@@ -2965,11 +3051,11 @@ mod tests {
         code.push(Push(n(42.0))); // setter's arg
         code.push(Local(0));
         code.push(Push(n(1.0)));
-        code.push(ArrGet); // setter
+        code.push(IndexGet); // setter
         code.push(CallDyn(1)); // setter(42) → (no result)
         code.push(Local(0));
         code.push(Push(n(0.0)));
-        code.push(ArrGet); // getter
+        code.push(IndexGet); // getter
         code.push(CallDyn(0)); // getter() → 42
         code.push(Return(1));
         // maker
@@ -3129,38 +3215,11 @@ mod tests {
             Push(n(2.0)),
             Call(4, 2), // call fn
             Return(0),
-            Push(n(99.0)), // fn pushes a temp FIRST (sp > fp)
-            Alloc(plain(1)),      // should fail
+            Push(n(99.0)),   // fn pushes a temp FIRST (sp > fp)
+            Alloc(plain(1)), // should fail
             Return(0),
         ];
         assert!(matches!(run_err(code), VMError::BadAlloc));
-    }
-
-    // ── variables ─────────────────────────────────────────────────
-
-    #[test]
-    fn read_write_variable() {
-        let mut vm = VM::new(vec![
-            Push(n(42.0)),
-            Write("x".into()),
-            Read("x".into()),
-            Push(n(1.0)),
-            Add,
-        ]);
-        loop {
-            match vm.step().unwrap() {
-                StepResult::Done => break,
-                _ => panic!(),
-            }
-        }
-        assert_eq!(vm.stack, vec![n(43.0)]);
-        assert_eq!(vm.variables.get("x"), Some(&n(42.0)));
-    }
-
-    #[test]
-    fn read_unset_variable_is_undefined() {
-        // JS: an unset binding reads as `undefined`, not `null`.
-        assert_eq!(run(vec![Read("nonexistent".into())]), vec![undef()]);
     }
 
     // ── frame access validation ───────────────────────────────────
@@ -3220,9 +3279,9 @@ mod tests {
             ArrNew(3),
             Push(n(1.0)),  // index
             Push(n(99.0)), // value
-            ArrSet,        // pops: value, index, arr_ptr (ptr consumed)
+            IndexSet,      // pops: value, index, arr_ptr (ptr consumed)
         ];
-        // ArrSet consumes ptr, nothing left on stack.
+        // IndexSet consumes ptr, nothing left on stack.
         assert!(run(code).is_empty());
     }
 
@@ -3237,9 +3296,9 @@ mod tests {
             Dup,           // save ptr for later
             Push(n(1.0)),  // index
             Push(n(99.0)), // value
-            ArrSet,        // pops value, index, ptr_copy → stack: [ptr]
+            IndexSet,      // pops value, index, ptr_copy → stack: [ptr]
             Push(n(1.0)),  // index
-            ArrGet,        // pops index, ptr → pushes arr[1]
+            IndexGet,      // pops index, ptr → pushes arr[1]
         ];
         assert_eq!(run(code), vec![n(99.0)]);
     }
@@ -3326,7 +3385,7 @@ mod tests {
             Push(n(10.0)),
             ArrNew(1),
             Push(n(5.0)), // index 5, out of bounds
-            ArrGet,       // JS: out-of-bounds reads as undefined
+            IndexGet,     // JS: out-of-bounds reads as undefined
         ];
         assert_eq!(run(code), vec![undef()]);
     }
@@ -3338,7 +3397,7 @@ mod tests {
             ArrNew(1),
             Push(n(5.0)),  // index
             Push(n(99.0)), // value
-            ArrSet,        // pops: value, index, arr_ptr
+            IndexSet,      // pops: value, index, arr_ptr
         ];
         assert!(matches!(run_err(code), VMError::ValueError));
     }
@@ -3354,7 +3413,7 @@ mod tests {
             Push(n(10.0)), // "b" value (second field)
             ObjNew(vec!["a".into(), "b".into()]),
             Push(s(0)), // field "a" (heap[0]="a")
-            ObjGetDyn,  // pops field_ptr, obj_ptr → pushes obj["a"]
+            IndexGet,   // pops key, obj_ptr → pushes obj["a"]
         ]);
         vm.alloc_string("a".to_string());
         loop {
@@ -3363,19 +3422,19 @@ mod tests {
                 _ => {}
             }
         }
-        // ObjGet consumes obj_ptr, so stack only has the retrieved value.
+        // IndexGet consumes obj_ptr, so stack only has the retrieved value.
         assert_eq!(vm.stack, vec![n(20.0)]);
     }
 
     #[test]
     fn obj_get_set_dynamic() {
-        // Test dynamic ObjGetDyn with a heap-allocated field name.
+        // Computed get via IndexGet with a heap-allocated string key.
         let mut vm = VM::new(vec![
             Push(n(1.0)),
             Push(n(2.0)),
             ObjNew(vec!["x".into(), "y".into()]), // x=1, y=2
             Push(s(0)),                           // field "x" (heap[0]="x")
-            ObjGetDyn,                            // → 1
+            IndexGet,                             // → 1
         ]);
         vm.alloc_string("x".to_string());
         loop {
@@ -3386,7 +3445,7 @@ mod tests {
         }
         assert_eq!(vm.stack, vec![n(1.0)]);
 
-        // Test dynamic ObjSetDyn: set a field, verify with ObjGet.
+        // Computed set via IndexSet: set a field, verify with ObjGet.
         let mut vm = VM::new(vec![
             Push(n(1.0)),
             Push(n(2.0)),
@@ -3394,7 +3453,7 @@ mod tests {
             Dup,                                  // keep ptr for verification
             Push(s(0)),                           // field "y" (heap[0]="y") — pushed before val
             Push(n(99.0)),                        // val — on top
-            ObjSetDyn,                            // pops val, field_ptr, obj_ptr → obj.y = 99
+            IndexSet,                             // pops val, key, obj_ptr → obj.y = 99
             // Stack: [ptr]
             ObjGet("y".into()), // → 99
         ]);
@@ -3437,19 +3496,34 @@ mod tests {
     #[test]
     fn object_enumeration() {
         // Build {a:1, b:2}; keys -> ["a","b"], values -> [1,2] (insertion order).
-        let build = || vec![Push(n(1.0)), Push(n(2.0)), ObjNew(vec!["a".into(), "b".into()])];
+        let build = || {
+            vec![
+                Push(n(1.0)),
+                Push(n(2.0)),
+                ObjNew(vec!["a".into(), "b".into()]),
+            ]
+        };
 
         let mut keys = build();
         keys.extend([ObjKeys, ArrLength]);
         assert_eq!(run(keys), vec![n(2.0)]);
         // First key is "a".
         let mut first_key = build();
-        first_key.extend([ObjKeys, Push(n(0.0)), ArrGet, ToStr]);
+        first_key.extend([ObjKeys, Push(n(0.0)), IndexGet, ToStr]);
         assert_eq!(run_last_str(first_key, &[]), "a");
 
         // values -> [1,2], summed.
         let mut vals = build();
-        vals.extend([ObjValues, Dup, Push(n(0.0)), ArrGet, Swap, Push(n(1.0)), ArrGet, Add]);
+        vals.extend([
+            ObjValues,
+            Dup,
+            Push(n(0.0)),
+            IndexGet,
+            Swap,
+            Push(n(1.0)),
+            IndexGet,
+            Add,
+        ]);
         assert_eq!(run(vals), vec![n(3.0)]);
 
         // has: "a" present, "z" absent.
@@ -3491,7 +3565,10 @@ mod tests {
         // Relational ops on undefined are all false (compare() yields None),
         // matching JS `undefined < 1 === false`, `undefined >= undefined === false`.
         assert_eq!(run(vec![Push(undef()), Push(n(1.0)), Lt]), vec![b(false)]);
-        assert_eq!(run(vec![Push(undef()), Push(undef()), GtEq]), vec![b(false)]);
+        assert_eq!(
+            run(vec![Push(undef()), Push(undef()), GtEq]),
+            vec![b(false)]
+        );
     }
 
     #[test]
@@ -3529,7 +3606,13 @@ mod tests {
         );
         assert_eq!(arr_tag, vec![b(true)]);
         let obj_tag = run_heap(
-            vec![Push(n(1.0)), ObjNew(vec!["a".into()]), TypeOf, Push(s(0)), Eq],
+            vec![
+                Push(n(1.0)),
+                ObjNew(vec!["a".into()]),
+                TypeOf,
+                Push(s(0)),
+                Eq,
+            ],
             &["object"],
         );
         assert_eq!(obj_tag, vec![b(true)]);
@@ -3990,7 +4073,10 @@ mod tests {
         let code = vec![Push(s(0)), ArrNew(1), Dup, Eq];
         assert_eq!(run_heap(code, &["abc"]), vec![b(true)]);
         // Strings remain primitives: distinct heap strings compare by content.
-        assert_eq!(run_heap(vec![Push(s(0)), Push(s(1)), Eq], &["abc", "abc"]), vec![b(true)]);
+        assert_eq!(
+            run_heap(vec![Push(s(0)), Push(s(1)), Eq], &["abc", "abc"]),
+            vec![b(true)]
+        );
     }
 
     #[test]
@@ -3999,9 +4085,9 @@ mod tests {
         // independent locals.
         let code = vec![
             Call(2, 0),
-            Return(1), // propagate the function's result to the final stack
-            Alloc(plain(1)),  // local 0
-            Alloc(plain(1)),  // local 1 (was previously rejected)
+            Return(1),       // propagate the function's result to the final stack
+            Alloc(plain(1)), // local 0
+            Alloc(plain(1)), // local 1 (was previously rejected)
             Push(n(7.0)),
             SetLocal(0),
             Push(n(8.0)),
@@ -4058,7 +4144,7 @@ mod tests {
             Call(3, 1),
             Return(0),
             Alloc(plain(1)), // local 0; sp == frame floor
-            Pop(1),   // nothing above the floor -> underflow
+            Pop(1),          // nothing above the floor -> underflow
             Return(0),
         ];
         assert!(matches!(run_err(code), VMError::StackUnderflow));
@@ -4071,7 +4157,7 @@ mod tests {
             Call(3, 1),
             Return(0),
             Alloc(plain(1)), // local 0; sp == floor
-            Dup,      // nothing above the floor -> underflow
+            Dup,             // nothing above the floor -> underflow
             Return(0),
         ];
         assert!(matches!(run_err(code), VMError::StackUnderflow));
@@ -4085,9 +4171,9 @@ mod tests {
             Push(n(1.0)),
             Call(3, 1),
             Return(0),
-            Alloc(plain(1)),     // local 0
-            Push(n(9.0)), // single temporary
-            Swap,         // would swap the temp with the local -> underflow
+            Alloc(plain(1)), // local 0
+            Push(n(9.0)),    // single temporary
+            Swap,            // would swap the temp with the local -> underflow
             Return(0),
         ];
         assert!(matches!(run_err(code), VMError::StackUnderflow));
@@ -4099,8 +4185,8 @@ mod tests {
             Push(n(1.0)),
             Call(3, 1),
             Return(0),
-            Alloc(plain(1)),     // local 0
-            Push(n(8.0)), // two temporaries (need three for Rot)
+            Alloc(plain(1)), // local 0
+            Push(n(8.0)),    // two temporaries (need three for Rot)
             Push(n(9.0)),
             Rot,
             Return(0),
@@ -4212,7 +4298,7 @@ mod tests {
     #[test]
     fn posint_too_large_for_index_errors() {
         // A PosInt beyond i64::MAX can't be an array index -> error, no panic.
-        let code = vec![Push(n(1.0)), ArrNew(1), Push(u(u64::MAX)), ArrGet];
+        let code = vec![Push(n(1.0)), ArrNew(1), Push(u(u64::MAX)), IndexGet];
         assert!(matches!(run_err(code), VMError::TypeError));
     }
 
@@ -4276,7 +4362,7 @@ mod tests {
             Push(n(20.0)),
             ArrNew(2), // [10, 20]
             Push(i(1)),
-            ArrGet,
+            IndexGet,
         ];
         assert_eq!(run(code), vec![n(20.0)]);
         // ...and as a bitwise operand.
