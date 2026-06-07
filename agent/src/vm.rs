@@ -251,6 +251,14 @@ pub enum UpdateMode {
     Postfix,
 }
 
+/// Whether `ObjSet`/`IndexSet` leaves the new value (normal assignment) or
+/// the old value (postfix `++`/`--` on non-local targets).
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum SetMode {
+    New,
+    Old,
+}
+
 // Instructions for a stack based language used for LLM composition of complex tool flows.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Instr {
@@ -400,9 +408,11 @@ pub enum Instr {
     // field 0's value is the first/deepest pushed.
     ObjNew(Vec<FieldName>), // [any, ...] -> obj
     ObjGet(FieldName),      // obj -> any
-    // Sets the field and leaves the assigned value (assignment is an
-    // expression). Statement-context callers follow it with Pop(1).
-    ObjSet(FieldName), // obj, any -> any
+    /// Sets the field and leaves a value on the stack (assignment is an
+    /// expression). In `New` mode leaves the assigned value; in `Old` mode
+    /// reads and leaves the previous value. Statement-context callers follow
+    /// `New` mode with `Pop(1)`.
+    ObjSet(FieldName, SetMode), // obj, any -> any
 
     // Runtime-polymorphic computed access `x[k]` / `x[k] = v`. A variable-keyed
     // index has no static type to choose array/object/string access, so these
@@ -414,8 +424,10 @@ pub enum Instr {
     // ArrGet/ArrSet/ObjGetDyn/ObjSetDyn. The static-name ObjGet/ObjSet remain
     // the fast path for `obj.foo`/`state.foo` (no per-access heap-string alloc).
     IndexGet, // container, key -> any
-    // Like ObjSet, leaves the assigned value (statement callers Pop it).
-    IndexSet, // container, key, value -> any
+    /// Like `ObjSet` with `SetMode`: `New` leaves the assigned value, `Old`
+    /// reads and leaves the previous value. Statement callers `Pop` the `New`
+    /// result.
+    IndexSet(SetMode), // container, key, value -> any
     // object enumeration / membership (JS Object.keys / Object.values,
     // `key in obj`, `delete obj[key]`). Keys/values are returned in insertion
     // order (IndexMap-backed). ObjDelete pushes whether the key was present.
@@ -1834,16 +1846,23 @@ impl VM {
                     self.ip += 1;
                 }
 
-                Instr::ObjSet(field) => {
+                Instr::ObjSet(field, mode) => {
                     let field = field.clone();
+                    let mode = *mode;
                     let val = self.stack.pop().ok_or(VMError::StackUnderflow)?;
                     let obj_ptr = self.pop_ptr()?;
                     let obj = self.heap_obj_mut(obj_ptr).ok_or(VMError::TypeError)?;
+                    // In Old mode, read the previous value before overwriting
+                    // (for postfix `++`/`--` on member targets).
+                    let old = match mode {
+                        SetMode::Old => obj.get(&field).copied().unwrap_or(StackValue::Undefined),
+                        SetMode::New => StackValue::Undefined, // placeholder, unused
+                    };
                     obj.insert(field, val);
-                    // Leave the assigned value: assignment is an expression whose
-                    // result is the RHS, and this lets `obj.f = v` lower without
-                    // any stack shuffling (and in source order).
-                    self.stack.push(val);
+                    match mode {
+                        SetMode::New => self.stack.push(val),
+                        SetMode::Old => self.stack.push(old),
+                    }
                     self.ip += 1;
                 }
 
@@ -1903,7 +1922,8 @@ impl VM {
                 // Runtime-polymorphic computed write. Arrays index by int (OOB or
                 // negative is an error — no hole-growing); objects key by the
                 // ToString'd key; strings are immutable (TypeError).
-                Instr::IndexSet => {
+                Instr::IndexSet(mode) => {
+                    let mode = *mode;
                     let val = self.stack.pop().ok_or(VMError::StackUnderflow)?;
                     let key = self.stack.pop().ok_or(VMError::StackUnderflow)?;
                     let container = self.pop_ptr()?;
@@ -1914,6 +1934,26 @@ impl VM {
                         HeapValue::Object(_) => false,
                         // Strings are immutable; closures aren't indexable.
                         _ => return Err(VMError::TypeError),
+                    };
+                    let old = if matches!(mode, SetMode::Old) {
+                        // Read the previous value before the write (for postfix
+                        // `++`/`--` on computed targets).
+                        if is_array {
+                            let idx = as_i64(&key).ok_or(VMError::TypeError)?;
+                            if idx < 0 {
+                                return Err(VMError::ValueError);
+                            }
+                            self.heap_arr(container)
+                                .and_then(|a| a.get(idx as usize).copied())
+                                .unwrap_or(StackValue::Undefined)
+                        } else {
+                            let field = self.to_js_string(&key, 0);
+                            self.heap_obj(container)
+                                .and_then(|o| o.get(&field).copied())
+                                .unwrap_or(StackValue::Undefined)
+                        }
+                    } else {
+                        StackValue::Undefined // placeholder, unused
                     };
                     if is_array {
                         let idx = as_i64(&key).ok_or(VMError::TypeError)?;
@@ -1931,9 +1971,10 @@ impl VM {
                         let obj = self.heap_obj_mut(container).ok_or(VMError::TypeError)?;
                         obj.insert(field, val);
                     }
-                    // Leave the assigned value (see ObjSet): assignment is an
-                    // expression, and this keeps `arr[i] = v` shuffle-free.
-                    self.stack.push(val);
+                    match mode {
+                        SetMode::New => self.stack.push(val),
+                        SetMode::Old => self.stack.push(old),
+                    }
                     self.ip += 1;
                 }
 
@@ -3228,9 +3269,9 @@ mod tests {
             Push(n(20.0)),
             Push(n(30.0)),
             ArrNew(3),
-            Push(n(1.0)),  // index
-            Push(n(99.0)), // value
-            IndexSet,      // pops value, index, arr_ptr; leaves the value
+            Push(n(1.0)),           // index
+            Push(n(99.0)),          // value
+            IndexSet(SetMode::New), // pops value, index, arr_ptr; leaves the value
         ];
         // IndexSet leaves the assigned value (assignment is an expression).
         assert_eq!(run(code), vec![n(99.0)]);
@@ -3244,13 +3285,13 @@ mod tests {
             Push(n(20.0)),
             Push(n(30.0)),
             ArrNew(3),
-            Dup,           // save ptr for later
-            Push(n(1.0)),  // index
-            Push(n(99.0)), // value
-            IndexSet,      // pops value, index, ptr_copy; leaves value → [ptr, 99]
-            Pop(1),        // drop the assigned-value result → [ptr]
-            Push(n(1.0)),  // index
-            IndexGet,      // pops index, ptr → pushes arr[1]
+            Dup,                    // save ptr for later
+            Push(n(1.0)),           // index
+            Push(n(99.0)),          // value
+            IndexSet(SetMode::New), // pops value, index, ptr_copy; leaves value → [ptr, 99]
+            Pop(1),                 // drop the assigned-value result → [ptr]
+            Push(n(1.0)),           // index
+            IndexGet,               // pops index, ptr → pushes arr[1]
         ];
         assert_eq!(run(code), vec![n(99.0)]);
     }
@@ -3271,9 +3312,9 @@ mod tests {
         let code = vec![
             Push(n(10.0)),
             ArrNew(1),
-            Push(n(5.0)),  // index
-            Push(n(99.0)), // value
-            IndexSet,      // pops: value, index, arr_ptr
+            Push(n(5.0)),           // index
+            Push(n(99.0)),          // value
+            IndexSet(SetMode::New), // pops: value, index, arr_ptr
         ];
         assert!(matches!(run_err(code), VMError::ValueError));
     }
@@ -3329,7 +3370,7 @@ mod tests {
             Dup,                                  // keep ptr for verification
             Push(s(0)),                           // field "y" (heap[0]="y") — pushed before val
             Push(n(99.0)),                        // val — on top
-            IndexSet,                             // obj.y = 99; leaves val → [ptr, 99]
+            IndexSet(SetMode::New),               // obj.y = 99; leaves val → [ptr, 99]
             Pop(1),                               // drop the result → [ptr]
             ObjGet("y".into()),                   // → 99
         ]);
@@ -3351,10 +3392,10 @@ mod tests {
             Push(n(2.0)),                         // x value
             Push(n(1.0)),                         // y value
             ObjNew(vec!["x".into(), "y".into()]), // x=2, y=1
-            Dup,                // keep ptr for verification after ObjSet consumes one
-            Push(n(99.0)),      // value to set
-            ObjSet("x".into()), // obj.x = 99; leaves value → [ptr, 99]
-            Pop(1),             // drop the result → [ptr]
+            Dup,           // keep ptr for verification after ObjSet consumes one
+            Push(n(99.0)), // value to set
+            ObjSet("x".into(), SetMode::New), // obj.x = 99; leaves value → [ptr, 99]
+            Pop(1),        // drop the result → [ptr]
             ObjGet("x".into()), // → 99
         ];
         assert_eq!(run(code), vec![n(99.0)]);

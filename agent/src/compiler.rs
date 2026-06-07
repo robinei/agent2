@@ -16,7 +16,7 @@ use oxc_parser::Parser;
 use oxc_span::{GetSpan, SourceType};
 
 use crate::builtin::Builtin;
-use crate::vm::{Instr, SlotKind, StackValue};
+use crate::vm::{Instr, SetMode, SlotKind, StackValue};
 
 /// A compiled program: the flat instruction stream, a parallel span table
 /// (`spans[ip]` = source byte offset of the instruction at `ip`), and the
@@ -1331,15 +1331,9 @@ impl<'src> Compiler<'src> {
 
     /// `++x` / `x++` / `--x` / `x--`. Numeric (forces `ToNumber` via `Sub`): the
     /// new value is `old − p` where `p = -1` for `++` and `+1` for `--`. Prefix
-    /// leaves the new value; postfix recovers and leaves the old value as
-    /// `new + p` (exact for the integers loop counters use).
-    ///
-    /// **Accepted divergence:** For non-local targets (member/index), postfix
-    /// `++`/`--` recomputes the old value as `new ∓ 1` rather than preserving
-    /// the source operand. It's exact for integers within 2^53 (loop counters),
-    /// but `let x = 0.1; x++` returns `0.1000…009` here vs `0.1` in JS.
-    /// For locals, `IncLocal` preserves the exact old value (postfix is exact),
-    /// fixing the divergence for the common loop-counter case.
+    /// leaves the new value; postfix leaves the old value. For locals, `IncLocal`
+    /// handles prefix/postfix in one instruction. For non-locals, `ObjSet`/
+    /// `IndexSet` in `SetMode::Old` preserves the exact old value.
     fn compile_update(&mut self, u: &ast::UpdateExpression, value_needed: bool) {
         let span = u.span.start;
         let lv = match self.lvalue_from_simple_target(&u.argument) {
@@ -1379,16 +1373,18 @@ impl<'src> Compiler<'src> {
         self.emit(Instr::Push(p), span);
         self.emit(Instr::Sub, span);
         if value_needed {
-            self.lvalue_emit_store(&lv, span);
+            let mode = if u.prefix { SetMode::New } else { SetMode::Old };
+            match &lv {
+                LValue::Member(_, field) => {
+                    self.emit(Instr::ObjSet(field.clone(), mode), span);
+                }
+                LValue::Index(..) => {
+                    self.emit(Instr::IndexSet(mode), span);
+                }
+                LValue::Local(_) => unreachable!("handled above"),
+            }
         } else {
             self.lvalue_emit_store_void(&lv, span);
-        }
-        if value_needed && !u.prefix {
-            // Postfix: recover the old value (new + p).
-            // Accepted divergence: for floating-point values, this may differ
-            // from JS by ~1 ULP (see doc comment above).
-            self.emit(Instr::Push(p), span);
-            self.emit(Instr::Add, span);
         }
     }
 
@@ -1512,8 +1508,8 @@ impl<'src> Compiler<'src> {
             LValue::Local(slot) => {
                 self.emit(Instr::TeeLocal(*slot), span);
             }
-            LValue::Member(_, field) => self.emit(Instr::ObjSet(field.clone()), span),
-            LValue::Index(..) => self.emit(Instr::IndexSet, span),
+            LValue::Member(_, field) => self.emit(Instr::ObjSet(field.clone(), SetMode::New), span),
+            LValue::Index(..) => self.emit(Instr::IndexSet(SetMode::New), span),
         }
     }
 
@@ -1527,11 +1523,11 @@ impl<'src> Compiler<'src> {
                 self.emit(Instr::SetLocal(*slot), span);
             }
             LValue::Member(_, field) => {
-                self.emit(Instr::ObjSet(field.clone()), span);
+                self.emit(Instr::ObjSet(field.clone(), SetMode::New), span);
                 self.emit(Instr::Pop(1), span);
             }
             LValue::Index(..) => {
-                self.emit(Instr::IndexSet, span);
+                self.emit(Instr::IndexSet(SetMode::New), span);
                 self.emit(Instr::Pop(1), span);
             }
         }
@@ -2780,9 +2776,9 @@ mod tests {
         assert_eq!(eval_phase2("let x = 5; return --x;"), num(4.0));
         // `++` coerces like ToNumber (string "5" → 6, not "51").
         assert_eq!(eval_phase2("let x = \"5\"; x++; return x;"), num(6.0));
-        // Member / index targets.
+        // Member / index targets — postsets now preserves the exact old value.
         let vm = run_vm("state.o = { n: 1 }; state.r = state.o.n++; state.after = state.o.n;");
-        assert_eq!(state_val(&vm, "r"), num(1.0));
+        assert_eq!(state_val(&vm, "r"), StackValue::PosInt(1));
         assert_eq!(state_val(&vm, "after"), num(2.0));
         let vm = run_vm("state.arr = [10]; state.r = ++state.arr[0]; state.after = state.arr[0];");
         assert_eq!(state_val(&vm, "r"), num(11.0));
