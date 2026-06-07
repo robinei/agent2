@@ -420,13 +420,10 @@ impl<'src> Compiler<'src> {
                 self.emit(Instr::Label(end), span);
             }
             Op::Or => {
-                // falsy: drop lhs, eval rhs; truthy: keep lhs.
-                let rhs = self.new_label();
+                // truthy: keep lhs; falsy: drop lhs, eval rhs.
                 let end = self.new_label();
                 self.emit(Instr::Dup, span);
-                self.emit(Instr::JFalse(rhs), span);
-                self.emit(Instr::Jump(end), span);
-                self.emit(Instr::Label(rhs), span);
+                self.emit(Instr::JTrue(end), span);
                 self.emit(Instr::Pop(1), span);
                 self.compile_expr(&log.right);
                 self.emit(Instr::Label(end), span);
@@ -1086,6 +1083,7 @@ fn backpatch(code: Vec<Instr>, spans: Vec<u32>, next_label: u32) -> (Vec<Instr>,
             Instr::Label(_) => continue,
             Instr::Jump(l) => Instr::Jump(label_offset[l as usize]),
             Instr::JFalse(l) => Instr::JFalse(label_offset[l as usize]),
+            Instr::JTrue(l) => Instr::JTrue(label_offset[l as usize]),
             Instr::Call(l, n) => Instr::Call(label_offset[l as usize], n),
             Instr::MakeClosure(l, caps) => Instr::MakeClosure(label_offset[l as usize], caps),
             Instr::Push(StackValue::Fn(l)) => Instr::Push(StackValue::Fn(label_offset[l as usize])),

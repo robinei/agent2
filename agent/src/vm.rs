@@ -261,6 +261,17 @@ pub enum Instr {
     Swap, // any, any -> any, any
     Rot,  // any, any, any -> any, any, any
 
+    // Generalized stack reach (Forth-like), counting from the top (0 = top).
+    // Both reject reaching below the current frame's temporaries (frame_floor),
+    // like Dup/Swap/Rot. Pick is the read-modify-write workhorse (duplicate an
+    // lvalue's object/key for a load-then-store); Dig reorders without copying.
+    //
+    // Pick(n): copy the n-th-from-top value to the top. Pick(0) == Dup.
+    Pick(usize), // any^(n+1) -> any^(n+1), any
+    // Dig(n): move the n-th-from-top value to the top, removing it from its
+    // old position. Dig(0) is a no-op, Dig(1) == Swap, Dig(2) == Rot.
+    Dig(usize), // any^(n+1) -> any^(n+1)
+
     // calls function starting at address. the N arguments are passed on the
     // stack in left-to-right order (arg 0 pushed first / deepest), and become
     // the new frame's args. depends on function whether or not a result is left
@@ -324,6 +335,10 @@ pub enum Instr {
 
     // pops the topmost value from the stack. jumps to the address if false
     JFalse(CodeAddr), // () -> ()
+
+    // pops the topmost value from the stack. jumps to the address if truthy.
+    // The truthy-mirror of JFalse, so `||` lowers without an extra Jump.
+    JTrue(CodeAddr), // () -> ()
 
     // EFFECT: invokes the named tool or function.
     // pops N arguments off the stack; args are taken in push order, so with
@@ -1189,6 +1204,31 @@ impl VM {
                     self.ip += 1;
                 }
 
+                Instr::Pick(n) => {
+                    let n = *n;
+                    let len = self.stack.len();
+                    // The picked value sits at len-1-n; it (and everything above)
+                    // must be a temporary, not a local/arg.
+                    if len < self.frame_floor() + n + 1 {
+                        return Err(VMError::StackUnderflow);
+                    }
+                    let val = self.stack[len - 1 - n];
+                    self.stack.push(val);
+                    self.ip += 1;
+                }
+
+                Instr::Dig(n) => {
+                    let n = *n;
+                    let len = self.stack.len();
+                    if len < self.frame_floor() + n + 1 {
+                        return Err(VMError::StackUnderflow);
+                    }
+                    // Remove the n-th-from-top value and re-push it on top.
+                    let val = self.stack.remove(len - 1 - n);
+                    self.stack.push(val);
+                    self.ip += 1;
+                }
+
                 // ── control flow ─────────────────────────────────
                 Instr::Call(addr, nargs) => {
                     if *addr as usize >= self.code.len() {
@@ -1305,6 +1345,18 @@ impl VM {
                     }
                     let val = self.stack.pop().ok_or(VMError::StackUnderflow)?;
                     if !self.is_truthy(&val) {
+                        self.ip = *addr;
+                    } else {
+                        self.ip += 1;
+                    }
+                }
+
+                Instr::JTrue(addr) => {
+                    if *addr as usize > self.code.len() {
+                        return Err(VMError::BadCall);
+                    }
+                    let val = self.stack.pop().ok_or(VMError::StackUnderflow)?;
+                    if self.is_truthy(&val) {
                         self.ip = *addr;
                     } else {
                         self.ip += 1;
@@ -2243,6 +2295,53 @@ mod tests {
         );
         assert!(matches!(run_err(vec![Swap]), VMError::StackUnderflow));
         assert!(matches!(run_err(vec![Rot]), VMError::StackUnderflow));
+    }
+
+    #[test]
+    fn pick() {
+        // Pick(0) is Dup; Pick(n) copies the n-th-from-top value to the top.
+        assert_eq!(run(vec![Push(n(1.0)), Pick(0)]), vec![n(1.0), n(1.0)]);
+        assert_eq!(
+            run(vec![Push(n(1.0)), Push(n(2.0)), Pick(1)]),
+            vec![n(1.0), n(2.0), n(1.0)]
+        );
+        assert_eq!(
+            run(vec![Push(n(1.0)), Push(n(2.0)), Push(n(3.0)), Pick(2)]),
+            vec![n(1.0), n(2.0), n(3.0), n(1.0)]
+        );
+        // Cannot reach below the frame's temporaries.
+        assert!(matches!(
+            run_err(vec![Push(n(1.0)), Pick(1)]),
+            VMError::StackUnderflow
+        ));
+    }
+
+    #[test]
+    fn dig() {
+        // Dig(0) no-op, Dig(1) == Swap, Dig(2) == Rot.
+        assert_eq!(run(vec![Push(n(1.0)), Dig(0)]), vec![n(1.0)]);
+        assert_eq!(
+            run(vec![Push(n(1.0)), Push(n(2.0)), Dig(1)]),
+            vec![n(2.0), n(1.0)]
+        );
+        assert_eq!(
+            run(vec![Push(n(1.0)), Push(n(2.0)), Push(n(3.0)), Dig(2)]),
+            vec![n(2.0), n(3.0), n(1.0)]
+        );
+        assert!(matches!(
+            run_err(vec![Push(n(1.0)), Dig(1)]),
+            VMError::StackUnderflow
+        ));
+    }
+
+    #[test]
+    fn jtrue() {
+        // Truthy takes the jump (skipping the Push); falsy falls through.
+        assert_eq!(run(vec![Push(b(true)), JTrue(3), Push(n(9.0))]), vec![]);
+        assert_eq!(
+            run(vec![Push(b(false)), JTrue(3), Push(n(9.0))]),
+            vec![n(9.0)]
+        );
     }
 
     // ── type predicates ───────────────────────────────────────────
