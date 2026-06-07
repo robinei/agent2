@@ -243,6 +243,14 @@ pub struct VM {
     pub fuel: u64,
 }
 
+/// Whether an `IncLocal` is prefix (`++x`) or postfix (`x++`), controlling
+/// whether the old or new value is left on the stack.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum UpdateMode {
+    Prefix,
+    Postfix,
+}
+
 // Instructions for a stack based language used for LLM composition of complex tool flows.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Instr {
@@ -279,6 +287,10 @@ pub enum Instr {
     // Dig(n): move the n-th-from-top value to the top, removing it from its
     // old position. Dig(0) is a no-op, Dig(1) == Swap, Dig(2) == Rot.
     Dig(usize), // any^(n+1) -> any^(n+1)
+
+    // Drop `n` values directly below the top, leaving the top in place.
+    // Nip(1) ≡ Swap; Pop, Nip(n) is the symmetric inverse of Dig(n).
+    Nip(usize), // any^(n+1) -> any
 
     // calls function starting at address. the N arguments are passed on the
     // stack in left-to-right order (arg 0 pushed first / deepest), and become
@@ -321,6 +333,18 @@ pub enum Instr {
 
     // pops the topmost value from the stack and writes to the local at the given index
     SetLocal(LocalIndex), // any -> ()
+
+    // Stores the top of stack to a local without popping (like WASM's
+    // `local.tee`): the value stays on the stack AND is written to the local
+    // slot. Replaces the common `Dup; SetLocal` pair.
+    TeeLocal(LocalIndex), // any -> any
+
+    // Increments or decrements a local variable in place. `p` is the value to
+    // *subtract* from the variable: NegInt(-1) increments (sub −1 = +1),
+    // PosInt(1) decrements (sub 1 = −1). Prefix mode leaves the new value on
+    // the stack; Postfix leaves the old value. Only emitted for `++`/`--` on
+    // local variables; member/index targets fall back to load-sub-store.
+    IncLocal(LocalIndex, StackValue, UpdateMode), // () -> any
 
     // JS `typeof`: pops a value and pushes its type tag as a string. Tags match
     // JS exactly, so they are coarse: "undefined", "object" (covers Null, arrays
@@ -1255,6 +1279,21 @@ impl VM {
                     self.ip += 1;
                 }
 
+                Instr::Nip(n) => {
+                    let n = *n;
+                    let len = self.stack.len();
+                    if len < self.frame_floor() + n + 1 {
+                        return Err(VMError::StackUnderflow);
+                    }
+                    // Remove n values directly below the top, leaving the top
+                    // in place. Nip(1) ≡ Swap; Pop, Nip(n) is the inverse of
+                    // Dig(n): where Dig moves element len-1-n to the top,
+                    // Nip drops it.
+                    let start = len - 1 - n;
+                    self.stack.drain(start..start + n);
+                    self.ip += 1;
+                }
+
                 // ── control flow ─────────────────────────────────
                 Instr::Call(addr, nargs) => {
                     if *addr as usize >= self.code.len() {
@@ -1482,6 +1521,63 @@ impl VM {
                         }
                         _ => self.stack[slot] = val,
                     }
+                    self.ip += 1;
+                }
+
+                Instr::TeeLocal(local) => {
+                    let frame = self.callstack.last().ok_or(VMError::BadLocal)?;
+                    if *local >= frame.local_count {
+                        return Err(VMError::BadLocal);
+                    }
+                    let val = *self.stack.last().ok_or(VMError::StackUnderflow)?;
+                    let slot = (self.fp + local) as usize;
+                    // Like SetLocal but peeks: the value stays on the stack
+                    // (assignment is an expression) while still writing to the
+                    // local. Replaces Dup; SetLocal.
+                    match self.stack[slot] {
+                        StackValue::Upval(c) => {
+                            *self.cells.get_mut(c as usize).ok_or(VMError::ValueError)? = val;
+                        }
+                        _ => self.stack[slot] = val,
+                    }
+                    self.ip += 1;
+                }
+
+                Instr::IncLocal(local, p, mode) => {
+                    let frame = self.callstack.last().ok_or(VMError::BadLocal)?;
+                    if *local >= frame.local_count {
+                        return Err(VMError::BadLocal);
+                    }
+                    let p: f64 = match p {
+                        StackValue::PosInt(n) => *n as f64,
+                        StackValue::NegInt(n) => *n as f64,
+                        _ => return Err(VMError::ValueError),
+                    };
+                    // Read current value (dereferencing boxed slots).
+                    let old = match self.stack[(self.fp + local) as usize] {
+                        StackValue::Upval(c) => {
+                            *self.cells.get(c as usize).ok_or(VMError::ValueError)?
+                        }
+                        other => other,
+                    };
+                    let old_num = self.to_number(&old).ok_or(VMError::TypeError)?;
+                    // Compute new value: subtract p (p = -1 for ++, p = 1 for --).
+                    let new_num = old_num - p;
+                    let new_val = StackValue::Number(new_num);
+                    // Store the new value.
+                    let slot = (self.fp + local) as usize;
+                    match self.stack[slot] {
+                        StackValue::Upval(c) => {
+                            *self.cells.get_mut(c as usize).ok_or(VMError::ValueError)? = new_val;
+                        }
+                        _ => self.stack[slot] = new_val,
+                    }
+                    // Push the appropriate result: old for postfix, new for prefix.
+                    let result = match mode {
+                        UpdateMode::Prefix => new_val,
+                        UpdateMode::Postfix => StackValue::Number(old_num),
+                    };
+                    self.stack.push(result);
                     self.ip += 1;
                 }
 
@@ -2129,6 +2225,100 @@ mod tests {
         assert!(matches!(
             run_err(vec![Push(n(1.0)), Dig(1)]),
             VMError::StackUnderflow
+        ));
+    }
+
+    #[test]
+    fn nip() {
+        // Nip(1) drops the value below top, leaving top in place.
+        assert_eq!(run(vec![Push(n(1.0)), Push(n(2.0)), Nip(1)]), vec![n(2.0)]);
+        // Nip(2) drops two values below top.
+        assert_eq!(
+            run(vec![Push(n(1.0)), Push(n(2.0)), Push(n(3.0)), Nip(2)]),
+            vec![n(3.0)]
+        );
+        // Nip rejects reaching below frame_floor.
+        assert!(matches!(
+            run_err(vec![Push(n(1.0)), Nip(1)]),
+            VMError::StackUnderflow
+        ));
+    }
+
+    #[test]
+    fn tee_local() {
+        // TeeLocal writes top to a local without popping.
+        // Alloc pushes Undefined as local 0; Push pushes 5.0 on top;
+        // TeeLocal writes 5.0 into local 0 (replacing Undefined) and
+        // leaves it on the stack. Result: [5.0, 5.0].
+        assert_eq!(
+            run(vec![
+                Alloc(vec![SlotKind::Plain]),
+                Push(n(5.0)),
+                TeeLocal(0),
+            ]),
+            vec![n(5.0), n(5.0)]
+        );
+        // Verify the local was actually written.
+        assert_eq!(
+            run(vec![
+                Alloc(vec![SlotKind::Plain]),
+                Push(n(7.0)),
+                TeeLocal(0),
+                Pop(1),
+                Local(0),
+            ]),
+            vec![n(7.0), n(7.0)]
+        );
+        // TeeLocal on out-of-range slot errors.
+        assert!(matches!(
+            run_err(vec![Push(n(1.0)), TeeLocal(0)]),
+            VMError::BadLocal
+        ));
+    }
+
+    #[test]
+    fn inc_local() {
+        use crate::vm::UpdateMode;
+        // Prefix ++ in place: new value on stack AND in local.
+        assert_eq!(
+            run(vec![
+                Alloc(vec![SlotKind::Plain]),
+                Push(n(5.0)),
+                SetLocal(0),
+                IncLocal(0, StackValue::NegInt(-1), UpdateMode::Prefix),
+            ]),
+            vec![n(6.0), n(6.0)]
+        );
+        // Postfix ++: old value on stack, local updated to new.
+        assert_eq!(
+            run(vec![
+                Alloc(vec![SlotKind::Plain]),
+                Push(n(5.0)),
+                SetLocal(0),
+                IncLocal(0, StackValue::NegInt(-1), UpdateMode::Postfix),
+            ]),
+            vec![n(6.0), n(5.0)]
+        );
+        // Postfix --: old value pushed, local decremented.
+        assert_eq!(
+            run(vec![
+                Alloc(vec![SlotKind::Plain]),
+                Push(n(5.0)),
+                SetLocal(0),
+                IncLocal(0, StackValue::PosInt(1), UpdateMode::Postfix),
+                Pop(1), // drop old value
+                Local(0),
+            ]),
+            vec![n(4.0), n(4.0)]
+        );
+        // IncLocal on out-of-range slot errors.
+        assert!(matches!(
+            run_err(vec![IncLocal(
+                0,
+                StackValue::NegInt(-1),
+                UpdateMode::Prefix
+            )]),
+            VMError::BadLocal
         ));
     }
 

@@ -218,11 +218,21 @@ impl<'src> Compiler<'src> {
     fn compile_stmt(&mut self, stmt: &ast::Statement) {
         match stmt {
             // Every expression statement leaves one value, popped to keep the
-            // stack-discipline invariant (one value per expression).
-            ast::Statement::ExpressionStatement(es) => {
-                self.compile_expr(&es.expression);
-                self.emit(Instr::Pop(1), es.span.start);
-            }
+            // stack-discipline invariant (one value per expression). For
+            // assignments and updates targeting locals, we lower directly in a
+            // "value-not-needed" mode, skipping the wasted Dup/Pop pair.
+            ast::Statement::ExpressionStatement(es) => match &es.expression {
+                ast::Expression::AssignmentExpression(a) => {
+                    self.compile_assignment(a, false);
+                }
+                ast::Expression::UpdateExpression(u) => {
+                    self.compile_update(u, false);
+                }
+                _ => {
+                    self.compile_expr(&es.expression);
+                    self.emit(Instr::Pop(1), es.span.start);
+                }
+            },
             ast::Statement::VariableDeclaration(decl) => self.compile_var_decl(decl),
             ast::Statement::BlockStatement(block) => {
                 // A block is a fresh lexical scope; slots are function-wide so
@@ -304,10 +314,13 @@ impl<'src> Compiler<'src> {
                         }
                         (None, Some(slot)) if !is_var => {
                             // `let x;` re-initializes to `undefined` each time the
-                            // declaration executes (e.g. per loop iteration); a
-                            // bare `var x;` is a no-op (already hoisted).
-                            self.emit(Instr::Push(StackValue::Undefined), d.span.start);
-                            self.emit(Instr::SetLocal(slot), d.span.start);
+                            // declaration executes (e.g. per loop iteration).
+                            // Outside a loop `Alloc` already zeroed the slot, so
+                            // skip the redundant Push+SetLocal.
+                            if !self.loops.is_empty() {
+                                self.emit(Instr::Push(StackValue::Undefined), d.span.start);
+                                self.emit(Instr::SetLocal(slot), d.span.start);
+                            }
                         }
                         _ => {}
                     }
@@ -380,7 +393,10 @@ impl<'src> Compiler<'src> {
             }
             ast::BindingPattern::ArrayPattern(arr) => {
                 if arr.rest.is_some() {
-                    self.error(arr.span.start, "rest elements in destructuring are not supported");
+                    self.error(
+                        arr.span.start,
+                        "rest elements in destructuring are not supported",
+                    );
                 }
                 for (i, el) in arr.elements.iter().enumerate() {
                     if let Some(el) = el {
@@ -394,7 +410,10 @@ impl<'src> Compiler<'src> {
             }
             ast::BindingPattern::ObjectPattern(obj) => {
                 if obj.rest.is_some() {
-                    self.error(obj.span.start, "rest elements in destructuring are not supported");
+                    self.error(
+                        obj.span.start,
+                        "rest elements in destructuring are not supported",
+                    );
                 }
                 for prop in &obj.properties {
                     self.emit(Instr::Dup, span);
@@ -727,7 +746,7 @@ impl<'src> Compiler<'src> {
             ast::Expression::UnaryExpression(un) => self.compile_unary(un),
             ast::Expression::LogicalExpression(log) => self.compile_logical(log),
             ast::Expression::ConditionalExpression(cond) => self.compile_conditional(cond),
-            ast::Expression::AssignmentExpression(a) => self.compile_assignment(a),
+            ast::Expression::AssignmentExpression(a) => self.compile_assignment(a, true),
             ast::Expression::SequenceExpression(seq) => {
                 // The comma operator: evaluate each, discard all but the last.
                 let last = seq.expressions.len().saturating_sub(1);
@@ -749,7 +768,7 @@ impl<'src> Compiler<'src> {
 
             ast::Expression::ParenthesizedExpression(p) => self.compile_expr(&p.expression),
 
-            ast::Expression::UpdateExpression(u) => self.compile_update(u),
+            ast::Expression::UpdateExpression(u) => self.compile_update(u, true),
 
             // ── informative errors for out-of-scope nodes ─────────────
             ast::Expression::FunctionExpression(f) => self.error(
@@ -1161,11 +1180,13 @@ impl<'src> Compiler<'src> {
 
     // ── assignment ───────────────────────────────────────────────────────
 
-    /// Assignment is an expression: it leaves the assigned value on the stack.
-    /// Plain `=`, compound (`+=` …), and short-circuiting logical (`&&=`/`||=`/
-    /// `??=`) assignment all share the [`LValue`] read/write lowering. Array/
-    /// object destructuring targets are handled separately.
-    fn compile_assignment(&mut self, a: &ast::AssignmentExpression) {
+    /// Assignment is an expression: when `value_needed` is true, it leaves the
+    /// assigned value on the stack. In void context (`value_needed == false`),
+    /// the value is either consumed by `SetLocal` (for locals) or popped after
+    /// `ObjSet`/`IndexSet`. Plain `=`, compound (`+=` …), and short-circuiting
+    /// logical (`&&=`/`||=`/`??=`) assignment all share the [`LValue`] read/write
+    /// lowering. Array/object destructuring targets are handled separately.
+    fn compile_assignment(&mut self, a: &ast::AssignmentExpression, value_needed: bool) {
         use ast::AssignmentOperator as Op;
         let span = a.span.start;
 
@@ -1179,8 +1200,13 @@ impl<'src> Compiler<'src> {
                     return;
                 }
                 self.compile_expr(&a.right);
-                self.emit(Instr::Dup, span); // one copy is the expression result
+                if value_needed {
+                    self.emit(Instr::Dup, span); // one copy is the expression result
+                }
                 self.destructure_assign(&a.left, span);
+                if !value_needed {
+                    // destructure_assign consumers the source; no value left
+                }
                 return;
             }
             _ => {}
@@ -1195,10 +1221,14 @@ impl<'src> Compiler<'src> {
             Op::Assign => {
                 self.lvalue_emit_addr(&lv, span);
                 self.compile_expr(&a.right);
-                self.lvalue_emit_store(&lv, span);
+                if value_needed {
+                    self.lvalue_emit_store(&lv, span);
+                } else {
+                    self.lvalue_emit_store_void(&lv, span);
+                }
             }
             Op::LogicalAnd | Op::LogicalOr | Op::LogicalNullish => {
-                self.compile_logical_assign(&lv, a.operator, &a.right, span);
+                self.compile_logical_assign(&lv, a.operator, &a.right, span, value_needed);
             }
             _ => {
                 let op = match self.compound_binary_instr(a.operator, span) {
@@ -1209,7 +1239,11 @@ impl<'src> Compiler<'src> {
                 self.lvalue_emit_load(&lv, span);
                 self.compile_expr(&a.right);
                 self.emit(op, span);
-                self.lvalue_emit_store(&lv, span);
+                if value_needed {
+                    self.lvalue_emit_store(&lv, span);
+                } else {
+                    self.lvalue_emit_store_void(&lv, span);
+                }
             }
         }
     }
@@ -1243,13 +1277,15 @@ impl<'src> Compiler<'src> {
     /// Short-circuiting logical assignment: `x &&= v` ≡ `x && (x = v)`,
     /// `x ||= v` ≡ `x || (x = v)`, `x ??= v` ≡ `x ?? (x = v)`. The RHS — and the
     /// store — run only on the non-short-circuit path; the lvalue's address is
-    /// evaluated once. Leaves the resulting value (old on short-circuit, else v).
+    /// evaluated once. When `value_needed` is true, leaves the resulting value
+    /// (old on short-circuit, else v); in void context discards it.
     fn compile_logical_assign(
         &mut self,
         lv: &LValue<'_, '_>,
         op: ast::AssignmentOperator,
         rhs: &ast::Expression,
         span: u32,
+        value_needed: bool,
     ) {
         use ast::AssignmentOperator as Op;
         let keep = self.new_label();
@@ -1260,6 +1296,10 @@ impl<'src> Compiler<'src> {
         match op {
             Op::LogicalNullish => self.emit(Instr::JNotNullish(keep), span),
             Op::LogicalAnd => {
+                // For `&&=`, need a copy of `old` to test truthiness without
+                // consuming it (the keep path needs it). In void context we
+                // can just peek (JFalse pops, but we'd lose old). We always
+                // Dup since the keep path or store path consumes `old`.
                 self.emit(Instr::Dup, span);
                 self.emit(Instr::JFalse(keep), span); // falsy → keep old
             }
@@ -1272,11 +1312,20 @@ impl<'src> Compiler<'src> {
         // Store path: discard old, evaluate the RHS, store it.
         self.emit(Instr::Pop(1), span);
         self.compile_expr(rhs);
-        self.lvalue_emit_store(lv, span);
+        if value_needed {
+            self.lvalue_emit_store(lv, span);
+        } else {
+            self.lvalue_emit_store_void(lv, span);
+        }
         self.emit(Instr::Jump(end), span);
         // Keep path: old is on top, above any address values — drop those.
         self.emit(Instr::Label(keep), span);
-        self.emit_drop_below_top(depth, span);
+        if value_needed {
+            self.emit_drop_below_top(depth, span);
+        } else {
+            // Void: discard EVERYTHING (old + address operands).
+            self.emit(Instr::Pop(1 + depth), span);
+        }
         self.emit(Instr::Label(end), span);
     }
 
@@ -1284,7 +1333,14 @@ impl<'src> Compiler<'src> {
     /// new value is `old − p` where `p = -1` for `++` and `+1` for `--`. Prefix
     /// leaves the new value; postfix recovers and leaves the old value as
     /// `new + p` (exact for the integers loop counters use).
-    fn compile_update(&mut self, u: &ast::UpdateExpression) {
+    ///
+    /// **Accepted divergence:** For non-local targets (member/index), postfix
+    /// `++`/`--` recomputes the old value as `new ∓ 1` rather than preserving
+    /// the source operand. It's exact for integers within 2^53 (loop counters),
+    /// but `let x = 0.1; x++` returns `0.1000…009` here vs `0.1` in JS.
+    /// For locals, `IncLocal` preserves the exact old value (postfix is exact),
+    /// fixing the divergence for the common loop-counter case.
+    fn compile_update(&mut self, u: &ast::UpdateExpression, value_needed: bool) {
         let span = u.span.start;
         let lv = match self.lvalue_from_simple_target(&u.argument) {
             Some(lv) => lv,
@@ -1295,13 +1351,42 @@ impl<'src> Compiler<'src> {
             ast::UpdateOperator::Increment => StackValue::NegInt(-1),
             ast::UpdateOperator::Decrement => StackValue::PosInt(1),
         };
+
+        // Fast path for local variables: use `IncLocal` (1 instruction) when
+        // the value is needed, or load-sub-store when void.
+        if let LValue::Local(slot) = &lv {
+            if value_needed {
+                let mode = if u.prefix {
+                    crate::vm::UpdateMode::Prefix
+                } else {
+                    crate::vm::UpdateMode::Postfix
+                };
+                self.emit(Instr::IncLocal(*slot, p, mode), span);
+            } else {
+                // Void: load, subtract, plain SetLocal (no Dup, no postfix
+                // recovery). The value is consumed by SetLocal.
+                self.emit(Instr::Local(*slot), span);
+                self.emit(Instr::Push(p), span);
+                self.emit(Instr::Sub, span);
+                self.emit(Instr::SetLocal(*slot), span);
+            }
+            return;
+        }
+
+        // Non-local targets (member/index): load-sub-store path.
         self.lvalue_emit_addr(&lv, span);
         self.lvalue_emit_load(&lv, span);
         self.emit(Instr::Push(p), span);
         self.emit(Instr::Sub, span);
-        self.lvalue_emit_store(&lv, span); // leaves the new value
-        if !u.prefix {
+        if value_needed {
+            self.lvalue_emit_store(&lv, span);
+        } else {
+            self.lvalue_emit_store_void(&lv, span);
+        }
+        if value_needed && !u.prefix {
             // Postfix: recover the old value (new + p).
+            // Accepted divergence: for floating-point values, this may differ
+            // from JS by ~1 ULP (see doc comment above).
             self.emit(Instr::Push(p), span);
             self.emit(Instr::Add, span);
         }
@@ -1319,9 +1404,10 @@ impl<'src> Compiler<'src> {
             ast::AssignmentTarget::AssignmentTargetIdentifier(id) => {
                 self.lvalue_for_identifier(id.name.as_str(), id.span.start)
             }
-            ast::AssignmentTarget::StaticMemberExpression(m) => {
-                Some(LValue::Member(&m.object, m.property.name.as_str().to_string()))
-            }
+            ast::AssignmentTarget::StaticMemberExpression(m) => Some(LValue::Member(
+                &m.object,
+                m.property.name.as_str().to_string(),
+            )),
             ast::AssignmentTarget::ComputedMemberExpression(m) => {
                 Some(LValue::Index(&m.object, &m.expression))
             }
@@ -1342,9 +1428,10 @@ impl<'src> Compiler<'src> {
             ast::SimpleAssignmentTarget::AssignmentTargetIdentifier(id) => {
                 self.lvalue_for_identifier(id.name.as_str(), id.span.start)
             }
-            ast::SimpleAssignmentTarget::StaticMemberExpression(m) => {
-                Some(LValue::Member(&m.object, m.property.name.as_str().to_string()))
-            }
+            ast::SimpleAssignmentTarget::StaticMemberExpression(m) => Some(LValue::Member(
+                &m.object,
+                m.property.name.as_str().to_string(),
+            )),
             ast::SimpleAssignmentTarget::ComputedMemberExpression(m) => {
                 Some(LValue::Index(&m.object, &m.expression))
             }
@@ -1357,11 +1444,7 @@ impl<'src> Compiler<'src> {
 
     /// Resolve an identifier write target: a local slot, or an error for
     /// `const`/`state`/undeclared names.
-    fn lvalue_for_identifier<'r, 'a>(
-        &mut self,
-        name: &str,
-        span: u32,
-    ) -> Option<LValue<'r, 'a>> {
+    fn lvalue_for_identifier<'r, 'a>(&mut self, name: &str, span: u32) -> Option<LValue<'r, 'a>> {
         match self.resolve_local(name) {
             Some(info) => {
                 if info.is_const {
@@ -1422,24 +1505,44 @@ impl<'src> Compiler<'src> {
     }
 
     /// With `[address…, value]` on the stack, store `value` into the lvalue and
-    /// leave it on the stack (assignment is an expression).
+    /// leave it on the stack (assignment is an expression). For locals, uses
+    /// `TeeLocal` (the one-instruction equivalent of `Dup; SetLocal`).
     fn lvalue_emit_store(&mut self, lv: &LValue<'_, '_>, span: u32) {
         match lv {
             LValue::Local(slot) => {
-                self.emit(Instr::Dup, span); // keep a copy as the result
-                self.emit(Instr::SetLocal(*slot), span);
+                self.emit(Instr::TeeLocal(*slot), span);
             }
             LValue::Member(_, field) => self.emit(Instr::ObjSet(field.clone()), span),
             LValue::Index(..) => self.emit(Instr::IndexSet, span),
         }
     }
 
+    /// Like [`lvalue_emit_store`], but for void context (the caller does NOT
+    /// need the resulting value). For locals, uses plain `SetLocal` (consumes
+    /// the value, pushing nothing). For non-locals, `ObjSet`/`IndexSet` always
+    /// leave the value — emit a `Pop(1)` to discard it.
+    fn lvalue_emit_store_void(&mut self, lv: &LValue<'_, '_>, span: u32) {
+        match lv {
+            LValue::Local(slot) => {
+                self.emit(Instr::SetLocal(*slot), span);
+            }
+            LValue::Member(_, field) => {
+                self.emit(Instr::ObjSet(field.clone()), span);
+                self.emit(Instr::Pop(1), span);
+            }
+            LValue::Index(..) => {
+                self.emit(Instr::IndexSet, span);
+                self.emit(Instr::Pop(1), span);
+            }
+        }
+    }
+
     /// Remove `n` values sitting directly below the top of the stack, leaving the
-    /// top in place. (`Swap`+`Pop` peels one at a time.)
+    /// top in place. Uses `Nip(n)` (one instruction) rather than `Swap`+`Pop`
+    /// pairs.
     fn emit_drop_below_top(&mut self, n: usize, span: u32) {
-        for _ in 0..n {
-            self.emit(Instr::Swap, span);
-            self.emit(Instr::Pop(1), span);
+        if n > 0 {
+            self.emit(Instr::Nip(n), span);
         }
     }
 
@@ -1452,7 +1555,10 @@ impl<'src> Compiler<'src> {
         match target {
             ast::AssignmentTarget::ArrayAssignmentTarget(arr) => {
                 if arr.rest.is_some() {
-                    self.error(arr.span.start, "rest elements in destructuring are not supported");
+                    self.error(
+                        arr.span.start,
+                        "rest elements in destructuring are not supported",
+                    );
                 }
                 for (i, el) in arr.elements.iter().enumerate() {
                     if let Some(el) = el {
@@ -1466,7 +1572,10 @@ impl<'src> Compiler<'src> {
             }
             ast::AssignmentTarget::ObjectAssignmentTarget(obj) => {
                 if obj.rest.is_some() {
-                    self.error(obj.span.start, "rest elements in destructuring are not supported");
+                    self.error(
+                        obj.span.start,
+                        "rest elements in destructuring are not supported",
+                    );
                 }
                 for prop in &obj.properties {
                     match prop {
@@ -1478,7 +1587,11 @@ impl<'src> Compiler<'src> {
                             if let Some(default) = &p.init {
                                 self.emit_default(default, span);
                             }
-                            self.assign_to_identifier(p.binding.name.as_str(), p.binding.span.start, span);
+                            self.assign_to_identifier(
+                                p.binding.name.as_str(),
+                                p.binding.span.start,
+                                span,
+                            );
                         }
                         ast::AssignmentTargetProperty::AssignmentTargetPropertyProperty(p) => {
                             self.emit(Instr::Dup, span);
@@ -1900,8 +2013,7 @@ fn count_decls_in_stmt(stmt: &ast::Statement) -> u32 {
         }
         ast::Statement::BlockStatement(b) => count_decls_in_stmts(&b.body),
         ast::Statement::IfStatement(s) => {
-            count_decls_in_stmt(&s.consequent)
-                + s.alternate.as_ref().map_or(0, count_decls_in_stmt)
+            count_decls_in_stmt(&s.consequent) + s.alternate.as_ref().map_or(0, count_decls_in_stmt)
         }
         ast::Statement::WhileStatement(s) => count_decls_in_stmt(&s.body),
         ast::Statement::DoWhileStatement(s) => count_decls_in_stmt(&s.body),
@@ -2451,7 +2563,10 @@ mod tests {
     fn local_declarations_and_reassignment() {
         assert_eq!(eval_phase2("let x = 5; return x;"), StackValue::PosInt(5));
         assert_eq!(eval_phase2("const x = 7; return x;"), StackValue::PosInt(7));
-        assert_eq!(eval_phase2("let x = 1; x = 2; return x;"), StackValue::PosInt(2));
+        assert_eq!(
+            eval_phase2("let x = 1; x = 2; return x;"),
+            StackValue::PosInt(2)
+        );
         // Uninitialized local is `undefined`.
         assert_eq!(eval_phase2("let x; return x;"), StackValue::Undefined);
         // Multiple declarators in one statement.
@@ -2461,9 +2576,7 @@ mod tests {
     #[test]
     fn block_scoping() {
         // An inner block shadows; the outer binding is restored after.
-        let vm = run_vm(
-            "let x = 1; { let x = 2; state.inner = x; } state.outer = x;",
-        );
+        let vm = run_vm("let x = 1; { let x = 2; state.inner = x; } state.outer = x;");
         assert_eq!(state_val(&vm, "inner"), StackValue::PosInt(2));
         assert_eq!(state_val(&vm, "outer"), StackValue::PosInt(1));
     }
@@ -2483,13 +2596,24 @@ mod tests {
 
     #[test]
     fn if_else() {
-        assert_eq!(eval_phase2("let r; if (1 > 0) r = 10; else r = 20; return r;"), StackValue::PosInt(10));
-        assert_eq!(eval_phase2("let r; if (0) r = 10; else r = 20; return r;"), StackValue::PosInt(20));
+        assert_eq!(
+            eval_phase2("let r; if (1 > 0) r = 10; else r = 20; return r;"),
+            StackValue::PosInt(10)
+        );
+        assert_eq!(
+            eval_phase2("let r; if (0) r = 10; else r = 20; return r;"),
+            StackValue::PosInt(20)
+        );
         // Dangling-if with no else leaves the prior value.
-        assert_eq!(eval_phase2("let r = 3; if (false) r = 9; return r;"), StackValue::PosInt(3));
+        assert_eq!(
+            eval_phase2("let r = 3; if (false) r = 9; return r;"),
+            StackValue::PosInt(3)
+        );
         // else-if chains.
         assert_eq!(
-            eval_phase2("let x = 2, r; if (x === 1) r = 1; else if (x === 2) r = 2; else r = 3; return r;"),
+            eval_phase2(
+                "let x = 2, r; if (x === 1) r = 1; else if (x === 2) r = 2; else r = 3; return r;"
+            ),
             StackValue::PosInt(2)
         );
     }
@@ -2554,12 +2678,16 @@ mod tests {
     fn break_and_continue() {
         // break stops the loop early.
         assert_eq!(
-            eval_phase2("let s = 0; for (let i = 0; i < 10; i++) { if (i === 3) break; s += i; } return s;"),
+            eval_phase2(
+                "let s = 0; for (let i = 0; i < 10; i++) { if (i === 3) break; s += i; } return s;"
+            ),
             num(3.0)
         );
         // continue skips the rest of the body (the for-update still runs).
         assert_eq!(
-            eval_phase2("let s = 0; for (let i = 0; i < 5; i++) { if (i % 2 === 0) continue; s += i; } return s;"),
+            eval_phase2(
+                "let s = 0; for (let i = 0; i < 5; i++) { if (i % 2 === 0) continue; s += i; } return s;"
+            ),
             num(4.0)
         );
         // break only exits the innermost loop.
@@ -2597,12 +2725,30 @@ mod tests {
 
     #[test]
     fn logical_assignment() {
-        assert_eq!(eval_phase2("let x = 0; x ||= 5; return x;"), StackValue::PosInt(5));
-        assert_eq!(eval_phase2("let x = 3; x ||= 5; return x;"), StackValue::PosInt(3));
-        assert_eq!(eval_phase2("let x = 3; x &&= 7; return x;"), StackValue::PosInt(7));
-        assert_eq!(eval_phase2("let x = 0; x &&= 7; return x;"), StackValue::PosInt(0));
-        assert_eq!(eval_phase2("let x = null; x ??= 9; return x;"), StackValue::PosInt(9));
-        assert_eq!(eval_phase2("let x = 0; x ??= 9; return x;"), StackValue::PosInt(0));
+        assert_eq!(
+            eval_phase2("let x = 0; x ||= 5; return x;"),
+            StackValue::PosInt(5)
+        );
+        assert_eq!(
+            eval_phase2("let x = 3; x ||= 5; return x;"),
+            StackValue::PosInt(3)
+        );
+        assert_eq!(
+            eval_phase2("let x = 3; x &&= 7; return x;"),
+            StackValue::PosInt(7)
+        );
+        assert_eq!(
+            eval_phase2("let x = 0; x &&= 7; return x;"),
+            StackValue::PosInt(0)
+        );
+        assert_eq!(
+            eval_phase2("let x = null; x ??= 9; return x;"),
+            StackValue::PosInt(9)
+        );
+        assert_eq!(
+            eval_phase2("let x = 0; x ??= 9; return x;"),
+            StackValue::PosInt(0)
+        );
 
         // Short-circuit must NOT evaluate the RHS (nor store).
         let vm = run_vm("state.hit = 0; let x = 3; x ||= (state.hit = 1); state.r = x;");
@@ -2649,10 +2795,19 @@ mod tests {
         assert_eq!(state_val(&vm, "a"), StackValue::PosInt(10));
         assert_eq!(state_val(&vm, "b"), StackValue::PosInt(20));
         // Holes skip elements.
-        assert_eq!(eval_phase2("let [, b] = [1, 2]; return b;"), StackValue::PosInt(2));
+        assert_eq!(
+            eval_phase2("let [, b] = [1, 2]; return b;"),
+            StackValue::PosInt(2)
+        );
         // Defaults apply only when the element is undefined.
-        assert_eq!(eval_phase2("let [a = 5] = []; return a;"), StackValue::PosInt(5));
-        assert_eq!(eval_phase2("let [a = 5] = [1]; return a;"), StackValue::PosInt(1));
+        assert_eq!(
+            eval_phase2("let [a = 5] = []; return a;"),
+            StackValue::PosInt(5)
+        );
+        assert_eq!(
+            eval_phase2("let [a = 5] = [1]; return a;"),
+            StackValue::PosInt(1)
+        );
         // Nested.
         let vm = run_vm("let [[a], { b }] = [[1], { b: 2 }]; state.a = a; state.b = b;");
         assert_eq!(state_val(&vm, "a"), StackValue::PosInt(1));
@@ -2665,9 +2820,18 @@ mod tests {
         assert_eq!(state_val(&vm, "x"), StackValue::PosInt(1));
         assert_eq!(state_val(&vm, "y"), StackValue::PosInt(2));
         // Renaming and defaults.
-        assert_eq!(eval_phase2("let { a: aa } = { a: 7 }; return aa;"), StackValue::PosInt(7));
-        assert_eq!(eval_phase2("let { b = 3 } = {}; return b;"), StackValue::PosInt(3));
-        assert_eq!(eval_phase2("let { b = 3 } = { b: 9 }; return b;"), StackValue::PosInt(9));
+        assert_eq!(
+            eval_phase2("let { a: aa } = { a: 7 }; return aa;"),
+            StackValue::PosInt(7)
+        );
+        assert_eq!(
+            eval_phase2("let { b = 3 } = {}; return b;"),
+            StackValue::PosInt(3)
+        );
+        assert_eq!(
+            eval_phase2("let { b = 3 } = { b: 9 }; return b;"),
+            StackValue::PosInt(9)
+        );
     }
 
     #[test]
@@ -2697,21 +2861,25 @@ mod tests {
     #[test]
     fn phase2_diagnostics() {
         for src in [
-            "const x = 1; x = 2;",               // const reassignment
-            "const x = 1; x += 1;",              // const compound
-            "const x = 1; x++;",                 // const update
-            "let state = 1;",                    // shadowing blessed `state`
-            "y = 1;",                            // assignment to undeclared
-            "break;",                            // break outside a loop
-            "continue;",                         // continue outside a loop
-            "let [a, ...rest] = [1, 2];",        // rest in destructuring
-            "outer: while (true) break outer;",  // labeled statements
+            "const x = 1; x = 2;",              // const reassignment
+            "const x = 1; x += 1;",             // const compound
+            "const x = 1; x++;",                // const update
+            "let state = 1;",                   // shadowing blessed `state`
+            "y = 1;",                           // assignment to undeclared
+            "break;",                           // break outside a loop
+            "continue;",                        // continue outside a loop
+            "let [a, ...rest] = [1, 2];",       // rest in destructuring
+            "outer: while (true) break outer;", // labeled statements
         ] {
             assert!(compile(src).is_err(), "expected `{src}` to fail to compile");
         }
         // Spot-check messages.
         let errs = compile("const x = 1; x = 2;").expect_err("const");
-        assert!(errs[0].message.contains("constant"), "got: {}", errs[0].message);
+        assert!(
+            errs[0].message.contains("constant"),
+            "got: {}",
+            errs[0].message
+        );
         let errs = compile("let [a, ...rest] = [1, 2];").expect_err("rest");
         assert!(errs[0].message.contains("rest"), "got: {}", errs[0].message);
     }
