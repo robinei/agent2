@@ -3,13 +3,12 @@
 //! Compiles a subset of JS into the stack VM in `vm.rs`. Parses with
 //! `oxc_parser`, traverses the AST, lowers supported constructs, and emits
 //! informative `Diagnostic`s for the rest. See `COMPILER_PLAN.md` for the full
-//! design; this file is the Phase 0 skeleton: parsing, the `Compiler` /
-//! `Program` / `Diagnostic` types, a label allocator, the backpatch pass, the
-//! span table, and codegen for literal + arithmetic expressions.
+//! design.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use indexmap::IndexMap;
 use oxc_allocator::Allocator;
 use oxc_ast::ast;
 use oxc_parser::Parser;
@@ -27,6 +26,72 @@ pub struct Program {
     pub spans: Vec<u32>,
     pub source: Arc<str>,
 }
+
+// ── Analysis structures (Phase 3: functions / closures) ─────────────
+
+/// Per-parameter analysis info.
+#[derive(Debug, Clone)]
+struct ParamInfo {
+    name: String,
+    has_default: bool,
+}
+
+/// Pre-computed analysis for one function scope (including the top-level
+/// program). The analysis pass walks all nested functions, detects free
+/// variables, and determines which slots must be `Boxed` because they are
+/// both captured and reassigned.
+#[derive(Debug)]
+struct FuncScope {
+    /// Unique id (index into the `ProgramAnalysis::scopes` vec).
+    id: usize,
+    /// Parent scope id (`usize::MAX` for the root program scope).
+    parent: usize,
+    /// Entry-point label for this function's body.
+    label: u32,
+    /// Parameters in order: (name, has_default).
+    params: Vec<ParamInfo>,
+    /// For a named function expression, the function's own name (visible
+    /// inside the body for self-recursion).
+    self_name: Option<String>,
+    /// Whether this is a declaration (hoisted into the prologue).
+    is_declaration: bool,
+    /// All bindings declared in this scope, in declaration order.
+    /// Each entry is (name, raw_slot_index, is_const). Raw slot indices
+    /// are 0-based within own locals (excluding upvals). Includes
+    /// duplicates for block-scoped names.
+    names: IndexMap<String, SlotInfo>,
+    /// Which own-local raw-slot indices are `const`.
+    const_slots: HashSet<u32>,
+    /// Which own-local raw-slot indices are reassigned in the body.
+    reassigned: HashSet<u32>,
+    /// Which own-local raw-slot indices are captured by nested functions.
+    captured: HashSet<u32>,
+    /// Nested function scope ids.
+    children: Vec<usize>,
+    /// Free variables: names referenced but not declared in this scope,
+    /// mapped to the first reference span.
+    free_vars: HashMap<String, u32>,
+    /// After the bottom-up capture pass, the capture list: absolute slot
+    /// indices (including upval slots) in the PARENT frame, in the order
+    /// they become the closure's leading locals.
+    captures: Vec<u32>,
+    /// Number of leading upval slots (pre-installed by `CallDyn`).
+    upval_count: u32,
+    /// Total number of own-local slots (params + declared vars).
+    own_local_count: u32,
+    /// Final slot kinds for all locals (upvals first, then own locals).
+    /// Computed after capture propagation.
+    slot_kinds: Vec<SlotKind>,
+}
+
+/// Complete scope-analysis result for a compilation unit.
+#[derive(Debug)]
+struct ProgramAnalysis {
+    scopes: Vec<FuncScope>,
+    root: usize,
+}
+
+// ─────────────────────────────────────────────────────────────────────
 
 /// A compile- or run-time diagnostic anchored at a source byte offset.
 #[derive(Debug, Clone, PartialEq)]
@@ -86,6 +151,11 @@ pub fn compile(source: &str) -> Result<Program, Vec<Diagnostic>> {
         compiler.error(span, err.message.to_string());
     }
 
+    // Phase 3: run scope/capture analysis over all nested functions before
+    // codegen, so we know which slots are `Boxed` and what the closure
+    // capture lists are.
+    compiler.analysis = Some(compiler.analyze_program(&ret.program));
+
     compiler.compile_program(&ret.program);
 
     if !compiler.diagnostics.is_empty() {
@@ -102,7 +172,7 @@ pub fn compile(source: &str) -> Result<Program, Vec<Diagnostic>> {
 
 /// A resolved local-variable binding: its frame slot plus whether it was
 /// declared `const` (so writes can be rejected at compile time).
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 struct SlotInfo {
     slot: u32,
     is_const: bool,
@@ -141,13 +211,33 @@ struct Compiler<'src> {
     /// scope where `var`s and top-level bindings live; blocks and loop heads push
     /// their own scopes. Block scoping affects *visibility* only — slots are
     /// function-wide and never reused (see the stack-discipline invariants in
-    /// COMPILER_PLAN). Phase 2 has no nested functions, so every slot is `Plain`.
+    /// COMPILER_PLAN).
     scopes: Vec<HashMap<String, SlotInfo>>,
-    /// Monotonic local-slot allocator for the current function.
-    next_slot: u32,
     /// Loop-context stack for `break`/`continue` (innermost loop last).
     loops: Vec<LoopCtx>,
     diagnostics: Vec<Diagnostic>,
+    /// Phase 3: scope/capture analysis pre-computed before codegen. `None`
+    /// during the analysis pass itself; `Some` during codegen.
+    analysis: Option<ProgramAnalysis>,
+    /// Phase 3: which function scope we are currently codegen'ing. This is an
+    /// index into `analysis.scopes`. Only set during codegen.
+    current_scope: usize,
+    /// Phase 3: per-scope cursor for matching children in AST order.
+    /// `next_child[parent_id]` = index of the next child to match.
+    next_child: Vec<usize>,
+    /// Phase 3: monotonic local-slot allocator for the current function.
+    /// Reset to 0 at each function scope entry. The analysis pre-computes
+    /// slot *kinds* (Plain/Boxed); the counter ensures names→slots match
+    /// the same order as the analysis walk.
+    next_slot: u32,
+    /// Phase 3: queue of matched declaration child IDs. When
+    /// `hoist_function_decl_in_stmt` matches a child scope, it pushes it
+    /// here; `compile_function_decl_body` removes it in FIFO order.
+    decl_child_queue: Vec<usize>,
+    /// Phase 3: cursor into `analysis.scopes[current_scope].names`.
+    /// Advanced by `declare_lexical` as declarations are processed,
+    /// ensuring shadowed names get their correct pre-computed slots.
+    next_name_idx: usize,
 }
 
 impl<'src> Compiler<'src> {
@@ -158,9 +248,14 @@ impl<'src> Compiler<'src> {
             spans: Vec::new(),
             next_label: 0,
             scopes: Vec::new(),
-            next_slot: 0,
             loops: Vec::new(),
             diagnostics: Vec::new(),
+            analysis: None,
+            current_scope: 0,
+            next_child: Vec::new(),
+            next_slot: 0,
+            decl_child_queue: Vec::new(),
+            next_name_idx: 0,
         }
     }
 
@@ -187,32 +282,1028 @@ impl<'src> Compiler<'src> {
 
     // ── codegen ──────────────────────────────────────────────────────
 
-    /// The whole program is the root frame's body. First reserve all of the
-    /// frame's locals in one prologue `Alloc` (the stack-discipline invariant:
-    /// no temporaries above the locals when `Alloc` runs), with `var`s hoisted
-    /// so forward references resolve; then lower each top-level statement; then
-    /// `Return(0)` to pop the root frame (→ `StepResult::Done`) and stop
-    /// execution falling into any appended function bodies.
+    /// The whole program is the root frame's body. Phase 3: scope/capture
+    /// analysis was already run (stored in `self.analysis`), so we know the
+    /// exact `Vec<SlotKind>` for the prologue `Alloc` and which slots are
+    /// const/reassigned/captured. After emitting the root body (including
+    /// hoisted function declarations), we drain `pending_functions` and emit
+    /// each function body.
     fn compile_program(&mut self, program: &ast::Program) {
-        // The program is the sole function scope (Phase 2 has no nested
-        // functions). Reserve its locals up front: count every binding (an
-        // over-estimate is harmless — extra slots are unused `Undefined`s), emit
-        // one `Alloc`, then hoist `var` names so their slots precede the
-        // lexical ones and references anywhere in the body resolve.
+        let analysis = self
+            .analysis
+            .as_ref()
+            .expect("analysis must run before codegen");
+        let root = &analysis.scopes[analysis.root];
+        self.current_scope = analysis.root;
+        self.next_slot = 0;
+
+        // Initialize the next_child cursor for all scopes.
+        self.next_child = vec![0usize; analysis.scopes.len()];
+
+        // Prologue: allocate all root locals with the correct SlotKinds
+        // (pre-computed by analysis).
         self.scopes.push(HashMap::new());
-        let slot_count = count_decls_in_stmts(&program.body);
-        if slot_count > 0 {
-            self.emit(
-                Instr::Alloc(vec![SlotKind::Plain; slot_count as usize]),
-                program.span.start,
-            );
+        self.next_name_idx = 0;
+
+        if !root.slot_kinds.is_empty() {
+            self.emit(Instr::Alloc(root.slot_kinds.clone()), program.span.start);
         }
+
+        // Hoist `var` declarations and function declarations. These use
+        // the monotonic `next_slot` counter which matches the analysis
+        // order (params first, then declared vars).
         self.hoist_vars_in_stmts(&program.body);
 
+        // Hoist function declarations into the prologue (emit bindings).
+        self.hoist_function_decls(&program.body);
+
+        // Compile top-level body statements.
         for stmt in &program.body {
             self.compile_stmt(stmt);
         }
+
+        // Root frame ends with Return(0) → StepResult::Done.
         self.emit(Instr::Return(0), program.span.end);
+    }
+
+    // ── Phase 3: scope / capture analysis ───────────────────────────────
+
+    /// Walk the entire AST and build the `ProgramAnalysis`: for each function
+    /// scope (including the root), collect params, declared locals, nested
+    /// functions, free variables, and reassignment info. Then run a bottom-up
+    /// capture-propagation pass to determine slot kinds and capture lists.
+    fn analyze_program(&mut self, program: &ast::Program) -> ProgramAnalysis {
+        let mut scopes = Vec::new();
+        let root = self.analyze_top_level(program, &mut scopes);
+        self.resolve_captures(&mut scopes);
+        ProgramAnalysis { scopes, root }
+    }
+
+    /// Build a `FuncScope` for the program root and walk its body.
+    fn analyze_top_level(&mut self, program: &ast::Program, scopes: &mut Vec<FuncScope>) -> usize {
+        let label = self.new_label();
+        let mut scope = FuncScope {
+            id: 0, // temporary; updated after children are pushed
+            parent: usize::MAX,
+            label,
+            params: Vec::new(),
+            self_name: None,
+            is_declaration: false,
+            names: IndexMap::new(),
+            const_slots: HashSet::new(),
+            reassigned: HashSet::new(),
+            captured: HashSet::new(),
+            children: Vec::new(),
+            free_vars: HashMap::new(),
+            captures: Vec::new(),
+            upval_count: 0,
+            own_local_count: 0,
+            slot_kinds: Vec::new(),
+        };
+
+        // Block-scoped name tracking for the analysis walk.
+        let mut block_scopes: Vec<IndexMap<String, u32>> = vec![IndexMap::new()];
+        let mut next_slot = 0u32;
+
+        // Use a temporary scopes vec for children; they'll be prepended to
+        // the main scopes vec before the root is pushed.
+        let mut child_scopes = Vec::new();
+        self.analyze_stmts(
+            &program.body,
+            0, // parent id (placeholder)
+            &mut scope,
+            &mut block_scopes,
+            &mut next_slot,
+            &mut child_scopes,
+        );
+
+        scope.own_local_count = next_slot;
+        scope.slot_kinds = vec![SlotKind::Plain; scope.own_local_count as usize];
+
+        // Children are pushed first, then the root. The correct IDs and
+        // parent references are already set by build_function_scope.
+        for child in child_scopes {
+            scopes.push(child);
+        }
+
+        let root_id = scopes.len();
+        scope.id = root_id;
+        // Fix up root's children parent references.
+        for &child_id in &scope.children {
+            scopes[child_id].parent = root_id;
+        }
+        scopes.push(scope);
+        root_id
+    }
+
+    /// Analyze a list of statements within a function scope.
+    fn analyze_stmts(
+        &mut self,
+        stmts: &[ast::Statement],
+        func_id: usize,
+        func_scope: &mut FuncScope,
+        block_scopes: &mut Vec<IndexMap<String, u32>>,
+        next_slot: &mut u32,
+        scopes: &mut Vec<FuncScope>,
+    ) {
+        for stmt in stmts {
+            self.analyze_stmt(stmt, func_id, func_scope, block_scopes, next_slot, scopes);
+        }
+    }
+
+    fn analyze_stmt(
+        &mut self,
+        stmt: &ast::Statement,
+        func_id: usize,
+        func_scope: &mut FuncScope,
+        block_scopes: &mut Vec<IndexMap<String, u32>>,
+        next_slot: &mut u32,
+        scopes: &mut Vec<FuncScope>,
+    ) {
+        match stmt {
+            ast::Statement::VariableDeclaration(decl) => {
+                let is_const = decl.kind == ast::VariableDeclarationKind::Const;
+                let is_var = decl.kind == ast::VariableDeclarationKind::Var;
+                for d in &decl.declarations {
+                    self.analyze_declare_pattern(
+                        &d.id,
+                        is_const,
+                        is_var,
+                        func_scope,
+                        block_scopes,
+                        next_slot,
+                    );
+                    if let Some(init) = &d.init {
+                        self.analyze_expr(init, func_id, func_scope, block_scopes, scopes);
+                    }
+                }
+            }
+            ast::Statement::FunctionDeclaration(f) => {
+                // Hoisted function declaration — add as a child scope.
+                let child = self.build_function_scope(
+                    f, func_id, true, // is_declaration
+                    scopes,
+                );
+                func_scope.children.push(child);
+                // Register the binding name in the function scope.
+                if let Some(id) = &f.id {
+                    let name = id.name.as_str();
+                    let slot = self.analyze_register_name(
+                        name,
+                        false, // functions are not const
+                        true,  // hoisted like var
+                        func_scope,
+                        block_scopes,
+                        next_slot,
+                    );
+                    // Also register in function-scope names for codegen lookup.
+                    func_scope
+                        .names
+                        .entry(name.to_string())
+                        .or_insert(SlotInfo {
+                            slot,
+                            is_const: false,
+                        });
+                }
+            }
+            ast::Statement::BlockStatement(block) => {
+                block_scopes.push(IndexMap::new());
+                self.analyze_stmts(
+                    &block.body,
+                    func_id,
+                    func_scope,
+                    block_scopes,
+                    next_slot,
+                    scopes,
+                );
+                block_scopes.pop();
+            }
+            ast::Statement::IfStatement(s) => {
+                self.analyze_expr(&s.test, func_id, func_scope, block_scopes, scopes);
+                self.analyze_stmt(
+                    &s.consequent,
+                    func_id,
+                    func_scope,
+                    block_scopes,
+                    next_slot,
+                    scopes,
+                );
+                if let Some(alt) = &s.alternate {
+                    self.analyze_stmt(alt, func_id, func_scope, block_scopes, next_slot, scopes);
+                }
+            }
+            ast::Statement::WhileStatement(s) => {
+                self.analyze_expr(&s.test, func_id, func_scope, block_scopes, scopes);
+                self.analyze_stmt(
+                    &s.body,
+                    func_id,
+                    func_scope,
+                    block_scopes,
+                    next_slot,
+                    scopes,
+                );
+            }
+            ast::Statement::DoWhileStatement(s) => {
+                self.analyze_stmt(
+                    &s.body,
+                    func_id,
+                    func_scope,
+                    block_scopes,
+                    next_slot,
+                    scopes,
+                );
+                self.analyze_expr(&s.test, func_id, func_scope, block_scopes, scopes);
+            }
+            ast::Statement::ForStatement(s) => {
+                if let Some(init) = &s.init {
+                    match init {
+                        ast::ForStatementInit::VariableDeclaration(decl) => {
+                            let is_const = decl.kind == ast::VariableDeclarationKind::Const;
+                            let is_var = decl.kind == ast::VariableDeclarationKind::Var;
+                            for d in &decl.declarations {
+                                self.analyze_declare_pattern(
+                                    &d.id,
+                                    is_const,
+                                    is_var,
+                                    func_scope,
+                                    block_scopes,
+                                    next_slot,
+                                );
+                                if let Some(init_expr) = &d.init {
+                                    self.analyze_expr(
+                                        init_expr,
+                                        func_id,
+                                        func_scope,
+                                        block_scopes,
+                                        scopes,
+                                    );
+                                }
+                            }
+                        }
+                        _ => {
+                            // Expression init (inherit_variants! means the
+                            // expression variants are flattened in). Use
+                            // as_expression() to get the expression ref.
+                            if let Some(expr) = init.as_expression() {
+                                self.analyze_expr(expr, func_id, func_scope, block_scopes, scopes);
+                            }
+                        }
+                    }
+                }
+                if let Some(test) = &s.test {
+                    self.analyze_expr(test, func_id, func_scope, block_scopes, scopes);
+                }
+                if let Some(update) = &s.update {
+                    self.analyze_expr(update, func_id, func_scope, block_scopes, scopes);
+                }
+                self.analyze_stmt(
+                    &s.body,
+                    func_id,
+                    func_scope,
+                    block_scopes,
+                    next_slot,
+                    scopes,
+                );
+            }
+            ast::Statement::ExpressionStatement(es) => {
+                self.analyze_expr(&es.expression, func_id, func_scope, block_scopes, scopes);
+            }
+            ast::Statement::ReturnStatement(r) => {
+                if let Some(val) = &r.argument {
+                    self.analyze_expr(val, func_id, func_scope, block_scopes, scopes);
+                }
+            }
+            ast::Statement::BreakStatement(_)
+            | ast::Statement::ContinueStatement(_)
+            | ast::Statement::EmptyStatement(_) => {}
+            // For constructs not yet supported, skip analysis (they'll error
+            // during codegen). Nested functions are caught by the recursive
+            // walk; other expressions are walked shallowly for free vars.
+            _ => {
+                // Walk any expressions inside the unsupported statement for
+                // free-variable detection (e.g. `for..of` has a body).
+                self.analyze_stmt_shallow(
+                    stmt,
+                    func_id,
+                    func_scope,
+                    block_scopes,
+                    next_slot,
+                    scopes,
+                );
+            }
+        }
+    }
+
+    /// Shallow analysis of unsupported statements: walk the statement tree
+    /// enough to find identifiers (so free variables are detected) but don't
+    /// create new function scopes (those will error during codegen).
+    fn analyze_stmt_shallow(
+        &mut self,
+        stmt: &ast::Statement,
+        func_id: usize,
+        func_scope: &mut FuncScope,
+        block_scopes: &mut Vec<IndexMap<String, u32>>,
+        next_slot: &mut u32,
+        scopes: &mut Vec<FuncScope>,
+    ) {
+        match stmt {
+            ast::Statement::ForOfStatement(s) => {
+                self.analyze_stmt(
+                    &s.body,
+                    func_id,
+                    func_scope,
+                    block_scopes,
+                    next_slot,
+                    scopes,
+                );
+            }
+            ast::Statement::ForInStatement(s) => {
+                self.analyze_stmt(
+                    &s.body,
+                    func_id,
+                    func_scope,
+                    block_scopes,
+                    next_slot,
+                    scopes,
+                );
+            }
+            ast::Statement::SwitchStatement(s) => {
+                self.analyze_expr(&s.discriminant, func_id, func_scope, block_scopes, scopes);
+                for case in &s.cases {
+                    if let Some(test) = &case.test {
+                        self.analyze_expr(test, func_id, func_scope, block_scopes, scopes);
+                    }
+                    for cs in &case.consequent {
+                        self.analyze_stmt(cs, func_id, func_scope, block_scopes, next_slot, scopes);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Register a name from a declaration pattern in the analysis, returning the
+    /// assigned slot index.
+    fn analyze_declare_pattern(
+        &mut self,
+        pat: &ast::BindingPattern,
+        is_const: bool,
+        is_var: bool,
+        func_scope: &mut FuncScope,
+        block_scopes: &mut Vec<IndexMap<String, u32>>,
+        next_slot: &mut u32,
+    ) {
+        match pat {
+            ast::BindingPattern::BindingIdentifier(id) => {
+                let name = id.name.as_str();
+                self.analyze_register_name(
+                    name,
+                    is_const,
+                    is_var,
+                    func_scope,
+                    block_scopes,
+                    next_slot,
+                );
+            }
+            ast::BindingPattern::AssignmentPattern(ap) => {
+                self.analyze_declare_pattern(
+                    &ap.left,
+                    is_const,
+                    is_var,
+                    func_scope,
+                    block_scopes,
+                    next_slot,
+                );
+            }
+            ast::BindingPattern::ArrayPattern(arr) => {
+                for el in arr.elements.iter().flatten() {
+                    self.analyze_declare_pattern(
+                        el,
+                        is_const,
+                        is_var,
+                        func_scope,
+                        block_scopes,
+                        next_slot,
+                    );
+                }
+                if let Some(rest) = &arr.rest {
+                    self.analyze_declare_pattern(
+                        &rest.argument,
+                        is_const,
+                        is_var,
+                        func_scope,
+                        block_scopes,
+                        next_slot,
+                    );
+                }
+            }
+            ast::BindingPattern::ObjectPattern(obj) => {
+                for prop in &obj.properties {
+                    self.analyze_declare_pattern(
+                        &prop.value,
+                        is_const,
+                        is_var,
+                        func_scope,
+                        block_scopes,
+                        next_slot,
+                    );
+                }
+                if let Some(rest) = &obj.rest {
+                    self.analyze_declare_pattern(
+                        &rest.argument,
+                        is_const,
+                        is_var,
+                        func_scope,
+                        block_scopes,
+                        next_slot,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Register a binding name and return its slot index. `var` names go to the
+    /// function-scope slot table (block_scopes[0]); `let`/`const` go to the
+    /// innermost block scope. A name already in the function scope (from a `var`)
+    /// is reused; otherwise a fresh slot is allocated.
+    fn analyze_register_name(
+        &mut self,
+        name: &str,
+        is_const: bool,
+        is_var: bool,
+        func_scope: &mut FuncScope,
+        block_scopes: &mut Vec<IndexMap<String, u32>>,
+        next_slot: &mut u32,
+    ) -> u32 {
+        if name == "state" {
+            // Shadowing `state` is an error during codegen; just skip.
+            return 0;
+        }
+        if is_var {
+            // `var` goes to the function scope (block_scopes[0]).
+            if let Some(&slot) = block_scopes[0].get(name) {
+                return slot;
+            }
+            let slot = *next_slot;
+            *next_slot += 1;
+            block_scopes[0].insert(name.to_string(), slot);
+            func_scope
+                .names
+                .entry(name.to_string())
+                .or_insert(SlotInfo {
+                    slot,
+                    is_const: false,
+                });
+            if is_const {
+                func_scope.const_slots.insert(slot);
+            }
+            slot
+        } else {
+            // `let`/`const` go to the innermost block scope.
+            let scope = block_scopes.last_mut().expect("at least one block scope");
+            if scope.contains_key(name) {
+                // Redeclaration in the same block — will be caught as an error
+                // during codegen. Assign a fresh slot anyway.
+                let slot = *next_slot;
+                *next_slot += 1;
+                scope.insert(name.to_string(), slot);
+                func_scope
+                    .names
+                    .entry(name.to_string())
+                    .or_insert(SlotInfo { slot, is_const });
+                if is_const {
+                    func_scope.const_slots.insert(slot);
+                }
+                return slot;
+            }
+            let slot = *next_slot;
+            *next_slot += 1;
+            scope.insert(name.to_string(), slot);
+            func_scope
+                .names
+                .entry(name.to_string())
+                .or_insert(SlotInfo { slot, is_const });
+            if is_const {
+                func_scope.const_slots.insert(slot);
+            }
+            slot
+        }
+    }
+
+    /// Analyze an expression for free-variable detection and reassignment
+    /// tracking.
+    fn analyze_expr(
+        &mut self,
+        expr: &ast::Expression,
+        func_id: usize,
+        func_scope: &mut FuncScope,
+        block_scopes: &mut Vec<IndexMap<String, u32>>,
+        scopes: &mut Vec<FuncScope>,
+    ) {
+        match expr {
+            ast::Expression::Identifier(id) => {
+                let name = id.name.as_str();
+                // Check if the name is a local in this function.
+                if !self.analyze_resolve_name(name, block_scopes).is_some() {
+                    // Free variable — record it.
+                    func_scope
+                        .free_vars
+                        .entry(name.to_string())
+                        .or_insert(id.span.start);
+                }
+            }
+            ast::Expression::AssignmentExpression(a) => {
+                // Mark the target as reassigned.
+                self.analyze_assignment_target(&a.left, func_scope, block_scopes);
+                self.analyze_expr(&a.right, func_id, func_scope, block_scopes, scopes);
+            }
+            ast::Expression::UpdateExpression(u) => {
+                // UpdateExpression.argument is a SimpleAssignmentTarget.
+                self.analyze_simple_assign_target(&u.argument, func_scope, block_scopes);
+            }
+            ast::Expression::BinaryExpression(b) => {
+                self.analyze_expr(&b.left, func_id, func_scope, block_scopes, scopes);
+                self.analyze_expr(&b.right, func_id, func_scope, block_scopes, scopes);
+            }
+            ast::Expression::UnaryExpression(u) => {
+                self.analyze_expr(&u.argument, func_id, func_scope, block_scopes, scopes);
+            }
+            ast::Expression::LogicalExpression(l) => {
+                self.analyze_expr(&l.left, func_id, func_scope, block_scopes, scopes);
+                self.analyze_expr(&l.right, func_id, func_scope, block_scopes, scopes);
+            }
+            ast::Expression::ConditionalExpression(c) => {
+                self.analyze_expr(&c.test, func_id, func_scope, block_scopes, scopes);
+                self.analyze_expr(&c.consequent, func_id, func_scope, block_scopes, scopes);
+                self.analyze_expr(&c.alternate, func_id, func_scope, block_scopes, scopes);
+            }
+            ast::Expression::CallExpression(c) => {
+                self.analyze_expr(&c.callee, func_id, func_scope, block_scopes, scopes);
+                for arg in &c.arguments {
+                    if let Some(e) = arg.as_expression() {
+                        self.analyze_expr(e, func_id, func_scope, block_scopes, scopes);
+                    }
+                }
+            }
+            ast::Expression::StaticMemberExpression(m) => {
+                self.analyze_expr(&m.object, func_id, func_scope, block_scopes, scopes);
+            }
+            ast::Expression::ComputedMemberExpression(m) => {
+                self.analyze_expr(&m.object, func_id, func_scope, block_scopes, scopes);
+                self.analyze_expr(&m.expression, func_id, func_scope, block_scopes, scopes);
+            }
+            ast::Expression::ArrayExpression(arr) => {
+                for el in &arr.elements {
+                    if let Some(e) = el.as_expression() {
+                        self.analyze_expr(e, func_id, func_scope, block_scopes, scopes);
+                    }
+                }
+            }
+            ast::Expression::ObjectExpression(obj) => {
+                for prop in &obj.properties {
+                    match prop {
+                        ast::ObjectPropertyKind::ObjectProperty(p) => {
+                            self.analyze_expr(&p.value, func_id, func_scope, block_scopes, scopes);
+                        }
+                        ast::ObjectPropertyKind::SpreadProperty(s) => {
+                            self.analyze_expr(
+                                &s.argument,
+                                func_id,
+                                func_scope,
+                                block_scopes,
+                                scopes,
+                            );
+                        }
+                    }
+                }
+            }
+            ast::Expression::TemplateLiteral(tl) => {
+                for e in &tl.expressions {
+                    self.analyze_expr(e, func_id, func_scope, block_scopes, scopes);
+                }
+            }
+            ast::Expression::SequenceExpression(seq) => {
+                for e in &seq.expressions {
+                    self.analyze_expr(e, func_id, func_scope, block_scopes, scopes);
+                }
+            }
+            ast::Expression::ParenthesizedExpression(p) => {
+                self.analyze_expr(&p.expression, func_id, func_scope, block_scopes, scopes);
+            }
+            ast::Expression::ChainExpression(chain) => {
+                // ChainExpression.expression is a ChainElement (not Expression).
+                // Walk into it to find nested identifiers.
+                self.analyze_chain_element(
+                    &chain.expression,
+                    func_id,
+                    func_scope,
+                    block_scopes,
+                    scopes,
+                );
+            }
+            ast::Expression::FunctionExpression(f) => {
+                let child = self.build_function_scope(f, func_id, false, scopes);
+                func_scope.children.push(child);
+            }
+            ast::Expression::ArrowFunctionExpression(a) => {
+                let child = self.build_arrow_scope(a, func_id, scopes);
+                func_scope.children.push(child);
+            }
+            // Literals and unsupported expressions: nothing to analyze.
+            _ => {}
+        }
+    }
+
+    /// Mark the target of an assignment as reassigned. For simple identifiers,
+    /// looks up the slot and marks it. For member expressions, marks nothing
+    /// (they don't affect slot boxing).
+    fn analyze_assignment_target(
+        &mut self,
+        target: &ast::AssignmentTarget,
+        func_scope: &mut FuncScope,
+        block_scopes: &mut Vec<IndexMap<String, u32>>,
+    ) {
+        match target {
+            ast::AssignmentTarget::AssignmentTargetIdentifier(id) => {
+                let name = id.name.as_str();
+                if let Some(slot) = self.analyze_resolve_name(name, block_scopes) {
+                    func_scope.reassigned.insert(slot);
+                }
+            }
+            ast::AssignmentTarget::StaticMemberExpression(_)
+            | ast::AssignmentTarget::ComputedMemberExpression(_) => {}
+            ast::AssignmentTarget::ArrayAssignmentTarget(arr) => {
+                for el in arr.elements.iter().flatten() {
+                    // Elements are AssignmentTargetMaybeDefault — use
+                    // as_assignment_target() to get the inner target.
+                    if let Some(t) = el.as_assignment_target() {
+                        self.analyze_assignment_target(t, func_scope, block_scopes);
+                    }
+                }
+                if let Some(rest) = &arr.rest {
+                    self.analyze_assignment_target(&rest.target, func_scope, block_scopes);
+                }
+            }
+            ast::AssignmentTarget::ObjectAssignmentTarget(obj) => {
+                for prop in &obj.properties {
+                    match prop {
+                        ast::AssignmentTargetProperty::AssignmentTargetPropertyIdentifier(p) => {
+                            // binding is an IdentifierReference — mark the slot.
+                            let name = p.binding.name.as_str();
+                            if let Some(slot) = self.analyze_resolve_name(name, block_scopes) {
+                                func_scope.reassigned.insert(slot);
+                            }
+                        }
+                        ast::AssignmentTargetProperty::AssignmentTargetPropertyProperty(p) => {
+                            // binding is an AssignmentTargetMaybeDefault.
+                            if let Some(t) = p.binding.as_assignment_target() {
+                                self.analyze_assignment_target(t, func_scope, block_scopes);
+                            }
+                        }
+                    }
+                }
+                if let Some(rest) = &obj.rest {
+                    self.analyze_assignment_target(&rest.target, func_scope, block_scopes);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Like `analyze_assignment_target` but for `SimpleAssignmentTarget`
+    /// (used by `UpdateExpression::argument`).
+    fn analyze_simple_assign_target(
+        &mut self,
+        target: &ast::SimpleAssignmentTarget,
+        func_scope: &mut FuncScope,
+        block_scopes: &mut Vec<IndexMap<String, u32>>,
+    ) {
+        match target {
+            ast::SimpleAssignmentTarget::AssignmentTargetIdentifier(id) => {
+                let name = id.name.as_str();
+                if let Some(slot) = self.analyze_resolve_name(name, block_scopes) {
+                    func_scope.reassigned.insert(slot);
+                }
+            }
+            ast::SimpleAssignmentTarget::StaticMemberExpression(_)
+            | ast::SimpleAssignmentTarget::ComputedMemberExpression(_) => {}
+            _ => {}
+        }
+    }
+
+    /// Walk into a `ChainElement` to find identifiers and nested expressions.
+    fn analyze_chain_element(
+        &mut self,
+        el: &ast::ChainElement,
+        func_id: usize,
+        func_scope: &mut FuncScope,
+        block_scopes: &mut Vec<IndexMap<String, u32>>,
+        scopes: &mut Vec<FuncScope>,
+    ) {
+        match el {
+            ast::ChainElement::CallExpression(c) => {
+                // Walk the callee and args.
+                self.analyze_expr(&c.callee, func_id, func_scope, block_scopes, scopes);
+                for arg in &c.arguments {
+                    if let Some(e) = arg.as_expression() {
+                        self.analyze_expr(e, func_id, func_scope, block_scopes, scopes);
+                    }
+                }
+            }
+            // Other ChainElement variants (StaticMemberExpression,
+            // ComputedMemberExpression, etc.) are fine to skip — the
+            // contained identifiers will be caught when the chain is
+            // lowered during codegen.
+            _ => {}
+        }
+    }
+
+    /// Resolve a name to its own-local slot index (0-based within the current
+    /// function's own locals). Returns `None` if the name is not declared in
+    /// this function (i.e., it's a free variable).
+    fn analyze_resolve_name(
+        &self,
+        name: &str,
+        block_scopes: &[IndexMap<String, u32>],
+    ) -> Option<u32> {
+        block_scopes.iter().rev().find_map(|s| s.get(name).copied())
+    }
+
+    /// Build a `FuncScope` for an `ast::Function` (used by both declarations and
+    /// expressions). Walks the body recursively to collect nested scopes.
+    fn build_function_scope(
+        &mut self,
+        func: &ast::Function,
+        parent_id: usize,
+        is_declaration: bool,
+        scopes: &mut Vec<FuncScope>,
+    ) -> usize {
+        let label = self.new_label();
+
+        // Collect parameters.
+        let mut params: Vec<ParamInfo> = Vec::new();
+        for param in &func.params.items {
+            // oxc stores parameter defaults on the FormalParameter's
+            // `initializer` field (inherited via `inherit_variants!`).
+            let has_default = param.initializer.is_some();
+            let (name, _pat_has_default) = self.analyze_param_info(&param.pattern);
+            for n in &name {
+                params.push(ParamInfo {
+                    name: n.clone(),
+                    has_default,
+                });
+            }
+        }
+
+        let self_name = func.id.as_ref().map(|id| id.name.as_str().to_string());
+
+        // Build the scope but don't push it yet. Children will be pushed
+        // first (by recursive calls), then this scope. After the walk we
+        // compute the correct id.
+        let mut scope = FuncScope {
+            id: 0, // placeholder; fixed up below
+            parent: parent_id,
+            label,
+            params,
+            self_name,
+            is_declaration,
+            names: IndexMap::new(),
+            const_slots: HashSet::new(),
+            reassigned: HashSet::new(),
+            captured: HashSet::new(),
+            children: Vec::new(),
+            free_vars: HashMap::new(),
+            captures: Vec::new(),
+            upval_count: 0,
+            own_local_count: 0,
+            slot_kinds: Vec::new(),
+        };
+
+        // Block-scoped name tracking.
+        let mut block_scopes: Vec<IndexMap<String, u32>> = vec![IndexMap::new()];
+        let mut next_slot = scope.params.len() as u32;
+
+        for (i, p) in scope.params.iter().enumerate() {
+            block_scopes[0].insert(p.name.clone(), i as u32);
+            scope.names.insert(
+                p.name.clone(),
+                SlotInfo {
+                    slot: i as u32,
+                    is_const: false,
+                },
+            );
+        }
+
+        if let Some(body) = &func.body {
+            self.analyze_stmts(
+                &body.statements,
+                0, // temporary parent id; will be fixed up
+                &mut scope,
+                &mut block_scopes,
+                &mut next_slot,
+                scopes,
+            );
+        }
+
+        scope.own_local_count = next_slot;
+        scope.slot_kinds = vec![SlotKind::Plain; next_slot as usize];
+
+        // Push the scope AFTER children. The true id is scopes.len().
+        let id = scopes.len();
+        scope.id = id;
+        // Fix up children's parent references to point to the correct id.
+        for &child_id in &scope.children {
+            scopes[child_id].parent = id;
+        }
+        scopes.push(scope);
+        id
+    }
+
+    /// Build a `FuncScope` for an arrow function.
+    fn build_arrow_scope(
+        &mut self,
+        arrow: &ast::ArrowFunctionExpression,
+        parent_id: usize,
+        scopes: &mut Vec<FuncScope>,
+    ) -> usize {
+        let label = self.new_label();
+
+        let mut params: Vec<ParamInfo> = Vec::new();
+        for param in &arrow.params.items {
+            let has_default = param.initializer.is_some();
+            let (name, _pat_has_default) = self.analyze_param_info(&param.pattern);
+            for n in &name {
+                params.push(ParamInfo {
+                    name: n.clone(),
+                    has_default,
+                });
+            }
+        }
+
+        let mut scope = FuncScope {
+            id: 0,
+            parent: parent_id,
+            label,
+            params,
+            self_name: None,
+            is_declaration: false,
+            names: IndexMap::new(),
+            const_slots: HashSet::new(),
+            reassigned: HashSet::new(),
+            captured: HashSet::new(),
+            children: Vec::new(),
+            free_vars: HashMap::new(),
+            captures: Vec::new(),
+            upval_count: 0,
+            own_local_count: 0,
+            slot_kinds: Vec::new(),
+        };
+
+        let mut block_scopes: Vec<IndexMap<String, u32>> = vec![IndexMap::new()];
+        let mut next_slot = scope.params.len() as u32;
+
+        for (i, p) in scope.params.iter().enumerate() {
+            block_scopes[0].insert(p.name.clone(), i as u32);
+            scope.names.insert(
+                p.name.clone(),
+                SlotInfo {
+                    slot: i as u32,
+                    is_const: false,
+                },
+            );
+        }
+
+        self.analyze_stmts(
+            &arrow.body.statements,
+            0,
+            &mut scope,
+            &mut block_scopes,
+            &mut next_slot,
+            scopes,
+        );
+
+        scope.own_local_count = next_slot;
+        scope.slot_kinds = vec![SlotKind::Plain; next_slot as usize];
+
+        let id = scopes.len();
+        scope.id = id;
+        for &child_id in &scope.children {
+            scopes[child_id].parent = id;
+        }
+        scopes.push(scope);
+        id
+    }
+
+    /// Extract binding names (recursively, for destructured params) and whether
+    /// the parameter has a default.
+    fn analyze_param_info(&self, pat: &ast::BindingPattern) -> (Vec<String>, bool) {
+        match pat {
+            ast::BindingPattern::BindingIdentifier(id) => {
+                (vec![id.name.as_str().to_string()], false)
+            }
+            ast::BindingPattern::AssignmentPattern(ap) => {
+                let (names, _) = self.analyze_param_info(&ap.left);
+                (names, true)
+            }
+            ast::BindingPattern::ArrayPattern(arr) => {
+                let mut names = Vec::new();
+                for el in arr.elements.iter().flatten() {
+                    let (n, _) = self.analyze_param_info(el);
+                    names.extend(n);
+                }
+                if let Some(rest) = &arr.rest {
+                    let (n, _) = self.analyze_param_info(&rest.argument);
+                    names.extend(n);
+                }
+                (names, false)
+            }
+            ast::BindingPattern::ObjectPattern(obj) => {
+                let mut names = Vec::new();
+                for prop in &obj.properties {
+                    let (n, _) = self.analyze_param_info(&prop.value);
+                    names.extend(n);
+                }
+                if let Some(rest) = &obj.rest {
+                    let (n, _) = self.analyze_param_info(&rest.argument);
+                    names.extend(n);
+                }
+                (names, false)
+            }
+        }
+    }
+
+    /// Bottom-up pass: for each scope, resolve its children's free variables
+    /// against its own locals, populate capture lists, and determine which slots
+    /// must be `Boxed` (captured AND reassigned).
+    fn resolve_captures(&self, scopes: &mut Vec<FuncScope>) {
+        // Process scopes in reverse order (children before parents).
+        for i in (0..scopes.len()).rev() {
+            // Gather the scope's children first.
+            let children: Vec<usize> = scopes[i].children.clone();
+
+            for &child_id in &children {
+                // Clone free_vars to release the borrow on scopes.
+                let free_vars: HashMap<String, u32> = scopes[child_id].free_vars.clone();
+                // A named function's own name inside its body is a
+                // self-reference, not a capture from the parent.
+                let self_name: Option<String> = scopes[child_id].self_name.clone();
+
+                for (fv_name, _fv_span) in &free_vars {
+                    // Skip free variables that match the function's own
+                    // name — they'll get a dedicated self-reference slot.
+                    if self_name.as_ref() == Some(fv_name) {
+                        continue;
+                    }
+                    // Copy the slot info to release the immutable borrow
+                    // before the mutable borrows below.
+                    let slot_info = scopes[i].names.get(fv_name).copied();
+                    if let Some(info) = slot_info {
+                        let parent_abs_slot = scopes[i].upval_count + info.slot;
+
+                        let child_ref = &mut scopes[child_id];
+                        if !child_ref.captures.contains(&parent_abs_slot) {
+                            child_ref.captures.push(parent_abs_slot);
+                        }
+
+                        scopes[i].captured.insert(info.slot);
+                    }
+                }
+            }
+        }
+
+        // Second pass (forward): compute slot kinds.
+        // Any slot that is captured by a nested function must be Boxed
+        // (conservative: we can't easily determine if the nested function
+        // reassigns it, and boxing is always safe).
+        for i in 0..scopes.len() {
+            let own_count = scopes[i].own_local_count;
+            let param_count = scopes[i].params.len() as u32;
+
+            let upval_count = scopes[i].captures.len() as u32;
+            scopes[i].upval_count = upval_count;
+
+            let mut kinds: Vec<SlotKind> = vec![SlotKind::Plain; upval_count as usize];
+
+            // Params: if captured, they get a Boxed copy slot.
+            for p_idx in 0..param_count {
+                if scopes[i].captured.contains(&p_idx) {
+                    kinds.push(SlotKind::Boxed);
+                } else {
+                    kinds.push(SlotKind::Plain);
+                }
+            }
+
+            // Declared locals (non-params): box if captured.
+            for s_idx in param_count..own_count {
+                if scopes[i].captured.contains(&s_idx) {
+                    kinds.push(SlotKind::Boxed);
+                } else {
+                    kinds.push(SlotKind::Plain);
+                }
+            }
+
+            scopes[i].slot_kinds = kinds;
+        }
     }
 
     fn compile_stmt(&mut self, stmt: &ast::Statement) {
@@ -251,15 +1342,34 @@ impl<'src> Compiler<'src> {
             ast::Statement::BreakStatement(s) => self.compile_break(s),
             ast::Statement::ContinueStatement(s) => self.compile_continue(s),
 
+            // ── Phase 3: functions / return ───────────────────────────
+            ast::Statement::FunctionDeclaration(f) => {
+                // The binding was already hoisted in the prologue by
+                // `hoist_function_decls`. Now emit the function body.
+                self.compile_function_decl_body(f);
+            }
+            ast::Statement::ReturnStatement(r) => {
+                let analysis = self
+                    .analysis
+                    .as_ref()
+                    .expect("analysis present during codegen");
+                if analysis.scopes[self.current_scope].parent == usize::MAX {
+                    self.error(r.span.start, "`return` outside a function");
+                    return;
+                }
+                match &r.argument {
+                    Some(expr) => {
+                        self.compile_expr(expr);
+                        self.emit(Instr::Return(1), r.span.start);
+                    }
+                    None => {
+                        self.emit(Instr::Push(StackValue::Undefined), r.span.start);
+                        self.emit(Instr::Return(1), r.span.start);
+                    }
+                }
+            }
+
             // Later phases / out of scope — informative errors.
-            ast::Statement::FunctionDeclaration(f) => self.error(
-                f.span.start,
-                "function declarations are not supported until Phase 3",
-            ),
-            ast::Statement::ReturnStatement(r) => self.error(
-                r.span.start,
-                "`return` outside a function is not supported until Phase 3",
-            ),
             ast::Statement::ForOfStatement(s) => {
                 self.error(s.span.start, "`for...of` is not supported until Phase 4")
             }
@@ -473,10 +1583,43 @@ impl<'src> Compiler<'src> {
 
     /// Declare a `let`/`const` binding in the current (innermost) scope, giving
     /// it a fresh function-wide slot. `state` is blessed and cannot be shadowed.
+    /// Phase 3: slot indices are pre-computed by the analysis; this method
+    /// looks up the pre-computed slot from the function scope.
     fn declare_lexical(&mut self, name: &str, span: u32, is_const: bool) -> u32 {
         if name == "state" {
             self.error(span, "cannot shadow the blessed `state` object");
         }
+        // Walk the analysis's pre-computed names (in declaration order) to
+        // find the next occurrence of this name. The analysis and codegen
+        // walk in the same order, so a simple forward scan with a cursor
+        // handles shadowed bindings correctly.
+        let analysis = self.analysis.as_ref().expect("analysis present");
+        let scope = &analysis.scopes[self.current_scope];
+        let upvals = scope.upval_count;
+        let names = &scope.names;
+        let mut idx = self.next_name_idx;
+        while idx < names.len() {
+            let (n, info) = names.get_index(idx).unwrap();
+            idx += 1;
+            if n == name {
+                self.next_name_idx = idx;
+                let abs_slot = upvals + info.slot;
+                self.next_slot = self.next_slot.max(abs_slot + 1);
+                self.scopes
+                    .last_mut()
+                    .expect("a scope is always open during codegen")
+                    .insert(
+                        name.to_string(),
+                        SlotInfo {
+                            slot: abs_slot,
+                            is_const: info.is_const,
+                        },
+                    );
+                return abs_slot;
+            }
+        }
+        // Not found in the remaining analysis entries — fallback (should be
+        // rare; e.g., a name not tracked by the analysis).
         let slot = self.next_slot;
         self.next_slot += 1;
         self.scopes
@@ -770,15 +1913,15 @@ impl<'src> Compiler<'src> {
 
             ast::Expression::UpdateExpression(u) => self.compile_update(u, true),
 
+            // ── Phase 3: function expressions / arrows ────────────────
+            ast::Expression::FunctionExpression(f) => {
+                self.compile_function_expr(f, f.span.start);
+            }
+            ast::Expression::ArrowFunctionExpression(f) => {
+                self.compile_arrow_expr(f, f.span.start);
+            }
+
             // ── informative errors for out-of-scope nodes ─────────────
-            ast::Expression::FunctionExpression(f) => self.error(
-                f.span.start,
-                "function expressions are not supported until Phase 3",
-            ),
-            ast::Expression::ArrowFunctionExpression(f) => self.error(
-                f.span.start,
-                "arrow functions are not supported until Phase 3",
-            ),
             ast::Expression::BigIntLiteral(b) => {
                 self.error(b.span.start, "BigInt is not supported")
             }
@@ -1747,7 +2890,7 @@ impl<'src> Compiler<'src> {
                 "computed method calls (`obj[expr](...)`) are not supported",
             ),
             ast::Expression::Identifier(id) => {
-                self.compile_global_call(id.name.as_str(), &argv, span)
+                self.compile_user_call(id.name.as_str(), &argv, span)
             }
             other => self.error(other.span().start, "unsupported call target"),
         }
@@ -1919,7 +3062,10 @@ impl<'src> Compiler<'src> {
             "slice" => Builtin::StrSlice,
             "trim" => Builtin::StrTrim,
             _ => {
-                self.error(span, format!("unsupported method `{method}`"));
+                // Not a known builtin method — treat as property access
+                // followed by dynamic call (e.g. `state.add5(3)` where
+                // add5 is a function stored in state).
+                self.compile_dynamic_method_call(recv, method, argv, span, optional);
                 return;
             }
         };
@@ -1927,6 +3073,632 @@ impl<'src> Compiler<'src> {
         // `meta()`. The variadic-default cases (e.g. `join` with no separator)
         // are handled by the builtin itself based on the received `argc`.
         self.compile_builtin_call(builtin, Some(recv), argv, span, optional);
+    }
+
+    /// Compile a method call where the method name is not a known builtin.
+    /// Lowers `recv.method(args)` to: evaluate recv, get property `method`,
+    /// evaluate args, then CallDyn.
+    fn compile_dynamic_method_call(
+        &mut self,
+        recv: &ast::Expression,
+        method: &str,
+        argv: &[&ast::Expression],
+        span: u32,
+        optional: bool,
+    ) {
+        // Evaluate the receiver.
+        self.compile_expr(recv);
+
+        if optional {
+            // Optional call: guard on the receiver before reading the property.
+            let end = self.begin_optional(span);
+            // Get the property from the non-nullish receiver.
+            self.emit(Instr::ObjGet(method.to_string()), span);
+            // Evaluate args.
+            self.compile_args(argv);
+            let argc = argv.len();
+            if argc > 0 {
+                self.emit(Instr::Dig(argc), span);
+            }
+            self.emit(Instr::CallDyn(argc as u32), span);
+            self.emit(Instr::Label(end), span);
+        } else {
+            // Get the property (consumes receiver, pushes property value).
+            self.emit(Instr::ObjGet(method.to_string()), span);
+            // Evaluate args.
+            self.compile_args(argv);
+            let argc = argv.len();
+            if argc > 0 {
+                // The callee sits below the args; Dig brings it to the top
+                // where CallDyn expects it.
+                self.emit(Instr::Dig(argc), span);
+            }
+            self.emit(Instr::CallDyn(argc as u32), span);
+        }
+    }
+
+    // ── Phase 3: function codegen ────────────────────────────────────
+
+    /// Call to a user-defined function identified by a bare name. If the name
+    /// resolves to a local binding, emit a static `Call` (when we know the
+    /// label) or `CallDyn`. Otherwise fall through to the built-in global call
+    /// path (`String`, `Number`, `Boolean`, `raise`).
+    fn compile_user_call(&mut self, name: &str, argv: &[&ast::Expression], span: u32) {
+        if let Some(info) = self.resolve_local(name) {
+            // Try to resolve to a static `Call`. If the function was declared
+            // in this scope and has NO captures, we can use a static Call.
+            // Functions with captures must use CallDyn so the VM installs
+            // the upvals as leading locals.
+            let label = self.find_callee_label(name);
+            match label {
+                Some(l) => {
+                    // Check whether this function has any captures.
+                    let has_captures = self.function_has_captures(name);
+                    if has_captures {
+                        // Dynamic call via Local + CallDyn (installs upvals).
+                        self.compile_args(argv);
+                        self.emit(Instr::Local(info.slot), span);
+                        self.emit(Instr::CallDyn(argv.len() as u32), span);
+                    } else {
+                        // Static call: push args and Call. Pad with Undefined if
+                        // the caller passes fewer args than the function expects
+                        // (for default parameters).
+                        let expected_arity = self.function_arity(name);
+                        self.compile_args(argv);
+                        let argc = argv.len() as u32;
+                        // Pad with Undefined for missing args.
+                        for _ in argc..expected_arity {
+                            self.emit(Instr::Push(StackValue::Undefined), span);
+                        }
+                        self.emit(Instr::Call(l, expected_arity), span);
+                    }
+                }
+                None => {
+                    // Dynamic call: push args, load callee, CallDyn.
+                    self.compile_args(argv);
+                    self.emit(Instr::Local(info.slot), span);
+                    self.emit(Instr::CallDyn(argv.len() as u32), span);
+                }
+            }
+            return;
+        }
+
+        // Not a local — try global/built-in.
+        self.compile_global_call(name, argv, span)
+    }
+
+    /// Check whether a named function in the current scope has captures.
+    fn function_has_captures(&self, name: &str) -> bool {
+        let analysis = self.analysis.as_ref().expect("analysis present");
+        let scope = &analysis.scopes[self.current_scope];
+        for &child_id in &scope.children {
+            let child = &analysis.scopes[child_id];
+            if child.is_declaration && child.self_name.as_deref() == Some(name) {
+                return !child.captures.is_empty();
+            }
+        }
+        false
+    }
+
+    /// Find the entry label of a function named `name` declared in the current
+    /// scope. Returns `None` if not statically known.
+    fn find_callee_label(&self, name: &str) -> Option<u32> {
+        let analysis = self.analysis.as_ref().expect("analysis present");
+        let scope = &analysis.scopes[self.current_scope];
+        for &child_id in &scope.children {
+            let child = &analysis.scopes[child_id];
+            if child.is_declaration && child.self_name.as_deref() == Some(name) {
+                return Some(child.label);
+            }
+        }
+        None
+    }
+
+    /// Get the declared parameter count of a function named `name` in the
+    /// current scope. Returns 0 if not found.
+    fn function_arity(&self, name: &str) -> u32 {
+        let analysis = self.analysis.as_ref().expect("analysis present");
+        let scope = &analysis.scopes[self.current_scope];
+        for &child_id in &scope.children {
+            let child = &analysis.scopes[child_id];
+            if child.is_declaration && child.self_name.as_deref() == Some(name) {
+                return child.params.len() as u32;
+            }
+        }
+        0
+    }
+
+    /// Return the next child scope id for `parent_id` (advancing the cursor).
+    fn next_child_scope(&mut self, parent_id: usize) -> Option<usize> {
+        let analysis = self.analysis.as_ref().expect("analysis present");
+        let scope = &analysis.scopes[parent_id];
+        let idx = self.next_child[parent_id];
+        if idx < scope.children.len() {
+            let child_id = scope.children[idx];
+            self.next_child[parent_id] = idx + 1;
+            Some(child_id)
+        } else {
+            None
+        }
+    }
+
+    /// Hoist function declarations in the current scope's prologue: walk the
+    /// AST statements to find `function` declarations, register their names
+    /// in scopes[0], and emit bindings. This must match the analysis walk
+    /// order so that `match_child_scope`'s cursor is properly synced.
+    fn hoist_function_decls(&mut self, stmts: &[ast::Statement]) {
+        for stmt in stmts {
+            self.hoist_function_decl_in_stmt(stmt);
+        }
+    }
+
+    fn hoist_function_decl_in_stmt(&mut self, stmt: &ast::Statement) {
+        match stmt {
+            ast::Statement::FunctionDeclaration(f) => {
+                let name = f.id.as_ref().map(|id| id.name.as_str());
+                let child_id = self.match_child_scope(
+                    self.current_scope,
+                    name,
+                    true, // is_declaration
+                    f.span.start,
+                );
+                let Some(child_id) = child_id else {
+                    return;
+                };
+                let (label, captures) = {
+                    let analysis = self.analysis.as_ref().expect("analysis present");
+                    let child = &analysis.scopes[child_id];
+                    (child.label, child.captures.clone())
+                };
+
+                // Save the child_id so compile_function_decl_body can
+                // find it without re-matching.
+                self.decl_child_queue.push(child_id);
+
+                // Register the name in scopes[0] (like var hoisting).
+                // Use the pre-computed slot from analysis since function
+                // declarations are unique per scope.
+                if let Some(name_str) = name {
+                    let slot = {
+                        let analysis: &ProgramAnalysis =
+                            self.analysis.as_ref().expect("analysis present");
+                        let child_scope = &analysis.scopes[child_id];
+                        let parent_id = child_scope.parent;
+                        if parent_id != usize::MAX {
+                            if let Some(info) = analysis.scopes[parent_id].names.get(name_str) {
+                                analysis.scopes[parent_id].upval_count + info.slot
+                            } else {
+                                self.next_slot
+                            }
+                        } else {
+                            self.next_slot
+                        }
+                    };
+                    self.scopes[0].insert(
+                        name_str.to_string(),
+                        SlotInfo {
+                            slot,
+                            is_const: false,
+                        },
+                    );
+
+                    // Emit the function value binding.
+                    let span = f.span.start;
+                    if captures.is_empty() {
+                        self.emit(Instr::Push(StackValue::Fn(label)), span);
+                    } else {
+                        self.emit(Instr::MakeClosure(label, captures), span);
+                    }
+                    self.emit(Instr::SetLocal(slot), span);
+                }
+            }
+            ast::Statement::BlockStatement(b) => {
+                for s in &b.body {
+                    self.hoist_function_decl_in_stmt(s);
+                }
+            }
+            ast::Statement::IfStatement(s) => {
+                self.hoist_function_decl_in_stmt(&s.consequent);
+                if let Some(alt) = &s.alternate {
+                    self.hoist_function_decl_in_stmt(alt);
+                }
+            }
+            ast::Statement::WhileStatement(s) => self.hoist_function_decl_in_stmt(&s.body),
+            ast::Statement::DoWhileStatement(s) => self.hoist_function_decl_in_stmt(&s.body),
+            ast::Statement::ForStatement(s) => self.hoist_function_decl_in_stmt(&s.body),
+            _ => {}
+        }
+    }
+
+    /// Emit the body of a function declaration. Called from `compile_stmt`
+    /// when a `FunctionDeclaration` is encountered during the body walk.
+    /// The child scope was already matched by `hoist_function_decl_in_stmt`
+    /// and pushed to `decl_child_queue`.
+    fn compile_function_decl_body(&mut self, f: &ast::Function) {
+        let child_id = match self.decl_child_queue.first().copied() {
+            Some(id) => {
+                self.decl_child_queue.remove(0);
+                id
+            }
+            None => {
+                self.error(
+                    f.span.start,
+                    "internal error: no queued child scope for function declaration",
+                );
+                return;
+            }
+        };
+
+        if let Some(body) = &f.body {
+            self.emit_function_def(child_id, &body.statements, &f.params, f.span.start, false);
+        }
+    }
+
+    /// Compile a function expression: emit the function value and its body.
+    fn compile_function_expr(&mut self, func: &ast::Function, span: u32) {
+        let func_name = func.id.as_ref().map(|id| id.name.as_str());
+        let child_id = self.match_child_scope(
+            self.current_scope,
+            func_name,
+            false, // !is_declaration
+            span,
+        );
+        let Some(child_id) = child_id else {
+            self.error(
+                span,
+                "internal error: function expression not found in analysis",
+            );
+            return;
+        };
+
+        // Clone the data we need from analysis so we can release the borrow
+        // before calling self.emit().
+        let (label, captures, is_empty_captures) = {
+            let analysis = self.analysis.as_ref().expect("analysis present");
+            let child = &analysis.scopes[child_id];
+            (
+                child.label,
+                child.captures.clone(),
+                child.captures.is_empty(),
+            )
+        };
+
+        // Emit the function value on the expression stack.
+        if is_empty_captures {
+            self.emit(Instr::Push(StackValue::Fn(label)), span);
+        } else {
+            self.emit(Instr::MakeClosure(label, captures), span);
+        }
+
+        // Emit the body after the current expression.
+        if let Some(body) = &func.body {
+            self.emit_function_def(child_id, &body.statements, &func.params, span, false);
+        }
+    }
+
+    /// Compile an arrow function expression.
+    fn compile_arrow_expr(&mut self, arrow: &ast::ArrowFunctionExpression, span: u32) {
+        let child_id = self.match_child_scope(
+            self.current_scope,
+            None,  // arrows are always anonymous
+            false, // !is_declaration
+            span,
+        );
+        let Some(child_id) = child_id else {
+            self.error(span, "internal error: arrow function not found in analysis");
+            return;
+        };
+
+        let (label, captures, is_empty_captures) = {
+            let analysis = self.analysis.as_ref().expect("analysis present");
+            let child = &analysis.scopes[child_id];
+            (
+                child.label,
+                child.captures.clone(),
+                child.captures.is_empty(),
+            )
+        };
+
+        if is_empty_captures {
+            self.emit(Instr::Push(StackValue::Fn(label)), span);
+        } else {
+            self.emit(Instr::MakeClosure(label, captures), span);
+        }
+
+        // Arrow expression bodies: the body is an expression, not a block.
+        // Emit the expression and then Return(1); no implicit Undefined return.
+        let is_expression_body = arrow.expression;
+        self.emit_function_def(
+            child_id,
+            &arrow.body.statements,
+            &arrow.params,
+            span,
+            is_expression_body,
+        );
+    }
+
+    /// Match a child scope by name and declaration status, advancing the
+    /// per-parent cursor. For anonymous functions, matches the next
+    /// non-declaration child.
+    fn match_child_scope(
+        &mut self,
+        parent_id: usize,
+        name: Option<&str>,
+        is_declaration: bool,
+        error_span: u32,
+    ) -> Option<usize> {
+        let result;
+        {
+            let analysis = self.analysis.as_ref().expect("analysis present");
+            let scope = &analysis.scopes[parent_id];
+            let start = self.next_child[parent_id];
+
+            let mut found = None;
+            for i in start..scope.children.len() {
+                let child_id = scope.children[i];
+                let child = &analysis.scopes[child_id];
+                let matches = child.is_declaration == is_declaration
+                    && match (name, &child.self_name) {
+                        (Some(n), Some(s)) => n == s.as_str(),
+                        (None, None) => true,
+                        _ => false,
+                    };
+                if matches {
+                    self.next_child[parent_id] = i + 1;
+                    found = Some(child_id);
+                    break;
+                }
+            }
+            result = found;
+        }
+
+        if result.is_none() {
+            self.error(
+                error_span,
+                format!(
+                    "internal error: unmatched child scope (name={name:?}, decl={is_declaration})"
+                ),
+            );
+        }
+        result
+    }
+
+    /// Emit a function body: label, prologue (Alloc, param copies/defaults,
+    /// self-reference), body statements, implicit Return. Called after the
+    /// function value has been pushed to the stack (or at the declaration site).
+    /// `is_expression_body`: if true (arrow expression body), don't add an
+    /// implicit `return undefined` at the end.
+    fn emit_function_def(
+        &mut self,
+        scope_id: usize,
+        body_stmts: &[ast::Statement],
+        params: &ast::FormalParameters,
+        span: u32,
+        is_expression_body: bool,
+    ) {
+        // Clone all the analysis data we need so we can release the borrow
+        // before calling self.emit().
+        let (label, upvals, slot_kinds, params_info, self_name, captures) = {
+            let analysis = self.analysis.as_ref().expect("analysis present");
+            let scope = &analysis.scopes[scope_id];
+            (
+                scope.label,
+                scope.upval_count,
+                scope.slot_kinds.clone(),
+                scope.params.clone(),
+                scope.self_name.clone(),
+                scope.captures.clone(),
+            )
+        };
+
+        let prev_scope = self.current_scope;
+        self.current_scope = scope_id;
+        self.next_slot = 0;
+
+        // Emit a Jump over the body for sequential execution, THEN the
+        // entry Label. Call/CallDyn jump to the Label (body start);
+        // sequential execution hits the Jump and skips the body.
+        let after = self.new_label();
+        self.emit(Instr::Jump(after), span);
+        self.emit(Instr::Label(label), span);
+
+        // Save and replace the scope stack — function bodies must not see
+        // the enclosing scope's bindings.
+        let saved_scopes = std::mem::take(&mut self.scopes);
+        self.scopes.push(HashMap::new());
+        self.next_name_idx = 0;
+
+        // Seed scopes[0] with pre-computed names from the analysis.
+        // Only insert the first occurrence of each name; duplicates
+        // (from block-scoped shadows) are handled by declare_lexical's
+        // cursor.
+        {
+            let analysis = self.analysis.as_ref().expect("analysis present");
+            let scope = &analysis.scopes[scope_id];
+            let mut seen = HashSet::new();
+            for (name, info) in &scope.names {
+                if seen.insert(name.clone()) {
+                    self.scopes[0].insert(
+                        name.clone(),
+                        SlotInfo {
+                            slot: upvals + info.slot,
+                            is_const: info.is_const,
+                        },
+                    );
+                }
+            }
+        }
+
+        // Allocate all own locals. The analysis pre-computed the slot
+        // kinds (Boxed/Plain) and the total count. The name→slot mapping
+        // is built dynamically during the body walk, which matches the
+        // analysis walk order.
+        let own_kinds: Vec<SlotKind> = slot_kinds[upvals as usize..].to_vec();
+        let own_len = own_kinds.len() as u32;
+        self.next_slot = own_len;
+        if !own_kinds.is_empty() {
+            self.emit(Instr::Alloc(own_kinds), span);
+        }
+
+        // Register parameter names in the function scope.
+        for (p_idx, p) in params_info.iter().enumerate() {
+            let abs_slot = upvals + p_idx as u32;
+            self.scopes[0].insert(
+                p.name.clone(),
+                SlotInfo {
+                    slot: abs_slot,
+                    is_const: false,
+                },
+            );
+        }
+
+        // Register captured variable names in the function scope. The
+        // captures list contains parent absolute slot indices; lookup
+        // the parent scope to find the corresponding names.
+        {
+            let analysis = self.analysis.as_ref().expect("analysis present");
+            let parent_id = analysis.scopes[scope_id].parent;
+            if parent_id != usize::MAX && !captures.is_empty() {
+                let parent = &analysis.scopes[parent_id];
+                for (cap_idx, &parent_slot) in captures.iter().enumerate() {
+                    // Find the name in the parent scope that maps to this slot.
+                    for (name, info) in &parent.names {
+                        if info.slot + parent.upval_count == parent_slot {
+                            self.scopes[0].insert(
+                                name.clone(),
+                                SlotInfo {
+                                    slot: cap_idx as u32, // upval slot index
+                                    is_const: false,
+                                },
+                            );
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Register the self-name (for named function expressions) in this
+        // function's scope, so it's visible inside the body for recursion.
+        if let Some(ref sn) = self_name {
+            // Self-name goes PAST all pre-computed own locals.
+            let self_slot = upvals + own_len;
+            self.scopes[0].insert(
+                sn.clone(),
+                SlotInfo {
+                    slot: self_slot,
+                    is_const: true,
+                },
+            );
+        }
+
+        // Copy captured/reassigned params from Arg to Boxed slots; apply
+        // parameter defaults.
+        for (p_idx, param_info) in params_info.iter().enumerate() {
+            let own_idx = p_idx as u32;
+            let abs_slot = upvals + own_idx;
+            // Check if this param needs boxing by examining the slot kind.
+            let slot_kind = slot_kinds.get(abs_slot as usize).copied();
+            let needs_box = matches!(slot_kind, Some(SlotKind::Boxed));
+
+            let pat = &params.items[p_idx].pattern;
+            let default_expr = params.items[p_idx].initializer.as_ref().map(|v| &**v);
+            self.emit_param_setup(
+                pat,
+                p_idx as u32,
+                abs_slot,
+                needs_box,
+                param_info.has_default,
+                default_expr,
+                span,
+            );
+        }
+
+        // Self-reference for named function expressions.
+        if let Some(ref sn) = self_name {
+            if let Some(info) = self.resolve_local(sn) {
+                // Allocate an extra slot for the self-reference.
+                self.emit(Instr::Alloc(vec![SlotKind::Plain]), span);
+                // Self-reference is always a bare Fn (never a MakeClosure
+                // capturing the current frame — that would capture the
+                // wrong things for invocation).
+                self.emit(Instr::Push(StackValue::Fn(label)), span);
+                self.emit(Instr::SetLocal(info.slot), span);
+            }
+        }
+
+        // Hoist inner function declarations (emit their bindings in this
+        // function's prologue).
+        self.hoist_function_decls(body_stmts);
+
+        // Compile the body statements.
+        if is_expression_body && body_stmts.len() == 1 {
+            // Arrow expression body: the single statement is an expression
+            // whose value is the return value. Compile the expression, then
+            // Return(1). Don't Pop the value.
+            if let ast::Statement::ExpressionStatement(es) = &body_stmts[0] {
+                self.compile_expr(&es.expression);
+                self.emit(Instr::Return(1), span);
+            }
+        } else {
+            for stmt in body_stmts {
+                self.compile_stmt(stmt);
+            }
+            // Implicit return at end of function.
+            self.emit(Instr::Push(StackValue::Undefined), span);
+            self.emit(Instr::Return(1), span);
+        }
+
+        // Label for the jump-over at the start.
+        self.emit(Instr::Label(after), span);
+
+        self.scopes.pop();
+        // Restore the enclosing scope stack.
+        self.scopes = saved_scopes;
+        self.current_scope = prev_scope;
+    }
+
+    /// Emit prologue code for one parameter: optionally read Arg, check for
+    /// undefined/default, and store to the appropriate slot. `has_default`
+    /// comes from the FormalParameter's `initializer` field (oxc stores
+    /// defaults there, not in the BindingPattern).
+    fn emit_param_setup(
+        &mut self,
+        _pattern: &ast::BindingPattern,
+        arg_idx: u32,
+        abs_slot: u32,
+        needs_box: bool,
+        has_default: bool,
+        default_expr: Option<&ast::Expression>,
+        span: u32,
+    ) {
+        if has_default {
+            // Parameter has a default: read Arg, check if undefined, apply
+            // default if needed, then store to the slot.
+            if let Some(default) = default_expr {
+                let skip_default = self.new_label();
+                self.emit(Instr::Arg(arg_idx), span);
+                self.emit(Instr::Dup, span);
+                self.emit(Instr::Push(StackValue::Undefined), span);
+                self.emit(Instr::Eq, span);
+                self.emit(Instr::JFalse(skip_default), span);
+                // Arg is undefined: pop it, evaluate default.
+                self.emit(Instr::Pop(1), span);
+                self.compile_expr(default);
+                self.emit(Instr::Label(skip_default), span);
+                // Store to the local slot (the value — arg or default — is on top).
+                self.emit(Instr::SetLocal(abs_slot), span);
+            }
+        } else if needs_box {
+            // No default, but we need a Boxed copy: Arg → SetLocal.
+            self.emit(Instr::Arg(arg_idx), span);
+            self.emit(Instr::SetLocal(abs_slot), span);
+        } else {
+            // Plain non-captured param: still copy Arg to Local so the body
+            // can use Local(slot) uniformly.
+            self.emit(Instr::Arg(arg_idx), span);
+            self.emit(Instr::SetLocal(abs_slot), span);
+        }
     }
 }
 
@@ -2493,11 +4265,9 @@ mod tests {
             "x;",             // undeclared variable
             "x = 1;",         // assignment to undeclared variable
             "i++;",           // update of undeclared variable
-            "foo(1);",        // undeclared function (Phase 3)
             "tools.send(1);", // tools (Phase 4)
             "raise(\"x\");",  // raise (Phase 4)
             "Math.tan(1);",   // unsupported intrinsic
-            "[1, 2].zap();",  // unknown method
             "Math.pow(1);",   // wrong arity (needs exactly 2)
             "f(...args);",    // spread arg
             "new Foo();",     // new
@@ -2913,5 +4683,138 @@ mod tests {
             },
             other => panic!("not a pointer: {other:?}"),
         }
+    }
+
+    // ── Phase 3: functions / closures ─────────────────────────────────
+
+    /// Run `src` and return `state.r`. Phase 3: programs can define and call
+    /// functions; we wrap the result in a well-known state slot.
+    fn eval_phase3(src: &str) -> StackValue {
+        let vm = run_vm(src);
+        state_val(&vm, "r")
+    }
+
+    #[test]
+    fn function_declaration_and_call() {
+        assert_eq!(
+            eval_phase3("function add(a, b) { return a + b; } state.r = add(3, 4);"),
+            num(7.0)
+        );
+    }
+
+    #[test]
+    fn function_hoisting_forward_reference() {
+        assert_eq!(
+            eval_phase3("state.r = add(2, 3); function add(a, b) { return a + b; }"),
+            num(5.0)
+        );
+    }
+
+    #[test]
+    fn function_return_without_value() {
+        assert_eq!(
+            eval_phase3("function f() { return; } state.r = f();"),
+            StackValue::Undefined
+        );
+    }
+
+    #[test]
+    fn function_implicit_return() {
+        assert_eq!(
+            eval_phase3("function f() {} state.r = f();"),
+            StackValue::Undefined
+        );
+    }
+
+    #[test]
+    fn parameter_defaults() {
+        // Default applied when called without an argument: the compiler
+        // pads with Undefined, which triggers the default expression.
+        assert_eq!(
+            eval_phase3("function f(x = 5) { return x; } state.r = f();"),
+            StackValue::PosInt(5)
+        );
+        assert_eq!(
+            eval_phase3("function f(x = 5) { return x; } state.r = f(9);"),
+            StackValue::PosInt(9)
+        );
+    }
+
+    #[test]
+    fn function_expression() {
+        assert_eq!(
+            eval_phase3("let add = function(a, b) { return a + b; }; state.r = add(5, 6);"),
+            num(11.0)
+        );
+    }
+
+    #[test]
+    fn arrow_expression_body() {
+        // Arrow with expression body implicitly returns.
+        assert_eq!(
+            eval_phase3("let add = (a, b) => a + b; state.r = add(3, 4);"),
+            num(7.0)
+        );
+    }
+
+    #[test]
+    fn arrow_block_body() {
+        assert_eq!(
+            eval_phase3("let f = (x) => { return x * 2; }; state.r = f(7);"),
+            num(14.0)
+        );
+    }
+
+    #[test]
+    fn recursion() {
+        assert_eq!(
+            eval_phase3(
+                "function fact(n) { if (n <= 1) return 1; return n * fact(n - 1); } state.r = fact(5);"
+            ),
+            num(120.0)
+        );
+    }
+
+    #[test]
+    fn mutual_recursion() {
+        assert_eq!(
+            eval_phase3(
+                "function isEven(n) { if (n === 0) return true; return isOdd(n - 1); } function isOdd(n) { if (n === 0) return false; return isEven(n - 1); } state.r = isEven(4);"
+            ),
+            StackValue::Bool(true)
+        );
+    }
+
+    #[test]
+    fn closure_captures_local() {
+        // Simple closure: inner function captures outer variable by value.
+        let vm = run_vm(
+            "function makeAdder(x) { return function(y) { return x + y; }; } state.add5 = makeAdder(5); state.r = state.add5(3);",
+        );
+        assert_eq!(state_val(&vm, "r"), num(8.0));
+    }
+
+    #[test]
+    fn closure_mutation_visible() {
+        let vm = run_vm(
+            "function makeCounter() { let count = 0; function inc() { count = count + 1; return count; } return inc; } state.c1 = makeCounter(); state.c1(); state.r = state.c1();",
+        );
+        assert_eq!(state_val(&vm, "r"), num(2.0));
+    }
+
+    #[test]
+    fn function_decl_in_block_scope() {
+        let vm = run_vm("state.r = foo(); { function foo() { return 9; } }");
+        assert_eq!(state_val(&vm, "r"), StackValue::PosInt(9));
+    }
+
+    #[test]
+    fn return_must_be_inside_function() {
+        let errs = compile("return 1;").expect_err("top-level return should error");
+        assert!(
+            errs[0].message.contains("return"),
+            "got: {}",
+            errs[0].message
+        );
     }
 }
