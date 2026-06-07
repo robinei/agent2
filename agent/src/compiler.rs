@@ -619,16 +619,13 @@ impl<'src> Compiler<'src> {
 
     // ── assignment ───────────────────────────────────────────────────────
 
-    /// Assignment is an expression: it leaves the assigned value on the stack.
+    /// Assignment is an expression: it leaves the assigned value on the stack
+    /// (the store instructions push it back), so lowering is just the operands
+    /// in source order followed by the store — no shuffling, correct eval order.
     ///
     /// Phase 1 supports plain `=` to a member/index/`state` target. Compound
     /// (`+=`), logical (`??=`), and identifier targets (which need local
     /// declarations) arrive in Phase 2.
-    ///
-    /// Accepted divergence: the RHS is evaluated *before* the target's
-    /// object/key subexpressions (RHS-first), because leaving the value requires
-    /// stashing a copy beneath the store operands and the VM has no deep-dig
-    /// primitive. Only observable when both sides have side effects.
     fn compile_assignment(&mut self, a: &ast::AssignmentExpression) {
         use ast::AssignmentOperator as Op;
         let span = a.span.start;
@@ -642,21 +639,15 @@ impl<'src> Compiler<'src> {
         match &a.left {
             ast::AssignmentTarget::StaticMemberExpression(m) => {
                 let field = m.property.name.as_str().to_string();
-                // rhs; Dup; obj; Swap  ->  [v, obj, v]; ObjSet -> [v]
-                self.compile_expr(&a.right);
-                self.emit(Instr::Dup, span);
                 self.compile_expr(&m.object);
-                self.emit(Instr::Swap, span);
-                self.emit(Instr::ObjSet(field), span);
+                self.compile_expr(&a.right);
+                self.emit(Instr::ObjSet(field), span); // leaves the value
             }
             ast::AssignmentTarget::ComputedMemberExpression(m) => {
-                // rhs; Dup; obj; key; Rot  ->  [v, obj, key, v]; IndexSet -> [v]
-                self.compile_expr(&a.right);
-                self.emit(Instr::Dup, span);
                 self.compile_expr(&m.object);
                 self.compile_expr(&m.expression);
-                self.emit(Instr::Rot, span);
-                self.emit(Instr::IndexSet, span);
+                self.compile_expr(&a.right);
+                self.emit(Instr::IndexSet, span); // leaves the value
             }
             ast::AssignmentTarget::AssignmentTargetIdentifier(id) => self.error(
                 id.span.start,

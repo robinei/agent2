@@ -358,7 +358,9 @@ pub enum Instr {
     // field 0's value is the first/deepest pushed.
     ObjNew(Vec<FieldName>), // [any, ...] -> obj
     ObjGet(FieldName),      // obj -> any
-    ObjSet(FieldName),      // obj, any -> ()
+    // Sets the field and leaves the assigned value (assignment is an
+    // expression). Statement-context callers follow it with Pop(1).
+    ObjSet(FieldName), // obj, any -> any
 
     // Runtime-polymorphic computed access `x[k]` / `x[k] = v`. A variable-keyed
     // index has no static type to choose array/object/string access, so these
@@ -370,7 +372,8 @@ pub enum Instr {
     // ArrGet/ArrSet/ObjGetDyn/ObjSetDyn. The static-name ObjGet/ObjSet remain
     // the fast path for `obj.foo`/`state.foo` (no per-access heap-string alloc).
     IndexGet, // container, key -> any
-    IndexSet, // container, key, value -> ()
+    // Like ObjSet, leaves the assigned value (statement callers Pop it).
+    IndexSet, // container, key, value -> any
     // object enumeration / membership (JS Object.keys / Object.values,
     // `key in obj`, `delete obj[key]`). Keys/values are returned in insertion
     // order (IndexMap-backed). ObjDelete pushes whether the key was present.
@@ -1714,6 +1717,10 @@ impl VM {
                     let obj_ptr = self.pop_ptr()?;
                     let obj = self.heap_obj_mut(obj_ptr).ok_or(VMError::TypeError)?;
                     obj.insert(field, val);
+                    // Leave the assigned value: assignment is an expression whose
+                    // result is the RHS, and this lets `obj.f = v` lower without
+                    // any stack shuffling (and in source order).
+                    self.stack.push(val);
                     self.ip += 1;
                 }
 
@@ -1801,6 +1808,9 @@ impl VM {
                         let obj = self.heap_obj_mut(container).ok_or(VMError::TypeError)?;
                         obj.insert(field, val);
                     }
+                    // Leave the assigned value (see ObjSet): assignment is an
+                    // expression, and this keeps `arr[i] = v` shuffle-free.
+                    self.stack.push(val);
                     self.ip += 1;
                 }
 
@@ -3430,10 +3440,10 @@ mod tests {
             ArrNew(3),
             Push(n(1.0)),  // index
             Push(n(99.0)), // value
-            IndexSet,      // pops: value, index, arr_ptr (ptr consumed)
+            IndexSet,      // pops value, index, arr_ptr; leaves the value
         ];
-        // IndexSet consumes ptr, nothing left on stack.
-        assert!(run(code).is_empty());
+        // IndexSet leaves the assigned value (assignment is an expression).
+        assert_eq!(run(code), vec![n(99.0)]);
     }
 
     #[test]
@@ -3447,7 +3457,8 @@ mod tests {
             Dup,           // save ptr for later
             Push(n(1.0)),  // index
             Push(n(99.0)), // value
-            IndexSet,      // pops value, index, ptr_copy → stack: [ptr]
+            IndexSet,      // pops value, index, ptr_copy; leaves value → [ptr, 99]
+            Pop(1),        // drop the assigned-value result → [ptr]
             Push(n(1.0)),  // index
             IndexGet,      // pops index, ptr → pushes arr[1]
         ];
@@ -3604,9 +3615,9 @@ mod tests {
             Dup,                                  // keep ptr for verification
             Push(s(0)),                           // field "y" (heap[0]="y") — pushed before val
             Push(n(99.0)),                        // val — on top
-            IndexSet,                             // pops val, key, obj_ptr → obj.y = 99
-            // Stack: [ptr]
-            ObjGet("y".into()), // → 99
+            IndexSet,                             // obj.y = 99; leaves val → [ptr, 99]
+            Pop(1),                               // drop the result → [ptr]
+            ObjGet("y".into()),                   // → 99
         ]);
         vm.alloc_string("y".to_string());
         loop {
@@ -3628,7 +3639,8 @@ mod tests {
             ObjNew(vec!["x".into(), "y".into()]), // x=2, y=1
             Dup,                // keep ptr for verification after ObjSet consumes one
             Push(n(99.0)),      // value to set
-            ObjSet("x".into()), // obj.x = 99, consumes one ptr
+            ObjSet("x".into()), // obj.x = 99; leaves value → [ptr, 99]
+            Pop(1),             // drop the result → [ptr]
             ObjGet("x".into()), // → 99
         ];
         assert_eq!(run(code), vec![n(99.0)]);
