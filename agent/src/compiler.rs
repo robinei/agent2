@@ -244,13 +244,10 @@ impl<'src> Compiler<'src> {
                 }
             }
 
+            ast::Statement::ForOfStatement(s) => self.compile_for_of(s),
+            ast::Statement::ForInStatement(s) => self.compile_for_in(s),
+
             // Later phases / out of scope — informative errors.
-            ast::Statement::ForOfStatement(s) => {
-                self.error(s.span.start, "`for...of` is not supported until Phase 4")
-            }
-            ast::Statement::ForInStatement(s) => {
-                self.error(s.span.start, "`for...in` is not supported until Phase 4")
-            }
             ast::Statement::SwitchStatement(s) => {
                 self.error(s.span.start, "`switch` is not supported until Phase 4")
             }
@@ -576,6 +573,107 @@ impl<'src> Compiler<'src> {
                 self.emit(Instr::Jump(target), s.span.start);
             }
             None => self.error(s.span.start, "`continue` outside a loop"),
+        }
+    }
+
+    /// `for (let x of iter) body` — iterate the values of an array/string. The
+    /// VM has no iterator protocol, so this lowers to an index counter: the
+    /// iterable and the index are kept on the stack as `[iter, idx]` for the
+    /// whole loop, and each step binds the loop variable to `iter[idx]`. A
+    /// non-array/string iterable is a runtime `TypeError` (from `ArrLength`).
+    fn compile_for_of(&mut self, s: &ast::ForOfStatement) {
+        let span = s.span.start;
+        let Some(slot) = self.for_loop_binding_slot(&s.left, span) else {
+            return;
+        };
+        // Push the iterable; `compile_index_loop` adds the counter and consumes
+        // both at the end.
+        self.compile_expr(&s.right);
+        self.compile_index_loop(slot, &s.body, span);
+    }
+
+    /// `for (let k in obj) body` — iterate the keys of an object (insertion
+    /// order). Lowers to `Object.keys(obj)` (an array of string keys) followed
+    /// by the same index loop as `for-of`, binding the loop variable to each
+    /// key. Over `state` this enumerates the blessed object's keys.
+    fn compile_for_in(&mut self, s: &ast::ForInStatement) {
+        let span = s.span.start;
+        let Some(slot) = self.for_loop_binding_slot(&s.left, span) else {
+            return;
+        };
+        self.compile_expr(&s.right);
+        self.emit(Instr::CallBuiltin(Builtin::ObjKeys, 1), span);
+        self.compile_index_loop(slot, &s.body, span);
+    }
+
+    /// Shared iteration scaffold for `for-of`/`for-in`. Expects the container to
+    /// iterate already on the stack top. Pushes an index counter, then on each
+    /// step binds `slot` to `container[idx]` and runs `body`; `break`/`continue`
+    /// resolve through the loop-context stack. The container and counter
+    /// (`[container, idx]`) are maintained on the stack at constant depth across
+    /// the loop top, the `continue` target, and the exit — so `break` (→ end)
+    /// and `continue` (→ increment) both land where exactly those two values
+    /// are present, and the final `Pop(2)` cleans them up.
+    fn compile_index_loop(&mut self, slot: u32, body: &ast::Statement, span: u32) {
+        self.emit(Instr::Push(StackValue::PosInt(0)), span); // [cont, idx]
+        let top = self.new_label();
+        let cont = self.new_label();
+        let end = self.new_label();
+        self.emit(Instr::Label(top), span);
+        // idx < length(container) ?
+        self.emit(Instr::Pick(0), span); // [cont, idx, idx]
+        self.emit(Instr::Pick(2), span); // [cont, idx, idx, cont]
+        self.emit(Instr::ArrLength, span); // [cont, idx, idx, len]
+        self.emit(Instr::Lt, span); // [cont, idx, idx<len]
+        self.emit(Instr::JFalse(end), span); // [cont, idx]
+        // Bind loop var = container[idx].
+        self.emit(Instr::Pick(1), span); // [cont, idx, cont]
+        self.emit(Instr::Pick(1), span); // [cont, idx, cont, idx]
+        self.emit(Instr::IndexGet, span); // [cont, idx, elem]
+        self.emit(Instr::SetLocal(slot), span); // [cont, idx]
+        self.loops.push(LoopCtx {
+            break_label: end,
+            continue_label: cont,
+        });
+        self.compile_stmt(body);
+        self.loops.pop();
+        // `continue` lands here, at the increment.
+        self.emit(Instr::Label(cont), span);
+        self.emit(Instr::Push(StackValue::PosInt(1)), span); // [cont, idx, 1]
+        self.emit(Instr::Add, span); // [cont, idx+1]
+        self.emit(Instr::Jump(top), span);
+        self.emit(Instr::Label(end), span);
+        self.emit(Instr::Pop(2), span); // drop [cont, idx]
+    }
+
+    /// Resolve the loop variable of a `for-of`/`for-in` head to its frame slot.
+    /// Only the `let`/`const`/`var x` single-identifier form is supported;
+    /// destructuring, multiple declarators, and the bare-assignment-target form
+    /// (`for (x of …)`) record a diagnostic and return `None`.
+    fn for_loop_binding_slot(&mut self, left: &ast::ForStatementLeft, span: u32) -> Option<u32> {
+        let decl = match left {
+            ast::ForStatementLeft::VariableDeclaration(decl) => decl,
+            _ => {
+                self.error(
+                    span,
+                    "for-of/for-in requires a `let`/`const`/`var` loop binding",
+                );
+                return None;
+            }
+        };
+        if decl.declarations.len() != 1 {
+            self.error(span, "for-of/for-in needs exactly one loop variable");
+            return None;
+        }
+        match &decl.declarations[0].id {
+            ast::BindingPattern::BindingIdentifier(id) => self.binding_slot(id.span.start),
+            _ => {
+                self.error(
+                    span,
+                    "destructuring in a for-of/for-in binding is not supported",
+                );
+                None
+            }
         }
     }
 
@@ -1609,7 +1707,14 @@ impl<'src> Compiler<'src> {
                             );
                         }
                         "tools" => {
-                            self.error(span, "`tools.*` calls are not supported until Phase 4");
+                            // `tools.foo(a, b)` → `Invoke("foo", 2)`. Recognized
+                            // structurally; `tools` is valid only as the receiver
+                            // of such a call (bare `tools` and `tools.foo` without
+                            // a call are undeclared-identifier errors elsewhere).
+                            // An optional member (`tools?.foo()`) is meaningless —
+                            // `tools` always exists — so it lowers identically.
+                            self.compile_args(&argv);
+                            self.emit(Instr::Invoke(method.to_string(), argv.len() as u32), span);
                             return;
                         }
                         _ => {}
@@ -1757,7 +1862,25 @@ impl<'src> Compiler<'src> {
                 self.compile_args(argv);
                 self.emit(Instr::ToBool, span);
             }
-            "raise" => self.error(span, "`raise` is not supported until Phase 4"),
+            "raise" => {
+                // `raise("...")` → `Raise(String)`. The `Raise` instruction
+                // carries a compile-time string, so the argument must be a
+                // string literal. `raise(...)` is an expression: it leaves one
+                // value (the host pushes the resumed value back on the stack),
+                // satisfying the one-value-per-expression invariant.
+                if !self.arity(argv, 1, span, "raise") {
+                    return;
+                }
+                match argv[0] {
+                    ast::Expression::StringLiteral(lit) => {
+                        self.emit(Instr::Raise(lit.value.as_str().to_string()), span);
+                    }
+                    other => self.error(
+                        other.span().start,
+                        "`raise` requires a string-literal argument",
+                    ),
+                }
+            }
             _ => self.error(
                 span,
                 format!("call to undeclared function `{name}` (user functions are Phase 3)"),
@@ -2686,12 +2809,14 @@ mod tests {
     fn diagnostics_for_unsupported() {
         // These all live in later phases / out of scope and must error cleanly.
         for src in [
-            "x;",             // undeclared variable
-            "x = 1;",         // assignment to undeclared variable
-            "i++;",           // update of undeclared variable
-            "tools.send(1);", // tools (Phase 4)
-            "raise(\"x\");",  // raise (Phase 4)
-            "Math.tan(1);",   // unsupported intrinsic
+            "x;",           // undeclared variable
+            "x = 1;",       // assignment to undeclared variable
+            "i++;",         // update of undeclared variable
+            "tools;",       // bare `tools` is not a value
+            "tools.send;",  // `tools.send` without a call
+            "raise(x);",    // raise with a non-literal argument
+            "raise();",     // raise with no argument
+            "Math.tan(1);", // unsupported intrinsic
             "Math.pow(1);",   // wrong arity (needs exactly 2)
             "f(...args);",    // spread arg
             "new Foo();",     // new
@@ -2745,6 +2870,83 @@ mod tests {
             },
             other => panic!("{other:?}"),
         }
+    }
+
+    // ── Phase 4: effects (tools / raise) ────────────────────────────────
+
+    #[test]
+    fn tools_call_lowers_to_invoke() {
+        // `tools.foo(a, b)` lowers to args-then-`Invoke("foo", 2)`.
+        let prog = compile("tools.notify(1, 2);").expect("compiles");
+        assert!(
+            prog.code
+                .contains(&Instr::Invoke("notify".to_string(), 2)),
+            "expected Invoke in {:?}",
+            prog.code
+        );
+    }
+
+    #[test]
+    fn tools_call_yields_invoke_effect() {
+        // End-to-end: a `tools.*` call yields an `Invoke` effect carrying the
+        // method name and the evaluated args; the host pushes a result to resume.
+        let prog = compile("state.r = tools.add(10, 3);").expect("compiles");
+        let mut vm = VM::for_program(prog.code, serde_json::Value::Null).unwrap();
+        match vm.step().unwrap() {
+            StepResult::Invoke { calls } => {
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0].name, "add");
+                assert_eq!(calls[0].args, vec![StackValue::PosInt(10), StackValue::PosInt(3)]);
+            }
+            other => panic!("expected Invoke, got {other:?}"),
+        }
+        // Host resolves the call and pushes the result; the program stores it.
+        vm.stack.push(StackValue::PosInt(13));
+        loop {
+            match vm.step().unwrap() {
+                StepResult::Done => break,
+                other => panic!("unexpected effect: {other:?}"),
+            }
+        }
+        assert_eq!(state_val(&vm, "r"), StackValue::PosInt(13));
+    }
+
+    #[test]
+    fn tools_call_with_no_args() {
+        let prog = compile("tools.tick();").expect("compiles");
+        assert!(prog.code.contains(&Instr::Invoke("tick".to_string(), 0)));
+    }
+
+    #[test]
+    fn raise_lowers_to_raise_instr() {
+        let prog = compile("raise(\"need_input\");").expect("compiles");
+        assert!(
+            prog.code.contains(&Instr::Raise("need_input".to_string())),
+            "expected Raise in {:?}",
+            prog.code
+        );
+    }
+
+    #[test]
+    fn raise_yields_effect_and_resumes_as_expression() {
+        // `raise(...)` is an expression: it yields a `Raise` effect, then the
+        // host pushes the resumed value which the program consumes.
+        let prog = compile("state.r = raise(\"pick_a_number\");").expect("compiles");
+        let mut vm = VM::for_program(prog.code, serde_json::Value::Null).unwrap();
+        match vm.step().unwrap() {
+            StepResult::Raise { condition } => assert_eq!(condition, "pick_a_number"),
+            other => panic!("expected Raise, got {other:?}"),
+        }
+        // Resume restart: advance past the Raise and push the resumed value.
+        vm.ip += 1;
+        vm.stack.push(StackValue::PosInt(42));
+        loop {
+            match vm.step().unwrap() {
+                StepResult::Done => break,
+                other => panic!("unexpected effect: {other:?}"),
+            }
+        }
+        assert_eq!(state_val(&vm, "r"), StackValue::PosInt(42));
     }
 
     // ── Phase 2: statements / control flow ──────────────────────────────
@@ -2887,6 +3089,91 @@ mod tests {
             ),
             num(3.0)
         );
+    }
+
+    #[test]
+    fn for_of_array() {
+        // Sum the values of an array.
+        assert_eq!(
+            eval_phase2("let s = 0; for (const x of [1, 2, 3, 4]) { s += x; } return s;"),
+            num(10.0)
+        );
+        // `let` binding, body without braces.
+        assert_eq!(
+            eval_phase2("let s = 0; for (let x of [10, 20]) s += x; return s;"),
+            num(30.0)
+        );
+        // Empty array: body never runs (the literal is untouched).
+        assert_eq!(
+            eval_phase2("let s = 99; for (const x of []) s = 0; return s;"),
+            StackValue::PosInt(99)
+        );
+    }
+
+    #[test]
+    fn for_of_string_chars() {
+        // for-of over a string yields its characters.
+        assert_eq!(
+            eval_str_phase2("let r = \"\"; for (const c of \"abc\") r = c + r; return r;"),
+            "cba"
+        );
+    }
+
+    #[test]
+    fn for_of_break_and_continue() {
+        // break exits early.
+        assert_eq!(
+            eval_phase2(
+                "let s = 0; for (const x of [1, 2, 3, 4]) { if (x === 3) break; s += x; } return s;"
+            ),
+            num(3.0)
+        );
+        // continue skips an element.
+        assert_eq!(
+            eval_phase2(
+                "let s = 0; for (const x of [1, 2, 3, 4]) { if (x % 2 === 0) continue; s += x; } return s;"
+            ),
+            num(4.0)
+        );
+        // Nested for-of: break exits only the inner loop.
+        assert_eq!(
+            eval_phase2(
+                "let c = 0; for (const i of [1, 2, 3]) { for (const j of [1, 2, 3]) { if (j === 2) break; c++; } } return c;"
+            ),
+            num(3.0)
+        );
+    }
+
+    #[test]
+    fn for_in_object_keys() {
+        // for-in yields the keys (insertion order) of an object.
+        let vm = run_vm(
+            "state.o = { a: 1, b: 2, c: 3 }; state.r = \"\"; for (const k in state.o) { state.r = state.r + k; }",
+        );
+        assert_eq!(eval_str_in(&vm, "r"), "abc");
+        // Sum the values by indexing back into the object with each key.
+        let vm = run_vm(
+            "state.o = { a: 1, b: 2, c: 3 }; let s = 0; for (const k in state.o) { s += state.o[k]; } state.r = s;",
+        );
+        assert_eq!(state_val(&vm, "r"), num(6.0));
+    }
+
+    #[test]
+    fn for_in_over_state() {
+        // for-in over the blessed `state` object enumerates its keys.
+        let vm = run_vm("state.x = 1; state.y = 2; let n = 0; for (const k in state) n++; state.r = n;");
+        assert_eq!(state_val(&vm, "r"), num(2.0));
+    }
+
+    #[test]
+    fn for_of_in_diagnostics() {
+        // Unsupported head forms record a clean diagnostic.
+        for src in [
+            "for (const [a, b] of [[1, 2]]) {}", // destructuring binding
+            "for (x of [1]) {}",                 // bare assignment target (undeclared)
+        ] {
+            assert!(compile(src).is_err(), "expected `{src}` to fail to compile");
+        }
     }
 
     #[test]

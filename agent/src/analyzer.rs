@@ -441,6 +441,34 @@ impl Analyzer {
                 }
                 self.analyze_hoist_stmt(&s.body, scope, block_scopes, next_slot);
             }
+            ast::Statement::ForOfStatement(s) => {
+                if let ast::ForStatementLeft::VariableDeclaration(decl) = &s.left {
+                    if decl.kind == ast::VariableDeclarationKind::Var {
+                        for d in &decl.declarations {
+                            self.hoist_var_pattern(&d.id, scope, block_scopes, next_slot);
+                        }
+                    }
+                }
+                self.analyze_hoist_stmt(&s.body, scope, block_scopes, next_slot);
+            }
+            ast::Statement::ForInStatement(s) => {
+                if let ast::ForStatementLeft::VariableDeclaration(decl) = &s.left {
+                    if decl.kind == ast::VariableDeclarationKind::Var {
+                        for d in &decl.declarations {
+                            self.hoist_var_pattern(&d.id, scope, block_scopes, next_slot);
+                        }
+                    }
+                }
+                self.analyze_hoist_stmt(&s.body, scope, block_scopes, next_slot);
+            }
+            ast::Statement::SwitchStatement(s) => {
+                // `var` declarations inside case clauses are function-scoped.
+                for case in &s.cases {
+                    for cs in &case.consequent {
+                        self.analyze_hoist_stmt(cs, scope, block_scopes, next_slot);
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -569,20 +597,23 @@ impl Analyzer {
             ast::Statement::BreakStatement(_)
             | ast::Statement::ContinueStatement(_)
             | ast::Statement::EmptyStatement(_) => {}
-            // Unsupported statements still get a shallow walk so identifiers in
-            // them are resolved/captured (they error later, during codegen).
-            //
-            // TODO(phase4): for-of/for-in are SHALLOW — body only. When codegen
-            // starts supporting them, extend these arms IN LOCKSTEP to also walk
-            // the iterable RHS expression and declare the loop binding
-            // (let/const -> block slot via analyze_register_name; var -> hoist),
-            // or the iterable's free vars resolve to "undeclared" and the loop
-            // variable gets no slot. See COMPILER_PLAN "Phase 4 — starting guide".
+            // for-of / for-in: walk the iterable/object RHS, declare the loop
+            // binding (let/const -> block slot; var was hoisted), then the body.
+            // A fresh block scope wraps the head + body so the loop binding does
+            // not leak past the loop.
             ast::Statement::ForOfStatement(s) => {
-                self.analyze_stmt(&s.body, scope, block_scopes, next_slot, scopes)
+                self.analyze_expr(&s.right, scope, block_scopes, scopes);
+                block_scopes.push(IndexMap::new());
+                self.analyze_for_head(&s.left, scope, block_scopes, next_slot, scopes);
+                self.analyze_stmt(&s.body, scope, block_scopes, next_slot, scopes);
+                block_scopes.pop();
             }
             ast::Statement::ForInStatement(s) => {
-                self.analyze_stmt(&s.body, scope, block_scopes, next_slot, scopes)
+                self.analyze_expr(&s.right, scope, block_scopes, scopes);
+                block_scopes.push(IndexMap::new());
+                self.analyze_for_head(&s.left, scope, block_scopes, next_slot, scopes);
+                self.analyze_stmt(&s.body, scope, block_scopes, next_slot, scopes);
+                block_scopes.pop();
             }
             // TODO(phase4): when codegen supports `switch`, push a single block
             // scope for the whole switch body here (lexical decls in `case`
@@ -600,6 +631,24 @@ impl Analyzer {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Declare the loop binding of a `for-of`/`for-in` head. Only the
+    /// `let`/`const`/`var x` declaration form is resolved here (the binding
+    /// gets a slot exactly like a normal declaration; `var` was already
+    /// hoisted). The bare-assignment-target form (`for (x of …)`) is left
+    /// unresolved — codegen rejects it.
+    fn analyze_for_head(
+        &mut self,
+        left: &ast::ForStatementLeft,
+        scope: &mut FuncScope,
+        block_scopes: &mut Vec<IndexMap<String, (u32, bool)>>,
+        next_slot: &mut u32,
+        scopes: &mut Vec<FuncScope>,
+    ) {
+        if let ast::ForStatementLeft::VariableDeclaration(decl) = left {
+            self.analyze_var_decl(decl, scope, block_scopes, next_slot, scopes);
         }
     }
 
