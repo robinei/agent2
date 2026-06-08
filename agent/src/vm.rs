@@ -2,6 +2,7 @@ use indexmap::IndexMap;
 use thin_vec::ThinVec;
 
 use crate::builtin::Builtin;
+use crate::compiler::Program;
 
 /*
 JS semantic compatibility — known divergences
@@ -46,9 +47,8 @@ The remaining intentional divergences from JS — deferred or accepted, NOT bugs
     (LLM) intervention, not JS error handling.
 */
 
-type ThinStr = ThinVec<u8>;
-
-pub type FieldName = ThinStr;
+pub use crate::thin_string::ThinString;
+pub type FieldName = ThinString;
 pub type CodeAddr = u32;
 pub type HeapAddr = u32;
 pub type StackAddr = u32;
@@ -109,7 +109,7 @@ pub enum StackValue {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum HeapValue {
-    String(ThinStr),
+    String(ThinString),
     Array(ThinVec<StackValue>),
     Object(Box<IndexMap<FieldName, StackValue>>),
     /// A closure: a code address plus its captured environment. Each upval is
@@ -287,7 +287,7 @@ pub enum Instr {
     PushFn(CodeAddr),
     PushPtr(HeapAddr),
     PushBuiltin(Builtin),
-    PushStr(ThinStr), // () -> str
+    PushStr(ThinString), // () -> str
 
     Pop(usize),
     Dup,
@@ -436,12 +436,12 @@ pub enum Instr {
     // pushed). step() batches a run of consecutive Invoke instructions into one
     // StepResult::Invoke (fan-out); the host runs them concurrently and pushes
     // one result per call, in call order.
-    Invoke(ThinStr, u32), // any, ... -> any
+    Invoke(ThinString, u32), // any, ... -> any
 
     // EFFECT: raise condition (like Lisp condition system). used to ask LLM in calling frame
     // to decide how to proceed, using restarts like returning a value, aborting,
     // and even rewriting the program preserving already written variables with execution starting at arbitrary point.
-    Raise(ThinStr), // () -> any
+    Raise(ThinString), // () -> any
 
     // pops N values where N is the number of field names, then pushes an
     // object with each field set to its corresponding value. Left-to-right:
@@ -676,16 +676,32 @@ impl VM {
     /// `Ptr(0)`, so the host persists by extracting `heap[0]` after the run and
     /// re-seeding it here next time. `PushStr`/literals alloc at `heap[1+]`, so
     /// `Ptr(0)` stays stable for the whole program.
-    pub fn for_program(code: Vec<Instr>, state: serde_json::Value) -> Result<Self, VMError> {
-        let mut vm = VM::new(code);
-        // Claim heap[0] for `state` before anything else allocates, so its
-        // address is fixed. Nested values seed into heap[1+].
+    /// Construct a VM to run a compiled `Program`, pre-allocating its string
+    /// constants at `heap[1..=N]` and installing the blessed `state` object at
+    /// `heap[0]`. `state` is seeded from the prior run's durable JSON (an
+    /// object); `Null`/non-object seeds yield an empty `state`. All
+    /// durable/host-context access lowers to ordinary object ops on `Ptr(0)`,
+    /// so the host persists by extracting `heap[0]` after the run and
+    /// re-seeding it here next time. Constants are immutable and freely shared
+    /// across many `PushPtr` references.
+    pub fn for_program(program: Program, state: serde_json::Value) -> Result<Self, VMError> {
+        let mut vm = VM::new(program.code);
+        // Reserve heap[0] for `state` (empty placeholder — filled after
+        // constants).
         vm.heap.push(HeapValue::Object(Box::new(IndexMap::new())));
+        // Pre-allocate constants at heap[1..=N]. Each constant's address is
+        // 1 + index, as emitted by the compiler.
+        for s in program.constants {
+            vm.heap.push(HeapValue::String(s));
+        }
+        // Seed state's nested values (they land at heap[N+1..], but addresses
+        // are computed at runtime and stored in the state map — the shift is
+        // transparent).
         if let serde_json::Value::Object(map) = state {
             let mut entries = IndexMap::with_capacity(map.len());
             for (k, v) in &map {
                 let sv = vm.json_to_stack_value(v, 0)?;
-                entries.insert(ThinStr::from(k.as_str()), sv);
+                entries.insert(ThinString::from(k.as_str()), sv);
             }
             if let Some(HeapValue::Object(o)) = vm.heap.get_mut(0) {
                 *o = Box::new(entries);
@@ -717,7 +733,7 @@ impl VM {
     /// caller can mutate the stack while batching consecutive invokes).
     fn invoke_at(&self, ip: CodeAddr) -> Option<(String, u32)> {
         match self.code.get(ip as usize) {
-            Some(Instr::Invoke(name, nargs)) => Some((String::from_utf8(name.to_vec()).unwrap(), *nargs)),
+            Some(Instr::Invoke(name, nargs)) => Some((name.as_str().to_owned(), *nargs)),
             _ => None,
         }
     }
@@ -732,7 +748,7 @@ impl VM {
 
     fn heap_str(&self, ptr: HeapAddr) -> Option<&str> {
         match self.heap.get(ptr as usize) {
-            Some(HeapValue::String(s)) => Some(std::str::from_utf8(s).unwrap()),
+            Some(HeapValue::String(s)) => Some(s.as_str()),
             _ => None,
         }
     }
@@ -765,7 +781,7 @@ impl VM {
         }
     }
 
-    pub(crate) fn alloc_string(&mut self, s: ThinStr) -> StackValue {
+    pub(crate) fn alloc_string(&mut self, s: ThinString) -> StackValue {
         let addr = self.heap.len() as HeapAddr;
         self.heap.push(HeapValue::String(s));
         StackValue::Ptr(addr)
@@ -831,42 +847,49 @@ impl VM {
 
     /// Whether a value is a heap string (used to pick `+`'s concat vs add path).
     fn is_string(&self, val: &StackValue) -> bool {
-        matches!(val, StackValue::Ptr(p) if self.heap_str(*p).is_some())
+        matches!(val, StackValue::Ptr(p) if matches!(self.heap.get(*p as usize), Some(HeapValue::String(_))))
     }
 
     /// JS `String(x)` / `ToString`. Arrays stringify like `Array.prototype.join(",")`
     /// (null/undefined elements → ""), plain objects → "[object Object]", and
     /// functions/closures → a generic function tag. `depth` bounds recursion
     /// through nested arrays so adversarial nesting can't overflow the stack.
-    pub(crate) fn to_js_string(&self, val: &StackValue, depth: usize) -> String {
+    pub(crate) fn to_js_string(&self, val: &StackValue, depth: usize) -> ThinString {
         if depth > MAX_JSON_DEPTH {
-            return String::new();
+            return ThinString::new();
         }
         match val {
-            StackValue::Undefined => "undefined".to_string(),
-            StackValue::Null => "null".to_string(),
-            StackValue::Bool(b) => b.to_string(),
-            StackValue::PosInt(u) => u.to_string(),
-            StackValue::NegInt(i) => i.to_string(),
-            StackValue::Number(n) => js_number_to_string(*n),
+            StackValue::Undefined => ThinString::from("undefined"),
+            StackValue::Null => ThinString::from("null"),
+            StackValue::Bool(b) => ThinString::from(b.to_string().as_str()),
+            StackValue::PosInt(u) => ThinString::from(u.to_string().as_str()),
+            StackValue::NegInt(i) => ThinString::from(i.to_string().as_str()),
+            StackValue::Number(n) => ThinString::from(js_number_to_string(*n).as_str()),
             StackValue::Fn(_) | StackValue::Builtin(_) => {
-                "function () { [native code] }".to_string()
+                ThinString::from("function () { [native code] }")
             }
-            StackValue::Upval(_) => String::new(),
+            StackValue::Upval(_) => ThinString::new(),
             StackValue::Ptr(p) => match self.heap.get(*p as usize) {
-                Some(HeapValue::String(s)) => String::from_utf8(s.to_vec()).unwrap(),
-                Some(HeapValue::Array(arr)) => arr
-                    .iter()
-                    .map(|v| match v {
-                        // join renders null/undefined holes as the empty string.
-                        StackValue::Null | StackValue::Undefined => String::new(),
-                        _ => self.to_js_string(v, depth + 1),
-                    })
-                    .collect::<Vec<_>>()
-                    .join(","),
-                Some(HeapValue::Object(_)) => "[object Object]".to_string(),
-                Some(HeapValue::Closure { .. }) => "function () { [native code] }".to_string(),
-                None => "null".to_string(), // dangling pointer
+                Some(HeapValue::String(s)) => s.clone(),
+                Some(HeapValue::Array(arr)) => {
+                    let mut out = ThinString::new();
+                    for (i, v) in arr.iter().enumerate() {
+                        if i > 0 {
+                            out.push_str(",");
+                        }
+                        match v {
+                            StackValue::Null | StackValue::Undefined => {}
+                            _ => {
+                                let s = self.to_js_string(v, depth + 1);
+                                out.push_str(s.as_str());
+                            }
+                        }
+                    }
+                    out
+                }
+                Some(HeapValue::Object(_)) => ThinString::from("[object Object]"),
+                Some(HeapValue::Closure { .. }) => ThinString::from("function () { [native code] }"),
+                None => ThinString::from("null"), // dangling pointer
             },
         }
     }
@@ -1015,20 +1038,20 @@ impl VM {
     }
 
     /// Pop a pointer and require it to point to a String; return the string.
-    fn pop_string(&mut self) -> Result<String, VMError> {
+    fn pop_string(&mut self) -> Result<ThinString, VMError> {
         let ptr = self.pop_ptr()?;
-        match self.heap_str(ptr) {
-            Some(s) => Ok(s.to_string()),
-            None => Err(VMError::TypeError),
+        match self.heap.get(ptr as usize) {
+            Some(HeapValue::String(s)) => Ok(s.clone()),
+            _ => Err(VMError::TypeError),
         }
     }
 
     /// Extract a string from a StackValue that has already been popped.
-    pub(crate) fn pop_string_from(&self, val: &StackValue) -> Result<String, VMError> {
+    pub(crate) fn pop_string_from(&self, val: &StackValue) -> Result<ThinString, VMError> {
         match val {
-            StackValue::Ptr(p) => match self.heap_str(*p) {
-                Some(s) => Ok(s.to_string()),
-                None => Err(VMError::TypeError),
+            StackValue::Ptr(p) => match self.heap.get(*p as usize) {
+                Some(HeapValue::String(s)) => Ok(s.clone()),
+                _ => Err(VMError::TypeError),
             },
             _ => Err(VMError::TypeError),
         }
@@ -1078,7 +1101,7 @@ impl VM {
                 }
             }
             StackValue::Ptr(p) => match self.heap_get(*p)? {
-                HeapValue::String(s) => serde_json::Value::String(String::from_utf8(s.to_vec()).unwrap()),
+                HeapValue::String(s) => serde_json::Value::String(s.as_str().to_owned()),
                 HeapValue::Array(arr) => serde_json::Value::Array(
                     arr.iter()
                         .map(|v| match v {
@@ -1095,7 +1118,7 @@ impl VM {
                         if matches!(v, StackValue::Undefined) {
                             continue;
                         }
-                        map.insert(String::from_utf8(k.to_vec()).unwrap(), self.stack_value_to_json(v, depth + 1)?);
+                        map.insert(k.as_str().to_owned(), self.stack_value_to_json(v, depth + 1)?);
                     }
                     serde_json::Value::Object(map)
                 }
@@ -1128,18 +1151,18 @@ impl VM {
                     StackValue::Number(n.as_f64().unwrap_or(0.0))
                 }
             }
-            serde_json::Value::String(s) => self.alloc_string(s.clone().into_bytes().into()),
+            serde_json::Value::String(s) => self.alloc_string(ThinString::from(s.as_str())),
             serde_json::Value::Array(arr) => {
-                let vals: Vec<StackValue> = arr
+                let vals: ThinVec<StackValue> = arr
                     .iter()
                     .map(|v| self.json_to_stack_value(v, depth + 1))
                     .collect::<Result<_, _>>()?;
-                self.alloc_array(vals.into())
+                self.alloc_array(vals)
             }
             serde_json::Value::Object(obj) => {
                 let mut map = IndexMap::new();
                 for (k, v) in obj {
-                    map.insert(k.clone().into_bytes().into(), self.json_to_stack_value(v, depth + 1)?);
+                    map.insert(ThinString::from(k.as_str()), self.json_to_stack_value(v, depth + 1)?);
                 }
                 self.alloc_object(map)
             }
@@ -1547,8 +1570,11 @@ impl VM {
                         if base + argc as usize > self.stack.len() {
                             return Err(VMError::StackUnderflow);
                         }
-                        let args = self.stack[base..base + argc as usize].to_vec();
-                        let arr = self.alloc_array(args.into());
+                        let args: ThinVec<StackValue> = self.stack[base..base + argc as usize]
+                            .iter()
+                            .copied()
+                            .collect();
+                        let arr = self.alloc_array(args);
                         if let StackValue::Ptr(p) = arr {
                             self.callstack.last_mut().unwrap().arguments_cache = Some(p);
                         }
@@ -1605,8 +1631,11 @@ impl VM {
                     if base + argc as usize > self.stack.len() {
                         return Err(VMError::StackUnderflow);
                     }
-                    let args = self.stack[base..base + argc as usize].to_vec();
-                    let arr = self.alloc_array(args.into());
+                    let args: ThinVec<StackValue> = self.stack[base..base + argc as usize]
+                        .iter()
+                        .copied()
+                        .collect();
+                    let arr = self.alloc_array(args);
                     let ptr = match arr {
                         StackValue::Ptr(p) => p,
                         _ => unreachable!("alloc_array returns a Ptr"),
@@ -1745,7 +1774,7 @@ impl VM {
                         // Internal indirection; never a legitimate operand.
                         StackValue::Upval(_) => return Err(VMError::ValueError),
                     };
-                    let s = self.alloc_string(tag.to_string().into_bytes().into());
+                    let s = self.alloc_string(ThinString::from(tag));
                     self.stack.push(s);
                     self.ip += 1;
                 }
@@ -1829,12 +1858,9 @@ impl VM {
                     // array/object/function in the numeric path is a TypeError
                     // (we do not ToPrimitive it — see the note on `loose_equal`).
                     let result = if self.is_string(&lhs) || self.is_string(&rhs) {
-                        let s = format!(
-                            "{}{}",
-                            self.to_js_string(&lhs, 0),
-                            self.to_js_string(&rhs, 0)
-                        );
-                        self.alloc_string(s.into_bytes().into())
+                        let mut s = self.to_js_string(&lhs, 0);
+                        s.push_str(self.to_js_string(&rhs, 0).as_str());
+                        self.alloc_string(s)
                     } else {
                         match (self.to_number(&lhs), self.to_number(&rhs)) {
                             (Some(a), Some(b)) => StackValue::Number(a + b),
@@ -1953,7 +1979,7 @@ impl VM {
                         return Err(VMError::StackUnderflow);
                     }
                     let split = self.stack.len() - n;
-                    let vals: Vec<StackValue> = self.stack.drain(split..).collect();
+                    let vals: ThinVec<StackValue> = self.stack.drain(split..).collect();
                     let mut obj = IndexMap::new();
                     // Left-to-right: field 0's value is the deepest (first
                     // pushed), so values line up with fields in order.
@@ -2007,7 +2033,7 @@ impl VM {
                 Instr::IndexGet => {
                     let key = self.stack.pop().ok_or(VMError::StackUnderflow)?;
                     let container = self.pop_ptr()?;
-                    let mut to_alloc: Option<String> = None;
+                    let mut to_alloc: Option<ThinString> = None;
                     let val = match self.heap_get(container)? {
                         HeapValue::Array(arr) => {
                             let idx = as_i64(&key).ok_or(VMError::TypeError)?;
@@ -2023,10 +2049,10 @@ impl VM {
                             // JS coerces a computed key with ToString.
                             let field = self.to_js_string(&key, 0);
                             // JS: a missing property reads as `undefined`.
-                            obj.get(field.as_bytes()).copied().unwrap_or(StackValue::Undefined)
+                            obj.get(field.as_str()).copied().unwrap_or(StackValue::Undefined)
                         }
                         HeapValue::String(s) => {
-                            let s = std::str::from_utf8(s).unwrap();
+                            let s = s.as_str();
                             let idx = as_i64(&key).ok_or(VMError::TypeError)?;
                             if idx < 0 {
                                 return Err(VMError::ValueError);
@@ -2040,14 +2066,16 @@ impl VM {
                             } else {
                                 // The codepoint starting at this byte, as a
                                 // 1-char string (built after the borrow ends).
-                                to_alloc = Some(s[idx..].chars().next().unwrap().to_string());
+                                to_alloc = Some(ThinString::from(
+                                    s[idx..].chars().next().unwrap().to_string().as_str(),
+                                ));
                                 StackValue::Undefined // placeholder, replaced below
                             }
                         }
                         _ => return Err(VMError::TypeError),
                     };
                     let result = match to_alloc {
-                        Some(s) => self.alloc_string(s.into_bytes().into()),
+                        Some(s) => self.alloc_string(s),
                         None => val,
                     };
                     self.stack.push(result);
@@ -2084,7 +2112,7 @@ impl VM {
                         } else {
                             let field = self.to_js_string(&key, 0);
                             self.heap_obj(container)
-                                .and_then(|o| o.get(field.as_bytes()).copied())
+                                .and_then(|o| o.get(field.as_str()).copied())
                                 .unwrap_or(StackValue::Undefined)
                         }
                     } else {
@@ -2104,7 +2132,7 @@ impl VM {
                     } else {
                         let field = self.to_js_string(&key, 0);
                         let obj = self.heap_obj_mut(container).ok_or(VMError::TypeError)?;
-                        obj.insert(field.into_bytes().into(), val);
+                        obj.insert(field, val);
                     }
                     match mode {
                         SetMode::New => self.stack.push(val),
@@ -2119,7 +2147,7 @@ impl VM {
                     let has = self
                         .heap_obj(obj_ptr)
                         .ok_or(VMError::TypeError)?
-                        .contains_key(field.as_bytes());
+                        .contains_key(field.as_str());
                     self.stack.push(StackValue::Bool(has));
                     self.ip += 1;
                 }
@@ -2131,7 +2159,7 @@ impl VM {
                     let existed = self
                         .heap_obj_mut(obj_ptr)
                         .ok_or(VMError::TypeError)?
-                        .shift_remove(field.as_bytes())
+                        .shift_remove(field.as_str())
                         .is_some();
                     self.stack.push(StackValue::Bool(existed));
                     self.ip += 1;
@@ -2145,8 +2173,8 @@ impl VM {
                     }
                     let split = self.stack.len() - n;
                     // Left-to-right: first pushed becomes element 0.
-                    let vals: Vec<StackValue> = self.stack.drain(split..).collect();
-                    let arr_ptr = self.alloc_array(vals.into());
+                    let vals: ThinVec<StackValue> = self.stack.drain(split..).collect();
+                    let arr_ptr = self.alloc_array(vals);
                     self.stack.push(arr_ptr);
                     self.ip += 1;
                 }
@@ -2170,7 +2198,7 @@ impl VM {
                 Instr::ToStr => {
                     let val = self.stack.pop().ok_or(VMError::StackUnderflow)?;
                     let s = self.to_js_string(&val, 0);
-                    let ptr = self.alloc_string(s.into_bytes().into());
+                    let ptr = self.alloc_string(s);
                     self.stack.push(ptr);
                     self.ip += 1;
                 }
@@ -2239,7 +2267,7 @@ impl VM {
                     // Do NOT advance ip — host may choose a different
                     // restart point (see Raise doc comment).
                     return Ok(StepResult::Raise {
-                        condition: String::from_utf8(condition.to_vec()).unwrap(),
+                        condition: condition.as_str().to_owned(),
                     });
                 }
             }
@@ -2612,7 +2640,7 @@ mod tests {
         }
         while !matches!(vm.step().unwrap(), StepResult::Done) {}
         match vm.heap.last() {
-            Some(HeapValue::String(s)) => String::from_utf8(s.to_vec()).unwrap(),
+            Some(HeapValue::String(s)) => s.as_str().to_owned(),
             other => panic!("expected a string result, got {other:?}"),
         }
     }
@@ -4008,5 +4036,44 @@ mod tests {
         assert_eq!(run(code), vec![n(20.0)]);
         // ...and as a bitwise operand.
         assert_eq!(run(vec![PushPosInt(10), PushPosInt(12), BitAnd]), vec![n(8.0)]);
+    }
+
+    // ── Phase 0: allocation baseline ────────────────────────────
+
+    /// Run a representative hot-loop workload and record the allocation count.
+    /// Each iteration does Math.abs + string concat + array push.
+    #[test]
+    fn alloc_baseline_hot_loop() {
+        use crate::alloc_counter;
+
+        // Build a loop that does builtin calls + string concat (the hot paths).
+        // Each iteration: Math.abs, string concat (s += "x").
+        let mut code = Vec::new();
+        // s = "hello"
+        code.push(PushStr("hello".into()));
+        // 100 iterations
+        for _ in 0..100 {
+            // Math.abs(-42) → drop result (just measuring the call overhead)
+            code.push(PushFloat(-42.0));
+            code.push(CallBuiltin(Builtin::MathAbs, 1));
+            code.push(Pop(1));
+            // s += "x" (string concat, the main allocator)
+            code.push(PushStr("x".into()));
+            code.push(Add);
+        }
+        // drop s
+        code.push(Pop(1));
+
+        alloc_counter::reset();
+        let mut vm = VM::new(code);
+        loop {
+            match vm.step().unwrap() {
+                StepResult::Done => break,
+                other => panic!("unexpected effect: {other:?}"),
+            }
+        }
+        let allocs = alloc_counter::count();
+        eprintln!("BASELINE hot_loop_100_iter: {allocs} allocs");
+        assert!(allocs > 0, "should have some allocations");
     }
 }

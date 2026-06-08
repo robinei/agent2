@@ -8,6 +8,8 @@
 
 use std::sync::Arc;
 
+use std::collections::HashMap;
+
 use oxc_allocator::Allocator;
 use oxc_ast::ast;
 use oxc_parser::Parser;
@@ -15,9 +17,8 @@ use oxc_span::{GetSpan, SourceType};
 
 use thin_vec::ThinVec;
 
-type ThinStr = ThinVec<u8>;
-
 use crate::analyzer::{self, ProgramAnalysis, RefSlot, frame_abs};
+use crate::vm::{HeapAddr, ThinString};
 use crate::builtin::Builtin;
 use crate::diag::Diagnostic;
 use crate::vm::{Instr, SetMode, SlotKind, StackValue};
@@ -30,6 +31,11 @@ pub struct Program {
     pub code: Vec<Instr>,
     pub spans: Vec<u32>,
     pub source: Arc<str>,
+    /// String literals discovered during compilation, to be pre-allocated into
+    /// the heap at `heap[1..=N]` before execution. Each constant's heap address
+    /// is `1 + index`; the compiler emits `PushPtr(1 + idx)` instead of
+    /// `PushStr(...)`. Deduplicated by content.
+    pub constants: Vec<ThinString>,
 }
 
 /// Compile JS source into a `Program`. Collects every diagnostic (oxc syntax
@@ -84,6 +90,7 @@ pub fn compile(source: &str) -> Result<Program, Vec<Diagnostic>> {
     Ok(Program {
         code,
         spans,
+        constants: compiler.constants,
         // The full source (user code + any appended prelude) so runtime
         // diagnostics render against the same offsets the spans were taken from.
         source: Arc::from(full_source.as_str()),
@@ -134,6 +141,11 @@ struct Compiler<'src> {
     /// `analysis.scopes`). Consulted only for static-call resolution of
     /// directly-named callees (`find_callee_label`/`function_arity`/…).
     current_scope: usize,
+    /// Deduplicated string literals (content → index into `constants`).
+    interned: HashMap<ThinString, u32>,
+    /// String literals to be pre-allocated at `heap[1..=N]`. A constant's heap
+    /// address is `1 + index`.
+    constants: Vec<ThinString>,
 }
 
 impl<'src> Compiler<'src> {
@@ -147,6 +159,8 @@ impl<'src> Compiler<'src> {
             diagnostics: Vec::new(),
             analysis: None,
             current_scope: 0,
+            interned: HashMap::new(),
+            constants: Vec::new(),
         }
     }
 
@@ -161,6 +175,18 @@ impl<'src> Compiler<'src> {
     fn emit(&mut self, instr: Instr, span: u32) {
         self.code.push(instr);
         self.spans.push(span);
+    }
+
+    /// Intern a string literal, returning its heap address (`1 + index`).
+    /// Deduplicated by content — identical strings share one slot.
+    fn intern_string(&mut self, s: ThinString) -> HeapAddr {
+        if let Some(&idx) = self.interned.get(s.as_str()) {
+            return 1 + idx;
+        }
+        let idx = self.constants.len() as u32;
+        self.interned.insert(s.clone(), idx);
+        self.constants.push(s);
+        1 + idx
     }
 
     /// Record a diagnostic; aborts the compile before a `Program` is produced.
@@ -429,7 +455,7 @@ impl<'src> Compiler<'src> {
                 return;
             }
         };
-        self.emit(Instr::ObjGet(ThinStr::from(name.as_str())), span);
+        self.emit(Instr::ObjGet(ThinString::from(name.as_str())), span);
     }
 
     /// Apply a destructuring/parameter default to the value on top of the stack:
@@ -840,10 +866,9 @@ impl<'src> Compiler<'src> {
                 }
             }
             ast::Expression::StringLiteral(lit) => {
-                self.emit(
-                    Instr::PushStr(lit.value.as_str().into()),
-                    lit.span.start,
-                );
+                let s = ThinString::from(lit.value.as_str());
+                let addr = self.intern_string(s);
+                self.emit(Instr::PushPtr(addr), lit.span.start);
             }
             ast::Expression::BooleanLiteral(lit) => {
                 self.emit(Instr::PushBool(lit.value), lit.span.start);
@@ -1197,14 +1222,14 @@ impl<'src> Compiler<'src> {
             self.compile_expr(&p.value);
             names.push(name);
         }
-        self.emit(Instr::ObjNew(names.into_iter().map(|n| ThinStr::from(n.as_str())).collect()), obj.span.start);
+        self.emit(Instr::ObjNew(names.into_iter().map(|n| ThinString::from(n.as_str())).collect()), obj.span.start);
     }
 
     fn compile_template(&mut self, tl: &ast::TemplateLiteral) {
         let span = tl.span.start;
         // result = quasi0 + expr0 + quasi1 + expr1 + … . The accumulator starts
-        // as a string (PushStr) and stays one, so every `Add` takes the concat
-        // path and ToString-coerces each interpolated value, as JS does.
+        // as a string (interned constant) and stays one, so every `Add` takes
+        // the concat path and ToString-coerces each interpolated value, as JS does.
         let quasi_str = |q: &ast::TemplateElement| {
             q.value
                 .cooked
@@ -1213,11 +1238,13 @@ impl<'src> Compiler<'src> {
                 .unwrap_or_else(|| q.value.raw.as_str())
                 .to_string()
         };
-        self.emit(Instr::PushStr(ThinStr::from(quasi_str(&tl.quasis[0]).as_str())), span);
+        let q0 = self.intern_string(ThinString::from(quasi_str(&tl.quasis[0]).as_str()));
+        self.emit(Instr::PushPtr(q0), span);
         for (i, expr) in tl.expressions.iter().enumerate() {
             self.compile_expr(expr);
             self.emit(Instr::Add, span);
-            self.emit(Instr::PushStr(ThinStr::from(quasi_str(&tl.quasis[i + 1]).as_str())), span);
+            let qn = self.intern_string(ThinString::from(quasi_str(&tl.quasis[i + 1]).as_str()));
+            self.emit(Instr::PushPtr(qn), span);
             self.emit(Instr::Add, span);
         }
     }
@@ -1507,7 +1534,7 @@ impl<'src> Compiler<'src> {
             let mode = if u.prefix { SetMode::New } else { SetMode::Old };
             match &lv {
                 LValue::Member(_, field) => {
-                    self.emit(Instr::ObjSet(ThinStr::from(field.as_str()), mode), span);
+                    self.emit(Instr::ObjSet(ThinString::from(field.as_str()), mode), span);
                 }
                 LValue::Index(..) => {
                     self.emit(Instr::IndexSet(mode), span);
@@ -1621,7 +1648,7 @@ impl<'src> Compiler<'src> {
             LValue::Local(slot) => self.emit(Instr::Local(*slot), span),
             LValue::Member(_, field) => {
                 self.emit(Instr::Dup, span); // copy the object
-                self.emit(Instr::ObjGet(ThinStr::from(field.as_str())), span);
+                self.emit(Instr::ObjGet(ThinString::from(field.as_str())), span);
             }
             LValue::Index(..) => {
                 self.emit(Instr::Pick(1), span); // copy the object
@@ -1639,7 +1666,7 @@ impl<'src> Compiler<'src> {
             LValue::Local(slot) => {
                 self.emit(Instr::TeeLocal(*slot), span);
             }
-            LValue::Member(_, field) => self.emit(Instr::ObjSet(ThinStr::from(field.as_str()), SetMode::New), span),
+            LValue::Member(_, field) => self.emit(Instr::ObjSet(ThinString::from(field.as_str()), SetMode::New), span),
             LValue::Index(..) => self.emit(Instr::IndexSet(SetMode::New), span),
         }
     }
@@ -1654,7 +1681,7 @@ impl<'src> Compiler<'src> {
                 self.emit(Instr::SetLocal(*slot), span);
             }
             LValue::Member(_, field) => {
-                self.emit(Instr::ObjSet(ThinStr::from(field.as_str()), SetMode::New), span);
+                self.emit(Instr::ObjSet(ThinString::from(field.as_str()), SetMode::New), span);
                 self.emit(Instr::Pop(1), span);
             }
             LValue::Index(..) => {
@@ -2690,7 +2717,7 @@ mod tests {
     /// Run a compiled program to completion via `for_program`, returning the
     /// finished VM so the heap/stack can be inspected.
     fn run_program(prog: Program) -> VM {
-        let mut vm = VM::for_program(prog.code, serde_json::Value::Null).unwrap();
+        let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
         loop {
             match vm.step().unwrap() {
                 StepResult::Done => return vm,
@@ -2730,10 +2757,10 @@ mod tests {
         // The blessed `state` object always lives at heap[0], even when seeded.
         let prog = compile("1;").expect("compiles");
         let state = serde_json::json!({ "count": 7 });
-        let vm = VM::for_program(prog.code, state).unwrap();
+        let vm = VM::for_program(prog, state).unwrap();
         match &vm.heap[0] {
             crate::vm::HeapValue::Object(o) => {
-                assert_eq!(o.get(&ThinStr::from("count")), Some(&StackValue::PosInt(7)));
+                assert_eq!(o.get(&ThinString::from("count")), Some(&StackValue::PosInt(7)));
             }
             other => panic!("expected state object at heap[0], got {other:?}"),
         }
@@ -2776,7 +2803,7 @@ mod tests {
     /// Read `state.<key>` (a slot of the heap[0] object) from a finished VM.
     fn state_val(vm: &VM, key: &str) -> StackValue {
         match &vm.heap[0] {
-            HeapValue::Object(o) => *o.get(&ThinStr::from(key)).unwrap_or_else(|| panic!("no state.{key}")),
+            HeapValue::Object(o) => *o.get(&ThinString::from(key)).unwrap_or_else(|| panic!("no state.{key}")),
             other => panic!("state is not an object: {other:?}"),
         }
     }
@@ -2793,7 +2820,7 @@ mod tests {
         let vm = run_vm(&format!("state.r = ({expr});"));
         match state_val(&vm, "r") {
             StackValue::Ptr(p) => match &vm.heap[p as usize] {
-                HeapValue::String(s) => String::from_utf8(s.to_vec()).unwrap(),
+                HeapValue::String(s) => s.as_str().to_owned(),
                 other => panic!("not a string: {other:?}"),
             },
             other => panic!("not a pointer: {other:?}"),
@@ -2887,7 +2914,7 @@ mod tests {
         let vm = run_vm("state.name = \"bob\"; state.r = `hi ${state.name}, ${1 + 2}!`;");
         match state_val(&vm, "r") {
             StackValue::Ptr(p) => match &vm.heap[p as usize] {
-                HeapValue::String(s) => assert_eq!(s.as_slice(), b"hi bob, 3!"),
+                HeapValue::String(s) => assert_eq!(s.as_bytes(), b"hi bob, 3!"),
                 other => panic!("{other:?}"),
             },
             other => panic!("{other:?}"),
@@ -2915,7 +2942,7 @@ mod tests {
         assert_eq!(state_val(&vm, "r"), StackValue::PosInt(9));
         match state_val(&vm, "obj") {
             StackValue::Ptr(p) => match &vm.heap[p as usize] {
-                HeapValue::Object(o) => assert_eq!(o.get(&ThinStr::from("a")), Some(&StackValue::PosInt(9))),
+                HeapValue::Object(o) => assert_eq!(o.get(&ThinString::from("a")), Some(&StackValue::PosInt(9))),
                 other => panic!("{other:?}"),
             },
             other => panic!("{other:?}"),
@@ -2986,7 +3013,7 @@ mod tests {
 
         // A present-but-non-callable callee is a runtime TypeError, like JS.
         let prog = compile("state.x = 5; state.x?.();").expect("compiles");
-        let mut vm = VM::for_program(prog.code, serde_json::Value::Null).unwrap();
+        let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
         let err = loop {
             match vm.step() {
                 Ok(StepResult::Done) => panic!("expected a runtime error"),
@@ -3139,7 +3166,7 @@ mod tests {
         match state_val(&vm, "r") {
             StackValue::Ptr(p) => match &vm.heap[p as usize] {
                 // r was set last, so it appears in the serialized object too.
-                HeapValue::String(s) => assert!(std::str::from_utf8(s).unwrap().contains("\"a\":1"), "got {}", String::from_utf8(s.to_vec()).unwrap()),
+                HeapValue::String(s) => assert!(s.as_str().contains("\"a\":1"), "got {}", s.as_str().to_owned()),
                 other => panic!("{other:?}"),
             },
             other => panic!("{other:?}"),
@@ -3164,7 +3191,7 @@ mod tests {
         // End-to-end: a `tools.*` call yields an `Invoke` effect carrying the
         // method name and the evaluated args; the host pushes a result to resume.
         let prog = compile("state.r = tools.add(10, 3);").expect("compiles");
-        let mut vm = VM::for_program(prog.code, serde_json::Value::Null).unwrap();
+        let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
         match vm.step().unwrap() {
             StepResult::Invoke { calls } => {
                 assert_eq!(calls.len(), 1);
@@ -3208,7 +3235,7 @@ mod tests {
         // `raise(...)` is an expression: it yields a `Raise` effect, then the
         // host pushes the resumed value which the program consumes.
         let prog = compile("state.r = raise(\"pick_a_number\");").expect("compiles");
-        let mut vm = VM::for_program(prog.code, serde_json::Value::Null).unwrap();
+        let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
         match vm.step().unwrap() {
             StepResult::Raise { condition } => assert_eq!(condition, "pick_a_number"),
             other => panic!("expected Raise, got {other:?}"),
@@ -3918,7 +3945,7 @@ mod tests {
         let vm = run_vm(&rewritten);
         match state_val(&vm, "__ret") {
             StackValue::Ptr(p) => match &vm.heap[p as usize] {
-                HeapValue::String(s) => String::from_utf8(s.to_vec()).unwrap(),
+                HeapValue::String(s) => s.as_str().to_owned(),
                 other => panic!("not a string: {other:?}"),
             },
             other => panic!("not a pointer: {other:?}"),
@@ -3929,7 +3956,7 @@ mod tests {
     fn eval_str_in(vm: &VM, key: &str) -> String {
         match state_val(vm, key) {
             StackValue::Ptr(p) => match &vm.heap[p as usize] {
-                HeapValue::String(s) => String::from_utf8(s.to_vec()).unwrap(),
+                HeapValue::String(s) => s.as_str().to_owned(),
                 other => panic!("not a string: {other:?}"),
             },
             other => panic!("not a pointer: {other:?}"),

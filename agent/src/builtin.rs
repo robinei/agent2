@@ -14,7 +14,7 @@
 //! result — assignment-style "leave a value" semantics, so every builtin call
 //! is a well-formed expression.
 
-use crate::vm::{StackValue, VM, VMError, as_i64};
+use crate::vm::{StackValue, ThinString, VM, VMError, as_i64};
 use thin_vec::ThinVec;
 
 /// A builtin's identity. Used both as the static call target
@@ -295,14 +295,30 @@ impl Builtin {
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
-/// Pop `n` stack values into a Vec (arg 0 first, deepest).
-fn pop_args(vm: &mut VM, n: u32) -> Result<Vec<StackValue>, VMError> {
-    let n = n as usize;
+/// Index (from the stack base) of the first argument (arg 0, the deepest).
+/// Validates that at least `argc` values are on the stack.
+fn arg_base(vm: &VM, argc: u32) -> Result<usize, VMError> {
+    let n = argc as usize;
     if vm.stack.len() < n {
         return Err(VMError::StackUnderflow);
     }
-    let start = vm.stack.len() - n;
-    Ok(vm.stack.drain(start..).collect())
+    Ok(vm.stack.len() - n)
+}
+
+/// Copy the top `argc` args into a fixed-size array (arg 0 first, deepest) and
+/// truncate the stack by `argc`, popping all arguments. `StackValue: Copy`, so
+/// this is a stack read of N×16 bytes, zero heap allocation. Surplus args past
+/// `N` are silently dropped (JS ignores extra arguments). The min arity is
+/// already guaranteed by [`Builtin::call`] from `meta()`.
+fn take_args<const N: usize>(vm: &mut VM, argc: u32) -> Result<[StackValue; N], VMError> {
+    let base = arg_base(vm, argc)?;
+    let mut out = [StackValue::Null; N];
+    let n = (argc as usize).min(N);
+    for i in 0..n {
+        out[i] = vm.stack[base + i];
+    }
+    vm.stack.truncate(base);
+    Ok(out)
 }
 
 /// Pop all `argc` arguments (arg 0 deepest-first). The lower arity bound is
@@ -310,13 +326,14 @@ fn pop_args(vm: &mut VM, n: u32) -> Result<Vec<StackValue>, VMError> {
 /// can index `args[0..want]` directly; `$want` documents that expectation and
 /// is checked in debug builds. Any surplus args past `want` are popped (so the
 /// stack stays balanced) but ignored — JS evaluates yet ignores extra args.
+/// Now delegates to `take_args` (zero-alloc). Returns `Result<[StackValue; N], VMError>`.
 macro_rules! check_arity {
     ($vm:expr, $argc:expr, $want:expr) => {{
         debug_assert!(
             $argc as usize >= $want,
             "Builtin::call guarantees at least the minimum arity"
         );
-        pop_args($vm, $argc)
+        take_args::<{ $want }>($vm, $argc)
     }};
 }
 
@@ -464,8 +481,8 @@ fn array_unshift(vm: &mut VM, argc: u32) -> Result<(), VMError> {
 
 /// `arr.join([sep])` → joins with sep (default ",").
 fn array_join(vm: &mut VM, argc: u32) -> Result<(), VMError> {
-    let args = pop_args(vm, argc)?;
-    let (arr_ptr, sep) = match args.len() {
+    let args = take_args::<2>(vm, argc)?;
+    let (arr_ptr, sep) = match argc {
         1 => match &args[0] {
             StackValue::Ptr(p) => (*p, ",".into()),
             _ => return Err(VMError::TypeError),
@@ -481,14 +498,24 @@ fn array_join(vm: &mut VM, argc: u32) -> Result<(), VMError> {
         _ => return Err(VMError::BadArg),
     };
     let arr = vm.heap_arr(arr_ptr).ok_or(VMError::TypeError)?;
-    let parts: Vec<String> = arr
+    let parts: Vec<ThinString> = arr
         .iter()
         .map(|v| match v {
-            StackValue::Null | StackValue::Undefined => String::new(),
+            StackValue::Null | StackValue::Undefined => ThinString::new(),
             _ => vm.to_js_string(v, 0),
         })
         .collect();
-    let ptr = vm.alloc_string(parts.join(&sep).into_bytes().into());
+    let joined = parts.iter().enumerate().fold(
+        ThinString::new(),
+        |mut acc, (i, s)| {
+            if i > 0 {
+                acc.push_str(sep.as_str());
+            }
+            acc.push_str(s.as_str());
+            acc
+        },
+    );
+    let ptr = vm.alloc_string(joined);
     vm.stack.push(ptr);
     Ok(())
 }
@@ -497,8 +524,8 @@ fn array_join(vm: &mut VM, argc: u32) -> Result<(), VMError> {
 
 /// `s.split(delim[, limit])` → array of substrings.
 fn str_split(vm: &mut VM, argc: u32) -> Result<(), VMError> {
-    let args = pop_args(vm, argc)?;
-    let (s, delim, limit) = match args.len() {
+    let args = take_args::<3>(vm, argc)?;
+    let (s, delim, limit) = match argc {
         2 => (
             vm.pop_string_from(&args[0])?,
             vm.pop_string_from(&args[1])?,
@@ -517,28 +544,28 @@ fn str_split(vm: &mut VM, argc: u32) -> Result<(), VMError> {
         ),
         _ => return Err(VMError::BadArg),
     };
-    let mut parts = Vec::new();
+    let mut parts: ThinVec<StackValue> = ThinVec::new();
     match limit {
         Some(lim) => {
-            for p in s.splitn(lim, &delim) {
-                parts.push(vm.alloc_string(p.as_bytes().to_vec().into()));
+            for p in s.splitn(lim, delim.as_str()) {
+                parts.push(vm.alloc_string(ThinString::from(p)));
             }
         }
         None => {
-            for p in s.split(&delim) {
-                parts.push(vm.alloc_string(p.as_bytes().to_vec().into()));
+            for p in s.split(delim.as_str()) {
+                parts.push(vm.alloc_string(ThinString::from(p)));
             }
         }
     }
-    let ptr = vm.alloc_array(parts.into());
+    let ptr = vm.alloc_array(parts);
     vm.stack.push(ptr);
     Ok(())
 }
 
 /// `s.includes(needle[, start])` → bool.
 fn str_includes(vm: &mut VM, argc: u32) -> Result<(), VMError> {
-    let args = pop_args(vm, argc)?;
-    let (haystack, needle, start) = match args.len() {
+    let args = take_args::<3>(vm, argc)?;
+    let (haystack, needle, start) = match argc {
         2 => (
             vm.pop_string_from(&args[0])?,
             vm.pop_string_from(&args[1])?,
@@ -556,9 +583,9 @@ fn str_includes(vm: &mut VM, argc: u32) -> Result<(), VMError> {
         // negative value behaves like 0.
         Some(s) => {
             let start = clamp_start(&haystack, s.max(0) as usize);
-            haystack[start..].contains(&needle)
+            haystack[start..].contains(needle.as_str())
         }
-        None => haystack.contains(&needle),
+        None => haystack.contains(needle.as_str()),
     };
     vm.stack.push(StackValue::Bool(found));
     Ok(())
@@ -566,8 +593,8 @@ fn str_includes(vm: &mut VM, argc: u32) -> Result<(), VMError> {
 
 /// `s.indexOf(needle[, start])` → int (or -1).
 fn str_index_of(vm: &mut VM, argc: u32) -> Result<(), VMError> {
-    let args = pop_args(vm, argc)?;
-    let (haystack, needle, start) = match args.len() {
+    let args = take_args::<3>(vm, argc)?;
+    let (haystack, needle, start) = match argc {
         2 => (
             vm.pop_string_from(&args[0])?,
             vm.pop_string_from(&args[1])?,
@@ -585,9 +612,9 @@ fn str_index_of(vm: &mut VM, argc: u32) -> Result<(), VMError> {
         // like 0, and a too-large one only matches the empty needle at len.
         Some(s) => {
             let start = clamp_start(&haystack, s.max(0) as usize);
-            haystack[start..].find(&needle).map(|p| (p + start) as f64)
+            haystack[start..].find(needle.as_str()).map(|p| (p + start) as f64)
         }
-        None => haystack.find(&needle).map(|p| p as f64),
+        None => haystack.find(needle.as_str()).map(|p| p as f64),
     };
     vm.stack.push(StackValue::Number(pos.unwrap_or(-1.0)));
     Ok(())
@@ -595,8 +622,8 @@ fn str_index_of(vm: &mut VM, argc: u32) -> Result<(), VMError> {
 
 /// `s.lastIndexOf(needle[, start])` → int (or -1).
 fn str_last_index_of(vm: &mut VM, argc: u32) -> Result<(), VMError> {
-    let args = pop_args(vm, argc)?;
-    let (haystack, needle, start) = match args.len() {
+    let args = take_args::<3>(vm, argc)?;
+    let (haystack, needle, start) = match argc {
         2 => (
             vm.pop_string_from(&args[0])?,
             vm.pop_string_from(&args[1])?,
@@ -618,9 +645,9 @@ fn str_last_index_of(vm: &mut VM, argc: u32) -> Result<(), VMError> {
             while end > 0 && !haystack.is_char_boundary(end) {
                 end -= 1;
             }
-            haystack[..end].rfind(&needle).map(|p| p as f64)
+            haystack[..end].rfind(needle.as_str()).map(|p| p as f64)
         }
-        None => haystack.rfind(&needle).map(|p| p as f64),
+        None => haystack.rfind(needle.as_str()).map(|p| p as f64),
     };
     vm.stack.push(StackValue::Number(pos.unwrap_or(-1.0)));
     Ok(())
@@ -632,7 +659,7 @@ fn str_starts_with(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     let haystack = vm.pop_string_from(&args[0])?;
     let prefix = vm.pop_string_from(&args[1])?;
     vm.stack
-        .push(StackValue::Bool(haystack.starts_with(&prefix)));
+        .push(StackValue::Bool(haystack.starts_with(prefix.as_str())));
     Ok(())
 }
 
@@ -641,7 +668,7 @@ fn str_ends_with(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     let args = check_arity!(vm, argc, 2)?;
     let haystack = vm.pop_string_from(&args[0])?;
     let suffix = vm.pop_string_from(&args[1])?;
-    vm.stack.push(StackValue::Bool(haystack.ends_with(&suffix)));
+    vm.stack.push(StackValue::Bool(haystack.ends_with(suffix.as_str())));
     Ok(())
 }
 
@@ -650,8 +677,8 @@ fn str_ends_with(vm: &mut VM, argc: u32) -> Result<(), VMError> {
 /// end; `start`/`end` must be in range and on char boundaries. Optional `end`
 /// defaults to the string length.
 fn str_slice(vm: &mut VM, argc: u32) -> Result<(), VMError> {
-    let args = pop_args(vm, argc)?;
-    let (s, start, end): (String, usize, usize) = match args.len() {
+    let args = take_args::<3>(vm, argc)?;
+    let (s, start, end): (ThinString, usize, usize) = match argc {
         2 => {
             let s = vm.pop_string_from(&args[0])?;
             let start = as_i64(&args[1]).ok_or(VMError::TypeError)?;
@@ -676,7 +703,7 @@ fn str_slice(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     if start > s.len() || end > s.len() || !s.is_char_boundary(start) || !s.is_char_boundary(end) {
         return Err(VMError::ValueError);
     }
-    let ptr = vm.alloc_string(s[start..end].as_bytes().to_vec().into());
+    let ptr = vm.alloc_string(ThinString::from(&s[start..end]));
     vm.stack.push(ptr);
     Ok(())
 }
@@ -685,7 +712,7 @@ fn str_slice(vm: &mut VM, argc: u32) -> Result<(), VMError> {
 fn str_trim(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     let args = check_arity!(vm, argc, 1)?;
     let s = vm.pop_string_from(&args[0])?;
-    let ptr = vm.alloc_string(s.trim().as_bytes().to_vec().into());
+    let ptr = vm.alloc_string(ThinString::from(s.trim()));
     vm.stack.push(ptr);
     Ok(())
 }
@@ -699,14 +726,14 @@ fn obj_keys(vm: &mut VM, argc: u32) -> Result<(), VMError> {
         StackValue::Ptr(p) => *p,
         _ => return Err(VMError::TypeError),
     };
-    let keys: Vec<ThinVec<u8>> = vm
+    let keys: Vec<ThinString> = vm
         .heap_obj(obj_ptr)
         .ok_or(VMError::TypeError)?
         .keys()
         .cloned()
         .collect();
-    let strs: Vec<StackValue> = keys.into_iter().map(|k| vm.alloc_string(k)).collect();
-    let ptr = vm.alloc_array(strs.into());
+    let strs: ThinVec<StackValue> = keys.into_iter().map(|k| vm.alloc_string(k)).collect();
+    let ptr = vm.alloc_array(strs);
     vm.stack.push(ptr);
     Ok(())
 }
@@ -718,13 +745,13 @@ fn obj_values(vm: &mut VM, argc: u32) -> Result<(), VMError> {
         StackValue::Ptr(p) => *p,
         _ => return Err(VMError::TypeError),
     };
-    let vals: Vec<StackValue> = vm
+    let vals: ThinVec<StackValue> = vm
         .heap_obj(obj_ptr)
         .ok_or(VMError::TypeError)?
         .values()
         .copied()
         .collect();
-    let ptr = vm.alloc_array(vals.into());
+    let ptr = vm.alloc_array(vals);
     vm.stack.push(ptr);
     Ok(())
 }
@@ -746,7 +773,7 @@ fn json_stringify(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     let args = check_arity!(vm, argc, 1)?;
     let json = vm.stack_value_to_json(&args[0], 0)?;
     let s = serde_json::to_string(&json).map_err(|_| VMError::ValueError)?;
-    let ptr = vm.alloc_string(s.into_bytes().into());
+    let ptr = vm.alloc_string(ThinString::from(s.as_str()));
     vm.stack.push(ptr);
     Ok(())
 }
@@ -769,15 +796,16 @@ fn number_parse_int(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     // `Builtin::call` guarantees `argc >= 1`; any args past the radix are
     // surplus and ignored (so `["1","2"].map(parseInt)` calls `parseInt(s, i)`,
     // the classic JS footgun, rather than erroring).
-    let args = check_arity!(vm, argc, 1)?;
+    let args = take_args::<2>(vm, argc)?;
     let s = vm.pop_string_from(&args[0])?;
     // JS coerces the radix via ToInt32; a missing/NaN radix means "auto" (0).
-    let radix = match args.get(1) {
-        Some(v) => match vm.to_number(v) {
+    let radix = if argc >= 2 {
+        match vm.to_number(&args[1]) {
             Some(n) if n.is_finite() => n as i64,
             _ => 0,
-        },
-        None => 0,
+        }
+    } else {
+        0
     };
     vm.stack.push(int_value(js_parse_int(&s, radix)));
     Ok(())
@@ -818,12 +846,13 @@ fn math_unary(vm: &mut VM, argc: u32, f: fn(f64) -> f64) -> Result<(), VMError> 
 /// `Math.min(...nums)` → the smallest, ToNumber-coercing each. Zero args →
 /// +Infinity. Follows `f64::min` (a NaN operand is ignored).
 fn math_min(vm: &mut VM, argc: u32) -> Result<(), VMError> {
-    let args = pop_args(vm, argc)?;
+    let base = arg_base(vm, argc)?;
     let mut acc = f64::INFINITY;
-    for v in &args {
-        let num = vm.to_number(v).ok_or(VMError::TypeError)?;
+    for i in 0..argc as usize {
+        let num = vm.to_number(&vm.stack[base + i]).ok_or(VMError::TypeError)?;
         acc = acc.min(num);
     }
+    vm.stack.truncate(base);
     vm.stack.push(StackValue::Number(acc));
     Ok(())
 }
@@ -831,12 +860,13 @@ fn math_min(vm: &mut VM, argc: u32) -> Result<(), VMError> {
 /// `Math.max(...nums)` → the largest, ToNumber-coercing each. Zero args →
 /// -Infinity. Follows `f64::max` (a NaN operand is ignored).
 fn math_max(vm: &mut VM, argc: u32) -> Result<(), VMError> {
-    let args = pop_args(vm, argc)?;
+    let base = arg_base(vm, argc)?;
     let mut acc = f64::NEG_INFINITY;
-    for v in &args {
-        let num = vm.to_number(v).ok_or(VMError::TypeError)?;
+    for i in 0..argc as usize {
+        let num = vm.to_number(&vm.stack[base + i]).ok_or(VMError::TypeError)?;
         acc = acc.max(num);
     }
+    vm.stack.truncate(base);
     vm.stack.push(StackValue::Number(acc));
     Ok(())
 }
@@ -1430,7 +1460,7 @@ mod tests {
         ]);
         while !matches!(vm.step().unwrap(), StepResult::Done) {}
         match vm.heap.last() {
-            Some(HeapValue::String(s)) => assert_eq!(std::str::from_utf8(s).unwrap(), "function"),
+            Some(HeapValue::String(s)) => assert_eq!(s.as_str(), "function"),
             other => panic!("{other:?}"),
         }
     }
