@@ -557,7 +557,7 @@ fn str_split(vm: &mut VM, argc: u32) -> Result<(), VMError> {
             }
         }
     }
-    let ptr = vm.alloc_array(small_to_thin(parts));
+    let ptr = vm.alloc_array(small_to_thin(&parts));
     vm.stack.push(ptr);
     Ok(())
 }
@@ -733,7 +733,7 @@ fn obj_keys(vm: &mut VM, argc: u32) -> Result<(), VMError> {
         .cloned()
         .collect();
     let strs: SmallVec<[StackValue; 16]> = keys.into_iter().map(|k| vm.alloc_string(k)).collect();
-    let ptr = vm.alloc_array(small_to_thin(strs));
+    let ptr = vm.alloc_array(small_to_thin(&strs));
     vm.stack.push(ptr);
     Ok(())
 }
@@ -751,7 +751,7 @@ fn obj_values(vm: &mut VM, argc: u32) -> Result<(), VMError> {
         .values()
         .copied()
         .collect();
-    let ptr = vm.alloc_array(small_to_thin(vals));
+    let ptr = vm.alloc_array(small_to_thin(&vals));
     vm.stack.push(ptr);
     Ok(())
 }

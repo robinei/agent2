@@ -54,7 +54,7 @@ pub type FieldName = ThinString;
 /// Convert a `SmallVec` to a `ThinVec`, copying from the stack allocation.
 /// Used at boundaries where heap storage is required (alloc_array,
 /// alloc_closure, etc.).
-pub(crate) fn small_to_thin(sv: SmallVec<[StackValue; 16]>) -> ThinVec<StackValue> {
+pub(crate) fn small_to_thin(sv: &SmallVec<[StackValue; 16]>) -> ThinVec<StackValue> {
     ThinVec::from(sv.as_slice())
 }
 pub type CodeAddr = u32;
@@ -1141,7 +1141,10 @@ impl VM {
                         if matches!(v, StackValue::Undefined) {
                             continue;
                         }
-                        map.insert(k.as_str().to_owned(), self.stack_value_to_json(v, depth + 1)?);
+                        map.insert(
+                            k.as_str().to_owned(),
+                            self.stack_value_to_json(v, depth + 1)?,
+                        );
                     }
                     serde_json::Value::Object(map)
                 }
@@ -1185,7 +1188,10 @@ impl VM {
             serde_json::Value::Object(obj) => {
                 let mut map = IndexMap::new();
                 for (k, v) in obj {
-                    map.insert(ThinString::from(k.as_str()), self.json_to_stack_value(v, depth + 1)?);
+                    map.insert(
+                        ThinString::from(k.as_str()),
+                        self.json_to_stack_value(v, depth + 1)?,
+                    );
                 }
                 self.alloc_object(map)
             }
@@ -1584,7 +1590,11 @@ impl VM {
                 Instr::EnterFrame(nparams, build_args, local_kinds) => {
                     let nparams = *nparams;
                     let build_args = *build_args;
-                    let local_kinds = local_kinds.clone(); // release borrow on self.code
+                    // Collect slot kinds into a stack-allocated SmallVec (zero
+                    // alloc for the typical ≤2 locals) instead of cloning the
+                    // ThinVec from self.code.
+                    let local_kinds: SmallVec<[SlotKind; 32]> =
+                        local_kinds.iter().copied().collect();
                     let frame = self.callstack.last().ok_or(VMError::BadArg)?;
                     let argc = frame.arg_count;
                     // The args arrived as the leading locals at [fp, fp + argc).
@@ -1595,11 +1605,12 @@ impl VM {
                         if base + argc as usize > self.stack.len() {
                             return Err(VMError::StackUnderflow);
                         }
-                        let args: SmallVec<[StackValue; 16]> = self.stack[base..base + argc as usize]
+                        let args: SmallVec<[StackValue; 16]> = self.stack
+                            [base..base + argc as usize]
                             .iter()
                             .copied()
                             .collect();
-                        let arr = self.alloc_array(small_to_thin(args));
+                        let arr = self.alloc_array(small_to_thin(&args));
                         if let StackValue::Ptr(p) = arr {
                             self.callstack.last_mut().unwrap().arguments_cache = Some(p);
                         }
@@ -1660,7 +1671,7 @@ impl VM {
                         .iter()
                         .copied()
                         .collect();
-                    let arr = self.alloc_array(small_to_thin(args));
+                    let arr = self.alloc_array(small_to_thin(&args));
                     let ptr = match arr {
                         StackValue::Ptr(p) => p,
                         _ => unreachable!("alloc_array returns a Ptr"),
@@ -2084,7 +2095,9 @@ impl VM {
                             // JS coerces a computed key with ToString.
                             let field = self.to_js_string(&key, 0);
                             // JS: a missing property reads as `undefined`.
-                            obj.get(field.as_str()).copied().unwrap_or(StackValue::Undefined)
+                            obj.get(field.as_str())
+                                .copied()
+                                .unwrap_or(StackValue::Undefined)
                         }
                         HeapValue::String(s) => {
                             let s = s.as_str();
@@ -2209,7 +2222,7 @@ impl VM {
                     let split = self.stack.len() - n;
                     // Left-to-right: first pushed becomes element 0.
                     let vals: SmallVec<[StackValue; 16]> = self.stack.drain(split..).collect();
-                    let arr_ptr = self.alloc_array(small_to_thin(vals));
+                    let arr_ptr = self.alloc_array(small_to_thin(&vals));
                     self.stack.push(arr_ptr);
                     self.ip += 1;
                 }
@@ -2410,7 +2423,10 @@ mod tests {
 
     #[test]
     fn push_and_pop() {
-        assert_eq!(run(vec![PushFloat(1.0), PushFloat(2.0), Pop(1)]), vec![n(1.0)]);
+        assert_eq!(
+            run(vec![PushFloat(1.0), PushFloat(2.0), Pop(1)]),
+            vec![n(1.0)]
+        );
         assert_eq!(run(vec![PushFloat(1.0), Pop(1)]), vec![]);
         assert!(matches!(run_err(vec![Pop(1)]), VMError::StackUnderflow));
     }
@@ -2439,7 +2455,12 @@ mod tests {
             vec![n(1.0), n(2.0), n(1.0)]
         );
         assert_eq!(
-            run(vec![PushFloat(1.0), PushFloat(2.0), PushFloat(3.0), Pick(2)]),
+            run(vec![
+                PushFloat(1.0),
+                PushFloat(2.0),
+                PushFloat(3.0),
+                Pick(2)
+            ]),
             vec![n(1.0), n(2.0), n(3.0), n(1.0)]
         );
         // Cannot reach below the frame's temporaries.
@@ -2470,7 +2491,10 @@ mod tests {
     #[test]
     fn nip() {
         // Nip(1) drops the value below top, leaving top in place.
-        assert_eq!(run(vec![PushFloat(1.0), PushFloat(2.0), Nip(1)]), vec![n(2.0)]);
+        assert_eq!(
+            run(vec![PushFloat(1.0), PushFloat(2.0), Nip(1)]),
+            vec![n(2.0)]
+        );
         // Nip(2) drops two values below top.
         assert_eq!(
             run(vec![PushFloat(1.0), PushFloat(2.0), PushFloat(3.0), Nip(2)]),
@@ -2618,9 +2642,18 @@ mod tests {
     #[test]
     fn add_sub_mul_div() {
         assert_eq!(run(vec![PushFloat(2.0), PushFloat(3.0), Add]), vec![n(5.0)]);
-        assert_eq!(run(vec![PushFloat(10.0), PushFloat(3.0), Sub]), vec![n(7.0)]);
-        assert_eq!(run(vec![PushFloat(4.0), PushFloat(5.0), Mul]), vec![n(20.0)]);
-        assert_eq!(run(vec![PushFloat(10.0), PushFloat(4.0), Div]), vec![n(2.5)]);
+        assert_eq!(
+            run(vec![PushFloat(10.0), PushFloat(3.0), Sub]),
+            vec![n(7.0)]
+        );
+        assert_eq!(
+            run(vec![PushFloat(4.0), PushFloat(5.0), Mul]),
+            vec![n(20.0)]
+        );
+        assert_eq!(
+            run(vec![PushFloat(10.0), PushFloat(4.0), Div]),
+            vec![n(2.5)]
+        );
         // JS: x/0 -> ±Infinity, 0/0 -> NaN (never an error).
         assert!(matches!(
             run(vec![PushFloat(1.0), PushFloat(0.0), Div]).as_slice(),
@@ -2634,10 +2667,16 @@ mod tests {
 
     #[test]
     fn mod_op() {
-        assert_eq!(run(vec![PushFloat(10.0), PushFloat(3.0), Mod]), vec![n(1.0)]);
+        assert_eq!(
+            run(vec![PushFloat(10.0), PushFloat(3.0), Mod]),
+            vec![n(1.0)]
+        );
         // JS %: float remainder (5.5 % 2 == 1.5), dividend's sign (-5 % 3 == -2).
         assert_eq!(run(vec![PushFloat(5.5), PushFloat(2.0), Mod]), vec![n(1.5)]);
-        assert_eq!(run(vec![PushFloat(-5.0), PushFloat(3.0), Mod]), vec![n(-2.0)]);
+        assert_eq!(
+            run(vec![PushFloat(-5.0), PushFloat(3.0), Mod]),
+            vec![n(-2.0)]
+        );
         // x % 0 -> NaN, not an error.
         assert!(matches!(
             run(vec![PushFloat(1.0), PushFloat(0.0), Mod]).as_slice(),
@@ -2805,7 +2844,10 @@ mod tests {
             "1,2"
         );
         assert_eq!(
-            run_last_str(vec![PushFloat(1.0), ObjNew(vec!["a".into()].into()), ToStr], &[]),
+            run_last_str(
+                vec![PushFloat(1.0), ObjNew(vec!["a".into()].into()), ToStr],
+                &[]
+            ),
             "[object Object]"
         );
     }
@@ -2815,8 +2857,14 @@ mod tests {
     #[test]
     fn eq_neq() {
         assert_eq!(run(vec![PushFloat(1.0), PushFloat(1.0), Eq]), vec![b(true)]);
-        assert_eq!(run(vec![PushFloat(1.0), PushFloat(2.0), Eq]), vec![b(false)]);
-        assert_eq!(run(vec![PushFloat(1.0), PushFloat(2.0), Neq]), vec![b(true)]);
+        assert_eq!(
+            run(vec![PushFloat(1.0), PushFloat(2.0), Eq]),
+            vec![b(false)]
+        );
+        assert_eq!(
+            run(vec![PushFloat(1.0), PushFloat(2.0), Neq]),
+            vec![b(true)]
+        );
         // NaN != NaN
         assert_eq!(
             run(vec![PushFloat(f64::NAN), PushFloat(f64::NAN), Eq]),
@@ -2829,22 +2877,10 @@ mod tests {
     #[test]
     fn loose_eq_nullish() {
         // null == undefined (and reflexively), but neither == anything else.
-        assert_eq!(
-            run(vec![PushNull, PushUndefined, LooseEq]),
-            vec![b(true)]
-        );
-        assert_eq!(
-            run(vec![PushUndefined, PushNull, LooseEq]),
-            vec![b(true)]
-        );
-        assert_eq!(
-            run(vec![PushNull, PushNull, LooseEq]),
-            vec![b(true)]
-        );
-        assert_eq!(
-            run(vec![PushNull, PushFloat(0.0), LooseEq]),
-            vec![b(false)]
-        );
+        assert_eq!(run(vec![PushNull, PushUndefined, LooseEq]), vec![b(true)]);
+        assert_eq!(run(vec![PushUndefined, PushNull, LooseEq]), vec![b(true)]);
+        assert_eq!(run(vec![PushNull, PushNull, LooseEq]), vec![b(true)]);
+        assert_eq!(run(vec![PushNull, PushFloat(0.0), LooseEq]), vec![b(false)]);
         assert_eq!(
             run(vec![PushUndefined, PushBool(false), LooseEq]),
             vec![b(false)]
@@ -2852,14 +2888,8 @@ mod tests {
         // strict still distinguishes them
         assert_eq!(run(vec![PushNull, PushUndefined, Eq]), vec![b(false)]);
         // LooseNeq is the negation
-        assert_eq!(
-            run(vec![PushNull, PushUndefined, LooseNeq]),
-            vec![b(false)]
-        );
-        assert_eq!(
-            run(vec![PushNull, PushFloat(0.0), LooseNeq]),
-            vec![b(true)]
-        );
+        assert_eq!(run(vec![PushNull, PushUndefined, LooseNeq]), vec![b(false)]);
+        assert_eq!(run(vec![PushNull, PushFloat(0.0), LooseNeq]), vec![b(true)]);
     }
 
     #[test]
@@ -2955,8 +2985,14 @@ mod tests {
         // Numbers
         assert_eq!(run(vec![PushFloat(1.0), PushFloat(2.0), Lt]), vec![b(true)]);
         assert_eq!(run(vec![PushFloat(2.0), PushFloat(1.0), Gt]), vec![b(true)]);
-        assert_eq!(run(vec![PushFloat(2.0), PushFloat(2.0), LtEq]), vec![b(true)]);
-        assert_eq!(run(vec![PushFloat(2.0), PushFloat(2.0), GtEq]), vec![b(true)]);
+        assert_eq!(
+            run(vec![PushFloat(2.0), PushFloat(2.0), LtEq]),
+            vec![b(true)]
+        );
+        assert_eq!(
+            run(vec![PushFloat(2.0), PushFloat(2.0), GtEq]),
+            vec![b(true)]
+        );
         // Incomparable types → false
         assert_eq!(run(vec![PushFloat(1.0), PushNull, Lt]), vec![b(false)]);
     }
@@ -2964,14 +3000,20 @@ mod tests {
     #[test]
     fn and_or() {
         // truthy && rhs → rhs
-        assert_eq!(run(vec![PushBool(true), PushFloat(42.0), And]), vec![n(42.0)]);
+        assert_eq!(
+            run(vec![PushBool(true), PushFloat(42.0), And]),
+            vec![n(42.0)]
+        );
         // falsy && rhs → falsy
         assert_eq!(
             run(vec![PushBool(false), PushFloat(42.0), And]),
             vec![b(false)]
         );
         // truthy || rhs → truthy
-        assert_eq!(run(vec![PushFloat(42.0), PushBool(false), Or]), vec![n(42.0)]);
+        assert_eq!(
+            run(vec![PushFloat(42.0), PushBool(false), Or]),
+            vec![n(42.0)]
+        );
         // falsy || rhs → rhs
         assert_eq!(run(vec![PushNull, PushFloat(99.0), Or]), vec![n(99.0)]);
     }
@@ -2992,8 +3034,14 @@ mod tests {
             run(vec![PushFloat(10.0), PushFloat(12.0), BitXor]),
             vec![n(6.0)] // 0b1010 ^ 0b1100 = 0b0110
         );
-        assert_eq!(run(vec![PushFloat(1.0), PushFloat(3.0), BitLhs]), vec![n(8.0)]);
-        assert_eq!(run(vec![PushFloat(8.0), PushFloat(2.0), BitRhs]), vec![n(2.0)]);
+        assert_eq!(
+            run(vec![PushFloat(1.0), PushFloat(3.0), BitLhs]),
+            vec![n(8.0)]
+        );
+        assert_eq!(
+            run(vec![PushFloat(8.0), PushFloat(2.0), BitRhs]),
+            vec![n(2.0)]
+        );
     }
 
     // ── control flow ──────────────────────────────────────────────
@@ -3006,7 +3054,10 @@ mod tests {
             vec![n(1.0)]
         );
         // JFalse with false → jump over Push
-        assert_eq!(run(vec![PushBool(false), JFalse(3), PushFloat(999.0)]), vec![]);
+        assert_eq!(
+            run(vec![PushBool(false), JFalse(3), PushFloat(999.0)]),
+            vec![]
+        );
         // JFalse with true → don't jump, execute Push
         assert_eq!(
             run(vec![PushBool(true), JFalse(3), PushFloat(42.0)]),
@@ -3485,8 +3536,8 @@ mod tests {
             PushFloat(20.0),
             PushFloat(30.0),
             ArrNew(3),
-            PushFloat(1.0),           // index
-            PushFloat(99.0),          // value
+            PushFloat(1.0),         // index
+            PushFloat(99.0),        // value
             IndexSet(SetMode::New), // pops value, index, arr_ptr; leaves the value
         ];
         // IndexSet leaves the assigned value (assignment is an expression).
@@ -3502,11 +3553,11 @@ mod tests {
             PushFloat(30.0),
             ArrNew(3),
             Dup,                    // save ptr for later
-            PushFloat(1.0),           // index
-            PushFloat(99.0),          // value
+            PushFloat(1.0),         // index
+            PushFloat(99.0),        // value
             IndexSet(SetMode::New), // pops value, index, ptr_copy; leaves value → [ptr, 99]
             Pop(1),                 // drop the assigned-value result → [ptr]
-            PushFloat(1.0),           // index
+            PushFloat(1.0),         // index
             IndexGet,               // pops index, ptr → pushes arr[1]
         ];
         assert_eq!(run(code), vec![n(99.0)]);
@@ -3518,7 +3569,7 @@ mod tests {
             PushFloat(10.0),
             ArrNew(1),
             PushFloat(5.0), // index 5, out of bounds
-            IndexGet,     // JS: out-of-bounds reads as undefined
+            IndexGet,       // JS: out-of-bounds reads as undefined
         ];
         assert_eq!(run(code), vec![undef()]);
     }
@@ -3528,8 +3579,8 @@ mod tests {
         let code = vec![
             PushFloat(10.0),
             ArrNew(1),
-            PushFloat(5.0),           // index
-            PushFloat(99.0),          // value
+            PushFloat(5.0),         // index
+            PushFloat(99.0),        // value
             IndexSet(SetMode::New), // pops: value, index, arr_ptr
         ];
         assert!(matches!(run_err(code), VMError::ValueError));
@@ -3566,8 +3617,8 @@ mod tests {
             PushFloat(1.0),
             PushFloat(2.0),
             ObjNew(vec!["x".into(), "y".into()].into()), // x=1, y=2
-            PushPtr(0),                           // field "x" (heap[0]="x")
-            IndexGet,                             // → 1
+            PushPtr(0),                                  // field "x" (heap[0]="x")
+            IndexGet,                                    // → 1
         ]);
         vm.alloc_string("x".into());
         loop {
@@ -3583,12 +3634,12 @@ mod tests {
             PushFloat(1.0),
             PushFloat(2.0),
             ObjNew(vec!["x".into(), "y".into()].into()), // x=1, y=2
-            Dup,                                  // keep ptr for verification
-            PushPtr(0),                           // field "y" (heap[0]="y") — pushed before val
-            PushFloat(99.0),                        // val — on top
-            IndexSet(SetMode::New),               // obj.y = 99; leaves val → [ptr, 99]
-            Pop(1),                               // drop the result → [ptr]
-            ObjGet("y".into()),                   // → 99
+            Dup,                                         // keep ptr for verification
+            PushPtr(0),             // field "y" (heap[0]="y") — pushed before val
+            PushFloat(99.0),        // val — on top
+            IndexSet(SetMode::New), // obj.y = 99; leaves val → [ptr, 99]
+            Pop(1),                 // drop the result → [ptr]
+            ObjGet("y".into()),     // → 99
         ]);
         vm.alloc_string("y".into());
         loop {
@@ -3605,13 +3656,13 @@ mod tests {
         // Test ObjSet (static set) and ObjGet (static get).
         // Create {x:2, y:1}, modify x=99 with ObjSet, verify with ObjGet.
         let code = vec![
-            PushFloat(2.0),                         // x value
-            PushFloat(1.0),                         // y value
+            PushFloat(2.0),                              // x value
+            PushFloat(1.0),                              // y value
             ObjNew(vec!["x".into(), "y".into()].into()), // x=2, y=1
-            Dup,           // keep ptr for verification after ObjSet consumes one
+            Dup,             // keep ptr for verification after ObjSet consumes one
             PushFloat(99.0), // value to set
             ObjSet("x".into(), SetMode::New), // obj.x = 99; leaves value → [ptr, 99]
-            Pop(1),        // drop the result → [ptr]
+            Pop(1),          // drop the result → [ptr]
             ObjGet("x".into()), // → 99
         ];
         assert_eq!(run(code), vec![n(99.0)]);
@@ -3851,7 +3902,10 @@ mod tests {
     #[test]
     fn number_signed_zero() {
         // -0.0 and +0.0 should be equal for Eq
-        assert_eq!(run(vec![PushFloat(-0.0), PushFloat(0.0), Eq]), vec![b(true)]);
+        assert_eq!(
+            run(vec![PushFloat(-0.0), PushFloat(0.0), Eq]),
+            vec![b(true)]
+        );
     }
 
     // ── robustness / regression ───────────────────────────────────
@@ -3938,7 +3992,10 @@ mod tests {
             VMError::ValueError
         ));
         // Valid shifts still work.
-        assert_eq!(run(vec![PushFloat(1.0), PushFloat(3.0), BitLhs]), vec![n(8.0)]);
+        assert_eq!(
+            run(vec![PushFloat(1.0), PushFloat(3.0), BitLhs]),
+            vec![n(8.0)]
+        );
     }
 
     #[test]
@@ -3949,7 +4006,7 @@ mod tests {
             Call(3, 1),
             Return(0),
             EnterFrame(0, false, plain(1).into()), // local 0; sp == frame floor
-            Pop(1),                         // nothing above the floor -> underflow
+            Pop(1),                                // nothing above the floor -> underflow
             Return(0),
         ];
         assert!(matches!(run_err(code), VMError::StackUnderflow));
@@ -3962,7 +4019,7 @@ mod tests {
             Call(3, 1),
             Return(0),
             EnterFrame(0, false, plain(1).into()), // local 0; sp == floor
-            Dup,                            // nothing above the floor -> underflow
+            Dup,                                   // nothing above the floor -> underflow
             Return(0),
         ];
         assert!(matches!(run_err(code), VMError::StackUnderflow));
@@ -3977,8 +4034,8 @@ mod tests {
             Call(3, 1),
             Return(0),
             EnterFrame(0, false, plain(1).into()), // local 0
-            PushFloat(9.0),                   // single temporary
-            Swap,                           // would swap the temp with the local -> underflow
+            PushFloat(9.0),                        // single temporary
+            Swap, // would swap the temp with the local -> underflow
             Return(0),
         ];
         assert!(matches!(run_err(code), VMError::StackUnderflow));
@@ -3991,7 +4048,7 @@ mod tests {
             Call(3, 1),
             Return(0),
             EnterFrame(0, false, plain(1).into()), // local 0
-            PushFloat(8.0),                   // two temporaries (need three for Rot)
+            PushFloat(8.0),                        // two temporaries (need three for Rot)
             PushFloat(9.0),
             Rot,
             Return(0),
@@ -4009,7 +4066,7 @@ mod tests {
             Return(1),
             EnterFrame(0, false, plain(1).into()), // local 0
             PushFloat(10.0),
-            SetLocal(0),  // local 0 = 10
+            SetLocal(0),    // local 0 = 10
             PushFloat(1.0), // temporaries: [1, 2]
             PushFloat(2.0),
             Swap,     // -> [2, 1]
@@ -4029,7 +4086,10 @@ mod tests {
         // representations (different sign domains).
         assert_eq!(run(vec![PushPosInt(5), PushNegInt(-5), Eq]), vec![b(false)]);
         // Ordering across the sign boundary is structural.
-        assert_eq!(run(vec![PushNegInt(-1), PushPosInt(u64::MAX), Lt]), vec![b(true)]);
+        assert_eq!(
+            run(vec![PushNegInt(-1), PushPosInt(u64::MAX), Lt]),
+            vec![b(true)]
+        );
     }
 
     #[test]
@@ -4054,7 +4114,10 @@ mod tests {
         // 1 == 1.0, ordering works across Int/Number.
         assert_eq!(run(vec![PushPosInt(1), PushFloat(1.0), Eq]), vec![b(true)]);
         assert_eq!(run(vec![PushPosInt(2), PushFloat(2.5), Lt]), vec![b(true)]);
-        assert_eq!(run(vec![PushFloat(3.0), PushPosInt(3), GtEq]), vec![b(true)]);
+        assert_eq!(
+            run(vec![PushFloat(3.0), PushPosInt(3), GtEq]),
+            vec![b(true)]
+        );
         assert_eq!(run(vec![PushPosInt(2), PushPosInt(2), Eq]), vec![b(true)]);
     }
 
@@ -4070,7 +4133,10 @@ mod tests {
         ];
         assert_eq!(run(code), vec![n(20.0)]);
         // ...and as a bitwise operand.
-        assert_eq!(run(vec![PushPosInt(10), PushPosInt(12), BitAnd]), vec![n(8.0)]);
+        assert_eq!(
+            run(vec![PushPosInt(10), PushPosInt(12), BitAnd]),
+            vec![n(8.0)]
+        );
     }
 
     // ── Phase 0: allocation baseline ────────────────────────────
@@ -4145,13 +4211,9 @@ mod tests {
         // 3. How many allocs for a single Add (string + string)?
         alloc_counter::reset();
         {
-            let mut vm = VM::new(vec![
-                PushPtr(0),
-                PushPtr(1),
-                Add,
-            ]);
+            let mut vm = VM::new(vec![PushPtr(0), PushPtr(1), Add]);
             vm.alloc_string("hello".into()); // heap[0]
-            vm.alloc_string("x".into());     // heap[1]
+            vm.alloc_string("x".into()); // heap[1]
             loop {
                 match vm.step().unwrap() {
                     StepResult::Done => break,
@@ -4165,10 +4227,7 @@ mod tests {
         // 4. How many allocs for Math.abs call?
         alloc_counter::reset();
         {
-            let mut vm = VM::new(vec![
-                PushFloat(-42.0),
-                CallBuiltin(Builtin::MathAbs, 1),
-            ]);
+            let mut vm = VM::new(vec![PushFloat(-42.0), CallBuiltin(Builtin::MathAbs, 1)]);
             loop {
                 match vm.step().unwrap() {
                     StepResult::Done => break,
@@ -4197,5 +4256,52 @@ mod tests {
         }
         let stack_growth = alloc_counter::count();
         eprintln!("  stack push x10: {stack_growth}");
+
+        // 7. Per-instruction: CallDyn on a bare Fn (no closure, no upvals).
+        alloc_counter::reset();
+        {
+            // Program: push Fn(3), CallDyn(0), Return(0) | PushPosInt(42), Return(1)
+            let mut vm = VM::new(vec![
+                PushFn(3),
+                CallDyn(0),
+                Return(0),
+                PushPosInt(42),
+                Return(1),
+            ]);
+            loop {
+                match vm.step().unwrap() {
+                    StepResult::Done => break,
+                    other => panic!("unexpected effect: {other:?}"),
+                }
+            }
+        }
+        let call_dyn_ret = alloc_counter::count();
+        eprintln!("  CallDyn + Return (bare Fn): {call_dyn_ret}");
+
+        // 8. Two CallDyn calls.
+        alloc_counter::reset();
+        {
+            let mut vm = VM::new(vec![
+                PushFn(5),
+                CallDyn(0),
+                PushFn(5),
+                CallDyn(0),
+                Return(0),
+                PushPosInt(42),
+                Return(1),
+            ]);
+            loop {
+                match vm.step().unwrap() {
+                    StepResult::Done => break,
+                    other => panic!("unexpected effect: {other:?}"),
+                }
+            }
+        }
+        let call_dyn_x2 = alloc_counter::count();
+        eprintln!("  CallDyn x2: {call_dyn_x2}");
+        eprintln!(
+            "  -> marginal per extra CallDyn: {}",
+            call_dyn_x2.saturating_sub(call_dyn_ret)
+        );
     }
 }
