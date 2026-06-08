@@ -4,7 +4,6 @@ mod compiler;
 mod diag;
 mod prelude;
 mod rc_str;
-mod thin_string;
 mod tree;
 mod types;
 mod vm;

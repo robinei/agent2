@@ -48,8 +48,12 @@ The remaining intentional divergences from JS — deferred or accepted, NOT bugs
     (LLM) intervention, not JS error handling.
 */
 
-pub use crate::thin_string::ThinString;
-pub type FieldName = ThinString;
+pub use crate::rc_str::RcStr;
+/// Object keys and string-valued instruction operands. A thin, refcounted,
+/// immutable string: cloning a key (`ObjNew`/`ObjSet`) or pushing a literal
+/// (`PushStr`) is a refcount bump, and identical interned names share one
+/// allocation.
+pub type FieldName = RcStr;
 
 /// Convert a `SmallVec` to a `ThinVec`, copying from the stack allocation.
 /// Used at boundaries where heap storage is required (alloc_array,
@@ -66,9 +70,20 @@ pub type ArgCount = u32;
 /// Index into the VM's `cells` side table (the store of captured bindings).
 pub type CellIndex = u32;
 
-#[derive(Copy, Clone, Debug, PartialEq)]
+/// Not `Copy`: the `String` variant owns an `RcStr` whose clone must bump a
+/// refcount and whose drop must release one. Every other variant is a trivial
+/// bit-copy, so `clone()` on a non-string value is as cheap as the old `Copy`.
+#[derive(Clone, Debug, PartialEq)]
 pub enum StackValue {
     Null,
+    /// An immutable UTF-8 string, stored inline as a thin refcounted handle
+    /// rather than behind a heap index. Cloning (stack dup, local read, pushing
+    /// a literal) is a refcount bump; `===`/`<` compare by content (with an O(1)
+    /// pointer-equality fast path for shared/interned strings). Unlike arrays
+    /// and objects — which are `Ptr` into `heap` and compare by reference
+    /// identity — strings are primitives and are reclaimed when the last
+    /// reference drops (the heap itself never reclaims).
+    String(RcStr),
     /// JS `undefined`: the value of an absent thing, as distinct from `null`
     /// (a present, intentionally-empty value). Produced internally — never by
     /// JSON, which only yields `Null` — by a missing object property, an
@@ -117,7 +132,6 @@ pub enum StackValue {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum HeapValue {
-    String(ThinString),
     Array(ThinVec<StackValue>),
     Object(Box<IndexMap<FieldName, StackValue>>),
     /// A closure: a code address plus its captured environment. Each upval is
@@ -295,7 +309,7 @@ pub enum Instr {
     PushFn(CodeAddr),
     PushPtr(HeapAddr),
     PushBuiltin(Builtin),
-    PushStr(ThinString), // () -> str
+    PushStr(RcStr), // () -> str
 
     Pop(usize),
     Dup,
@@ -444,12 +458,12 @@ pub enum Instr {
     // pushed). step() batches a run of consecutive Invoke instructions into one
     // StepResult::Invoke (fan-out); the host runs them concurrently and pushes
     // one result per call, in call order.
-    Invoke(ThinString, u32), // any, ... -> any
+    Invoke(RcStr, u32), // any, ... -> any
 
     // EFFECT: raise condition (like Lisp condition system). used to ask LLM in calling frame
     // to decide how to proceed, using restarts like returning a value, aborting,
     // and even rewriting the program preserving already written variables with execution starting at arbitrary point.
-    Raise(ThinString), // () -> any
+    Raise(RcStr), // () -> any
 
     // pops N values where N is the number of field names, then pushes an
     // object with each field set to its corresponding value. Left-to-right:
@@ -653,6 +667,16 @@ fn js_str_to_number(s: &str) -> f64 {
     }
 }
 
+/// Helper for `loose_equal`: a numeric value vs a string. Coerces the string
+/// with `ToNumber` (`js_str_to_number`) and compares by f64. Non-numeric `num`
+/// (already filtered by the caller's `is_number` guard) yields `false`.
+fn num_loose_eq_str(num: &StackValue, s: &str) -> bool {
+    match as_f64(num) {
+        Some(a) => a == js_str_to_number(s),
+        None => false,
+    }
+}
+
 // ── VM impl ───────────────────────────────────────────────────────────
 
 impl VM {
@@ -682,34 +706,21 @@ impl VM {
     /// durable JSON (an object); `Null`/non-object seeds yield an empty `state`.
     /// All durable/host-context access lowers to ordinary object ops on
     /// `Ptr(0)`, so the host persists by extracting `heap[0]` after the run and
-    /// re-seeding it here next time. `PushStr`/literals alloc at `heap[1+]`, so
-    /// `Ptr(0)` stays stable for the whole program.
-    /// Construct a VM to run a compiled `Program`, pre-allocating its string
-    /// constants at `heap[1..=N]` and installing the blessed `state` object at
-    /// `heap[0]`. `state` is seeded from the prior run's durable JSON (an
-    /// object); `Null`/non-object seeds yield an empty `state`. All
-    /// durable/host-context access lowers to ordinary object ops on `Ptr(0)`,
-    /// so the host persists by extracting `heap[0]` after the run and
-    /// re-seeding it here next time. Constants are immutable and freely shared
-    /// across many `PushPtr` references.
+    /// re-seeding it here next time. String literals are not heap-allocated —
+    /// they ride inline in `PushStr` as `RcStr` — so `heap[0]` is the only
+    /// pre-seeded slot and `Ptr(0)` stays stable for the whole program.
     pub fn for_program(program: Program, state: serde_json::Value) -> Result<Self, VMError> {
         let mut vm = VM::new(program.code);
-        // Reserve heap[0] for `state` (empty placeholder — filled after
-        // constants).
+        // Reserve heap[0] for `state` (filled in just below). Strings no longer
+        // occupy heap slots, so this is the sole pre-allocation.
         vm.heap.push(HeapValue::Object(Box::new(IndexMap::new())));
-        // Pre-allocate constants at heap[1..=N]. Each constant's address is
-        // 1 + index, as emitted by the compiler.
-        for s in program.constants {
-            vm.heap.push(HeapValue::String(s));
-        }
-        // Seed state's nested values (they land at heap[N+1..], but addresses
-        // are computed at runtime and stored in the state map — the shift is
-        // transparent).
+        // Seed state's nested values (arrays/objects land at heap[1..]; their
+        // addresses are computed at runtime and stored in the state map).
         if let serde_json::Value::Object(map) = state {
             let mut entries = IndexMap::with_capacity(map.len());
             for (k, v) in &map {
                 let sv = vm.json_to_stack_value(v, 0)?;
-                entries.insert(ThinString::from(k.as_str()), sv);
+                entries.insert(RcStr::from(k.as_str()), sv);
             }
             if let Some(HeapValue::Object(o)) = vm.heap.get_mut(0) {
                 *o = Box::new(entries);
@@ -754,13 +765,6 @@ impl VM {
         self.heap.get(ptr as usize).ok_or(VMError::ValueError)
     }
 
-    fn heap_str(&self, ptr: HeapAddr) -> Option<&str> {
-        match self.heap.get(ptr as usize) {
-            Some(HeapValue::String(s)) => Some(s.as_str()),
-            _ => None,
-        }
-    }
-
     pub(crate) fn heap_arr(&self, ptr: HeapAddr) -> Option<&ThinVec<StackValue>> {
         match self.heap.get(ptr as usize) {
             Some(HeapValue::Array(a)) => Some(a),
@@ -789,10 +793,11 @@ impl VM {
         }
     }
 
-    pub(crate) fn alloc_string(&mut self, s: ThinString) -> StackValue {
-        let addr = self.heap.len() as HeapAddr;
-        self.heap.push(HeapValue::String(s));
-        StackValue::Ptr(addr)
+    /// Push a string value onto the stack. Strings live inline as `RcStr`, not
+    /// in `heap`, so this is just a stack push (no heap slot, no growth). The
+    /// builtin/string-producing counterpart to `alloc_array`/`alloc_object`.
+    pub(crate) fn push_str_value(&mut self, s: impl Into<RcStr>) {
+        self.stack.push(StackValue::String(s.into()));
     }
 
     pub(crate) fn alloc_array(&mut self, arr: ThinVec<StackValue>) -> StackValue {
@@ -825,10 +830,10 @@ impl VM {
             StackValue::PosInt(u) => *u != 0,
             // NegInt is always negative (i64::MIN..=-1), hence never zero.
             StackValue::NegInt(_) => true,
-            // Empty string is falsy; any other string and all arrays/objects/
-            // closures/functions are truthy.
-            StackValue::Ptr(p) => !matches!(self.heap_str(*p), Some("")),
-            StackValue::Fn(_) | StackValue::Builtin(_) => true,
+            // Empty string is falsy; any other string is truthy.
+            StackValue::String(s) => !s.as_str().is_empty(),
+            // All arrays/objects/closures/functions are truthy.
+            StackValue::Ptr(_) | StackValue::Fn(_) | StackValue::Builtin(_) => true,
             // Internal indirection; never a legitimate operand.
             StackValue::Upval(_) => false,
         }
@@ -848,23 +853,23 @@ impl VM {
             StackValue::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
             StackValue::Null => Some(0.0),
             StackValue::Undefined => Some(f64::NAN),
-            StackValue::Ptr(p) => self.heap_str(*p).map(js_str_to_number),
-            StackValue::Fn(_) | StackValue::Builtin(_) | StackValue::Upval(_) => None,
+            StackValue::String(s) => Some(js_str_to_number(s)),
+            StackValue::Ptr(_)
+            | StackValue::Fn(_)
+            | StackValue::Builtin(_)
+            | StackValue::Upval(_) => None,
         }
     }
 
-    /// Whether a value is a heap string (used to pick `+`'s concat vs add path).
-    fn is_string(&self, val: &StackValue) -> bool {
-        matches!(val, StackValue::Ptr(p) if matches!(self.heap.get(*p as usize), Some(HeapValue::String(_))))
+    /// Whether a value is a string (used to pick `+`'s concat vs add path).
+    fn is_string(val: &StackValue) -> bool {
+        matches!(val, StackValue::String(_))
     }
 
-    /// Byte length of a heap string, if it is one.
-    fn heap_str_len(&self, val: &StackValue) -> Option<usize> {
+    /// Byte length of a string value, if it is one.
+    fn str_byte_len(val: &StackValue) -> Option<usize> {
         match val {
-            StackValue::Ptr(p) => match self.heap.get(*p as usize) {
-                Some(HeapValue::String(s)) => Some(s.len()),
-                _ => None,
-            },
+            StackValue::String(s) => Some(s.len()),
             _ => None,
         }
     }
@@ -873,7 +878,7 @@ impl VM {
     /// the heap are copied by slicing (zero extra allocation); other types are
     /// converted and appended. Used by `to_js_string` (which wraps a buffer) and
     /// directly by `Add` to avoid intermediate clones.
-    fn write_js_string(&self, val: &StackValue, depth: usize, buf: &mut ThinString) {
+    fn write_js_string(&self, val: &StackValue, depth: usize, buf: &mut String) {
         if depth > MAX_JSON_DEPTH {
             return;
         }
@@ -884,12 +889,12 @@ impl VM {
             StackValue::PosInt(u) => buf.push_str(&u.to_string()),
             StackValue::NegInt(i) => buf.push_str(&i.to_string()),
             StackValue::Number(n) => buf.push_str(&js_number_to_string(*n)),
+            StackValue::String(s) => buf.push_str(s.as_str()),
             StackValue::Fn(_) | StackValue::Builtin(_) => {
                 buf.push_str("function () { [native code] }");
             }
             StackValue::Upval(_) => {}
             StackValue::Ptr(p) => match self.heap.get(*p as usize) {
-                Some(HeapValue::String(s)) => buf.push_str(s.as_str()),
                 Some(HeapValue::Array(arr)) => {
                     for (i, v) in arr.iter().enumerate() {
                         if i > 0 {
@@ -910,11 +915,17 @@ impl VM {
         }
     }
 
-    /// JS `String(x)` / `ToString`. Delegates to [`write_js_string`].
-    pub(crate) fn to_js_string(&self, val: &StackValue, depth: usize) -> ThinString {
-        let mut out = ThinString::new();
+    /// JS `String(x)` / `ToString`. Delegates to [`write_js_string`], assembling
+    /// in a growable `String` and freezing to an immutable `RcStr` once.
+    pub(crate) fn to_js_string(&self, val: &StackValue, depth: usize) -> RcStr {
+        // Fast path: an existing string is already an `RcStr` — share it (a
+        // refcount bump) instead of copying its bytes through a fresh buffer.
+        if let StackValue::String(s) = val {
+            return s.clone();
+        }
+        let mut out = String::new();
         self.write_js_string(val, depth, &mut out);
-        out
+        RcStr::from(out)
     }
 
     /// Reference/value equality matching JS `===`. Primitives compare by value;
@@ -951,23 +962,14 @@ impl VM {
             (StackValue::Fn(a), StackValue::Fn(b)) => a == b,
             // Builtins compare by identity, like Fn.
             (StackValue::Builtin(a), StackValue::Builtin(b)) => a == b,
-            (StackValue::Ptr(p), StackValue::Ptr(q)) => {
-                match (self.heap.get(*p as usize), self.heap.get(*q as usize)) {
-                    // Same heap address is the same object (JS reference identity
-                    // — the only equality arrays/objects/closures get). Distinct
-                    // pointers are equal only when both are strings with equal
-                    // content, since strings are primitives despite being heap-
-                    // allocated. A dangling pointer matches nothing (no panic).
-                    (Some(a), Some(b)) => {
-                        p == q
-                            || matches!(
-                                (a, b),
-                                (HeapValue::String(x), HeapValue::String(y)) if x == y
-                            )
-                    }
-                    _ => false,
-                }
-            }
+            // Strings are primitives: equal by *content*. `RcStr`'s `==` short-
+            // circuits on pointer identity, so comparing shared/interned strings
+            // (e.g. two clones of one literal) is O(1).
+            (StackValue::String(a), StackValue::String(b)) => a == b,
+            // Same heap address is the same object — JS reference identity, the
+            // only equality arrays/objects/closures get (`{a:1} === {a:1}` is
+            // false). A correct program never dangles (the heap only grows).
+            (StackValue::Ptr(p), StackValue::Ptr(q)) => p == q,
             _ => false,
         }
     }
@@ -1001,21 +1003,11 @@ impl VM {
             (Bool(b), _) => self.loose_equal(&Number(if *b { 1.0 } else { 0.0 }), rhs),
             (_, Bool(b)) => self.loose_equal(lhs, &Number(if *b { 1.0 } else { 0.0 })),
             // Number vs string (either order): coerce the string with ToNumber.
-            (l, Ptr(p)) if is_number(l) => self.num_loose_eq_str(l, *p),
-            (Ptr(p), r) if is_number(r) => self.num_loose_eq_str(r, *p),
+            (l, String(s)) if is_number(l) => num_loose_eq_str(l, s),
+            (String(s), r) if is_number(r) => num_loose_eq_str(r, s),
             // No further coercion: same-type primitives and heap-vs-heap defer
             // to the strict structural comparison.
             _ => self.values_equal(lhs, rhs),
-        }
-    }
-
-    /// Helper for `loose_equal`: a numeric value vs a heap pointer. Coerces the
-    /// pointee only if it is a string (`ToNumber`); arrays/objects/closures are
-    /// not coerced (see the divergence note on `loose_equal`).
-    fn num_loose_eq_str(&self, num: &StackValue, ptr: HeapAddr) -> bool {
-        match (as_f64(num), self.heap_str(ptr)) {
-            (Some(a), Some(s)) => a == js_str_to_number(s),
-            _ => false,
         }
     }
 
@@ -1034,12 +1026,9 @@ impl VM {
             (StackValue::Number(a), StackValue::PosInt(b)) => a.partial_cmp(&(*b as f64)),
             (StackValue::NegInt(a), StackValue::Number(b)) => (*a as f64).partial_cmp(b),
             (StackValue::Number(a), StackValue::NegInt(b)) => a.partial_cmp(&(*b as f64)),
-            (StackValue::Ptr(p), StackValue::Ptr(q)) => {
-                match (self.heap.get(*p as usize), self.heap.get(*q as usize)) {
-                    (Some(HeapValue::String(a)), Some(HeapValue::String(b))) => Some(a.cmp(b)),
-                    _ => None,
-                }
-            }
+            // Strings order lexicographically by bytes (UTF-8 byte order matches
+            // code-point order). Arrays/objects/closures are incomparable.
+            (StackValue::String(a), StackValue::String(b)) => Some(a.cmp(b)),
             _ => None,
         }
     }
@@ -1060,35 +1049,31 @@ impl VM {
         as_i64(&self.stack.pop().ok_or(VMError::StackUnderflow)?).ok_or(VMError::TypeError)
     }
 
-    /// Pop a pointer and require it to point to a String; return the string.
-    fn pop_string(&mut self) -> Result<ThinString, VMError> {
-        let ptr = self.pop_ptr()?;
-        match self.heap.get(ptr as usize) {
-            Some(HeapValue::String(s)) => Ok(s.clone()),
+    /// Pop a value and require it to be a String; return it (a refcount bump).
+    fn pop_string(&mut self) -> Result<RcStr, VMError> {
+        match self.stack.pop().ok_or(VMError::StackUnderflow)? {
+            StackValue::String(s) => Ok(s),
             _ => Err(VMError::TypeError),
         }
     }
 
-    /// Extract a `&str` from a StackValue that has already been popped. Returns
-    /// a borrow into the heap — the caller must not mutate the heap while the
-    /// `&str` is live. Use this for read-only builtins that push scalar results
-    /// (bool, number) to avoid cloning the string.
-    pub(crate) fn str_from<'a>(&'a self, val: &StackValue) -> Result<&'a str, VMError> {
+    /// Borrow the `&str` of an already-popped string value. The borrow is tied
+    /// to `val` (not the VM), so — unlike when strings lived in the heap — the
+    /// caller may freely mutate the VM while it is live. Use for read-only
+    /// builtins that push a scalar result without cloning the string.
+    pub(crate) fn str_from<'a>(&self, val: &'a StackValue) -> Result<&'a str, VMError> {
         match val {
-            StackValue::Ptr(p) => self.heap_str(*p).ok_or(VMError::TypeError),
+            StackValue::String(s) => Ok(s.as_str()),
             _ => Err(VMError::TypeError),
         }
     }
 
-    /// Extract an owned (cloned) string from an already-popped StackValue. The
-    /// clone sibling of `str_from`: use this when the builtin must retain the
-    /// string while it mutates the heap (e.g. allocates its result).
-    pub(crate) fn string_from(&self, val: &StackValue) -> Result<ThinString, VMError> {
+    /// Extract an owned `RcStr` from an already-popped string value — a refcount
+    /// bump, sharing the same allocation. The clone sibling of `str_from`; use
+    /// it when the builtin must retain the string past a borrow of the VM.
+    pub(crate) fn string_from(&self, val: &StackValue) -> Result<RcStr, VMError> {
         match val {
-            StackValue::Ptr(p) => match self.heap.get(*p as usize) {
-                Some(HeapValue::String(s)) => Ok(s.clone()),
-                _ => Err(VMError::TypeError),
-            },
+            StackValue::String(s) => Ok(s.clone()),
             _ => Err(VMError::TypeError),
         }
     }
@@ -1136,8 +1121,8 @@ impl VM {
                     }
                 }
             }
+            StackValue::String(s) => serde_json::Value::String(s.as_str().to_owned()),
             StackValue::Ptr(p) => match self.heap_get(*p)? {
-                HeapValue::String(s) => serde_json::Value::String(s.as_str().to_owned()),
                 HeapValue::Array(arr) => serde_json::Value::Array(
                     arr.iter()
                         .map(|v| match v {
@@ -1190,7 +1175,7 @@ impl VM {
                     StackValue::Number(n.as_f64().unwrap_or(0.0))
                 }
             }
-            serde_json::Value::String(s) => self.alloc_string(ThinString::from(s.as_str())),
+            serde_json::Value::String(s) => StackValue::String(RcStr::from(s.as_str())),
             serde_json::Value::Array(arr) => {
                 let vals: ThinVec<StackValue> = arr
                     .iter()
@@ -1202,7 +1187,7 @@ impl VM {
                 let mut map = IndexMap::new();
                 for (k, v) in obj {
                     map.insert(
-                        ThinString::from(k.as_str()),
+                        RcStr::from(k.as_str()),
                         self.json_to_stack_value(v, depth + 1)?,
                     );
                 }
@@ -1329,11 +1314,11 @@ impl VM {
                 }
 
                 Instr::PushStr(s) => {
-                    let s = s.clone(); // release the borrow on self.code
-                    let ptr = self.alloc_string(s);
-                    self.stack.push(ptr);
+                    // A refcount bump sharing the instruction's `RcStr` — no
+                    // allocation, no heap slot. Identical literals were interned
+                    // at compile time, so they all share one allocation.
+                    self.stack.push(StackValue::String(s.clone()));
                     self.ip += 1;
-                    continue;
                 }
 
                 Instr::Pop(n) => {
@@ -1350,7 +1335,7 @@ impl VM {
                     if self.stack.len() < self.frame_floor() + 1 {
                         return Err(VMError::StackUnderflow);
                     }
-                    let top = *self.stack.last().unwrap();
+                    let top = self.stack.last().unwrap().clone();
                     self.stack.push(top);
                     self.ip += 1;
                 }
@@ -1382,7 +1367,7 @@ impl VM {
                     if len < self.frame_floor() + n + 1 {
                         return Err(VMError::StackUnderflow);
                     }
-                    let val = self.stack[len - 1 - n];
+                    let val = self.stack[len - 1 - n].clone();
                     self.stack.push(val);
                     self.ip += 1;
                 }
@@ -1471,7 +1456,7 @@ impl VM {
                         StackValue::Ptr(p) => {
                             let (addr, upvals) = match self.heap_get(p)? {
                                 HeapValue::Closure { addr, upvals } => {
-                                    (*addr, upvals.iter().copied().collect())
+                                    (*addr, upvals.iter().cloned().collect())
                                 }
                                 _ => return Err(VMError::TypeError),
                             };
@@ -1513,8 +1498,7 @@ impl VM {
                     }
                     // Collect into stack-allocated SmallVec instead of cloning
                     // the ThinVec from self.code. LocalIndex is u32 (Copy).
-                    let captures: SmallVec<[LocalIndex; 8]> =
-                        captures.iter().copied().collect();
+                    let captures: SmallVec<[LocalIndex; 8]> = captures.iter().copied().collect();
                     let local_count = self.callstack.last().ok_or(VMError::BadLocal)?.local_count;
                     let mut upvals: SmallVec<[StackValue; 8]> = SmallVec::new();
                     for slot in captures {
@@ -1524,7 +1508,7 @@ impl VM {
                         // Copy the slot verbatim: a Boxed slot carries its Upval
                         // handle (shared, by-reference), a Plain slot its value
                         // (a by-value snapshot).
-                        upvals.push(self.stack[(self.fp + slot) as usize]);
+                        upvals.push(self.stack[(self.fp + slot) as usize].clone());
                     }
                     let closure = self.alloc_closure(addr, ThinVec::from(upvals.as_slice()));
                     self.stack.push(closure);
@@ -1543,7 +1527,7 @@ impl VM {
                     }
                     let ret_start = self.stack.len() - n;
                     for i in 0..n {
-                        self.stack[keep_below + i] = self.stack[ret_start + i];
+                        self.stack[keep_below + i] = self.stack[ret_start + i].clone();
                     }
                     self.stack.truncate(keep_below + n);
                     self.ip = frame.return_addr;
@@ -1624,7 +1608,7 @@ impl VM {
                         let args: SmallVec<[StackValue; 16]> = self.stack
                             [base..base + argc as usize]
                             .iter()
-                            .copied()
+                            .cloned()
                             .collect();
                         let arr = self.alloc_array(small_to_thin(&args));
                         if let StackValue::Ptr(p) = arr {
@@ -1685,7 +1669,7 @@ impl VM {
                     }
                     let args: SmallVec<[StackValue; 16]> = self.stack[base..base + argc as usize]
                         .iter()
-                        .copied()
+                        .cloned()
                         .collect();
                     let arr = self.alloc_array(small_to_thin(&args));
                     let ptr = match arr {
@@ -1704,11 +1688,11 @@ impl VM {
                     }
                     // A Boxed slot holds an Upval marker; dereference it so the
                     // value — never the marker — reaches the expression stack.
-                    let val = match self.stack[(self.fp + local) as usize] {
+                    let val = match &self.stack[(self.fp + local) as usize] {
                         StackValue::Upval(c) => {
-                            *self.cells.get(c as usize).ok_or(VMError::ValueError)?
+                            self.cells.get(*c as usize).ok_or(VMError::ValueError)?.clone()
                         }
-                        other => other,
+                        other => other.clone(),
                     };
                     self.stack.push(val);
                     self.ip += 1;
@@ -1737,7 +1721,7 @@ impl VM {
                     if *local >= frame.local_count {
                         return Err(VMError::BadLocal);
                     }
-                    let val = *self.stack.last().ok_or(VMError::StackUnderflow)?;
+                    let val = self.stack.last().ok_or(VMError::StackUnderflow)?.clone();
                     let slot = (self.fp + local) as usize;
                     // Like SetLocal but peeks: the value stays on the stack
                     // (assignment is an expression) while still writing to the
@@ -1758,11 +1742,11 @@ impl VM {
                     }
                     let slot = (self.fp + local) as usize;
                     // Read the current value, dereferencing an existing Upval.
-                    let val = match self.stack[slot] {
+                    let val = match &self.stack[slot] {
                         StackValue::Upval(c) => {
-                            *self.cells.get(c as usize).ok_or(VMError::ValueError)?
+                            self.cells.get(*c as usize).ok_or(VMError::ValueError)?.clone()
                         }
-                        other => other,
+                        other => other.clone(),
                     };
                     // Allocate a fresh cell seeded with that value and point the
                     // slot at it, so subsequent captures see a per-iteration cell.
@@ -1778,11 +1762,11 @@ impl VM {
                         return Err(VMError::BadLocal);
                     }
                     // Read current value (dereferencing boxed slots).
-                    let old = match self.stack[(self.fp + u32::from(*local)) as usize] {
+                    let old = match &self.stack[(self.fp + u32::from(*local)) as usize] {
                         StackValue::Upval(c) => {
-                            *self.cells.get(c as usize).ok_or(VMError::ValueError)?
+                            self.cells.get(*c as usize).ok_or(VMError::ValueError)?.clone()
                         }
-                        other => other,
+                        other => other.clone(),
                     };
                     let old_num = self.to_number(&old).ok_or(VMError::TypeError)?;
                     // Compute new value: subtract p (p = -1 for ++, p = 1 for --).
@@ -1798,7 +1782,7 @@ impl VM {
                     }
                     // Push the appropriate result: old for postfix, new for prefix.
                     let result = match mode {
-                        UpdateMode::Prefix => new_val,
+                        UpdateMode::Prefix => StackValue::Number(new_num),
                         UpdateMode::Postfix => StackValue::Number(old_num),
                     };
                     self.stack.push(result);
@@ -1817,17 +1801,16 @@ impl VM {
                         StackValue::Number(_) | StackValue::PosInt(_) | StackValue::NegInt(_) => {
                             "number"
                         }
+                        StackValue::String(_) => "string",
                         StackValue::Fn(_) | StackValue::Builtin(_) => "function",
                         StackValue::Ptr(p) => match self.heap_get(p)? {
-                            HeapValue::String(_) => "string",
                             HeapValue::Array(_) | HeapValue::Object(_) => "object",
                             HeapValue::Closure { .. } => "function",
                         },
                         // Internal indirection; never a legitimate operand.
                         StackValue::Upval(_) => return Err(VMError::ValueError),
                     };
-                    let s = self.alloc_string(ThinString::from(tag));
-                    self.stack.push(s);
+                    self.push_str_value(tag);
                     self.ip += 1;
                 }
 
@@ -1862,11 +1845,7 @@ impl VM {
                 }
                 Instr::IsStr => {
                     let val = self.stack.pop().ok_or(VMError::StackUnderflow)?;
-                    let is_str = matches!(
-                        val,
-                        StackValue::Ptr(p)
-                            if matches!(self.heap.get(p as usize), Some(HeapValue::String(_)))
-                    );
+                    let is_str = matches!(val, StackValue::String(_));
                     self.stack.push(StackValue::Bool(is_str));
                     self.ip += 1;
                 }
@@ -1909,20 +1888,17 @@ impl VM {
                     // both); otherwise add numerically (ToNumber both). An
                     // array/object/function in the numeric path is a TypeError
                     // (we do not ToPrimitive it — see the note on `loose_equal`).
-                    let result = if self.is_string(&lhs) || self.is_string(&rhs) {
-                        // Pre-size the buffer when both operands are heap strings
-                        // (the common concat path), saving incremental growth.
-                        let cap = match (self.heap_str_len(&lhs), self.heap_str_len(&rhs)) {
-                            (Some(a), Some(b)) => Some(a + b),
-                            _ => None,
+                    let result = if Self::is_string(&lhs) || Self::is_string(&rhs) {
+                        // Pre-size the buffer when both operands are strings (the
+                        // common concat path), saving incremental growth.
+                        let cap = match (Self::str_byte_len(&lhs), Self::str_byte_len(&rhs)) {
+                            (Some(a), Some(b)) => a + b,
+                            _ => 0,
                         };
-                        let mut s = match cap {
-                            Some(n) => ThinString::with_capacity(n),
-                            None => ThinString::new(),
-                        };
+                        let mut s = String::with_capacity(cap);
                         self.write_js_string(&lhs, 0, &mut s);
                         self.write_js_string(&rhs, 0, &mut s);
-                        self.alloc_string(s)
+                        StackValue::String(RcStr::from(s))
                     } else {
                         match (self.to_number(&lhs), self.to_number(&rhs)) {
                             (Some(a), Some(b)) => StackValue::Number(a + b),
@@ -2044,9 +2020,10 @@ impl VM {
                     let vals: SmallVec<[StackValue; 16]> = self.stack.drain(split..).collect();
                     let mut obj = IndexMap::new();
                     // Left-to-right: field 0's value is the deepest (first
-                    // pushed), so values line up with fields in order.
-                    for (i, field) in fields.iter().enumerate() {
-                        obj.insert(field.clone(), vals[i]);
+                    // pushed), so values line up with fields in order. `field`
+                    // clones are refcount bumps on the interned `RcStr` key.
+                    for (field, val) in fields.iter().zip(vals) {
+                        obj.insert(field.clone(), val);
                     }
                     let obj_ptr = self.alloc_object(obj);
                     self.stack.push(obj_ptr);
@@ -2064,10 +2041,9 @@ impl VM {
                     };
                     // JS: a missing property reads as `undefined`, not `null`.
                     let val = match self.heap.get(obj_ptr as usize) {
-                        Some(HeapValue::Object(obj)) => obj
-                            .get(field_str)
-                            .copied()
-                            .unwrap_or(StackValue::Undefined),
+                        Some(HeapValue::Object(obj)) => {
+                            obj.get(field_str).cloned().unwrap_or(StackValue::Undefined)
+                        }
                         _ => StackValue::Undefined,
                     };
                     self.stack.pop(); // discard the object pointer
@@ -2092,21 +2068,24 @@ impl VM {
                     // get_mut (avoids cloning the key when it already exists).
                     let result = match mode {
                         SetMode::Old => {
-                            let old = obj.get(field_str).copied().unwrap_or(StackValue::Undefined);
+                            let old = obj.get(field_str).cloned().unwrap_or(StackValue::Undefined);
                             if let Some(slot) = obj.get_mut(field_str) {
                                 *slot = val;
                             } else {
-                                obj.insert(ThinString::from(field_str), val);
+                                obj.insert(RcStr::from(field_str), val);
                             }
                             old
                         }
                         SetMode::New => {
+                            // `New` returns the assigned value; clone (a refcount
+                            // bump for strings) since the slot takes ownership.
+                            let result = val.clone();
                             if let Some(slot) = obj.get_mut(field_str) {
                                 *slot = val;
                             } else {
-                                obj.insert(ThinString::from(field_str), val);
+                                obj.insert(RcStr::from(field_str), val);
                             }
-                            val
+                            result
                         }
                     };
                     self.stack.pop(); // discard the object pointer
@@ -2120,28 +2099,12 @@ impl VM {
                 // it is computed under the heap borrow and allocated after.
                 Instr::IndexGet => {
                     let key = self.stack.pop().ok_or(VMError::StackUnderflow)?;
-                    let container = self.pop_ptr()?;
-                    let mut to_alloc: Option<ThinString> = None;
-                    let val = match self.heap_get(container)? {
-                        HeapValue::Array(arr) => {
-                            let idx = as_i64(&key).ok_or(VMError::TypeError)?;
-                            if idx < 0 {
-                                return Err(VMError::ValueError);
-                            }
-                            // JS: an out-of-bounds index reads as `undefined`.
-                            arr.get(idx as usize)
-                                .copied()
-                                .unwrap_or(StackValue::Undefined)
-                        }
-                        HeapValue::Object(obj) => {
-                            // JS coerces a computed key with ToString.
-                            let field = self.to_js_string(&key, 0);
-                            // JS: a missing property reads as `undefined`.
-                            obj.get(field.as_str())
-                                .copied()
-                                .unwrap_or(StackValue::Undefined)
-                        }
-                        HeapValue::String(s) => {
+                    let container = self.stack.pop().ok_or(VMError::StackUnderflow)?;
+                    let val = match &container {
+                        // String char-indexing: strings are inline values now, so
+                        // this no longer routes through the heap. The single-char
+                        // result is a fresh `RcStr`.
+                        StackValue::String(s) => {
                             let s = s.as_str();
                             let idx = as_i64(&key).ok_or(VMError::TypeError)?;
                             if idx < 0 {
@@ -2154,21 +2117,34 @@ impl VM {
                             } else if !s.is_char_boundary(idx) {
                                 return Err(VMError::ValueError);
                             } else {
-                                // The codepoint starting at this byte, as a
-                                // 1-char string (built after the borrow ends).
-                                to_alloc = Some(ThinString::from(
-                                    s[idx..].chars().next().unwrap().to_string().as_str(),
-                                ));
-                                StackValue::Undefined // placeholder, replaced below
+                                let ch = s[idx..].chars().next().unwrap();
+                                StackValue::String(RcStr::from(ch.to_string()))
                             }
                         }
+                        StackValue::Ptr(p) => match self.heap_get(*p)? {
+                            HeapValue::Array(arr) => {
+                                let idx = as_i64(&key).ok_or(VMError::TypeError)?;
+                                if idx < 0 {
+                                    return Err(VMError::ValueError);
+                                }
+                                // JS: an out-of-bounds index reads as `undefined`.
+                                arr.get(idx as usize)
+                                    .cloned()
+                                    .unwrap_or(StackValue::Undefined)
+                            }
+                            HeapValue::Object(obj) => {
+                                // JS coerces a computed key with ToString.
+                                let field = self.to_js_string(&key, 0);
+                                // JS: a missing property reads as `undefined`.
+                                obj.get(field.as_str())
+                                    .cloned()
+                                    .unwrap_or(StackValue::Undefined)
+                            }
+                            _ => return Err(VMError::TypeError),
+                        },
                         _ => return Err(VMError::TypeError),
                     };
-                    let result = match to_alloc {
-                        Some(s) => self.alloc_string(s),
-                        None => val,
-                    };
-                    self.stack.push(result);
+                    self.stack.push(val);
                     self.ip += 1;
                 }
 
@@ -2197,16 +2173,23 @@ impl VM {
                                 return Err(VMError::ValueError);
                             }
                             self.heap_arr(container)
-                                .and_then(|a| a.get(idx as usize).copied())
+                                .and_then(|a| a.get(idx as usize).cloned())
                                 .unwrap_or(StackValue::Undefined)
                         } else {
                             let field = self.to_js_string(&key, 0);
                             self.heap_obj(container)
-                                .and_then(|o| o.get(field.as_str()).copied())
+                                .and_then(|o| o.get(field.as_str()).cloned())
                                 .unwrap_or(StackValue::Undefined)
                         }
                     } else {
                         StackValue::Undefined // placeholder, unused
+                    };
+                    // The value left on the stack: the assigned value (`New`) or
+                    // the previous one (`Old`). Computed before the store, which
+                    // moves `val`; the clone is a refcount bump for strings.
+                    let result = match mode {
+                        SetMode::New => val.clone(),
+                        SetMode::Old => old,
                     };
                     if is_array {
                         let idx = as_i64(&key).ok_or(VMError::TypeError)?;
@@ -2224,10 +2207,7 @@ impl VM {
                         let obj = self.heap_obj_mut(container).ok_or(VMError::TypeError)?;
                         obj.insert(field, val);
                     }
-                    match mode {
-                        SetMode::New => self.stack.push(val),
-                        SetMode::Old => self.stack.push(old),
-                    }
+                    self.stack.push(result);
                     self.ip += 1;
                 }
 
@@ -2272,11 +2252,11 @@ impl VM {
                 Instr::ArrLength => {
                     let val = self.stack.pop().ok_or(VMError::StackUnderflow)?;
                     let len = match val {
+                        // String length is in UTF-8 *bytes* (consistent with the
+                        // byte-offset string ops below).
+                        StackValue::String(s) => s.len(),
                         StackValue::Ptr(p) => match self.heap_get(p)? {
                             HeapValue::Array(a) => a.len(),
-                            // String length is in UTF-8 *bytes* (consistent with
-                            // the byte-offset string ops below).
-                            HeapValue::String(s) => s.len(),
                             _ => return Err(VMError::TypeError),
                         },
                         _ => return Err(VMError::TypeError),
@@ -2288,8 +2268,7 @@ impl VM {
                 Instr::ToStr => {
                     let val = self.stack.pop().ok_or(VMError::StackUnderflow)?;
                     let s = self.to_js_string(&val, 0);
-                    let ptr = self.alloc_string(s);
-                    self.stack.push(ptr);
+                    self.stack.push(StackValue::String(s));
                     self.ip += 1;
                 }
 
@@ -2385,18 +2364,10 @@ mod tests {
         }
     }
 
-    /// Run code with pre-allocated heap strings (addr 0, 1, 2, …).
-    fn run_heap(code: Vec<Instr>, strings: &[&str]) -> Vec<StackValue> {
-        let mut vm = VM::new(code);
-        for s in strings {
-            vm.alloc_string((*s).into());
-        }
-        loop {
-            match vm.step().unwrap() {
-                StepResult::Done => return vm.stack.clone(),
-                other => panic!("unexpected effect: {other:?}"),
-            }
-        }
+    /// Build a `PushStr` for a string literal — terse sugar for the many tests
+    /// that push string operands inline.
+    fn ps(val: &str) -> Instr {
+        Instr::PushStr(RcStr::from(val))
     }
 
     /// Run code to the first effect (Invoke/Raise), returning the StepResult.
@@ -2452,9 +2423,13 @@ mod tests {
     fn undef() -> StackValue {
         StackValue::Undefined
     }
-    /// Heap pointer to string at the given index (pre-loaded via run_heap).
+    /// Heap pointer value (array/object) at the given address.
     fn s(addr: u32) -> StackValue {
         StackValue::Ptr(addr)
+    }
+    /// A string value (strings are inline now, not heap pointers).
+    fn str_v(val: &str) -> StackValue {
+        StackValue::String(RcStr::from(val))
     }
     /// `n` plain (unboxed) local slots, for `EnterFrame`.
     fn plain(n: usize) -> Vec<SlotKind> {
@@ -2728,35 +2703,19 @@ mod tests {
 
     #[test]
     fn add_strings() {
-        // heap[0]="hello ", heap[1]="world"
+        // Concatenation yields an inline string value on the stack.
         assert_eq!(
-            run_heap(vec![PushPtr(0), PushPtr(1), Add], &["hello ", "world"]),
-            vec![s(2)] // new string at heap[2]
+            run(vec![ps("hello "), ps("world"), Add]),
+            vec![str_v("hello world")]
         );
-        // Verify the concatenated string
-        let mut vm = VM::new(vec![Add]);
-        vm.heap.push(HeapValue::String("hello ".into()));
-        vm.heap.push(HeapValue::String("world".into()));
-        vm.stack.push(s(0));
-        vm.stack.push(s(1));
-        match vm.step().unwrap() {
-            StepResult::Done => {}
-            _ => panic!(),
-        }
-        assert_eq!(vm.heap[2], HeapValue::String("hello world".into()));
     }
 
-    /// Run `code` (with preloaded heap strings) and return the last heap value
-    /// as a String, panicking if it isn't one. Handy for ops that allocate a
-    /// result string (Add concat, ToStr, ArrJoin).
-    fn run_last_str(code: Vec<Instr>, strings: &[&str]) -> String {
-        let mut vm = VM::new(code);
-        for s in strings {
-            vm.alloc_string((*s).into());
-        }
-        while !matches!(vm.step().unwrap(), StepResult::Done) {}
-        match vm.heap.last() {
-            Some(HeapValue::String(s)) => s.as_str().to_owned(),
+    /// Run `code` and return the top of the stack as a String, panicking if it
+    /// isn't one. Handy for ops that produce a result string (Add concat, ToStr,
+    /// ArrJoin).
+    fn run_last_str(code: Vec<Instr>) -> String {
+        match run(code).last() {
+            Some(StackValue::String(s)) => s.as_str().to_owned(),
             other => panic!("expected a string result, got {other:?}"),
         }
     }
@@ -2765,27 +2724,24 @@ mod tests {
     fn add_concat_coerces() {
         // `+` concatenates when either side is a string, coercing the other.
         assert_eq!(
-            run_last_str(vec![PushPtr(0), PushFloat(5.0), Add], &["x="]),
+            run_last_str(vec![ps("x="), PushFloat(5.0), Add]),
             "x=5"
         );
         assert_eq!(
-            run_last_str(vec![PushFloat(5.0), PushPtr(0), Add], &["!"]),
+            run_last_str(vec![PushFloat(5.0), ps("!"), Add]),
             "5!"
         );
         assert_eq!(
-            run_last_str(vec![PushPtr(0), PushNull, Add], &["v="]),
+            run_last_str(vec![ps("v="), PushNull, Add]),
             "v=null"
         );
         assert_eq!(
-            run_last_str(vec![PushPtr(0), PushBool(true), Add], &["b="]),
+            run_last_str(vec![ps("b="), PushBool(true), Add]),
             "b=true"
         );
         // An array operand stringifies like join(",") on the concat path.
         assert_eq!(
-            run_last_str(
-                vec![PushFloat(1.0), PushFloat(2.0), ArrNew(2), PushPtr(0), Add],
-                &["!"]
-            ),
+            run_last_str(vec![PushFloat(1.0), PushFloat(2.0), ArrNew(2), ps("!"), Add]),
             "1,2!"
         );
     }
@@ -2794,13 +2750,13 @@ mod tests {
     fn arithmetic_coerces() {
         // ToNumber coercion on -, *, /, % (strings, bools, null).
         assert_eq!(
-            run_heap(vec![PushPtr(0), PushFloat(1.0), Sub], &["6"]),
+            run(vec![ps("6"), PushFloat(1.0), Sub]),
             vec![n(5.0)]
         );
         assert_eq!(run(vec![PushBool(true), PushFloat(2.0), Mul]), vec![n(2.0)]);
         assert_eq!(run(vec![PushNull, PushFloat(1.0), Add]), vec![n(1.0)]);
         assert_eq!(
-            run_heap(vec![PushPtr(0), PushPtr(1), Mul], &["6", "2"]),
+            run(vec![ps("6"), ps("2"), Mul]),
             vec![n(12.0)]
         );
         // undefined -> NaN propagates.
@@ -2810,7 +2766,7 @@ mod tests {
         ));
         // An unparseable string -> NaN.
         assert!(matches!(
-            run_heap(vec![PushPtr(0), PushFloat(1.0), Mul], &["abc"]).as_slice(),
+            run(vec![ps("abc"), PushFloat(1.0), Mul]).as_slice(),
             [StackValue::Number(x)] if x.is_nan()
         ));
     }
@@ -2828,10 +2784,10 @@ mod tests {
         ] {
             assert_eq!(run(code), vec![b(true)], "expected falsy");
         }
-        assert_eq!(run_heap(vec![PushPtr(0), Not], &[""]), vec![b(true)]); // "" falsy
+        assert_eq!(run(vec![ps(""), Not]), vec![b(true)]); // "" falsy
         // Truthy: nonzero, "0", non-empty string, [], {}.
         assert_eq!(run(vec![PushFloat(1.0), Not]), vec![b(false)]);
-        assert_eq!(run_heap(vec![PushPtr(0), Not], &["0"]), vec![b(false)]); // "0" truthy
+        assert_eq!(run(vec![ps("0"), Not]), vec![b(false)]); // "0" truthy
         assert_eq!(run(vec![ArrNew(0), Not]), vec![b(false)]); // [] truthy
         assert_eq!(run(vec![ObjNew(vec![].into()), Not]), vec![b(false)]); // {} truthy
         // And JFalse on 0 takes the branch (0 is falsy).
@@ -2843,7 +2799,7 @@ mod tests {
     #[test]
     fn to_num_instruction() {
         // JS ToNumber: strings parse, bools→0/1, null→0, undefined/garbage→NaN.
-        assert_eq!(run_heap(vec![PushPtr(0), ToNum], &["42"]), vec![n(42.0)]);
+        assert_eq!(run(vec![ps("42"), ToNum]), vec![n(42.0)]);
         assert_eq!(run(vec![PushBool(true), ToNum]), vec![n(1.0)]);
         assert_eq!(run(vec![PushNull, ToNum]), vec![n(0.0)]);
         assert!(matches!(
@@ -2862,34 +2818,31 @@ mod tests {
         assert_eq!(run(vec![PushFloat(0.0), ToBool]), vec![b(false)]);
         assert_eq!(run(vec![PushFloat(1.0), ToBool]), vec![b(true)]);
         assert_eq!(run(vec![PushNull, ToBool]), vec![b(false)]);
-        assert_eq!(run_heap(vec![PushPtr(0), ToBool], &[""]), vec![b(false)]);
+        assert_eq!(run(vec![ps(""), ToBool]), vec![b(false)]);
         assert_eq!(run(vec![ArrNew(0), ToBool]), vec![b(true)]); // [] is truthy
     }
 
     #[test]
     fn to_str_instruction() {
-        assert_eq!(run_last_str(vec![PushFloat(5.0), ToStr], &[]), "5");
-        assert_eq!(run_last_str(vec![PushFloat(1.5), ToStr], &[]), "1.5");
-        assert_eq!(run_last_str(vec![PushNegInt(-3), ToStr], &[]), "-3");
-        assert_eq!(run_last_str(vec![PushNull, ToStr], &[]), "null");
-        assert_eq!(run_last_str(vec![PushUndefined, ToStr], &[]), "undefined");
-        assert_eq!(run_last_str(vec![PushBool(true), ToStr], &[]), "true");
+        assert_eq!(run_last_str(vec![PushFloat(5.0), ToStr]), "5");
+        assert_eq!(run_last_str(vec![PushFloat(1.5), ToStr]), "1.5");
+        assert_eq!(run_last_str(vec![PushNegInt(-3), ToStr]), "-3");
+        assert_eq!(run_last_str(vec![PushNull, ToStr]), "null");
+        assert_eq!(run_last_str(vec![PushUndefined, ToStr]), "undefined");
+        assert_eq!(run_last_str(vec![PushBool(true), ToStr]), "true");
         // NaN / Infinity get JS spellings.
-        assert_eq!(run_last_str(vec![PushFloat(f64::NAN), ToStr], &[]), "NaN");
+        assert_eq!(run_last_str(vec![PushFloat(f64::NAN), ToStr]), "NaN");
         assert_eq!(
-            run_last_str(vec![PushFloat(f64::INFINITY), ToStr], &[]),
+            run_last_str(vec![PushFloat(f64::INFINITY), ToStr]),
             "Infinity"
         );
         // Array -> join(","), object -> "[object Object]".
         assert_eq!(
-            run_last_str(vec![PushFloat(1.0), PushFloat(2.0), ArrNew(2), ToStr], &[]),
+            run_last_str(vec![PushFloat(1.0), PushFloat(2.0), ArrNew(2), ToStr]),
             "1,2"
         );
         assert_eq!(
-            run_last_str(
-                vec![PushFloat(1.0), ObjNew(vec!["a".into()].into()), ToStr],
-                &[]
-            ),
+            run_last_str(vec![PushFloat(1.0), ObjNew(vec!["a".into()].into()), ToStr]),
             "[object Object]"
         );
     }
@@ -2953,45 +2906,31 @@ mod tests {
 
     #[test]
     fn loose_eq_number_string_coercion() {
-        // heap[0]="1", [1]="", [2]="abc", [3]="1.5"
-        let strings = ["1", "", "abc", "1.5"];
         // 1 == "1"
         assert_eq!(
-            run_heap(vec![PushFloat(1.0), PushPtr(0), LooseEq], &strings),
+            run(vec![PushFloat(1.0), ps("1"), LooseEq]),
             vec![b(true)]
         );
         // "1" == 1 (other order)
         assert_eq!(
-            run_heap(vec![PushPtr(0), PushFloat(1.0), LooseEq], &strings),
+            run(vec![ps("1"), PushFloat(1.0), LooseEq]),
             vec![b(true)]
         );
         // 0 == "" (empty string ToNumber is 0)
-        assert_eq!(
-            run_heap(vec![PushFloat(0.0), PushPtr(1), LooseEq], &strings),
-            vec![b(true)]
-        );
+        assert_eq!(run(vec![PushFloat(0.0), ps(""), LooseEq]), vec![b(true)]);
         // false == "" via double coercion
-        assert_eq!(
-            run_heap(vec![PushBool(false), PushPtr(1), LooseEq], &strings),
-            vec![b(true)]
-        );
+        assert_eq!(run(vec![PushBool(false), ps(""), LooseEq]), vec![b(true)]);
         // 1 == "abc" -> NaN -> false
-        assert_eq!(
-            run_heap(vec![PushFloat(1.0), PushPtr(2), LooseEq], &strings),
-            vec![b(false)]
-        );
+        assert_eq!(run(vec![PushFloat(1.0), ps("abc"), LooseEq]), vec![b(false)]);
         // 1.5 == "1.5"
-        assert_eq!(
-            run_heap(vec![PushFloat(1.5), PushPtr(3), LooseEq], &strings),
-            vec![b(true)]
-        );
+        assert_eq!(run(vec![PushFloat(1.5), ps("1.5"), LooseEq]), vec![b(true)]);
     }
 
     #[test]
     fn loose_eq_strings_not_coerced_to_each_other() {
         // Two strings still compare as strings (no numeric coercion): "1" vs "1.0".
         assert_eq!(
-            run_heap(vec![PushPtr(0), PushPtr(1), LooseEq], &["1", "1.0"]),
+            run(vec![ps("1"), ps("1.0"), LooseEq]),
             vec![b(false)]
         );
     }
@@ -3007,19 +2946,11 @@ mod tests {
 
     #[test]
     fn string_eq() {
-        // heap[0]="abc", heap[1]="abc", heap[2]="xyz"
-        let code = vec![PushPtr(0), PushPtr(1), Eq, PushPtr(0), PushPtr(2), Eq];
-        let mut vm = VM::new(code);
-        vm.heap.push(HeapValue::String("abc".into()));
-        vm.heap.push(HeapValue::String("abc".into()));
-        vm.heap.push(HeapValue::String("xyz".into()));
-        loop {
-            match vm.step().unwrap() {
-                StepResult::Done => break,
-                _ => {}
-            }
-        }
-        assert_eq!(vm.stack, vec![b(true), b(false)]);
+        // Strings compare by content: "abc"=="abc" is true, "abc"=="xyz" false.
+        // (The two "abc" operands are distinct allocations, exercising the
+        // value-compare path, not just the pointer fast path.)
+        let out = run(vec![ps("abc"), ps("abc"), Eq, ps("abc"), ps("xyz"), Eq]);
+        assert_eq!(out, vec![b(true), b(false)]);
     }
 
     #[test]
@@ -3634,63 +3565,42 @@ mod tests {
     fn obj_new_get_set() {
         // Left-to-right: fields ["a","b"], values pushed in field order.
         // Push a-val (20), push b-val (10) → a=20, b=10
-        let mut vm = VM::new(vec![
+        let out = run(vec![
             PushFloat(20.0), // "a" value (first field, pushed first)
             PushFloat(10.0), // "b" value (second field)
             ObjNew(vec!["a".into(), "b".into()].into()),
-            PushPtr(0), // field "a" (heap[0]="a")
-            IndexGet,   // pops key, obj_ptr → pushes obj["a"]
+            ps("a"),  // field "a" (the string key)
+            IndexGet, // pops key, obj_ptr → pushes obj["a"]
         ]);
-        vm.alloc_string("a".into());
-        loop {
-            match vm.step().unwrap() {
-                StepResult::Done => break,
-                _ => {}
-            }
-        }
         // IndexGet consumes obj_ptr, so stack only has the retrieved value.
-        assert_eq!(vm.stack, vec![n(20.0)]);
+        assert_eq!(out, vec![n(20.0)]);
     }
 
     #[test]
     fn obj_get_set_dynamic() {
-        // Computed get via IndexGet with a heap-allocated string key.
-        let mut vm = VM::new(vec![
+        // Computed get via IndexGet with a string key.
+        let out = run(vec![
             PushFloat(1.0),
             PushFloat(2.0),
             ObjNew(vec!["x".into(), "y".into()].into()), // x=1, y=2
-            PushPtr(0),                                  // field "x" (heap[0]="x")
+            ps("x"),                                     // field "x"
             IndexGet,                                    // → 1
         ]);
-        vm.alloc_string("x".into());
-        loop {
-            match vm.step().unwrap() {
-                StepResult::Done => break,
-                _ => {}
-            }
-        }
-        assert_eq!(vm.stack, vec![n(1.0)]);
+        assert_eq!(out, vec![n(1.0)]);
 
         // Computed set via IndexSet: set a field, verify with ObjGet.
-        let mut vm = VM::new(vec![
+        let out = run(vec![
             PushFloat(1.0),
             PushFloat(2.0),
             ObjNew(vec!["x".into(), "y".into()].into()), // x=1, y=2
             Dup,                                         // keep ptr for verification
-            PushPtr(0),             // field "y" (heap[0]="y") — pushed before val
+            ps("y"),                // field "y" — pushed before val
             PushFloat(99.0),        // val — on top
             IndexSet(SetMode::New), // obj.y = 99; leaves val → [ptr, 99]
             Pop(1),                 // drop the result → [ptr]
             ObjGet("y".into()),     // → 99
         ]);
-        vm.alloc_string("y".into());
-        loop {
-            match vm.step().unwrap() {
-                StepResult::Done => break,
-                _ => {}
-            }
-        }
-        assert_eq!(vm.stack, vec![n(99.0)]);
+        assert_eq!(out, vec![n(99.0)]);
     }
 
     #[test]
@@ -3781,7 +3691,7 @@ mod tests {
                 StackValue::Fn(a) => PushFn(*a),
                 _ => panic!("unexpected stack value"),
             };
-            let out = run_heap(vec![instr, TypeOf, PushPtr(0), Eq], &[tag]);
+            let out = run(vec![instr, TypeOf, ps(tag), Eq]);
             assert_eq!(out, vec![b(true)], "typeof {val:?} should be {tag:?}");
         }
     }
@@ -3789,36 +3699,27 @@ mod tests {
     #[test]
     fn typeof_heap_values() {
         // string -> "string", array/object -> "object", closure -> "function".
-        let str_tag = run_heap(vec![PushPtr(0), TypeOf, PushPtr(1), Eq], &["hi", "string"]);
+        let str_tag = run(vec![ps("hi"), TypeOf, ps("string"), Eq]);
         assert_eq!(str_tag, vec![b(true)]);
-        let arr_tag = run_heap(
-            vec![PushFloat(1.0), ArrNew(1), TypeOf, PushPtr(0), Eq],
-            &["object"],
-        );
+        let arr_tag = run(vec![PushFloat(1.0), ArrNew(1), TypeOf, ps("object"), Eq]);
         assert_eq!(arr_tag, vec![b(true)]);
-        let obj_tag = run_heap(
-            vec![
-                PushFloat(1.0),
-                ObjNew(vec!["a".into()].into()),
-                TypeOf,
-                PushPtr(0),
-                Eq,
-            ],
-            &["object"],
-        );
+        let obj_tag = run(vec![
+            PushFloat(1.0),
+            ObjNew(vec!["a".into()].into()),
+            TypeOf,
+            ps("object"),
+            Eq,
+        ]);
         assert_eq!(obj_tag, vec![b(true)]);
         // typeof a missing property is "undefined".
-        let miss_tag = run_heap(
-            vec![
-                PushFloat(1.0),
-                ObjNew(vec!["a".into()].into()),
-                ObjGet("b".into()),
-                TypeOf,
-                PushPtr(0),
-                Eq,
-            ],
-            &["undefined"],
-        );
+        let miss_tag = run(vec![
+            PushFloat(1.0),
+            ObjNew(vec!["a".into()].into()),
+            ObjGet("b".into()),
+            TypeOf,
+            ps("undefined"),
+            Eq,
+        ]);
         assert_eq!(miss_tag, vec![b(true)]);
     }
 
@@ -3983,24 +3884,22 @@ mod tests {
         ));
         // Type predicates stay total (false) on a dangling pointer.
         assert_eq!(run(vec![PushPtr(99), IsStr]), vec![b(false)]);
-        // Equality with a dangling pointer is simply not-equal, no panic.
-        assert_eq!(run(vec![PushPtr(99), PushPtr(99), Eq]), vec![b(false)]);
+        // `===` on pointers is pure reference identity (no heap lookup), so the
+        // same address compares equal — even when dangling — without panicking.
+        assert_eq!(run(vec![PushPtr(99), PushPtr(99), Eq]), vec![b(true)]);
     }
 
     #[test]
     fn object_array_equality_is_by_reference() {
         // JS ===: two distinct arrays/objects are never equal, even with
         // identical content.
-        let code = vec![PushPtr(0), ArrNew(1), PushPtr(1), ArrNew(1), Eq];
-        assert_eq!(run_heap(code, &["abc", "abc"]), vec![b(false)]);
+        let code = vec![ps("abc"), ArrNew(1), ps("abc"), ArrNew(1), Eq];
+        assert_eq!(run(code), vec![b(false)]);
         // But the SAME array (one allocation, duplicated handle) is equal.
-        let code = vec![PushPtr(0), ArrNew(1), Dup, Eq];
-        assert_eq!(run_heap(code, &["abc"]), vec![b(true)]);
-        // Strings remain primitives: distinct heap strings compare by content.
-        assert_eq!(
-            run_heap(vec![PushPtr(0), PushPtr(1), Eq], &["abc", "abc"]),
-            vec![b(true)]
-        );
+        let code = vec![ps("abc"), ArrNew(1), Dup, Eq];
+        assert_eq!(run(code), vec![b(true)]);
+        // Strings remain primitives: distinct allocations compare by content.
+        assert_eq!(run(vec![ps("abc"), ps("abc"), Eq]), vec![b(true)]);
     }
 
     #[test]
@@ -4184,37 +4083,30 @@ mod tests {
     // ── Phase 0: allocation baseline ────────────────────────────
 
     /// Run a representative hot-loop workload and record the allocation count.
-    /// Run a representative hot-loop workload and record the allocation count.
-    /// Each iteration does Math.abs + string concat. String literals are
-    /// pre-allocated once (simulating Phase 4 constant interning) and referenced
-    /// by Ptr, so the loop body incurs zero per-iteration string-literal allocs.
+    /// Each iteration does Math.abs + a string concat `s += "x"`. String
+    /// literals ride inline in `PushStr` as `RcStr` (each push is a refcount
+    /// bump, zero per-iteration literal allocation); only the concat allocates.
     #[test]
     fn alloc_baseline_hot_loop() {
         use crate::alloc_counter;
 
         // Build a loop that does builtin calls + string concat (the hot paths).
-        // Each iteration: Math.abs, string concat (s += "x").
         let mut code = Vec::new();
-        // s = "hello" — pre-allocated at heap[0]
-        code.push(PushPtr(0));
-        // 100 iterations
+        code.push(ps("hello")); // s = "hello"
         for _ in 0..100 {
             // Math.abs(-42) → drop result (just measuring the call overhead)
             code.push(PushFloat(-42.0));
             code.push(CallBuiltin(Builtin::MathAbs, 1));
             code.push(Pop(1));
-            // s += "x" — "x" pre-allocated at heap[1]
-            code.push(PushPtr(1));
+            // s += "x" — the literal is a refcount bump; the Add allocates.
+            code.push(ps("x"));
             code.push(Add);
         }
-        // drop s
-        code.push(Pop(1));
+        code.push(Pop(1)); // drop s
 
-        alloc_counter::reset();
+        // Reset after building `code` so the literals' construction isn't counted.
         let mut vm = VM::new(code);
-        // Pre-allocate the string constants once (simulates Phase 4).
-        vm.alloc_string("hello".into());
-        vm.alloc_string("x".into());
+        alloc_counter::reset();
         loop {
             match vm.step().unwrap() {
                 StepResult::Done => break,
@@ -4231,36 +4123,31 @@ mod tests {
     fn alloc_breakdown() {
         use crate::alloc_counter;
 
-        // 1. How many allocs for a single alloc_string?
+        // 1. How many allocs to materialize one string value? One: the single
+        //    `RcStr` block (header + bytes).
         alloc_counter::reset();
-        {
-            let mut vm = VM::new(vec![]);
-            vm.alloc_string("x".into());
-        }
-        let per_alloc_string = alloc_counter::count();
-        eprintln!("  alloc_string: {per_alloc_string}");
+        let _s = StackValue::String(RcStr::from("x"));
+        let per_string = alloc_counter::count();
+        eprintln!("  RcStr::from: {per_string}");
 
-        // 2. How many allocs for to_js_string on a string Ptr?
+        // 2. How many allocs for to_js_string on a string value? Zero — the fast
+        //    path clones the existing `RcStr` (a refcount bump).
+        let v = StackValue::String(RcStr::from("hello"));
+        let vm = VM::new(vec![]);
         alloc_counter::reset();
-        {
-            let mut vm = VM::new(vec![]);
-            let ptr = vm.alloc_string("hello".into());
-            let _ = vm.to_js_string(&ptr, 0);
-        }
+        let _ = vm.to_js_string(&v, 0);
         let per_to_js_string = alloc_counter::count();
         eprintln!("  to_js_string on string: {per_to_js_string}");
 
-        // 3. How many allocs for a single Add (string + string)?
+        // 3. How many allocs for a single Add (string + string)? The pushes are
+        //    refcount bumps; only the result string allocates.
+        let code = vec![ps("hello"), ps("x"), Add];
+        let mut vm = VM::new(code);
         alloc_counter::reset();
-        {
-            let mut vm = VM::new(vec![PushPtr(0), PushPtr(1), Add]);
-            vm.alloc_string("hello".into()); // heap[0]
-            vm.alloc_string("x".into()); // heap[1]
-            loop {
-                match vm.step().unwrap() {
-                    StepResult::Done => break,
-                    other => panic!("unexpected effect: {other:?}"),
-                }
+        loop {
+            match vm.step().unwrap() {
+                StepResult::Done => break,
+                other => panic!("unexpected effect: {other:?}"),
             }
         }
         let per_add = alloc_counter::count();

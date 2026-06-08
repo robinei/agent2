@@ -14,7 +14,7 @@
 //! result — assignment-style "leave a value" semantics, so every builtin call
 //! is a well-formed expression.
 
-use crate::vm::{StackValue, ThinString, VM, VMError, as_i64, small_to_thin};
+use crate::vm::{RcStr, StackValue, VM, VMError, as_i64, small_to_thin};
 use smallvec::SmallVec;
 
 /// A builtin's identity. Used both as the static call target
@@ -305,18 +305,24 @@ fn arg_base(vm: &VM, argc: u32) -> Result<usize, VMError> {
     Ok(vm.stack.len() - n)
 }
 
-/// Copy the top `argc` args into a fixed-size array (arg 0 first, deepest) and
-/// truncate the stack by `argc`, popping all arguments. `StackValue: Copy`, so
-/// this is a stack read of N×16 bytes, zero heap allocation. Surplus args past
-/// `N` are silently dropped (JS ignores extra arguments). The min arity is
-/// already guaranteed by [`Builtin::call`] from `meta()`.
+/// Clone the top `argc` args into a fixed-size array (arg 0 first, deepest) and
+/// truncate the stack by `argc`, popping all arguments. Each clone is a refcount
+/// bump for strings and a cheap bit-copy otherwise. Surplus args past `N` are
+/// silently dropped (JS ignores extra arguments). The min arity is already
+/// guaranteed by [`Builtin::call`] from `meta()`.
 fn take_args<const N: usize>(vm: &mut VM, argc: u32) -> Result<[StackValue; N], VMError> {
     let base = arg_base(vm, argc)?;
-    let mut out = [StackValue::Null; N];
     let n = (argc as usize).min(N);
-    for i in 0..n {
-        out[i] = vm.stack[base + i];
-    }
+    // Clone each arg out of the stack (a refcount bump for strings, a bit-copy
+    // otherwise); surplus slots default to `Null`. `StackValue` is no longer
+    // `Copy`, so this can't be an array-repeat init.
+    let out = std::array::from_fn(|i| {
+        if i < n {
+            vm.stack[base + i].clone()
+        } else {
+            StackValue::Null
+        }
+    });
     vm.stack.truncate(base);
     Ok(out)
 }
@@ -427,7 +433,7 @@ fn array_push(vm: &mut VM, argc: u32) -> Result<(), VMError> {
         StackValue::Ptr(p) => *p,
         _ => return Err(VMError::TypeError),
     };
-    let val = args[1];
+    let val = args[1].clone();
     let arr = vm.heap_arr_mut(arr_ptr).ok_or(VMError::TypeError)?;
     arr.push(val);
     let len = arr.len();
@@ -471,7 +477,7 @@ fn array_unshift(vm: &mut VM, argc: u32) -> Result<(), VMError> {
         StackValue::Ptr(p) => *p,
         _ => return Err(VMError::TypeError),
     };
-    let val = args[1];
+    let val = args[1].clone();
     let arr = vm.heap_arr_mut(arr_ptr).ok_or(VMError::TypeError)?;
     arr.insert(0, val);
     let len = arr.len();
@@ -498,25 +504,17 @@ fn array_join(vm: &mut VM, argc: u32) -> Result<(), VMError> {
         _ => return Err(VMError::BadArg),
     };
     let arr = vm.heap_arr(arr_ptr).ok_or(VMError::TypeError)?;
-    let parts: SmallVec<[ThinString; 16]> = arr
-        .iter()
-        .map(|v| match v {
-            StackValue::Null | StackValue::Undefined => ThinString::new(),
-            _ => vm.to_js_string(v, 0),
-        })
-        .collect();
-    let joined = parts.iter().enumerate().fold(
-        ThinString::new(),
-        |mut acc, (i, s)| {
-            if i > 0 {
-                acc.push_str(sep.as_str());
-            }
-            acc.push_str(s.as_str());
-            acc
-        },
-    );
-    let ptr = vm.alloc_string(joined);
-    vm.stack.push(ptr);
+    let mut joined = String::new();
+    for (i, v) in arr.iter().enumerate() {
+        if i > 0 {
+            joined.push_str(sep.as_str());
+        }
+        // JS: null/undefined elements contribute the empty string.
+        if !matches!(v, StackValue::Null | StackValue::Undefined) {
+            joined.push_str(vm.to_js_string(v, 0).as_str());
+        }
+    }
+    vm.push_str_value(joined);
     Ok(())
 }
 
@@ -548,12 +546,12 @@ fn str_split(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     match limit {
         Some(lim) => {
             for p in s.splitn(lim, delim.as_str()) {
-                parts.push(vm.alloc_string(ThinString::from(p)));
+                parts.push(StackValue::String(RcStr::from(p)));
             }
         }
         None => {
             for p in s.split(delim.as_str()) {
-                parts.push(vm.alloc_string(ThinString::from(p)));
+                parts.push(StackValue::String(RcStr::from(p)));
             }
         }
     }
@@ -672,7 +670,7 @@ fn str_ends_with(vm: &mut VM, argc: u32) -> Result<(), VMError> {
 /// defaults to the string length.
 fn str_slice(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     let args = take_args::<3>(vm, argc)?;
-    let (s, start, end): (ThinString, usize, usize) = match argc {
+    let (s, start, end): (RcStr, usize, usize) = match argc {
         2 => {
             let s = vm.string_from(&args[0])?;
             let start = as_i64(&args[1]).ok_or(VMError::TypeError)?;
@@ -697,8 +695,7 @@ fn str_slice(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     if start > s.len() || end > s.len() || !s.is_char_boundary(start) || !s.is_char_boundary(end) {
         return Err(VMError::ValueError);
     }
-    let ptr = vm.alloc_string(ThinString::from(&s[start..end]));
-    vm.stack.push(ptr);
+    vm.push_str_value(&s[start..end]);
     Ok(())
 }
 
@@ -706,8 +703,7 @@ fn str_slice(vm: &mut VM, argc: u32) -> Result<(), VMError> {
 fn str_trim(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     let args = check_arity!(vm, argc, 1)?;
     let s = vm.string_from(&args[0])?;
-    let ptr = vm.alloc_string(ThinString::from(s.trim()));
-    vm.stack.push(ptr);
+    vm.push_str_value(s.trim());
     Ok(())
 }
 
@@ -720,13 +716,14 @@ fn obj_keys(vm: &mut VM, argc: u32) -> Result<(), VMError> {
         StackValue::Ptr(p) => *p,
         _ => return Err(VMError::TypeError),
     };
-    let keys: SmallVec<[ThinString; 8]> = vm
+    let keys: SmallVec<[RcStr; 8]> = vm
         .heap_obj(obj_ptr)
         .ok_or(VMError::TypeError)?
         .keys()
         .cloned()
         .collect();
-    let strs: SmallVec<[StackValue; 16]> = keys.into_iter().map(|k| vm.alloc_string(k)).collect();
+    let strs: SmallVec<[StackValue; 16]> =
+        keys.into_iter().map(StackValue::String).collect();
     let ptr = vm.alloc_array(small_to_thin(&strs));
     vm.stack.push(ptr);
     Ok(())
@@ -743,7 +740,7 @@ fn obj_values(vm: &mut VM, argc: u32) -> Result<(), VMError> {
         .heap_obj(obj_ptr)
         .ok_or(VMError::TypeError)?
         .values()
-        .copied()
+        .cloned()
         .collect();
     let ptr = vm.alloc_array(small_to_thin(&vals));
     vm.stack.push(ptr);
@@ -767,8 +764,7 @@ fn json_stringify(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     let args = check_arity!(vm, argc, 1)?;
     let json = vm.stack_value_to_json(&args[0], 0)?;
     let s = serde_json::to_string(&json).map_err(|_| VMError::ValueError)?;
-    let ptr = vm.alloc_string(ThinString::from(s.as_str()));
-    vm.stack.push(ptr);
+    vm.push_str_value(s);
     Ok(())
 }
 
@@ -879,7 +875,7 @@ fn math_pow(vm: &mut VM, argc: u32) -> Result<(), VMError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vm::{HeapValue, Instr, StepResult};
+    use crate::vm::{Instr, StepResult};
 
     fn run(code: Vec<Instr>) -> Vec<StackValue> {
         let mut vm = VM::new(code);
@@ -973,10 +969,9 @@ mod tests {
             Instr::ArrNew(2),
             Instr::CallBuiltin(Builtin::ArrayJoin, 1),
         ]);
-        // result is a Ptr to a heap string "1,2"
         match &out[0] {
-            StackValue::Ptr(_) => {}
-            other => panic!("expected Ptr, got {other:?}"),
+            StackValue::String(s) => assert_eq!(s.as_str(), "1,2"),
+            other => panic!("expected string, got {other:?}"),
         }
     }
 
@@ -990,8 +985,8 @@ mod tests {
             Instr::CallBuiltin(Builtin::ArrayJoin, 2),
         ]);
         match &out[0] {
-            StackValue::Ptr(_) => {}
-            other => panic!("expected Ptr, got {other:?}"),
+            StackValue::String(s) => assert_eq!(s.as_str(), "1 - 2"),
+            other => panic!("expected string, got {other:?}"),
         }
     }
 
@@ -1151,10 +1146,9 @@ mod tests {
             Instr::PushPosInt(4),
             Instr::CallBuiltin(Builtin::StrSlice, 3),
         ]);
-        // result is a Ptr to "ell"
         match &out[0] {
-            StackValue::Ptr(_) => {}
-            other => panic!("expected Ptr, got {other:?}"),
+            StackValue::String(s) => assert_eq!(s.as_str(), "ell"),
+            other => panic!("expected string, got {other:?}"),
         }
     }
 
@@ -1166,8 +1160,8 @@ mod tests {
             Instr::CallBuiltin(Builtin::StrSlice, 2),
         ]);
         match &out[0] {
-            StackValue::Ptr(_) => {}
-            other => panic!("expected Ptr, got {other:?}"),
+            StackValue::String(s) => assert_eq!(s.as_str(), "llo"),
+            other => panic!("expected string, got {other:?}"),
         }
     }
 
@@ -1180,8 +1174,8 @@ mod tests {
             Instr::CallBuiltin(Builtin::StrTrim, 1),
         ]);
         match &out[0] {
-            StackValue::Ptr(_) => {}
-            other => panic!("expected Ptr, got {other:?}"),
+            StackValue::String(s) => assert_eq!(s.as_str(), "hi"),
+            other => panic!("expected string, got {other:?}"),
         }
     }
 
@@ -1234,8 +1228,8 @@ mod tests {
             Instr::CallBuiltin(Builtin::JSONStringify, 1),
         ]);
         match &out[0] {
-            StackValue::Ptr(_) => {}
-            other => panic!("expected Ptr, got {other:?}"),
+            StackValue::String(s) => assert_eq!(s.as_str(), "3.5"),
+            other => panic!("expected string, got {other:?}"),
         }
     }
 
@@ -1453,8 +1447,8 @@ mod tests {
             Instr::TypeOf,
         ]);
         while !matches!(vm.step().unwrap(), StepResult::Done) {}
-        match vm.heap.last() {
-            Some(HeapValue::String(s)) => assert_eq!(s.as_str(), "function"),
+        match vm.stack.last() {
+            Some(StackValue::String(s)) => assert_eq!(s.as_str(), "function"),
             other => panic!("{other:?}"),
         }
     }

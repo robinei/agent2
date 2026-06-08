@@ -126,12 +126,6 @@ impl RcStr {
         self.as_str().as_bytes()
     }
 
-    /// Validate `bytes` as UTF-8 once at this boundary, then store them.
-    pub fn from_utf8(bytes: &[u8]) -> Result<Self, std::str::Utf8Error> {
-        std::str::from_utf8(bytes)?;
-        Ok(Self::from_bytes(bytes))
-    }
-
     /// Current strong-reference count. Test/diagnostic use only.
     #[cfg(test)]
     fn strong_count(&self) -> usize {
