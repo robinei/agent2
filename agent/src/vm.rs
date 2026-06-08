@@ -359,6 +359,16 @@ pub enum Instr {
     // slot. Replaces the common `Dup; SetLocal` pair.
     TeeLocal(LocalIndex), // any -> any
 
+    // Re-box a (Boxed) local: allocate a fresh `cells` entry seeded with the
+    // slot's current value and store a new `Upval` marker into the slot. Used to
+    // give each loop iteration its own captured cell, so closures created in
+    // different iterations capture distinct bindings (JS `let`/`const`
+    // per-iteration semantics) even though the stack slot is reused. Seeding the
+    // new cell with the current value carries a for-head variable forward to the
+    // next iteration; for a fresh declaration the following `SetLocal` overwrites
+    // it. () -> ()
+    FreshCell(LocalIndex),
+
     // Increments or decrements a local variable in place. `p` is the value to
     // *subtract* from the variable: NegInt(-1) increments (sub −1 = +1),
     // PosInt(1) decrements (sub 1 = −1). Prefix mode leaves the new value on
@@ -1594,6 +1604,27 @@ impl VM {
                         }
                         _ => self.stack[slot] = val,
                     }
+                    self.ip += 1;
+                }
+
+                Instr::FreshCell(local) => {
+                    let frame = self.callstack.last().ok_or(VMError::BadLocal)?;
+                    if *local >= frame.local_count {
+                        return Err(VMError::BadLocal);
+                    }
+                    let slot = (self.fp + local) as usize;
+                    // Read the current value, dereferencing an existing Upval.
+                    let val = match self.stack[slot] {
+                        StackValue::Upval(c) => {
+                            *self.cells.get(c as usize).ok_or(VMError::ValueError)?
+                        }
+                        other => other,
+                    };
+                    // Allocate a fresh cell seeded with that value and point the
+                    // slot at it, so subsequent captures see a per-iteration cell.
+                    let idx = self.cells.len() as CellIndex;
+                    self.cells.push(val);
+                    self.stack[slot] = StackValue::Upval(idx);
                     self.ip += 1;
                 }
 
