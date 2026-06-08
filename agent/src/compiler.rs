@@ -4268,4 +4268,53 @@ mod tests {
         );
         assert_eq!(state_val(&vm, "r"), StackValue::PosInt(42));
     }
+
+    // ── allocation baseline (compiled, realistic workload) ──────────
+
+    /// Baseline: makeCounter closure called 100× in a loop. Exercises closures,
+    /// upval mutation, arithmetic, and string concat in compiled code.
+    #[test]
+    fn alloc_baseline_makecounter() {
+        use crate::alloc_counter;
+
+        let prog = compile(
+            "function makeCounter() { \
+               let count = 0; \
+               function inc() { count = count + 1; return count; } \
+               return inc; \
+             } \
+             let c = makeCounter(); \
+             let s = 'x'; \
+             for (let i = 0; i < 100; i++) { \
+               c(); \
+               s = s + 'x'; \
+             } \
+             state.r = c(); \
+             state.s = s;",
+        )
+        .expect("compiles");
+
+        alloc_counter::reset();
+        let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
+        loop {
+            match vm.step().unwrap() {
+                StepResult::Done => break,
+                other => panic!("unexpected effect: {other:?}"),
+            }
+        }
+        let allocs = alloc_counter::count();
+        eprintln!("BASELINE makecounter_100_iter: {allocs} allocs");
+
+        // Verify correctness: count should be 101 (0→1…→100 + 1 final call).
+        // Arithmetic degrades to Number, so we get Number(101.0) not PosInt(101).
+        assert_eq!(state_val(&vm, "r"), num(101.0));
+        // String "x" + 100×"x" = 101 "x"s
+        match state_val(&vm, "s") {
+            StackValue::Ptr(p) => match &vm.heap[p as usize] {
+                HeapValue::String(s) => assert_eq!(s.len(), 101),
+                other => panic!("not a string: {other:?}"),
+            },
+            other => panic!("not a pointer: {other:?}"),
+        }
+    }
 }

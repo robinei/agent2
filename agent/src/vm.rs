@@ -149,7 +149,7 @@ pub struct CallFrame {
     /// the callee's upval locals by the prologue `EnterFrame` (after the arg
     /// region is normalized to `nparams`, so the upvals land at the right slots).
     /// Empty for static `Call` and bare-`Fn` calls (no captures).
-    pending_upvals: ThinVec<StackValue>,
+    pending_upvals: SmallVec<[StackValue; 8]>,
     /// Lazily-built, per-frame cache for the `arguments` array (its heap
     /// address). Built on the first `Instr::Arguments` in this frame and reused
     /// by later references, so repeated `arguments` uses don't re-materialize
@@ -669,7 +669,7 @@ impl VM {
                 return_addr: 0,
                 prev_fp: 0,
                 arguments_cache: None,
-                pending_upvals: ThinVec::new(),
+                pending_upvals: SmallVec::new(),
             }],
             ip: 0,
             fp: 0,
@@ -1412,7 +1412,7 @@ impl VM {
                         return_addr: self.ip + 1,
                         prev_fp: self.fp,
                         arguments_cache: None,
-                        pending_upvals: ThinVec::new(),
+                        pending_upvals: SmallVec::new(),
                     });
                     self.ip = *addr;
                     self.fp = (self.stack.len() as u32) - *nargs;
@@ -1444,14 +1444,16 @@ impl VM {
                                 return_addr: self.ip + 1,
                                 prev_fp: self.fp,
                                 arguments_cache: None,
-                                pending_upvals: ThinVec::new(),
+                                pending_upvals: SmallVec::new(),
                             });
                             self.fp = (self.stack.len() as u32) - nargs;
                             self.ip = addr;
                         }
                         StackValue::Ptr(p) => {
                             let (addr, upvals) = match self.heap_get(p)? {
-                                HeapValue::Closure { addr, upvals } => (*addr, upvals.clone()),
+                                HeapValue::Closure { addr, upvals } => {
+                                    (*addr, upvals.iter().copied().collect())
+                                }
                                 _ => return Err(VMError::TypeError),
                             };
                             if addr as usize >= self.code.len() {
