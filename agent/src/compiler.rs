@@ -39,7 +39,7 @@ struct ParamInfo {
 /// Pre-computed analysis for one function scope (including the top-level
 /// program). The analysis pass walks all nested functions, detects free
 /// variables, and determines which slots must be `Boxed` because they are
-/// both captured and reassigned.
+/// captured by a nested function (conservative: all captured slots are boxed).
 #[derive(Debug)]
 struct FuncScope {
     /// Unique id (index into the `ProgramAnalysis::scopes` vec).
@@ -60,17 +60,12 @@ struct FuncScope {
     /// are 0-based within own locals (excluding upvals). Includes
     /// duplicates for block-scoped names.
     names: IndexMap<String, SlotInfo>,
-    /// Which own-local raw-slot indices are `const`.
-    const_slots: HashSet<u32>,
-    /// Which own-local raw-slot indices are reassigned in the body.
-    reassigned: HashSet<u32>,
     /// Which own-local raw-slot indices are captured by nested functions.
     captured: HashSet<u32>,
     /// Nested function scope ids.
     children: Vec<usize>,
-    /// Free variables: names referenced but not declared in this scope,
-    /// mapped to the first reference span.
-    free_vars: HashMap<String, u32>,
+    /// Free variables: names referenced but not declared in this scope.
+    free_vars: HashSet<String>,
     /// After the bottom-up capture pass, the capture list: absolute slot
     /// indices (including upval slots) in the PARENT frame, in the order
     /// they become the closure's leading locals.
@@ -285,7 +280,7 @@ impl<'src> Compiler<'src> {
     /// The whole program is the root frame's body. Phase 3: scope/capture
     /// analysis was already run (stored in `self.analysis`), so we know the
     /// exact `Vec<SlotKind>` for the prologue `Alloc` and which slots are
-    /// const/reassigned/captured. After emitting the root body (including
+    /// captured. After emitting the root body (including
     /// hoisted function declarations), we drain `pending_functions` and emit
     /// each function body.
     fn compile_program(&mut self, program: &ast::Program) {
@@ -350,11 +345,9 @@ impl<'src> Compiler<'src> {
             self_name: None,
             is_declaration: false,
             names: IndexMap::new(),
-            const_slots: HashSet::new(),
-            reassigned: HashSet::new(),
             captured: HashSet::new(),
             children: Vec::new(),
-            free_vars: HashMap::new(),
+            free_vars: HashSet::new(),
             captures: Vec::new(),
             upval_count: 0,
             own_local_count: 0,
@@ -754,9 +747,6 @@ impl<'src> Compiler<'src> {
                     slot,
                     is_const: false,
                 });
-            if is_const {
-                func_scope.const_slots.insert(slot);
-            }
             slot
         } else {
             // `let`/`const` go to the innermost block scope.
@@ -771,9 +761,6 @@ impl<'src> Compiler<'src> {
                     .names
                     .entry(name.to_string())
                     .or_insert(SlotInfo { slot, is_const });
-                if is_const {
-                    func_scope.const_slots.insert(slot);
-                }
                 return slot;
             }
             let slot = *next_slot;
@@ -783,9 +770,6 @@ impl<'src> Compiler<'src> {
                 .names
                 .entry(name.to_string())
                 .or_insert(SlotInfo { slot, is_const });
-            if is_const {
-                func_scope.const_slots.insert(slot);
-            }
             slot
         }
     }
@@ -804,22 +788,13 @@ impl<'src> Compiler<'src> {
             ast::Expression::Identifier(id) => {
                 let name = id.name.as_str();
                 // Check if the name is a local in this function.
-                if !self.analyze_resolve_name(name, block_scopes).is_some() {
+                if self.analyze_resolve_name(name, block_scopes).is_none() {
                     // Free variable — record it.
-                    func_scope
-                        .free_vars
-                        .entry(name.to_string())
-                        .or_insert(id.span.start);
+                    func_scope.free_vars.insert(name.to_string());
                 }
             }
             ast::Expression::AssignmentExpression(a) => {
-                // Mark the target as reassigned.
-                self.analyze_assignment_target(&a.left, func_scope, block_scopes);
                 self.analyze_expr(&a.right, func_id, func_scope, block_scopes, scopes);
-            }
-            ast::Expression::UpdateExpression(u) => {
-                // UpdateExpression.argument is a SimpleAssignmentTarget.
-                self.analyze_simple_assign_target(&u.argument, func_scope, block_scopes);
             }
             ast::Expression::BinaryExpression(b) => {
                 self.analyze_expr(&b.left, func_id, func_scope, block_scopes, scopes);
@@ -914,83 +889,6 @@ impl<'src> Compiler<'src> {
         }
     }
 
-    /// Mark the target of an assignment as reassigned. For simple identifiers,
-    /// looks up the slot and marks it. For member expressions, marks nothing
-    /// (they don't affect slot boxing).
-    fn analyze_assignment_target(
-        &mut self,
-        target: &ast::AssignmentTarget,
-        func_scope: &mut FuncScope,
-        block_scopes: &mut Vec<IndexMap<String, u32>>,
-    ) {
-        match target {
-            ast::AssignmentTarget::AssignmentTargetIdentifier(id) => {
-                let name = id.name.as_str();
-                if let Some(slot) = self.analyze_resolve_name(name, block_scopes) {
-                    func_scope.reassigned.insert(slot);
-                }
-            }
-            ast::AssignmentTarget::StaticMemberExpression(_)
-            | ast::AssignmentTarget::ComputedMemberExpression(_) => {}
-            ast::AssignmentTarget::ArrayAssignmentTarget(arr) => {
-                for el in arr.elements.iter().flatten() {
-                    // Elements are AssignmentTargetMaybeDefault — use
-                    // as_assignment_target() to get the inner target.
-                    if let Some(t) = el.as_assignment_target() {
-                        self.analyze_assignment_target(t, func_scope, block_scopes);
-                    }
-                }
-                if let Some(rest) = &arr.rest {
-                    self.analyze_assignment_target(&rest.target, func_scope, block_scopes);
-                }
-            }
-            ast::AssignmentTarget::ObjectAssignmentTarget(obj) => {
-                for prop in &obj.properties {
-                    match prop {
-                        ast::AssignmentTargetProperty::AssignmentTargetPropertyIdentifier(p) => {
-                            // binding is an IdentifierReference — mark the slot.
-                            let name = p.binding.name.as_str();
-                            if let Some(slot) = self.analyze_resolve_name(name, block_scopes) {
-                                func_scope.reassigned.insert(slot);
-                            }
-                        }
-                        ast::AssignmentTargetProperty::AssignmentTargetPropertyProperty(p) => {
-                            // binding is an AssignmentTargetMaybeDefault.
-                            if let Some(t) = p.binding.as_assignment_target() {
-                                self.analyze_assignment_target(t, func_scope, block_scopes);
-                            }
-                        }
-                    }
-                }
-                if let Some(rest) = &obj.rest {
-                    self.analyze_assignment_target(&rest.target, func_scope, block_scopes);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    /// Like `analyze_assignment_target` but for `SimpleAssignmentTarget`
-    /// (used by `UpdateExpression::argument`).
-    fn analyze_simple_assign_target(
-        &mut self,
-        target: &ast::SimpleAssignmentTarget,
-        func_scope: &mut FuncScope,
-        block_scopes: &mut Vec<IndexMap<String, u32>>,
-    ) {
-        match target {
-            ast::SimpleAssignmentTarget::AssignmentTargetIdentifier(id) => {
-                let name = id.name.as_str();
-                if let Some(slot) = self.analyze_resolve_name(name, block_scopes) {
-                    func_scope.reassigned.insert(slot);
-                }
-            }
-            ast::SimpleAssignmentTarget::StaticMemberExpression(_)
-            | ast::SimpleAssignmentTarget::ComputedMemberExpression(_) => {}
-            _ => {}
-        }
-    }
-
     /// Walk into a `ChainElement` to find identifiers and nested expressions.
     fn analyze_chain_element(
         &mut self,
@@ -1068,11 +966,9 @@ impl<'src> Compiler<'src> {
             self_name,
             is_declaration,
             names: IndexMap::new(),
-            const_slots: HashSet::new(),
-            reassigned: HashSet::new(),
             captured: HashSet::new(),
             children: Vec::new(),
-            free_vars: HashMap::new(),
+            free_vars: HashSet::new(),
             captures: Vec::new(),
             upval_count: 0,
             own_local_count: 0,
@@ -1148,11 +1044,9 @@ impl<'src> Compiler<'src> {
             self_name: None,
             is_declaration: false,
             names: IndexMap::new(),
-            const_slots: HashSet::new(),
-            reassigned: HashSet::new(),
             captured: HashSet::new(),
             children: Vec::new(),
-            free_vars: HashMap::new(),
+            free_vars: HashSet::new(),
             captures: Vec::new(),
             upval_count: 0,
             own_local_count: 0,
@@ -1234,7 +1128,7 @@ impl<'src> Compiler<'src> {
 
     /// Bottom-up pass: for each scope, resolve its children's free variables
     /// against its own locals, populate capture lists, and determine which slots
-    /// must be `Boxed` (captured AND reassigned).
+    /// must be `Boxed` (any slot captured by a nested function).
     fn resolve_captures(&self, scopes: &mut Vec<FuncScope>) {
         // Process scopes in reverse order (children before parents).
         for i in (0..scopes.len()).rev() {
@@ -1243,12 +1137,12 @@ impl<'src> Compiler<'src> {
 
             for &child_id in &children {
                 // Clone free_vars to release the borrow on scopes.
-                let free_vars: HashMap<String, u32> = scopes[child_id].free_vars.clone();
+                let free_vars: HashSet<String> = scopes[child_id].free_vars.clone();
                 // A named function's own name inside its body is a
                 // self-reference, not a capture from the parent.
                 let self_name: Option<String> = scopes[child_id].self_name.clone();
 
-                for (fv_name, _fv_span) in &free_vars {
+                for fv_name in &free_vars {
                     // Skip free variables that match the function's own
                     // name — they'll get a dedicated self-reference slot.
                     if self_name.as_ref() == Some(fv_name) {
@@ -3592,7 +3486,7 @@ impl<'src> Compiler<'src> {
             );
         }
 
-        // Copy captured/reassigned params from Arg to Boxed slots; apply
+        // Copy captured params from Arg to Boxed slots; apply
         // parameter defaults.
         for (p_idx, param_info) in params_info.iter().enumerate() {
             let own_idx = p_idx as u32;
