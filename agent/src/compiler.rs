@@ -34,9 +34,21 @@ pub struct Program {
 pub fn compile(source: &str) -> Result<Program, Vec<Diagnostic>> {
     let allocator = Allocator::default();
     let source_type = SourceType::default(); // JavaScript module
-    let ret = Parser::new(&allocator, source, source_type).parse();
 
-    let mut compiler = Compiler::new(source);
+    // Append only the higher-order-method helpers (`__map`, …) the program
+    // actually uses. They are real JS compiled in the same unit (appended, so
+    // user spans are unchanged), hoisted like any top-level function and
+    // referenced by label from the call sites. A program using no such methods
+    // gets an empty prelude and compiles byte-for-byte unchanged.
+    let prelude = crate::prelude::assemble(source);
+    let full_source = if prelude.is_empty() {
+        source.to_string()
+    } else {
+        format!("{source}\n{prelude}")
+    };
+    let ret = Parser::new(&allocator, &full_source, source_type).parse();
+
+    let mut compiler = Compiler::new(&full_source);
 
     // Convert oxc's own syntax errors into our Diagnostic shape.
     for err in &ret.errors {
@@ -68,7 +80,9 @@ pub fn compile(source: &str) -> Result<Program, Vec<Diagnostic>> {
     Ok(Program {
         code,
         spans,
-        source: Arc::from(source),
+        // The full source (user code + any appended prelude) so runtime
+        // diagnostics render against the same offsets the spans were taken from.
+        source: Arc::from(full_source.as_str()),
     })
 }
 
@@ -1968,6 +1982,17 @@ impl<'src> Compiler<'src> {
             "endsWith" => Builtin::StrEndsWith,
             "slice" => Builtin::StrSlice,
             "trim" => Builtin::StrTrim,
+            // ── higher-order array methods (prelude helpers) ──────────
+            "map" => return self.compile_hof(recv, argv, span, optional, "__map", 1),
+            "filter" => return self.compile_hof(recv, argv, span, optional, "__filter", 1),
+            "forEach" => return self.compile_hof(recv, argv, span, optional, "__forEach", 1),
+            "some" => return self.compile_hof(recv, argv, span, optional, "__some", 1),
+            "every" => return self.compile_hof(recv, argv, span, optional, "__every", 1),
+            "find" => return self.compile_hof(recv, argv, span, optional, "__find", 1),
+            "findIndex" => {
+                return self.compile_hof(recv, argv, span, optional, "__findIndex", 1)
+            }
+            "reduce" => return self.compile_reduce(recv, argv, span, optional),
             _ => {
                 // Not a known builtin method — treat as property access
                 // followed by dynamic call (e.g. `state.add5(3)` where
@@ -2022,6 +2047,102 @@ impl<'src> Compiler<'src> {
             }
             self.emit(Instr::CallDyn(argc as u32), span);
         }
+    }
+
+    // ── Phase 4.0: higher-order array methods (prelude) ──────────────
+
+    /// Lower a higher-order array method (`arr.map(cb)`, `arr.filter(cb)`, …) to
+    /// a static `Call` of its prelude helper. `helper` is the helper's function
+    /// name (`"__map"`); `want_cb` is the number of callback arguments the call
+    /// site must supply (the receiver is added implicitly as the helper's first
+    /// parameter). The helper is self-contained (no captures), so a static
+    /// `Call` is always valid.
+    fn compile_hof(
+        &mut self,
+        recv: &ast::Expression,
+        argv: &[&ast::Expression],
+        span: u32,
+        optional: bool,
+        helper: &str,
+        want_cb: usize,
+    ) {
+        if argv.len() != want_cb {
+            self.error(
+                span,
+                format!(
+                    "`{}` expects {want_cb} argument(s), got {}",
+                    &helper[2..],
+                    argv.len()
+                ),
+            );
+            return;
+        }
+        self.emit_prelude_call(helper, recv, argv, span, optional);
+    }
+
+    /// `arr.reduce(cb[, init])`. The two JS forms map to two helpers: with an
+    /// initial value → `__reduce(a, f, acc)`; without → `__reduce1(a, f)`
+    /// (seeded from element 0).
+    fn compile_reduce(
+        &mut self,
+        recv: &ast::Expression,
+        argv: &[&ast::Expression],
+        span: u32,
+        optional: bool,
+    ) {
+        match argv.len() {
+            2 => self.emit_prelude_call("__reduce", recv, argv, span, optional),
+            1 => self.emit_prelude_call("__reduce1", recv, argv, span, optional),
+            n => self.error(span, format!("`reduce` expects 1 or 2 argument(s), got {n}")),
+        }
+    }
+
+    /// Emit a static call to a prelude helper: evaluate the receiver (the
+    /// helper's first parameter), then the remaining args, then
+    /// `Call(helper_label, 1 + argv.len())`. `optional` (`arr?.map(cb)`) guards
+    /// the receiver — a nullish receiver short-circuits to `undefined`, skipping
+    /// the args and the call.
+    fn emit_prelude_call(
+        &mut self,
+        helper: &str,
+        recv: &ast::Expression,
+        argv: &[&ast::Expression],
+        span: u32,
+        optional: bool,
+    ) {
+        let Some(label) = self.find_root_callee_label(helper) else {
+            // The prelude assembler appends a helper whenever its method appears
+            // in source, so a missing label is an internal inconsistency.
+            self.error(span, format!("internal error: prelude helper `{helper}` is unavailable"));
+            return;
+        };
+        let arity = 1 + argv.len() as u32; // receiver + callback (+ init)
+        self.compile_expr(recv);
+        let end = if optional {
+            Some(self.begin_optional(span))
+        } else {
+            None
+        };
+        self.compile_args(argv);
+        self.emit(Instr::Call(label, arity), span);
+        if let Some(end) = end {
+            self.emit(Instr::Label(end), span);
+        }
+    }
+
+    /// Find the entry label of a top-level (root-scope) function declaration by
+    /// name. Used to resolve prelude helpers, which are always declared at the
+    /// top level regardless of where the call site is.
+    fn find_root_callee_label(&self, name: &str) -> Option<u32> {
+        let analysis = self.analysis.as_ref().expect("analysis present");
+        let root = &analysis.scopes[analysis.root];
+        for &child_id in &root.children {
+            let child = &analysis.scopes[child_id];
+            if child.is_declaration && child.self_name.as_deref() == Some(name) {
+                return Some(child.label);
+            }
+        }
+        None
     }
 
     // ── Phase 3: function codegen ────────────────────────────────────
@@ -3301,6 +3422,132 @@ mod tests {
     fn switch_continue_outside_loop_errors() {
         // `continue` in a switch with no enclosing loop is an error.
         assert!(compile("switch (1) { case 1: continue; }").is_err());
+    }
+
+    // ── Phase 4.0: higher-order array methods (prelude) ─────────────────
+
+    #[test]
+    fn hof_map_filter() {
+        // map applies the callback to each element.
+        let vm = run_vm("state.r = [1, 2, 3].map(x => x * 2);");
+        match state_val(&vm, "r") {
+            StackValue::Ptr(p) => match &vm.heap[p as usize] {
+                HeapValue::Array(a) => assert_eq!(a.len(), 3),
+                other => panic!("{other:?}"),
+            },
+            other => panic!("{other:?}"),
+        }
+        // map result summed back via reduce.
+        assert_eq!(
+            eval_phase2("let a = [1, 2, 3].map(x => x * 2); return a[0] + a[1] + a[2];"),
+            num(12.0)
+        );
+        // filter keeps matching elements.
+        assert_eq!(
+            eval_phase2("let a = [1, 2, 3, 4].filter(x => x % 2 === 0); return a.length;"),
+            num(2.0)
+        );
+    }
+
+    #[test]
+    fn hof_reduce_both_forms() {
+        // reduce with an initial value.
+        assert_eq!(
+            eval_phase2("return [1, 2, 3, 4].reduce((s, x) => s + x, 0);"),
+            num(10.0)
+        );
+        // reduce without an initial value (seeds from element 0).
+        assert_eq!(
+            eval_phase2("return [1, 2, 3, 4].reduce((s, x) => s + x);"),
+            num(10.0)
+        );
+    }
+
+    #[test]
+    fn hof_search_methods() {
+        assert_eq!(
+            eval_phase2("return [1, 2, 3].some(x => x === 2);"),
+            StackValue::Bool(true)
+        );
+        assert_eq!(
+            eval_phase2("return [1, 2, 3].every(x => x > 0);"),
+            StackValue::Bool(true)
+        );
+        assert_eq!(
+            eval_phase2("return [1, 2, 3].every(x => x > 1);"),
+            StackValue::Bool(false)
+        );
+        // find returns the matching element (an untouched literal here).
+        assert_eq!(
+            eval_phase2("return [5, 6, 7].find(x => x > 5);"),
+            StackValue::PosInt(6)
+        );
+        assert_eq!(
+            eval_phase2("return [5, 6, 7].findIndex(x => x === 7);"),
+            num(2.0)
+        );
+        // find with no match → undefined; findIndex with no match → -1.
+        assert_eq!(
+            eval_phase2("return [1, 2].find(x => x > 9);"),
+            StackValue::Undefined
+        );
+        assert_eq!(
+            eval_phase2("return [1, 2].findIndex(x => x > 9);"),
+            StackValue::NegInt(-1)
+        );
+    }
+
+    #[test]
+    fn hof_foreach_side_effects() {
+        // forEach runs the callback for its effects and returns undefined.
+        let vm = run_vm("state.sum = 0; [1, 2, 3].forEach(x => { state.sum += x; });");
+        assert_eq!(state_val(&vm, "sum"), num(6.0));
+    }
+
+    #[test]
+    fn hof_callback_index_and_array_args() {
+        // The callback receives (element, index, array).
+        assert_eq!(
+            eval_phase2("return [10, 20, 30].map((x, i) => x + i).reduce((s, x) => s + x, 0);"),
+            num(63.0) // (10+0)+(20+1)+(30+2) = 63
+        );
+    }
+
+    #[test]
+    fn hof_closure_callback_captures() {
+        // A callback closing over an enclosing local works (CallDyn path).
+        assert_eq!(
+            eval_phase2("let k = 10; return [1, 2, 3].map(x => x + k).reduce((s, x) => s + x, 0);"),
+            num(36.0) // (1+10)+(2+10)+(3+10) = 36
+        );
+    }
+
+    #[test]
+    fn hof_chained_and_nested() {
+        // Chained higher-order methods.
+        assert_eq!(
+            eval_phase2(
+                "return [1, 2, 3, 4, 5].filter(x => x % 2 === 1).map(x => x * x).reduce((s, x) => s + x, 0);"
+            ),
+            num(35.0) // 1 + 9 + 25
+        );
+    }
+
+    #[test]
+    fn hof_inside_user_function() {
+        // A higher-order call inside a user function resolves the top-level
+        // prelude helper from a nested scope. (Uses `run_vm` directly because
+        // the function body has its own `return`.)
+        let vm = run_vm(
+            "function total(a) { return a.map(x => x + 1).reduce((s, x) => s + x, 0); } state.r = total([1, 2, 3]);",
+        );
+        assert_eq!(state_val(&vm, "r"), num(9.0)); // 2 + 3 + 4
+    }
+
+    #[test]
+    fn hof_arity_errors() {
+        assert!(compile("[1].map();").is_err()); // needs a callback
+        assert!(compile("[1].reduce();").is_err()); // needs 1 or 2 args
     }
 
     #[test]

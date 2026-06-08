@@ -366,8 +366,13 @@ Consequences:
 
 ## Higher-order methods (`map`/`filter`/`reduce`/…) — prelude
 
-> **Status: NOT YET IMPLEMENTED.** Planned for Phase 3 but slipped; it is now
-> task 4.0 (do first). See **Phase 4 — starting guide**.
+> **Status: IMPLEMENTED (Phase 4.0).** Helpers live in `agent/src/prelude.rs`
+> (`__map`/`__filter`/`__reduce`/`__reduce1`/`__forEach`/`__some`/`__every`/
+> `__find`/`__findIndex`). They are appended to the user source (tree-shaken:
+> only the helpers whose method appears are included, so HOF-free programs
+> compile unchanged), hoisted like any top-level function, and called via a
+> static `Call` from `compile_method_call`. A bare builtin callback
+> (`arr.map(Math.sqrt)`) is an accepted divergence — wrap it (`x => …`).
 
 Higher-order array methods take callbacks and need loop-local state (index,
 accumulator). **Decision: prelude.** Small helpers (`__map(arr, cb)`, …) are
@@ -434,10 +439,11 @@ Destructuring and default parameters are **in** scope via desugaring (Phase 2/3)
    Pass 1 is now an authoritative span-keyed resolver (`analyzer.rs`); codegen
    (`compiler.rs`) keeps no scope state. **The prelude/stdlib mechanism
    (`map`/`filter`/`reduce`/…) slipped — it is now the first task of Phase 4.**
-4. **Effects & remainder:** the prelude (carried over from Phase 3), `tools.*` →
-   `Invoke`, `raise` → `Raise`, `for-of` / `for-in`, `switch`, and deferred
-   built-ins as needed. Unsupported nodes → informative errors throughout. See
-   **Phase 4 — starting guide** below for the full task list and traps.
+4. **Effects & remainder — DONE:** the prelude (`map`/`filter`/`reduce`/…,
+   §4.0), `tools.*` → `Invoke` and `raise` → `Raise` (§4.1), `for-of` /
+   `for-in` (§4.2), and `switch` (§4.3) all land. Deferred built-ins remain
+   additive (§4.5). Unsupported nodes → informative errors throughout. See
+   **Phase 4 — starting guide** below for the design notes and traps.
 
 ## Phase 4 — starting guide
 
