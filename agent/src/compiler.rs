@@ -302,12 +302,12 @@ impl<'src> Compiler<'src> {
                     match (&d.init, slot) {
                         (Some(init), Some(slot)) => {
                             self.compile_expr(init);
-                            // Inside a loop, a captured (Boxed) binding gets a
-                            // fresh cell each iteration so in-loop closures
+                            // Inside a loop, a captured `let`/`const` binding gets
+                            // a fresh cell each iteration so in-loop closures
                             // capture per-iteration copies. The new cell's seed
                             // value is irrelevant here — this SetLocal overwrites
                             // it with the initializer.
-                            self.fresh_cell_if_boxed_in_loop(slot, d.span.start);
+                            self.fresh_cell_if_needed(slot, d.span.start);
                             self.emit(Instr::SetLocal(slot), d.span.start);
                         }
                         (None, Some(slot)) if !is_var => {
@@ -316,7 +316,7 @@ impl<'src> Compiler<'src> {
                             // Outside a loop `Alloc` already zeroed the slot, so
                             // skip the redundant Push+SetLocal.
                             if !self.loops.is_empty() {
-                                self.fresh_cell_if_boxed_in_loop(slot, d.span.start);
+                                self.fresh_cell_if_needed(slot, d.span.start);
                                 self.emit(Instr::Push(StackValue::Undefined), d.span.start);
                                 self.emit(Instr::SetLocal(slot), d.span.start);
                             }
@@ -472,28 +472,32 @@ impl<'src> Compiler<'src> {
             .copied()
     }
 
-    /// Whether the given absolute frame slot is `Boxed` in the current scope.
-    /// `slot_kinds` is own-local-indexed (it excludes the leading upvals), while
-    /// emitted slots are absolute (`upval_count + own`), so we subtract the upval
-    /// count first; an upval slot (below that) is never re-boxed.
-    fn slot_is_boxed(&self, slot: u32) -> bool {
+    /// Whether the given absolute frame slot is a per-iteration "fresh" slot in
+    /// the current scope — a captured (`let`/`const`) binding declared inside a
+    /// loop, which gets a new cell each iteration via `FreshCell`. The analyzer
+    /// records these in `fresh_owns` (own-slot indices) and allocates them
+    /// `Plain` (no eager cell). `fresh_owns` is own-local-indexed (it excludes
+    /// the leading upvals) while emitted slots are absolute (`upval_count + own`),
+    /// so subtract the upval count first.
+    fn slot_needs_fresh(&self, slot: u32) -> bool {
         let scope = &self
             .analysis
             .as_ref()
             .expect("analysis present")
             .scopes[self.current_scope];
         match slot.checked_sub(scope.upval_count) {
-            Some(own) => matches!(scope.slot_kinds.get(own as usize), Some(SlotKind::Boxed)),
+            Some(own) => scope.fresh_owns.contains(&own),
             None => false,
         }
     }
 
-    /// Emit `FreshCell(slot)` when inside a loop and the slot is captured
-    /// (`Boxed`). This gives the binding a per-iteration cell so closures created
-    /// in different iterations capture distinct copies. A no-op for plain slots
-    /// (never captured) and outside loops (the declaration runs once).
-    fn fresh_cell_if_boxed_in_loop(&mut self, slot: u32, span: u32) {
-        if !self.loops.is_empty() && self.slot_is_boxed(slot) {
+    /// Emit `FreshCell(slot)` for a body declaration of a per-iteration binding.
+    /// Gated on `self.loops` so the for-statement head (compiled in the `init`
+    /// clause before the loop context is pushed) is excluded — `compile_for`
+    /// re-boxes the head explicitly. Captured `var` bindings are function-scoped,
+    /// never in `fresh_owns`, so they are correctly left shared.
+    fn fresh_cell_if_needed(&mut self, slot: u32, span: u32) {
+        if !self.loops.is_empty() && self.slot_needs_fresh(slot) {
             self.emit(Instr::FreshCell(slot), span);
         }
     }
@@ -561,20 +565,21 @@ impl<'src> Compiler<'src> {
 
     fn compile_for(&mut self, s: &ast::ForStatement) {
         let span = s.span.start;
-        // Captured (`Boxed`) head bindings need a fresh cell per iteration so
-        // closures created in the body capture per-iteration copies. The init
-        // declaration runs once (outside the loop), so its bindings are NOT
-        // handled by `compile_var_decl`'s in-loop path; we re-box them explicitly
-        // below, modeling the spec's CreatePerIterationEnvironment.
-        let mut head_boxed: Vec<u32> = Vec::new();
+        // Captured head bindings need a fresh cell per iteration so closures
+        // created in the body capture per-iteration copies. The init declaration
+        // runs once (outside the loop), so its bindings are NOT handled by
+        // `compile_var_decl`'s in-loop path; we re-box them explicitly below,
+        // modeling the spec's CreatePerIterationEnvironment. (`var` heads are
+        // function-scoped — never in `fresh_owns` — so they stay shared.)
+        let mut head_fresh: Vec<u32> = Vec::new();
         match &s.init {
             Some(ast::ForStatementInit::VariableDeclaration(decl)) => {
                 self.compile_var_decl(decl);
                 for d in &decl.declarations {
                     if let ast::BindingPattern::BindingIdentifier(id) = &d.id {
                         if let Some(slot) = self.binding_slot(id.span.start) {
-                            if self.slot_is_boxed(slot) {
-                                head_boxed.push(slot);
+                            if self.slot_needs_fresh(slot) {
+                                head_fresh.push(slot);
                             }
                         }
                     }
@@ -591,7 +596,7 @@ impl<'src> Compiler<'src> {
             None => {}
         }
         // Initial per-iteration environment: seed each head binding's first cell.
-        for &slot in &head_boxed {
+        for &slot in &head_fresh {
             self.emit(Instr::FreshCell(slot), span);
         }
         let top = self.new_label();
@@ -613,7 +618,7 @@ impl<'src> Compiler<'src> {
         // Re-box BEFORE the update so the just-captured cell is never mutated:
         // the new cell copies the current value forward, the update mutates the
         // new cell, and the next body sees/captures it.
-        for &slot in &head_boxed {
+        for &slot in &head_fresh {
             self.emit(Instr::FreshCell(slot), span);
         }
         if let Some(update) = &s.update {
@@ -708,8 +713,8 @@ impl<'src> Compiler<'src> {
         self.emit(Instr::IndexGet, span); // [cont, idx, elem]
         // A captured loop variable gets a fresh cell each iteration so in-loop
         // closures capture per-iteration copies; the SetLocal then binds the
-        // element into that fresh cell.
-        if self.slot_is_boxed(slot) {
+        // element into that fresh cell. (`var` heads stay shared.)
+        if self.slot_needs_fresh(slot) {
             self.emit(Instr::FreshCell(slot), span);
         }
         self.emit(Instr::SetLocal(slot), span); // [cont, idx]
@@ -4096,6 +4101,41 @@ mod tests {
             "let sum = 0; for (let i = 0; i < 5; i++) { sum = sum + i; } state.r = sum;",
         );
         assert_eq!(state_val(&vm, "r"), num(10.0)); // 0+1+2+3+4
+    }
+
+    #[test]
+    fn captured_var_in_loop_is_shared_not_per_iteration() {
+        // `var` is function-scoped: a single binding shared across iterations, so
+        // all closures observe the final value (3), unlike `let`. Must NOT be
+        // re-boxed per iteration.
+        let vm = run_vm(
+            "let fns = []; \
+             for (var i = 0; i < 3; i++) { fns.push(() => i); } \
+             let a = fns[0], b = fns[1], c = fns[2]; \
+             state.r = a() * 100 + b() * 10 + c();",
+        );
+        assert_eq!(state_val(&vm, "r"), num(333.0)); // shared `var i` == 3
+    }
+
+    #[test]
+    fn captured_loop_var_allocates_plain_not_boxed() {
+        // The optimization: a captured loop variable is allocated `Plain` (no
+        // eager cell in the preamble) and re-boxed per iteration via FreshCell.
+        // Here the only captured binding is the loop var `i`, so the prologue
+        // `Alloc` must contain no `Boxed` slot, yet FreshCell is emitted.
+        let prog = compile(
+            "let fns = []; for (let i = 0; i < 3; i++) { fns.push(() => i); }",
+        )
+        .expect("compiles");
+        let has_boxed = prog.code.iter().any(|i| {
+            matches!(i, Instr::Alloc(kinds) if kinds.iter().any(|k| *k == SlotKind::Boxed))
+        });
+        assert!(!has_boxed, "captured loop var should be Plain-allocated: {:?}", prog.code);
+        assert!(
+            prog.code.iter().any(|i| matches!(i, Instr::FreshCell(_))),
+            "captured loop var should still be re-boxed per iteration: {:?}",
+            prog.code
+        );
     }
 
     #[test]

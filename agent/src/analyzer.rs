@@ -48,8 +48,18 @@ pub(crate) struct FuncScope {
     /// resolution uses `local_refs`/`binding_spans` (keyed by span), so this
     /// table is consulted only by capture resolution.
     names: IndexMap<String, SlotInfo>,
-    /// Which own-local slot indices are captured by nested functions (→ Boxed).
+    /// Which own-local slot indices are captured by nested functions (→ Boxed,
+    /// unless also `loop_declared`, in which case → per-iteration `fresh_owns`).
     captured: HashSet<u32>,
+    /// Own-local slot indices for `let`/`const` bindings declared lexically
+    /// inside a loop (loop head or loop body). Combined with `captured` this
+    /// yields `fresh_owns`.
+    loop_declared: HashSet<u32>,
+    /// Own-local slot indices that are captured AND loop-declared: each loop
+    /// iteration gives them a fresh cell (the compiler emits `FreshCell`), so
+    /// they are allocated `Plain` (no eager cell) rather than `Boxed`. Derived
+    /// in `resolve_captures`.
+    pub(crate) fresh_owns: HashSet<u32>,
     /// Nested function scope ids.
     pub(crate) children: Vec<usize>,
     /// Free variables: names referenced but not declared in this scope. Drives
@@ -121,6 +131,8 @@ impl FuncScope {
             is_declaration,
             names: IndexMap::new(),
             captured: HashSet::new(),
+            loop_declared: HashSet::new(),
+            fresh_owns: HashSet::new(),
             children: Vec::new(),
             free_vars: IndexSet::new(),
             binding_spans: Vec::new(),
@@ -193,17 +205,28 @@ fn resolve_captures(scopes: &mut [FuncScope]) {
         scopes[i].upval_count = scopes[i].captures.len() as u32;
     }
 
-    // Own-local slot kinds: a slot captured by some descendant must be Boxed.
+    // Own-local slot kinds. A slot captured by some descendant is normally
+    // `Boxed` (one eager cell, shared by reference). But a captured slot that is
+    // also loop-declared (`let`/`const` in a loop head/body) gets a *fresh* cell
+    // each iteration via `FreshCell`, so it needs no eager cell — it is allocated
+    // `Plain` and recorded in `fresh_owns` for the compiler to drive `FreshCell`.
     for s in scopes.iter_mut() {
+        let mut fresh = HashSet::new();
         s.slot_kinds = (0..s.own_local_count)
             .map(|slot| {
                 if s.captured.contains(&slot) {
-                    SlotKind::Boxed
+                    if s.loop_declared.contains(&slot) {
+                        fresh.insert(slot);
+                        SlotKind::Plain
+                    } else {
+                        SlotKind::Boxed
+                    }
                 } else {
                     SlotKind::Plain
                 }
             })
             .collect();
+        s.fresh_owns = fresh;
     }
 }
 
@@ -282,6 +305,7 @@ pub(crate) fn analyze(program: &ast::Program) -> Analysis {
     let mut analyzer = Analyzer {
         next_label: 0,
         diagnostics: Vec::new(),
+        loop_depth: 0,
     };
     let program = analyzer.analyze_program(program);
     Analysis {
@@ -296,6 +320,11 @@ pub(crate) fn analyze(program: &ast::Program) -> Analysis {
 struct Analyzer {
     next_label: u32,
     diagnostics: Vec<Diagnostic>,
+    /// Lexical loop-nesting depth at the current walk position (reset to 0 when
+    /// entering a nested function body). A `let`/`const` declared while this is
+    /// `> 0` is a per-iteration binding: if also captured, it gets a fresh cell
+    /// each iteration rather than one eager cell, so its `Alloc` slot is `Plain`.
+    loop_depth: u32,
 }
 
 impl Analyzer {
@@ -559,13 +588,20 @@ impl Analyzer {
             }
             ast::Statement::WhileStatement(s) => {
                 self.analyze_expr(&s.test, scope, block_scopes, scopes);
+                self.loop_depth += 1;
                 self.analyze_stmt(&s.body, scope, block_scopes, next_slot, scopes);
+                self.loop_depth -= 1;
             }
             ast::Statement::DoWhileStatement(s) => {
+                self.loop_depth += 1;
                 self.analyze_stmt(&s.body, scope, block_scopes, next_slot, scopes);
+                self.loop_depth -= 1;
                 self.analyze_expr(&s.test, scope, block_scopes, scopes);
             }
             ast::Statement::ForStatement(s) => {
+                // The head declaration and body are all per-iteration: a `let`
+                // declared in the head (`for (let i …)`) is loop-declared too.
+                self.loop_depth += 1;
                 if let Some(init) = &s.init {
                     match init {
                         ast::ForStatementInit::VariableDeclaration(decl) => {
@@ -585,6 +621,7 @@ impl Analyzer {
                     self.analyze_expr(update, scope, block_scopes, scopes);
                 }
                 self.analyze_stmt(&s.body, scope, block_scopes, next_slot, scopes);
+                self.loop_depth -= 1;
             }
             ast::Statement::ExpressionStatement(es) => {
                 self.analyze_expr(&es.expression, scope, block_scopes, scopes);
@@ -604,15 +641,19 @@ impl Analyzer {
             ast::Statement::ForOfStatement(s) => {
                 self.analyze_expr(&s.right, scope, block_scopes, scopes);
                 block_scopes.push(IndexMap::new());
+                self.loop_depth += 1;
                 self.analyze_for_head(&s.left, scope, block_scopes, next_slot, scopes);
                 self.analyze_stmt(&s.body, scope, block_scopes, next_slot, scopes);
+                self.loop_depth -= 1;
                 block_scopes.pop();
             }
             ast::Statement::ForInStatement(s) => {
                 self.analyze_expr(&s.right, scope, block_scopes, scopes);
                 block_scopes.push(IndexMap::new());
+                self.loop_depth += 1;
                 self.analyze_for_head(&s.left, scope, block_scopes, next_slot, scopes);
                 self.analyze_stmt(&s.body, scope, block_scopes, next_slot, scopes);
+                self.loop_depth -= 1;
                 block_scopes.pop();
             }
             // `switch`: the whole body shares **one** lexical block (a `let` in
@@ -816,6 +857,12 @@ impl Analyzer {
                 .names
                 .entry(name.to_string())
                 .or_insert(SlotInfo { slot, is_const });
+            // A `let`/`const` declared inside a loop is a per-iteration binding;
+            // record it so a captured one becomes `fresh_owns` (Plain + per-iter
+            // FreshCell) rather than an eagerly-boxed shared cell.
+            if self.loop_depth > 0 {
+                scope.loop_declared.insert(slot);
+            }
             slot
         };
         scope.binding_spans.push((span, slot));
@@ -1151,7 +1198,12 @@ impl Analyzer {
             }
         }
         self.analyze_hoist(body, scope, &mut block_scopes, &mut next_slot);
+        // A nested function is a fresh frame: its bindings are not per-iteration
+        // with respect to any loop enclosing the *definition*. Reset loop depth
+        // for the body walk and restore it afterwards.
+        let saved_loop_depth = std::mem::replace(&mut self.loop_depth, 0);
         self.analyze_stmts(body, scope, &mut block_scopes, &mut next_slot, scopes);
+        self.loop_depth = saved_loop_depth;
         scope.own_local_count = next_slot;
     }
 
