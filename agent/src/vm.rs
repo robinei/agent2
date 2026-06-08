@@ -858,48 +858,63 @@ impl VM {
         matches!(val, StackValue::Ptr(p) if matches!(self.heap.get(*p as usize), Some(HeapValue::String(_))))
     }
 
-    /// JS `String(x)` / `ToString`. Arrays stringify like `Array.prototype.join(",")`
-    /// (null/undefined elements → ""), plain objects → "[object Object]", and
-    /// functions/closures → a generic function tag. `depth` bounds recursion
-    /// through nested arrays so adversarial nesting can't overflow the stack.
-    pub(crate) fn to_js_string(&self, val: &StackValue, depth: usize) -> ThinString {
+    /// Byte length of a heap string, if it is one.
+    fn heap_str_len(&self, val: &StackValue) -> Option<usize> {
+        match val {
+            StackValue::Ptr(p) => match self.heap.get(*p as usize) {
+                Some(HeapValue::String(s)) => Some(s.len()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Write the JS `ToString` representation of `val` into `buf`. Strings in
+    /// the heap are copied by slicing (zero extra allocation); other types are
+    /// converted and appended. Used by `to_js_string` (which wraps a buffer) and
+    /// directly by `Add` to avoid intermediate clones.
+    fn write_js_string(&self, val: &StackValue, depth: usize, buf: &mut ThinString) {
         if depth > MAX_JSON_DEPTH {
-            return ThinString::new();
+            return;
         }
         match val {
-            StackValue::Undefined => ThinString::from("undefined"),
-            StackValue::Null => ThinString::from("null"),
-            StackValue::Bool(b) => ThinString::from(b.to_string().as_str()),
-            StackValue::PosInt(u) => ThinString::from(u.to_string().as_str()),
-            StackValue::NegInt(i) => ThinString::from(i.to_string().as_str()),
-            StackValue::Number(n) => ThinString::from(js_number_to_string(*n).as_str()),
+            StackValue::Undefined => buf.push_str("undefined"),
+            StackValue::Null => buf.push_str("null"),
+            StackValue::Bool(b) => buf.push_str(if *b { "true" } else { "false" }),
+            StackValue::PosInt(u) => buf.push_str(&u.to_string()),
+            StackValue::NegInt(i) => buf.push_str(&i.to_string()),
+            StackValue::Number(n) => buf.push_str(&js_number_to_string(*n)),
             StackValue::Fn(_) | StackValue::Builtin(_) => {
-                ThinString::from("function () { [native code] }")
+                buf.push_str("function () { [native code] }");
             }
-            StackValue::Upval(_) => ThinString::new(),
+            StackValue::Upval(_) => {}
             StackValue::Ptr(p) => match self.heap.get(*p as usize) {
-                Some(HeapValue::String(s)) => s.clone(),
+                Some(HeapValue::String(s)) => buf.push_str(s.as_str()),
                 Some(HeapValue::Array(arr)) => {
-                    let mut out = ThinString::new();
                     for (i, v) in arr.iter().enumerate() {
                         if i > 0 {
-                            out.push_str(",");
+                            buf.push_str(",");
                         }
                         match v {
                             StackValue::Null | StackValue::Undefined => {}
-                            _ => {
-                                let s = self.to_js_string(v, depth + 1);
-                                out.push_str(s.as_str());
-                            }
+                            _ => self.write_js_string(v, depth + 1, buf),
                         }
                     }
-                    out
                 }
-                Some(HeapValue::Object(_)) => ThinString::from("[object Object]"),
-                Some(HeapValue::Closure { .. }) => ThinString::from("function () { [native code] }"),
-                None => ThinString::from("null"), // dangling pointer
+                Some(HeapValue::Object(_)) => buf.push_str("[object Object]"),
+                Some(HeapValue::Closure { .. }) => {
+                    buf.push_str("function () { [native code] }");
+                }
+                None => buf.push_str("null"), // dangling pointer
             },
         }
+    }
+
+    /// JS `String(x)` / `ToString`. Delegates to [`write_js_string`].
+    pub(crate) fn to_js_string(&self, val: &StackValue, depth: usize) -> ThinString {
+        let mut out = ThinString::new();
+        self.write_js_string(val, depth, &mut out);
+        out
     }
 
     /// Reference/value equality matching JS `===`. Primitives compare by value;
@@ -1866,8 +1881,18 @@ impl VM {
                     // array/object/function in the numeric path is a TypeError
                     // (we do not ToPrimitive it — see the note on `loose_equal`).
                     let result = if self.is_string(&lhs) || self.is_string(&rhs) {
-                        let mut s = self.to_js_string(&lhs, 0);
-                        s.push_str(self.to_js_string(&rhs, 0).as_str());
+                        // Pre-size the buffer when both operands are heap strings
+                        // (the common concat path), saving incremental growth.
+                        let cap = match (self.heap_str_len(&lhs), self.heap_str_len(&rhs)) {
+                            (Some(a), Some(b)) => Some(a + b),
+                            _ => None,
+                        };
+                        let mut s = match cap {
+                            Some(n) => ThinString::with_capacity(n),
+                            None => ThinString::new(),
+                        };
+                        self.write_js_string(&lhs, 0, &mut s);
+                        self.write_js_string(&rhs, 0, &mut s);
                         self.alloc_string(s)
                     } else {
                         match (self.to_number(&lhs), self.to_number(&rhs)) {
@@ -4089,5 +4114,86 @@ mod tests {
         let allocs = alloc_counter::count();
         eprintln!("BASELINE hot_loop_100_iter: {allocs} allocs");
         assert!(allocs > 0, "should have some allocations");
+    }
+
+    /// Breakdown: measure each allocation source in isolation.
+    #[test]
+    fn alloc_breakdown() {
+        use crate::alloc_counter;
+
+        // 1. How many allocs for a single alloc_string?
+        alloc_counter::reset();
+        {
+            let mut vm = VM::new(vec![]);
+            vm.alloc_string("x".into());
+        }
+        let per_alloc_string = alloc_counter::count();
+        eprintln!("  alloc_string: {per_alloc_string}");
+
+        // 2. How many allocs for to_js_string on a string Ptr?
+        alloc_counter::reset();
+        {
+            let mut vm = VM::new(vec![]);
+            let ptr = vm.alloc_string("hello".into());
+            let _ = vm.to_js_string(&ptr, 0);
+        }
+        let per_to_js_string = alloc_counter::count();
+        eprintln!("  to_js_string on string: {per_to_js_string}");
+
+        // 3. How many allocs for a single Add (string + string)?
+        alloc_counter::reset();
+        {
+            let mut vm = VM::new(vec![
+                PushPtr(0),
+                PushPtr(1),
+                Add,
+            ]);
+            vm.alloc_string("hello".into()); // heap[0]
+            vm.alloc_string("x".into());     // heap[1]
+            loop {
+                match vm.step().unwrap() {
+                    StepResult::Done => break,
+                    other => panic!("unexpected effect: {other:?}"),
+                }
+            }
+        }
+        let per_add = alloc_counter::count();
+        eprintln!("  Add (str+str): {per_add}");
+
+        // 4. How many allocs for Math.abs call?
+        alloc_counter::reset();
+        {
+            let mut vm = VM::new(vec![
+                PushFloat(-42.0),
+                CallBuiltin(Builtin::MathAbs, 1),
+            ]);
+            loop {
+                match vm.step().unwrap() {
+                    StepResult::Done => break,
+                    other => panic!("unexpected effect: {other:?}"),
+                }
+            }
+        }
+        let per_math_abs = alloc_counter::count();
+        eprintln!("  Math.abs: {per_math_abs}");
+
+        // 5. VM construction (Vec::new for heap/stack/cells/callstack)
+        alloc_counter::reset();
+        {
+            let _vm = VM::new(vec![]);
+        }
+        let vm_new = alloc_counter::count();
+        eprintln!("  VM::new: {vm_new}");
+
+        // 6. Stack Vec growth during execution
+        alloc_counter::reset();
+        {
+            let mut vm = VM::new(vec![]);
+            for _ in 0..10 {
+                vm.stack.push(StackValue::Null);
+            }
+        }
+        let stack_growth = alloc_counter::count();
+        eprintln!("  stack push x10: {stack_growth}");
     }
 }
