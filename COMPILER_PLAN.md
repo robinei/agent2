@@ -366,6 +366,9 @@ Consequences:
 
 ## Higher-order methods (`map`/`filter`/`reduce`/…) — prelude
 
+> **Status: NOT YET IMPLEMENTED.** Planned for Phase 3 but slipped; it is now
+> task 4.0 (do first). See **Phase 4 — starting guide**.
+
 Higher-order array methods take callbacks and need loop-local state (index,
 accumulator). **Decision: prelude.** Small helpers (`__map(arr, cb)`, …) are
 written in JS, compiled by our own compiler, prepended once, and referenced by
@@ -426,12 +429,100 @@ Destructuring and default parameters are **in** scope via desugaring (Phase 2/3)
    `++`/`--` / logical-assignment, destructuring (desugar), `if`, `while`,
    `for`, `do/while`, `break`/`continue` (loop-context stack), blocks,
    expression-statement `Pop`.
-3. **Functions / closures:** declarations (hoisted), expressions, arrows,
-   params + defaults, `return`, capture analysis, `MakeClosure`, recursion, and
-   the prelude/stdlib mechanism (`map`/`filter`/`reduce`/…).
-4. **Effects & remainder:** `tools.*` → `Invoke`, `raise` → `Raise`, `for-of` /
-   `for-in`, `switch`, and deferred built-ins as needed. Unsupported nodes →
-   informative errors throughout.
+3. **Functions / closures — DONE:** declarations (hoisted), expressions, arrows,
+   params + defaults, `return`, capture analysis, `MakeClosure`, recursion.
+   Pass 1 is now an authoritative span-keyed resolver (`analyzer.rs`); codegen
+   (`compiler.rs`) keeps no scope state. **The prelude/stdlib mechanism
+   (`map`/`filter`/`reduce`/…) slipped — it is now the first task of Phase 4.**
+4. **Effects & remainder:** the prelude (carried over from Phase 3), `tools.*` →
+   `Invoke`, `raise` → `Raise`, `for-of` / `for-in`, `switch`, and deferred
+   built-ins as needed. Unsupported nodes → informative errors throughout. See
+   **Phase 4 — starting guide** below for the full task list and traps.
+
+## Phase 4 — starting guide
+
+Everything needed to begin Phase 4, in priority order. The recurring rule:
+**Pass 1 (`analyzer.rs`) and Pass 2 (`compiler.rs`) must be extended in
+lockstep.** Codegen resolves every binding/reference/function by source span via
+the analyzer's tables and keeps no scope state of its own — so a construct that
+codegen newly *supports* must also be *resolved* by the analyzer in the same
+change, or its references resolve to "undeclared" and its bindings get no slot.
+
+### 4.0 Prelude / higher-order methods (carried over from Phase 3) — do first
+`map`/`filter`/`reduce`/`forEach`/… are **not implemented** (the `Builtin` enum
+has only `push`/`pop`/`shift`/`unshift`/`join`; `arr.map(cb)` currently errors).
+The prerequisites (functions, closures, loops) now all work, so the planned
+approach is unblocked: write the helpers in JS (`__map(arr, cb)`, …), compile
+them in the **same unit** as the user program (prepended once), and lower
+`arr.map(cb)` to a `Call` of the helper's label. Call sites stay tiny; each
+helper's loop temps live in its own frame. The user callback is invoked per
+element via `CallDyn`. See **Higher-order methods — prelude** above for the
+rationale. This is probably the highest-value capability for orchestration
+flows (mapping/filtering over tool results), so land it before the rest.
+
+### 4.1 `tools.*` → `Invoke`, `raise` → `Raise` (small; analyzer already ready)
+The analyzer already handles `tools` and `raise` correctly: both flow through as
+free/global names (dropped from `ref_resolution`), recognized **structurally**
+in codegen. Phase 4 just replaces the two "until Phase 4" error stubs in
+`compiler.rs` with emission:
+- `tools.foo(a, b)` → `Invoke("foo", 2)` (bare `tools`, `tools.foo` without a
+  call, and computed `tools[x](...)` stay errors — see Locked decision §3).
+- `raise("...")` → `Raise(String)`; the argument **must** be a string literal
+  (a non-literal argument is an error — §4). `raise(...)` is an expression: the
+  host pushes the resumed value back on the stack.
+The real substance is the host's **rewrite-from-top** resume loop (see "Replan /
+rewrite model"), which is VM/host, not compiler — `compile()` is stateless per
+call, so re-running from the top is free. VM support is partly exercised already
+(`resume_after_invoke`, `raise_yields`).
+
+### 4.2 `for-of` / `for-in` — the lockstep trap
+The analyzer currently gives these only a **shallow** walk (body only —
+`analyzer.rs`, the `ForOfStatement`/`ForInStatement` arms of `analyze_stmt`). It
+does **not** walk the iterable expression nor declare the loop binding. This is
+harmless *today* because codegen errors on them first, but turning codegen on
+without upgrading the analyzer will produce exactly the "undeclared variable" /
+missing-slot failures the span-keyed refactor was meant to kill. When
+implementing, in the **same change**:
+- analyzer: walk the iterable/object RHS expression (`analyze_expr`), and
+  declare the loop binding — `let`/`const` → fresh block slot recorded in
+  `binding_slot`; `var` → hoist via `analyze_hoist`/`hoist_var_pattern`.
+- codegen: emit the iteration, binding the loop variable each step via
+  `binding_slot[binding.span]`.
+- `break`/`continue` work via the existing loop-context stack.
+- **Per-iteration binding stays deferred:** a closure capturing a `for-of`
+  `const x` shares one binding (last-value), same accepted divergence as the
+  C-style `for`.
+- `for (… of …)` and `for (… in …)` over `state` enumerate the blessed object's
+  keys/values via the existing `Object` ops.
+
+### 4.3 `switch` — needs a non-loop break target
+- `break` in a `switch` jumps to the switch end; `continue` is **not** valid in
+  a switch. The current `LoopCtx` stack models loops only — add a break-only
+  context entry (or push a `LoopCtx` whose `continue_label` is guarded/unused)
+  so `break` resolves but `continue` still escapes to the enclosing loop.
+- Lexical `let`/`const` in `case` clauses share **one** block (the switch body):
+  push a single block scope for the whole switch in the analyzer. (`analyze_stmt`
+  already walks the discriminant, case tests, and consequents for references;
+  only the block scope + binding slots need adding when codegen lands.)
+
+### 4.4 Desugaring discipline (applies to prelude, spread, exotic destructuring)
+All resolution is keyed on `span.start`, which assumes every binding/reference/
+function maps to a **unique real source span**. The prelude is safe (it is real
+JS text compiled alongside the user program). **Do not** hand-fabricate synthetic
+AST nodes with zero/duplicated spans — they would collide in `binding_slot` /
+`ref_resolution` / `scope_by_span`. Prefer "lower to source text + recompile"
+(the prelude approach) over building AST nodes by hand.
+
+### 4.5 Deferred built-ins — additive, non-blocking
+Add `Builtin` variants on demand (the `meta()`/`call()` registry gives arity and
+dispatch for free); compile-error until then. See **Deferred built-ins** above.
+
+### 4.6 Testing
+All current coverage is integration-style via `compile()` + the VM (the closure/
+capture/shadowing tests in `compiler.rs` are the template). Keep adding edge
+cases as for-of/switch/prelude land — especially capture/shadowing interactions
+with the new binding forms. A few analyzer-level asserts are worth it only if a
+bug is hard to trigger end-to-end.
 
 ## Dependencies
 

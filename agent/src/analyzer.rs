@@ -571,12 +571,23 @@ impl Analyzer {
             | ast::Statement::EmptyStatement(_) => {}
             // Unsupported statements still get a shallow walk so identifiers in
             // them are resolved/captured (they error later, during codegen).
+            //
+            // TODO(phase4): for-of/for-in are SHALLOW — body only. When codegen
+            // starts supporting them, extend these arms IN LOCKSTEP to also walk
+            // the iterable RHS expression and declare the loop binding
+            // (let/const -> block slot via analyze_register_name; var -> hoist),
+            // or the iterable's free vars resolve to "undeclared" and the loop
+            // variable gets no slot. See COMPILER_PLAN "Phase 4 — starting guide".
             ast::Statement::ForOfStatement(s) => {
                 self.analyze_stmt(&s.body, scope, block_scopes, next_slot, scopes)
             }
             ast::Statement::ForInStatement(s) => {
                 self.analyze_stmt(&s.body, scope, block_scopes, next_slot, scopes)
             }
+            // TODO(phase4): when codegen supports `switch`, push a single block
+            // scope for the whole switch body here (lexical decls in `case`
+            // clauses share one block), and give codegen a non-loop `break`
+            // target (`continue` is invalid in a switch).
             ast::Statement::SwitchStatement(s) => {
                 self.analyze_expr(&s.discriminant, scope, block_scopes, scopes);
                 for case in &s.cases {
