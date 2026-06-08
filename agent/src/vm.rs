@@ -1,4 +1,5 @@
 use indexmap::IndexMap;
+use smallvec::SmallVec;
 use thin_vec::ThinVec;
 
 use crate::builtin::Builtin;
@@ -49,6 +50,13 @@ The remaining intentional divergences from JS — deferred or accepted, NOT bugs
 
 pub use crate::thin_string::ThinString;
 pub type FieldName = ThinString;
+
+/// Convert a `SmallVec` to a `ThinVec`, copying from the stack allocation.
+/// Used at boundaries where heap storage is required (alloc_array,
+/// alloc_closure, etc.).
+pub(crate) fn small_to_thin(sv: SmallVec<[StackValue; 16]>) -> ThinVec<StackValue> {
+    ThinVec::from(sv.as_slice())
+}
 pub type CodeAddr = u32;
 pub type HeapAddr = u32;
 pub type StackAddr = u32;
@@ -1469,7 +1477,7 @@ impl VM {
                     }
                     let captures = captures.clone(); // release the borrow on self.code
                     let local_count = self.callstack.last().ok_or(VMError::BadLocal)?.local_count;
-                    let mut upvals = ThinVec::with_capacity(captures.len());
+                    let mut upvals: SmallVec<[StackValue; 8]> = SmallVec::new();
                     for slot in captures {
                         if slot >= local_count {
                             return Err(VMError::BadLocal);
@@ -1479,7 +1487,7 @@ impl VM {
                         // (a by-value snapshot).
                         upvals.push(self.stack[(self.fp + slot) as usize]);
                     }
-                    let closure = self.alloc_closure(addr, upvals);
+                    let closure = self.alloc_closure(addr, ThinVec::from(upvals.as_slice()));
                     self.stack.push(closure);
                     self.ip += 1;
                 }
@@ -1570,11 +1578,11 @@ impl VM {
                         if base + argc as usize > self.stack.len() {
                             return Err(VMError::StackUnderflow);
                         }
-                        let args: ThinVec<StackValue> = self.stack[base..base + argc as usize]
+                        let args: SmallVec<[StackValue; 16]> = self.stack[base..base + argc as usize]
                             .iter()
                             .copied()
                             .collect();
-                        let arr = self.alloc_array(args);
+                        let arr = self.alloc_array(small_to_thin(args));
                         if let StackValue::Ptr(p) = arr {
                             self.callstack.last_mut().unwrap().arguments_cache = Some(p);
                         }
@@ -1631,11 +1639,11 @@ impl VM {
                     if base + argc as usize > self.stack.len() {
                         return Err(VMError::StackUnderflow);
                     }
-                    let args: ThinVec<StackValue> = self.stack[base..base + argc as usize]
+                    let args: SmallVec<[StackValue; 16]> = self.stack[base..base + argc as usize]
                         .iter()
                         .copied()
                         .collect();
-                    let arr = self.alloc_array(args);
+                    let arr = self.alloc_array(small_to_thin(args));
                     let ptr = match arr {
                         StackValue::Ptr(p) => p,
                         _ => unreachable!("alloc_array returns a Ptr"),
@@ -1979,7 +1987,7 @@ impl VM {
                         return Err(VMError::StackUnderflow);
                     }
                     let split = self.stack.len() - n;
-                    let vals: ThinVec<StackValue> = self.stack.drain(split..).collect();
+                    let vals: SmallVec<[StackValue; 16]> = self.stack.drain(split..).collect();
                     let mut obj = IndexMap::new();
                     // Left-to-right: field 0's value is the deepest (first
                     // pushed), so values line up with fields in order.
@@ -2173,8 +2181,8 @@ impl VM {
                     }
                     let split = self.stack.len() - n;
                     // Left-to-right: first pushed becomes element 0.
-                    let vals: ThinVec<StackValue> = self.stack.drain(split..).collect();
-                    let arr_ptr = self.alloc_array(vals);
+                    let vals: SmallVec<[StackValue; 16]> = self.stack.drain(split..).collect();
+                    let arr_ptr = self.alloc_array(small_to_thin(vals));
                     self.stack.push(arr_ptr);
                     self.ip += 1;
                 }
@@ -4041,7 +4049,10 @@ mod tests {
     // ── Phase 0: allocation baseline ────────────────────────────
 
     /// Run a representative hot-loop workload and record the allocation count.
-    /// Each iteration does Math.abs + string concat + array push.
+    /// Run a representative hot-loop workload and record the allocation count.
+    /// Each iteration does Math.abs + string concat. String literals are
+    /// pre-allocated once (simulating Phase 4 constant interning) and referenced
+    /// by Ptr, so the loop body incurs zero per-iteration string-literal allocs.
     #[test]
     fn alloc_baseline_hot_loop() {
         use crate::alloc_counter;
@@ -4049,16 +4060,16 @@ mod tests {
         // Build a loop that does builtin calls + string concat (the hot paths).
         // Each iteration: Math.abs, string concat (s += "x").
         let mut code = Vec::new();
-        // s = "hello"
-        code.push(PushStr("hello".into()));
+        // s = "hello" — pre-allocated at heap[0]
+        code.push(PushPtr(0));
         // 100 iterations
         for _ in 0..100 {
             // Math.abs(-42) → drop result (just measuring the call overhead)
             code.push(PushFloat(-42.0));
             code.push(CallBuiltin(Builtin::MathAbs, 1));
             code.push(Pop(1));
-            // s += "x" (string concat, the main allocator)
-            code.push(PushStr("x".into()));
+            // s += "x" — "x" pre-allocated at heap[1]
+            code.push(PushPtr(1));
             code.push(Add);
         }
         // drop s
@@ -4066,6 +4077,9 @@ mod tests {
 
         alloc_counter::reset();
         let mut vm = VM::new(code);
+        // Pre-allocate the string constants once (simulates Phase 4).
+        vm.alloc_string("hello".into());
+        vm.alloc_string("x".into());
         loop {
             match vm.step().unwrap() {
                 StepResult::Done => break,

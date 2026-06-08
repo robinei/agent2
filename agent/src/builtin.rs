@@ -14,8 +14,8 @@
 //! result — assignment-style "leave a value" semantics, so every builtin call
 //! is a well-formed expression.
 
-use crate::vm::{StackValue, ThinString, VM, VMError, as_i64};
-use thin_vec::ThinVec;
+use crate::vm::{StackValue, ThinString, VM, VMError, as_i64, small_to_thin};
+use smallvec::SmallVec;
 
 /// A builtin's identity. Used both as the static call target
 /// (`Instr::CallBuiltin(Builtin, argc)`, the compiler's fast path) and as a
@@ -498,7 +498,7 @@ fn array_join(vm: &mut VM, argc: u32) -> Result<(), VMError> {
         _ => return Err(VMError::BadArg),
     };
     let arr = vm.heap_arr(arr_ptr).ok_or(VMError::TypeError)?;
-    let parts: Vec<ThinString> = arr
+    let parts: SmallVec<[ThinString; 16]> = arr
         .iter()
         .map(|v| match v {
             StackValue::Null | StackValue::Undefined => ThinString::new(),
@@ -544,7 +544,7 @@ fn str_split(vm: &mut VM, argc: u32) -> Result<(), VMError> {
         ),
         _ => return Err(VMError::BadArg),
     };
-    let mut parts: ThinVec<StackValue> = ThinVec::new();
+    let mut parts: SmallVec<[StackValue; 16]> = SmallVec::new();
     match limit {
         Some(lim) => {
             for p in s.splitn(lim, delim.as_str()) {
@@ -557,7 +557,7 @@ fn str_split(vm: &mut VM, argc: u32) -> Result<(), VMError> {
             }
         }
     }
-    let ptr = vm.alloc_array(parts);
+    let ptr = vm.alloc_array(small_to_thin(parts));
     vm.stack.push(ptr);
     Ok(())
 }
@@ -726,14 +726,14 @@ fn obj_keys(vm: &mut VM, argc: u32) -> Result<(), VMError> {
         StackValue::Ptr(p) => *p,
         _ => return Err(VMError::TypeError),
     };
-    let keys: Vec<ThinString> = vm
+    let keys: SmallVec<[ThinString; 8]> = vm
         .heap_obj(obj_ptr)
         .ok_or(VMError::TypeError)?
         .keys()
         .cloned()
         .collect();
-    let strs: ThinVec<StackValue> = keys.into_iter().map(|k| vm.alloc_string(k)).collect();
-    let ptr = vm.alloc_array(strs);
+    let strs: SmallVec<[StackValue; 16]> = keys.into_iter().map(|k| vm.alloc_string(k)).collect();
+    let ptr = vm.alloc_array(small_to_thin(strs));
     vm.stack.push(ptr);
     Ok(())
 }
@@ -745,13 +745,13 @@ fn obj_values(vm: &mut VM, argc: u32) -> Result<(), VMError> {
         StackValue::Ptr(p) => *p,
         _ => return Err(VMError::TypeError),
     };
-    let vals: ThinVec<StackValue> = vm
+    let vals: SmallVec<[StackValue; 16]> = vm
         .heap_obj(obj_ptr)
         .ok_or(VMError::TypeError)?
         .values()
         .copied()
         .collect();
-    let ptr = vm.alloc_array(vals);
+    let ptr = vm.alloc_array(small_to_thin(vals));
     vm.stack.push(ptr);
     Ok(())
 }
