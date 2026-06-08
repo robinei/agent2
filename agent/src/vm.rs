@@ -1498,7 +1498,10 @@ impl VM {
                     if addr as usize >= self.code.len() {
                         return Err(VMError::BadCall);
                     }
-                    let captures = captures.clone(); // release the borrow on self.code
+                    // Collect into stack-allocated SmallVec instead of cloning
+                    // the ThinVec from self.code. LocalIndex is u32 (Copy).
+                    let captures: SmallVec<[LocalIndex; 8]> =
+                        captures.iter().copied().collect();
                     let local_count = self.callstack.last().ok_or(VMError::BadLocal)?.local_count;
                     let mut upvals: SmallVec<[StackValue; 8]> = SmallVec::new();
                     for slot in captures {
