@@ -241,27 +241,15 @@ impl Builtin {
     /// source of truth) so every call path is consistent — including the
     /// first-class-value path where a builtin is invoked via `CallDyn` (e.g.
     /// `arr.map(Math.sqrt)`, where the helper passes `(element, index, array)`).
-    /// Fewer than `min_args` is a `BadArg` error; **extra arguments beyond
-    /// `max_args` are dropped**, matching JS, which ignores surplus arguments.
-    /// After normalization each body can trust `argc ∈ [min_args, max_args]`.
+    /// Fewer than `min_args` is a `BadArg` error. **Surplus arguments are left
+    /// in place**: each body pops *all* `argc` arguments (keeping the stack
+    /// balanced) and simply ignores any beyond the ones it reads, matching JS,
+    /// which evaluates but ignores extra arguments. So no stack truncation is
+    /// needed here — only the lower bound is checked.
     pub fn call(self, vm: &mut VM, argc: u32) -> Result<(), VMError> {
-        let meta = self.meta();
-        if argc < meta.min_args {
+        if argc < self.meta().min_args {
             return Err(VMError::BadArg);
         }
-        // Surplus args sit on top of the stack (pushed last); discard them so
-        // the body sees exactly its declared maximum. Variadic builtins set
-        // `max_args = u32::MAX`, so this never trims them.
-        let argc = if argc > meta.max_args {
-            let extra = (argc - meta.max_args) as usize;
-            if vm.stack.len() < extra {
-                return Err(VMError::StackUnderflow);
-            }
-            vm.stack.truncate(vm.stack.len() - extra);
-            meta.max_args
-        } else {
-            argc
-        };
         match self {
             // ── array methods ──
             Builtin::ArrayPush => array_push(vm, argc),
@@ -316,12 +304,17 @@ fn pop_args(vm: &mut VM, n: u32) -> Result<Vec<StackValue>, VMError> {
     Ok(vm.stack.drain(start..).collect())
 }
 
-/// Pop exactly `$want` arguments, erroring if `argc` doesn't match.
+/// Pop all `argc` arguments (arg 0 deepest-first). The lower arity bound is
+/// already enforced by [`Builtin::call`] from `meta()`, so a fixed-arity body
+/// can index `args[0..want]` directly; `$want` documents that expectation and
+/// is checked in debug builds. Any surplus args past `want` are popped (so the
+/// stack stays balanced) but ignored — JS evaluates yet ignores extra args.
 macro_rules! check_arity {
     ($vm:expr, $argc:expr, $want:expr) => {{
-        if $argc as usize != $want {
-            return Err(VMError::BadArg);
-        }
+        debug_assert!(
+            $argc as usize >= $want,
+            "Builtin::call guarantees at least the minimum arity"
+        );
         pop_args($vm, $argc)
     }};
 }
@@ -772,10 +765,10 @@ fn number_is_integer(vm: &mut VM, argc: u32) -> Result<(), VMError> {
 /// `0x` prefix, any radix in `[2, 36]`, leading-digit parse with trailing
 /// characters ignored). Unparseable input yields `NaN`, like the browser.
 fn number_parse_int(vm: &mut VM, argc: u32) -> Result<(), VMError> {
-    let args = pop_args(vm, argc)?;
-    if args.is_empty() || args.len() > 2 {
-        return Err(VMError::BadArg);
-    }
+    // `Builtin::call` guarantees `argc >= 1`; any args past the radix are
+    // surplus and ignored (so `["1","2"].map(parseInt)` calls `parseInt(s, i)`,
+    // the classic JS footgun, rather than erroring).
+    let args = check_arity!(vm, argc, 1)?;
     let s = vm.pop_string_from(&args[0])?;
     // JS coerces the radix via ToInt32; a missing/NaN radix means "auto" (0).
     let radix = match args.get(1) {

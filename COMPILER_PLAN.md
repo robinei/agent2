@@ -309,6 +309,19 @@ Consequences:
   vars, function-wide single-slot is observationally identical. Until
   implemented, closures over a loop var share one binding (last-value
   semantics).
+- **`arguments`** is supported: inside any frame it is an array of that frame's
+  arguments (including those past the declared parameters), built lazily and
+  cached per frame (`CallFrame::arguments_cache`, the `Instr::Arguments` op) so
+  repeated references reuse one array. A real binding named `arguments` shadows
+  it. **Divergence:** an arrow's `arguments` is its *own* frame's args, not the
+  enclosing function's (JS arrows inherit `arguments` lexically); at the module
+  top level it is the empty array (JS has no top-level `arguments`).
+- **Builtin surplus args are ignored, not rejected** (JS semantics): a builtin
+  consumes all `argc` arguments but reads only those up to its `meta()`
+  `max_args`. This is what lets a builtin be used as a first-class callback
+  (`arr.map(Math.sqrt)`); enforcement of the *lower* bound stays central in
+  `Builtin::call`. (Direct `Namespace.method(...)` calls keep their strict
+  compile-time arity check, so `Math.abs(1, 2)` is still a compile error.)
 - `Math.max`/`Math.min` are variadic builtins (0..N args), matching JS spec.
 - `f64::max`/`f64::min` semantics: a NaN operand is ignored (divergence from
   JS `Math.max`/`Math.min` which return NaN if any arg is NaN).

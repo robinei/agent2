@@ -134,6 +134,11 @@ pub struct CallFrame {
     local_count: u32,
     return_addr: CodeAddr,
     prev_fp: StackAddr,
+    /// Lazily-built, per-frame cache for the `arguments` array (its heap
+    /// address). Built on the first `Instr::Arguments` in this frame and reused
+    /// by later references, so repeated `arguments` uses don't re-materialize
+    /// the array. `None` until first use (and for frames that never use it).
+    arguments_cache: Option<HeapAddr>,
 }
 
 /*
@@ -335,6 +340,13 @@ pub enum Instr {
     // load the argument at the argument index of the current stack frame, and
     // push it onto the stack. Arg(0) is the first argument (see Call).
     Arg(ArgIndex),
+
+    // Push the `arguments` array for the current frame: a fresh heap array of
+    // all `arg_count` arguments (arg 0 first). Built lazily and cached per
+    // frame (`CallFrame::arguments_cache`), so repeated references reuse the
+    // same array rather than re-materializing it. Lowers the `arguments`
+    // identifier. () -> arr
+    Arguments,
 
     // load the local variable at the local index of the current stack frame, and push it onto the stack
     Local(LocalIndex),
@@ -620,6 +632,7 @@ impl VM {
                 local_count: 0,
                 return_addr: 0,
                 prev_fp: 0,
+                arguments_cache: None,
             }],
             ip: 0,
             fp: 0,
@@ -1319,6 +1332,7 @@ impl VM {
                         local_count: 0,
                         return_addr: self.ip + 1,
                         prev_fp: self.fp,
+                        arguments_cache: None,
                     });
                     self.ip = *addr;
                     self.fp = self.stack.len() as StackAddr;
@@ -1349,6 +1363,7 @@ impl VM {
                                 local_count: 0,
                                 return_addr: self.ip + 1,
                                 prev_fp: self.fp,
+                                arguments_cache: None,
                             });
                             self.fp = self.stack.len() as StackAddr;
                             self.ip = addr;
@@ -1371,6 +1386,7 @@ impl VM {
                                 local_count: 0,
                                 return_addr: self.ip + 1,
                                 prev_fp: self.fp,
+                                arguments_cache: None,
                             });
                             self.fp = self.stack.len() as StackAddr;
                             // A closure's captured environment becomes the callee's
@@ -1498,6 +1514,32 @@ impl VM {
                     // fp - arg_count, arg_count-1 is on top at fp - 1.
                     let slot = (self.fp - frame.arg_count + arg) as usize;
                     self.stack.push(self.stack[slot]);
+                    self.ip += 1;
+                }
+
+                Instr::Arguments => {
+                    let frame = self.callstack.last().ok_or(VMError::BadArg)?;
+                    // Reuse the cached array when this frame already built one.
+                    if let Some(ptr) = frame.arguments_cache {
+                        self.stack.push(StackValue::Ptr(ptr));
+                        self.ip += 1;
+                        continue;
+                    }
+                    // Build it from the frame's args (arg 0 deepest at
+                    // fp - arg_count). Copy them out before touching the heap.
+                    let argc = frame.arg_count;
+                    let base = (self.fp - argc) as usize;
+                    if base + argc as usize > self.stack.len() {
+                        return Err(VMError::StackUnderflow);
+                    }
+                    let args = self.stack[base..base + argc as usize].to_vec();
+                    let arr = self.alloc_array(args);
+                    let ptr = match arr {
+                        StackValue::Ptr(p) => p,
+                        _ => unreachable!("alloc_array returns a Ptr"),
+                    };
+                    self.callstack.last_mut().unwrap().arguments_cache = Some(ptr);
+                    self.stack.push(arr);
                     self.ip += 1;
                 }
 
@@ -2913,6 +2955,48 @@ mod tests {
         // Top of stack must be a Fn, not some other value.
         let code = vec![Push(n(1.0)), Push(n(2.0)), CallDyn(1)];
         assert!(matches!(run_err(code), VMError::TypeError));
+    }
+
+    #[test]
+    fn arguments_builds_array_of_frame_args() {
+        // Call a fn with 3 args; its body builds `arguments` and returns it.
+        // [0..2] push args, [3] callable, [4] CallDyn(3), [5] Return(1)
+        // [6] Arguments (fn body), [7] Return(1)
+        let mut vm = VM::new(vec![
+            Push(n(10.0)),
+            Push(n(20.0)),
+            Push(n(30.0)),
+            Push(f(6)),
+            CallDyn(3),
+            Return(1),
+            Arguments,
+            Return(1),
+        ]);
+        while !matches!(vm.step().unwrap(), StepResult::Done) {}
+        match vm.stack.as_slice() {
+            [StackValue::Ptr(p)] => match &vm.heap[*p as usize] {
+                HeapValue::Array(a) => assert_eq!(a, &vec![n(10.0), n(20.0), n(30.0)]),
+                other => panic!("expected array, got {other:?}"),
+            },
+            other => panic!("expected one Ptr, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn arguments_is_cached_within_a_frame() {
+        // Two `Arguments` in the same frame yield the SAME heap pointer (the
+        // per-frame cache), so `Eq` (reference equality for arrays) is true.
+        let out = run(vec![
+            Push(n(1.0)),
+            Push(f(4)),
+            CallDyn(1),
+            Return(1),
+            Arguments, // fn body: build (and cache)
+            Arguments, // reuse the cached array
+            Eq,        // same Ptr → true
+            Return(1),
+        ]);
+        assert_eq!(out, vec![b(true)]);
     }
 
     #[test]

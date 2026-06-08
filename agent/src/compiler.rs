@@ -844,6 +844,12 @@ impl<'src> Compiler<'src> {
             self.emit(Instr::Local(r.slot), span);
             return;
         }
+        // `arguments` (when not shadowed by a real binding above) is the current
+        // frame's argument array — built and cached per frame by the VM.
+        if name == "arguments" {
+            self.emit(Instr::Arguments, span);
+            return;
+        }
         let value = match name {
             "state" => StackValue::Ptr(0),
             "undefined" => StackValue::Undefined,
@@ -2165,15 +2171,20 @@ impl<'src> Compiler<'src> {
             // the upvals as leading locals.
             match self.find_callee_label(name) {
                 Some(l) if !self.function_has_captures(name) => {
-                    // Static call: push args and Call. Pad with Undefined if
-                    // the caller passes fewer args than the function expects
-                    // (for default parameters).
+                    // Static call: push args and Call. Pad with Undefined when
+                    // the caller passes fewer args than the function declares
+                    // (for default parameters). The frame's `arg_count` must be
+                    // the number of values actually pushed — so when the caller
+                    // passes *more* args than declared params, pass the larger
+                    // count (not the declared arity), keeping `Arg(i)` aligned
+                    // and the surplus reachable via `arguments`.
                     let expected_arity = self.function_arity(name);
                     self.compile_args(argv);
-                    for _ in argv.len() as u32..expected_arity {
+                    let passed = argv.len() as u32;
+                    for _ in passed..expected_arity {
                         self.emit(Instr::Push(StackValue::Undefined), span);
                     }
-                    self.emit(Instr::Call(l, expected_arity), span);
+                    self.emit(Instr::Call(l, passed.max(expected_arity)), span);
                 }
                 _ => {
                     // Dynamic call: push args, load callee, CallDyn (installs
@@ -3548,6 +3559,57 @@ mod tests {
     fn hof_arity_errors() {
         assert!(compile("[1].map();").is_err()); // needs a callback
         assert!(compile("[1].reduce();").is_err()); // needs 1 or 2 args
+    }
+
+    // ── Phase 4: `arguments` ────────────────────────────────────────────
+
+    #[test]
+    fn arguments_variadic_sum() {
+        // A param-less function reads all of its args through `arguments`.
+        let vm = run_vm(
+            "function sum() { let t = 0; for (let i = 0; i < arguments.length; i++) { t += arguments[i]; } return t; } state.r = sum(1, 2, 3, 4);",
+        );
+        assert_eq!(state_val(&vm, "r"), num(10.0));
+    }
+
+    #[test]
+    fn arguments_beyond_declared_params() {
+        // Arguments past the declared parameters are still visible.
+        let vm = run_vm("function f(a) { return a + arguments.length; } state.r = f(10, 20, 30);");
+        assert_eq!(state_val(&vm, "r"), num(13.0)); // 10 + 3
+    }
+
+    #[test]
+    fn arguments_is_cached_per_frame() {
+        // Two references in the same frame yield the *same* array object
+        // (reference-equal under `===`), which only holds if the per-frame
+        // cache reuses one build instead of materializing a fresh array each
+        // time.
+        let vm = run_vm("function f() { return arguments === arguments; } state.r = f(1, 2);");
+        assert_eq!(state_val(&vm, "r"), StackValue::Bool(true));
+    }
+
+    #[test]
+    fn arguments_can_be_shadowed() {
+        // A real binding named `arguments` shadows the frame-args array.
+        let vm =
+            run_vm("function f() { let arguments = 42; return arguments; } state.r = f(1, 2, 3);");
+        assert_eq!(state_val(&vm, "r"), StackValue::PosInt(42));
+    }
+
+    #[test]
+    fn arguments_in_arrow_is_own_frame() {
+        // Accepted divergence from JS (where an arrow inherits the enclosing
+        // `arguments`): here an arrow's `arguments` is its own frame's args.
+        let vm = run_vm("let f = (a) => arguments.length; state.r = f(1, 2, 3);");
+        assert_eq!(state_val(&vm, "r"), num(3.0));
+    }
+
+    #[test]
+    fn arguments_at_top_level_is_empty() {
+        // The root frame has no args, so top-level `arguments` is an empty array.
+        let vm = run_vm("state.r = arguments.length;");
+        assert_eq!(state_val(&vm, "r"), num(0.0));
     }
 
     #[test]
