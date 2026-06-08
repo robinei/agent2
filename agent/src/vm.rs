@@ -1,4 +1,5 @@
 use indexmap::IndexMap;
+use thin_vec::ThinVec;
 
 use crate::builtin::Builtin;
 
@@ -45,7 +46,9 @@ The remaining intentional divergences from JS — deferred or accepted, NOT bugs
     (LLM) intervention, not JS error handling.
 */
 
-pub type FieldName = String;
+type ThinStr = ThinVec<u8>;
+
+pub type FieldName = ThinStr;
 pub type CodeAddr = u32;
 pub type HeapAddr = u32;
 pub type StackAddr = u32;
@@ -106,9 +109,9 @@ pub enum StackValue {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum HeapValue {
-    String(String),
-    Array(Vec<StackValue>),
-    Object(IndexMap<String, StackValue>),
+    String(ThinStr),
+    Array(ThinVec<StackValue>),
+    Object(Box<IndexMap<FieldName, StackValue>>),
     /// A closure: a code address plus its captured environment. Each upval is
     /// either a plain value (an immutable / by-value capture) or an `Upval`
     /// handle (a shared, mutable by-reference capture). Built by `MakeClosure`,
@@ -116,7 +119,7 @@ pub enum HeapValue {
     /// locals. Like `Fn`, it has no JSON form and compares by identity.
     Closure {
         addr: CodeAddr,
-        upvals: Vec<StackValue>,
+        upvals: ThinVec<StackValue>,
     },
 }
 
@@ -138,7 +141,7 @@ pub struct CallFrame {
     /// the callee's upval locals by the prologue `EnterFrame` (after the arg
     /// region is normalized to `nparams`, so the upvals land at the right slots).
     /// Empty for static `Call` and bare-`Fn` calls (no captures).
-    pending_upvals: Vec<StackValue>,
+    pending_upvals: ThinVec<StackValue>,
     /// Lazily-built, per-frame cache for the `arguments` array (its heap
     /// address). Built on the first `Instr::Arguments` in this frame and reused
     /// by later references, so repeated `arguments` uses don't re-materialize
@@ -275,15 +278,16 @@ pub enum SetMode {
 // Instructions for a stack based language used for LLM composition of complex tool flows.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Instr {
-    Push(StackValue), // () -> any
-
-    // Allocate a heap string at runtime and push its Ptr. `Push` carries a
-    // `Copy` StackValue and so cannot introduce a String constant; PushStr is
-    // the lowering target for string literals, string-valued keys, and
-    // template-literal fragments. Like ArrNew/ObjNew it builds fresh each
-    // execution (re-alloc per run, no constant pool), landing at heap[1+] so
-    // the blessed `state` at Ptr(0) stays stable.
-    PushStr(String), // () -> str
+    PushNull,
+    PushUndefined,
+    PushBool(bool),
+    PushFloat(f64), // () -> any
+    PushPosInt(u64),
+    PushNegInt(i64),
+    PushFn(CodeAddr),
+    PushPtr(HeapAddr),
+    PushBuiltin(Builtin),
+    PushStr(ThinStr), // () -> str
 
     Pop(usize),
     Dup,
@@ -331,7 +335,7 @@ pub enum Instr {
     // Plain slot yields its current value (a by-value snapshot — which the
     // compiler only emits when the binding is provably never reassigned). The
     // captures are listed in the order the target body expects its upvals.
-    MakeClosure(CodeAddr, Vec<LocalIndex>), // () -> fn
+    MakeClosure(CodeAddr, ThinVec<LocalIndex>), // () -> fn
 
     // return from in-program function Call, returning the top N values (in
     // push order, so the first-pushed return value stays first).
@@ -353,7 +357,7 @@ pub enum Instr {
     //     (named/recursive functions) is the last kind.
     // This is the sole frame-setup instruction: there is no separate per-arg
     // copy or local-allocation step.
-    EnterFrame(u32, bool, Vec<SlotKind>),
+    EnterFrame(u16, bool, ThinVec<SlotKind>),
 
     // Push the `arguments` array for the current frame: a fresh heap array of
     // all `arg_count` arguments (arg 0 first). Built lazily and cached per
@@ -388,7 +392,7 @@ pub enum Instr {
     // PosInt(1) decrements (sub 1 = −1). Prefix mode leaves the new value on
     // the stack; Postfix leaves the old value. Only emitted for `++`/`--` on
     // local variables; member/index targets fall back to load-sub-store.
-    IncLocal(LocalIndex, StackValue, UpdateMode), // () -> any
+    IncLocal(u16, f64, UpdateMode), // () -> any
 
     // JS `typeof`: pops a value and pushes its type tag as a string. Tags match
     // JS exactly, so they are coarse: "undefined", "object" (covers Null, arrays
@@ -432,18 +436,18 @@ pub enum Instr {
     // pushed). step() batches a run of consecutive Invoke instructions into one
     // StepResult::Invoke (fan-out); the host runs them concurrently and pushes
     // one result per call, in call order.
-    Invoke(String, u32), // any, ... -> any
+    Invoke(ThinStr, u32), // any, ... -> any
 
     // EFFECT: raise condition (like Lisp condition system). used to ask LLM in calling frame
     // to decide how to proceed, using restarts like returning a value, aborting,
     // and even rewriting the program preserving already written variables with execution starting at arbitrary point.
-    Raise(String), // () -> any
+    Raise(ThinStr), // () -> any
 
     // pops N values where N is the number of field names, then pushes an
     // object with each field set to its corresponding value. Left-to-right:
     // field 0's value is the first/deepest pushed.
-    ObjNew(Vec<FieldName>), // [any, ...] -> obj
-    ObjGet(FieldName),      // obj -> any
+    ObjNew(ThinVec<FieldName>), // [any, ...] -> obj
+    ObjGet(FieldName),          // obj -> any
     /// Sets the field and leaves a value on the stack (assignment is an
     /// expression). In `New` mode leaves the assigned value; in `Old` mode
     /// reads and leaves the previous value. Statement-context callers follow
@@ -657,7 +661,7 @@ impl VM {
                 return_addr: 0,
                 prev_fp: 0,
                 arguments_cache: None,
-                pending_upvals: Vec::new(),
+                pending_upvals: ThinVec::new(),
             }],
             ip: 0,
             fp: 0,
@@ -676,15 +680,15 @@ impl VM {
         let mut vm = VM::new(code);
         // Claim heap[0] for `state` before anything else allocates, so its
         // address is fixed. Nested values seed into heap[1+].
-        vm.heap.push(HeapValue::Object(IndexMap::new()));
+        vm.heap.push(HeapValue::Object(Box::new(IndexMap::new())));
         if let serde_json::Value::Object(map) = state {
             let mut entries = IndexMap::with_capacity(map.len());
             for (k, v) in &map {
                 let sv = vm.json_to_stack_value(v, 0)?;
-                entries.insert(k.clone(), sv);
+                entries.insert(ThinStr::from(k.as_str()), sv);
             }
             if let Some(HeapValue::Object(o)) = vm.heap.get_mut(0) {
-                *o = entries;
+                *o = Box::new(entries);
             }
         }
         Ok(vm)
@@ -713,7 +717,7 @@ impl VM {
     /// caller can mutate the stack while batching consecutive invokes).
     fn invoke_at(&self, ip: CodeAddr) -> Option<(String, u32)> {
         match self.code.get(ip as usize) {
-            Some(Instr::Invoke(name, nargs)) => Some((name.clone(), *nargs)),
+            Some(Instr::Invoke(name, nargs)) => Some((String::from_utf8(name.to_vec()).unwrap(), *nargs)),
             _ => None,
         }
     }
@@ -728,58 +732,58 @@ impl VM {
 
     fn heap_str(&self, ptr: HeapAddr) -> Option<&str> {
         match self.heap.get(ptr as usize) {
-            Some(HeapValue::String(s)) => Some(s),
+            Some(HeapValue::String(s)) => Some(std::str::from_utf8(s).unwrap()),
             _ => None,
         }
     }
 
-    pub(crate) fn heap_arr(&self, ptr: HeapAddr) -> Option<&Vec<StackValue>> {
+    pub(crate) fn heap_arr(&self, ptr: HeapAddr) -> Option<&ThinVec<StackValue>> {
         match self.heap.get(ptr as usize) {
             Some(HeapValue::Array(a)) => Some(a),
             _ => None,
         }
     }
 
-    pub(crate) fn heap_arr_mut(&mut self, ptr: HeapAddr) -> Option<&mut Vec<StackValue>> {
+    pub(crate) fn heap_arr_mut(&mut self, ptr: HeapAddr) -> Option<&mut ThinVec<StackValue>> {
         match self.heap.get_mut(ptr as usize) {
             Some(HeapValue::Array(a)) => Some(a),
             _ => None,
         }
     }
 
-    pub(crate) fn heap_obj(&self, ptr: HeapAddr) -> Option<&IndexMap<String, StackValue>> {
+    pub(crate) fn heap_obj(&self, ptr: HeapAddr) -> Option<&IndexMap<FieldName, StackValue>> {
         match self.heap.get(ptr as usize) {
-            Some(HeapValue::Object(o)) => Some(o),
+            Some(HeapValue::Object(o)) => Some(&**o),
             _ => None,
         }
     }
 
-    fn heap_obj_mut(&mut self, ptr: HeapAddr) -> Option<&mut IndexMap<String, StackValue>> {
+    fn heap_obj_mut(&mut self, ptr: HeapAddr) -> Option<&mut IndexMap<FieldName, StackValue>> {
         match self.heap.get_mut(ptr as usize) {
-            Some(HeapValue::Object(o)) => Some(o),
+            Some(HeapValue::Object(o)) => Some(&mut **o),
             _ => None,
         }
     }
 
-    pub(crate) fn alloc_string(&mut self, s: String) -> StackValue {
+    pub(crate) fn alloc_string(&mut self, s: ThinStr) -> StackValue {
         let addr = self.heap.len() as HeapAddr;
         self.heap.push(HeapValue::String(s));
         StackValue::Ptr(addr)
     }
 
-    pub(crate) fn alloc_array(&mut self, arr: Vec<StackValue>) -> StackValue {
+    pub(crate) fn alloc_array(&mut self, arr: ThinVec<StackValue>) -> StackValue {
         let addr = self.heap.len() as HeapAddr;
         self.heap.push(HeapValue::Array(arr));
         StackValue::Ptr(addr)
     }
 
-    fn alloc_object(&mut self, obj: IndexMap<String, StackValue>) -> StackValue {
+    fn alloc_object(&mut self, obj: IndexMap<FieldName, StackValue>) -> StackValue {
         let addr = self.heap.len() as HeapAddr;
-        self.heap.push(HeapValue::Object(obj));
+        self.heap.push(HeapValue::Object(Box::new(obj)));
         StackValue::Ptr(addr)
     }
 
-    fn alloc_closure(&mut self, addr: CodeAddr, upvals: Vec<StackValue>) -> StackValue {
+    fn alloc_closure(&mut self, addr: CodeAddr, upvals: ThinVec<StackValue>) -> StackValue {
         let heap_addr = self.heap.len() as HeapAddr;
         self.heap.push(HeapValue::Closure { addr, upvals });
         StackValue::Ptr(heap_addr)
@@ -850,7 +854,7 @@ impl VM {
             }
             StackValue::Upval(_) => String::new(),
             StackValue::Ptr(p) => match self.heap.get(*p as usize) {
-                Some(HeapValue::String(s)) => s.clone(),
+                Some(HeapValue::String(s)) => String::from_utf8(s.to_vec()).unwrap(),
                 Some(HeapValue::Array(arr)) => arr
                     .iter()
                     .map(|v| match v {
@@ -1074,7 +1078,7 @@ impl VM {
                 }
             }
             StackValue::Ptr(p) => match self.heap_get(*p)? {
-                HeapValue::String(s) => serde_json::Value::String(s.clone()),
+                HeapValue::String(s) => serde_json::Value::String(String::from_utf8(s.to_vec()).unwrap()),
                 HeapValue::Array(arr) => serde_json::Value::Array(
                     arr.iter()
                         .map(|v| match v {
@@ -1086,12 +1090,12 @@ impl VM {
                 ),
                 HeapValue::Object(obj) => {
                     let mut map = serde_json::Map::new();
-                    for (k, v) in obj {
+                    for (k, v) in obj.iter() {
                         // JS: properties whose value is `undefined` are omitted.
                         if matches!(v, StackValue::Undefined) {
                             continue;
                         }
-                        map.insert(k.clone(), self.stack_value_to_json(v, depth + 1)?);
+                        map.insert(String::from_utf8(k.to_vec()).unwrap(), self.stack_value_to_json(v, depth + 1)?);
                     }
                     serde_json::Value::Object(map)
                 }
@@ -1124,18 +1128,18 @@ impl VM {
                     StackValue::Number(n.as_f64().unwrap_or(0.0))
                 }
             }
-            serde_json::Value::String(s) => self.alloc_string(s.clone()),
+            serde_json::Value::String(s) => self.alloc_string(s.clone().into_bytes().into()),
             serde_json::Value::Array(arr) => {
                 let vals: Vec<StackValue> = arr
                     .iter()
                     .map(|v| self.json_to_stack_value(v, depth + 1))
                     .collect::<Result<_, _>>()?;
-                self.alloc_array(vals)
+                self.alloc_array(vals.into())
             }
             serde_json::Value::Object(obj) => {
                 let mut map = IndexMap::new();
                 for (k, v) in obj {
-                    map.insert(k.clone(), self.json_to_stack_value(v, depth + 1)?);
+                    map.insert(k.clone().into_bytes().into(), self.json_to_stack_value(v, depth + 1)?);
                 }
                 self.alloc_object(map)
             }
@@ -1222,8 +1226,40 @@ impl VM {
             self.fuel -= 1;
             match &self.code[self.ip as usize] {
                 // ── stack manipulation ───────────────────────────
-                Instr::Push(val) => {
-                    self.stack.push(*val);
+                Instr::PushNull => {
+                    self.stack.push(StackValue::Null);
+                    self.ip += 1;
+                }
+                Instr::PushUndefined => {
+                    self.stack.push(StackValue::Undefined);
+                    self.ip += 1;
+                }
+                Instr::PushBool(b) => {
+                    self.stack.push(StackValue::Bool(*b));
+                    self.ip += 1;
+                }
+                Instr::PushFloat(f) => {
+                    self.stack.push(StackValue::Number(*f));
+                    self.ip += 1;
+                }
+                Instr::PushPosInt(u) => {
+                    self.stack.push(StackValue::PosInt(*u));
+                    self.ip += 1;
+                }
+                Instr::PushNegInt(i) => {
+                    self.stack.push(StackValue::NegInt(*i));
+                    self.ip += 1;
+                }
+                Instr::PushFn(addr) => {
+                    self.stack.push(StackValue::Fn(*addr));
+                    self.ip += 1;
+                }
+                Instr::PushPtr(h) => {
+                    self.stack.push(StackValue::Ptr(*h));
+                    self.ip += 1;
+                }
+                Instr::PushBuiltin(b) => {
+                    self.stack.push(StackValue::Builtin(*b));
                     self.ip += 1;
                 }
 
@@ -1232,6 +1268,7 @@ impl VM {
                     let ptr = self.alloc_string(s);
                     self.stack.push(ptr);
                     self.ip += 1;
+                    continue;
                 }
 
                 Instr::Pop(n) => {
@@ -1329,7 +1366,7 @@ impl VM {
                         return_addr: self.ip + 1,
                         prev_fp: self.fp,
                         arguments_cache: None,
-                        pending_upvals: Vec::new(),
+                        pending_upvals: ThinVec::new(),
                     });
                     self.ip = *addr;
                     self.fp = (self.stack.len() as u32) - *nargs;
@@ -1361,7 +1398,7 @@ impl VM {
                                 return_addr: self.ip + 1,
                                 prev_fp: self.fp,
                                 arguments_cache: None,
-                                pending_upvals: Vec::new(),
+                                pending_upvals: ThinVec::new(),
                             });
                             self.fp = (self.stack.len() as u32) - nargs;
                             self.ip = addr;
@@ -1409,7 +1446,7 @@ impl VM {
                     }
                     let captures = captures.clone(); // release the borrow on self.code
                     let local_count = self.callstack.last().ok_or(VMError::BadLocal)?.local_count;
-                    let mut upvals = Vec::with_capacity(captures.len());
+                    let mut upvals = ThinVec::with_capacity(captures.len());
                     for slot in captures {
                         if slot >= local_count {
                             return Err(VMError::BadLocal);
@@ -1511,7 +1548,7 @@ impl VM {
                             return Err(VMError::StackUnderflow);
                         }
                         let args = self.stack[base..base + argc as usize].to_vec();
-                        let arr = self.alloc_array(args);
+                        let arr = self.alloc_array(args.into());
                         if let StackValue::Ptr(p) = arr {
                             self.callstack.last_mut().unwrap().arguments_cache = Some(p);
                         }
@@ -1546,7 +1583,7 @@ impl VM {
                         self.stack.push(slot);
                     }
                     self.callstack.last_mut().unwrap().local_count =
-                        nparams + k + local_kinds.len() as u32;
+                        nparams as u32 + k + local_kinds.len() as u32;
                     self.ip += 1;
                 }
 
@@ -1569,7 +1606,7 @@ impl VM {
                         return Err(VMError::StackUnderflow);
                     }
                     let args = self.stack[base..base + argc as usize].to_vec();
-                    let arr = self.alloc_array(args);
+                    let arr = self.alloc_array(args.into());
                     let ptr = match arr {
                         StackValue::Ptr(p) => p,
                         _ => unreachable!("alloc_array returns a Ptr"),
@@ -1656,16 +1693,11 @@ impl VM {
 
                 Instr::IncLocal(local, p, mode) => {
                     let frame = self.callstack.last().ok_or(VMError::BadLocal)?;
-                    if *local >= frame.local_count {
+                    if u32::from(*local) >= frame.local_count {
                         return Err(VMError::BadLocal);
                     }
-                    let p: f64 = match p {
-                        StackValue::PosInt(n) => *n as f64,
-                        StackValue::NegInt(n) => *n as f64,
-                        _ => return Err(VMError::ValueError),
-                    };
                     // Read current value (dereferencing boxed slots).
-                    let old = match self.stack[(self.fp + local) as usize] {
+                    let old = match self.stack[(self.fp + u32::from(*local)) as usize] {
                         StackValue::Upval(c) => {
                             *self.cells.get(c as usize).ok_or(VMError::ValueError)?
                         }
@@ -1673,10 +1705,10 @@ impl VM {
                     };
                     let old_num = self.to_number(&old).ok_or(VMError::TypeError)?;
                     // Compute new value: subtract p (p = -1 for ++, p = 1 for --).
-                    let new_num = old_num - p;
+                    let new_num = old_num - *p;
                     let new_val = StackValue::Number(new_num);
                     // Store the new value.
-                    let slot = (self.fp + local) as usize;
+                    let slot = (self.fp + u32::from(*local)) as usize;
                     match self.stack[slot] {
                         StackValue::Upval(c) => {
                             *self.cells.get_mut(c as usize).ok_or(VMError::ValueError)? = new_val;
@@ -1713,7 +1745,7 @@ impl VM {
                         // Internal indirection; never a legitimate operand.
                         StackValue::Upval(_) => return Err(VMError::ValueError),
                     };
-                    let s = self.alloc_string(tag.to_string());
+                    let s = self.alloc_string(tag.to_string().into_bytes().into());
                     self.stack.push(s);
                     self.ip += 1;
                 }
@@ -1802,7 +1834,7 @@ impl VM {
                             self.to_js_string(&lhs, 0),
                             self.to_js_string(&rhs, 0)
                         );
-                        self.alloc_string(s)
+                        self.alloc_string(s.into_bytes().into())
                     } else {
                         match (self.to_number(&lhs), self.to_number(&rhs)) {
                             (Some(a), Some(b)) => StackValue::Number(a + b),
@@ -1939,7 +1971,7 @@ impl VM {
                     // JS: a missing property reads as `undefined`, not `null`.
                     let val = self
                         .heap_obj(obj_ptr)
-                        .and_then(|obj| obj.get(&field).copied())
+                        .and_then(|obj| obj.get(field.as_ref()).copied())
                         .unwrap_or(StackValue::Undefined);
                     self.stack.push(val);
                     self.ip += 1;
@@ -1954,7 +1986,10 @@ impl VM {
                     // In Old mode, read the previous value before overwriting
                     // (for postfix `++`/`--` on member targets).
                     let old = match mode {
-                        SetMode::Old => obj.get(&field).copied().unwrap_or(StackValue::Undefined),
+                        SetMode::Old => obj
+                            .get(field.as_ref())
+                            .copied()
+                            .unwrap_or(StackValue::Undefined),
                         SetMode::New => StackValue::Undefined, // placeholder, unused
                     };
                     obj.insert(field, val);
@@ -1988,9 +2023,10 @@ impl VM {
                             // JS coerces a computed key with ToString.
                             let field = self.to_js_string(&key, 0);
                             // JS: a missing property reads as `undefined`.
-                            obj.get(&field).copied().unwrap_or(StackValue::Undefined)
+                            obj.get(field.as_bytes()).copied().unwrap_or(StackValue::Undefined)
                         }
                         HeapValue::String(s) => {
+                            let s = std::str::from_utf8(s).unwrap();
                             let idx = as_i64(&key).ok_or(VMError::TypeError)?;
                             if idx < 0 {
                                 return Err(VMError::ValueError);
@@ -2011,7 +2047,7 @@ impl VM {
                         _ => return Err(VMError::TypeError),
                     };
                     let result = match to_alloc {
-                        Some(s) => self.alloc_string(s),
+                        Some(s) => self.alloc_string(s.into_bytes().into()),
                         None => val,
                     };
                     self.stack.push(result);
@@ -2048,7 +2084,7 @@ impl VM {
                         } else {
                             let field = self.to_js_string(&key, 0);
                             self.heap_obj(container)
-                                .and_then(|o| o.get(&field).copied())
+                                .and_then(|o| o.get(field.as_bytes()).copied())
                                 .unwrap_or(StackValue::Undefined)
                         }
                     } else {
@@ -2068,7 +2104,7 @@ impl VM {
                     } else {
                         let field = self.to_js_string(&key, 0);
                         let obj = self.heap_obj_mut(container).ok_or(VMError::TypeError)?;
-                        obj.insert(field, val);
+                        obj.insert(field.into_bytes().into(), val);
                     }
                     match mode {
                         SetMode::New => self.stack.push(val),
@@ -2083,7 +2119,7 @@ impl VM {
                     let has = self
                         .heap_obj(obj_ptr)
                         .ok_or(VMError::TypeError)?
-                        .contains_key(&field);
+                        .contains_key(field.as_bytes());
                     self.stack.push(StackValue::Bool(has));
                     self.ip += 1;
                 }
@@ -2095,7 +2131,7 @@ impl VM {
                     let existed = self
                         .heap_obj_mut(obj_ptr)
                         .ok_or(VMError::TypeError)?
-                        .shift_remove(&field)
+                        .shift_remove(field.as_bytes())
                         .is_some();
                     self.stack.push(StackValue::Bool(existed));
                     self.ip += 1;
@@ -2110,7 +2146,7 @@ impl VM {
                     let split = self.stack.len() - n;
                     // Left-to-right: first pushed becomes element 0.
                     let vals: Vec<StackValue> = self.stack.drain(split..).collect();
-                    let arr_ptr = self.alloc_array(vals);
+                    let arr_ptr = self.alloc_array(vals.into());
                     self.stack.push(arr_ptr);
                     self.ip += 1;
                 }
@@ -2134,7 +2170,7 @@ impl VM {
                 Instr::ToStr => {
                     let val = self.stack.pop().ok_or(VMError::StackUnderflow)?;
                     let s = self.to_js_string(&val, 0);
-                    let ptr = self.alloc_string(s);
+                    let ptr = self.alloc_string(s.into_bytes().into());
                     self.stack.push(ptr);
                     self.ip += 1;
                 }
@@ -2203,7 +2239,7 @@ impl VM {
                     // Do NOT advance ip — host may choose a different
                     // restart point (see Raise doc comment).
                     return Ok(StepResult::Raise {
-                        condition: condition.clone(),
+                        condition: String::from_utf8(condition.to_vec()).unwrap(),
                     });
                 }
             }
@@ -2235,7 +2271,7 @@ mod tests {
     fn run_heap(code: Vec<Instr>, strings: &[&str]) -> Vec<StackValue> {
         let mut vm = VM::new(code);
         for s in strings {
-            vm.alloc_string(s.to_string());
+            vm.alloc_string((*s).into());
         }
         loop {
             match vm.step().unwrap() {
@@ -2311,20 +2347,20 @@ mod tests {
 
     #[test]
     fn push_and_pop() {
-        assert_eq!(run(vec![Push(n(1.0)), Push(n(2.0)), Pop(1)]), vec![n(1.0)]);
-        assert_eq!(run(vec![Push(n(1.0)), Pop(1)]), vec![]);
+        assert_eq!(run(vec![PushFloat(1.0), PushFloat(2.0), Pop(1)]), vec![n(1.0)]);
+        assert_eq!(run(vec![PushFloat(1.0), Pop(1)]), vec![]);
         assert!(matches!(run_err(vec![Pop(1)]), VMError::StackUnderflow));
     }
 
     #[test]
     fn dup_swap_rot() {
-        assert_eq!(run(vec![Push(n(1.0)), Dup]), vec![n(1.0), n(1.0)]);
+        assert_eq!(run(vec![PushFloat(1.0), Dup]), vec![n(1.0), n(1.0)]);
         assert_eq!(
-            run(vec![Push(n(1.0)), Push(n(2.0)), Swap]),
+            run(vec![PushFloat(1.0), PushFloat(2.0), Swap]),
             vec![n(2.0), n(1.0)]
         );
         assert_eq!(
-            run(vec![Push(n(1.0)), Push(n(2.0)), Push(n(3.0)), Rot]),
+            run(vec![PushFloat(1.0), PushFloat(2.0), PushFloat(3.0), Rot]),
             vec![n(2.0), n(3.0), n(1.0)]
         );
         assert!(matches!(run_err(vec![Swap]), VMError::StackUnderflow));
@@ -2334,18 +2370,18 @@ mod tests {
     #[test]
     fn pick() {
         // Pick(0) is Dup; Pick(n) copies the n-th-from-top value to the top.
-        assert_eq!(run(vec![Push(n(1.0)), Pick(0)]), vec![n(1.0), n(1.0)]);
+        assert_eq!(run(vec![PushFloat(1.0), Pick(0)]), vec![n(1.0), n(1.0)]);
         assert_eq!(
-            run(vec![Push(n(1.0)), Push(n(2.0)), Pick(1)]),
+            run(vec![PushFloat(1.0), PushFloat(2.0), Pick(1)]),
             vec![n(1.0), n(2.0), n(1.0)]
         );
         assert_eq!(
-            run(vec![Push(n(1.0)), Push(n(2.0)), Push(n(3.0)), Pick(2)]),
+            run(vec![PushFloat(1.0), PushFloat(2.0), PushFloat(3.0), Pick(2)]),
             vec![n(1.0), n(2.0), n(3.0), n(1.0)]
         );
         // Cannot reach below the frame's temporaries.
         assert!(matches!(
-            run_err(vec![Push(n(1.0)), Pick(1)]),
+            run_err(vec![PushFloat(1.0), Pick(1)]),
             VMError::StackUnderflow
         ));
     }
@@ -2353,17 +2389,17 @@ mod tests {
     #[test]
     fn dig() {
         // Dig(0) no-op, Dig(1) == Swap, Dig(2) == Rot.
-        assert_eq!(run(vec![Push(n(1.0)), Dig(0)]), vec![n(1.0)]);
+        assert_eq!(run(vec![PushFloat(1.0), Dig(0)]), vec![n(1.0)]);
         assert_eq!(
-            run(vec![Push(n(1.0)), Push(n(2.0)), Dig(1)]),
+            run(vec![PushFloat(1.0), PushFloat(2.0), Dig(1)]),
             vec![n(2.0), n(1.0)]
         );
         assert_eq!(
-            run(vec![Push(n(1.0)), Push(n(2.0)), Push(n(3.0)), Dig(2)]),
+            run(vec![PushFloat(1.0), PushFloat(2.0), PushFloat(3.0), Dig(2)]),
             vec![n(2.0), n(3.0), n(1.0)]
         );
         assert!(matches!(
-            run_err(vec![Push(n(1.0)), Dig(1)]),
+            run_err(vec![PushFloat(1.0), Dig(1)]),
             VMError::StackUnderflow
         ));
     }
@@ -2371,15 +2407,15 @@ mod tests {
     #[test]
     fn nip() {
         // Nip(1) drops the value below top, leaving top in place.
-        assert_eq!(run(vec![Push(n(1.0)), Push(n(2.0)), Nip(1)]), vec![n(2.0)]);
+        assert_eq!(run(vec![PushFloat(1.0), PushFloat(2.0), Nip(1)]), vec![n(2.0)]);
         // Nip(2) drops two values below top.
         assert_eq!(
-            run(vec![Push(n(1.0)), Push(n(2.0)), Push(n(3.0)), Nip(2)]),
+            run(vec![PushFloat(1.0), PushFloat(2.0), PushFloat(3.0), Nip(2)]),
             vec![n(3.0)]
         );
         // Nip rejects reaching below frame_floor.
         assert!(matches!(
-            run_err(vec![Push(n(1.0)), Nip(1)]),
+            run_err(vec![PushFloat(1.0), Nip(1)]),
             VMError::StackUnderflow
         ));
     }
@@ -2392,8 +2428,8 @@ mod tests {
         // leaves it on the stack. Result: [5.0, 5.0].
         assert_eq!(
             run(vec![
-                EnterFrame(0, false, vec![SlotKind::Plain]),
-                Push(n(5.0)),
+                EnterFrame(0, false, vec![SlotKind::Plain].into()),
+                PushFloat(5.0),
                 TeeLocal(0),
             ]),
             vec![n(5.0), n(5.0)]
@@ -2401,8 +2437,8 @@ mod tests {
         // Verify the local was actually written.
         assert_eq!(
             run(vec![
-                EnterFrame(0, false, vec![SlotKind::Plain]),
-                Push(n(7.0)),
+                EnterFrame(0, false, vec![SlotKind::Plain].into()),
+                PushFloat(7.0),
                 TeeLocal(0),
                 Pop(1),
                 Local(0),
@@ -2411,7 +2447,7 @@ mod tests {
         );
         // TeeLocal on out-of-range slot errors.
         assert!(matches!(
-            run_err(vec![Push(n(1.0)), TeeLocal(0)]),
+            run_err(vec![PushFloat(1.0), TeeLocal(0)]),
             VMError::BadLocal
         ));
     }
@@ -2422,30 +2458,30 @@ mod tests {
         // Prefix ++ in place: new value on stack AND in local.
         assert_eq!(
             run(vec![
-                EnterFrame(0, false, vec![SlotKind::Plain]),
-                Push(n(5.0)),
+                EnterFrame(0, false, vec![SlotKind::Plain].into()),
+                PushFloat(5.0),
                 SetLocal(0),
-                IncLocal(0, StackValue::NegInt(-1), UpdateMode::Prefix),
+                IncLocal(0, -1.0, UpdateMode::Prefix),
             ]),
             vec![n(6.0), n(6.0)]
         );
         // Postfix ++: old value on stack, local updated to new.
         assert_eq!(
             run(vec![
-                EnterFrame(0, false, vec![SlotKind::Plain]),
-                Push(n(5.0)),
+                EnterFrame(0, false, vec![SlotKind::Plain].into()),
+                PushFloat(5.0),
                 SetLocal(0),
-                IncLocal(0, StackValue::NegInt(-1), UpdateMode::Postfix),
+                IncLocal(0, -1.0, UpdateMode::Postfix),
             ]),
             vec![n(6.0), n(5.0)]
         );
         // Postfix --: old value pushed, local decremented.
         assert_eq!(
             run(vec![
-                EnterFrame(0, false, vec![SlotKind::Plain]),
-                Push(n(5.0)),
+                EnterFrame(0, false, vec![SlotKind::Plain].into()),
+                PushFloat(5.0),
                 SetLocal(0),
-                IncLocal(0, StackValue::PosInt(1), UpdateMode::Postfix),
+                IncLocal(0, 1.0, UpdateMode::Postfix),
                 Pop(1), // drop old value
                 Local(0),
             ]),
@@ -2453,11 +2489,7 @@ mod tests {
         );
         // IncLocal on out-of-range slot errors.
         assert!(matches!(
-            run_err(vec![IncLocal(
-                0,
-                StackValue::NegInt(-1),
-                UpdateMode::Prefix
-            )]),
+            run_err(vec![IncLocal(0, -1.0, UpdateMode::Prefix)]),
             VMError::BadLocal
         ));
     }
@@ -2465,9 +2497,9 @@ mod tests {
     #[test]
     fn jtrue() {
         // Truthy takes the jump (skipping the Push); falsy falls through.
-        assert_eq!(run(vec![Push(b(true)), JTrue(3), Push(n(9.0))]), vec![]);
+        assert_eq!(run(vec![PushBool(true), JTrue(3), PushFloat(9.0)]), vec![]);
         assert_eq!(
-            run(vec![Push(b(false)), JTrue(3), Push(n(9.0))]),
+            run(vec![PushBool(false), JTrue(3), PushFloat(9.0)]),
             vec![n(9.0)]
         );
     }
@@ -2476,16 +2508,16 @@ mod tests {
     fn jnotnullish() {
         // Not nullish: takes the jump and LEAVES the value (peek, no pop).
         assert_eq!(
-            run(vec![Push(n(5.0)), JNotNullish(3), Push(n(9.0))]),
+            run(vec![PushFloat(5.0), JNotNullish(3), PushFloat(9.0)]),
             vec![n(5.0)]
         );
         // null / undefined: fall through; the value stays for the short-circuit.
         assert_eq!(
-            run(vec![Push(null()), JNotNullish(3), Push(n(9.0))]),
+            run(vec![PushNull, JNotNullish(3), PushFloat(9.0)]),
             vec![null(), n(9.0)]
         );
         assert_eq!(
-            run(vec![Push(undef()), JNotNullish(3), Push(n(9.0))]),
+            run(vec![PushUndefined, JNotNullish(3), PushFloat(9.0)]),
             vec![undef(), n(9.0)]
         );
     }
@@ -2494,26 +2526,26 @@ mod tests {
 
     #[test]
     fn is_null() {
-        assert_eq!(run(vec![Push(null()), IsNull]), vec![b(true)]);
-        assert_eq!(run(vec![Push(n(0.0)), IsNull]), vec![b(false)]);
+        assert_eq!(run(vec![PushNull, IsNull]), vec![b(true)]);
+        assert_eq!(run(vec![PushFloat(0.0), IsNull]), vec![b(false)]);
     }
 
     #[test]
     fn is_bool() {
-        assert_eq!(run(vec![Push(b(true)), IsBool]), vec![b(true)]);
-        assert_eq!(run(vec![Push(n(0.0)), IsBool]), vec![b(false)]);
+        assert_eq!(run(vec![PushBool(true), IsBool]), vec![b(true)]);
+        assert_eq!(run(vec![PushFloat(0.0), IsBool]), vec![b(false)]);
     }
 
     // ── unary operators ───────────────────────────────────────────
 
     #[test]
     fn not_bitnot() {
-        assert_eq!(run(vec![Push(b(false)), Not]), vec![b(true)]);
-        assert_eq!(run(vec![Push(null()), Not]), vec![b(true)]);
-        assert_eq!(run(vec![Push(n(1.0)), Not]), vec![b(false)]);
-        assert_eq!(run(vec![Push(n(5.0)), BitNot]), vec![n(-6.0)]);
+        assert_eq!(run(vec![PushBool(false), Not]), vec![b(true)]);
+        assert_eq!(run(vec![PushNull, Not]), vec![b(true)]);
+        assert_eq!(run(vec![PushFloat(1.0), Not]), vec![b(false)]);
+        assert_eq!(run(vec![PushFloat(5.0), BitNot]), vec![n(-6.0)]);
         assert!(matches!(
-            run_err(vec![Push(n(3.14)), BitNot]),
+            run_err(vec![PushFloat(3.14), BitNot]),
             VMError::TypeError
         ));
     }
@@ -2522,30 +2554,30 @@ mod tests {
 
     #[test]
     fn add_sub_mul_div() {
-        assert_eq!(run(vec![Push(n(2.0)), Push(n(3.0)), Add]), vec![n(5.0)]);
-        assert_eq!(run(vec![Push(n(10.0)), Push(n(3.0)), Sub]), vec![n(7.0)]);
-        assert_eq!(run(vec![Push(n(4.0)), Push(n(5.0)), Mul]), vec![n(20.0)]);
-        assert_eq!(run(vec![Push(n(10.0)), Push(n(4.0)), Div]), vec![n(2.5)]);
+        assert_eq!(run(vec![PushFloat(2.0), PushFloat(3.0), Add]), vec![n(5.0)]);
+        assert_eq!(run(vec![PushFloat(10.0), PushFloat(3.0), Sub]), vec![n(7.0)]);
+        assert_eq!(run(vec![PushFloat(4.0), PushFloat(5.0), Mul]), vec![n(20.0)]);
+        assert_eq!(run(vec![PushFloat(10.0), PushFloat(4.0), Div]), vec![n(2.5)]);
         // JS: x/0 -> ±Infinity, 0/0 -> NaN (never an error).
         assert!(matches!(
-            run(vec![Push(n(1.0)), Push(n(0.0)), Div]).as_slice(),
+            run(vec![PushFloat(1.0), PushFloat(0.0), Div]).as_slice(),
             [StackValue::Number(x)] if x.is_infinite() && *x > 0.0
         ));
         assert!(matches!(
-            run(vec![Push(n(0.0)), Push(n(0.0)), Div]).as_slice(),
+            run(vec![PushFloat(0.0), PushFloat(0.0), Div]).as_slice(),
             [StackValue::Number(x)] if x.is_nan()
         ));
     }
 
     #[test]
     fn mod_op() {
-        assert_eq!(run(vec![Push(n(10.0)), Push(n(3.0)), Mod]), vec![n(1.0)]);
+        assert_eq!(run(vec![PushFloat(10.0), PushFloat(3.0), Mod]), vec![n(1.0)]);
         // JS %: float remainder (5.5 % 2 == 1.5), dividend's sign (-5 % 3 == -2).
-        assert_eq!(run(vec![Push(n(5.5)), Push(n(2.0)), Mod]), vec![n(1.5)]);
-        assert_eq!(run(vec![Push(n(-5.0)), Push(n(3.0)), Mod]), vec![n(-2.0)]);
+        assert_eq!(run(vec![PushFloat(5.5), PushFloat(2.0), Mod]), vec![n(1.5)]);
+        assert_eq!(run(vec![PushFloat(-5.0), PushFloat(3.0), Mod]), vec![n(-2.0)]);
         // x % 0 -> NaN, not an error.
         assert!(matches!(
-            run(vec![Push(n(1.0)), Push(n(0.0)), Mod]).as_slice(),
+            run(vec![PushFloat(1.0), PushFloat(0.0), Mod]).as_slice(),
             [StackValue::Number(x)] if x.is_nan()
         ));
     }
@@ -2554,7 +2586,7 @@ mod tests {
     fn add_strings() {
         // heap[0]="hello ", heap[1]="world"
         assert_eq!(
-            run_heap(vec![Push(s(0)), Push(s(1)), Add], &["hello ", "world"]),
+            run_heap(vec![PushPtr(0), PushPtr(1), Add], &["hello ", "world"]),
             vec![s(2)] // new string at heap[2]
         );
         // Verify the concatenated string
@@ -2576,11 +2608,11 @@ mod tests {
     fn run_last_str(code: Vec<Instr>, strings: &[&str]) -> String {
         let mut vm = VM::new(code);
         for s in strings {
-            vm.alloc_string(s.to_string());
+            vm.alloc_string((*s).into());
         }
         while !matches!(vm.step().unwrap(), StepResult::Done) {}
         match vm.heap.last() {
-            Some(HeapValue::String(s)) => s.clone(),
+            Some(HeapValue::String(s)) => String::from_utf8(s.to_vec()).unwrap(),
             other => panic!("expected a string result, got {other:?}"),
         }
     }
@@ -2589,25 +2621,25 @@ mod tests {
     fn add_concat_coerces() {
         // `+` concatenates when either side is a string, coercing the other.
         assert_eq!(
-            run_last_str(vec![Push(s(0)), Push(n(5.0)), Add], &["x="]),
+            run_last_str(vec![PushPtr(0), PushFloat(5.0), Add], &["x="]),
             "x=5"
         );
         assert_eq!(
-            run_last_str(vec![Push(n(5.0)), Push(s(0)), Add], &["!"]),
+            run_last_str(vec![PushFloat(5.0), PushPtr(0), Add], &["!"]),
             "5!"
         );
         assert_eq!(
-            run_last_str(vec![Push(s(0)), Push(null()), Add], &["v="]),
+            run_last_str(vec![PushPtr(0), PushNull, Add], &["v="]),
             "v=null"
         );
         assert_eq!(
-            run_last_str(vec![Push(s(0)), Push(b(true)), Add], &["b="]),
+            run_last_str(vec![PushPtr(0), PushBool(true), Add], &["b="]),
             "b=true"
         );
         // An array operand stringifies like join(",") on the concat path.
         assert_eq!(
             run_last_str(
-                vec![Push(n(1.0)), Push(n(2.0)), ArrNew(2), Push(s(0)), Add],
+                vec![PushFloat(1.0), PushFloat(2.0), ArrNew(2), PushPtr(0), Add],
                 &["!"]
             ),
             "1,2!"
@@ -2618,23 +2650,23 @@ mod tests {
     fn arithmetic_coerces() {
         // ToNumber coercion on -, *, /, % (strings, bools, null).
         assert_eq!(
-            run_heap(vec![Push(s(0)), Push(n(1.0)), Sub], &["6"]),
+            run_heap(vec![PushPtr(0), PushFloat(1.0), Sub], &["6"]),
             vec![n(5.0)]
         );
-        assert_eq!(run(vec![Push(b(true)), Push(n(2.0)), Mul]), vec![n(2.0)]);
-        assert_eq!(run(vec![Push(null()), Push(n(1.0)), Add]), vec![n(1.0)]);
+        assert_eq!(run(vec![PushBool(true), PushFloat(2.0), Mul]), vec![n(2.0)]);
+        assert_eq!(run(vec![PushNull, PushFloat(1.0), Add]), vec![n(1.0)]);
         assert_eq!(
-            run_heap(vec![Push(s(0)), Push(s(1)), Mul], &["6", "2"]),
+            run_heap(vec![PushPtr(0), PushPtr(1), Mul], &["6", "2"]),
             vec![n(12.0)]
         );
         // undefined -> NaN propagates.
         assert!(matches!(
-            run(vec![Push(undef()), Push(n(1.0)), Sub]).as_slice(),
+            run(vec![PushUndefined, PushFloat(1.0), Sub]).as_slice(),
             [StackValue::Number(x)] if x.is_nan()
         ));
         // An unparseable string -> NaN.
         assert!(matches!(
-            run_heap(vec![Push(s(0)), Push(n(1.0)), Mul], &["abc"]).as_slice(),
+            run_heap(vec![PushPtr(0), PushFloat(1.0), Mul], &["abc"]).as_slice(),
             [StackValue::Number(x)] if x.is_nan()
         ));
     }
@@ -2643,35 +2675,35 @@ mod tests {
     fn truthiness_matches_js() {
         // Falsy: false, 0, NaN, "", null, undefined.
         for code in [
-            vec![Push(b(false)), Not],
-            vec![Push(n(0.0)), Not],
-            vec![Push(u(0)), Not],
-            vec![Push(n(f64::NAN)), Not],
-            vec![Push(null()), Not],
-            vec![Push(undef()), Not],
+            vec![PushBool(false), Not],
+            vec![PushFloat(0.0), Not],
+            vec![PushPosInt(0), Not],
+            vec![PushFloat(f64::NAN), Not],
+            vec![PushNull, Not],
+            vec![PushUndefined, Not],
         ] {
             assert_eq!(run(code), vec![b(true)], "expected falsy");
         }
-        assert_eq!(run_heap(vec![Push(s(0)), Not], &[""]), vec![b(true)]); // "" falsy
+        assert_eq!(run_heap(vec![PushPtr(0), Not], &[""]), vec![b(true)]); // "" falsy
         // Truthy: nonzero, "0", non-empty string, [], {}.
-        assert_eq!(run(vec![Push(n(1.0)), Not]), vec![b(false)]);
-        assert_eq!(run_heap(vec![Push(s(0)), Not], &["0"]), vec![b(false)]); // "0" truthy
+        assert_eq!(run(vec![PushFloat(1.0), Not]), vec![b(false)]);
+        assert_eq!(run_heap(vec![PushPtr(0), Not], &["0"]), vec![b(false)]); // "0" truthy
         assert_eq!(run(vec![ArrNew(0), Not]), vec![b(false)]); // [] truthy
-        assert_eq!(run(vec![ObjNew(vec![]), Not]), vec![b(false)]); // {} truthy
+        assert_eq!(run(vec![ObjNew(vec![].into()), Not]), vec![b(false)]); // {} truthy
         // And JFalse on 0 takes the branch (0 is falsy).
-        assert_eq!(run(vec![Push(n(0.0)), JFalse(3), Push(n(9.0))]), vec![]);
+        assert_eq!(run(vec![PushFloat(0.0), JFalse(3), PushFloat(9.0)]), vec![]);
         // || picks the second operand when the first is 0 (falsy).
-        assert_eq!(run(vec![Push(n(0.0)), Push(n(7.0)), Or]), vec![n(7.0)]);
+        assert_eq!(run(vec![PushFloat(0.0), PushFloat(7.0), Or]), vec![n(7.0)]);
     }
 
     #[test]
     fn to_num_instruction() {
         // JS ToNumber: strings parse, bools→0/1, null→0, undefined/garbage→NaN.
-        assert_eq!(run_heap(vec![Push(s(0)), ToNum], &["42"]), vec![n(42.0)]);
-        assert_eq!(run(vec![Push(b(true)), ToNum]), vec![n(1.0)]);
-        assert_eq!(run(vec![Push(null()), ToNum]), vec![n(0.0)]);
+        assert_eq!(run_heap(vec![PushPtr(0), ToNum], &["42"]), vec![n(42.0)]);
+        assert_eq!(run(vec![PushBool(true), ToNum]), vec![n(1.0)]);
+        assert_eq!(run(vec![PushNull, ToNum]), vec![n(0.0)]);
         assert!(matches!(
-            run(vec![Push(undef()), ToNum]).as_slice(),
+            run(vec![PushUndefined, ToNum]).as_slice(),
             [StackValue::Number(x)] if x.is_nan()
         ));
         // An array/object has no numeric form.
@@ -2683,34 +2715,34 @@ mod tests {
 
     #[test]
     fn to_bool_instruction() {
-        assert_eq!(run(vec![Push(n(0.0)), ToBool]), vec![b(false)]);
-        assert_eq!(run(vec![Push(n(1.0)), ToBool]), vec![b(true)]);
-        assert_eq!(run(vec![Push(null()), ToBool]), vec![b(false)]);
-        assert_eq!(run_heap(vec![Push(s(0)), ToBool], &[""]), vec![b(false)]);
+        assert_eq!(run(vec![PushFloat(0.0), ToBool]), vec![b(false)]);
+        assert_eq!(run(vec![PushFloat(1.0), ToBool]), vec![b(true)]);
+        assert_eq!(run(vec![PushNull, ToBool]), vec![b(false)]);
+        assert_eq!(run_heap(vec![PushPtr(0), ToBool], &[""]), vec![b(false)]);
         assert_eq!(run(vec![ArrNew(0), ToBool]), vec![b(true)]); // [] is truthy
     }
 
     #[test]
     fn to_str_instruction() {
-        assert_eq!(run_last_str(vec![Push(n(5.0)), ToStr], &[]), "5");
-        assert_eq!(run_last_str(vec![Push(n(1.5)), ToStr], &[]), "1.5");
-        assert_eq!(run_last_str(vec![Push(i(-3)), ToStr], &[]), "-3");
-        assert_eq!(run_last_str(vec![Push(null()), ToStr], &[]), "null");
-        assert_eq!(run_last_str(vec![Push(undef()), ToStr], &[]), "undefined");
-        assert_eq!(run_last_str(vec![Push(b(true)), ToStr], &[]), "true");
+        assert_eq!(run_last_str(vec![PushFloat(5.0), ToStr], &[]), "5");
+        assert_eq!(run_last_str(vec![PushFloat(1.5), ToStr], &[]), "1.5");
+        assert_eq!(run_last_str(vec![PushNegInt(-3), ToStr], &[]), "-3");
+        assert_eq!(run_last_str(vec![PushNull, ToStr], &[]), "null");
+        assert_eq!(run_last_str(vec![PushUndefined, ToStr], &[]), "undefined");
+        assert_eq!(run_last_str(vec![PushBool(true), ToStr], &[]), "true");
         // NaN / Infinity get JS spellings.
-        assert_eq!(run_last_str(vec![Push(n(f64::NAN)), ToStr], &[]), "NaN");
+        assert_eq!(run_last_str(vec![PushFloat(f64::NAN), ToStr], &[]), "NaN");
         assert_eq!(
-            run_last_str(vec![Push(n(f64::INFINITY)), ToStr], &[]),
+            run_last_str(vec![PushFloat(f64::INFINITY), ToStr], &[]),
             "Infinity"
         );
         // Array -> join(","), object -> "[object Object]".
         assert_eq!(
-            run_last_str(vec![Push(n(1.0)), Push(n(2.0)), ArrNew(2), ToStr], &[]),
+            run_last_str(vec![PushFloat(1.0), PushFloat(2.0), ArrNew(2), ToStr], &[]),
             "1,2"
         );
         assert_eq!(
-            run_last_str(vec![Push(n(1.0)), ObjNew(vec!["a".into()]), ToStr], &[]),
+            run_last_str(vec![PushFloat(1.0), ObjNew(vec!["a".into()].into()), ToStr], &[]),
             "[object Object]"
         );
     }
@@ -2719,50 +2751,50 @@ mod tests {
 
     #[test]
     fn eq_neq() {
-        assert_eq!(run(vec![Push(n(1.0)), Push(n(1.0)), Eq]), vec![b(true)]);
-        assert_eq!(run(vec![Push(n(1.0)), Push(n(2.0)), Eq]), vec![b(false)]);
-        assert_eq!(run(vec![Push(n(1.0)), Push(n(2.0)), Neq]), vec![b(true)]);
+        assert_eq!(run(vec![PushFloat(1.0), PushFloat(1.0), Eq]), vec![b(true)]);
+        assert_eq!(run(vec![PushFloat(1.0), PushFloat(2.0), Eq]), vec![b(false)]);
+        assert_eq!(run(vec![PushFloat(1.0), PushFloat(2.0), Neq]), vec![b(true)]);
         // NaN != NaN
         assert_eq!(
-            run(vec![Push(n(f64::NAN)), Push(n(f64::NAN)), Eq]),
+            run(vec![PushFloat(f64::NAN), PushFloat(f64::NAN), Eq]),
             vec![b(false)]
         );
         // different types are not equal
-        assert_eq!(run(vec![Push(n(0.0)), Push(null()), Eq]), vec![b(false)]);
+        assert_eq!(run(vec![PushFloat(0.0), PushNull, Eq]), vec![b(false)]);
     }
 
     #[test]
     fn loose_eq_nullish() {
         // null == undefined (and reflexively), but neither == anything else.
         assert_eq!(
-            run(vec![Push(null()), Push(undef()), LooseEq]),
+            run(vec![PushNull, PushUndefined, LooseEq]),
             vec![b(true)]
         );
         assert_eq!(
-            run(vec![Push(undef()), Push(null()), LooseEq]),
+            run(vec![PushUndefined, PushNull, LooseEq]),
             vec![b(true)]
         );
         assert_eq!(
-            run(vec![Push(null()), Push(null()), LooseEq]),
+            run(vec![PushNull, PushNull, LooseEq]),
             vec![b(true)]
         );
         assert_eq!(
-            run(vec![Push(null()), Push(n(0.0)), LooseEq]),
+            run(vec![PushNull, PushFloat(0.0), LooseEq]),
             vec![b(false)]
         );
         assert_eq!(
-            run(vec![Push(undef()), Push(b(false)), LooseEq]),
+            run(vec![PushUndefined, PushBool(false), LooseEq]),
             vec![b(false)]
         );
         // strict still distinguishes them
-        assert_eq!(run(vec![Push(null()), Push(undef()), Eq]), vec![b(false)]);
+        assert_eq!(run(vec![PushNull, PushUndefined, Eq]), vec![b(false)]);
         // LooseNeq is the negation
         assert_eq!(
-            run(vec![Push(null()), Push(undef()), LooseNeq]),
+            run(vec![PushNull, PushUndefined, LooseNeq]),
             vec![b(false)]
         );
         assert_eq!(
-            run(vec![Push(null()), Push(n(0.0)), LooseNeq]),
+            run(vec![PushNull, PushFloat(0.0), LooseNeq]),
             vec![b(true)]
         );
     }
@@ -2771,15 +2803,15 @@ mod tests {
     fn loose_eq_boolean_coercion() {
         // booleans coerce to 0/1.
         assert_eq!(
-            run(vec![Push(b(true)), Push(n(1.0)), LooseEq]),
+            run(vec![PushBool(true), PushFloat(1.0), LooseEq]),
             vec![b(true)]
         );
         assert_eq!(
-            run(vec![Push(b(false)), Push(n(0.0)), LooseEq]),
+            run(vec![PushBool(false), PushFloat(0.0), LooseEq]),
             vec![b(true)]
         );
         assert_eq!(
-            run(vec![Push(b(true)), Push(n(2.0)), LooseEq]),
+            run(vec![PushBool(true), PushFloat(2.0), LooseEq]),
             vec![b(false)]
         );
     }
@@ -2790,32 +2822,32 @@ mod tests {
         let strings = ["1", "", "abc", "1.5"];
         // 1 == "1"
         assert_eq!(
-            run_heap(vec![Push(n(1.0)), Push(s(0)), LooseEq], &strings),
+            run_heap(vec![PushFloat(1.0), PushPtr(0), LooseEq], &strings),
             vec![b(true)]
         );
         // "1" == 1 (other order)
         assert_eq!(
-            run_heap(vec![Push(s(0)), Push(n(1.0)), LooseEq], &strings),
+            run_heap(vec![PushPtr(0), PushFloat(1.0), LooseEq], &strings),
             vec![b(true)]
         );
         // 0 == "" (empty string ToNumber is 0)
         assert_eq!(
-            run_heap(vec![Push(n(0.0)), Push(s(1)), LooseEq], &strings),
+            run_heap(vec![PushFloat(0.0), PushPtr(1), LooseEq], &strings),
             vec![b(true)]
         );
         // false == "" via double coercion
         assert_eq!(
-            run_heap(vec![Push(b(false)), Push(s(1)), LooseEq], &strings),
+            run_heap(vec![PushBool(false), PushPtr(1), LooseEq], &strings),
             vec![b(true)]
         );
         // 1 == "abc" -> NaN -> false
         assert_eq!(
-            run_heap(vec![Push(n(1.0)), Push(s(2)), LooseEq], &strings),
+            run_heap(vec![PushFloat(1.0), PushPtr(2), LooseEq], &strings),
             vec![b(false)]
         );
         // 1.5 == "1.5"
         assert_eq!(
-            run_heap(vec![Push(n(1.5)), Push(s(3)), LooseEq], &strings),
+            run_heap(vec![PushFloat(1.5), PushPtr(3), LooseEq], &strings),
             vec![b(true)]
         );
     }
@@ -2824,7 +2856,7 @@ mod tests {
     fn loose_eq_strings_not_coerced_to_each_other() {
         // Two strings still compare as strings (no numeric coercion): "1" vs "1.0".
         assert_eq!(
-            run_heap(vec![Push(s(0)), Push(s(1)), LooseEq], &["1", "1.0"]),
+            run_heap(vec![PushPtr(0), PushPtr(1), LooseEq], &["1", "1.0"]),
             vec![b(false)]
         );
     }
@@ -2833,7 +2865,7 @@ mod tests {
     fn loose_eq_object_vs_primitive_not_coerced() {
         // Documented divergence: [5] == 5 is false here (true in JS).
         assert_eq!(
-            run(vec![Push(n(5.0)), ArrNew(1), Push(n(5.0)), LooseEq]),
+            run(vec![PushFloat(5.0), ArrNew(1), PushFloat(5.0), LooseEq]),
             vec![b(false)]
         );
     }
@@ -2841,7 +2873,7 @@ mod tests {
     #[test]
     fn string_eq() {
         // heap[0]="abc", heap[1]="abc", heap[2]="xyz"
-        let code = vec![Push(s(0)), Push(s(1)), Eq, Push(s(0)), Push(s(2)), Eq];
+        let code = vec![PushPtr(0), PushPtr(1), Eq, PushPtr(0), PushPtr(2), Eq];
         let mut vm = VM::new(code);
         vm.heap.push(HeapValue::String("abc".into()));
         vm.heap.push(HeapValue::String("abc".into()));
@@ -2858,27 +2890,27 @@ mod tests {
     #[test]
     fn ordering() {
         // Numbers
-        assert_eq!(run(vec![Push(n(1.0)), Push(n(2.0)), Lt]), vec![b(true)]);
-        assert_eq!(run(vec![Push(n(2.0)), Push(n(1.0)), Gt]), vec![b(true)]);
-        assert_eq!(run(vec![Push(n(2.0)), Push(n(2.0)), LtEq]), vec![b(true)]);
-        assert_eq!(run(vec![Push(n(2.0)), Push(n(2.0)), GtEq]), vec![b(true)]);
+        assert_eq!(run(vec![PushFloat(1.0), PushFloat(2.0), Lt]), vec![b(true)]);
+        assert_eq!(run(vec![PushFloat(2.0), PushFloat(1.0), Gt]), vec![b(true)]);
+        assert_eq!(run(vec![PushFloat(2.0), PushFloat(2.0), LtEq]), vec![b(true)]);
+        assert_eq!(run(vec![PushFloat(2.0), PushFloat(2.0), GtEq]), vec![b(true)]);
         // Incomparable types → false
-        assert_eq!(run(vec![Push(n(1.0)), Push(null()), Lt]), vec![b(false)]);
+        assert_eq!(run(vec![PushFloat(1.0), PushNull, Lt]), vec![b(false)]);
     }
 
     #[test]
     fn and_or() {
         // truthy && rhs → rhs
-        assert_eq!(run(vec![Push(b(true)), Push(n(42.0)), And]), vec![n(42.0)]);
+        assert_eq!(run(vec![PushBool(true), PushFloat(42.0), And]), vec![n(42.0)]);
         // falsy && rhs → falsy
         assert_eq!(
-            run(vec![Push(b(false)), Push(n(42.0)), And]),
+            run(vec![PushBool(false), PushFloat(42.0), And]),
             vec![b(false)]
         );
         // truthy || rhs → truthy
-        assert_eq!(run(vec![Push(n(42.0)), Push(b(false)), Or]), vec![n(42.0)]);
+        assert_eq!(run(vec![PushFloat(42.0), PushBool(false), Or]), vec![n(42.0)]);
         // falsy || rhs → rhs
-        assert_eq!(run(vec![Push(null()), Push(n(99.0)), Or]), vec![n(99.0)]);
+        assert_eq!(run(vec![PushNull, PushFloat(99.0), Or]), vec![n(99.0)]);
     }
 
     // ── bitwise ops ───────────────────────────────────────────────
@@ -2886,19 +2918,19 @@ mod tests {
     #[test]
     fn bitwise() {
         assert_eq!(
-            run(vec![Push(n(10.0)), Push(n(12.0)), BitAnd]),
+            run(vec![PushFloat(10.0), PushFloat(12.0), BitAnd]),
             vec![n(8.0)] // 0b1010 & 0b1100 = 0b1000
         );
         assert_eq!(
-            run(vec![Push(n(10.0)), Push(n(12.0)), BitOr]),
+            run(vec![PushFloat(10.0), PushFloat(12.0), BitOr]),
             vec![n(14.0)] // 0b1010 | 0b1100 = 0b1110
         );
         assert_eq!(
-            run(vec![Push(n(10.0)), Push(n(12.0)), BitXor]),
+            run(vec![PushFloat(10.0), PushFloat(12.0), BitXor]),
             vec![n(6.0)] // 0b1010 ^ 0b1100 = 0b0110
         );
-        assert_eq!(run(vec![Push(n(1.0)), Push(n(3.0)), BitLhs]), vec![n(8.0)]);
-        assert_eq!(run(vec![Push(n(8.0)), Push(n(2.0)), BitRhs]), vec![n(2.0)]);
+        assert_eq!(run(vec![PushFloat(1.0), PushFloat(3.0), BitLhs]), vec![n(8.0)]);
+        assert_eq!(run(vec![PushFloat(8.0), PushFloat(2.0), BitRhs]), vec![n(2.0)]);
     }
 
     // ── control flow ──────────────────────────────────────────────
@@ -2907,25 +2939,25 @@ mod tests {
     fn jump_and_jfalse() {
         // Jump over a Push: should only leave n(1.0) on stack
         assert_eq!(
-            run(vec![Push(n(1.0)), Jump(3), Push(n(999.0))]),
+            run(vec![PushFloat(1.0), Jump(3), PushFloat(999.0)]),
             vec![n(1.0)]
         );
         // JFalse with false → jump over Push
-        assert_eq!(run(vec![Push(b(false)), JFalse(3), Push(n(999.0))]), vec![]);
+        assert_eq!(run(vec![PushBool(false), JFalse(3), PushFloat(999.0)]), vec![]);
         // JFalse with true → don't jump, execute Push
         assert_eq!(
-            run(vec![Push(b(true)), JFalse(3), Push(n(42.0))]),
+            run(vec![PushBool(true), JFalse(3), PushFloat(42.0)]),
             vec![n(42.0)]
         );
         // Null is falsy
-        assert_eq!(run(vec![Push(null()), JFalse(3), Push(n(999.0))]), vec![]);
+        assert_eq!(run(vec![PushNull, JFalse(3), PushFloat(999.0)]), vec![]);
     }
 
     #[test]
     fn label_noop() {
         // Label should be a no-op at runtime
         assert_eq!(
-            run(vec![Push(n(1.0)), Label(42), Push(n(2.0))]),
+            run(vec![PushFloat(1.0), Label(42), PushFloat(2.0)]),
             vec![n(1.0), n(2.0)]
         );
     }
@@ -2946,8 +2978,8 @@ mod tests {
         // [7] Return(1)  -- fn: return 1 value
         assert_eq!(
             run(vec![
-                Push(n(10.0)),
-                Push(n(20.0)),
+                PushFloat(10.0),
+                PushFloat(20.0),
                 Call(4, 2),
                 Return(1),
                 Local(0),
@@ -2965,8 +2997,8 @@ mod tests {
         // Push 10 then 3 -> arg0=10, arg1=3 -> 10 - 3 = 7.
         assert_eq!(
             run(vec![
-                Push(n(10.0)),
-                Push(n(3.0)),
+                PushFloat(10.0),
+                PushFloat(3.0),
                 Call(4, 2),
                 Return(1),
                 Local(0),
@@ -2993,9 +3025,9 @@ mod tests {
         // [8] Return(1)
         assert_eq!(
             run(vec![
-                Push(n(10.0)),
-                Push(n(3.0)),
-                Push(f(5)),
+                PushFloat(10.0),
+                PushFloat(3.0),
+                PushFn(5),
                 CallDyn(2),
                 Return(1),
                 Local(0),
@@ -3010,7 +3042,7 @@ mod tests {
     #[test]
     fn call_dyn_requires_fn() {
         // Top of stack must be a Fn, not some other value.
-        let code = vec![Push(n(1.0)), Push(n(2.0)), CallDyn(1)];
+        let code = vec![PushFloat(1.0), PushFloat(2.0), CallDyn(1)];
         assert!(matches!(run_err(code), VMError::TypeError));
     }
 
@@ -3020,10 +3052,10 @@ mod tests {
         // [0..2] push args, [3] callable, [4] CallDyn(3), [5] Return(1)
         // [6] Arguments (fn body), [7] Return(1)
         let mut vm = VM::new(vec![
-            Push(n(10.0)),
-            Push(n(20.0)),
-            Push(n(30.0)),
-            Push(f(6)),
+            PushFloat(10.0),
+            PushFloat(20.0),
+            PushFloat(30.0),
+            PushFn(6),
             CallDyn(3),
             Return(1),
             Arguments,
@@ -3044,8 +3076,8 @@ mod tests {
         // Two `Arguments` in the same frame yield the SAME heap pointer (the
         // per-frame cache), so `Eq` (reference equality for arrays) is true.
         let out = run(vec![
-            Push(n(1.0)),
-            Push(f(4)),
+            PushFloat(1.0),
+            PushFn(4),
             CallDyn(1),
             Return(1),
             Arguments, // fn body: build (and cache)
@@ -3058,15 +3090,15 @@ mod tests {
 
     #[test]
     fn call_dyn_bad_addr() {
-        let code = vec![Push(f(999)), CallDyn(0)];
+        let code = vec![PushFn(999), CallDyn(0)];
         assert!(matches!(run_err(code), VMError::BadCall));
     }
 
     #[test]
     fn fn_value_equality_and_json() {
         // Same address -> equal; different -> not.
-        assert_eq!(run(vec![Push(f(3)), Push(f(3)), Eq]), vec![b(true)]);
-        assert_eq!(run(vec![Push(f(3)), Push(f(4)), Eq]), vec![b(false)]);
+        assert_eq!(run(vec![PushFn(3), PushFn(3), Eq]), vec![b(true)]);
+        assert_eq!(run(vec![PushFn(3), PushFn(4), Eq]), vec![b(false)]);
     }
 
     // ── closures ──────────────────────────────────────────────────
@@ -3076,22 +3108,22 @@ mod tests {
     /// returns `count`. Returns makeCounter's code address.
     fn append_counter(code: &mut Vec<Instr>) -> u32 {
         let mc = code.len() as u32;
-        code.push(EnterFrame(0, false, vec![SlotKind::Boxed])); // slot 0 = count (by-ref)
-        code.push(Push(n(0.0)));
+        code.push(EnterFrame(0, false, vec![SlotKind::Boxed].into())); // slot 0 = count (by-ref)
+        code.push(PushFloat(0.0));
         code.push(SetLocal(0)); // count = 0 (writes through the cell)
         let mk = code.len();
-        code.push(MakeClosure(0, vec![0])); // patched: capture count
+        code.push(MakeClosure(0, vec![0].into())); // patched: capture count
         code.push(Return(1));
         let inner = code.len() as u32;
         // 0 params, 1 upval → EnterFrame installs the captured cell at slot 0.
-        code.push(EnterFrame(0, false, vec![]));
+        code.push(EnterFrame(0, false, vec![].into()));
         code.push(Local(0)); // count  (slot 0 = captured upval)
-        code.push(Push(n(1.0)));
+        code.push(PushFloat(1.0));
         code.push(Add);
         code.push(SetLocal(0)); // count = count + 1 (through the shared cell)
         code.push(Local(0));
         code.push(Return(1)); // return count
-        code[mk] = MakeClosure(inner, vec![0]);
+        code[mk] = MakeClosure(inner, vec![0].into());
         mc
     }
 
@@ -3130,7 +3162,7 @@ mod tests {
         // Two makeCounter() results must not share state: c1(), c1(), c2()
         // → [1, 2, 1].
         let mut code: Vec<Instr> = Vec::new();
-        code.push(EnterFrame(0, false, plain(2))); // local 0 = c1, local 1 = c2
+        code.push(EnterFrame(0, false, plain(2).into())); // local 0 = c1, local 1 = c2
         let call1 = code.len();
         code.push(Call(0, 0));
         code.push(SetLocal(0));
@@ -3155,7 +3187,7 @@ mod tests {
         };
         assert_eq!(
             vm.heap[p as usize],
-            HeapValue::Array(vec![n(1.0), n(2.0), n(1.0)])
+            HeapValue::Array(vec![n(1.0), n(2.0), n(1.0)].into())
         );
     }
 
@@ -3171,20 +3203,20 @@ mod tests {
         code.push(Return(1));
         // maker
         let maker = code.len() as u32;
-        code.push(EnterFrame(0, false, plain(1))); // slot 0 = x (NOT boxed)
-        code.push(Push(n(5.0)));
+        code.push(EnterFrame(0, false, plain(1).into())); // slot 0 = x (NOT boxed)
+        code.push(PushFloat(5.0));
         code.push(SetLocal(0));
         let mk = code.len();
-        code.push(MakeClosure(0, vec![0])); // snapshot x = 5
-        code.push(Push(n(99.0)));
+        code.push(MakeClosure(0, vec![0].into())); // snapshot x = 5
+        code.push(PushFloat(99.0));
         code.push(SetLocal(0)); // x = 99 AFTER capture (must not be seen)
         code.push(Return(1));
         let inner = code.len() as u32;
-        code.push(EnterFrame(0, false, vec![])); // install the by-value upval at slot 0
+        code.push(EnterFrame(0, false, vec![].into())); // install the by-value upval at slot 0
         code.push(Local(0)); // return captured snapshot
         code.push(Return(1));
         code[call] = Call(maker, 0);
-        code[mk] = MakeClosure(inner, vec![0]);
+        code[mk] = MakeClosure(inner, vec![0].into());
         assert_eq!(run(code), vec![n(5.0)]);
     }
 
@@ -3194,44 +3226,44 @@ mod tests {
         // other's writes. setter(42) then getter() → 42.
         let mut code: Vec<Instr> = Vec::new();
         // main: arr = maker(); setter = arr[1]; setter(42); getter = arr[0]; getter()
-        code.push(EnterFrame(0, false, plain(1))); // local 0 = [getter, setter]
+        code.push(EnterFrame(0, false, plain(1).into())); // local 0 = [getter, setter]
         let call = code.len();
         code.push(Call(0, 0));
         code.push(SetLocal(0));
-        code.push(Push(n(42.0))); // setter's arg
+        code.push(PushFloat(42.0)); // setter's arg
         code.push(Local(0));
-        code.push(Push(n(1.0)));
+        code.push(PushFloat(1.0));
         code.push(IndexGet); // setter
         code.push(CallDyn(1)); // setter(42) → (no result)
         code.push(Local(0));
-        code.push(Push(n(0.0)));
+        code.push(PushFloat(0.0));
         code.push(IndexGet); // getter
         code.push(CallDyn(0)); // getter() → 42
         code.push(Return(1));
         // maker
         let maker = code.len() as u32;
-        code.push(EnterFrame(0, false, vec![SlotKind::Boxed])); // slot 0 = x (by-ref)
-        code.push(Push(n(0.0)));
+        code.push(EnterFrame(0, false, vec![SlotKind::Boxed].into())); // slot 0 = x (by-ref)
+        code.push(PushFloat(0.0));
         code.push(SetLocal(0));
         let mk_get = code.len();
-        code.push(MakeClosure(0, vec![0]));
+        code.push(MakeClosure(0, vec![0].into()));
         let mk_set = code.len();
-        code.push(MakeClosure(0, vec![0]));
+        code.push(MakeClosure(0, vec![0].into()));
         code.push(ArrNew(2)); // [getter, setter]
         code.push(Return(1));
         let getter = code.len() as u32;
-        code.push(EnterFrame(0, false, vec![])); // upval x at slot 0
+        code.push(EnterFrame(0, false, vec![].into())); // upval x at slot 0
         code.push(Local(0));
         code.push(Return(1));
         let setter = code.len() as u32;
         // 1 param (slot 0) + 1 upval x (slot 1): write the param into x's cell.
-        code.push(EnterFrame(1, false, vec![]));
+        code.push(EnterFrame(1, false, vec![].into()));
         code.push(Local(0)); // the arg
         code.push(SetLocal(1)); // x = arg (through the shared cell)
         code.push(Return(0));
         code[call] = Call(maker, 0);
-        code[mk_get] = MakeClosure(getter, vec![0]);
-        code[mk_set] = MakeClosure(setter, vec![0]);
+        code[mk_get] = MakeClosure(getter, vec![0].into());
+        code[mk_set] = MakeClosure(setter, vec![0].into());
         assert_eq!(run(code), vec![n(42.0)]);
     }
 
@@ -3247,25 +3279,25 @@ mod tests {
         code.push(CallDyn(0)); // → 7
         code.push(Return(1));
         let outer = code.len() as u32;
-        code.push(EnterFrame(0, false, vec![SlotKind::Boxed]));
-        code.push(Push(n(7.0)));
+        code.push(EnterFrame(0, false, vec![SlotKind::Boxed].into()));
+        code.push(PushFloat(7.0));
         code.push(SetLocal(0));
         let mk_mid = code.len();
-        code.push(MakeClosure(0, vec![0]));
+        code.push(MakeClosure(0, vec![0].into()));
         code.push(Return(1));
         let middle = code.len() as u32;
         // middle's slot 0 is x (installed upval); forward it to inner.
-        code.push(EnterFrame(0, false, vec![]));
+        code.push(EnterFrame(0, false, vec![].into()));
         let mk_in = code.len();
-        code.push(MakeClosure(0, vec![0]));
+        code.push(MakeClosure(0, vec![0].into()));
         code.push(Return(1));
         let inner = code.len() as u32;
-        code.push(EnterFrame(0, false, vec![]));
+        code.push(EnterFrame(0, false, vec![].into()));
         code.push(Local(0));
         code.push(Return(1));
         code[call] = Call(outer, 0);
-        code[mk_mid] = MakeClosure(middle, vec![0]);
-        code[mk_in] = MakeClosure(inner, vec![0]);
+        code[mk_mid] = MakeClosure(middle, vec![0].into());
+        code[mk_in] = MakeClosure(inner, vec![0].into());
         assert_eq!(run(code), vec![n(7.0)]);
     }
 
@@ -3273,10 +3305,10 @@ mod tests {
     fn closure_identity_equality() {
         // The same closure object equals itself (reference identity)…
         let same = vec![
-            EnterFrame(0, false, vec![SlotKind::Boxed]),
-            Push(n(1.0)),
+            EnterFrame(0, false, vec![SlotKind::Boxed].into()),
+            PushFloat(1.0),
             SetLocal(0),
-            MakeClosure(6, vec![0]),
+            MakeClosure(6, vec![0].into()),
             Dup,
             Eq,
             Return(1), // addr 6: also a valid (never-called) closure target
@@ -3284,11 +3316,11 @@ mod tests {
         assert_eq!(run(same), vec![b(true)]);
         // …but two distinct closure objects do not (no content equality).
         let distinct = vec![
-            EnterFrame(0, false, vec![SlotKind::Boxed]),
-            Push(n(1.0)),
+            EnterFrame(0, false, vec![SlotKind::Boxed].into()),
+            PushFloat(1.0),
             SetLocal(0),
-            MakeClosure(7, vec![0]),
-            MakeClosure(7, vec![0]),
+            MakeClosure(7, vec![0].into()),
+            MakeClosure(7, vec![0].into()),
             Eq,
             Return(1),
             Return(1), // addr 7
@@ -3302,8 +3334,8 @@ mod tests {
         let code = vec![
             Call(2, 0),
             Return(0),
-            EnterFrame(0, false, plain(1)),
-            MakeClosure(0, vec![5]), // only slot 0 exists
+            EnterFrame(0, false, plain(1).into()),
+            MakeClosure(0, vec![5].into()), // only slot 0 exists
             Return(1),
         ];
         assert!(matches!(run_err(code), VMError::BadLocal));
@@ -3330,11 +3362,11 @@ mod tests {
         // [10] Return(1)
         assert_eq!(
             run(vec![
-                Push(n(7.0)),
-                Push(n(8.0)),
+                PushFloat(7.0),
+                PushFloat(8.0),
                 Call(4, 2),
                 Return(1),
-                EnterFrame(2, false, plain(1)),
+                EnterFrame(2, false, plain(1).into()),
                 Local(0),
                 Local(1),
                 Add,
@@ -3352,7 +3384,7 @@ mod tests {
     fn local_oob() {
         // Called with one arg (→ local 0); reading local 1 is out of range.
         let code = vec![
-            Push(n(1.0)),
+            PushFloat(1.0),
             Call(3, 1),
             Return(0),
             Local(1), // only local 0 (the arg) exists
@@ -3372,9 +3404,9 @@ mod tests {
     fn arr_new_and_length() {
         assert_eq!(
             run(vec![
-                Push(n(1.0)),
-                Push(n(2.0)),
-                Push(n(3.0)),
+                PushFloat(1.0),
+                PushFloat(2.0),
+                PushFloat(3.0),
                 ArrNew(3),
                 ArrLength
             ]),
@@ -3386,12 +3418,12 @@ mod tests {
     fn arr_get_set() {
         // Create [10, 20, 30], set arr[1] = 99, read it back.
         let code = vec![
-            Push(n(10.0)),
-            Push(n(20.0)),
-            Push(n(30.0)),
+            PushFloat(10.0),
+            PushFloat(20.0),
+            PushFloat(30.0),
             ArrNew(3),
-            Push(n(1.0)),           // index
-            Push(n(99.0)),          // value
+            PushFloat(1.0),           // index
+            PushFloat(99.0),          // value
             IndexSet(SetMode::New), // pops value, index, arr_ptr; leaves the value
         ];
         // IndexSet leaves the assigned value (assignment is an expression).
@@ -3402,16 +3434,16 @@ mod tests {
     fn arr_get_set_with_dup() {
         // Keep ptr around with Dup before mutation.
         let code = vec![
-            Push(n(10.0)),
-            Push(n(20.0)),
-            Push(n(30.0)),
+            PushFloat(10.0),
+            PushFloat(20.0),
+            PushFloat(30.0),
             ArrNew(3),
             Dup,                    // save ptr for later
-            Push(n(1.0)),           // index
-            Push(n(99.0)),          // value
+            PushFloat(1.0),           // index
+            PushFloat(99.0),          // value
             IndexSet(SetMode::New), // pops value, index, ptr_copy; leaves value → [ptr, 99]
             Pop(1),                 // drop the assigned-value result → [ptr]
-            Push(n(1.0)),           // index
+            PushFloat(1.0),           // index
             IndexGet,               // pops index, ptr → pushes arr[1]
         ];
         assert_eq!(run(code), vec![n(99.0)]);
@@ -3420,9 +3452,9 @@ mod tests {
     #[test]
     fn arr_get_oob() {
         let code = vec![
-            Push(n(10.0)),
+            PushFloat(10.0),
             ArrNew(1),
-            Push(n(5.0)), // index 5, out of bounds
+            PushFloat(5.0), // index 5, out of bounds
             IndexGet,     // JS: out-of-bounds reads as undefined
         ];
         assert_eq!(run(code), vec![undef()]);
@@ -3431,10 +3463,10 @@ mod tests {
     #[test]
     fn arr_set_oob() {
         let code = vec![
-            Push(n(10.0)),
+            PushFloat(10.0),
             ArrNew(1),
-            Push(n(5.0)),           // index
-            Push(n(99.0)),          // value
+            PushFloat(5.0),           // index
+            PushFloat(99.0),          // value
             IndexSet(SetMode::New), // pops: value, index, arr_ptr
         ];
         assert!(matches!(run_err(code), VMError::ValueError));
@@ -3447,13 +3479,13 @@ mod tests {
         // Left-to-right: fields ["a","b"], values pushed in field order.
         // Push a-val (20), push b-val (10) → a=20, b=10
         let mut vm = VM::new(vec![
-            Push(n(20.0)), // "a" value (first field, pushed first)
-            Push(n(10.0)), // "b" value (second field)
-            ObjNew(vec!["a".into(), "b".into()]),
-            Push(s(0)), // field "a" (heap[0]="a")
+            PushFloat(20.0), // "a" value (first field, pushed first)
+            PushFloat(10.0), // "b" value (second field)
+            ObjNew(vec!["a".into(), "b".into()].into()),
+            PushPtr(0), // field "a" (heap[0]="a")
             IndexGet,   // pops key, obj_ptr → pushes obj["a"]
         ]);
-        vm.alloc_string("a".to_string());
+        vm.alloc_string("a".into());
         loop {
             match vm.step().unwrap() {
                 StepResult::Done => break,
@@ -3468,13 +3500,13 @@ mod tests {
     fn obj_get_set_dynamic() {
         // Computed get via IndexGet with a heap-allocated string key.
         let mut vm = VM::new(vec![
-            Push(n(1.0)),
-            Push(n(2.0)),
-            ObjNew(vec!["x".into(), "y".into()]), // x=1, y=2
-            Push(s(0)),                           // field "x" (heap[0]="x")
+            PushFloat(1.0),
+            PushFloat(2.0),
+            ObjNew(vec!["x".into(), "y".into()].into()), // x=1, y=2
+            PushPtr(0),                           // field "x" (heap[0]="x")
             IndexGet,                             // → 1
         ]);
-        vm.alloc_string("x".to_string());
+        vm.alloc_string("x".into());
         loop {
             match vm.step().unwrap() {
                 StepResult::Done => break,
@@ -3485,17 +3517,17 @@ mod tests {
 
         // Computed set via IndexSet: set a field, verify with ObjGet.
         let mut vm = VM::new(vec![
-            Push(n(1.0)),
-            Push(n(2.0)),
-            ObjNew(vec!["x".into(), "y".into()]), // x=1, y=2
+            PushFloat(1.0),
+            PushFloat(2.0),
+            ObjNew(vec!["x".into(), "y".into()].into()), // x=1, y=2
             Dup,                                  // keep ptr for verification
-            Push(s(0)),                           // field "y" (heap[0]="y") — pushed before val
-            Push(n(99.0)),                        // val — on top
+            PushPtr(0),                           // field "y" (heap[0]="y") — pushed before val
+            PushFloat(99.0),                        // val — on top
             IndexSet(SetMode::New),               // obj.y = 99; leaves val → [ptr, 99]
             Pop(1),                               // drop the result → [ptr]
             ObjGet("y".into()),                   // → 99
         ]);
-        vm.alloc_string("y".to_string());
+        vm.alloc_string("y".into());
         loop {
             match vm.step().unwrap() {
                 StepResult::Done => break,
@@ -3510,11 +3542,11 @@ mod tests {
         // Test ObjSet (static set) and ObjGet (static get).
         // Create {x:2, y:1}, modify x=99 with ObjSet, verify with ObjGet.
         let code = vec![
-            Push(n(2.0)),                         // x value
-            Push(n(1.0)),                         // y value
-            ObjNew(vec!["x".into(), "y".into()]), // x=2, y=1
+            PushFloat(2.0),                         // x value
+            PushFloat(1.0),                         // y value
+            ObjNew(vec!["x".into(), "y".into()].into()), // x=2, y=1
             Dup,           // keep ptr for verification after ObjSet consumes one
-            Push(n(99.0)), // value to set
+            PushFloat(99.0), // value to set
             ObjSet("x".into(), SetMode::New), // obj.x = 99; leaves value → [ptr, 99]
             Pop(1),        // drop the result → [ptr]
             ObjGet("x".into()), // → 99
@@ -3525,8 +3557,8 @@ mod tests {
     #[test]
     fn obj_get_missing_key() {
         let code = vec![
-            Push(n(1.0)),
-            ObjNew(vec!["x".into()]),
+            PushFloat(1.0),
+            ObjNew(vec!["x".into()].into()),
             ObjGet("no_such_key".into()), // JS: missing key reads as undefined
         ];
         assert_eq!(run(code), vec![undef()]);
@@ -3536,26 +3568,26 @@ mod tests {
 
     #[test]
     fn undefined_is_falsy() {
-        assert_eq!(run(vec![Push(undef()), Not]), vec![b(true)]);
+        assert_eq!(run(vec![PushUndefined, Not]), vec![b(true)]);
         // Branches like null: JFalse on undefined takes the jump.
-        assert_eq!(run(vec![Push(undef()), JFalse(3), Push(n(9.0))]), vec![]);
+        assert_eq!(run(vec![PushUndefined, JFalse(3), PushFloat(9.0)]), vec![]);
     }
 
     #[test]
     fn undefined_strict_equality() {
         // undefined === undefined, but undefined !== null (Eq is strict ===).
-        assert_eq!(run(vec![Push(undef()), Push(undef()), Eq]), vec![b(true)]);
-        assert_eq!(run(vec![Push(undef()), Push(null()), Eq]), vec![b(false)]);
-        assert_eq!(run(vec![Push(null()), Push(undef()), Neq]), vec![b(true)]);
+        assert_eq!(run(vec![PushUndefined, PushUndefined, Eq]), vec![b(true)]);
+        assert_eq!(run(vec![PushUndefined, PushNull, Eq]), vec![b(false)]);
+        assert_eq!(run(vec![PushNull, PushUndefined, Neq]), vec![b(true)]);
     }
 
     #[test]
     fn undefined_is_not_comparable() {
         // Relational ops on undefined are all false (compare() yields None),
         // matching JS `undefined < 1 === false`, `undefined >= undefined === false`.
-        assert_eq!(run(vec![Push(undef()), Push(n(1.0)), Lt]), vec![b(false)]);
+        assert_eq!(run(vec![PushUndefined, PushFloat(1.0), Lt]), vec![b(false)]);
         assert_eq!(
-            run(vec![Push(undef()), Push(undef()), GtEq]),
+            run(vec![PushUndefined, PushUndefined, GtEq]),
             vec![b(false)]
         );
     }
@@ -3564,7 +3596,7 @@ mod tests {
     fn uninitialized_local_is_undefined() {
         // `let x;` then read x -> undefined.
         let code = vec![
-            EnterFrame(0, false, vec![SlotKind::Plain]),
+            EnterFrame(0, false, vec![SlotKind::Plain].into()),
             Local(0),
             Return(1),
         ];
@@ -3583,7 +3615,17 @@ mod tests {
             (f(0), "function"),
         ];
         for (val, tag) in cases {
-            let out = run_heap(vec![Push(*val), TypeOf, Push(s(0)), Eq], &[tag]);
+            let instr = match val {
+                StackValue::Undefined => PushUndefined,
+                StackValue::Null => PushNull,
+                StackValue::Bool(b) => PushBool(*b),
+                StackValue::Number(f) => PushFloat(*f),
+                StackValue::PosInt(u) => PushPosInt(*u),
+                StackValue::NegInt(i) => PushNegInt(*i),
+                StackValue::Fn(a) => PushFn(*a),
+                _ => panic!("unexpected stack value"),
+            };
+            let out = run_heap(vec![instr, TypeOf, PushPtr(0), Eq], &[tag]);
             assert_eq!(out, vec![b(true)], "typeof {val:?} should be {tag:?}");
         }
     }
@@ -3591,19 +3633,19 @@ mod tests {
     #[test]
     fn typeof_heap_values() {
         // string -> "string", array/object -> "object", closure -> "function".
-        let str_tag = run_heap(vec![Push(s(0)), TypeOf, Push(s(1)), Eq], &["hi", "string"]);
+        let str_tag = run_heap(vec![PushPtr(0), TypeOf, PushPtr(1), Eq], &["hi", "string"]);
         assert_eq!(str_tag, vec![b(true)]);
         let arr_tag = run_heap(
-            vec![Push(n(1.0)), ArrNew(1), TypeOf, Push(s(0)), Eq],
+            vec![PushFloat(1.0), ArrNew(1), TypeOf, PushPtr(0), Eq],
             &["object"],
         );
         assert_eq!(arr_tag, vec![b(true)]);
         let obj_tag = run_heap(
             vec![
-                Push(n(1.0)),
-                ObjNew(vec!["a".into()]),
+                PushFloat(1.0),
+                ObjNew(vec!["a".into()].into()),
                 TypeOf,
-                Push(s(0)),
+                PushPtr(0),
                 Eq,
             ],
             &["object"],
@@ -3612,11 +3654,11 @@ mod tests {
         // typeof a missing property is "undefined".
         let miss_tag = run_heap(
             vec![
-                Push(n(1.0)),
-                ObjNew(vec!["a".into()]),
+                PushFloat(1.0),
+                ObjNew(vec!["a".into()].into()),
                 ObjGet("b".into()),
                 TypeOf,
-                Push(s(0)),
+                PushPtr(0),
                 Eq,
             ],
             &["undefined"],
@@ -3629,8 +3671,8 @@ mod tests {
     #[test]
     fn invoke_yields() {
         match run_effect(vec![
-            Push(n(1.0)),
-            Push(n(2.0)),
+            PushFloat(1.0),
+            PushFloat(2.0),
             Invoke("my_tool".into(), 2),
         ]) {
             StepResult::Invoke { calls } => {
@@ -3656,8 +3698,8 @@ mod tests {
     #[test]
     fn resume_after_invoke() {
         let mut vm = VM::new(vec![
-            Push(n(10.0)),
-            Push(n(3.0)),
+            PushFloat(10.0),
+            PushFloat(3.0),
             Invoke("add".into(), 2),
             Return(1), // return the result
         ]);
@@ -3682,9 +3724,9 @@ mod tests {
         // evaluate/push all calls' args in order — call 0 (a) deepest, and
         // within a multi-arg call, arg 0 deepest. Here: a(1, 2), b(3).
         let mut vm = VM::new(vec![
-            Push(n(1.0)), // a's arg 0
-            Push(n(2.0)), // a's arg 1
-            Push(n(3.0)), // b's arg 0
+            PushFloat(1.0), // a's arg 0
+            PushFloat(2.0), // a's arg 1
+            PushFloat(3.0), // b's arg 0
             Invoke("a".into(), 2),
             Invoke("b".into(), 1),
         ]);
@@ -3712,9 +3754,9 @@ mod tests {
     fn invoke_does_not_batch_across_other_ops() {
         // A non-Invoke instruction between two Invokes breaks the batch.
         let mut vm = VM::new(vec![
-            Push(n(1.0)),
+            PushFloat(1.0),
             Invoke("a".into(), 1),
-            Push(n(2.0)),
+            PushFloat(2.0),
             Invoke("b".into(), 1),
         ]);
         match vm.step().unwrap() {
@@ -3746,7 +3788,7 @@ mod tests {
     #[test]
     fn number_signed_zero() {
         // -0.0 and +0.0 should be equal for Eq
-        assert_eq!(run(vec![Push(n(-0.0)), Push(n(0.0)), Eq]), vec![b(true)]);
+        assert_eq!(run(vec![PushFloat(-0.0), PushFloat(0.0), Eq]), vec![b(true)]);
     }
 
     // ── robustness / regression ───────────────────────────────────
@@ -3762,7 +3804,7 @@ mod tests {
 
     #[test]
     fn fuel_is_consumed_per_instruction() {
-        let mut vm = VM::new(vec![Push(n(1.0)), Push(n(2.0)), Add]);
+        let mut vm = VM::new(vec![PushFloat(1.0), PushFloat(2.0), Add]);
         let before = vm.fuel;
         loop {
             match vm.step().unwrap() {
@@ -3777,27 +3819,27 @@ mod tests {
     fn dangling_pointer_does_not_panic() {
         // A Ptr literal with no backing heap cell must error, not panic.
         assert!(matches!(
-            run_err(vec![Push(s(99)), ArrLength]),
+            run_err(vec![PushPtr(99), ArrLength]),
             VMError::ValueError
         ));
         // Type predicates stay total (false) on a dangling pointer.
-        assert_eq!(run(vec![Push(s(99)), IsStr]), vec![b(false)]);
+        assert_eq!(run(vec![PushPtr(99), IsStr]), vec![b(false)]);
         // Equality with a dangling pointer is simply not-equal, no panic.
-        assert_eq!(run(vec![Push(s(99)), Push(s(99)), Eq]), vec![b(false)]);
+        assert_eq!(run(vec![PushPtr(99), PushPtr(99), Eq]), vec![b(false)]);
     }
 
     #[test]
     fn object_array_equality_is_by_reference() {
         // JS ===: two distinct arrays/objects are never equal, even with
         // identical content.
-        let code = vec![Push(s(0)), ArrNew(1), Push(s(1)), ArrNew(1), Eq];
+        let code = vec![PushPtr(0), ArrNew(1), PushPtr(1), ArrNew(1), Eq];
         assert_eq!(run_heap(code, &["abc", "abc"]), vec![b(false)]);
         // But the SAME array (one allocation, duplicated handle) is equal.
-        let code = vec![Push(s(0)), ArrNew(1), Dup, Eq];
+        let code = vec![PushPtr(0), ArrNew(1), Dup, Eq];
         assert_eq!(run_heap(code, &["abc"]), vec![b(true)]);
         // Strings remain primitives: distinct heap strings compare by content.
         assert_eq!(
-            run_heap(vec![Push(s(0)), Push(s(1)), Eq], &["abc", "abc"]),
+            run_heap(vec![PushPtr(0), PushPtr(1), Eq], &["abc", "abc"]),
             vec![b(true)]
         );
     }
@@ -3809,10 +3851,10 @@ mod tests {
         let code = vec![
             Call(2, 0),
             Return(1), // propagate the function's result to the final stack
-            EnterFrame(0, false, plain(2)),
-            Push(n(7.0)),
+            EnterFrame(0, false, plain(2).into()),
+            PushFloat(7.0),
             SetLocal(0),
-            Push(n(8.0)),
+            PushFloat(8.0),
             SetLocal(1),
             Local(0),
             Local(1),
@@ -3825,25 +3867,25 @@ mod tests {
     #[test]
     fn bit_shift_rejects_bad_count() {
         assert!(matches!(
-            run_err(vec![Push(n(1.0)), Push(n(64.0)), BitLhs]),
+            run_err(vec![PushFloat(1.0), PushFloat(64.0), BitLhs]),
             VMError::ValueError
         ));
         assert!(matches!(
-            run_err(vec![Push(n(1.0)), Push(n(-1.0)), BitRhs]),
+            run_err(vec![PushFloat(1.0), PushFloat(-1.0), BitRhs]),
             VMError::ValueError
         ));
         // Valid shifts still work.
-        assert_eq!(run(vec![Push(n(1.0)), Push(n(3.0)), BitLhs]), vec![n(8.0)]);
+        assert_eq!(run(vec![PushFloat(1.0), PushFloat(3.0), BitLhs]), vec![n(8.0)]);
     }
 
     #[test]
     fn pop_respects_frame_floor() {
         // fn: 1 arg, 1 local, no temporaries. Pop must not steal a local.
         let code = vec![
-            Push(n(1.0)),
+            PushFloat(1.0),
             Call(3, 1),
             Return(0),
-            EnterFrame(0, false, plain(1)), // local 0; sp == frame floor
+            EnterFrame(0, false, plain(1).into()), // local 0; sp == frame floor
             Pop(1),                         // nothing above the floor -> underflow
             Return(0),
         ];
@@ -3853,10 +3895,10 @@ mod tests {
     #[test]
     fn dup_cannot_duplicate_local() {
         let code = vec![
-            Push(n(1.0)),
+            PushFloat(1.0),
             Call(3, 1),
             Return(0),
-            EnterFrame(0, false, plain(1)), // local 0; sp == floor
+            EnterFrame(0, false, plain(1).into()), // local 0; sp == floor
             Dup,                            // nothing above the floor -> underflow
             Return(0),
         ];
@@ -3868,11 +3910,11 @@ mod tests {
         // One local + one temporary: Swap needs two temporaries above the
         // floor, but only one exists.
         let code = vec![
-            Push(n(1.0)),
+            PushFloat(1.0),
             Call(3, 1),
             Return(0),
-            EnterFrame(0, false, plain(1)), // local 0
-            Push(n(9.0)),                   // single temporary
+            EnterFrame(0, false, plain(1).into()), // local 0
+            PushFloat(9.0),                   // single temporary
             Swap,                           // would swap the temp with the local -> underflow
             Return(0),
         ];
@@ -3882,12 +3924,12 @@ mod tests {
     #[test]
     fn rot_cannot_cross_frame_floor() {
         let code = vec![
-            Push(n(1.0)),
+            PushFloat(1.0),
             Call(3, 1),
             Return(0),
-            EnterFrame(0, false, plain(1)), // local 0
-            Push(n(8.0)),                   // two temporaries (need three for Rot)
-            Push(n(9.0)),
+            EnterFrame(0, false, plain(1).into()), // local 0
+            PushFloat(8.0),                   // two temporaries (need three for Rot)
+            PushFloat(9.0),
             Rot,
             Return(0),
         ];
@@ -3899,14 +3941,14 @@ mod tests {
         // Sanity: with enough temporaries above the floor, the ops succeed
         // and leave locals/args untouched.
         let code = vec![
-            Push(n(5.0)),
+            PushFloat(5.0),
             Call(3, 1),
             Return(1),
-            EnterFrame(0, false, plain(1)), // local 0
-            Push(n(10.0)),
+            EnterFrame(0, false, plain(1).into()), // local 0
+            PushFloat(10.0),
             SetLocal(0),  // local 0 = 10
-            Push(n(1.0)), // temporaries: [1, 2]
-            Push(n(2.0)),
+            PushFloat(1.0), // temporaries: [1, 2]
+            PushFloat(2.0),
             Swap,     // -> [2, 1]
             Pop(1),   // -> [2]
             Local(0), // -> [2, 10]
@@ -3922,15 +3964,15 @@ mod tests {
     fn negative_integers_are_negint_and_roundtrip() {
         // PosInt and NegInt never compare equal even at the boundary value 0
         // representations (different sign domains).
-        assert_eq!(run(vec![Push(u(5)), Push(i(-5)), Eq]), vec![b(false)]);
+        assert_eq!(run(vec![PushPosInt(5), PushNegInt(-5), Eq]), vec![b(false)]);
         // Ordering across the sign boundary is structural.
-        assert_eq!(run(vec![Push(i(-1)), Push(u(u64::MAX)), Lt]), vec![b(true)]);
+        assert_eq!(run(vec![PushNegInt(-1), PushPosInt(u64::MAX), Lt]), vec![b(true)]);
     }
 
     #[test]
     fn posint_too_large_for_index_errors() {
         // A PosInt beyond i64::MAX can't be an array index -> error, no panic.
-        let code = vec![Push(n(1.0)), ArrNew(1), Push(u(u64::MAX)), IndexGet];
+        let code = vec![PushFloat(1.0), ArrNew(1), PushPosInt(u64::MAX), IndexGet];
         assert!(matches!(run_err(code), VMError::TypeError));
     }
 
@@ -3938,33 +3980,33 @@ mod tests {
     fn int_arithmetic_degrades_to_number() {
         // The transport guarantee is identity-preservation, NOT integer math:
         // any arithmetic promotes Int -> Number(f64).
-        assert_eq!(run(vec![Push(i(2)), Push(i(3)), Add]), vec![n(5.0)]);
-        assert_eq!(run(vec![Push(i(10)), Push(n(4.0)), Sub]), vec![n(6.0)]);
-        assert_eq!(run(vec![Push(i(10)), Push(i(3)), Mod]), vec![n(1.0)]);
-        assert_eq!(run(vec![Push(i(5)), Neg]), vec![n(-5.0)]);
+        assert_eq!(run(vec![PushPosInt(2), PushPosInt(3), Add]), vec![n(5.0)]);
+        assert_eq!(run(vec![PushPosInt(10), PushFloat(4.0), Sub]), vec![n(6.0)]);
+        assert_eq!(run(vec![PushPosInt(10), PushPosInt(3), Mod]), vec![n(1.0)]);
+        assert_eq!(run(vec![PushPosInt(5), Neg]), vec![n(-5.0)]);
     }
 
     #[test]
     fn int_number_cross_comparison() {
         // 1 == 1.0, ordering works across Int/Number.
-        assert_eq!(run(vec![Push(i(1)), Push(n(1.0)), Eq]), vec![b(true)]);
-        assert_eq!(run(vec![Push(i(2)), Push(n(2.5)), Lt]), vec![b(true)]);
-        assert_eq!(run(vec![Push(n(3.0)), Push(i(3)), GtEq]), vec![b(true)]);
-        assert_eq!(run(vec![Push(i(2)), Push(i(2)), Eq]), vec![b(true)]);
+        assert_eq!(run(vec![PushPosInt(1), PushFloat(1.0), Eq]), vec![b(true)]);
+        assert_eq!(run(vec![PushPosInt(2), PushFloat(2.5), Lt]), vec![b(true)]);
+        assert_eq!(run(vec![PushFloat(3.0), PushPosInt(3), GtEq]), vec![b(true)]);
+        assert_eq!(run(vec![PushPosInt(2), PushPosInt(2), Eq]), vec![b(true)]);
     }
 
     #[test]
     fn int_indices_and_bitops() {
         // Int works directly as an array index (left-to-right: first = arr[0]).
         let code = vec![
-            Push(n(10.0)),
-            Push(n(20.0)),
+            PushFloat(10.0),
+            PushFloat(20.0),
             ArrNew(2), // [10, 20]
-            Push(i(1)),
+            PushPosInt(1),
             IndexGet,
         ];
         assert_eq!(run(code), vec![n(20.0)]);
         // ...and as a bitwise operand.
-        assert_eq!(run(vec![Push(i(10)), Push(i(12)), BitAnd]), vec![n(8.0)]);
+        assert_eq!(run(vec![PushPosInt(10), PushPosInt(12), BitAnd]), vec![n(8.0)]);
     }
 }

@@ -13,6 +13,10 @@ use oxc_ast::ast;
 use oxc_parser::Parser;
 use oxc_span::{GetSpan, SourceType};
 
+use thin_vec::ThinVec;
+
+type ThinStr = ThinVec<u8>;
+
 use crate::analyzer::{self, ProgramAnalysis, RefSlot, frame_abs};
 use crate::builtin::Builtin;
 use crate::diag::Diagnostic;
@@ -188,7 +192,10 @@ impl<'src> Compiler<'src> {
         if !root.slot_kinds.is_empty() || root.uses_arguments {
             let kinds = root.slot_kinds.clone();
             let uses_arguments = root.uses_arguments;
-            self.emit(Instr::EnterFrame(0, uses_arguments, kinds), program.span.start);
+            self.emit(
+                Instr::EnterFrame(0, uses_arguments, kinds.into()),
+                program.span.start,
+            );
         }
 
         // Hoist function declarations into the prologue (emit their bindings).
@@ -259,7 +266,7 @@ impl<'src> Compiler<'src> {
                         self.emit(Instr::Return(1), r.span.start);
                     }
                     None => {
-                        self.emit(Instr::Push(StackValue::Undefined), r.span.start);
+                        self.emit(Instr::PushUndefined, r.span.start);
                         self.emit(Instr::Return(1), r.span.start);
                     }
                 }
@@ -321,7 +328,7 @@ impl<'src> Compiler<'src> {
                             // so skip the redundant Push+SetLocal.
                             if !self.loops.is_empty() {
                                 self.fresh_cell_if_needed(slot, d.span.start);
-                                self.emit(Instr::Push(StackValue::Undefined), d.span.start);
+                                self.emit(Instr::PushUndefined, d.span.start);
                                 self.emit(Instr::SetLocal(slot), d.span.start);
                             }
                         }
@@ -372,7 +379,7 @@ impl<'src> Compiler<'src> {
                 for (i, el) in arr.elements.iter().enumerate() {
                     if let Some(el) = el {
                         self.emit(Instr::Dup, span);
-                        self.emit(Instr::Push(StackValue::PosInt(i as u64)), span);
+                        self.emit(Instr::PushPosInt(i as u64), span);
                         self.emit(Instr::IndexGet, span);
                         self.destructure_binding(el, span);
                     }
@@ -422,7 +429,7 @@ impl<'src> Compiler<'src> {
                 return;
             }
         };
-        self.emit(Instr::ObjGet(name), span);
+        self.emit(Instr::ObjGet(ThinStr::from(name.as_str())), span);
     }
 
     /// Apply a destructuring/parameter default to the value on top of the stack:
@@ -432,7 +439,7 @@ impl<'src> Compiler<'src> {
     fn emit_default(&mut self, default: &ast::Expression, span: u32) {
         let have = self.new_label();
         self.emit(Instr::Dup, span);
-        self.emit(Instr::Push(StackValue::Undefined), span);
+        self.emit(Instr::PushUndefined, span);
         self.emit(Instr::Eq, span);
         self.emit(Instr::JFalse(have), span); // not undefined → keep the value
         self.emit(Instr::Pop(1), span); // undefined → drop and use the default
@@ -696,7 +703,7 @@ impl<'src> Compiler<'src> {
     /// and `continue` (→ increment) both land where exactly those two values
     /// are present, and the final `Pop(2)` cleans them up.
     fn compile_index_loop(&mut self, slot: u32, body: &ast::Statement, span: u32) {
-        self.emit(Instr::Push(StackValue::PosInt(0)), span); // [cont, idx]
+        self.emit(Instr::PushPosInt(0), span); // [cont, idx]
         let top = self.new_label();
         let cont = self.new_label();
         let end = self.new_label();
@@ -726,7 +733,7 @@ impl<'src> Compiler<'src> {
         self.loops.pop();
         // `continue` lands here, at the increment.
         self.emit(Instr::Label(cont), span);
-        self.emit(Instr::Push(StackValue::PosInt(1)), span); // [cont, idx, 1]
+        self.emit(Instr::PushPosInt(1), span); // [cont, idx, 1]
         self.emit(Instr::Add, span); // [cont, idx+1]
         self.emit(Instr::Jump(top), span);
         self.emit(Instr::Label(end), span);
@@ -822,22 +829,27 @@ impl<'src> Compiler<'src> {
         match expr {
             // ── literals ──────────────────────────────────────────────
             ast::Expression::NumericLiteral(lit) => {
-                self.emit(
-                    Instr::Push(number_literal_to_value(lit.value)),
-                    lit.span.start,
-                );
+                match number_literal_to_value(lit.value) {
+                    StackValue::PosInt(v) => {
+                        self.emit(Instr::PushPosInt(v), lit.span.start)
+                    }
+                    StackValue::Number(v) => {
+                        self.emit(Instr::PushFloat(v), lit.span.start)
+                    }
+                    _ => unreachable!(),
+                }
             }
             ast::Expression::StringLiteral(lit) => {
                 self.emit(
-                    Instr::PushStr(lit.value.as_str().to_string()),
+                    Instr::PushStr(lit.value.as_str().into()),
                     lit.span.start,
                 );
             }
             ast::Expression::BooleanLiteral(lit) => {
-                self.emit(Instr::Push(StackValue::Bool(lit.value)), lit.span.start);
+                self.emit(Instr::PushBool(lit.value), lit.span.start);
             }
             ast::Expression::NullLiteral(lit) => {
-                self.emit(Instr::Push(StackValue::Null), lit.span.start);
+                self.emit(Instr::PushNull, lit.span.start);
             }
             ast::Expression::TemplateLiteral(tl) => self.compile_template(tl),
 
@@ -921,17 +933,15 @@ impl<'src> Compiler<'src> {
             self.emit(Instr::Arguments, span);
             return;
         }
-        let value = match name {
-            "state" => StackValue::Ptr(0),
-            "undefined" => StackValue::Undefined,
-            "NaN" => StackValue::Number(f64::NAN),
-            "Infinity" => StackValue::Number(f64::INFINITY),
+        match name {
+            "state" => self.emit(Instr::PushPtr(0), span),
+            "undefined" => self.emit(Instr::PushUndefined, span),
+            "NaN" => self.emit(Instr::PushFloat(f64::NAN), span),
+            "Infinity" => self.emit(Instr::PushFloat(f64::INFINITY), span),
             _ => {
                 self.error(span, format!("undeclared variable `{name}`"));
-                return;
             }
-        };
-        self.emit(Instr::Push(value), span);
+        }
     }
 
     // ── operators ──────────────────────────────────────────────────────
@@ -996,7 +1006,12 @@ impl<'src> Compiler<'src> {
                 // Fold `-<numeric literal>` to a canonical NegInt/Number at
                 // compile time; otherwise `Neg` promotes to Number(-x).
                 if let ast::Expression::NumericLiteral(lit) = &un.argument {
-                    self.emit(Instr::Push(f64_to_value(-lit.value)), span);
+                    match f64_to_value(-lit.value) {
+                        StackValue::PosInt(v) => self.emit(Instr::PushPosInt(v), span),
+                        StackValue::NegInt(v) => self.emit(Instr::PushNegInt(v), span),
+                        StackValue::Number(v) => self.emit(Instr::PushFloat(v), span),
+                        _ => unreachable!(),
+                    }
                 } else {
                     self.compile_expr(&un.argument);
                     self.emit(Instr::Neg, span);
@@ -1021,7 +1036,7 @@ impl<'src> Compiler<'src> {
             Op::Void => {
                 self.compile_expr(&un.argument);
                 self.emit(Instr::Pop(1), span);
-                self.emit(Instr::Push(StackValue::Undefined), span);
+                self.emit(Instr::PushUndefined, span);
             }
             Op::Delete => self.compile_delete(&un.argument, span),
         }
@@ -1035,7 +1050,7 @@ impl<'src> Compiler<'src> {
             ast::Expression::StaticMemberExpression(m) => {
                 self.compile_expr(&m.object);
                 self.emit(
-                    Instr::PushStr(m.property.name.as_str().to_string()),
+                    Instr::PushStr(m.property.name.as_str().into()),
                     m.property.span.start,
                 );
                 self.emit(Instr::ObjDelete, span);
@@ -1059,7 +1074,7 @@ impl<'src> Compiler<'src> {
             ast::ChainElement::StaticMemberExpression(m) => {
                 self.compile_expr(&m.object);
                 self.emit(
-                    Instr::PushStr(m.property.name.as_str().to_string()),
+                    Instr::PushStr(m.property.name.as_str().into()),
                     m.property.span.start,
                 );
                 self.emit(Instr::ObjDelete, span);
@@ -1182,7 +1197,7 @@ impl<'src> Compiler<'src> {
             self.compile_expr(&p.value);
             names.push(name);
         }
-        self.emit(Instr::ObjNew(names), obj.span.start);
+        self.emit(Instr::ObjNew(names.into_iter().map(|n| ThinStr::from(n.as_str())).collect()), obj.span.start);
     }
 
     fn compile_template(&mut self, tl: &ast::TemplateLiteral) {
@@ -1198,11 +1213,11 @@ impl<'src> Compiler<'src> {
                 .unwrap_or_else(|| q.value.raw.as_str())
                 .to_string()
         };
-        self.emit(Instr::PushStr(quasi_str(&tl.quasis[0])), span);
+        self.emit(Instr::PushStr(ThinStr::from(quasi_str(&tl.quasis[0]).as_str())), span);
         for (i, expr) in tl.expressions.iter().enumerate() {
             self.compile_expr(expr);
             self.emit(Instr::Add, span);
-            self.emit(Instr::PushStr(quasi_str(&tl.quasis[i + 1])), span);
+            self.emit(Instr::PushStr(ThinStr::from(quasi_str(&tl.quasis[i + 1]).as_str())), span);
             self.emit(Instr::Add, span);
         }
     }
@@ -1219,7 +1234,7 @@ impl<'src> Compiler<'src> {
         // `Builtin`. `?.` here is a no-op — a namespace is never nullish.
         if let ast::Expression::Identifier(obj) = &m.object {
             if let Some(builtin) = namespace_builtin(obj.name.as_str(), m.property.name.as_str()) {
-                self.emit(Instr::Push(StackValue::Builtin(builtin)), m.span.start);
+                self.emit(Instr::PushBuiltin(builtin), m.span.start);
                 return;
             }
         }
@@ -1239,7 +1254,7 @@ impl<'src> Compiler<'src> {
         if name == "length" {
             self.emit(Instr::ArrLength, span);
         } else {
-            self.emit(Instr::ObjGet(name.to_string()), span);
+            self.emit(Instr::ObjGet(name.into()), span);
         }
     }
 
@@ -1273,7 +1288,7 @@ impl<'src> Compiler<'src> {
         let end = self.new_label();
         self.emit(Instr::JNotNullish(cont), span);
         self.emit(Instr::Pop(1), span);
-        self.emit(Instr::Push(StackValue::Undefined), span);
+        self.emit(Instr::PushUndefined, span);
         self.emit(Instr::Jump(end), span);
         self.emit(Instr::Label(cont), span);
         end
@@ -1458,8 +1473,8 @@ impl<'src> Compiler<'src> {
         };
         // `p`: ++ subtracts -1 (i.e. adds 1); -- subtracts +1.
         let p = match u.operator {
-            ast::UpdateOperator::Increment => StackValue::NegInt(-1),
-            ast::UpdateOperator::Decrement => StackValue::PosInt(1),
+            ast::UpdateOperator::Increment => -1.0,
+            ast::UpdateOperator::Decrement => 1.0,
         };
 
         // Fast path for local variables: use `IncLocal` (1 instruction) when
@@ -1471,12 +1486,12 @@ impl<'src> Compiler<'src> {
                 } else {
                     crate::vm::UpdateMode::Postfix
                 };
-                self.emit(Instr::IncLocal(*slot, p, mode), span);
+                self.emit(Instr::IncLocal(*slot as u16, p, mode), span);
             } else {
                 // Void: load, subtract, plain SetLocal (no Dup, no postfix
                 // recovery). The value is consumed by SetLocal.
                 self.emit(Instr::Local(*slot), span);
-                self.emit(Instr::Push(p), span);
+                self.emit(Instr::PushFloat(p), span);
                 self.emit(Instr::Sub, span);
                 self.emit(Instr::SetLocal(*slot), span);
             }
@@ -1486,13 +1501,13 @@ impl<'src> Compiler<'src> {
         // Non-local targets (member/index): load-sub-store path.
         self.lvalue_emit_addr(&lv, span);
         self.lvalue_emit_load(&lv, span);
-        self.emit(Instr::Push(p), span);
+        self.emit(Instr::PushFloat(p), span);
         self.emit(Instr::Sub, span);
         if value_needed {
             let mode = if u.prefix { SetMode::New } else { SetMode::Old };
             match &lv {
                 LValue::Member(_, field) => {
-                    self.emit(Instr::ObjSet(field.clone(), mode), span);
+                    self.emit(Instr::ObjSet(ThinStr::from(field.as_str()), mode), span);
                 }
                 LValue::Index(..) => {
                     self.emit(Instr::IndexSet(mode), span);
@@ -1606,7 +1621,7 @@ impl<'src> Compiler<'src> {
             LValue::Local(slot) => self.emit(Instr::Local(*slot), span),
             LValue::Member(_, field) => {
                 self.emit(Instr::Dup, span); // copy the object
-                self.emit(Instr::ObjGet(field.clone()), span);
+                self.emit(Instr::ObjGet(ThinStr::from(field.as_str())), span);
             }
             LValue::Index(..) => {
                 self.emit(Instr::Pick(1), span); // copy the object
@@ -1624,7 +1639,7 @@ impl<'src> Compiler<'src> {
             LValue::Local(slot) => {
                 self.emit(Instr::TeeLocal(*slot), span);
             }
-            LValue::Member(_, field) => self.emit(Instr::ObjSet(field.clone(), SetMode::New), span),
+            LValue::Member(_, field) => self.emit(Instr::ObjSet(ThinStr::from(field.as_str()), SetMode::New), span),
             LValue::Index(..) => self.emit(Instr::IndexSet(SetMode::New), span),
         }
     }
@@ -1639,7 +1654,7 @@ impl<'src> Compiler<'src> {
                 self.emit(Instr::SetLocal(*slot), span);
             }
             LValue::Member(_, field) => {
-                self.emit(Instr::ObjSet(field.clone(), SetMode::New), span);
+                self.emit(Instr::ObjSet(ThinStr::from(field.as_str()), SetMode::New), span);
                 self.emit(Instr::Pop(1), span);
             }
             LValue::Index(..) => {
@@ -1675,7 +1690,7 @@ impl<'src> Compiler<'src> {
                 for (i, el) in arr.elements.iter().enumerate() {
                     if let Some(el) = el {
                         self.emit(Instr::Dup, span);
-                        self.emit(Instr::Push(StackValue::PosInt(i as u64)), span);
+                        self.emit(Instr::PushPosInt(i as u64), span);
                         self.emit(Instr::IndexGet, span);
                         self.assign_maybe_default(el, span);
                     }
@@ -1695,7 +1710,7 @@ impl<'src> Compiler<'src> {
                             // Shorthand `{a}` / `{a = d}`: the key and the target
                             // are the same identifier.
                             self.emit(Instr::Dup, span);
-                            self.emit(Instr::ObjGet(p.binding.name.as_str().to_string()), span);
+                            self.emit(Instr::ObjGet(p.binding.name.as_str().into()), span);
                             if let Some(default) = &p.init {
                                 self.emit_default(default, span);
                             }
@@ -1857,7 +1872,7 @@ impl<'src> Compiler<'src> {
                             // An optional member (`tools?.foo()`) is meaningless —
                             // `tools` always exists — so it lowers identically.
                             self.compile_args(&argv);
-                            self.emit(Instr::Invoke(method.to_string(), argv.len() as u32), span);
+                            self.emit(Instr::Invoke(method.into(), argv.len() as u32), span);
                             return;
                         }
                         _ => {}
@@ -2016,7 +2031,7 @@ impl<'src> Compiler<'src> {
                 }
                 match argv[0] {
                     ast::Expression::StringLiteral(lit) => {
-                        self.emit(Instr::Raise(lit.value.as_str().to_string()), span);
+                        self.emit(Instr::Raise(lit.value.as_str().into()), span);
                     }
                     other => self.error(
                         other.span().start,
@@ -2100,7 +2115,7 @@ impl<'src> Compiler<'src> {
             // Optional call: guard on the receiver before reading the property.
             let end = self.begin_optional(span);
             // Get the property from the non-nullish receiver.
-            self.emit(Instr::ObjGet(method.to_string()), span);
+            self.emit(Instr::ObjGet(method.into()), span);
             // Evaluate args.
             self.compile_args(argv);
             let argc = argv.len();
@@ -2111,7 +2126,7 @@ impl<'src> Compiler<'src> {
             self.emit(Instr::Label(end), span);
         } else {
             // Get the property (consumes receiver, pushes property value).
-            self.emit(Instr::ObjGet(method.to_string()), span);
+            self.emit(Instr::ObjGet(method.into()), span);
             // Evaluate args.
             self.compile_args(argv);
             let argc = argv.len();
@@ -2256,7 +2271,7 @@ impl<'src> Compiler<'src> {
                     self.compile_args(argv);
                     let passed = argv.len() as u32;
                     for _ in passed..expected_arity {
-                        self.emit(Instr::Push(StackValue::Undefined), span);
+                        self.emit(Instr::PushUndefined, span);
                     }
                     self.emit(Instr::Call(l, passed.max(expected_arity)), span);
                 }
@@ -2341,9 +2356,9 @@ impl<'src> Compiler<'src> {
                     if let Some(slot) = self.binding_slot(id.span.start) {
                         let span = f.span.start;
                         if captures.is_empty() {
-                            self.emit(Instr::Push(StackValue::Fn(label)), span);
+                            self.emit(Instr::PushFn(label), span);
                         } else {
-                            self.emit(Instr::MakeClosure(label, captures), span);
+                            self.emit(Instr::MakeClosure(label, captures.into()), span);
                         }
                         self.emit(Instr::SetLocal(slot), span);
                     }
@@ -2424,9 +2439,9 @@ impl<'src> Compiler<'src> {
             (child.label, child.captures.clone())
         };
         if captures.is_empty() {
-            self.emit(Instr::Push(StackValue::Fn(label)), span);
+            self.emit(Instr::PushFn(label), span);
         } else {
-            self.emit(Instr::MakeClosure(label, captures), span);
+            self.emit(Instr::MakeClosure(label, captures.into()), span);
         }
     }
 
@@ -2488,7 +2503,7 @@ impl<'src> Compiler<'src> {
             local_kinds.push(SlotKind::Plain);
         }
         self.emit(
-            Instr::EnterFrame(nparams, uses_arguments, local_kinds),
+            Instr::EnterFrame(nparams as u16, uses_arguments, local_kinds.into()),
             span,
         );
 
@@ -2506,7 +2521,7 @@ impl<'src> Compiler<'src> {
         // slot was allocated by EnterFrame above; fill it with the bare `Fn`.
         if self_name.is_some() {
             let self_slot = frame_abs(own_local_count, nparams, upval_count);
-            self.emit(Instr::Push(StackValue::Fn(label)), span);
+            self.emit(Instr::PushFn(label), span);
             self.emit(Instr::SetLocal(self_slot), span);
         }
 
@@ -2522,7 +2537,7 @@ impl<'src> Compiler<'src> {
             for stmt in body_stmts {
                 self.compile_stmt(stmt);
             }
-            self.emit(Instr::Push(StackValue::Undefined), span);
+            self.emit(Instr::PushUndefined, span);
             self.emit(Instr::Return(1), span);
         }
 
@@ -2550,7 +2565,7 @@ impl<'src> Compiler<'src> {
                 // if Local(slot) === undefined { slot = default }
                 let skip_default = self.new_label();
                 self.emit(Instr::Local(slot), span);
-                self.emit(Instr::Push(StackValue::Undefined), span);
+                self.emit(Instr::PushUndefined, span);
                 self.emit(Instr::Eq, span);
                 self.emit(Instr::JFalse(skip_default), span);
                 self.compile_expr(default);
@@ -2656,7 +2671,7 @@ fn backpatch(code: Vec<Instr>, spans: Vec<u32>, next_label: u32) -> (Vec<Instr>,
             Instr::JNotNullish(l) => Instr::JNotNullish(label_offset[l as usize]),
             Instr::Call(l, n) => Instr::Call(label_offset[l as usize], n),
             Instr::MakeClosure(l, caps) => Instr::MakeClosure(label_offset[l as usize], caps),
-            Instr::Push(StackValue::Fn(l)) => Instr::Push(StackValue::Fn(label_offset[l as usize])),
+            Instr::PushFn(l) => Instr::PushFn(label_offset[l as usize]),
             other => other,
         };
         out_code.push(rewritten);
@@ -2692,9 +2707,9 @@ mod tests {
         assert_eq!(
             prog.code,
             vec![
-                Instr::Push(StackValue::PosInt(1)),
-                Instr::Push(StackValue::PosInt(2)),
-                Instr::Push(StackValue::PosInt(3)),
+                Instr::PushPosInt(1),
+                Instr::PushPosInt(2),
+                Instr::PushPosInt(3),
                 Instr::Mul,
                 Instr::Add,
                 Instr::Pop(1),
@@ -2718,7 +2733,7 @@ mod tests {
         let vm = VM::for_program(prog.code, state).unwrap();
         match &vm.heap[0] {
             crate::vm::HeapValue::Object(o) => {
-                assert_eq!(o.get("count"), Some(&StackValue::PosInt(7)));
+                assert_eq!(o.get(&ThinStr::from("count")), Some(&StackValue::PosInt(7)));
             }
             other => panic!("expected state object at heap[0], got {other:?}"),
         }
@@ -2761,7 +2776,7 @@ mod tests {
     /// Read `state.<key>` (a slot of the heap[0] object) from a finished VM.
     fn state_val(vm: &VM, key: &str) -> StackValue {
         match &vm.heap[0] {
-            HeapValue::Object(o) => *o.get(key).unwrap_or_else(|| panic!("no state.{key}")),
+            HeapValue::Object(o) => *o.get(&ThinStr::from(key)).unwrap_or_else(|| panic!("no state.{key}")),
             other => panic!("state is not an object: {other:?}"),
         }
     }
@@ -2778,7 +2793,7 @@ mod tests {
         let vm = run_vm(&format!("state.r = ({expr});"));
         match state_val(&vm, "r") {
             StackValue::Ptr(p) => match &vm.heap[p as usize] {
-                HeapValue::String(s) => s.clone(),
+                HeapValue::String(s) => String::from_utf8(s.to_vec()).unwrap(),
                 other => panic!("not a string: {other:?}"),
             },
             other => panic!("not a pointer: {other:?}"),
@@ -2872,7 +2887,7 @@ mod tests {
         let vm = run_vm("state.name = \"bob\"; state.r = `hi ${state.name}, ${1 + 2}!`;");
         match state_val(&vm, "r") {
             StackValue::Ptr(p) => match &vm.heap[p as usize] {
-                HeapValue::String(s) => assert_eq!(s, "hi bob, 3!"),
+                HeapValue::String(s) => assert_eq!(s.as_slice(), b"hi bob, 3!"),
                 other => panic!("{other:?}"),
             },
             other => panic!("{other:?}"),
@@ -2900,7 +2915,7 @@ mod tests {
         assert_eq!(state_val(&vm, "r"), StackValue::PosInt(9));
         match state_val(&vm, "obj") {
             StackValue::Ptr(p) => match &vm.heap[p as usize] {
-                HeapValue::Object(o) => assert_eq!(o.get("a"), Some(&StackValue::PosInt(9))),
+                HeapValue::Object(o) => assert_eq!(o.get(&ThinStr::from("a")), Some(&StackValue::PosInt(9))),
                 other => panic!("{other:?}"),
             },
             other => panic!("{other:?}"),
@@ -3124,7 +3139,7 @@ mod tests {
         match state_val(&vm, "r") {
             StackValue::Ptr(p) => match &vm.heap[p as usize] {
                 // r was set last, so it appears in the serialized object too.
-                HeapValue::String(s) => assert!(s.contains("\"a\":1"), "got {s}"),
+                HeapValue::String(s) => assert!(std::str::from_utf8(s).unwrap().contains("\"a\":1"), "got {}", String::from_utf8(s.to_vec()).unwrap()),
                 other => panic!("{other:?}"),
             },
             other => panic!("{other:?}"),
@@ -3138,7 +3153,7 @@ mod tests {
         // `tools.foo(a, b)` lowers to args-then-`Invoke("foo", 2)`.
         let prog = compile("tools.notify(1, 2);").expect("compiles");
         assert!(
-            prog.code.contains(&Instr::Invoke("notify".to_string(), 2)),
+            prog.code.contains(&Instr::Invoke("notify".into(), 2)),
             "expected Invoke in {:?}",
             prog.code
         );
@@ -3175,14 +3190,14 @@ mod tests {
     #[test]
     fn tools_call_with_no_args() {
         let prog = compile("tools.tick();").expect("compiles");
-        assert!(prog.code.contains(&Instr::Invoke("tick".to_string(), 0)));
+        assert!(prog.code.contains(&Instr::Invoke("tick".into(), 0)));
     }
 
     #[test]
     fn raise_lowers_to_raise_instr() {
         let prog = compile("raise(\"need_input\");").expect("compiles");
         assert!(
-            prog.code.contains(&Instr::Raise("need_input".to_string())),
+            prog.code.contains(&Instr::Raise("need_input".into())),
             "expected Raise in {:?}",
             prog.code
         );
@@ -3903,7 +3918,7 @@ mod tests {
         let vm = run_vm(&rewritten);
         match state_val(&vm, "__ret") {
             StackValue::Ptr(p) => match &vm.heap[p as usize] {
-                HeapValue::String(s) => s.clone(),
+                HeapValue::String(s) => String::from_utf8(s.to_vec()).unwrap(),
                 other => panic!("not a string: {other:?}"),
             },
             other => panic!("not a pointer: {other:?}"),
@@ -3914,7 +3929,7 @@ mod tests {
     fn eval_str_in(vm: &VM, key: &str) -> String {
         match state_val(vm, key) {
             StackValue::Ptr(p) => match &vm.heap[p as usize] {
-                HeapValue::String(s) => s.clone(),
+                HeapValue::String(s) => String::from_utf8(s.to_vec()).unwrap(),
                 other => panic!("not a string: {other:?}"),
             },
             other => panic!("not a pointer: {other:?}"),

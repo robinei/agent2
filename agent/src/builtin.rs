@@ -15,6 +15,7 @@
 //! is a well-formed expression.
 
 use crate::vm::{StackValue, VM, VMError, as_i64};
+use thin_vec::ThinVec;
 
 /// A builtin's identity. Used both as the static call target
 /// (`Instr::CallBuiltin(Builtin, argc)`, the compiler's fast path) and as a
@@ -466,7 +467,7 @@ fn array_join(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     let args = pop_args(vm, argc)?;
     let (arr_ptr, sep) = match args.len() {
         1 => match &args[0] {
-            StackValue::Ptr(p) => (*p, ",".to_string()),
+            StackValue::Ptr(p) => (*p, ",".into()),
             _ => return Err(VMError::TypeError),
         },
         2 => {
@@ -487,7 +488,7 @@ fn array_join(vm: &mut VM, argc: u32) -> Result<(), VMError> {
             _ => vm.to_js_string(v, 0),
         })
         .collect();
-    let ptr = vm.alloc_string(parts.join(&sep));
+    let ptr = vm.alloc_string(parts.join(&sep).into_bytes().into());
     vm.stack.push(ptr);
     Ok(())
 }
@@ -520,16 +521,16 @@ fn str_split(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     match limit {
         Some(lim) => {
             for p in s.splitn(lim, &delim) {
-                parts.push(vm.alloc_string(p.to_string()));
+                parts.push(vm.alloc_string(p.as_bytes().to_vec().into()));
             }
         }
         None => {
             for p in s.split(&delim) {
-                parts.push(vm.alloc_string(p.to_string()));
+                parts.push(vm.alloc_string(p.as_bytes().to_vec().into()));
             }
         }
     }
-    let ptr = vm.alloc_array(parts);
+    let ptr = vm.alloc_array(parts.into());
     vm.stack.push(ptr);
     Ok(())
 }
@@ -675,7 +676,7 @@ fn str_slice(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     if start > s.len() || end > s.len() || !s.is_char_boundary(start) || !s.is_char_boundary(end) {
         return Err(VMError::ValueError);
     }
-    let ptr = vm.alloc_string(s[start..end].to_string());
+    let ptr = vm.alloc_string(s[start..end].as_bytes().to_vec().into());
     vm.stack.push(ptr);
     Ok(())
 }
@@ -684,7 +685,7 @@ fn str_slice(vm: &mut VM, argc: u32) -> Result<(), VMError> {
 fn str_trim(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     let args = check_arity!(vm, argc, 1)?;
     let s = vm.pop_string_from(&args[0])?;
-    let ptr = vm.alloc_string(s.trim().to_string());
+    let ptr = vm.alloc_string(s.trim().as_bytes().to_vec().into());
     vm.stack.push(ptr);
     Ok(())
 }
@@ -698,14 +699,14 @@ fn obj_keys(vm: &mut VM, argc: u32) -> Result<(), VMError> {
         StackValue::Ptr(p) => *p,
         _ => return Err(VMError::TypeError),
     };
-    let keys: Vec<String> = vm
+    let keys: Vec<ThinVec<u8>> = vm
         .heap_obj(obj_ptr)
         .ok_or(VMError::TypeError)?
         .keys()
         .cloned()
         .collect();
     let strs: Vec<StackValue> = keys.into_iter().map(|k| vm.alloc_string(k)).collect();
-    let ptr = vm.alloc_array(strs);
+    let ptr = vm.alloc_array(strs.into());
     vm.stack.push(ptr);
     Ok(())
 }
@@ -723,7 +724,7 @@ fn obj_values(vm: &mut VM, argc: u32) -> Result<(), VMError> {
         .values()
         .copied()
         .collect();
-    let ptr = vm.alloc_array(vals);
+    let ptr = vm.alloc_array(vals.into());
     vm.stack.push(ptr);
     Ok(())
 }
@@ -745,7 +746,7 @@ fn json_stringify(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     let args = check_arity!(vm, argc, 1)?;
     let json = vm.stack_value_to_json(&args[0], 0)?;
     let s = serde_json::to_string(&json).map_err(|_| VMError::ValueError)?;
-    let ptr = vm.alloc_string(s);
+    let ptr = vm.alloc_string(s.into_bytes().into());
     vm.stack.push(ptr);
     Ok(())
 }
@@ -871,10 +872,10 @@ mod tests {
     #[test]
     fn call_builtin_array_push_returns_length() {
         let out = run(vec![
-            Instr::Push(StackValue::Number(10.0)),
+            Instr::PushFloat(10.0),
             Instr::ArrNew(1),
             Instr::Dup,
-            Instr::Push(StackValue::Number(20.0)),
+            Instr::PushFloat(20.0),
             Instr::CallBuiltin(Builtin::ArrayPush, 2),
         ]);
         assert_eq!(out.last(), Some(&StackValue::Number(2.0)));
@@ -885,8 +886,8 @@ mod tests {
     #[test]
     fn call_builtin_array_pop_returns_last() {
         let out = run(vec![
-            Instr::Push(StackValue::Number(1.0)),
-            Instr::Push(StackValue::Number(2.0)),
+            Instr::PushFloat(1.0),
+            Instr::PushFloat(2.0),
             Instr::ArrNew(2),
             Instr::CallBuiltin(Builtin::ArrayPop, 1),
         ]);
@@ -907,8 +908,8 @@ mod tests {
     #[test]
     fn call_builtin_array_shift_returns_first() {
         let out = run(vec![
-            Instr::Push(StackValue::Number(1.0)),
-            Instr::Push(StackValue::Number(2.0)),
+            Instr::PushFloat(1.0),
+            Instr::PushFloat(2.0),
             Instr::ArrNew(2),
             Instr::CallBuiltin(Builtin::ArrayShift, 1),
         ]);
@@ -929,10 +930,10 @@ mod tests {
     #[test]
     fn call_builtin_array_unshift_returns_length() {
         let out = run(vec![
-            Instr::Push(StackValue::Number(2.0)),
+            Instr::PushFloat(2.0),
             Instr::ArrNew(1),
             Instr::Dup,
-            Instr::Push(StackValue::Number(1.0)),
+            Instr::PushFloat(1.0),
             Instr::CallBuiltin(Builtin::ArrayUnshift, 2),
         ]);
         assert_eq!(out.last(), Some(&StackValue::Number(2.0)));
@@ -943,8 +944,8 @@ mod tests {
     #[test]
     fn call_builtin_array_join_default_sep() {
         let out = run(vec![
-            Instr::Push(StackValue::Number(1.0)),
-            Instr::Push(StackValue::Number(2.0)),
+            Instr::PushFloat(1.0),
+            Instr::PushFloat(2.0),
             Instr::ArrNew(2),
             Instr::CallBuiltin(Builtin::ArrayJoin, 1),
         ]);
@@ -958,10 +959,10 @@ mod tests {
     #[test]
     fn call_builtin_array_join_custom_sep() {
         let out = run(vec![
-            Instr::Push(StackValue::Number(1.0)),
-            Instr::Push(StackValue::Number(2.0)),
+            Instr::PushFloat(1.0),
+            Instr::PushFloat(2.0),
             Instr::ArrNew(2),
-            Instr::PushStr(" - ".to_string()),
+            Instr::PushStr(" - ".into()),
             Instr::CallBuiltin(Builtin::ArrayJoin, 2),
         ]);
         match &out[0] {
@@ -975,8 +976,8 @@ mod tests {
     #[test]
     fn call_builtin_str_split() {
         let out = run(vec![
-            Instr::PushStr("a,b,c".to_string()),
-            Instr::PushStr(",".to_string()),
+            Instr::PushStr("a,b,c".into()),
+            Instr::PushStr(",".into()),
             Instr::CallBuiltin(Builtin::StrSplit, 2),
         ]);
         // result is an array Ptr
@@ -989,9 +990,9 @@ mod tests {
     #[test]
     fn call_builtin_str_split_with_limit() {
         let out = run(vec![
-            Instr::PushStr("a,b,c".to_string()),
-            Instr::PushStr(",".to_string()),
-            Instr::Push(StackValue::PosInt(2)),
+            Instr::PushStr("a,b,c".into()),
+            Instr::PushStr(",".into()),
+            Instr::PushPosInt(2),
             Instr::CallBuiltin(Builtin::StrSplit, 3),
         ]);
         match &out[0] {
@@ -1005,8 +1006,8 @@ mod tests {
     #[test]
     fn call_builtin_str_includes() {
         let out = run(vec![
-            Instr::PushStr("hello world".to_string()),
-            Instr::PushStr("world".to_string()),
+            Instr::PushStr("hello world".into()),
+            Instr::PushStr("world".into()),
             Instr::CallBuiltin(Builtin::StrIncludes, 2),
         ]);
         assert_eq!(out, vec![StackValue::Bool(true)]);
@@ -1015,8 +1016,8 @@ mod tests {
     #[test]
     fn call_builtin_str_includes_not_found() {
         let out = run(vec![
-            Instr::PushStr("hello".to_string()),
-            Instr::PushStr("x".to_string()),
+            Instr::PushStr("hello".into()),
+            Instr::PushStr("x".into()),
             Instr::CallBuiltin(Builtin::StrIncludes, 2),
         ]);
         assert_eq!(out, vec![StackValue::Bool(false)]);
@@ -1027,8 +1028,8 @@ mod tests {
     #[test]
     fn call_builtin_str_index_of() {
         let out = run(vec![
-            Instr::PushStr("hello".to_string()),
-            Instr::PushStr("l".to_string()),
+            Instr::PushStr("hello".into()),
+            Instr::PushStr("l".into()),
             Instr::CallBuiltin(Builtin::StrIndexOf, 2),
         ]);
         assert_eq!(out, vec![StackValue::Number(2.0)]);
@@ -1037,8 +1038,8 @@ mod tests {
     #[test]
     fn call_builtin_str_index_of_not_found() {
         let out = run(vec![
-            Instr::PushStr("abc".to_string()),
-            Instr::PushStr("x".to_string()),
+            Instr::PushStr("abc".into()),
+            Instr::PushStr("x".into()),
             Instr::CallBuiltin(Builtin::StrIndexOf, 2),
         ]);
         assert_eq!(out, vec![StackValue::Number(-1.0)]);
@@ -1049,8 +1050,8 @@ mod tests {
     #[test]
     fn call_builtin_str_last_index_of() {
         let out = run(vec![
-            Instr::PushStr("hello".to_string()),
-            Instr::PushStr("l".to_string()),
+            Instr::PushStr("hello".into()),
+            Instr::PushStr("l".into()),
             Instr::CallBuiltin(Builtin::StrLastIndexOf, 2),
         ]);
         assert_eq!(out, vec![StackValue::Number(3.0)]);
@@ -1062,9 +1063,9 @@ mod tests {
     fn call_builtin_str_index_of_negative_start_clamps() {
         // "hello".indexOf("h", -5) === 0
         let out = run(vec![
-            Instr::PushStr("hello".to_string()),
-            Instr::PushStr("h".to_string()),
-            Instr::Push(StackValue::NegInt(-5)),
+            Instr::PushStr("hello".into()),
+            Instr::PushStr("h".into()),
+            Instr::PushNegInt(-5),
             Instr::CallBuiltin(Builtin::StrIndexOf, 3),
         ]);
         assert_eq!(out, vec![StackValue::Number(0.0)]);
@@ -1074,9 +1075,9 @@ mod tests {
     fn call_builtin_str_includes_negative_start_clamps() {
         // "hello".includes("h", -5) === true
         let out = run(vec![
-            Instr::PushStr("hello".to_string()),
-            Instr::PushStr("h".to_string()),
-            Instr::Push(StackValue::NegInt(-5)),
+            Instr::PushStr("hello".into()),
+            Instr::PushStr("h".into()),
+            Instr::PushNegInt(-5),
             Instr::CallBuiltin(Builtin::StrIncludes, 3),
         ]);
         assert_eq!(out, vec![StackValue::Bool(true)]);
@@ -1086,9 +1087,9 @@ mod tests {
     fn call_builtin_str_last_index_of_negative_start_clamps() {
         // "hello".lastIndexOf("l", -3) === -1 (only an index-0 match qualifies)
         let out = run(vec![
-            Instr::PushStr("hello".to_string()),
-            Instr::PushStr("l".to_string()),
-            Instr::Push(StackValue::NegInt(-3)),
+            Instr::PushStr("hello".into()),
+            Instr::PushStr("l".into()),
+            Instr::PushNegInt(-3),
             Instr::CallBuiltin(Builtin::StrLastIndexOf, 3),
         ]);
         assert_eq!(out, vec![StackValue::Number(-1.0)]);
@@ -1099,8 +1100,8 @@ mod tests {
     #[test]
     fn call_builtin_str_starts_with() {
         let out = run(vec![
-            Instr::PushStr("hello".to_string()),
-            Instr::PushStr("hel".to_string()),
+            Instr::PushStr("hello".into()),
+            Instr::PushStr("hel".into()),
             Instr::CallBuiltin(Builtin::StrStartsWith, 2),
         ]);
         assert_eq!(out, vec![StackValue::Bool(true)]);
@@ -1109,8 +1110,8 @@ mod tests {
     #[test]
     fn call_builtin_str_ends_with() {
         let out = run(vec![
-            Instr::PushStr("hello".to_string()),
-            Instr::PushStr("lo".to_string()),
+            Instr::PushStr("hello".into()),
+            Instr::PushStr("lo".into()),
             Instr::CallBuiltin(Builtin::StrEndsWith, 2),
         ]);
         assert_eq!(out, vec![StackValue::Bool(true)]);
@@ -1121,9 +1122,9 @@ mod tests {
     #[test]
     fn call_builtin_str_slice() {
         let out = run(vec![
-            Instr::PushStr("hello".to_string()),
-            Instr::Push(StackValue::PosInt(1)),
-            Instr::Push(StackValue::PosInt(4)),
+            Instr::PushStr("hello".into()),
+            Instr::PushPosInt(1),
+            Instr::PushPosInt(4),
             Instr::CallBuiltin(Builtin::StrSlice, 3),
         ]);
         // result is a Ptr to "ell"
@@ -1136,8 +1137,8 @@ mod tests {
     #[test]
     fn call_builtin_str_slice_single_arg() {
         let out = run(vec![
-            Instr::PushStr("hello".to_string()),
-            Instr::Push(StackValue::PosInt(2)),
+            Instr::PushStr("hello".into()),
+            Instr::PushPosInt(2),
             Instr::CallBuiltin(Builtin::StrSlice, 2),
         ]);
         match &out[0] {
@@ -1151,7 +1152,7 @@ mod tests {
     #[test]
     fn call_builtin_str_trim() {
         let out = run(vec![
-            Instr::PushStr("  hi  ".to_string()),
+            Instr::PushStr("  hi  ".into()),
             Instr::CallBuiltin(Builtin::StrTrim, 1),
         ]);
         match &out[0] {
@@ -1166,9 +1167,9 @@ mod tests {
     fn call_builtin_obj_keys() {
         // ObjNew with 2 field names pops 2 values. Push them first.
         let out = run(vec![
-            Instr::Push(StackValue::Number(1.0)),
-            Instr::Push(StackValue::Number(2.0)),
-            Instr::ObjNew(vec!["a".to_string(), "b".to_string()]),
+            Instr::PushFloat(1.0),
+            Instr::PushFloat(2.0),
+            Instr::ObjNew(vec!["a".into(), "b".into()].into()),
             Instr::CallBuiltin(Builtin::ObjKeys, 1),
         ]);
         // result is an array Ptr
@@ -1181,8 +1182,8 @@ mod tests {
     #[test]
     fn call_builtin_obj_values() {
         let out = run(vec![
-            Instr::Push(StackValue::Number(5.0)),
-            Instr::ObjNew(vec!["x".to_string()]),
+            Instr::PushFloat(5.0),
+            Instr::ObjNew(vec!["x".into()].into()),
             Instr::CallBuiltin(Builtin::ObjValues, 1),
         ]);
         match &out[0] {
@@ -1196,7 +1197,7 @@ mod tests {
     #[test]
     fn call_builtin_json_parse() {
         let out = run(vec![
-            Instr::PushStr("42".to_string()),
+            Instr::PushStr("42".into()),
             Instr::CallBuiltin(Builtin::JSONParse, 1),
         ]);
         assert_eq!(out, vec![StackValue::PosInt(42)]);
@@ -1205,7 +1206,7 @@ mod tests {
     #[test]
     fn call_builtin_json_stringify() {
         let out = run(vec![
-            Instr::Push(StackValue::Number(3.5)),
+            Instr::PushFloat(3.5),
             Instr::CallBuiltin(Builtin::JSONStringify, 1),
         ]);
         match &out[0] {
@@ -1219,7 +1220,7 @@ mod tests {
     #[test]
     fn call_builtin_number_is_integer() {
         let out = run(vec![
-            Instr::Push(StackValue::PosInt(5)),
+            Instr::PushPosInt(5),
             Instr::CallBuiltin(Builtin::NumberIsInteger, 1),
         ]);
         assert_eq!(out, vec![StackValue::Bool(true)]);
@@ -1228,7 +1229,7 @@ mod tests {
     #[test]
     fn call_builtin_number_parse_int() {
         let out = run(vec![
-            Instr::PushStr("42".to_string()),
+            Instr::PushStr("42".into()),
             Instr::CallBuiltin(Builtin::NumberParseInt, 1),
         ]);
         assert_eq!(out, vec![StackValue::PosInt(42)]);
@@ -1238,7 +1239,7 @@ mod tests {
     fn call_builtin_number_parse_int_ignores_trailing() {
         // JS parseInt("42px") === 42 — leading digits, trailing ignored.
         let out = run(vec![
-            Instr::PushStr("42px".to_string()),
+            Instr::PushStr("42px".into()),
             Instr::CallBuiltin(Builtin::NumberParseInt, 1),
         ]);
         assert_eq!(out, vec![StackValue::PosInt(42)]);
@@ -1248,8 +1249,8 @@ mod tests {
     fn call_builtin_number_parse_int_radix() {
         // parseInt("ff", 16) === 255
         let out = run(vec![
-            Instr::PushStr("ff".to_string()),
-            Instr::Push(StackValue::PosInt(16)),
+            Instr::PushStr("ff".into()),
+            Instr::PushPosInt(16),
             Instr::CallBuiltin(Builtin::NumberParseInt, 2),
         ]);
         assert_eq!(out, vec![StackValue::PosInt(255)]);
@@ -1259,7 +1260,7 @@ mod tests {
     fn call_builtin_number_parse_int_hex_prefix() {
         // parseInt("0x1A") auto-detects base 16 === 26
         let out = run(vec![
-            Instr::PushStr("0x1A".to_string()),
+            Instr::PushStr("0x1A".into()),
             Instr::CallBuiltin(Builtin::NumberParseInt, 1),
         ]);
         assert_eq!(out, vec![StackValue::PosInt(26)]);
@@ -1268,7 +1269,7 @@ mod tests {
     #[test]
     fn call_builtin_number_parse_int_negative() {
         let out = run(vec![
-            Instr::PushStr("  -17 ".to_string()),
+            Instr::PushStr("  -17 ".into()),
             Instr::CallBuiltin(Builtin::NumberParseInt, 1),
         ]);
         assert_eq!(out, vec![StackValue::NegInt(-17)]);
@@ -1278,7 +1279,7 @@ mod tests {
     fn call_builtin_number_parse_int_nan() {
         // No leading digits → NaN (a Number, not an error).
         let out = run(vec![
-            Instr::PushStr("nope".to_string()),
+            Instr::PushStr("nope".into()),
             Instr::CallBuiltin(Builtin::NumberParseInt, 1),
         ]);
         assert!(matches!(out.as_slice(), [StackValue::Number(n)] if n.is_nan()));
@@ -1294,7 +1295,7 @@ mod tests {
     #[test]
     fn call_builtin_number_parse_float() {
         let out = run(vec![
-            Instr::PushStr("3.14".to_string()),
+            Instr::PushStr("3.14".into()),
             Instr::CallBuiltin(Builtin::NumberParseFloat, 1),
         ]);
         assert_eq!(out, vec![StackValue::Number(3.14)]);
@@ -1314,7 +1315,7 @@ mod tests {
     #[test]
     fn call_builtin_array_is_array_false() {
         let out = run(vec![
-            Instr::Push(StackValue::Number(1.0)),
+            Instr::PushFloat(1.0),
             Instr::CallBuiltin(Builtin::ArrayIsArray, 1),
         ]);
         assert_eq!(out, vec![StackValue::Bool(false)]);
@@ -1325,7 +1326,7 @@ mod tests {
     #[test]
     fn call_builtin_math_abs() {
         let out = run(vec![
-            Instr::Push(StackValue::Number(-5.0)),
+            Instr::PushFloat(-5.0),
             Instr::CallBuiltin(Builtin::MathAbs, 1),
         ]);
         assert_eq!(out, vec![StackValue::Number(5.0)]);
@@ -1334,7 +1335,7 @@ mod tests {
     #[test]
     fn call_builtin_math_sqrt() {
         let out = run(vec![
-            Instr::Push(StackValue::Number(9.0)),
+            Instr::PushFloat(9.0),
             Instr::CallBuiltin(Builtin::MathSqrt, 1),
         ]);
         assert_eq!(out, vec![StackValue::Number(3.0)]);
@@ -1343,19 +1344,19 @@ mod tests {
     #[test]
     fn call_builtin_math_ceil_floor_round() {
         let out = run(vec![
-            Instr::Push(StackValue::Number(2.3)),
+            Instr::PushFloat(2.3),
             Instr::CallBuiltin(Builtin::MathCeil, 1),
         ]);
         assert_eq!(out, vec![StackValue::Number(3.0)]);
 
         let out = run(vec![
-            Instr::Push(StackValue::Number(2.7)),
+            Instr::PushFloat(2.7),
             Instr::CallBuiltin(Builtin::MathFloor, 1),
         ]);
         assert_eq!(out, vec![StackValue::Number(2.0)]);
 
         let out = run(vec![
-            Instr::Push(StackValue::Number(2.5)),
+            Instr::PushFloat(2.5),
             Instr::CallBuiltin(Builtin::MathRound, 1),
         ]);
         assert_eq!(out, vec![StackValue::Number(3.0)]);
@@ -1364,7 +1365,7 @@ mod tests {
     #[test]
     fn call_builtin_math_sign() {
         let out = run(vec![
-            Instr::Push(StackValue::Number(-7.0)),
+            Instr::PushFloat(-7.0),
             Instr::CallBuiltin(Builtin::MathSign, 1),
         ]);
         assert_eq!(out, vec![StackValue::Number(-1.0)]);
@@ -1373,9 +1374,9 @@ mod tests {
     #[test]
     fn call_builtin_math_max_variadic() {
         let out = run(vec![
-            Instr::Push(StackValue::Number(3.0)),
-            Instr::Push(StackValue::Number(9.0)),
-            Instr::Push(StackValue::Number(5.0)),
+            Instr::PushFloat(3.0),
+            Instr::PushFloat(9.0),
+            Instr::PushFloat(5.0),
             Instr::CallBuiltin(Builtin::MathMax, 3),
         ]);
         assert_eq!(out, vec![StackValue::Number(9.0)]);
@@ -1390,9 +1391,9 @@ mod tests {
     #[test]
     fn call_builtin_math_min_variadic() {
         let out = run(vec![
-            Instr::Push(StackValue::Number(3.0)),
-            Instr::Push(StackValue::Number(-1.0)),
-            Instr::Push(StackValue::Number(5.0)),
+            Instr::PushFloat(3.0),
+            Instr::PushFloat(-1.0),
+            Instr::PushFloat(5.0),
             Instr::CallBuiltin(Builtin::MathMin, 3),
         ]);
         assert_eq!(out, vec![StackValue::Number(-1.0)]);
@@ -1401,8 +1402,8 @@ mod tests {
     #[test]
     fn call_builtin_math_pow() {
         let out = run(vec![
-            Instr::Push(StackValue::Number(2.0)),
-            Instr::Push(StackValue::Number(3.0)),
+            Instr::PushFloat(2.0),
+            Instr::PushFloat(3.0),
             Instr::CallBuiltin(Builtin::MathPow, 2),
         ]);
         assert_eq!(out, vec![StackValue::Number(8.0)]);
@@ -1413,9 +1414,9 @@ mod tests {
     #[test]
     fn builtin_as_first_class_value_via_calldyn() {
         let out = run(vec![
-            Instr::Push(StackValue::Number(2.0)),
-            Instr::Push(StackValue::Number(7.0)),
-            Instr::Push(StackValue::Builtin(Builtin::MathMax)),
+            Instr::PushFloat(2.0),
+            Instr::PushFloat(7.0),
+            Instr::PushBuiltin(Builtin::MathMax),
             Instr::CallDyn(2),
         ]);
         assert_eq!(out, vec![StackValue::Number(7.0)]);
@@ -1424,12 +1425,12 @@ mod tests {
     #[test]
     fn builtin_value_shape() {
         let mut vm = VM::new(vec![
-            Instr::Push(StackValue::Builtin(Builtin::MathMax)),
+            Instr::PushBuiltin(Builtin::MathMax),
             Instr::TypeOf,
         ]);
         while !matches!(vm.step().unwrap(), StepResult::Done) {}
         match vm.heap.last() {
-            Some(HeapValue::String(s)) => assert_eq!(s, "function"),
+            Some(HeapValue::String(s)) => assert_eq!(std::str::from_utf8(s).unwrap(), "function"),
             other => panic!("{other:?}"),
         }
     }
@@ -1442,10 +1443,10 @@ mod tests {
         // (as a callback would be: `(element, index, array)`) drops the surplus
         // and uses only the first argument.
         let out = run(vec![
-            Instr::Push(StackValue::Number(9.0)), // the element
-            Instr::Push(StackValue::Number(1.0)), // index — ignored
-            Instr::Push(StackValue::Number(7.0)), // array stand-in — ignored
-            Instr::Push(StackValue::Builtin(Builtin::MathSqrt)),
+            Instr::PushFloat(9.0), // the element
+            Instr::PushFloat(1.0), // index — ignored
+            Instr::PushFloat(7.0), // array stand-in — ignored
+            Instr::PushBuiltin(Builtin::MathSqrt),
             Instr::CallDyn(3),
         ]);
         assert_eq!(out, vec![StackValue::Number(3.0)]);
@@ -1455,8 +1456,8 @@ mod tests {
     fn builtin_below_min_args_errors() {
         // Math.pow needs 2 args; calling it with 1 is a BadArg error.
         let mut vm = VM::new(vec![
-            Instr::Push(StackValue::Number(2.0)),
-            Instr::Push(StackValue::Builtin(Builtin::MathPow)),
+            Instr::PushFloat(2.0),
+            Instr::PushBuiltin(Builtin::MathPow),
             Instr::CallDyn(1),
         ]);
         let err = loop {
@@ -1473,10 +1474,10 @@ mod tests {
     fn variadic_builtin_keeps_all_args() {
         // Math.max is variadic (max = u32::MAX): surplus is never trimmed.
         let out = run(vec![
-            Instr::Push(StackValue::Number(1.0)),
-            Instr::Push(StackValue::Number(9.0)),
-            Instr::Push(StackValue::Number(4.0)),
-            Instr::Push(StackValue::Builtin(Builtin::MathMax)),
+            Instr::PushFloat(1.0),
+            Instr::PushFloat(9.0),
+            Instr::PushFloat(4.0),
+            Instr::PushBuiltin(Builtin::MathMax),
             Instr::CallDyn(3),
         ]);
         assert_eq!(out, vec![StackValue::Number(9.0)]);
