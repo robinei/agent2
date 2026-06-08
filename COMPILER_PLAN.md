@@ -171,6 +171,17 @@ Two passes per function are unavoidable: capture analysis must see nested
 functions' free-variable use *before* we can decide which slots are `Boxed` and
 emit the correct prologue `Alloc`.
 
+**Pass 1 is the single source of truth for names.** It walks the AST once,
+records every binding occurrence and identifier reference keyed by source span,
+then resolves captures bottom-up (free variables propagate up the scope tree;
+the resolvable ones become upvals, boxing the captured owner slot). A final step
+turns the recorded own-slots into absolute frame slots, yielding three
+span-keyed tables — `binding_slot` (declaration → slot), `ref_resolution`
+(reference → slot + const-ness), `scope_by_span` (function node → scope). **Pass
+2 (codegen) keeps no scope state of its own**: it looks every binding/reference/
+function up by span. This avoids re-deriving slot assignment in codegen (the
+source of an earlier crop of cursor-synchronization bugs).
+
 ## Output artifact
 
 ```rust
@@ -204,10 +215,15 @@ Storing the **byte offset** (not a precomputed line) keeps it flexible and cheap
 ## Code layout in the flat vector
 
 - Top-level code occupies offset 0 (where `ip` starts) and ends with `Return(0)`.
-- Function bodies are compiled from a worklist (`pending_functions`) and appended
-  after the top-level region as `Label(entry) · prologue · body · Return`.
-- Append order is irrelevant — everything is label-referenced and resolved in
-  Pass 3. A function body is reachable only via `Call`/`CallDyn`.
+- Function bodies are emitted **inline at their definition site**, guarded by a
+  jump-over: `Jump(after) · Label(entry) · prologue · body · Return · Label(after)`.
+  Sequential execution hits the `Jump` and skips the body; `Call`/`CallDyn` enter
+  at `Label(entry)`. This was chosen over a deferred worklist
+  (`pending_functions`) of appended bodies: the worklist would have to store
+  borrowed AST nodes, forcing the whole `Compiler` to carry the arena lifetime,
+  whereas inline emission needs none of that and costs only one `Jump`+`Label`
+  per function (negligible under the fuel budget). Either way the body is
+  reachable only via `Call`/`CallDyn`, and all addresses resolve in Pass 3.
 
 ## Calls — lower everything to `CallDyn` initially
 
