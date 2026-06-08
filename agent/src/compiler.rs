@@ -13,7 +13,7 @@ use oxc_ast::ast;
 use oxc_parser::Parser;
 use oxc_span::{GetSpan, SourceType};
 
-use crate::analyzer::{self, frame_abs, ProgramAnalysis, RefSlot};
+use crate::analyzer::{self, ProgramAnalysis, RefSlot, frame_abs};
 use crate::builtin::Builtin;
 use crate::diag::Diagnostic;
 use crate::vm::{Instr, SetMode, SlotKind, StackValue};
@@ -480,11 +480,7 @@ impl<'src> Compiler<'src> {
     /// the leading upvals) while emitted slots are absolute (`upval_count + own`),
     /// so subtract the upval count first.
     fn slot_needs_fresh(&self, slot: u32) -> bool {
-        let scope = &self
-            .analysis
-            .as_ref()
-            .expect("analysis present")
-            .scopes[self.current_scope];
+        let scope = &self.analysis.as_ref().expect("analysis present").scopes[self.current_scope];
         match slot.checked_sub(scope.upval_count) {
             Some(own) => scope.fresh_owns.contains(&own),
             None => false,
@@ -2066,9 +2062,7 @@ impl<'src> Compiler<'src> {
             "some" => return self.compile_hof(recv, argv, span, optional, "__some", 1),
             "every" => return self.compile_hof(recv, argv, span, optional, "__every", 1),
             "find" => return self.compile_hof(recv, argv, span, optional, "__find", 1),
-            "findIndex" => {
-                return self.compile_hof(recv, argv, span, optional, "__findIndex", 1)
-            }
+            "findIndex" => return self.compile_hof(recv, argv, span, optional, "__findIndex", 1),
             "reduce" => return self.compile_reduce(recv, argv, span, optional),
             _ => {
                 // Not a known builtin method — treat as property access
@@ -2170,7 +2164,10 @@ impl<'src> Compiler<'src> {
         match argv.len() {
             2 => self.emit_prelude_call("__reduce", recv, argv, span, optional),
             1 => self.emit_prelude_call("__reduce1", recv, argv, span, optional),
-            n => self.error(span, format!("`reduce` expects 1 or 2 argument(s), got {n}")),
+            n => self.error(
+                span,
+                format!("`reduce` expects 1 or 2 argument(s), got {n}"),
+            ),
         }
     }
 
@@ -2190,7 +2187,10 @@ impl<'src> Compiler<'src> {
         let Some(label) = self.find_root_callee_label(helper) else {
             // The prelude assembler appends a helper whenever its method appears
             // in source, so a missing label is an internal inconsistency.
-            self.error(span, format!("internal error: prelude helper `{helper}` is unavailable"));
+            self.error(
+                span,
+                format!("internal error: prelude helper `{helper}` is unavailable"),
+            );
             return;
         };
         let arity = 1 + argv.len() as u32; // receiver + callback (+ init)
@@ -2440,7 +2440,15 @@ impl<'src> Compiler<'src> {
         span: u32,
         is_expression_body: bool,
     ) {
-        let (label, slot_kinds, params_info, self_name, upval_count, own_local_count, uses_arguments) = {
+        let (
+            label,
+            slot_kinds,
+            params_info,
+            self_name,
+            upval_count,
+            own_local_count,
+            uses_arguments,
+        ) = {
             let analysis = self.analysis.as_ref().expect("analysis present");
             let scope = &analysis.scopes[scope_id];
             (
@@ -2474,7 +2482,10 @@ impl<'src> Compiler<'src> {
         if self_name.is_some() {
             local_kinds.push(SlotKind::Plain);
         }
-        self.emit(Instr::EnterFrame(nparams, uses_arguments, local_kinds), span);
+        self.emit(
+            Instr::EnterFrame(nparams, uses_arguments, local_kinds),
+            span,
+        );
 
         // Per-parameter prologue: apply defaults (the arg is already in the slot)
         // and box captured params in place. Plain params with no default need no
@@ -3060,10 +3071,10 @@ mod tests {
             "raise(x);",    // raise with a non-literal argument
             "raise();",     // raise with no argument
             "Math.tan(1);", // unsupported intrinsic
-            "Math.pow(1);",   // wrong arity (needs exactly 2)
-            "f(...args);",    // spread arg
-            "new Foo();",     // new
-            "class C {}",     // class statement
+            "Math.pow(1);", // wrong arity (needs exactly 2)
+            "f(...args);",  // spread arg
+            "new Foo();",   // new
+            "class C {}",   // class statement
         ] {
             assert!(compile(src).is_err(), "expected `{src}` to fail to compile");
         }
@@ -3122,8 +3133,7 @@ mod tests {
         // `tools.foo(a, b)` lowers to args-then-`Invoke("foo", 2)`.
         let prog = compile("tools.notify(1, 2);").expect("compiles");
         assert!(
-            prog.code
-                .contains(&Instr::Invoke("notify".to_string(), 2)),
+            prog.code.contains(&Instr::Invoke("notify".to_string(), 2)),
             "expected Invoke in {:?}",
             prog.code
         );
@@ -3139,7 +3149,10 @@ mod tests {
             StepResult::Invoke { calls } => {
                 assert_eq!(calls.len(), 1);
                 assert_eq!(calls[0].name, "add");
-                assert_eq!(calls[0].args, vec![StackValue::PosInt(10), StackValue::PosInt(3)]);
+                assert_eq!(
+                    calls[0].args,
+                    vec![StackValue::PosInt(10), StackValue::PosInt(3)]
+                );
             }
             other => panic!("expected Invoke, got {other:?}"),
         }
@@ -3404,7 +3417,8 @@ mod tests {
     #[test]
     fn for_in_over_state() {
         // for-in over the blessed `state` object enumerates its keys.
-        let vm = run_vm("state.x = 1; state.y = 2; let n = 0; for (const k in state) n++; state.r = n;");
+        let vm =
+            run_vm("state.x = 1; state.y = 2; let n = 0; for (const k in state) n++; state.r = n;");
         assert_eq!(state_val(&vm, "r"), num(2.0));
     }
 
@@ -4085,9 +4099,8 @@ mod tests {
         // The fresh per-iteration cell is seeded with the previous iteration's
         // value, so the update (`i++`) and the running total stay correct even
         // with re-boxing.
-        let vm = run_vm(
-            "let sum = 0; for (let i = 0; i < 5; i++) { sum = sum + i; } state.r = sum;",
-        );
+        let vm =
+            run_vm("let sum = 0; for (let i = 0; i < 5; i++) { sum = sum + i; } state.r = sum;");
         assert_eq!(state_val(&vm, "r"), num(10.0)); // 0+1+2+3+4
     }
 
@@ -4111,14 +4124,16 @@ mod tests {
         // eager cell in the preamble) and re-boxed per iteration via FreshCell.
         // Here the only captured binding is the loop var `i`, so the prologue
         // `Alloc` must contain no `Boxed` slot, yet FreshCell is emitted.
-        let prog = compile(
-            "let fns = []; for (let i = 0; i < 3; i++) { fns.push(() => i); }",
-        )
-        .expect("compiles");
-        let has_boxed = prog.code.iter().any(|i| {
-            matches!(i, Instr::Alloc(kinds) if kinds.iter().any(|k| *k == SlotKind::Boxed))
-        });
-        assert!(!has_boxed, "captured loop var should be Plain-allocated: {:?}", prog.code);
+        let prog = compile("let fns = []; for (let i = 0; i < 3; i++) { fns.push(() => i); }")
+            .expect("compiles");
+        let has_boxed = prog.code.iter().any(
+            |i| matches!(i, Instr::Alloc(kinds) if kinds.iter().any(|k| *k == SlotKind::Boxed)),
+        );
+        assert!(
+            !has_boxed,
+            "captured loop var should be Plain-allocated: {:?}",
+            prog.code
+        );
         assert!(
             prog.code.iter().any(|i| matches!(i, Instr::FreshCell(_))),
             "captured loop var should still be re-boxed per iteration: {:?}",
@@ -4130,7 +4145,8 @@ mod tests {
     fn plain_loop_var_emits_no_fresh_cell() {
         // A loop variable not captured by any closure stays a Plain slot, so no
         // FreshCell is emitted (per-iteration freshness is unobservable).
-        let prog = compile("let s = 0; for (let i = 0; i < 3; i++) { s = s + i; }").expect("compiles");
+        let prog =
+            compile("let s = 0; for (let i = 0; i < 3; i++) { s = s + i; }").expect("compiles");
         assert!(
             !prog.code.iter().any(|i| matches!(i, Instr::FreshCell(_))),
             "uncaptured loop var should not emit FreshCell: {:?}",

@@ -1406,9 +1406,7 @@ impl VM {
                         }
                         StackValue::Ptr(p) => {
                             let (addr, upvals) = match self.heap_get(p)? {
-                                HeapValue::Closure { addr, upvals } => {
-                                    (*addr, upvals.clone())
-                                }
+                                HeapValue::Closure { addr, upvals } => (*addr, upvals.clone()),
                                 _ => return Err(VMError::TypeError),
                             };
                             if addr as usize >= self.code.len() {
@@ -1566,9 +1564,8 @@ impl VM {
                     }
                     // 3. Install the closure's captured environment as the upval
                     //    locals, now landing at [fp + nparams, fp + nparams + K).
-                    let upvals = std::mem::take(
-                        &mut self.callstack.last_mut().unwrap().pending_upvals,
-                    );
+                    let upvals =
+                        std::mem::take(&mut self.callstack.last_mut().unwrap().pending_upvals);
                     let k = upvals.len() as u32;
                     for uv in upvals {
                         self.stack.push(uv);
