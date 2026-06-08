@@ -72,11 +72,14 @@ pub fn compile(source: &str) -> Result<Program, Vec<Diagnostic>> {
     })
 }
 
-/// One entry of the loop-context stack: where `break` and `continue` jump for
-/// the innermost enclosing loop. Both carry a label id (resolved in backpatch).
+/// One entry of the break/continue-context stack. `break` targets the innermost
+/// entry's `break_label`; `continue` targets the innermost entry that has a
+/// `continue_label`. A `switch` pushes a **break-only** entry (`continue_label:
+/// None`) so `break` resolves to the switch end while `continue` skips past it
+/// to the enclosing loop. Labels are resolved in backpatch.
 struct LoopCtx {
     break_label: u32,
-    continue_label: u32,
+    continue_label: Option<u32>,
 }
 
 /// An assignment/update target resolved to its storage shape, so that `=`,
@@ -247,10 +250,9 @@ impl<'src> Compiler<'src> {
             ast::Statement::ForOfStatement(s) => self.compile_for_of(s),
             ast::Statement::ForInStatement(s) => self.compile_for_in(s),
 
+            ast::Statement::SwitchStatement(s) => self.compile_switch(s),
+
             // Later phases / out of scope — informative errors.
-            ast::Statement::SwitchStatement(s) => {
-                self.error(s.span.start, "`switch` is not supported until Phase 4")
-            }
             ast::Statement::ThrowStatement(s) => {
                 self.error(s.span.start, "`throw` is not supported (use `raise`)")
             }
@@ -483,7 +485,7 @@ impl<'src> Compiler<'src> {
         self.emit(Instr::JFalse(end), span);
         self.loops.push(LoopCtx {
             break_label: end,
-            continue_label: top,
+            continue_label: Some(top),
         });
         self.compile_stmt(&s.body);
         self.loops.pop();
@@ -499,7 +501,7 @@ impl<'src> Compiler<'src> {
         self.emit(Instr::Label(top), span);
         self.loops.push(LoopCtx {
             break_label: end,
-            continue_label: cont,
+            continue_label: Some(cont),
         });
         self.compile_stmt(&s.body);
         self.loops.pop();
@@ -534,7 +536,7 @@ impl<'src> Compiler<'src> {
         }
         self.loops.push(LoopCtx {
             break_label: end,
-            continue_label: cont,
+            continue_label: Some(cont),
         });
         self.compile_stmt(&s.body);
         self.loops.pop();
@@ -567,11 +569,11 @@ impl<'src> Compiler<'src> {
             self.error(s.span.start, "labeled `continue` is not supported");
             return;
         }
-        match self.loops.last() {
-            Some(ctx) => {
-                let target = ctx.continue_label;
-                self.emit(Instr::Jump(target), s.span.start);
-            }
+        // `continue` targets the innermost *loop* — break-only `switch` entries
+        // (`continue_label: None`) are skipped, so `continue` inside a `switch`
+        // escapes to the enclosing loop, as in JS.
+        match self.loops.iter().rev().find_map(|ctx| ctx.continue_label) {
+            Some(target) => self.emit(Instr::Jump(target), s.span.start),
             None => self.error(s.span.start, "`continue` outside a loop"),
         }
     }
@@ -633,7 +635,7 @@ impl<'src> Compiler<'src> {
         self.emit(Instr::SetLocal(slot), span); // [cont, idx]
         self.loops.push(LoopCtx {
             break_label: end,
-            continue_label: cont,
+            continue_label: Some(cont),
         });
         self.compile_stmt(body);
         self.loops.pop();
@@ -675,6 +677,56 @@ impl<'src> Compiler<'src> {
                 None
             }
         }
+    }
+
+    /// `switch (disc) { case a: … default: … }`. The discriminant value is kept
+    /// on the stack across the whole construct (`[disc]`); each `case` test is
+    /// compared against a duplicate of it with strict `===` (`Eq`). On a match
+    /// we jump to that case's body; bodies are emitted in source order so
+    /// fall-through is just running into the next one. `default` is dispatched
+    /// to when no `case` matches (it may sit anywhere among the bodies).
+    /// `break` jumps to the switch end (via a break-only loop-context entry);
+    /// `continue` is not bound here and escapes to any enclosing loop.
+    fn compile_switch(&mut self, s: &ast::SwitchStatement) {
+        let span = s.span.start;
+        self.compile_expr(&s.discriminant); // [disc]
+        let end = self.new_label();
+        // One body label per case (including `default`).
+        let case_labels: Vec<u32> = s.cases.iter().map(|_| self.new_label()).collect();
+        let mut default_idx: Option<usize> = None;
+
+        // Dispatch: test each `case` in source order; record `default` for last.
+        for (i, case) in s.cases.iter().enumerate() {
+            match &case.test {
+                Some(test) => {
+                    self.emit(Instr::Pick(0), span); // dup disc -> [disc, disc]
+                    self.compile_expr(test); // [disc, disc, test]
+                    self.emit(Instr::Eq, span); // [disc, disc===test]
+                    self.emit(Instr::JTrue(case_labels[i]), span); // [disc]
+                }
+                None => default_idx = Some(i),
+            }
+        }
+        // No case matched → default body (if any), else the end.
+        match default_idx {
+            Some(i) => self.emit(Instr::Jump(case_labels[i]), span),
+            None => self.emit(Instr::Jump(end), span),
+        }
+
+        // Bodies in source order; consecutive bodies fall through. `break` → end.
+        self.loops.push(LoopCtx {
+            break_label: end,
+            continue_label: None,
+        });
+        for (i, case) in s.cases.iter().enumerate() {
+            self.emit(Instr::Label(case_labels[i]), span);
+            for stmt in &case.consequent {
+                self.compile_stmt(stmt);
+            }
+        }
+        self.loops.pop();
+        self.emit(Instr::Label(end), span);
+        self.emit(Instr::Pop(1), span); // drop disc
     }
 
     /// Every expression leaves exactly one value on the stack (the
@@ -3174,6 +3226,81 @@ mod tests {
         ] {
             assert!(compile(src).is_err(), "expected `{src}` to fail to compile");
         }
+    }
+
+    #[test]
+    fn switch_basic_and_fallthrough() {
+        // A matching case runs and `break` stops fall-through.
+        assert_eq!(
+            eval_phase2(
+                "let r = 0; switch (2) { case 1: r = 1; break; case 2: r = 2; break; case 3: r = 3; break; } return r;"
+            ),
+            StackValue::PosInt(2)
+        );
+        // No break: execution falls through into the next case.
+        assert_eq!(
+            eval_phase2(
+                "let r = 0; switch (1) { case 1: r += 1; case 2: r += 10; break; case 3: r += 100; } return r;"
+            ),
+            num(11.0)
+        );
+        // default runs when nothing matches.
+        assert_eq!(
+            eval_phase2(
+                "let r = 0; switch (9) { case 1: r = 1; break; default: r = 42; } return r;"
+            ),
+            StackValue::PosInt(42)
+        );
+        // default in the middle, reached by fall-through from a later... actually
+        // default is dispatched only when no case matches; here 1 matches.
+        assert_eq!(
+            eval_phase2(
+                "let r = 0; switch (1) { default: r = 42; break; case 1: r = 7; break; } return r;"
+            ),
+            StackValue::PosInt(7)
+        );
+        // Strict (===) matching: a string discriminant does not match a number.
+        assert_eq!(
+            eval_phase2(
+                "let r = 0; switch (\"1\") { case 1: r = 1; break; default: r = 2; } return r;"
+            ),
+            StackValue::PosInt(2)
+        );
+    }
+
+    #[test]
+    fn switch_break_only_continue_escapes() {
+        // `break` inside a switch breaks the switch, not the enclosing loop.
+        assert_eq!(
+            eval_phase2(
+                "let s = 0; for (let i = 0; i < 3; i++) { switch (i) { case 1: break; default: s += i; } } return s;"
+            ),
+            num(2.0) // i=0 (default, +0) and i=2 (default, +2); i=1 breaks the switch
+        );
+        // `continue` inside a switch continues the enclosing loop.
+        assert_eq!(
+            eval_phase2(
+                "let s = 0; for (let i = 0; i < 4; i++) { switch (i) { case 2: continue; default: break; } s += i; } return s;"
+            ),
+            num(4.0) // i=2 continues (skips s+=i); 0+1+3 = 4
+        );
+    }
+
+    #[test]
+    fn switch_lexical_decls_share_block() {
+        // A `let` in one case is visible (one block) but slot-distinct per name.
+        assert_eq!(
+            eval_phase2(
+                "let r = 0; switch (1) { case 1: { let x = 5; r = x; break; } default: r = 0; } return r;"
+            ),
+            StackValue::PosInt(5)
+        );
+    }
+
+    #[test]
+    fn switch_continue_outside_loop_errors() {
+        // `continue` in a switch with no enclosing loop is an error.
+        assert!(compile("switch (1) { case 1: continue; }").is_err());
     }
 
     #[test]

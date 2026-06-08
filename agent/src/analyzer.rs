@@ -615,12 +615,13 @@ impl Analyzer {
                 self.analyze_stmt(&s.body, scope, block_scopes, next_slot, scopes);
                 block_scopes.pop();
             }
-            // TODO(phase4): when codegen supports `switch`, push a single block
-            // scope for the whole switch body here (lexical decls in `case`
-            // clauses share one block), and give codegen a non-loop `break`
-            // target (`continue` is invalid in a switch).
+            // `switch`: the whole body shares **one** lexical block (a `let` in
+            // one `case` is visible in later cases), so push a single block scope
+            // around all the case tests and consequents. `break`/`continue`
+            // targeting is handled in codegen (break-only context for the switch).
             ast::Statement::SwitchStatement(s) => {
                 self.analyze_expr(&s.discriminant, scope, block_scopes, scopes);
+                block_scopes.push(IndexMap::new());
                 for case in &s.cases {
                     if let Some(test) = &case.test {
                         self.analyze_expr(test, scope, block_scopes, scopes);
@@ -629,6 +630,7 @@ impl Analyzer {
                         self.analyze_stmt(cs, scope, block_scopes, next_slot, scopes);
                     }
                 }
+                block_scopes.pop();
             }
             _ => {}
         }
