@@ -1080,8 +1080,10 @@ impl VM {
         }
     }
 
-    /// Extract a string from a StackValue that has already been popped.
-    pub(crate) fn pop_string_from(&self, val: &StackValue) -> Result<ThinString, VMError> {
+    /// Extract an owned (cloned) string from an already-popped StackValue. The
+    /// clone sibling of `str_from`: use this when the builtin must retain the
+    /// string while it mutates the heap (e.g. allocates its result).
+    pub(crate) fn string_from(&self, val: &StackValue) -> Result<ThinString, VMError> {
         match val {
             StackValue::Ptr(p) => match self.heap.get(*p as usize) {
                 Some(HeapValue::String(s)) => Ok(s.clone()),

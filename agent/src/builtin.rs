@@ -527,13 +527,13 @@ fn str_split(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     let args = take_args::<3>(vm, argc)?;
     let (s, delim, limit) = match argc {
         2 => (
-            vm.pop_string_from(&args[0])?,
-            vm.pop_string_from(&args[1])?,
+            vm.string_from(&args[0])?,
+            vm.string_from(&args[1])?,
             None,
         ),
         3 => (
-            vm.pop_string_from(&args[0])?,
-            vm.pop_string_from(&args[1])?,
+            vm.string_from(&args[0])?,
+            vm.string_from(&args[1])?,
             {
                 let lim = as_i64(&args[2]).ok_or(VMError::TypeError)?;
                 if lim < 0 {
@@ -674,7 +674,7 @@ fn str_slice(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     let args = take_args::<3>(vm, argc)?;
     let (s, start, end): (ThinString, usize, usize) = match argc {
         2 => {
-            let s = vm.pop_string_from(&args[0])?;
+            let s = vm.string_from(&args[0])?;
             let start = as_i64(&args[1]).ok_or(VMError::TypeError)?;
             if start < 0 {
                 return Err(VMError::ValueError);
@@ -684,7 +684,7 @@ fn str_slice(vm: &mut VM, argc: u32) -> Result<(), VMError> {
             (s, start, end)
         }
         3 => {
-            let s = vm.pop_string_from(&args[0])?;
+            let s = vm.string_from(&args[0])?;
             let start = as_i64(&args[1]).ok_or(VMError::TypeError)?;
             let end = as_i64(&args[2]).ok_or(VMError::TypeError)?;
             if start < 0 || end < 0 || start > end {
@@ -705,7 +705,7 @@ fn str_slice(vm: &mut VM, argc: u32) -> Result<(), VMError> {
 /// `s.trim()` → trimmed string.
 fn str_trim(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     let args = check_arity!(vm, argc, 1)?;
-    let s = vm.pop_string_from(&args[0])?;
+    let s = vm.string_from(&args[0])?;
     let ptr = vm.alloc_string(ThinString::from(s.trim()));
     vm.stack.push(ptr);
     Ok(())
@@ -755,7 +755,7 @@ fn obj_values(vm: &mut VM, argc: u32) -> Result<(), VMError> {
 /// `JSON.parse(s)` → any.
 fn json_parse(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     let args = check_arity!(vm, argc, 1)?;
-    let s = vm.pop_string_from(&args[0])?;
+    let s = vm.string_from(&args[0])?;
     let json: serde_json::Value = serde_json::from_str(&s).map_err(|_| VMError::ValueError)?;
     let val = vm.json_to_stack_value(&json, 0)?;
     vm.stack.push(val);
