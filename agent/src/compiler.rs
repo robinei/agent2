@@ -13,7 +13,7 @@ use oxc_ast::ast;
 use oxc_parser::Parser;
 use oxc_span::{GetSpan, SourceType};
 
-use crate::analyzer::{self, ProgramAnalysis, RefSlot};
+use crate::analyzer::{self, frame_abs, ProgramAnalysis, RefSlot};
 use crate::builtin::Builtin;
 use crate::diag::Diagnostic;
 use crate::vm::{Instr, SetMode, SlotKind, StackValue};
@@ -2243,12 +2243,11 @@ impl<'src> Compiler<'src> {
             match self.find_callee_label(name) {
                 Some(l) if !self.function_has_captures(name) => {
                     // Static call: push args and Call. Pad with Undefined when
-                    // the caller passes fewer args than the function declares
-                    // (for default parameters). The frame's `arg_count` must be
-                    // the number of values actually pushed — so when the caller
+                    // the caller passes fewer args than the function declares, so
+                    // `arg_count` reaches the declared arity. When the caller
                     // passes *more* args than declared params, pass the larger
-                    // count (not the declared arity), keeping `Arg(i)` aligned
-                    // and the surplus reachable via `arguments`.
+                    // count so the surplus stays reachable via `arguments` (the
+                    // prologue `EnterFrame` then normalizes the slots to nparams).
                     let expected_arity = self.function_arity(name);
                     self.compile_args(argv);
                     let passed = argv.len() as u32;
@@ -2441,7 +2440,7 @@ impl<'src> Compiler<'src> {
         span: u32,
         is_expression_body: bool,
     ) {
-        let (label, slot_kinds, params_info, self_name, upval_count, own_local_count) = {
+        let (label, slot_kinds, params_info, self_name, upval_count, own_local_count, uses_arguments) = {
             let analysis = self.analysis.as_ref().expect("analysis present");
             let scope = &analysis.scopes[scope_id];
             (
@@ -2451,8 +2450,10 @@ impl<'src> Compiler<'src> {
                 scope.self_name.clone(),
                 scope.upval_count,
                 scope.own_local_count,
+                scope.uses_arguments,
             )
         };
+        let nparams = params_info.len() as u32;
 
         let prev_scope = self.current_scope;
         self.current_scope = scope_id;
@@ -2463,36 +2464,32 @@ impl<'src> Compiler<'src> {
         self.emit(Instr::Jump(after), span);
         self.emit(Instr::Label(label), span);
 
-        // Allocate all own locals with their precomputed kinds (upvals were
-        // pre-installed as leading locals by the caller).
-        if !slot_kinds.is_empty() {
-            self.emit(Instr::Alloc(slot_kinds.clone()), span);
-        }
-
-        // Copy each parameter from its `Arg` into its local slot (writing
-        // through a boxed cell when captured), applying defaults.
-        for (p_idx, param_info) in params_info.iter().enumerate() {
-            let abs_slot = upval_count + p_idx as u32;
-            let needs_box = matches!(slot_kinds.get(p_idx).copied(), Some(SlotKind::Boxed));
-            let pat = &params.items[p_idx].pattern;
-            let default_expr = params.items[p_idx].initializer.as_ref().map(|v| &**v);
-            self.emit_param_setup(
-                pat,
-                p_idx as u32,
-                abs_slot,
-                needs_box,
-                param_info.has_default,
-                default_expr,
-                span,
-            );
-        }
-
-        // Self-reference (named function expression / recursive declaration):
-        // a dedicated `Plain` slot just past the own locals, holding a bare
-        // `Fn` (never a closure over the current frame).
+        // Prologue frame setup in one instruction: the args are already in place
+        // as the leading locals [0, nparams) (so no per-param copy), upvals get
+        // installed at [nparams, nparams+K), and the declared (non-param) own
+        // locals — plus the self-reference slot, if any — are allocated from
+        // their kinds. `slot_kinds[..nparams]` are the params (handled below);
+        // `slot_kinds[nparams..]` are the declared locals.
+        let mut local_kinds: Vec<SlotKind> = slot_kinds[nparams as usize..].to_vec();
         if self_name.is_some() {
-            let self_slot = upval_count + own_local_count;
-            self.emit(Instr::Alloc(vec![SlotKind::Plain]), span);
+            local_kinds.push(SlotKind::Plain);
+        }
+        self.emit(Instr::EnterFrame(nparams, uses_arguments, local_kinds), span);
+
+        // Per-parameter prologue: apply defaults (the arg is already in the slot)
+        // and box captured params in place. Plain params with no default need no
+        // code — their value is already in the local slot.
+        for (p_idx, param_info) in params_info.iter().enumerate() {
+            let slot = p_idx as u32; // params occupy slots 0..nparams
+            let needs_box = matches!(slot_kinds.get(p_idx).copied(), Some(SlotKind::Boxed));
+            let default_expr = params.items[p_idx].initializer.as_ref().map(|v| &**v);
+            self.emit_param_setup(slot, needs_box, param_info.has_default, default_expr, span);
+        }
+
+        // Self-reference (named function expression / recursive declaration): the
+        // slot was allocated by EnterFrame above; fill it with the bare `Fn`.
+        if self_name.is_some() {
+            let self_slot = frame_abs(own_local_count, nparams, upval_count);
             self.emit(Instr::Push(StackValue::Fn(label)), span);
             self.emit(Instr::SetLocal(self_slot), span);
         }
@@ -2517,46 +2514,37 @@ impl<'src> Compiler<'src> {
         self.current_scope = prev_scope;
     }
 
-    /// Emit prologue code for one parameter: optionally read Arg, check for
-    /// undefined/default, and store to the appropriate slot. `has_default`
-    /// comes from the FormalParameter's `initializer` field (oxc stores
-    /// defaults there, not in the BindingPattern).
+    /// Emit per-parameter prologue code. The argument value is already in the
+    /// param's local `slot` (placed in-frame by `EnterFrame`), so:
+    ///   - with a default: if the slot is `undefined`, replace it with the
+    ///     default expression's value;
+    ///   - if captured (`needs_box`): box the slot in place with `FreshCell`
+    ///     (Plain value → fresh cell), so closures capture it by reference.
+    /// A plain param with no default needs no code at all.
     fn emit_param_setup(
         &mut self,
-        _pattern: &ast::BindingPattern,
-        arg_idx: u32,
-        abs_slot: u32,
+        slot: u32,
         needs_box: bool,
         has_default: bool,
         default_expr: Option<&ast::Expression>,
         span: u32,
     ) {
         if has_default {
-            // Parameter has a default: read Arg, check if undefined, apply
-            // default if needed, then store to the slot.
             if let Some(default) = default_expr {
+                // if Local(slot) === undefined { slot = default }
                 let skip_default = self.new_label();
-                self.emit(Instr::Arg(arg_idx), span);
-                self.emit(Instr::Dup, span);
+                self.emit(Instr::Local(slot), span);
                 self.emit(Instr::Push(StackValue::Undefined), span);
                 self.emit(Instr::Eq, span);
                 self.emit(Instr::JFalse(skip_default), span);
-                // Arg is undefined: pop it, evaluate default.
-                self.emit(Instr::Pop(1), span);
                 self.compile_expr(default);
+                self.emit(Instr::SetLocal(slot), span);
                 self.emit(Instr::Label(skip_default), span);
-                // Store to the local slot (the value — arg or default — is on top).
-                self.emit(Instr::SetLocal(abs_slot), span);
             }
-        } else if needs_box {
-            // No default, but we need a Boxed copy: Arg → SetLocal.
-            self.emit(Instr::Arg(arg_idx), span);
-            self.emit(Instr::SetLocal(abs_slot), span);
-        } else {
-            // Plain non-captured param: still copy Arg to Local so the body
-            // can use Local(slot) uniformly.
-            self.emit(Instr::Arg(arg_idx), span);
-            self.emit(Instr::SetLocal(abs_slot), span);
+        }
+        if needs_box {
+            // Promote the plain arg value in the slot to a shared cell.
+            self.emit(Instr::FreshCell(slot), span);
         }
     }
 }

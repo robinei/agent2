@@ -85,6 +85,11 @@ pub(crate) struct FuncScope {
     pub(crate) upval_count: u32,
     /// Total number of own-local slots (params + declared vars).
     pub(crate) own_local_count: u32,
+    /// Whether the body references the special `arguments` array (an `arguments`
+    /// identifier that does not resolve to a real binding). Drives eager
+    /// materialization of the arguments array in the prologue, before the arg
+    /// region is normalized to exactly `nparams`.
+    pub(crate) uses_arguments: bool,
     /// Final slot kinds for own locals (`Alloc` operand; upvals excluded).
     pub(crate) slot_kinds: Vec<SlotKind>,
 }
@@ -142,8 +147,22 @@ impl FuncScope {
             captures: Vec::new(),
             upval_count: 0,
             own_local_count: 0,
+            uses_arguments: false,
             slot_kinds: Vec::new(),
         }
+    }
+}
+
+/// Absolute frame slot for an own-local index under the `[params | upvals |
+/// locals]` layout: the `nparams` params keep slots `0..nparams` (they arrive in
+/// place as the call's arguments), then the `K` upvals occupy `nparams..nparams+K`,
+/// then the remaining own locals are shifted up by `K`. (`own == own_local_count`
+/// yields the self-reference slot just past all own locals.)
+pub(crate) fn frame_abs(own: u32, nparams: u32, upval_count: u32) -> u32 {
+    if own < nparams {
+        own
+    } else {
+        own + upval_count
     }
 }
 
@@ -187,12 +206,18 @@ fn resolve_captures(scopes: &mut [FuncScope]) {
             if self_name.as_deref() == Some(fv.as_str()) {
                 continue;
             }
+            let parent_nparams = scopes[parent].params.len() as u32;
             let (parent_abs, is_const) = if let Some(info) = scopes[parent].names.get(&fv).copied()
             {
                 scopes[parent].captured.insert(info.slot);
-                (scopes[parent].upval_count + info.slot, info.is_const)
+                (
+                    frame_abs(info.slot, parent_nparams, scopes[parent].upval_count),
+                    info.is_const,
+                )
             } else if let Some(&(idx, is_const)) = scopes[parent].upval_by_name.get(&fv) {
-                (idx, is_const)
+                // Capturing one of the parent's own upvals: its absolute slot is
+                // `parent_nparams + idx` under the [params | upvals | locals] layout.
+                (parent_nparams + idx, is_const)
             } else {
                 // Not declared in any ancestor: a global/`state`/undeclared
                 // name — not an upval.
@@ -247,14 +272,15 @@ fn finalize_tables(
         if s.node_span != u32::MAX {
             scope_by_span.insert(s.node_span, s.id);
         }
+        let nparams = s.params.len() as u32;
         for &(span, own) in &s.binding_spans {
-            binding_slot.insert(span, s.upval_count + own);
+            binding_slot.insert(span, frame_abs(own, nparams, s.upval_count));
         }
         for &(span, own, is_const) in &s.local_refs {
             ref_resolution.insert(
                 span,
                 RefSlot {
-                    slot: s.upval_count + own,
+                    slot: frame_abs(own, nparams, s.upval_count),
                     is_const,
                 },
             );
@@ -265,15 +291,16 @@ fn finalize_tables(
                 ref_resolution.insert(
                     *span,
                     RefSlot {
-                        slot: s.upval_count + s.own_local_count,
+                        slot: frame_abs(s.own_local_count, nparams, s.upval_count),
                         is_const: true,
                     },
                 );
             } else if let Some(&(idx, is_const)) = s.upval_by_name.get(name) {
+                // The body's own upvals occupy slots [nparams, nparams + K).
                 ref_resolution.insert(
                     *span,
                     RefSlot {
-                        slot: idx,
+                        slot: nparams + idx,
                         is_const,
                     },
                 );
@@ -982,6 +1009,12 @@ impl Analyzer {
         if let Some((slot, is_const)) = self.analyze_resolve_name(name, block_scopes) {
             scope.local_refs.push((span, slot, is_const));
         } else {
+            // An unshadowed `arguments` reference uses the frame's argument array
+            // (the compiler emits `Arguments`, not a `Local`); flag the scope so
+            // the prologue materializes that array before normalizing the args.
+            if name == "arguments" {
+                scope.uses_arguments = true;
+            }
             scope.free_refs.push((span, name.to_string()));
             scope.free_vars.insert(name.to_string());
         }

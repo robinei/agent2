@@ -134,6 +134,11 @@ pub struct CallFrame {
     local_count: u32,
     return_addr: CodeAddr,
     prev_fp: StackAddr,
+    /// A closure's captured environment, stashed by `CallDyn` and installed as
+    /// the callee's upval locals by the prologue `EnterFrame` (after the arg
+    /// region is normalized to `nparams`, so the upvals land at the right slots).
+    /// Empty for static `Call` and bare-`Fn` calls (no captures).
+    pending_upvals: Vec<StackValue>,
     /// Lazily-built, per-frame cache for the `arguments` array (its heap
     /// address). Built on the first `Instr::Arguments` in this frame and reused
     /// by later references, so repeated `arguments` uses don't re-materialize
@@ -148,23 +153,22 @@ Stack layout:
     ┌──────────────────────┐
     │  expr temporaries    │  ← sp
     ├──────────────────────┤
-    │  local M-1           │  fp + M-1
-    │  ...                 │
-    │  local 1             │  fp + 1
-    │  local 0             │  fp
-    ├──────────────────────┤
-    │  arg_N-1             │  fp - 1
-    │  ...                 │
-    │  arg_1               │  fp - (N-1)
-    │  arg_0               │  fp - N
+    │  declared locals     │  fp + nparams + K ..
+    │  upvals (K)          │  fp + nparams .. fp + nparams + K - 1
+    │  params (= args)     │  fp .. fp + nparams - 1
+    │  local 0 / arg 0     │  fp
     ├──────────────────────┤
     │  caller's temps      │
     └──────────────────────┘
     lower addresses
 
-Args follow the uniform left-to-right convention: the caller pushes them
-left-to-right, so arg_0 (the first argument) is pushed first and sits deepest
-(fp - N), and arg_N-1 is on top (fp - 1).
+There is no separate "argument" region: `fp` points at arg 0, and the arguments
+ARE the leading locals (slots `0..nparams`), so a parameter reference is just a
+`Local`. The caller pushes args left-to-right (arg 0 deepest at `fp`); the
+prologue `EnterFrame` then normalizes the region to exactly `nparams` (dropping
+surplus / padding missing), installs the closure's upvals at `[nparams, nparams
++ K)`, and allocates the declared locals above them. The whole frame —
+including args — is reclaimed by `Return`, whose result(s) land at `fp`.
 
 
 Closures — the compiler contract
@@ -190,15 +194,17 @@ the compiler's job. A future codegen MUST uphold all of this:
    access and a permanent cell. Acceptable under this VM's no-GC, short-program
    design.)
 
-3. Closure-frame slot layout (the ABI).
-   `CallDyn` installs a closure's captured environment as the callee's LEADING
-   locals: captured upvals occupy slots 0..K (in `MakeClosure`'s capture
-   order), and `local_count` is preset to K. Therefore, when compiling a
-   function that will be reached as a closure, lay out:
-       slot 0 .. K-1  = captured upvals  (DO NOT re-`Alloc` these)
-       slot K, K+1 .. = the body's own locals (its first `Alloc` starts here)
-   and emit `MakeClosure(addr, captures)` at the definition site with `captures`
-   ordered to match exactly the slot order the body expects.
+3. Frame slot layout (the ABI).
+   Arguments arrive in place as the leading locals, so the layout is:
+       slot 0 .. nparams-1            = params (= the call's arguments)
+       slot nparams .. nparams+K-1    = captured upvals (MakeClosure order)
+       slot nparams+K ..              = the body's own declared locals
+   The prologue `EnterFrame(nparams, build_args, local_kinds)` establishes all
+   of this: it normalizes the incoming args to `nparams`, installs the closure's
+   captured environment (which `CallDyn` stashed in the frame) as the upval
+   locals, and allocates the declared locals from `local_kinds`. Emit
+   `MakeClosure(addr, captures)` at the definition site with `captures` ordered
+   to match exactly the upval slot order the body expects.
 
 4. `MakeClosure(addr, captures)` capture kinds, by value vs by reference.
    Each entry of `captures` is a slot index in the ENCLOSING frame; the slot is
@@ -216,9 +222,10 @@ the compiler's job. A future codegen MUST uphold all of this:
    flat `cells` index threads through every intermediate closure unchanged.
 
 6. Captured parameters.
-   `Arg` reads plain values below `fp` and there is no `SetArg`. To capture (or
-   reassign) a parameter, the prologue must copy it into a `Boxed` local
-   (`Arg(i)` then `SetLocal(boxed_slot)`); capture that local, not the arg.
+   Arguments arrive in place as the leading locals (slots `0..nparams`, set up
+   by `EnterFrame`), holding plain values. To capture (or reassign) a parameter,
+   the prologue boxes its slot in place with `FreshCell` (plain value → fresh
+   cell); closures then capture that boxed local.
 
 7. Non-capturing functions stay cheap.
    A lambda/function with no captures should remain a bare `StackValue::Fn`
@@ -337,9 +344,22 @@ pub enum Instr {
     // push order, so the first-pushed return value stays first).
     Return(usize),
 
-    // load the argument at the argument index of the current stack frame, and
-    // push it onto the stack. Arg(0) is the first argument (see Call).
-    Arg(ArgIndex),
+    // Prologue frame setup, emitted as the first instruction of every function/
+    // arrow body. Arguments arrive in place as the leading locals (the caller
+    // pushed them; `fp` points at arg 0), so there is no per-argument copy.
+    // `EnterFrame(nparams, build_args, local_kinds)`:
+    //   - if `build_args`, eagerly materialize the `arguments` array from the
+    //     actual args (before they are normalized) and cache it in the frame;
+    //   - normalize the arg region to exactly `nparams` slots (drop surplus args
+    //     / pad missing params with Undefined);
+    //   - install the closure's captured environment (stashed by `CallDyn`) as
+    //     the upval locals at slots [nparams, nparams + K);
+    //   - allocate the declared (non-param) own locals from `local_kinds`, the
+    //     same way `Alloc` does (Undefined for Plain, a fresh cell + Upval for
+    //     Boxed), so the final layout is [params | upvals | locals]. The
+    //     self-reference slot (named/recursive functions) is the last kind.
+    // Subsumes the prologue's `Arg` copies and `Alloc` into one instruction.
+    EnterFrame(u32, bool, Vec<SlotKind>),
 
     // Push the `arguments` array for the current frame: a fresh heap array of
     // all `arg_count` arguments (arg 0 first). Built lazily and cached per
@@ -636,13 +656,14 @@ impl VM {
             heap: Vec::new(),
             cells: Vec::new(),
             stack: Vec::new(),
-            // Root frame so that Arg/Local/Alloc are valid from the start.
+            // Root frame so that Local/Alloc are valid from the start.
             callstack: vec![CallFrame {
                 arg_count: 0,
                 local_count: 0,
                 return_addr: 0,
                 prev_fp: 0,
                 arguments_cache: None,
+                pending_upvals: Vec::new(),
             }],
             ip: 0,
             fp: 0,
@@ -1337,15 +1358,19 @@ impl VM {
                     if *nargs as usize > self.stack.len() {
                         return Err(VMError::StackUnderflow);
                     }
+                    // `fp` points at arg 0: the args ARE the callee's leading
+                    // locals (slots 0..nargs). The prologue `EnterFrame` then
+                    // normalizes them to exactly `nparams`. No copy.
                     self.callstack.push(CallFrame {
                         arg_count: *nargs,
-                        local_count: 0,
+                        local_count: *nargs,
                         return_addr: self.ip + 1,
                         prev_fp: self.fp,
                         arguments_cache: None,
+                        pending_upvals: Vec::new(),
                     });
                     self.ip = *addr;
-                    self.fp = self.stack.len() as StackAddr;
+                    self.fp = (self.stack.len() as u32) - *nargs;
                 }
 
                 Instr::CallDyn(nargs) => {
@@ -1370,18 +1395,19 @@ impl VM {
                             }
                             self.callstack.push(CallFrame {
                                 arg_count: nargs,
-                                local_count: 0,
+                                local_count: nargs,
                                 return_addr: self.ip + 1,
                                 prev_fp: self.fp,
                                 arguments_cache: None,
+                                pending_upvals: Vec::new(),
                             });
-                            self.fp = self.stack.len() as StackAddr;
+                            self.fp = (self.stack.len() as u32) - nargs;
                             self.ip = addr;
                         }
                         StackValue::Ptr(p) => {
                             let (addr, upvals) = match self.heap_get(p)? {
                                 HeapValue::Closure { addr, upvals } => {
-                                    (*addr, Some(upvals.clone()))
+                                    (*addr, upvals.clone())
                                 }
                                 _ => return Err(VMError::TypeError),
                             };
@@ -1391,23 +1417,18 @@ impl VM {
                             if nargs as usize > self.stack.len() {
                                 return Err(VMError::StackUnderflow);
                             }
+                            // Stash the captured environment; `EnterFrame` installs
+                            // it as the upval locals after normalizing the args, so
+                            // it lands at slots [nparams, nparams + K).
                             self.callstack.push(CallFrame {
                                 arg_count: nargs,
-                                local_count: 0,
+                                local_count: nargs,
                                 return_addr: self.ip + 1,
                                 prev_fp: self.fp,
                                 arguments_cache: None,
+                                pending_upvals: upvals,
                             });
-                            self.fp = self.stack.len() as StackAddr;
-                            // A closure's captured environment becomes the callee's
-                            // leading locals (slots 0..K).
-                            if let Some(upvals) = upvals {
-                                let k = upvals.len() as u32;
-                                for uv in upvals {
-                                    self.stack.push(uv);
-                                }
-                                self.callstack.last_mut().unwrap().local_count = k;
-                            }
+                            self.fp = (self.stack.len() as u32) - nargs;
                             self.ip = addr;
                         }
                         _ => return Err(VMError::TypeError),
@@ -1445,10 +1466,10 @@ impl VM {
 
                 Instr::Return(nrets) => {
                     let frame = self.callstack.pop().ok_or(VMError::BadReturn)?;
-                    if frame.arg_count > self.fp {
-                        return Err(VMError::StackUnderflow);
-                    }
-                    let keep_below = (self.fp - frame.arg_count) as usize;
+                    // `fp` points at the frame base (arg 0 / local 0), which is
+                    // where the caller pushed the args — so the return value(s)
+                    // replace the whole frame, restoring the caller's stack.
+                    let keep_below = self.fp as usize;
                     let n = *nrets;
                     if self.stack.len() < keep_below + n {
                         return Err(VMError::StackUnderflow);
@@ -1515,30 +1536,76 @@ impl VM {
                 }
 
                 // ── frame access ────────────────────────────────
-                Instr::Arg(arg) => {
+                Instr::EnterFrame(nparams, build_args, local_kinds) => {
+                    let nparams = *nparams;
+                    let build_args = *build_args;
+                    let local_kinds = local_kinds.clone(); // release borrow on self.code
                     let frame = self.callstack.last().ok_or(VMError::BadArg)?;
-                    if *arg >= frame.arg_count {
-                        return Err(VMError::BadArg);
+                    let argc = frame.arg_count;
+                    // The args arrived as the leading locals at [fp, fp + argc).
+                    // 1. Materialize the `arguments` array (from the actual args)
+                    //    BEFORE normalizing, if the body uses it.
+                    if build_args {
+                        let base = self.fp as usize;
+                        if base + argc as usize > self.stack.len() {
+                            return Err(VMError::StackUnderflow);
+                        }
+                        let args = self.stack[base..base + argc as usize].to_vec();
+                        let arr = self.alloc_array(args);
+                        if let StackValue::Ptr(p) = arr {
+                            self.callstack.last_mut().unwrap().arguments_cache = Some(p);
+                        }
                     }
-                    // Left-to-right: arg 0 is the deepest (first pushed) at
-                    // fp - arg_count, arg_count-1 is on top at fp - 1.
-                    let slot = (self.fp - frame.arg_count + arg) as usize;
-                    self.stack.push(self.stack[slot]);
+                    // 2. Normalize the arg region to exactly `nparams` slots:
+                    //    drop surplus args, or pad missing params with Undefined.
+                    let want = self.fp as usize + nparams as usize;
+                    if self.stack.len() > want {
+                        self.stack.truncate(want);
+                    } else {
+                        self.stack.resize(want, StackValue::Undefined);
+                    }
+                    // 3. Install the closure's captured environment as the upval
+                    //    locals, now landing at [fp + nparams, fp + nparams + K).
+                    let upvals = std::mem::take(
+                        &mut self.callstack.last_mut().unwrap().pending_upvals,
+                    );
+                    let k = upvals.len() as u32;
+                    for uv in upvals {
+                        self.stack.push(uv);
+                    }
+                    // 4. Allocate the declared (non-param) own locals + self-ref
+                    //    slot, exactly as `Alloc` does (Boxed → fresh cell + Upval).
+                    for kind in &local_kinds {
+                        let slot = match kind {
+                            SlotKind::Plain => StackValue::Undefined,
+                            SlotKind::Boxed => {
+                                let idx = self.cells.len() as CellIndex;
+                                self.cells.push(StackValue::Undefined);
+                                StackValue::Upval(idx)
+                            }
+                        };
+                        self.stack.push(slot);
+                    }
+                    self.callstack.last_mut().unwrap().local_count =
+                        nparams + k + local_kinds.len() as u32;
                     self.ip += 1;
                 }
 
                 Instr::Arguments => {
                     let frame = self.callstack.last().ok_or(VMError::BadArg)?;
-                    // Reuse the cached array when this frame already built one.
+                    // Reuse the cached array when this frame already built one
+                    // (functions that use `arguments` build it eagerly in the
+                    // prologue's EnterFrame; the lazy path here serves the root
+                    // frame, which has no args).
                     if let Some(ptr) = frame.arguments_cache {
                         self.stack.push(StackValue::Ptr(ptr));
                         self.ip += 1;
                         continue;
                     }
-                    // Build it from the frame's args (arg 0 deepest at
-                    // fp - arg_count). Copy them out before touching the heap.
+                    // Build it from the frame's args (arg 0 at fp). Copy them out
+                    // before touching the heap.
                     let argc = frame.arg_count;
-                    let base = (self.fp - argc) as usize;
+                    let base = self.fp as usize;
                     if base + argc as usize > self.stack.len() {
                         return Err(VMError::StackUnderflow);
                     }
@@ -2914,8 +2981,8 @@ mod tests {
         // [1] Push(20)   -- arg 1
         // [2] Call(4, 2) -- call fn at 4 with 2 args
         // [3] Return(1)  -- main returns 1 value
-        // [4] Arg(0)     -- fn: push arg 0 (10)
-        // [5] Arg(1)     -- fn: push arg 1 (20)
+        // [4] Local(0)   -- fn: args arrive in place as locals (10)
+        // [5] Local(1)   -- fn: local 1 (20)
         // [6] Add        -- fn: 10 + 20 = 30
         // [7] Return(1)  -- fn: return 1 value
         assert_eq!(
@@ -2924,8 +2991,8 @@ mod tests {
                 Push(n(20.0)),
                 Call(4, 2),
                 Return(1),
-                Arg(0),
-                Arg(1),
+                Local(0),
+                Local(1),
                 Add,
                 Return(1),
             ]),
@@ -2943,8 +3010,8 @@ mod tests {
                 Push(n(3.0)),
                 Call(4, 2),
                 Return(1),
-                Arg(0),
-                Arg(1),
+                Local(0),
+                Local(1),
                 Sub,
                 Return(1),
             ]),
@@ -2961,8 +3028,8 @@ mod tests {
         // [2] Push(Fn(5))    callable on top
         // [3] CallDyn(2)
         // [4] Return(1)      main returns the result
-        // [5] Arg(0)         fn body
-        // [6] Arg(1)
+        // [5] Local(0)       fn body: args arrive in place as locals
+        // [6] Local(1)
         // [7] Sub            10 - 3
         // [8] Return(1)
         assert_eq!(
@@ -2972,8 +3039,8 @@ mod tests {
                 Push(f(5)),
                 CallDyn(2),
                 Return(1),
-                Arg(0),
-                Arg(1),
+                Local(0),
+                Local(1),
                 Sub,
                 Return(1),
             ]),
@@ -3057,6 +3124,8 @@ mod tests {
         code.push(MakeClosure(0, vec![0])); // patched: capture count
         code.push(Return(1));
         let inner = code.len() as u32;
+        // 0 params, 1 upval → EnterFrame installs the captured cell at slot 0.
+        code.push(EnterFrame(0, false, vec![]));
         code.push(Local(0)); // count  (slot 0 = captured upval)
         code.push(Push(n(1.0)));
         code.push(Add);
@@ -3152,6 +3221,7 @@ mod tests {
         code.push(SetLocal(0)); // x = 99 AFTER capture (must not be seen)
         code.push(Return(1));
         let inner = code.len() as u32;
+        code.push(EnterFrame(0, false, vec![])); // install the by-value upval at slot 0
         code.push(Local(0)); // return captured snapshot
         code.push(Return(1));
         code[call] = Call(maker, 0);
@@ -3191,11 +3261,14 @@ mod tests {
         code.push(ArrNew(2)); // [getter, setter]
         code.push(Return(1));
         let getter = code.len() as u32;
+        code.push(EnterFrame(0, false, vec![])); // upval x at slot 0
         code.push(Local(0));
         code.push(Return(1));
         let setter = code.len() as u32;
-        code.push(Arg(0));
-        code.push(SetLocal(0)); // x = arg (through the shared cell)
+        // 1 param (slot 0) + 1 upval x (slot 1): write the param into x's cell.
+        code.push(EnterFrame(1, false, vec![]));
+        code.push(Local(0)); // the arg
+        code.push(SetLocal(1)); // x = arg (through the shared cell)
         code.push(Return(0));
         code[call] = Call(maker, 0);
         code[mk_get] = MakeClosure(getter, vec![0]);
@@ -3223,10 +3296,12 @@ mod tests {
         code.push(Return(1));
         let middle = code.len() as u32;
         // middle's slot 0 is x (installed upval); forward it to inner.
+        code.push(EnterFrame(0, false, vec![]));
         let mk_in = code.len();
         code.push(MakeClosure(0, vec![0]));
         code.push(Return(1));
         let inner = code.len() as u32;
+        code.push(EnterFrame(0, false, vec![]));
         code.push(Local(0));
         code.push(Return(1));
         code[call] = Call(outer, 0);
@@ -3284,17 +3359,15 @@ mod tests {
 
     #[test]
     fn call_with_locals() {
-        // Function allocates a local, stores arg+arg in it, returns it.
-        // [0] Push(7)
-        // [1] Push(8)
-        // [2] Call(4, 2)
-        // [3] Return(1)
-        // [4] Alloc(plain(1))
-        // [5] Arg(0)
-        // [6] Arg(1)
+        // Function allocates a local, stores arg+arg in it, returns it. Args
+        // arrive in place as locals 0,1; the declared local is allocated at
+        // slot 2 (after the two params).
+        // [4] Alloc(plain(1))  -- declared local at slot 2
+        // [5] Local(0)         -- arg 0 (7)
+        // [6] Local(1)         -- arg 1 (8)
         // [7] Add
-        // [8] SetLocal(0)
-        // [9] Local(0)
+        // [8] SetLocal(2)
+        // [9] Local(2)
         // [10] Return(1)
         assert_eq!(
             run(vec![
@@ -3303,11 +3376,11 @@ mod tests {
                 Call(4, 2),
                 Return(1),
                 Alloc(plain(1)),
-                Arg(0),
-                Arg(1),
-                Add,
-                SetLocal(0),
                 Local(0),
+                Local(1),
+                Add,
+                SetLocal(2),
+                Local(2),
                 Return(1),
             ]),
             vec![n(15.0)]
@@ -3332,24 +3405,13 @@ mod tests {
     // ── frame access validation ───────────────────────────────────
 
     #[test]
-    fn arg_oob() {
-        let code = vec![
-            Push(n(1.0)),
-            Call(3, 1),
-            Return(0),
-            Arg(5), // only 1 arg available
-            Return(0),
-        ];
-        assert!(matches!(run_err(code), VMError::BadArg));
-    }
-
-    #[test]
     fn local_oob() {
+        // Called with one arg (→ local 0); reading local 1 is out of range.
         let code = vec![
             Push(n(1.0)),
             Call(3, 1),
             Return(0),
-            Local(0), // no locals allocated
+            Local(1), // only local 0 (the arg) exists
             Return(0),
         ];
         assert!(matches!(run_err(code), VMError::BadLocal));
