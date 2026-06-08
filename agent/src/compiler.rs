@@ -170,7 +170,7 @@ impl<'src> Compiler<'src> {
     // ── codegen ──────────────────────────────────────────────────────
 
     /// The whole program is the root frame's body. Scope/capture analysis ran
-    /// already (in `self.analysis`), so the prologue `Alloc` slot kinds and all
+    /// already (in `self.analysis`), so the prologue `EnterFrame` slot kinds and all
     /// binding/reference/function resolutions are precomputed and looked up by
     /// span. Function bodies are emitted inline (guarded by a jump-over) at
     /// their definition sites.
@@ -182,9 +182,13 @@ impl<'src> Compiler<'src> {
         let root = &analysis.scopes[analysis.root];
         self.current_scope = analysis.root;
 
-        // Prologue: allocate all root locals with the precomputed SlotKinds.
-        if !root.slot_kinds.is_empty() {
-            self.emit(Instr::Alloc(root.slot_kinds.clone()), program.span.start);
+        // Prologue. The root frame has no params and no upvals, so `EnterFrame`
+        // just allocates its locals (and eagerly builds top-level `arguments` if
+        // referenced). Skip it entirely when there is nothing to set up.
+        if !root.slot_kinds.is_empty() || root.uses_arguments {
+            let kinds = root.slot_kinds.clone();
+            let uses_arguments = root.uses_arguments;
+            self.emit(Instr::EnterFrame(0, uses_arguments, kinds), program.span.start);
         }
 
         // Hoist function declarations into the prologue (emit their bindings).
@@ -313,8 +317,8 @@ impl<'src> Compiler<'src> {
                         (None, Some(slot)) if !is_var => {
                             // `let x;` re-initializes to `undefined` each time the
                             // declaration executes (e.g. per loop iteration).
-                            // Outside a loop `Alloc` already zeroed the slot, so
-                            // skip the redundant Push+SetLocal.
+                            // Outside a loop `EnterFrame` already zeroed the slot,
+                            // so skip the redundant Push+SetLocal.
                             if !self.loops.is_empty() {
                                 self.fresh_cell_if_needed(slot, d.span.start);
                                 self.emit(Instr::Push(StackValue::Undefined), d.span.start);
@@ -2426,9 +2430,10 @@ impl<'src> Compiler<'src> {
         }
     }
 
-    /// Emit a function body: jump-over guard, entry label, prologue (`Alloc`,
-    /// param copies/defaults, self-reference), body statements, implicit
-    /// `Return`. Called after the function value has been pushed (expressions)
+    /// Emit a function body: jump-over guard, entry label, prologue
+    /// (`EnterFrame`, param defaults / captured-param boxing, self-reference),
+    /// body statements, implicit `Return`. Called after the function value has
+    /// been pushed (expressions)
     /// or at the declaration site. `is_expression_body` (arrow `=> expr`)
     /// suppresses the trailing implicit `return undefined`. All slots/kinds come
     /// from analysis; there is no codegen-side scope state to set up.
@@ -4123,11 +4128,11 @@ mod tests {
         // The optimization: a captured loop variable is allocated `Plain` (no
         // eager cell in the preamble) and re-boxed per iteration via FreshCell.
         // Here the only captured binding is the loop var `i`, so the prologue
-        // `Alloc` must contain no `Boxed` slot, yet FreshCell is emitted.
+        // `EnterFrame` must contain no `Boxed` slot, yet FreshCell is emitted.
         let prog = compile("let fns = []; for (let i = 0; i < 3; i++) { fns.push(() => i); }")
             .expect("compiles");
         let has_boxed = prog.code.iter().any(
-            |i| matches!(i, Instr::Alloc(kinds) if kinds.iter().any(|k| *k == SlotKind::Boxed)),
+            |i| matches!(i, Instr::EnterFrame(_, _, kinds) if kinds.iter().any(|k| *k == SlotKind::Boxed)),
         );
         assert!(
             !has_boxed,

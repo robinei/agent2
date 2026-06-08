@@ -90,7 +90,9 @@ pub(crate) struct FuncScope {
     /// materialization of the arguments array in the prologue, before the arg
     /// region is normalized to exactly `nparams`.
     pub(crate) uses_arguments: bool,
-    /// Final slot kinds for own locals (`Alloc` operand; upvals excluded).
+    /// Final slot kinds for own locals (params first, then declared vars). The
+    /// compiler routes the declared kinds into `EnterFrame`'s `local_kinds` and
+    /// boxes any captured params in place via `FreshCell`.
     pub(crate) slot_kinds: Vec<SlotKind>,
 }
 
@@ -350,7 +352,7 @@ struct Analyzer {
     /// Lexical loop-nesting depth at the current walk position (reset to 0 when
     /// entering a nested function body). A `let`/`const` declared while this is
     /// `> 0` is a per-iteration binding: if also captured, it gets a fresh cell
-    /// each iteration rather than one eager cell, so its `Alloc` slot is `Plain`.
+    /// each iteration rather than one eager cell, so its slot kind is `Plain`.
     loop_depth: u32,
 }
 

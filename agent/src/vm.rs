@@ -120,7 +120,7 @@ pub enum HeapValue {
     },
 }
 
-/// Storage class for a local slot declared by `Alloc`. A `Plain` slot is an
+/// Storage class for a local slot declared by `EnterFrame`. A `Plain` slot is an
 /// ordinary stack local; a `Boxed` slot is captured by reference, so it is
 /// backed by a `cells` entry and addressed through an `Upval` marker.
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -181,13 +181,14 @@ the compiler's job. A future codegen MUST uphold all of this:
 
 1. Capture analysis (who gets boxed).
    A variable that is captured by any nested function AND is ever reassigned
-   (by its owner or any closure) must be `Boxed` in its OWNING frame's `Alloc`.
-   Everything else stays `Plain`. A captured-but-never-reassigned variable may
-   stay `Plain` and be captured by value — see point 4.
+   (by its owner or any closure) must be `Boxed` in its OWNING frame's slot
+   kinds. Everything else stays `Plain`. A captured-but-never-reassigned
+   variable may stay `Plain` and be captured by value — see point 4.
 
 2. Boxing is per-binding and eager.
-   `Alloc(Vec<SlotKind>)` declares each new slot's storage class. A `Boxed`
-   slot is backed by a fresh `cells` entry from birth; `Local`/`SetLocal`
+   `EnterFrame`'s `local_kinds` declares each declared slot's storage class
+   (and a captured *parameter* is boxed in place by a prologue `FreshCell`). A
+   `Boxed` slot is backed by a fresh `cells` entry from birth; `Local`/`SetLocal`
    transparently route through it. There is no "open upvalue" / close step —
    the cell already has identity and outlives the frame, so a returned closure
    keeps working after its defining frame is gone. (Cost: one indirection per
@@ -284,14 +285,6 @@ pub enum Instr {
     // the blessed `state` at Ptr(0) stays stable.
     PushStr(String), // () -> str
 
-    // Grow the current frame's locals region by one slot per kind. A `Plain`
-    // slot is initialized to Undefined (an ordinary local, like JS `let x;`); a
-    // `Boxed` slot allocates a fresh cell (init Undefined) in the `cells` side
-    // table and stores an `Upval` marker, so that binding is captured by
-    // reference — every Local/SetLocal routes through the shared cell. Successive
-    // Allocs each append more slots, but only when no expression temporaries sit
-    // above the locals.
-    Alloc(Vec<SlotKind>),
     Pop(usize),
     Dup,
     Swap, // any, any -> any, any
@@ -355,10 +348,11 @@ pub enum Instr {
     //   - install the closure's captured environment (stashed by `CallDyn`) as
     //     the upval locals at slots [nparams, nparams + K);
     //   - allocate the declared (non-param) own locals from `local_kinds`, the
-    //     same way `Alloc` does (Undefined for Plain, a fresh cell + Upval for
-    //     Boxed), so the final layout is [params | upvals | locals]. The
-    //     self-reference slot (named/recursive functions) is the last kind.
-    // Subsumes the prologue's `Arg` copies and `Alloc` into one instruction.
+    //     Undefined for Plain, a fresh cell + Upval for Boxed, so the final
+    //     layout is [params | upvals | locals]. The self-reference slot
+    //     (named/recursive functions) is the last kind.
+    // This is the sole frame-setup instruction: there is no separate per-arg
+    // copy or local-allocation step.
     EnterFrame(u32, bool, Vec<SlotKind>),
 
     // Push the `arguments` array for the current frame: a fresh heap array of
@@ -656,7 +650,7 @@ impl VM {
             heap: Vec::new(),
             cells: Vec::new(),
             stack: Vec::new(),
-            // Root frame so that Local/Alloc are valid from the start.
+            // Root frame so that Local is valid from the start.
             callstack: vec![CallFrame {
                 arg_count: 0,
                 local_count: 0,
@@ -1240,38 +1234,6 @@ impl VM {
                     self.ip += 1;
                 }
 
-                Instr::Alloc(kinds) => {
-                    // Locals occupy [fp, fp + local_count). Allocation is only
-                    // valid when no expression temporaries sit above them, i.e.
-                    // sp == fp + local_count. This permits multiple successive
-                    // Alloc instructions (each grows the locals region) while
-                    // still rejecting an Alloc issued mid-expression.
-                    let kinds = kinds.clone(); // release the borrow on self.code
-                    let frame = self.callstack.last().ok_or(VMError::BadAlloc)?;
-                    let locals_top = self.fp as usize + frame.local_count as usize;
-                    if self.stack.len() != locals_top {
-                        return Err(VMError::BadAlloc);
-                    }
-                    // A Plain slot is just Undefined (a declared-but-unassigned
-                    // local, as in JS `let x;`); a Boxed slot allocates a fresh
-                    // cell (also Undefined) and stores an Upval marker pointing at
-                    // it, so the binding is captured by reference.
-                    for kind in &kinds {
-                        let slot = match kind {
-                            SlotKind::Plain => StackValue::Undefined,
-                            SlotKind::Boxed => {
-                                let idx = self.cells.len() as CellIndex;
-                                self.cells.push(StackValue::Undefined);
-                                StackValue::Upval(idx)
-                            }
-                        };
-                        self.stack.push(slot);
-                    }
-                    let frame = self.callstack.last_mut().ok_or(VMError::BadAlloc)?;
-                    frame.local_count += kinds.len() as u32;
-                    self.ip += 1;
-                }
-
                 Instr::Pop(n) => {
                     // Only expression temporaries may be popped, never locals
                     // or args belonging to the current/caller frame.
@@ -1571,7 +1533,7 @@ impl VM {
                         self.stack.push(uv);
                     }
                     // 4. Allocate the declared (non-param) own locals + self-ref
-                    //    slot, exactly as `Alloc` does (Boxed → fresh cell + Upval).
+                    // slot (Boxed → fresh cell + Upval).
                     for kind in &local_kinds {
                         let slot = match kind {
                             SlotKind::Plain => StackValue::Undefined,
@@ -2340,7 +2302,7 @@ mod tests {
     fn s(addr: u32) -> StackValue {
         StackValue::Ptr(addr)
     }
-    /// `n` plain (unboxed) local slots, for `Alloc`.
+    /// `n` plain (unboxed) local slots, for `EnterFrame`.
     fn plain(n: usize) -> Vec<SlotKind> {
         vec![SlotKind::Plain; n]
     }
@@ -2425,12 +2387,12 @@ mod tests {
     #[test]
     fn tee_local() {
         // TeeLocal writes top to a local without popping.
-        // Alloc pushes Undefined as local 0; Push pushes 5.0 on top;
+        // EnterFrame allocates Undefined as local 0; Push pushes 5.0 on top;
         // TeeLocal writes 5.0 into local 0 (replacing Undefined) and
         // leaves it on the stack. Result: [5.0, 5.0].
         assert_eq!(
             run(vec![
-                Alloc(vec![SlotKind::Plain]),
+                EnterFrame(0, false, vec![SlotKind::Plain]),
                 Push(n(5.0)),
                 TeeLocal(0),
             ]),
@@ -2439,7 +2401,7 @@ mod tests {
         // Verify the local was actually written.
         assert_eq!(
             run(vec![
-                Alloc(vec![SlotKind::Plain]),
+                EnterFrame(0, false, vec![SlotKind::Plain]),
                 Push(n(7.0)),
                 TeeLocal(0),
                 Pop(1),
@@ -2460,7 +2422,7 @@ mod tests {
         // Prefix ++ in place: new value on stack AND in local.
         assert_eq!(
             run(vec![
-                Alloc(vec![SlotKind::Plain]),
+                EnterFrame(0, false, vec![SlotKind::Plain]),
                 Push(n(5.0)),
                 SetLocal(0),
                 IncLocal(0, StackValue::NegInt(-1), UpdateMode::Prefix),
@@ -2470,7 +2432,7 @@ mod tests {
         // Postfix ++: old value on stack, local updated to new.
         assert_eq!(
             run(vec![
-                Alloc(vec![SlotKind::Plain]),
+                EnterFrame(0, false, vec![SlotKind::Plain]),
                 Push(n(5.0)),
                 SetLocal(0),
                 IncLocal(0, StackValue::NegInt(-1), UpdateMode::Postfix),
@@ -2480,7 +2442,7 @@ mod tests {
         // Postfix --: old value pushed, local decremented.
         assert_eq!(
             run(vec![
-                Alloc(vec![SlotKind::Plain]),
+                EnterFrame(0, false, vec![SlotKind::Plain]),
                 Push(n(5.0)),
                 SetLocal(0),
                 IncLocal(0, StackValue::PosInt(1), UpdateMode::Postfix),
@@ -3114,7 +3076,7 @@ mod tests {
     /// returns `count`. Returns makeCounter's code address.
     fn append_counter(code: &mut Vec<Instr>) -> u32 {
         let mc = code.len() as u32;
-        code.push(Alloc(vec![SlotKind::Boxed])); // slot 0 = count (by-ref)
+        code.push(EnterFrame(0, false, vec![SlotKind::Boxed])); // slot 0 = count (by-ref)
         code.push(Push(n(0.0)));
         code.push(SetLocal(0)); // count = 0 (writes through the cell)
         let mk = code.len();
@@ -3168,7 +3130,7 @@ mod tests {
         // Two makeCounter() results must not share state: c1(), c1(), c2()
         // → [1, 2, 1].
         let mut code: Vec<Instr> = Vec::new();
-        code.push(Alloc(plain(2))); // local 0 = c1, local 1 = c2
+        code.push(EnterFrame(0, false, plain(2))); // local 0 = c1, local 1 = c2
         let call1 = code.len();
         code.push(Call(0, 0));
         code.push(SetLocal(0));
@@ -3209,7 +3171,7 @@ mod tests {
         code.push(Return(1));
         // maker
         let maker = code.len() as u32;
-        code.push(Alloc(plain(1))); // slot 0 = x (NOT boxed)
+        code.push(EnterFrame(0, false, plain(1))); // slot 0 = x (NOT boxed)
         code.push(Push(n(5.0)));
         code.push(SetLocal(0));
         let mk = code.len();
@@ -3232,7 +3194,7 @@ mod tests {
         // other's writes. setter(42) then getter() → 42.
         let mut code: Vec<Instr> = Vec::new();
         // main: arr = maker(); setter = arr[1]; setter(42); getter = arr[0]; getter()
-        code.push(Alloc(plain(1))); // local 0 = [getter, setter]
+        code.push(EnterFrame(0, false, plain(1))); // local 0 = [getter, setter]
         let call = code.len();
         code.push(Call(0, 0));
         code.push(SetLocal(0));
@@ -3248,7 +3210,7 @@ mod tests {
         code.push(Return(1));
         // maker
         let maker = code.len() as u32;
-        code.push(Alloc(vec![SlotKind::Boxed])); // slot 0 = x (by-ref)
+        code.push(EnterFrame(0, false, vec![SlotKind::Boxed])); // slot 0 = x (by-ref)
         code.push(Push(n(0.0)));
         code.push(SetLocal(0));
         let mk_get = code.len();
@@ -3285,7 +3247,7 @@ mod tests {
         code.push(CallDyn(0)); // → 7
         code.push(Return(1));
         let outer = code.len() as u32;
-        code.push(Alloc(vec![SlotKind::Boxed]));
+        code.push(EnterFrame(0, false, vec![SlotKind::Boxed]));
         code.push(Push(n(7.0)));
         code.push(SetLocal(0));
         let mk_mid = code.len();
@@ -3311,7 +3273,7 @@ mod tests {
     fn closure_identity_equality() {
         // The same closure object equals itself (reference identity)…
         let same = vec![
-            Alloc(vec![SlotKind::Boxed]),
+            EnterFrame(0, false, vec![SlotKind::Boxed]),
             Push(n(1.0)),
             SetLocal(0),
             MakeClosure(6, vec![0]),
@@ -3322,7 +3284,7 @@ mod tests {
         assert_eq!(run(same), vec![b(true)]);
         // …but two distinct closure objects do not (no content equality).
         let distinct = vec![
-            Alloc(vec![SlotKind::Boxed]),
+            EnterFrame(0, false, vec![SlotKind::Boxed]),
             Push(n(1.0)),
             SetLocal(0),
             MakeClosure(7, vec![0]),
@@ -3340,7 +3302,7 @@ mod tests {
         let code = vec![
             Call(2, 0),
             Return(0),
-            Alloc(plain(1)),
+            EnterFrame(0, false, plain(1)),
             MakeClosure(0, vec![5]), // only slot 0 exists
             Return(1),
         ];
@@ -3359,9 +3321,9 @@ mod tests {
         // Function allocates a local, stores arg+arg in it, returns it. Args
         // arrive in place as locals 0,1; the declared local is allocated at
         // slot 2 (after the two params).
-        // [4] Alloc(plain(1))  -- declared local at slot 2
-        // [5] Local(0)         -- arg 0 (7)
-        // [6] Local(1)         -- arg 1 (8)
+        // [4] EnterFrame(2, false, plain(1)) -- 2 params + 1 local at slot 2
+        // [5] Local(0)                        -- arg 0 (7)
+        // [6] Local(1)                        -- arg 1 (8)
         // [7] Add
         // [8] SetLocal(2)
         // [9] Local(2)
@@ -3372,7 +3334,7 @@ mod tests {
                 Push(n(8.0)),
                 Call(4, 2),
                 Return(1),
-                Alloc(plain(1)),
+                EnterFrame(2, false, plain(1)),
                 Local(0),
                 Local(1),
                 Add,
@@ -3382,21 +3344,6 @@ mod tests {
             ]),
             vec![n(15.0)]
         );
-    }
-
-    #[test]
-    fn alloc_bad_when_sp_not_fp() {
-        // Alloc should fail when temporaries are on the stack (sp > fp)
-        let code = vec![
-            Push(n(1.0)), // caller pushes an arg
-            Push(n(2.0)),
-            Call(4, 2), // call fn
-            Return(0),
-            Push(n(99.0)),   // fn pushes a temp FIRST (sp > fp)
-            Alloc(plain(1)), // should fail
-            Return(0),
-        ];
-        assert!(matches!(run_err(code), VMError::BadAlloc));
     }
 
     // ── frame access validation ───────────────────────────────────
@@ -3616,7 +3563,11 @@ mod tests {
     #[test]
     fn uninitialized_local_is_undefined() {
         // `let x;` then read x -> undefined.
-        let code = vec![Alloc(vec![SlotKind::Plain]), Local(0), Return(1)];
+        let code = vec![
+            EnterFrame(0, false, vec![SlotKind::Plain]),
+            Local(0),
+            Return(1),
+        ];
         assert_eq!(run(code), vec![undef()]);
     }
 
@@ -3852,14 +3803,13 @@ mod tests {
     }
 
     #[test]
-    fn incremental_alloc_allowed() {
-        // Two successive Allocs in a function should both succeed and yield
-        // independent locals.
+    fn frame_allocates_multiple_locals() {
+        // A frame allocates all its locals at once (EnterFrame), yielding
+        // independent slots.
         let code = vec![
             Call(2, 0),
-            Return(1),       // propagate the function's result to the final stack
-            Alloc(plain(1)), // local 0
-            Alloc(plain(1)), // local 1 (was previously rejected)
+            Return(1), // propagate the function's result to the final stack
+            EnterFrame(0, false, plain(2)),
             Push(n(7.0)),
             SetLocal(0),
             Push(n(8.0)),
@@ -3893,8 +3843,8 @@ mod tests {
             Push(n(1.0)),
             Call(3, 1),
             Return(0),
-            Alloc(plain(1)), // local 0; sp == frame floor
-            Pop(1),          // nothing above the floor -> underflow
+            EnterFrame(0, false, plain(1)), // local 0; sp == frame floor
+            Pop(1),                         // nothing above the floor -> underflow
             Return(0),
         ];
         assert!(matches!(run_err(code), VMError::StackUnderflow));
@@ -3906,8 +3856,8 @@ mod tests {
             Push(n(1.0)),
             Call(3, 1),
             Return(0),
-            Alloc(plain(1)), // local 0; sp == floor
-            Dup,             // nothing above the floor -> underflow
+            EnterFrame(0, false, plain(1)), // local 0; sp == floor
+            Dup,                            // nothing above the floor -> underflow
             Return(0),
         ];
         assert!(matches!(run_err(code), VMError::StackUnderflow));
@@ -3921,9 +3871,9 @@ mod tests {
             Push(n(1.0)),
             Call(3, 1),
             Return(0),
-            Alloc(plain(1)), // local 0
-            Push(n(9.0)),    // single temporary
-            Swap,            // would swap the temp with the local -> underflow
+            EnterFrame(0, false, plain(1)), // local 0
+            Push(n(9.0)),                   // single temporary
+            Swap,                           // would swap the temp with the local -> underflow
             Return(0),
         ];
         assert!(matches!(run_err(code), VMError::StackUnderflow));
@@ -3935,8 +3885,8 @@ mod tests {
             Push(n(1.0)),
             Call(3, 1),
             Return(0),
-            Alloc(plain(1)), // local 0
-            Push(n(8.0)),    // two temporaries (need three for Rot)
+            EnterFrame(0, false, plain(1)), // local 0
+            Push(n(8.0)),                   // two temporaries (need three for Rot)
             Push(n(9.0)),
             Rot,
             Return(0),
@@ -3952,7 +3902,7 @@ mod tests {
             Push(n(5.0)),
             Call(3, 1),
             Return(1),
-            Alloc(plain(1)), // local 0
+            EnterFrame(0, false, plain(1)), // local 0
             Push(n(10.0)),
             SetLocal(0),  // local 0 = 10
             Push(n(1.0)), // temporaries: [1, 2]
