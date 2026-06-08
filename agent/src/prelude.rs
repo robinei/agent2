@@ -15,13 +15,10 @@
 //! Only the helpers a program actually uses are appended (tree-shaking), so a
 //! program that uses no higher-order methods compiles byte-for-byte unchanged.
 //!
-//! Accepted divergence: a **bare namespaced builtin** passed as the callback
-//! (`arr.map(Math.sqrt)`) does not work, because the helper always invokes the
-//! callback with `(element, index, array)` and builtins enforce exact arity —
-//! `Math.sqrt` would be called with 3 args and raise a `TypeError`. Wrap it in
-//! a lambda instead: `arr.map(x => Math.sqrt(x))`. User functions/closures
-//! tolerate the extra args (they map params positionally and ignore the rest),
-//! so only direct builtin references are affected.
+//! A **bare namespaced builtin** works as the callback (`arr.map(Math.sqrt)`):
+//! the helper invokes it with `(element, index, array)` and builtins ignore
+//! surplus arguments (flexible arity from `Builtin::meta`), just like user
+//! functions/closures map params positionally and ignore the rest.
 
 /// One higher-order method: the call-site method name and the JS source of the
 /// helper(s) it lowers to. The helper **names** referenced by the compiler

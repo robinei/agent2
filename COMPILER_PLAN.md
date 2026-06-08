@@ -372,7 +372,8 @@ Consequences:
 > only the helpers whose method appears are included, so HOF-free programs
 > compile unchanged), hoisted like any top-level function, and called via a
 > static `Call` from `compile_method_call`. A bare builtin callback
-> (`arr.map(Math.sqrt)`) is an accepted divergence — wrap it (`x => …`).
+> (`arr.map(Math.sqrt)`) works: builtins ignore surplus args (flexible arity
+> from `Builtin::meta`, enforced centrally in `Builtin::call`).
 
 Higher-order array methods take callbacks and need loop-local state (index,
 accumulator). **Decision: prelude.** Small helpers (`__map(arr, cb)`, …) are

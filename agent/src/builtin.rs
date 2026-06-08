@@ -236,7 +236,32 @@ impl Builtin {
 
     /// Dispatch: run the builtin against `vm`, consuming `argc` stack arguments
     /// and pushing one result.
+    ///
+    /// Arity is enforced centrally from [`meta`](Builtin::meta) (the single
+    /// source of truth) so every call path is consistent — including the
+    /// first-class-value path where a builtin is invoked via `CallDyn` (e.g.
+    /// `arr.map(Math.sqrt)`, where the helper passes `(element, index, array)`).
+    /// Fewer than `min_args` is a `BadArg` error; **extra arguments beyond
+    /// `max_args` are dropped**, matching JS, which ignores surplus arguments.
+    /// After normalization each body can trust `argc ∈ [min_args, max_args]`.
     pub fn call(self, vm: &mut VM, argc: u32) -> Result<(), VMError> {
+        let meta = self.meta();
+        if argc < meta.min_args {
+            return Err(VMError::BadArg);
+        }
+        // Surplus args sit on top of the stack (pushed last); discard them so
+        // the body sees exactly its declared maximum. Variadic builtins set
+        // `max_args = u32::MAX`, so this never trims them.
+        let argc = if argc > meta.max_args {
+            let extra = (argc - meta.max_args) as usize;
+            if vm.stack.len() < extra {
+                return Err(VMError::StackUnderflow);
+            }
+            vm.stack.truncate(vm.stack.len() - extra);
+            meta.max_args
+        } else {
+            argc
+        };
         match self {
             // ── array methods ──
             Builtin::ArrayPush => array_push(vm, argc),
@@ -1414,5 +1439,53 @@ mod tests {
             Some(HeapValue::String(s)) => assert_eq!(s, "function"),
             other => panic!("{other:?}"),
         }
+    }
+
+    // ── flexible arity (meta-driven) ───────────────────────────────────
+
+    #[test]
+    fn builtin_ignores_surplus_args() {
+        // A fixed-arity builtin (Math.sqrt, max 1) invoked with extra args
+        // (as a callback would be: `(element, index, array)`) drops the surplus
+        // and uses only the first argument.
+        let out = run(vec![
+            Instr::Push(StackValue::Number(9.0)), // the element
+            Instr::Push(StackValue::Number(1.0)), // index — ignored
+            Instr::Push(StackValue::Number(7.0)), // array stand-in — ignored
+            Instr::Push(StackValue::Builtin(Builtin::MathSqrt)),
+            Instr::CallDyn(3),
+        ]);
+        assert_eq!(out, vec![StackValue::Number(3.0)]);
+    }
+
+    #[test]
+    fn builtin_below_min_args_errors() {
+        // Math.pow needs 2 args; calling it with 1 is a BadArg error.
+        let mut vm = VM::new(vec![
+            Instr::Push(StackValue::Number(2.0)),
+            Instr::Push(StackValue::Builtin(Builtin::MathPow)),
+            Instr::CallDyn(1),
+        ]);
+        let err = loop {
+            match vm.step() {
+                Err(e) => break e,
+                Ok(StepResult::Done) => panic!("expected error"),
+                Ok(_) => {}
+            }
+        };
+        assert!(matches!(err, VMError::BadArg), "got {err:?}");
+    }
+
+    #[test]
+    fn variadic_builtin_keeps_all_args() {
+        // Math.max is variadic (max = u32::MAX): surplus is never trimmed.
+        let out = run(vec![
+            Instr::Push(StackValue::Number(1.0)),
+            Instr::Push(StackValue::Number(9.0)),
+            Instr::Push(StackValue::Number(4.0)),
+            Instr::Push(StackValue::Builtin(Builtin::MathMax)),
+            Instr::CallDyn(3),
+        ]);
+        assert_eq!(out, vec![StackValue::Number(9.0)]);
     }
 }

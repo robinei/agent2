@@ -3551,6 +3551,17 @@ mod tests {
     }
 
     #[test]
+    fn hof_bare_builtin_callback() {
+        // A namespaced builtin passed directly as the callback works: the helper
+        // invokes it with (element, index, array) and the builtin ignores the
+        // surplus args (flexible arity from `Builtin::meta`).
+        assert_eq!(
+            eval_phase2("return [4, 9, 16].map(Math.sqrt).reduce((s, x) => s + x, 0);"),
+            num(9.0) // 2 + 3 + 4
+        );
+    }
+
+    #[test]
     fn compound_assignment() {
         // Local targets.
         assert_eq!(eval_phase2("let x = 5; x += 3; return x;"), num(8.0));
