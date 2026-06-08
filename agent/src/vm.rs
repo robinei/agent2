@@ -2038,37 +2038,63 @@ impl VM {
                 }
 
                 Instr::ObjGet(field) => {
-                    let field = field.clone();
-                    let obj_ptr = self.pop_ptr()?;
+                    let field_str = field.as_str(); // borrows self.code
+                    // Peek the object pointer instead of popping, so we can
+                    // use field_str (which borrows self.code) for the lookup
+                    // without cloning.
+                    let obj_ptr = match self.stack.last() {
+                        Some(StackValue::Ptr(p)) => *p,
+                        _ => return Err(VMError::TypeError),
+                    };
                     // JS: a missing property reads as `undefined`, not `null`.
-                    let val = self
-                        .heap_obj(obj_ptr)
-                        .and_then(|obj| obj.get(field.as_ref()).copied())
-                        .unwrap_or(StackValue::Undefined);
+                    let val = match self.heap.get(obj_ptr as usize) {
+                        Some(HeapValue::Object(obj)) => obj
+                            .get(field_str)
+                            .copied()
+                            .unwrap_or(StackValue::Undefined),
+                        _ => StackValue::Undefined,
+                    };
+                    self.stack.pop(); // discard the object pointer
                     self.stack.push(val);
                     self.ip += 1;
                 }
 
                 Instr::ObjSet(field, mode) => {
-                    let field = field.clone();
+                    let field_str = field.as_str(); // borrows self.code
                     let mode = *mode;
+                    // Stack: [..., obj_ptr, val] (val on top).
                     let val = self.stack.pop().ok_or(VMError::StackUnderflow)?;
-                    let obj_ptr = self.pop_ptr()?;
-                    let obj = self.heap_obj_mut(obj_ptr).ok_or(VMError::TypeError)?;
-                    // In Old mode, read the previous value before overwriting
-                    // (for postfix `++`/`--` on member targets).
-                    let old = match mode {
-                        SetMode::Old => obj
-                            .get(field.as_ref())
-                            .copied()
-                            .unwrap_or(StackValue::Undefined),
-                        SetMode::New => StackValue::Undefined, // placeholder, unused
+                    let obj_ptr = match self.stack.last() {
+                        Some(StackValue::Ptr(p)) => *p,
+                        _ => return Err(VMError::TypeError),
                     };
-                    obj.insert(field, val);
-                    match mode {
-                        SetMode::New => self.stack.push(val),
-                        SetMode::Old => self.stack.push(old),
-                    }
+                    let obj = match self.heap.get_mut(obj_ptr as usize) {
+                        Some(HeapValue::Object(o)) => o,
+                        _ => return Err(VMError::TypeError),
+                    };
+                    // Read the old value before overwriting, then write through
+                    // get_mut (avoids cloning the key when it already exists).
+                    let result = match mode {
+                        SetMode::Old => {
+                            let old = obj.get(field_str).copied().unwrap_or(StackValue::Undefined);
+                            if let Some(slot) = obj.get_mut(field_str) {
+                                *slot = val;
+                            } else {
+                                obj.insert(ThinString::from(field_str), val);
+                            }
+                            old
+                        }
+                        SetMode::New => {
+                            if let Some(slot) = obj.get_mut(field_str) {
+                                *slot = val;
+                            } else {
+                                obj.insert(ThinString::from(field_str), val);
+                            }
+                            val
+                        }
+                    };
+                    self.stack.pop(); // discard the object pointer
+                    self.stack.push(result);
                     self.ip += 1;
                 }
 
