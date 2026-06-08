@@ -567,25 +567,23 @@ fn str_includes(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     let args = take_args::<3>(vm, argc)?;
     let (haystack, needle, start) = match argc {
         2 => (
-            vm.pop_string_from(&args[0])?,
-            vm.pop_string_from(&args[1])?,
+            vm.str_from(&args[0])?,
+            vm.str_from(&args[1])?,
             None,
         ),
         3 => (
-            vm.pop_string_from(&args[0])?,
-            vm.pop_string_from(&args[1])?,
+            vm.str_from(&args[0])?,
+            vm.str_from(&args[1])?,
             Some(as_i64(&args[2]).ok_or(VMError::TypeError)?),
         ),
         _ => return Err(VMError::BadArg),
     };
     let found = match start {
-        // JS clamps the start position into range rather than erroring; a
-        // negative value behaves like 0.
         Some(s) => {
-            let start = clamp_start(&haystack, s.max(0) as usize);
-            haystack[start..].contains(needle.as_str())
+            let start = clamp_start(haystack, s.max(0) as usize);
+            haystack[start..].contains(needle)
         }
-        None => haystack.contains(needle.as_str()),
+        None => haystack.contains(needle),
     };
     vm.stack.push(StackValue::Bool(found));
     Ok(())
@@ -596,25 +594,23 @@ fn str_index_of(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     let args = take_args::<3>(vm, argc)?;
     let (haystack, needle, start) = match argc {
         2 => (
-            vm.pop_string_from(&args[0])?,
-            vm.pop_string_from(&args[1])?,
+            vm.str_from(&args[0])?,
+            vm.str_from(&args[1])?,
             None,
         ),
         3 => (
-            vm.pop_string_from(&args[0])?,
-            vm.pop_string_from(&args[1])?,
+            vm.str_from(&args[0])?,
+            vm.str_from(&args[1])?,
             Some(as_i64(&args[2]).ok_or(VMError::TypeError)?),
         ),
         _ => return Err(VMError::BadArg),
     };
     let pos = match start {
-        // JS clamps the start position into range; a negative value behaves
-        // like 0, and a too-large one only matches the empty needle at len.
         Some(s) => {
-            let start = clamp_start(&haystack, s.max(0) as usize);
-            haystack[start..].find(needle.as_str()).map(|p| (p + start) as f64)
+            let start = clamp_start(haystack, s.max(0) as usize);
+            haystack[start..].find(needle).map(|p| (p + start) as f64)
         }
-        None => haystack.find(needle.as_str()).map(|p| p as f64),
+        None => haystack.find(needle).map(|p| p as f64),
     };
     vm.stack.push(StackValue::Number(pos.unwrap_or(-1.0)));
     Ok(())
@@ -625,29 +621,27 @@ fn str_last_index_of(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     let args = take_args::<3>(vm, argc)?;
     let (haystack, needle, start) = match argc {
         2 => (
-            vm.pop_string_from(&args[0])?,
-            vm.pop_string_from(&args[1])?,
+            vm.str_from(&args[0])?,
+            vm.str_from(&args[1])?,
             None,
         ),
         3 => (
-            vm.pop_string_from(&args[0])?,
-            vm.pop_string_from(&args[1])?,
+            vm.str_from(&args[0])?,
+            vm.str_from(&args[1])?,
             Some(as_i64(&args[2]).ok_or(VMError::TypeError)?),
         ),
         _ => return Err(VMError::BadArg),
     };
     let pos = match start {
-        // JS searches backward for a match starting at index <= `start`; a
-        // negative value behaves like 0 (only an index-0 match qualifies).
         Some(s) => {
             let from = s.max(0) as usize;
             let mut end = haystack.len().min(from + needle.len());
             while end > 0 && !haystack.is_char_boundary(end) {
                 end -= 1;
             }
-            haystack[..end].rfind(needle.as_str()).map(|p| p as f64)
+            haystack[..end].rfind(needle).map(|p| p as f64)
         }
-        None => haystack.rfind(needle.as_str()).map(|p| p as f64),
+        None => haystack.rfind(needle).map(|p| p as f64),
     };
     vm.stack.push(StackValue::Number(pos.unwrap_or(-1.0)));
     Ok(())
@@ -656,19 +650,19 @@ fn str_last_index_of(vm: &mut VM, argc: u32) -> Result<(), VMError> {
 /// `s.startsWith(prefix)` → bool.
 fn str_starts_with(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     let args = check_arity!(vm, argc, 2)?;
-    let haystack = vm.pop_string_from(&args[0])?;
-    let prefix = vm.pop_string_from(&args[1])?;
+    let haystack = vm.str_from(&args[0])?;
+    let prefix = vm.str_from(&args[1])?;
     vm.stack
-        .push(StackValue::Bool(haystack.starts_with(prefix.as_str())));
+        .push(StackValue::Bool(haystack.starts_with(prefix)));
     Ok(())
 }
 
 /// `s.endsWith(suffix)` → bool.
 fn str_ends_with(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     let args = check_arity!(vm, argc, 2)?;
-    let haystack = vm.pop_string_from(&args[0])?;
-    let suffix = vm.pop_string_from(&args[1])?;
-    vm.stack.push(StackValue::Bool(haystack.ends_with(suffix.as_str())));
+    let haystack = vm.str_from(&args[0])?;
+    let suffix = vm.str_from(&args[1])?;
+    vm.stack.push(StackValue::Bool(haystack.ends_with(suffix)));
     Ok(())
 }
 
@@ -797,7 +791,7 @@ fn number_parse_int(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     // surplus and ignored (so `["1","2"].map(parseInt)` calls `parseInt(s, i)`,
     // the classic JS footgun, rather than erroring).
     let args = take_args::<2>(vm, argc)?;
-    let s = vm.pop_string_from(&args[0])?;
+    let s = vm.str_from(&args[0])?;
     // JS coerces the radix via ToInt32; a missing/NaN radix means "auto" (0).
     let radix = if argc >= 2 {
         match vm.to_number(&args[1]) {
@@ -807,14 +801,14 @@ fn number_parse_int(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     } else {
         0
     };
-    vm.stack.push(int_value(js_parse_int(&s, radix)));
+    vm.stack.push(int_value(js_parse_int(s, radix)));
     Ok(())
 }
 
 /// `Number.parseFloat(s)` → float.
 fn number_parse_float(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     let args = check_arity!(vm, argc, 1)?;
-    let s = vm.pop_string_from(&args[0])?;
+    let s = vm.str_from(&args[0])?;
     let n: f64 = s.trim().parse().map_err(|_| VMError::ValueError)?;
     vm.stack.push(StackValue::Number(n));
     Ok(())

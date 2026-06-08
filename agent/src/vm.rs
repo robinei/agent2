@@ -1069,6 +1069,17 @@ impl VM {
         }
     }
 
+    /// Extract a `&str` from a StackValue that has already been popped. Returns
+    /// a borrow into the heap — the caller must not mutate the heap while the
+    /// `&str` is live. Use this for read-only builtins that push scalar results
+    /// (bool, number) to avoid cloning the string.
+    pub(crate) fn str_from<'a>(&'a self, val: &StackValue) -> Result<&'a str, VMError> {
+        match val {
+            StackValue::Ptr(p) => self.heap_str(*p).ok_or(VMError::TypeError),
+            _ => Err(VMError::TypeError),
+        }
+    }
+
     /// Extract a string from a StackValue that has already been popped.
     pub(crate) fn pop_string_from(&self, val: &StackValue) -> Result<ThinString, VMError> {
         match val {
