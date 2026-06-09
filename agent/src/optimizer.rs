@@ -363,7 +363,7 @@ fn pe_value_to_push(v: &Value) -> Option<Instr> {
         Value::Bool(b) => Instr::PushBool(*b),
         Value::PosInt(u) => Instr::PushPosInt(*u),
         Value::NegInt(i) => Instr::PushNegInt(*i),
-        Value::Number(n) => Instr::PushFloat(*n),
+        Value::Float(n) => Instr::PushFloat(*n),
         Value::String(s) => Instr::PushStr(s.clone()),
         _ => return None,
     })

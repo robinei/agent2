@@ -589,7 +589,7 @@ impl<'src> Compiler<'src> {
             ConstValue::Num(n) => match f64_to_value(*n) {
                 Value::PosInt(u) => Instr::PushPosInt(u),
                 Value::NegInt(i) => Instr::PushNegInt(i),
-                Value::Number(f) => Instr::PushFloat(f),
+                Value::Float(f) => Instr::PushFloat(f),
                 _ => unreachable!("f64_to_value yields an int or float"),
             },
             // A constant function (Phase F): its value is its code address.
@@ -966,7 +966,7 @@ impl<'src> Compiler<'src> {
             // ── literals ──────────────────────────────────────────────
             ast::Expression::NumericLiteral(lit) => match number_literal_to_value(lit.value) {
                 Value::PosInt(v) => self.emit(Instr::PushPosInt(v), lit.span.start),
-                Value::Number(v) => self.emit(Instr::PushFloat(v), lit.span.start),
+                Value::Float(v) => self.emit(Instr::PushFloat(v), lit.span.start),
                 _ => unreachable!(),
             },
             ast::Expression::StringLiteral(lit) => {
@@ -1155,7 +1155,7 @@ impl<'src> Compiler<'src> {
                     match f64_to_value(-lit.value) {
                         Value::PosInt(v) => self.emit(Instr::PushPosInt(v), span),
                         Value::NegInt(v) => self.emit(Instr::PushNegInt(v), span),
-                        Value::Number(v) => self.emit(Instr::PushFloat(v), span),
+                        Value::Float(v) => self.emit(Instr::PushFloat(v), span),
                         _ => unreachable!(),
                     }
                 } else {
@@ -2851,7 +2851,7 @@ fn number_literal_to_value(value: f64) -> Value {
     if value.fract() == 0.0 && value >= 0.0 && value <= u64::MAX as f64 {
         Value::PosInt(value as u64)
     } else {
-        Value::Number(value)
+        Value::Float(value)
     }
 }
 
@@ -2864,7 +2864,7 @@ fn f64_to_value(value: f64) -> Value {
     } else if value.fract() == 0.0 && value < 0.0 && value >= i64::MIN as f64 {
         Value::NegInt(value as i64)
     } else {
-        Value::Number(value)
+        Value::Float(value)
     }
 }
 
@@ -2981,7 +2981,7 @@ mod tests {
         let vm = run_program(prog);
         // 0+1+2 + 4+5+6 = 18 (3 skipped, break at 7).
         let o = &vm.objects[0];
-        assert_eq!(o.get(&RcStr::from("sum")), Some(&Value::Number(18.0)));
+        assert_eq!(o.get(&RcStr::from("sum")), Some(&Value::Float(18.0)));
     }
 
     #[test]
@@ -3571,7 +3571,7 @@ mod tests {
     }
 
     fn num(v: f64) -> Value {
-        Value::Number(v)
+        Value::Float(v)
     }
 
     #[test]
@@ -3583,8 +3583,8 @@ mod tests {
         assert_eq!(eval("null"), Value::Null);
         assert_eq!(eval("undefined"), Value::Undefined);
         assert_eq!(eval_str("\"hi\""), "hi");
-        assert!(matches!(eval("NaN"), Value::Number(n) if n.is_nan()));
-        assert!(matches!(eval("Infinity"), Value::Number(n) if n.is_infinite()));
+        assert!(matches!(eval("NaN"), Value::Float(n) if n.is_nan()));
+        assert!(matches!(eval("Infinity"), Value::Float(n) if n.is_infinite()));
     }
 
     #[test]

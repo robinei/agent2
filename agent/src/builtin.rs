@@ -368,7 +368,7 @@ fn int_value(n: f64) -> Value {
             return Value::NegInt(n as i64);
         }
     }
-    Value::Number(n)
+    Value::Float(n)
 }
 
 /// JS `parseInt(string, radix)`: skip leading whitespace, an optional sign, an
@@ -440,7 +440,7 @@ fn array_push(vm: &mut VM, argc: u32) -> Result<(), VMError> {
         .ok_or(VMError::TypeError)?;
     arr.push(val);
     let len = arr.len();
-    vm.stack.push(Value::Number(len as f64));
+    vm.stack.push(Value::Float(len as f64));
     Ok(())
 }
 
@@ -493,7 +493,7 @@ fn array_unshift(vm: &mut VM, argc: u32) -> Result<(), VMError> {
         .ok_or(VMError::TypeError)?;
     arr.insert(0, val);
     let len = arr.len();
-    vm.stack.push(Value::Number(len as f64));
+    vm.stack.push(Value::Float(len as f64));
     Ok(())
 }
 
@@ -606,7 +606,7 @@ fn str_index_of(vm: &mut VM, argc: u32) -> Result<(), VMError> {
         }
         None => haystack.find(needle).map(|p| p as f64),
     };
-    vm.stack.push(Value::Number(pos.unwrap_or(-1.0)));
+    vm.stack.push(Value::Float(pos.unwrap_or(-1.0)));
     Ok(())
 }
 
@@ -633,7 +633,7 @@ fn str_last_index_of(vm: &mut VM, argc: u32) -> Result<(), VMError> {
         }
         None => haystack.rfind(needle).map(|p| p as f64),
     };
-    vm.stack.push(Value::Number(pos.unwrap_or(-1.0)));
+    vm.stack.push(Value::Float(pos.unwrap_or(-1.0)));
     Ok(())
 }
 
@@ -766,7 +766,7 @@ fn json_stringify(vm: &mut VM, argc: u32) -> Result<(), VMError> {
 fn number_is_integer(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     let args = check_arity!(vm, argc, 1)?;
     let is_int = matches!(&args[0], Value::PosInt(_) | Value::NegInt(_))
-        || matches!(&args[0], Value::Number(n) if crate::vm::float_is_int(*n));
+        || matches!(&args[0], Value::Float(n) if crate::vm::float_is_int(*n));
     vm.stack.push(Value::Bool(is_int));
     Ok(())
 }
@@ -798,7 +798,7 @@ fn number_parse_float(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     let args = check_arity!(vm, argc, 1)?;
     let s = vm.str_from(&args[0])?;
     let n: f64 = s.trim().parse().map_err(|_| VMError::ValueError)?;
-    vm.stack.push(Value::Number(n));
+    vm.stack.push(Value::Float(n));
     Ok(())
 }
 
@@ -818,7 +818,7 @@ fn array_is_array(vm: &mut VM, argc: u32) -> Result<(), VMError> {
 fn math_unary(vm: &mut VM, argc: u32, f: fn(f64) -> f64) -> Result<(), VMError> {
     let args = check_arity!(vm, argc, 1)?;
     let n = vm.to_number(&args[0]).ok_or(VMError::TypeError)?;
-    vm.stack.push(Value::Number(f(n)));
+    vm.stack.push(Value::Float(f(n)));
     Ok(())
 }
 
@@ -834,7 +834,7 @@ fn math_min(vm: &mut VM, argc: u32) -> Result<(), VMError> {
         acc = acc.min(num);
     }
     vm.stack.truncate(base);
-    vm.stack.push(Value::Number(acc));
+    vm.stack.push(Value::Float(acc));
     Ok(())
 }
 
@@ -850,7 +850,7 @@ fn math_max(vm: &mut VM, argc: u32) -> Result<(), VMError> {
         acc = acc.max(num);
     }
     vm.stack.truncate(base);
-    vm.stack.push(Value::Number(acc));
+    vm.stack.push(Value::Float(acc));
     Ok(())
 }
 
@@ -859,7 +859,7 @@ fn math_pow(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     let args = check_arity!(vm, argc, 2)?;
     let base = vm.to_number(&args[0]).ok_or(VMError::TypeError)?;
     let exp = vm.to_number(&args[1]).ok_or(VMError::TypeError)?;
-    vm.stack.push(Value::Number(base.powf(exp)));
+    vm.stack.push(Value::Float(base.powf(exp)));
     Ok(())
 }
 
@@ -891,7 +891,7 @@ mod tests {
             Instr::PushFloat(20.0),
             Instr::CallBuiltin(Builtin::ArrayPush, 2),
         ]);
-        assert_eq!(out.last(), Some(&Value::Number(2.0)));
+        assert_eq!(out.last(), Some(&Value::Float(2.0)));
     }
 
     // ── ArrayPop ───────────────────────────────────────────────────────
@@ -904,7 +904,7 @@ mod tests {
             Instr::ArrNew(2),
             Instr::CallBuiltin(Builtin::ArrayPop, 1),
         ]);
-        assert_eq!(out, vec![Value::Number(2.0)]);
+        assert_eq!(out, vec![Value::Float(2.0)]);
     }
 
     #[test]
@@ -926,7 +926,7 @@ mod tests {
             Instr::ArrNew(2),
             Instr::CallBuiltin(Builtin::ArrayShift, 1),
         ]);
-        assert_eq!(out, vec![Value::Number(1.0)]);
+        assert_eq!(out, vec![Value::Float(1.0)]);
     }
 
     #[test]
@@ -949,7 +949,7 @@ mod tests {
             Instr::PushFloat(1.0),
             Instr::CallBuiltin(Builtin::ArrayUnshift, 2),
         ]);
-        assert_eq!(out.last(), Some(&Value::Number(2.0)));
+        assert_eq!(out.last(), Some(&Value::Float(2.0)));
     }
 
     // ── ArrayJoin ──────────────────────────────────────────────────────
@@ -1044,7 +1044,7 @@ mod tests {
             Instr::PushStr("l".into()),
             Instr::CallBuiltin(Builtin::StrIndexOf, 2),
         ]);
-        assert_eq!(out, vec![Value::Number(2.0)]);
+        assert_eq!(out, vec![Value::Float(2.0)]);
     }
 
     #[test]
@@ -1054,7 +1054,7 @@ mod tests {
             Instr::PushStr("x".into()),
             Instr::CallBuiltin(Builtin::StrIndexOf, 2),
         ]);
-        assert_eq!(out, vec![Value::Number(-1.0)]);
+        assert_eq!(out, vec![Value::Float(-1.0)]);
     }
 
     // ── StrLastIndexOf ─────────────────────────────────────────────────
@@ -1066,7 +1066,7 @@ mod tests {
             Instr::PushStr("l".into()),
             Instr::CallBuiltin(Builtin::StrLastIndexOf, 2),
         ]);
-        assert_eq!(out, vec![Value::Number(3.0)]);
+        assert_eq!(out, vec![Value::Float(3.0)]);
     }
 
     // ── negative `start` clamps to 0, matching JS (rather than failing) ─
@@ -1080,7 +1080,7 @@ mod tests {
             Instr::PushNegInt(-5),
             Instr::CallBuiltin(Builtin::StrIndexOf, 3),
         ]);
-        assert_eq!(out, vec![Value::Number(0.0)]);
+        assert_eq!(out, vec![Value::Float(0.0)]);
     }
 
     #[test]
@@ -1104,7 +1104,7 @@ mod tests {
             Instr::PushNegInt(-3),
             Instr::CallBuiltin(Builtin::StrLastIndexOf, 3),
         ]);
-        assert_eq!(out, vec![Value::Number(-1.0)]);
+        assert_eq!(out, vec![Value::Float(-1.0)]);
     }
 
     // ── StrStartsWith / StrEndsWith ────────────────────────────────────
@@ -1293,7 +1293,7 @@ mod tests {
             Instr::PushStr("nope".into()),
             Instr::CallBuiltin(Builtin::NumberParseInt, 1),
         ]);
-        assert!(matches!(out.as_slice(), [Value::Number(n)] if n.is_nan()));
+        assert!(matches!(out.as_slice(), [Value::Float(n)] if n.is_nan()));
     }
 
     #[test]
@@ -1309,7 +1309,7 @@ mod tests {
             Instr::PushStr("3.14".into()),
             Instr::CallBuiltin(Builtin::NumberParseFloat, 1),
         ]);
-        assert_eq!(out, vec![Value::Number(3.14)]);
+        assert_eq!(out, vec![Value::Float(3.14)]);
     }
 
     // ── Array.isArray ──────────────────────────────────────────────────
@@ -1340,7 +1340,7 @@ mod tests {
             Instr::PushFloat(-5.0),
             Instr::CallBuiltin(Builtin::MathAbs, 1),
         ]);
-        assert_eq!(out, vec![Value::Number(5.0)]);
+        assert_eq!(out, vec![Value::Float(5.0)]);
     }
 
     #[test]
@@ -1349,7 +1349,7 @@ mod tests {
             Instr::PushFloat(9.0),
             Instr::CallBuiltin(Builtin::MathSqrt, 1),
         ]);
-        assert_eq!(out, vec![Value::Number(3.0)]);
+        assert_eq!(out, vec![Value::Float(3.0)]);
     }
 
     #[test]
@@ -1358,19 +1358,19 @@ mod tests {
             Instr::PushFloat(2.3),
             Instr::CallBuiltin(Builtin::MathCeil, 1),
         ]);
-        assert_eq!(out, vec![Value::Number(3.0)]);
+        assert_eq!(out, vec![Value::Float(3.0)]);
 
         let out = run(vec![
             Instr::PushFloat(2.7),
             Instr::CallBuiltin(Builtin::MathFloor, 1),
         ]);
-        assert_eq!(out, vec![Value::Number(2.0)]);
+        assert_eq!(out, vec![Value::Float(2.0)]);
 
         let out = run(vec![
             Instr::PushFloat(2.5),
             Instr::CallBuiltin(Builtin::MathRound, 1),
         ]);
-        assert_eq!(out, vec![Value::Number(3.0)]);
+        assert_eq!(out, vec![Value::Float(3.0)]);
     }
 
     #[test]
@@ -1379,7 +1379,7 @@ mod tests {
             Instr::PushFloat(-7.0),
             Instr::CallBuiltin(Builtin::MathSign, 1),
         ]);
-        assert_eq!(out, vec![Value::Number(-1.0)]);
+        assert_eq!(out, vec![Value::Float(-1.0)]);
     }
 
     #[test]
@@ -1390,13 +1390,13 @@ mod tests {
             Instr::PushFloat(5.0),
             Instr::CallBuiltin(Builtin::MathMax, 3),
         ]);
-        assert_eq!(out, vec![Value::Number(9.0)]);
+        assert_eq!(out, vec![Value::Float(9.0)]);
     }
 
     #[test]
     fn call_builtin_math_max_zero_args() {
         let out = run(vec![Instr::CallBuiltin(Builtin::MathMax, 0)]);
-        assert!(matches!(out.as_slice(), [Value::Number(x)] if x.is_infinite() && *x < 0.0));
+        assert!(matches!(out.as_slice(), [Value::Float(x)] if x.is_infinite() && *x < 0.0));
     }
 
     #[test]
@@ -1407,7 +1407,7 @@ mod tests {
             Instr::PushFloat(5.0),
             Instr::CallBuiltin(Builtin::MathMin, 3),
         ]);
-        assert_eq!(out, vec![Value::Number(-1.0)]);
+        assert_eq!(out, vec![Value::Float(-1.0)]);
     }
 
     #[test]
@@ -1417,7 +1417,7 @@ mod tests {
             Instr::PushFloat(3.0),
             Instr::CallBuiltin(Builtin::MathPow, 2),
         ]);
-        assert_eq!(out, vec![Value::Number(8.0)]);
+        assert_eq!(out, vec![Value::Float(8.0)]);
     }
 
     // ── first-class value tests ────────────────────────────────────────
@@ -1430,7 +1430,7 @@ mod tests {
             Instr::PushBuiltin(Builtin::MathMax),
             Instr::CallDyn(2),
         ]);
-        assert_eq!(out, vec![Value::Number(7.0)]);
+        assert_eq!(out, vec![Value::Float(7.0)]);
     }
 
     #[test]
@@ -1457,7 +1457,7 @@ mod tests {
             Instr::PushBuiltin(Builtin::MathSqrt),
             Instr::CallDyn(3),
         ]);
-        assert_eq!(out, vec![Value::Number(3.0)]);
+        assert_eq!(out, vec![Value::Float(3.0)]);
     }
 
     #[test]
@@ -1488,6 +1488,6 @@ mod tests {
             Instr::PushBuiltin(Builtin::MathMax),
             Instr::CallDyn(3),
         ]);
-        assert_eq!(out, vec![Value::Number(9.0)]);
+        assert_eq!(out, vec![Value::Float(9.0)]);
     }
 }

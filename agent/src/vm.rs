@@ -76,15 +76,6 @@ pub type CellIndex = u32;
 /// bit-copy, so `clone()` on a non-string value is as cheap as the old `Copy`.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Value {
-    Null,
-    /// An immutable UTF-8 string, stored inline as a thin refcounted handle
-    /// rather than behind a heap index. Cloning (stack dup, local read, pushing
-    /// a literal) is a refcount bump; `===`/`<` compare by content (with an O(1)
-    /// pointer-equality fast path for shared/interned strings). Unlike arrays
-    /// and objects — which are `Ptr` into `heap` and compare by reference
-    /// identity — strings are primitives and are reclaimed when the last
-    /// reference drops (the heap itself never reclaims).
-    String(RcStr),
     /// JS `undefined`: the value of an absent thing, as distinct from `null`
     /// (a present, intentionally-empty value). Produced internally — never by
     /// JSON, which only yields `Null` — by a missing object property, an
@@ -93,8 +84,8 @@ pub enum Value {
     /// split. Falsy, has no JSON form of its own (see `stack_value_to_json`),
     /// and `=== undefined` only (strict): `undefined !== null`.
     Undefined,
+    Null,
     Bool(bool),
-    Number(f64),
     /// A non-negative integer (0 ..= u64::MAX) and a negative integer
     /// (i64::MIN ..= -1). Together they mirror serde_json's internal number
     /// representation (`PosInt(u64) | NegInt(i64) | Float(f64)`) exactly, which
@@ -109,6 +100,24 @@ pub enum Value {
     /// computation.
     PosInt(u64),
     NegInt(i64),
+    Float(f64),
+    /// An immutable UTF-8 string, stored inline as a thin refcounted handle
+    /// rather than behind a heap index. Cloning (stack dup, local read, pushing
+    /// a literal) is a refcount bump; `===`/`<` compare by content (with an O(1)
+    /// pointer-equality fast path for shared/interned strings). Unlike arrays
+    /// and objects — which are `Ptr` into `heap` and compare by reference
+    /// identity — strings are primitives and are reclaimed when the last
+    /// reference drops (the heap itself never reclaims).
+    String(RcStr),
+    Array(ArrayPtr),
+    Object(ObjectPtr),
+    /// Internal indirection for a captured *by-reference* binding: indexes the
+    /// VM's `cells` side table, which has identity and outlives stack frames.
+    /// Only ever stored in a frame's local (or captured-arg) slots;
+    /// `Local`/`SetLocal` dereference it transparently, so the marker never
+    /// surfaces in expression temporaries, heap collections, or variables.
+    Upval(CellIndex),
+    Closure(ClosurePtr),
     /// A first-class function value: just a code address, with no captured
     /// environment. Covers non-capturing lambdas and named functions passed as
     /// values (dispatch tables, `map`/`filter` callbacks, etc.). Capturing
@@ -116,15 +125,6 @@ pub enum Value {
     /// captured environment), built by `MakeClosure` and likewise called
     /// through `CallDyn`.
     Fn(CodeAddr),
-    Array(ArrayPtr),
-    Object(ObjectPtr),
-    Closure(ClosurePtr),
-    /// Internal indirection for a captured *by-reference* binding: indexes the
-    /// VM's `cells` side table, which has identity and outlives stack frames.
-    /// Only ever stored in a frame's local (or captured-arg) slots;
-    /// `Local`/`SetLocal` dereference it transparently, so the marker never
-    /// surfaces in expression temporaries, heap collections, or variables.
-    Upval(CellIndex),
     /// A builtin stdlib function as a first-class value (`Math.max`, `arr.push`
     /// passed as a callback). Like `Fn`, it is callable (via `CallDyn`), is a
     /// "function" under `typeof`, compares by identity, and has no JSON form.
@@ -304,16 +304,17 @@ pub enum SetMode {
 // Instructions for a stack based language used for LLM composition of complex tool flows.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Instr {
-    PushNull,
     PushUndefined,
+    PushNull,
     PushBool(bool),
-    PushFloat(f64), // () -> any
     PushPosInt(u64),
     PushNegInt(i64),
-    PushFn(CodeAddr),
-    PushObject(ObjectPtr),
-    PushBuiltin(Builtin),
+    PushFloat(f64), // () -> any
     PushStr(RcStr), // () -> str
+    PushArray(ArrayPtr),
+    PushObject(ObjectPtr),
+    PushFn(CodeAddr),
+    PushBuiltin(Builtin),
 
     Pop(usize),
     Dup,
@@ -631,7 +632,7 @@ pub(crate) fn float_is_int(n: f64) -> bool {
 /// operands and always produce `Number`.
 fn as_f64(val: &Value) -> Option<f64> {
     match val {
-        Value::Number(n) => Some(*n),
+        Value::Float(n) => Some(*n),
         Value::PosInt(u) => Some(*u as f64),
         Value::NegInt(i) => Some(*i as f64),
         _ => None,
@@ -645,13 +646,13 @@ pub(crate) fn as_i64(val: &Value) -> Option<i64> {
     match val {
         Value::NegInt(i) => Some(*i),
         Value::PosInt(u) => i64::try_from(*u).ok(),
-        Value::Number(n) if float_is_int(*n) => Some(*n as i64),
+        Value::Float(n) if float_is_int(*n) => Some(*n as i64),
         _ => None,
     }
 }
 
 fn is_number(val: &Value) -> bool {
-    matches!(val, Value::Number(_) | Value::PosInt(_) | Value::NegInt(_))
+    matches!(val, Value::Float(_) | Value::PosInt(_) | Value::NegInt(_))
 }
 
 /// JS `ToNumber` applied to a string, as used when a loose `==` compares a
@@ -822,7 +823,7 @@ impl VM {
         match val {
             Value::Bool(b) => *b,
             Value::Null | Value::Undefined => false,
-            Value::Number(n) => *n != 0.0 && !n.is_nan(),
+            Value::Float(n) => *n != 0.0 && !n.is_nan(),
             Value::PosInt(u) => *u != 0,
             // NegInt is always negative (i64::MIN..=-1), hence never zero.
             Value::NegInt(_) => true,
@@ -847,7 +848,7 @@ impl VM {
     /// those is a TypeError.
     pub(crate) fn to_number(&self, val: &Value) -> Option<f64> {
         match val {
-            Value::Number(n) => Some(*n),
+            Value::Float(n) => Some(*n),
             Value::PosInt(u) => Some(*u as f64),
             Value::NegInt(i) => Some(*i as f64),
             Value::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
@@ -890,7 +891,7 @@ impl VM {
             Value::Bool(b) => buf.push_str(if *b { "true" } else { "false" }),
             Value::PosInt(u) => buf.push_str(&u.to_string()),
             Value::NegInt(i) => buf.push_str(&i.to_string()),
-            Value::Number(n) => buf.push_str(&js_number_to_string(*n)),
+            Value::Float(n) => buf.push_str(&js_number_to_string(*n)),
             Value::String(s) => buf.push_str(s.as_str()),
             Value::Fn(_) | Value::Builtin(_) => {
                 buf.push_str("function () { [native code] }");
@@ -940,7 +941,7 @@ impl VM {
             // (Loose `null == undefined` would need a separate op; Eq is ===.)
             (Value::Undefined, Value::Undefined) => true,
             (Value::Bool(a), Value::Bool(b)) => a == b,
-            (Value::Number(a), Value::Number(b)) => {
+            (Value::Float(a), Value::Float(b)) => {
                 if a.is_nan() && b.is_nan() {
                     false // NaN != NaN per IEEE 754
                 } else {
@@ -954,10 +955,10 @@ impl VM {
             (Value::PosInt(a), Value::PosInt(b)) => a == b,
             (Value::NegInt(a), Value::NegInt(b)) => a == b,
             (Value::PosInt(_), Value::NegInt(_)) | (Value::NegInt(_), Value::PosInt(_)) => false,
-            (Value::PosInt(a), Value::Number(b)) => !b.is_nan() && (*a as f64) == *b,
-            (Value::Number(a), Value::PosInt(b)) => !a.is_nan() && *a == (*b as f64),
-            (Value::NegInt(a), Value::Number(b)) => !b.is_nan() && (*a as f64) == *b,
-            (Value::Number(a), Value::NegInt(b)) => !a.is_nan() && *a == (*b as f64),
+            (Value::PosInt(a), Value::Float(b)) => !b.is_nan() && (*a as f64) == *b,
+            (Value::Float(a), Value::PosInt(b)) => !a.is_nan() && *a == (*b as f64),
+            (Value::NegInt(a), Value::Float(b)) => !b.is_nan() && (*a as f64) == *b,
+            (Value::Float(a), Value::NegInt(b)) => !a.is_nan() && *a == (*b as f64),
             // Function values are equal iff they point at the same code address.
             (Value::Fn(a), Value::Fn(b)) => a == b,
             // Builtins compare by identity, like Fn.
@@ -1002,8 +1003,8 @@ impl VM {
         }
         match (lhs, rhs) {
             // Boolean → number, then re-run the comparison.
-            (Bool(b), _) => self.loose_equal(&Number(if *b { 1.0 } else { 0.0 }), rhs),
-            (_, Bool(b)) => self.loose_equal(lhs, &Number(if *b { 1.0 } else { 0.0 })),
+            (Bool(b), _) => self.loose_equal(&Float(if *b { 1.0 } else { 0.0 }), rhs),
+            (_, Bool(b)) => self.loose_equal(lhs, &Float(if *b { 1.0 } else { 0.0 })),
             // Number vs string (either order): coerce the string with ToNumber.
             (l, String(s)) if is_number(l) => num_loose_eq_str(l, s),
             (String(s), r) if is_number(r) => num_loose_eq_str(r, s),
@@ -1018,16 +1019,16 @@ impl VM {
         match (lhs, rhs) {
             (Value::Null, Value::Null) => Some(std::cmp::Ordering::Equal),
             (Value::Bool(a), Value::Bool(b)) => Some(a.cmp(b)),
-            (Value::Number(a), Value::Number(b)) => a.partial_cmp(b),
+            (Value::Float(a), Value::Float(b)) => a.partial_cmp(b),
             (Value::PosInt(a), Value::PosInt(b)) => Some(a.cmp(b)),
             (Value::NegInt(a), Value::NegInt(b)) => Some(a.cmp(b)),
             // Sign decides cross-variant ordering with no value juggling.
             (Value::PosInt(_), Value::NegInt(_)) => Some(std::cmp::Ordering::Greater),
             (Value::NegInt(_), Value::PosInt(_)) => Some(std::cmp::Ordering::Less),
-            (Value::PosInt(a), Value::Number(b)) => (*a as f64).partial_cmp(b),
-            (Value::Number(a), Value::PosInt(b)) => a.partial_cmp(&(*b as f64)),
-            (Value::NegInt(a), Value::Number(b)) => (*a as f64).partial_cmp(b),
-            (Value::Number(a), Value::NegInt(b)) => a.partial_cmp(&(*b as f64)),
+            (Value::PosInt(a), Value::Float(b)) => (*a as f64).partial_cmp(b),
+            (Value::Float(a), Value::PosInt(b)) => a.partial_cmp(&(*b as f64)),
+            (Value::NegInt(a), Value::Float(b)) => (*a as f64).partial_cmp(b),
+            (Value::Float(a), Value::NegInt(b)) => a.partial_cmp(&(*b as f64)),
             // Strings order lexicographically by bytes (UTF-8 byte order matches
             // code-point order). Arrays/objects/closures are incomparable.
             (Value::String(a), Value::String(b)) => Some(a.cmp(b)),
@@ -1101,7 +1102,7 @@ impl VM {
             // value, where JS.stringify returns the JS value `undefined` — no
             // JSON — so we surface an error rather than inventing one.
             Value::Undefined => return Err(VMError::ValueError),
-            Value::Number(n) => {
+            Value::Float(n) => {
                 // Preserve integer formatting when possible (f64-only VM
                 // internals, but JSON consumers care about int vs float).
                 if float_is_int(*n) && *n >= (i64::MIN as f64) && *n <= (i64::MAX as f64) {
@@ -1168,7 +1169,7 @@ impl VM {
                 } else if let Some(i) = n.as_i64() {
                     Value::NegInt(i)
                 } else {
-                    Value::Number(n.as_f64().unwrap_or(0.0))
+                    Value::Float(n.as_f64().unwrap_or(0.0))
                 }
             }
             serde_json::Value::String(s) => Value::String(RcStr::from(s.as_str())),
@@ -1205,7 +1206,7 @@ impl VM {
                 let val = self.stack.pop().ok_or(VMError::StackUnderflow)?;
                 match self.to_number(&val) {
                     Some(n) => {
-                        self.stack.push(Value::Number($op(n)));
+                        self.stack.push(Value::Float($op(n)));
                         self.ip += 1;
                     }
                     None => return Err(VMError::TypeError),
@@ -1222,7 +1223,7 @@ impl VM {
                 let lhs = self.stack.pop().ok_or(VMError::StackUnderflow)?;
                 match (self.to_number(&lhs), self.to_number(&rhs)) {
                     (Some(a), Some(b)) => {
-                        self.stack.push(Value::Number($op(a, b)));
+                        self.stack.push(Value::Float($op(a, b)));
                         self.ip += 1;
                     }
                     _ => return Err(VMError::TypeError),
@@ -1238,7 +1239,7 @@ impl VM {
                 let lhs = self.stack.pop().ok_or(VMError::StackUnderflow)?;
                 match (as_i64(&lhs), as_i64(&rhs)) {
                     (Some(a), Some(b)) => {
-                        self.stack.push(Value::Number($op(a, b) as f64));
+                        self.stack.push(Value::Float($op(a, b) as f64));
                         self.ip += 1;
                     }
                     _ => return Err(VMError::TypeError),
@@ -1272,20 +1273,16 @@ impl VM {
             self.fuel -= 1;
             match &self.code[self.ip as usize] {
                 // ── stack manipulation ───────────────────────────
-                Instr::PushNull => {
-                    self.stack.push(Value::Null);
-                    self.ip += 1;
-                }
                 Instr::PushUndefined => {
                     self.stack.push(Value::Undefined);
                     self.ip += 1;
                 }
-                Instr::PushBool(b) => {
-                    self.stack.push(Value::Bool(*b));
+                Instr::PushNull => {
+                    self.stack.push(Value::Null);
                     self.ip += 1;
                 }
-                Instr::PushFloat(f) => {
-                    self.stack.push(Value::Number(*f));
+                Instr::PushBool(b) => {
+                    self.stack.push(Value::Bool(*b));
                     self.ip += 1;
                 }
                 Instr::PushPosInt(u) => {
@@ -1296,24 +1293,28 @@ impl VM {
                     self.stack.push(Value::NegInt(*i));
                     self.ip += 1;
                 }
-                Instr::PushFn(addr) => {
-                    self.stack.push(Value::Fn(*addr));
+                Instr::PushFloat(f) => {
+                    self.stack.push(Value::Float(*f));
+                    self.ip += 1;
+                }
+                Instr::PushStr(s) => {
+                    self.stack.push(Value::String(s.clone()));
+                    self.ip += 1;
+                }
+                Instr::PushArray(h) => {
+                    self.stack.push(Value::Array(*h));
                     self.ip += 1;
                 }
                 Instr::PushObject(h) => {
                     self.stack.push(Value::Object(*h));
                     self.ip += 1;
                 }
-                Instr::PushBuiltin(b) => {
-                    self.stack.push(Value::Builtin(*b));
+                Instr::PushFn(addr) => {
+                    self.stack.push(Value::Fn(*addr));
                     self.ip += 1;
                 }
-
-                Instr::PushStr(s) => {
-                    // A refcount bump sharing the instruction's `RcStr` — no
-                    // allocation, no heap slot. Identical literals were interned
-                    // at compile time, so they all share one allocation.
-                    self.stack.push(Value::String(s.clone()));
+                Instr::PushBuiltin(b) => {
+                    self.stack.push(Value::Builtin(*b));
                     self.ip += 1;
                 }
 
@@ -1780,7 +1781,7 @@ impl VM {
                     let old_num = self.to_number(&old).ok_or(VMError::TypeError)?;
                     // Compute new value: subtract p (p = -1 for ++, p = 1 for --).
                     let new_num = old_num - *p;
-                    let new_val = Value::Number(new_num);
+                    let new_val = Value::Float(new_num);
                     // Store the new value.
                     let slot = (self.fp + u32::from(*local)) as usize;
                     match self.stack[slot] {
@@ -1791,8 +1792,8 @@ impl VM {
                     }
                     // Push the appropriate result: old for postfix, new for prefix.
                     let result = match mode {
-                        UpdateMode::Prefix => Value::Number(new_num),
-                        UpdateMode::Postfix => Value::Number(old_num),
+                        UpdateMode::Prefix => Value::Float(new_num),
+                        UpdateMode::Postfix => Value::Float(old_num),
                     };
                     self.stack.push(result);
                     self.ip += 1;
@@ -1807,7 +1808,7 @@ impl VM {
                         Value::Undefined => "undefined",
                         Value::Null => "object",
                         Value::Bool(_) => "boolean",
-                        Value::Number(_) | Value::PosInt(_) | Value::NegInt(_) => "number",
+                        Value::Float(_) | Value::PosInt(_) | Value::NegInt(_) => "number",
                         Value::String(_) => "string",
                         Value::Fn(_) | Value::Builtin(_) => "function",
                         Value::Array(_) | Value::Object(_) => "object",
@@ -1834,7 +1835,7 @@ impl VM {
                     // True only for a Number with a fractional part (an Int is
                     // never a float). Use IsNum to test "is any number".
                     let val = self.stack.pop().ok_or(VMError::StackUnderflow)?;
-                    let is_float = matches!(val, Value::Number(n) if !float_is_int(n));
+                    let is_float = matches!(val, Value::Float(n) if !float_is_int(n));
                     self.stack.push(Value::Bool(is_float));
                     self.ip += 1;
                 }
@@ -1842,7 +1843,7 @@ impl VM {
                     let val = self.stack.pop().ok_or(VMError::StackUnderflow)?;
                     self.stack.push(Value::Bool(matches!(
                         val,
-                        Value::Number(_) | Value::PosInt(_) | Value::NegInt(_)
+                        Value::Float(_) | Value::PosInt(_) | Value::NegInt(_)
                     )));
                     self.ip += 1;
                 }
@@ -1872,7 +1873,7 @@ impl VM {
                     let val = self.stack.pop().ok_or(VMError::StackUnderflow)?;
                     match as_i64(&val) {
                         Some(i) => {
-                            self.stack.push(Value::Number(!i as f64));
+                            self.stack.push(Value::Float(!i as f64));
                             self.ip += 1;
                         }
                         None => return Err(VMError::TypeError),
@@ -1900,7 +1901,7 @@ impl VM {
                         Value::String(RcStr::from(s))
                     } else {
                         match (self.to_number(&lhs), self.to_number(&rhs)) {
-                            (Some(a), Some(b)) => Value::Number(a + b),
+                            (Some(a), Some(b)) => Value::Float(a + b),
                             _ => return Err(VMError::TypeError),
                         }
                     };
@@ -1992,7 +1993,7 @@ impl VM {
                     if !(0..64).contains(&b) {
                         return Err(VMError::ValueError);
                     }
-                    self.stack.push(Value::Number((a << b) as f64));
+                    self.stack.push(Value::Float((a << b) as f64));
                     self.ip += 1;
                 }
                 Instr::BitRhs => {
@@ -2001,7 +2002,7 @@ impl VM {
                     if !(0..64).contains(&b) {
                         return Err(VMError::ValueError);
                     }
-                    self.stack.push(Value::Number((a >> b) as f64));
+                    self.stack.push(Value::Float((a >> b) as f64));
                     self.ip += 1;
                 }
 
@@ -2279,7 +2280,7 @@ impl VM {
                             .len(),
                         _ => return Err(VMError::TypeError),
                     };
-                    self.stack.push(Value::Number(len as f64));
+                    self.stack.push(Value::Float(len as f64));
                     self.ip += 1;
                 }
 
@@ -2295,7 +2296,7 @@ impl VM {
                     // array/object/function has no numeric form (TypeError).
                     let val = self.stack.pop().ok_or(VMError::StackUnderflow)?;
                     match self.to_number(&val) {
-                        Some(num) => self.stack.push(Value::Number(num)),
+                        Some(num) => self.stack.push(Value::Float(num)),
                         None => return Err(VMError::TypeError),
                     }
                     self.ip += 1;
@@ -2414,7 +2415,7 @@ mod tests {
     // ── helpers ───────────────────────────────────────────────────
 
     fn n(v: f64) -> Value {
-        Value::Number(v)
+        Value::Float(v)
     }
     /// Canonical integer value: non-negative -> PosInt, negative -> NegInt.
     fn i(v: i64) -> Value {
@@ -2692,11 +2693,11 @@ mod tests {
         // JS: x/0 -> ±Infinity, 0/0 -> NaN (never an error).
         assert!(matches!(
             run(vec![PushFloat(1.0), PushFloat(0.0), Div]).as_slice(),
-            [Value::Number(x)] if x.is_infinite() && *x > 0.0
+            [Value::Float(x)] if x.is_infinite() && *x > 0.0
         ));
         assert!(matches!(
             run(vec![PushFloat(0.0), PushFloat(0.0), Div]).as_slice(),
-            [Value::Number(x)] if x.is_nan()
+            [Value::Float(x)] if x.is_nan()
         ));
     }
 
@@ -2715,7 +2716,7 @@ mod tests {
         // x % 0 -> NaN, not an error.
         assert!(matches!(
             run(vec![PushFloat(1.0), PushFloat(0.0), Mod]).as_slice(),
-            [Value::Number(x)] if x.is_nan()
+            [Value::Float(x)] if x.is_nan()
         ));
     }
 
@@ -2768,12 +2769,12 @@ mod tests {
         // undefined -> NaN propagates.
         assert!(matches!(
             run(vec![PushUndefined, PushFloat(1.0), Sub]).as_slice(),
-            [Value::Number(x)] if x.is_nan()
+            [Value::Float(x)] if x.is_nan()
         ));
         // An unparseable string -> NaN.
         assert!(matches!(
             run(vec![ps("abc"), PushFloat(1.0), Mul]).as_slice(),
-            [Value::Number(x)] if x.is_nan()
+            [Value::Float(x)] if x.is_nan()
         ));
     }
 
@@ -2810,7 +2811,7 @@ mod tests {
         assert_eq!(run(vec![PushNull, ToNum]), vec![n(0.0)]);
         assert!(matches!(
             run(vec![PushUndefined, ToNum]).as_slice(),
-            [Value::Number(x)] if x.is_nan()
+            [Value::Float(x)] if x.is_nan()
         ));
         // An array/object has no numeric form.
         assert!(matches!(
@@ -3682,7 +3683,7 @@ mod tests {
                 Value::Undefined => PushUndefined,
                 Value::Null => PushNull,
                 Value::Bool(b) => PushBool(*b),
-                Value::Number(f) => PushFloat(*f),
+                Value::Float(f) => PushFloat(*f),
                 Value::PosInt(u) => PushPosInt(*u),
                 Value::NegInt(i) => PushNegInt(*i),
                 Value::Fn(a) => PushFn(*a),
