@@ -78,8 +78,8 @@ impl Builtin {
             // ── array methods (receiver + args) ──
             Builtin::ArrayPush => BuiltinMeta {
                 name: "push",
-                min_args: 2, // recv + 1
-                max_args: 2,
+                min_args: 1, // recv
+                max_args: u32::MAX,
             },
             Builtin::ArrayPop => BuiltinMeta {
                 name: "pop",
@@ -93,8 +93,8 @@ impl Builtin {
             },
             Builtin::ArrayUnshift => BuiltinMeta {
                 name: "unshift",
-                min_args: 2, // recv + 1
-                max_args: 2,
+                min_args: 1, // recv
+                max_args: u32::MAX,
             },
             Builtin::ArrayJoin => BuiltinMeta {
                 name: "join",
