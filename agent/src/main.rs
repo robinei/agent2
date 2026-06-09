@@ -2,6 +2,7 @@ mod analyzer;
 mod builtin;
 mod compiler;
 mod diag;
+mod optimizer;
 mod prelude;
 mod rc_str;
 mod tree;
@@ -48,12 +49,7 @@ mod alloc_counter {
             bump();
             unsafe { System.alloc_zeroed(layout) }
         }
-        unsafe fn realloc(
-            &self,
-            ptr: *mut u8,
-            layout: Layout,
-            new_size: usize,
-        ) -> *mut u8 {
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
             bump();
             unsafe { System.realloc(ptr, layout, new_size) }
         }

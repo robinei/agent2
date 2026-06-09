@@ -273,6 +273,14 @@ pub struct VM {
     pub callstack: Vec<CallFrame>,
     pub ip: CodeAddr,
     pub fp: StackAddr,
+    /// Cache of the current (top) call frame's `local_count`, mirrored here so
+    /// the hottest instructions (`Local`/`SetLocal`/`Pop`/`Dup`/… and
+    /// `frame_floor`) read a plain field instead of chasing `callstack.last()`
+    /// every time. Kept in sync wherever a frame's `local_count` is set:
+    /// `Call`/`CallDyn` (→ nargs), `EnterFrame` (→ final count), and `Return`
+    /// (→ the restored caller frame's count). `local_count` only changes at
+    /// those four sites, so the mirror is always current.
+    cur_local_count: u32,
     /// Remaining instruction budget. Decremented once per executed
     /// instruction across all `step()` calls; reaching zero yields
     /// `VMError::OutOfFuel`. The heap grows monotonically (no reclamation,
@@ -697,6 +705,7 @@ impl VM {
             }],
             ip: 0,
             fp: 0,
+            cur_local_count: 0,
             fuel: DEFAULT_FUEL,
         }
     }
@@ -743,8 +752,7 @@ impl VM {
     /// temporaries above that. Stack-manipulation ops (Dup/Swap/Rot/Pop) must
     /// not reach below this floor into locals, args, or the caller's stack.
     fn frame_floor(&self) -> usize {
-        let local_count = self.callstack.last().map_or(0, |f| f.local_count) as usize;
-        self.fp as usize + local_count
+        self.fp as usize + self.cur_local_count as usize
     }
 
     /// If the instruction at `ip` is an `Invoke`, return its name and arg
@@ -1420,6 +1428,7 @@ impl VM {
                     });
                     self.ip = *addr;
                     self.fp = (self.stack.len() as u32) - *nargs;
+                    self.cur_local_count = *nargs;
                 }
 
                 Instr::CallDyn(nargs) => {
@@ -1451,6 +1460,7 @@ impl VM {
                                 pending_upvals: SmallVec::new(),
                             });
                             self.fp = (self.stack.len() as u32) - nargs;
+                            self.cur_local_count = nargs;
                             self.ip = addr;
                         }
                         StackValue::Ptr(p) => {
@@ -1478,6 +1488,7 @@ impl VM {
                                 pending_upvals: upvals,
                             });
                             self.fp = (self.stack.len() as u32) - nargs;
+                            self.cur_local_count = nargs;
                             self.ip = addr;
                         }
                         _ => return Err(VMError::TypeError),
@@ -1499,7 +1510,7 @@ impl VM {
                     // Collect into stack-allocated SmallVec instead of cloning
                     // the ThinVec from self.code. LocalIndex is u32 (Copy).
                     let captures: SmallVec<[LocalIndex; 8]> = captures.iter().copied().collect();
-                    let local_count = self.callstack.last().ok_or(VMError::BadLocal)?.local_count;
+                    let local_count = self.cur_local_count;
                     let mut upvals: SmallVec<[StackValue; 8]> = SmallVec::new();
                     for slot in captures {
                         if slot >= local_count {
@@ -1526,8 +1537,18 @@ impl VM {
                         return Err(VMError::StackUnderflow);
                     }
                     let ret_start = self.stack.len() - n;
+                    // Move (don't clone) each return value down to the frame
+                    // base; the source region is truncated away immediately, so
+                    // cloning would just bump-then-drop a refcount for string/
+                    // heap returns. Ascending order is safe: dest indices
+                    // (`keep_below..`) are <= source indices (`ret_start..`), so
+                    // a source slot is never read after being overwritten.
                     for i in 0..n {
-                        self.stack[keep_below + i] = self.stack[ret_start + i].clone();
+                        let v = std::mem::replace(
+                            &mut self.stack[ret_start + i],
+                            StackValue::Undefined,
+                        );
+                        self.stack[keep_below + i] = v;
                     }
                     self.stack.truncate(keep_below + n);
                     self.ip = frame.return_addr;
@@ -1535,6 +1556,9 @@ impl VM {
                     if self.callstack.is_empty() {
                         return Ok(StepResult::Done);
                     }
+                    // Refresh the local-count cache from the restored caller
+                    // frame (returns are far rarer than local accesses).
+                    self.cur_local_count = self.callstack.last().map_or(0, |f| f.local_count);
                 }
 
                 Instr::Jump(addr) => {
@@ -1644,8 +1668,9 @@ impl VM {
                         };
                         self.stack.push(slot);
                     }
-                    self.callstack.last_mut().unwrap().local_count =
-                        nparams as u32 + k + local_kinds.len() as u32;
+                    let total = nparams as u32 + k + local_kinds.len() as u32;
+                    self.callstack.last_mut().unwrap().local_count = total;
+                    self.cur_local_count = total;
                     self.ip += 1;
                 }
 
@@ -1682,16 +1707,17 @@ impl VM {
                 }
 
                 Instr::Local(local) => {
-                    let frame = self.callstack.last().ok_or(VMError::BadLocal)?;
-                    if *local >= frame.local_count {
+                    if *local >= self.cur_local_count {
                         return Err(VMError::BadLocal);
                     }
                     // A Boxed slot holds an Upval marker; dereference it so the
                     // value — never the marker — reaches the expression stack.
                     let val = match &self.stack[(self.fp + local) as usize] {
-                        StackValue::Upval(c) => {
-                            self.cells.get(*c as usize).ok_or(VMError::ValueError)?.clone()
-                        }
+                        StackValue::Upval(c) => self
+                            .cells
+                            .get(*c as usize)
+                            .ok_or(VMError::ValueError)?
+                            .clone(),
                         other => other.clone(),
                     };
                     self.stack.push(val);
@@ -1699,8 +1725,7 @@ impl VM {
                 }
 
                 Instr::SetLocal(local) => {
-                    let frame = self.callstack.last().ok_or(VMError::BadLocal)?;
-                    if *local >= frame.local_count {
+                    if *local >= self.cur_local_count {
                         return Err(VMError::BadLocal);
                     }
                     let val = self.stack.pop().ok_or(VMError::StackUnderflow)?;
@@ -1717,8 +1742,7 @@ impl VM {
                 }
 
                 Instr::TeeLocal(local) => {
-                    let frame = self.callstack.last().ok_or(VMError::BadLocal)?;
-                    if *local >= frame.local_count {
+                    if *local >= self.cur_local_count {
                         return Err(VMError::BadLocal);
                     }
                     let val = self.stack.last().ok_or(VMError::StackUnderflow)?.clone();
@@ -1736,16 +1760,17 @@ impl VM {
                 }
 
                 Instr::FreshCell(local) => {
-                    let frame = self.callstack.last().ok_or(VMError::BadLocal)?;
-                    if *local >= frame.local_count {
+                    if *local >= self.cur_local_count {
                         return Err(VMError::BadLocal);
                     }
                     let slot = (self.fp + local) as usize;
                     // Read the current value, dereferencing an existing Upval.
                     let val = match &self.stack[slot] {
-                        StackValue::Upval(c) => {
-                            self.cells.get(*c as usize).ok_or(VMError::ValueError)?.clone()
-                        }
+                        StackValue::Upval(c) => self
+                            .cells
+                            .get(*c as usize)
+                            .ok_or(VMError::ValueError)?
+                            .clone(),
                         other => other.clone(),
                     };
                     // Allocate a fresh cell seeded with that value and point the
@@ -1757,15 +1782,16 @@ impl VM {
                 }
 
                 Instr::IncLocal(local, p, mode) => {
-                    let frame = self.callstack.last().ok_or(VMError::BadLocal)?;
-                    if u32::from(*local) >= frame.local_count {
+                    if u32::from(*local) >= self.cur_local_count {
                         return Err(VMError::BadLocal);
                     }
                     // Read current value (dereferencing boxed slots).
                     let old = match &self.stack[(self.fp + u32::from(*local)) as usize] {
-                        StackValue::Upval(c) => {
-                            self.cells.get(*c as usize).ok_or(VMError::ValueError)?.clone()
-                        }
+                        StackValue::Upval(c) => self
+                            .cells
+                            .get(*c as usize)
+                            .ok_or(VMError::ValueError)?
+                            .clone(),
                         other => other.clone(),
                     };
                     let old_num = self.to_number(&old).ok_or(VMError::TypeError)?;
@@ -2723,25 +2749,19 @@ mod tests {
     #[test]
     fn add_concat_coerces() {
         // `+` concatenates when either side is a string, coercing the other.
-        assert_eq!(
-            run_last_str(vec![ps("x="), PushFloat(5.0), Add]),
-            "x=5"
-        );
-        assert_eq!(
-            run_last_str(vec![PushFloat(5.0), ps("!"), Add]),
-            "5!"
-        );
-        assert_eq!(
-            run_last_str(vec![ps("v="), PushNull, Add]),
-            "v=null"
-        );
-        assert_eq!(
-            run_last_str(vec![ps("b="), PushBool(true), Add]),
-            "b=true"
-        );
+        assert_eq!(run_last_str(vec![ps("x="), PushFloat(5.0), Add]), "x=5");
+        assert_eq!(run_last_str(vec![PushFloat(5.0), ps("!"), Add]), "5!");
+        assert_eq!(run_last_str(vec![ps("v="), PushNull, Add]), "v=null");
+        assert_eq!(run_last_str(vec![ps("b="), PushBool(true), Add]), "b=true");
         // An array operand stringifies like join(",") on the concat path.
         assert_eq!(
-            run_last_str(vec![PushFloat(1.0), PushFloat(2.0), ArrNew(2), ps("!"), Add]),
+            run_last_str(vec![
+                PushFloat(1.0),
+                PushFloat(2.0),
+                ArrNew(2),
+                ps("!"),
+                Add
+            ]),
             "1,2!"
         );
     }
@@ -2749,16 +2769,10 @@ mod tests {
     #[test]
     fn arithmetic_coerces() {
         // ToNumber coercion on -, *, /, % (strings, bools, null).
-        assert_eq!(
-            run(vec![ps("6"), PushFloat(1.0), Sub]),
-            vec![n(5.0)]
-        );
+        assert_eq!(run(vec![ps("6"), PushFloat(1.0), Sub]), vec![n(5.0)]);
         assert_eq!(run(vec![PushBool(true), PushFloat(2.0), Mul]), vec![n(2.0)]);
         assert_eq!(run(vec![PushNull, PushFloat(1.0), Add]), vec![n(1.0)]);
-        assert_eq!(
-            run(vec![ps("6"), ps("2"), Mul]),
-            vec![n(12.0)]
-        );
+        assert_eq!(run(vec![ps("6"), ps("2"), Mul]), vec![n(12.0)]);
         // undefined -> NaN propagates.
         assert!(matches!(
             run(vec![PushUndefined, PushFloat(1.0), Sub]).as_slice(),
@@ -2907,21 +2921,18 @@ mod tests {
     #[test]
     fn loose_eq_number_string_coercion() {
         // 1 == "1"
-        assert_eq!(
-            run(vec![PushFloat(1.0), ps("1"), LooseEq]),
-            vec![b(true)]
-        );
+        assert_eq!(run(vec![PushFloat(1.0), ps("1"), LooseEq]), vec![b(true)]);
         // "1" == 1 (other order)
-        assert_eq!(
-            run(vec![ps("1"), PushFloat(1.0), LooseEq]),
-            vec![b(true)]
-        );
+        assert_eq!(run(vec![ps("1"), PushFloat(1.0), LooseEq]), vec![b(true)]);
         // 0 == "" (empty string ToNumber is 0)
         assert_eq!(run(vec![PushFloat(0.0), ps(""), LooseEq]), vec![b(true)]);
         // false == "" via double coercion
         assert_eq!(run(vec![PushBool(false), ps(""), LooseEq]), vec![b(true)]);
         // 1 == "abc" -> NaN -> false
-        assert_eq!(run(vec![PushFloat(1.0), ps("abc"), LooseEq]), vec![b(false)]);
+        assert_eq!(
+            run(vec![PushFloat(1.0), ps("abc"), LooseEq]),
+            vec![b(false)]
+        );
         // 1.5 == "1.5"
         assert_eq!(run(vec![PushFloat(1.5), ps("1.5"), LooseEq]), vec![b(true)]);
     }
@@ -2929,10 +2940,7 @@ mod tests {
     #[test]
     fn loose_eq_strings_not_coerced_to_each_other() {
         // Two strings still compare as strings (no numeric coercion): "1" vs "1.0".
-        assert_eq!(
-            run(vec![ps("1"), ps("1.0"), LooseEq]),
-            vec![b(false)]
-        );
+        assert_eq!(run(vec![ps("1"), ps("1.0"), LooseEq]), vec![b(false)]);
     }
 
     #[test]
@@ -3594,11 +3602,11 @@ mod tests {
             PushFloat(2.0),
             ObjNew(vec!["x".into(), "y".into()].into()), // x=1, y=2
             Dup,                                         // keep ptr for verification
-            ps("y"),                // field "y" — pushed before val
-            PushFloat(99.0),        // val — on top
-            IndexSet(SetMode::New), // obj.y = 99; leaves val → [ptr, 99]
-            Pop(1),                 // drop the result → [ptr]
-            ObjGet("y".into()),     // → 99
+            ps("y"),                                     // field "y" — pushed before val
+            PushFloat(99.0),                             // val — on top
+            IndexSet(SetMode::New),                      // obj.y = 99; leaves val → [ptr, 99]
+            Pop(1),                                      // drop the result → [ptr]
+            ObjGet("y".into()),                          // → 99
         ]);
         assert_eq!(out, vec![n(99.0)]);
     }

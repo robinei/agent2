@@ -11,6 +11,60 @@ use oxc_ast::ast;
 use crate::diag::Diagnostic;
 use crate::vm::SlotKind;
 
+/// A compile-time constant value bound by a `const x = <literal>` declaration.
+/// Such bindings are *not* runtime variables: they occupy no frame slot, are
+/// never captured, and every reference resolves to this value (the compiler
+/// emits the corresponding push). Numbers are kept as `f64` and lowered through
+/// the compiler's usual `f64_to_value`, so propagation matches what the literal
+/// would have compiled to.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum ConstValue {
+    Null,
+    Undefined,
+    Bool(bool),
+    Num(f64),
+    Str(String),
+    /// A non-capturing, non-reassigned function: its value is a fixed code
+    /// address (`Fn(label)`), so the binding is a compile-time constant — no
+    /// slot, references emit `PushFn(label)`, calls are static `Call(label)`.
+    /// `arity` is the declared parameter count (for static-call arg padding).
+    Fn { label: u32, arity: u32 },
+}
+
+/// How a name resolves within a function's lexical (block) scopes. A `Slot` is an
+/// ordinary frame local (param / `let` / `var`); a `Const` is a compile-time
+/// constant binding that never reaches the frame.
+#[derive(Clone, Debug)]
+pub(crate) enum NameRes {
+    Slot { slot: u32, is_const: bool },
+    Const(ConstValue),
+}
+
+/// The lexical block-scope stack threaded through analysis: innermost scope last.
+pub(crate) type BlockScopes = Vec<IndexMap<String, NameRes>>;
+
+/// Recognize an initializer that is a compile-time constant *literal* (the
+/// scope of constant-binding elimination, v1): literals and a unary minus on a
+/// numeric literal. Returns the value, or `None` for anything that needs runtime
+/// evaluation (a non-literal const still gets a slot and ordinary propagation).
+fn literal_const_value(expr: &ast::Expression) -> Option<ConstValue> {
+    match expr {
+        ast::Expression::NumericLiteral(n) => Some(ConstValue::Num(n.value)),
+        ast::Expression::StringLiteral(s) => Some(ConstValue::Str(s.value.to_string())),
+        ast::Expression::BooleanLiteral(b) => Some(ConstValue::Bool(b.value)),
+        ast::Expression::NullLiteral(_) => Some(ConstValue::Null),
+        ast::Expression::UnaryExpression(u)
+            if u.operator == ast::UnaryOperator::UnaryNegation =>
+        {
+            match &u.argument {
+                ast::Expression::NumericLiteral(n) => Some(ConstValue::Num(-n.value)),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 // ── Analysis structures (Phase 3: functions / closures) ─────────────
 
 /// Per-parameter analysis info.
@@ -40,6 +94,13 @@ pub(crate) struct FuncScope {
     /// For a named function expression, the function's own name (visible
     /// inside the body for self-recursion).
     pub(crate) self_name: Option<String>,
+    /// If this function scope is the initializer of `let`/`const NAME = <fn-expr>`,
+    /// the binding NAME in the enclosing scope. Lets a non-capturing function
+    /// *expression* bound to an immutable name become a constant function
+    /// (Phase F), like a declaration — provided the binding is never reassigned
+    /// (checked separately). `var` is excluded (hoisted-`undefined` semantics).
+    /// `None` for declarations and non-simple-bound expressions.
+    pub(crate) binding_name: Option<String>,
     /// Whether this is a declaration (hoisted into the prologue).
     pub(crate) is_declaration: bool,
     /// Distinct binding names declared in this scope → (own-slot, is_const).
@@ -51,6 +112,13 @@ pub(crate) struct FuncScope {
     /// Which own-local slot indices are captured by nested functions (→ Boxed,
     /// unless also `loop_declared`, in which case → per-iteration `fresh_owns`).
     captured: HashSet<u32>,
+    /// Own-local slot indices that are the target of an assignment/update within
+    /// this scope (beyond their declaration). A binding that is NOT reassigned
+    /// and NOT captured is immutable in fact — an "effectively-const" `let`/`var`
+    /// the compiler may propagate like a `const`. (A binding mutated by a nested
+    /// closure is necessarily in `captured`, so the `!reassigned && !captured`
+    /// test catches it even though the write isn't recorded here.)
+    reassigned: HashSet<u32>,
     /// Own-local slot indices for `let`/`const` bindings declared lexically
     /// inside a loop (loop head or loop body). Combined with `captured` this
     /// yields `fresh_owns`.
@@ -68,13 +136,30 @@ pub(crate) struct FuncScope {
     /// Binding occurrences declared here: (binding span, own-slot). Finalized
     /// into `ProgramAnalysis::binding_slot` (own-slot → absolute) after capture
     /// resolution fixes `upval_count`.
-    binding_spans: Vec<(u32, u32)>,
+    binding_spans: Vec<(u32, u32, bool)>,
     /// Identifier references that resolved to an own local: (ref span, own-slot,
     /// is_const). Finalized into `ref_resolution`.
     local_refs: Vec<(u32, u32, bool)>,
     /// Identifier references that were free here: (ref span, name). Finalized to
     /// an upval slot (if captured) or the self-reference slot, else dropped.
     free_refs: Vec<(u32, String)>,
+    /// Compile-time const bindings declared in this scope, by name (mirrors
+    /// `names`, but for `const x = <literal>` bindings that occupy no slot).
+    /// Consulted by `resolve_captures` so a nested function's reference resolves
+    /// to the value instead of becoming a capture.
+    const_names: IndexMap<String, ConstValue>,
+    /// References (by span) that resolved to a const binding *in this scope* —
+    /// the compiler emits the literal. Finalized into `ProgramAnalysis::const_refs`.
+    const_refs: Vec<(u32, ConstValue)>,
+    /// Free-variable names that resolved (up the scope chain) to an enclosing
+    /// const — so the body's `free_refs` of that name become const refs rather
+    /// than upvals. Filled by `resolve_captures`.
+    const_by_name: HashMap<String, ConstValue>,
+    /// Own-local slots that turned out to be **constant functions** (Phase F):
+    /// own-slot → `Fn { label, arity }`. A same-scope reference to such a slot
+    /// emits the `Fn` literal instead of a `Local`; the binding store is skipped.
+    /// Filled after the const-function fixpoint, before `resolve_captures`.
+    const_fn_slots: HashMap<u32, ConstValue>,
     /// Captured names → (upval slot index, is_const), filled by capture
     /// resolution. Used to finalize `free_refs`.
     upval_by_name: HashMap<String, (u32, bool)>,
@@ -100,7 +185,12 @@ pub(crate) struct FuncScope {
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct RefSlot {
     pub(crate) slot: u32,
+    /// Declared `const` (drives the const-reassignment error).
     pub(crate) is_const: bool,
+    /// Immutable in fact: a `const`, or a `let`/`var` that is never reassigned
+    /// and never captured. Gates constant propagation (a stronger, value-safe
+    /// condition than `is_const`); does NOT relax the reassignment check.
+    pub(crate) immutable: bool,
 }
 
 /// Complete scope-analysis result for a compilation unit.
@@ -115,6 +205,22 @@ pub(crate) struct ProgramAnalysis {
     /// not a local (global/`state`/`undefined`/… or undeclared); codegen falls
     /// back to name-based resolution.
     pub(crate) ref_resolution: HashMap<u32, RefSlot>,
+    /// Binding occurrence span → whether the binding is immutable in fact (see
+    /// `RefSlot::immutable`). Drives whether a `const`/effectively-const
+    /// initializer is recorded for propagation.
+    pub(crate) binding_immutable: HashMap<u32, bool>,
+    /// Binding occurrence span → whether the binding is captured by a nested
+    /// function. A non-captured, fully-propagated binding has a dead store the
+    /// compiler can drop (a captured one's slot is read by `MakeClosure`).
+    pub(crate) binding_captured: HashMap<u32, bool>,
+    /// Identifier-reference span → the compile-time constant it resolves to
+    /// (a `const x = <literal>` binding, intra- or cross-function). The compiler
+    /// emits the literal; these bindings have no slot and are never captured.
+    pub(crate) const_refs: HashMap<u32, ConstValue>,
+    /// Scope ids of constant functions (Phase F): non-reassigned function
+    /// declarations that capture nothing. The compiler skips their binding store
+    /// (the slot is dead) — references/calls go through `const_refs`.
+    pub(crate) const_fn_scopes: std::collections::HashSet<usize>,
     /// Function/arrow AST node span → its `scopes` index.
     pub(crate) scope_by_span: HashMap<u32, usize>,
 }
@@ -135,9 +241,11 @@ impl FuncScope {
             node_span,
             params,
             self_name,
+            binding_name: None,
             is_declaration,
             names: IndexMap::new(),
             captured: HashSet::new(),
+            reassigned: HashSet::new(),
             loop_declared: HashSet::new(),
             fresh_owns: HashSet::new(),
             children: Vec::new(),
@@ -145,6 +253,10 @@ impl FuncScope {
             binding_spans: Vec::new(),
             local_refs: Vec::new(),
             free_refs: Vec::new(),
+            const_names: IndexMap::new(),
+            const_refs: Vec::new(),
+            const_by_name: HashMap::new(),
+            const_fn_slots: HashMap::new(),
             upval_by_name: HashMap::new(),
             captures: Vec::new(),
             upval_count: 0,
@@ -165,6 +277,179 @@ pub(crate) fn frame_abs(own: u32, nparams: u32, upval_count: u32) -> u32 {
         own
     } else {
         own + upval_count
+    }
+}
+
+/// Phase F — identify **constant functions** and leave `scopes` fully capture-
+/// resolved with them registered. A constant function is a function *declaration*
+/// that is never reassigned and captures nothing once constant functions resolve
+/// to their `Fn(label)` value (so mutually/self-recursive functions, whose only
+/// "captures" are each other, qualify).
+///
+/// This is a greatest-fixpoint *over capture resolution itself* — which is what
+/// makes it handle transitive captures correctly (a function that forwards a
+/// captured variable down to a nested closure really does capture it). Start by
+/// optimistically assuming every non-reassigned function declaration is constant;
+/// register them (so references resolve to values, not captures); run
+/// `resolve_captures`; **demote** any that still ended up with a real capture;
+/// repeat until stable. Monotone (demote-only) ⇒ converges. The final iteration
+/// leaves `scopes` with the correct captures/upvals for `finalize_tables`.
+fn resolve_const_functions(scopes: &mut Vec<FuncScope>) -> HashSet<usize> {
+    // `resolve_captures` mutates `free_vars` (propagation) and the derived
+    // capture fields; snapshot the inputs so each iteration starts clean.
+    let direct_free: Vec<IndexSet<String>> = scopes.iter().map(|s| s.free_vars.clone()).collect();
+    let direct_consts: Vec<IndexMap<String, ConstValue>> =
+        scopes.iter().map(|s| s.const_names.clone()).collect();
+
+    let mut const_fns: HashSet<usize> = HashSet::new();
+    for (id, s) in scopes.iter().enumerate() {
+        if s.parent == usize::MAX {
+            continue;
+        }
+        // The external binding: a declaration's own name, or a function
+        // expression's `const NAME = …` binding. Either must be non-reassigned.
+        let Some(name) = const_fn_binding_name(s) else {
+            continue;
+        };
+        if let Some(info) = scopes[s.parent].names.get(name) {
+            if !scopes[s.parent].reassigned.contains(&info.slot) {
+                const_fns.insert(id);
+            }
+        }
+    }
+
+    loop {
+        for (i, s) in scopes.iter_mut().enumerate() {
+            s.free_vars = direct_free[i].clone();
+            s.const_names = direct_consts[i].clone();
+            s.const_fn_slots.clear();
+            s.captured.clear();
+            s.captures.clear();
+            s.upval_by_name.clear();
+            s.const_by_name.clear();
+            s.upval_count = 0;
+            s.slot_kinds.clear();
+            s.fresh_owns.clear();
+        }
+        register_const_fns(scopes, &const_fns);
+        resolve_captures(scopes);
+        // A "constant" function that still captures a real slot isn't one.
+        let demoted: Vec<usize> = const_fns
+            .iter()
+            .copied()
+            .filter(|&f| !scopes[f].captures.is_empty())
+            .collect();
+        if demoted.is_empty() {
+            break;
+        }
+        for f in demoted {
+            const_fns.remove(&f);
+        }
+    }
+
+    // Reclaim the dead const-function slots, then re-resolve captures against the
+    // compacted slot numbers (the fixpoint above left `const_fn_slots` populated).
+    compact_const_fn_slots(scopes);
+    for (i, s) in scopes.iter_mut().enumerate() {
+        s.free_vars = direct_free[i].clone();
+        s.const_names = direct_consts[i].clone();
+        s.captured.clear();
+        s.captures.clear();
+        s.upval_by_name.clear();
+        s.const_by_name.clear();
+        s.upval_count = 0;
+        s.slot_kinds.clear();
+        s.fresh_owns.clear();
+    }
+    register_const_fns(scopes, &const_fns);
+    resolve_captures(scopes);
+    const_fns
+}
+
+/// The external binding name of a constant-function candidate: a declaration's
+/// own name, or a function expression's `const NAME = …` binding. (A named
+/// function expression's `self_name` is its *internal* recursion name, distinct
+/// from its external `const` binding.)
+fn const_fn_binding_name(s: &FuncScope) -> Option<&String> {
+    if s.is_declaration {
+        s.self_name.as_ref()
+    } else {
+        s.binding_name.as_ref()
+    }
+}
+
+/// Reclaim the (now dead) frame slots of constant functions: each scope's
+/// const-function binding slots are removed and the surviving own-locals are
+/// renumbered down, so a constant function is truly zero-cost (no reserved
+/// slot). Same-scope references to a const function are rewritten to its `Fn`
+/// constant here; cross-scope ones already resolved via `const_names`. Run after
+/// the fixpoint, before the final `resolve_captures` (which recomputes captures
+/// against the compacted slot numbers).
+fn compact_const_fn_slots(scopes: &mut [FuncScope]) {
+    for s in scopes.iter_mut() {
+        if s.const_fn_slots.is_empty() {
+            continue;
+        }
+        let mut dead: Vec<u32> = s.const_fn_slots.keys().copied().collect();
+        dead.sort_unstable();
+        // Surviving own-slot → compacted index (shifted down past dead slots).
+        let remap = |slot: u32| -> Option<u32> {
+            if dead.binary_search(&slot).is_ok() {
+                None
+            } else {
+                Some(slot - dead.iter().filter(|&&d| d < slot).count() as u32)
+            }
+        };
+
+        // Same-scope refs to a const function become its `Fn` constant; survivors
+        // keep their (renumbered) slot.
+        let mut kept = Vec::with_capacity(s.local_refs.len());
+        for (span, slot, is_const) in std::mem::take(&mut s.local_refs) {
+            if let Some(val) = s.const_fn_slots.get(&slot) {
+                s.const_refs.push((span, val.clone()));
+            } else {
+                kept.push((span, remap(slot).expect("non-const-fn slot survives"), is_const));
+            }
+        }
+        s.local_refs = kept;
+
+        s.names.retain(|_, info| match remap(info.slot) {
+            Some(n) => {
+                info.slot = n;
+                true
+            }
+            None => false,
+        });
+        s.binding_spans = std::mem::take(&mut s.binding_spans)
+            .into_iter()
+            .filter_map(|(span, slot, is_const)| remap(slot).map(|n| (span, n, is_const)))
+            .collect();
+        s.reassigned = s.reassigned.iter().filter_map(|&sl| remap(sl)).collect();
+        s.loop_declared = s.loop_declared.iter().filter_map(|&sl| remap(sl)).collect();
+        s.own_local_count -= dead.len() as u32;
+        s.const_fn_slots.clear();
+    }
+}
+
+/// Register each constant function as an `Fn` constant in its enclosing scope:
+/// by name in `const_names` (so `resolve_captures` resolves references to it as
+/// a value, never a capture) and by slot in `const_fn_slots` (so a same-scope
+/// reference emits the literal). Run before `resolve_captures`.
+fn register_const_fns(scopes: &mut [FuncScope], const_fns: &HashSet<usize>) {
+    for &sf in const_fns {
+        let parent = scopes[sf].parent;
+        let Some(name) = const_fn_binding_name(&scopes[sf]).cloned() else {
+            continue;
+        };
+        let val = ConstValue::Fn {
+            label: scopes[sf].label,
+            arity: scopes[sf].params.len() as u32,
+        };
+        let slot = scopes[parent].names.get(&name).map(|i| i.slot);
+        scopes[parent].const_names.entry(name).or_insert(val.clone());
+        if let Some(slot) = slot {
+            scopes[parent].const_fn_slots.insert(slot, val);
+        }
     }
 }
 
@@ -189,7 +474,11 @@ fn resolve_captures(scopes: &mut [FuncScope]) {
             if self_name.as_deref() == Some(fv.as_str()) {
                 continue;
             }
-            if !scopes[parent].names.contains_key(&fv) {
+            // Don't propagate a name the parent resolves: a slot (`names`) is
+            // captured below; a const (`const_names`) resolves to a value here.
+            if !scopes[parent].names.contains_key(&fv)
+                && !scopes[parent].const_names.contains_key(&fv)
+            {
                 scopes[parent].free_vars.insert(fv);
             }
         }
@@ -209,6 +498,18 @@ fn resolve_captures(scopes: &mut [FuncScope]) {
                 continue;
             }
             let parent_nparams = scopes[parent].params.len() as u32;
+            // Const resolution (nearest-first): the parent's own const, or a const
+            // the parent itself resolved to (transitive capture-of-a-const). Such a
+            // free var becomes a const ref, never a capture.
+            if let Some(value) = scopes[parent]
+                .const_names
+                .get(&fv)
+                .or_else(|| scopes[parent].const_by_name.get(&fv))
+                .cloned()
+            {
+                scopes[i].const_by_name.insert(fv, value);
+                continue;
+            }
             let (parent_abs, is_const) = if let Some(info) = scopes[parent].names.get(&fv).copied()
             {
                 scopes[parent].captured.insert(info.slot);
@@ -262,48 +563,93 @@ fn resolve_captures(scopes: &mut [FuncScope]) {
 /// fixed every `upval_count`.
 fn finalize_tables(
     scopes: &[FuncScope],
+    const_fns: &HashSet<usize>,
 ) -> (
     HashMap<u32, u32>,
     HashMap<u32, RefSlot>,
+    HashMap<u32, bool>,
+    HashMap<u32, bool>,
+    HashMap<u32, ConstValue>,
     HashMap<u32, usize>,
 ) {
     let mut binding_slot = HashMap::new();
     let mut ref_resolution = HashMap::new();
+    let mut binding_immutable = HashMap::new();
+    let mut binding_captured = HashMap::new();
+    let mut const_refs = HashMap::new();
     let mut scope_by_span = HashMap::new();
     for s in scopes {
         if s.node_span != u32::MAX {
             scope_by_span.insert(s.node_span, s.id);
         }
         let nparams = s.params.len() as u32;
-        for &(span, own) in &s.binding_spans {
+        // A binding/own-local is immutable in fact when it is `const`, or it is
+        // never reassigned in its scope AND never captured by a nested function
+        // (a closure-mutated binding is necessarily captured, so this catches it).
+        let own_immutable =
+            |own: u32, is_const: bool| is_const || (!s.reassigned.contains(&own) && !s.captured.contains(&own));
+        for &(span, own, is_const) in &s.binding_spans {
             binding_slot.insert(span, frame_abs(own, nparams, s.upval_count));
+            binding_immutable.insert(span, own_immutable(own, is_const));
+            binding_captured.insert(span, s.captured.contains(&own));
         }
         for &(span, own, is_const) in &s.local_refs {
+            // A same-scope reference to a constant function (Phase F) emits the
+            // `Fn` literal — no slot read.
+            if let Some(value) = s.const_fn_slots.get(&own) {
+                const_refs.insert(span, value.clone());
+                continue;
+            }
             ref_resolution.insert(
                 span,
                 RefSlot {
                     slot: frame_abs(own, nparams, s.upval_count),
                     is_const,
+                    immutable: own_immutable(own, is_const),
                 },
             );
         }
+        // Const references resolved within this scope.
+        for (span, value) in &s.const_refs {
+            const_refs.insert(*span, value.clone());
+        }
         for (span, name) in &s.free_refs {
             if s.self_name.as_deref() == Some(name.as_str()) {
-                // Self-reference: the dedicated slot past all own locals.
-                ref_resolution.insert(
-                    *span,
-                    RefSlot {
-                        slot: frame_abs(s.own_local_count, nparams, s.upval_count),
-                        is_const: true,
-                    },
-                );
+                // Self-reference. A constant function refers to *itself* by its own
+                // `Fn(label)` constant (static self-recursion, no self-slot);
+                // otherwise the dedicated self-slot past all own locals.
+                if const_fns.contains(&s.id) {
+                    const_refs.insert(
+                        *span,
+                        ConstValue::Fn {
+                            label: s.label,
+                            arity: s.params.len() as u32,
+                        },
+                    );
+                } else {
+                    ref_resolution.insert(
+                        *span,
+                        RefSlot {
+                            slot: frame_abs(s.own_local_count, nparams, s.upval_count),
+                            is_const: true,
+                            immutable: true,
+                        },
+                    );
+                }
+            } else if let Some(value) = s.const_by_name.get(name) {
+                // A free var that resolved (up the chain) to an enclosing const:
+                // emit the literal — no upval, no capture.
+                const_refs.insert(*span, value.clone());
             } else if let Some(&(idx, is_const)) = s.upval_by_name.get(name) {
-                // The body's own upvals occupy slots [nparams, nparams + K).
+                // The body's own upvals occupy slots [nparams, nparams + K). An
+                // upval's immutability follows the captured binding's const-ness
+                // (effectively-const lets are not propagated across capture).
                 ref_resolution.insert(
                     *span,
                     RefSlot {
                         slot: nparams + idx,
                         is_const,
+                        immutable: is_const,
                     },
                 );
             }
@@ -311,7 +657,14 @@ fn finalize_tables(
             // falls back to name-based resolution.
         }
     }
-    (binding_slot, ref_resolution, scope_by_span)
+    (
+        binding_slot,
+        ref_resolution,
+        binding_immutable,
+        binding_captured,
+        const_refs,
+        scope_by_span,
+    )
 }
 /// A resolved local-variable binding: its frame slot plus whether it was
 /// declared `const` (so writes can be rejected at compile time).
@@ -386,13 +739,28 @@ impl Analyzer {
     fn analyze_program(&mut self, program: &ast::Program) -> ProgramAnalysis {
         let mut scopes = Vec::new();
         let root = self.analyze_top_level(program, &mut scopes);
-        resolve_captures(&mut scopes);
-        let (binding_slot, ref_resolution, scope_by_span) = finalize_tables(&scopes);
+        // Phase F: identify constant functions (a fixpoint over capture
+        // resolution) and leave `scopes` capture-resolved with them registered,
+        // so their references resolve to `Fn` values rather than captures —
+        // breaking self/mutual-recursion captures.
+        let const_fns = resolve_const_functions(&mut scopes);
+        let (
+            binding_slot,
+            ref_resolution,
+            binding_immutable,
+            binding_captured,
+            const_refs,
+            scope_by_span,
+        ) = finalize_tables(&scopes, &const_fns);
         ProgramAnalysis {
             scopes,
             root,
             binding_slot,
             ref_resolution,
+            binding_immutable,
+            binding_captured,
+            const_refs,
+            const_fn_scopes: const_fns,
             scope_by_span,
         }
     }
@@ -401,7 +769,7 @@ impl Analyzer {
     fn analyze_top_level(&mut self, program: &ast::Program, scopes: &mut Vec<FuncScope>) -> usize {
         let label = self.new_label();
         let mut scope = FuncScope::new(usize::MAX, label, u32::MAX, Vec::new(), None, false);
-        let mut block_scopes: Vec<IndexMap<String, (u32, bool)>> = vec![IndexMap::new()];
+        let mut block_scopes: BlockScopes = vec![IndexMap::new()];
         let mut next_slot = 0u32;
 
         self.analyze_hoist(&program.body, &mut scope, &mut block_scopes, &mut next_slot);
@@ -438,7 +806,7 @@ impl Analyzer {
         &mut self,
         stmts: &[ast::Statement],
         scope: &mut FuncScope,
-        block_scopes: &mut Vec<IndexMap<String, (u32, bool)>>,
+        block_scopes: &mut BlockScopes,
         next_slot: &mut u32,
     ) {
         for stmt in stmts {
@@ -450,7 +818,7 @@ impl Analyzer {
         &mut self,
         stmt: &ast::Statement,
         scope: &mut FuncScope,
-        block_scopes: &mut Vec<IndexMap<String, (u32, bool)>>,
+        block_scopes: &mut BlockScopes,
         next_slot: &mut u32,
     ) {
         match stmt {
@@ -536,7 +904,7 @@ impl Analyzer {
         &mut self,
         pat: &ast::BindingPattern,
         scope: &mut FuncScope,
-        block_scopes: &mut Vec<IndexMap<String, (u32, bool)>>,
+        block_scopes: &mut BlockScopes,
         next_slot: &mut u32,
     ) {
         match pat {
@@ -577,7 +945,7 @@ impl Analyzer {
         &mut self,
         stmts: &[ast::Statement],
         scope: &mut FuncScope,
-        block_scopes: &mut Vec<IndexMap<String, (u32, bool)>>,
+        block_scopes: &mut BlockScopes,
         next_slot: &mut u32,
         scopes: &mut Vec<FuncScope>,
     ) {
@@ -590,7 +958,7 @@ impl Analyzer {
         &mut self,
         stmt: &ast::Statement,
         scope: &mut FuncScope,
-        block_scopes: &mut Vec<IndexMap<String, (u32, bool)>>,
+        block_scopes: &mut BlockScopes,
         next_slot: &mut u32,
         scopes: &mut Vec<FuncScope>,
     ) {
@@ -715,7 +1083,7 @@ impl Analyzer {
         &mut self,
         left: &ast::ForStatementLeft,
         scope: &mut FuncScope,
-        block_scopes: &mut Vec<IndexMap<String, (u32, bool)>>,
+        block_scopes: &mut BlockScopes,
         next_slot: &mut u32,
         scopes: &mut Vec<FuncScope>,
     ) {
@@ -728,13 +1096,27 @@ impl Analyzer {
         &mut self,
         decl: &ast::VariableDeclaration,
         scope: &mut FuncScope,
-        block_scopes: &mut Vec<IndexMap<String, (u32, bool)>>,
+        block_scopes: &mut BlockScopes,
         next_slot: &mut u32,
         scopes: &mut Vec<FuncScope>,
     ) {
         let is_const = decl.kind == ast::VariableDeclarationKind::Const;
         let is_var = decl.kind == ast::VariableDeclarationKind::Var;
         for d in &decl.declarations {
+            // Constant-binding elimination: `const x = <literal>` is a compile-time
+            // binding — it occupies no slot and is never captured; references
+            // resolve to the value. The literal initializer has no refs/effects,
+            // so it is not analyzed. (`state` may not be shadowed.)
+            if is_const {
+                if let ast::BindingPattern::BindingIdentifier(id) = &d.id {
+                    if id.name != "state" {
+                        if let Some(value) = d.init.as_ref().and_then(literal_const_value) {
+                            self.analyze_register_const(id.name.as_str(), value, scope, block_scopes);
+                            continue;
+                        }
+                    }
+                }
+            }
             // `var` names were hoisted; `let`/`const` register here.
             self.analyze_declare_pattern(
                 &d.id,
@@ -747,8 +1129,45 @@ impl Analyzer {
             );
             if let Some(init) = &d.init {
                 self.analyze_expr(init, scope, block_scopes, scopes);
+                // `let`/`const NAME = <fn-expr>`: link the function-expression
+                // scope to its binding, so a non-capturing one bound to an
+                // immutable (never-reassigned) name becomes a constant function
+                // (Phase F), like a declaration. `var` is excluded — its hoisted-
+                // `undefined` value means a pre-assignment reference isn't the
+                // function. Reassignment is checked later (in the fixpoint).
+                if !is_var {
+                    if let ast::BindingPattern::BindingIdentifier(id) = &d.id {
+                        let fn_span = match init {
+                            ast::Expression::ArrowFunctionExpression(a) => Some(a.span.start),
+                            ast::Expression::FunctionExpression(f) => Some(f.span.start),
+                            _ => None,
+                        };
+                        if let Some(fn_span) = fn_span {
+                            if let Some(s) = scopes.iter_mut().find(|s| s.node_span == fn_span) {
+                                s.binding_name = Some(id.name.to_string());
+                            }
+                        }
+                    }
+                }
             }
         }
+    }
+
+    /// Register a `const x = <literal>` as a compile-time binding: visible by name
+    /// (for resolution + shadowing) in the current block scope and in this
+    /// function's `const_names` (for cross-function resolution), but with no slot.
+    fn analyze_register_const(
+        &mut self,
+        name: &str,
+        value: ConstValue,
+        scope: &mut FuncScope,
+        block_scopes: &mut BlockScopes,
+    ) {
+        block_scopes
+            .last_mut()
+            .expect("a block scope is always open")
+            .insert(name.to_string(), NameRes::Const(value.clone()));
+        scope.const_names.entry(name.to_string()).or_insert(value);
     }
 
     /// Register `let`/`const` binding names (skipped for already-hoisted `var`s)
@@ -759,7 +1178,7 @@ impl Analyzer {
         is_const: bool,
         is_var: bool,
         scope: &mut FuncScope,
-        block_scopes: &mut Vec<IndexMap<String, (u32, bool)>>,
+        block_scopes: &mut BlockScopes,
         next_slot: &mut u32,
         scopes: &mut Vec<FuncScope>,
     ) {
@@ -855,7 +1274,7 @@ impl Analyzer {
         is_const: bool,
         is_var: bool,
         scope: &mut FuncScope,
-        block_scopes: &mut Vec<IndexMap<String, (u32, bool)>>,
+        block_scopes: &mut BlockScopes,
         next_slot: &mut u32,
     ) -> u32 {
         if name == "state" {
@@ -863,12 +1282,18 @@ impl Analyzer {
             return 0;
         }
         let slot = if is_var {
-            if let Some(&(slot, _)) = block_scopes[0].get(name) {
-                slot
+            if let Some(NameRes::Slot { slot, .. }) = block_scopes[0].get(name) {
+                *slot
             } else {
                 let slot = *next_slot;
                 *next_slot += 1;
-                block_scopes[0].insert(name.to_string(), (slot, false));
+                block_scopes[0].insert(
+                    name.to_string(),
+                    NameRes::Slot {
+                        slot,
+                        is_const: false,
+                    },
+                );
                 scope.names.entry(name.to_string()).or_insert(SlotInfo {
                     slot,
                     is_const: false,
@@ -881,7 +1306,7 @@ impl Analyzer {
             block_scopes
                 .last_mut()
                 .expect("a block scope is always open")
-                .insert(name.to_string(), (slot, is_const));
+                .insert(name.to_string(), NameRes::Slot { slot, is_const });
             scope
                 .names
                 .entry(name.to_string())
@@ -894,7 +1319,7 @@ impl Analyzer {
             }
             slot
         };
-        scope.binding_spans.push((span, slot));
+        scope.binding_spans.push((span, slot, is_const));
         slot
     }
 
@@ -902,7 +1327,7 @@ impl Analyzer {
         &mut self,
         expr: &ast::Expression,
         scope: &mut FuncScope,
-        block_scopes: &mut Vec<IndexMap<String, (u32, bool)>>,
+        block_scopes: &mut BlockScopes,
         scopes: &mut Vec<FuncScope>,
     ) {
         match expr {
@@ -1006,11 +1431,23 @@ impl Analyzer {
         name: &str,
         span: u32,
         scope: &mut FuncScope,
-        block_scopes: &[IndexMap<String, (u32, bool)>],
+        block_scopes: &BlockScopes,
     ) {
-        if let Some((slot, is_const)) = self.analyze_resolve_name(name, block_scopes) {
-            scope.local_refs.push((span, slot, is_const));
-        } else {
+        match self.analyze_resolve_name(name, block_scopes) {
+            Some(NameRes::Slot { slot, is_const }) => {
+                scope.local_refs.push((span, slot, is_const));
+                return;
+            }
+            // A compile-time const binding: this reference resolves to the value
+            // (the compiler emits the literal); it never becomes a free var, so
+            // const bindings are never captured.
+            Some(NameRes::Const(value)) => {
+                scope.const_refs.push((span, value));
+                return;
+            }
+            None => {}
+        }
+        {
             // An unshadowed `arguments` reference uses the frame's argument array
             // (the compiler emits `Arguments`, not a `Local`); flag the scope so
             // the prologue materializes that array before normalizing the args.
@@ -1028,12 +1465,19 @@ impl Analyzer {
         &mut self,
         target: &ast::AssignmentTarget,
         scope: &mut FuncScope,
-        block_scopes: &mut Vec<IndexMap<String, (u32, bool)>>,
+        block_scopes: &mut BlockScopes,
         scopes: &mut Vec<FuncScope>,
     ) {
         match target {
             ast::AssignmentTarget::AssignmentTargetIdentifier(id) => {
                 self.analyze_ref(id.name.as_str(), id.span.start, scope, block_scopes);
+                // Record the write so the binding isn't treated as immutable. A
+                // write to a const resolves to no slot (the compiler rejects it).
+                if let Some(NameRes::Slot { slot, .. }) =
+                    self.analyze_resolve_name(id.name.as_str(), block_scopes)
+                {
+                    scope.reassigned.insert(slot);
+                }
             }
             ast::AssignmentTarget::StaticMemberExpression(m) => {
                 self.analyze_expr(&m.object, scope, block_scopes, scopes);
@@ -1091,7 +1535,7 @@ impl Analyzer {
         &mut self,
         m: &ast::AssignmentTargetMaybeDefault,
         scope: &mut FuncScope,
-        block_scopes: &mut Vec<IndexMap<String, (u32, bool)>>,
+        block_scopes: &mut BlockScopes,
         scopes: &mut Vec<FuncScope>,
     ) {
         match m {
@@ -1112,12 +1556,18 @@ impl Analyzer {
         &mut self,
         target: &ast::SimpleAssignmentTarget,
         scope: &mut FuncScope,
-        block_scopes: &mut Vec<IndexMap<String, (u32, bool)>>,
+        block_scopes: &mut BlockScopes,
         scopes: &mut Vec<FuncScope>,
     ) {
         match target {
             ast::SimpleAssignmentTarget::AssignmentTargetIdentifier(id) => {
                 self.analyze_ref(id.name.as_str(), id.span.start, scope, block_scopes);
+                // Record the `++`/`--` write so the binding isn't immutable.
+                if let Some(NameRes::Slot { slot, .. }) =
+                    self.analyze_resolve_name(id.name.as_str(), block_scopes)
+                {
+                    scope.reassigned.insert(slot);
+                }
             }
             ast::SimpleAssignmentTarget::StaticMemberExpression(m) => {
                 self.analyze_expr(&m.object, scope, block_scopes, scopes);
@@ -1135,7 +1585,7 @@ impl Analyzer {
         &mut self,
         el: &ast::ChainElement,
         scope: &mut FuncScope,
-        block_scopes: &mut Vec<IndexMap<String, (u32, bool)>>,
+        block_scopes: &mut BlockScopes,
         scopes: &mut Vec<FuncScope>,
     ) {
         match el {
@@ -1159,13 +1609,9 @@ impl Analyzer {
     }
 
     /// Resolve a name against the current function's block scopes (innermost
-    /// first), returning its own-slot and const-ness, or `None` if not local.
-    fn analyze_resolve_name(
-        &self,
-        name: &str,
-        block_scopes: &[IndexMap<String, (u32, bool)>],
-    ) -> Option<(u32, bool)> {
-        block_scopes.iter().rev().find_map(|s| s.get(name).copied())
+    /// first): a frame slot, a compile-time const, or `None` if not local.
+    fn analyze_resolve_name(&self, name: &str, block_scopes: &BlockScopes) -> Option<NameRes> {
+        block_scopes.iter().rev().find_map(|s| s.get(name).cloned())
     }
 
     /// Build a `FuncScope` for a function declaration or expression.
@@ -1213,10 +1659,16 @@ impl Analyzer {
         body: &[ast::Statement],
         scopes: &mut Vec<FuncScope>,
     ) {
-        let mut block_scopes: Vec<IndexMap<String, (u32, bool)>> = vec![IndexMap::new()];
+        let mut block_scopes: BlockScopes = vec![IndexMap::new()];
         let mut next_slot = scope.params.len() as u32;
         for (i, p) in scope.params.iter().enumerate() {
-            block_scopes[0].insert(p.name.clone(), (i as u32, false));
+            block_scopes[0].insert(
+                p.name.clone(),
+                NameRes::Slot {
+                    slot: i as u32,
+                    is_const: false,
+                },
+            );
             scope.names.insert(
                 p.name.clone(),
                 SlotInfo {

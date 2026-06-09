@@ -8,17 +8,17 @@
 
 use std::sync::Arc;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use oxc_allocator::Allocator;
 use oxc_ast::ast;
 use oxc_parser::Parser;
 use oxc_span::{GetSpan, SourceType};
 
-use crate::analyzer::{self, ProgramAnalysis, RefSlot, frame_abs};
-use crate::vm::RcStr;
+use crate::analyzer::{self, ConstValue, ProgramAnalysis, RefSlot, frame_abs};
 use crate::builtin::Builtin;
 use crate::diag::Diagnostic;
+use crate::vm::RcStr;
 use crate::vm::{Instr, SetMode, SlotKind, StackValue};
 
 /// A compiled program: the flat instruction stream, a parallel span table
@@ -79,7 +79,11 @@ pub fn compile(source: &str) -> Result<Program, Vec<Diagnostic>> {
         return Err(compiler.diagnostics);
     }
 
-    let (code, spans) = backpatch(compiler.code, compiler.spans, compiler.next_label);
+    // Optimize the label-form code and resolve labels to offsets. See
+    // `optimizer.rs` for the passes (CFG simplification, peephole, const-fold,
+    // branch inversion — iterated to a fixpoint) and backpatch.
+    let (code, spans) =
+        crate::optimizer::finalize(compiler.code, compiler.spans, compiler.next_label);
     Ok(Program {
         code,
         spans,
@@ -137,6 +141,15 @@ struct Compiler<'src> {
     /// allocation, which each `PushStr` then clones (a refcount bump). Stored as
     /// a set keyed by the string itself (via `RcStr: Borrow<str>`).
     interned: HashSet<RcStr>,
+    /// Constant-propagation environment for the current function frame: a slot
+    /// holding a `const` bound to a compile-time constant maps to the literal
+    /// push that reproduces it, so references emit the literal instead of a
+    /// `Local` load. Sound with no dataflow because a `const` is write-once
+    /// (reassignment is rejected) and every `let`/`const` gets a unique slot
+    /// (no reuse, even when shadowing), so an entry never goes stale. Saved and
+    /// reset per function body in `emit_function_def` (slot numbers are
+    /// frame-relative, so a callee's slots must not see the caller's constants).
+    const_env: HashMap<u32, Instr>,
 }
 
 impl<'src> Compiler<'src> {
@@ -151,6 +164,7 @@ impl<'src> Compiler<'src> {
             analysis: None,
             current_scope: 0,
             interned: HashSet::new(),
+            const_env: HashMap::new(),
         }
     }
 
@@ -324,19 +338,58 @@ impl<'src> Compiler<'src> {
             return;
         }
         for d in &decl.declarations {
+            // `const NAME = <non-capturing fn-expr>` is a constant function
+            // (Phase F): emit only the body — no value push, no store — since
+            // references resolve to its `Fn` constant.
+            if let ast::BindingPattern::BindingIdentifier(_) = &d.id {
+                if let Some(init) = &d.init {
+                    if self.emit_const_fn_expr_body(init) {
+                        continue;
+                    }
+                }
+            }
             match &d.id {
                 ast::BindingPattern::BindingIdentifier(id) => {
                     let slot = self.binding_slot(id.span.start);
                     match (&d.init, slot) {
                         (Some(init), Some(slot)) => {
+                            let init_start = self.code.len();
                             self.compile_expr(init);
-                            // Inside a loop, a captured `let`/`const` binding gets
-                            // a fresh cell each iteration so in-loop closures
-                            // capture per-iteration copies. The new cell's seed
-                            // value is irrelevant here — this SetLocal overwrites
-                            // it with the initializer.
-                            self.fresh_cell_if_needed(slot, d.span.start);
-                            self.emit(Instr::SetLocal(slot), d.span.start);
+                            let init_end = self.code.len();
+                            // Record an immutable binding (a `const`, or an
+                            // effectively-const `let`/`var` — never reassigned and
+                            // never captured) bound to a compile-time constant, so
+                            // references emit the literal directly (and then fold).
+                            // (Mutable, captured-and-mutable, non-constant, and
+                            // destructured initializers aren't recorded.)
+                            let recorded = self.binding_immutable(id.span.start)
+                                && match crate::optimizer::const_eval(
+                                    &self.code[init_start..init_end],
+                                ) {
+                                    Some(push) => {
+                                        self.const_env.insert(slot, push);
+                                        true
+                                    }
+                                    None => false,
+                                };
+                            // Dead-store elimination: if every read is propagated
+                            // (recorded) and the slot is not captured (so
+                            // `MakeClosure` never reads it), the initializer store
+                            // is dead. `const_eval` succeeding guarantees the init
+                            // is pure const-pushes/ops (no labels/effects), so we
+                            // can drop the emitted init wholesale.
+                            if recorded && !self.binding_captured(id.span.start) {
+                                self.code.truncate(init_start);
+                                self.spans.truncate(init_start);
+                            } else {
+                                // Inside a loop, a captured `let`/`const` binding
+                                // gets a fresh cell each iteration so in-loop
+                                // closures capture per-iteration copies. The new
+                                // cell's seed value is irrelevant here — this
+                                // SetLocal overwrites it with the initializer.
+                                self.fresh_cell_if_needed(slot, d.span.start);
+                                self.emit(Instr::SetLocal(slot), d.span.start);
+                            }
                         }
                         (None, Some(slot)) if !is_var => {
                             // `let x;` re-initializes to `undefined` each time the
@@ -476,6 +529,72 @@ impl<'src> Compiler<'src> {
             .binding_slot
             .get(&span)
             .copied()
+    }
+
+    /// Whether the binding declared at `span` is immutable in fact (a `const`,
+    /// or an un-reassigned, un-captured `let`/`var`) — so its constant
+    /// initializer may be recorded for propagation. Defaults to `false`.
+    fn binding_immutable(&self, span: u32) -> bool {
+        self.analysis
+            .as_ref()
+            .expect("analysis present")
+            .binding_immutable
+            .get(&span)
+            .copied()
+            .unwrap_or(false)
+    }
+
+    /// Whether the binding declared at `span` is captured by a nested function.
+    /// A non-captured binding's slot is read only by its own frame, so once every
+    /// read is propagated its store is dead and can be dropped.
+    fn binding_captured(&self, span: u32) -> bool {
+        self.analysis
+            .as_ref()
+            .expect("analysis present")
+            .binding_captured
+            .get(&span)
+            .copied()
+            .unwrap_or(false)
+    }
+
+    /// The compile-time constant an identifier reference at `span` resolves to
+    /// (a `const x = <literal>` binding — eliminated, no slot), if any.
+    fn const_ref(&self, span: u32) -> Option<ConstValue> {
+        self.analysis
+            .as_ref()
+            .expect("analysis present")
+            .const_refs
+            .get(&span)
+            .cloned()
+    }
+
+    /// Whether the function scope `scope_id` is a constant function (Phase F):
+    /// non-capturing and non-reassigned, so its binding store is dead.
+    fn is_const_fn_scope(&self, scope_id: usize) -> bool {
+        self.analysis
+            .as_ref()
+            .expect("analysis present")
+            .const_fn_scopes
+            .contains(&scope_id)
+    }
+
+    /// The push instruction that materializes a [`ConstValue`]. Numbers go
+    /// through `f64_to_value` so the result matches the original literal exactly.
+    fn const_value_push(&mut self, v: &ConstValue) -> Instr {
+        match v {
+            ConstValue::Null => Instr::PushNull,
+            ConstValue::Undefined => Instr::PushUndefined,
+            ConstValue::Bool(b) => Instr::PushBool(*b),
+            ConstValue::Str(s) => Instr::PushStr(self.intern_string(s)),
+            ConstValue::Num(n) => match f64_to_value(*n) {
+                StackValue::PosInt(u) => Instr::PushPosInt(u),
+                StackValue::NegInt(i) => Instr::PushNegInt(i),
+                StackValue::Number(f) => Instr::PushFloat(f),
+                _ => unreachable!("f64_to_value yields an int or float"),
+            },
+            // A constant function (Phase F): its value is its code address.
+            ConstValue::Fn { label, .. } => Instr::PushFn(*label),
+        }
     }
 
     /// Resolution of an identifier *reference* (keyed by its span), or `None`
@@ -845,17 +964,11 @@ impl<'src> Compiler<'src> {
     fn compile_expr(&mut self, expr: &ast::Expression) {
         match expr {
             // ── literals ──────────────────────────────────────────────
-            ast::Expression::NumericLiteral(lit) => {
-                match number_literal_to_value(lit.value) {
-                    StackValue::PosInt(v) => {
-                        self.emit(Instr::PushPosInt(v), lit.span.start)
-                    }
-                    StackValue::Number(v) => {
-                        self.emit(Instr::PushFloat(v), lit.span.start)
-                    }
-                    _ => unreachable!(),
-                }
-            }
+            ast::Expression::NumericLiteral(lit) => match number_literal_to_value(lit.value) {
+                StackValue::PosInt(v) => self.emit(Instr::PushPosInt(v), lit.span.start),
+                StackValue::Number(v) => self.emit(Instr::PushFloat(v), lit.span.start),
+                _ => unreachable!(),
+            },
             ast::Expression::StringLiteral(lit) => {
                 let s = self.intern_string(lit.value.as_str());
                 self.emit(Instr::PushStr(s), lit.span.start);
@@ -938,7 +1051,25 @@ impl<'src> Compiler<'src> {
         // A local/param/captured variable resolves to its frame slot (resolved
         // by analysis, keyed by this reference's span); `Local` dereferences a
         // boxed slot transparently.
+        // An eliminated `const x = <literal>` binding (Phase E): no slot — the
+        // reference is the literal itself (resolved intra- or cross-function by
+        // analysis). Composes with const-folding like any other push.
+        if let Some(value) = self.const_ref(span) {
+            let push = self.const_value_push(&value);
+            self.emit(push, span);
+            return;
+        }
         if let Some(r) = self.ref_slot(span) {
+            // Constant propagation: an immutable binding (a `const`, or an
+            // effectively-const `let`/`var`) bound to a compile-time constant is
+            // read as the literal directly (which then composes with const-
+            // folding), rather than a `Local` load.
+            if r.immutable {
+                if let Some(push) = self.const_env.get(&r.slot) {
+                    self.emit(push.clone(), span);
+                    return;
+                }
+            }
             self.emit(Instr::Local(r.slot), span);
             return;
         }
@@ -1212,7 +1343,10 @@ impl<'src> Compiler<'src> {
             self.compile_expr(&p.value);
             names.push(name);
         }
-        self.emit(Instr::ObjNew(names.into_iter().map(|n| RcStr::from(n.as_str())).collect()), obj.span.start);
+        self.emit(
+            Instr::ObjNew(names.into_iter().map(|n| RcStr::from(n.as_str())).collect()),
+            obj.span.start,
+        );
     }
 
     fn compile_template(&mut self, tl: &ast::TemplateLiteral) {
@@ -1505,12 +1639,13 @@ impl<'src> Compiler<'src> {
                 };
                 self.emit(Instr::IncLocal(*slot as u16, p, mode), span);
             } else {
-                // Void: load, subtract, plain SetLocal (no Dup, no postfix
-                // recovery). The value is consumed by SetLocal.
-                self.emit(Instr::Local(*slot), span);
-                self.emit(Instr::PushFloat(p), span);
-                self.emit(Instr::Sub, span);
-                self.emit(Instr::SetLocal(*slot), span);
+                // Void: `IncLocal` (in-place update) then drop its result. The
+                // update mode is irrelevant since the pushed value is popped.
+                self.emit(
+                    Instr::IncLocal(*slot as u16, p, crate::vm::UpdateMode::Postfix),
+                    span,
+                );
+                self.emit(Instr::Pop(1), span);
             }
             return;
         }
@@ -1589,6 +1724,12 @@ impl<'src> Compiler<'src> {
     /// Resolve an identifier write target: a local slot, or an error for
     /// `const`/`state`/undeclared names.
     fn lvalue_for_identifier<'r, 'a>(&mut self, name: &str, span: u32) -> Option<LValue<'r, 'a>> {
+        // An eliminated `const` (Phase E) has no slot; a write to it is still a
+        // constant reassignment error.
+        if self.const_ref(span).is_some() {
+            self.error(span, format!("assignment to constant `{name}`"));
+            return None;
+        }
         match self.ref_slot(span) {
             Some(r) => {
                 if r.is_const {
@@ -1656,7 +1797,10 @@ impl<'src> Compiler<'src> {
             LValue::Local(slot) => {
                 self.emit(Instr::TeeLocal(*slot), span);
             }
-            LValue::Member(_, field) => self.emit(Instr::ObjSet(RcStr::from(field.as_str()), SetMode::New), span),
+            LValue::Member(_, field) => self.emit(
+                Instr::ObjSet(RcStr::from(field.as_str()), SetMode::New),
+                span,
+            ),
             LValue::Index(..) => self.emit(Instr::IndexSet(SetMode::New), span),
         }
     }
@@ -1671,7 +1815,10 @@ impl<'src> Compiler<'src> {
                 self.emit(Instr::SetLocal(*slot), span);
             }
             LValue::Member(_, field) => {
-                self.emit(Instr::ObjSet(RcStr::from(field.as_str()), SetMode::New), span);
+                self.emit(
+                    Instr::ObjSet(RcStr::from(field.as_str()), SetMode::New),
+                    span,
+                );
                 self.emit(Instr::Pop(1), span);
             }
             LValue::Index(..) => {
@@ -1790,6 +1937,12 @@ impl<'src> Compiler<'src> {
 
     /// Store the value on top of the stack into a named local, consuming it.
     fn assign_to_identifier(&mut self, name: &str, id_span: u32, span: u32) {
+        // An eliminated `const` (Phase E) has no slot; reassigning it is an error.
+        if self.const_ref(id_span).is_some() {
+            self.error(id_span, format!("assignment to constant `{name}`"));
+            self.emit(Instr::Pop(1), span);
+            return;
+        }
         match self.ref_slot(id_span) {
             Some(r) => {
                 if r.is_const {
@@ -2271,6 +2424,17 @@ impl<'src> Compiler<'src> {
         argv: &[&ast::Expression],
         span: u32,
     ) {
+        // A constant function (Phase F): no slot — call its label statically.
+        // Pad missing args to the declared arity (as the slotted path does).
+        if let Some(ConstValue::Fn { label, arity }) = self.const_ref(callee_span) {
+            self.compile_args(argv);
+            let passed = argv.len() as u32;
+            for _ in passed..arity {
+                self.emit(Instr::PushUndefined, span);
+            }
+            self.emit(Instr::Call(label, passed.max(arity)), span);
+            return;
+        }
         if let Some(r) = self.ref_slot(callee_span) {
             // Try to resolve to a static `Call`. If the function was declared
             // in this scope and has NO captures, we can use a static Call.
@@ -2369,6 +2533,11 @@ impl<'src> Compiler<'src> {
                     let child = &analysis.scopes[scope_id];
                     (child.label, child.captures.clone())
                 };
+                // A constant function (Phase F) has no live slot — its binding
+                // store is dead (references/calls go through its `Fn` constant).
+                if self.is_const_fn_scope(scope_id) {
+                    return;
+                }
                 if let Some(id) = &f.id {
                     if let Some(slot) = self.binding_slot(id.span.start) {
                         let span = f.span.start;
@@ -2447,6 +2616,35 @@ impl<'src> Compiler<'src> {
         );
     }
 
+    /// If `init` is a function expression that is a constant function (Phase F),
+    /// emit only its body (the jump-over guards it) — no value push, no store,
+    /// since references resolve to its `Fn` constant — and return `true`.
+    fn emit_const_fn_expr_body(&mut self, init: &ast::Expression) -> bool {
+        let span = match init {
+            ast::Expression::ArrowFunctionExpression(a) => a.span.start,
+            ast::Expression::FunctionExpression(f) => f.span.start,
+            _ => return false,
+        };
+        let Some(scope_id) = self.scope_for_node(span) else {
+            return false;
+        };
+        if !self.is_const_fn_scope(scope_id) {
+            return false;
+        }
+        match init {
+            ast::Expression::ArrowFunctionExpression(a) => {
+                self.emit_function_def(scope_id, &a.body.statements, &a.params, span, a.expression);
+            }
+            ast::Expression::FunctionExpression(f) => {
+                if let Some(body) = &f.body {
+                    self.emit_function_def(scope_id, &body.statements, &f.params, span, false);
+                }
+            }
+            _ => unreachable!(),
+        }
+        true
+    }
+
     /// Push a function value: a bare `Fn` when it captures nothing, else a
     /// `MakeClosure` over its capture list.
     fn emit_closure_value(&mut self, scope_id: usize, span: u32) {
@@ -2485,6 +2683,7 @@ impl<'src> Compiler<'src> {
             upval_count,
             own_local_count,
             uses_arguments,
+            captures,
         ) = {
             let analysis = self.analysis.as_ref().expect("analysis present");
             let scope = &analysis.scopes[scope_id];
@@ -2496,12 +2695,27 @@ impl<'src> Compiler<'src> {
                 scope.upval_count,
                 scope.own_local_count,
                 scope.uses_arguments,
+                scope.captures.clone(),
             )
         };
         let nparams = params_info.len() as u32;
 
         let prev_scope = self.current_scope;
         self.current_scope = scope_id;
+        // Slot numbers are frame-relative, so the callee gets its own const env.
+        // Phase D: seed it with constants captured *by value* — a `const`/
+        // effectively-const capture is an immutable snapshot, so the upval holds a
+        // fixed value. `captures[i]` is the parent slot; it installs at the child's
+        // upval slot `nparams + i`, so a reference to that upval propagates the
+        // literal inside the closure body.
+        let prev_const_env = std::mem::take(&mut self.const_env);
+        let mut child_const_env: HashMap<u32, Instr> = HashMap::new();
+        for (i, &parent_slot) in captures.iter().enumerate() {
+            if let Some(push) = prev_const_env.get(&parent_slot) {
+                child_const_env.insert(nparams + i as u32, push.clone());
+            }
+        }
+        self.const_env = child_const_env;
 
         // Jump over the body for sequential execution; `Call`/`CallDyn` enter at
         // the label below.
@@ -2516,7 +2730,9 @@ impl<'src> Compiler<'src> {
         // their kinds. `slot_kinds[..nparams]` are the params (handled below);
         // `slot_kinds[nparams..]` are the declared locals.
         let mut local_kinds: Vec<SlotKind> = slot_kinds[nparams as usize..].to_vec();
-        if self_name.is_some() {
+        // The self-reference slot — except for a constant function, which refers
+        // to itself by its `Fn` constant, so the slot would be dead.
+        if self_name.is_some() && !self.is_const_fn_scope(scope_id) {
             local_kinds.push(SlotKind::Plain);
         }
         self.emit(
@@ -2536,7 +2752,9 @@ impl<'src> Compiler<'src> {
 
         // Self-reference (named function expression / recursive declaration): the
         // slot was allocated by EnterFrame above; fill it with the bare `Fn`.
-        if self_name.is_some() {
+        // A constant function (Phase F) refers to itself by its `Fn` constant
+        // (static self-recursion), so the self-slot is dead — skip the setup.
+        if self_name.is_some() && !self.is_const_fn_scope(scope_id) {
             let self_slot = frame_abs(own_local_count, nparams, upval_count);
             self.emit(Instr::PushFn(label), span);
             self.emit(Instr::SetLocal(self_slot), span);
@@ -2560,6 +2778,7 @@ impl<'src> Compiler<'src> {
 
         self.emit(Instr::Label(after), span);
         self.current_scope = prev_scope;
+        self.const_env = prev_const_env;
     }
 
     /// Emit per-parameter prologue code. The argument value is already in the
@@ -2659,44 +2878,6 @@ fn number_key_to_string(value: f64) -> String {
     }
 }
 
-/// Strip `Label` markers and rewrite every label-id address into a real code
-/// offset, copying spans in lockstep so the table stays aligned with the
-/// compacted code. Single linear pass after a first scan that records each
-/// label's offset.
-fn backpatch(code: Vec<Instr>, spans: Vec<u32>, next_label: u32) -> (Vec<Instr>, Vec<u32>) {
-    // First scan: the offset of each label is the count of non-Label
-    // instructions preceding it.
-    let mut label_offset = vec![0u32; next_label as usize];
-    let mut offset = 0u32;
-    for instr in &code {
-        match instr {
-            Instr::Label(id) => label_offset[*id as usize] = offset,
-            _ => offset += 1,
-        }
-    }
-
-    // Second scan: drop Labels, rewrite addresses (which carry label ids until
-    // now), and emit spans in lockstep.
-    let mut out_code = Vec::with_capacity(code.len());
-    let mut out_spans = Vec::with_capacity(spans.len());
-    for (instr, span) in code.into_iter().zip(spans) {
-        let rewritten = match instr {
-            Instr::Label(_) => continue,
-            Instr::Jump(l) => Instr::Jump(label_offset[l as usize]),
-            Instr::JFalse(l) => Instr::JFalse(label_offset[l as usize]),
-            Instr::JTrue(l) => Instr::JTrue(label_offset[l as usize]),
-            Instr::JNotNullish(l) => Instr::JNotNullish(label_offset[l as usize]),
-            Instr::Call(l, n) => Instr::Call(label_offset[l as usize], n),
-            Instr::MakeClosure(l, caps) => Instr::MakeClosure(label_offset[l as usize], caps),
-            Instr::PushFn(l) => Instr::PushFn(label_offset[l as usize]),
-            other => other,
-        };
-        out_code.push(rewritten);
-        out_spans.push(span);
-    }
-    (out_code, out_spans)
-}
-
 // ── tests ────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -2717,29 +2898,613 @@ mod tests {
     }
 
     #[test]
-    fn roundtrip_literal_arithmetic() {
-        // `1 + 2 * 3` lowers to: push the three literals, multiply 2*3, add,
-        // then the expression-statement Pop and the top-level Return(0).
+    fn const_folds_literal_arithmetic() {
+        // `1 + 2 * 3` is fully constant-folded to `7`; as a bare value statement
+        // it is then dead (pure push + Pop), leaving just the root `Return(0)`.
         let prog = compile("1 + 2 * 3;").expect("compiles");
-        assert_eq!(
-            prog.code,
-            vec![
-                Instr::PushPosInt(1),
-                Instr::PushPosInt(2),
-                Instr::PushPosInt(3),
-                Instr::Mul,
-                Instr::Add,
-                Instr::Pop(1),
-                Instr::Return(0),
-            ]
-        );
-        // spans stay in lockstep with code.
+        assert_eq!(prog.code, vec![Instr::Return(0)]);
         assert_eq!(prog.spans.len(), prog.code.len());
-
-        // And it executes cleanly through for_program (heap[0] = state), ending
-        // with an empty stack after the expression value is popped.
         let vm = run_program(prog);
         assert!(vm.stack.is_empty());
+
+        // When the folded value is actually used, the constant lands in state.
+        // (VM arithmetic yields `Number`, so 7 is stored as `Number(7.0)`.)
+        let prog = compile("state.x = 1 + 2 * 3;").expect("compiles");
+        assert!(
+            !prog
+                .code
+                .iter()
+                .any(|i| matches!(i, Instr::Add | Instr::Mul)),
+            "arithmetic should be folded away: {:?}",
+            prog.code
+        );
+        let vm = run_program(prog);
+        assert_eq!(state_val(&vm, "x"), num(7.0));
+    }
+
+    #[test]
+    fn peephole_folds_not_into_branch() {
+        // `if (!cond) body` should NOT contain a `Not` immediately before a
+        // conditional jump — the peephole folds it into the opposite branch.
+        let prog = compile("let c = true; if (!c) { state.x = 1; }").expect("compiles");
+        let has_not = prog.code.iter().any(|i| matches!(i, Instr::Not));
+        assert!(!has_not, "Not should be folded away: {:?}", prog.code);
+        // And it still behaves correctly: `c` is true, so the body is skipped.
+        let vm = run_program(prog);
+        match &vm.heap[0] {
+            crate::vm::HeapValue::Object(o) => {
+                assert_eq!(o.get(&RcStr::from("x")), None, "body must not run");
+            }
+            other => panic!("expected state object, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn peephole_not_fold_preserves_semantics_when_taken() {
+        // `!c` is true here, so the body runs.
+        let prog = compile("let c = false; if (!c) { state.x = 1; }").expect("compiles");
+        assert!(!prog.code.iter().any(|i| matches!(i, Instr::Not)));
+        let vm = run_program(prog);
+        match &vm.heap[0] {
+            crate::vm::HeapValue::Object(o) => {
+                assert_eq!(o.get(&RcStr::from("x")), Some(&StackValue::PosInt(1)));
+            }
+            other => panic!("expected state object, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn simplify_cfg_eliminates_dead_code_after_return() {
+        // Code after an unconditional `return` (before any label) is unreachable
+        // and must be dropped.
+        let prog = compile("function f() { return 1; let x = 2; return x; } state.r = f();")
+            .expect("compiles");
+        // Exactly one `Return` instr should survive inside `f` for the live path
+        // (plus the root frame's Return(0)). The dead `return x` and its setup
+        // are gone, so there is no `PushPosInt(2)` in the stream.
+        assert!(
+            !prog.code.iter().any(|i| matches!(i, Instr::PushPosInt(2))),
+            "dead `let x = 2` should be eliminated: {:?}",
+            prog.code
+        );
+        let vm = run_program(prog);
+        match &vm.heap[0] {
+            crate::vm::HeapValue::Object(o) => {
+                assert_eq!(o.get(&RcStr::from("r")), Some(&StackValue::PosInt(1)));
+            }
+            other => panic!("expected state object, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn simplify_cfg_preserves_loop_semantics() {
+        // A loop with break/continue exercises jump threading + jump-to-next;
+        // verify the observable result is unchanged.
+        let prog = compile(
+            "let sum = 0; \
+             for (let i = 0; i < 10; i++) { \
+               if (i === 3) { continue; } \
+               if (i === 7) { break; } \
+               sum = sum + i; \
+             } \
+             state.sum = sum;",
+        )
+        .expect("compiles");
+        let vm = run_program(prog);
+        // 0+1+2 + 4+5+6 = 18 (3 skipped, break at 7).
+        match &vm.heap[0] {
+            crate::vm::HeapValue::Object(o) => {
+                assert_eq!(o.get(&RcStr::from("sum")), Some(&StackValue::Number(18.0)));
+            }
+            other => panic!("expected state object, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn peephole_double_negation_compiles_to_tobool() {
+        // A *runtime* operand (`state.c`) isn't const-folded, so `!!` exercises
+        // the `Not;Not → ToBool` peephole: no `Not`, one `ToBool`.
+        let prog = compile("state.b = !!state.c;").expect("compiles");
+        assert!(
+            !prog.code.iter().any(|i| matches!(i, Instr::Not)),
+            "!! should fold to ToBool, no Not left: {:?}",
+            prog.code
+        );
+        assert!(prog.code.iter().any(|i| matches!(i, Instr::ToBool)));
+        // `state.c` is undefined here → `!!undefined` is `false`.
+        let vm = run_program(prog);
+        match &vm.heap[0] {
+            crate::vm::HeapValue::Object(o) => {
+                assert_eq!(o.get(&RcStr::from("b")), Some(&StackValue::Bool(false)));
+            }
+            other => panic!("expected state object, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn peephole_drops_pure_value_statement() {
+        // A bare `5;` expression statement (pure push + Pop) leaves nothing.
+        let prog = compile("5;").expect("compiles");
+        assert_eq!(prog.code, vec![Instr::Return(0)]);
+    }
+
+    #[test]
+    fn optimize_empty_if_body_collapses() {
+        // `if (c) {}` — the then-body is empty, so after optimization the branch
+        // degenerates to just consuming the condition (no jump survives).
+        let prog = compile("let c = true; if (c) { }").expect("compiles");
+        assert!(
+            !prog
+                .code
+                .iter()
+                .any(|i| matches!(i, Instr::JFalse(_) | Instr::JTrue(_) | Instr::Jump(_))),
+            "empty if should leave no branch: {:?}",
+            prog.code
+        );
+        // Still executes cleanly.
+        let _ = run_program(prog);
+    }
+
+    #[test]
+    fn const_propagation_folds_uses() {
+        // A `const` bound to a literal is propagated to its uses, so `N * 2`
+        // folds to `10` — no `Mul`, and no `Local` load of `N`.
+        let prog = compile("const N = 5; state.x = N * 2;").expect("compiles");
+        assert!(
+            !prog
+                .code
+                .iter()
+                .any(|i| matches!(i, Instr::Mul | Instr::Local(_))),
+            "N should be propagated and folded: {:?}",
+            prog.code
+        );
+        let vm = run_program(prog);
+        assert_eq!(state_val(&vm, "x"), num(10.0));
+    }
+
+    #[test]
+    fn const_propagation_chains() {
+        // A const initializer that reads earlier consts folds transitively.
+        let prog = compile("const a = 3; const b = a + 1; state.x = b;").expect("compiles");
+        let vm = run_program(prog);
+        assert_eq!(state_val(&vm, "x"), num(4.0));
+    }
+
+    #[test]
+    fn const_propagation_respects_shadowing() {
+        // Each `const` gets a unique slot, so propagation never confuses an inner
+        // shadow with the outer binding.
+        let prog =
+            compile("const x = 1; { const x = 2; state.a = x; } state.b = x;").expect("compiles");
+        let vm = run_program(prog);
+        assert_eq!(state_val(&vm, "a"), StackValue::PosInt(2));
+        assert_eq!(state_val(&vm, "b"), StackValue::PosInt(1));
+    }
+
+    #[test]
+    fn let_is_not_propagated() {
+        // A reassigned `let` must read its slot, never a stale literal.
+        let prog = compile("let y = 5; y = 6; state.x = y;").expect("compiles");
+        assert!(
+            prog.code.iter().any(|i| matches!(i, Instr::Local(_))),
+            "reassigned let must load: {:?}",
+            prog.code
+        );
+        let vm = run_program(prog);
+        assert_eq!(state_val(&vm, "x"), StackValue::PosInt(6));
+    }
+
+    #[test]
+    fn const_captured_by_closure_is_correct() {
+        // `k` is a literal const, eliminated and resolved to its value inside the
+        // hoisted `f` (cross-function const resolution via `resolve_captures`).
+        let prog =
+            compile("const k = 7; function f() { return k; } state.x = f();").expect("compiles");
+        let vm = run_program(prog);
+        assert_eq!(state_val(&vm, "x"), StackValue::PosInt(7));
+    }
+
+    // ── Phase A: constant branch folding ─────────────────────────────
+
+    #[test]
+    fn const_branch_folds_dead_arm() {
+        // `if (FLAG)` on a const folds the branch; the dead arm is pruned.
+        let prog =
+            compile("const FLAG = false; if (FLAG) { state.x = 1; } state.y = 2;").expect("ok");
+        assert!(
+            !prog
+                .code
+                .iter()
+                .any(|i| matches!(i, Instr::JFalse(_) | Instr::JTrue(_))),
+            "branch on a constant should be folded: {:?}",
+            prog.code
+        );
+        assert!(
+            !prog.code.iter().any(|i| matches!(i, Instr::PushPosInt(1))),
+            "dead arm should be eliminated: {:?}",
+            prog.code
+        );
+        let vm = run_program(prog);
+        match &vm.heap[0] {
+            crate::vm::HeapValue::Object(o) => {
+                assert_eq!(o.get(&RcStr::from("x")), None);
+                assert_eq!(o.get(&RcStr::from("y")), Some(&StackValue::PosInt(2)));
+            }
+            other => panic!("expected state object, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn const_branch_keeps_live_arm() {
+        // `if (true)` keeps the body and drops the branch entirely.
+        let prog = compile("const FLAG = true; if (FLAG) { state.x = 1; }").expect("ok");
+        assert!(
+            !prog
+                .code
+                .iter()
+                .any(|i| matches!(i, Instr::JFalse(_) | Instr::JTrue(_) | Instr::Jump(_))),
+            "live constant branch should leave no jump: {:?}",
+            prog.code
+        );
+        let vm = run_program(prog);
+        assert_eq!(state_val(&vm, "x"), StackValue::PosInt(1));
+    }
+
+    // ── Phase C: effectively-const `let` ─────────────────────────────
+
+    #[test]
+    fn effectively_const_let_propagates() {
+        // A `let` never reassigned and never captured is propagated like a const.
+        let prog = compile("let N = 5; state.x = N * 2;").expect("compiles");
+        assert!(
+            !prog.code.iter().any(|i| matches!(i, Instr::Mul | Instr::Local(_))),
+            "effectively-const let should fold: {:?}",
+            prog.code
+        );
+        let vm = run_program(prog);
+        assert_eq!(state_val(&vm, "x"), num(10.0));
+    }
+
+    #[test]
+    fn later_reassignment_defeats_propagation_everywhere() {
+        // A reassignment anywhere makes the binding non-immutable, so even the
+        // use *before* it loads the slot (sound without dataflow).
+        let prog = compile("let N = 5; state.x = N; N = 9; state.y = N;").expect("ok");
+        assert!(
+            prog.code.iter().any(|i| matches!(i, Instr::Local(_))),
+            "a reassigned let must load: {:?}",
+            prog.code
+        );
+        let vm = run_program(prog);
+        assert_eq!(state_val(&vm, "x"), StackValue::PosInt(5));
+        assert_eq!(state_val(&vm, "y"), StackValue::PosInt(9));
+    }
+
+    // ── Phase D: captured-const seeding into closures ────────────────
+
+    #[test]
+    fn captured_const_propagates_into_closure() {
+        // `k` is a literal const → eliminated; inside the arrow `k * 2` folds to
+        // `20`, and `f` captures nothing (no `Mul`).
+        let prog = compile("const k = 10; const f = () => k * 2; state.x = f();").expect("ok");
+        assert!(
+            !prog.code.iter().any(|i| matches!(i, Instr::Mul)),
+            "captured const should fold inside the closure: {:?}",
+            prog.code
+        );
+        let vm = run_program(prog);
+        assert_eq!(state_val(&vm, "x"), num(20.0));
+    }
+
+    // ── Phase E: constant binding elimination (slot + capture) ───────
+
+    #[test]
+    fn literal_const_has_no_slot_or_store() {
+        // A literal `const` is a compile-time binding: no `SetLocal` (no store)
+        // and no `Local` (reads are literals).
+        let prog = compile("const N = 5; state.x = N;").expect("compiles");
+        assert!(
+            !prog
+                .code
+                .iter()
+                .any(|i| matches!(i, Instr::SetLocal(_) | Instr::Local(_))),
+            "literal const should occupy no slot: {:?}",
+            prog.code
+        );
+        let vm = run_program(prog);
+        assert_eq!(state_val(&vm, "x"), StackValue::PosInt(5));
+    }
+
+    #[test]
+    fn const_only_closure_demotes_to_fn() {
+        // `f` references only the literal const `k`, which is eliminated — so `f`
+        // captures nothing and is a bare `Fn` (no `MakeClosure`, no heap closure).
+        let prog = compile("const k = 5; const f = () => k; state.x = f();").expect("ok");
+        assert!(
+            !prog.code.iter().any(|i| matches!(i, Instr::MakeClosure(..))),
+            "const-only closure should demote to Fn: {:?}",
+            prog.code
+        );
+        let vm = run_program(prog);
+        assert_eq!(state_val(&vm, "x"), StackValue::PosInt(5));
+    }
+
+    #[test]
+    fn const_only_closure_in_loop_demotes_to_fn() {
+        // The `map` callback references only a literal const → no per-iteration
+        // closure allocation (bare `Fn`, not `MakeClosure`).
+        let prog = compile(
+            "const f = 2; state.r = [1, 2, 3].map(x => x * f);",
+        )
+        .expect("ok");
+        assert!(
+            !prog.code.iter().any(|i| matches!(i, Instr::MakeClosure(..))),
+            "callback over a const should not allocate a closure: {:?}",
+            prog.code
+        );
+        let vm = run_program(prog);
+        match state_val(&vm, "r") {
+            StackValue::Ptr(p) => {
+                let arr = vm.heap_arr(p).expect("array");
+                assert_eq!(arr.len(), 3);
+                assert_eq!(arr[2], num(6.0));
+            }
+            other => panic!("expected array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_literal_captured_const_keeps_its_store() {
+        // A *non-literal* const (an object) still gets a slot and is captured by
+        // value, so its store is kept and the closure is a real `MakeClosure`.
+        let prog =
+            compile("const o = { v: 5 }; const f = () => o.v; state.x = f();").expect("ok");
+        assert!(
+            prog.code.iter().any(|i| matches!(i, Instr::SetLocal(_))),
+            "non-literal captured const must keep its store: {:?}",
+            prog.code
+        );
+        assert!(prog.code.iter().any(|i| matches!(i, Instr::MakeClosure(..))));
+        let vm = run_program(prog);
+        assert_eq!(state_val(&vm, "x"), StackValue::PosInt(5));
+    }
+
+    #[test]
+    fn const_elimination_respects_shadowing() {
+        // Inner literal const shadows the outer; each reference resolves to its
+        // own value even though neither occupies a slot.
+        let prog =
+            compile("const x = 1; { const x = 2; state.a = x; } state.b = x;").expect("ok");
+        let vm = run_program(prog);
+        assert_eq!(state_val(&vm, "a"), StackValue::PosInt(2));
+        assert_eq!(state_val(&vm, "b"), StackValue::PosInt(1));
+    }
+
+    #[test]
+    fn const_write_still_errors_when_eliminated() {
+        // Reassigning an eliminated const is still a compile error.
+        let errs = compile("const N = 5; N = 6;").expect_err("should reject");
+        assert!(
+            errs.iter().any(|d| d.message.contains("constant")),
+            "expected an assignment-to-constant error: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn transitively_captured_const_folds() {
+        // `k` captured through two closure levels still resolves to its value.
+        let prog = compile(
+            "const k = 3; const outer = () => { const inner = () => k * 10; return inner(); }; state.x = outer();",
+        )
+        .expect("ok");
+        assert!(
+            !prog.code.iter().any(|i| matches!(i, Instr::Mul)),
+            "transitive const should fold: {:?}",
+            prog.code
+        );
+        let vm = run_program(prog);
+        assert_eq!(state_val(&vm, "x"), num(30.0));
+    }
+
+    // ── Phase F: constant functions ──────────────────────────────────
+
+    #[test]
+    fn mutual_recursion_allocates_no_closures() {
+        // Today's wart: `a`/`b` capture each other → two heap closures. As const
+        // functions they capture nothing — no `MakeClosure`.
+        let prog = compile(
+            "function isEven(n){ return n === 0 ? true : isOdd(n - 1); } \
+             function isOdd(n){ return n === 0 ? false : isEven(n - 1); } \
+             state.x = isEven(10);",
+        )
+        .expect("ok");
+        assert!(
+            !prog.code.iter().any(|i| matches!(i, Instr::MakeClosure(..))),
+            "mutual recursion should allocate no closures: {:?}",
+            prog.code
+        );
+        let vm = run_program(prog);
+        assert_eq!(state_val(&vm, "x"), StackValue::Bool(true));
+    }
+
+    #[test]
+    fn self_recursion_is_static_with_no_slot() {
+        // A const function recurses via its own `Fn` constant: static `Call`,
+        // no `CallDyn`, no `MakeClosure`, no self-slot setup.
+        let prog =
+            compile("function fact(n){ return n <= 1 ? 1 : n * fact(n - 1); } state.x = fact(5);")
+                .expect("ok");
+        assert!(
+            !prog
+                .code
+                .iter()
+                .any(|i| matches!(i, Instr::CallDyn(_) | Instr::MakeClosure(..))),
+            "self-recursion should be static: {:?}",
+            prog.code
+        );
+        // `n * fact(...)` is arithmetic → `Number`, so 120 is `Number(120.0)`.
+        let vm = run_program(prog);
+        assert_eq!(state_val(&vm, "x"), num(120.0));
+    }
+
+    #[test]
+    fn function_passed_as_value_is_fn_constant() {
+        // A const function passed as a callback emits `PushFn` (no closure).
+        let prog =
+            compile("function dbl(x){ return x * 2; } state.r = [1, 2, 3].map(dbl);").expect("ok");
+        assert!(prog.code.iter().any(|i| matches!(i, Instr::PushFn(_))));
+        assert!(!prog.code.iter().any(|i| matches!(i, Instr::MakeClosure(..))));
+        let vm = run_program(prog);
+        match state_val(&vm, "r") {
+            StackValue::Ptr(p) => {
+                let a = vm.heap_arr(p).expect("array");
+                assert_eq!(a[2], num(6.0));
+            }
+            other => panic!("expected array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn function_capturing_real_var_stays_a_closure() {
+        // `adder` captures `base` (a real `let`), so it must remain a real
+        // closure — correctness preserved.
+        let vm = run_vm(
+            "function make() { let base = 100; \
+               function adder(n) { return base + n; } \
+               return adder(5); \
+             } \
+             state.x = make();",
+        );
+        assert_eq!(state_val(&vm, "x"), num(105.0));
+    }
+
+    #[test]
+    fn reassigned_function_is_not_a_constant() {
+        // `f` is reassigned, so it isn't a const function (keeps a mutable slot);
+        // compiling must succeed (no "assignment to constant") and run correctly.
+        let prog =
+            compile("function f() { return 1; } state.a = f(); f = 5; state.b = typeof f;")
+                .expect("reassignable function binding");
+        let vm = run_program(prog);
+        assert_eq!(state_val(&vm, "a"), StackValue::PosInt(1));
+        match state_val(&vm, "b") {
+            StackValue::String(s) => assert_eq!(s.as_str(), "number"),
+            other => panic!("expected string, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn const_arrow_is_a_constant_function() {
+        // A non-capturing arrow bound to a `const` is a constant function: no
+        // closure, called/passed via its `Fn`.
+        let prog = compile(
+            "const dbl = (x) => x * 2; state.r = [1, 2, 3].map(dbl); state.y = dbl(5);",
+        )
+        .expect("ok");
+        assert!(
+            !prog.code.iter().any(|i| matches!(i, Instr::MakeClosure(..))),
+            "const arrow should be a Fn constant: {:?}",
+            prog.code
+        );
+        let vm = run_program(prog);
+        assert_eq!(state_val(&vm, "y"), num(10.0));
+        match state_val(&vm, "r") {
+            StackValue::Ptr(p) => assert_eq!(vm.heap_arr(p).unwrap()[2], num(6.0)),
+            other => panic!("expected array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn const_named_fn_expr_self_recursion_is_static() {
+        let prog =
+            compile("const fact = function f(n){ return n <= 1 ? 1 : n * f(n - 1); }; state.x = fact(4);")
+                .expect("ok");
+        assert!(
+            !prog
+                .code
+                .iter()
+                .any(|i| matches!(i, Instr::CallDyn(_) | Instr::MakeClosure(..))),
+            "named const fn-expr self-recursion should be static: {:?}",
+            prog.code
+        );
+        let vm = run_program(prog);
+        assert_eq!(state_val(&vm, "x"), num(24.0));
+    }
+
+    #[test]
+    fn capturing_const_arrow_stays_a_closure() {
+        // A const arrow that captures a real `let` is still a real closure.
+        let vm = run_vm(
+            "function make() { let base = 100; const add = (n) => base + n; return add(5); } \
+             state.x = make();",
+        );
+        assert_eq!(state_val(&vm, "x"), num(105.0));
+    }
+
+    #[test]
+    fn const_fn_reclaims_its_frame_slot() {
+        // A constant function occupies no frame slot (caveat 2): the root frame
+        // allocates only the real local `x`, not a slot for `f`. And renumbering
+        // the survivor is correct.
+        let prog =
+            compile("function f() { return 1; } let x = 0; x = f(); state.x = x;").expect("ok");
+        let local_count = prog.code.iter().find_map(|i| match i {
+            Instr::EnterFrame(_, _, kinds) => Some(kinds.len()),
+            _ => None,
+        });
+        assert_eq!(
+            local_count,
+            Some(1),
+            "only `x` should occupy a slot, not `f`: {:?}",
+            prog.code
+        );
+        let vm = run_program(prog);
+        assert_eq!(state_val(&vm, "x"), StackValue::PosInt(1));
+    }
+
+    #[test]
+    fn const_fn_between_locals_renumbers_correctly() {
+        // A const fn declared between two mutable locals must not corrupt their
+        // slots when its slot is reclaimed.
+        let vm = run_vm(
+            "let a = 1; function f() { return 10; } let b = 2; \
+             a = a + f(); b = b + f(); state.r = a * 100 + b;",
+        );
+        // a = 1 + 10 = 11; b = 2 + 10 = 12 → 11*100 + 12 = 1112.
+        assert_eq!(state_val(&vm, "r"), num(1112.0));
+    }
+
+    #[test]
+    fn never_reassigned_let_function_is_constant() {
+        // A `let` holding a non-capturing function, never reassigned, is just as
+        // immutable as a `const` — so it's a constant function (no closure).
+        let prog = compile("let dbl = (x) => x * 2; state.r = [1, 2, 3].map(dbl);").expect("ok");
+        assert!(
+            !prog.code.iter().any(|i| matches!(i, Instr::MakeClosure(..))),
+            "never-reassigned let function should be a Fn constant: {:?}",
+            prog.code
+        );
+        let vm = run_program(prog);
+        match state_val(&vm, "r") {
+            StackValue::Ptr(p) => assert_eq!(vm.heap_arr(p).unwrap()[2], num(6.0)),
+            other => panic!("expected array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reassigned_let_function_is_not_constant() {
+        // Reassigning the binding defeats const-function treatment; still correct.
+        let vm = run_vm("let f = () => 1; state.a = f(); f = () => 2; state.b = f();");
+        assert_eq!(state_val(&vm, "a"), StackValue::PosInt(1));
+        assert_eq!(state_val(&vm, "b"), StackValue::PosInt(2));
+    }
+
+    #[test]
+    fn var_function_is_not_a_constant() {
+        // `var` is excluded (hoisted `undefined`): it stays an ordinary binding,
+        // and still runs correctly.
+        let vm = run_vm("var f = () => 7; state.x = f();");
+        assert_eq!(state_val(&vm, "x"), StackValue::PosInt(7));
     }
 
     #[test]
@@ -2929,7 +3694,9 @@ mod tests {
         assert_eq!(state_val(&vm, "r"), StackValue::PosInt(9));
         match state_val(&vm, "obj") {
             StackValue::Ptr(p) => match &vm.heap[p as usize] {
-                HeapValue::Object(o) => assert_eq!(o.get(&RcStr::from("a")), Some(&StackValue::PosInt(9))),
+                HeapValue::Object(o) => {
+                    assert_eq!(o.get(&RcStr::from("a")), Some(&StackValue::PosInt(9)))
+                }
                 other => panic!("{other:?}"),
             },
             other => panic!("{other:?}"),
@@ -3153,7 +3920,11 @@ mod tests {
         match state_val(&vm, "r") {
             // r was set last, so it appears in the serialized object too.
             StackValue::String(s) => {
-                assert!(s.as_str().contains("\"a\":1"), "got {}", s.as_str().to_owned())
+                assert!(
+                    s.as_str().contains("\"a\":1"),
+                    "got {}",
+                    s.as_str().to_owned()
+                )
             }
             other => panic!("{other:?}"),
         }
@@ -4351,26 +5122,26 @@ mod tests {
             .expect("compiles"),
         );
         eprintln!("  makeCounter + 2 inc calls: {inc_2}");
-        eprintln!("  -> marginal per inc call: {}", inc_2.saturating_sub(inc_1));
+        eprintln!(
+            "  -> marginal per inc call: {}",
+            inc_2.saturating_sub(inc_1)
+        );
 
         // 3c. Bare function call (no captures, no closure).
-        let (_, bare_0) = run_counted(
-            compile("function f() { return 1; }").expect("compiles"),
-        );
+        let (_, bare_0) = run_counted(compile("function f() { return 1; }").expect("compiles"));
         eprintln!("  bare fn decl (no call): {bare_0}");
 
-        let (_, bare_1) = run_counted(
-            compile("function f() { return 1; } f();").expect("compiles"),
-        );
+        let (_, bare_1) =
+            run_counted(compile("function f() { return 1; } f();").expect("compiles"));
         eprintln!("  bare fn decl + 1 call: {bare_1}");
 
-        let (_, bare_2) = run_counted(
-            compile("function f() { return 1; } f(); f();").expect("compiles"),
-        );
+        let (_, bare_2) =
+            run_counted(compile("function f() { return 1; } f(); f();").expect("compiles"));
         eprintln!("  bare fn decl + 2 calls: {bare_2}");
-        eprintln!("  -> marginal per bare call: {}", bare_2.saturating_sub(bare_1));
-
-
+        eprintln!(
+            "  -> marginal per bare call: {}",
+            bare_2.saturating_sub(bare_1)
+        );
 
         // 4. 100 iterations (full benchmark).
         let (_, full) = run_counted(
@@ -4457,3 +5228,8 @@ mod tests {
         }
     }
 }
+
+
+
+
+

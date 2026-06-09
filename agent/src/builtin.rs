@@ -524,22 +524,14 @@ fn array_join(vm: &mut VM, argc: u32) -> Result<(), VMError> {
 fn str_split(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     let args = take_args::<3>(vm, argc)?;
     let (s, delim, limit) = match argc {
-        2 => (
-            vm.string_from(&args[0])?,
-            vm.string_from(&args[1])?,
-            None,
-        ),
-        3 => (
-            vm.string_from(&args[0])?,
-            vm.string_from(&args[1])?,
-            {
-                let lim = as_i64(&args[2]).ok_or(VMError::TypeError)?;
-                if lim < 0 {
-                    return Err(VMError::ValueError);
-                }
-                Some(lim as usize)
-            },
-        ),
+        2 => (vm.string_from(&args[0])?, vm.string_from(&args[1])?, None),
+        3 => (vm.string_from(&args[0])?, vm.string_from(&args[1])?, {
+            let lim = as_i64(&args[2]).ok_or(VMError::TypeError)?;
+            if lim < 0 {
+                return Err(VMError::ValueError);
+            }
+            Some(lim as usize)
+        }),
         _ => return Err(VMError::BadArg),
     };
     let mut parts: SmallVec<[StackValue; 16]> = SmallVec::new();
@@ -564,11 +556,7 @@ fn str_split(vm: &mut VM, argc: u32) -> Result<(), VMError> {
 fn str_includes(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     let args = take_args::<3>(vm, argc)?;
     let (haystack, needle, start) = match argc {
-        2 => (
-            vm.str_from(&args[0])?,
-            vm.str_from(&args[1])?,
-            None,
-        ),
+        2 => (vm.str_from(&args[0])?, vm.str_from(&args[1])?, None),
         3 => (
             vm.str_from(&args[0])?,
             vm.str_from(&args[1])?,
@@ -591,11 +579,7 @@ fn str_includes(vm: &mut VM, argc: u32) -> Result<(), VMError> {
 fn str_index_of(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     let args = take_args::<3>(vm, argc)?;
     let (haystack, needle, start) = match argc {
-        2 => (
-            vm.str_from(&args[0])?,
-            vm.str_from(&args[1])?,
-            None,
-        ),
+        2 => (vm.str_from(&args[0])?, vm.str_from(&args[1])?, None),
         3 => (
             vm.str_from(&args[0])?,
             vm.str_from(&args[1])?,
@@ -618,11 +602,7 @@ fn str_index_of(vm: &mut VM, argc: u32) -> Result<(), VMError> {
 fn str_last_index_of(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     let args = take_args::<3>(vm, argc)?;
     let (haystack, needle, start) = match argc {
-        2 => (
-            vm.str_from(&args[0])?,
-            vm.str_from(&args[1])?,
-            None,
-        ),
+        2 => (vm.str_from(&args[0])?, vm.str_from(&args[1])?, None),
         3 => (
             vm.str_from(&args[0])?,
             vm.str_from(&args[1])?,
@@ -722,8 +702,7 @@ fn obj_keys(vm: &mut VM, argc: u32) -> Result<(), VMError> {
         .keys()
         .cloned()
         .collect();
-    let strs: SmallVec<[StackValue; 16]> =
-        keys.into_iter().map(StackValue::String).collect();
+    let strs: SmallVec<[StackValue; 16]> = keys.into_iter().map(StackValue::String).collect();
     let ptr = vm.alloc_array(small_to_thin(&strs));
     vm.stack.push(ptr);
     Ok(())
@@ -839,7 +818,9 @@ fn math_min(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     let base = arg_base(vm, argc)?;
     let mut acc = f64::INFINITY;
     for i in 0..argc as usize {
-        let num = vm.to_number(&vm.stack[base + i]).ok_or(VMError::TypeError)?;
+        let num = vm
+            .to_number(&vm.stack[base + i])
+            .ok_or(VMError::TypeError)?;
         acc = acc.min(num);
     }
     vm.stack.truncate(base);
@@ -853,7 +834,9 @@ fn math_max(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     let base = arg_base(vm, argc)?;
     let mut acc = f64::NEG_INFINITY;
     for i in 0..argc as usize {
-        let num = vm.to_number(&vm.stack[base + i]).ok_or(VMError::TypeError)?;
+        let num = vm
+            .to_number(&vm.stack[base + i])
+            .ok_or(VMError::TypeError)?;
         acc = acc.max(num);
     }
     vm.stack.truncate(base);
@@ -1442,10 +1425,7 @@ mod tests {
 
     #[test]
     fn builtin_value_shape() {
-        let mut vm = VM::new(vec![
-            Instr::PushBuiltin(Builtin::MathMax),
-            Instr::TypeOf,
-        ]);
+        let mut vm = VM::new(vec![Instr::PushBuiltin(Builtin::MathMax), Instr::TypeOf]);
         while !matches!(vm.step().unwrap(), StepResult::Done) {}
         match vm.stack.last() {
             Some(StackValue::String(s)) => assert_eq!(s.as_str(), "function"),
