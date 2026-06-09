@@ -4,6 +4,7 @@ use thin_vec::ThinVec;
 
 use crate::builtin::Builtin;
 use crate::compiler::Program;
+pub use crate::rc_str::RcStr;
 
 /*
 JS semantic compatibility — known divergences
@@ -48,7 +49,6 @@ The remaining intentional divergences from JS — deferred or accepted, NOT bugs
     (LLM) intervention, not JS error handling.
 */
 
-pub use crate::rc_str::RcStr;
 /// Object keys and string-valued instruction operands. A thin, refcounted,
 /// immutable string: cloning a key (`ObjNew`/`ObjSet`) or pushing a literal
 /// (`PushStr`) is a refcount bump, and identical interned names share one
@@ -62,9 +62,10 @@ pub(crate) fn small_to_thin(sv: &SmallVec<[StackValue; 16]>) -> ThinVec<StackVal
     ThinVec::from(sv.as_slice())
 }
 pub type CodeAddr = u32;
-pub type HeapAddr = u32;
 pub type StackAddr = u32;
-pub type ArgIndex = u32;
+pub type ArrayPtr = u32;
+pub type ObjectPtr = u32;
+pub type ClosurePtr = u32;
 pub type LocalIndex = u32;
 pub type ArgCount = u32;
 /// Index into the VM's `cells` side table (the store of captured bindings).
@@ -111,11 +112,13 @@ pub enum StackValue {
     /// A first-class function value: just a code address, with no captured
     /// environment. Covers non-capturing lambdas and named functions passed as
     /// values (dispatch tables, `map`/`filter` callbacks, etc.). Capturing
-    /// lambdas instead become a `HeapValue::Closure` (a code address plus a
+    /// lambdas instead become a `StackValue::Closure` (a code address plus a
     /// captured environment), built by `MakeClosure` and likewise called
     /// through `CallDyn`.
     Fn(CodeAddr),
-    Ptr(HeapAddr),
+    Array(ArrayPtr),
+    Object(ObjectPtr),
+    Closure(ClosurePtr),
     /// Internal indirection for a captured *by-reference* binding: indexes the
     /// VM's `cells` side table, which has identity and outlives stack frames.
     /// Only ever stored in a frame's local (or captured-arg) slots;
@@ -128,21 +131,6 @@ pub enum StackValue {
     /// The compiler's common path uses the static `Instr::CallBuiltin` instead;
     /// this variant exists for the rarer higher-order/callback use.
     Builtin(Builtin),
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum HeapValue {
-    Array(ThinVec<StackValue>),
-    Object(Box<IndexMap<FieldName, StackValue>>),
-    /// A closure: a code address plus its captured environment. Each upval is
-    /// either a plain value (an immutable / by-value capture) or an `Upval`
-    /// handle (a shared, mutable by-reference capture). Built by `MakeClosure`,
-    /// called via `CallDyn`, which installs `upvals` as the callee's leading
-    /// locals. Like `Fn`, it has no JSON form and compares by identity.
-    Closure {
-        addr: CodeAddr,
-        upvals: ThinVec<StackValue>,
-    },
 }
 
 /// Storage class for a local slot declared by `EnterFrame`. A `Plain` slot is an
@@ -168,7 +156,13 @@ pub struct CallFrame {
     /// address). Built on the first `Instr::Arguments` in this frame and reused
     /// by later references, so repeated `arguments` uses don't re-materialize
     /// the array. `None` until first use (and for frames that never use it).
-    arguments_cache: Option<HeapAddr>,
+    arguments_cache: Option<ArrayPtr>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Closure {
+    addr: CodeAddr,
+    upvals: ThinVec<StackValue>,
 }
 
 /*
@@ -264,7 +258,9 @@ identity, and (like `Fn`) have no JSON representation.
 */
 pub struct VM {
     pub code: Vec<Instr>,
-    pub heap: Vec<HeapValue>,
+    pub arrays: Vec<ThinVec<StackValue>>,
+    pub objects: Vec<IndexMap<FieldName, StackValue>>,
+    pub closures: Vec<Closure>,
     /// Side table of captured bindings (cells). A `Boxed` local lives here so
     /// it has identity and outlives its frame; `StackValue::Upval` indexes it.
     /// Grows monotonically (no reclamation), like `heap`.
@@ -315,7 +311,7 @@ pub enum Instr {
     PushPosInt(u64),
     PushNegInt(i64),
     PushFn(CodeAddr),
-    PushPtr(HeapAddr),
+    PushObject(ObjectPtr),
     PushBuiltin(Builtin),
     PushStr(RcStr), // () -> str
 
@@ -347,7 +343,7 @@ pub enum Instr {
 
     // indirect call: the callable sits on top, above its N args (left-to-right,
     // so arg 0 is deepest). The callable is either a bare `Fn` value or a `Ptr`
-    // to a `HeapValue::Closure`; pops it and calls with the same convention as
+    // to a `StackValue::Closure`; pops it and calls with the same convention as
     // Call. For a closure, its captured environment is installed as the
     // callee's leading locals (slots 0..K) before the body runs. Errors if the
     // top value is neither a Fn nor a closure.
@@ -360,7 +356,7 @@ pub enum Instr {
     CallBuiltin(Builtin, u32), // any, ... -> any
 
     // build a closure over the listed local slots of the current frame and push
-    // a Ptr to the resulting HeapValue::Closure. Each captured slot is copied
+    // a Closure to the resulting value. Each captured slot is copied
     // verbatim: a Boxed slot yields its Upval handle (shared, by-reference), a
     // Plain slot yields its current value (a by-value snapshot — which the
     // compiler only emits when the binding is provably never reassigned). The
@@ -691,7 +687,9 @@ impl VM {
     pub fn new(code: Vec<Instr>) -> Self {
         VM {
             code,
-            heap: Vec::new(),
+            arrays: Vec::new(),
+            objects: Vec::new(),
+            closures: Vec::new(),
             cells: Vec::new(),
             stack: Vec::new(),
             // Root frame so that Local is valid from the start.
@@ -711,19 +709,20 @@ impl VM {
     }
 
     /// Construct a VM to run a compiled `Program`, with the blessed `state`
-    /// object installed at `heap[0]`. `state` is seeded from the prior run's
+    /// object installed at `objects[0]`. `state` is seeded from the prior run's
     /// durable JSON (an object); `Null`/non-object seeds yield an empty `state`.
     /// All durable/host-context access lowers to ordinary object ops on
-    /// `Ptr(0)`, so the host persists by extracting `heap[0]` after the run and
-    /// re-seeding it here next time. String literals are not heap-allocated —
-    /// they ride inline in `PushStr` as `RcStr` — so `heap[0]` is the only
-    /// pre-seeded slot and `Ptr(0)` stays stable for the whole program.
+    /// `Object(0)`, so the host persists by extracting `objects[0]` after the
+    /// run and re-seeding it here next time. String literals are not
+    /// heap-allocated — they ride inline in `PushStr` as `RcStr` — so
+    /// `objects[0]` is the only pre-seeded slot and `Object(0)` stays stable
+    /// for the whole program.
     pub fn for_program(program: Program, state: serde_json::Value) -> Result<Self, VMError> {
         let mut vm = VM::new(program.code);
-        // Reserve heap[0] for `state` (filled in just below). Strings no longer
+        // Reserve objects[0] for `state` (filled in just below). Strings no longer
         // occupy heap slots, so this is the sole pre-allocation.
-        vm.heap.push(HeapValue::Object(Box::new(IndexMap::new())));
-        // Seed state's nested values (arrays/objects land at heap[1..]; their
+        vm.objects.push(IndexMap::new());
+        // Seed state's nested values (arrays/objects land at objects[1..]; their
         // addresses are computed at runtime and stored in the state map).
         if let serde_json::Value::Object(map) = state {
             let mut entries = IndexMap::with_capacity(map.len());
@@ -731,18 +730,18 @@ impl VM {
                 let sv = vm.json_to_stack_value(v, 0)?;
                 entries.insert(RcStr::from(k.as_str()), sv);
             }
-            if let Some(HeapValue::Object(o)) = vm.heap.get_mut(0) {
-                *o = Box::new(entries);
+            if let Some(o) = vm.objects.get_mut(0) {
+                *o = entries;
             }
         }
         Ok(vm)
     }
 
-    /// Extract the blessed `state` object (heap[0]) as a JSON value. This is the
+    /// Extract the blessed `state` object (objects[0]) as a JSON value. This is the
     /// persistence boundary the host uses to save/restore durable state between
     /// runs.
     pub fn state_to_json(&self) -> Result<serde_json::Value, VMError> {
-        self.stack_value_to_json(&StackValue::Ptr(0), 0)
+        self.stack_value_to_json(&StackValue::Object(0), 0)
     }
 
     // ── heap access helpers ──────────────────────────────────────────
@@ -765,40 +764,32 @@ impl VM {
         }
     }
 
-    /// Bounds-checked heap read. A correct program never produces a
+    /// Bounds-checked array read. A correct program never produces a
     /// dangling pointer (the heap only ever grows), but a value pushed as a
-    /// literal `Ptr` could be out of range — surface that as an error rather
+    /// literal `Array` could be out of range — surface that as an error rather
     /// than panicking and taking down the host.
-    fn heap_get(&self, ptr: HeapAddr) -> Result<&HeapValue, VMError> {
-        self.heap.get(ptr as usize).ok_or(VMError::ValueError)
+    fn array_get(&self, ptr: ArrayPtr) -> Result<&ThinVec<StackValue>, VMError> {
+        self.arrays.get(ptr as usize).ok_or(VMError::ValueError)
     }
 
-    pub(crate) fn heap_arr(&self, ptr: HeapAddr) -> Option<&ThinVec<StackValue>> {
-        match self.heap.get(ptr as usize) {
-            Some(HeapValue::Array(a)) => Some(a),
-            _ => None,
-        }
+    pub(crate) fn heap_arr(&self, ptr: ArrayPtr) -> Option<&ThinVec<StackValue>> {
+        self.arrays.get(ptr as usize)
     }
 
-    pub(crate) fn heap_arr_mut(&mut self, ptr: HeapAddr) -> Option<&mut ThinVec<StackValue>> {
-        match self.heap.get_mut(ptr as usize) {
-            Some(HeapValue::Array(a)) => Some(a),
-            _ => None,
-        }
+    pub(crate) fn heap_arr_mut(&mut self, ptr: ArrayPtr) -> Option<&mut ThinVec<StackValue>> {
+        self.arrays.get_mut(ptr as usize)
     }
 
-    pub(crate) fn heap_obj(&self, ptr: HeapAddr) -> Option<&IndexMap<FieldName, StackValue>> {
-        match self.heap.get(ptr as usize) {
-            Some(HeapValue::Object(o)) => Some(&**o),
-            _ => None,
-        }
+    pub(crate) fn heap_obj(&self, ptr: ObjectPtr) -> Option<&IndexMap<FieldName, StackValue>> {
+        self.objects.get(ptr as usize)
     }
 
-    fn heap_obj_mut(&mut self, ptr: HeapAddr) -> Option<&mut IndexMap<FieldName, StackValue>> {
-        match self.heap.get_mut(ptr as usize) {
-            Some(HeapValue::Object(o)) => Some(&mut **o),
-            _ => None,
-        }
+    fn heap_obj_mut(&mut self, ptr: ObjectPtr) -> Option<&mut IndexMap<FieldName, StackValue>> {
+        self.objects.get_mut(ptr as usize)
+    }
+
+    fn closure_get(&self, ptr: ClosurePtr) -> Result<&Closure, VMError> {
+        self.closures.get(ptr as usize).ok_or(VMError::ValueError)
     }
 
     /// Push a string value onto the stack. Strings live inline as `RcStr`, not
@@ -809,21 +800,21 @@ impl VM {
     }
 
     pub(crate) fn alloc_array(&mut self, arr: ThinVec<StackValue>) -> StackValue {
-        let addr = self.heap.len() as HeapAddr;
-        self.heap.push(HeapValue::Array(arr));
-        StackValue::Ptr(addr)
+        let addr = self.arrays.len() as ArrayPtr;
+        self.arrays.push(arr);
+        StackValue::Array(addr)
     }
 
     fn alloc_object(&mut self, obj: IndexMap<FieldName, StackValue>) -> StackValue {
-        let addr = self.heap.len() as HeapAddr;
-        self.heap.push(HeapValue::Object(Box::new(obj)));
-        StackValue::Ptr(addr)
+        let addr = self.objects.len() as ObjectPtr;
+        self.objects.push(obj);
+        StackValue::Object(addr)
     }
 
     fn alloc_closure(&mut self, addr: CodeAddr, upvals: ThinVec<StackValue>) -> StackValue {
-        let heap_addr = self.heap.len() as HeapAddr;
-        self.heap.push(HeapValue::Closure { addr, upvals });
-        StackValue::Ptr(heap_addr)
+        let idx = self.closures.len() as ClosurePtr;
+        self.closures.push(Closure { addr, upvals });
+        StackValue::Closure(idx)
     }
 
     /// JS truthiness. The falsy set is exactly `false`, `0`/`-0`, `NaN`, `""`,
@@ -841,7 +832,11 @@ impl VM {
             // Empty string is falsy; any other string is truthy.
             StackValue::String(s) => !s.as_str().is_empty(),
             // All arrays/objects/closures/functions are truthy.
-            StackValue::Ptr(_) | StackValue::Fn(_) | StackValue::Builtin(_) => true,
+            StackValue::Array(_)
+            | StackValue::Object(_)
+            | StackValue::Closure(_)
+            | StackValue::Fn(_)
+            | StackValue::Builtin(_) => true,
             // Internal indirection; never a legitimate operand.
             StackValue::Upval(_) => false,
         }
@@ -862,7 +857,9 @@ impl VM {
             StackValue::Null => Some(0.0),
             StackValue::Undefined => Some(f64::NAN),
             StackValue::String(s) => Some(js_str_to_number(s)),
-            StackValue::Ptr(_)
+            StackValue::Array(_)
+            | StackValue::Object(_)
+            | StackValue::Closure(_)
             | StackValue::Fn(_)
             | StackValue::Builtin(_)
             | StackValue::Upval(_) => None,
@@ -902,8 +899,8 @@ impl VM {
                 buf.push_str("function () { [native code] }");
             }
             StackValue::Upval(_) => {}
-            StackValue::Ptr(p) => match self.heap.get(*p as usize) {
-                Some(HeapValue::Array(arr)) => {
+            StackValue::Array(p) => {
+                if let Some(arr) = self.arrays.get(*p as usize) {
                     for (i, v) in arr.iter().enumerate() {
                         if i > 0 {
                             buf.push_str(",");
@@ -914,12 +911,11 @@ impl VM {
                         }
                     }
                 }
-                Some(HeapValue::Object(_)) => buf.push_str("[object Object]"),
-                Some(HeapValue::Closure { .. }) => {
-                    buf.push_str("function () { [native code] }");
-                }
-                None => buf.push_str("null"), // dangling pointer
-            },
+            }
+            StackValue::Object(_) => buf.push_str("[object Object]"),
+            StackValue::Closure(_) => {
+                buf.push_str("function () { [native code] }");
+            }
         }
     }
 
@@ -977,7 +973,9 @@ impl VM {
             // Same heap address is the same object — JS reference identity, the
             // only equality arrays/objects/closures get (`{a:1} === {a:1}` is
             // false). A correct program never dangles (the heap only grows).
-            (StackValue::Ptr(p), StackValue::Ptr(q)) => p == q,
+            (StackValue::Array(p), StackValue::Array(q)) => p == q,
+            (StackValue::Object(p), StackValue::Object(q)) => p == q,
+            (StackValue::Closure(p), StackValue::Closure(q)) => p == q,
             _ => false,
         }
     }
@@ -1038,14 +1036,6 @@ impl VM {
             // code-point order). Arrays/objects/closures are incomparable.
             (StackValue::String(a), StackValue::String(b)) => Some(a.cmp(b)),
             _ => None,
-        }
-    }
-
-    /// Pop a value and require it to be a heap pointer.
-    pub(crate) fn pop_ptr(&mut self) -> Result<HeapAddr, VMError> {
-        match self.stack.pop().ok_or(VMError::StackUnderflow)? {
-            StackValue::Ptr(p) => Ok(p),
-            _ => Err(VMError::TypeError),
         }
     }
 
@@ -1130,8 +1120,9 @@ impl VM {
                 }
             }
             StackValue::String(s) => serde_json::Value::String(s.as_str().to_owned()),
-            StackValue::Ptr(p) => match self.heap_get(*p)? {
-                HeapValue::Array(arr) => serde_json::Value::Array(
+            StackValue::Array(p) => {
+                let arr = self.arrays.get(*p as usize).ok_or(VMError::ValueError)?;
+                serde_json::Value::Array(
                     arr.iter()
                         .map(|v| match v {
                             // JS: `undefined` array slots stringify to `null`.
@@ -1139,24 +1130,25 @@ impl VM {
                             _ => self.stack_value_to_json(v, depth + 1),
                         })
                         .collect::<Result<_, _>>()?,
-                ),
-                HeapValue::Object(obj) => {
-                    let mut map = serde_json::Map::new();
-                    for (k, v) in obj.iter() {
-                        // JS: properties whose value is `undefined` are omitted.
-                        if matches!(v, StackValue::Undefined) {
-                            continue;
-                        }
-                        map.insert(
-                            k.as_str().to_owned(),
-                            self.stack_value_to_json(v, depth + 1)?,
-                        );
+                )
+            }
+            StackValue::Object(p) => {
+                let obj = self.objects.get(*p as usize).ok_or(VMError::ValueError)?;
+                let mut map = serde_json::Map::new();
+                for (k, v) in obj.iter() {
+                    // JS: properties whose value is `undefined` are omitted.
+                    if matches!(v, StackValue::Undefined) {
+                        continue;
                     }
-                    serde_json::Value::Object(map)
+                    map.insert(
+                        k.as_str().to_owned(),
+                        self.stack_value_to_json(v, depth + 1)?,
+                    );
                 }
-                // A closure has no JSON representation (see Fn above).
-                HeapValue::Closure { .. } => return Err(VMError::ValueError),
-            },
+                serde_json::Value::Object(map)
+            }
+            // A closure has no JSON representation (see Fn above).
+            StackValue::Closure(_) => return Err(VMError::ValueError),
         })
     }
 
@@ -1312,8 +1304,8 @@ impl VM {
                     self.stack.push(StackValue::Fn(*addr));
                     self.ip += 1;
                 }
-                Instr::PushPtr(h) => {
-                    self.stack.push(StackValue::Ptr(*h));
+                Instr::PushObject(h) => {
+                    self.stack.push(StackValue::Object(*h));
                     self.ip += 1;
                 }
                 Instr::PushBuiltin(b) => {
@@ -1463,13 +1455,12 @@ impl VM {
                             self.cur_local_count = nargs;
                             self.ip = addr;
                         }
-                        StackValue::Ptr(p) => {
-                            let (addr, upvals) = match self.heap_get(p)? {
-                                HeapValue::Closure { addr, upvals } => {
-                                    (*addr, upvals.iter().cloned().collect())
-                                }
-                                _ => return Err(VMError::TypeError),
-                            };
+                        StackValue::Closure(p) => {
+                            let closure =
+                                self.closures.get(p as usize).ok_or(VMError::ValueError)?;
+                            let addr = closure.addr;
+                            let upvals: SmallVec<[StackValue; 8]> =
+                                closure.upvals.iter().cloned().collect();
                             if addr as usize >= self.code.len() {
                                 return Err(VMError::BadCall);
                             }
@@ -1635,7 +1626,7 @@ impl VM {
                             .cloned()
                             .collect();
                         let arr = self.alloc_array(small_to_thin(&args));
-                        if let StackValue::Ptr(p) = arr {
+                        if let StackValue::Array(p) = arr {
                             self.callstack.last_mut().unwrap().arguments_cache = Some(p);
                         }
                     }
@@ -1681,7 +1672,7 @@ impl VM {
                     // prologue's EnterFrame; the lazy path here serves the root
                     // frame, which has no args).
                     if let Some(ptr) = frame.arguments_cache {
-                        self.stack.push(StackValue::Ptr(ptr));
+                        self.stack.push(StackValue::Array(ptr));
                         self.ip += 1;
                         continue;
                     }
@@ -1698,8 +1689,8 @@ impl VM {
                         .collect();
                     let arr = self.alloc_array(small_to_thin(&args));
                     let ptr = match arr {
-                        StackValue::Ptr(p) => p,
-                        _ => unreachable!("alloc_array returns a Ptr"),
+                        StackValue::Array(p) => p,
+                        _ => unreachable!("alloc_array returns an Array"),
                     };
                     self.callstack.last_mut().unwrap().arguments_cache = Some(ptr);
                     self.stack.push(arr);
@@ -1829,10 +1820,8 @@ impl VM {
                         }
                         StackValue::String(_) => "string",
                         StackValue::Fn(_) | StackValue::Builtin(_) => "function",
-                        StackValue::Ptr(p) => match self.heap_get(p)? {
-                            HeapValue::Array(_) | HeapValue::Object(_) => "object",
-                            HeapValue::Closure { .. } => "function",
-                        },
+                        StackValue::Array(_) | StackValue::Object(_) => "object",
+                        StackValue::Closure(_) => "function",
                         // Internal indirection; never a legitimate operand.
                         StackValue::Upval(_) => return Err(VMError::ValueError),
                     };
@@ -1877,11 +1866,7 @@ impl VM {
                 }
                 Instr::IsObj => {
                     let val = self.stack.pop().ok_or(VMError::StackUnderflow)?;
-                    let is_obj = matches!(
-                        val,
-                        StackValue::Ptr(p)
-                            if matches!(self.heap.get(p as usize), Some(HeapValue::Object(_)))
-                    );
+                    let is_obj = matches!(val, StackValue::Object(_));
                     self.stack.push(StackValue::Bool(is_obj));
                     self.ip += 1;
                 }
@@ -2062,14 +2047,12 @@ impl VM {
                     // use field_str (which borrows self.code) for the lookup
                     // without cloning.
                     let obj_ptr = match self.stack.last() {
-                        Some(StackValue::Ptr(p)) => *p,
+                        Some(StackValue::Object(p)) => *p,
                         _ => return Err(VMError::TypeError),
                     };
                     // JS: a missing property reads as `undefined`, not `null`.
-                    let val = match self.heap.get(obj_ptr as usize) {
-                        Some(HeapValue::Object(obj)) => {
-                            obj.get(field_str).cloned().unwrap_or(StackValue::Undefined)
-                        }
+                    let val = match self.objects.get(obj_ptr as usize) {
+                        Some(obj) => obj.get(field_str).cloned().unwrap_or(StackValue::Undefined),
                         _ => StackValue::Undefined,
                     };
                     self.stack.pop(); // discard the object pointer
@@ -2083,11 +2066,11 @@ impl VM {
                     // Stack: [..., obj_ptr, val] (val on top).
                     let val = self.stack.pop().ok_or(VMError::StackUnderflow)?;
                     let obj_ptr = match self.stack.last() {
-                        Some(StackValue::Ptr(p)) => *p,
+                        Some(StackValue::Object(p)) => *p,
                         _ => return Err(VMError::TypeError),
                     };
-                    let obj = match self.heap.get_mut(obj_ptr as usize) {
-                        Some(HeapValue::Object(o)) => o,
+                    let obj = match self.objects.get_mut(obj_ptr as usize) {
+                        Some(o) => o,
                         _ => return Err(VMError::TypeError),
                     };
                     // Read the old value before overwriting, then write through
@@ -2147,27 +2130,26 @@ impl VM {
                                 StackValue::String(RcStr::from(ch.to_string()))
                             }
                         }
-                        StackValue::Ptr(p) => match self.heap_get(*p)? {
-                            HeapValue::Array(arr) => {
-                                let idx = as_i64(&key).ok_or(VMError::TypeError)?;
-                                if idx < 0 {
-                                    return Err(VMError::ValueError);
-                                }
-                                // JS: an out-of-bounds index reads as `undefined`.
-                                arr.get(idx as usize)
-                                    .cloned()
-                                    .unwrap_or(StackValue::Undefined)
+                        StackValue::Array(p) => {
+                            let arr = self.arrays.get(*p as usize).ok_or(VMError::ValueError)?;
+                            let idx = as_i64(&key).ok_or(VMError::TypeError)?;
+                            if idx < 0 {
+                                return Err(VMError::ValueError);
                             }
-                            HeapValue::Object(obj) => {
-                                // JS coerces a computed key with ToString.
-                                let field = self.to_js_string(&key, 0);
-                                // JS: a missing property reads as `undefined`.
-                                obj.get(field.as_str())
-                                    .cloned()
-                                    .unwrap_or(StackValue::Undefined)
-                            }
-                            _ => return Err(VMError::TypeError),
-                        },
+                            // JS: an out-of-bounds index reads as `undefined`.
+                            arr.get(idx as usize)
+                                .cloned()
+                                .unwrap_or(StackValue::Undefined)
+                        }
+                        StackValue::Object(p) => {
+                            let obj = self.objects.get(*p as usize).ok_or(VMError::ValueError)?;
+                            // JS coerces a computed key with ToString.
+                            let field = self.to_js_string(&key, 0);
+                            // JS: a missing property reads as `undefined`.
+                            obj.get(field.as_str())
+                                .cloned()
+                                .unwrap_or(StackValue::Undefined)
+                        }
                         _ => return Err(VMError::TypeError),
                     };
                     self.stack.push(val);
@@ -2181,12 +2163,10 @@ impl VM {
                     let mode = *mode;
                     let val = self.stack.pop().ok_or(VMError::StackUnderflow)?;
                     let key = self.stack.pop().ok_or(VMError::StackUnderflow)?;
-                    let container = self.pop_ptr()?;
-                    // Determine the container kind, releasing the borrow before
-                    // taking the mutable one below.
-                    let is_array = match self.heap_get(container)? {
-                        HeapValue::Array(_) => true,
-                        HeapValue::Object(_) => false,
+                    let container = self.stack.pop().ok_or(VMError::StackUnderflow)?;
+                    let is_array = match &container {
+                        StackValue::Array(_) => true,
+                        StackValue::Object(_) => false,
                         // Strings are immutable; closures aren't indexable.
                         _ => return Err(VMError::TypeError),
                     };
@@ -2198,14 +2178,24 @@ impl VM {
                             if idx < 0 {
                                 return Err(VMError::ValueError);
                             }
-                            self.heap_arr(container)
-                                .and_then(|a| a.get(idx as usize).cloned())
-                                .unwrap_or(StackValue::Undefined)
+                            match &container {
+                                StackValue::Array(p) => self
+                                    .arrays
+                                    .get(*p as usize)
+                                    .and_then(|a| a.get(idx as usize).cloned())
+                                    .unwrap_or(StackValue::Undefined),
+                                _ => unreachable!(),
+                            }
                         } else {
                             let field = self.to_js_string(&key, 0);
-                            self.heap_obj(container)
-                                .and_then(|o| o.get(field.as_str()).cloned())
-                                .unwrap_or(StackValue::Undefined)
+                            match &container {
+                                StackValue::Object(p) => self
+                                    .objects
+                                    .get(*p as usize)
+                                    .and_then(|o| o.get(field.as_str()).cloned())
+                                    .unwrap_or(StackValue::Undefined),
+                                _ => unreachable!(),
+                            }
                         }
                     } else {
                         StackValue::Undefined // placeholder, unused
@@ -2223,14 +2213,22 @@ impl VM {
                             return Err(VMError::ValueError);
                         }
                         let idx = idx as usize;
-                        let arr = self.heap_arr_mut(container).ok_or(VMError::TypeError)?;
+                        let p = match &container {
+                            StackValue::Array(p) => *p,
+                            _ => unreachable!(),
+                        };
+                        let arr = self.arrays.get_mut(p as usize).ok_or(VMError::TypeError)?;
                         if idx >= arr.len() {
                             return Err(VMError::ValueError);
                         }
                         arr[idx] = val;
                     } else {
                         let field = self.to_js_string(&key, 0);
-                        let obj = self.heap_obj_mut(container).ok_or(VMError::TypeError)?;
+                        let p = match &container {
+                            StackValue::Object(p) => *p,
+                            _ => unreachable!(),
+                        };
+                        let obj = self.objects.get_mut(p as usize).ok_or(VMError::TypeError)?;
                         obj.insert(field, val);
                     }
                     self.stack.push(result);
@@ -2239,9 +2237,13 @@ impl VM {
 
                 Instr::ObjHas => {
                     let field = self.pop_string()?;
-                    let obj_ptr = self.pop_ptr()?;
+                    let obj_ptr = match self.stack.pop().ok_or(VMError::StackUnderflow)? {
+                        StackValue::Object(p) => p,
+                        _ => return Err(VMError::TypeError),
+                    };
                     let has = self
-                        .heap_obj(obj_ptr)
+                        .objects
+                        .get(obj_ptr as usize)
                         .ok_or(VMError::TypeError)?
                         .contains_key(field.as_str());
                     self.stack.push(StackValue::Bool(has));
@@ -2250,10 +2252,14 @@ impl VM {
 
                 Instr::ObjDelete => {
                     let field = self.pop_string()?;
-                    let obj_ptr = self.pop_ptr()?;
+                    let obj_ptr = match self.stack.pop().ok_or(VMError::StackUnderflow)? {
+                        StackValue::Object(p) => p,
+                        _ => return Err(VMError::TypeError),
+                    };
                     // shift_remove keeps the remaining keys in insertion order.
                     let existed = self
-                        .heap_obj_mut(obj_ptr)
+                        .objects
+                        .get_mut(obj_ptr as usize)
                         .ok_or(VMError::TypeError)?
                         .shift_remove(field.as_str())
                         .is_some();
@@ -2281,10 +2287,16 @@ impl VM {
                         // String length is in UTF-8 *bytes* (consistent with the
                         // byte-offset string ops below).
                         StackValue::String(s) => s.len(),
-                        StackValue::Ptr(p) => match self.heap_get(p)? {
-                            HeapValue::Array(a) => a.len(),
-                            _ => return Err(VMError::TypeError),
-                        },
+                        StackValue::Array(p) => self
+                            .arrays
+                            .get(p as usize)
+                            .ok_or(VMError::ValueError)?
+                            .len(),
+                        StackValue::Object(p) => self
+                            .objects
+                            .get(p as usize)
+                            .ok_or(VMError::ValueError)?
+                            .len(),
                         _ => return Err(VMError::TypeError),
                     };
                     self.stack.push(StackValue::Number(len as f64));
@@ -2449,9 +2461,9 @@ mod tests {
     fn undef() -> StackValue {
         StackValue::Undefined
     }
-    /// Heap pointer value (array/object) at the given address.
+    /// Object value at the given address.
     fn s(addr: u32) -> StackValue {
-        StackValue::Ptr(addr)
+        StackValue::Object(addr)
     }
     /// A string value (strings are inline now, not heap pointers).
     fn str_v(val: &str) -> StackValue {
@@ -3158,11 +3170,11 @@ mod tests {
         ]);
         while !matches!(vm.step().unwrap(), StepResult::Done) {}
         match vm.stack.as_slice() {
-            [StackValue::Ptr(p)] => match &vm.heap[*p as usize] {
-                HeapValue::Array(a) => assert_eq!(a, &vec![n(10.0), n(20.0), n(30.0)]),
-                other => panic!("expected array, got {other:?}"),
-            },
-            other => panic!("expected one Ptr, got {other:?}"),
+            [StackValue::Array(p)] => {
+                let a = &vm.arrays[*p as usize];
+                assert_eq!(a, &vec![n(10.0), n(20.0), n(30.0)]);
+            }
+            other => panic!("expected one Array, got {other:?}"),
         }
     }
 
@@ -3277,13 +3289,10 @@ mod tests {
         code[call2] = Call(mc, 0);
 
         let vm = run_vm(code);
-        let StackValue::Ptr(p) = vm.stack[0] else {
+        let StackValue::Array(p) = vm.stack[0] else {
             panic!("expected array pointer");
         };
-        assert_eq!(
-            vm.heap[p as usize],
-            HeapValue::Array(vec![n(1.0), n(2.0), n(1.0)].into())
-        );
+        assert_eq!(vm.arrays[p as usize].as_slice(), &[n(1.0), n(2.0), n(1.0)]);
     }
 
     #[test]
@@ -3885,16 +3894,16 @@ mod tests {
 
     #[test]
     fn dangling_pointer_does_not_panic() {
-        // A Ptr literal with no backing heap cell must error, not panic.
+        // A PushPtr with no backing heap cell must error, not panic.
         assert!(matches!(
-            run_err(vec![PushPtr(99), ArrLength]),
+            run_err(vec![PushObject(99), ArrLength]),
             VMError::ValueError
         ));
         // Type predicates stay total (false) on a dangling pointer.
-        assert_eq!(run(vec![PushPtr(99), IsStr]), vec![b(false)]);
+        assert_eq!(run(vec![PushObject(99), IsStr]), vec![b(false)]);
         // `===` on pointers is pure reference identity (no heap lookup), so the
         // same address compares equal — even when dangling — without panicking.
-        assert_eq!(run(vec![PushPtr(99), PushPtr(99), Eq]), vec![b(true)]);
+        assert_eq!(run(vec![PushObject(99), PushObject(99), Eq]), vec![b(true)]);
     }
 
     #[test]

@@ -1080,7 +1080,7 @@ impl<'src> Compiler<'src> {
             return;
         }
         match name {
-            "state" => self.emit(Instr::PushPtr(0), span),
+            "state" => self.emit(Instr::PushObject(0), span),
             "undefined" => self.emit(Instr::PushUndefined, span),
             "NaN" => self.emit(Instr::PushFloat(f64::NAN), span),
             "Infinity" => self.emit(Instr::PushFloat(f64::INFINITY), span),
@@ -2931,12 +2931,8 @@ mod tests {
         assert!(!has_not, "Not should be folded away: {:?}", prog.code);
         // And it still behaves correctly: `c` is true, so the body is skipped.
         let vm = run_program(prog);
-        match &vm.heap[0] {
-            crate::vm::HeapValue::Object(o) => {
-                assert_eq!(o.get(&RcStr::from("x")), None, "body must not run");
-            }
-            other => panic!("expected state object, got {other:?}"),
-        }
+        let o = &vm.objects[0];
+        assert_eq!(o.get(&RcStr::from("x")), None, "body must not run");
     }
 
     #[test]
@@ -2945,12 +2941,8 @@ mod tests {
         let prog = compile("let c = false; if (!c) { state.x = 1; }").expect("compiles");
         assert!(!prog.code.iter().any(|i| matches!(i, Instr::Not)));
         let vm = run_program(prog);
-        match &vm.heap[0] {
-            crate::vm::HeapValue::Object(o) => {
-                assert_eq!(o.get(&RcStr::from("x")), Some(&StackValue::PosInt(1)));
-            }
-            other => panic!("expected state object, got {other:?}"),
-        }
+        let o = &vm.objects[0];
+        assert_eq!(o.get(&RcStr::from("x")), Some(&StackValue::PosInt(1)));
     }
 
     #[test]
@@ -2968,12 +2960,8 @@ mod tests {
             prog.code
         );
         let vm = run_program(prog);
-        match &vm.heap[0] {
-            crate::vm::HeapValue::Object(o) => {
-                assert_eq!(o.get(&RcStr::from("r")), Some(&StackValue::PosInt(1)));
-            }
-            other => panic!("expected state object, got {other:?}"),
-        }
+        let o = &vm.objects[0];
+        assert_eq!(o.get(&RcStr::from("r")), Some(&StackValue::PosInt(1)));
     }
 
     #[test]
@@ -2992,12 +2980,8 @@ mod tests {
         .expect("compiles");
         let vm = run_program(prog);
         // 0+1+2 + 4+5+6 = 18 (3 skipped, break at 7).
-        match &vm.heap[0] {
-            crate::vm::HeapValue::Object(o) => {
-                assert_eq!(o.get(&RcStr::from("sum")), Some(&StackValue::Number(18.0)));
-            }
-            other => panic!("expected state object, got {other:?}"),
-        }
+        let o = &vm.objects[0];
+        assert_eq!(o.get(&RcStr::from("sum")), Some(&StackValue::Number(18.0)));
     }
 
     #[test]
@@ -3013,12 +2997,8 @@ mod tests {
         assert!(prog.code.iter().any(|i| matches!(i, Instr::ToBool)));
         // `state.c` is undefined here → `!!undefined` is `false`.
         let vm = run_program(prog);
-        match &vm.heap[0] {
-            crate::vm::HeapValue::Object(o) => {
-                assert_eq!(o.get(&RcStr::from("b")), Some(&StackValue::Bool(false)));
-            }
-            other => panic!("expected state object, got {other:?}"),
-        }
+        let o = &vm.objects[0];
+        assert_eq!(o.get(&RcStr::from("b")), Some(&StackValue::Bool(false)));
     }
 
     #[test]
@@ -3125,13 +3105,9 @@ mod tests {
             prog.code
         );
         let vm = run_program(prog);
-        match &vm.heap[0] {
-            crate::vm::HeapValue::Object(o) => {
-                assert_eq!(o.get(&RcStr::from("x")), None);
-                assert_eq!(o.get(&RcStr::from("y")), Some(&StackValue::PosInt(2)));
-            }
-            other => panic!("expected state object, got {other:?}"),
-        }
+        let o = &vm.objects[0];
+        assert_eq!(o.get(&RcStr::from("x")), None);
+        assert_eq!(o.get(&RcStr::from("y")), Some(&StackValue::PosInt(2)));
     }
 
     #[test]
@@ -3157,7 +3133,10 @@ mod tests {
         // A `let` never reassigned and never captured is propagated like a const.
         let prog = compile("let N = 5; state.x = N * 2;").expect("compiles");
         assert!(
-            !prog.code.iter().any(|i| matches!(i, Instr::Mul | Instr::Local(_))),
+            !prog
+                .code
+                .iter()
+                .any(|i| matches!(i, Instr::Mul | Instr::Local(_))),
             "effectively-const let should fold: {:?}",
             prog.code
         );
@@ -3221,7 +3200,10 @@ mod tests {
         // captures nothing and is a bare `Fn` (no `MakeClosure`, no heap closure).
         let prog = compile("const k = 5; const f = () => k; state.x = f();").expect("ok");
         assert!(
-            !prog.code.iter().any(|i| matches!(i, Instr::MakeClosure(..))),
+            !prog
+                .code
+                .iter()
+                .any(|i| matches!(i, Instr::MakeClosure(..))),
             "const-only closure should demote to Fn: {:?}",
             prog.code
         );
@@ -3233,19 +3215,19 @@ mod tests {
     fn const_only_closure_in_loop_demotes_to_fn() {
         // The `map` callback references only a literal const → no per-iteration
         // closure allocation (bare `Fn`, not `MakeClosure`).
-        let prog = compile(
-            "const f = 2; state.r = [1, 2, 3].map(x => x * f);",
-        )
-        .expect("ok");
+        let prog = compile("const f = 2; state.r = [1, 2, 3].map(x => x * f);").expect("ok");
         assert!(
-            !prog.code.iter().any(|i| matches!(i, Instr::MakeClosure(..))),
+            !prog
+                .code
+                .iter()
+                .any(|i| matches!(i, Instr::MakeClosure(..))),
             "callback over a const should not allocate a closure: {:?}",
             prog.code
         );
         let vm = run_program(prog);
         match state_val(&vm, "r") {
-            StackValue::Ptr(p) => {
-                let arr = vm.heap_arr(p).expect("array");
+            StackValue::Array(p) => {
+                let arr = &vm.arrays[p as usize];
                 assert_eq!(arr.len(), 3);
                 assert_eq!(arr[2], num(6.0));
             }
@@ -3257,14 +3239,17 @@ mod tests {
     fn non_literal_captured_const_keeps_its_store() {
         // A *non-literal* const (an object) still gets a slot and is captured by
         // value, so its store is kept and the closure is a real `MakeClosure`.
-        let prog =
-            compile("const o = { v: 5 }; const f = () => o.v; state.x = f();").expect("ok");
+        let prog = compile("const o = { v: 5 }; const f = () => o.v; state.x = f();").expect("ok");
         assert!(
             prog.code.iter().any(|i| matches!(i, Instr::SetLocal(_))),
             "non-literal captured const must keep its store: {:?}",
             prog.code
         );
-        assert!(prog.code.iter().any(|i| matches!(i, Instr::MakeClosure(..))));
+        assert!(
+            prog.code
+                .iter()
+                .any(|i| matches!(i, Instr::MakeClosure(..)))
+        );
         let vm = run_program(prog);
         assert_eq!(state_val(&vm, "x"), StackValue::PosInt(5));
     }
@@ -3273,8 +3258,7 @@ mod tests {
     fn const_elimination_respects_shadowing() {
         // Inner literal const shadows the outer; each reference resolves to its
         // own value even though neither occupies a slot.
-        let prog =
-            compile("const x = 1; { const x = 2; state.a = x; } state.b = x;").expect("ok");
+        let prog = compile("const x = 1; { const x = 2; state.a = x; } state.b = x;").expect("ok");
         let vm = run_program(prog);
         assert_eq!(state_val(&vm, "a"), StackValue::PosInt(2));
         assert_eq!(state_val(&vm, "b"), StackValue::PosInt(1));
@@ -3319,7 +3303,10 @@ mod tests {
         )
         .expect("ok");
         assert!(
-            !prog.code.iter().any(|i| matches!(i, Instr::MakeClosure(..))),
+            !prog
+                .code
+                .iter()
+                .any(|i| matches!(i, Instr::MakeClosure(..))),
             "mutual recursion should allocate no closures: {:?}",
             prog.code
         );
@@ -3353,11 +3340,16 @@ mod tests {
         let prog =
             compile("function dbl(x){ return x * 2; } state.r = [1, 2, 3].map(dbl);").expect("ok");
         assert!(prog.code.iter().any(|i| matches!(i, Instr::PushFn(_))));
-        assert!(!prog.code.iter().any(|i| matches!(i, Instr::MakeClosure(..))));
+        assert!(
+            !prog
+                .code
+                .iter()
+                .any(|i| matches!(i, Instr::MakeClosure(..)))
+        );
         let vm = run_program(prog);
         match state_val(&vm, "r") {
-            StackValue::Ptr(p) => {
-                let a = vm.heap_arr(p).expect("array");
+            StackValue::Array(p) => {
+                let a = &vm.arrays[p as usize];
                 assert_eq!(a[2], num(6.0));
             }
             other => panic!("expected array, got {other:?}"),
@@ -3382,9 +3374,8 @@ mod tests {
     fn reassigned_function_is_not_a_constant() {
         // `f` is reassigned, so it isn't a const function (keeps a mutable slot);
         // compiling must succeed (no "assignment to constant") and run correctly.
-        let prog =
-            compile("function f() { return 1; } state.a = f(); f = 5; state.b = typeof f;")
-                .expect("reassignable function binding");
+        let prog = compile("function f() { return 1; } state.a = f(); f = 5; state.b = typeof f;")
+            .expect("reassignable function binding");
         let vm = run_program(prog);
         assert_eq!(state_val(&vm, "a"), StackValue::PosInt(1));
         match state_val(&vm, "b") {
@@ -3397,28 +3388,31 @@ mod tests {
     fn const_arrow_is_a_constant_function() {
         // A non-capturing arrow bound to a `const` is a constant function: no
         // closure, called/passed via its `Fn`.
-        let prog = compile(
-            "const dbl = (x) => x * 2; state.r = [1, 2, 3].map(dbl); state.y = dbl(5);",
-        )
-        .expect("ok");
+        let prog =
+            compile("const dbl = (x) => x * 2; state.r = [1, 2, 3].map(dbl); state.y = dbl(5);")
+                .expect("ok");
         assert!(
-            !prog.code.iter().any(|i| matches!(i, Instr::MakeClosure(..))),
+            !prog
+                .code
+                .iter()
+                .any(|i| matches!(i, Instr::MakeClosure(..))),
             "const arrow should be a Fn constant: {:?}",
             prog.code
         );
         let vm = run_program(prog);
         assert_eq!(state_val(&vm, "y"), num(10.0));
         match state_val(&vm, "r") {
-            StackValue::Ptr(p) => assert_eq!(vm.heap_arr(p).unwrap()[2], num(6.0)),
+            StackValue::Array(p) => assert_eq!(vm.arrays[p as usize][2], num(6.0)),
             other => panic!("expected array, got {other:?}"),
         }
     }
 
     #[test]
     fn const_named_fn_expr_self_recursion_is_static() {
-        let prog =
-            compile("const fact = function f(n){ return n <= 1 ? 1 : n * f(n - 1); }; state.x = fact(4);")
-                .expect("ok");
+        let prog = compile(
+            "const fact = function f(n){ return n <= 1 ? 1 : n * f(n - 1); }; state.x = fact(4);",
+        )
+        .expect("ok");
         assert!(
             !prog
                 .code
@@ -3480,13 +3474,16 @@ mod tests {
         // immutable as a `const` — so it's a constant function (no closure).
         let prog = compile("let dbl = (x) => x * 2; state.r = [1, 2, 3].map(dbl);").expect("ok");
         assert!(
-            !prog.code.iter().any(|i| matches!(i, Instr::MakeClosure(..))),
+            !prog
+                .code
+                .iter()
+                .any(|i| matches!(i, Instr::MakeClosure(..))),
             "never-reassigned let function should be a Fn constant: {:?}",
             prog.code
         );
         let vm = run_program(prog);
         match state_val(&vm, "r") {
-            StackValue::Ptr(p) => assert_eq!(vm.heap_arr(p).unwrap()[2], num(6.0)),
+            StackValue::Array(p) => assert_eq!(vm.arrays[p as usize][2], num(6.0)),
             other => panic!("expected array, got {other:?}"),
         }
     }
@@ -3513,12 +3510,8 @@ mod tests {
         let prog = compile("1;").expect("compiles");
         let state = serde_json::json!({ "count": 7 });
         let vm = VM::for_program(prog, state).unwrap();
-        match &vm.heap[0] {
-            crate::vm::HeapValue::Object(o) => {
-                assert_eq!(o.get(&RcStr::from("count")), Some(&StackValue::PosInt(7)));
-            }
-            other => panic!("expected state object at heap[0], got {other:?}"),
-        }
+        let o = &vm.objects[0];
+        assert_eq!(o.get(&RcStr::from("count")), Some(&StackValue::PosInt(7)));
     }
 
     #[test]
@@ -3545,8 +3538,6 @@ mod tests {
     // routes every expression through the real VM and the `state`/`Ptr(0)`
     // lowering at once.
 
-    use crate::vm::HeapValue;
-
     /// Compile + run `src` to completion, returning the finished VM.
     fn run_vm(src: &str) -> VM {
         match compile(src) {
@@ -3555,15 +3546,12 @@ mod tests {
         }
     }
 
-    /// Read `state.<key>` (a slot of the heap[0] object) from a finished VM.
+    /// Read `state.<key>` (a slot of the objects[0] state object) from a finished VM.
     fn state_val(vm: &VM, key: &str) -> StackValue {
-        match &vm.heap[0] {
-            HeapValue::Object(o) => o
-                .get(&RcStr::from(key))
-                .cloned()
-                .unwrap_or_else(|| panic!("no state.{key}")),
-            other => panic!("state is not an object: {other:?}"),
-        }
+        vm.objects[0]
+            .get(&RcStr::from(key))
+            .cloned()
+            .unwrap_or_else(|| panic!("no state.{key}"))
     }
 
     /// Evaluate a single expression by assigning it to `state.r`, returning the
@@ -3693,12 +3681,10 @@ mod tests {
         let vm = run_vm("state.obj = { a: 1 }; state.r = (state.obj.a = 9);");
         assert_eq!(state_val(&vm, "r"), StackValue::PosInt(9));
         match state_val(&vm, "obj") {
-            StackValue::Ptr(p) => match &vm.heap[p as usize] {
-                HeapValue::Object(o) => {
-                    assert_eq!(o.get(&RcStr::from("a")), Some(&StackValue::PosInt(9)))
-                }
-                other => panic!("{other:?}"),
-            },
+            StackValue::Object(p) => {
+                let o = &vm.objects[p as usize];
+                assert_eq!(o.get(&RcStr::from("a")), Some(&StackValue::PosInt(9)))
+            }
             other => panic!("{other:?}"),
         }
         // Index assignment into an array.
@@ -4319,10 +4305,7 @@ mod tests {
         // map applies the callback to each element.
         let vm = run_vm("state.r = [1, 2, 3].map(x => x * 2);");
         match state_val(&vm, "r") {
-            StackValue::Ptr(p) => match &vm.heap[p as usize] {
-                HeapValue::Array(a) => assert_eq!(a.len(), 3),
-                other => panic!("{other:?}"),
-            },
+            StackValue::Array(p) => assert_eq!(vm.arrays[p as usize].len(), 3),
             other => panic!("{other:?}"),
         }
         // map result summed back via reduce.
@@ -5228,8 +5211,3 @@ mod tests {
         }
     }
 }
-
-
-
-
-

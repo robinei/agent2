@@ -430,11 +430,11 @@ fn js_parse_int(input: &str, mut radix: i64) -> f64 {
 fn array_push(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     let args = check_arity!(vm, argc, 2)?;
     let arr_ptr = match &args[0] {
-        StackValue::Ptr(p) => *p,
+        StackValue::Array(p) => *p,
         _ => return Err(VMError::TypeError),
     };
     let val = args[1].clone();
-    let arr = vm.heap_arr_mut(arr_ptr).ok_or(VMError::TypeError)?;
+    let arr = vm.arrays.get_mut(arr_ptr as usize).ok_or(VMError::TypeError)?;
     arr.push(val);
     let len = arr.len();
     vm.stack.push(StackValue::Number(len as f64));
@@ -445,10 +445,10 @@ fn array_push(vm: &mut VM, argc: u32) -> Result<(), VMError> {
 fn array_pop(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     let args = check_arity!(vm, argc, 1)?;
     let arr_ptr = match &args[0] {
-        StackValue::Ptr(p) => *p,
+        StackValue::Array(p) => *p,
         _ => return Err(VMError::TypeError),
     };
-    let arr = vm.heap_arr_mut(arr_ptr).ok_or(VMError::TypeError)?;
+    let arr = vm.arrays.get_mut(arr_ptr as usize).ok_or(VMError::TypeError)?;
     let val = arr.pop().ok_or(VMError::ValueError)?;
     vm.stack.push(val);
     Ok(())
@@ -458,10 +458,10 @@ fn array_pop(vm: &mut VM, argc: u32) -> Result<(), VMError> {
 fn array_shift(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     let args = check_arity!(vm, argc, 1)?;
     let arr_ptr = match &args[0] {
-        StackValue::Ptr(p) => *p,
+        StackValue::Array(p) => *p,
         _ => return Err(VMError::TypeError),
     };
-    let arr = vm.heap_arr_mut(arr_ptr).ok_or(VMError::TypeError)?;
+    let arr = vm.arrays.get_mut(arr_ptr as usize).ok_or(VMError::TypeError)?;
     if arr.is_empty() {
         return Err(VMError::ValueError);
     }
@@ -474,11 +474,11 @@ fn array_shift(vm: &mut VM, argc: u32) -> Result<(), VMError> {
 fn array_unshift(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     let args = check_arity!(vm, argc, 2)?;
     let arr_ptr = match &args[0] {
-        StackValue::Ptr(p) => *p,
+        StackValue::Array(p) => *p,
         _ => return Err(VMError::TypeError),
     };
     let val = args[1].clone();
-    let arr = vm.heap_arr_mut(arr_ptr).ok_or(VMError::TypeError)?;
+    let arr = vm.arrays.get_mut(arr_ptr as usize).ok_or(VMError::TypeError)?;
     arr.insert(0, val);
     let len = arr.len();
     vm.stack.push(StackValue::Number(len as f64));
@@ -490,12 +490,12 @@ fn array_join(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     let args = take_args::<2>(vm, argc)?;
     let (arr_ptr, sep) = match argc {
         1 => match &args[0] {
-            StackValue::Ptr(p) => (*p, ",".into()),
+            StackValue::Array(p) => (*p, ",".into()),
             _ => return Err(VMError::TypeError),
         },
         2 => {
             let p = match &args[0] {
-                StackValue::Ptr(p) => *p,
+                StackValue::Array(p) => *p,
                 _ => return Err(VMError::TypeError),
             };
             let s = vm.to_js_string(&args[1], 0);
@@ -503,7 +503,7 @@ fn array_join(vm: &mut VM, argc: u32) -> Result<(), VMError> {
         }
         _ => return Err(VMError::BadArg),
     };
-    let arr = vm.heap_arr(arr_ptr).ok_or(VMError::TypeError)?;
+    let arr = vm.arrays.get(arr_ptr as usize).ok_or(VMError::TypeError)?;
     let mut joined = String::new();
     for (i, v) in arr.iter().enumerate() {
         if i > 0 {
@@ -693,11 +693,12 @@ fn str_trim(vm: &mut VM, argc: u32) -> Result<(), VMError> {
 fn obj_keys(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     let args = check_arity!(vm, argc, 1)?;
     let obj_ptr = match &args[0] {
-        StackValue::Ptr(p) => *p,
+        StackValue::Object(p) => *p,
         _ => return Err(VMError::TypeError),
     };
     let keys: SmallVec<[RcStr; 8]> = vm
-        .heap_obj(obj_ptr)
+        .objects
+        .get(obj_ptr as usize)
         .ok_or(VMError::TypeError)?
         .keys()
         .cloned()
@@ -712,11 +713,12 @@ fn obj_keys(vm: &mut VM, argc: u32) -> Result<(), VMError> {
 fn obj_values(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     let args = check_arity!(vm, argc, 1)?;
     let obj_ptr = match &args[0] {
-        StackValue::Ptr(p) => *p,
+        StackValue::Object(p) => *p,
         _ => return Err(VMError::TypeError),
     };
     let vals: SmallVec<[StackValue; 16]> = vm
-        .heap_obj(obj_ptr)
+        .objects
+        .get(obj_ptr as usize)
         .ok_or(VMError::TypeError)?
         .values()
         .cloned()
@@ -794,10 +796,7 @@ fn number_parse_float(vm: &mut VM, argc: u32) -> Result<(), VMError> {
 /// `Array.isArray(x)` → bool.
 fn array_is_array(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     let args = check_arity!(vm, argc, 1)?;
-    let is_arr = match &args[0] {
-        StackValue::Ptr(p) => vm.heap_arr(*p).is_some(),
-        _ => false,
-    };
+    let is_arr = matches!(&args[0], StackValue::Array(_));
     vm.stack.push(StackValue::Bool(is_arr));
     Ok(())
 }
@@ -982,10 +981,10 @@ mod tests {
             Instr::PushStr(",".into()),
             Instr::CallBuiltin(Builtin::StrSplit, 2),
         ]);
-        // result is an array Ptr
+        // result is an array
         match &out[0] {
-            StackValue::Ptr(_) => {}
-            other => panic!("expected Ptr, got {other:?}"),
+            StackValue::Array(_) => {}
+            other => panic!("expected Array, got {other:?}"),
         }
     }
 
@@ -998,8 +997,8 @@ mod tests {
             Instr::CallBuiltin(Builtin::StrSplit, 3),
         ]);
         match &out[0] {
-            StackValue::Ptr(_) => {}
-            other => panic!("expected Ptr, got {other:?}"),
+            StackValue::Array(_) => {}
+            other => panic!("expected Array, got {other:?}"),
         }
     }
 
@@ -1173,10 +1172,10 @@ mod tests {
             Instr::ObjNew(vec!["a".into(), "b".into()].into()),
             Instr::CallBuiltin(Builtin::ObjKeys, 1),
         ]);
-        // result is an array Ptr
+        // result is an array
         match &out[0] {
-            StackValue::Ptr(_) => {}
-            other => panic!("expected Ptr, got {other:?}"),
+            StackValue::Array(_) => {}
+            other => panic!("expected Array, got {other:?}"),
         }
     }
 
@@ -1188,8 +1187,8 @@ mod tests {
             Instr::CallBuiltin(Builtin::ObjValues, 1),
         ]);
         match &out[0] {
-            StackValue::Ptr(_) => {}
-            other => panic!("expected Ptr, got {other:?}"),
+            StackValue::Array(_) => {}
+            other => panic!("expected Array, got {other:?}"),
         }
     }
 

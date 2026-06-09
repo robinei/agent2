@@ -241,7 +241,7 @@ fn pe_is_pure_push(i: &Instr) -> bool {
             | Instr::PushPosInt(_)
             | Instr::PushNegInt(_)
             | Instr::PushFn(_)
-            | Instr::PushPtr(_)
+            | Instr::PushObject(_)
             | Instr::PushBuiltin(_)
             | Instr::PushStr(_)
             | Instr::Local(_)
@@ -688,7 +688,11 @@ mod tests {
         );
         // "" is falsy, "0" is truthy.
         assert_eq!(
-            peephole(vec![Instr::PushStr(RcStr::from("")), Instr::JFalse(0)], s0(2)).0,
+            peephole(
+                vec![Instr::PushStr(RcStr::from("")), Instr::JFalse(0)],
+                s0(2)
+            )
+            .0,
             vec![Instr::Jump(0)]
         );
         // A non-constant condition is untouched.
