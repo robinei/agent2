@@ -58,7 +58,7 @@ pub type FieldName = RcStr;
 /// Convert a `SmallVec` to a `ThinVec`, copying from the stack allocation.
 /// Used at boundaries where heap storage is required (alloc_array,
 /// alloc_closure, etc.).
-pub(crate) fn small_to_thin(sv: &SmallVec<[StackValue; 16]>) -> ThinVec<StackValue> {
+pub(crate) fn small_to_thin(sv: &SmallVec<[Value; 16]>) -> ThinVec<Value> {
     ThinVec::from(sv.as_slice())
 }
 pub type CodeAddr = u32;
@@ -75,7 +75,7 @@ pub type CellIndex = u32;
 /// refcount and whose drop must release one. Every other variant is a trivial
 /// bit-copy, so `clone()` on a non-string value is as cheap as the old `Copy`.
 #[derive(Clone, Debug, PartialEq)]
-pub enum StackValue {
+pub enum Value {
     Null,
     /// An immutable UTF-8 string, stored inline as a thin refcounted handle
     /// rather than behind a heap index. Cloning (stack dup, local read, pushing
@@ -112,7 +112,7 @@ pub enum StackValue {
     /// A first-class function value: just a code address, with no captured
     /// environment. Covers non-capturing lambdas and named functions passed as
     /// values (dispatch tables, `map`/`filter` callbacks, etc.). Capturing
-    /// lambdas instead become a `StackValue::Closure` (a code address plus a
+    /// lambdas instead become a `Value::Closure` (a code address plus a
     /// captured environment), built by `MakeClosure` and likewise called
     /// through `CallDyn`.
     Fn(CodeAddr),
@@ -151,7 +151,7 @@ pub struct CallFrame {
     /// the callee's upval locals by the prologue `EnterFrame` (after the arg
     /// region is normalized to `nparams`, so the upvals land at the right slots).
     /// Empty for static `Call` and bare-`Fn` calls (no captures).
-    pending_upvals: SmallVec<[StackValue; 8]>,
+    pending_upvals: SmallVec<[Value; 8]>,
     /// Lazily-built, per-frame cache for the `arguments` array (its heap
     /// address). Built on the first `Instr::Arguments` in this frame and reused
     /// by later references, so repeated `arguments` uses don't re-materialize
@@ -162,7 +162,7 @@ pub struct CallFrame {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Closure {
     addr: CodeAddr,
-    upvals: ThinVec<StackValue>,
+    upvals: ThinVec<Value>,
 }
 
 /*
@@ -248,7 +248,7 @@ the compiler's job. A future codegen MUST uphold all of this:
    cell); closures then capture that boxed local.
 
 7. Non-capturing functions stay cheap.
-   A lambda/function with no captures should remain a bare `StackValue::Fn`
+   A lambda/function with no captures should remain a bare `Value::Fn`
    (zero heap allocation). Only emit `MakeClosure` when there is something to
    capture.
 
@@ -258,14 +258,14 @@ identity, and (like `Fn`) have no JSON representation.
 */
 pub struct VM {
     pub code: Vec<Instr>,
-    pub arrays: Vec<ThinVec<StackValue>>,
-    pub objects: Vec<IndexMap<FieldName, StackValue>>,
+    pub arrays: Vec<ThinVec<Value>>,
+    pub objects: Vec<IndexMap<FieldName, Value>>,
     pub closures: Vec<Closure>,
     /// Side table of captured bindings (cells). A `Boxed` local lives here so
-    /// it has identity and outlives its frame; `StackValue::Upval` indexes it.
+    /// it has identity and outlives its frame; `Value::Upval` indexes it.
     /// Grows monotonically (no reclamation), like `heap`.
-    pub cells: Vec<StackValue>,
-    pub stack: Vec<StackValue>, // sp == stack.len()
+    pub cells: Vec<Value>,
+    pub stack: Vec<Value>, // sp == stack.len()
     pub callstack: Vec<CallFrame>,
     pub ip: CodeAddr,
     pub fp: StackAddr,
@@ -343,7 +343,7 @@ pub enum Instr {
 
     // indirect call: the callable sits on top, above its N args (left-to-right,
     // so arg 0 is deepest). The callable is either a bare `Fn` value or a `Ptr`
-    // to a `StackValue::Closure`; pops it and calls with the same convention as
+    // to a `Value::Closure`; pops it and calls with the same convention as
     // Call. For a closure, its captured environment is installed as the
     // callee's leading locals (slots 0..K) before the body runs. Errors if the
     // top value is neither a Fn nor a closure.
@@ -582,7 +582,7 @@ const MAX_JSON_DEPTH: usize = 128;
 pub struct InvokeCall {
     pub name: String,
     /// Arguments in call order (`args[0]` is the first argument).
-    pub args: Vec<StackValue>,
+    pub args: Vec<Value>,
 }
 
 #[derive(Debug)]
@@ -629,11 +629,11 @@ pub(crate) fn float_is_int(n: f64) -> bool {
 /// None for non-numeric values. This is the single coercion point that keeps
 /// `Int` from multiplying the arithmetic match arms: ops just `as_f64` their
 /// operands and always produce `Number`.
-fn as_f64(val: &StackValue) -> Option<f64> {
+fn as_f64(val: &Value) -> Option<f64> {
     match val {
-        StackValue::Number(n) => Some(*n),
-        StackValue::PosInt(u) => Some(*u as f64),
-        StackValue::NegInt(i) => Some(*i as f64),
+        Value::Number(n) => Some(*n),
+        Value::PosInt(u) => Some(*u as f64),
+        Value::NegInt(i) => Some(*i as f64),
         _ => None,
     }
 }
@@ -641,20 +641,17 @@ fn as_f64(val: &StackValue) -> Option<f64> {
 /// Coerce a numeric value to i64 for integer-only ops (mod, bitwise, shifts,
 /// indices). `NegInt` is taken directly; a `PosInt` must fit in i64; a
 /// `Number` must be integer-valued. Returns None otherwise.
-pub(crate) fn as_i64(val: &StackValue) -> Option<i64> {
+pub(crate) fn as_i64(val: &Value) -> Option<i64> {
     match val {
-        StackValue::NegInt(i) => Some(*i),
-        StackValue::PosInt(u) => i64::try_from(*u).ok(),
-        StackValue::Number(n) if float_is_int(*n) => Some(*n as i64),
+        Value::NegInt(i) => Some(*i),
+        Value::PosInt(u) => i64::try_from(*u).ok(),
+        Value::Number(n) if float_is_int(*n) => Some(*n as i64),
         _ => None,
     }
 }
 
-fn is_number(val: &StackValue) -> bool {
-    matches!(
-        val,
-        StackValue::Number(_) | StackValue::PosInt(_) | StackValue::NegInt(_)
-    )
+fn is_number(val: &Value) -> bool {
+    matches!(val, Value::Number(_) | Value::PosInt(_) | Value::NegInt(_))
 }
 
 /// JS `ToNumber` applied to a string, as used when a loose `==` compares a
@@ -674,7 +671,7 @@ fn js_str_to_number(s: &str) -> f64 {
 /// Helper for `loose_equal`: a numeric value vs a string. Coerces the string
 /// with `ToNumber` (`js_str_to_number`) and compares by f64. Non-numeric `num`
 /// (already filtered by the caller's `is_number` guard) yields `false`.
-fn num_loose_eq_str(num: &StackValue, s: &str) -> bool {
+fn num_loose_eq_str(num: &Value, s: &str) -> bool {
     match as_f64(num) {
         Some(a) => a == js_str_to_number(s),
         None => false,
@@ -741,7 +738,7 @@ impl VM {
     /// persistence boundary the host uses to save/restore durable state between
     /// runs.
     pub fn state_to_json(&self) -> Result<serde_json::Value, VMError> {
-        self.stack_value_to_json(&StackValue::Object(0), 0)
+        self.stack_value_to_json(&Value::Object(0), 0)
     }
 
     // ── heap access helpers ──────────────────────────────────────────
@@ -768,23 +765,23 @@ impl VM {
     /// dangling pointer (the heap only ever grows), but a value pushed as a
     /// literal `Array` could be out of range — surface that as an error rather
     /// than panicking and taking down the host.
-    fn array_get(&self, ptr: ArrayPtr) -> Result<&ThinVec<StackValue>, VMError> {
+    fn array_get(&self, ptr: ArrayPtr) -> Result<&ThinVec<Value>, VMError> {
         self.arrays.get(ptr as usize).ok_or(VMError::ValueError)
     }
 
-    pub(crate) fn heap_arr(&self, ptr: ArrayPtr) -> Option<&ThinVec<StackValue>> {
+    pub(crate) fn heap_arr(&self, ptr: ArrayPtr) -> Option<&ThinVec<Value>> {
         self.arrays.get(ptr as usize)
     }
 
-    pub(crate) fn heap_arr_mut(&mut self, ptr: ArrayPtr) -> Option<&mut ThinVec<StackValue>> {
+    pub(crate) fn heap_arr_mut(&mut self, ptr: ArrayPtr) -> Option<&mut ThinVec<Value>> {
         self.arrays.get_mut(ptr as usize)
     }
 
-    pub(crate) fn heap_obj(&self, ptr: ObjectPtr) -> Option<&IndexMap<FieldName, StackValue>> {
+    pub(crate) fn heap_obj(&self, ptr: ObjectPtr) -> Option<&IndexMap<FieldName, Value>> {
         self.objects.get(ptr as usize)
     }
 
-    fn heap_obj_mut(&mut self, ptr: ObjectPtr) -> Option<&mut IndexMap<FieldName, StackValue>> {
+    fn heap_obj_mut(&mut self, ptr: ObjectPtr) -> Option<&mut IndexMap<FieldName, Value>> {
         self.objects.get_mut(ptr as usize)
     }
 
@@ -796,49 +793,49 @@ impl VM {
     /// in `heap`, so this is just a stack push (no heap slot, no growth). The
     /// builtin/string-producing counterpart to `alloc_array`/`alloc_object`.
     pub(crate) fn push_str_value(&mut self, s: impl Into<RcStr>) {
-        self.stack.push(StackValue::String(s.into()));
+        self.stack.push(Value::String(s.into()));
     }
 
-    pub(crate) fn alloc_array(&mut self, arr: ThinVec<StackValue>) -> StackValue {
+    pub(crate) fn alloc_array(&mut self, arr: ThinVec<Value>) -> Value {
         let addr = self.arrays.len() as ArrayPtr;
         self.arrays.push(arr);
-        StackValue::Array(addr)
+        Value::Array(addr)
     }
 
-    fn alloc_object(&mut self, obj: IndexMap<FieldName, StackValue>) -> StackValue {
+    fn alloc_object(&mut self, obj: IndexMap<FieldName, Value>) -> Value {
         let addr = self.objects.len() as ObjectPtr;
         self.objects.push(obj);
-        StackValue::Object(addr)
+        Value::Object(addr)
     }
 
-    fn alloc_closure(&mut self, addr: CodeAddr, upvals: ThinVec<StackValue>) -> StackValue {
+    fn alloc_closure(&mut self, addr: CodeAddr, upvals: ThinVec<Value>) -> Value {
         let idx = self.closures.len() as ClosurePtr;
         self.closures.push(Closure { addr, upvals });
-        StackValue::Closure(idx)
+        Value::Closure(idx)
     }
 
     /// JS truthiness. The falsy set is exactly `false`, `0`/`-0`, `NaN`, `""`,
     /// `null`, and `undefined`; everything else (incl. empty arrays/objects and
     /// the string "0") is truthy. Needs heap access to detect the empty string,
     /// hence a method.
-    fn is_truthy(&self, val: &StackValue) -> bool {
+    fn is_truthy(&self, val: &Value) -> bool {
         match val {
-            StackValue::Bool(b) => *b,
-            StackValue::Null | StackValue::Undefined => false,
-            StackValue::Number(n) => *n != 0.0 && !n.is_nan(),
-            StackValue::PosInt(u) => *u != 0,
+            Value::Bool(b) => *b,
+            Value::Null | Value::Undefined => false,
+            Value::Number(n) => *n != 0.0 && !n.is_nan(),
+            Value::PosInt(u) => *u != 0,
             // NegInt is always negative (i64::MIN..=-1), hence never zero.
-            StackValue::NegInt(_) => true,
+            Value::NegInt(_) => true,
             // Empty string is falsy; any other string is truthy.
-            StackValue::String(s) => !s.as_str().is_empty(),
+            Value::String(s) => !s.as_str().is_empty(),
             // All arrays/objects/closures/functions are truthy.
-            StackValue::Array(_)
-            | StackValue::Object(_)
-            | StackValue::Closure(_)
-            | StackValue::Fn(_)
-            | StackValue::Builtin(_) => true,
+            Value::Array(_)
+            | Value::Object(_)
+            | Value::Closure(_)
+            | Value::Fn(_)
+            | Value::Builtin(_) => true,
             // Internal indirection; never a legitimate operand.
-            StackValue::Upval(_) => false,
+            Value::Upval(_) => false,
         }
     }
 
@@ -848,33 +845,33 @@ impl VM {
     /// first — arrays, objects, closures, functions — which this VM deliberately
     /// does not coerce (see the divergence note on `loose_equal`); arithmetic on
     /// those is a TypeError.
-    pub(crate) fn to_number(&self, val: &StackValue) -> Option<f64> {
+    pub(crate) fn to_number(&self, val: &Value) -> Option<f64> {
         match val {
-            StackValue::Number(n) => Some(*n),
-            StackValue::PosInt(u) => Some(*u as f64),
-            StackValue::NegInt(i) => Some(*i as f64),
-            StackValue::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
-            StackValue::Null => Some(0.0),
-            StackValue::Undefined => Some(f64::NAN),
-            StackValue::String(s) => Some(js_str_to_number(s)),
-            StackValue::Array(_)
-            | StackValue::Object(_)
-            | StackValue::Closure(_)
-            | StackValue::Fn(_)
-            | StackValue::Builtin(_)
-            | StackValue::Upval(_) => None,
+            Value::Number(n) => Some(*n),
+            Value::PosInt(u) => Some(*u as f64),
+            Value::NegInt(i) => Some(*i as f64),
+            Value::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
+            Value::Null => Some(0.0),
+            Value::Undefined => Some(f64::NAN),
+            Value::String(s) => Some(js_str_to_number(s)),
+            Value::Array(_)
+            | Value::Object(_)
+            | Value::Closure(_)
+            | Value::Fn(_)
+            | Value::Builtin(_)
+            | Value::Upval(_) => None,
         }
     }
 
     /// Whether a value is a string (used to pick `+`'s concat vs add path).
-    fn is_string(val: &StackValue) -> bool {
-        matches!(val, StackValue::String(_))
+    fn is_string(val: &Value) -> bool {
+        matches!(val, Value::String(_))
     }
 
     /// Byte length of a string value, if it is one.
-    fn str_byte_len(val: &StackValue) -> Option<usize> {
+    fn str_byte_len(val: &Value) -> Option<usize> {
         match val {
-            StackValue::String(s) => Some(s.len()),
+            Value::String(s) => Some(s.len()),
             _ => None,
         }
     }
@@ -883,37 +880,37 @@ impl VM {
     /// the heap are copied by slicing (zero extra allocation); other types are
     /// converted and appended. Used by `to_js_string` (which wraps a buffer) and
     /// directly by `Add` to avoid intermediate clones.
-    fn write_js_string(&self, val: &StackValue, depth: usize, buf: &mut String) {
+    fn write_js_string(&self, val: &Value, depth: usize, buf: &mut String) {
         if depth > MAX_JSON_DEPTH {
             return;
         }
         match val {
-            StackValue::Undefined => buf.push_str("undefined"),
-            StackValue::Null => buf.push_str("null"),
-            StackValue::Bool(b) => buf.push_str(if *b { "true" } else { "false" }),
-            StackValue::PosInt(u) => buf.push_str(&u.to_string()),
-            StackValue::NegInt(i) => buf.push_str(&i.to_string()),
-            StackValue::Number(n) => buf.push_str(&js_number_to_string(*n)),
-            StackValue::String(s) => buf.push_str(s.as_str()),
-            StackValue::Fn(_) | StackValue::Builtin(_) => {
+            Value::Undefined => buf.push_str("undefined"),
+            Value::Null => buf.push_str("null"),
+            Value::Bool(b) => buf.push_str(if *b { "true" } else { "false" }),
+            Value::PosInt(u) => buf.push_str(&u.to_string()),
+            Value::NegInt(i) => buf.push_str(&i.to_string()),
+            Value::Number(n) => buf.push_str(&js_number_to_string(*n)),
+            Value::String(s) => buf.push_str(s.as_str()),
+            Value::Fn(_) | Value::Builtin(_) => {
                 buf.push_str("function () { [native code] }");
             }
-            StackValue::Upval(_) => {}
-            StackValue::Array(p) => {
+            Value::Upval(_) => {}
+            Value::Array(p) => {
                 if let Some(arr) = self.arrays.get(*p as usize) {
                     for (i, v) in arr.iter().enumerate() {
                         if i > 0 {
                             buf.push_str(",");
                         }
                         match v {
-                            StackValue::Null | StackValue::Undefined => {}
+                            Value::Null | Value::Undefined => {}
                             _ => self.write_js_string(v, depth + 1, buf),
                         }
                     }
                 }
             }
-            StackValue::Object(_) => buf.push_str("[object Object]"),
-            StackValue::Closure(_) => {
+            Value::Object(_) => buf.push_str("[object Object]"),
+            Value::Closure(_) => {
                 buf.push_str("function () { [native code] }");
             }
         }
@@ -921,10 +918,10 @@ impl VM {
 
     /// JS `String(x)` / `ToString`. Delegates to [`write_js_string`], assembling
     /// in a growable `String` and freezing to an immutable `RcStr` once.
-    pub(crate) fn to_js_string(&self, val: &StackValue, depth: usize) -> RcStr {
+    pub(crate) fn to_js_string(&self, val: &Value, depth: usize) -> RcStr {
         // Fast path: an existing string is already an `RcStr` — share it (a
         // refcount bump) instead of copying its bytes through a fresh buffer.
-        if let StackValue::String(s) = val {
+        if let Value::String(s) = val {
             return s.clone();
         }
         let mut out = String::new();
@@ -936,14 +933,14 @@ impl VM {
     /// strings, though heap-allocated here, are primitives and so compare by
     /// *content*. Arrays, objects, and closures compare by *reference identity*
     /// (same heap address) — `{a:1} === {a:1}` is false, as in JS.
-    fn values_equal(&self, lhs: &StackValue, rhs: &StackValue) -> bool {
+    fn values_equal(&self, lhs: &Value, rhs: &Value) -> bool {
         match (lhs, rhs) {
-            (StackValue::Null, StackValue::Null) => true,
+            (Value::Null, Value::Null) => true,
             // Strict (===): undefined equals only itself; undefined !== null.
             // (Loose `null == undefined` would need a separate op; Eq is ===.)
-            (StackValue::Undefined, StackValue::Undefined) => true,
-            (StackValue::Bool(a), StackValue::Bool(b)) => a == b,
-            (StackValue::Number(a), StackValue::Number(b)) => {
+            (Value::Undefined, Value::Undefined) => true,
+            (Value::Bool(a), Value::Bool(b)) => a == b,
+            (Value::Number(a), Value::Number(b)) => {
                 if a.is_nan() && b.is_nan() {
                     false // NaN != NaN per IEEE 754
                 } else {
@@ -954,28 +951,27 @@ impl VM {
             // NegInt never overlap (different sign) so they're never equal.
             // Comparison to Number is by f64 value (so 1 == 1.0); huge ints
             // beyond f64's mantissa are an accepted edge case.
-            (StackValue::PosInt(a), StackValue::PosInt(b)) => a == b,
-            (StackValue::NegInt(a), StackValue::NegInt(b)) => a == b,
-            (StackValue::PosInt(_), StackValue::NegInt(_))
-            | (StackValue::NegInt(_), StackValue::PosInt(_)) => false,
-            (StackValue::PosInt(a), StackValue::Number(b)) => !b.is_nan() && (*a as f64) == *b,
-            (StackValue::Number(a), StackValue::PosInt(b)) => !a.is_nan() && *a == (*b as f64),
-            (StackValue::NegInt(a), StackValue::Number(b)) => !b.is_nan() && (*a as f64) == *b,
-            (StackValue::Number(a), StackValue::NegInt(b)) => !a.is_nan() && *a == (*b as f64),
+            (Value::PosInt(a), Value::PosInt(b)) => a == b,
+            (Value::NegInt(a), Value::NegInt(b)) => a == b,
+            (Value::PosInt(_), Value::NegInt(_)) | (Value::NegInt(_), Value::PosInt(_)) => false,
+            (Value::PosInt(a), Value::Number(b)) => !b.is_nan() && (*a as f64) == *b,
+            (Value::Number(a), Value::PosInt(b)) => !a.is_nan() && *a == (*b as f64),
+            (Value::NegInt(a), Value::Number(b)) => !b.is_nan() && (*a as f64) == *b,
+            (Value::Number(a), Value::NegInt(b)) => !a.is_nan() && *a == (*b as f64),
             // Function values are equal iff they point at the same code address.
-            (StackValue::Fn(a), StackValue::Fn(b)) => a == b,
+            (Value::Fn(a), Value::Fn(b)) => a == b,
             // Builtins compare by identity, like Fn.
-            (StackValue::Builtin(a), StackValue::Builtin(b)) => a == b,
+            (Value::Builtin(a), Value::Builtin(b)) => a == b,
             // Strings are primitives: equal by *content*. `RcStr`'s `==` short-
             // circuits on pointer identity, so comparing shared/interned strings
             // (e.g. two clones of one literal) is O(1).
-            (StackValue::String(a), StackValue::String(b)) => a == b,
+            (Value::String(a), Value::String(b)) => a == b,
             // Same heap address is the same object — JS reference identity, the
             // only equality arrays/objects/closures get (`{a:1} === {a:1}` is
             // false). A correct program never dangles (the heap only grows).
-            (StackValue::Array(p), StackValue::Array(q)) => p == q,
-            (StackValue::Object(p), StackValue::Object(q)) => p == q,
-            (StackValue::Closure(p), StackValue::Closure(q)) => p == q,
+            (Value::Array(p), Value::Array(q)) => p == q,
+            (Value::Object(p), Value::Object(q)) => p == q,
+            (Value::Closure(p), Value::Closure(q)) => p == q,
             _ => false,
         }
     }
@@ -996,8 +992,8 @@ impl VM {
     /// object↔primitive equality is never an intentional pattern in this DSL,
     /// where heap values are data containers; skipping it avoids the
     /// `toString`/`valueOf` machinery and the footguns it brings.
-    fn loose_equal(&self, lhs: &StackValue, rhs: &StackValue) -> bool {
-        use StackValue::*;
+    fn loose_equal(&self, lhs: &Value, rhs: &Value) -> bool {
+        use Value::*;
         // null / undefined: loosely equal to each other, to nothing else.
         let l_nullish = matches!(lhs, Null | Undefined);
         let r_nullish = matches!(rhs, Null | Undefined);
@@ -1018,23 +1014,23 @@ impl VM {
     }
 
     /// Total ordering for comparable types. Returns None for incomparable types.
-    fn compare(&self, lhs: &StackValue, rhs: &StackValue) -> Option<std::cmp::Ordering> {
+    fn compare(&self, lhs: &Value, rhs: &Value) -> Option<std::cmp::Ordering> {
         match (lhs, rhs) {
-            (StackValue::Null, StackValue::Null) => Some(std::cmp::Ordering::Equal),
-            (StackValue::Bool(a), StackValue::Bool(b)) => Some(a.cmp(b)),
-            (StackValue::Number(a), StackValue::Number(b)) => a.partial_cmp(b),
-            (StackValue::PosInt(a), StackValue::PosInt(b)) => Some(a.cmp(b)),
-            (StackValue::NegInt(a), StackValue::NegInt(b)) => Some(a.cmp(b)),
+            (Value::Null, Value::Null) => Some(std::cmp::Ordering::Equal),
+            (Value::Bool(a), Value::Bool(b)) => Some(a.cmp(b)),
+            (Value::Number(a), Value::Number(b)) => a.partial_cmp(b),
+            (Value::PosInt(a), Value::PosInt(b)) => Some(a.cmp(b)),
+            (Value::NegInt(a), Value::NegInt(b)) => Some(a.cmp(b)),
             // Sign decides cross-variant ordering with no value juggling.
-            (StackValue::PosInt(_), StackValue::NegInt(_)) => Some(std::cmp::Ordering::Greater),
-            (StackValue::NegInt(_), StackValue::PosInt(_)) => Some(std::cmp::Ordering::Less),
-            (StackValue::PosInt(a), StackValue::Number(b)) => (*a as f64).partial_cmp(b),
-            (StackValue::Number(a), StackValue::PosInt(b)) => a.partial_cmp(&(*b as f64)),
-            (StackValue::NegInt(a), StackValue::Number(b)) => (*a as f64).partial_cmp(b),
-            (StackValue::Number(a), StackValue::NegInt(b)) => a.partial_cmp(&(*b as f64)),
+            (Value::PosInt(_), Value::NegInt(_)) => Some(std::cmp::Ordering::Greater),
+            (Value::NegInt(_), Value::PosInt(_)) => Some(std::cmp::Ordering::Less),
+            (Value::PosInt(a), Value::Number(b)) => (*a as f64).partial_cmp(b),
+            (Value::Number(a), Value::PosInt(b)) => a.partial_cmp(&(*b as f64)),
+            (Value::NegInt(a), Value::Number(b)) => (*a as f64).partial_cmp(b),
+            (Value::Number(a), Value::NegInt(b)) => a.partial_cmp(&(*b as f64)),
             // Strings order lexicographically by bytes (UTF-8 byte order matches
             // code-point order). Arrays/objects/closures are incomparable.
-            (StackValue::String(a), StackValue::String(b)) => Some(a.cmp(b)),
+            (Value::String(a), Value::String(b)) => Some(a.cmp(b)),
             _ => None,
         }
     }
@@ -1050,7 +1046,7 @@ impl VM {
     /// Pop a value and require it to be a String; return it (a refcount bump).
     fn pop_string(&mut self) -> Result<RcStr, VMError> {
         match self.stack.pop().ok_or(VMError::StackUnderflow)? {
-            StackValue::String(s) => Ok(s),
+            Value::String(s) => Ok(s),
             _ => Err(VMError::TypeError),
         }
     }
@@ -1059,9 +1055,9 @@ impl VM {
     /// to `val` (not the VM), so — unlike when strings lived in the heap — the
     /// caller may freely mutate the VM while it is live. Use for read-only
     /// builtins that push a scalar result without cloning the string.
-    pub(crate) fn str_from<'a>(&self, val: &'a StackValue) -> Result<&'a str, VMError> {
+    pub(crate) fn str_from<'a>(&self, val: &'a Value) -> Result<&'a str, VMError> {
         match val {
-            StackValue::String(s) => Ok(s.as_str()),
+            Value::String(s) => Ok(s.as_str()),
             _ => Err(VMError::TypeError),
         }
     }
@@ -1069,9 +1065,9 @@ impl VM {
     /// Extract an owned `RcStr` from an already-popped string value — a refcount
     /// bump, sharing the same allocation. The clone sibling of `str_from`; use
     /// it when the builtin must retain the string past a borrow of the VM.
-    pub(crate) fn string_from(&self, val: &StackValue) -> Result<RcStr, VMError> {
+    pub(crate) fn string_from(&self, val: &Value) -> Result<RcStr, VMError> {
         match val {
-            StackValue::String(s) => Ok(s.clone()),
+            Value::String(s) => Ok(s.clone()),
             _ => Err(VMError::TypeError),
         }
     }
@@ -1080,23 +1076,23 @@ impl VM {
 
     pub(crate) fn stack_value_to_json(
         &self,
-        val: &StackValue,
+        val: &Value,
         depth: usize,
     ) -> Result<serde_json::Value, VMError> {
         if depth > MAX_JSON_DEPTH {
             return Err(VMError::ValueError);
         }
         Ok(match val {
-            StackValue::Null => serde_json::Value::Null,
-            StackValue::Bool(b) => serde_json::Value::Bool(*b),
+            Value::Null => serde_json::Value::Null,
+            Value::Bool(b) => serde_json::Value::Bool(*b),
             // Integers carry through losslessly — both map onto a native
             // serde_json::Number (this is the whole point of mirroring it).
-            StackValue::PosInt(u) => serde_json::Value::Number(serde_json::Number::from(*u)),
-            StackValue::NegInt(i) => serde_json::Value::Number(serde_json::Number::from(*i)),
+            Value::PosInt(u) => serde_json::Value::Number(serde_json::Number::from(*u)),
+            Value::NegInt(i) => serde_json::Value::Number(serde_json::Number::from(*i)),
             // A function/closure has no JSON representation, and an Upval marker
             // is an internal indirection that should never reach here: fail
             // loudly rather than silently dropping it.
-            StackValue::Fn(_) | StackValue::Builtin(_) | StackValue::Upval(_) => {
+            Value::Fn(_) | Value::Builtin(_) | Value::Upval(_) => {
                 return Err(VMError::ValueError);
             }
             // `undefined` has no JSON form. Like JS `JSON.stringify`, it is
@@ -1104,8 +1100,8 @@ impl VM {
             // at those parent sites below); reaching here means it is the root
             // value, where JS.stringify returns the JS value `undefined` — no
             // JSON — so we surface an error rather than inventing one.
-            StackValue::Undefined => return Err(VMError::ValueError),
-            StackValue::Number(n) => {
+            Value::Undefined => return Err(VMError::ValueError),
+            Value::Number(n) => {
                 // Preserve integer formatting when possible (f64-only VM
                 // internals, but JSON consumers care about int vs float).
                 if float_is_int(*n) && *n >= (i64::MIN as f64) && *n <= (i64::MAX as f64) {
@@ -1119,25 +1115,25 @@ impl VM {
                     }
                 }
             }
-            StackValue::String(s) => serde_json::Value::String(s.as_str().to_owned()),
-            StackValue::Array(p) => {
+            Value::String(s) => serde_json::Value::String(s.as_str().to_owned()),
+            Value::Array(p) => {
                 let arr = self.arrays.get(*p as usize).ok_or(VMError::ValueError)?;
                 serde_json::Value::Array(
                     arr.iter()
                         .map(|v| match v {
                             // JS: `undefined` array slots stringify to `null`.
-                            StackValue::Undefined => Ok(serde_json::Value::Null),
+                            Value::Undefined => Ok(serde_json::Value::Null),
                             _ => self.stack_value_to_json(v, depth + 1),
                         })
                         .collect::<Result<_, _>>()?,
                 )
             }
-            StackValue::Object(p) => {
+            Value::Object(p) => {
                 let obj = self.objects.get(*p as usize).ok_or(VMError::ValueError)?;
                 let mut map = serde_json::Map::new();
                 for (k, v) in obj.iter() {
                     // JS: properties whose value is `undefined` are omitted.
-                    if matches!(v, StackValue::Undefined) {
+                    if matches!(v, Value::Undefined) {
                         continue;
                     }
                     map.insert(
@@ -1148,7 +1144,7 @@ impl VM {
                 serde_json::Value::Object(map)
             }
             // A closure has no JSON representation (see Fn above).
-            StackValue::Closure(_) => return Err(VMError::ValueError),
+            Value::Closure(_) => return Err(VMError::ValueError),
         })
     }
 
@@ -1156,28 +1152,28 @@ impl VM {
         &mut self,
         json: &serde_json::Value,
         depth: usize,
-    ) -> Result<StackValue, VMError> {
+    ) -> Result<Value, VMError> {
         if depth > MAX_JSON_DEPTH {
             return Err(VMError::ValueError);
         }
         Ok(match json {
-            serde_json::Value::Null => StackValue::Null,
-            serde_json::Value::Bool(b) => StackValue::Bool(*b),
+            serde_json::Value::Null => Value::Null,
+            serde_json::Value::Bool(b) => Value::Bool(*b),
             serde_json::Value::Number(n) => {
                 // Mirror serde's own split: non-negative -> PosInt (full u64),
                 // negative -> NegInt, fractions -> Number. Check as_u64 first so
                 // non-negatives become canonical PosInt.
                 if let Some(u) = n.as_u64() {
-                    StackValue::PosInt(u)
+                    Value::PosInt(u)
                 } else if let Some(i) = n.as_i64() {
-                    StackValue::NegInt(i)
+                    Value::NegInt(i)
                 } else {
-                    StackValue::Number(n.as_f64().unwrap_or(0.0))
+                    Value::Number(n.as_f64().unwrap_or(0.0))
                 }
             }
-            serde_json::Value::String(s) => StackValue::String(RcStr::from(s.as_str())),
+            serde_json::Value::String(s) => Value::String(RcStr::from(s.as_str())),
             serde_json::Value::Array(arr) => {
-                let vals: ThinVec<StackValue> = arr
+                let vals: ThinVec<Value> = arr
                     .iter()
                     .map(|v| self.json_to_stack_value(v, depth + 1))
                     .collect::<Result<_, _>>()?;
@@ -1209,7 +1205,7 @@ impl VM {
                 let val = self.stack.pop().ok_or(VMError::StackUnderflow)?;
                 match self.to_number(&val) {
                     Some(n) => {
-                        self.stack.push(StackValue::Number($op(n)));
+                        self.stack.push(Value::Number($op(n)));
                         self.ip += 1;
                     }
                     None => return Err(VMError::TypeError),
@@ -1226,7 +1222,7 @@ impl VM {
                 let lhs = self.stack.pop().ok_or(VMError::StackUnderflow)?;
                 match (self.to_number(&lhs), self.to_number(&rhs)) {
                     (Some(a), Some(b)) => {
-                        self.stack.push(StackValue::Number($op(a, b)));
+                        self.stack.push(Value::Number($op(a, b)));
                         self.ip += 1;
                     }
                     _ => return Err(VMError::TypeError),
@@ -1242,7 +1238,7 @@ impl VM {
                 let lhs = self.stack.pop().ok_or(VMError::StackUnderflow)?;
                 match (as_i64(&lhs), as_i64(&rhs)) {
                     (Some(a), Some(b)) => {
-                        self.stack.push(StackValue::Number($op(a, b) as f64));
+                        self.stack.push(Value::Number($op(a, b) as f64));
                         self.ip += 1;
                     }
                     _ => return Err(VMError::TypeError),
@@ -1259,7 +1255,7 @@ impl VM {
                     .compare(&lhs, &rhs)
                     .map(|ord| ord == std::cmp::Ordering::$expected)
                     .unwrap_or(false);
-                self.stack.push(StackValue::Bool(result));
+                self.stack.push(Value::Bool(result));
                 self.ip += 1;
             }};
         }
@@ -1277,39 +1273,39 @@ impl VM {
             match &self.code[self.ip as usize] {
                 // ── stack manipulation ───────────────────────────
                 Instr::PushNull => {
-                    self.stack.push(StackValue::Null);
+                    self.stack.push(Value::Null);
                     self.ip += 1;
                 }
                 Instr::PushUndefined => {
-                    self.stack.push(StackValue::Undefined);
+                    self.stack.push(Value::Undefined);
                     self.ip += 1;
                 }
                 Instr::PushBool(b) => {
-                    self.stack.push(StackValue::Bool(*b));
+                    self.stack.push(Value::Bool(*b));
                     self.ip += 1;
                 }
                 Instr::PushFloat(f) => {
-                    self.stack.push(StackValue::Number(*f));
+                    self.stack.push(Value::Number(*f));
                     self.ip += 1;
                 }
                 Instr::PushPosInt(u) => {
-                    self.stack.push(StackValue::PosInt(*u));
+                    self.stack.push(Value::PosInt(*u));
                     self.ip += 1;
                 }
                 Instr::PushNegInt(i) => {
-                    self.stack.push(StackValue::NegInt(*i));
+                    self.stack.push(Value::NegInt(*i));
                     self.ip += 1;
                 }
                 Instr::PushFn(addr) => {
-                    self.stack.push(StackValue::Fn(*addr));
+                    self.stack.push(Value::Fn(*addr));
                     self.ip += 1;
                 }
                 Instr::PushObject(h) => {
-                    self.stack.push(StackValue::Object(*h));
+                    self.stack.push(Value::Object(*h));
                     self.ip += 1;
                 }
                 Instr::PushBuiltin(b) => {
-                    self.stack.push(StackValue::Builtin(*b));
+                    self.stack.push(Value::Builtin(*b));
                     self.ip += 1;
                 }
 
@@ -1317,7 +1313,7 @@ impl VM {
                     // A refcount bump sharing the instruction's `RcStr` — no
                     // allocation, no heap slot. Identical literals were interned
                     // at compile time, so they all share one allocation.
-                    self.stack.push(StackValue::String(s.clone()));
+                    self.stack.push(Value::String(s.clone()));
                     self.ip += 1;
                 }
 
@@ -1431,12 +1427,12 @@ impl VM {
                     // Closure (code + captures).
                     let callable = self.stack.pop().ok_or(VMError::StackUnderflow)?;
                     match callable {
-                        StackValue::Builtin(b) => {
+                        Value::Builtin(b) => {
                             // No-frame call: pop args, push result, advance ip.
                             b.call(self, nargs)?;
                             self.ip += 1;
                         }
-                        StackValue::Fn(addr) => {
+                        Value::Fn(addr) => {
                             if addr as usize >= self.code.len() {
                                 return Err(VMError::BadCall);
                             }
@@ -1455,11 +1451,11 @@ impl VM {
                             self.cur_local_count = nargs;
                             self.ip = addr;
                         }
-                        StackValue::Closure(p) => {
+                        Value::Closure(p) => {
                             let closure =
                                 self.closures.get(p as usize).ok_or(VMError::ValueError)?;
                             let addr = closure.addr;
-                            let upvals: SmallVec<[StackValue; 8]> =
+                            let upvals: SmallVec<[Value; 8]> =
                                 closure.upvals.iter().cloned().collect();
                             if addr as usize >= self.code.len() {
                                 return Err(VMError::BadCall);
@@ -1502,7 +1498,7 @@ impl VM {
                     // the ThinVec from self.code. LocalIndex is u32 (Copy).
                     let captures: SmallVec<[LocalIndex; 8]> = captures.iter().copied().collect();
                     let local_count = self.cur_local_count;
-                    let mut upvals: SmallVec<[StackValue; 8]> = SmallVec::new();
+                    let mut upvals: SmallVec<[Value; 8]> = SmallVec::new();
                     for slot in captures {
                         if slot >= local_count {
                             return Err(VMError::BadLocal);
@@ -1535,10 +1531,7 @@ impl VM {
                     // (`keep_below..`) are <= source indices (`ret_start..`), so
                     // a source slot is never read after being overwritten.
                     for i in 0..n {
-                        let v = std::mem::replace(
-                            &mut self.stack[ret_start + i],
-                            StackValue::Undefined,
-                        );
+                        let v = std::mem::replace(&mut self.stack[ret_start + i], Value::Undefined);
                         self.stack[keep_below + i] = v;
                     }
                     self.stack.truncate(keep_below + n);
@@ -1589,7 +1582,7 @@ impl VM {
                     }
                     // Peek: leave the value for the branch that proceeds with it.
                     let val = self.stack.last().ok_or(VMError::StackUnderflow)?;
-                    if !matches!(val, StackValue::Null | StackValue::Undefined) {
+                    if !matches!(val, Value::Null | Value::Undefined) {
                         self.ip = *addr;
                     } else {
                         self.ip += 1;
@@ -1620,13 +1613,12 @@ impl VM {
                         if base + argc as usize > self.stack.len() {
                             return Err(VMError::StackUnderflow);
                         }
-                        let args: SmallVec<[StackValue; 16]> = self.stack
-                            [base..base + argc as usize]
+                        let args: SmallVec<[Value; 16]> = self.stack[base..base + argc as usize]
                             .iter()
                             .cloned()
                             .collect();
                         let arr = self.alloc_array(small_to_thin(&args));
-                        if let StackValue::Array(p) = arr {
+                        if let Value::Array(p) = arr {
                             self.callstack.last_mut().unwrap().arguments_cache = Some(p);
                         }
                     }
@@ -1636,7 +1628,7 @@ impl VM {
                     if self.stack.len() > want {
                         self.stack.truncate(want);
                     } else {
-                        self.stack.resize(want, StackValue::Undefined);
+                        self.stack.resize(want, Value::Undefined);
                     }
                     // 3. Install the closure's captured environment as the upval
                     //    locals, now landing at [fp + nparams, fp + nparams + K).
@@ -1650,11 +1642,11 @@ impl VM {
                     // slot (Boxed → fresh cell + Upval).
                     for kind in &local_kinds {
                         let slot = match kind {
-                            SlotKind::Plain => StackValue::Undefined,
+                            SlotKind::Plain => Value::Undefined,
                             SlotKind::Boxed => {
                                 let idx = self.cells.len() as CellIndex;
-                                self.cells.push(StackValue::Undefined);
-                                StackValue::Upval(idx)
+                                self.cells.push(Value::Undefined);
+                                Value::Upval(idx)
                             }
                         };
                         self.stack.push(slot);
@@ -1672,7 +1664,7 @@ impl VM {
                     // prologue's EnterFrame; the lazy path here serves the root
                     // frame, which has no args).
                     if let Some(ptr) = frame.arguments_cache {
-                        self.stack.push(StackValue::Array(ptr));
+                        self.stack.push(Value::Array(ptr));
                         self.ip += 1;
                         continue;
                     }
@@ -1683,13 +1675,13 @@ impl VM {
                     if base + argc as usize > self.stack.len() {
                         return Err(VMError::StackUnderflow);
                     }
-                    let args: SmallVec<[StackValue; 16]> = self.stack[base..base + argc as usize]
+                    let args: SmallVec<[Value; 16]> = self.stack[base..base + argc as usize]
                         .iter()
                         .cloned()
                         .collect();
                     let arr = self.alloc_array(small_to_thin(&args));
                     let ptr = match arr {
-                        StackValue::Array(p) => p,
+                        Value::Array(p) => p,
                         _ => unreachable!("alloc_array returns an Array"),
                     };
                     self.callstack.last_mut().unwrap().arguments_cache = Some(ptr);
@@ -1704,7 +1696,7 @@ impl VM {
                     // A Boxed slot holds an Upval marker; dereference it so the
                     // value — never the marker — reaches the expression stack.
                     let val = match &self.stack[(self.fp + local) as usize] {
-                        StackValue::Upval(c) => self
+                        Value::Upval(c) => self
                             .cells
                             .get(*c as usize)
                             .ok_or(VMError::ValueError)?
@@ -1724,7 +1716,7 @@ impl VM {
                     // Write through a Boxed slot to its shared cell; a Plain slot
                     // is overwritten in place.
                     match self.stack[slot] {
-                        StackValue::Upval(c) => {
+                        Value::Upval(c) => {
                             *self.cells.get_mut(c as usize).ok_or(VMError::ValueError)? = val;
                         }
                         _ => self.stack[slot] = val,
@@ -1742,7 +1734,7 @@ impl VM {
                     // (assignment is an expression) while still writing to the
                     // local. Replaces Dup; SetLocal.
                     match self.stack[slot] {
-                        StackValue::Upval(c) => {
+                        Value::Upval(c) => {
                             *self.cells.get_mut(c as usize).ok_or(VMError::ValueError)? = val;
                         }
                         _ => self.stack[slot] = val,
@@ -1757,7 +1749,7 @@ impl VM {
                     let slot = (self.fp + local) as usize;
                     // Read the current value, dereferencing an existing Upval.
                     let val = match &self.stack[slot] {
-                        StackValue::Upval(c) => self
+                        Value::Upval(c) => self
                             .cells
                             .get(*c as usize)
                             .ok_or(VMError::ValueError)?
@@ -1768,7 +1760,7 @@ impl VM {
                     // slot at it, so subsequent captures see a per-iteration cell.
                     let idx = self.cells.len() as CellIndex;
                     self.cells.push(val);
-                    self.stack[slot] = StackValue::Upval(idx);
+                    self.stack[slot] = Value::Upval(idx);
                     self.ip += 1;
                 }
 
@@ -1778,7 +1770,7 @@ impl VM {
                     }
                     // Read current value (dereferencing boxed slots).
                     let old = match &self.stack[(self.fp + u32::from(*local)) as usize] {
-                        StackValue::Upval(c) => self
+                        Value::Upval(c) => self
                             .cells
                             .get(*c as usize)
                             .ok_or(VMError::ValueError)?
@@ -1788,19 +1780,19 @@ impl VM {
                     let old_num = self.to_number(&old).ok_or(VMError::TypeError)?;
                     // Compute new value: subtract p (p = -1 for ++, p = 1 for --).
                     let new_num = old_num - *p;
-                    let new_val = StackValue::Number(new_num);
+                    let new_val = Value::Number(new_num);
                     // Store the new value.
                     let slot = (self.fp + u32::from(*local)) as usize;
                     match self.stack[slot] {
-                        StackValue::Upval(c) => {
+                        Value::Upval(c) => {
                             *self.cells.get_mut(c as usize).ok_or(VMError::ValueError)? = new_val;
                         }
                         _ => self.stack[slot] = new_val,
                     }
                     // Push the appropriate result: old for postfix, new for prefix.
                     let result = match mode {
-                        UpdateMode::Prefix => StackValue::Number(new_num),
-                        UpdateMode::Postfix => StackValue::Number(old_num),
+                        UpdateMode::Prefix => Value::Number(new_num),
+                        UpdateMode::Postfix => Value::Number(old_num),
                     };
                     self.stack.push(result);
                     self.ip += 1;
@@ -1812,18 +1804,16 @@ impl VM {
                     // JS typeof tags. Note the coarseness: null/array/object all
                     // report "object"; int and float both "number".
                     let tag = match val {
-                        StackValue::Undefined => "undefined",
-                        StackValue::Null => "object",
-                        StackValue::Bool(_) => "boolean",
-                        StackValue::Number(_) | StackValue::PosInt(_) | StackValue::NegInt(_) => {
-                            "number"
-                        }
-                        StackValue::String(_) => "string",
-                        StackValue::Fn(_) | StackValue::Builtin(_) => "function",
-                        StackValue::Array(_) | StackValue::Object(_) => "object",
-                        StackValue::Closure(_) => "function",
+                        Value::Undefined => "undefined",
+                        Value::Null => "object",
+                        Value::Bool(_) => "boolean",
+                        Value::Number(_) | Value::PosInt(_) | Value::NegInt(_) => "number",
+                        Value::String(_) => "string",
+                        Value::Fn(_) | Value::Builtin(_) => "function",
+                        Value::Array(_) | Value::Object(_) => "object",
+                        Value::Closure(_) => "function",
                         // Internal indirection; never a legitimate operand.
-                        StackValue::Upval(_) => return Err(VMError::ValueError),
+                        Value::Upval(_) => return Err(VMError::ValueError),
                     };
                     self.push_str_value(tag);
                     self.ip += 1;
@@ -1832,42 +1822,40 @@ impl VM {
                 // ── type predicates ─────────────────────────────
                 Instr::IsNull => {
                     let val = self.stack.pop().ok_or(VMError::StackUnderflow)?;
-                    self.stack
-                        .push(StackValue::Bool(matches!(val, StackValue::Null)));
+                    self.stack.push(Value::Bool(matches!(val, Value::Null)));
                     self.ip += 1;
                 }
                 Instr::IsBool => {
                     let val = self.stack.pop().ok_or(VMError::StackUnderflow)?;
-                    self.stack
-                        .push(StackValue::Bool(matches!(val, StackValue::Bool(_))));
+                    self.stack.push(Value::Bool(matches!(val, Value::Bool(_))));
                     self.ip += 1;
                 }
                 Instr::IsFloat => {
                     // True only for a Number with a fractional part (an Int is
                     // never a float). Use IsNum to test "is any number".
                     let val = self.stack.pop().ok_or(VMError::StackUnderflow)?;
-                    let is_float = matches!(val, StackValue::Number(n) if !float_is_int(n));
-                    self.stack.push(StackValue::Bool(is_float));
+                    let is_float = matches!(val, Value::Number(n) if !float_is_int(n));
+                    self.stack.push(Value::Bool(is_float));
                     self.ip += 1;
                 }
                 Instr::IsNum => {
                     let val = self.stack.pop().ok_or(VMError::StackUnderflow)?;
-                    self.stack.push(StackValue::Bool(matches!(
+                    self.stack.push(Value::Bool(matches!(
                         val,
-                        StackValue::Number(_) | StackValue::PosInt(_) | StackValue::NegInt(_)
+                        Value::Number(_) | Value::PosInt(_) | Value::NegInt(_)
                     )));
                     self.ip += 1;
                 }
                 Instr::IsStr => {
                     let val = self.stack.pop().ok_or(VMError::StackUnderflow)?;
-                    let is_str = matches!(val, StackValue::String(_));
-                    self.stack.push(StackValue::Bool(is_str));
+                    let is_str = matches!(val, Value::String(_));
+                    self.stack.push(Value::Bool(is_str));
                     self.ip += 1;
                 }
                 Instr::IsObj => {
                     let val = self.stack.pop().ok_or(VMError::StackUnderflow)?;
-                    let is_obj = matches!(val, StackValue::Object(_));
-                    self.stack.push(StackValue::Bool(is_obj));
+                    let is_obj = matches!(val, Value::Object(_));
+                    self.stack.push(Value::Bool(is_obj));
                     self.ip += 1;
                 }
 
@@ -1876,7 +1864,7 @@ impl VM {
 
                 Instr::Not => {
                     let val = self.stack.pop().ok_or(VMError::StackUnderflow)?;
-                    self.stack.push(StackValue::Bool(!self.is_truthy(&val)));
+                    self.stack.push(Value::Bool(!self.is_truthy(&val)));
                     self.ip += 1;
                 }
 
@@ -1884,7 +1872,7 @@ impl VM {
                     let val = self.stack.pop().ok_or(VMError::StackUnderflow)?;
                     match as_i64(&val) {
                         Some(i) => {
-                            self.stack.push(StackValue::Number(!i as f64));
+                            self.stack.push(Value::Number(!i as f64));
                             self.ip += 1;
                         }
                         None => return Err(VMError::TypeError),
@@ -1909,10 +1897,10 @@ impl VM {
                         let mut s = String::with_capacity(cap);
                         self.write_js_string(&lhs, 0, &mut s);
                         self.write_js_string(&rhs, 0, &mut s);
-                        StackValue::String(RcStr::from(s))
+                        Value::String(RcStr::from(s))
                     } else {
                         match (self.to_number(&lhs), self.to_number(&rhs)) {
-                            (Some(a), Some(b)) => StackValue::Number(a + b),
+                            (Some(a), Some(b)) => Value::Number(a + b),
                             _ => return Err(VMError::TypeError),
                         }
                     };
@@ -1933,29 +1921,25 @@ impl VM {
                 Instr::Eq => {
                     let rhs = self.stack.pop().ok_or(VMError::StackUnderflow)?;
                     let lhs = self.stack.pop().ok_or(VMError::StackUnderflow)?;
-                    self.stack
-                        .push(StackValue::Bool(self.values_equal(&lhs, &rhs)));
+                    self.stack.push(Value::Bool(self.values_equal(&lhs, &rhs)));
                     self.ip += 1;
                 }
                 Instr::Neq => {
                     let rhs = self.stack.pop().ok_or(VMError::StackUnderflow)?;
                     let lhs = self.stack.pop().ok_or(VMError::StackUnderflow)?;
-                    self.stack
-                        .push(StackValue::Bool(!self.values_equal(&lhs, &rhs)));
+                    self.stack.push(Value::Bool(!self.values_equal(&lhs, &rhs)));
                     self.ip += 1;
                 }
                 Instr::LooseEq => {
                     let rhs = self.stack.pop().ok_or(VMError::StackUnderflow)?;
                     let lhs = self.stack.pop().ok_or(VMError::StackUnderflow)?;
-                    self.stack
-                        .push(StackValue::Bool(self.loose_equal(&lhs, &rhs)));
+                    self.stack.push(Value::Bool(self.loose_equal(&lhs, &rhs)));
                     self.ip += 1;
                 }
                 Instr::LooseNeq => {
                     let rhs = self.stack.pop().ok_or(VMError::StackUnderflow)?;
                     let lhs = self.stack.pop().ok_or(VMError::StackUnderflow)?;
-                    self.stack
-                        .push(StackValue::Bool(!self.loose_equal(&lhs, &rhs)));
+                    self.stack.push(Value::Bool(!self.loose_equal(&lhs, &rhs)));
                     self.ip += 1;
                 }
 
@@ -1968,7 +1952,7 @@ impl VM {
                         .compare(&lhs, &rhs)
                         .map(|ord| ord != std::cmp::Ordering::Greater)
                         .unwrap_or(false);
-                    self.stack.push(StackValue::Bool(result));
+                    self.stack.push(Value::Bool(result));
                     self.ip += 1;
                 }
                 Instr::GtEq => {
@@ -1978,7 +1962,7 @@ impl VM {
                         .compare(&lhs, &rhs)
                         .map(|ord| ord != std::cmp::Ordering::Less)
                         .unwrap_or(false);
-                    self.stack.push(StackValue::Bool(result));
+                    self.stack.push(Value::Bool(result));
                     self.ip += 1;
                 }
 
@@ -2008,7 +1992,7 @@ impl VM {
                     if !(0..64).contains(&b) {
                         return Err(VMError::ValueError);
                     }
-                    self.stack.push(StackValue::Number((a << b) as f64));
+                    self.stack.push(Value::Number((a << b) as f64));
                     self.ip += 1;
                 }
                 Instr::BitRhs => {
@@ -2017,7 +2001,7 @@ impl VM {
                     if !(0..64).contains(&b) {
                         return Err(VMError::ValueError);
                     }
-                    self.stack.push(StackValue::Number((a >> b) as f64));
+                    self.stack.push(Value::Number((a >> b) as f64));
                     self.ip += 1;
                 }
 
@@ -2028,7 +2012,7 @@ impl VM {
                         return Err(VMError::StackUnderflow);
                     }
                     let split = self.stack.len() - n;
-                    let vals: SmallVec<[StackValue; 16]> = self.stack.drain(split..).collect();
+                    let vals: SmallVec<[Value; 16]> = self.stack.drain(split..).collect();
                     let mut obj = IndexMap::new();
                     // Left-to-right: field 0's value is the deepest (first
                     // pushed), so values line up with fields in order. `field`
@@ -2047,13 +2031,13 @@ impl VM {
                     // use field_str (which borrows self.code) for the lookup
                     // without cloning.
                     let obj_ptr = match self.stack.last() {
-                        Some(StackValue::Object(p)) => *p,
+                        Some(Value::Object(p)) => *p,
                         _ => return Err(VMError::TypeError),
                     };
                     // JS: a missing property reads as `undefined`, not `null`.
                     let val = match self.objects.get(obj_ptr as usize) {
-                        Some(obj) => obj.get(field_str).cloned().unwrap_or(StackValue::Undefined),
-                        _ => StackValue::Undefined,
+                        Some(obj) => obj.get(field_str).cloned().unwrap_or(Value::Undefined),
+                        _ => Value::Undefined,
                     };
                     self.stack.pop(); // discard the object pointer
                     self.stack.push(val);
@@ -2066,7 +2050,7 @@ impl VM {
                     // Stack: [..., obj_ptr, val] (val on top).
                     let val = self.stack.pop().ok_or(VMError::StackUnderflow)?;
                     let obj_ptr = match self.stack.last() {
-                        Some(StackValue::Object(p)) => *p,
+                        Some(Value::Object(p)) => *p,
                         _ => return Err(VMError::TypeError),
                     };
                     let obj = match self.objects.get_mut(obj_ptr as usize) {
@@ -2077,7 +2061,7 @@ impl VM {
                     // get_mut (avoids cloning the key when it already exists).
                     let result = match mode {
                         SetMode::Old => {
-                            let old = obj.get(field_str).cloned().unwrap_or(StackValue::Undefined);
+                            let old = obj.get(field_str).cloned().unwrap_or(Value::Undefined);
                             if let Some(slot) = obj.get_mut(field_str) {
                                 *slot = val;
                             } else {
@@ -2113,7 +2097,7 @@ impl VM {
                         // String char-indexing: strings are inline values now, so
                         // this no longer routes through the heap. The single-char
                         // result is a fresh `RcStr`.
-                        StackValue::String(s) => {
+                        Value::String(s) => {
                             let s = s.as_str();
                             let idx = as_i64(&key).ok_or(VMError::TypeError)?;
                             if idx < 0 {
@@ -2122,33 +2106,29 @@ impl VM {
                             let idx = idx as usize;
                             if idx >= s.len() {
                                 // JS: an out-of-range char index is `undefined`.
-                                StackValue::Undefined
+                                Value::Undefined
                             } else if !s.is_char_boundary(idx) {
                                 return Err(VMError::ValueError);
                             } else {
                                 let ch = s[idx..].chars().next().unwrap();
-                                StackValue::String(RcStr::from(ch.to_string()))
+                                Value::String(RcStr::from(ch.to_string()))
                             }
                         }
-                        StackValue::Array(p) => {
+                        Value::Array(p) => {
                             let arr = self.arrays.get(*p as usize).ok_or(VMError::ValueError)?;
                             let idx = as_i64(&key).ok_or(VMError::TypeError)?;
                             if idx < 0 {
                                 return Err(VMError::ValueError);
                             }
                             // JS: an out-of-bounds index reads as `undefined`.
-                            arr.get(idx as usize)
-                                .cloned()
-                                .unwrap_or(StackValue::Undefined)
+                            arr.get(idx as usize).cloned().unwrap_or(Value::Undefined)
                         }
-                        StackValue::Object(p) => {
+                        Value::Object(p) => {
                             let obj = self.objects.get(*p as usize).ok_or(VMError::ValueError)?;
                             // JS coerces a computed key with ToString.
                             let field = self.to_js_string(&key, 0);
                             // JS: a missing property reads as `undefined`.
-                            obj.get(field.as_str())
-                                .cloned()
-                                .unwrap_or(StackValue::Undefined)
+                            obj.get(field.as_str()).cloned().unwrap_or(Value::Undefined)
                         }
                         _ => return Err(VMError::TypeError),
                     };
@@ -2165,8 +2145,8 @@ impl VM {
                     let key = self.stack.pop().ok_or(VMError::StackUnderflow)?;
                     let container = self.stack.pop().ok_or(VMError::StackUnderflow)?;
                     let is_array = match &container {
-                        StackValue::Array(_) => true,
-                        StackValue::Object(_) => false,
+                        Value::Array(_) => true,
+                        Value::Object(_) => false,
                         // Strings are immutable; closures aren't indexable.
                         _ => return Err(VMError::TypeError),
                     };
@@ -2179,26 +2159,26 @@ impl VM {
                                 return Err(VMError::ValueError);
                             }
                             match &container {
-                                StackValue::Array(p) => self
+                                Value::Array(p) => self
                                     .arrays
                                     .get(*p as usize)
                                     .and_then(|a| a.get(idx as usize).cloned())
-                                    .unwrap_or(StackValue::Undefined),
+                                    .unwrap_or(Value::Undefined),
                                 _ => unreachable!(),
                             }
                         } else {
                             let field = self.to_js_string(&key, 0);
                             match &container {
-                                StackValue::Object(p) => self
+                                Value::Object(p) => self
                                     .objects
                                     .get(*p as usize)
                                     .and_then(|o| o.get(field.as_str()).cloned())
-                                    .unwrap_or(StackValue::Undefined),
+                                    .unwrap_or(Value::Undefined),
                                 _ => unreachable!(),
                             }
                         }
                     } else {
-                        StackValue::Undefined // placeholder, unused
+                        Value::Undefined // placeholder, unused
                     };
                     // The value left on the stack: the assigned value (`New`) or
                     // the previous one (`Old`). Computed before the store, which
@@ -2214,7 +2194,7 @@ impl VM {
                         }
                         let idx = idx as usize;
                         let p = match &container {
-                            StackValue::Array(p) => *p,
+                            Value::Array(p) => *p,
                             _ => unreachable!(),
                         };
                         let arr = self.arrays.get_mut(p as usize).ok_or(VMError::TypeError)?;
@@ -2225,7 +2205,7 @@ impl VM {
                     } else {
                         let field = self.to_js_string(&key, 0);
                         let p = match &container {
-                            StackValue::Object(p) => *p,
+                            Value::Object(p) => *p,
                             _ => unreachable!(),
                         };
                         let obj = self.objects.get_mut(p as usize).ok_or(VMError::TypeError)?;
@@ -2238,7 +2218,7 @@ impl VM {
                 Instr::ObjHas => {
                     let field = self.pop_string()?;
                     let obj_ptr = match self.stack.pop().ok_or(VMError::StackUnderflow)? {
-                        StackValue::Object(p) => p,
+                        Value::Object(p) => p,
                         _ => return Err(VMError::TypeError),
                     };
                     let has = self
@@ -2246,14 +2226,14 @@ impl VM {
                         .get(obj_ptr as usize)
                         .ok_or(VMError::TypeError)?
                         .contains_key(field.as_str());
-                    self.stack.push(StackValue::Bool(has));
+                    self.stack.push(Value::Bool(has));
                     self.ip += 1;
                 }
 
                 Instr::ObjDelete => {
                     let field = self.pop_string()?;
                     let obj_ptr = match self.stack.pop().ok_or(VMError::StackUnderflow)? {
-                        StackValue::Object(p) => p,
+                        Value::Object(p) => p,
                         _ => return Err(VMError::TypeError),
                     };
                     // shift_remove keeps the remaining keys in insertion order.
@@ -2263,7 +2243,7 @@ impl VM {
                         .ok_or(VMError::TypeError)?
                         .shift_remove(field.as_str())
                         .is_some();
-                    self.stack.push(StackValue::Bool(existed));
+                    self.stack.push(Value::Bool(existed));
                     self.ip += 1;
                 }
 
@@ -2275,7 +2255,7 @@ impl VM {
                     }
                     let split = self.stack.len() - n;
                     // Left-to-right: first pushed becomes element 0.
-                    let vals: SmallVec<[StackValue; 16]> = self.stack.drain(split..).collect();
+                    let vals: SmallVec<[Value; 16]> = self.stack.drain(split..).collect();
                     let arr_ptr = self.alloc_array(small_to_thin(&vals));
                     self.stack.push(arr_ptr);
                     self.ip += 1;
@@ -2286,27 +2266,27 @@ impl VM {
                     let len = match val {
                         // String length is in UTF-8 *bytes* (consistent with the
                         // byte-offset string ops below).
-                        StackValue::String(s) => s.len(),
-                        StackValue::Array(p) => self
+                        Value::String(s) => s.len(),
+                        Value::Array(p) => self
                             .arrays
                             .get(p as usize)
                             .ok_or(VMError::ValueError)?
                             .len(),
-                        StackValue::Object(p) => self
+                        Value::Object(p) => self
                             .objects
                             .get(p as usize)
                             .ok_or(VMError::ValueError)?
                             .len(),
                         _ => return Err(VMError::TypeError),
                     };
-                    self.stack.push(StackValue::Number(len as f64));
+                    self.stack.push(Value::Number(len as f64));
                     self.ip += 1;
                 }
 
                 Instr::ToStr => {
                     let val = self.stack.pop().ok_or(VMError::StackUnderflow)?;
                     let s = self.to_js_string(&val, 0);
-                    self.stack.push(StackValue::String(s));
+                    self.stack.push(Value::String(s));
                     self.ip += 1;
                 }
 
@@ -2315,7 +2295,7 @@ impl VM {
                     // array/object/function has no numeric form (TypeError).
                     let val = self.stack.pop().ok_or(VMError::StackUnderflow)?;
                     match self.to_number(&val) {
-                        Some(num) => self.stack.push(StackValue::Number(num)),
+                        Some(num) => self.stack.push(Value::Number(num)),
                         None => return Err(VMError::TypeError),
                     }
                     self.ip += 1;
@@ -2323,7 +2303,7 @@ impl VM {
 
                 Instr::ToBool => {
                     let val = self.stack.pop().ok_or(VMError::StackUnderflow)?;
-                    self.stack.push(StackValue::Bool(self.is_truthy(&val)));
+                    self.stack.push(Value::Bool(self.is_truthy(&val)));
                     self.ip += 1;
                 }
 
@@ -2392,7 +2372,7 @@ mod tests {
     // ── harness ──────────────────────────────────────────────────
 
     /// Run code in a fresh VM (no initial heap) to completion; return final stack.
-    fn run(code: Vec<Instr>) -> Vec<StackValue> {
+    fn run(code: Vec<Instr>) -> Vec<Value> {
         let mut vm = VM::new(code);
         loop {
             match vm.step().unwrap() {
@@ -2433,41 +2413,41 @@ mod tests {
 
     // ── helpers ───────────────────────────────────────────────────
 
-    fn n(v: f64) -> StackValue {
-        StackValue::Number(v)
+    fn n(v: f64) -> Value {
+        Value::Number(v)
     }
     /// Canonical integer value: non-negative -> PosInt, negative -> NegInt.
-    fn i(v: i64) -> StackValue {
+    fn i(v: i64) -> Value {
         if v < 0 {
-            StackValue::NegInt(v)
+            Value::NegInt(v)
         } else {
-            StackValue::PosInt(v as u64)
+            Value::PosInt(v as u64)
         }
     }
     /// A PosInt directly (for values above i64::MAX).
-    fn u(v: u64) -> StackValue {
-        StackValue::PosInt(v)
+    fn u(v: u64) -> Value {
+        Value::PosInt(v)
     }
     /// A function value pointing at a code address.
-    fn f(addr: u32) -> StackValue {
-        StackValue::Fn(addr)
+    fn f(addr: u32) -> Value {
+        Value::Fn(addr)
     }
-    fn b(v: bool) -> StackValue {
-        StackValue::Bool(v)
+    fn b(v: bool) -> Value {
+        Value::Bool(v)
     }
-    fn null() -> StackValue {
-        StackValue::Null
+    fn null() -> Value {
+        Value::Null
     }
-    fn undef() -> StackValue {
-        StackValue::Undefined
+    fn undef() -> Value {
+        Value::Undefined
     }
     /// Object value at the given address.
-    fn s(addr: u32) -> StackValue {
-        StackValue::Object(addr)
+    fn s(addr: u32) -> Value {
+        Value::Object(addr)
     }
     /// A string value (strings are inline now, not heap pointers).
-    fn str_v(val: &str) -> StackValue {
-        StackValue::String(RcStr::from(val))
+    fn str_v(val: &str) -> Value {
+        Value::String(RcStr::from(val))
     }
     /// `n` plain (unboxed) local slots, for `EnterFrame`.
     fn plain(n: usize) -> Vec<SlotKind> {
@@ -2712,11 +2692,11 @@ mod tests {
         // JS: x/0 -> ±Infinity, 0/0 -> NaN (never an error).
         assert!(matches!(
             run(vec![PushFloat(1.0), PushFloat(0.0), Div]).as_slice(),
-            [StackValue::Number(x)] if x.is_infinite() && *x > 0.0
+            [Value::Number(x)] if x.is_infinite() && *x > 0.0
         ));
         assert!(matches!(
             run(vec![PushFloat(0.0), PushFloat(0.0), Div]).as_slice(),
-            [StackValue::Number(x)] if x.is_nan()
+            [Value::Number(x)] if x.is_nan()
         ));
     }
 
@@ -2735,7 +2715,7 @@ mod tests {
         // x % 0 -> NaN, not an error.
         assert!(matches!(
             run(vec![PushFloat(1.0), PushFloat(0.0), Mod]).as_slice(),
-            [StackValue::Number(x)] if x.is_nan()
+            [Value::Number(x)] if x.is_nan()
         ));
     }
 
@@ -2753,7 +2733,7 @@ mod tests {
     /// ArrJoin).
     fn run_last_str(code: Vec<Instr>) -> String {
         match run(code).last() {
-            Some(StackValue::String(s)) => s.as_str().to_owned(),
+            Some(Value::String(s)) => s.as_str().to_owned(),
             other => panic!("expected a string result, got {other:?}"),
         }
     }
@@ -2788,12 +2768,12 @@ mod tests {
         // undefined -> NaN propagates.
         assert!(matches!(
             run(vec![PushUndefined, PushFloat(1.0), Sub]).as_slice(),
-            [StackValue::Number(x)] if x.is_nan()
+            [Value::Number(x)] if x.is_nan()
         ));
         // An unparseable string -> NaN.
         assert!(matches!(
             run(vec![ps("abc"), PushFloat(1.0), Mul]).as_slice(),
-            [StackValue::Number(x)] if x.is_nan()
+            [Value::Number(x)] if x.is_nan()
         ));
     }
 
@@ -2830,7 +2810,7 @@ mod tests {
         assert_eq!(run(vec![PushNull, ToNum]), vec![n(0.0)]);
         assert!(matches!(
             run(vec![PushUndefined, ToNum]).as_slice(),
-            [StackValue::Number(x)] if x.is_nan()
+            [Value::Number(x)] if x.is_nan()
         ));
         // An array/object has no numeric form.
         assert!(matches!(
@@ -3170,7 +3150,7 @@ mod tests {
         ]);
         while !matches!(vm.step().unwrap(), StepResult::Done) {}
         match vm.stack.as_slice() {
-            [StackValue::Array(p)] => {
+            [Value::Array(p)] => {
                 let a = &vm.arrays[*p as usize];
                 assert_eq!(a, &vec![n(10.0), n(20.0), n(30.0)]);
             }
@@ -3289,7 +3269,7 @@ mod tests {
         code[call2] = Call(mc, 0);
 
         let vm = run_vm(code);
-        let StackValue::Array(p) = vm.stack[0] else {
+        let Value::Array(p) = vm.stack[0] else {
             panic!("expected array pointer");
         };
         assert_eq!(vm.arrays[p as usize].as_slice(), &[n(1.0), n(2.0), n(1.0)]);
@@ -3689,7 +3669,7 @@ mod tests {
     #[test]
     fn typeof_tags() {
         // typeof returns JS strings; check each via a heap-string comparison.
-        let cases: &[(StackValue, &str)] = &[
+        let cases: &[(Value, &str)] = &[
             (undef(), "undefined"),
             (null(), "object"),
             (b(true), "boolean"),
@@ -3699,13 +3679,13 @@ mod tests {
         ];
         for (val, tag) in cases {
             let instr = match val {
-                StackValue::Undefined => PushUndefined,
-                StackValue::Null => PushNull,
-                StackValue::Bool(b) => PushBool(*b),
-                StackValue::Number(f) => PushFloat(*f),
-                StackValue::PosInt(u) => PushPosInt(*u),
-                StackValue::NegInt(i) => PushNegInt(*i),
-                StackValue::Fn(a) => PushFn(*a),
+                Value::Undefined => PushUndefined,
+                Value::Null => PushNull,
+                Value::Bool(b) => PushBool(*b),
+                Value::Number(f) => PushFloat(*f),
+                Value::PosInt(u) => PushPosInt(*u),
+                Value::NegInt(i) => PushNegInt(*i),
+                Value::Fn(a) => PushFn(*a),
                 _ => panic!("unexpected stack value"),
             };
             let out = run(vec![instr, TypeOf, ps(tag), Eq]);
@@ -4143,13 +4123,13 @@ mod tests {
         // 1. How many allocs to materialize one string value? One: the single
         //    `RcStr` block (header + bytes).
         alloc_counter::reset();
-        let _s = StackValue::String(RcStr::from("x"));
+        let _s = Value::String(RcStr::from("x"));
         let per_string = alloc_counter::count();
         eprintln!("  RcStr::from: {per_string}");
 
         // 2. How many allocs for to_js_string on a string value? Zero — the fast
         //    path clones the existing `RcStr` (a refcount bump).
-        let v = StackValue::String(RcStr::from("hello"));
+        let v = Value::String(RcStr::from("hello"));
         let vm = VM::new(vec![]);
         alloc_counter::reset();
         let _ = vm.to_js_string(&v, 0);
@@ -4197,7 +4177,7 @@ mod tests {
         {
             let mut vm = VM::new(vec![]);
             for _ in 0..10 {
-                vm.stack.push(StackValue::Null);
+                vm.stack.push(Value::Null);
             }
         }
         let stack_growth = alloc_counter::count();

@@ -21,7 +21,7 @@
 //! bare `Jump` exposes threading for cfg; cfg pruning exposes adjacencies for
 //! peephole), so [`optimize`] iterates the trio to a fixpoint.
 
-use crate::vm::{Instr, StackValue, StepResult, VM};
+use crate::vm::{Instr, StepResult, VM, Value};
 
 /// Compiler entry point: optimize the label-form code, then resolve labels.
 pub(crate) fn finalize(
@@ -356,15 +356,15 @@ fn pe_fold_arity(op: &Instr) -> Option<usize> {
 /// `None` for values that aren't compile-time constants (heap pointers,
 /// functions, builtins). A folded `Number` stays `PushFloat` — never re-
 /// canonicalized to an int — so it matches what the op produced at runtime.
-fn pe_value_to_push(v: &StackValue) -> Option<Instr> {
+fn pe_value_to_push(v: &Value) -> Option<Instr> {
     Some(match v {
-        StackValue::Null => Instr::PushNull,
-        StackValue::Undefined => Instr::PushUndefined,
-        StackValue::Bool(b) => Instr::PushBool(*b),
-        StackValue::PosInt(u) => Instr::PushPosInt(*u),
-        StackValue::NegInt(i) => Instr::PushNegInt(*i),
-        StackValue::Number(n) => Instr::PushFloat(*n),
-        StackValue::String(s) => Instr::PushStr(s.clone()),
+        Value::Null => Instr::PushNull,
+        Value::Undefined => Instr::PushUndefined,
+        Value::Bool(b) => Instr::PushBool(*b),
+        Value::PosInt(u) => Instr::PushPosInt(*u),
+        Value::NegInt(i) => Instr::PushNegInt(*i),
+        Value::Number(n) => Instr::PushFloat(*n),
+        Value::String(s) => Instr::PushStr(s.clone()),
         _ => return None,
     })
 }

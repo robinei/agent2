@@ -19,7 +19,7 @@ between phases (see Phase 0).
   string builtins always allocate a *new* `HeapValue::String`; grep confirms no
   in-place mutation). This is what makes Phase 3 (skip revalidation) and Phase 4
   (share/intern constant strings) sound.
-- **`StackValue` is `Copy` and 16 bytes.** Reading args by value off the stack
+- **`Value` is `Copy` and 16 bytes.** Reading args by value off the stack
   is cheap and releases the borrow on `vm.stack`, which is what lets Phase 1
   read args directly then call `&mut self` heap allocators.
 - **`heap[0]` is always the `state` object** (a placeholder is pushed even when
@@ -70,11 +70,11 @@ hand-written tests.
 
 ## Phase 1 — Builtins read args from the stack (no arg `Vec`)
 
-**Target:** `pop_args` (`builtin.rs:299`) allocates a `Vec<StackValue>` on
+**Target:** `pop_args` (`builtin.rs:299`) allocates a `Vec<Value>` on
 *every* builtin call. In a hot loop (`Math.abs`, `arr.push`, …) that's one heap
 alloc per call. Eliminate it.
 
-**Design.** Since `StackValue: Copy`, a builtin can copy the few args it needs
+**Design.** Since `Value: Copy`, a builtin can copy the few args it needs
 out by value, truncate the stack to drop the arg region, then do its work
 (including `&mut self` heap allocation) with no outstanding borrow.
 
@@ -85,9 +85,9 @@ Replace `pop_args` with two helpers:
 fn arg_base(vm: &VM, argc: u32) -> Result<usize, VMError>;
 
 /// Copy the top `argc` args into a fixed array (for fixed-arity builtins) and
-/// truncate the stack. `StackValue: Copy`, so this is a memcpy of ≤N*16 bytes,
+/// truncate the stack. `Value: Copy`, so this is a memcpy of ≤N*16 bytes,
 /// no heap allocation. Min arity is already guaranteed by `Builtin::call`.
-fn take_args<const N: usize>(vm: &mut VM, argc: u32) -> Result<[StackValue; N], VMError>;
+fn take_args<const N: usize>(vm: &mut VM, argc: u32) -> Result<[Value; N], VMError>;
 ```
 
 - **Fixed-arity builtins** (the majority: math ops, `str_slice`, `str_trim`,
@@ -121,8 +121,8 @@ Sites:
   regions: build the `ThinVec` directly from the slice instead of
   `.to_vec()`/`collect().into()`.
 - `builtin.rs:707-708` (`obj_keys`): currently clones keys into
-  `Vec<ThinVec<u8>>`, maps through `alloc_string` into `Vec<StackValue>`, then
-  `.into()`. Collect the final `StackValue`s straight into `ThinVec`, dropping
+  `Vec<ThinVec<u8>>`, maps through `alloc_string` into `Vec<Value>`, then
+  `.into()`. Collect the final `Value`s straight into `ThinVec`, dropping
   the intermediate `Vec`.
 - `builtin.rs:726` (`obj_values`), `builtin.rs:490` (`array_join` parts) — same
   treatment.

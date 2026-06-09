@@ -141,12 +141,12 @@ expensive/effectful **tool calls**, whose results are already in `state`.
    RHS) on the stack, so assignment is a well-formed expression without extra
    stack shuffling. Statement callers follow with `Pop(1)`.
 8. **Builtin infrastructure** (`builtin.rs`, `Builtin` enum, `CallBuiltin` instr,
-   `StackValue::Builtin`). Call-shaped intrinsics (`arr.push(x)`, `s.split(",")`,
+   `Value::Builtin`). Call-shaped intrinsics (`arr.push(x)`, `s.split(",")`,
    `Math.max(a,b)`, `Object.keys(o)`, `JSON.parse(s)`, …) are now lowered to
    `Instr::CallBuiltin(Builtin, argc)`. The `Builtin` enum is the id + registry:
    `meta()` provides arity bounds (compiler reads for arity checks/errors),
    `call()` does the dispatch. Builtins are also first-class values
-   (`StackValue::Builtin`) for passing as callbacks (`arr.map(Math.sqrt)`).
+   (`Value::Builtin`) for passing as callbacks (`arr.map(Math.sqrt)`).
    Calling convention: `argc` args on stack L→R (arg 0 deepest; receiver is arg 0
    for methods); builtin pops exactly `argc` and pushes exactly one result.
    **Removed instructions** (superseded by builtins): `ArrPush`, `ArrPop`,
@@ -203,7 +203,7 @@ Storing the **byte offset** (not a precomputed line) keeps it flexible and cheap
 - `Jump`, `JFalse`, `Call`, `MakeClosure` carry a **label id** in their
   `CodeAddr` field during codegen (same `u32`, reinterpreted until Pass 3).
 - A **function used as a value** (`map(foo, …)`, storing a function in a var)
-  lowers to `Push(StackValue::Fn(label_id))`, so backpatch must also rewrite
+  lowers to `Push(Value::Fn(label_id))`, so backpatch must also rewrite
   `Fn` addresses buried inside `Push`. This is safe because the compiler never
   emits a real code address pre-backpatch — every `Fn`/`Jump`/`Call`/
   `MakeClosure` address is a label id until Pass 3.
@@ -270,7 +270,7 @@ registry gives variadic/optional-argument support for free.
 
 Consequences:
 - Those method names are effectively reserved.
-- A builtin can be passed as a first-class value (`StackValue::Builtin`) for
+- A builtin can be passed as a first-class value (`Value::Builtin`) for
   callback use (`arr.map(Math.sqrt)`).
 - **Dispatch is purely syntactic and assumes the conventional receiver type**
   (no static types). `.length` → `ArrLength` (arrays/strings); an object property
@@ -351,7 +351,7 @@ Consequences:
   the first compiler use of `CallDyn`; non-optional dynamic calls (`f(x)` on a
   value) still await user functions in Phase 3. The callable values that exist
   today are **first-class builtin references**: a namespaced builtin named but
-  not called (`Math.sqrt`, `JSON.parse`) lowers to `Push(StackValue::Builtin)`
+  not called (`Math.sqrt`, `JSON.parse`) lowers to `Push(Value::Builtin)`
   via the shared `namespace_builtin` map, so `Math.max?.(a, b)` and
   `state.fn?.(x)` (after `state.fn = Math.sqrt`) both work end-to-end.
 - **Assignment is an expression.** `a = b`, `obj.f = v`, `arr[i] = v`, compound

@@ -10,7 +10,7 @@
 //!
 //! # Why hand-rolled
 //!
-//! `Rc<str>` is a *fat* pointer (16 bytes), which would widen `StackValue` from
+//! `Rc<str>` is a *fat* pointer (16 bytes), which would widen `Value` from
 //! 16 to 24. `Rc<String>` is thin (8 bytes) but double-indirect and
 //! double-allocating (`Rc → RcBox → String → buf`). `RcStr` is thin (8 bytes)
 //! *and* single-allocation / single-indirection: refcount, length, and bytes

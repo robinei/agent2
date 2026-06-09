@@ -19,7 +19,7 @@ use crate::analyzer::{self, ConstValue, ProgramAnalysis, RefSlot, frame_abs};
 use crate::builtin::Builtin;
 use crate::diag::Diagnostic;
 use crate::vm::RcStr;
-use crate::vm::{Instr, SetMode, SlotKind, StackValue};
+use crate::vm::{Instr, SetMode, SlotKind, Value};
 
 /// A compiled program: the flat instruction stream, a parallel span table
 /// (`spans[ip]` = source byte offset of the instruction at `ip`), and the
@@ -587,9 +587,9 @@ impl<'src> Compiler<'src> {
             ConstValue::Bool(b) => Instr::PushBool(*b),
             ConstValue::Str(s) => Instr::PushStr(self.intern_string(s)),
             ConstValue::Num(n) => match f64_to_value(*n) {
-                StackValue::PosInt(u) => Instr::PushPosInt(u),
-                StackValue::NegInt(i) => Instr::PushNegInt(i),
-                StackValue::Number(f) => Instr::PushFloat(f),
+                Value::PosInt(u) => Instr::PushPosInt(u),
+                Value::NegInt(i) => Instr::PushNegInt(i),
+                Value::Number(f) => Instr::PushFloat(f),
                 _ => unreachable!("f64_to_value yields an int or float"),
             },
             // A constant function (Phase F): its value is its code address.
@@ -965,8 +965,8 @@ impl<'src> Compiler<'src> {
         match expr {
             // ── literals ──────────────────────────────────────────────
             ast::Expression::NumericLiteral(lit) => match number_literal_to_value(lit.value) {
-                StackValue::PosInt(v) => self.emit(Instr::PushPosInt(v), lit.span.start),
-                StackValue::Number(v) => self.emit(Instr::PushFloat(v), lit.span.start),
+                Value::PosInt(v) => self.emit(Instr::PushPosInt(v), lit.span.start),
+                Value::Number(v) => self.emit(Instr::PushFloat(v), lit.span.start),
                 _ => unreachable!(),
             },
             ast::Expression::StringLiteral(lit) => {
@@ -1153,9 +1153,9 @@ impl<'src> Compiler<'src> {
                 // compile time; otherwise `Neg` promotes to Number(-x).
                 if let ast::Expression::NumericLiteral(lit) = &un.argument {
                     match f64_to_value(-lit.value) {
-                        StackValue::PosInt(v) => self.emit(Instr::PushPosInt(v), span),
-                        StackValue::NegInt(v) => self.emit(Instr::PushNegInt(v), span),
-                        StackValue::Number(v) => self.emit(Instr::PushFloat(v), span),
+                        Value::PosInt(v) => self.emit(Instr::PushPosInt(v), span),
+                        Value::NegInt(v) => self.emit(Instr::PushNegInt(v), span),
+                        Value::Number(v) => self.emit(Instr::PushFloat(v), span),
                         _ => unreachable!(),
                     }
                 } else {
@@ -2847,24 +2847,24 @@ fn namespace_builtin(ns: &str, method: &str) -> Option<Builtin> {
 /// Canonicalize a non-negative numeric literal: an integer in `u64` range
 /// becomes a `PosInt`, otherwise a `Number`. Literals are non-negative; unary
 /// minus is a separate operator folded via `f64_to_value`.
-fn number_literal_to_value(value: f64) -> StackValue {
+fn number_literal_to_value(value: f64) -> Value {
     if value.fract() == 0.0 && value >= 0.0 && value <= u64::MAX as f64 {
-        StackValue::PosInt(value as u64)
+        Value::PosInt(value as u64)
     } else {
-        StackValue::Number(value)
+        Value::Number(value)
     }
 }
 
 /// Canonicalize an arbitrary (possibly negative) f64 into the VM's integer
 /// variants when it is integral and in range, mirroring serde_json's split:
 /// non-negative → `PosInt`, negative → `NegInt`, otherwise `Number`.
-fn f64_to_value(value: f64) -> StackValue {
+fn f64_to_value(value: f64) -> Value {
     if value.fract() == 0.0 && value >= 0.0 && value <= u64::MAX as f64 {
-        StackValue::PosInt(value as u64)
+        Value::PosInt(value as u64)
     } else if value.fract() == 0.0 && value < 0.0 && value >= i64::MIN as f64 {
-        StackValue::NegInt(value as i64)
+        Value::NegInt(value as i64)
     } else {
-        StackValue::Number(value)
+        Value::Number(value)
     }
 }
 
@@ -2942,7 +2942,7 @@ mod tests {
         assert!(!prog.code.iter().any(|i| matches!(i, Instr::Not)));
         let vm = run_program(prog);
         let o = &vm.objects[0];
-        assert_eq!(o.get(&RcStr::from("x")), Some(&StackValue::PosInt(1)));
+        assert_eq!(o.get(&RcStr::from("x")), Some(&Value::PosInt(1)));
     }
 
     #[test]
@@ -2961,7 +2961,7 @@ mod tests {
         );
         let vm = run_program(prog);
         let o = &vm.objects[0];
-        assert_eq!(o.get(&RcStr::from("r")), Some(&StackValue::PosInt(1)));
+        assert_eq!(o.get(&RcStr::from("r")), Some(&Value::PosInt(1)));
     }
 
     #[test]
@@ -2981,7 +2981,7 @@ mod tests {
         let vm = run_program(prog);
         // 0+1+2 + 4+5+6 = 18 (3 skipped, break at 7).
         let o = &vm.objects[0];
-        assert_eq!(o.get(&RcStr::from("sum")), Some(&StackValue::Number(18.0)));
+        assert_eq!(o.get(&RcStr::from("sum")), Some(&Value::Number(18.0)));
     }
 
     #[test]
@@ -2998,7 +2998,7 @@ mod tests {
         // `state.c` is undefined here → `!!undefined` is `false`.
         let vm = run_program(prog);
         let o = &vm.objects[0];
-        assert_eq!(o.get(&RcStr::from("b")), Some(&StackValue::Bool(false)));
+        assert_eq!(o.get(&RcStr::from("b")), Some(&Value::Bool(false)));
     }
 
     #[test]
@@ -3057,8 +3057,8 @@ mod tests {
         let prog =
             compile("const x = 1; { const x = 2; state.a = x; } state.b = x;").expect("compiles");
         let vm = run_program(prog);
-        assert_eq!(state_val(&vm, "a"), StackValue::PosInt(2));
-        assert_eq!(state_val(&vm, "b"), StackValue::PosInt(1));
+        assert_eq!(state_val(&vm, "a"), Value::PosInt(2));
+        assert_eq!(state_val(&vm, "b"), Value::PosInt(1));
     }
 
     #[test]
@@ -3071,7 +3071,7 @@ mod tests {
             prog.code
         );
         let vm = run_program(prog);
-        assert_eq!(state_val(&vm, "x"), StackValue::PosInt(6));
+        assert_eq!(state_val(&vm, "x"), Value::PosInt(6));
     }
 
     #[test]
@@ -3081,7 +3081,7 @@ mod tests {
         let prog =
             compile("const k = 7; function f() { return k; } state.x = f();").expect("compiles");
         let vm = run_program(prog);
-        assert_eq!(state_val(&vm, "x"), StackValue::PosInt(7));
+        assert_eq!(state_val(&vm, "x"), Value::PosInt(7));
     }
 
     // ── Phase A: constant branch folding ─────────────────────────────
@@ -3107,7 +3107,7 @@ mod tests {
         let vm = run_program(prog);
         let o = &vm.objects[0];
         assert_eq!(o.get(&RcStr::from("x")), None);
-        assert_eq!(o.get(&RcStr::from("y")), Some(&StackValue::PosInt(2)));
+        assert_eq!(o.get(&RcStr::from("y")), Some(&Value::PosInt(2)));
     }
 
     #[test]
@@ -3123,7 +3123,7 @@ mod tests {
             prog.code
         );
         let vm = run_program(prog);
-        assert_eq!(state_val(&vm, "x"), StackValue::PosInt(1));
+        assert_eq!(state_val(&vm, "x"), Value::PosInt(1));
     }
 
     // ── Phase C: effectively-const `let` ─────────────────────────────
@@ -3155,8 +3155,8 @@ mod tests {
             prog.code
         );
         let vm = run_program(prog);
-        assert_eq!(state_val(&vm, "x"), StackValue::PosInt(5));
-        assert_eq!(state_val(&vm, "y"), StackValue::PosInt(9));
+        assert_eq!(state_val(&vm, "x"), Value::PosInt(5));
+        assert_eq!(state_val(&vm, "y"), Value::PosInt(9));
     }
 
     // ── Phase D: captured-const seeding into closures ────────────────
@@ -3191,7 +3191,7 @@ mod tests {
             prog.code
         );
         let vm = run_program(prog);
-        assert_eq!(state_val(&vm, "x"), StackValue::PosInt(5));
+        assert_eq!(state_val(&vm, "x"), Value::PosInt(5));
     }
 
     #[test]
@@ -3208,7 +3208,7 @@ mod tests {
             prog.code
         );
         let vm = run_program(prog);
-        assert_eq!(state_val(&vm, "x"), StackValue::PosInt(5));
+        assert_eq!(state_val(&vm, "x"), Value::PosInt(5));
     }
 
     #[test]
@@ -3226,7 +3226,7 @@ mod tests {
         );
         let vm = run_program(prog);
         match state_val(&vm, "r") {
-            StackValue::Array(p) => {
+            Value::Array(p) => {
                 let arr = &vm.arrays[p as usize];
                 assert_eq!(arr.len(), 3);
                 assert_eq!(arr[2], num(6.0));
@@ -3251,7 +3251,7 @@ mod tests {
                 .any(|i| matches!(i, Instr::MakeClosure(..)))
         );
         let vm = run_program(prog);
-        assert_eq!(state_val(&vm, "x"), StackValue::PosInt(5));
+        assert_eq!(state_val(&vm, "x"), Value::PosInt(5));
     }
 
     #[test]
@@ -3260,8 +3260,8 @@ mod tests {
         // own value even though neither occupies a slot.
         let prog = compile("const x = 1; { const x = 2; state.a = x; } state.b = x;").expect("ok");
         let vm = run_program(prog);
-        assert_eq!(state_val(&vm, "a"), StackValue::PosInt(2));
-        assert_eq!(state_val(&vm, "b"), StackValue::PosInt(1));
+        assert_eq!(state_val(&vm, "a"), Value::PosInt(2));
+        assert_eq!(state_val(&vm, "b"), Value::PosInt(1));
     }
 
     #[test]
@@ -3311,7 +3311,7 @@ mod tests {
             prog.code
         );
         let vm = run_program(prog);
-        assert_eq!(state_val(&vm, "x"), StackValue::Bool(true));
+        assert_eq!(state_val(&vm, "x"), Value::Bool(true));
     }
 
     #[test]
@@ -3348,7 +3348,7 @@ mod tests {
         );
         let vm = run_program(prog);
         match state_val(&vm, "r") {
-            StackValue::Array(p) => {
+            Value::Array(p) => {
                 let a = &vm.arrays[p as usize];
                 assert_eq!(a[2], num(6.0));
             }
@@ -3377,9 +3377,9 @@ mod tests {
         let prog = compile("function f() { return 1; } state.a = f(); f = 5; state.b = typeof f;")
             .expect("reassignable function binding");
         let vm = run_program(prog);
-        assert_eq!(state_val(&vm, "a"), StackValue::PosInt(1));
+        assert_eq!(state_val(&vm, "a"), Value::PosInt(1));
         match state_val(&vm, "b") {
-            StackValue::String(s) => assert_eq!(s.as_str(), "number"),
+            Value::String(s) => assert_eq!(s.as_str(), "number"),
             other => panic!("expected string, got {other:?}"),
         }
     }
@@ -3402,7 +3402,7 @@ mod tests {
         let vm = run_program(prog);
         assert_eq!(state_val(&vm, "y"), num(10.0));
         match state_val(&vm, "r") {
-            StackValue::Array(p) => assert_eq!(vm.arrays[p as usize][2], num(6.0)),
+            Value::Array(p) => assert_eq!(vm.arrays[p as usize][2], num(6.0)),
             other => panic!("expected array, got {other:?}"),
         }
     }
@@ -3453,7 +3453,7 @@ mod tests {
             prog.code
         );
         let vm = run_program(prog);
-        assert_eq!(state_val(&vm, "x"), StackValue::PosInt(1));
+        assert_eq!(state_val(&vm, "x"), Value::PosInt(1));
     }
 
     #[test]
@@ -3483,7 +3483,7 @@ mod tests {
         );
         let vm = run_program(prog);
         match state_val(&vm, "r") {
-            StackValue::Array(p) => assert_eq!(vm.arrays[p as usize][2], num(6.0)),
+            Value::Array(p) => assert_eq!(vm.arrays[p as usize][2], num(6.0)),
             other => panic!("expected array, got {other:?}"),
         }
     }
@@ -3492,8 +3492,8 @@ mod tests {
     fn reassigned_let_function_is_not_constant() {
         // Reassigning the binding defeats const-function treatment; still correct.
         let vm = run_vm("let f = () => 1; state.a = f(); f = () => 2; state.b = f();");
-        assert_eq!(state_val(&vm, "a"), StackValue::PosInt(1));
-        assert_eq!(state_val(&vm, "b"), StackValue::PosInt(2));
+        assert_eq!(state_val(&vm, "a"), Value::PosInt(1));
+        assert_eq!(state_val(&vm, "b"), Value::PosInt(2));
     }
 
     #[test]
@@ -3501,7 +3501,7 @@ mod tests {
         // `var` is excluded (hoisted `undefined`): it stays an ordinary binding,
         // and still runs correctly.
         let vm = run_vm("var f = () => 7; state.x = f();");
-        assert_eq!(state_val(&vm, "x"), StackValue::PosInt(7));
+        assert_eq!(state_val(&vm, "x"), Value::PosInt(7));
     }
 
     #[test]
@@ -3511,7 +3511,7 @@ mod tests {
         let state = serde_json::json!({ "count": 7 });
         let vm = VM::for_program(prog, state).unwrap();
         let o = &vm.objects[0];
-        assert_eq!(o.get(&RcStr::from("count")), Some(&StackValue::PosInt(7)));
+        assert_eq!(o.get(&RcStr::from("count")), Some(&Value::PosInt(7)));
     }
 
     #[test]
@@ -3547,7 +3547,7 @@ mod tests {
     }
 
     /// Read `state.<key>` (a slot of the objects[0] state object) from a finished VM.
-    fn state_val(vm: &VM, key: &str) -> StackValue {
+    fn state_val(vm: &VM, key: &str) -> Value {
         vm.objects[0]
             .get(&RcStr::from(key))
             .cloned()
@@ -3555,8 +3555,8 @@ mod tests {
     }
 
     /// Evaluate a single expression by assigning it to `state.r`, returning the
-    /// resulting `StackValue`.
-    fn eval(expr: &str) -> StackValue {
+    /// resulting `Value`.
+    fn eval(expr: &str) -> Value {
         let vm = run_vm(&format!("state.r = ({expr});"));
         state_val(&vm, "r")
     }
@@ -3565,26 +3565,26 @@ mod tests {
     fn eval_str(expr: &str) -> String {
         let vm = run_vm(&format!("state.r = ({expr});"));
         match state_val(&vm, "r") {
-            StackValue::String(s) => s.as_str().to_owned(),
+            Value::String(s) => s.as_str().to_owned(),
             other => panic!("not a string: {other:?}"),
         }
     }
 
-    fn num(v: f64) -> StackValue {
-        StackValue::Number(v)
+    fn num(v: f64) -> Value {
+        Value::Number(v)
     }
 
     #[test]
     fn literals() {
-        assert_eq!(eval("42"), StackValue::PosInt(42));
-        assert_eq!(eval("-7"), StackValue::NegInt(-7)); // folded literal
+        assert_eq!(eval("42"), Value::PosInt(42));
+        assert_eq!(eval("-7"), Value::NegInt(-7)); // folded literal
         assert_eq!(eval("3.5"), num(3.5));
-        assert_eq!(eval("true"), StackValue::Bool(true));
-        assert_eq!(eval("null"), StackValue::Null);
-        assert_eq!(eval("undefined"), StackValue::Undefined);
+        assert_eq!(eval("true"), Value::Bool(true));
+        assert_eq!(eval("null"), Value::Null);
+        assert_eq!(eval("undefined"), Value::Undefined);
         assert_eq!(eval_str("\"hi\""), "hi");
-        assert!(matches!(eval("NaN"), StackValue::Number(n) if n.is_nan()));
-        assert!(matches!(eval("Infinity"), StackValue::Number(n) if n.is_infinite()));
+        assert!(matches!(eval("NaN"), Value::Number(n) if n.is_nan()));
+        assert!(matches!(eval("Infinity"), Value::Number(n) if n.is_infinite()));
     }
 
     #[test]
@@ -3595,51 +3595,51 @@ mod tests {
         assert_eq!(eval("2 ** 10"), num(1024.0));
         assert_eq!(eval("7 & 3"), num(3.0));
         assert_eq!(eval("1 << 4"), num(16.0));
-        assert_eq!(eval("-5"), StackValue::NegInt(-5));
+        assert_eq!(eval("-5"), Value::NegInt(-5));
         assert_eq!(eval("+\"42\""), num(42.0)); // unary plus ToNumber
-        assert_eq!(eval("!0"), StackValue::Bool(true));
+        assert_eq!(eval("!0"), Value::Bool(true));
         assert_eq!(eval("~0"), num(-1.0));
         assert_eq!(eval_str("\"a\" + \"b\""), "ab");
     }
 
     #[test]
     fn comparisons_and_equality() {
-        assert_eq!(eval("1 < 2"), StackValue::Bool(true));
-        assert_eq!(eval("2 <= 2"), StackValue::Bool(true));
-        assert_eq!(eval("3 === 3"), StackValue::Bool(true));
-        assert_eq!(eval("3 !== 4"), StackValue::Bool(true));
-        assert_eq!(eval("1 == \"1\""), StackValue::Bool(true)); // loose
-        assert_eq!(eval("1 === \"1\""), StackValue::Bool(false)); // strict
-        assert_eq!(eval("null == undefined"), StackValue::Bool(true));
+        assert_eq!(eval("1 < 2"), Value::Bool(true));
+        assert_eq!(eval("2 <= 2"), Value::Bool(true));
+        assert_eq!(eval("3 === 3"), Value::Bool(true));
+        assert_eq!(eval("3 !== 4"), Value::Bool(true));
+        assert_eq!(eval("1 == \"1\""), Value::Bool(true)); // loose
+        assert_eq!(eval("1 === \"1\""), Value::Bool(false)); // strict
+        assert_eq!(eval("null == undefined"), Value::Bool(true));
     }
 
     #[test]
     fn short_circuit_logical() {
-        assert_eq!(eval("0 && 5"), StackValue::PosInt(0));
-        assert_eq!(eval("3 && 5"), StackValue::PosInt(5));
-        assert_eq!(eval("0 || 5"), StackValue::PosInt(5));
-        assert_eq!(eval("3 || 5"), StackValue::PosInt(3));
-        assert_eq!(eval("null ?? 5"), StackValue::PosInt(5));
-        assert_eq!(eval("0 ?? 5"), StackValue::PosInt(0)); // 0 is not nullish
-        assert_eq!(eval("undefined ?? 9"), StackValue::PosInt(9));
+        assert_eq!(eval("0 && 5"), Value::PosInt(0));
+        assert_eq!(eval("3 && 5"), Value::PosInt(5));
+        assert_eq!(eval("0 || 5"), Value::PosInt(5));
+        assert_eq!(eval("3 || 5"), Value::PosInt(3));
+        assert_eq!(eval("null ?? 5"), Value::PosInt(5));
+        assert_eq!(eval("0 ?? 5"), Value::PosInt(0)); // 0 is not nullish
+        assert_eq!(eval("undefined ?? 9"), Value::PosInt(9));
     }
 
     #[test]
     fn short_circuit_does_not_evaluate_rhs() {
         // The RHS assignment must NOT run when the LHS short-circuits.
         let vm = run_vm("state.hit = 0; state.r = false && (state.hit = 1);");
-        assert_eq!(state_val(&vm, "r"), StackValue::Bool(false));
-        assert_eq!(state_val(&vm, "hit"), StackValue::PosInt(0));
+        assert_eq!(state_val(&vm, "r"), Value::Bool(false));
+        assert_eq!(state_val(&vm, "hit"), Value::PosInt(0));
 
         let vm = run_vm("state.hit = 0; state.r = true || (state.hit = 1);");
-        assert_eq!(state_val(&vm, "r"), StackValue::Bool(true));
-        assert_eq!(state_val(&vm, "hit"), StackValue::PosInt(0));
+        assert_eq!(state_val(&vm, "r"), Value::Bool(true));
+        assert_eq!(state_val(&vm, "hit"), Value::PosInt(0));
     }
 
     #[test]
     fn ternary() {
-        assert_eq!(eval("1 ? 10 : 20"), StackValue::PosInt(10));
-        assert_eq!(eval("0 ? 10 : 20"), StackValue::PosInt(20));
+        assert_eq!(eval("1 ? 10 : 20"), Value::PosInt(10));
+        assert_eq!(eval("0 ? 10 : 20"), Value::PosInt(20));
     }
 
     #[test]
@@ -3656,7 +3656,7 @@ mod tests {
     fn template_literals() {
         let vm = run_vm("state.name = \"bob\"; state.r = `hi ${state.name}, ${1 + 2}!`;");
         match state_val(&vm, "r") {
-            StackValue::String(s) => assert_eq!(s.as_bytes(), b"hi bob, 3!"),
+            Value::String(s) => assert_eq!(s.as_bytes(), b"hi bob, 3!"),
             other => panic!("{other:?}"),
         }
     }
@@ -3665,12 +3665,12 @@ mod tests {
     fn arrays_and_objects() {
         // Array literal, length, index read.
         assert_eq!(eval("[10, 20, 30].length"), num(3.0));
-        assert_eq!(eval("[10, 20, 30][1]"), StackValue::PosInt(20));
-        assert_eq!(eval("[10, 20][5]"), StackValue::Undefined); // OOB read
+        assert_eq!(eval("[10, 20, 30][1]"), Value::PosInt(20));
+        assert_eq!(eval("[10, 20][5]"), Value::Undefined); // OOB read
         // Object literal + member read (static and computed).
-        assert_eq!(eval("({ a: 1, b: 2 }).b"), StackValue::PosInt(2));
-        assert_eq!(eval("({ a: 1, b: 2 })[\"a\"]"), StackValue::PosInt(1));
-        assert_eq!(eval("({ a: 1 }).missing"), StackValue::Undefined);
+        assert_eq!(eval("({ a: 1, b: 2 }).b"), Value::PosInt(2));
+        assert_eq!(eval("({ a: 1, b: 2 })[\"a\"]"), Value::PosInt(1));
+        assert_eq!(eval("({ a: 1 }).missing"), Value::Undefined);
         // Numeric key.
         assert_eq!(eval("({ 1: \"x\" })[1]"), eval("\"x\""));
     }
@@ -3679,30 +3679,30 @@ mod tests {
     fn member_and_index_assignment() {
         // Static member assignment leaves the value and mutates the object.
         let vm = run_vm("state.obj = { a: 1 }; state.r = (state.obj.a = 9);");
-        assert_eq!(state_val(&vm, "r"), StackValue::PosInt(9));
+        assert_eq!(state_val(&vm, "r"), Value::PosInt(9));
         match state_val(&vm, "obj") {
-            StackValue::Object(p) => {
+            Value::Object(p) => {
                 let o = &vm.objects[p as usize];
-                assert_eq!(o.get(&RcStr::from("a")), Some(&StackValue::PosInt(9)))
+                assert_eq!(o.get(&RcStr::from("a")), Some(&Value::PosInt(9)))
             }
             other => panic!("{other:?}"),
         }
         // Index assignment into an array.
         let vm = run_vm("state.arr = [1, 2, 3]; state.arr[0] = 99; state.r = state.arr[0];");
-        assert_eq!(state_val(&vm, "r"), StackValue::PosInt(99));
+        assert_eq!(state_val(&vm, "r"), Value::PosInt(99));
         // Index assignment into an object (string key coercion).
         let vm = run_vm("state.o = {}; state.o[\"k\"] = 7; state.r = state.o.k;");
-        assert_eq!(state_val(&vm, "r"), StackValue::PosInt(7));
+        assert_eq!(state_val(&vm, "r"), Value::PosInt(7));
     }
 
     #[test]
     fn optional_chaining() {
         // Missing base short-circuits to undefined; present base reads through.
-        assert_eq!(eval("state.nope?.x"), StackValue::Undefined);
+        assert_eq!(eval("state.nope?.x"), Value::Undefined);
         let vm = run_vm("state.obj = { x: 7 }; state.r = state.obj?.x;");
-        assert_eq!(state_val(&vm, "r"), StackValue::PosInt(7));
+        assert_eq!(state_val(&vm, "r"), Value::PosInt(7));
         // A fully-optional chain short-circuits across links.
-        assert_eq!(eval("state.nope?.a?.b"), StackValue::Undefined);
+        assert_eq!(eval("state.nope?.a?.b"), Value::Undefined);
     }
 
     #[test]
@@ -3715,12 +3715,12 @@ mod tests {
 
         // Nullish receiver: the whole call short-circuits to undefined.
         let vm = run_vm("state.r = state.nope?.push(2);");
-        assert_eq!(state_val(&vm, "r"), StackValue::Undefined);
+        assert_eq!(state_val(&vm, "r"), Value::Undefined);
 
         // Short-circuit must NOT evaluate the arguments.
         let vm = run_vm("state.hit = 0; state.r = state.nope?.push(state.hit = 1);");
-        assert_eq!(state_val(&vm, "r"), StackValue::Undefined);
-        assert_eq!(state_val(&vm, "hit"), StackValue::PosInt(0));
+        assert_eq!(state_val(&vm, "r"), Value::Undefined);
+        assert_eq!(state_val(&vm, "hit"), Value::PosInt(0));
 
         // String methods take the same optional path.
         let vm = run_vm("state.s = \"a,b,c\"; state.r = state.s?.split(\",\").length;");
@@ -3744,12 +3744,12 @@ mod tests {
         assert_eq!(state_val(&vm, "r"), num(4.0));
 
         // Nullish callee short-circuits to undefined.
-        assert_eq!(eval("state.nope?.()"), StackValue::Undefined);
+        assert_eq!(eval("state.nope?.()"), Value::Undefined);
 
         // Short-circuit must NOT evaluate the arguments.
         let vm = run_vm("state.hit = 0; state.r = state.nope?.(state.hit = 1);");
-        assert_eq!(state_val(&vm, "r"), StackValue::Undefined);
-        assert_eq!(state_val(&vm, "hit"), StackValue::PosInt(0));
+        assert_eq!(state_val(&vm, "r"), Value::Undefined);
+        assert_eq!(state_val(&vm, "hit"), Value::PosInt(0));
 
         // A present-but-non-callable callee is a runtime TypeError, like JS.
         let prog = compile("state.x = 5; state.x?.();").expect("compiles");
@@ -3792,15 +3792,15 @@ mod tests {
     #[test]
     fn in_and_delete() {
         let vm = run_vm("state.o = { a: 1 }; state.r = (\"a\" in state.o);");
-        assert_eq!(state_val(&vm, "r"), StackValue::Bool(true));
+        assert_eq!(state_val(&vm, "r"), Value::Bool(true));
         let vm = run_vm("state.o = { a: 1 }; state.r = (\"b\" in state.o);");
-        assert_eq!(state_val(&vm, "r"), StackValue::Bool(false));
+        assert_eq!(state_val(&vm, "r"), Value::Bool(false));
         // delete removes the key and returns whether it existed.
         let vm = run_vm(
             "state.o = { a: 1 }; state.r = delete state.o.a; state.had = (\"a\" in state.o);",
         );
-        assert_eq!(state_val(&vm, "r"), StackValue::Bool(true));
-        assert_eq!(state_val(&vm, "had"), StackValue::Bool(false));
+        assert_eq!(state_val(&vm, "r"), Value::Bool(true));
+        assert_eq!(state_val(&vm, "had"), Value::Bool(false));
     }
 
     #[test]
@@ -3811,29 +3811,29 @@ mod tests {
         assert_eq!(eval("Math.floor(3.9)"), num(3.0));
         assert_eq!(eval("Math.pow(2, 5)"), num(32.0));
         assert_eq!(eval("Object.keys({ a: 1, b: 2 }).length"), num(2.0));
-        assert_eq!(eval("Object.values({ a: 5 })[0]"), StackValue::PosInt(5));
+        assert_eq!(eval("Object.values({ a: 5 })[0]"), Value::PosInt(5));
         assert_eq!(eval("JSON.parse(\"[1,2,3]\").length"), num(3.0));
         assert_eq!(eval_str("JSON.stringify([1,2])"), "[1,2]");
-        assert_eq!(eval("Number.isInteger(4)"), StackValue::Bool(true));
-        assert_eq!(eval("Array.isArray([1])"), StackValue::Bool(true));
-        assert_eq!(eval("Array.isArray(5)"), StackValue::Bool(false));
+        assert_eq!(eval("Number.isInteger(4)"), Value::Bool(true));
+        assert_eq!(eval("Array.isArray([1])"), Value::Bool(true));
+        assert_eq!(eval("Array.isArray(5)"), Value::Bool(false));
     }
 
     #[test]
     fn intrinsics_global() {
         assert_eq!(eval_str("String(5)"), "5");
         assert_eq!(eval("Number(\"42\")"), num(42.0));
-        assert_eq!(eval("Boolean(0)"), StackValue::Bool(false));
-        assert_eq!(eval("Boolean(\"x\")"), StackValue::Bool(true));
+        assert_eq!(eval("Boolean(0)"), Value::Bool(false));
+        assert_eq!(eval("Boolean(\"x\")"), Value::Bool(true));
     }
 
     #[test]
     fn intrinsics_methods() {
         assert_eq!(eval("\"a,b,c\".split(\",\").length"), num(3.0));
         assert_eq!(eval("\"a,b,c\".split(\",\", 2).length"), num(2.0));
-        assert_eq!(eval("\"hello\".includes(\"ell\")"), StackValue::Bool(true));
-        assert_eq!(eval("\"hello\".startsWith(\"he\")"), StackValue::Bool(true));
-        assert_eq!(eval("\"hello\".endsWith(\"lo\")"), StackValue::Bool(true));
+        assert_eq!(eval("\"hello\".includes(\"ell\")"), Value::Bool(true));
+        assert_eq!(eval("\"hello\".startsWith(\"he\")"), Value::Bool(true));
+        assert_eq!(eval("\"hello\".endsWith(\"lo\")"), Value::Bool(true));
         assert_eq!(eval("\"hello\".indexOf(\"l\")"), num(2.0));
         assert_eq!(eval_str("\"hello\".slice(1, 3)"), "el");
         assert_eq!(eval_str("\"  hi  \".trim()"), "hi");
@@ -3843,7 +3843,7 @@ mod tests {
         let vm = run_vm("state.arr = [1]; state.arr.push(2); state.r = state.arr.length;");
         assert_eq!(state_val(&vm, "r"), num(2.0));
         let vm = run_vm("state.arr = [1, 2, 3]; state.r = state.arr.pop();");
-        assert_eq!(state_val(&vm, "r"), StackValue::PosInt(3));
+        assert_eq!(state_val(&vm, "r"), Value::PosInt(3));
     }
 
     #[test]
@@ -3905,7 +3905,7 @@ mod tests {
         let vm = run_vm("state.a = 1; state.r = JSON.stringify(state);");
         match state_val(&vm, "r") {
             // r was set last, so it appears in the serialized object too.
-            StackValue::String(s) => {
+            Value::String(s) => {
                 assert!(
                     s.as_str().contains("\"a\":1"),
                     "got {}",
@@ -3939,22 +3939,19 @@ mod tests {
             StepResult::Invoke { calls } => {
                 assert_eq!(calls.len(), 1);
                 assert_eq!(calls[0].name, "add");
-                assert_eq!(
-                    calls[0].args,
-                    vec![StackValue::PosInt(10), StackValue::PosInt(3)]
-                );
+                assert_eq!(calls[0].args, vec![Value::PosInt(10), Value::PosInt(3)]);
             }
             other => panic!("expected Invoke, got {other:?}"),
         }
         // Host resolves the call and pushes the result; the program stores it.
-        vm.stack.push(StackValue::PosInt(13));
+        vm.stack.push(Value::PosInt(13));
         loop {
             match vm.step().unwrap() {
                 StepResult::Done => break,
                 other => panic!("unexpected effect: {other:?}"),
             }
         }
-        assert_eq!(state_val(&vm, "r"), StackValue::PosInt(13));
+        assert_eq!(state_val(&vm, "r"), Value::PosInt(13));
     }
 
     #[test]
@@ -3985,28 +3982,25 @@ mod tests {
         }
         // Resume restart: advance past the Raise and push the resumed value.
         vm.ip += 1;
-        vm.stack.push(StackValue::PosInt(42));
+        vm.stack.push(Value::PosInt(42));
         loop {
             match vm.step().unwrap() {
                 StepResult::Done => break,
                 other => panic!("unexpected effect: {other:?}"),
             }
         }
-        assert_eq!(state_val(&vm, "r"), StackValue::PosInt(42));
+        assert_eq!(state_val(&vm, "r"), Value::PosInt(42));
     }
 
     // ── Phase 2: statements / control flow ──────────────────────────────
 
     #[test]
     fn local_declarations_and_reassignment() {
-        assert_eq!(eval_phase2("let x = 5; return x;"), StackValue::PosInt(5));
-        assert_eq!(eval_phase2("const x = 7; return x;"), StackValue::PosInt(7));
-        assert_eq!(
-            eval_phase2("let x = 1; x = 2; return x;"),
-            StackValue::PosInt(2)
-        );
+        assert_eq!(eval_phase2("let x = 5; return x;"), Value::PosInt(5));
+        assert_eq!(eval_phase2("const x = 7; return x;"), Value::PosInt(7));
+        assert_eq!(eval_phase2("let x = 1; x = 2; return x;"), Value::PosInt(2));
         // Uninitialized local is `undefined`.
-        assert_eq!(eval_phase2("let x; return x;"), StackValue::Undefined);
+        assert_eq!(eval_phase2("let x; return x;"), Value::Undefined);
         // Multiple declarators in one statement.
         assert_eq!(eval_phase2("let a = 1, b = 2; return a + b;"), num(3.0));
     }
@@ -4015,8 +4009,8 @@ mod tests {
     fn block_scoping() {
         // An inner block shadows; the outer binding is restored after.
         let vm = run_vm("let x = 1; { let x = 2; state.inner = x; } state.outer = x;");
-        assert_eq!(state_val(&vm, "inner"), StackValue::PosInt(2));
-        assert_eq!(state_val(&vm, "outer"), StackValue::PosInt(1));
+        assert_eq!(state_val(&vm, "inner"), Value::PosInt(2));
+        assert_eq!(state_val(&vm, "outer"), Value::PosInt(1));
     }
 
     #[test]
@@ -4024,35 +4018,32 @@ mod tests {
         // `var` is visible (as undefined) before its declaration runs.
         let vm = run_vm("state.before = typeof x; var x = 5; state.after = x;");
         assert_eq!(eval_str_in(&vm, "before"), "undefined");
-        assert_eq!(state_val(&vm, "after"), StackValue::PosInt(5));
+        assert_eq!(state_val(&vm, "after"), Value::PosInt(5));
         // A `var` in a block belongs to the function scope.
-        assert_eq!(
-            eval_phase2("{ var y = 9; } return y;"),
-            StackValue::PosInt(9)
-        );
+        assert_eq!(eval_phase2("{ var y = 9; } return y;"), Value::PosInt(9));
     }
 
     #[test]
     fn if_else() {
         assert_eq!(
             eval_phase2("let r; if (1 > 0) r = 10; else r = 20; return r;"),
-            StackValue::PosInt(10)
+            Value::PosInt(10)
         );
         assert_eq!(
             eval_phase2("let r; if (0) r = 10; else r = 20; return r;"),
-            StackValue::PosInt(20)
+            Value::PosInt(20)
         );
         // Dangling-if with no else leaves the prior value.
         assert_eq!(
             eval_phase2("let r = 3; if (false) r = 9; return r;"),
-            StackValue::PosInt(3)
+            Value::PosInt(3)
         );
         // else-if chains.
         assert_eq!(
             eval_phase2(
                 "let x = 2, r; if (x === 1) r = 1; else if (x === 2) r = 2; else r = 3; return r;"
             ),
-            StackValue::PosInt(2)
+            Value::PosInt(2)
         );
     }
 
@@ -4152,7 +4143,7 @@ mod tests {
         // Empty array: body never runs (the literal is untouched).
         assert_eq!(
             eval_phase2("let s = 99; for (const x of []) s = 0; return s;"),
-            StackValue::PosInt(99)
+            Value::PosInt(99)
         );
     }
 
@@ -4230,7 +4221,7 @@ mod tests {
             eval_phase2(
                 "let r = 0; switch (2) { case 1: r = 1; break; case 2: r = 2; break; case 3: r = 3; break; } return r;"
             ),
-            StackValue::PosInt(2)
+            Value::PosInt(2)
         );
         // No break: execution falls through into the next case.
         assert_eq!(
@@ -4244,7 +4235,7 @@ mod tests {
             eval_phase2(
                 "let r = 0; switch (9) { case 1: r = 1; break; default: r = 42; } return r;"
             ),
-            StackValue::PosInt(42)
+            Value::PosInt(42)
         );
         // default in the middle, reached by fall-through from a later... actually
         // default is dispatched only when no case matches; here 1 matches.
@@ -4252,14 +4243,14 @@ mod tests {
             eval_phase2(
                 "let r = 0; switch (1) { default: r = 42; break; case 1: r = 7; break; } return r;"
             ),
-            StackValue::PosInt(7)
+            Value::PosInt(7)
         );
         // Strict (===) matching: a string discriminant does not match a number.
         assert_eq!(
             eval_phase2(
                 "let r = 0; switch (\"1\") { case 1: r = 1; break; default: r = 2; } return r;"
             ),
-            StackValue::PosInt(2)
+            Value::PosInt(2)
         );
     }
 
@@ -4288,7 +4279,7 @@ mod tests {
             eval_phase2(
                 "let r = 0; switch (1) { case 1: { let x = 5; r = x; break; } default: r = 0; } return r;"
             ),
-            StackValue::PosInt(5)
+            Value::PosInt(5)
         );
     }
 
@@ -4305,7 +4296,7 @@ mod tests {
         // map applies the callback to each element.
         let vm = run_vm("state.r = [1, 2, 3].map(x => x * 2);");
         match state_val(&vm, "r") {
-            StackValue::Array(p) => assert_eq!(vm.arrays[p as usize].len(), 3),
+            Value::Array(p) => assert_eq!(vm.arrays[p as usize].len(), 3),
             other => panic!("{other:?}"),
         }
         // map result summed back via reduce.
@@ -4338,20 +4329,20 @@ mod tests {
     fn hof_search_methods() {
         assert_eq!(
             eval_phase2("return [1, 2, 3].some(x => x === 2);"),
-            StackValue::Bool(true)
+            Value::Bool(true)
         );
         assert_eq!(
             eval_phase2("return [1, 2, 3].every(x => x > 0);"),
-            StackValue::Bool(true)
+            Value::Bool(true)
         );
         assert_eq!(
             eval_phase2("return [1, 2, 3].every(x => x > 1);"),
-            StackValue::Bool(false)
+            Value::Bool(false)
         );
         // find returns the matching element (an untouched literal here).
         assert_eq!(
             eval_phase2("return [5, 6, 7].find(x => x > 5);"),
-            StackValue::PosInt(6)
+            Value::PosInt(6)
         );
         assert_eq!(
             eval_phase2("return [5, 6, 7].findIndex(x => x === 7);"),
@@ -4360,11 +4351,11 @@ mod tests {
         // find with no match → undefined; findIndex with no match → -1.
         assert_eq!(
             eval_phase2("return [1, 2].find(x => x > 9);"),
-            StackValue::Undefined
+            Value::Undefined
         );
         assert_eq!(
             eval_phase2("return [1, 2].findIndex(x => x > 9);"),
-            StackValue::NegInt(-1)
+            Value::NegInt(-1)
         );
     }
 
@@ -4446,7 +4437,7 @@ mod tests {
         // cache reuses one build instead of materializing a fresh array each
         // time.
         let vm = run_vm("function f() { return arguments === arguments; } state.r = f(1, 2);");
-        assert_eq!(state_val(&vm, "r"), StackValue::Bool(true));
+        assert_eq!(state_val(&vm, "r"), Value::Bool(true));
     }
 
     #[test]
@@ -4454,7 +4445,7 @@ mod tests {
         // A real binding named `arguments` shadows the frame-args array.
         let vm =
             run_vm("function f() { let arguments = 42; return arguments; } state.r = f(1, 2, 3);");
-        assert_eq!(state_val(&vm, "r"), StackValue::PosInt(42));
+        assert_eq!(state_val(&vm, "r"), Value::PosInt(42));
     }
 
     #[test]
@@ -4511,43 +4502,43 @@ mod tests {
     fn logical_assignment() {
         assert_eq!(
             eval_phase2("let x = 0; x ||= 5; return x;"),
-            StackValue::PosInt(5)
+            Value::PosInt(5)
         );
         assert_eq!(
             eval_phase2("let x = 3; x ||= 5; return x;"),
-            StackValue::PosInt(3)
+            Value::PosInt(3)
         );
         assert_eq!(
             eval_phase2("let x = 3; x &&= 7; return x;"),
-            StackValue::PosInt(7)
+            Value::PosInt(7)
         );
         assert_eq!(
             eval_phase2("let x = 0; x &&= 7; return x;"),
-            StackValue::PosInt(0)
+            Value::PosInt(0)
         );
         assert_eq!(
             eval_phase2("let x = null; x ??= 9; return x;"),
-            StackValue::PosInt(9)
+            Value::PosInt(9)
         );
         assert_eq!(
             eval_phase2("let x = 0; x ??= 9; return x;"),
-            StackValue::PosInt(0)
+            Value::PosInt(0)
         );
 
         // Short-circuit must NOT evaluate the RHS (nor store).
         let vm = run_vm("state.hit = 0; let x = 3; x ||= (state.hit = 1); state.r = x;");
-        assert_eq!(state_val(&vm, "hit"), StackValue::PosInt(0));
-        assert_eq!(state_val(&vm, "r"), StackValue::PosInt(3));
+        assert_eq!(state_val(&vm, "hit"), Value::PosInt(0));
+        assert_eq!(state_val(&vm, "r"), Value::PosInt(3));
 
         // Member target, store path.
         let vm = run_vm("state.o = { a: null }; state.o.a ??= 5; state.r = state.o.a;");
-        assert_eq!(state_val(&vm, "r"), StackValue::PosInt(5));
+        assert_eq!(state_val(&vm, "r"), Value::PosInt(5));
         // Member target, keep path (address values cleaned up).
         let vm = run_vm("state.o = { a: 2 }; state.r = (state.o.a ??= 99);");
-        assert_eq!(state_val(&vm, "r"), StackValue::PosInt(2));
+        assert_eq!(state_val(&vm, "r"), Value::PosInt(2));
         // Index target, keep path.
         let vm = run_vm("state.arr = [7]; state.r = (state.arr[0] ||= 1);");
-        assert_eq!(state_val(&vm, "r"), StackValue::PosInt(7));
+        assert_eq!(state_val(&vm, "r"), Value::PosInt(7));
     }
 
     #[test]
@@ -4566,7 +4557,7 @@ mod tests {
         assert_eq!(eval_phase2("let x = \"5\"; x++; return x;"), num(6.0));
         // Member / index targets — postsets now preserves the exact old value.
         let vm = run_vm("state.o = { n: 1 }; state.r = state.o.n++; state.after = state.o.n;");
-        assert_eq!(state_val(&vm, "r"), StackValue::PosInt(1));
+        assert_eq!(state_val(&vm, "r"), Value::PosInt(1));
         assert_eq!(state_val(&vm, "after"), num(2.0));
         let vm = run_vm("state.arr = [10]; state.r = ++state.arr[0]; state.after = state.arr[0];");
         assert_eq!(state_val(&vm, "r"), num(11.0));
@@ -4576,60 +4567,57 @@ mod tests {
     #[test]
     fn array_destructuring_declaration() {
         let vm = run_vm("let [a, b] = [10, 20]; state.a = a; state.b = b;");
-        assert_eq!(state_val(&vm, "a"), StackValue::PosInt(10));
-        assert_eq!(state_val(&vm, "b"), StackValue::PosInt(20));
+        assert_eq!(state_val(&vm, "a"), Value::PosInt(10));
+        assert_eq!(state_val(&vm, "b"), Value::PosInt(20));
         // Holes skip elements.
         assert_eq!(
             eval_phase2("let [, b] = [1, 2]; return b;"),
-            StackValue::PosInt(2)
+            Value::PosInt(2)
         );
         // Defaults apply only when the element is undefined.
-        assert_eq!(
-            eval_phase2("let [a = 5] = []; return a;"),
-            StackValue::PosInt(5)
-        );
+        assert_eq!(eval_phase2("let [a = 5] = []; return a;"), Value::PosInt(5));
         assert_eq!(
             eval_phase2("let [a = 5] = [1]; return a;"),
-            StackValue::PosInt(1)
+            Value::PosInt(1)
         );
         // Nested.
         let vm = run_vm("let [[a], { b }] = [[1], { b: 2 }]; state.a = a; state.b = b;");
-        assert_eq!(state_val(&vm, "a"), StackValue::PosInt(1));
-        assert_eq!(state_val(&vm, "b"), StackValue::PosInt(2));
+        assert_eq!(state_val(&vm, "a"), Value::PosInt(1));
+        assert_eq!(state_val(&vm, "b"), Value::PosInt(2));
     }
 
     #[test]
     fn object_destructuring_declaration() {
         let vm = run_vm("let { x, y } = { x: 1, y: 2 }; state.x = x; state.y = y;");
-        assert_eq!(state_val(&vm, "x"), StackValue::PosInt(1));
-        assert_eq!(state_val(&vm, "y"), StackValue::PosInt(2));
+        assert_eq!(state_val(&vm, "x"), Value::PosInt(1));
+        assert_eq!(state_val(&vm, "y"), Value::PosInt(2));
         // Renaming and defaults.
         assert_eq!(
             eval_phase2("let { a: aa } = { a: 7 }; return aa;"),
-            StackValue::PosInt(7)
+            Value::PosInt(7)
         );
         assert_eq!(
             eval_phase2("let { b = 3 } = {}; return b;"),
-            StackValue::PosInt(3)
+            Value::PosInt(3)
         );
         assert_eq!(
             eval_phase2("let { b = 3 } = { b: 9 }; return b;"),
-            StackValue::PosInt(9)
+            Value::PosInt(9)
         );
     }
 
     #[test]
     fn destructuring_assignment() {
         let vm = run_vm("let a, b; [a, b] = [3, 4]; state.a = a; state.b = b;");
-        assert_eq!(state_val(&vm, "a"), StackValue::PosInt(3));
-        assert_eq!(state_val(&vm, "b"), StackValue::PosInt(4));
+        assert_eq!(state_val(&vm, "a"), Value::PosInt(3));
+        assert_eq!(state_val(&vm, "b"), Value::PosInt(4));
         // Object destructuring assignment needs parens.
         let vm = run_vm("let x, y; ({ x, y } = { x: 5, y: 6 }); state.x = x; state.y = y;");
-        assert_eq!(state_val(&vm, "x"), StackValue::PosInt(5));
-        assert_eq!(state_val(&vm, "y"), StackValue::PosInt(6));
+        assert_eq!(state_val(&vm, "x"), Value::PosInt(5));
+        assert_eq!(state_val(&vm, "y"), Value::PosInt(6));
         // Renamed object target.
         let vm = run_vm("let z; ({ a: z } = { a: 8 }); state.z = z;");
-        assert_eq!(state_val(&vm, "z"), StackValue::PosInt(8));
+        assert_eq!(state_val(&vm, "z"), Value::PosInt(8));
     }
 
     #[test]
@@ -4639,7 +4627,7 @@ mod tests {
         let vm = run_vm(
             "let last; for (let i = 0; i < 2; i++) { let x; if (i === 0) x = 5; last = x; } state.r = last;",
         );
-        assert_eq!(state_val(&vm, "r"), StackValue::Undefined);
+        assert_eq!(state_val(&vm, "r"), Value::Undefined);
     }
 
     #[test]
@@ -4673,7 +4661,7 @@ mod tests {
     /// Run a statement sequence ending in `return <expr>;`, rewritten as the
     /// final expression assigned to `state.__ret`, and return that value. Lets
     /// tests read the result of code that uses locals/control flow.
-    fn eval_phase2(src: &str) -> StackValue {
+    fn eval_phase2(src: &str) -> Value {
         let rewritten = src.replacen("return ", "state.__ret = ", 1);
         let vm = run_vm(&rewritten);
         state_val(&vm, "__ret")
@@ -4684,7 +4672,7 @@ mod tests {
         let rewritten = src.replacen("return ", "state.__ret = ", 1);
         let vm = run_vm(&rewritten);
         match state_val(&vm, "__ret") {
-            StackValue::String(s) => s.as_str().to_owned(),
+            Value::String(s) => s.as_str().to_owned(),
             other => panic!("not a string: {other:?}"),
         }
     }
@@ -4692,7 +4680,7 @@ mod tests {
     /// Read `state.<key>` as an owned string from a finished VM.
     fn eval_str_in(vm: &VM, key: &str) -> String {
         match state_val(vm, key) {
-            StackValue::String(s) => s.as_str().to_owned(),
+            Value::String(s) => s.as_str().to_owned(),
             other => panic!("not a string: {other:?}"),
         }
     }
@@ -4701,7 +4689,7 @@ mod tests {
 
     /// Run `src` and return `state.r`. Phase 3: programs can define and call
     /// functions; we wrap the result in a well-known state slot.
-    fn eval_phase3(src: &str) -> StackValue {
+    fn eval_phase3(src: &str) -> Value {
         let vm = run_vm(src);
         state_val(&vm, "r")
     }
@@ -4726,7 +4714,7 @@ mod tests {
     fn function_return_without_value() {
         assert_eq!(
             eval_phase3("function f() { return; } state.r = f();"),
-            StackValue::Undefined
+            Value::Undefined
         );
     }
 
@@ -4734,7 +4722,7 @@ mod tests {
     fn function_implicit_return() {
         assert_eq!(
             eval_phase3("function f() {} state.r = f();"),
-            StackValue::Undefined
+            Value::Undefined
         );
     }
 
@@ -4744,11 +4732,11 @@ mod tests {
         // pads with Undefined, which triggers the default expression.
         assert_eq!(
             eval_phase3("function f(x = 5) { return x; } state.r = f();"),
-            StackValue::PosInt(5)
+            Value::PosInt(5)
         );
         assert_eq!(
             eval_phase3("function f(x = 5) { return x; } state.r = f(9);"),
-            StackValue::PosInt(9)
+            Value::PosInt(9)
         );
     }
 
@@ -4793,7 +4781,7 @@ mod tests {
             eval_phase3(
                 "function isEven(n) { if (n === 0) return true; return isOdd(n - 1); } function isOdd(n) { if (n === 0) return false; return isEven(n - 1); } state.r = isEven(4);"
             ),
-            StackValue::Bool(true)
+            Value::Bool(true)
         );
     }
 
@@ -4938,7 +4926,7 @@ mod tests {
     #[test]
     fn function_decl_in_block_scope() {
         let vm = run_vm("state.r = foo(); { function foo() { return 9; } }");
-        assert_eq!(state_val(&vm, "r"), StackValue::PosInt(9));
+        assert_eq!(state_val(&vm, "r"), Value::PosInt(9));
     }
 
     #[test]
@@ -4967,7 +4955,7 @@ mod tests {
              } \
              state.r = outer();",
         );
-        assert_eq!(state_val(&vm, "r"), StackValue::PosInt(10));
+        assert_eq!(state_val(&vm, "r"), Value::PosInt(10));
     }
 
     #[test]
@@ -4980,9 +4968,9 @@ mod tests {
              { let x = 3; state.b = x; } \
              state.c = x;",
         );
-        assert_eq!(state_val(&vm, "a"), StackValue::PosInt(2));
-        assert_eq!(state_val(&vm, "b"), StackValue::PosInt(3));
-        assert_eq!(state_val(&vm, "c"), StackValue::PosInt(1));
+        assert_eq!(state_val(&vm, "a"), Value::PosInt(2));
+        assert_eq!(state_val(&vm, "b"), Value::PosInt(3));
+        assert_eq!(state_val(&vm, "c"), Value::PosInt(1));
     }
 
     #[test]
@@ -5000,7 +4988,7 @@ mod tests {
              } \
              state.r = make();",
         );
-        assert_eq!(state_val(&vm, "r"), StackValue::PosInt(42));
+        assert_eq!(state_val(&vm, "r"), Value::PosInt(42));
     }
 
     // ── allocation baseline (compiled, realistic workload) ──────────
@@ -5206,7 +5194,7 @@ mod tests {
         // Verify correctness.
         assert_eq!(state_val(&vm, "r"), num(101.0));
         match state_val(&vm, "s") {
-            StackValue::String(s) => assert_eq!(s.len(), 101),
+            Value::String(s) => assert_eq!(s.len(), 101),
             other => panic!("not a string: {other:?}"),
         }
     }

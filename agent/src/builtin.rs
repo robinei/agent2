@@ -14,12 +14,12 @@
 //! result — assignment-style "leave a value" semantics, so every builtin call
 //! is a well-formed expression.
 
-use crate::vm::{RcStr, StackValue, VM, VMError, as_i64, small_to_thin};
+use crate::vm::{RcStr, VM, VMError, Value, as_i64, small_to_thin};
 use smallvec::SmallVec;
 
 /// A builtin's identity. Used both as the static call target
 /// (`Instr::CallBuiltin(Builtin, argc)`, the compiler's fast path) and as a
-/// first-class value (`StackValue::Builtin(Builtin)`, for passing a builtin as
+/// first-class value (`Value::Builtin(Builtin)`, for passing a builtin as
 /// a callback — invoked through `CallDyn`). The enum *is* the registry key:
 /// `Debug` prints the name and equality is trivial.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -310,17 +310,17 @@ fn arg_base(vm: &VM, argc: u32) -> Result<usize, VMError> {
 /// bump for strings and a cheap bit-copy otherwise. Surplus args past `N` are
 /// silently dropped (JS ignores extra arguments). The min arity is already
 /// guaranteed by [`Builtin::call`] from `meta()`.
-fn take_args<const N: usize>(vm: &mut VM, argc: u32) -> Result<[StackValue; N], VMError> {
+fn take_args<const N: usize>(vm: &mut VM, argc: u32) -> Result<[Value; N], VMError> {
     let base = arg_base(vm, argc)?;
     let n = (argc as usize).min(N);
     // Clone each arg out of the stack (a refcount bump for strings, a bit-copy
-    // otherwise); surplus slots default to `Null`. `StackValue` is no longer
+    // otherwise); surplus slots default to `Null`. `Value` is no longer
     // `Copy`, so this can't be an array-repeat init.
     let out = std::array::from_fn(|i| {
         if i < n {
             vm.stack[base + i].clone()
         } else {
-            StackValue::Null
+            Value::Null
         }
     });
     vm.stack.truncate(base);
@@ -332,7 +332,7 @@ fn take_args<const N: usize>(vm: &mut VM, argc: u32) -> Result<[StackValue; N], 
 /// can index `args[0..want]` directly; `$want` documents that expectation and
 /// is checked in debug builds. Any surplus args past `want` are popped (so the
 /// stack stays balanced) but ignored — JS evaluates yet ignores extra args.
-/// Now delegates to `take_args` (zero-alloc). Returns `Result<[StackValue; N], VMError>`.
+/// Now delegates to `take_args` (zero-alloc). Returns `Result<[Value; N], VMError>`.
 macro_rules! check_arity {
     ($vm:expr, $argc:expr, $want:expr) => {{
         debug_assert!(
@@ -355,20 +355,20 @@ fn clamp_start(s: &str, idx: usize) -> usize {
     i
 }
 
-/// Build a number `StackValue` from an integer-valued `f64`, mirroring the
+/// Build a number `Value` from an integer-valued `f64`, mirroring the
 /// `PosInt`/`NegInt`/`Number` split used by [`VM::json_to_stack_value`]:
 /// non-negative integers that fit become `PosInt`, negative ones `NegInt`, and
 /// anything else (fractions, out-of-range magnitudes, NaN/∞) stays `Number`.
-fn int_value(n: f64) -> StackValue {
+fn int_value(n: f64) -> Value {
     if n.fract() == 0.0 {
         if (0.0..=u64::MAX as f64).contains(&n) {
-            return StackValue::PosInt(n as u64);
+            return Value::PosInt(n as u64);
         }
         if n < 0.0 && n >= i64::MIN as f64 {
-            return StackValue::NegInt(n as i64);
+            return Value::NegInt(n as i64);
         }
     }
-    StackValue::Number(n)
+    Value::Number(n)
 }
 
 /// JS `parseInt(string, radix)`: skip leading whitespace, an optional sign, an
@@ -430,14 +430,17 @@ fn js_parse_int(input: &str, mut radix: i64) -> f64 {
 fn array_push(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     let args = check_arity!(vm, argc, 2)?;
     let arr_ptr = match &args[0] {
-        StackValue::Array(p) => *p,
+        Value::Array(p) => *p,
         _ => return Err(VMError::TypeError),
     };
     let val = args[1].clone();
-    let arr = vm.arrays.get_mut(arr_ptr as usize).ok_or(VMError::TypeError)?;
+    let arr = vm
+        .arrays
+        .get_mut(arr_ptr as usize)
+        .ok_or(VMError::TypeError)?;
     arr.push(val);
     let len = arr.len();
-    vm.stack.push(StackValue::Number(len as f64));
+    vm.stack.push(Value::Number(len as f64));
     Ok(())
 }
 
@@ -445,10 +448,13 @@ fn array_push(vm: &mut VM, argc: u32) -> Result<(), VMError> {
 fn array_pop(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     let args = check_arity!(vm, argc, 1)?;
     let arr_ptr = match &args[0] {
-        StackValue::Array(p) => *p,
+        Value::Array(p) => *p,
         _ => return Err(VMError::TypeError),
     };
-    let arr = vm.arrays.get_mut(arr_ptr as usize).ok_or(VMError::TypeError)?;
+    let arr = vm
+        .arrays
+        .get_mut(arr_ptr as usize)
+        .ok_or(VMError::TypeError)?;
     let val = arr.pop().ok_or(VMError::ValueError)?;
     vm.stack.push(val);
     Ok(())
@@ -458,10 +464,13 @@ fn array_pop(vm: &mut VM, argc: u32) -> Result<(), VMError> {
 fn array_shift(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     let args = check_arity!(vm, argc, 1)?;
     let arr_ptr = match &args[0] {
-        StackValue::Array(p) => *p,
+        Value::Array(p) => *p,
         _ => return Err(VMError::TypeError),
     };
-    let arr = vm.arrays.get_mut(arr_ptr as usize).ok_or(VMError::TypeError)?;
+    let arr = vm
+        .arrays
+        .get_mut(arr_ptr as usize)
+        .ok_or(VMError::TypeError)?;
     if arr.is_empty() {
         return Err(VMError::ValueError);
     }
@@ -474,14 +483,17 @@ fn array_shift(vm: &mut VM, argc: u32) -> Result<(), VMError> {
 fn array_unshift(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     let args = check_arity!(vm, argc, 2)?;
     let arr_ptr = match &args[0] {
-        StackValue::Array(p) => *p,
+        Value::Array(p) => *p,
         _ => return Err(VMError::TypeError),
     };
     let val = args[1].clone();
-    let arr = vm.arrays.get_mut(arr_ptr as usize).ok_or(VMError::TypeError)?;
+    let arr = vm
+        .arrays
+        .get_mut(arr_ptr as usize)
+        .ok_or(VMError::TypeError)?;
     arr.insert(0, val);
     let len = arr.len();
-    vm.stack.push(StackValue::Number(len as f64));
+    vm.stack.push(Value::Number(len as f64));
     Ok(())
 }
 
@@ -490,12 +502,12 @@ fn array_join(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     let args = take_args::<2>(vm, argc)?;
     let (arr_ptr, sep) = match argc {
         1 => match &args[0] {
-            StackValue::Array(p) => (*p, ",".into()),
+            Value::Array(p) => (*p, ",".into()),
             _ => return Err(VMError::TypeError),
         },
         2 => {
             let p = match &args[0] {
-                StackValue::Array(p) => *p,
+                Value::Array(p) => *p,
                 _ => return Err(VMError::TypeError),
             };
             let s = vm.to_js_string(&args[1], 0);
@@ -510,7 +522,7 @@ fn array_join(vm: &mut VM, argc: u32) -> Result<(), VMError> {
             joined.push_str(sep.as_str());
         }
         // JS: null/undefined elements contribute the empty string.
-        if !matches!(v, StackValue::Null | StackValue::Undefined) {
+        if !matches!(v, Value::Null | Value::Undefined) {
             joined.push_str(vm.to_js_string(v, 0).as_str());
         }
     }
@@ -534,16 +546,16 @@ fn str_split(vm: &mut VM, argc: u32) -> Result<(), VMError> {
         }),
         _ => return Err(VMError::BadArg),
     };
-    let mut parts: SmallVec<[StackValue; 16]> = SmallVec::new();
+    let mut parts: SmallVec<[Value; 16]> = SmallVec::new();
     match limit {
         Some(lim) => {
             for p in s.splitn(lim, delim.as_str()) {
-                parts.push(StackValue::String(RcStr::from(p)));
+                parts.push(Value::String(RcStr::from(p)));
             }
         }
         None => {
             for p in s.split(delim.as_str()) {
-                parts.push(StackValue::String(RcStr::from(p)));
+                parts.push(Value::String(RcStr::from(p)));
             }
         }
     }
@@ -571,7 +583,7 @@ fn str_includes(vm: &mut VM, argc: u32) -> Result<(), VMError> {
         }
         None => haystack.contains(needle),
     };
-    vm.stack.push(StackValue::Bool(found));
+    vm.stack.push(Value::Bool(found));
     Ok(())
 }
 
@@ -594,7 +606,7 @@ fn str_index_of(vm: &mut VM, argc: u32) -> Result<(), VMError> {
         }
         None => haystack.find(needle).map(|p| p as f64),
     };
-    vm.stack.push(StackValue::Number(pos.unwrap_or(-1.0)));
+    vm.stack.push(Value::Number(pos.unwrap_or(-1.0)));
     Ok(())
 }
 
@@ -621,7 +633,7 @@ fn str_last_index_of(vm: &mut VM, argc: u32) -> Result<(), VMError> {
         }
         None => haystack.rfind(needle).map(|p| p as f64),
     };
-    vm.stack.push(StackValue::Number(pos.unwrap_or(-1.0)));
+    vm.stack.push(Value::Number(pos.unwrap_or(-1.0)));
     Ok(())
 }
 
@@ -630,8 +642,7 @@ fn str_starts_with(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     let args = check_arity!(vm, argc, 2)?;
     let haystack = vm.str_from(&args[0])?;
     let prefix = vm.str_from(&args[1])?;
-    vm.stack
-        .push(StackValue::Bool(haystack.starts_with(prefix)));
+    vm.stack.push(Value::Bool(haystack.starts_with(prefix)));
     Ok(())
 }
 
@@ -640,7 +651,7 @@ fn str_ends_with(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     let args = check_arity!(vm, argc, 2)?;
     let haystack = vm.str_from(&args[0])?;
     let suffix = vm.str_from(&args[1])?;
-    vm.stack.push(StackValue::Bool(haystack.ends_with(suffix)));
+    vm.stack.push(Value::Bool(haystack.ends_with(suffix)));
     Ok(())
 }
 
@@ -693,7 +704,7 @@ fn str_trim(vm: &mut VM, argc: u32) -> Result<(), VMError> {
 fn obj_keys(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     let args = check_arity!(vm, argc, 1)?;
     let obj_ptr = match &args[0] {
-        StackValue::Object(p) => *p,
+        Value::Object(p) => *p,
         _ => return Err(VMError::TypeError),
     };
     let keys: SmallVec<[RcStr; 8]> = vm
@@ -703,7 +714,7 @@ fn obj_keys(vm: &mut VM, argc: u32) -> Result<(), VMError> {
         .keys()
         .cloned()
         .collect();
-    let strs: SmallVec<[StackValue; 16]> = keys.into_iter().map(StackValue::String).collect();
+    let strs: SmallVec<[Value; 16]> = keys.into_iter().map(Value::String).collect();
     let ptr = vm.alloc_array(small_to_thin(&strs));
     vm.stack.push(ptr);
     Ok(())
@@ -713,10 +724,10 @@ fn obj_keys(vm: &mut VM, argc: u32) -> Result<(), VMError> {
 fn obj_values(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     let args = check_arity!(vm, argc, 1)?;
     let obj_ptr = match &args[0] {
-        StackValue::Object(p) => *p,
+        Value::Object(p) => *p,
         _ => return Err(VMError::TypeError),
     };
-    let vals: SmallVec<[StackValue; 16]> = vm
+    let vals: SmallVec<[Value; 16]> = vm
         .objects
         .get(obj_ptr as usize)
         .ok_or(VMError::TypeError)?
@@ -754,9 +765,9 @@ fn json_stringify(vm: &mut VM, argc: u32) -> Result<(), VMError> {
 /// `Number.isInteger(x)` → bool.
 fn number_is_integer(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     let args = check_arity!(vm, argc, 1)?;
-    let is_int = matches!(&args[0], StackValue::PosInt(_) | StackValue::NegInt(_))
-        || matches!(&args[0], StackValue::Number(n) if crate::vm::float_is_int(*n));
-    vm.stack.push(StackValue::Bool(is_int));
+    let is_int = matches!(&args[0], Value::PosInt(_) | Value::NegInt(_))
+        || matches!(&args[0], Value::Number(n) if crate::vm::float_is_int(*n));
+    vm.stack.push(Value::Bool(is_int));
     Ok(())
 }
 
@@ -787,7 +798,7 @@ fn number_parse_float(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     let args = check_arity!(vm, argc, 1)?;
     let s = vm.str_from(&args[0])?;
     let n: f64 = s.trim().parse().map_err(|_| VMError::ValueError)?;
-    vm.stack.push(StackValue::Number(n));
+    vm.stack.push(Value::Number(n));
     Ok(())
 }
 
@@ -796,8 +807,8 @@ fn number_parse_float(vm: &mut VM, argc: u32) -> Result<(), VMError> {
 /// `Array.isArray(x)` → bool.
 fn array_is_array(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     let args = check_arity!(vm, argc, 1)?;
-    let is_arr = matches!(&args[0], StackValue::Array(_));
-    vm.stack.push(StackValue::Bool(is_arr));
+    let is_arr = matches!(&args[0], Value::Array(_));
+    vm.stack.push(Value::Bool(is_arr));
     Ok(())
 }
 
@@ -807,7 +818,7 @@ fn array_is_array(vm: &mut VM, argc: u32) -> Result<(), VMError> {
 fn math_unary(vm: &mut VM, argc: u32, f: fn(f64) -> f64) -> Result<(), VMError> {
     let args = check_arity!(vm, argc, 1)?;
     let n = vm.to_number(&args[0]).ok_or(VMError::TypeError)?;
-    vm.stack.push(StackValue::Number(f(n)));
+    vm.stack.push(Value::Number(f(n)));
     Ok(())
 }
 
@@ -823,7 +834,7 @@ fn math_min(vm: &mut VM, argc: u32) -> Result<(), VMError> {
         acc = acc.min(num);
     }
     vm.stack.truncate(base);
-    vm.stack.push(StackValue::Number(acc));
+    vm.stack.push(Value::Number(acc));
     Ok(())
 }
 
@@ -839,7 +850,7 @@ fn math_max(vm: &mut VM, argc: u32) -> Result<(), VMError> {
         acc = acc.max(num);
     }
     vm.stack.truncate(base);
-    vm.stack.push(StackValue::Number(acc));
+    vm.stack.push(Value::Number(acc));
     Ok(())
 }
 
@@ -848,7 +859,7 @@ fn math_pow(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     let args = check_arity!(vm, argc, 2)?;
     let base = vm.to_number(&args[0]).ok_or(VMError::TypeError)?;
     let exp = vm.to_number(&args[1]).ok_or(VMError::TypeError)?;
-    vm.stack.push(StackValue::Number(base.powf(exp)));
+    vm.stack.push(Value::Number(base.powf(exp)));
     Ok(())
 }
 
@@ -859,7 +870,7 @@ mod tests {
     use super::*;
     use crate::vm::{Instr, StepResult};
 
-    fn run(code: Vec<Instr>) -> Vec<StackValue> {
+    fn run(code: Vec<Instr>) -> Vec<Value> {
         let mut vm = VM::new(code);
         loop {
             match vm.step().unwrap() {
@@ -880,7 +891,7 @@ mod tests {
             Instr::PushFloat(20.0),
             Instr::CallBuiltin(Builtin::ArrayPush, 2),
         ]);
-        assert_eq!(out.last(), Some(&StackValue::Number(2.0)));
+        assert_eq!(out.last(), Some(&Value::Number(2.0)));
     }
 
     // ── ArrayPop ───────────────────────────────────────────────────────
@@ -893,7 +904,7 @@ mod tests {
             Instr::ArrNew(2),
             Instr::CallBuiltin(Builtin::ArrayPop, 1),
         ]);
-        assert_eq!(out, vec![StackValue::Number(2.0)]);
+        assert_eq!(out, vec![Value::Number(2.0)]);
     }
 
     #[test]
@@ -915,7 +926,7 @@ mod tests {
             Instr::ArrNew(2),
             Instr::CallBuiltin(Builtin::ArrayShift, 1),
         ]);
-        assert_eq!(out, vec![StackValue::Number(1.0)]);
+        assert_eq!(out, vec![Value::Number(1.0)]);
     }
 
     #[test]
@@ -938,7 +949,7 @@ mod tests {
             Instr::PushFloat(1.0),
             Instr::CallBuiltin(Builtin::ArrayUnshift, 2),
         ]);
-        assert_eq!(out.last(), Some(&StackValue::Number(2.0)));
+        assert_eq!(out.last(), Some(&Value::Number(2.0)));
     }
 
     // ── ArrayJoin ──────────────────────────────────────────────────────
@@ -952,7 +963,7 @@ mod tests {
             Instr::CallBuiltin(Builtin::ArrayJoin, 1),
         ]);
         match &out[0] {
-            StackValue::String(s) => assert_eq!(s.as_str(), "1,2"),
+            Value::String(s) => assert_eq!(s.as_str(), "1,2"),
             other => panic!("expected string, got {other:?}"),
         }
     }
@@ -967,7 +978,7 @@ mod tests {
             Instr::CallBuiltin(Builtin::ArrayJoin, 2),
         ]);
         match &out[0] {
-            StackValue::String(s) => assert_eq!(s.as_str(), "1 - 2"),
+            Value::String(s) => assert_eq!(s.as_str(), "1 - 2"),
             other => panic!("expected string, got {other:?}"),
         }
     }
@@ -983,7 +994,7 @@ mod tests {
         ]);
         // result is an array
         match &out[0] {
-            StackValue::Array(_) => {}
+            Value::Array(_) => {}
             other => panic!("expected Array, got {other:?}"),
         }
     }
@@ -997,7 +1008,7 @@ mod tests {
             Instr::CallBuiltin(Builtin::StrSplit, 3),
         ]);
         match &out[0] {
-            StackValue::Array(_) => {}
+            Value::Array(_) => {}
             other => panic!("expected Array, got {other:?}"),
         }
     }
@@ -1011,7 +1022,7 @@ mod tests {
             Instr::PushStr("world".into()),
             Instr::CallBuiltin(Builtin::StrIncludes, 2),
         ]);
-        assert_eq!(out, vec![StackValue::Bool(true)]);
+        assert_eq!(out, vec![Value::Bool(true)]);
     }
 
     #[test]
@@ -1021,7 +1032,7 @@ mod tests {
             Instr::PushStr("x".into()),
             Instr::CallBuiltin(Builtin::StrIncludes, 2),
         ]);
-        assert_eq!(out, vec![StackValue::Bool(false)]);
+        assert_eq!(out, vec![Value::Bool(false)]);
     }
 
     // ── StrIndexOf ─────────────────────────────────────────────────────
@@ -1033,7 +1044,7 @@ mod tests {
             Instr::PushStr("l".into()),
             Instr::CallBuiltin(Builtin::StrIndexOf, 2),
         ]);
-        assert_eq!(out, vec![StackValue::Number(2.0)]);
+        assert_eq!(out, vec![Value::Number(2.0)]);
     }
 
     #[test]
@@ -1043,7 +1054,7 @@ mod tests {
             Instr::PushStr("x".into()),
             Instr::CallBuiltin(Builtin::StrIndexOf, 2),
         ]);
-        assert_eq!(out, vec![StackValue::Number(-1.0)]);
+        assert_eq!(out, vec![Value::Number(-1.0)]);
     }
 
     // ── StrLastIndexOf ─────────────────────────────────────────────────
@@ -1055,7 +1066,7 @@ mod tests {
             Instr::PushStr("l".into()),
             Instr::CallBuiltin(Builtin::StrLastIndexOf, 2),
         ]);
-        assert_eq!(out, vec![StackValue::Number(3.0)]);
+        assert_eq!(out, vec![Value::Number(3.0)]);
     }
 
     // ── negative `start` clamps to 0, matching JS (rather than failing) ─
@@ -1069,7 +1080,7 @@ mod tests {
             Instr::PushNegInt(-5),
             Instr::CallBuiltin(Builtin::StrIndexOf, 3),
         ]);
-        assert_eq!(out, vec![StackValue::Number(0.0)]);
+        assert_eq!(out, vec![Value::Number(0.0)]);
     }
 
     #[test]
@@ -1081,7 +1092,7 @@ mod tests {
             Instr::PushNegInt(-5),
             Instr::CallBuiltin(Builtin::StrIncludes, 3),
         ]);
-        assert_eq!(out, vec![StackValue::Bool(true)]);
+        assert_eq!(out, vec![Value::Bool(true)]);
     }
 
     #[test]
@@ -1093,7 +1104,7 @@ mod tests {
             Instr::PushNegInt(-3),
             Instr::CallBuiltin(Builtin::StrLastIndexOf, 3),
         ]);
-        assert_eq!(out, vec![StackValue::Number(-1.0)]);
+        assert_eq!(out, vec![Value::Number(-1.0)]);
     }
 
     // ── StrStartsWith / StrEndsWith ────────────────────────────────────
@@ -1105,7 +1116,7 @@ mod tests {
             Instr::PushStr("hel".into()),
             Instr::CallBuiltin(Builtin::StrStartsWith, 2),
         ]);
-        assert_eq!(out, vec![StackValue::Bool(true)]);
+        assert_eq!(out, vec![Value::Bool(true)]);
     }
 
     #[test]
@@ -1115,7 +1126,7 @@ mod tests {
             Instr::PushStr("lo".into()),
             Instr::CallBuiltin(Builtin::StrEndsWith, 2),
         ]);
-        assert_eq!(out, vec![StackValue::Bool(true)]);
+        assert_eq!(out, vec![Value::Bool(true)]);
     }
 
     // ── StrSlice ───────────────────────────────────────────────────────
@@ -1129,7 +1140,7 @@ mod tests {
             Instr::CallBuiltin(Builtin::StrSlice, 3),
         ]);
         match &out[0] {
-            StackValue::String(s) => assert_eq!(s.as_str(), "ell"),
+            Value::String(s) => assert_eq!(s.as_str(), "ell"),
             other => panic!("expected string, got {other:?}"),
         }
     }
@@ -1142,7 +1153,7 @@ mod tests {
             Instr::CallBuiltin(Builtin::StrSlice, 2),
         ]);
         match &out[0] {
-            StackValue::String(s) => assert_eq!(s.as_str(), "llo"),
+            Value::String(s) => assert_eq!(s.as_str(), "llo"),
             other => panic!("expected string, got {other:?}"),
         }
     }
@@ -1156,7 +1167,7 @@ mod tests {
             Instr::CallBuiltin(Builtin::StrTrim, 1),
         ]);
         match &out[0] {
-            StackValue::String(s) => assert_eq!(s.as_str(), "hi"),
+            Value::String(s) => assert_eq!(s.as_str(), "hi"),
             other => panic!("expected string, got {other:?}"),
         }
     }
@@ -1174,7 +1185,7 @@ mod tests {
         ]);
         // result is an array
         match &out[0] {
-            StackValue::Array(_) => {}
+            Value::Array(_) => {}
             other => panic!("expected Array, got {other:?}"),
         }
     }
@@ -1187,7 +1198,7 @@ mod tests {
             Instr::CallBuiltin(Builtin::ObjValues, 1),
         ]);
         match &out[0] {
-            StackValue::Array(_) => {}
+            Value::Array(_) => {}
             other => panic!("expected Array, got {other:?}"),
         }
     }
@@ -1200,7 +1211,7 @@ mod tests {
             Instr::PushStr("42".into()),
             Instr::CallBuiltin(Builtin::JSONParse, 1),
         ]);
-        assert_eq!(out, vec![StackValue::PosInt(42)]);
+        assert_eq!(out, vec![Value::PosInt(42)]);
     }
 
     #[test]
@@ -1210,7 +1221,7 @@ mod tests {
             Instr::CallBuiltin(Builtin::JSONStringify, 1),
         ]);
         match &out[0] {
-            StackValue::String(s) => assert_eq!(s.as_str(), "3.5"),
+            Value::String(s) => assert_eq!(s.as_str(), "3.5"),
             other => panic!("expected string, got {other:?}"),
         }
     }
@@ -1223,7 +1234,7 @@ mod tests {
             Instr::PushPosInt(5),
             Instr::CallBuiltin(Builtin::NumberIsInteger, 1),
         ]);
-        assert_eq!(out, vec![StackValue::Bool(true)]);
+        assert_eq!(out, vec![Value::Bool(true)]);
     }
 
     #[test]
@@ -1232,7 +1243,7 @@ mod tests {
             Instr::PushStr("42".into()),
             Instr::CallBuiltin(Builtin::NumberParseInt, 1),
         ]);
-        assert_eq!(out, vec![StackValue::PosInt(42)]);
+        assert_eq!(out, vec![Value::PosInt(42)]);
     }
 
     #[test]
@@ -1242,7 +1253,7 @@ mod tests {
             Instr::PushStr("42px".into()),
             Instr::CallBuiltin(Builtin::NumberParseInt, 1),
         ]);
-        assert_eq!(out, vec![StackValue::PosInt(42)]);
+        assert_eq!(out, vec![Value::PosInt(42)]);
     }
 
     #[test]
@@ -1253,7 +1264,7 @@ mod tests {
             Instr::PushPosInt(16),
             Instr::CallBuiltin(Builtin::NumberParseInt, 2),
         ]);
-        assert_eq!(out, vec![StackValue::PosInt(255)]);
+        assert_eq!(out, vec![Value::PosInt(255)]);
     }
 
     #[test]
@@ -1263,7 +1274,7 @@ mod tests {
             Instr::PushStr("0x1A".into()),
             Instr::CallBuiltin(Builtin::NumberParseInt, 1),
         ]);
-        assert_eq!(out, vec![StackValue::PosInt(26)]);
+        assert_eq!(out, vec![Value::PosInt(26)]);
     }
 
     #[test]
@@ -1272,7 +1283,7 @@ mod tests {
             Instr::PushStr("  -17 ".into()),
             Instr::CallBuiltin(Builtin::NumberParseInt, 1),
         ]);
-        assert_eq!(out, vec![StackValue::NegInt(-17)]);
+        assert_eq!(out, vec![Value::NegInt(-17)]);
     }
 
     #[test]
@@ -1282,7 +1293,7 @@ mod tests {
             Instr::PushStr("nope".into()),
             Instr::CallBuiltin(Builtin::NumberParseInt, 1),
         ]);
-        assert!(matches!(out.as_slice(), [StackValue::Number(n)] if n.is_nan()));
+        assert!(matches!(out.as_slice(), [Value::Number(n)] if n.is_nan()));
     }
 
     #[test]
@@ -1298,7 +1309,7 @@ mod tests {
             Instr::PushStr("3.14".into()),
             Instr::CallBuiltin(Builtin::NumberParseFloat, 1),
         ]);
-        assert_eq!(out, vec![StackValue::Number(3.14)]);
+        assert_eq!(out, vec![Value::Number(3.14)]);
     }
 
     // ── Array.isArray ──────────────────────────────────────────────────
@@ -1309,7 +1320,7 @@ mod tests {
             Instr::ArrNew(0),
             Instr::CallBuiltin(Builtin::ArrayIsArray, 1),
         ]);
-        assert_eq!(out, vec![StackValue::Bool(true)]);
+        assert_eq!(out, vec![Value::Bool(true)]);
     }
 
     #[test]
@@ -1318,7 +1329,7 @@ mod tests {
             Instr::PushFloat(1.0),
             Instr::CallBuiltin(Builtin::ArrayIsArray, 1),
         ]);
-        assert_eq!(out, vec![StackValue::Bool(false)]);
+        assert_eq!(out, vec![Value::Bool(false)]);
     }
 
     // ── Math ─────────────────────────────────────────────────────────
@@ -1329,7 +1340,7 @@ mod tests {
             Instr::PushFloat(-5.0),
             Instr::CallBuiltin(Builtin::MathAbs, 1),
         ]);
-        assert_eq!(out, vec![StackValue::Number(5.0)]);
+        assert_eq!(out, vec![Value::Number(5.0)]);
     }
 
     #[test]
@@ -1338,7 +1349,7 @@ mod tests {
             Instr::PushFloat(9.0),
             Instr::CallBuiltin(Builtin::MathSqrt, 1),
         ]);
-        assert_eq!(out, vec![StackValue::Number(3.0)]);
+        assert_eq!(out, vec![Value::Number(3.0)]);
     }
 
     #[test]
@@ -1347,19 +1358,19 @@ mod tests {
             Instr::PushFloat(2.3),
             Instr::CallBuiltin(Builtin::MathCeil, 1),
         ]);
-        assert_eq!(out, vec![StackValue::Number(3.0)]);
+        assert_eq!(out, vec![Value::Number(3.0)]);
 
         let out = run(vec![
             Instr::PushFloat(2.7),
             Instr::CallBuiltin(Builtin::MathFloor, 1),
         ]);
-        assert_eq!(out, vec![StackValue::Number(2.0)]);
+        assert_eq!(out, vec![Value::Number(2.0)]);
 
         let out = run(vec![
             Instr::PushFloat(2.5),
             Instr::CallBuiltin(Builtin::MathRound, 1),
         ]);
-        assert_eq!(out, vec![StackValue::Number(3.0)]);
+        assert_eq!(out, vec![Value::Number(3.0)]);
     }
 
     #[test]
@@ -1368,7 +1379,7 @@ mod tests {
             Instr::PushFloat(-7.0),
             Instr::CallBuiltin(Builtin::MathSign, 1),
         ]);
-        assert_eq!(out, vec![StackValue::Number(-1.0)]);
+        assert_eq!(out, vec![Value::Number(-1.0)]);
     }
 
     #[test]
@@ -1379,13 +1390,13 @@ mod tests {
             Instr::PushFloat(5.0),
             Instr::CallBuiltin(Builtin::MathMax, 3),
         ]);
-        assert_eq!(out, vec![StackValue::Number(9.0)]);
+        assert_eq!(out, vec![Value::Number(9.0)]);
     }
 
     #[test]
     fn call_builtin_math_max_zero_args() {
         let out = run(vec![Instr::CallBuiltin(Builtin::MathMax, 0)]);
-        assert!(matches!(out.as_slice(), [StackValue::Number(x)] if x.is_infinite() && *x < 0.0));
+        assert!(matches!(out.as_slice(), [Value::Number(x)] if x.is_infinite() && *x < 0.0));
     }
 
     #[test]
@@ -1396,7 +1407,7 @@ mod tests {
             Instr::PushFloat(5.0),
             Instr::CallBuiltin(Builtin::MathMin, 3),
         ]);
-        assert_eq!(out, vec![StackValue::Number(-1.0)]);
+        assert_eq!(out, vec![Value::Number(-1.0)]);
     }
 
     #[test]
@@ -1406,7 +1417,7 @@ mod tests {
             Instr::PushFloat(3.0),
             Instr::CallBuiltin(Builtin::MathPow, 2),
         ]);
-        assert_eq!(out, vec![StackValue::Number(8.0)]);
+        assert_eq!(out, vec![Value::Number(8.0)]);
     }
 
     // ── first-class value tests ────────────────────────────────────────
@@ -1419,7 +1430,7 @@ mod tests {
             Instr::PushBuiltin(Builtin::MathMax),
             Instr::CallDyn(2),
         ]);
-        assert_eq!(out, vec![StackValue::Number(7.0)]);
+        assert_eq!(out, vec![Value::Number(7.0)]);
     }
 
     #[test]
@@ -1427,7 +1438,7 @@ mod tests {
         let mut vm = VM::new(vec![Instr::PushBuiltin(Builtin::MathMax), Instr::TypeOf]);
         while !matches!(vm.step().unwrap(), StepResult::Done) {}
         match vm.stack.last() {
-            Some(StackValue::String(s)) => assert_eq!(s.as_str(), "function"),
+            Some(Value::String(s)) => assert_eq!(s.as_str(), "function"),
             other => panic!("{other:?}"),
         }
     }
@@ -1446,7 +1457,7 @@ mod tests {
             Instr::PushBuiltin(Builtin::MathSqrt),
             Instr::CallDyn(3),
         ]);
-        assert_eq!(out, vec![StackValue::Number(3.0)]);
+        assert_eq!(out, vec![Value::Number(3.0)]);
     }
 
     #[test]
@@ -1477,6 +1488,6 @@ mod tests {
             Instr::PushBuiltin(Builtin::MathMax),
             Instr::CallDyn(3),
         ]);
-        assert_eq!(out, vec![StackValue::Number(9.0)]);
+        assert_eq!(out, vec![Value::Number(9.0)]);
     }
 }
