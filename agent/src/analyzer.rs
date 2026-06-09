@@ -28,7 +28,10 @@ pub(crate) enum ConstValue {
     /// address (`Fn(label)`), so the binding is a compile-time constant — no
     /// slot, references emit `PushFn(label)`, calls are static `Call(label)`.
     /// `arity` is the declared parameter count (for static-call arg padding).
-    Fn { label: u32, arity: u32 },
+    Fn {
+        label: u32,
+        arity: u32,
+    },
 }
 
 /// How a name resolves within a function's lexical (block) scopes. A `Slot` is an
@@ -53,9 +56,7 @@ fn literal_const_value(expr: &ast::Expression) -> Option<ConstValue> {
         ast::Expression::StringLiteral(s) => Some(ConstValue::Str(s.value.to_string())),
         ast::Expression::BooleanLiteral(b) => Some(ConstValue::Bool(b.value)),
         ast::Expression::NullLiteral(_) => Some(ConstValue::Null),
-        ast::Expression::UnaryExpression(u)
-            if u.operator == ast::UnaryOperator::UnaryNegation =>
-        {
+        ast::Expression::UnaryExpression(u) if u.operator == ast::UnaryOperator::UnaryNegation => {
             match &u.argument {
                 ast::Expression::NumericLiteral(n) => Some(ConstValue::Num(-n.value)),
                 _ => None,
@@ -408,7 +409,11 @@ fn compact_const_fn_slots(scopes: &mut [FuncScope]) {
             if let Some(val) = s.const_fn_slots.get(&slot) {
                 s.const_refs.push((span, val.clone()));
             } else {
-                kept.push((span, remap(slot).expect("non-const-fn slot survives"), is_const));
+                kept.push((
+                    span,
+                    remap(slot).expect("non-const-fn slot survives"),
+                    is_const,
+                ));
             }
         }
         s.local_refs = kept;
@@ -446,7 +451,10 @@ fn register_const_fns(scopes: &mut [FuncScope], const_fns: &HashSet<usize>) {
             arity: scopes[sf].params.len() as u32,
         };
         let slot = scopes[parent].names.get(&name).map(|i| i.slot);
-        scopes[parent].const_names.entry(name).or_insert(val.clone());
+        scopes[parent]
+            .const_names
+            .entry(name)
+            .or_insert(val.clone());
         if let Some(slot) = slot {
             scopes[parent].const_fn_slots.insert(slot, val);
         }
@@ -586,8 +594,9 @@ fn finalize_tables(
         // A binding/own-local is immutable in fact when it is `const`, or it is
         // never reassigned in its scope AND never captured by a nested function
         // (a closure-mutated binding is necessarily captured, so this catches it).
-        let own_immutable =
-            |own: u32, is_const: bool| is_const || (!s.reassigned.contains(&own) && !s.captured.contains(&own));
+        let own_immutable = |own: u32, is_const: bool| {
+            is_const || (!s.reassigned.contains(&own) && !s.captured.contains(&own))
+        };
         for &(span, own, is_const) in &s.binding_spans {
             binding_slot.insert(span, frame_abs(own, nparams, s.upval_count));
             binding_immutable.insert(span, own_immutable(own, is_const));
@@ -1111,7 +1120,12 @@ impl Analyzer {
                 if let ast::BindingPattern::BindingIdentifier(id) = &d.id {
                     if id.name != "state" {
                         if let Some(value) = d.init.as_ref().and_then(literal_const_value) {
-                            self.analyze_register_const(id.name.as_str(), value, scope, block_scopes);
+                            self.analyze_register_const(
+                                id.name.as_str(),
+                                value,
+                                scope,
+                                block_scopes,
+                            );
                             continue;
                         }
                     }
