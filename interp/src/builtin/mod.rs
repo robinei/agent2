@@ -21,8 +21,14 @@ use thin_vec::ThinVec;
 /// is active). Mirrors `VM::fail` but takes `ip` explicitly.
 fn fail_at(ip: CodeAddr, kind: ErrorKind, msg: &str) -> VMError {
     let resume = match kind {
+        ErrorKind::StackUnderflow
+        | ErrorKind::BadReturn
+        | ErrorKind::BadCall
+        | ErrorKind::BadAlloc
+        | ErrorKind::BadArg
+        | ErrorKind::BadLocal => ResumeMode::NotResumable,
         ErrorKind::OutOfFuel => ResumeMode::RetrySameInstr,
-        _ => ResumeMode::NotResumable,
+        ErrorKind::TypeError | ErrorKind::ValueError => ResumeMode::PushValueThenContinue,
     };
     VMError {
         kind,

@@ -2263,6 +2263,98 @@ fn render_error_without_source_falls_back() {
     );
 }
 
+// ── resume_with tests (Step 3) ──────────────────────────────────
+
+#[test]
+fn resume_with_push_value_then_continue() {
+    // `return [] - 1;` → TypeError in Sub (binary_num! pops first).
+    // resume_with should feed a replacement value and the program completes.
+    let prog = crate::testutil::compile_ok("return [] - 1;");
+    let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
+    let err = loop {
+        match vm.step() {
+            Err(e) => break e,
+            Ok(StepResult::Done { .. }) => panic!("expected error"),
+            Ok(_) => {}
+        }
+    };
+    assert!(matches!(err.kind, ErrorKind::TypeError));
+    assert!(matches!(err.resume, ResumeMode::PushValueThenContinue));
+    // Feed 0.0 as the subtraction result; program should complete with 0.
+    vm.resume_with(&err, Value::Float(0.0)).unwrap();
+    match vm.step().unwrap() {
+        StepResult::Done { value } => {
+            assert_eq!(value, Value::Float(0.0));
+        }
+        other => panic!("expected Done after resume, got {other:?}"),
+    }
+}
+
+#[test]
+fn resume_with_retry_same_instr_out_of_fuel() {
+    // OutOfFuel is RetrySameInstr: refuel and re-step.
+    let mut vm = VM::new(vec![PushPosInt(1), PushPosInt(2), Add]);
+    vm.fuel = 0; // force immediate OutOfFuel
+    let err = vm.step().unwrap_err();
+    assert!(matches!(err.kind, ErrorKind::OutOfFuel));
+    assert!(matches!(err.resume, ResumeMode::RetrySameInstr));
+    // Refuel and re-step: should succeed now.
+    vm.fuel = 10;
+    match vm.step().unwrap() {
+        StepResult::Done { .. } => {} // fine
+        other => panic!("expected Done, got {other:?}"),
+    }
+}
+
+#[test]
+fn resume_with_not_resumable_errors() {
+    // ObjGet on a non-object is NotResumable (peek check). resume_with must fail.
+    let mut vm = VM::new(vec![
+        PushPosInt(1),
+        PushStr("foo".into()),
+        ObjGet("foo".into()),
+    ]);
+    // Pop the extra value so only non-object is on stack (ObjGet peeks stack.last())
+    vm.stack.pop();
+    let err = vm.step().unwrap_err();
+    assert!(matches!(err.kind, ErrorKind::TypeError));
+    assert!(matches!(err.resume, ResumeMode::NotResumable));
+    let result = vm.resume_with(&err, Value::Null);
+    assert!(result.is_err(), "resume_with on NotResumable should error");
+    assert!(matches!(result.unwrap_err().kind, ErrorKind::BadArg));
+}
+
+#[test]
+fn push_value_then_continue_pop_first_invariant() {
+    // Verify the invariant: after a PushValueThenContinue error, the stack
+    // has the instruction's operands consumed, so resume_with just pushes
+    // and continues without additional fixup.
+    let mut vm = VM::new(vec![
+        PushPosInt(42),            // some unrelated value
+        PushStr("notanum".into()), // operand that will fail to_number()
+        BitNot,                    // unary op: pops operand, fails to_number
+    ]);
+    // Stack: [42, "notanum"]
+    let err = loop {
+        match vm.step() {
+            Err(e) => break e,
+            Ok(StepResult::Done { .. }) => panic!("expected error"),
+            Ok(_) => {}
+        }
+    };
+    assert!(matches!(err.resume, ResumeMode::PushValueThenContinue));
+    // After the error, the failed operand was consumed — only 42 remains.
+    assert_eq!(vm.stack.len(), 1);
+    // resume_with pushes a replacement and advances ip past BitNot.
+    vm.resume_with(&err, Value::Float(99.0)).unwrap();
+    assert_eq!(vm.stack.len(), 2);
+    // Continue stepping — should reach Done.
+    match vm.step().unwrap() {
+        StepResult::Done { .. } => {}
+        other => panic!("expected Done, got {other:?}"),
+    }
+}
+
 #[test]
 fn cyclic_value_serialization_errors() {
     // A self-referential object must error, not hang, on serialization.

@@ -269,6 +269,34 @@ pub enum ErrorKind {
 
 /// Whether the host can resume from this error by feeding a value (see
 /// `VM::resume_with`).
+///
+/// # Pop-first invariant
+///
+/// A `PushValueThenContinue` error is only constructed **after** the
+/// instruction's full operand consumption from the expression stack, so
+/// `resume_with` needs no per-instruction stack fixup — it just pushes
+/// the replacement value and advances ip.
+///
+/// # Classification audit (instruction/site → mode → why)
+///
+/// | Site | Kind | Mode | Reason |
+/// |------|------|------|--------|
+/// | unary_num! / binary_num! / binary_int! / cmp_op! macros | TypeError | PushValueThenContinue | ops popped before coercion |
+/// | Add (string concat path) | TypeError | PushValueThenContinue | both ops popped before to_number |
+/// | BitNot, ToNum, TypeOf, IncLocal(cell) | TypeError/ValueError | PushValueThenContinue | operand popped first |
+/// | CallDyn non-callable | TypeError | PushValueThenContinue | callable popped before match |
+/// | IndexGet (non-container, bad index, mid-codepoint) | TypeError/ValueError | PushValueThenContinue | container+key popped first |
+/// | IndexSet (non-container, negative/OOB index) | TypeError/ValueError | PushValueThenContinue | val+key+container popped first |
+/// | ObjHas / ObjDelete (non-object) | TypeError | PushValueThenContinue | field+object popped first |
+/// | Builtin take_args / check_arity! bodies | TypeError/ValueError | PushValueThenContinue | args popped before type check |
+/// | **ObjGet** (non-object peek) | TypeError | **NotResumable** | object peeked (not popped) before check |
+/// | **ObjSet** (non-object peek, bad heap slot) | TypeError | **NotResumable** | value popped, object peeked (not fully consumed) |
+/// | **IncLocal** (non-numeric local) | TypeError | **NotResumable** | reads local by peek (no stack consumption) |
+/// | StackUnderflow, BadReturn, BadCall, BadAlloc, BadArg, BadLocal | — | NotResumable | invariant violation / compiler bug |
+/// | OutOfFuel | — | RetrySameInstr | nothing consumed; refuel and retry |
+///
+/// All 9 `ErrorKind`s are covered. The three bolded sites are the only
+/// TypeError/ValueError sites that error before full operand consumption.
 #[derive(Debug)]
 pub enum ResumeMode {
     /// Internal invariant broken (compiler bug / host misuse). Never resume.
@@ -295,8 +323,14 @@ impl VMError {
     /// `get_mut`).
     pub fn fail_at(ip: CodeAddr, kind: ErrorKind, msg: impl Into<String>) -> Self {
         let resume = match kind {
+            ErrorKind::StackUnderflow
+            | ErrorKind::BadReturn
+            | ErrorKind::BadCall
+            | ErrorKind::BadAlloc
+            | ErrorKind::BadArg
+            | ErrorKind::BadLocal => ResumeMode::NotResumable,
             ErrorKind::OutOfFuel => ResumeMode::RetrySameInstr,
-            _ => ResumeMode::NotResumable,
+            ErrorKind::TypeError | ErrorKind::ValueError => ResumeMode::PushValueThenContinue,
         };
         VMError {
             kind,

@@ -629,9 +629,10 @@ impl VM {
                             .clone(),
                         other => other.clone(),
                     };
-                    let old_num = old
-                        .to_number()
-                        .ok_or_else(|| self.fail(ErrorKind::TypeError, "type error"))?;
+                    // NotResumable: reads local by peek (no stack pop), so operand not consumed.
+                    let old_num = old.to_number().ok_or_else(|| {
+                        self.fail_not_resumable(ErrorKind::TypeError, "type error")
+                    })?;
                     // Compute new value: subtract p (p = -1 for ++, p = 1 for --).
                     let new_num = old_num - *p;
                     let new_val = Value::Float(new_num);
@@ -970,7 +971,10 @@ impl VM {
                     // without cloning.
                     let obj_ptr = match self.stack.last() {
                         Some(Value::Object(p)) => *p,
-                        _ => return Err(self.fail(ErrorKind::TypeError, "type error")),
+                        // NotResumable: errors before popping (peek-style check).
+                        _ => {
+                            return Err(self.fail_not_resumable(ErrorKind::TypeError, "type error"));
+                        }
                     };
                     // JS: a missing property reads as `undefined`, not `null`.
                     let val = match self.objects.get(obj_ptr as usize) {
@@ -992,11 +996,17 @@ impl VM {
                         .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
                     let obj_ptr = match self.stack.last() {
                         Some(Value::Object(p)) => *p,
-                        _ => return Err(self.fail(ErrorKind::TypeError, "type error")),
+                        // NotResumable: errors before popping (peek-style check).
+                        _ => {
+                            return Err(self.fail_not_resumable(ErrorKind::TypeError, "type error"));
+                        }
                     };
                     let obj = match self.objects.get_mut(obj_ptr as usize) {
                         Some(o) => o,
-                        _ => return Err(self.fail(ErrorKind::TypeError, "type error")),
+                        // NotResumable: object peeked, not fully consumed.
+                        _ => {
+                            return Err(self.fail_not_resumable(ErrorKind::TypeError, "type error"));
+                        }
                     };
                     // Read the old value before overwriting, then write through
                     // get_mut (avoids cloning the key when it already exists).

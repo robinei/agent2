@@ -34,10 +34,32 @@ impl VM {
     /// captured consistently. The `resume` field defaults to `NotResumable`;
     /// sites that qualify for a softer mode override it after the fact
     /// (see Step 3 audit).
+    /// Like `fail` but always sets `NotResumable`. For sites that error before
+    /// consuming all instruction operands (peek-style checks, etc.).
+    pub fn fail_not_resumable(&self, kind: ErrorKind, msg: impl Into<String>) -> VMError {
+        VMError {
+            kind,
+            ip: self.ip,
+            message: msg.into(),
+            resume: ResumeMode::NotResumable,
+        }
+    }
+
     pub fn fail(&self, kind: ErrorKind, msg: impl Into<String>) -> VMError {
         let resume = match kind {
+            // Invariant violations: compiler bug or host misuse — never resume.
+            ErrorKind::StackUnderflow
+            | ErrorKind::BadReturn
+            | ErrorKind::BadCall
+            | ErrorKind::BadAlloc
+            | ErrorKind::BadArg
+            | ErrorKind::BadLocal => ResumeMode::NotResumable,
+            // OutOfFuel: nothing was consumed; fix fuel and step() again.
             ErrorKind::OutOfFuel => ResumeMode::RetrySameInstr,
-            _ => ResumeMode::NotResumable,
+            // TypeError / ValueError: most sites pop operands first (macros,
+            // take_args, check_arity!). Default to PushValueThenContinue;
+            // specific sites that error before popping override below.
+            ErrorKind::TypeError | ErrorKind::ValueError => ResumeMode::PushValueThenContinue,
         };
         VMError {
             kind,
@@ -45,6 +67,24 @@ impl VM {
             message: msg.into(),
             resume,
         }
+    }
+
+    /// Apply the resume fixup for a PushValueThenContinue error:
+    /// push `value`, advance ip past the failed instruction.
+    /// Errors if this error's resume mode is not `PushValueThenContinue`.
+    pub fn resume_with(&mut self, e: &VMError, value: Value) -> Result<(), VMError> {
+        if !matches!(e.resume, ResumeMode::PushValueThenContinue) {
+            return Err(self.fail(
+                ErrorKind::BadArg,
+                format!(
+                    "cannot resume: error {:?} is not PushValueThenContinue",
+                    e.kind
+                ),
+            ));
+        }
+        self.stack.push(value);
+        self.ip = e.ip + 1;
+        Ok(())
     }
 
     /// Render an error against the VM's source (when available). Falls back
