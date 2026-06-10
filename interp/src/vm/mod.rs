@@ -252,8 +252,8 @@ pub struct InvokeCall {
     pub args: Vec<Value>,
 }
 
-#[derive(Debug)]
-pub enum VMError {
+#[derive(Debug, PartialEq)]
+pub enum ErrorKind {
     StackUnderflow,
     BadReturn,
     BadCall,
@@ -265,6 +265,46 @@ pub enum VMError {
     /// Instruction budget exhausted (guards against infinite loops in
     /// LLM-generated programs).
     OutOfFuel,
+}
+
+/// Whether the host can resume from this error by feeding a value (see
+/// `VM::resume_with`).
+#[derive(Debug)]
+pub enum ResumeMode {
+    /// Internal invariant broken (compiler bug / host misuse). Never resume.
+    NotResumable,
+    /// The failed instruction's operands were consumed; pushing a
+    /// replacement result and advancing ip resumes as if it succeeded.
+    PushValueThenContinue,
+    /// Nothing was consumed; fix the budget/input and step() again
+    /// (ip unchanged). Currently: OutOfFuel.
+    RetrySameInstr,
+}
+
+#[derive(Debug)]
+pub struct VMError {
+    pub kind: ErrorKind,
+    pub ip: CodeAddr,
+    pub message: String,
+    pub resume: ResumeMode,
+}
+
+impl VMError {
+    /// Construct an error at a given ip without borrowing the VM. For use
+    /// when a mutable borrow of the VM is already active (e.g. after
+    /// `get_mut`).
+    pub fn fail_at(ip: CodeAddr, kind: ErrorKind, msg: impl Into<String>) -> Self {
+        let resume = match kind {
+            ErrorKind::OutOfFuel => ResumeMode::RetrySameInstr,
+            _ => ResumeMode::NotResumable,
+        };
+        VMError {
+            kind,
+            ip,
+            message: msg.into(),
+            resume,
+        }
+    }
 }
 
 // ── submodules ──────────────────────────────────────────────

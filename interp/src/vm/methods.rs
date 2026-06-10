@@ -1,5 +1,7 @@
 use super::*;
 
+use crate::diag::Diagnostic;
+
 impl VM {
     pub fn new(code: Vec<Instr>) -> Self {
         VM {
@@ -24,6 +26,41 @@ impl VM {
             fuel: DEFAULT_FUEL,
             spans: Vec::new(),
             source: Arc::from(""),
+        }
+    }
+
+    /// Construct an error from the current instruction pointer. Every runtime
+    /// error site must go through this helper so `ip` and `resume` are
+    /// captured consistently. The `resume` field defaults to `NotResumable`;
+    /// sites that qualify for a softer mode override it after the fact
+    /// (see Step 3 audit).
+    pub fn fail(&self, kind: ErrorKind, msg: impl Into<String>) -> VMError {
+        let resume = match kind {
+            ErrorKind::OutOfFuel => ResumeMode::RetrySameInstr,
+            _ => ResumeMode::NotResumable,
+        };
+        VMError {
+            kind,
+            ip: self.ip,
+            message: msg.into(),
+            resume,
+        }
+    }
+
+    /// Render an error against the VM's source (when available). Falls back
+    /// to a plain "at instruction {ip}" format when spans/source are empty
+    /// (hand-assembled code via `VM::new`).
+    pub fn render_error(&self, e: &VMError) -> String {
+        let ip = e.ip as usize;
+        if ip < self.spans.len() && !self.source.is_empty() {
+            let span = self.spans[ip];
+            let diag = Diagnostic {
+                span,
+                message: e.message.clone(),
+            };
+            diag.render(&self.source)
+        } else {
+            format!("{} (at instruction {ip})", e.message)
         }
     }
 
@@ -154,16 +191,20 @@ impl VM {
     pub(super) fn pop_int(&mut self) -> Result<i64, VMError> {
         self.stack
             .pop()
-            .ok_or(VMError::StackUnderflow)?
+            .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?
             .as_i64()
-            .ok_or(VMError::TypeError)
+            .ok_or_else(|| self.fail(ErrorKind::TypeError, "type error"))
     }
 
     /// Pop a value and require it to be a String; return it (a refcount bump).
     pub(super) fn pop_string(&mut self) -> Result<RcStr, VMError> {
-        match self.stack.pop().ok_or(VMError::StackUnderflow)? {
+        match self
+            .stack
+            .pop()
+            .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?
+        {
             Value::String(s) => Ok(s),
-            _ => Err(VMError::TypeError),
+            _ => Err(self.fail(ErrorKind::TypeError, "type error")),
         }
     }
 
@@ -174,7 +215,7 @@ impl VM {
     pub(crate) fn str_from<'a>(&self, val: &'a Value) -> Result<&'a str, VMError> {
         match val {
             Value::String(s) => Ok(s.as_str()),
-            _ => Err(VMError::TypeError),
+            _ => Err(self.fail(ErrorKind::TypeError, "type error")),
         }
     }
 
@@ -184,7 +225,7 @@ impl VM {
     pub(crate) fn string_from(&self, val: &Value) -> Result<RcStr, VMError> {
         match val {
             Value::String(s) => Ok(s.clone()),
-            _ => Err(VMError::TypeError),
+            _ => Err(self.fail(ErrorKind::TypeError, "type error")),
         }
     }
 
@@ -196,7 +237,7 @@ impl VM {
         depth: usize,
     ) -> Result<serde_json::Value, VMError> {
         if depth > MAX_JSON_DEPTH {
-            return Err(VMError::ValueError);
+            return Err(self.fail(ErrorKind::ValueError, "value error"));
         }
         Ok(match val {
             Value::Null => serde_json::Value::Null,
@@ -209,14 +250,14 @@ impl VM {
             // is an internal indirection that should never reach here: fail
             // loudly rather than silently dropping it.
             Value::Fn(_) | Value::Builtin(_) | Value::Upval(_) => {
-                return Err(VMError::ValueError);
+                return Err(self.fail(ErrorKind::ValueError, "value error"));
             }
             // `undefined` has no JSON form. Like JS `JSON.stringify`, it is
             // *dropped* in an object and coerced to *null* in an array (handled
             // at those parent sites below); reaching here means it is the root
             // value, where JS.stringify returns the JS value `undefined` — no
             // JSON — so we surface an error rather than inventing one.
-            Value::Undefined => return Err(VMError::ValueError),
+            Value::Undefined => return Err(self.fail(ErrorKind::ValueError, "value error")),
             Value::Float(n) => {
                 // Preserve integer formatting when possible (f64-only VM
                 // internals, but JSON consumers care about int vs float).
@@ -233,7 +274,10 @@ impl VM {
             }
             Value::String(s) => serde_json::Value::String(s.as_str().to_owned()),
             Value::Array(p) => {
-                let arr = self.arrays.get(*p as usize).ok_or(VMError::ValueError)?;
+                let arr = self
+                    .arrays
+                    .get(*p as usize)
+                    .ok_or_else(|| self.fail(ErrorKind::ValueError, "value error"))?;
                 serde_json::Value::Array(
                     arr.iter()
                         .map(|v| match v {
@@ -245,7 +289,10 @@ impl VM {
                 )
             }
             Value::Object(p) => {
-                let obj = self.objects.get(*p as usize).ok_or(VMError::ValueError)?;
+                let obj = self
+                    .objects
+                    .get(*p as usize)
+                    .ok_or_else(|| self.fail(ErrorKind::ValueError, "value error"))?;
                 let mut map = serde_json::Map::new();
                 for (k, v) in obj.iter() {
                     // JS: properties whose value is `undefined` are omitted.
@@ -260,7 +307,7 @@ impl VM {
                 serde_json::Value::Object(map)
             }
             // A closure has no JSON representation (see Fn above).
-            Value::Closure(_) => return Err(VMError::ValueError),
+            Value::Closure(_) => return Err(self.fail(ErrorKind::ValueError, "value error")),
         })
     }
 
@@ -270,7 +317,7 @@ impl VM {
         depth: usize,
     ) -> Result<Value, VMError> {
         if depth > MAX_JSON_DEPTH {
-            return Err(VMError::ValueError);
+            return Err(self.fail(ErrorKind::ValueError, "value error"));
         }
         Ok(match json {
             serde_json::Value::Null => Value::Null,

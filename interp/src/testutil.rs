@@ -4,7 +4,7 @@
 //! `vm/tests.rs`, and `builtin/mod.rs`.
 
 use crate::compiler::{Program, compile};
-use crate::vm::{StepResult, VM, VMError, Value};
+use crate::vm::{ErrorKind, StepResult, VM, VMError, Value};
 
 // ── compilation ──────────────────────────────────────────────────────────
 
@@ -102,6 +102,12 @@ pub fn run_runtime_err(src: &str) -> VMError {
     }
 }
 
+/// Compile + run until a runtime error occurs; return only the `ErrorKind`.
+/// Sugar for tests that don't need the full `VMError`.
+pub fn run_err_kind(src: &str) -> ErrorKind {
+    run_runtime_err(src).kind
+}
+
 // ── value constructors ───────────────────────────────────────────────────
 
 /// Shorthand for `Value::Float(f64)`. Used in assertions: `num(7.0)`.
@@ -159,6 +165,6 @@ mod tests {
     fn run_runtime_err_catches_type_error() {
         // Accessing a property on a non-object is a runtime TypeError.
         let err = run_runtime_err("return null.foo;");
-        assert!(matches!(err, VMError::TypeError), "got {err:?}");
+        assert!(err.kind == ErrorKind::TypeError, "got {err:?}");
     }
 }

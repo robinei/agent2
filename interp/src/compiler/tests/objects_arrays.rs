@@ -104,7 +104,7 @@ fn optional_invocation_calls() {
             Err(e) => break e,
         }
     };
-    assert!(matches!(err, crate::vm::VMError::TypeError), "got: {err:?}");
+    assert!(err.kind == crate::vm::ErrorKind::TypeError, "got: {err:?}");
 }
 
 // ── in / delete ──────────────────────────────────────────────────

@@ -18,7 +18,9 @@ pub(crate) mod testutil;
 pub use compiler::{Program, compile};
 pub use diag::Diagnostic;
 pub use rc_str::RcStr;
-pub use vm::{DEFAULT_FUEL, Instr, InvokeCall, StepResult, VM, VMError, Value};
+pub use vm::{
+    DEFAULT_FUEL, ErrorKind, Instr, InvokeCall, ResumeMode, StepResult, VM, VMError, Value,
+};
 
 // ── test-only allocation counter ─────────────────────────────────────────────
 

@@ -14,8 +14,23 @@
 //! result — assignment-style "leave a value" semantics, so every builtin call
 //! is a well-formed expression.
 
-use crate::vm::{RcStr, VM, VMError, Value};
+use crate::vm::{CodeAddr, ErrorKind, RcStr, ResumeMode, VM, VMError, Value};
 use thin_vec::ThinVec;
+
+/// Construct an error without borrowing `VM` (for use when a mutable borrow
+/// is active). Mirrors `VM::fail` but takes `ip` explicitly.
+fn fail_at(ip: CodeAddr, kind: ErrorKind, msg: &str) -> VMError {
+    let resume = match kind {
+        ErrorKind::OutOfFuel => ResumeMode::RetrySameInstr,
+        _ => ResumeMode::NotResumable,
+    };
+    VMError {
+        kind,
+        ip,
+        message: msg.into(),
+        resume,
+    }
+}
 
 /// A builtin's identity. Used both as the static call target
 /// (`Instr::CallBuiltin(Builtin, argc)`, the compiler's fast path) and as a
@@ -249,7 +264,7 @@ impl Builtin {
     /// needed here — only the lower bound is checked.
     pub fn call(self, vm: &mut VM, argc: u32) -> Result<(), VMError> {
         if argc < self.meta().min_args {
-            return Err(VMError::BadArg);
+            return Err(vm.fail(ErrorKind::BadArg, "bad argument"));
         }
         match self {
             // ── array methods ──
@@ -300,7 +315,7 @@ impl Builtin {
 fn arg_base(vm: &VM, argc: u32) -> Result<usize, VMError> {
     let n = argc as usize;
     if vm.stack.len() < n {
-        return Err(VMError::StackUnderflow);
+        return Err(vm.fail(ErrorKind::StackUnderflow, "stack underflow"));
     }
     Ok(vm.stack.len() - n)
 }
@@ -431,12 +446,13 @@ fn array_push(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     let args = take_args::<2>(vm, argc)?;
     let arr_ptr = match &args[0] {
         Value::Array(p) => *p,
-        _ => return Err(VMError::TypeError),
+        _ => return Err(vm.fail(ErrorKind::TypeError, "type error")),
     };
+    let ip = vm.ip;
     let arr = vm
         .arrays
         .get_mut(arr_ptr as usize)
-        .ok_or(VMError::TypeError)?;
+        .ok_or_else(|| fail_at(ip, ErrorKind::TypeError, "type error"))?;
     // No element → no-op, just return length (JS `[].push()` returns 0).
     if argc > 1 {
         arr.push(args[1].clone());
@@ -451,13 +467,16 @@ fn array_pop(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     let args = check_arity!(vm, argc, 1)?;
     let arr_ptr = match &args[0] {
         Value::Array(p) => *p,
-        _ => return Err(VMError::TypeError),
+        _ => return Err(vm.fail(ErrorKind::TypeError, "type error")),
     };
+    let ip = vm.ip;
     let arr = vm
         .arrays
         .get_mut(arr_ptr as usize)
-        .ok_or(VMError::TypeError)?;
-    let val = arr.pop().ok_or(VMError::ValueError)?;
+        .ok_or_else(|| fail_at(ip, ErrorKind::TypeError, "type error"))?;
+    let val = arr
+        .pop()
+        .ok_or_else(|| vm.fail(ErrorKind::ValueError, "value error"))?;
     vm.stack.push(val);
     Ok(())
 }
@@ -467,14 +486,15 @@ fn array_shift(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     let args = check_arity!(vm, argc, 1)?;
     let arr_ptr = match &args[0] {
         Value::Array(p) => *p,
-        _ => return Err(VMError::TypeError),
+        _ => return Err(vm.fail(ErrorKind::TypeError, "type error")),
     };
+    let ip = vm.ip;
     let arr = vm
         .arrays
         .get_mut(arr_ptr as usize)
-        .ok_or(VMError::TypeError)?;
+        .ok_or_else(|| fail_at(ip, ErrorKind::TypeError, "type error"))?;
     if arr.is_empty() {
-        return Err(VMError::ValueError);
+        return Err(vm.fail(ErrorKind::ValueError, "value error"));
     }
     let val = arr.remove(0);
     vm.stack.push(val);
@@ -486,12 +506,13 @@ fn array_unshift(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     let args = take_args::<2>(vm, argc)?;
     let arr_ptr = match &args[0] {
         Value::Array(p) => *p,
-        _ => return Err(VMError::TypeError),
+        _ => return Err(vm.fail(ErrorKind::TypeError, "type error")),
     };
+    let ip = vm.ip;
     let arr = vm
         .arrays
         .get_mut(arr_ptr as usize)
-        .ok_or(VMError::TypeError)?;
+        .ok_or_else(|| fail_at(ip, ErrorKind::TypeError, "type error"))?;
     // No element → no-op, just return length.
     if argc > 1 {
         arr.insert(0, args[1].clone());
@@ -507,19 +528,22 @@ fn array_join(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     let (arr_ptr, sep) = match argc {
         1 => match &args[0] {
             Value::Array(p) => (*p, ",".into()),
-            _ => return Err(VMError::TypeError),
+            _ => return Err(vm.fail(ErrorKind::TypeError, "type error")),
         },
         2 => {
             let p = match &args[0] {
                 Value::Array(p) => *p,
-                _ => return Err(VMError::TypeError),
+                _ => return Err(vm.fail(ErrorKind::TypeError, "type error")),
             };
             let s = vm.to_js_string(&args[1], 0);
             (p, s)
         }
-        _ => return Err(VMError::BadArg),
+        _ => return Err(vm.fail(ErrorKind::BadArg, "bad argument")),
     };
-    let arr = vm.arrays.get(arr_ptr as usize).ok_or(VMError::TypeError)?;
+    let arr = vm
+        .arrays
+        .get(arr_ptr as usize)
+        .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?;
     let mut joined = String::new();
     for (i, v) in arr.iter().enumerate() {
         if i > 0 {
@@ -542,13 +566,15 @@ fn str_split(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     let (s, delim, limit) = match argc {
         2 => (vm.string_from(&args[0])?, vm.string_from(&args[1])?, None),
         3 => (vm.string_from(&args[0])?, vm.string_from(&args[1])?, {
-            let lim = args[2].as_i64().ok_or(VMError::TypeError)?;
+            let lim = args[2]
+                .as_i64()
+                .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?;
             if lim < 0 {
-                return Err(VMError::ValueError);
+                return Err(vm.fail(ErrorKind::ValueError, "value error"));
             }
             Some(lim as usize)
         }),
-        _ => return Err(VMError::BadArg),
+        _ => return Err(vm.fail(ErrorKind::BadArg, "bad argument")),
     };
     let parts: ThinVec<Value> = match limit {
         Some(lim) => s
@@ -573,9 +599,13 @@ fn str_includes(vm: &mut VM, argc: u32) -> Result<(), VMError> {
         3 => (
             vm.str_from(&args[0])?,
             vm.str_from(&args[1])?,
-            Some(args[2].as_i64().ok_or(VMError::TypeError)?),
+            Some(
+                args[2]
+                    .as_i64()
+                    .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?,
+            ),
         ),
-        _ => return Err(VMError::BadArg),
+        _ => return Err(vm.fail(ErrorKind::BadArg, "bad argument")),
     };
     let found = match start {
         Some(s) => {
@@ -596,9 +626,13 @@ fn str_index_of(vm: &mut VM, argc: u32) -> Result<(), VMError> {
         3 => (
             vm.str_from(&args[0])?,
             vm.str_from(&args[1])?,
-            Some(args[2].as_i64().ok_or(VMError::TypeError)?),
+            Some(
+                args[2]
+                    .as_i64()
+                    .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?,
+            ),
         ),
-        _ => return Err(VMError::BadArg),
+        _ => return Err(vm.fail(ErrorKind::BadArg, "bad argument")),
     };
     let pos = match start {
         Some(s) => {
@@ -619,9 +653,13 @@ fn str_last_index_of(vm: &mut VM, argc: u32) -> Result<(), VMError> {
         3 => (
             vm.str_from(&args[0])?,
             vm.str_from(&args[1])?,
-            Some(args[2].as_i64().ok_or(VMError::TypeError)?),
+            Some(
+                args[2]
+                    .as_i64()
+                    .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?,
+            ),
         ),
-        _ => return Err(VMError::BadArg),
+        _ => return Err(vm.fail(ErrorKind::BadArg, "bad argument")),
     };
     let pos = match start {
         Some(s) => {
@@ -665,9 +703,11 @@ fn str_slice(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     let (s, start, end): (RcStr, usize, usize) = match argc {
         2 => {
             let s = vm.string_from(&args[0])?;
-            let start = args[1].as_i64().ok_or(VMError::TypeError)?;
+            let start = args[1]
+                .as_i64()
+                .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?;
             if start < 0 {
-                return Err(VMError::ValueError);
+                return Err(vm.fail(ErrorKind::ValueError, "value error"));
             }
             let start = start as usize;
             let end = s.len();
@@ -675,17 +715,21 @@ fn str_slice(vm: &mut VM, argc: u32) -> Result<(), VMError> {
         }
         3 => {
             let s = vm.string_from(&args[0])?;
-            let start = args[1].as_i64().ok_or(VMError::TypeError)?;
-            let end = args[2].as_i64().ok_or(VMError::TypeError)?;
+            let start = args[1]
+                .as_i64()
+                .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?;
+            let end = args[2]
+                .as_i64()
+                .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?;
             if start < 0 || end < 0 || start > end {
-                return Err(VMError::ValueError);
+                return Err(vm.fail(ErrorKind::ValueError, "value error"));
             }
             (s, start as usize, end as usize)
         }
-        _ => return Err(VMError::BadArg),
+        _ => return Err(vm.fail(ErrorKind::BadArg, "bad argument")),
     };
     if start > s.len() || end > s.len() || !s.is_char_boundary(start) || !s.is_char_boundary(end) {
-        return Err(VMError::ValueError);
+        return Err(vm.fail(ErrorKind::ValueError, "value error"));
     }
     vm.push_str_value(&s[start..end]);
     Ok(())
@@ -706,12 +750,12 @@ fn obj_keys(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     let args = check_arity!(vm, argc, 1)?;
     let obj_ptr = match &args[0] {
         Value::Object(p) => *p,
-        _ => return Err(VMError::TypeError),
+        _ => return Err(vm.fail(ErrorKind::TypeError, "type error")),
     };
     let keys: ThinVec<RcStr> = vm
         .objects
         .get(obj_ptr as usize)
-        .ok_or(VMError::TypeError)?
+        .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?
         .keys()
         .cloned()
         .collect();
@@ -726,12 +770,12 @@ fn obj_values(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     let args = check_arity!(vm, argc, 1)?;
     let obj_ptr = match &args[0] {
         Value::Object(p) => *p,
-        _ => return Err(VMError::TypeError),
+        _ => return Err(vm.fail(ErrorKind::TypeError, "type error")),
     };
     let vals: ThinVec<Value> = vm
         .objects
         .get(obj_ptr as usize)
-        .ok_or(VMError::TypeError)?
+        .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?
         .values()
         .cloned()
         .collect();
@@ -746,7 +790,8 @@ fn obj_values(vm: &mut VM, argc: u32) -> Result<(), VMError> {
 fn json_parse(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     let args = check_arity!(vm, argc, 1)?;
     let s = vm.string_from(&args[0])?;
-    let json: serde_json::Value = serde_json::from_str(&s).map_err(|_| VMError::ValueError)?;
+    let json: serde_json::Value =
+        serde_json::from_str(&s).map_err(|_| vm.fail(ErrorKind::ValueError, "value error"))?;
     let val = vm.json_to_stack_value(&json, 0)?;
     vm.stack.push(val);
     Ok(())
@@ -756,7 +801,8 @@ fn json_parse(vm: &mut VM, argc: u32) -> Result<(), VMError> {
 fn json_stringify(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     let args = check_arity!(vm, argc, 1)?;
     let json = vm.stack_value_to_json(&args[0], 0)?;
-    let s = serde_json::to_string(&json).map_err(|_| VMError::ValueError)?;
+    let s =
+        serde_json::to_string(&json).map_err(|_| vm.fail(ErrorKind::ValueError, "value error"))?;
     vm.push_str_value(s);
     Ok(())
 }
@@ -798,7 +844,10 @@ fn number_parse_int(vm: &mut VM, argc: u32) -> Result<(), VMError> {
 fn number_parse_float(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     let args = check_arity!(vm, argc, 1)?;
     let s = vm.str_from(&args[0])?;
-    let n: f64 = s.trim().parse().map_err(|_| VMError::ValueError)?;
+    let n: f64 = s
+        .trim()
+        .parse()
+        .map_err(|_| vm.fail(ErrorKind::ValueError, "value error"))?;
     vm.stack.push(Value::Float(n));
     Ok(())
 }
@@ -818,7 +867,9 @@ fn array_is_array(vm: &mut VM, argc: u32) -> Result<(), VMError> {
 /// Math unary: pop one arg, coerce ToNumber, apply f, push Number.
 fn math_unary(vm: &mut VM, argc: u32, f: fn(f64) -> f64) -> Result<(), VMError> {
     let args = check_arity!(vm, argc, 1)?;
-    let n = args[0].to_number().ok_or(VMError::TypeError)?;
+    let n = args[0]
+        .to_number()
+        .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?;
     vm.stack.push(Value::Float(f(n)));
     Ok(())
 }
@@ -829,7 +880,9 @@ fn math_min(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     let base = arg_base(vm, argc)?;
     let mut acc = f64::INFINITY;
     for i in 0..argc as usize {
-        let num = vm.stack[base + i].to_number().ok_or(VMError::TypeError)?;
+        let num = vm.stack[base + i]
+            .to_number()
+            .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?;
         acc = acc.min(num);
     }
     vm.stack.truncate(base);
@@ -843,7 +896,9 @@ fn math_max(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     let base = arg_base(vm, argc)?;
     let mut acc = f64::NEG_INFINITY;
     for i in 0..argc as usize {
-        let num = vm.stack[base + i].to_number().ok_or(VMError::TypeError)?;
+        let num = vm.stack[base + i]
+            .to_number()
+            .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?;
         acc = acc.max(num);
     }
     vm.stack.truncate(base);
@@ -854,8 +909,12 @@ fn math_max(vm: &mut VM, argc: u32) -> Result<(), VMError> {
 /// `Math.pow(base, exp)` → base^exp.
 fn math_pow(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     let args = check_arity!(vm, argc, 2)?;
-    let base = args[0].to_number().ok_or(VMError::TypeError)?;
-    let exp = args[1].to_number().ok_or(VMError::TypeError)?;
+    let base = args[0]
+        .to_number()
+        .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?;
+    let exp = args[1]
+        .to_number()
+        .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?;
     vm.stack.push(Value::Float(base.powf(exp)));
     Ok(())
 }
@@ -910,7 +969,7 @@ mod tests {
             Instr::ArrNew(0),
             Instr::CallBuiltin(Builtin::ArrayPop, 1),
         ]);
-        assert!(matches!(vm.step(), Err(VMError::ValueError)));
+        assert!(vm.step().unwrap_err().kind == ErrorKind::ValueError);
     }
 
     // ── ArrayShift ─────────────────────────────────────────────────────
@@ -932,7 +991,7 @@ mod tests {
             Instr::ArrNew(0),
             Instr::CallBuiltin(Builtin::ArrayShift, 1),
         ]);
-        assert!(matches!(vm.step(), Err(VMError::ValueError)));
+        assert!(vm.step().unwrap_err().kind == ErrorKind::ValueError);
     }
 
     // ── ArrayUnshift ───────────────────────────────────────────────────
@@ -1297,7 +1356,7 @@ mod tests {
     fn call_builtin_number_parse_int_zero_args_is_error_not_panic() {
         // Regression: a malformed CallBuiltin must not index an empty arg list.
         let mut vm = VM::new(vec![Instr::CallBuiltin(Builtin::NumberParseInt, 0)]);
-        assert!(matches!(vm.step(), Err(VMError::BadArg)));
+        assert!(vm.step().unwrap_err().kind == ErrorKind::BadArg);
     }
 
     #[test]
@@ -1472,7 +1531,7 @@ mod tests {
                 Ok(_) => {}
             }
         };
-        assert!(matches!(err, VMError::BadArg), "got {err:?}");
+        assert!(err.kind == ErrorKind::BadArg, "got {err:?}");
     }
 
     #[test]

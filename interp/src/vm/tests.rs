@@ -103,7 +103,10 @@ fn push_and_pop() {
         vec![n(1.0)]
     );
     assert_eq!(run(vec![PushFloat(1.0), Pop(1)]), vec![]);
-    assert!(matches!(run_err(vec![Pop(1)]), VMError::StackUnderflow));
+    assert!(matches!(
+        run_err(vec![Pop(1)]).kind,
+        ErrorKind::StackUnderflow
+    ));
 }
 
 #[test]
@@ -120,8 +123,14 @@ fn dup_swap_rot() {
         run(vec![PushFloat(1.0), PushFloat(2.0), PushFloat(3.0), Dig(2)]),
         vec![n(2.0), n(3.0), n(1.0)]
     );
-    assert!(matches!(run_err(vec![Dig(1)]), VMError::StackUnderflow));
-    assert!(matches!(run_err(vec![Dig(2)]), VMError::StackUnderflow));
+    assert!(matches!(
+        run_err(vec![Dig(1)]).kind,
+        ErrorKind::StackUnderflow
+    ));
+    assert!(matches!(
+        run_err(vec![Dig(2)]).kind,
+        ErrorKind::StackUnderflow
+    ));
 }
 
 #[test]
@@ -143,8 +152,8 @@ fn pick() {
     );
     // Cannot reach below the frame's temporaries.
     assert!(matches!(
-        run_err(vec![PushFloat(1.0), Pick(1)]),
-        VMError::StackUnderflow
+        run_err(vec![PushFloat(1.0), Pick(1)]).kind,
+        ErrorKind::StackUnderflow
     ));
 }
 
@@ -161,8 +170,8 @@ fn dig() {
         vec![n(2.0), n(3.0), n(1.0)]
     );
     assert!(matches!(
-        run_err(vec![PushFloat(1.0), Dig(1)]),
-        VMError::StackUnderflow
+        run_err(vec![PushFloat(1.0), Dig(1)]).kind,
+        ErrorKind::StackUnderflow
     ));
 }
 
@@ -180,8 +189,8 @@ fn nip() {
     );
     // Nip rejects reaching below frame_floor.
     assert!(matches!(
-        run_err(vec![PushFloat(1.0), Nip(1)]),
-        VMError::StackUnderflow
+        run_err(vec![PushFloat(1.0), Nip(1)]).kind,
+        ErrorKind::StackUnderflow
     ));
 }
 
@@ -212,8 +221,8 @@ fn tee_local() {
     );
     // TeeLocal on out-of-range slot errors.
     assert!(matches!(
-        run_err(vec![PushFloat(1.0), TeeLocal(0)]),
-        VMError::BadLocal
+        run_err(vec![PushFloat(1.0), TeeLocal(0)]).kind,
+        ErrorKind::BadLocal
     ));
 }
 
@@ -254,8 +263,8 @@ fn inc_local() {
     );
     // IncLocal on out-of-range slot errors.
     assert!(matches!(
-        run_err(vec![IncLocal(0, -1.0, UpdateMode::Prefix)]),
-        VMError::BadLocal
+        run_err(vec![IncLocal(0, -1.0, UpdateMode::Prefix)]).kind,
+        ErrorKind::BadLocal
     ));
 }
 
@@ -310,8 +319,8 @@ fn not_bitnot() {
     assert_eq!(run(vec![PushFloat(1.0), Not]), vec![b(false)]);
     assert_eq!(run(vec![PushFloat(5.0), BitNot]), vec![n(-6.0)]);
     assert!(matches!(
-        run_err(vec![PushFloat(3.14), BitNot]),
-        VMError::TypeError
+        run_err(vec![PushFloat(3.14), BitNot]).kind,
+        ErrorKind::TypeError
     ));
 }
 
@@ -457,8 +466,8 @@ fn to_num_instruction() {
     ));
     // An array/object has no numeric form.
     assert!(matches!(
-        run_err(vec![ArrNew(0), ToNum]),
-        VMError::TypeError
+        run_err(vec![ArrNew(0), ToNum]).kind,
+        ErrorKind::TypeError
     ));
 }
 
@@ -773,7 +782,7 @@ fn call_dyn_indirect() {
 fn call_dyn_requires_fn() {
     // Top of stack must be a Fn, not some other value.
     let code = vec![PushFloat(1.0), PushFloat(2.0), CallDyn(1)];
-    assert!(matches!(run_err(code), VMError::TypeError));
+    assert!(matches!(run_err(code).kind, ErrorKind::TypeError));
 }
 
 #[test]
@@ -821,7 +830,7 @@ fn arguments_is_cached_within_a_frame() {
 #[test]
 fn call_dyn_bad_addr() {
     let code = vec![PushFn(999), CallDyn(0)];
-    assert!(matches!(run_err(code), VMError::BadCall));
+    assert!(matches!(run_err(code).kind, ErrorKind::BadCall));
 }
 
 #[test]
@@ -1065,14 +1074,14 @@ fn make_closure_rejects_out_of_range_capture() {
         MakeClosure(0, vec![5].into()), // only slot 0 exists
         Return(1),
     ];
-    assert!(matches!(run_err(code), VMError::BadLocal));
+    assert!(matches!(run_err(code).kind, ErrorKind::BadLocal));
 }
 
 #[test]
 fn call_dyn_rejects_non_closure_pointer() {
     // A Ptr to a non-closure heap value (here an array) is not callable.
     let code = vec![ArrNew(0), CallDyn(0)];
-    assert!(matches!(run_err(code), VMError::TypeError));
+    assert!(matches!(run_err(code).kind, ErrorKind::TypeError));
 }
 
 #[test]
@@ -1117,12 +1126,15 @@ fn local_oob() {
         Local(1), // only local 0 (the arg) exists
         Return(0),
     ];
-    assert!(matches!(run_err(code), VMError::BadLocal));
+    assert!(matches!(run_err(code).kind, ErrorKind::BadLocal));
 }
 
 #[test]
 fn call_bad_addr() {
-    assert!(matches!(run_err(vec![Call(999, 0)]), VMError::BadCall));
+    assert!(matches!(
+        run_err(vec![Call(999, 0)]).kind,
+        ErrorKind::BadCall
+    ));
 }
 
 // ── array operations ──────────────────────────────────────────
@@ -1196,7 +1208,7 @@ fn arr_set_oob() {
         PushFloat(99.0),        // value
         IndexSet(SetMode::New), // pops: value, index, arr_ptr
     ];
-    assert!(matches!(run_err(code), VMError::ValueError));
+    assert!(matches!(run_err(code).kind, ErrorKind::ValueError));
 }
 
 // ── object operations ─────────────────────────────────────────
@@ -1498,7 +1510,7 @@ fn fuel_stops_infinite_loop() {
     // [Jump(0)] loops forever; the fuel budget must break it.
     let mut vm = VM::new(vec![Jump(0)]);
     vm.fuel = 1000;
-    assert!(matches!(vm.step().unwrap_err(), VMError::OutOfFuel));
+    assert!(matches!(vm.step().unwrap_err().kind, ErrorKind::OutOfFuel));
     assert_eq!(vm.fuel, 0);
 }
 
@@ -1519,8 +1531,8 @@ fn fuel_is_consumed_per_instruction() {
 fn dangling_pointer_does_not_panic() {
     // A PushPtr with no backing heap cell must error, not panic.
     assert!(matches!(
-        run_err(vec![PushObject(99), ArrLength]),
-        VMError::ValueError
+        run_err(vec![PushObject(99), ArrLength]).kind,
+        ErrorKind::ValueError
     ));
     // Type predicates stay total (false) on a dangling pointer.
     assert_eq!(run(vec![PushObject(99), IsStr]), vec![b(false)]);
@@ -1565,12 +1577,12 @@ fn frame_allocates_multiple_locals() {
 #[test]
 fn bit_shift_rejects_bad_count() {
     assert!(matches!(
-        run_err(vec![PushFloat(1.0), PushFloat(64.0), BitLhs]),
-        VMError::ValueError
+        run_err(vec![PushFloat(1.0), PushFloat(64.0), BitLhs]).kind,
+        ErrorKind::ValueError
     ));
     assert!(matches!(
-        run_err(vec![PushFloat(1.0), PushFloat(-1.0), BitRhs]),
-        VMError::ValueError
+        run_err(vec![PushFloat(1.0), PushFloat(-1.0), BitRhs]).kind,
+        ErrorKind::ValueError
     ));
     // Valid shifts still work.
     assert_eq!(
@@ -1590,7 +1602,7 @@ fn pop_respects_frame_floor() {
         Pop(1),                                // nothing above the floor -> underflow
         Return(0),
     ];
-    assert!(matches!(run_err(code), VMError::StackUnderflow));
+    assert!(matches!(run_err(code).kind, ErrorKind::StackUnderflow));
 }
 
 #[test]
@@ -1603,7 +1615,7 @@ fn dup_cannot_duplicate_local() {
         Pick(0),                               // nothing above the floor -> underflow
         Return(0),
     ];
-    assert!(matches!(run_err(code), VMError::StackUnderflow));
+    assert!(matches!(run_err(code).kind, ErrorKind::StackUnderflow));
 }
 
 #[test]
@@ -1619,7 +1631,7 @@ fn swap_cannot_cross_frame_floor() {
         Dig(1),                                // would swap the temp with the local -> underflow
         Return(0),
     ];
-    assert!(matches!(run_err(code), VMError::StackUnderflow));
+    assert!(matches!(run_err(code).kind, ErrorKind::StackUnderflow));
 }
 
 #[test]
@@ -1634,7 +1646,7 @@ fn rot_cannot_cross_frame_floor() {
         Dig(2),
         Return(0),
     ];
-    assert!(matches!(run_err(code), VMError::StackUnderflow));
+    assert!(matches!(run_err(code).kind, ErrorKind::StackUnderflow));
 }
 
 #[test]
@@ -1677,7 +1689,7 @@ fn negative_integers_are_negint_and_roundtrip() {
 fn posint_too_large_for_index_errors() {
     // A PosInt beyond i64::MAX can't be an array index -> error, no panic.
     let code = vec![PushFloat(1.0), ArrNew(1), PushPosInt(u64::MAX), IndexGet];
-    assert!(matches!(run_err(code), VMError::TypeError));
+    assert!(matches!(run_err(code).kind, ErrorKind::TypeError));
 }
 
 #[test]
@@ -1886,7 +1898,7 @@ fn string_mid_codepoint_index_errors() {
         IndexGet,
     ]);
     match vm.step() {
-        Err(VMError::ValueError) => {} // expected
+        Err(e) if e.kind == ErrorKind::ValueError => {} // expected
         other => panic!("expected ValueError, got {other:?}"),
     }
 }
@@ -1923,7 +1935,7 @@ fn out_of_fuel_stops_infinite_loop() {
             Ok(_) => {}
         }
     };
-    assert!(matches!(err, VMError::OutOfFuel));
+    assert!(matches!(err.kind, ErrorKind::OutOfFuel));
 }
 
 // ── relational non-coercion (JS divergence) ─────────────────────
@@ -1955,7 +1967,7 @@ fn arr_index_negative_errors() {
         IndexGet,       // should error
     ]);
     match vm.step() {
-        Err(VMError::ValueError) => {} // expected
+        Err(e) if e.kind == ErrorKind::ValueError => {} // expected
         other => panic!("expected ValueError, got {other:?}"),
     }
     // Negative IndexSet on an array is also a ValueError.
@@ -1967,7 +1979,7 @@ fn arr_index_negative_errors() {
         IndexSet(SetMode::New),
     ]);
     match vm.step() {
-        Err(VMError::ValueError) => {} // expected
+        Err(e) if e.kind == ErrorKind::ValueError => {} // expected
         other => panic!("expected ValueError, got {other:?}"),
     }
 }
@@ -2108,7 +2120,7 @@ fn fuel_charged_per_batched_invoke() {
     // One more step should succeed without OutOfFuel.
     match vm.step() {
         Ok(StepResult::Done { .. }) => {} // fine: ran to completion
-        Err(VMError::OutOfFuel) => {
+        Err(e) if e.kind == ErrorKind::OutOfFuel => {
             panic!("unexpected OutOfFuel; fuel left: {}", vm.fuel);
         }
         other => panic!("unexpected: {other:?}"),
@@ -2162,7 +2174,7 @@ fn stack_value_to_json_depth_limit() {
     // `stack_value_to_json` on the deeply nested value should error.
     let result = vm.stack_value_to_json(&innermost, 0);
     assert!(
-        matches!(result, Err(VMError::ValueError)),
+        matches!(result, Err(ref e) if e.kind == ErrorKind::ValueError),
         "expected ValueError for depth > 128, got {result:?}"
     );
 }
@@ -2178,7 +2190,7 @@ fn json_to_value_depth_limit() {
     let mut vm = VM::new(vec![]);
     let result = vm.json_to_stack_value(&val, 0);
     assert!(
-        matches!(result, Err(VMError::ValueError)),
+        matches!(result, Err(ref e) if e.kind == ErrorKind::ValueError),
         "expected ValueError for depth > 128, got {result:?}"
     );
 }
@@ -2206,6 +2218,51 @@ fn vm_new_leaves_spans_and_source_empty() {
     assert!(vm.source.is_empty());
 }
 
+// ── render_error tests ─────────────────────────────────────────
+
+#[test]
+fn render_error_with_source_and_spans() {
+    // A compiled program's error should render with the source line + caret.
+    let prog = crate::testutil::compile_ok("return [] - 1;");
+    let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
+    let err = loop {
+        match vm.step() {
+            Err(e) => break e,
+            Ok(StepResult::Done { .. }) => panic!("expected error"),
+            Ok(_) => {}
+        }
+    };
+    let rendered = vm.render_error(&err);
+    assert!(
+        rendered.contains("return [] - 1;"),
+        "should contain source line, got: {rendered}"
+    );
+    assert!(
+        rendered.contains("^"),
+        "should contain caret, got: {rendered}"
+    );
+    assert!(
+        rendered.contains("cannot coerce to number"),
+        "should contain the message, got: {rendered}"
+    );
+}
+
+#[test]
+fn render_error_without_source_falls_back() {
+    // A VM::new error (no spans/source) should render as "at instruction N".
+    let mut vm = VM::new(vec![Instr::Pop(1)]); // will StackUnderflow
+    let err = vm.step().unwrap_err();
+    let rendered = vm.render_error(&err);
+    assert!(
+        rendered.contains("at instruction 0"),
+        "should show instruction ip, got: {rendered}"
+    );
+    assert!(
+        rendered.contains("stack underflow"),
+        "should show the message, got: {rendered}"
+    );
+}
+
 #[test]
 fn cyclic_value_serialization_errors() {
     // A self-referential object must error, not hang, on serialization.
@@ -2219,7 +2276,7 @@ fn cyclic_value_serialization_errors() {
     );
     let result = vm.stack_value_to_json(&Value::Object(0), 0);
     assert!(
-        matches!(result, Err(VMError::ValueError)),
+        matches!(result, Err(ref e) if e.kind == ErrorKind::ValueError),
         "expected ValueError for cyclic value, got {result:?}"
     );
 }

@@ -9,13 +9,16 @@ impl VM {
         /// `undefined` or unparseable string coerces to NaN and propagates.
         macro_rules! unary_num {
             ($op:expr) => {{
-                let val = self.stack.pop().ok_or(VMError::StackUnderflow)?;
+                let val = self
+                    .stack
+                    .pop()
+                    .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
                 match val.to_number() {
                     Some(n) => {
                         self.stack.push(Value::Float($op(n)));
                         self.ip += 1;
                     }
-                    None => return Err(VMError::TypeError),
+                    None => return Err(self.fail(ErrorKind::TypeError, "cannot coerce to number")),
                 }
             }};
         }
@@ -25,14 +28,20 @@ impl VM {
         /// TypeError; undefined/unparseable strings become NaN.
         macro_rules! binary_num {
             ($op:expr) => {{
-                let rhs = self.stack.pop().ok_or(VMError::StackUnderflow)?;
-                let lhs = self.stack.pop().ok_or(VMError::StackUnderflow)?;
+                let rhs = self
+                    .stack
+                    .pop()
+                    .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
+                let lhs = self
+                    .stack
+                    .pop()
+                    .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
                 match (lhs.to_number(), rhs.to_number()) {
                     (Some(a), Some(b)) => {
                         self.stack.push(Value::Float($op(a, b)));
                         self.ip += 1;
                     }
-                    _ => return Err(VMError::TypeError),
+                    _ => return Err(self.fail(ErrorKind::TypeError, "cannot coerce to number")),
                 }
             }};
         }
@@ -41,14 +50,20 @@ impl VM {
         /// apply i64→i64→i64, push Number.
         macro_rules! binary_int {
             ($op:expr) => {{
-                let rhs = self.stack.pop().ok_or(VMError::StackUnderflow)?;
-                let lhs = self.stack.pop().ok_or(VMError::StackUnderflow)?;
+                let rhs = self
+                    .stack
+                    .pop()
+                    .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
+                let lhs = self
+                    .stack
+                    .pop()
+                    .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
                 match (lhs.as_i64(), rhs.as_i64()) {
                     (Some(a), Some(b)) => {
                         self.stack.push(Value::Float($op(a, b) as f64));
                         self.ip += 1;
                     }
-                    _ => return Err(VMError::TypeError),
+                    _ => return Err(self.fail(ErrorKind::TypeError, "expected integer")),
                 }
             }};
         }
@@ -56,8 +71,14 @@ impl VM {
         /// Pop rhs then lhs, compare with self.compare(), push Bool.
         macro_rules! cmp_op {
             ($expected:ident) => {{
-                let rhs = self.stack.pop().ok_or(VMError::StackUnderflow)?;
-                let lhs = self.stack.pop().ok_or(VMError::StackUnderflow)?;
+                let rhs = self
+                    .stack
+                    .pop()
+                    .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
+                let lhs = self
+                    .stack
+                    .pop()
+                    .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
                 let result = lhs
                     .compare(&rhs)
                     .map(|ord| ord == std::cmp::Ordering::$expected)
@@ -76,7 +97,7 @@ impl VM {
                 });
             }
             if self.fuel == 0 {
-                return Err(VMError::OutOfFuel);
+                return Err(self.fail(ErrorKind::OutOfFuel, "fuel exhausted"));
             }
             self.fuel -= 1;
             match &self.code[self.ip as usize] {
@@ -130,7 +151,7 @@ impl VM {
                     // Only expression temporaries may be popped, never locals
                     // or args belonging to the current/caller frame.
                     if self.stack.len() < self.frame_floor() + *n {
-                        return Err(VMError::StackUnderflow);
+                        return Err(self.fail(ErrorKind::StackUnderflow, "stack underflow"));
                     }
                     self.stack.truncate(self.stack.len() - n);
                     self.ip += 1;
@@ -142,7 +163,7 @@ impl VM {
                     // The picked value sits at len-1-n; it (and everything above)
                     // must be a temporary, not a local/arg.
                     if len < self.frame_floor() + n + 1 {
-                        return Err(VMError::StackUnderflow);
+                        return Err(self.fail(ErrorKind::StackUnderflow, "stack underflow"));
                     }
                     let val = self.stack[len - 1 - n].clone();
                     self.stack.push(val);
@@ -153,7 +174,7 @@ impl VM {
                     let n = *n;
                     let len = self.stack.len();
                     if len < self.frame_floor() + n + 1 {
-                        return Err(VMError::StackUnderflow);
+                        return Err(self.fail(ErrorKind::StackUnderflow, "stack underflow"));
                     }
                     // Fast paths for the common small-n cases, matching the
                     // performance of the former Dup/Swap/Rot dispatch.
@@ -176,7 +197,7 @@ impl VM {
                     let n = *n;
                     let len = self.stack.len();
                     if len < self.frame_floor() + n + 1 {
-                        return Err(VMError::StackUnderflow);
+                        return Err(self.fail(ErrorKind::StackUnderflow, "stack underflow"));
                     }
                     // Remove n values directly below the top, leaving the top
                     // in place. Nip(1) ≡ Dig(1); Pop; Nip(n) is the inverse of
@@ -190,10 +211,10 @@ impl VM {
                 // ── control flow ─────────────────────────────────
                 Instr::Call(addr, nargs) => {
                     if *addr as usize >= self.code.len() {
-                        return Err(VMError::BadCall);
+                        return Err(self.fail(ErrorKind::BadCall, "bad call target"));
                     }
                     if *nargs as usize > self.stack.len() {
-                        return Err(VMError::StackUnderflow);
+                        return Err(self.fail(ErrorKind::StackUnderflow, "stack underflow"));
                     }
                     // `fp` points at arg 0: the args ARE the callee's leading
                     // locals (slots 0..nargs). The prologue `EnterFrame` then
@@ -217,7 +238,10 @@ impl VM {
                     // args sit exactly where a static Call expects them. The
                     // callable is either a bare Fn, a Builtin, or a Ptr to a
                     // Closure (code + captures).
-                    let callable = self.stack.pop().ok_or(VMError::StackUnderflow)?;
+                    let callable = self
+                        .stack
+                        .pop()
+                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
                     match callable {
                         Value::Builtin(b) => {
                             // No-frame call: pop args, push result, advance ip.
@@ -226,10 +250,10 @@ impl VM {
                         }
                         Value::Fn(addr) => {
                             if addr as usize >= self.code.len() {
-                                return Err(VMError::BadCall);
+                                return Err(self.fail(ErrorKind::BadCall, "bad call target"));
                             }
                             if nargs as usize > self.stack.len() {
-                                return Err(VMError::StackUnderflow);
+                                return Err(self.fail(ErrorKind::StackUnderflow, "stack underflow"));
                             }
                             self.callstack.push(CallFrame {
                                 arg_count: nargs,
@@ -244,16 +268,18 @@ impl VM {
                             self.ip = addr;
                         }
                         Value::Closure(p) => {
-                            let closure =
-                                self.closures.get(p as usize).ok_or(VMError::ValueError)?;
+                            let closure = self
+                                .closures
+                                .get(p as usize)
+                                .ok_or_else(|| self.fail(ErrorKind::ValueError, "value error"))?;
                             let addr = closure.addr;
                             let upvals: SmallVec<[Value; 8]> =
                                 closure.upvals.iter().cloned().collect();
                             if addr as usize >= self.code.len() {
-                                return Err(VMError::BadCall);
+                                return Err(self.fail(ErrorKind::BadCall, "bad call target"));
                             }
                             if nargs as usize > self.stack.len() {
-                                return Err(VMError::StackUnderflow);
+                                return Err(self.fail(ErrorKind::StackUnderflow, "stack underflow"));
                             }
                             // Stash the captured environment; `EnterFrame` installs
                             // it as the upval locals after normalizing the args, so
@@ -270,7 +296,7 @@ impl VM {
                             self.cur_local_count = nargs;
                             self.ip = addr;
                         }
-                        _ => return Err(VMError::TypeError),
+                        _ => return Err(self.fail(ErrorKind::TypeError, "type error")),
                     }
                 }
 
@@ -284,7 +310,7 @@ impl VM {
                 Instr::MakeClosure(addr, captures) => {
                     let addr = *addr;
                     if addr as usize >= self.code.len() {
-                        return Err(VMError::BadCall);
+                        return Err(self.fail(ErrorKind::BadCall, "bad call target"));
                     }
                     // Collect into stack-allocated SmallVec instead of cloning
                     // the ThinVec from self.code. LocalIndex is u32 (Copy).
@@ -293,7 +319,7 @@ impl VM {
                     let mut upvals: SmallVec<[Value; 8]> = SmallVec::new();
                     for slot in captures {
                         if (slot as u32) >= local_count {
-                            return Err(VMError::BadLocal);
+                            return Err(self.fail(ErrorKind::BadLocal, "bad local"));
                         }
                         // Copy the slot verbatim: a Boxed slot carries its Upval
                         // handle (shared, by-reference), a Plain slot its value
@@ -306,14 +332,17 @@ impl VM {
                 }
 
                 Instr::Return(nrets) => {
-                    let frame = self.callstack.pop().ok_or(VMError::BadReturn)?;
+                    let frame = self
+                        .callstack
+                        .pop()
+                        .ok_or_else(|| self.fail(ErrorKind::BadReturn, "bad return"))?;
                     // `fp` points at the frame base (arg 0 / local 0), which is
                     // where the caller pushed the args — so the return value(s)
                     // replace the whole frame, restoring the caller's stack.
                     let keep_below = self.fp as usize;
                     let n = *nrets;
                     if self.stack.len() < keep_below + n {
-                        return Err(VMError::StackUnderflow);
+                        return Err(self.fail(ErrorKind::StackUnderflow, "stack underflow"));
                     }
                     let ret_start = self.stack.len() - n;
                     // Move (don't clone) each return value down to the frame
@@ -342,16 +371,19 @@ impl VM {
 
                 Instr::Jump(addr) => {
                     if *addr as usize > self.code.len() {
-                        return Err(VMError::BadCall);
+                        return Err(self.fail(ErrorKind::BadCall, "bad call target"));
                     }
                     self.ip = *addr;
                 }
 
                 Instr::JFalse(addr) => {
                     if *addr as usize > self.code.len() {
-                        return Err(VMError::BadCall);
+                        return Err(self.fail(ErrorKind::BadCall, "bad call target"));
                     }
-                    let val = self.stack.pop().ok_or(VMError::StackUnderflow)?;
+                    let val = self
+                        .stack
+                        .pop()
+                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
                     if !val.is_truthy() {
                         self.ip = *addr;
                     } else {
@@ -361,9 +393,12 @@ impl VM {
 
                 Instr::JTrue(addr) => {
                     if *addr as usize > self.code.len() {
-                        return Err(VMError::BadCall);
+                        return Err(self.fail(ErrorKind::BadCall, "bad call target"));
                     }
-                    let val = self.stack.pop().ok_or(VMError::StackUnderflow)?;
+                    let val = self
+                        .stack
+                        .pop()
+                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
                     if val.is_truthy() {
                         self.ip = *addr;
                     } else {
@@ -373,10 +408,13 @@ impl VM {
 
                 Instr::JNotNullish(addr) => {
                     if *addr as usize > self.code.len() {
-                        return Err(VMError::BadCall);
+                        return Err(self.fail(ErrorKind::BadCall, "bad call target"));
                     }
                     // Peek: leave the value for the branch that proceeds with it.
-                    let val = self.stack.last().ok_or(VMError::StackUnderflow)?;
+                    let val = self
+                        .stack
+                        .last()
+                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
                     if !matches!(val, Value::Null | Value::Undefined) {
                         self.ip = *addr;
                     } else {
@@ -398,7 +436,10 @@ impl VM {
                     // ThinVec from self.code.
                     let local_kinds: SmallVec<[SlotKind; 32]> =
                         local_kinds.iter().copied().collect();
-                    let frame = self.callstack.last().ok_or(VMError::BadArg)?;
+                    let frame = self
+                        .callstack
+                        .last()
+                        .ok_or_else(|| self.fail(ErrorKind::BadArg, "bad argument"))?;
                     let argc = frame.arg_count;
                     // The args arrived as the leading locals at [fp, fp + argc).
                     // 1. Materialize the `arguments` array (from the actual args)
@@ -406,7 +447,7 @@ impl VM {
                     if build_args {
                         let base = self.fp as usize;
                         if base + argc as usize > self.stack.len() {
-                            return Err(VMError::StackUnderflow);
+                            return Err(self.fail(ErrorKind::StackUnderflow, "stack underflow"));
                         }
                         let args: ThinVec<Value> = self.stack[base..base + argc as usize]
                             .iter()
@@ -453,7 +494,10 @@ impl VM {
                 }
 
                 Instr::Arguments => {
-                    let frame = self.callstack.last().ok_or(VMError::BadArg)?;
+                    let frame = self
+                        .callstack
+                        .last()
+                        .ok_or_else(|| self.fail(ErrorKind::BadArg, "bad argument"))?;
                     // Reuse the cached array when this frame already built one
                     // (functions that use `arguments` build it eagerly in the
                     // prologue's EnterFrame; the lazy path here serves the root
@@ -468,7 +512,7 @@ impl VM {
                     let argc = frame.arg_count;
                     let base = self.fp as usize;
                     if base + argc as usize > self.stack.len() {
-                        return Err(VMError::StackUnderflow);
+                        return Err(self.fail(ErrorKind::StackUnderflow, "stack underflow"));
                     }
                     let args: ThinVec<Value> = self.stack[base..base + argc as usize]
                         .iter()
@@ -486,7 +530,7 @@ impl VM {
 
                 Instr::Local(local) => {
                     if (*local as u32) >= self.cur_local_count {
-                        return Err(VMError::BadLocal);
+                        return Err(self.fail(ErrorKind::BadLocal, "bad local"));
                     }
                     // A Boxed slot holds an Upval marker; dereference it so the
                     // value — never the marker — reaches the expression stack.
@@ -494,7 +538,7 @@ impl VM {
                         Value::Upval(c) => self
                             .cells
                             .get(*c as usize)
-                            .ok_or(VMError::ValueError)?
+                            .ok_or_else(|| self.fail(ErrorKind::ValueError, "value error"))?
                             .clone(),
                         other => other.clone(),
                     };
@@ -504,15 +548,21 @@ impl VM {
 
                 Instr::SetLocal(local) => {
                     if (*local as u32) >= self.cur_local_count {
-                        return Err(VMError::BadLocal);
+                        return Err(self.fail(ErrorKind::BadLocal, "bad local"));
                     }
-                    let val = self.stack.pop().ok_or(VMError::StackUnderflow)?;
+                    let val = self
+                        .stack
+                        .pop()
+                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
                     let slot = (self.fp + *local as u32) as usize;
                     // Write through a Boxed slot to its shared cell; a Plain slot
                     // is overwritten in place.
                     match self.stack[slot] {
                         Value::Upval(c) => {
-                            *self.cells.get_mut(c as usize).ok_or(VMError::ValueError)? = val;
+                            let ip = self.ip;
+                            *self.cells.get_mut(c as usize).ok_or_else(|| {
+                                VMError::fail_at(ip, ErrorKind::ValueError, "value error")
+                            })? = val;
                         }
                         _ => self.stack[slot] = val,
                     }
@@ -521,16 +571,23 @@ impl VM {
 
                 Instr::TeeLocal(local) => {
                     if (*local as u32) >= self.cur_local_count {
-                        return Err(VMError::BadLocal);
+                        return Err(self.fail(ErrorKind::BadLocal, "bad local"));
                     }
-                    let val = self.stack.last().ok_or(VMError::StackUnderflow)?.clone();
+                    let val = self
+                        .stack
+                        .last()
+                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?
+                        .clone();
                     let slot = (self.fp + *local as u32) as usize;
                     // Like SetLocal but peeks: the value stays on the stack
                     // (assignment is an expression) while still writing to the
                     // local. Replaces Pick(0); SetLocal (formerly Dup; SetLocal).
                     match self.stack[slot] {
                         Value::Upval(c) => {
-                            *self.cells.get_mut(c as usize).ok_or(VMError::ValueError)? = val;
+                            let ip = self.ip;
+                            *self.cells.get_mut(c as usize).ok_or_else(|| {
+                                VMError::fail_at(ip, ErrorKind::ValueError, "value error")
+                            })? = val;
                         }
                         _ => self.stack[slot] = val,
                     }
@@ -539,7 +596,7 @@ impl VM {
 
                 Instr::FreshCell(local) => {
                     if (*local as u32) >= self.cur_local_count {
-                        return Err(VMError::BadLocal);
+                        return Err(self.fail(ErrorKind::BadLocal, "bad local"));
                     }
                     let slot = (self.fp + *local as u32) as usize;
                     // Read the current value, dereferencing an existing Upval.
@@ -547,7 +604,7 @@ impl VM {
                         Value::Upval(c) => self
                             .cells
                             .get(*c as usize)
-                            .ok_or(VMError::ValueError)?
+                            .ok_or_else(|| self.fail(ErrorKind::ValueError, "value error"))?
                             .clone(),
                         other => other.clone(),
                     };
@@ -561,18 +618,20 @@ impl VM {
 
                 Instr::IncLocal(local, p, mode) => {
                     if *local as u32 >= self.cur_local_count {
-                        return Err(VMError::BadLocal);
+                        return Err(self.fail(ErrorKind::BadLocal, "bad local"));
                     }
                     // Read current value (dereferencing boxed slots).
                     let old = match &self.stack[(self.fp + *local as u32) as usize] {
                         Value::Upval(c) => self
                             .cells
                             .get(*c as usize)
-                            .ok_or(VMError::ValueError)?
+                            .ok_or_else(|| self.fail(ErrorKind::ValueError, "value error"))?
                             .clone(),
                         other => other.clone(),
                     };
-                    let old_num = old.to_number().ok_or(VMError::TypeError)?;
+                    let old_num = old
+                        .to_number()
+                        .ok_or_else(|| self.fail(ErrorKind::TypeError, "type error"))?;
                     // Compute new value: subtract p (p = -1 for ++, p = 1 for --).
                     let new_num = old_num - *p;
                     let new_val = Value::Float(new_num);
@@ -580,7 +639,10 @@ impl VM {
                     let slot = (self.fp + *local as u32) as usize;
                     match self.stack[slot] {
                         Value::Upval(c) => {
-                            *self.cells.get_mut(c as usize).ok_or(VMError::ValueError)? = new_val;
+                            let ip = self.ip;
+                            *self.cells.get_mut(c as usize).ok_or_else(|| {
+                                VMError::fail_at(ip, ErrorKind::ValueError, "value error")
+                            })? = new_val;
                         }
                         _ => self.stack[slot] = new_val,
                     }
@@ -595,7 +657,10 @@ impl VM {
 
                 // ── type queries ────────────────────────────────
                 Instr::TypeOf => {
-                    let val = self.stack.pop().ok_or(VMError::StackUnderflow)?;
+                    let val = self
+                        .stack
+                        .pop()
+                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
                     // JS typeof tags. Note the coarseness: null/array/object all
                     // report "object"; int and float both "number".
                     let tag = match val {
@@ -608,7 +673,9 @@ impl VM {
                         Value::Array(_) | Value::Object(_) => "object",
                         Value::Closure(_) => "function",
                         // Internal indirection; never a legitimate operand.
-                        Value::Upval(_) => return Err(VMError::ValueError),
+                        Value::Upval(_) => {
+                            return Err(self.fail(ErrorKind::ValueError, "value error"));
+                        }
                     };
                     self.push_str_value(tag);
                     self.ip += 1;
@@ -616,25 +683,37 @@ impl VM {
 
                 // ── type predicates ─────────────────────────────
                 Instr::IsNull => {
-                    let val = self.stack.pop().ok_or(VMError::StackUnderflow)?;
+                    let val = self
+                        .stack
+                        .pop()
+                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
                     self.stack.push(Value::Bool(matches!(val, Value::Null)));
                     self.ip += 1;
                 }
                 Instr::IsBool => {
-                    let val = self.stack.pop().ok_or(VMError::StackUnderflow)?;
+                    let val = self
+                        .stack
+                        .pop()
+                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
                     self.stack.push(Value::Bool(matches!(val, Value::Bool(_))));
                     self.ip += 1;
                 }
                 Instr::IsFloat => {
                     // True only for a Number with a fractional part (an Int is
                     // never a float). Use IsNum to test "is any number".
-                    let val = self.stack.pop().ok_or(VMError::StackUnderflow)?;
+                    let val = self
+                        .stack
+                        .pop()
+                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
                     let is_float = matches!(val, Value::Float(n) if !float_is_int(n));
                     self.stack.push(Value::Bool(is_float));
                     self.ip += 1;
                 }
                 Instr::IsNum => {
-                    let val = self.stack.pop().ok_or(VMError::StackUnderflow)?;
+                    let val = self
+                        .stack
+                        .pop()
+                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
                     self.stack.push(Value::Bool(matches!(
                         val,
                         Value::Float(_) | Value::PosInt(_) | Value::NegInt(_)
@@ -642,13 +721,19 @@ impl VM {
                     self.ip += 1;
                 }
                 Instr::IsStr => {
-                    let val = self.stack.pop().ok_or(VMError::StackUnderflow)?;
+                    let val = self
+                        .stack
+                        .pop()
+                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
                     let is_str = matches!(val, Value::String(_));
                     self.stack.push(Value::Bool(is_str));
                     self.ip += 1;
                 }
                 Instr::IsObj => {
-                    let val = self.stack.pop().ok_or(VMError::StackUnderflow)?;
+                    let val = self
+                        .stack
+                        .pop()
+                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
                     let is_obj = matches!(val, Value::Object(_));
                     self.stack.push(Value::Bool(is_obj));
                     self.ip += 1;
@@ -658,26 +743,38 @@ impl VM {
                 Instr::Neg => unary_num!(|n: f64| -n),
 
                 Instr::Not => {
-                    let val = self.stack.pop().ok_or(VMError::StackUnderflow)?;
+                    let val = self
+                        .stack
+                        .pop()
+                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
                     self.stack.push(Value::Bool(!val.is_truthy()));
                     self.ip += 1;
                 }
 
                 Instr::BitNot => {
-                    let val = self.stack.pop().ok_or(VMError::StackUnderflow)?;
+                    let val = self
+                        .stack
+                        .pop()
+                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
                     match val.as_i64() {
                         Some(i) => {
                             self.stack.push(Value::Float(!i as f64));
                             self.ip += 1;
                         }
-                        None => return Err(VMError::TypeError),
+                        None => return Err(self.fail(ErrorKind::TypeError, "type error")),
                     }
                 }
 
                 // ── binary operators ────────────────────────────
                 Instr::Add => {
-                    let rhs = self.stack.pop().ok_or(VMError::StackUnderflow)?;
-                    let lhs = self.stack.pop().ok_or(VMError::StackUnderflow)?;
+                    let rhs = self
+                        .stack
+                        .pop()
+                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
+                    let lhs = self
+                        .stack
+                        .pop()
+                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
                     // JS `+`: if either operand is a string, concatenate (ToString
                     // both); otherwise add numerically (ToNumber both). An
                     // array/object/function in the numeric path is a TypeError
@@ -696,7 +793,7 @@ impl VM {
                     } else {
                         match (lhs.to_number(), rhs.to_number()) {
                             (Some(a), Some(b)) => Value::Float(a + b),
-                            _ => return Err(VMError::TypeError),
+                            _ => return Err(self.fail(ErrorKind::TypeError, "type error")),
                         }
                     };
                     self.stack.push(result);
@@ -714,26 +811,50 @@ impl VM {
                 Instr::Pow => binary_num!(|a: f64, b: f64| a.powf(b)),
 
                 Instr::Eq => {
-                    let rhs = self.stack.pop().ok_or(VMError::StackUnderflow)?;
-                    let lhs = self.stack.pop().ok_or(VMError::StackUnderflow)?;
+                    let rhs = self
+                        .stack
+                        .pop()
+                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
+                    let lhs = self
+                        .stack
+                        .pop()
+                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
                     self.stack.push(Value::Bool(lhs.strict_equal(&rhs)));
                     self.ip += 1;
                 }
                 Instr::Neq => {
-                    let rhs = self.stack.pop().ok_or(VMError::StackUnderflow)?;
-                    let lhs = self.stack.pop().ok_or(VMError::StackUnderflow)?;
+                    let rhs = self
+                        .stack
+                        .pop()
+                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
+                    let lhs = self
+                        .stack
+                        .pop()
+                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
                     self.stack.push(Value::Bool(!lhs.strict_equal(&rhs)));
                     self.ip += 1;
                 }
                 Instr::LooseEq => {
-                    let rhs = self.stack.pop().ok_or(VMError::StackUnderflow)?;
-                    let lhs = self.stack.pop().ok_or(VMError::StackUnderflow)?;
+                    let rhs = self
+                        .stack
+                        .pop()
+                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
+                    let lhs = self
+                        .stack
+                        .pop()
+                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
                     self.stack.push(Value::Bool(lhs.loose_equal(&rhs)));
                     self.ip += 1;
                 }
                 Instr::LooseNeq => {
-                    let rhs = self.stack.pop().ok_or(VMError::StackUnderflow)?;
-                    let lhs = self.stack.pop().ok_or(VMError::StackUnderflow)?;
+                    let rhs = self
+                        .stack
+                        .pop()
+                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
+                    let lhs = self
+                        .stack
+                        .pop()
+                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
                     self.stack.push(Value::Bool(!lhs.loose_equal(&rhs)));
                     self.ip += 1;
                 }
@@ -741,8 +862,14 @@ impl VM {
                 Instr::Lt => cmp_op!(Less),
                 Instr::Gt => cmp_op!(Greater),
                 Instr::LtEq => {
-                    let rhs = self.stack.pop().ok_or(VMError::StackUnderflow)?;
-                    let lhs = self.stack.pop().ok_or(VMError::StackUnderflow)?;
+                    let rhs = self
+                        .stack
+                        .pop()
+                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
+                    let lhs = self
+                        .stack
+                        .pop()
+                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
                     let result = lhs
                         .compare(&rhs)
                         .map(|ord| ord != std::cmp::Ordering::Greater)
@@ -751,8 +878,14 @@ impl VM {
                     self.ip += 1;
                 }
                 Instr::GtEq => {
-                    let rhs = self.stack.pop().ok_or(VMError::StackUnderflow)?;
-                    let lhs = self.stack.pop().ok_or(VMError::StackUnderflow)?;
+                    let rhs = self
+                        .stack
+                        .pop()
+                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
+                    let lhs = self
+                        .stack
+                        .pop()
+                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
                     let result = lhs
                         .compare(&rhs)
                         .map(|ord| ord != std::cmp::Ordering::Less)
@@ -762,14 +895,26 @@ impl VM {
                 }
 
                 Instr::And => {
-                    let rhs = self.stack.pop().ok_or(VMError::StackUnderflow)?;
-                    let lhs = self.stack.pop().ok_or(VMError::StackUnderflow)?;
+                    let rhs = self
+                        .stack
+                        .pop()
+                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
+                    let lhs = self
+                        .stack
+                        .pop()
+                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
                     self.stack.push(if lhs.is_truthy() { rhs } else { lhs });
                     self.ip += 1;
                 }
                 Instr::Or => {
-                    let rhs = self.stack.pop().ok_or(VMError::StackUnderflow)?;
-                    let lhs = self.stack.pop().ok_or(VMError::StackUnderflow)?;
+                    let rhs = self
+                        .stack
+                        .pop()
+                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
+                    let lhs = self
+                        .stack
+                        .pop()
+                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
                     self.stack.push(if lhs.is_truthy() { lhs } else { rhs });
                     self.ip += 1;
                 }
@@ -783,7 +928,7 @@ impl VM {
                     let b = self.pop_int()?;
                     let a = self.pop_int()?;
                     if !(0..64).contains(&b) {
-                        return Err(VMError::ValueError);
+                        return Err(self.fail(ErrorKind::ValueError, "value error"));
                     }
                     self.stack.push(Value::Float((a << b) as f64));
                     self.ip += 1;
@@ -792,7 +937,7 @@ impl VM {
                     let b = self.pop_int()?;
                     let a = self.pop_int()?;
                     if !(0..64).contains(&b) {
-                        return Err(VMError::ValueError);
+                        return Err(self.fail(ErrorKind::ValueError, "value error"));
                     }
                     self.stack.push(Value::Float((a >> b) as f64));
                     self.ip += 1;
@@ -802,7 +947,7 @@ impl VM {
                 Instr::ObjNew(fields) => {
                     let n = fields.len();
                     if n > self.stack.len() {
-                        return Err(VMError::StackUnderflow);
+                        return Err(self.fail(ErrorKind::StackUnderflow, "stack underflow"));
                     }
                     let split = self.stack.len() - n;
                     let vals: SmallVec<[Value; 16]> = self.stack.drain(split..).collect();
@@ -825,7 +970,7 @@ impl VM {
                     // without cloning.
                     let obj_ptr = match self.stack.last() {
                         Some(Value::Object(p)) => *p,
-                        _ => return Err(VMError::TypeError),
+                        _ => return Err(self.fail(ErrorKind::TypeError, "type error")),
                     };
                     // JS: a missing property reads as `undefined`, not `null`.
                     let val = match self.objects.get(obj_ptr as usize) {
@@ -841,14 +986,17 @@ impl VM {
                     let field_str = field.as_str(); // borrows self.code
                     let mode = *mode;
                     // Stack: [..., obj_ptr, val] (val on top).
-                    let val = self.stack.pop().ok_or(VMError::StackUnderflow)?;
+                    let val = self
+                        .stack
+                        .pop()
+                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
                     let obj_ptr = match self.stack.last() {
                         Some(Value::Object(p)) => *p,
-                        _ => return Err(VMError::TypeError),
+                        _ => return Err(self.fail(ErrorKind::TypeError, "type error")),
                     };
                     let obj = match self.objects.get_mut(obj_ptr as usize) {
                         Some(o) => o,
-                        _ => return Err(VMError::TypeError),
+                        _ => return Err(self.fail(ErrorKind::TypeError, "type error")),
                     };
                     // Read the old value before overwriting, then write through
                     // get_mut (avoids cloning the key when it already exists).
@@ -884,47 +1032,62 @@ impl VM {
                 // (byte-offset char). A char result needs a fresh allocation, so
                 // it is computed under the heap borrow and allocated after.
                 Instr::IndexGet => {
-                    let key = self.stack.pop().ok_or(VMError::StackUnderflow)?;
-                    let container = self.stack.pop().ok_or(VMError::StackUnderflow)?;
-                    let val = match &container {
-                        // String char-indexing: strings are inline values now, so
-                        // this no longer routes through the heap. The single-char
-                        // result is a fresh `RcStr`.
-                        Value::String(s) => {
-                            let s = s.as_str();
-                            let idx = key.as_i64().ok_or(VMError::TypeError)?;
-                            if idx < 0 {
-                                return Err(VMError::ValueError);
+                    let key = self
+                        .stack
+                        .pop()
+                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
+                    let container = self
+                        .stack
+                        .pop()
+                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
+                    let val =
+                        match &container {
+                            // String char-indexing: strings are inline values now, so
+                            // this no longer routes through the heap. The single-char
+                            // result is a fresh `RcStr`.
+                            Value::String(s) => {
+                                let s = s.as_str();
+                                let idx = key
+                                    .as_i64()
+                                    .ok_or_else(|| self.fail(ErrorKind::TypeError, "type error"))?;
+                                if idx < 0 {
+                                    return Err(self.fail(ErrorKind::ValueError, "value error"));
+                                }
+                                let idx = idx as usize;
+                                if idx >= s.len() {
+                                    // JS: an out-of-range char index is `undefined`.
+                                    Value::Undefined
+                                } else if !s.is_char_boundary(idx) {
+                                    return Err(self.fail(ErrorKind::ValueError, "value error"));
+                                } else {
+                                    let ch = s[idx..].chars().next().unwrap();
+                                    Value::String(RcStr::from(ch.to_string()))
+                                }
                             }
-                            let idx = idx as usize;
-                            if idx >= s.len() {
-                                // JS: an out-of-range char index is `undefined`.
-                                Value::Undefined
-                            } else if !s.is_char_boundary(idx) {
-                                return Err(VMError::ValueError);
-                            } else {
-                                let ch = s[idx..].chars().next().unwrap();
-                                Value::String(RcStr::from(ch.to_string()))
+                            Value::Array(p) => {
+                                let arr = self.arrays.get(*p as usize).ok_or_else(|| {
+                                    self.fail(ErrorKind::ValueError, "value error")
+                                })?;
+                                let idx = key
+                                    .as_i64()
+                                    .ok_or_else(|| self.fail(ErrorKind::TypeError, "type error"))?;
+                                if idx < 0 {
+                                    return Err(self.fail(ErrorKind::ValueError, "value error"));
+                                }
+                                // JS: an out-of-bounds index reads as `undefined`.
+                                arr.get(idx as usize).cloned().unwrap_or(Value::Undefined)
                             }
-                        }
-                        Value::Array(p) => {
-                            let arr = self.arrays.get(*p as usize).ok_or(VMError::ValueError)?;
-                            let idx = key.as_i64().ok_or(VMError::TypeError)?;
-                            if idx < 0 {
-                                return Err(VMError::ValueError);
+                            Value::Object(p) => {
+                                let obj = self.objects.get(*p as usize).ok_or_else(|| {
+                                    self.fail(ErrorKind::ValueError, "value error")
+                                })?;
+                                // JS coerces a computed key with ToString.
+                                let field = self.to_js_string(&key, 0);
+                                // JS: a missing property reads as `undefined`.
+                                obj.get(field.as_str()).cloned().unwrap_or(Value::Undefined)
                             }
-                            // JS: an out-of-bounds index reads as `undefined`.
-                            arr.get(idx as usize).cloned().unwrap_or(Value::Undefined)
-                        }
-                        Value::Object(p) => {
-                            let obj = self.objects.get(*p as usize).ok_or(VMError::ValueError)?;
-                            // JS coerces a computed key with ToString.
-                            let field = self.to_js_string(&key, 0);
-                            // JS: a missing property reads as `undefined`.
-                            obj.get(field.as_str()).cloned().unwrap_or(Value::Undefined)
-                        }
-                        _ => return Err(VMError::TypeError),
-                    };
+                            _ => return Err(self.fail(ErrorKind::TypeError, "type error")),
+                        };
                     self.stack.push(val);
                     self.ip += 1;
                 }
@@ -934,22 +1097,33 @@ impl VM {
                 // ToString'd key; strings are immutable (TypeError).
                 Instr::IndexSet(mode) => {
                     let mode = *mode;
-                    let val = self.stack.pop().ok_or(VMError::StackUnderflow)?;
-                    let key = self.stack.pop().ok_or(VMError::StackUnderflow)?;
-                    let container = self.stack.pop().ok_or(VMError::StackUnderflow)?;
+                    let val = self
+                        .stack
+                        .pop()
+                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
+                    let key = self
+                        .stack
+                        .pop()
+                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
+                    let container = self
+                        .stack
+                        .pop()
+                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
                     let is_array = match &container {
                         Value::Array(_) => true,
                         Value::Object(_) => false,
                         // Strings are immutable; closures aren't indexable.
-                        _ => return Err(VMError::TypeError),
+                        _ => return Err(self.fail(ErrorKind::TypeError, "type error")),
                     };
                     let old = if matches!(mode, SetMode::Old) {
                         // Read the previous value before the write (for postfix
                         // `++`/`--` on computed targets).
                         if is_array {
-                            let idx = key.as_i64().ok_or(VMError::TypeError)?;
+                            let idx = key
+                                .as_i64()
+                                .ok_or_else(|| self.fail(ErrorKind::TypeError, "type error"))?;
                             if idx < 0 {
-                                return Err(VMError::ValueError);
+                                return Err(self.fail(ErrorKind::ValueError, "value error"));
                             }
                             match &container {
                                 Value::Array(p) => self
@@ -981,18 +1155,23 @@ impl VM {
                         SetMode::Old => old,
                     };
                     if is_array {
-                        let idx = key.as_i64().ok_or(VMError::TypeError)?;
+                        let idx = key
+                            .as_i64()
+                            .ok_or_else(|| self.fail(ErrorKind::TypeError, "type error"))?;
                         if idx < 0 {
-                            return Err(VMError::ValueError);
+                            return Err(self.fail(ErrorKind::ValueError, "value error"));
                         }
                         let idx = idx as usize;
                         let p = match &container {
                             Value::Array(p) => *p,
                             _ => unreachable!(),
                         };
-                        let arr = self.arrays.get_mut(p as usize).ok_or(VMError::TypeError)?;
+                        let ip = self.ip;
+                        let arr = self.arrays.get_mut(p as usize).ok_or_else(|| {
+                            VMError::fail_at(ip, ErrorKind::TypeError, "type error")
+                        })?;
                         if idx >= arr.len() {
-                            return Err(VMError::ValueError);
+                            return Err(self.fail(ErrorKind::ValueError, "value error"));
                         }
                         arr[idx] = val;
                     } else {
@@ -1001,7 +1180,10 @@ impl VM {
                             Value::Object(p) => *p,
                             _ => unreachable!(),
                         };
-                        let obj = self.objects.get_mut(p as usize).ok_or(VMError::TypeError)?;
+                        let ip = self.ip;
+                        let obj = self.objects.get_mut(p as usize).ok_or_else(|| {
+                            VMError::fail_at(ip, ErrorKind::TypeError, "type error")
+                        })?;
                         obj.insert(field, val);
                     }
                     self.stack.push(result);
@@ -1010,14 +1192,17 @@ impl VM {
 
                 Instr::ObjHas => {
                     let field = self.pop_string()?;
-                    let obj_ptr = match self.stack.pop().ok_or(VMError::StackUnderflow)? {
-                        Value::Object(p) => p,
-                        _ => return Err(VMError::TypeError),
-                    };
+                    let obj_ptr =
+                        match self.stack.pop().ok_or_else(|| {
+                            self.fail(ErrorKind::StackUnderflow, "stack underflow")
+                        })? {
+                            Value::Object(p) => p,
+                            _ => return Err(self.fail(ErrorKind::TypeError, "type error")),
+                        };
                     let has = self
                         .objects
                         .get(obj_ptr as usize)
-                        .ok_or(VMError::TypeError)?
+                        .ok_or_else(|| self.fail(ErrorKind::TypeError, "type error"))?
                         .contains_key(field.as_str());
                     self.stack.push(Value::Bool(has));
                     self.ip += 1;
@@ -1025,15 +1210,19 @@ impl VM {
 
                 Instr::ObjDelete => {
                     let field = self.pop_string()?;
-                    let obj_ptr = match self.stack.pop().ok_or(VMError::StackUnderflow)? {
-                        Value::Object(p) => p,
-                        _ => return Err(VMError::TypeError),
-                    };
+                    let obj_ptr =
+                        match self.stack.pop().ok_or_else(|| {
+                            self.fail(ErrorKind::StackUnderflow, "stack underflow")
+                        })? {
+                            Value::Object(p) => p,
+                            _ => return Err(self.fail(ErrorKind::TypeError, "type error")),
+                        };
                     // shift_remove keeps the remaining keys in insertion order.
+                    let ip = self.ip;
                     let existed = self
                         .objects
                         .get_mut(obj_ptr as usize)
-                        .ok_or(VMError::TypeError)?
+                        .ok_or_else(|| VMError::fail_at(ip, ErrorKind::TypeError, "type error"))?
                         .shift_remove(field.as_str())
                         .is_some();
                     self.stack.push(Value::Bool(existed));
@@ -1044,7 +1233,7 @@ impl VM {
                 Instr::ArrNew(n) => {
                     let n = *n as usize;
                     if n > self.stack.len() {
-                        return Err(VMError::StackUnderflow);
+                        return Err(self.fail(ErrorKind::StackUnderflow, "stack underflow"));
                     }
                     let split = self.stack.len() - n;
                     // Left-to-right: first pushed becomes element 0.
@@ -1055,7 +1244,10 @@ impl VM {
                 }
 
                 Instr::ArrLength => {
-                    let val = self.stack.pop().ok_or(VMError::StackUnderflow)?;
+                    let val = self
+                        .stack
+                        .pop()
+                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
                     let len = match val {
                         // String length is in UTF-8 *bytes* (consistent with the
                         // byte-offset string ops below).
@@ -1063,21 +1255,24 @@ impl VM {
                         Value::Array(p) => self
                             .arrays
                             .get(p as usize)
-                            .ok_or(VMError::ValueError)?
+                            .ok_or_else(|| self.fail(ErrorKind::ValueError, "value error"))?
                             .len(),
                         Value::Object(p) => self
                             .objects
                             .get(p as usize)
-                            .ok_or(VMError::ValueError)?
+                            .ok_or_else(|| self.fail(ErrorKind::ValueError, "value error"))?
                             .len(),
-                        _ => return Err(VMError::TypeError),
+                        _ => return Err(self.fail(ErrorKind::TypeError, "type error")),
                     };
                     self.stack.push(Value::Float(len as f64));
                     self.ip += 1;
                 }
 
                 Instr::ToStr => {
-                    let val = self.stack.pop().ok_or(VMError::StackUnderflow)?;
+                    let val = self
+                        .stack
+                        .pop()
+                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
                     let s = self.to_js_string(&val, 0);
                     self.stack.push(Value::String(s));
                     self.ip += 1;
@@ -1086,16 +1281,22 @@ impl VM {
                 Instr::ToNum => {
                     // ToNumber, matching the arithmetic operators' coercion: an
                     // array/object/function has no numeric form (TypeError).
-                    let val = self.stack.pop().ok_or(VMError::StackUnderflow)?;
+                    let val = self
+                        .stack
+                        .pop()
+                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
                     match val.to_number() {
                         Some(num) => self.stack.push(Value::Float(num)),
-                        None => return Err(VMError::TypeError),
+                        None => return Err(self.fail(ErrorKind::TypeError, "type error")),
                     }
                     self.ip += 1;
                 }
 
                 Instr::ToBool => {
-                    let val = self.stack.pop().ok_or(VMError::StackUnderflow)?;
+                    let val = self
+                        .stack
+                        .pop()
+                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
                     self.stack.push(Value::Bool(val.is_truthy()));
                     self.ip += 1;
                 }
@@ -1117,7 +1318,7 @@ impl VM {
                         // batch can't bypass the budget.
                         if !sigs.is_empty() {
                             if self.fuel == 0 {
-                                return Err(VMError::OutOfFuel);
+                                return Err(self.fail(ErrorKind::OutOfFuel, "fuel exhausted"));
                             }
                             self.fuel -= 1;
                         }
@@ -1128,7 +1329,7 @@ impl VM {
 
                     let total: usize = sigs.iter().map(|(_, n)| *n as usize).sum();
                     if total > self.stack.len() {
-                        return Err(VMError::StackUnderflow);
+                        return Err(self.fail(ErrorKind::StackUnderflow, "stack underflow"));
                     }
                     // Region in push order: region[0] is call 0's arg 0.
                     let region = self.stack.split_off(self.stack.len() - total);
