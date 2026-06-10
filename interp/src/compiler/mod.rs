@@ -2041,7 +2041,7 @@ impl<'src> Compiler<'src> {
                 // intrinsic; otherwise it is a method on the receiver value.
                 if let ast::Expression::Identifier(obj) = &m.object {
                     match obj.name.as_str() {
-                        "Math" | "Object" | "JSON" | "Number" | "Array" => {
+                        "Math" | "Object" | "JSON" | "Number" | "Array" | "console" => {
                             return self.compile_namespace_call(
                                 obj.name.as_str(),
                                 method,

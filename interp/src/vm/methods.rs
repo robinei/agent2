@@ -26,6 +26,7 @@ impl VM {
             fuel: DEFAULT_FUEL,
             spans: Vec::new(),
             source: Arc::from(""),
+            console_lines: Vec::new(),
         }
     }
 

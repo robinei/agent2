@@ -200,6 +200,12 @@ pub struct VM {
     /// `Program::source`. Empty for `VM::new` programs, where error
     /// rendering degrades gracefully to "at instruction N".
     pub source: Arc<str>,
+    /// Size-capped ring buffer of console output lines (from `console.log`,
+    /// `console.warn`, `console.error`, `console.info`). The host reads this
+    /// for diagnostics; it is never a result channel. When the cap (256 lines)
+    /// is exceeded, the oldest line is dropped and replaced by a
+    /// `[... N lines dropped]` marker.
+    pub console_lines: Vec<String>,
 }
 
 pub struct CallFrame {
