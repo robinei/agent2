@@ -125,3 +125,41 @@ pub fn eval_str(expr: &str) -> String {
         other => panic!("not a string: {other:?}"),
     }
 }
+
+// ── self-tests (harness API coverage) ──────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vm::{StepResult, VMError};
+
+    #[test]
+    fn compile_errs_renders_diagnostics() {
+        let errs = compile_errs("let x = y;"); // undeclared `y`
+        assert!(!errs.is_empty(), "expected at least one diagnostic");
+        assert!(
+            errs[0].contains("undeclared") || errs[0].contains("y"),
+            "got: {}",
+            errs[0]
+        );
+    }
+
+    #[test]
+    fn run_to_effect_yields_invoke() {
+        let (_vm, effect) = run_to_effect("tools.foo(1);");
+        match effect {
+            StepResult::Invoke { calls } => {
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0].name, "foo");
+            }
+            other => panic!("expected Invoke, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_runtime_err_catches_type_error() {
+        // Accessing a property on a non-object is a runtime TypeError.
+        let err = run_runtime_err("return null.foo;");
+        assert!(matches!(err, VMError::TypeError), "got {err:?}");
+    }
+}

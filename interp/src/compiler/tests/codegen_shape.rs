@@ -6,7 +6,8 @@
 use super::*;
 use crate::compiler::compile;
 use crate::testutil;
-use crate::vm::{Instr, VM, Value};
+use crate::builtin::Builtin;
+use crate::vm::{Instr, SlotKind, VM, Value};
 use crate::rc_str::RcStr;
 
 // ── core optimizer: const-fold / peephole / simplify_cfg ─────────
@@ -598,4 +599,64 @@ fn for_program_seeds_input_at_heap0() {
     let vm = VM::for_program(prog, state).unwrap();
     let o = &vm.objects[0];
     assert_eq!(o.get(&RcStr::from("count")), Some(&Value::PosInt(7)));
+}
+
+// ── effects lowering ──────────────────────────────────────────────
+
+#[test]
+fn tools_call_lowers_to_invoke() {
+    // `tools.foo(a, b)` lowers to args-then-`Invoke("foo", 2)`.
+    let prog = compile("tools.notify(1, 2);").expect("compiles");
+    assert!(
+        prog.code.contains(&Instr::Invoke("notify".into(), 2)),
+        "expected Invoke in {:?}",
+        prog.code
+    );
+}
+
+#[test]
+fn tools_call_with_no_args() {
+    let prog = compile("tools.tick();").expect("compiles");
+    assert!(prog.code.contains(&Instr::Invoke("tick".into(), 0)));
+}
+
+#[test]
+fn raise_lowers_to_raise_instr() {
+    let prog = compile("raise(\"need_input\");").expect("compiles");
+    assert!(
+        prog.code.contains(&Instr::Raise("need_input".into())),
+        "expected Raise in {:?}",
+        prog.code
+    );
+}
+
+// ── optional-call lowering ────────────────────────────────────────
+
+#[test]
+fn optional_call_reclaims_static_builtin() {
+    let prog = compile("Math.max?.(3, 7);").expect("compiles");
+    assert!(
+        prog.code.iter().any(|i| matches!(i, Instr::CallBuiltin(Builtin::MathMax, 2))),
+        "expected CallBuiltin(MathMax, 2), got {:?}", prog.code
+    );
+    assert!(
+        !prog.code.iter().any(|i| matches!(i, Instr::CallDyn(_) | Instr::JNotNullish(_))),
+        "guard/CallDyn should have been reclaimed: {:?}", prog.code
+    );
+}
+
+// ── closure / cell shape ──────────────────────────────────────────
+
+#[test]
+fn captured_loop_var_allocates_plain_not_boxed() {
+    let prog = compile("let fns = []; for (let i = 0; i < 3; i++) { fns.push(() => i); }").expect("compiles");
+    let has_boxed = prog.code.iter().any(|i| matches!(i, Instr::EnterFrame(_, _, kinds) if kinds.iter().any(|k| *k == SlotKind::Boxed)));
+    assert!(!has_boxed, "captured loop var should be Plain-allocated: {:?}", prog.code);
+    assert!(prog.code.iter().any(|i| matches!(i, Instr::FreshCell(_))), "captured loop var should still be re-boxed per iteration: {:?}", prog.code);
+}
+
+#[test]
+fn plain_loop_var_emits_no_fresh_cell() {
+    let prog = compile("let s = 0; for (let i = 0; i < 3; i++) { s = s + i; }").expect("compiles");
+    assert!(!prog.code.iter().any(|i| matches!(i, Instr::FreshCell(_))), "uncaptured loop var should not emit FreshCell: {:?}", prog.code);
 }

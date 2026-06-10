@@ -17,19 +17,20 @@ fn local_declarations_and_reassignment() {
 
 #[test]
 fn block_scoping() {
-    let vm = testutil::run("let x = 1; { let x = 2; input.inner = x; } input.outer = x;");
-    assert_eq!(input_val(&vm, "inner"), Value::PosInt(2));
-    assert_eq!(input_val(&vm, "outer"), Value::PosInt(1));
+    assert_eq!(
+        testutil::run_ret("let x = 1; let inner; { let x = 2; inner = x; } let outer = x; return { inner, outer };")
+            .as_object().unwrap(),
+        &serde_json::json!({"inner": 2, "outer": 1}).as_object().unwrap().clone()
+    );
 }
 
 #[test]
 fn var_is_function_scoped_and_hoisted() {
-    let vm = testutil::run("input.before = typeof x; var x = 5; input.after = x;");
-    match input_val(&vm, "before") {
-        Value::String(s) => assert_eq!(s.as_str(), "undefined"),
-        other => panic!("not a string: {other:?}"),
-    }
-    assert_eq!(input_val(&vm, "after"), Value::PosInt(5));
+    assert_eq!(
+        testutil::run_ret("let before = typeof x; var x = 5; let after = x; return { before, after };")
+            .as_object().unwrap(),
+        &serde_json::json!({"before": "undefined", "after": 5}).as_object().unwrap().clone()
+    );
     assert_eq!(testutil::run_val("{ var y = 9; } return y;"), Value::PosInt(9));
 }
 
@@ -99,10 +100,14 @@ fn for_of_break_and_continue() {
 
 #[test]
 fn for_in_object_keys() {
-    let vm = testutil::run("input.o = { a: 1, b: 2, c: 3 }; input.r = \"\"; for (const k in input.o) { input.r = input.r + k; }");
-    match input_val(&vm, "r") { Value::String(s) => assert_eq!(s.as_str(), "abc"), other => panic!("not a string: {other:?}") }
-    let vm = testutil::run("input.o = { a: 1, b: 2, c: 3 }; let s = 0; for (const k in input.o) { s += input.o[k]; } input.r = s;");
-    assert_eq!(input_val(&vm, "r"), testutil::num(6.0));
+    assert_eq!(
+        testutil::run_ret("let o = { a: 1, b: 2, c: 3 }; let r = \"\"; for (const k in o) { r = r + k; } return r;"),
+        serde_json::json!("abc")
+    );
+    assert_eq!(
+        testutil::run_ret("let o = { a: 1, b: 2, c: 3 }; let s = 0; for (const k in o) { s += o[k]; } return s;"),
+        serde_json::json!(6)
+    );
 }
 
 #[test]
@@ -129,4 +134,25 @@ fn switch_break_only_continue_escapes() {
 #[test]
 fn switch_lexical_decls_share_block() {
     assert_eq!(testutil::run_val("let r = 0; switch (1) { case 1: { let x = 5; r = x; break; } default: r = 0; } return r;"), Value::PosInt(5));
+}
+
+#[test]
+fn continue_in_do_while_retests_condition() {
+    // `continue` inside `do-while` jumps to the condition, which re-tests.
+    assert_eq!(
+        testutil::run_ret("let i = 0; let s = 0; do { i++; if (i < 3) continue; s++; } while (i < 5); return { i, s };"),
+        serde_json::json!({"i": 5, "s": 3})
+    );
+    // i=1,2: continue (skip s++). i=3,4,5: s++ → s=3.
+}
+
+#[test]
+fn switch_break_only_continue_skips_to_enclosing_loop() {
+    // `continue` inside a `switch` (no loop on the switch itself) must
+    // skip to the innermost enclosing loop, not error.
+    assert_eq!(
+        testutil::run_ret("let s = 0; for (let i = 1; i <= 3; i++) { switch (i) { case 1: s++; break; case 2: continue; default: s += 10; } } return s;"),
+        serde_json::json!(11)
+    );
+    // i=1: s=1, break. i=2: continue → skip increment. i=3: s=11.
 }

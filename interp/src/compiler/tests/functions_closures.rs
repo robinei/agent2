@@ -1,47 +1,66 @@
 //! Function, closure, capture, `arguments`, and per-iteration cell tests.
 //! Also includes some lang_basics/objects_arrays tests that were co-located.
 
-use super::*;
 use crate::compiler::compile;
 use crate::testutil;
-use crate::vm::{Instr, SlotKind, StepResult, VM, Value};
+use crate::vm::{StepResult, VM, Value};
 
 #[test]
 fn arguments_variadic_sum() {
-    let vm = testutil::run(
-        "function sum() { let t = 0; for (let i = 0; i < arguments.length; i++) { t += arguments[i]; } return t; } input.r = sum(1, 2, 3, 4);",
+    assert_eq!(
+        testutil::run_ret("function sum() { let t = 0; for (let i = 0; i < arguments.length; i++) { t += arguments[i]; } return t; } return sum(1, 2, 3, 4);"),
+        serde_json::json!(10)
     );
-    assert_eq!(input_val(&vm, "r"), testutil::num(10.0));
 }
 
 #[test]
 fn arguments_beyond_declared_params() {
-    let vm = testutil::run("function f(a) { return a + arguments.length; } input.r = f(10, 20, 30);");
-    assert_eq!(input_val(&vm, "r"), testutil::num(13.0));
+    assert_eq!(
+        testutil::run_ret("function f(a) { return a + arguments.length; } return f(10, 20, 30);"),
+        serde_json::json!(13)
+    );
+}
+
+#[test]
+fn missing_args_pad_to_undefined() {
+    // Fewer args than declared params: the missing params are `undefined`
+    // (JS-like — user-function arity is not strict; the VM normalizes).
+    assert_eq!(
+        testutil::run_ret("function f(a, b) { return [a, b === undefined]; } return f(1);"),
+        serde_json::json!([1, true])
+    );
 }
 
 #[test]
 fn arguments_is_cached_per_frame() {
-    let vm = testutil::run("function f() { return arguments === arguments; } input.r = f(1, 2);");
-    assert_eq!(input_val(&vm, "r"), Value::Bool(true));
+    assert_eq!(
+        testutil::run_ret("function f() { return arguments === arguments; } return f(1, 2);"),
+        serde_json::json!(true)
+    );
 }
 
 #[test]
 fn arguments_can_be_shadowed() {
-    let vm = testutil::run("function f() { let arguments = 42; return arguments; } input.r = f(1, 2, 3);");
-    assert_eq!(input_val(&vm, "r"), Value::PosInt(42));
+    assert_eq!(
+        testutil::run_val("function f() { let arguments = 42; return arguments; } return f(1, 2, 3);"),
+        Value::PosInt(42)
+    );
 }
 
 #[test]
 fn arguments_in_arrow_is_own_frame() {
-    let vm = testutil::run("let f = (a) => arguments.length; input.r = f(1, 2, 3);");
-    assert_eq!(input_val(&vm, "r"), testutil::num(3.0));
+    assert_eq!(
+        testutil::run_ret("let f = (a) => arguments.length; return f(1, 2, 3);"),
+        serde_json::json!(3)
+    );
 }
 
 #[test]
 fn arguments_at_top_level_is_empty() {
-    let vm = testutil::run("input.r = arguments.length;");
-    assert_eq!(input_val(&vm, "r"), testutil::num(0.0));
+    assert_eq!(
+        testutil::run_ret("return arguments.length;"),
+        serde_json::json!(0)
+    );
 }
 
 #[test]
@@ -64,10 +83,14 @@ fn compound_assignment() {
         Value::String(s) => assert_eq!(s.as_str(), "ab"),
         other => panic!("not a string: {other:?}"),
     }
-    let vm = testutil::run("input.o = { a: 1 }; input.o.a += 4; input.r = input.o.a;");
-    assert_eq!(input_val(&vm, "r"), testutil::num(5.0));
-    let vm = testutil::run("input.arr = [1, 2]; input.arr[0] += 10; input.r = input.arr[0];");
-    assert_eq!(input_val(&vm, "r"), testutil::num(11.0));
+    assert_eq!(
+        testutil::run_val("let o = { a: 1 }; o.a += 4; return o.a;"),
+        testutil::num(5.0)
+    );
+    assert_eq!(
+        testutil::run_val("let arr = [1, 2]; arr[0] += 10; return arr[0];"),
+        testutil::num(11.0)
+    );
     assert_eq!(testutil::run_val("let x = 5; return (x += 5);"), testutil::num(10.0));
 }
 
@@ -79,22 +102,31 @@ fn logical_assignment() {
     assert_eq!(testutil::run_val("let x = 0; x &&= 7; return x;"), Value::PosInt(0));
     assert_eq!(testutil::run_val("let x = null; x ??= 9; return x;"), Value::PosInt(9));
     assert_eq!(testutil::run_val("let x = 0; x ??= 9; return x;"), Value::PosInt(0));
-    let vm = testutil::run("input.hit = 0; let x = 3; x ||= (input.hit = 1); input.r = x;");
-    assert_eq!(input_val(&vm, "hit"), Value::PosInt(0));
-    assert_eq!(input_val(&vm, "r"), Value::PosInt(3));
-    let vm = testutil::run("input.o = { a: null }; input.o.a ??= 5; input.r = input.o.a;");
-    assert_eq!(input_val(&vm, "r"), Value::PosInt(5));
-    let vm = testutil::run("input.o = { a: 2 }; input.r = (input.o.a ??= 99);");
-    assert_eq!(input_val(&vm, "r"), Value::PosInt(2));
-    let vm = testutil::run("input.arr = [7]; input.r = (input.arr[0] ||= 1);");
-    assert_eq!(input_val(&vm, "r"), Value::PosInt(7));
+    // Short-circuit: RHS must not evaluate when LHS is truthy.
+    assert_eq!(
+        testutil::run_ret("let hit = 0; let x = 3; x ||= (hit = 1); return { hit, x };"),
+        serde_json::json!({"hit": 0, "x": 3})
+    );
+    assert_eq!(
+        testutil::run_val("let o = { a: null }; o.a ??= 5; return o.a;"),
+        Value::PosInt(5)
+    );
+    assert_eq!(
+        testutil::run_val("let o = { a: 2 }; return (o.a ??= 99);"),
+        Value::PosInt(2)
+    );
+    assert_eq!(
+        testutil::run_val("let arr = [7]; return (arr[0] ||= 1);"),
+        Value::PosInt(7)
+    );
 }
 
 #[test]
 fn increment_decrement() {
-    let vm = testutil::run("let x = 5; input.a = x++; input.b = x;");
-    assert_eq!(input_val(&vm, "a"), testutil::num(5.0));
-    assert_eq!(input_val(&vm, "b"), testutil::num(6.0));
+    assert_eq!(
+        testutil::run_ret("let x = 5; let a = x++; let b = x; return { a, b };"),
+        serde_json::json!({"a": 5, "b": 6})
+    );
     assert_eq!(testutil::run_val("let x = 5; x--; return x;"), testutil::num(4.0));
     assert_eq!(testutil::run_val("let x = 5; return --x;"), testutil::num(4.0));
     assert_eq!(testutil::run_val("let x = \"5\"; x++; return x;"), testutil::num(6.0));
@@ -102,9 +134,10 @@ fn increment_decrement() {
 
 #[test]
 fn array_destructuring_declaration() {
-    let vm = testutil::run("let [a, b] = [10, 20]; input.a = a; input.b = b;");
-    assert_eq!(input_val(&vm, "a"), Value::PosInt(10));
-    assert_eq!(input_val(&vm, "b"), Value::PosInt(20));
+    assert_eq!(
+        testutil::run_ret("let [a, b] = [10, 20]; return { a, b };"),
+        serde_json::json!({"a": 10, "b": 20})
+    );
     assert_eq!(testutil::run_val("let [, b] = [1, 2]; return b;"), Value::PosInt(2));
     assert_eq!(testutil::run_val("let [a = 5] = []; return a;"), Value::PosInt(5));
     assert_eq!(testutil::run_val("let [a = 5] = [1]; return a;"), Value::PosInt(1));
@@ -112,9 +145,10 @@ fn array_destructuring_declaration() {
 
 #[test]
 fn object_destructuring_declaration() {
-    let vm = testutil::run("let { x, y } = { x: 1, y: 2 }; input.x = x; input.y = y;");
-    assert_eq!(input_val(&vm, "x"), Value::PosInt(1));
-    assert_eq!(input_val(&vm, "y"), Value::PosInt(2));
+    assert_eq!(
+        testutil::run_ret("let { x, y } = { x: 1, y: 2 }; return { x, y };"),
+        serde_json::json!({"x": 1, "y": 2})
+    );
     assert_eq!(testutil::run_val("let { a: aa } = { a: 7 }; return aa;"), Value::PosInt(7));
     assert_eq!(testutil::run_val("let { b = 3 } = {}; return b;"), Value::PosInt(3));
     assert_eq!(testutil::run_val("let { b = 3 } = { b: 9 }; return b;"), Value::PosInt(9));
@@ -122,17 +156,19 @@ fn object_destructuring_declaration() {
 
 #[test]
 fn destructuring_assignment() {
-    let vm = testutil::run("let a, b; [a, b] = [3, 4]; input.a = a; input.b = b;");
-    assert_eq!(input_val(&vm, "a"), Value::PosInt(3));
-    assert_eq!(input_val(&vm, "b"), Value::PosInt(4));
+    assert_eq!(
+        testutil::run_ret("let a, b; [a, b] = [3, 4]; return { a, b };"),
+        serde_json::json!({"a": 3, "b": 4})
+    );
 }
 
 #[test]
 fn let_without_init_resets_each_iteration() {
-    let vm = testutil::run(
-        "let last; for (let i = 0; i < 2; i++) { let x; if (i === 0) x = 5; last = x; } input.r = last;",
+    // `let x` without init in a loop body resets to undefined each iteration.
+    assert_eq!(
+        testutil::run_val("let last; for (let i = 0; i < 2; i++) { let x; if (i === 0) x = 5; last = x; } return last;"),
+        Value::Undefined
     );
-    assert_eq!(input_val(&vm, "r"), Value::Undefined);
 }
 
 #[test]
@@ -211,78 +247,84 @@ fn mutual_recursion() {
 
 #[test]
 fn closure_captures_local() {
-    let vm = testutil::run("function makeAdder(x) { return function(y) { return x + y; }; } input.add5 = makeAdder(5); input.r = input.add5(3);");
-    assert_eq!(input_val(&vm, "r"), testutil::num(8.0));
+    assert_eq!(
+        testutil::run_ret("function makeAdder(x) { return function(y) { return x + y; }; } let add5 = makeAdder(5); return add5(3);"),
+        serde_json::json!(8)
+    );
 }
 
 #[test]
 fn closure_mutation_visible() {
-    let vm = testutil::run("function makeCounter() { let count = 0; function inc() { count = count + 1; return count; } return inc; } input.c1 = makeCounter(); input.c1(); input.r = input.c1();");
-    assert_eq!(input_val(&vm, "r"), testutil::num(2.0));
+    assert_eq!(
+        testutil::run_ret("function makeCounter() { let count = 0; function inc() { count = count + 1; return count; } return inc; } let c = makeCounter(); c(); return c();"),
+        serde_json::json!(2)
+    );
 }
 
 // ── per-iteration capture ────────────────────────────────────────
 
 #[test]
 fn for_let_head_var_captured_per_iteration() {
-    let vm = testutil::run("let fns = []; for (let i = 0; i < 3; i++) { fns.push(() => i); } let a = fns[0], b = fns[1], c = fns[2]; input.r = a() * 100 + b() * 10 + c();");
-    assert_eq!(input_val(&vm, "r"), testutil::num(12.0));
+    assert_eq!(
+        testutil::run_ret("let fns = []; for (let i = 0; i < 3; i++) { fns.push(() => i); } let a = fns[0], b = fns[1], c = fns[2]; return a() * 100 + b() * 10 + c();"),
+        serde_json::json!(12)
+    );
 }
 
 #[test]
 fn for_body_declared_var_captured_per_iteration() {
-    let vm = testutil::run("let fns = []; for (let i = 0; i < 3; i++) { let j = i * 2; fns.push(() => j); } let a = fns[0], b = fns[1], c = fns[2]; input.r = a() * 100 + b() * 10 + c();");
-    assert_eq!(input_val(&vm, "r"), testutil::num(24.0));
+    assert_eq!(
+        testutil::run_ret("let fns = []; for (let i = 0; i < 3; i++) { let j = i * 2; fns.push(() => j); } let a = fns[0], b = fns[1], c = fns[2]; return a() * 100 + b() * 10 + c();"),
+        serde_json::json!(24)
+    );
 }
 
 #[test]
 fn for_of_loop_var_captured_per_iteration() {
-    let vm = testutil::run("let fns = []; for (const x of [10, 20, 30]) { fns.push(() => x); } let a = fns[0], b = fns[1], c = fns[2]; input.r = a() * 100 + b() * 10 + c();");
-    assert_eq!(input_val(&vm, "r"), testutil::num(1230.0));
+    assert_eq!(
+        testutil::run_ret("let fns = []; for (const x of [10, 20, 30]) { fns.push(() => x); } let a = fns[0], b = fns[1], c = fns[2]; return a() * 100 + b() * 10 + c();"),
+        serde_json::json!(1230)
+    );
 }
 
 #[test]
 fn for_in_loop_var_captured_per_iteration() {
-    let vm = testutil::run("let fns = []; let obj = { a: 1, b: 2 }; for (const k in obj) { fns.push(() => k); } let a = fns[0], b = fns[1]; input.r = a() + b();");
-    match input_val(&vm, "r") { Value::String(s) => assert_eq!(s.as_str(), "ab"), other => panic!("not a string: {other:?}") }
+    assert_eq!(
+        testutil::run_ret("let fns = []; let obj = { a: 1, b: 2 }; for (const k in obj) { fns.push(() => k); } let a = fns[0], b = fns[1]; return a() + b();"),
+        serde_json::json!("ab")
+    );
 }
 
 #[test]
 fn while_body_declared_var_captured_per_iteration() {
-    let vm = testutil::run("let fns = []; let i = 0; while (i < 3) { let j = i; fns.push(() => j); i = i + 1; } let a = fns[0], b = fns[1], c = fns[2]; input.r = a() * 100 + b() * 10 + c();");
-    assert_eq!(input_val(&vm, "r"), testutil::num(12.0));
+    assert_eq!(
+        testutil::run_ret("let fns = []; let i = 0; while (i < 3) { let j = i; fns.push(() => j); i = i + 1; } let a = fns[0], b = fns[1], c = fns[2]; return a() * 100 + b() * 10 + c();"),
+        serde_json::json!(12)
+    );
 }
 
 #[test]
 fn for_head_var_value_carries_forward() {
-    let vm = testutil::run("let sum = 0; for (let i = 0; i < 5; i++) { sum = sum + i; } input.r = sum;");
-    assert_eq!(input_val(&vm, "r"), testutil::num(10.0));
+    assert_eq!(
+        testutil::run_ret("let sum = 0; for (let i = 0; i < 5; i++) { sum = sum + i; } return sum;"),
+        serde_json::json!(10)
+    );
 }
 
 #[test]
 fn captured_var_in_loop_is_shared_not_per_iteration() {
-    let vm = testutil::run("let fns = []; for (var i = 0; i < 3; i++) { fns.push(() => i); } let a = fns[0], b = fns[1], c = fns[2]; input.r = a() * 100 + b() * 10 + c();");
-    assert_eq!(input_val(&vm, "r"), testutil::num(333.0));
-}
-
-#[test]
-fn captured_loop_var_allocates_plain_not_boxed() {
-    let prog = compile("let fns = []; for (let i = 0; i < 3; i++) { fns.push(() => i); }").expect("compiles");
-    let has_boxed = prog.code.iter().any(|i| matches!(i, Instr::EnterFrame(_, _, kinds) if kinds.iter().any(|k| *k == SlotKind::Boxed)));
-    assert!(!has_boxed, "captured loop var should be Plain-allocated: {:?}", prog.code);
-    assert!(prog.code.iter().any(|i| matches!(i, Instr::FreshCell(_))), "captured loop var should still be re-boxed per iteration: {:?}", prog.code);
-}
-
-#[test]
-fn plain_loop_var_emits_no_fresh_cell() {
-    let prog = compile("let s = 0; for (let i = 0; i < 3; i++) { s = s + i; }").expect("compiles");
-    assert!(!prog.code.iter().any(|i| matches!(i, Instr::FreshCell(_))), "uncaptured loop var should not emit FreshCell: {:?}", prog.code);
+    assert_eq!(
+        testutil::run_ret("let fns = []; for (var i = 0; i < 3; i++) { fns.push(() => i); } let a = fns[0], b = fns[1], c = fns[2]; return a() * 100 + b() * 10 + c();"),
+        serde_json::json!(333)
+    );
 }
 
 #[test]
 fn function_decl_in_block_scope() {
-    let vm = testutil::run("input.r = foo(); { function foo() { return 9; } }");
-    assert_eq!(input_val(&vm, "r"), Value::PosInt(9));
+    assert_eq!(
+        testutil::run_val("let r = foo(); { function foo() { return 9; } } return r;"),
+        Value::PosInt(9)
+    );
 }
 
 #[test]
@@ -297,20 +339,24 @@ fn top_level_return_value() {
 
 #[test]
 fn capture_through_intermediate_function() {
-    let vm = testutil::run("function outer() { let x = 10; function middle() { function inner() { return x; } return inner(); } return middle(); } input.r = outer();");
-    assert_eq!(input_val(&vm, "r"), Value::PosInt(10));
+    assert_eq!(
+        testutil::run_val("function outer() { let x = 10; function middle() { function inner() { return x; } return inner(); } return middle(); } return outer();"),
+        Value::PosInt(10)
+    );
 }
 
 #[test]
 fn sibling_block_shadowing_uses_distinct_bindings() {
-    let vm = testutil::run("let x = 1; { let x = 2; input.a = x; } { let x = 3; input.b = x; } input.c = x;");
-    assert_eq!(input_val(&vm, "a"), Value::PosInt(2));
-    assert_eq!(input_val(&vm, "b"), Value::PosInt(3));
-    assert_eq!(input_val(&vm, "c"), Value::PosInt(1));
+    assert_eq!(
+        testutil::run_ret("let x = 1; let a; { let x = 2; a = x; } let b; { let x = 3; b = x; } let c = x; return { a, b, c };"),
+        serde_json::json!({"a": 2, "b": 3, "c": 1})
+    );
 }
 
 #[test]
 fn write_only_capture_is_detected() {
-    let vm = testutil::run("function make() { let v = 0; function setter(n) { v = n; } function getter() { return v; } setter(42); return getter(); } input.r = make();");
-    assert_eq!(input_val(&vm, "r"), Value::PosInt(42));
+    assert_eq!(
+        testutil::run_val("function make() { let v = 0; function setter(n) { v = n; } function getter() { return v; } setter(42); return getter(); } return make();"),
+        Value::PosInt(42)
+    );
 }

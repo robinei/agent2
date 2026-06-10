@@ -5,8 +5,7 @@ use super::*;
 use crate::compiler::compile;
 use crate::testutil;
 use crate::testutil::{eval, eval_str};
-use crate::vm::{Instr, StepResult, VM, Value};
-use crate::builtin::Builtin;
+use crate::vm::{StepResult, VM, Value};
 use crate::rc_str::RcStr;
 
 // ── arrays & objects ─────────────────────────────────────────────
@@ -43,25 +42,37 @@ fn member_and_index_assignment() {
 
 #[test]
 fn optional_chaining() {
-    assert_eq!(eval("input.nope?.x"), Value::Undefined);
-    let vm = testutil::run("input.obj = { x: 7 }; input.r = input.obj?.x;");
-    assert_eq!(input_val(&vm, "r"), Value::PosInt(7));
-    assert_eq!(eval("input.nope?.a?.b"), Value::Undefined);
+    assert_eq!(eval("({}).nope?.x"), Value::Undefined);
+    assert_eq!(
+        testutil::run_val("let obj = { x: 7 }; return obj?.x;"),
+        Value::PosInt(7)
+    );
+    assert_eq!(eval("({}).nope?.a?.b"), Value::Undefined);
 }
 
 #[test]
 fn optional_method_calls() {
-    let vm = testutil::run("input.arr = [1]; input.r = input.arr?.push(2);");
-    assert_eq!(input_val(&vm, "r"), testutil::num(2.0));
-    let vm = testutil::run("input.arr = [1]; input.arr?.push(2); input.r = input.arr.length;");
-    assert_eq!(input_val(&vm, "r"), testutil::num(2.0));
-    let vm = testutil::run("input.r = input.nope?.push(2);");
-    assert_eq!(input_val(&vm, "r"), Value::Undefined);
-    let vm = testutil::run("input.hit = 0; input.r = input.nope?.push(input.hit = 1);");
-    assert_eq!(input_val(&vm, "r"), Value::Undefined);
-    assert_eq!(input_val(&vm, "hit"), Value::PosInt(0));
-    let vm = testutil::run("input.s = \"a,b,c\"; input.r = input.s?.split(\",\").length;");
-    assert_eq!(input_val(&vm, "r"), testutil::num(3.0));
+    assert_eq!(
+        testutil::run_ret("let arr = [1]; return arr?.push(2);"),
+        serde_json::json!(2)
+    );
+    assert_eq!(
+        testutil::run_ret("let arr = [1]; arr?.push(2); return arr.length;"),
+        serde_json::json!(2)
+    );
+    assert_eq!(
+        testutil::run_val("return ({}).nope?.push(2);"),
+        Value::Undefined
+    );
+    // Short-circuit: RHS must not evaluate when target is nullish.
+    assert_eq!(
+        testutil::run_val("let hit = 0; ({}).nope?.push(hit = 1); return hit;"),
+        Value::PosInt(0)
+    );
+    assert_eq!(
+        testutil::run_ret("let s = \"a,b,c\"; return s?.split(\",\").length;"),
+        serde_json::json!(3)
+    );
 }
 
 #[test]
@@ -73,13 +84,18 @@ fn first_class_builtin_refs() {
 fn optional_invocation_calls() {
     assert_eq!(eval("Math.max?.(3, 7)"), testutil::num(7.0));
     assert_eq!(eval("Math.sqrt?.(9)"), testutil::num(3.0));
-    let vm = testutil::run("input.f = Math.sqrt; input.r = input.f?.(16);");
-    assert_eq!(input_val(&vm, "r"), testutil::num(4.0));
-    assert_eq!(eval("input.nope?.()"), Value::Undefined);
-    let vm = testutil::run("input.hit = 0; input.r = input.nope?.(input.hit = 1);");
-    assert_eq!(input_val(&vm, "r"), Value::Undefined);
-    assert_eq!(input_val(&vm, "hit"), Value::PosInt(0));
-    let prog = compile("input.x = 5; input.x?.();").expect("compiles");
+    assert_eq!(
+        testutil::run_val("let f = Math.sqrt; return f?.(16);"),
+        testutil::num(4.0)
+    );
+    assert_eq!(eval("({}).nope?.()"), Value::Undefined);
+    // Short-circuit: RHS must not evaluate when target is nullish.
+    assert_eq!(
+        testutil::run_val("let hit = 0; ({}).nope?.(hit = 1); return hit;"),
+        Value::PosInt(0)
+    );
+    // Calling a non-function value is a runtime TypeError.
+    let prog = compile("let x = 5; x?.();").expect("compiles");
     let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
     let err = loop {
         match vm.step() {
@@ -91,31 +107,22 @@ fn optional_invocation_calls() {
     assert!(matches!(err, crate::vm::VMError::TypeError), "got: {err:?}");
 }
 
-#[test]
-fn optional_call_reclaims_static_builtin() {
-    let prog = compile("Math.max?.(3, 7);").expect("compiles");
-    assert!(
-        prog.code.iter().any(|i| matches!(i, Instr::CallBuiltin(Builtin::MathMax, 2))),
-        "expected CallBuiltin(MathMax, 2), got {:?}", prog.code
-    );
-    assert!(
-        !prog.code.iter().any(|i| matches!(i, Instr::CallDyn(_) | Instr::JNotNullish(_))),
-        "guard/CallDyn should have been reclaimed: {:?}", prog.code
-    );
-    assert_eq!(eval("Math.max?.(3, 7)"), testutil::num(7.0));
-}
-
 // ── in / delete ──────────────────────────────────────────────────
 
 #[test]
 fn in_and_delete() {
-    let vm = testutil::run("input.o = { a: 1 }; input.r = (\"a\" in input.o);");
-    assert_eq!(input_val(&vm, "r"), Value::Bool(true));
-    let vm = testutil::run("input.o = { a: 1 }; input.r = (\"b\" in input.o);");
-    assert_eq!(input_val(&vm, "r"), Value::Bool(false));
-    let vm = testutil::run("input.o = { a: 1 }; input.r = delete input.o.a; input.had = (\"a\" in input.o);");
-    assert_eq!(input_val(&vm, "r"), Value::Bool(true));
-    assert_eq!(input_val(&vm, "had"), Value::Bool(false));
+    assert_eq!(
+        testutil::run_ret("let o = { a: 1 }; return \"a\" in o;"),
+        serde_json::json!(true)
+    );
+    assert_eq!(
+        testutil::run_ret("let o = { a: 1 }; return \"b\" in o;"),
+        serde_json::json!(false)
+    );
+    assert_eq!(
+        testutil::run_ret("let o = { a: 1 }; let r = delete o.a; let had = \"a\" in o; return { r, had };"),
+        serde_json::json!({"r": true, "had": false})
+    );
 }
 
 // ── input pointer ────────────────────────────────────────────────

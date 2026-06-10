@@ -1,7 +1,6 @@
 //! Higher-order array method tests — prelude lowering + runtime behavior.
 //! Exercises `map`, `filter`, `reduce`, `forEach`, `find`, `some`, `every`.
 
-use super::*;
 use crate::compiler::compile;
 use crate::testutil;
 use crate::vm::Value;
@@ -11,11 +10,10 @@ use crate::vm::Value;
 #[test]
 fn hof_map_filter() {
     // map applies the callback to each element.
-    let vm = testutil::run("input.r = [1, 2, 3].map(x => x * 2);");
-    match input_val(&vm, "r") {
-        Value::Array(p) => assert_eq!(vm.arrays[p as usize].len(), 3),
-        other => panic!("{other:?}"),
-    }
+    assert_eq!(
+        testutil::run_ret("return [1, 2, 3].map(x => x * 2);"),
+        serde_json::json!([2, 4, 6])
+    );
     // map result summed back via reduce.
     assert_eq!(
         testutil::run_val("let a = [1, 2, 3].map(x => x * 2); return a[0] + a[1] + a[2];"),
@@ -76,8 +74,10 @@ fn hof_search_methods() {
 
 #[test]
 fn hof_foreach_side_effects() {
-    let vm = testutil::run("input.sum = 0; [1, 2, 3].forEach(x => { input.sum += x; });");
-    assert_eq!(input_val(&vm, "sum"), testutil::num(6.0));
+    assert_eq!(
+        testutil::run_ret("let sum = 0; [1, 2, 3].forEach(x => { sum += x; }); return sum;"),
+        serde_json::json!(6)
+    );
 }
 
 #[test]
@@ -108,10 +108,10 @@ fn hof_chained_and_nested() {
 
 #[test]
 fn hof_inside_user_function() {
-    let vm = testutil::run(
-        "function total(a) { return a.map(x => x + 1).reduce((s, x) => s + x, 0); } input.r = total([1, 2, 3]);",
+    assert_eq!(
+        testutil::run_ret("function total(a) { return a.map(x => x + 1).reduce((s, x) => s + x, 0); } return total([1, 2, 3]);"),
+        serde_json::json!(9) // 2 + 3 + 4
     );
-    assert_eq!(input_val(&vm, "r"), testutil::num(9.0)); // 2 + 3 + 4
 }
 
 #[test]

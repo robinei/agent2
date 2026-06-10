@@ -62,3 +62,31 @@ fn for_of_in_diagnostics() {
 fn switch_continue_outside_loop_errors() {
     assert!(compile("switch (1) { case 1: continue; }").is_err());
 }
+
+#[test]
+fn labeled_statement_is_rejected() {
+    let errs = compile("outer: while (true) break outer;").expect_err("should fail");
+    let msg = &errs[0].message;
+    assert!(
+        msg.contains("labeled"),
+        "expected 'labeled' in message, got: {msg}"
+    );
+}
+
+#[test]
+fn unsigned_right_shift_is_rejected() {
+    // `>>>` (unsigned right shift) is a documented JS divergence — unsupported.
+    let errs = compile("1 >>> 2;").expect_err("should fail");
+    let msg = &errs[0].message;
+    assert!(
+        msg.contains("unsigned") || msg.contains(">>>"),
+        "expected 'unsigned right shift' rejection, got: {msg}"
+    );
+    // `>>>=` is also rejected.
+    let errs = compile("let x = 1; x >>>= 2;").expect_err("should fail");
+    let msg = &errs[0].message;
+    assert!(
+        msg.contains("unsigned"),
+        "expected rejection for >>>=, got: {msg}"
+    );
+}

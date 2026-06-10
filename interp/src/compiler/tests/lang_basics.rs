@@ -1,6 +1,5 @@
 //! Language basics: literals, operators, coercion, builtin intrinsics.
 
-use super::*;
 use crate::testutil;
 use crate::testutil::{eval, eval_str};
 use crate::vm::Value;
@@ -59,12 +58,14 @@ fn short_circuit_logical() {
 
 #[test]
 fn short_circuit_does_not_evaluate_rhs() {
-    let vm = testutil::run("input.hit = 0; input.r = false && (input.hit = 1);");
-    assert_eq!(input_val(&vm, "r"), Value::Bool(false));
-    assert_eq!(input_val(&vm, "hit"), Value::PosInt(0));
-    let vm = testutil::run("input.hit = 0; input.r = true || (input.hit = 1);");
-    assert_eq!(input_val(&vm, "r"), Value::Bool(true));
-    assert_eq!(input_val(&vm, "hit"), Value::PosInt(0));
+    assert_eq!(
+        testutil::run_ret("let hit = 0; let r = false && (hit = 1); return { hit, r };"),
+        serde_json::json!({"hit": 0, "r": false})
+    );
+    assert_eq!(
+        testutil::run_ret("let hit = 0; let r = true || (hit = 1); return { hit, r };"),
+        serde_json::json!({"hit": 0, "r": true})
+    );
 }
 
 #[test]
@@ -85,11 +86,10 @@ fn typeof_op() {
 
 #[test]
 fn template_literals() {
-    let vm = testutil::run("input.name = \"bob\"; input.r = `hi ${input.name}, ${1 + 2}!`;");
-    match input_val(&vm, "r") {
-        Value::String(s) => assert_eq!(s.as_bytes(), b"hi bob, 3!"),
-        other => panic!("{other:?}"),
-    }
+    assert_eq!(
+        testutil::run_ret("let name = \"bob\"; return `hi ${name}, ${1 + 2}!`;"),
+        serde_json::json!("hi bob, 3!")
+    );
 }
 
 // ── intrinsics ───────────────────────────────────────────────────
@@ -130,8 +130,31 @@ fn intrinsics_methods() {
     assert_eq!(eval_str("\"  hi  \".trim()"), "hi");
     assert_eq!(eval_str("[\"a\", \"b\"].join(\"-\")"), "a-b");
     assert_eq!(eval_str("[1, 2].join()"), "1,2");
-    let vm = testutil::run("input.arr = [1]; input.arr.push(2); input.r = input.arr.length;");
-    assert_eq!(input_val(&vm, "r"), testutil::num(2.0));
-    let vm = testutil::run("input.arr = [1, 2, 3]; input.r = input.arr.pop();");
-    assert_eq!(input_val(&vm, "r"), Value::PosInt(3));
+    assert_eq!(
+        testutil::run_ret("let arr = [1]; arr.push(2); return arr.length;"),
+        serde_json::json!(2)
+    );
+    assert_eq!(
+        testutil::run_val("let arr = [1, 2, 3]; return arr.pop();"),
+        Value::PosInt(3)
+    );
+}
+
+// ── top-level return semantics ─────────────────────────────────────
+
+#[test]
+fn top_level_return_void_yields_undefined() {
+    assert_eq!(testutil::run_val("return;"), Value::Undefined);
+}
+
+#[test]
+fn top_level_return_object_values() {
+    // Arbitrary JSON-able values round-trip through `Done { value }`.
+    assert_eq!(
+        testutil::run_ret("return { a: 1, b: \"hi\" };"),
+        serde_json::json!({"a": 1, "b": "hi"})
+    );
+    assert_eq!(testutil::run_ret("return [1, 2, 3];"), serde_json::json!([1, 2, 3]));
+    assert_eq!(testutil::run_ret("return true;"), serde_json::json!(true));
+    assert_eq!(testutil::run_ret("return null;"), serde_json::json!(null));
 }
