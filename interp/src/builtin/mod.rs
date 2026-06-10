@@ -177,6 +177,18 @@ builtins! {
     StrEndsWith,    BuiltinKind::Method, "endsWith",    2, 2, str_ends_with;
     StrSlice,       BuiltinKind::Method, "slice",       2, 3, str_slice;
     StrTrim,        BuiltinKind::Method, "trim",        1, 1, str_trim;
+    StrReplace,      BuiltinKind::Method, "replace",      3, 3, str_replace;
+    StrReplaceAll,   BuiltinKind::Method, "replaceAll",   3, 3, str_replace_all;
+    StrToLowerCase,  BuiltinKind::Method, "toLowerCase",  1, 1, str_to_lower_case;
+    StrToUpperCase,  BuiltinKind::Method, "toUpperCase",  1, 1, str_to_upper_case;
+    StrPadStart,     BuiltinKind::Method, "padStart",     2, 3, str_pad_start;
+    StrPadEnd,       BuiltinKind::Method, "padEnd",       2, 3, str_pad_end;
+    StrRepeat,       BuiltinKind::Method, "repeat",       2, 2, str_repeat;
+    StrTrimStart,    BuiltinKind::Method, "trimStart",    1, 1, str_trim_start;
+    StrTrimEnd,      BuiltinKind::Method, "trimEnd",      1, 1, str_trim_end;
+    StrCharAt,       BuiltinKind::Method, "charAt",       2, 2, str_char_at;
+    StrAt,           BuiltinKind::Method, "at",           2, 2, str_at;
+    StrConcat,       BuiltinKind::Method, "concat",       1, VARARG, str_concat;
     // ── object static ──
     ObjKeys,   BuiltinKind::Namespace("Object"), "keys",   1, 1, obj_keys;
     ObjValues, BuiltinKind::Namespace("Object"), "values", 1, 1, obj_values;
@@ -671,6 +683,169 @@ fn str_slice(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 fn str_trim(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let s = vm.string_from(args.get(vm, 0))?;
     Ok(Value::String(RcStr::from(s.trim())))
+}
+
+/// `s.replace(pattern, replacement)` — string-only patterns.
+fn str_replace(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let s = vm.string_from(args.get(vm, 0))?;
+    // JS: pattern must be a string; regex is unsupported.
+    let pattern = vm.to_js_string(args.get(vm, 1), 0);
+    let replacement = vm.to_js_string(args.get(vm, 2), 0);
+    // Replace only the first occurrence.
+    if let Some(idx) = s.find(pattern.as_str()) {
+        let mut out = String::with_capacity(s.len() - pattern.len() + replacement.len());
+        out.push_str(&s[..idx]);
+        out.push_str(replacement.as_str());
+        out.push_str(&s[idx + pattern.len()..]);
+        Ok(Value::String(RcStr::from(out)))
+    } else {
+        Ok(Value::String(s))
+    }
+}
+
+/// `s.replaceAll(pattern, replacement)` — string-only patterns.
+fn str_replace_all(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let s = vm.string_from(args.get(vm, 0))?;
+    let pattern = vm.to_js_string(args.get(vm, 1), 0);
+    let replacement = vm.to_js_string(args.get(vm, 2), 0);
+    Ok(Value::String(RcStr::from(s.replace(
+        pattern.as_str(),
+        replacement.as_str(),
+    ))))
+}
+
+/// `s.toLowerCase()` → lowercase string.
+fn str_to_lower_case(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let s = vm.string_from(args.get(vm, 0))?;
+    Ok(Value::String(RcStr::from(s.to_lowercase())))
+}
+
+/// `s.toUpperCase()` → uppercase string.
+fn str_to_upper_case(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let s = vm.string_from(args.get(vm, 0))?;
+    Ok(Value::String(RcStr::from(s.to_uppercase())))
+}
+
+/// `s.padStart(targetLength[, padString])` → padded string.
+fn str_pad_start(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let s = vm.string_from(args.get(vm, 0))?;
+    let len = args.get(vm, 1);
+    let target_len = len
+        .to_number()
+        .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?
+        as usize;
+    let pad: RcStr = match args.get(vm, 2) {
+        Value::Undefined => RcStr::from(" "),
+        v => vm.to_js_string(v, 0),
+    };
+    if s.len() >= target_len || pad.is_empty() {
+        return Ok(Value::String(s));
+    }
+    let needed = target_len - s.len();
+    let pad_chars: Vec<char> = pad.chars().collect();
+    let mut out = String::with_capacity(target_len);
+    for i in 0..needed {
+        out.push(pad_chars[i % pad_chars.len()]);
+    }
+    out.push_str(&s);
+    Ok(Value::String(RcStr::from(out)))
+}
+
+/// `s.padEnd(targetLength[, padString])` → padded string.
+fn str_pad_end(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let s = vm.string_from(args.get(vm, 0))?;
+    let len = args.get(vm, 1);
+    let target_len = len
+        .to_number()
+        .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?
+        as usize;
+    let pad: RcStr = match args.get(vm, 2) {
+        Value::Undefined => RcStr::from(" "),
+        v => vm.to_js_string(v, 0),
+    };
+    if s.len() >= target_len || pad.is_empty() {
+        return Ok(Value::String(s));
+    }
+    let needed = target_len - s.len();
+    let pad_chars: Vec<char> = pad.chars().collect();
+    let mut out = String::with_capacity(target_len);
+    out.push_str(&s);
+    for i in 0..needed {
+        out.push(pad_chars[i % pad_chars.len()]);
+    }
+    Ok(Value::String(RcStr::from(out)))
+}
+
+/// `s.repeat(count)` → repeated string. Negative counts → ValueError.
+fn str_repeat(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let s = vm.string_from(args.get(vm, 0))?;
+    let count = args
+        .get(vm, 1)
+        .to_number()
+        .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?;
+    if count < 0.0 || count.is_infinite() {
+        return Err(vm.fail(ErrorKind::ValueError, "value error"));
+    }
+    let n = (count as usize).min(10_000); // reasonable cap
+    Ok(Value::String(RcStr::from(s.as_str().repeat(n))))
+}
+
+/// `s.trimStart()` → left-trimmed string.
+fn str_trim_start(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let s = vm.string_from(args.get(vm, 0))?;
+    Ok(Value::String(RcStr::from(s.trim_start())))
+}
+
+/// `s.trimEnd()` → right-trimmed string.
+fn str_trim_end(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let s = vm.string_from(args.get(vm, 0))?;
+    Ok(Value::String(RcStr::from(s.trim_end())))
+}
+
+/// `s.charAt(index)` → single character (UTF-8 byte range) or empty string.
+fn str_char_at(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let s = vm.string_from(args.get(vm, 0))?;
+    let idx = args
+        .get(vm, 1)
+        .to_number()
+        .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?
+        as i64;
+    if idx < 0 || idx as usize >= s.len() {
+        return Ok(Value::String(RcStr::from("")));
+    }
+    let byte = s.as_bytes()[idx as usize];
+    // Return the single byte as a char (charAt is per-byte in our string model)
+    Ok(Value::String(RcStr::from(
+        (byte as char).to_string(),
+    )))
+}
+
+/// `s.at(index)` → character at index (negative counts from end), or undefined.
+fn str_at(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let s = vm.string_from(args.get(vm, 0))?;
+    let idx = args
+        .get(vm, 1)
+        .to_number()
+        .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?;
+    let len = s.len() as i64;
+    let i = if idx < 0.0 { idx as i64 + len } else { idx as i64 };
+    if i < 0 || i as usize >= s.len() {
+        return Ok(Value::Undefined);
+    }
+    let byte = s.as_bytes()[i as usize];
+    Ok(Value::String(RcStr::from(
+        (byte as char).to_string(),
+    )))
+}
+
+/// `s.concat(str1, str2, …)` → concatenated string. Receiver must be a string.
+fn str_concat(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let mut out = vm.to_js_string(args.get(vm, 0), 0).to_string();
+    for i in 1..args.argc {
+        let piece = vm.to_js_string(args.get(vm, i), 0);
+        out.push_str(piece.as_str());
+    }
+    Ok(Value::String(RcStr::from(out)))
 }
 
 // ── object static implementations ────────────────────────────────────────────
@@ -1795,6 +1970,100 @@ mod tests {
             Value::String(s) => assert_eq!(s.as_str(), "hello"),
             other => panic!("expected string, got {other:?}"),
         }
+    }
+
+    // ── Step 4b: string method tests ──────────────────────────────────
+
+    #[test]
+    fn string_replace_and_replace_all() {
+        // replace only the first occurrence.
+        assert_eq!(
+            testutil::run_ret("return 'aba'.replace('a', 'x');"),
+            serde_json::json!("xba")
+        );
+        // replaceAll replaces all.
+        assert_eq!(
+            testutil::run_ret("return 'aba'.replaceAll('a', 'x');"),
+            serde_json::json!("xbx")
+        );
+    }
+
+    #[test]
+    fn string_case_methods() {
+        assert_eq!(
+            testutil::run_ret("return 'Hello'.toLowerCase();"),
+            serde_json::json!("hello")
+        );
+        assert_eq!(
+            testutil::run_ret("return 'Hello'.toUpperCase();"),
+            serde_json::json!("HELLO")
+        );
+    }
+
+    #[test]
+    fn string_pad() {
+        assert_eq!(
+            testutil::run_ret("return '5'.padStart(3, '0');"),
+            serde_json::json!("005")
+        );
+        assert_eq!(
+            testutil::run_ret("return '5'.padEnd(3, '0');"),
+            serde_json::json!("500")
+        );
+    }
+
+    #[test]
+    fn string_repeat() {
+        assert_eq!(
+            testutil::run_ret("return 'ab'.repeat(0);"),
+            serde_json::json!("")
+        );
+        assert_eq!(
+            testutil::run_ret("return 'ab'.repeat(2);"),
+            serde_json::json!("abab")
+        );
+        // Negative → ValueError (RangeError in JS).
+        assert_eq!(
+            testutil::run_err_kind("return 'ab'.repeat(-1);"),
+            ErrorKind::ValueError
+        );
+    }
+
+    #[test]
+    fn string_trim_variants() {
+        assert_eq!(
+            testutil::run_ret("return '  a '.trimStart();"),
+            serde_json::json!("a ")
+        );
+        assert_eq!(
+            testutil::run_ret("return '  a '.trimEnd();"),
+            serde_json::json!("  a")
+        );
+    }
+
+    #[test]
+    fn string_char_at_and_at() {
+        // charAt returns empty string for OOB.
+        assert_eq!(
+            testutil::run_ret("return 'abc'.charAt(5);"),
+            serde_json::json!("")
+        );
+        // at returns undefined for OOB.
+        let v = testutil::run_val("return 'abc'.at(5);");
+        assert_eq!(v, Value::Undefined);
+        // at with negative index.
+        assert_eq!(
+            testutil::run_ret("return 'abc'.at(-1);"),
+            serde_json::json!("c")
+        );
+    }
+
+    #[test]
+    fn string_concat() {
+        assert_eq!(
+            testutil::run_ret("return 'a'.concat('b', 'c');"),
+            serde_json::json!("abc")
+        );
     }
 
     // ── Step 4a: console tests ────────────────────────────────────────
