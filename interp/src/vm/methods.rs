@@ -278,6 +278,12 @@ impl VM {
         RcStr::from(out)
     }
 
+    pub(super) fn pop(&mut self) -> Result<Value, VMError> {
+        self.stack
+            .pop()
+            .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))
+    }
+
     pub(super) fn pop_int(&mut self) -> Result<i64, VMError> {
         self.stack
             .pop()

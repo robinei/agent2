@@ -9,10 +9,7 @@ impl VM {
         /// `undefined` or unparseable string coerces to NaN and propagates.
         macro_rules! unary_num {
             ($op:expr) => {{
-                let val = self
-                    .stack
-                    .pop()
-                    .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
+                let val = self.pop()?;
                 match val.to_number() {
                     Some(n) => {
                         self.stack.push(Value::Float($op(n)));
@@ -35,14 +32,8 @@ impl VM {
         /// TypeError; undefined/unparseable strings become NaN.
         macro_rules! binary_num {
             ($op:expr) => {{
-                let rhs = self
-                    .stack
-                    .pop()
-                    .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
-                let lhs = self
-                    .stack
-                    .pop()
-                    .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
+                let rhs = self.pop()?;
+                let lhs = self.pop()?;
                 match (lhs.to_number(), rhs.to_number()) {
                     (Some(a), Some(b)) => {
                         self.stack.push(Value::Float($op(a, b)));
@@ -66,14 +57,8 @@ impl VM {
         /// apply i64→i64→i64, push Number.
         macro_rules! binary_int {
             ($op:expr) => {{
-                let rhs = self
-                    .stack
-                    .pop()
-                    .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
-                let lhs = self
-                    .stack
-                    .pop()
-                    .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
+                let rhs = self.pop()?;
+                let lhs = self.pop()?;
                 match (lhs.as_i64(), rhs.as_i64()) {
                     (Some(a), Some(b)) => {
                         self.stack.push(Value::Float($op(a, b) as f64));
@@ -96,14 +81,8 @@ impl VM {
         /// Pop rhs then lhs, compare with self.compare(), push Bool.
         macro_rules! cmp_op {
             ($expected:ident) => {{
-                let rhs = self
-                    .stack
-                    .pop()
-                    .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
-                let lhs = self
-                    .stack
-                    .pop()
-                    .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
+                let rhs = self.pop()?;
+                let lhs = self.pop()?;
                 let result = lhs
                     .compare(&rhs)
                     .map(|ord| ord == std::cmp::Ordering::$expected)
@@ -263,10 +242,7 @@ impl VM {
                     // args sit exactly where a static Call expects them. The
                     // callable is either a bare Fn, a Builtin, or a Ptr to a
                     // Closure (code + captures).
-                    let callable = self
-                        .stack
-                        .pop()
-                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
+                    let callable = self.pop()?;
                     match callable {
                         Value::Builtin(b) => {
                             // No-frame call: pop args, push result, advance ip.
@@ -414,30 +390,26 @@ impl VM {
                 }
 
                 Instr::JFalse(addr) => {
-                    if *addr as usize > self.code.len() {
+                    let addr = *addr;
+                    if addr as usize > self.code.len() {
                         return Err(self.fail(ErrorKind::BadCall, "bad call target"));
                     }
-                    let val = self
-                        .stack
-                        .pop()
-                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
+                    let val = self.pop()?;
                     if !val.is_truthy() {
-                        self.ip = *addr;
+                        self.ip = addr;
                     } else {
                         self.ip += 1;
                     }
                 }
 
                 Instr::JTrue(addr) => {
-                    if *addr as usize > self.code.len() {
+                    let addr = *addr;
+                    if addr as usize > self.code.len() {
                         return Err(self.fail(ErrorKind::BadCall, "bad call target"));
                     }
-                    let val = self
-                        .stack
-                        .pop()
-                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
+                    let val = self.pop()?;
                     if val.is_truthy() {
-                        self.ip = *addr;
+                        self.ip = addr;
                     } else {
                         self.ip += 1;
                     }
@@ -584,14 +556,12 @@ impl VM {
                 }
 
                 Instr::SetLocal(local) => {
-                    if (*local as u32) >= self.cur_local_count {
+                    let local = *local;
+                    if (local as u32) >= self.cur_local_count {
                         return Err(self.fail(ErrorKind::BadLocal, "bad local"));
                     }
-                    let val = self
-                        .stack
-                        .pop()
-                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
-                    let slot = (self.fp + *local as u32) as usize;
+                    let val = self.pop()?;
+                    let slot = (self.fp + local as u32) as usize;
                     // Write through a Boxed slot to its shared cell; a Plain slot
                     // is overwritten in place.
                     match self.stack[slot] {
@@ -699,10 +669,7 @@ impl VM {
 
                 // ── type queries ────────────────────────────────
                 Instr::TypeOf => {
-                    let val = self
-                        .stack
-                        .pop()
-                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
+                    let val = self.pop()?;
                     // JS typeof tags. Note the coarseness: null/array/object all
                     // report "object"; int and float both "number".
                     let tag = match val {
@@ -725,37 +692,25 @@ impl VM {
 
                 // ── type predicates ─────────────────────────────
                 Instr::IsNull => {
-                    let val = self
-                        .stack
-                        .pop()
-                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
+                    let val = self.pop()?;
                     self.stack.push(Value::Bool(matches!(val, Value::Null)));
                     self.ip += 1;
                 }
                 Instr::IsBool => {
-                    let val = self
-                        .stack
-                        .pop()
-                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
+                    let val = self.pop()?;
                     self.stack.push(Value::Bool(matches!(val, Value::Bool(_))));
                     self.ip += 1;
                 }
                 Instr::IsFloat => {
                     // True only for a Number with a fractional part (an Int is
                     // never a float). Use IsNum to test "is any number".
-                    let val = self
-                        .stack
-                        .pop()
-                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
+                    let val = self.pop()?;
                     let is_float = matches!(val, Value::Float(n) if !float_is_int(n));
                     self.stack.push(Value::Bool(is_float));
                     self.ip += 1;
                 }
                 Instr::IsNum => {
-                    let val = self
-                        .stack
-                        .pop()
-                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
+                    let val = self.pop()?;
                     self.stack.push(Value::Bool(matches!(
                         val,
                         Value::Float(_) | Value::PosInt(_) | Value::NegInt(_)
@@ -763,19 +718,13 @@ impl VM {
                     self.ip += 1;
                 }
                 Instr::IsStr => {
-                    let val = self
-                        .stack
-                        .pop()
-                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
+                    let val = self.pop()?;
                     let is_str = matches!(val, Value::String(_));
                     self.stack.push(Value::Bool(is_str));
                     self.ip += 1;
                 }
                 Instr::IsObj => {
-                    let val = self
-                        .stack
-                        .pop()
-                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
+                    let val = self.pop()?;
                     let is_obj = matches!(val, Value::Object(_));
                     self.stack.push(Value::Bool(is_obj));
                     self.ip += 1;
@@ -785,19 +734,13 @@ impl VM {
                 Instr::Neg => unary_num!(|n: f64| -n),
 
                 Instr::Not => {
-                    let val = self
-                        .stack
-                        .pop()
-                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
+                    let val = self.pop()?;
                     self.stack.push(Value::Bool(!val.is_truthy()));
                     self.ip += 1;
                 }
 
                 Instr::BitNot => {
-                    let val = self
-                        .stack
-                        .pop()
-                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
+                    let val = self.pop()?;
                     match val.as_i64() {
                         Some(i) => {
                             self.stack.push(Value::Float(!i as f64));
@@ -809,14 +752,8 @@ impl VM {
 
                 // ── binary operators ────────────────────────────
                 Instr::Add => {
-                    let rhs = self
-                        .stack
-                        .pop()
-                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
-                    let lhs = self
-                        .stack
-                        .pop()
-                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
+                    let rhs = self.pop()?;
+                    let lhs = self.pop()?;
                     // JS `+`: if either operand is a string, concatenate (ToString
                     // both); otherwise add numerically (ToNumber both). An
                     // array/object/function in the numeric path is a TypeError
@@ -862,50 +799,26 @@ impl VM {
                 Instr::Pow => binary_num!(|a: f64, b: f64| a.powf(b)),
 
                 Instr::Eq => {
-                    let rhs = self
-                        .stack
-                        .pop()
-                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
-                    let lhs = self
-                        .stack
-                        .pop()
-                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
+                    let rhs = self.pop()?;
+                    let lhs = self.pop()?;
                     self.stack.push(Value::Bool(lhs.strict_equal(&rhs)));
                     self.ip += 1;
                 }
                 Instr::Neq => {
-                    let rhs = self
-                        .stack
-                        .pop()
-                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
-                    let lhs = self
-                        .stack
-                        .pop()
-                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
+                    let rhs = self.pop()?;
+                    let lhs = self.pop()?;
                     self.stack.push(Value::Bool(!lhs.strict_equal(&rhs)));
                     self.ip += 1;
                 }
                 Instr::LooseEq => {
-                    let rhs = self
-                        .stack
-                        .pop()
-                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
-                    let lhs = self
-                        .stack
-                        .pop()
-                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
+                    let rhs = self.pop()?;
+                    let lhs = self.pop()?;
                     self.stack.push(Value::Bool(lhs.loose_equal(&rhs)));
                     self.ip += 1;
                 }
                 Instr::LooseNeq => {
-                    let rhs = self
-                        .stack
-                        .pop()
-                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
-                    let lhs = self
-                        .stack
-                        .pop()
-                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
+                    let rhs = self.pop()?;
+                    let lhs = self.pop()?;
                     self.stack.push(Value::Bool(!lhs.loose_equal(&rhs)));
                     self.ip += 1;
                 }
@@ -913,14 +826,8 @@ impl VM {
                 Instr::Lt => cmp_op!(Less),
                 Instr::Gt => cmp_op!(Greater),
                 Instr::LtEq => {
-                    let rhs = self
-                        .stack
-                        .pop()
-                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
-                    let lhs = self
-                        .stack
-                        .pop()
-                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
+                    let rhs = self.pop()?;
+                    let lhs = self.pop()?;
                     let result = lhs
                         .compare(&rhs)
                         .map(|ord| ord != std::cmp::Ordering::Greater)
@@ -929,14 +836,8 @@ impl VM {
                     self.ip += 1;
                 }
                 Instr::GtEq => {
-                    let rhs = self
-                        .stack
-                        .pop()
-                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
-                    let lhs = self
-                        .stack
-                        .pop()
-                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
+                    let rhs = self.pop()?;
+                    let lhs = self.pop()?;
                     let result = lhs
                         .compare(&rhs)
                         .map(|ord| ord != std::cmp::Ordering::Less)
@@ -946,26 +847,14 @@ impl VM {
                 }
 
                 Instr::And => {
-                    let rhs = self
-                        .stack
-                        .pop()
-                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
-                    let lhs = self
-                        .stack
-                        .pop()
-                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
+                    let rhs = self.pop()?;
+                    let lhs = self.pop()?;
                     self.stack.push(if lhs.is_truthy() { rhs } else { lhs });
                     self.ip += 1;
                 }
                 Instr::Or => {
-                    let rhs = self
-                        .stack
-                        .pop()
-                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
-                    let lhs = self
-                        .stack
-                        .pop()
-                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
+                    let rhs = self.pop()?;
+                    let lhs = self.pop()?;
                     self.stack.push(if lhs.is_truthy() { lhs } else { rhs });
                     self.ip += 1;
                 }
@@ -1044,13 +933,11 @@ impl VM {
                 }
 
                 Instr::ObjSet(field, mode) => {
-                    let field_str = field.as_str(); // borrows self.code
+                    // borrows self.code
+                    let field = field.clone();
                     let mode = *mode;
                     // Stack: [..., obj_ptr, val] (val on top).
-                    let val = self
-                        .stack
-                        .pop()
-                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
+                    let val = self.pop()?;
                     let obj_ptr = match self.stack.last() {
                         Some(Value::Object(p)) => *p,
                         // NotResumable: errors before popping (peek-style check).
@@ -1078,11 +965,11 @@ impl VM {
                     // get_mut (avoids cloning the key when it already exists).
                     let result = match mode {
                         SetMode::Old => {
-                            let old = obj.get(field_str).cloned().unwrap_or(Value::Undefined);
-                            if let Some(slot) = obj.get_mut(field_str) {
+                            let old = obj.get(&field).cloned().unwrap_or(Value::Undefined);
+                            if let Some(slot) = obj.get_mut(&field) {
                                 *slot = val;
                             } else {
-                                obj.insert(RcStr::from(field_str), val);
+                                obj.insert(field, val);
                             }
                             old
                         }
@@ -1090,10 +977,10 @@ impl VM {
                             // `New` returns the assigned value; clone (a refcount
                             // bump for strings) since the slot takes ownership.
                             let result = val.clone();
-                            if let Some(slot) = obj.get_mut(field_str) {
+                            if let Some(slot) = obj.get_mut(&field) {
                                 *slot = val;
                             } else {
-                                obj.insert(RcStr::from(field_str), val);
+                                obj.insert(field, val);
                             }
                             result
                         }
@@ -1108,14 +995,8 @@ impl VM {
                 // (byte-offset char). A char result needs a fresh allocation, so
                 // it is computed under the heap borrow and allocated after.
                 Instr::IndexGet => {
-                    let key = self
-                        .stack
-                        .pop()
-                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
-                    let container = self
-                        .stack
-                        .pop()
-                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
+                    let key = self.pop()?;
+                    let container = self.pop()?;
                     let val =
                         match &container {
                             // String char-indexing: strings are inline values now, so
@@ -1180,18 +1061,9 @@ impl VM {
                 // ToString'd key; strings are immutable (TypeError).
                 Instr::IndexSet(mode) => {
                     let mode = *mode;
-                    let val = self
-                        .stack
-                        .pop()
-                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
-                    let key = self
-                        .stack
-                        .pop()
-                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
-                    let container = self
-                        .stack
-                        .pop()
-                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
+                    let val = self.pop()?;
+                    let key = self.pop()?;
+                    let container = self.pop()?;
                     let is_array = match &container {
                         Value::Array(_) => true,
                         Value::Object(_) => false,
@@ -1340,10 +1212,7 @@ impl VM {
                 }
 
                 Instr::ArrLength => {
-                    let val = self
-                        .stack
-                        .pop()
-                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
+                    let val = self.pop()?;
                     let len = match val {
                         // String length is in UTF-8 *bytes* (consistent with the
                         // byte-offset string ops below).
@@ -1365,10 +1234,7 @@ impl VM {
                 }
 
                 Instr::ToStr => {
-                    let val = self
-                        .stack
-                        .pop()
-                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
+                    let val = self.pop()?;
                     let s = self.to_js_string(&val, 0);
                     self.stack.push(Value::String(s));
                     self.ip += 1;
@@ -1377,10 +1243,7 @@ impl VM {
                 Instr::ToNum => {
                     // ToNumber, matching the arithmetic operators' coercion: an
                     // array/object/function has no numeric form (TypeError).
-                    let val = self
-                        .stack
-                        .pop()
-                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
+                    let val = self.pop()?;
                     match val.to_number() {
                         Some(num) => self.stack.push(Value::Float(num)),
                         None => return Err(self.fail(ErrorKind::TypeError, "type error")),
@@ -1389,10 +1252,7 @@ impl VM {
                 }
 
                 Instr::ToBool => {
-                    let val = self
-                        .stack
-                        .pop()
-                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
+                    let val = self.pop()?;
                     self.stack.push(Value::Bool(val.is_truthy()));
                     self.ip += 1;
                 }
