@@ -23,7 +23,7 @@ fn arrays_and_objects() {
 
 #[test]
 fn member_and_index_assignment() {
-    let vm = testutil::run("input.obj = { a: 1 }; input.r = (input.obj.a = 9);");
+    let vm = testutil::run_vm("input.obj = { a: 1 }; input.r = (input.obj.a = 9);");
     assert_eq!(input_val(&vm, "r"), Value::PosInt(9));
     match input_val(&vm, "obj") {
         Value::Object(p) => {
@@ -32,9 +32,9 @@ fn member_and_index_assignment() {
         }
         other => panic!("{other:?}"),
     }
-    let vm = testutil::run("input.arr = [1, 2, 3]; input.arr[0] = 99; input.r = input.arr[0];");
+    let vm = testutil::run_vm("input.arr = [1, 2, 3]; input.arr[0] = 99; input.r = input.arr[0];");
     assert_eq!(input_val(&vm, "r"), Value::PosInt(99));
-    let vm = testutil::run("input.o = {}; input.o[\"k\"] = 7; input.r = input.o.k;");
+    let vm = testutil::run_vm("input.o = {}; input.o[\"k\"] = 7; input.r = input.o.k;");
     assert_eq!(input_val(&vm, "r"), Value::PosInt(7));
 }
 
@@ -131,7 +131,7 @@ fn in_and_delete() {
 
 #[test]
 fn input_is_ptr_zero() {
-    let vm = testutil::run("input.a = 1; input.r = JSON.stringify(input);");
+    let vm = testutil::run_vm("input.a = 1; input.r = JSON.stringify(input);");
     match input_val(&vm, "r") {
         Value::String(s) => {
             assert!(

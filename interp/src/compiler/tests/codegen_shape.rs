@@ -465,7 +465,7 @@ fn function_passed_as_value_is_fn_constant() {
 
 #[test]
 fn function_capturing_real_var_stays_a_closure() {
-    let vm = testutil::run(
+    let vm = testutil::run_vm(
         "function make() { let base = 100; \
                function adder(n) { return base + n; } \
                return adder(5); \
@@ -527,7 +527,7 @@ fn const_named_fn_expr_self_recursion_is_static() {
 
 #[test]
 fn capturing_const_arrow_stays_a_closure() {
-    let vm = testutil::run(
+    let vm = testutil::run_vm(
         "function make() { let base = 100; const add = (n) => base + n; return add(5); } \
              input.x = make();",
     );
@@ -553,7 +553,7 @@ fn const_fn_reclaims_its_frame_slot() {
 
 #[test]
 fn const_fn_between_locals_renumbers_correctly() {
-    let vm = testutil::run(
+    let vm = testutil::run_vm(
         "let a = 1; function f() { return 10; } let b = 2; \
              a = a + f(); b = b + f(); input.r = a * 100 + b;",
     );
@@ -580,14 +580,14 @@ fn never_reassigned_let_function_is_constant() {
 
 #[test]
 fn reassigned_let_function_is_not_constant() {
-    let vm = testutil::run("let f = () => 1; input.a = f(); f = () => 2; input.b = f();");
+    let vm = testutil::run_vm("let f = () => 1; input.a = f(); f = () => 2; input.b = f();");
     assert_eq!(input_val(&vm, "a"), Value::PosInt(1));
     assert_eq!(input_val(&vm, "b"), Value::PosInt(2));
 }
 
 #[test]
 fn var_function_is_not_a_constant() {
-    let vm = testutil::run("var f = () => 7; input.x = f();");
+    let vm = testutil::run_vm("var f = () => 7; input.x = f();");
     assert_eq!(input_val(&vm, "x"), Value::PosInt(7));
 }
 

@@ -117,6 +117,22 @@ impl Value {
         }
     }
 
+    /// Build a number `Value` from an integer-valued `f64`, mirroring the
+    /// `PosInt`/`NegInt`/`Number` split used by [`VM::json_to_stack_value`]:
+    /// non-negative integers that fit become `PosInt`, negative ones `NegInt`, and
+    /// anything else (fractions, out-of-range magnitudes, NaN/∞) stays `Number`.
+    pub(crate) fn int_from_f64(n: f64) -> Value {
+        if n.fract() == 0.0 {
+            if (0.0..=u64::MAX as f64).contains(&n) {
+                return Value::PosInt(n as u64);
+            }
+            if n < 0.0 && n >= i64::MIN as f64 {
+                return Value::NegInt(n as i64);
+            }
+        }
+        Value::Float(n)
+    }
+
     /// Whether a value is a string (used to pick `+`'s concat vs add path).
     pub(crate) fn is_string(&self) -> bool {
         matches!(self, Value::String(_))

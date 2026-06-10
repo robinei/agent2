@@ -210,7 +210,7 @@ fn for_in_object_keys() {
 
 #[test]
 fn for_in_over_input() {
-    let vm = testutil::run(
+    let vm = testutil::run_vm(
         "input.x = 1; input.y = 2; let n = 0; for (const k in input) n++; input.r = n;",
     );
     assert_eq!(input_val(&vm, "r"), testutil::num(2.0));

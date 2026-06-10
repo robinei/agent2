@@ -3,6 +3,7 @@
 //! Consolidates helpers that were duplicated across `compiler/tests.rs`,
 //! `vm/tests.rs`, and `builtin/mod.rs`.
 
+use crate::Instr;
 use crate::compiler::{Program, compile};
 use crate::vm::{ErrorKind, StepResult, VM, VMError, Value};
 
@@ -30,9 +31,17 @@ pub fn compile_errs(src: &str) -> Vec<String> {
 
 // ── execution ────────────────────────────────────────────────────────────
 
+pub fn run_instrs(code: Vec<Instr>) -> Vec<Value> {
+    let mut vm = VM::new(code);
+    match vm.step().unwrap() {
+        StepResult::Done { .. } => return vm.stack.clone(),
+        other => panic!("unexpected effect: {other:?}"),
+    }
+}
+
 /// Compile + run to `Done`, returning the finished VM. Panics on any
 /// effect or runtime error.
-pub fn run(src: &str) -> VM {
+pub fn run_vm(src: &str) -> VM {
     let prog = compile_ok(src);
     let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
     loop {
