@@ -1300,65 +1300,154 @@ impl<'src> Compiler<'src> {
     // ── composite literals ──────────────────────────────────────────────
 
     fn compile_array(&mut self, arr: &ast::ArrayExpression) {
-        let mut n = 0u32;
-        for el in &arr.elements {
-            match el.as_expression() {
-                Some(e) => {
-                    self.compile_expr(e);
-                    n += 1;
+        let span = arr.span.start;
+        // Fast path: no spread elements (byte-for-byte unchanged from before)
+        let has_spread = arr.elements.iter().any(|el| {
+            matches!(el, ast::ArrayExpressionElement::SpreadElement(_))
+        });
+        if !has_spread {
+            let mut n = 0u32;
+            for el in &arr.elements {
+                match el.as_expression() {
+                    Some(e) => {
+                        self.compile_expr(e);
+                        n += 1;
+                    }
+                    None => {
+                        self.error(el.span().start, "array holes are not supported");
+                        return;
+                    }
                 }
-                None => {
-                    self.error(
-                        el.span().start,
-                        "array holes and spread elements are not supported",
-                    );
-                    return;
+            }
+            self.emit(Instr::ArrNew(n), span);
+            return;
+        }
+
+        // Slow path: incremental building with spread elements.
+        // Start with ArrNew for the leading static segment (possibly empty).
+        let mut leading = 0u32;
+        for el in &arr.elements {
+            match el {
+                ast::ArrayExpressionElement::SpreadElement(_) => break,
+                _ => {
+                    if let Some(e) = el.as_expression() {
+                        self.compile_expr(e);
+                        leading += 1;
+                    } else {
+                        self.error(el.span().start, "array holes are not supported");
+                        return;
+                    }
                 }
             }
         }
-        self.emit(Instr::ArrNew(n), arr.span.start);
+        self.emit(Instr::ArrNew(leading), span);
+
+        // Remaining elements: alternate spreads and single-element pushes.
+        for el in &arr.elements[leading as usize..] {
+            match el {
+                ast::ArrayExpressionElement::SpreadElement(s) => {
+                    self.compile_expr(&s.argument);
+                    self.emit(Instr::ArrExtend, span);
+                }
+                _ => {
+                    if let Some(e) = el.as_expression() {
+                        self.compile_expr(e);
+                        self.emit(Instr::ArrPush, span);
+                    } else {
+                        self.error(el.span().start, "array holes are not supported");
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Validate a static (non-spread) object literal property and extract its
+    /// field name. Reports a compile error and returns `None` for getters/
+    /// setters, methods, computed keys, and unsupported key forms.
+    fn static_property_name(&mut self, p: &ast::ObjectProperty) -> Option<RcStr> {
+        if p.kind != ast::PropertyKind::Init {
+            self.error(p.span.start, "getters/setters are not supported");
+            return None;
+        }
+        if p.method {
+            self.error(p.span.start, "object methods are not supported");
+            return None;
+        }
+        if p.computed {
+            self.error(p.span.start, "computed object keys are not supported");
+            return None;
+        }
+        match &p.key {
+            ast::PropertyKey::StaticIdentifier(id) => Some(RcStr::from(id.name.as_str())),
+            ast::PropertyKey::StringLiteral(s) => Some(RcStr::from(s.value.as_str())),
+            ast::PropertyKey::NumericLiteral(num) => {
+                Some(RcStr::from(number_key_to_string(num.value).as_str()))
+            }
+            _ => {
+                self.error(p.key.span().start, "unsupported object key");
+                None
+            }
+        }
     }
 
     fn compile_object(&mut self, obj: &ast::ObjectExpression) {
-        let mut names: Vec<String> = Vec::with_capacity(obj.properties.len());
-        for prop in &obj.properties {
+        let span = obj.span.start;
+        // Fast path: no spread (byte-for-byte unchanged from before)
+        let has_spread = obj.properties.iter().any(|prop| {
+            matches!(prop, ast::ObjectPropertyKind::SpreadProperty(_))
+        });
+        if !has_spread {
+            let mut names: Vec<RcStr> = Vec::with_capacity(obj.properties.len());
+            for prop in &obj.properties {
+                let p = match prop {
+                    ast::ObjectPropertyKind::ObjectProperty(p) => p,
+                    ast::ObjectPropertyKind::SpreadProperty(_) => unreachable!(),
+                };
+                let Some(name) = self.static_property_name(p) else { return };
+                self.compile_expr(&p.value);
+                names.push(name);
+            }
+            self.emit(Instr::ObjNew(names.into()), span);
+            return;
+        }
+
+        // Slow path: incremental building with spread properties.
+        // Phase 1: emit ObjNew for the leading static segment (possibly empty).
+        let leading_count = obj.properties.iter().take_while(|prop| {
+            !matches!(prop, ast::ObjectPropertyKind::SpreadProperty(_))
+        }).count();
+
+        let mut leading_names: Vec<RcStr> = Vec::with_capacity(leading_count);
+        for prop in &obj.properties[..leading_count] {
             let p = match prop {
                 ast::ObjectPropertyKind::ObjectProperty(p) => p,
-                ast::ObjectPropertyKind::SpreadProperty(s) => {
-                    self.error(s.span.start, "object spread is not supported");
-                    return;
-                }
+                ast::ObjectPropertyKind::SpreadProperty(_) => unreachable!(),
             };
-            if p.kind != ast::PropertyKind::Init {
-                self.error(p.span.start, "getters/setters are not supported");
-                return;
-            }
-            if p.method {
-                self.error(p.span.start, "object methods are not supported");
-                return;
-            }
-            if p.computed {
-                self.error(p.span.start, "computed object keys are not supported");
-                return;
-            }
-            let name = match &p.key {
-                ast::PropertyKey::StaticIdentifier(id) => id.name.as_str().to_string(),
-                ast::PropertyKey::StringLiteral(s) => s.value.as_str().to_string(),
-                ast::PropertyKey::NumericLiteral(num) => number_key_to_string(num.value),
-                _ => {
-                    self.error(p.key.span().start, "unsupported object key");
-                    return;
-                }
-            };
-            // Values are pushed in source order (field 0's value deepest), then
-            // ObjNew consumes them against the parallel field-name list.
+            let Some(name) = self.static_property_name(p) else { return };
             self.compile_expr(&p.value);
-            names.push(name);
+            leading_names.push(name);
         }
-        self.emit(
-            Instr::ObjNew(names.into_iter().map(|n| RcStr::from(n.as_str())).collect()),
-            obj.span.start,
-        );
+        self.emit(Instr::ObjNew(leading_names.into()), span);
+
+        // Phase 2: remaining properties — spreads and static fields after the
+        // object exists.  For a static field after a spread we use
+        // Pick(0) + ObjSet + Pop(1) to keep the object on the stack.
+        for prop in &obj.properties[leading_count..] {
+            match prop {
+                ast::ObjectPropertyKind::SpreadProperty(s) => {
+                    self.compile_expr(&s.argument);
+                    self.emit(Instr::ObjExtend, span);
+                }
+                ast::ObjectPropertyKind::ObjectProperty(p) => {
+                    let Some(name) = self.static_property_name(p) else { return };
+                    self.emit(Instr::Pick(0), span);
+                    self.compile_expr(&p.value);
+                    self.emit(Instr::ObjSet(name, SetMode::New), span);
+                    self.emit(Instr::Pop(1), span);
+                }
+            }
+        }
     }
 
     fn compile_template(&mut self, tl: &ast::TemplateLiteral) {

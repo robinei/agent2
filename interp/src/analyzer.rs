@@ -1388,8 +1388,15 @@ impl Analyzer {
             }
             ast::Expression::ArrayExpression(arr) => {
                 for el in &arr.elements {
-                    if let Some(e) = el.as_expression() {
-                        self.analyze_expr(e, scope, block_scopes, scopes);
+                    match el {
+                        ast::ArrayExpressionElement::SpreadElement(s) => {
+                            self.analyze_expr(&s.argument, scope, block_scopes, scopes);
+                        }
+                        _ => {
+                            if let Some(e) = el.as_expression() {
+                                self.analyze_expr(e, scope, block_scopes, scopes);
+                            }
+                        }
                     }
                 }
             }

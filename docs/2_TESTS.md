@@ -303,6 +303,8 @@ this follow-up (commit `tests:` after Step 7).
 | i64 bitwise | ✅ Covered | `bitwise`, `bit_shift_rejects_bad_count` | `vm/tests.rs` |
 | NaN in Math.min/max | ✅ Covered | `math_min_max_nan_ignored` | `vm/tests.rs` |
 | No `>>>` | ✅ Covered | `unsigned_right_shift_is_rejected` | `compiler/tests/diagnostics.rs` |
+| Array spread of non-arrays is TypeError (JS spreads any iterable, incl. strings) | ✅ Covered | `spread_non_container_errors`, `arr_extend_non_array_error` | `compiler/tests/objects_arrays.rs`, `vm/tests.rs` |
+| Object spread of non-objects is TypeError (JS copies index keys from arrays/strings; null/undefined still no-op) | ✅ Covered | `spread_non_container_errors`, `obj_extend_non_object_error` | `compiler/tests/objects_arrays.rs`, `vm/tests.rs` |
 
 ## Resource guards
 

@@ -239,12 +239,23 @@ pub enum Instr {
     // object enumeration / membership (JS Object.keys / Object.values,
     // `key in obj`, `delete obj[key]`). Keys/values are returned in insertion
     // order (IndexMap-backed). ObjDelete pushes whether the key was present.
+    /// Copy all fields of `src` into `obj` (insertion order, later wins).
+    /// null/undefined src is a no-op. Non-object src is a TypeError
+    /// (documented divergence from JS, which would copy index keys from
+    /// arrays/strings).
+    ObjExtend, // obj, src -> obj
     ObjHas,    // obj, str -> bool
     ObjDelete, // obj, str -> bool
 
     // pops N values and pushes an array with them as initial values.
     // Left-to-right: the first/deepest pushed becomes element 0.
     ArrNew(ArgCount), // [any, ...] -> arr
+    /// Append all elements of `src` to `arr`. `src` must be an array;
+    /// string/iterable srcs are a TypeError (documented divergence).
+    ArrExtend, // arr, src -> arr
+    /// Push a single value to the end of an array. Pops the value, pops
+    /// the array, pushes the array back.
+    ArrPush, // arr, val -> arr
     ArrLength,        // arr|str -> int
 
     // JS `String(x)` / ToString: pops any value, pushes its string form. Unlike

@@ -1197,6 +1197,49 @@ impl VM {
                     self.ip += 1;
                 }
 
+                Instr::ObjExtend => {
+                    let src = self.pop()?;
+                    let obj_ptr = match self.pop()? {
+                        Value::Object(p) => p,
+                        _ => {
+                            return Err(self.fail(
+                                ErrorKind::TypeError,
+                                "object spread target must be an object",
+                            ))
+                        }
+                    };
+                    // null/undefined src is a no-op (JS semantics).
+                    // Non-object, non-null/undefined src is TypeError
+                    // (divergence: JS would copy index keys from arrays/strings).
+                    let ip = self.ip;
+                    match src {
+                        Value::Null | Value::Undefined => {}
+                        Value::Object(src_ptr) => {
+                            let entries: SmallVec<[(FieldName, Value); 8]> = self
+                                .objects
+                                .get(src_ptr as usize)
+                                .ok_or_else(|| {
+                                    VMError::fail_at(ip, ErrorKind::TypeError, "bad object pointer")
+                                })?
+                                .iter()
+                                .map(|(k, v)| (k.clone(), v.clone()))
+                                .collect();
+                            let obj = self.objects.get_mut(obj_ptr as usize).ok_or_else(|| {
+                                VMError::fail_at(ip, ErrorKind::TypeError, "bad object pointer")
+                            })?;
+                            obj.extend(entries);
+                        }
+                        _ => {
+                            return Err(self.fail(
+                                ErrorKind::TypeError,
+                                "object spread source must be an object (or null/undefined)",
+                            ))
+                        }
+                    }
+                    self.stack.push(Value::Object(obj_ptr));
+                    self.ip += 1;
+                }
+
                 // ── array operations ────────────────────────────
                 Instr::ArrNew(n) => {
                     let n = *n as usize;
@@ -1208,6 +1251,63 @@ impl VM {
                     let vals: ThinVec<Value> = self.stack.drain(split..).collect();
                     let arr_ptr = self.alloc_array(vals);
                     self.stack.push(arr_ptr);
+                    self.ip += 1;
+                }
+
+                Instr::ArrExtend => {
+                    let src = self.pop()?;
+                    let arr_ptr = match self.pop()? {
+                        Value::Array(p) => p,
+                        _ => {
+                            return Err(self.fail(
+                                ErrorKind::TypeError,
+                                "array spread target must be an array",
+                            ))
+                        }
+                    };
+                    let ip = self.ip;
+                    match src {
+                        Value::Array(src_ptr) => {
+                            let src_elts: ThinVec<Value> = self
+                                .arrays
+                                .get(src_ptr as usize)
+                                .ok_or_else(|| {
+                                    VMError::fail_at(ip, ErrorKind::TypeError, "bad array pointer")
+                                })?
+                                .clone();
+                            let arr = self.arrays.get_mut(arr_ptr as usize).ok_or_else(|| {
+                                VMError::fail_at(ip, ErrorKind::TypeError, "bad array pointer")
+                            })?;
+                            arr.extend(src_elts);
+                        }
+                        _ => {
+                            return Err(self.fail(
+                                ErrorKind::TypeError,
+                                "array spread source must be an array",
+                            ))
+                        }
+                    }
+                    self.stack.push(Value::Array(arr_ptr));
+                    self.ip += 1;
+                }
+
+                Instr::ArrPush => {
+                    let val = self.pop()?;
+                    let arr_ptr = match self.pop()? {
+                        Value::Array(p) => p,
+                        _ => {
+                            return Err(self.fail(
+                                ErrorKind::TypeError,
+                                "array push target must be an array",
+                            ))
+                        }
+                    };
+                    let ip = self.ip;
+                    let arr = self.arrays.get_mut(arr_ptr as usize).ok_or_else(|| {
+                        VMError::fail_at(ip, ErrorKind::TypeError, "bad array pointer")
+                    })?;
+                    arr.push(val);
+                    self.stack.push(Value::Array(arr_ptr));
                     self.ip += 1;
                 }
 

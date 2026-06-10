@@ -127,6 +127,165 @@ fn in_and_delete() {
     );
 }
 
+// ── spread ────────────────────────────────────────────────────────
+
+#[test]
+fn array_spread() {
+    assert_eq!(eval("[...[1, 2, 3]].length"), testutil::num(3.0));
+    assert_eq!(
+        testutil::run_val("let a = [1, 2]; return [...a, 3, 4].length;"),
+        testutil::num(4.0)
+    );
+    assert_eq!(
+        testutil::run_val("let a = [1, 2]; return [0, ...a].length;"),
+        testutil::num(3.0)
+    );
+    assert_eq!(
+        testutil::run_val("let a = [1]; let b = [2]; return [...a, ...b, 3].length;"),
+        testutil::num(3.0)
+    );
+}
+
+#[test]
+fn array_spread_element_values() {
+    assert_eq!(
+        testutil::run_ret("let a = [10, 20]; return [...a, 30][2];"),
+        serde_json::json!(30)
+    );
+    assert_eq!(
+        testutil::run_ret("let a = [10, 20]; return [0, ...a][1];"),
+        serde_json::json!(10)
+    );
+    assert_eq!(
+        testutil::run_ret("let a = [1, 2]; return [...a, 3, 4][3];"),
+        serde_json::json!(4)
+    );
+    // Empty spread.
+    assert_eq!(
+        testutil::run_ret("let a = []; return [...a, 99].length;"),
+        serde_json::json!(1)
+    );
+}
+
+#[test]
+fn object_spread() {
+    assert_eq!(
+        testutil::run_ret("let a = { x: 1 }; return { ...a }.x;"),
+        serde_json::json!(1)
+    );
+    assert_eq!(
+        testutil::run_ret("let a = { x: 1 }; return { ...a, y: 2 }.y;"),
+        serde_json::json!(2)
+    );
+    assert_eq!(
+        testutil::run_ret("let a = { x: 1 }; return { y: 2, ...a }.x;"),
+        serde_json::json!(1)
+    );
+}
+
+#[test]
+fn object_spread_later_wins() {
+    // Later field overwrites earlier.
+    assert_eq!(
+        testutil::run_ret("let a = { x: 1 }; return { ...a, x: 99 }.x;"),
+        serde_json::json!(99)
+    );
+    assert_eq!(
+        testutil::run_ret("let a = { x: 99 }; return { x: 1, ...a }.x;"),
+        serde_json::json!(99)
+    );
+}
+
+#[test]
+fn object_spread_null_undefined() {
+    // null/undefined spread source is a no-op.
+    assert_eq!(
+        testutil::run_ret("let a = null; return { ...a, x: 1 }.x;"),
+        serde_json::json!(1)
+    );
+    assert_eq!(
+        testutil::run_ret("let a = undefined; return { ...a, x: 2 }.x;"),
+        serde_json::json!(2)
+    );
+}
+
+#[test]
+fn object_spread_multiple() {
+    assert_eq!(
+        testutil::run_ret(
+            "let a = { x: 1 }; let b = { y: 2 }; return { ...a, ...b, z: 3 }.z;"
+        ),
+        serde_json::json!(3)
+    );
+    assert_eq!(
+        testutil::run_ret(
+            "let a = { x: 1 }; let b = { y: 2 }; return { ...a, ...b }.y;"
+        ),
+        serde_json::json!(2)
+    );
+}
+
+/// Spread of a non-array / non-object value is a TypeError (documented
+/// divergence: JS spreads any iterable in arrays — including strings — and
+/// copies index keys from arrays/strings in objects).
+#[test]
+fn spread_non_container_errors() {
+    use crate::vm::ErrorKind;
+    // Array spread: strings and numbers are not spreadable.
+    assert!(matches!(
+        testutil::run_err_kind("let a = [...\"ab\"]; return a;"),
+        ErrorKind::TypeError
+    ));
+    assert!(matches!(
+        testutil::run_err_kind("let n = 5; let a = [1, ...n]; return a;"),
+        ErrorKind::TypeError
+    ));
+    // Object spread: arrays, strings, and numbers are not spreadable
+    // (null/undefined are no-ops, tested separately).
+    assert!(matches!(
+        testutil::run_err_kind("let o = { ...\"ab\" }; return o;"),
+        ErrorKind::TypeError
+    ));
+    assert!(matches!(
+        testutil::run_err_kind("let o = { ...[1, 2] }; return o;"),
+        ErrorKind::TypeError
+    ));
+    assert!(matches!(
+        testutil::run_err_kind("let o = { ...5 }; return o;"),
+        ErrorKind::TypeError
+    ));
+}
+
+/// Plain literals must compile byte-for-byte unchanged: the no-spread fast
+/// path emits exactly the pre-spread instruction sequence, with no
+/// ArrExtend/ArrPush/ObjExtend.
+#[test]
+fn no_spread_plain_literals_compile_unchanged() {
+    use crate::vm::Instr;
+    let prog = compile("return [1, 2, 3];").expect("compiles");
+    assert_eq!(
+        prog.code,
+        vec![
+            Instr::PushPosInt(1),
+            Instr::PushPosInt(2),
+            Instr::PushPosInt(3),
+            Instr::ArrNew(3),
+            Instr::Return(1),
+        ]
+    );
+
+    let prog = compile("return { a: 1, b: 2 };").expect("compiles");
+    assert_eq!(
+        prog.code,
+        vec![
+            Instr::PushPosInt(1),
+            Instr::PushPosInt(2),
+            Instr::ObjNew(vec!["a".into(), "b".into()].into()),
+            Instr::Return(1),
+        ]
+    );
+}
+
 // ── input pointer ────────────────────────────────────────────────
 
 #[test]

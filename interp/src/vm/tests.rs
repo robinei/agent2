@@ -1211,6 +1211,64 @@ fn arr_set_oob() {
     assert!(matches!(run_err(code).kind, ErrorKind::ValueError));
 }
 
+#[test]
+fn arr_extend_and_push() {
+    // Build [1, 2, 3] via ArrNew + ArrExtend + ArrPush, verify length.
+    let code = vec![
+        PushFloat(1.0),           // leading element
+        ArrNew(1),                // [1]
+        PushFloat(10.0),
+        PushFloat(20.0),
+        ArrNew(2),                // [10, 20] — the extend source
+        ArrExtend,                // [1, 10, 20]
+        PushFloat(99.0),          // trailing element
+        ArrPush,                  // [1, 10, 20, 99]
+        ArrLength,
+    ];
+    assert_eq!(run(code), vec![n(4.0)]);
+}
+
+#[test]
+fn arr_extend_empty_leading() {
+    // Start with empty array then extend.
+    let code = vec![
+        ArrNew(0),                // []
+        PushFloat(3.0),
+        PushFloat(4.0),
+        ArrNew(2),                // [3, 4]
+        ArrExtend,                // [3, 4]
+        ArrLength,
+    ];
+    assert_eq!(run(code), vec![n(2.0)]);
+}
+
+#[test]
+fn arr_extend_non_array_error() {
+    // ArrExtend on a non-array source is a TypeError.
+    let code = vec![
+        ArrNew(0),
+        PushFloat(42.0),          // not an array
+        ArrExtend,
+    ];
+    assert!(matches!(run_err(code).kind, ErrorKind::TypeError));
+}
+
+#[test]
+fn arr_push_twice() {
+    // Multiple ArrPush calls.
+    let code = vec![
+        ArrNew(0),
+        PushFloat(1.0),
+        ArrPush,
+        PushFloat(2.0),
+        ArrPush,
+        PushFloat(3.0),
+        ArrPush,
+        ArrLength,
+    ];
+    assert_eq!(run(code), vec![n(3.0)]);
+}
+
 // ── object operations ─────────────────────────────────────────
 
 #[test]
@@ -1280,6 +1338,71 @@ fn obj_get_missing_key() {
         ObjGet("no_such_key".into()), // JS: missing key reads as undefined
     ];
     assert_eq!(run(code), vec![undef()]);
+}
+
+#[test]
+fn obj_extend_merges_fields() {
+    // Build {a:1} then extend with {b:2}, then {c:3} via ObjSet.
+    let code = vec![
+        PushFloat(1.0),                           // a value
+        ObjNew(vec!["a".into()].into()),          // {a:1}
+        PushFloat(2.0),
+        ObjNew(vec!["b".into()].into()),          // {b:2}
+        ObjExtend,                                // {a:1, b:2}
+        Pick(0),                                  // dup for next read
+        PushFloat(3.0),                           // c value
+        ObjSet("c".into(), SetMode::New),         // {a:1, b:2, c:3}; leaves val
+        Pop(1),                                   // drop val, keep obj
+        ObjGet("a".into()),                       // → 1
+    ];
+    assert_eq!(run(code), vec![n(1.0)]);
+}
+
+#[test]
+fn obj_extend_null_undefined_noop() {
+    // null/undefined source is a no-op.
+    let code = vec![
+        PushFloat(1.0),
+        ObjNew(vec!["x".into()].into()),          // {x:1}
+        PushNull,                                 // src = null (no-op)
+        ObjExtend,                                // {x:1}
+        ObjGet("x".into()),
+    ];
+    assert_eq!(run(code), vec![n(1.0)]);
+
+    let code2 = vec![
+        PushFloat(2.0),
+        ObjNew(vec!["y".into()].into()),          // {y:2}
+        PushUndefined,                            // src = undefined (no-op)
+        ObjExtend,                                // {y:2}
+        ObjGet("y".into()),
+    ];
+    assert_eq!(run(code2), vec![n(2.0)]);
+}
+
+#[test]
+fn obj_extend_non_object_error() {
+    // Non-object, non-null/undefined src is TypeError.
+    let code = vec![
+        ObjNew(vec![].into()),                    // {}
+        PushFloat(42.0),                          // not an object
+        ObjExtend,
+    ];
+    assert!(matches!(run_err(code).kind, ErrorKind::TypeError));
+}
+
+#[test]
+fn obj_extend_later_wins() {
+    // Later field wins on conflict (IndexMap insertion-order semantics).
+    let code = vec![
+        PushFloat(1.0),
+        ObjNew(vec!["x".into()].into()),          // {x:1}
+        PushFloat(2.0),
+        ObjNew(vec!["x".into()].into()),          // {x:2}
+        ObjExtend,                                // {x:2} (later wins)
+        ObjGet("x".into()),
+    ];
+    assert_eq!(run(code), vec![n(2.0)]);
 }
 
 // ── undefined & typeof ────────────────────────────────────────

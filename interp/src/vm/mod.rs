@@ -311,6 +311,9 @@ pub enum ErrorKind {
 /// | JSON depth / unsupported type (JSON.stringify, to_json) | ValueError | PushValueThenContinue | args popped by builtin before conversion |
 /// | **ObjGet** (non-object peek) | TypeError | **NotResumable** | object peeked (not popped) before check |
 /// | **ObjSet** (non-object peek) | TypeError | **NotResumable** | value popped, object peeked (not fully consumed) |
+/// | **ObjExtend** (non-object src) | TypeError | PushValueThenContinue | both src+obj popped first |
+/// | **ArrExtend** (non-array src) | TypeError | PushValueThenContinue | both src+arr popped first |
+/// | **ArrPush** (non-array target) | TypeError | PushValueThenContinue | both val+arr popped first |
 /// | **IncLocal** (non-numeric local) | TypeError | **NotResumable** | reads local by peek (no stack consumption) |
 /// | bad heap/cell pointer (`get`/`get_mut` on arrays/objects/cells/closures) | TypeError/ValueError | **NotResumable** | corrupt heap = invariant violation; some sites also have no result slot (SetLocal) |
 /// | Raise with argc > 1 | BadArg | NotResumable | instruction contract violated (compiler emits 0 or 1) |
