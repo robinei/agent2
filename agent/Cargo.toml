@@ -8,13 +8,7 @@ uuid = { version = "1.23.2", features = ["v4"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 jiff = { version = "0.2.28", features = ["serde"] }
-indexmap = "2.14.0"
-oxc_parser = "0.134.0"
-oxc_ast = "0.134.0"
-oxc_allocator = "0.134.0"
-oxc_span = "0.134.0"
-thin-vec = "0.2.18"
-smallvec = "1.15.1"
+interp = { path = "../interp" }
 
 [dev-dependencies]
 tempfile = "3"
