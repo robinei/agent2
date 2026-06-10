@@ -168,14 +168,18 @@ builtins! {
     ArrayShift,   BuiltinKind::Method, "shift",       1, 1,      array_shift;
     ArrayUnshift, BuiltinKind::Method, "unshift",     1, VARARG, array_unshift;
     ArrayJoin,    BuiltinKind::Method, "join",        1, 2,      array_join;
+    ArrayReverse, BuiltinKind::Method, "reverse",     1, 1,      array_reverse;
+    ArrayFlat,    BuiltinKind::Method, "flat",        1, 2,      array_flat;
+    ArrayFill,    BuiltinKind::Method, "fill",        2, VARARG, array_fill;
+    ArraySplice,  BuiltinKind::Method, "splice",      1, VARARG, array_splice;
     // ── string methods (Method, receiver + args) ──
     StrSplit,       BuiltinKind::Method, "split",       2, 3, str_split;
-    StrIncludes,    BuiltinKind::Method, "includes",    2, 3, str_includes;
-    StrIndexOf,     BuiltinKind::Method, "indexOf",     2, 3, str_index_of;
-    StrLastIndexOf, BuiltinKind::Method, "lastIndexOf", 2, 3, str_last_index_of;
+    StrIncludes,    BuiltinKind::Method, "includes",    2, 3, includes_poly;
+    StrIndexOf,     BuiltinKind::Method, "indexOf",     2, 3, index_of_poly;
+    StrLastIndexOf, BuiltinKind::Method, "lastIndexOf", 2, 3, last_index_of_poly;
     StrStartsWith,  BuiltinKind::Method, "startsWith",  2, 2, str_starts_with;
     StrEndsWith,    BuiltinKind::Method, "endsWith",    2, 2, str_ends_with;
-    StrSlice,       BuiltinKind::Method, "slice",       2, 3, str_slice;
+    StrSlice,       BuiltinKind::Method, "slice",       2, 3, slice_poly;
     StrTrim,        BuiltinKind::Method, "trim",        1, 1, str_trim;
     StrReplace,      BuiltinKind::Method, "replace",      3, 3, str_replace;
     StrReplaceAll,   BuiltinKind::Method, "replaceAll",   3, 3, str_replace_all;
@@ -187,8 +191,8 @@ builtins! {
     StrTrimStart,    BuiltinKind::Method, "trimStart",    1, 1, str_trim_start;
     StrTrimEnd,      BuiltinKind::Method, "trimEnd",      1, 1, str_trim_end;
     StrCharAt,       BuiltinKind::Method, "charAt",       2, 2, str_char_at;
-    StrAt,           BuiltinKind::Method, "at",           2, 2, str_at;
-    StrConcat,       BuiltinKind::Method, "concat",       1, VARARG, str_concat;
+    StrAt,           BuiltinKind::Method, "at",           2, 2, at_poly;
+    StrConcat,       BuiltinKind::Method, "concat",       1, VARARG, concat_poly;
     // ── object static ──
     ObjKeys,   BuiltinKind::Namespace("Object"), "keys",   1, 1, obj_keys;
     ObjValues, BuiltinKind::Namespace("Object"), "values", 1, 1, obj_values;
@@ -520,6 +524,158 @@ fn array_join(vm: &mut VM, args: Args) -> Result<Value, VMError> {
         }
     }
     Ok(Value::String(RcStr::from(joined)))
+}
+
+/// `arr.reverse()` → reverses in-place, returns the receiver.
+fn array_reverse(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let arr_ptr = match args.get(vm, 0) {
+        Value::Array(p) => *p,
+        _ => return Err(vm.fail(ErrorKind::TypeError, "type error")),
+    };
+    let ip = vm.ip;
+    let arr = vm
+        .arrays
+        .get_mut(arr_ptr as usize)
+        .ok_or_else(|| fail_at(ip, ErrorKind::TypeError, "bad array pointer"))?;
+    arr.reverse();
+    Ok(Value::Array(arr_ptr))
+}
+
+/// `arr.flat([depth])` → flattens nested arrays to the given depth (default 1).
+fn array_flat(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let arr_ptr = match args.get(vm, 0) {
+        Value::Array(p) => *p,
+        _ => return Err(vm.fail(ErrorKind::TypeError, "type error")),
+    };
+    let depth = match args.get(vm, 1) {
+        Value::Undefined => 1usize,
+        v => v
+            .to_number()
+            .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?
+            as usize,
+    };
+    let ip = vm.ip;
+    let arr = vm
+        .arrays
+        .get(arr_ptr as usize)
+        .ok_or_else(|| fail_at(ip, ErrorKind::TypeError, "bad array pointer"))?;
+    let mut result: ThinVec<Value> = ThinVec::new();
+    flatten_into(vm, arr, depth, &mut result)?;
+    Ok(vm.alloc_array(result))
+}
+
+fn flatten_into(
+    vm: &VM,
+    src: &[Value],
+    depth: usize,
+    out: &mut ThinVec<Value>,
+) -> Result<(), VMError> {
+    for v in src {
+        if depth > 0 {
+            if let Value::Array(p) = v {
+                let nested = vm
+                    .arrays
+                    .get(*p as usize)
+                    .ok_or_else(|| vm.fail(ErrorKind::TypeError, "bad array pointer"))?;
+                flatten_into(vm, nested, depth - 1, out)?;
+                continue;
+            }
+        }
+        out.push(v.clone());
+    }
+    Ok(())
+}
+
+/// `arr.fill(value[, start[, end]])` → fills in-place, returns the receiver.
+fn array_fill(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let arr_ptr = match args.get(vm, 0) {
+        Value::Array(p) => *p,
+        _ => return Err(vm.fail(ErrorKind::TypeError, "type error")),
+    };
+    let value = args.get(vm, 1).clone();
+    // Extract start/end values before borrowing arr.
+    let start_arg = args.get(vm, 2).clone();
+    let end_arg = args.get(vm, 3).clone();
+    let ip = vm.ip;
+    let arr = vm
+        .arrays
+        .get_mut(arr_ptr as usize)
+        .ok_or_else(|| fail_at(ip, ErrorKind::TypeError, "bad array pointer"))?;
+    let len = arr.len() as i64;
+    let to_idx = |v: &Value, default: i64| -> i64 {
+        if matches!(v, Value::Undefined) {
+            return default;
+        }
+        v.to_number().map(|n| {
+            let i = n as i64;
+            if i < 0 { (i + len).max(0) } else { i.min(len) }
+        }).unwrap_or(default)
+    };
+    let start = to_idx(&start_arg, 0).max(0) as usize;
+    let end = to_idx(&end_arg, len).max(0) as usize;
+    let end = end.min(arr.len());
+    for i in start..end {
+        arr[i] = value.clone();
+    }
+    Ok(Value::Array(arr_ptr))
+}
+
+/// `arr.splice(start[, deleteCount[, ...items]])` → mutates in-place, returns
+/// the removed elements.
+fn array_splice(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let arr_ptr = match args.get(vm, 0) {
+        Value::Array(p) => *p,
+        _ => return Err(vm.fail(ErrorKind::TypeError, "type error")),
+    };
+    // Extract all args before mutable borrow.
+    let start_val = args.get(vm, 1).clone();
+    let del_val = if args.argc >= 3 {
+        Some(args.get(vm, 2).clone())
+    } else {
+        None
+    };
+    let to_insert: SmallVec<[Value; 8]> = (3..args.argc)
+        .map(|i| args.get(vm, i).clone())
+        .collect();
+    let ip = vm.ip;
+    let arr = vm
+        .arrays
+        .get_mut(arr_ptr as usize)
+        .ok_or_else(|| fail_at(ip, ErrorKind::TypeError, "bad array pointer"))?;
+    let len = arr.len() as i64;
+    let to_idx = |v: &Value| -> i64 {
+        if matches!(v, Value::Undefined) {
+            return 0;
+        }
+        v.to_number()
+            .map(|n| {
+                let i = n as i64;
+                if i < 0 { (i + len).max(0) } else { i.min(len) }
+            })
+            .unwrap_or(0)
+    };
+    let start = to_idx(&start_val);
+    let del_count = match &del_val {
+        Some(v) if !matches!(v, Value::Undefined) => {
+            let n = v.to_number().unwrap_or(0.0);
+            (n as i64).max(0).min(len - start) as usize
+        }
+        _ => (len - start).max(0) as usize,
+    };
+    let start = start as usize;
+    let removed: ThinVec<Value> = arr.drain(start..start + del_count).collect();
+    drop(arr);
+    // Insert new items at start position.
+    if !to_insert.is_empty() {
+        let arr = vm
+            .arrays
+            .get_mut(arr_ptr as usize)
+            .ok_or_else(|| fail_at(ip, ErrorKind::TypeError, "bad array pointer"))?;
+        for v in to_insert.into_iter().rev() {
+            arr.insert(start, v);
+        }
+    }
+    Ok(vm.alloc_array(removed))
 }
 
 // ── string method implementations ────────────────────────────────────────────
@@ -1096,6 +1252,194 @@ fn console_write(vm: &mut VM, args: Args, prefix: &str) -> Result<Value, VMError
     }
     vm.console_lines.push(full);
     Ok(Value::Undefined)
+}
+
+// ── polymorphic handlers (dispatch on receiver: string vs array) ─────────────
+
+fn slice_poly(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    match args.get(vm, 0) {
+        Value::String(_) => str_slice(vm, args),
+        Value::Array(_) => array_slice_builtin(vm, args),
+        _ => Err(vm.fail(ErrorKind::TypeError, "type error")),
+    }
+}
+
+fn includes_poly(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    match args.get(vm, 0) {
+        Value::String(_) => str_includes(vm, args),
+        Value::Array(_) => array_includes(vm, args),
+        _ => Err(vm.fail(ErrorKind::TypeError, "type error")),
+    }
+}
+
+fn index_of_poly(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    match args.get(vm, 0) {
+        Value::String(_) => str_index_of(vm, args),
+        Value::Array(_) => array_index_of(vm, args),
+        _ => Err(vm.fail(ErrorKind::TypeError, "type error")),
+    }
+}
+
+fn last_index_of_poly(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    match args.get(vm, 0) {
+        Value::String(_) => str_last_index_of(vm, args),
+        Value::Array(_) => array_last_index_of(vm, args),
+        _ => Err(vm.fail(ErrorKind::TypeError, "type error")),
+    }
+}
+
+fn at_poly(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    match args.get(vm, 0) {
+        Value::String(_) => str_at(vm, args),
+        Value::Array(_) => array_at(vm, args),
+        _ => Err(vm.fail(ErrorKind::TypeError, "type error")),
+    }
+}
+
+fn concat_poly(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    match args.get(vm, 0) {
+        Value::String(_) => str_concat(vm, args),
+        Value::Array(_) => array_concat(vm, args),
+        _ => Err(vm.fail(ErrorKind::TypeError, "type error")),
+    }
+}
+
+/// `arr.slice(start[, end])` → new array, subset of the original.
+fn array_slice_builtin(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let arr_ptr = match args.get(vm, 0) {
+        Value::Array(p) => *p,
+        _ => return Err(vm.fail(ErrorKind::TypeError, "type error")),
+    };
+    let arr = vm
+        .arrays
+        .get(arr_ptr as usize)
+        .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?;
+    let len = arr.len() as i64;
+    let to_idx = |v: &Value, default: i64| -> i64 {
+        if matches!(v, Value::Undefined) {
+            return default;
+        }
+        v.to_number()
+            .map(|n| {
+                let i = n as i64;
+                if i < 0 { (i + len).max(0) } else { i.min(len) }
+            })
+            .unwrap_or(default)
+    };
+    let start = to_idx(args.get(vm, 1), 0).max(0) as usize;
+    let end = to_idx(args.get(vm, 2), len).max(0) as usize;
+    let end = end.min(arr.len());
+    if start >= end {
+        return Ok(vm.alloc_array(ThinVec::new()));
+    }
+    let subset: ThinVec<Value> = arr[start..end].iter().cloned().collect();
+    Ok(vm.alloc_array(subset))
+}
+
+fn array_includes(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let arr_ptr = match args.get(vm, 0) {
+        Value::Array(p) => *p,
+        _ => return Err(vm.fail(ErrorKind::TypeError, "type error")),
+    };
+    let needle = args.get(vm, 1);
+    let start = args.get(vm, 2).to_number().unwrap_or(0.0) as usize;
+    let arr = vm
+        .arrays
+        .get(arr_ptr as usize)
+        .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?;
+    for v in &arr[start.min(arr.len())..] {
+        if v == needle {
+            return Ok(Value::Bool(true));
+        }
+    }
+    Ok(Value::Bool(false))
+}
+
+fn array_index_of(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let arr_ptr = match args.get(vm, 0) {
+        Value::Array(p) => *p,
+        _ => return Err(vm.fail(ErrorKind::TypeError, "type error")),
+    };
+    let needle = args.get(vm, 1);
+    let start = args.get(vm, 2).to_number().unwrap_or(0.0) as i64;
+    let arr = vm
+        .arrays
+        .get(arr_ptr as usize)
+        .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?;
+    let from = start.max(0) as usize;
+    for (i, v) in arr.iter().enumerate().skip(from) {
+        if v == needle {
+            return Ok(int_value(i as f64));
+        }
+    }
+    Ok(Value::NegInt(-1))
+}
+
+fn array_last_index_of(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let arr_ptr = match args.get(vm, 0) {
+        Value::Array(p) => *p,
+        _ => return Err(vm.fail(ErrorKind::TypeError, "type error")),
+    };
+    let needle = args.get(vm, 1);
+    let arr = vm
+        .arrays
+        .get(arr_ptr as usize)
+        .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?;
+    // Default start is last index + needle length (JS behavior)
+    let start = match args.get(vm, 2) {
+        Value::Undefined => arr.len() as i64,
+        v => v.to_number().unwrap_or(arr.len() as f64) as i64,
+    };
+    let end = (start + 1).min(arr.len() as i64).max(0) as usize;
+    for (i, v) in arr.iter().enumerate().take(end).rev() {
+        if v == needle {
+            return Ok(int_value(i as f64));
+        }
+    }
+    Ok(Value::NegInt(-1))
+}
+
+fn array_at(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let arr_ptr = match args.get(vm, 0) {
+        Value::Array(p) => *p,
+        _ => return Err(vm.fail(ErrorKind::TypeError, "type error")),
+    };
+    let idx = args.get(vm, 1).to_number().unwrap_or(0.0);
+    let arr = vm
+        .arrays
+        .get(arr_ptr as usize)
+        .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?;
+    let len = arr.len() as i64;
+    let i = if idx < 0.0 { idx as i64 + len } else { idx as i64 };
+    if i < 0 || i as usize >= arr.len() {
+        return Ok(Value::Undefined);
+    }
+    Ok(arr[i as usize].clone())
+}
+
+fn array_concat(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let arr_ptr = match args.get(vm, 0) {
+        Value::Array(p) => *p,
+        _ => return Err(vm.fail(ErrorKind::TypeError, "type error")),
+    };
+    let arr = vm
+        .arrays
+        .get(arr_ptr as usize)
+        .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?;
+    let mut result: ThinVec<Value> = arr.clone();
+    for i in 1..args.argc {
+        match args.get(vm, i) {
+            Value::Array(p) => {
+                let other = vm
+                    .arrays
+                    .get(*p as usize)
+                    .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?;
+                result.extend(other.iter().cloned());
+            }
+            v => result.push(v.clone()),
+        }
+    }
+    Ok(vm.alloc_array(result))
 }
 
 // ── tests ────────────────────────────────────────────────────────────────────
@@ -2063,6 +2407,83 @@ mod tests {
         assert_eq!(
             testutil::run_ret("return 'a'.concat('b', 'c');"),
             serde_json::json!("abc")
+        );
+    }
+
+    // ── Step 4c: array method tests ───────────────────────────────────
+
+    #[test]
+    fn array_reverse() {
+        assert_eq!(
+            testutil::run_ret("return [1,2,3].reverse();"),
+            serde_json::json!([3, 2, 1])
+        );
+    }
+
+    #[test]
+    fn array_flat() {
+        // Default depth 1.
+        assert_eq!(
+            testutil::run_ret("return [1,[2,[3]]].flat();"),
+            serde_json::json!([1, 2, [3]])
+        );
+        // Depth 2.
+        assert_eq!(
+            testutil::run_ret("return [1,[2,[3]]].flat(2);"),
+            serde_json::json!([1, 2, 3])
+        );
+    }
+
+    #[test]
+    fn array_fill() {
+        assert_eq!(
+            testutil::run_ret("return [1,2,3].fill(0, 1);"),
+            serde_json::json!([1, 0, 0])
+        );
+    }
+
+    #[test]
+    fn array_splice() {
+        // splice(1, 2, 9) — delete 2 at index 1, insert 9.
+        assert_eq!(
+            testutil::run_ret(
+                "const a=[1,2,3,4]; const r=a.splice(1,2,9); return [a,r];",
+            ),
+            serde_json::json!([[1, 9, 4], [2, 3]])
+        );
+    }
+
+    #[test]
+    fn array_polymorphic_methods() {
+        // slice
+        assert_eq!(
+            testutil::run_ret("return [1,2,3].slice(1);"),
+            serde_json::json!([2, 3])
+        );
+        // indexOf
+        assert_eq!(
+            testutil::run_ret("return [1,2,3].indexOf(2);"),
+            serde_json::json!(1)
+        );
+        // lastIndexOf
+        assert_eq!(
+            testutil::run_ret("return [1,2,1].lastIndexOf(1);"),
+            serde_json::json!(2)
+        );
+        // includes
+        assert_eq!(
+            testutil::run_ret("return [1,2,3].includes(3);"),
+            serde_json::json!(true)
+        );
+        // at
+        assert_eq!(
+            testutil::run_ret("return [1,2,3].at(-1);"),
+            serde_json::json!(3)
+        );
+        // concat
+        assert_eq!(
+            testutil::run_ret("return [1,2].concat(3, [4]);"),
+            serde_json::json!([1, 2, 3, 4])
         );
     }
 
