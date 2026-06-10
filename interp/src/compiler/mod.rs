@@ -1396,7 +1396,9 @@ impl<'src> Compiler<'src> {
         // `Math.sqrt` passed as a callback or invoked via `?.()`): push the
         // `Builtin`. `?.` here is a no-op — a namespace is never nullish.
         if let ast::Expression::Identifier(obj) = &m.object {
-            if let Some(builtin) = namespace_builtin(obj.name.as_str(), m.property.name.as_str()) {
+            if let Some(builtin) =
+                Builtin::for_namespace(obj.name.as_str(), m.property.name.as_str())
+            {
                 self.emit(Instr::PushBuiltin(builtin), m.span.start);
                 return;
             }
@@ -2005,7 +2007,8 @@ impl<'src> Compiler<'src> {
             // callables today; named function refs join them in Phase 3.)
             if let ast::Expression::StaticMemberExpression(m) = &call.callee {
                 if let ast::Expression::Identifier(obj) = &m.object {
-                    if namespace_builtin(obj.name.as_str(), m.property.name.as_str()).is_some() {
+                    if Builtin::for_namespace(obj.name.as_str(), m.property.name.as_str()).is_some()
+                    {
                         return self.compile_namespace_call(
                             obj.name.as_str(),
                             m.property.name.as_str(),
@@ -2163,8 +2166,7 @@ impl<'src> Compiler<'src> {
     }
 
     /// Compile a namespaced static call (`Math.max(…)`, `JSON.parse(…)`, …) by
-    /// looking the receiver-less builtin up in [`namespace_builtin`] — the same
-    /// map that backs first-class references like `Math.sqrt` used as a value.
+    /// looking the receiver-less builtin up in the declarative table.
     fn compile_namespace_call(
         &mut self,
         ns: &str,
@@ -2172,7 +2174,7 @@ impl<'src> Compiler<'src> {
         argv: &[&ast::Expression],
         span: u32,
     ) {
-        match namespace_builtin(ns, method) {
+        match Builtin::for_namespace(ns, method) {
             Some(builtin) => self.compile_builtin_call(builtin, None, argv, span, false),
             None => self.error(span, format!("unsupported `{ns}.{method}`")),
         }
@@ -2251,23 +2253,8 @@ impl<'src> Compiler<'src> {
         span: u32,
         optional: bool,
     ) {
-        let builtin = match method {
-            // ── array methods ─────────────────────────────────────────
-            "push" => Builtin::ArrayPush,
-            "unshift" => Builtin::ArrayUnshift,
-            "pop" => Builtin::ArrayPop,
-            "shift" => Builtin::ArrayShift,
-            "join" => Builtin::ArrayJoin,
-            // ── string methods ────────────────────────────────────────
-            "split" => Builtin::StrSplit,
-            "includes" => Builtin::StrIncludes,
-            "indexOf" => Builtin::StrIndexOf,
-            "lastIndexOf" => Builtin::StrLastIndexOf,
-            "startsWith" => Builtin::StrStartsWith,
-            "endsWith" => Builtin::StrEndsWith,
-            "slice" => Builtin::StrSlice,
-            "trim" => Builtin::StrTrim,
-            // ── higher-order array methods (prelude helpers) ──────────
+        // ── higher-order array methods (prelude helpers) ──────────
+        match method {
             "map" => return self.compile_hof(recv, argv, span, optional, "__map", 1),
             "filter" => return self.compile_hof(recv, argv, span, optional, "__filter", 1),
             "forEach" => return self.compile_hof(recv, argv, span, optional, "__forEach", 1),
@@ -2276,18 +2263,16 @@ impl<'src> Compiler<'src> {
             "find" => return self.compile_hof(recv, argv, span, optional, "__find", 1),
             "findIndex" => return self.compile_hof(recv, argv, span, optional, "__findIndex", 1),
             "reduce" => return self.compile_reduce(recv, argv, span, optional),
-            _ => {
-                // Not a known builtin method — treat as property access
-                // followed by dynamic call (e.g. `state.add5(3)` where
-                // add5 is a function stored in state).
-                self.compile_dynamic_method_call(recv, method, argv, span, optional);
-                return;
-            }
-        };
-        // The receiver is arg 0 and counts toward arity; bounds come from
-        // `meta()`. The variadic-default cases (e.g. `join` with no separator)
-        // are handled by the builtin itself based on the received `argc`.
-        self.compile_builtin_call(builtin, Some(recv), argv, span, optional);
+            _ => {}
+        }
+        if let Some(builtin) = Builtin::for_method(method) {
+            self.compile_builtin_call(builtin, Some(recv), argv, span, optional);
+            return;
+        }
+        // Not a known builtin method — treat as property access
+        // followed by dynamic call (e.g. `state.add5(3)` where
+        // add5 is a function stored in state).
+        self.compile_dynamic_method_call(recv, method, argv, span, optional);
     }
 
     /// Compile a method call where the method name is not a known builtin.
@@ -2850,34 +2835,6 @@ impl<'src> Compiler<'src> {
             self.emit(Instr::FreshCell(slot as LocalIndex), span);
         }
     }
-}
-
-/// Map a reserved namespace + method to its receiver-less `Builtin`, if any.
-/// Single source of truth for both static calls (`Math.max(…)`) and first-class
-/// references (`Math.sqrt` used as a value / callback). Method builtins that
-/// need a receiver (`push`, `slice`, …) are intentionally absent — they are not
-/// first-class without binding.
-fn namespace_builtin(ns: &str, method: &str) -> Option<Builtin> {
-    Some(match (ns, method) {
-        ("Math", "max") => Builtin::MathMax,
-        ("Math", "min") => Builtin::MathMin,
-        ("Math", "pow") => Builtin::MathPow,
-        ("Math", "abs") => Builtin::MathAbs,
-        ("Math", "sqrt") => Builtin::MathSqrt,
-        ("Math", "floor") => Builtin::MathFloor,
-        ("Math", "ceil") => Builtin::MathCeil,
-        ("Math", "round") => Builtin::MathRound,
-        ("Math", "sign") => Builtin::MathSign,
-        ("Object", "keys") => Builtin::ObjKeys,
-        ("Object", "values") => Builtin::ObjValues,
-        ("JSON", "parse") => Builtin::JSONParse,
-        ("JSON", "stringify") => Builtin::JSONStringify,
-        ("Number", "isInteger") => Builtin::NumberIsInteger,
-        ("Number", "parseInt") => Builtin::NumberParseInt,
-        ("Number", "parseFloat") => Builtin::NumberParseFloat,
-        ("Array", "isArray") => Builtin::ArrayIsArray,
-        _ => return None,
-    })
 }
 
 /// Canonicalize a non-negative numeric literal: an integer in `u64` range

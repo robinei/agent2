@@ -25,300 +25,174 @@ fn fail_at(ip: CodeAddr, kind: ErrorKind, msg: &str) -> VMError {
     VMError::fail_at(ip, kind, msg)
 }
 
-/// A builtin's identity. Used both as the static call target
-/// (`Instr::CallBuiltin(Builtin, argc)`, the compiler's fast path) and as a
-/// first-class value (`Value::Builtin(Builtin)`, for passing a builtin as
-/// a callback — invoked through `CallDyn`). The enum *is* the registry key:
-/// `Debug` prints the name and equality is trivial.
+// ── declarative builtin registry ─────────────────────────────────────────────
+
+/// The kind of a builtin: either a method on a receiver value (string or array),
+/// or a static function under a namespace (`Math.abs`, `JSON.parse`, …).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum Builtin {
-    // ── array methods ──
-    ArrayPush,
-    ArrayPop,
-    ArrayShift,
-    ArrayUnshift,
-    ArrayJoin,
-    // ── string methods ──
-    StrSplit,
-    StrIncludes,
-    StrIndexOf,
-    StrLastIndexOf,
-    StrStartsWith,
-    StrEndsWith,
-    StrSlice,
-    StrTrim,
+pub enum BuiltinKind {
+    Method,
+    Namespace(&'static str),
+}
+
+/// Sentinel for variadic builtins: no upper bound on argument count.
+const VARARG: u32 = u32::MAX;
+
+/// The single-source-of-truth macro for every builtin. One row per builtin
+/// declares its enum variant, kind, display name, argument bounds (counting the
+/// receiver for methods), and handler function. The macro emits the enum,
+/// `meta()`, `call()`, `for_method()`, and `for_namespace()` — no hand-written
+/// dispatch duplication.
+macro_rules! builtins {
+    (
+        $(
+            $variant:ident, $kind:expr, $name:literal, $min:expr, $max:expr, $handler:ident;
+        )*
+    ) => {
+        /// A builtin's identity. Used both as the static call target
+        /// (`Instr::CallBuiltin(Builtin, argc)`, the compiler's fast path) and
+        /// as a first-class value (`Value::Builtin(Builtin)`, for passing a
+        /// builtin as a callback — invoked through `CallDyn`). The enum *is*
+        /// the registry key: `Debug` prints the name and equality is trivial.
+        #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+        pub enum Builtin {
+            $(
+                $variant,
+            )*
+        }
+
+        /// Compile-time facts about a builtin: its display name and accepted
+        /// argument count (inclusive, **counting the receiver** for methods).
+        /// One source of truth the compiler reads for arity checks and error
+        /// messages.
+        pub struct BuiltinMeta {
+            pub name: &'static str,
+            pub min_args: u32,
+            pub max_args: u32,
+            pub kind: BuiltinKind,
+        }
+
+        impl Builtin {
+            pub const fn meta(self) -> BuiltinMeta {
+                match self {
+                    $(
+                        Builtin::$variant => BuiltinMeta {
+                            name: $name,
+                            min_args: $min,
+                            max_args: $max,
+                            kind: $kind,
+                        },
+                    )*
+                }
+            }
+
+            /// Dispatch: run the builtin against `vm`, consuming `argc` stack
+            /// arguments and pushing one result.
+            ///
+            /// Arguments are read in-place via `Args` — never moved, cloned, or
+            /// collected. The epilogue truncates the stack and pushes the result
+            /// on both the `Ok` and `Err` paths, preserving the pop-first
+            /// invariant.
+            pub fn call(self, vm: &mut VM, argc: u32) -> Result<(), VMError> {
+                let n = argc as usize;
+                if vm.stack.len() < n {
+                    return Err(vm.fail(ErrorKind::StackUnderflow, "stack underflow"));
+                }
+                let base = vm.stack.len() - n;
+                let args = Args { base, argc: n };
+                if argc < self.meta().min_args {
+                    vm.stack.truncate(base);
+                    return Err(vm.fail(
+                        ErrorKind::BadArg,
+                        format!(
+                            "`{}` called with too few arguments ({argc})",
+                            self.meta().name
+                        ),
+                    ));
+                }
+                let result = match self {
+                    $(
+                        Builtin::$variant => $handler(vm, args),
+                    )*
+                };
+                // Epilogue: truncate args on both paths, push result on Ok.
+                vm.stack.truncate(args.base);
+                match result {
+                    Ok(val) => {
+                        vm.stack.push(val);
+                        Ok(())
+                    }
+                    Err(mut e) => {
+                        e.message = format!("in `{}`: {}", self.meta().name, e.message);
+                        Err(e)
+                    }
+                }
+            }
+
+            /// Look up a method builtin by name (for `recv.push(…)` style calls).
+            pub fn for_method(name: &str) -> Option<Builtin> {
+                $(
+                    if matches!($kind, BuiltinKind::Method) && $name == name {
+                        return Some(Builtin::$variant);
+                    }
+                )*
+                None
+            }
+
+            /// Look up a namespaced builtin by namespace + method name (for
+            /// `Math.abs(…)` style calls and `Math.sqrt` as a value).
+            pub fn for_namespace(ns: &str, name: &str) -> Option<Builtin> {
+                $(
+                    if let BuiltinKind::Namespace(ns_val) = $kind {
+                        if ns_val == ns && $name == name {
+                            return Some(Builtin::$variant);
+                        }
+                    }
+                )*
+                None
+            }
+        }
+    };
+}
+
+builtins! {
+    // ── array methods (Method, receiver + args) ──
+    ArrayPush,    BuiltinKind::Method, "push",        1, VARARG, array_push;
+    ArrayPop,     BuiltinKind::Method, "pop",         1, 1,      array_pop;
+    ArrayShift,   BuiltinKind::Method, "shift",       1, 1,      array_shift;
+    ArrayUnshift, BuiltinKind::Method, "unshift",     1, VARARG, array_unshift;
+    ArrayJoin,    BuiltinKind::Method, "join",        1, 2,      array_join;
+    // ── string methods (Method, receiver + args) ──
+    StrSplit,       BuiltinKind::Method, "split",       2, 3, str_split;
+    StrIncludes,    BuiltinKind::Method, "includes",    2, 3, str_includes;
+    StrIndexOf,     BuiltinKind::Method, "indexOf",     2, 3, str_index_of;
+    StrLastIndexOf, BuiltinKind::Method, "lastIndexOf", 2, 3, str_last_index_of;
+    StrStartsWith,  BuiltinKind::Method, "startsWith",  2, 2, str_starts_with;
+    StrEndsWith,    BuiltinKind::Method, "endsWith",    2, 2, str_ends_with;
+    StrSlice,       BuiltinKind::Method, "slice",       2, 3, str_slice;
+    StrTrim,        BuiltinKind::Method, "trim",        1, 1, str_trim;
     // ── object static ──
-    ObjKeys,
-    ObjValues,
+    ObjKeys,   BuiltinKind::Namespace("Object"), "keys",   1, 1, obj_keys;
+    ObjValues, BuiltinKind::Namespace("Object"), "values", 1, 1, obj_values;
     // ── JSON static ──
-    JSONParse,
-    JSONStringify,
+    JSONParse,     BuiltinKind::Namespace("JSON"), "parse",     1, 1, json_parse;
+    JSONStringify, BuiltinKind::Namespace("JSON"), "stringify", 1, 1, json_stringify;
     // ── Number static ──
-    NumberIsInteger,
-    NumberParseInt,
-    NumberParseFloat,
+    NumberIsInteger,  BuiltinKind::Namespace("Number"), "isInteger",  1, 1, number_is_integer;
+    NumberParseInt,   BuiltinKind::Namespace("Number"), "parseInt",   1, 2, number_parse_int;
+    NumberParseFloat, BuiltinKind::Namespace("Number"), "parseFloat", 1, 1, number_parse_float;
     // ── Array static ──
-    ArrayIsArray,
+    ArrayIsArray, BuiltinKind::Namespace("Array"), "isArray", 1, 1, array_is_array;
     // ── Math ──
-    MathAbs,
-    MathSqrt,
-    MathCeil,
-    MathFloor,
-    MathRound,
-    MathSign,
-    MathMin,
-    MathMax,
-    MathPow,
-}
-
-/// Compile-time facts about a builtin: its display name and accepted argument
-/// count (inclusive, **counting the receiver** for methods). One source of
-/// truth the compiler reads for arity checks and error messages.
-pub struct BuiltinMeta {
-    pub name: &'static str,
-    pub min_args: u32,
-    pub max_args: u32,
-}
-
-impl Builtin {
-    pub const fn meta(self) -> BuiltinMeta {
-        match self {
-            // ── array methods (receiver + args) ──
-            Builtin::ArrayPush => BuiltinMeta {
-                name: "push",
-                min_args: 1, // recv only (no element → no-op, returns length)
-                max_args: u32::MAX,
-            },
-            Builtin::ArrayPop => BuiltinMeta {
-                name: "pop",
-                min_args: 1, // recv
-                max_args: 1,
-            },
-            Builtin::ArrayShift => BuiltinMeta {
-                name: "shift",
-                min_args: 1, // recv
-                max_args: 1,
-            },
-            Builtin::ArrayUnshift => BuiltinMeta {
-                name: "unshift",
-                min_args: 1, // recv only (no element → no-op, returns length)
-                max_args: u32::MAX,
-            },
-            Builtin::ArrayJoin => BuiltinMeta {
-                name: "join",
-                min_args: 1, // recv (separator defaults to "," when argc==1)
-                max_args: 2,
-            },
-            // ── string methods (receiver + args) ──
-            Builtin::StrSplit => BuiltinMeta {
-                name: "split",
-                min_args: 2, // recv + delim
-                max_args: 3, // recv + delim + limit
-            },
-            Builtin::StrIncludes => BuiltinMeta {
-                name: "includes",
-                min_args: 2, // recv + needle
-                max_args: 3, // recv + needle + start
-            },
-            Builtin::StrIndexOf => BuiltinMeta {
-                name: "indexOf",
-                min_args: 2, // recv + needle
-                max_args: 3, // recv + needle + start
-            },
-            Builtin::StrLastIndexOf => BuiltinMeta {
-                name: "lastIndexOf",
-                min_args: 2, // recv + needle
-                max_args: 3, // recv + needle + start
-            },
-            Builtin::StrStartsWith => BuiltinMeta {
-                name: "startsWith",
-                min_args: 2, // recv + prefix
-                max_args: 2,
-            },
-            Builtin::StrEndsWith => BuiltinMeta {
-                name: "endsWith",
-                min_args: 2, // recv + suffix
-                max_args: 2,
-            },
-            Builtin::StrSlice => BuiltinMeta {
-                name: "slice",
-                min_args: 2, // recv + start
-                max_args: 3, // recv + start + end
-            },
-            Builtin::StrTrim => BuiltinMeta {
-                name: "trim",
-                min_args: 1, // recv
-                max_args: 1,
-            },
-            // ── object static (no receiver) ──
-            Builtin::ObjKeys => BuiltinMeta {
-                name: "Object.keys",
-                min_args: 1,
-                max_args: 1,
-            },
-            Builtin::ObjValues => BuiltinMeta {
-                name: "Object.values",
-                min_args: 1,
-                max_args: 1,
-            },
-            // ── JSON static (no receiver) ──
-            Builtin::JSONParse => BuiltinMeta {
-                name: "JSON.parse",
-                min_args: 1,
-                max_args: 1,
-            },
-            Builtin::JSONStringify => BuiltinMeta {
-                name: "JSON.stringify",
-                min_args: 1,
-                max_args: 1,
-            },
-            // ── Number static (no receiver) ──
-            Builtin::NumberIsInteger => BuiltinMeta {
-                name: "Number.isInteger",
-                min_args: 1,
-                max_args: 1,
-            },
-            Builtin::NumberParseInt => BuiltinMeta {
-                name: "Number.parseInt",
-                min_args: 1,
-                max_args: 2,
-            },
-            Builtin::NumberParseFloat => BuiltinMeta {
-                name: "Number.parseFloat",
-                min_args: 1,
-                max_args: 1,
-            },
-            // ── Array static (no receiver) ──
-            Builtin::ArrayIsArray => BuiltinMeta {
-                name: "Array.isArray",
-                min_args: 1,
-                max_args: 1,
-            },
-            // ── Math (no receiver) ──
-            Builtin::MathAbs => BuiltinMeta {
-                name: "Math.abs",
-                min_args: 1,
-                max_args: 1,
-            },
-            Builtin::MathSqrt => BuiltinMeta {
-                name: "Math.sqrt",
-                min_args: 1,
-                max_args: 1,
-            },
-            Builtin::MathCeil => BuiltinMeta {
-                name: "Math.ceil",
-                min_args: 1,
-                max_args: 1,
-            },
-            Builtin::MathFloor => BuiltinMeta {
-                name: "Math.floor",
-                min_args: 1,
-                max_args: 1,
-            },
-            Builtin::MathRound => BuiltinMeta {
-                name: "Math.round",
-                min_args: 1,
-                max_args: 1,
-            },
-            Builtin::MathSign => BuiltinMeta {
-                name: "Math.sign",
-                min_args: 1,
-                max_args: 1,
-            },
-            Builtin::MathMin => BuiltinMeta {
-                name: "Math.min",
-                min_args: 0,
-                max_args: u32::MAX, // variadic
-            },
-            Builtin::MathMax => BuiltinMeta {
-                name: "Math.max",
-                min_args: 0,
-                max_args: u32::MAX, // variadic
-            },
-            Builtin::MathPow => BuiltinMeta {
-                name: "Math.pow",
-                min_args: 2,
-                max_args: 2,
-            },
-        }
-    }
-
-    /// Dispatch: run the builtin against `vm`, consuming `argc` stack arguments
-    /// and pushing one result.
-    ///
-    /// Arguments are read in-place via `Args` — never moved, cloned, or
-    /// collected. The epilogue truncates the stack and pushes the result on
-    /// both the `Ok` and `Err` paths, preserving the pop-first invariant.
-    pub fn call(self, vm: &mut VM, argc: u32) -> Result<(), VMError> {
-        let n = argc as usize;
-        if vm.stack.len() < n {
-            return Err(vm.fail(ErrorKind::StackUnderflow, "stack underflow"));
-        }
-        let base = vm.stack.len() - n;
-        let args = Args { base, argc: n };
-        if argc < self.meta().min_args {
-            // Truncate arguments before returning the error.
-            vm.stack.truncate(base);
-            return Err(vm.fail(
-                ErrorKind::BadArg,
-                format!(
-                    "`{}` called with too few arguments ({argc})",
-                    self.meta().name
-                ),
-            ));
-        }
-        let result = match self {
-            // ── array methods ──
-            Builtin::ArrayPush => array_push(vm, args),
-            Builtin::ArrayPop => array_pop(vm, args),
-            Builtin::ArrayShift => array_shift(vm, args),
-            Builtin::ArrayUnshift => array_unshift(vm, args),
-            Builtin::ArrayJoin => array_join(vm, args),
-            // ── string methods ──
-            Builtin::StrSplit => str_split(vm, args),
-            Builtin::StrIncludes => str_includes(vm, args),
-            Builtin::StrIndexOf => str_index_of(vm, args),
-            Builtin::StrLastIndexOf => str_last_index_of(vm, args),
-            Builtin::StrStartsWith => str_starts_with(vm, args),
-            Builtin::StrEndsWith => str_ends_with(vm, args),
-            Builtin::StrSlice => str_slice(vm, args),
-            Builtin::StrTrim => str_trim(vm, args),
-            // ── object static ──
-            Builtin::ObjKeys => obj_keys(vm, args),
-            Builtin::ObjValues => obj_values(vm, args),
-            // ── JSON static ──
-            Builtin::JSONParse => json_parse(vm, args),
-            Builtin::JSONStringify => json_stringify(vm, args),
-            // ── Number static ──
-            Builtin::NumberIsInteger => number_is_integer(vm, args),
-            Builtin::NumberParseInt => number_parse_int(vm, args),
-            Builtin::NumberParseFloat => number_parse_float(vm, args),
-            // ── Array static ──
-            Builtin::ArrayIsArray => array_is_array(vm, args),
-            // ── Math ──
-            Builtin::MathAbs => math_unary(vm, args, |n| n.abs()),
-            Builtin::MathSqrt => math_unary(vm, args, |n| n.sqrt()),
-            Builtin::MathCeil => math_unary(vm, args, |n| n.ceil()),
-            Builtin::MathFloor => math_unary(vm, args, |n| n.floor()),
-            Builtin::MathRound => math_unary(vm, args, |n| n.round()),
-            Builtin::MathSign => math_unary(vm, args, |n| n.signum()),
-            Builtin::MathMin => math_min(vm, args),
-            Builtin::MathMax => math_max(vm, args),
-            Builtin::MathPow => math_pow(vm, args),
-        };
-        // Epilogue: truncate args on both paths, push result on Ok.
-        vm.stack.truncate(args.base);
-        match result {
-            Ok(val) => {
-                vm.stack.push(val);
-                Ok(())
-            }
-            Err(mut e) => {
-                e.message = format!("in `{}`: {}", self.meta().name, e.message);
-                Err(e)
-            }
-        }
-    }
+    MathAbs,   BuiltinKind::Namespace("Math"), "abs",   1, 1,      math_abs;
+    MathSqrt,  BuiltinKind::Namespace("Math"), "sqrt",  1, 1,      math_sqrt;
+    MathCeil,  BuiltinKind::Namespace("Math"), "ceil",  1, 1,      math_ceil;
+    MathFloor, BuiltinKind::Namespace("Math"), "floor", 1, 1,      math_floor;
+    MathRound, BuiltinKind::Namespace("Math"), "round", 1, 1,      math_round;
+    MathSign,  BuiltinKind::Namespace("Math"), "sign",  1, 1,      math_sign;
+    MathMin,   BuiltinKind::Namespace("Math"), "min",   0, VARARG, math_min;
+    MathMax,   BuiltinKind::Namespace("Math"), "max",   0, VARARG, math_max;
+    MathPow,   BuiltinKind::Namespace("Math"), "pow",   2, 2,      math_pow;
 }
 
 // ── argument accessor ────────────────────────────────────────────────────────
@@ -798,6 +672,28 @@ fn array_is_array(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 }
 
 // ── Math implementations ─────────────────────────────────────────────────────
+
+/// Note: `math_abs` / `math_sqrt` etc. are individual functions so the macro
+/// can map them. `math_unary` is used as a helper only.
+
+fn math_abs(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    math_unary(vm, args, |n| n.abs())
+}
+fn math_sqrt(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    math_unary(vm, args, |n| n.sqrt())
+}
+fn math_ceil(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    math_unary(vm, args, |n| n.ceil())
+}
+fn math_floor(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    math_unary(vm, args, |n| n.floor())
+}
+fn math_round(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    math_unary(vm, args, |n| n.round())
+}
+fn math_sign(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    math_unary(vm, args, |n| n.signum())
+}
 
 /// Math unary: read one arg, coerce ToNumber, apply f, return Number.
 fn math_unary(vm: &mut VM, args: Args, f: fn(f64) -> f64) -> Result<Value, VMError> {
@@ -1527,5 +1423,29 @@ mod tests {
                 _ => {}
             }
         }
+    }
+
+    // ── Step 2: lookup tests ───────────────────────────────────────────
+
+    #[test]
+    fn for_method_lookup() {
+        assert_eq!(Builtin::for_method("push"), Some(Builtin::ArrayPush));
+        assert_eq!(Builtin::for_method("trim"), Some(Builtin::StrTrim));
+        assert_eq!(Builtin::for_method("abs"), None); // namespace, not method
+        assert_eq!(Builtin::for_method("nope"), None);
+    }
+
+    #[test]
+    fn for_namespace_lookup() {
+        assert_eq!(
+            Builtin::for_namespace("Math", "abs"),
+            Some(Builtin::MathAbs)
+        );
+        assert_eq!(
+            Builtin::for_namespace("Object", "keys"),
+            Some(Builtin::ObjKeys)
+        );
+        assert_eq!(Builtin::for_namespace("Math", "push"), None);
+        assert_eq!(Builtin::for_namespace("Foo", "bar"), None);
     }
 }
