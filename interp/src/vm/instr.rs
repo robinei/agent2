@@ -1,60 +1,32 @@
-/*
-JS semantic compatibility — known divergences
-=============================================
-
-This VM models JS runtime semantics closely so that LLM-written JS lowers to it
-without surprises. The following behaviors are JS-faithful and worth keeping in
-mind: `undefined` is distinct from `null` (property/index/var misses yield
-`undefined`); `==`/`!=` (LooseEq/LooseNeq) coerce while `===`/`!==` (Eq/Neq) are
-strict; truthiness uses the JS falsy set (`false`, `0`, `NaN`, `""`, `null`,
-`undefined`); `+` concatenates when either operand is a string and otherwise
-adds with ToNumber coercion; `-`/`*`/`/`/`%` coerce ToNumber; division/modulo by
-zero yield `Infinity`/`NaN` rather than erroring; objects/arrays compare by
-reference identity under `===`.
-
-The remaining intentional divergences from JS — deferred or accepted, NOT bugs:
-
-  • Relational operators (`<` `>` `<=` `>=`) do NOT coerce across types: a
-    number-vs-string or null-vs-number comparison is `false` (JS would coerce,
-    e.g. `1 < "2"` is `true` in JS). String-vs-string and number-vs-number work.
-  • `ToPrimitive` on objects is never performed. Arithmetic/`==` against a plain
-    object or array is a TypeError / `false` (JS would call `toString`/`valueOf`,
-    so `[5] == 5` and `[] + 1` differ here). `+` against a string still works,
-    because that path uses ToString, which IS implemented.
-  • Array bounds: an out-of-range read yields `undefined` (JS-faithful), but a
-    negative index errors and an out-of-range *write* (`arr[len+k] = x`) errors
-    rather than growing the array with holes as JS does.
-  • Function arity is strict: reading an argument past those passed is an error,
-    not `undefined`. The compiler is expected to pass exact arity (no implicit
-    `arguments`, default, or rest-param holes).
-  • Strings are UTF-8 byte sequences: `.length` and all index/offset string ops
-    count/use UTF-8 *bytes*, not UTF-16 code units (`"é".length` is 2 here, 1 in
-    JS; "😀" is 4 here, 2 in JS). ASCII text is identical.
-  • Bitwise ops (`& | ^ << >> ~`) operate on full i64, not JS's 32-bit ToInt32
-    semantics, and there is no unsigned right shift (`>>>`). Shift counts must be
-    0..63 (JS masks to 0..31).
-  • `Math.min`/`Math.max` (Min/Max) follow Rust's `f64::min`/`max`, which ignore
-    a NaN operand; JS propagates NaN. `Math.sign` of ±0 is ±1 here (JS gives ±0).
-  • Number→string uses Rust's float formatting for the non-integer path, so very
-    large/small magnitudes are not rendered in JS's exponential form (`1e21`).
-  • No exceptions/try/catch/throw: the `Raise` condition mechanism is for host
-    (LLM) intervention, not JS error handling.
-*/
-
-use thin_vec::ThinVec;
 use crate::builtin::Builtin;
 use crate::rc_str::RcStr;
-use super::value::{FieldName, SlotKind};
+use thin_vec::ThinVec;
 
 pub type CodeAddr = u32;
 pub type StackAddr = u32;
 pub type ArrayPtr = u32;
 pub type ObjectPtr = u32;
 pub type ClosurePtr = u32;
-pub type LocalIndex = u32;
+pub type LocalIndex = u16;
+pub type LocalCount = u16;
 pub type ArgCount = u32;
 /// Index into the VM's `cells` side table (the store of captured bindings).
 pub type CellIndex = u32;
+
+/// Object keys and string-valued instruction operands. A thin, refcounted,
+/// immutable string: cloning a key (`ObjNew`/`ObjSet`) or pushing a literal
+/// (`PushStr`) is a refcount bump, and identical interned names share one
+/// allocation.
+pub type FieldName = RcStr;
+
+/// Storage class for a local slot declared by `EnterFrame`. A `Plain` slot is an
+/// ordinary stack local; a `Boxed` slot is captured by reference, so it is
+/// backed by a `cells` entry and addressed through an `Upval` marker.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum SlotKind {
+    Plain,
+    Boxed,
+}
 
 /// Whether an `IncLocal` is prefix (`++x`) or postfix (`x++`), controlling
 /// whether the old or new value is left on the stack.
@@ -75,17 +47,17 @@ pub enum SetMode {
 // Instructions for a stack based language used for LLM composition of complex tool flows.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Instr {
-    PushUndefined,
-    PushNull,
-    PushBool(bool),
-    PushPosInt(u64),
-    PushNegInt(i64),
-    PushFloat(f64), // () -> any
-    PushStr(RcStr), // () -> str
-    PushArray(ArrayPtr),
-    PushObject(ObjectPtr),
-    PushFn(CodeAddr),
-    PushBuiltin(Builtin),
+    PushUndefined,         // () -> undefined
+    PushNull,              // () -> null
+    PushBool(bool),        // () -> bool
+    PushPosInt(u64),       // () -> num
+    PushNegInt(i64),       // () -> num
+    PushFloat(f64),        // () -> num
+    PushStr(RcStr),        // () -> str
+    PushArray(ArrayPtr),   // () -> arr
+    PushObject(ObjectPtr), // () -> obj
+    PushFn(CodeAddr),      // () -> fn
+    PushBuiltin(Builtin),  // () -> builtin
 
     Pop(usize),
 
@@ -109,7 +81,7 @@ pub enum Instr {
     // stack in left-to-right order (arg 0 pushed first / deepest), and become
     // the new frame's args. depends on function whether or not a result is left
     // on stack after it returns.
-    Call(CodeAddr, u32), // any, ... -> [any]
+    Call(CodeAddr, ArgCount), // any, ... -> [any]
 
     // indirect call: the callable sits on top, above its N args (left-to-right,
     // so arg 0 is deepest). The callable is either a bare `Fn` value or a `Ptr`
@@ -117,13 +89,13 @@ pub enum Instr {
     // Call. For a closure, its captured environment is installed as the
     // callee's leading locals (slots 0..K) before the body runs. Errors if the
     // top value is neither a Fn nor a closure.
-    CallDyn(u32), // any, ..., fn -> [any]
+    CallDyn(ArgCount), // any, ..., fn -> [any]
 
     // static call to a known builtin (the compiler's fast path, analogous to
     // Call for user functions). The N arguments sit on the stack left-to-right
     // (arg 0 deepest; receiver is arg 0 for methods); the builtin pops them and
     // pushes exactly one result. No call frame is created. See builtin.rs.
-    CallBuiltin(Builtin, u32), // any, ... -> any
+    CallBuiltin(Builtin, ArgCount), // any, ... -> any
 
     // build a closure over the listed local slots of the current frame and push
     // a Closure to the resulting value. Each captured slot is copied
@@ -153,7 +125,7 @@ pub enum Instr {
     //     (named/recursive functions) is the last kind.
     // This is the sole frame-setup instruction: there is no separate per-arg
     // copy or local-allocation step.
-    EnterFrame(u16, bool, ThinVec<SlotKind>),
+    EnterFrame(LocalCount, bool, ThinVec<SlotKind>),
 
     // Push the `arguments` array for the current frame: a fresh heap array of
     // all `arg_count` arguments (arg 0 first). Built lazily and cached per
@@ -188,7 +160,7 @@ pub enum Instr {
     // PosInt(1) decrements (sub 1 = −1). Prefix mode leaves the new value on
     // the stack; Postfix leaves the old value. Only emitted for `++`/`--` on
     // local variables; member/index targets fall back to load-sub-store.
-    IncLocal(u16, f64, UpdateMode), // () -> any
+    IncLocal(LocalIndex, f64, UpdateMode), // () -> any
 
     // JS `typeof`: pops a value and pushes its type tag as a string. Tags match
     // JS exactly, so they are coarse: "undefined", "object" (covers Null, arrays
@@ -232,7 +204,7 @@ pub enum Instr {
     // pushed). step() batches a run of consecutive Invoke instructions into one
     // StepResult::Invoke (fan-out); the host runs them concurrently and pushes
     // one result per call, in call order.
-    Invoke(RcStr, u32), // any, ... -> any
+    Invoke(RcStr, ArgCount), // any, ... -> any
 
     // EFFECT: raise condition (like Lisp condition system). used to ask LLM in calling frame
     // to decide how to proceed, using restarts like returning a value, aborting,
@@ -272,8 +244,8 @@ pub enum Instr {
 
     // pops N values and pushes an array with them as initial values.
     // Left-to-right: the first/deepest pushed becomes element 0.
-    ArrNew(u32), // [any, ...] -> arr
-    ArrLength,   // arr|str -> int
+    ArrNew(ArgCount), // [any, ...] -> arr
+    ArrLength,        // arr|str -> int
 
     // JS `String(x)` / ToString: pops any value, pushes its string form. Unlike
     // StrFromJson (which emits JSON, and rejects non-JSON values), this matches
@@ -321,95 +293,3 @@ pub enum Instr {
     BitRhs,   // int, int -> int
     Pow,      // num, num -> num
 }
-
-/*
-
-Stack layout:
-    higher addresses
-    ┌──────────────────────┐
-    │  expr temporaries    │  ← sp
-    ├──────────────────────┤
-    │  declared locals     │  fp + nparams + K ..
-    │  upvals (K)          │  fp + nparams .. fp + nparams + K - 1
-    │  params (= args)     │  fp .. fp + nparams - 1
-    │  local 0 / arg 0     │  fp
-    ├──────────────────────┤
-    │  caller's temps      │
-    └──────────────────────┘
-    lower addresses
-
-There is no separate "argument" region: `fp` points at arg 0, and the arguments
-ARE the leading locals (slots `0..nparams`), so a parameter reference is just a
-`Local`. The caller pushes args left-to-right (arg 0 deepest at `fp`); the
-prologue `EnterFrame` then normalizes the region to exactly `nparams` (dropping
-surplus / padding missing), installs the closure's upvals at `[nparams, nparams
-+ K)`, and allocates the declared locals above them. The whole frame —
-including args — is reclaimed by `Return`, whose result(s) land at `fp`.
-
-
-Closures — the compiler contract
-================================
-
-The VM gives you capture-by-reference (JS `let`/`var` semantics) via three
-moving parts: `Boxed` local slots, the `cells` side table, and `MakeClosure` /
-`CallDyn`. The runtime stays dumb; the analysis and slot bookkeeping below are
-the compiler's job. A future codegen MUST uphold all of this:
-
-1. Capture analysis (who gets boxed).
-   A variable that is captured by any nested function AND is ever reassigned
-   (by its owner or any closure) must be `Boxed` in its OWNING frame's slot
-   kinds. Everything else stays `Plain`. A captured-but-never-reassigned
-   variable may stay `Plain` and be captured by value — see point 4.
-
-2. Boxing is per-binding and eager.
-   `EnterFrame`'s `local_kinds` declares each declared slot's storage class
-   (and a captured *parameter* is boxed in place by a prologue `FreshCell`). A
-   `Boxed` slot is backed by a fresh `cells` entry from birth; `Local`/`SetLocal`
-   transparently route through it. There is no "open upvalue" / close step —
-   the cell already has identity and outlives the frame, so a returned closure
-   keeps working after its defining frame is gone. (Cost: one indirection per
-   access and a permanent cell. Acceptable under this VM's no-GC, short-program
-   design.)
-
-3. Frame slot layout (the ABI).
-   Arguments arrive in place as the leading locals, so the layout is:
-       slot 0 .. nparams-1            = params (= the call's arguments)
-       slot nparams .. nparams+K-1    = captured upvals (MakeClosure order)
-       slot nparams+K ..              = the body's own declared locals
-   The prologue `EnterFrame(nparams, build_args, local_kinds)` establishes all
-   of this: it normalizes the incoming args to `nparams`, installs the closure's
-   captured environment (which `CallDyn` stashed in the frame) as the upval
-   locals, and allocates the declared locals from `local_kinds`. Emit
-   `MakeClosure(addr, captures)` at the definition site with `captures` ordered
-   to match exactly the upval slot order the body expects.
-
-4. `MakeClosure(addr, captures)` capture kinds, by value vs by reference.
-   Each entry of `captures` is a slot index in the ENCLOSING frame; the slot is
-   copied verbatim into the new closure. A `Boxed` slot copies its `Upval`
-   handle → shared, by-reference (mutations are mutually visible). A `Plain`
-   slot copies its value → an immutable by-value snapshot. Only capture a
-   `Plain` slot when the analysis in point 1 proved the binding is effectively
-   `const` (assigned once, before every capturing `MakeClosure`, and never
-   after). A `Plain` capture of a `Ptr` still shares the heap object — it
-   freezes the binding, not the object, which is correct JS semantics.
-
-5. Transitive / nested capture is free.
-   A closure capturing a variable owned several scopes up just lists its own
-   (installed-upval) slot; copying that slot forwards the SAME cell handle. The
-   flat `cells` index threads through every intermediate closure unchanged.
-
-6. Captured parameters.
-   Arguments arrive in place as the leading locals (slots `0..nparams`, set up
-   by `EnterFrame`), holding plain values. To capture (or reassign) a parameter,
-   the prologue boxes its slot in place with `FreshCell` (plain value → fresh
-   cell); closures then capture that boxed local.
-
-7. Non-capturing functions stay cheap.
-   A lambda/function with no captures should remain a bare `Value::Fn`
-   (zero heap allocation). Only emit `MakeClosure` when there is something to
-   capture.
-
-Closure values are first-class: callable via `CallDyn`, compared by reference
-identity, and (like `Fn`) have no JSON representation.
-
-*/

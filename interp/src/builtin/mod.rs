@@ -14,8 +14,8 @@
 //! result — assignment-style "leave a value" semantics, so every builtin call
 //! is a well-formed expression.
 
-use crate::vm::{RcStr, VM, VMError, Value, as_i64, small_to_thin};
-use smallvec::SmallVec;
+use crate::vm::{RcStr, VM, VMError, Value};
+use thin_vec::ThinVec;
 
 /// A builtin's identity. Used both as the static call target
 /// (`Instr::CallBuiltin(Builtin, argc)`, the compiler's fast path) and as a
@@ -542,7 +542,7 @@ fn str_split(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     let (s, delim, limit) = match argc {
         2 => (vm.string_from(&args[0])?, vm.string_from(&args[1])?, None),
         3 => (vm.string_from(&args[0])?, vm.string_from(&args[1])?, {
-            let lim = as_i64(&args[2]).ok_or(VMError::TypeError)?;
+            let lim = args[2].as_i64().ok_or(VMError::TypeError)?;
             if lim < 0 {
                 return Err(VMError::ValueError);
             }
@@ -550,20 +550,17 @@ fn str_split(vm: &mut VM, argc: u32) -> Result<(), VMError> {
         }),
         _ => return Err(VMError::BadArg),
     };
-    let mut parts: SmallVec<[Value; 16]> = SmallVec::new();
-    match limit {
-        Some(lim) => {
-            for p in s.splitn(lim, delim.as_str()) {
-                parts.push(Value::String(RcStr::from(p)));
-            }
-        }
-        None => {
-            for p in s.split(delim.as_str()) {
-                parts.push(Value::String(RcStr::from(p)));
-            }
-        }
-    }
-    let ptr = vm.alloc_array(small_to_thin(&parts));
+    let parts: ThinVec<Value> = match limit {
+        Some(lim) => s
+            .splitn(lim, delim.as_str())
+            .map(|p| Value::String(RcStr::from(p)))
+            .collect(),
+        None => s
+            .split(delim.as_str())
+            .map(|p| Value::String(RcStr::from(p)))
+            .collect(),
+    };
+    let ptr = vm.alloc_array(parts);
     vm.stack.push(ptr);
     Ok(())
 }
@@ -576,7 +573,7 @@ fn str_includes(vm: &mut VM, argc: u32) -> Result<(), VMError> {
         3 => (
             vm.str_from(&args[0])?,
             vm.str_from(&args[1])?,
-            Some(as_i64(&args[2]).ok_or(VMError::TypeError)?),
+            Some(args[2].as_i64().ok_or(VMError::TypeError)?),
         ),
         _ => return Err(VMError::BadArg),
     };
@@ -599,7 +596,7 @@ fn str_index_of(vm: &mut VM, argc: u32) -> Result<(), VMError> {
         3 => (
             vm.str_from(&args[0])?,
             vm.str_from(&args[1])?,
-            Some(as_i64(&args[2]).ok_or(VMError::TypeError)?),
+            Some(args[2].as_i64().ok_or(VMError::TypeError)?),
         ),
         _ => return Err(VMError::BadArg),
     };
@@ -622,7 +619,7 @@ fn str_last_index_of(vm: &mut VM, argc: u32) -> Result<(), VMError> {
         3 => (
             vm.str_from(&args[0])?,
             vm.str_from(&args[1])?,
-            Some(as_i64(&args[2]).ok_or(VMError::TypeError)?),
+            Some(args[2].as_i64().ok_or(VMError::TypeError)?),
         ),
         _ => return Err(VMError::BadArg),
     };
@@ -668,7 +665,7 @@ fn str_slice(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     let (s, start, end): (RcStr, usize, usize) = match argc {
         2 => {
             let s = vm.string_from(&args[0])?;
-            let start = as_i64(&args[1]).ok_or(VMError::TypeError)?;
+            let start = args[1].as_i64().ok_or(VMError::TypeError)?;
             if start < 0 {
                 return Err(VMError::ValueError);
             }
@@ -678,8 +675,8 @@ fn str_slice(vm: &mut VM, argc: u32) -> Result<(), VMError> {
         }
         3 => {
             let s = vm.string_from(&args[0])?;
-            let start = as_i64(&args[1]).ok_or(VMError::TypeError)?;
-            let end = as_i64(&args[2]).ok_or(VMError::TypeError)?;
+            let start = args[1].as_i64().ok_or(VMError::TypeError)?;
+            let end = args[2].as_i64().ok_or(VMError::TypeError)?;
             if start < 0 || end < 0 || start > end {
                 return Err(VMError::ValueError);
             }
@@ -711,15 +708,15 @@ fn obj_keys(vm: &mut VM, argc: u32) -> Result<(), VMError> {
         Value::Object(p) => *p,
         _ => return Err(VMError::TypeError),
     };
-    let keys: SmallVec<[RcStr; 8]> = vm
+    let keys: ThinVec<RcStr> = vm
         .objects
         .get(obj_ptr as usize)
         .ok_or(VMError::TypeError)?
         .keys()
         .cloned()
         .collect();
-    let strs: SmallVec<[Value; 16]> = keys.into_iter().map(Value::String).collect();
-    let ptr = vm.alloc_array(small_to_thin(&strs));
+    let strs: ThinVec<Value> = keys.into_iter().map(Value::String).collect();
+    let ptr = vm.alloc_array(strs);
     vm.stack.push(ptr);
     Ok(())
 }
@@ -731,14 +728,14 @@ fn obj_values(vm: &mut VM, argc: u32) -> Result<(), VMError> {
         Value::Object(p) => *p,
         _ => return Err(VMError::TypeError),
     };
-    let vals: SmallVec<[Value; 16]> = vm
+    let vals: ThinVec<Value> = vm
         .objects
         .get(obj_ptr as usize)
         .ok_or(VMError::TypeError)?
         .values()
         .cloned()
         .collect();
-    let ptr = vm.alloc_array(small_to_thin(&vals));
+    let ptr = vm.alloc_array(vals);
     vm.stack.push(ptr);
     Ok(())
 }
@@ -786,7 +783,7 @@ fn number_parse_int(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     let s = vm.str_from(&args[0])?;
     // JS coerces the radix via ToInt32; a missing/NaN radix means "auto" (0).
     let radix = if argc >= 2 {
-        match vm.to_number(&args[1]) {
+        match args[1].to_number() {
             Some(n) if n.is_finite() => n as i64,
             _ => 0,
         }
@@ -821,7 +818,7 @@ fn array_is_array(vm: &mut VM, argc: u32) -> Result<(), VMError> {
 /// Math unary: pop one arg, coerce ToNumber, apply f, push Number.
 fn math_unary(vm: &mut VM, argc: u32, f: fn(f64) -> f64) -> Result<(), VMError> {
     let args = check_arity!(vm, argc, 1)?;
-    let n = vm.to_number(&args[0]).ok_or(VMError::TypeError)?;
+    let n = args[0].to_number().ok_or(VMError::TypeError)?;
     vm.stack.push(Value::Float(f(n)));
     Ok(())
 }
@@ -832,9 +829,7 @@ fn math_min(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     let base = arg_base(vm, argc)?;
     let mut acc = f64::INFINITY;
     for i in 0..argc as usize {
-        let num = vm
-            .to_number(&vm.stack[base + i])
-            .ok_or(VMError::TypeError)?;
+        let num = vm.stack[base + i].to_number().ok_or(VMError::TypeError)?;
         acc = acc.min(num);
     }
     vm.stack.truncate(base);
@@ -848,9 +843,7 @@ fn math_max(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     let base = arg_base(vm, argc)?;
     let mut acc = f64::NEG_INFINITY;
     for i in 0..argc as usize {
-        let num = vm
-            .to_number(&vm.stack[base + i])
-            .ok_or(VMError::TypeError)?;
+        let num = vm.stack[base + i].to_number().ok_or(VMError::TypeError)?;
         acc = acc.max(num);
     }
     vm.stack.truncate(base);
@@ -861,8 +854,8 @@ fn math_max(vm: &mut VM, argc: u32) -> Result<(), VMError> {
 /// `Math.pow(base, exp)` → base^exp.
 fn math_pow(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     let args = check_arity!(vm, argc, 2)?;
-    let base = vm.to_number(&args[0]).ok_or(VMError::TypeError)?;
-    let exp = vm.to_number(&args[1]).ok_or(VMError::TypeError)?;
+    let base = args[0].to_number().ok_or(VMError::TypeError)?;
+    let exp = args[1].to_number().ok_or(VMError::TypeError)?;
     vm.stack.push(Value::Float(base.powf(exp)));
     Ok(())
 }

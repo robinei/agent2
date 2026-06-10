@@ -1,24 +1,8 @@
-use smallvec::SmallVec;
-use thin_vec::ThinVec;
-
 use crate::builtin::Builtin;
 pub use crate::rc_str::RcStr;
 
 use super::instr;
 use super::instr::CodeAddr;
-
-/// Object keys and string-valued instruction operands. A thin, refcounted,
-/// immutable string: cloning a key (`ObjNew`/`ObjSet`) or pushing a literal
-/// (`PushStr`) is a refcount bump, and identical interned names share one
-/// allocation.
-pub type FieldName = RcStr;
-
-/// Convert a `SmallVec` to a `ThinVec`, copying from the stack allocation.
-/// Used at boundaries where heap storage is required (alloc_array,
-/// alloc_closure, etc.).
-pub(crate) fn small_to_thin(sv: &SmallVec<[Value; 16]>) -> ThinVec<Value> {
-    ThinVec::from(sv.as_slice())
-}
 
 /// Not `Copy`: the `String` variant owns an `RcStr` whose clone must bump a
 /// refcount and whose drop must release one. Every other variant is a trivial
@@ -82,19 +66,202 @@ pub enum Value {
     Builtin(Builtin),
 }
 
-/// Storage class for a local slot declared by `EnterFrame`. A `Plain` slot is an
-/// ordinary stack local; a `Boxed` slot is captured by reference, so it is
-/// backed by a `cells` entry and addressed through an `Upval` marker.
-#[derive(Copy, Clone, Debug, PartialEq)]
-pub enum SlotKind {
-    Plain,
-    Boxed,
-}
+// ── Value methods ────────────────────────────────────────────
+impl Value {
+    /// JS truthiness. The falsy set is exactly `false`, `0`/`-0`, `NaN`, `""`,
+    /// `null`, and `undefined`; everything else (incl. empty arrays/objects and
+    /// the string "0") is truthy. Needs heap access to detect the empty string,
+    /// hence a method.
+    pub(crate) fn is_truthy(&self) -> bool {
+        match self {
+            Value::Bool(b) => *b,
+            Value::Null | Value::Undefined => false,
+            Value::Float(n) => *n != 0.0 && !n.is_nan(),
+            Value::PosInt(u) => *u != 0,
+            // NegInt is always negative (i64::MIN..=-1), hence never zero.
+            Value::NegInt(_) => true,
+            // Empty string is falsy; any other string is truthy.
+            Value::String(s) => !s.as_str().is_empty(),
+            // All arrays/objects/closures/functions are truthy.
+            Value::Array(_)
+            | Value::Object(_)
+            | Value::Closure(_)
+            | Value::Fn(_)
+            | Value::Builtin(_) => true,
+            // Internal indirection; never a legitimate operand.
+            Value::Upval(_) => false,
+        }
+    }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct Closure {
-    pub addr: CodeAddr,
-    pub upvals: ThinVec<Value>,
+    /// JS `ToNumber` for the arithmetic operators. `null`→0, `undefined`→NaN,
+    /// booleans→0/1, numbers pass through, strings parse (`ToNumber`, NaN when
+    /// unparseable). Returns None for values JS would route through `ToPrimitive`
+    /// first — arrays, objects, closures, functions — which this VM deliberately
+    /// does not coerce (see the divergence note on `loose_equal`); arithmetic on
+    /// those is a TypeError.
+    pub(crate) fn to_number(&self) -> Option<f64> {
+        match self {
+            Value::Float(n) => Some(*n),
+            Value::PosInt(u) => Some(*u as f64),
+            Value::NegInt(i) => Some(*i as f64),
+            Value::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
+            Value::Null => Some(0.0),
+            Value::Undefined => Some(f64::NAN),
+            Value::String(s) => Some(js_str_to_number(s)),
+            Value::Array(_)
+            | Value::Object(_)
+            | Value::Closure(_)
+            | Value::Fn(_)
+            | Value::Builtin(_)
+            | Value::Upval(_) => None,
+        }
+    }
+
+    /// Whether a value is a string (used to pick `+`'s concat vs add path).
+    pub(crate) fn is_string(&self) -> bool {
+        matches!(self, Value::String(_))
+    }
+
+    /// Reference/value equality matching JS `===`. Primitives compare by value;
+    /// strings, though heap-allocated here, are primitives and so compare by
+    /// *content*. Arrays, objects, and closures compare by *reference identity*
+    /// (same heap address) — `{a:1} === {a:1}` is false, as in JS.
+    pub(crate) fn strict_equal(&self, other: &Value) -> bool {
+        match (self, other) {
+            (Value::Null, Value::Null) => true,
+            // Strict (===): undefined equals only itself; undefined !== null.
+            // (Loose `null == undefined` would need a separate op; Eq is ===.)
+            (Value::Undefined, Value::Undefined) => true,
+            (Value::Bool(a), Value::Bool(b)) => a == b,
+            (Value::Float(a), Value::Float(b)) => {
+                if a.is_nan() && b.is_nan() {
+                    false // NaN != NaN per IEEE 754
+                } else {
+                    a == b
+                }
+            }
+            // Integers compare exactly within the same variant; PosInt and
+            // NegInt never overlap (different sign) so they're never equal.
+            // Comparison to Number is by f64 value (so 1 == 1.0); huge ints
+            // beyond f64's mantissa are an accepted edge case.
+            (Value::PosInt(a), Value::PosInt(b)) => a == b,
+            (Value::NegInt(a), Value::NegInt(b)) => a == b,
+            (Value::PosInt(_), Value::NegInt(_)) | (Value::NegInt(_), Value::PosInt(_)) => false,
+            (Value::PosInt(a), Value::Float(b)) => !b.is_nan() && (*a as f64) == *b,
+            (Value::Float(a), Value::PosInt(b)) => !a.is_nan() && *a == (*b as f64),
+            (Value::NegInt(a), Value::Float(b)) => !b.is_nan() && (*a as f64) == *b,
+            (Value::Float(a), Value::NegInt(b)) => !a.is_nan() && *a == (*b as f64),
+            // Function values are equal iff they point at the same code address.
+            (Value::Fn(a), Value::Fn(b)) => a == b,
+            // Builtins compare by identity, like Fn.
+            (Value::Builtin(a), Value::Builtin(b)) => a == b,
+            // Strings are primitives: equal by *content*. `RcStr`'s `==` short-
+            // circuits on pointer identity, so comparing shared/interned strings
+            // (e.g. two clones of one literal) is O(1).
+            (Value::String(a), Value::String(b)) => a == b,
+            // Same heap address is the same object — JS reference identity, the
+            // only equality arrays/objects/closures get (`{a:1} === {a:1}` is
+            // false). A correct program never dangles (the heap only grows).
+            (Value::Array(p), Value::Array(q)) => p == q,
+            (Value::Object(p), Value::Object(q)) => p == q,
+            (Value::Closure(p), Value::Closure(q)) => p == q,
+            _ => false,
+        }
+    }
+
+    /// JS Abstract Equality Comparison (`==`). Differs from `values_equal`
+    /// (`===`) only by coercion, applied in spec order:
+    ///   • `null` and `undefined` are loosely equal to each other and to
+    ///     nothing else;
+    ///   • a boolean coerces to a number (false→0, true→1) and the comparison
+    ///     re-runs;
+    ///   • a number vs a string coerces the string with `ToNumber`;
+    ///   • any other pairing falls through to the strict structural compare
+    ///     (so two numbers, two strings, or two heap collections behave exactly
+    ///     as `===` does here).
+    ///
+    /// One deliberate divergence: an object/array vs a primitive is NOT coerced
+    /// via `ToPrimitive` (so `[5] == 5` is false here, true in JS). Loose
+    /// object↔primitive equality is never an intentional pattern in this DSL,
+    /// where heap values are data containers; skipping it avoids the
+    /// `toString`/`valueOf` machinery and the footguns it brings.
+    pub(crate) fn loose_equal(&self, other: &Value) -> bool {
+        use Value::*;
+        // null / undefined: loosely equal to each other, to nothing else.
+        let l_nullish = matches!(self, Null | Undefined);
+        let r_nullish = matches!(other, Null | Undefined);
+        if l_nullish || r_nullish {
+            return l_nullish && r_nullish;
+        }
+        match (self, other) {
+            // Boolean → number, then re-run the comparison.
+            (Bool(b), _) => Value::Float(if *b { 1.0 } else { 0.0 }).loose_equal(other),
+            (_, Bool(b)) => Value::Float(if *b { 1.0 } else { 0.0 }).loose_equal(other),
+            // Number vs string (either order): coerce the string with ToNumber.
+            (l, String(s)) if l.is_number() => l.num_loose_eq_str(s),
+            (String(s), r) if r.is_number() => r.num_loose_eq_str(s),
+            // No further coercion: same-type primitives and heap-vs-heap defer
+            // to the strict structural comparison.
+            _ => self.strict_equal(other),
+        }
+    }
+
+    /// Total ordering for comparable types. Returns None for incomparable types.
+    pub(crate) fn compare(&self, other: &Value) -> Option<std::cmp::Ordering> {
+        match (self, other) {
+            (Value::Null, Value::Null) => Some(std::cmp::Ordering::Equal),
+            (Value::Bool(a), Value::Bool(b)) => Some(a.cmp(b)),
+            (Value::Float(a), Value::Float(b)) => a.partial_cmp(b),
+            (Value::PosInt(a), Value::PosInt(b)) => Some(a.cmp(b)),
+            (Value::NegInt(a), Value::NegInt(b)) => Some(a.cmp(b)),
+            // Sign decides cross-variant ordering with no value juggling.
+            (Value::PosInt(_), Value::NegInt(_)) => Some(std::cmp::Ordering::Greater),
+            (Value::NegInt(_), Value::PosInt(_)) => Some(std::cmp::Ordering::Less),
+            (Value::PosInt(a), Value::Float(b)) => (*a as f64).partial_cmp(b),
+            (Value::Float(a), Value::PosInt(b)) => a.partial_cmp(&(*b as f64)),
+            (Value::NegInt(a), Value::Float(b)) => (*a as f64).partial_cmp(b),
+            (Value::Float(a), Value::NegInt(b)) => a.partial_cmp(&(*b as f64)),
+            // Strings order lexicographically by bytes (UTF-8 byte order matches
+            // code-point order). Arrays/objects/closures are incomparable.
+            (Value::String(a), Value::String(b)) => Some(a.cmp(b)),
+            _ => None,
+        }
+    }
+    pub(crate) fn as_f64(&self) -> Option<f64> {
+        match self {
+            Value::Float(n) => Some(*n),
+            Value::PosInt(u) => Some(*u as f64),
+            Value::NegInt(i) => Some(*i as f64),
+            _ => None,
+        }
+    }
+    pub(crate) fn as_i64(&self) -> Option<i64> {
+        match self {
+            Value::NegInt(i) => Some(*i),
+            Value::PosInt(u) => i64::try_from(*u).ok(),
+            Value::Float(n) if float_is_int(*n) => Some(*n as i64),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn is_number(&self) -> bool {
+        matches!(self, Value::Float(_) | Value::PosInt(_) | Value::NegInt(_))
+    }
+
+    pub(crate) fn num_loose_eq_str(&self, s: &str) -> bool {
+        match self.as_f64() {
+            Some(a) => a == js_str_to_number(s),
+            None => false,
+        }
+    }
+
+    /// Byte length of a string value, if it is one.
+    pub(crate) fn str_byte_len(&self) -> Option<usize> {
+        match self {
+            Value::String(s) => Some(s.len()),
+            _ => None,
+        }
+    }
 }
 
 // ── free helper functions ─────────────────────────────────────────────
@@ -124,30 +291,10 @@ pub(crate) fn float_is_int(n: f64) -> bool {
 /// None for non-numeric values. This is the single coercion point that keeps
 /// `Int` from multiplying the arithmetic match arms: ops just `as_f64` their
 /// operands and always produce `Number`.
-pub(crate) fn as_f64(val: &Value) -> Option<f64> {
-    match val {
-        Value::Float(n) => Some(*n),
-        Value::PosInt(u) => Some(*u as f64),
-        Value::NegInt(i) => Some(*i as f64),
-        _ => None,
-    }
-}
 
 /// Coerce a numeric value to i64 for integer-only ops (mod, bitwise, shifts,
 /// indices). `NegInt` is taken directly; a `PosInt` must fit in i64; a
 /// `Number` must be integer-valued. Returns None otherwise.
-pub(crate) fn as_i64(val: &Value) -> Option<i64> {
-    match val {
-        Value::NegInt(i) => Some(*i),
-        Value::PosInt(u) => i64::try_from(*u).ok(),
-        Value::Float(n) if float_is_int(*n) => Some(*n as i64),
-        _ => None,
-    }
-}
-
-pub(crate) fn is_number(val: &Value) -> bool {
-    matches!(val, Value::Float(_) | Value::PosInt(_) | Value::NegInt(_))
-}
 
 /// JS `ToNumber` applied to a string, as used when a loose `==` compares a
 /// number to a string. Trims whitespace, treats the empty string as 0, and
@@ -160,15 +307,5 @@ pub(crate) fn js_str_to_number(s: &str) -> f64 {
         0.0
     } else {
         t.parse::<f64>().unwrap_or(f64::NAN)
-    }
-}
-
-/// Helper for `loose_equal`: a numeric value vs a string. Coerces the string
-/// with `ToNumber` (`js_str_to_number`) and compares by f64. Non-numeric `num`
-/// (already filtered by the caller's `is_number` guard) yields `false`.
-pub(crate) fn num_loose_eq_str(num: &Value, s: &str) -> bool {
-    match as_f64(num) {
-        Some(a) => a == js_str_to_number(s),
-        None => false,
     }
 }

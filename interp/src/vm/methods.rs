@@ -1,0 +1,318 @@
+use super::*;
+
+impl VM {
+    pub fn new(code: Vec<Instr>) -> Self {
+        VM {
+            code,
+            arrays: Vec::new(),
+            objects: Vec::new(),
+            closures: Vec::new(),
+            cells: Vec::new(),
+            stack: Vec::new(),
+            // Root frame so that Local is valid from the start.
+            callstack: vec![CallFrame {
+                arg_count: 0,
+                local_count: 0,
+                return_addr: 0,
+                prev_fp: 0,
+                arguments_cache: None,
+                pending_upvals: SmallVec::new(),
+            }],
+            ip: 0,
+            fp: 0,
+            cur_local_count: 0,
+            fuel: DEFAULT_FUEL,
+        }
+    }
+
+    /// Construct a VM to run a compiled `Program`, with the blessed `state`
+    /// object installed at `objects[0]`. `state` is seeded from the prior run's
+    /// durable JSON (an object); `Null`/non-object seeds yield an empty `state`.
+    /// All durable/host-context access lowers to ordinary object ops on
+    /// `Object(0)`, so the host persists by extracting `objects[0]` after the
+    /// run and re-seeding it here next time. String literals are not
+    /// heap-allocated — they ride inline in `PushStr` as `RcStr` — so
+    /// `objects[0]` is the only pre-seeded slot and `Object(0)` stays stable
+    /// for the whole program.
+    pub fn for_program(program: Program, state: serde_json::Value) -> Result<Self, VMError> {
+        let mut vm = VM::new(program.code);
+        // Reserve objects[0] for `state` (filled in just below). Strings no longer
+        // occupy heap slots, so this is the sole pre-allocation.
+        vm.objects.push(IndexMap::new());
+        // Seed state's nested values (arrays/objects land at objects[1..]; their
+        // addresses are computed at runtime and stored in the state map).
+        if let serde_json::Value::Object(map) = state {
+            let mut entries = IndexMap::with_capacity(map.len());
+            for (k, v) in &map {
+                let sv = vm.json_to_stack_value(v, 0)?;
+                entries.insert(RcStr::from(k.as_str()), sv);
+            }
+            if let Some(o) = vm.objects.get_mut(0) {
+                *o = entries;
+            }
+        }
+        Ok(vm)
+    }
+
+    /// Extract the blessed `state` object (objects[0]) as a JSON value. This is the
+    /// persistence boundary the host uses to save/restore durable state between
+    /// runs.
+    pub fn state_to_json(&self) -> Result<serde_json::Value, VMError> {
+        self.stack_value_to_json(&Value::Object(0), 0)
+    }
+
+    // ── heap access helpers ──────────────────────────────────────────
+
+    /// Lowest stack index the current frame's expression temporaries may
+    /// occupy. Args live below `fp`, locals in `[fp, fp + local_count)`, and
+    /// temporaries above that. Stack-manipulation ops (Pick/Dig/Nip/Pop) must
+    /// not reach below this floor into locals, args, or the caller's stack.
+    pub(super) fn frame_floor(&self) -> usize {
+        self.fp as usize + self.cur_local_count as usize
+    }
+
+    /// If the instruction at `ip` is an `Invoke`, return its name and arg
+    /// count as owned values (releasing the borrow on `self.code` so the
+    /// caller can mutate the stack while batching consecutive invokes).
+    pub(super) fn invoke_at(&self, ip: CodeAddr) -> Option<(String, u32)> {
+        match self.code.get(ip as usize) {
+            Some(Instr::Invoke(name, nargs)) => Some((name.as_str().to_owned(), *nargs)),
+            _ => None,
+        }
+    }
+
+    /// Push a string value onto the stack. Strings live inline as `RcStr`, not
+    /// in `heap`, so this is just a stack push (no heap slot, no growth). The
+    /// builtin/string-producing counterpart to `alloc_array`/`alloc_object`.
+    pub(crate) fn push_str_value(&mut self, s: impl Into<RcStr>) {
+        self.stack.push(Value::String(s.into()));
+    }
+
+    pub(crate) fn alloc_array(&mut self, arr: ThinVec<Value>) -> Value {
+        let addr = self.arrays.len() as ArrayPtr;
+        self.arrays.push(arr);
+        Value::Array(addr)
+    }
+
+    pub(super) fn alloc_object(&mut self, obj: IndexMap<FieldName, Value>) -> Value {
+        let addr = self.objects.len() as ObjectPtr;
+        self.objects.push(obj);
+        Value::Object(addr)
+    }
+
+    pub(super) fn alloc_closure(&mut self, addr: CodeAddr, upvals: ThinVec<Value>) -> Value {
+        let idx = self.closures.len() as ClosurePtr;
+        self.closures.push(Closure { addr, upvals });
+        Value::Closure(idx)
+    }
+
+    /// Write the JS `ToString` representation of `val` into `buf`. Strings in
+    /// the heap are copied by slicing (zero extra allocation); other types are
+    /// converted and appended. Used by `to_js_string` (which wraps a buffer) and
+    /// directly by `Add` to avoid intermediate clones.
+    pub(super) fn write_js_string(&self, val: &Value, depth: usize, buf: &mut String) {
+        if depth > MAX_JSON_DEPTH {
+            return;
+        }
+        match val {
+            Value::Undefined => buf.push_str("undefined"),
+            Value::Null => buf.push_str("null"),
+            Value::Bool(b) => buf.push_str(if *b { "true" } else { "false" }),
+            Value::PosInt(u) => buf.push_str(&u.to_string()),
+            Value::NegInt(i) => buf.push_str(&i.to_string()),
+            Value::Float(n) => buf.push_str(&js_number_to_string(*n)),
+            Value::String(s) => buf.push_str(s.as_str()),
+            Value::Fn(_) | Value::Builtin(_) => {
+                buf.push_str("function () { [native code] }");
+            }
+            Value::Upval(_) => {}
+            Value::Array(p) => {
+                if let Some(arr) = self.arrays.get(*p as usize) {
+                    for (i, v) in arr.iter().enumerate() {
+                        if i > 0 {
+                            buf.push_str(",");
+                        }
+                        match v {
+                            Value::Null | Value::Undefined => {}
+                            _ => self.write_js_string(v, depth + 1, buf),
+                        }
+                    }
+                }
+            }
+            Value::Object(_) => buf.push_str("[object Object]"),
+            Value::Closure(_) => {
+                buf.push_str("function () { [native code] }");
+            }
+        }
+    }
+
+    /// JS `String(x)` / `ToString`. Delegates to [`write_js_string`], assembling
+    /// in a growable `String` and freezing to an immutable `RcStr` once.
+    pub(crate) fn to_js_string(&self, val: &Value, depth: usize) -> RcStr {
+        // Fast path: an existing string is already an `RcStr` — share it (a
+        // refcount bump) instead of copying its bytes through a fresh buffer.
+        if let Value::String(s) = val {
+            return s.clone();
+        }
+        let mut out = String::new();
+        self.write_js_string(val, depth, &mut out);
+        RcStr::from(out)
+    }
+
+    pub(super) fn pop_int(&mut self) -> Result<i64, VMError> {
+        self.stack
+            .pop()
+            .ok_or(VMError::StackUnderflow)?
+            .as_i64()
+            .ok_or(VMError::TypeError)
+    }
+
+    /// Pop a value and require it to be a String; return it (a refcount bump).
+    pub(super) fn pop_string(&mut self) -> Result<RcStr, VMError> {
+        match self.stack.pop().ok_or(VMError::StackUnderflow)? {
+            Value::String(s) => Ok(s),
+            _ => Err(VMError::TypeError),
+        }
+    }
+
+    /// Borrow the `&str` of an already-popped string value. The borrow is tied
+    /// to `val` (not the VM), so — unlike when strings lived in the heap — the
+    /// caller may freely mutate the VM while it is live. Use for read-only
+    /// builtins that push a scalar result without cloning the string.
+    pub(crate) fn str_from<'a>(&self, val: &'a Value) -> Result<&'a str, VMError> {
+        match val {
+            Value::String(s) => Ok(s.as_str()),
+            _ => Err(VMError::TypeError),
+        }
+    }
+
+    /// Extract an owned `RcStr` from an already-popped string value — a refcount
+    /// bump, sharing the same allocation. The clone sibling of `str_from`; use
+    /// it when the builtin must retain the string past a borrow of the VM.
+    pub(crate) fn string_from(&self, val: &Value) -> Result<RcStr, VMError> {
+        match val {
+            Value::String(s) => Ok(s.clone()),
+            _ => Err(VMError::TypeError),
+        }
+    }
+
+    // ── JSON conversion helpers ──────────────────────────────────────
+
+    pub(crate) fn stack_value_to_json(
+        &self,
+        val: &Value,
+        depth: usize,
+    ) -> Result<serde_json::Value, VMError> {
+        if depth > MAX_JSON_DEPTH {
+            return Err(VMError::ValueError);
+        }
+        Ok(match val {
+            Value::Null => serde_json::Value::Null,
+            Value::Bool(b) => serde_json::Value::Bool(*b),
+            // Integers carry through losslessly — both map onto a native
+            // serde_json::Number (this is the whole point of mirroring it).
+            Value::PosInt(u) => serde_json::Value::Number(serde_json::Number::from(*u)),
+            Value::NegInt(i) => serde_json::Value::Number(serde_json::Number::from(*i)),
+            // A function/closure has no JSON representation, and an Upval marker
+            // is an internal indirection that should never reach here: fail
+            // loudly rather than silently dropping it.
+            Value::Fn(_) | Value::Builtin(_) | Value::Upval(_) => {
+                return Err(VMError::ValueError);
+            }
+            // `undefined` has no JSON form. Like JS `JSON.stringify`, it is
+            // *dropped* in an object and coerced to *null* in an array (handled
+            // at those parent sites below); reaching here means it is the root
+            // value, where JS.stringify returns the JS value `undefined` — no
+            // JSON — so we surface an error rather than inventing one.
+            Value::Undefined => return Err(VMError::ValueError),
+            Value::Float(n) => {
+                // Preserve integer formatting when possible (f64-only VM
+                // internals, but JSON consumers care about int vs float).
+                if float_is_int(*n) && *n >= (i64::MIN as f64) && *n <= (i64::MAX as f64) {
+                    serde_json::Value::Number(serde_json::Number::from(*n as i64))
+                } else {
+                    // NaN/Infinity have no JSON representation -> null, rather
+                    // than silently coercing to 0.
+                    match serde_json::Number::from_f64(*n) {
+                        Some(num) => serde_json::Value::Number(num),
+                        None => serde_json::Value::Null,
+                    }
+                }
+            }
+            Value::String(s) => serde_json::Value::String(s.as_str().to_owned()),
+            Value::Array(p) => {
+                let arr = self.arrays.get(*p as usize).ok_or(VMError::ValueError)?;
+                serde_json::Value::Array(
+                    arr.iter()
+                        .map(|v| match v {
+                            // JS: `undefined` array slots stringify to `null`.
+                            Value::Undefined => Ok(serde_json::Value::Null),
+                            _ => self.stack_value_to_json(v, depth + 1),
+                        })
+                        .collect::<Result<_, _>>()?,
+                )
+            }
+            Value::Object(p) => {
+                let obj = self.objects.get(*p as usize).ok_or(VMError::ValueError)?;
+                let mut map = serde_json::Map::new();
+                for (k, v) in obj.iter() {
+                    // JS: properties whose value is `undefined` are omitted.
+                    if matches!(v, Value::Undefined) {
+                        continue;
+                    }
+                    map.insert(
+                        k.as_str().to_owned(),
+                        self.stack_value_to_json(v, depth + 1)?,
+                    );
+                }
+                serde_json::Value::Object(map)
+            }
+            // A closure has no JSON representation (see Fn above).
+            Value::Closure(_) => return Err(VMError::ValueError),
+        })
+    }
+
+    pub(crate) fn json_to_stack_value(
+        &mut self,
+        json: &serde_json::Value,
+        depth: usize,
+    ) -> Result<Value, VMError> {
+        if depth > MAX_JSON_DEPTH {
+            return Err(VMError::ValueError);
+        }
+        Ok(match json {
+            serde_json::Value::Null => Value::Null,
+            serde_json::Value::Bool(b) => Value::Bool(*b),
+            serde_json::Value::Number(n) => {
+                // Mirror serde's own split: non-negative -> PosInt (full u64),
+                // negative -> NegInt, fractions -> Number. Check as_u64 first so
+                // non-negatives become canonical PosInt.
+                if let Some(u) = n.as_u64() {
+                    Value::PosInt(u)
+                } else if let Some(i) = n.as_i64() {
+                    Value::NegInt(i)
+                } else {
+                    Value::Float(n.as_f64().unwrap_or(0.0))
+                }
+            }
+            serde_json::Value::String(s) => Value::String(RcStr::from(s.as_str())),
+            serde_json::Value::Array(arr) => {
+                let vals: ThinVec<Value> = arr
+                    .iter()
+                    .map(|v| self.json_to_stack_value(v, depth + 1))
+                    .collect::<Result<_, _>>()?;
+                self.alloc_array(vals)
+            }
+            serde_json::Value::Object(obj) => {
+                let mut map = IndexMap::new();
+                for (k, v) in obj {
+                    map.insert(
+                        RcStr::from(k.as_str()),
+                        self.json_to_stack_value(v, depth + 1)?,
+                    );
+                }
+                self.alloc_object(map)
+            }
+        })
+    }
+}

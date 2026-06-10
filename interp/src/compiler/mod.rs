@@ -19,7 +19,7 @@ use crate::analyzer::{self, ConstValue, ProgramAnalysis, RefSlot, frame_abs};
 use crate::builtin::Builtin;
 use crate::diag::Diagnostic;
 use crate::vm::RcStr;
-use crate::vm::{Instr, SetMode, SlotKind, Value};
+use crate::vm::{Instr, LocalIndex, SetMode, SlotKind, Value};
 
 /// A compiled program: the flat instruction stream, a parallel span table
 /// (`spans[ip]` = source byte offset of the instruction at `ip`), and the
@@ -388,7 +388,7 @@ impl<'src> Compiler<'src> {
                                 // cell's seed value is irrelevant here — this
                                 // SetLocal overwrites it with the initializer.
                                 self.fresh_cell_if_needed(slot, d.span.start);
-                                self.emit(Instr::SetLocal(slot), d.span.start);
+                                self.emit(Instr::SetLocal(slot as LocalIndex), d.span.start);
                             }
                         }
                         (None, Some(slot)) if !is_var => {
@@ -399,7 +399,7 @@ impl<'src> Compiler<'src> {
                             if !self.loops.is_empty() {
                                 self.fresh_cell_if_needed(slot, d.span.start);
                                 self.emit(Instr::PushUndefined, d.span.start);
-                                self.emit(Instr::SetLocal(slot), d.span.start);
+                                self.emit(Instr::SetLocal(slot as LocalIndex), d.span.start);
                             }
                         }
                         _ => {}
@@ -428,7 +428,7 @@ impl<'src> Compiler<'src> {
         match pat {
             ast::BindingPattern::BindingIdentifier(id) => {
                 match self.binding_slot(id.span.start) {
-                    Some(slot) => self.emit(Instr::SetLocal(slot), span),
+                    Some(slot) => self.emit(Instr::SetLocal(slot as LocalIndex), span),
                     None => {
                         // No slot (an earlier error, e.g. shadowing `state`).
                         self.emit(Instr::Pop(1), span);
@@ -641,7 +641,7 @@ impl<'src> Compiler<'src> {
     /// never in `fresh_owns`, so they are correctly left shared.
     fn fresh_cell_if_needed(&mut self, slot: u32, span: u32) {
         if !self.loops.is_empty() && self.slot_needs_fresh(slot) {
-            self.emit(Instr::FreshCell(slot), span);
+            self.emit(Instr::FreshCell(slot as LocalIndex), span);
         }
     }
 
@@ -740,7 +740,7 @@ impl<'src> Compiler<'src> {
         }
         // Initial per-iteration environment: seed each head binding's first cell.
         for &slot in &head_fresh {
-            self.emit(Instr::FreshCell(slot), span);
+            self.emit(Instr::FreshCell(slot as LocalIndex), span);
         }
         let top = self.new_label();
         let cont = self.new_label();
@@ -762,7 +762,7 @@ impl<'src> Compiler<'src> {
         // the new cell copies the current value forward, the update mutates the
         // new cell, and the next body sees/captures it.
         for &slot in &head_fresh {
-            self.emit(Instr::FreshCell(slot), span);
+            self.emit(Instr::FreshCell(slot as LocalIndex), span);
         }
         if let Some(update) = &s.update {
             self.compile_expr(update);
@@ -858,9 +858,9 @@ impl<'src> Compiler<'src> {
         // closures capture per-iteration copies; the SetLocal then binds the
         // element into that fresh cell. (`var` heads stay shared.)
         if self.slot_needs_fresh(slot) {
-            self.emit(Instr::FreshCell(slot), span);
+            self.emit(Instr::FreshCell(slot as LocalIndex), span);
         }
-        self.emit(Instr::SetLocal(slot), span); // [cont, idx]
+        self.emit(Instr::SetLocal(slot as LocalIndex), span); // [cont, idx]
         self.loops.push(LoopCtx {
             break_label: end,
             continue_label: Some(cont),
@@ -1070,7 +1070,7 @@ impl<'src> Compiler<'src> {
                     return;
                 }
             }
-            self.emit(Instr::Local(r.slot), span);
+            self.emit(Instr::Local(r.slot as LocalIndex), span);
             return;
         }
         // `arguments` (when not shadowed by a real binding above) is the current
@@ -1776,7 +1776,7 @@ impl<'src> Compiler<'src> {
     /// copy the buried object/key for the read.
     fn lvalue_emit_load(&mut self, lv: &LValue<'_, '_>, span: u32) {
         match lv {
-            LValue::Local(slot) => self.emit(Instr::Local(*slot), span),
+            LValue::Local(slot) => self.emit(Instr::Local(*slot as LocalIndex), span),
             LValue::Member(_, field) => {
                 self.emit(Instr::Pick(0), span); // copy the object
                 self.emit(Instr::ObjGet(RcStr::from(field.as_str())), span);
@@ -1795,7 +1795,7 @@ impl<'src> Compiler<'src> {
     fn lvalue_emit_store(&mut self, lv: &LValue<'_, '_>, span: u32) {
         match lv {
             LValue::Local(slot) => {
-                self.emit(Instr::TeeLocal(*slot), span);
+                self.emit(Instr::TeeLocal(*slot as LocalIndex), span);
             }
             LValue::Member(_, field) => self.emit(
                 Instr::ObjSet(RcStr::from(field.as_str()), SetMode::New),
@@ -1812,7 +1812,7 @@ impl<'src> Compiler<'src> {
     fn lvalue_emit_store_void(&mut self, lv: &LValue<'_, '_>, span: u32) {
         match lv {
             LValue::Local(slot) => {
-                self.emit(Instr::SetLocal(*slot), span);
+                self.emit(Instr::SetLocal(*slot as LocalIndex), span);
             }
             LValue::Member(_, field) => {
                 self.emit(
@@ -1948,7 +1948,7 @@ impl<'src> Compiler<'src> {
                 if r.is_const {
                     self.error(id_span, format!("assignment to constant `{name}`"));
                 }
-                self.emit(Instr::SetLocal(r.slot), span);
+                self.emit(Instr::SetLocal(r.slot as LocalIndex), span);
             }
             None => {
                 self.error(
@@ -2460,7 +2460,7 @@ impl<'src> Compiler<'src> {
                     // Dynamic call: push args, load callee, CallDyn (installs
                     // upvals for captured/closure callees).
                     self.compile_args(argv);
-                    self.emit(Instr::Local(r.slot), span);
+                    self.emit(Instr::Local(r.slot as LocalIndex), span);
                     self.emit(Instr::CallDyn(argv.len() as u32), span);
                 }
             }
@@ -2544,9 +2544,15 @@ impl<'src> Compiler<'src> {
                         if captures.is_empty() {
                             self.emit(Instr::PushFn(label), span);
                         } else {
-                            self.emit(Instr::MakeClosure(label, captures.into()), span);
+                            self.emit(
+                                Instr::MakeClosure(
+                                    label,
+                                    captures.iter().map(|&c| c as LocalIndex).collect(),
+                                ),
+                                span,
+                            );
                         }
-                        self.emit(Instr::SetLocal(slot), span);
+                        self.emit(Instr::SetLocal(slot as LocalIndex), span);
                     }
                 }
             }
@@ -2656,7 +2662,10 @@ impl<'src> Compiler<'src> {
         if captures.is_empty() {
             self.emit(Instr::PushFn(label), span);
         } else {
-            self.emit(Instr::MakeClosure(label, captures.into()), span);
+            self.emit(
+                Instr::MakeClosure(label, captures.iter().map(|&c| c as LocalIndex).collect()),
+                span,
+            );
         }
     }
 
@@ -2757,7 +2766,7 @@ impl<'src> Compiler<'src> {
         if self_name.is_some() && !self.is_const_fn_scope(scope_id) {
             let self_slot = frame_abs(own_local_count, nparams, upval_count);
             self.emit(Instr::PushFn(label), span);
-            self.emit(Instr::SetLocal(self_slot), span);
+            self.emit(Instr::SetLocal(self_slot as LocalIndex), span);
         }
 
         // Inner function declarations: emit their bindings in this prologue.
@@ -2800,18 +2809,18 @@ impl<'src> Compiler<'src> {
             if let Some(default) = default_expr {
                 // if Local(slot) === undefined { slot = default }
                 let skip_default = self.new_label();
-                self.emit(Instr::Local(slot), span);
+                self.emit(Instr::Local(slot as LocalIndex), span);
                 self.emit(Instr::PushUndefined, span);
                 self.emit(Instr::Eq, span);
                 self.emit(Instr::JFalse(skip_default), span);
                 self.compile_expr(default);
-                self.emit(Instr::SetLocal(slot), span);
+                self.emit(Instr::SetLocal(slot as LocalIndex), span);
                 self.emit(Instr::Label(skip_default), span);
             }
         }
         if needs_box {
             // Promote the plain arg value in the slot to a shared cell.
-            self.emit(Instr::FreshCell(slot), span);
+            self.emit(Instr::FreshCell(slot as LocalIndex), span);
         }
     }
 }

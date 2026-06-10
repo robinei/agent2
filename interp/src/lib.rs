@@ -12,10 +12,10 @@ pub mod prelude;
 pub mod rc_str;
 pub mod vm;
 
-pub use compiler::{compile, Program};
+pub use compiler::{Program, compile};
 pub use diag::Diagnostic;
 pub use rc_str::RcStr;
-pub use vm::{DEFAULT_FUEL, InvokeCall, Instr, StepResult, VM, VMError, Value};
+pub use vm::{DEFAULT_FUEL, Instr, InvokeCall, StepResult, VM, VMError, Value};
 
 // ── test-only allocation counter ─────────────────────────────────────────────
 

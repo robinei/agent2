@@ -1,5 +1,6 @@
 #[cfg(test)]
 mod tests {
+    use crate::builtin::Builtin;
     use crate::vm::instr::Instr::*;
     use crate::vm::*;
 
