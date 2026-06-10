@@ -1918,7 +1918,7 @@ fn string_empty_needle_index_of() {
             other => panic!("unexpected effect: {other:?}"),
         }
     }
-    assert_eq!(vm.stack.last(), Some(&Value::Float(0.0)));
+    assert_eq!(vm.stack.last(), Some(&Value::PosInt(0)));
 }
 
 // ── resource guards ─────────────────────────────────────────────

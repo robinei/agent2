@@ -281,8 +281,8 @@ pub enum ErrorKind {
 ///
 /// # Pop-first invariant
 ///
-/// A `PushValueThenContinue` error is only constructed **after** the
-/// instruction's full operand consumption from the expression stack, so
+/// A `PushValueThenContinue` error has its instruction's operands
+/// consumed before the error propagates out of `step()`, so
 /// `resume_with` needs no per-instruction stack fixup — it just pushes
 /// the replacement value and advances ip.
 ///
@@ -297,7 +297,7 @@ pub enum ErrorKind {
 /// | IndexGet (non-container, bad index, mid-codepoint) | TypeError/ValueError | PushValueThenContinue | container+key popped first |
 /// | IndexSet (non-container, negative/OOB index) | TypeError/ValueError | PushValueThenContinue | val+key+container popped first |
 /// | ObjHas / ObjDelete (non-object) | TypeError | PushValueThenContinue | field+object popped first |
-/// | Builtin take_args / check_arity! bodies | TypeError/ValueError | PushValueThenContinue | args popped before type check |
+/// | Builtin handlers (args truncated by `Builtin::call` epilogue on the error path) | TypeError/ValueError | PushValueThenContinue | args truncated before error propagates |
 /// | JSON depth / unsupported type (JSON.stringify, to_json) | ValueError | PushValueThenContinue | args popped by builtin before conversion |
 /// | **ObjGet** (non-object peek) | TypeError | **NotResumable** | object peeked (not popped) before check |
 /// | **ObjSet** (non-object peek) | TypeError | **NotResumable** | value popped, object peeked (not fully consumed) |

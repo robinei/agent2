@@ -15,6 +15,7 @@
 //! is a well-formed expression.
 
 use crate::vm::{CodeAddr, ErrorKind, RcStr, VM, VMError, Value};
+use smallvec::SmallVec;
 use thin_vec::ThinVec;
 
 /// Construct a `NotResumable` error without borrowing `VM` (for use when a
@@ -245,17 +246,19 @@ impl Builtin {
     /// Dispatch: run the builtin against `vm`, consuming `argc` stack arguments
     /// and pushing one result.
     ///
-    /// Arity is enforced centrally from [`meta`](Builtin::meta) (the single
-    /// source of truth) so every call path is consistent — including the
-    /// first-class-value path where a builtin is invoked via `CallDyn` (e.g.
-    /// `arr.map(Math.sqrt)`, where the helper passes `(element, index, array)`).
-    /// Fewer than `min_args` is a `BadArg` error. **Surplus arguments are left
-    /// in place**: each body pops *all* `argc` arguments (keeping the stack
-    /// balanced) and simply ignores any beyond the ones it reads, matching JS,
-    /// which evaluates but ignores extra arguments. So no stack truncation is
-    /// needed here — only the lower bound is checked.
+    /// Arguments are read in-place via `Args` — never moved, cloned, or
+    /// collected. The epilogue truncates the stack and pushes the result on
+    /// both the `Ok` and `Err` paths, preserving the pop-first invariant.
     pub fn call(self, vm: &mut VM, argc: u32) -> Result<(), VMError> {
+        let n = argc as usize;
+        if vm.stack.len() < n {
+            return Err(vm.fail(ErrorKind::StackUnderflow, "stack underflow"));
+        }
+        let base = vm.stack.len() - n;
+        let args = Args { base, argc: n };
         if argc < self.meta().min_args {
+            // Truncate arguments before returning the error.
+            vm.stack.truncate(base);
             return Err(vm.fail(
                 ErrorKind::BadArg,
                 format!(
@@ -266,101 +269,91 @@ impl Builtin {
         }
         let result = match self {
             // ── array methods ──
-            Builtin::ArrayPush => array_push(vm, argc),
-            Builtin::ArrayPop => array_pop(vm, argc),
-            Builtin::ArrayShift => array_shift(vm, argc),
-            Builtin::ArrayUnshift => array_unshift(vm, argc),
-            Builtin::ArrayJoin => array_join(vm, argc),
+            Builtin::ArrayPush => array_push(vm, args),
+            Builtin::ArrayPop => array_pop(vm, args),
+            Builtin::ArrayShift => array_shift(vm, args),
+            Builtin::ArrayUnshift => array_unshift(vm, args),
+            Builtin::ArrayJoin => array_join(vm, args),
             // ── string methods ──
-            Builtin::StrSplit => str_split(vm, argc),
-            Builtin::StrIncludes => str_includes(vm, argc),
-            Builtin::StrIndexOf => str_index_of(vm, argc),
-            Builtin::StrLastIndexOf => str_last_index_of(vm, argc),
-            Builtin::StrStartsWith => str_starts_with(vm, argc),
-            Builtin::StrEndsWith => str_ends_with(vm, argc),
-            Builtin::StrSlice => str_slice(vm, argc),
-            Builtin::StrTrim => str_trim(vm, argc),
+            Builtin::StrSplit => str_split(vm, args),
+            Builtin::StrIncludes => str_includes(vm, args),
+            Builtin::StrIndexOf => str_index_of(vm, args),
+            Builtin::StrLastIndexOf => str_last_index_of(vm, args),
+            Builtin::StrStartsWith => str_starts_with(vm, args),
+            Builtin::StrEndsWith => str_ends_with(vm, args),
+            Builtin::StrSlice => str_slice(vm, args),
+            Builtin::StrTrim => str_trim(vm, args),
             // ── object static ──
-            Builtin::ObjKeys => obj_keys(vm, argc),
-            Builtin::ObjValues => obj_values(vm, argc),
+            Builtin::ObjKeys => obj_keys(vm, args),
+            Builtin::ObjValues => obj_values(vm, args),
             // ── JSON static ──
-            Builtin::JSONParse => json_parse(vm, argc),
-            Builtin::JSONStringify => json_stringify(vm, argc),
+            Builtin::JSONParse => json_parse(vm, args),
+            Builtin::JSONStringify => json_stringify(vm, args),
             // ── Number static ──
-            Builtin::NumberIsInteger => number_is_integer(vm, argc),
-            Builtin::NumberParseInt => number_parse_int(vm, argc),
-            Builtin::NumberParseFloat => number_parse_float(vm, argc),
+            Builtin::NumberIsInteger => number_is_integer(vm, args),
+            Builtin::NumberParseInt => number_parse_int(vm, args),
+            Builtin::NumberParseFloat => number_parse_float(vm, args),
             // ── Array static ──
-            Builtin::ArrayIsArray => array_is_array(vm, argc),
+            Builtin::ArrayIsArray => array_is_array(vm, args),
             // ── Math ──
-            Builtin::MathAbs => math_unary(vm, argc, |n| n.abs()),
-            Builtin::MathSqrt => math_unary(vm, argc, |n| n.sqrt()),
-            Builtin::MathCeil => math_unary(vm, argc, |n| n.ceil()),
-            Builtin::MathFloor => math_unary(vm, argc, |n| n.floor()),
-            Builtin::MathRound => math_unary(vm, argc, |n| n.round()),
-            Builtin::MathSign => math_unary(vm, argc, |n| n.signum()),
-            Builtin::MathMin => math_min(vm, argc),
-            Builtin::MathMax => math_max(vm, argc),
-            Builtin::MathPow => math_pow(vm, argc),
+            Builtin::MathAbs => math_unary(vm, args, |n| n.abs()),
+            Builtin::MathSqrt => math_unary(vm, args, |n| n.sqrt()),
+            Builtin::MathCeil => math_unary(vm, args, |n| n.ceil()),
+            Builtin::MathFloor => math_unary(vm, args, |n| n.floor()),
+            Builtin::MathRound => math_unary(vm, args, |n| n.round()),
+            Builtin::MathSign => math_unary(vm, args, |n| n.signum()),
+            Builtin::MathMin => math_min(vm, args),
+            Builtin::MathMax => math_max(vm, args),
+            Builtin::MathPow => math_pow(vm, args),
         };
-        // Prefix failures with the builtin's name (Step 4: builtin failures
-        // identify themselves via `BuiltinMeta::name`).
-        result.map_err(|mut e| {
-            e.message = format!("in `{}`: {}", self.meta().name, e.message);
-            e
-        })
+        // Epilogue: truncate args on both paths, push result on Ok.
+        vm.stack.truncate(args.base);
+        match result {
+            Ok(val) => {
+                vm.stack.push(val);
+                Ok(())
+            }
+            Err(mut e) => {
+                e.message = format!("in `{}`: {}", self.meta().name, e.message);
+                Err(e)
+            }
+        }
+    }
+}
+
+// ── argument accessor ────────────────────────────────────────────────────────
+
+/// Zero-cost argument handle: a short-lived borrow token that reads arguments
+/// in-place on the stack. `Copy` so handlers can pass it by value.
+///
+/// An absent argument (index ≥ argc) yields `&Value::Undefined`, matching JS
+/// semantics. Handlers apply JS-level defaults for optional args (e.g. `join`
+/// separator → `","`, `slice` end → length) themselves.
+#[derive(Clone, Copy)]
+struct Args {
+    /// Index of arg 0 in `vm.stack` (the deepest).
+    base: usize,
+    /// Number of arguments present.
+    argc: usize,
+}
+
+impl Args {
+    /// Arg `i`, or `&Value::Undefined` if absent. Zero-cost — no clone.
+    fn get<'a>(&self, vm: &'a VM, i: usize) -> &'a Value {
+        if i < self.argc {
+            &vm.stack[self.base + i]
+        } else {
+            &Value::Undefined
+        }
+    }
+    /// All args (arg 0 = receiver, deepest) as a read-only slice.
+    #[allow(dead_code)]
+    fn slice<'a>(&self, vm: &'a VM) -> &'a [Value] {
+        &vm.stack[self.base..self.base + self.argc]
     }
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
-
-/// Index (from the stack base) of the first argument (arg 0, the deepest).
-/// Validates that at least `argc` values are on the stack.
-fn arg_base(vm: &VM, argc: u32) -> Result<usize, VMError> {
-    let n = argc as usize;
-    if vm.stack.len() < n {
-        return Err(vm.fail(ErrorKind::StackUnderflow, "stack underflow"));
-    }
-    Ok(vm.stack.len() - n)
-}
-
-/// Clone the top `argc` args into a fixed-size array (arg 0 first, deepest) and
-/// truncate the stack by `argc`, popping all arguments. Each clone is a refcount
-/// bump for strings and a cheap bit-copy otherwise. Surplus args past `N` are
-/// silently dropped (JS ignores extra arguments). The min arity is already
-/// guaranteed by [`Builtin::call`] from `meta()`.
-fn take_args<const N: usize>(vm: &mut VM, argc: u32) -> Result<[Value; N], VMError> {
-    let base = arg_base(vm, argc)?;
-    let n = (argc as usize).min(N);
-    // Clone each arg out of the stack (a refcount bump for strings, a bit-copy
-    // otherwise); surplus slots default to `Null`. `Value` is no longer
-    // `Copy`, so this can't be an array-repeat init.
-    let out = std::array::from_fn(|i| {
-        if i < n {
-            vm.stack[base + i].clone()
-        } else {
-            Value::Null
-        }
-    });
-    vm.stack.truncate(base);
-    Ok(out)
-}
-
-/// Pop all `argc` arguments (arg 0 deepest-first). The lower arity bound is
-/// already enforced by [`Builtin::call`] from `meta()`, so a fixed-arity body
-/// can index `args[0..want]` directly; `$want` documents that expectation and
-/// is checked in debug builds. Any surplus args past `want` are popped (so the
-/// stack stays balanced) but ignored — JS evaluates yet ignores extra args.
-/// Now delegates to `take_args` (zero-alloc). Returns `Result<[Value; N], VMError>`.
-macro_rules! check_arity {
-    ($vm:expr, $argc:expr, $want:expr) => {{
-        debug_assert!(
-            $argc as usize >= $want,
-            "Builtin::call guarantees at least the minimum arity"
-        );
-        take_args::<{ $want }>($vm, $argc)
-    }};
-}
 
 /// Clamp a byte offset into `[0, s.len()]` and round it up to the next UTF-8
 /// char boundary, so it can always be used as a slice start. Used to apply JS's
@@ -370,6 +363,16 @@ fn clamp_start(s: &str, idx: usize) -> usize {
     let mut i = idx.min(s.len());
     while i < s.len() && !s.is_char_boundary(i) {
         i += 1;
+    }
+    i
+}
+
+/// Clamp a byte offset into `[0, s.len()]` and round it down to the previous
+/// UTF-8 char boundary, so it can safely be used as an end-of-slice boundary.
+fn clamp_end(s: &str, idx: usize) -> usize {
+    let mut i = idx.min(s.len());
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
     }
     i
 }
@@ -445,31 +448,29 @@ fn js_parse_int(input: &str, mut radix: i64) -> f64 {
 
 // ── array method implementations ─────────────────────────────────────────────
 
-/// `arr.push(x)` → appends `x` and returns the new length.
-fn array_push(vm: &mut VM, argc: u32) -> Result<(), VMError> {
-    let args = take_args::<2>(vm, argc)?;
-    let arr_ptr = match &args[0] {
+/// `arr.push(a, b, …)` → appends all arguments and returns the new length.
+fn array_push(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let arr_ptr = match args.get(vm, 0) {
         Value::Array(p) => *p,
         _ => return Err(vm.fail(ErrorKind::TypeError, "type error")),
     };
     let ip = vm.ip;
+    // Clone the values to push first (immutable borrow of vm.stack), then
+    // mutate the array.
+    let to_push: SmallVec<[Value; 8]> = args.slice(vm)[1..].iter().cloned().collect();
     let arr = vm
         .arrays
         .get_mut(arr_ptr as usize)
         .ok_or_else(|| fail_at(ip, ErrorKind::TypeError, "bad array pointer"))?;
-    // No element → no-op, just return length (JS `[].push()` returns 0).
-    if argc > 1 {
-        arr.push(args[1].clone());
+    for v in to_push {
+        arr.push(v);
     }
-    let len = arr.len();
-    vm.stack.push(Value::Float(len as f64));
-    Ok(())
+    Ok(int_value(arr.len() as f64))
 }
 
 /// `arr.pop()` → removes and returns the last element.
-fn array_pop(vm: &mut VM, argc: u32) -> Result<(), VMError> {
-    let args = check_arity!(vm, argc, 1)?;
-    let arr_ptr = match &args[0] {
+fn array_pop(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let arr_ptr = match args.get(vm, 0) {
         Value::Array(p) => *p,
         _ => return Err(vm.fail(ErrorKind::TypeError, "type error")),
     };
@@ -481,14 +482,12 @@ fn array_pop(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     let val = arr
         .pop()
         .ok_or_else(|| vm.fail(ErrorKind::ValueError, "value error"))?;
-    vm.stack.push(val);
-    Ok(())
+    Ok(val)
 }
 
 /// `arr.shift()` → removes and returns the first element.
-fn array_shift(vm: &mut VM, argc: u32) -> Result<(), VMError> {
-    let args = check_arity!(vm, argc, 1)?;
-    let arr_ptr = match &args[0] {
+fn array_shift(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let arr_ptr = match args.get(vm, 0) {
         Value::Array(p) => *p,
         _ => return Err(vm.fail(ErrorKind::TypeError, "type error")),
     };
@@ -500,49 +499,39 @@ fn array_shift(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     if arr.is_empty() {
         return Err(vm.fail(ErrorKind::ValueError, "value error"));
     }
-    let val = arr.remove(0);
-    vm.stack.push(val);
-    Ok(())
+    Ok(arr.remove(0))
 }
 
-/// `arr.unshift(x)` → prepends `x` and returns the new length.
-fn array_unshift(vm: &mut VM, argc: u32) -> Result<(), VMError> {
-    let args = take_args::<2>(vm, argc)?;
-    let arr_ptr = match &args[0] {
+/// `arr.unshift(a, b, …)` → prepends all arguments (preserving order) and
+/// returns the new length.
+fn array_unshift(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let arr_ptr = match args.get(vm, 0) {
         Value::Array(p) => *p,
         _ => return Err(vm.fail(ErrorKind::TypeError, "type error")),
     };
     let ip = vm.ip;
+    // Clone the values first (immutable borrow), then mutate.
+    let to_insert: SmallVec<[Value; 8]> = args.slice(vm)[1..].iter().cloned().collect();
     let arr = vm
         .arrays
         .get_mut(arr_ptr as usize)
         .ok_or_else(|| fail_at(ip, ErrorKind::TypeError, "bad array pointer"))?;
-    // No element → no-op, just return length.
-    if argc > 1 {
-        arr.insert(0, args[1].clone());
+    // Insert in reverse so order is preserved: unshift(1,2) → [1,2,...]
+    for v in to_insert.into_iter().rev() {
+        arr.insert(0, v);
     }
-    let len = arr.len();
-    vm.stack.push(Value::Float(len as f64));
-    Ok(())
+    Ok(int_value(arr.len() as f64))
 }
 
 /// `arr.join([sep])` → joins with sep (default ",").
-fn array_join(vm: &mut VM, argc: u32) -> Result<(), VMError> {
-    let args = take_args::<2>(vm, argc)?;
-    let (arr_ptr, sep) = match argc {
-        1 => match &args[0] {
-            Value::Array(p) => (*p, ",".into()),
-            _ => return Err(vm.fail(ErrorKind::TypeError, "type error")),
-        },
-        2 => {
-            let p = match &args[0] {
-                Value::Array(p) => *p,
-                _ => return Err(vm.fail(ErrorKind::TypeError, "type error")),
-            };
-            let s = vm.to_js_string(&args[1], 0);
-            (p, s)
-        }
-        _ => return Err(vm.fail(ErrorKind::BadArg, "bad argument")),
+fn array_join(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let arr_ptr = match args.get(vm, 0) {
+        Value::Array(p) => *p,
+        _ => return Err(vm.fail(ErrorKind::TypeError, "type error")),
+    };
+    let sep = match args.get(vm, 1) {
+        Value::Undefined => RcStr::from(","),
+        v => vm.to_js_string(v, 0),
     };
     let arr = vm
         .arrays
@@ -558,201 +547,166 @@ fn array_join(vm: &mut VM, argc: u32) -> Result<(), VMError> {
             joined.push_str(vm.to_js_string(v, 0).as_str());
         }
     }
-    vm.push_str_value(joined);
-    Ok(())
+    Ok(Value::String(RcStr::from(joined)))
 }
 
 // ── string method implementations ────────────────────────────────────────────
 
 /// `s.split(delim[, limit])` → array of substrings.
-fn str_split(vm: &mut VM, argc: u32) -> Result<(), VMError> {
-    let args = take_args::<3>(vm, argc)?;
-    let (s, delim, limit) = match argc {
-        2 => (vm.string_from(&args[0])?, vm.string_from(&args[1])?, None),
-        3 => (vm.string_from(&args[0])?, vm.string_from(&args[1])?, {
-            let lim = args[2]
+fn str_split(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let s = vm.string_from(args.get(vm, 0))?;
+    // split() / split(undefined) → [s]
+    let delim = args.get(vm, 1);
+    if matches!(delim, Value::Undefined) {
+        let parts: ThinVec<Value> = thin_vec::thin_vec![Value::String(s)];
+        return Ok(vm.alloc_array(parts));
+    }
+    let delim_s = vm.string_from(delim)?;
+    let limit = match args.get(vm, 2) {
+        Value::Undefined => None,
+        v => {
+            let lim = v
                 .as_i64()
                 .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?;
-            if lim < 0 {
-                return Err(vm.fail(ErrorKind::ValueError, "value error"));
-            }
-            Some(lim as usize)
-        }),
-        _ => return Err(vm.fail(ErrorKind::BadArg, "bad argument")),
+            // JS: ToUint32 coercion — negative wraps huge → effectively no limit
+            if lim < 0 { None } else { Some(lim as usize) }
+        }
     };
-    let parts: ThinVec<Value> = match limit {
-        Some(lim) => s
-            .splitn(lim, delim.as_str())
+    let parts: ThinVec<Value> = if delim_s.is_empty() {
+        // split("") → array of characters (per UTF-8 char here — byte-string
+        // divergence). No leading/trailing empty entries.
+        let chars: ThinVec<Value> = s
+            .chars()
+            .map(|c| Value::String(RcStr::from(c.to_string())))
+            .collect();
+        match limit {
+            Some(lim) => chars.into_iter().take(lim).collect(),
+            None => chars,
+        }
+    } else {
+        let splits: ThinVec<Value> = s
+            .split(delim_s.as_str())
             .map(|p| Value::String(RcStr::from(p)))
-            .collect(),
-        None => s
-            .split(delim.as_str())
-            .map(|p| Value::String(RcStr::from(p)))
-            .collect(),
+            .collect();
+        match limit {
+            Some(lim) => splits.into_iter().take(lim).collect(),
+            None => splits,
+        }
     };
-    let ptr = vm.alloc_array(parts);
-    vm.stack.push(ptr);
-    Ok(())
+    Ok(vm.alloc_array(parts))
 }
 
 /// `s.includes(needle[, start])` → bool.
-fn str_includes(vm: &mut VM, argc: u32) -> Result<(), VMError> {
-    let args = take_args::<3>(vm, argc)?;
-    let (haystack, needle, start) = match argc {
-        2 => (vm.str_from(&args[0])?, vm.str_from(&args[1])?, None),
-        3 => (
-            vm.str_from(&args[0])?,
-            vm.str_from(&args[1])?,
-            Some(
-                args[2]
-                    .as_i64()
-                    .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?,
-            ),
-        ),
-        _ => return Err(vm.fail(ErrorKind::BadArg, "bad argument")),
+fn str_includes(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let haystack = vm.str_from(args.get(vm, 0))?;
+    let needle = vm.str_from(args.get(vm, 1))?;
+    let start = match args.get(vm, 2) {
+        Value::Undefined => 0i64,
+        v => v
+            .as_i64()
+            .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?,
     };
-    let found = match start {
-        Some(s) => {
-            let start = clamp_start(haystack, s.max(0) as usize);
-            haystack[start..].contains(needle)
-        }
-        None => haystack.contains(needle),
-    };
-    vm.stack.push(Value::Bool(found));
-    Ok(())
+    let start = clamp_start(haystack, start.max(0) as usize);
+    Ok(Value::Bool(haystack[start..].contains(needle)))
 }
 
 /// `s.indexOf(needle[, start])` → int (or -1).
-fn str_index_of(vm: &mut VM, argc: u32) -> Result<(), VMError> {
-    let args = take_args::<3>(vm, argc)?;
-    let (haystack, needle, start) = match argc {
-        2 => (vm.str_from(&args[0])?, vm.str_from(&args[1])?, None),
-        3 => (
-            vm.str_from(&args[0])?,
-            vm.str_from(&args[1])?,
-            Some(
-                args[2]
-                    .as_i64()
-                    .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?,
-            ),
-        ),
-        _ => return Err(vm.fail(ErrorKind::BadArg, "bad argument")),
+fn str_index_of(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let haystack = vm.str_from(args.get(vm, 0))?;
+    let needle = vm.str_from(args.get(vm, 1))?;
+    let start = match args.get(vm, 2) {
+        Value::Undefined => 0i64,
+        v => v
+            .as_i64()
+            .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?,
     };
-    let pos = match start {
-        Some(s) => {
-            let start = clamp_start(haystack, s.max(0) as usize);
-            haystack[start..].find(needle).map(|p| (p + start) as f64)
-        }
-        None => haystack.find(needle).map(|p| p as f64),
-    };
-    vm.stack.push(Value::Float(pos.unwrap_or(-1.0)));
-    Ok(())
+    let start = clamp_start(haystack, start.max(0) as usize);
+    let pos = haystack[start..].find(needle).map(|p| (p + start) as f64);
+    Ok(int_value(pos.unwrap_or(-1.0)))
 }
 
 /// `s.lastIndexOf(needle[, start])` → int (or -1).
-fn str_last_index_of(vm: &mut VM, argc: u32) -> Result<(), VMError> {
-    let args = take_args::<3>(vm, argc)?;
-    let (haystack, needle, start) = match argc {
-        2 => (vm.str_from(&args[0])?, vm.str_from(&args[1])?, None),
-        3 => (
-            vm.str_from(&args[0])?,
-            vm.str_from(&args[1])?,
-            Some(
-                args[2]
-                    .as_i64()
-                    .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?,
-            ),
-        ),
-        _ => return Err(vm.fail(ErrorKind::BadArg, "bad argument")),
+fn str_last_index_of(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let haystack = vm.str_from(args.get(vm, 0))?;
+    let needle = vm.str_from(args.get(vm, 1))?;
+    let start = match args.get(vm, 2) {
+        Value::Undefined => haystack.len() as i64,
+        v => v
+            .as_i64()
+            .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?,
     };
-    let pos = match start {
-        Some(s) => {
-            let from = s.max(0) as usize;
-            let mut end = haystack.len().min(from + needle.len());
-            while end > 0 && !haystack.is_char_boundary(end) {
-                end -= 1;
-            }
-            haystack[..end].rfind(needle).map(|p| p as f64)
-        }
-        None => haystack.rfind(needle).map(|p| p as f64),
-    };
-    vm.stack.push(Value::Float(pos.unwrap_or(-1.0)));
-    Ok(())
+    let from = start.max(0) as usize;
+    let end = clamp_end(haystack, from + needle.len());
+    let pos = haystack[..end].rfind(needle).map(|p| p as f64);
+    Ok(int_value(pos.unwrap_or(-1.0)))
 }
 
 /// `s.startsWith(prefix)` → bool.
-fn str_starts_with(vm: &mut VM, argc: u32) -> Result<(), VMError> {
-    let args = check_arity!(vm, argc, 2)?;
-    let haystack = vm.str_from(&args[0])?;
-    let prefix = vm.str_from(&args[1])?;
-    vm.stack.push(Value::Bool(haystack.starts_with(prefix)));
-    Ok(())
+fn str_starts_with(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let haystack = vm.str_from(args.get(vm, 0))?;
+    let prefix = vm.str_from(args.get(vm, 1))?;
+    Ok(Value::Bool(haystack.starts_with(prefix)))
 }
 
 /// `s.endsWith(suffix)` → bool.
-fn str_ends_with(vm: &mut VM, argc: u32) -> Result<(), VMError> {
-    let args = check_arity!(vm, argc, 2)?;
-    let haystack = vm.str_from(&args[0])?;
-    let suffix = vm.str_from(&args[1])?;
-    vm.stack.push(Value::Bool(haystack.ends_with(suffix)));
-    Ok(())
+fn str_ends_with(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let haystack = vm.str_from(args.get(vm, 0))?;
+    let suffix = vm.str_from(args.get(vm, 1))?;
+    Ok(Value::Bool(haystack.ends_with(suffix)))
 }
 
-/// `s.slice(start[, end])` → substring over a half-open byte range. Unlike JS,
-/// negative indices are rejected (`ValueError`) rather than counted from the
-/// end; `start`/`end` must be in range and on char boundaries. Optional `end`
-/// defaults to the string length.
-fn str_slice(vm: &mut VM, argc: u32) -> Result<(), VMError> {
-    let args = take_args::<3>(vm, argc)?;
-    let (s, start, end): (RcStr, usize, usize) = match argc {
-        2 => {
-            let s = vm.string_from(&args[0])?;
-            let start = args[1]
-                .as_i64()
-                .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?;
-            if start < 0 {
-                return Err(vm.fail(ErrorKind::ValueError, "value error"));
-            }
-            let start = start as usize;
-            let end = s.len();
-            (s, start, end)
+/// `s.slice(start[, end])` → substring over a half-open byte range.
+/// JS semantics: negative indices count from end, everything clamps,
+/// `start ≥ end` → `""`. Only mid-codepoint is an error (byte-string divergence).
+fn str_slice(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let s = vm.string_from(args.get(vm, 0))?;
+    let len = s.len() as i64;
+
+    let to_offset = |v: &Value, default: i64| -> Result<i64, VMError> {
+        if matches!(v, Value::Undefined) {
+            return Ok(default);
         }
-        3 => {
-            let s = vm.string_from(&args[0])?;
-            let start = args[1]
-                .as_i64()
-                .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?;
-            let end = args[2]
-                .as_i64()
-                .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?;
-            if start < 0 || end < 0 || start > end {
-                return Err(vm.fail(ErrorKind::ValueError, "value error"));
-            }
-            (s, start as usize, end as usize)
+        let n = v
+            .as_i64()
+            .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?;
+        if n < 0 {
+            Ok((n + len).max(0))
+        } else {
+            Ok(n.min(len))
         }
-        _ => return Err(vm.fail(ErrorKind::BadArg, "bad argument")),
     };
-    if start > s.len() || end > s.len() || !s.is_char_boundary(start) || !s.is_char_boundary(end) {
+
+    let start = to_offset(args.get(vm, 1), 0)? as usize;
+    let end = to_offset(args.get(vm, 2), len)?.max(0) as usize;
+
+    // JS: start ≥ end → ""
+    if start >= end {
+        return Ok(Value::String(RcStr::from("")));
+    }
+
+    let end = end.min(s.len());
+    let start_clamped = clamp_start(&s, start.min(s.len()));
+    let end_clamped = clamp_end(&s, end);
+
+    // Mid-codepoint error (only error case)
+    if start_clamped < start || end_clamped > end {
         return Err(vm.fail(ErrorKind::ValueError, "value error"));
     }
-    vm.push_str_value(&s[start..end]);
-    Ok(())
+
+    Ok(Value::String(RcStr::from(&s[start_clamped..end_clamped])))
 }
 
 /// `s.trim()` → trimmed string.
-fn str_trim(vm: &mut VM, argc: u32) -> Result<(), VMError> {
-    let args = check_arity!(vm, argc, 1)?;
-    let s = vm.string_from(&args[0])?;
-    vm.push_str_value(s.trim());
-    Ok(())
+fn str_trim(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let s = vm.string_from(args.get(vm, 0))?;
+    Ok(Value::String(RcStr::from(s.trim())))
 }
 
 // ── object static implementations ────────────────────────────────────────────
 
 /// `Object.keys(obj)` → array of strings.
-fn obj_keys(vm: &mut VM, argc: u32) -> Result<(), VMError> {
-    let args = check_arity!(vm, argc, 1)?;
-    let obj_ptr = match &args[0] {
+fn obj_keys(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let obj_ptr = match args.get(vm, 0) {
         Value::Object(p) => *p,
         _ => return Err(vm.fail(ErrorKind::TypeError, "type error")),
     };
@@ -764,15 +718,12 @@ fn obj_keys(vm: &mut VM, argc: u32) -> Result<(), VMError> {
         .cloned()
         .collect();
     let strs: ThinVec<Value> = keys.into_iter().map(Value::String).collect();
-    let ptr = vm.alloc_array(strs);
-    vm.stack.push(ptr);
-    Ok(())
+    Ok(vm.alloc_array(strs))
 }
 
 /// `Object.values(obj)` → array of values.
-fn obj_values(vm: &mut VM, argc: u32) -> Result<(), VMError> {
-    let args = check_arity!(vm, argc, 1)?;
-    let obj_ptr = match &args[0] {
+fn obj_values(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let obj_ptr = match args.get(vm, 0) {
         Value::Object(p) => *p,
         _ => return Err(vm.fail(ErrorKind::TypeError, "type error")),
     };
@@ -783,144 +734,119 @@ fn obj_values(vm: &mut VM, argc: u32) -> Result<(), VMError> {
         .values()
         .cloned()
         .collect();
-    let ptr = vm.alloc_array(vals);
-    vm.stack.push(ptr);
-    Ok(())
+    Ok(vm.alloc_array(vals))
 }
 
 // ── JSON static implementations ──────────────────────────────────────────────
 
 /// `JSON.parse(s)` → any.
-fn json_parse(vm: &mut VM, argc: u32) -> Result<(), VMError> {
-    let args = check_arity!(vm, argc, 1)?;
-    let s = vm.string_from(&args[0])?;
+fn json_parse(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let s = vm.string_from(args.get(vm, 0))?;
     let json: serde_json::Value =
         serde_json::from_str(&s).map_err(|_| vm.fail(ErrorKind::ValueError, "value error"))?;
-    let val = vm.json_to_stack_value(&json, 0)?;
-    vm.stack.push(val);
-    Ok(())
+    vm.json_to_stack_value(&json, 0)
 }
 
 /// `JSON.stringify(x)` → str.
-fn json_stringify(vm: &mut VM, argc: u32) -> Result<(), VMError> {
-    let args = check_arity!(vm, argc, 1)?;
-    let json = vm.stack_value_to_json(&args[0], 0)?;
+fn json_stringify(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let json = vm.stack_value_to_json(args.get(vm, 0), 0)?;
     let s =
         serde_json::to_string(&json).map_err(|_| vm.fail(ErrorKind::ValueError, "value error"))?;
-    vm.push_str_value(s);
-    Ok(())
+    Ok(Value::String(RcStr::from(s)))
 }
 
 // ── Number static implementations ────────────────────────────────────────────
 
 /// `Number.isInteger(x)` → bool.
-fn number_is_integer(vm: &mut VM, argc: u32) -> Result<(), VMError> {
-    let args = check_arity!(vm, argc, 1)?;
-    let is_int = matches!(&args[0], Value::PosInt(_) | Value::NegInt(_))
-        || matches!(&args[0], Value::Float(n) if crate::vm::float_is_int(*n));
-    vm.stack.push(Value::Bool(is_int));
-    Ok(())
+fn number_is_integer(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let v = args.get(vm, 0);
+    let is_int = matches!(v, Value::PosInt(_) | Value::NegInt(_))
+        || matches!(v, Value::Float(n) if crate::vm::float_is_int(*n));
+    Ok(Value::Bool(is_int))
 }
 
 /// `Number.parseInt(s[, radix])` → int (full JS semantics: optional sign,
 /// `0x` prefix, any radix in `[2, 36]`, leading-digit parse with trailing
 /// characters ignored). Unparseable input yields `NaN`, like the browser.
-fn number_parse_int(vm: &mut VM, argc: u32) -> Result<(), VMError> {
-    // `Builtin::call` guarantees `argc >= 1`; any args past the radix are
-    // surplus and ignored (so `["1","2"].map(parseInt)` calls `parseInt(s, i)`,
-    // the classic JS footgun, rather than erroring).
-    let args = take_args::<2>(vm, argc)?;
-    let s = vm.str_from(&args[0])?;
-    // JS coerces the radix via ToInt32; a missing/NaN radix means "auto" (0).
-    let radix = if argc >= 2 {
-        match args[1].to_number() {
+fn number_parse_int(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let s = vm.str_from(args.get(vm, 0))?;
+    let radix = match args.get(vm, 1) {
+        Value::Undefined => 0,
+        v => match v.to_number() {
             Some(n) if n.is_finite() => n as i64,
             _ => 0,
-        }
-    } else {
-        0
+        },
     };
-    vm.stack.push(int_value(js_parse_int(s, radix)));
-    Ok(())
+    Ok(int_value(js_parse_int(s, radix)))
 }
 
 /// `Number.parseFloat(s)` → float.
-fn number_parse_float(vm: &mut VM, argc: u32) -> Result<(), VMError> {
-    let args = check_arity!(vm, argc, 1)?;
-    let s = vm.str_from(&args[0])?;
+fn number_parse_float(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let s = vm.str_from(args.get(vm, 0))?;
     let n: f64 = s
         .trim()
         .parse()
         .map_err(|_| vm.fail(ErrorKind::ValueError, "value error"))?;
-    vm.stack.push(Value::Float(n));
-    Ok(())
+    Ok(Value::Float(n))
 }
 
 // ── Array static implementations ─────────────────────────────────────────────
 
 /// `Array.isArray(x)` → bool.
-fn array_is_array(vm: &mut VM, argc: u32) -> Result<(), VMError> {
-    let args = check_arity!(vm, argc, 1)?;
-    let is_arr = matches!(&args[0], Value::Array(_));
-    vm.stack.push(Value::Bool(is_arr));
-    Ok(())
+fn array_is_array(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    Ok(Value::Bool(matches!(args.get(vm, 0), Value::Array(_))))
 }
 
 // ── Math implementations ─────────────────────────────────────────────────────
 
-/// Math unary: pop one arg, coerce ToNumber, apply f, push Number.
-fn math_unary(vm: &mut VM, argc: u32, f: fn(f64) -> f64) -> Result<(), VMError> {
-    let args = check_arity!(vm, argc, 1)?;
-    let n = args[0]
+/// Math unary: read one arg, coerce ToNumber, apply f, return Number.
+fn math_unary(vm: &mut VM, args: Args, f: fn(f64) -> f64) -> Result<Value, VMError> {
+    let n = args
+        .get(vm, 0)
         .to_number()
         .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?;
-    vm.stack.push(Value::Float(f(n)));
-    Ok(())
+    Ok(Value::Float(f(n)))
 }
 
 /// `Math.min(...nums)` → the smallest, ToNumber-coercing each. Zero args →
 /// +Infinity. Follows `f64::min` (a NaN operand is ignored).
-fn math_min(vm: &mut VM, argc: u32) -> Result<(), VMError> {
-    let base = arg_base(vm, argc)?;
+fn math_min(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let mut acc = f64::INFINITY;
-    for i in 0..argc as usize {
-        let num = vm.stack[base + i]
+    for i in 0..args.argc {
+        let num = args
+            .get(vm, i)
             .to_number()
             .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?;
         acc = acc.min(num);
     }
-    vm.stack.truncate(base);
-    vm.stack.push(Value::Float(acc));
-    Ok(())
+    Ok(Value::Float(acc))
 }
 
 /// `Math.max(...nums)` → the largest, ToNumber-coercing each. Zero args →
 /// -Infinity. Follows `f64::max` (a NaN operand is ignored).
-fn math_max(vm: &mut VM, argc: u32) -> Result<(), VMError> {
-    let base = arg_base(vm, argc)?;
+fn math_max(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let mut acc = f64::NEG_INFINITY;
-    for i in 0..argc as usize {
-        let num = vm.stack[base + i]
+    for i in 0..args.argc {
+        let num = args
+            .get(vm, i)
             .to_number()
             .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?;
         acc = acc.max(num);
     }
-    vm.stack.truncate(base);
-    vm.stack.push(Value::Float(acc));
-    Ok(())
+    Ok(Value::Float(acc))
 }
 
 /// `Math.pow(base, exp)` → base^exp.
-fn math_pow(vm: &mut VM, argc: u32) -> Result<(), VMError> {
-    let args = check_arity!(vm, argc, 2)?;
-    let base = args[0]
+fn math_pow(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let base = args
+        .get(vm, 0)
         .to_number()
         .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?;
-    let exp = args[1]
+    let exp = args
+        .get(vm, 1)
         .to_number()
         .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?;
-    vm.stack.push(Value::Float(base.powf(exp)));
-    Ok(())
+    Ok(Value::Float(base.powf(exp)))
 }
 
 // ── tests ────────────────────────────────────────────────────────────────────
@@ -928,6 +854,7 @@ fn math_pow(vm: &mut VM, argc: u32) -> Result<(), VMError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil;
     use crate::vm::{Instr, StepResult};
 
     fn run(code: Vec<Instr>) -> Vec<Value> {
@@ -951,7 +878,7 @@ mod tests {
             Instr::PushFloat(20.0),
             Instr::CallBuiltin(Builtin::ArrayPush, 2),
         ]);
-        assert_eq!(out.last(), Some(&Value::Float(2.0)));
+        assert_eq!(out.last(), Some(&Value::PosInt(2)));
     }
 
     // ── ArrayPop ───────────────────────────────────────────────────────
@@ -1009,7 +936,7 @@ mod tests {
             Instr::PushFloat(1.0),
             Instr::CallBuiltin(Builtin::ArrayUnshift, 2),
         ]);
-        assert_eq!(out.last(), Some(&Value::Float(2.0)));
+        assert_eq!(out.last(), Some(&Value::PosInt(2)));
     }
 
     // ── ArrayJoin ──────────────────────────────────────────────────────
@@ -1104,7 +1031,7 @@ mod tests {
             Instr::PushStr("l".into()),
             Instr::CallBuiltin(Builtin::StrIndexOf, 2),
         ]);
-        assert_eq!(out, vec![Value::Float(2.0)]);
+        assert_eq!(out, vec![Value::PosInt(2)]);
     }
 
     #[test]
@@ -1114,7 +1041,7 @@ mod tests {
             Instr::PushStr("x".into()),
             Instr::CallBuiltin(Builtin::StrIndexOf, 2),
         ]);
-        assert_eq!(out, vec![Value::Float(-1.0)]);
+        assert_eq!(out, vec![Value::NegInt(-1)]);
     }
 
     // ── StrLastIndexOf ─────────────────────────────────────────────────
@@ -1126,7 +1053,7 @@ mod tests {
             Instr::PushStr("l".into()),
             Instr::CallBuiltin(Builtin::StrLastIndexOf, 2),
         ]);
-        assert_eq!(out, vec![Value::Float(3.0)]);
+        assert_eq!(out, vec![Value::PosInt(3)]);
     }
 
     // ── negative `start` clamps to 0, matching JS (rather than failing) ─
@@ -1140,7 +1067,7 @@ mod tests {
             Instr::PushNegInt(-5),
             Instr::CallBuiltin(Builtin::StrIndexOf, 3),
         ]);
-        assert_eq!(out, vec![Value::Float(0.0)]);
+        assert_eq!(out, vec![Value::PosInt(0)]);
     }
 
     #[test]
@@ -1164,7 +1091,7 @@ mod tests {
             Instr::PushNegInt(-3),
             Instr::CallBuiltin(Builtin::StrLastIndexOf, 3),
         ]);
-        assert_eq!(out, vec![Value::Float(-1.0)]);
+        assert_eq!(out, vec![Value::NegInt(-1)]);
     }
 
     // ── StrStartsWith / StrEndsWith ────────────────────────────────────
@@ -1549,5 +1476,56 @@ mod tests {
             Instr::CallDyn(3),
         ]);
         assert_eq!(out, vec![Value::Float(9.0)]);
+    }
+
+    // ── Step 1: new Args-based tests ───────────────────────────────────
+
+    #[test]
+    fn optional_arg_defaults_via_undefined_rule() {
+        // [1,2,3].join() → "1,2,3"
+        assert_eq!(
+            testutil::run_ret("return [1,2,3].join();"),
+            serde_json::json!("1,2,3")
+        );
+        // "a,b".split(",") → ["a","b"]
+        assert_eq!(
+            testutil::run_ret("return 'a,b'.split(',');"),
+            serde_json::json!(["a", "b"])
+        );
+        // "abc".slice(1) → "bc"
+        assert_eq!(
+            testutil::run_ret("return 'abc'.slice(1);"),
+            serde_json::json!("bc")
+        );
+    }
+
+    #[test]
+    fn resumability_builtin_failure_consumes_operands() {
+        // [].pop() → ValueError. After failure, operands should be consumed.
+        let mut vm = VM::for_program(
+            testutil::compile_ok("return [].pop();"),
+            serde_json::Value::Null,
+        )
+        .unwrap();
+        let err = loop {
+            match vm.step() {
+                Err(e) => break e,
+                Ok(StepResult::Done { .. }) => panic!("expected error"),
+                Ok(_) => {}
+            }
+        };
+        assert_eq!(err.kind, ErrorKind::ValueError);
+        // Stack has operands consumed: only the error-predecessor state should remain.
+        // We can resume_with a value.
+        vm.resume_with(&err, Value::PosInt(99)).unwrap();
+        loop {
+            match vm.step().unwrap() {
+                StepResult::Done { value } => {
+                    assert_eq!(value, Value::PosInt(99));
+                    break;
+                }
+                _ => {}
+            }
+        }
     }
 }

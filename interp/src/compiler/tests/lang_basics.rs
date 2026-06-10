@@ -128,7 +128,7 @@ fn intrinsics_methods() {
     assert_eq!(eval("\"hello\".includes(\"ell\")"), Value::Bool(true));
     assert_eq!(eval("\"hello\".startsWith(\"he\")"), Value::Bool(true));
     assert_eq!(eval("\"hello\".endsWith(\"lo\")"), Value::Bool(true));
-    assert_eq!(eval("\"hello\".indexOf(\"l\")"), testutil::num(2.0));
+    assert_eq!(eval("\"hello\".indexOf(\"l\")"), Value::PosInt(2));
     assert_eq!(eval_str("\"hello\".slice(1, 3)"), "el");
     assert_eq!(eval_str("\"  hi  \".trim()"), "hi");
     assert_eq!(eval_str("[\"a\", \"b\"].join(\"-\")"), "a-b");
