@@ -262,6 +262,23 @@ impl Value {
             _ => None,
         }
     }
+
+    /// Human-readable type name for error messages. Coarse JS-style tags:
+    /// "undefined", "null", "boolean", "number", "string", "array",
+    /// "object", "function".
+    pub(crate) fn type_name(&self) -> &'static str {
+        match self {
+            Value::Undefined => "undefined",
+            Value::Null => "null",
+            Value::Bool(_) => "boolean",
+            Value::Float(_) | Value::PosInt(_) | Value::NegInt(_) => "number",
+            Value::String(_) => "string",
+            Value::Array(_) => "array",
+            Value::Object(_) => "object",
+            Value::Fn(_) | Value::Builtin(_) | Value::Closure(_) => "function",
+            Value::Upval(_) => "upval",
+        }
+    }
 }
 
 // ── free helper functions ─────────────────────────────────────────────

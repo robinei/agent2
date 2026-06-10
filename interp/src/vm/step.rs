@@ -18,7 +18,14 @@ impl VM {
                         self.stack.push(Value::Float($op(n)));
                         self.ip += 1;
                     }
-                    None => return Err(self.fail(ErrorKind::TypeError, "cannot coerce to number")),
+                    None => {
+                        let msg = format!(
+                            "cannot coerce {} ({}) to number",
+                            val.type_name(),
+                            self.preview(&val)
+                        );
+                        return Err(self.fail(ErrorKind::TypeError, msg));
+                    }
                 }
             }};
         }
@@ -41,7 +48,16 @@ impl VM {
                         self.stack.push(Value::Float($op(a, b)));
                         self.ip += 1;
                     }
-                    _ => return Err(self.fail(ErrorKind::TypeError, "cannot coerce to number")),
+                    _ => {
+                        let msg = format!(
+                            "cannot coerce {} ({}) and {} ({}) to number",
+                            lhs.type_name(),
+                            self.preview(&lhs),
+                            rhs.type_name(),
+                            self.preview(&rhs)
+                        );
+                        return Err(self.fail(ErrorKind::TypeError, msg));
+                    }
                 }
             }};
         }
@@ -63,7 +79,16 @@ impl VM {
                         self.stack.push(Value::Float($op(a, b) as f64));
                         self.ip += 1;
                     }
-                    _ => return Err(self.fail(ErrorKind::TypeError, "expected integer")),
+                    _ => {
+                        let msg = format!(
+                            "expected integer operands, got {} ({}) and {} ({})",
+                            lhs.type_name(),
+                            self.preview(&lhs),
+                            rhs.type_name(),
+                            self.preview(&rhs)
+                        );
+                        return Err(self.fail(ErrorKind::TypeError, msg));
+                    }
                 }
             }};
         }
@@ -296,7 +321,11 @@ impl VM {
                             self.cur_local_count = nargs;
                             self.ip = addr;
                         }
-                        _ => return Err(self.fail(ErrorKind::TypeError, "type error")),
+                        _ => {
+                            let msg =
+                                format!("cannot call a {} as a function", callable.type_name());
+                            return Err(self.fail(ErrorKind::TypeError, msg));
+                        }
                     }
                 }
 
@@ -794,7 +823,16 @@ impl VM {
                     } else {
                         match (lhs.to_number(), rhs.to_number()) {
                             (Some(a), Some(b)) => Value::Float(a + b),
-                            _ => return Err(self.fail(ErrorKind::TypeError, "type error")),
+                            _ => {
+                                let msg = format!(
+                                    "cannot add {} ({}) and {} ({})",
+                                    lhs.type_name(),
+                                    self.preview(&lhs),
+                                    rhs.type_name(),
+                                    self.preview(&rhs)
+                                );
+                                return Err(self.fail(ErrorKind::TypeError, msg));
+                            }
                         }
                     };
                     self.stack.push(result);
@@ -973,7 +1011,14 @@ impl VM {
                         Some(Value::Object(p)) => *p,
                         // NotResumable: errors before popping (peek-style check).
                         _ => {
-                            return Err(self.fail_not_resumable(ErrorKind::TypeError, "type error"));
+                            let msg = format!(
+                                "cannot read property on {}",
+                                self.stack
+                                    .last()
+                                    .map(|v| v.type_name())
+                                    .unwrap_or("nothing")
+                            );
+                            return Err(self.fail_not_resumable(ErrorKind::TypeError, msg));
                         }
                     };
                     // JS: a missing property reads as `undefined`, not `null`.
@@ -998,14 +1043,23 @@ impl VM {
                         Some(Value::Object(p)) => *p,
                         // NotResumable: errors before popping (peek-style check).
                         _ => {
-                            return Err(self.fail_not_resumable(ErrorKind::TypeError, "type error"));
+                            let msg = format!(
+                                "cannot set property on {}",
+                                self.stack
+                                    .last()
+                                    .map(|v| v.type_name())
+                                    .unwrap_or("nothing")
+                            );
+                            return Err(self.fail_not_resumable(ErrorKind::TypeError, msg));
                         }
                     };
                     let obj = match self.objects.get_mut(obj_ptr as usize) {
                         Some(o) => o,
                         // NotResumable: object peeked, not fully consumed.
                         _ => {
-                            return Err(self.fail_not_resumable(ErrorKind::TypeError, "type error"));
+                            return Err(
+                                self.fail_not_resumable(ErrorKind::TypeError, "bad object pointer")
+                            );
                         }
                     };
                     // Read the old value before overwriting, then write through
@@ -1096,7 +1150,14 @@ impl VM {
                                 // JS: a missing property reads as `undefined`.
                                 obj.get(field.as_str()).cloned().unwrap_or(Value::Undefined)
                             }
-                            _ => return Err(self.fail(ErrorKind::TypeError, "type error")),
+                            _ => {
+                                let msg = format!(
+                                    "cannot index into {} with {}",
+                                    container.type_name(),
+                                    self.preview(&key)
+                                );
+                                return Err(self.fail(ErrorKind::TypeError, msg));
+                            }
                         };
                     self.stack.push(val);
                     self.ip += 1;
@@ -1123,7 +1184,10 @@ impl VM {
                         Value::Array(_) => true,
                         Value::Object(_) => false,
                         // Strings are immutable; closures aren't indexable.
-                        _ => return Err(self.fail(ErrorKind::TypeError, "type error")),
+                        _ => {
+                            let msg = format!("cannot index-set on {}", container.type_name());
+                            return Err(self.fail(ErrorKind::TypeError, msg));
+                        }
                     };
                     let old = if matches!(mode, SetMode::Old) {
                         // Read the previous value before the write (for postfix

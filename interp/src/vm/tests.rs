@@ -2242,8 +2242,8 @@ fn render_error_with_source_and_spans() {
         "should contain caret, got: {rendered}"
     );
     assert!(
-        rendered.contains("cannot coerce to number"),
-        "should contain the message, got: {rendered}"
+        rendered.contains("cannot coerce array") && rendered.contains("to number"),
+        "should contain coercion message with type, got: {rendered}"
     );
 }
 
@@ -2353,6 +2353,133 @@ fn push_value_then_continue_pop_first_invariant() {
         StepResult::Done { .. } => {}
         other => panic!("expected Done, got {other:?}"),
     }
+}
+
+// ── Step 4: message quality tests ──────────────────────────────
+
+#[test]
+fn type_name_covers_all_variants() {
+    use crate::vm::value::Value;
+    assert_eq!(Value::Undefined.type_name(), "undefined");
+    assert_eq!(Value::Null.type_name(), "null");
+    assert_eq!(Value::Bool(true).type_name(), "boolean");
+    assert_eq!(Value::Float(1.0).type_name(), "number");
+    assert_eq!(Value::PosInt(1).type_name(), "number");
+    assert_eq!(Value::NegInt(-1).type_name(), "number");
+    assert_eq!(Value::String("hi".into()).type_name(), "string");
+    assert_eq!(Value::Array(0).type_name(), "array");
+    assert_eq!(Value::Object(0).type_name(), "object");
+    assert_eq!(Value::Fn(0).type_name(), "function");
+}
+
+#[test]
+fn preview_string_truncation() {
+    let mut vm = VM::new(vec![]);
+    // Short string: quoted as-is.
+    let short = Value::String("hello".into());
+    assert!(
+        vm.preview(&short).contains("hello"),
+        "got: {}",
+        vm.preview(&short)
+    );
+    // Long string: truncated with …
+    let long = Value::String("a".repeat(50).into());
+    let prev = vm.preview(&long);
+    assert!(prev.starts_with('\"') && prev.contains('…'), "got: {prev}");
+    assert!(prev.len() <= 50, "too long: {prev}");
+}
+
+#[test]
+fn preview_array_summary() {
+    let mut vm = VM::new(vec![]);
+    let arr = vm.alloc_array(vec![Value::PosInt(1), Value::PosInt(2)].into());
+    assert_eq!(vm.preview(&arr), "[array of 2]");
+}
+
+#[test]
+fn preview_object_summary() {
+    let mut vm = VM::new(vec![]);
+    let obj = vm.alloc_object(
+        [
+            ("a".into(), Value::PosInt(1)),
+            ("b".into(), Value::PosInt(2)),
+        ]
+        .into_iter()
+        .collect(),
+    );
+    let prev = vm.preview(&obj);
+    assert!(prev.starts_with("{object with keys"), "got: {prev}");
+    assert!(prev.contains("a") && prev.contains("b"), "got: {prev}");
+}
+
+#[test]
+fn message_coercion_includes_type_name() {
+    // binary_num! TypeError: `[] + 1` → array + number
+    let prog = crate::testutil::compile_ok("return [] + 1;");
+    let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
+    let err = loop {
+        match vm.step() {
+            Err(e) => break e,
+            Ok(StepResult::Done { .. }) => panic!("expected error"),
+            Ok(_) => {}
+        }
+    };
+    let msg = &err.message;
+    assert!(msg.contains("array"), "should mention array type: {msg}");
+    assert!(msg.contains("number"), "should mention number type: {msg}");
+    assert!(
+        msg.contains("[array of 0]"),
+        "should include preview: {msg}"
+    );
+}
+
+#[test]
+fn message_indexget_includes_container_type() {
+    // IndexGet on non-container: container first (deep), key second (top).
+    let err = run_err(vec![
+        PushPosInt(42), // container (deep, popped second)
+        PushPosInt(0),  // key (top, popped first)
+        IndexGet,
+    ]);
+    assert!(
+        err.message.contains("number"),
+        "should mention type: {}",
+        err.message
+    );
+    assert!(
+        err.message.contains("cannot index into"),
+        "got: {}",
+        err.message
+    );
+}
+
+#[test]
+fn message_objget_non_object_includes_type() {
+    // ObjGet peeks stack.last() — if it's not an object, message names the type.
+    let err = run_err(vec![PushPosInt(42), ObjGet("key".into())]);
+    assert!(
+        err.message.contains("number"),
+        "should mention type: {}",
+        err.message
+    );
+}
+
+#[test]
+fn message_negative_index_includes_value() {
+    // IndexGet with negative index: container first (deep), key second (top).
+    let mut vm = VM::new(vec![
+        PushArray(0),   // container (deep, popped second)
+        PushNegInt(-1), // key (top, popped first)
+        IndexGet,
+    ]);
+    vm.arrays.push(vec![].into());
+    let err = vm.step().unwrap_err();
+    assert!(
+        err.kind == ErrorKind::ValueError,
+        "expected ValueError, got {:?}: {}",
+        err.kind,
+        err.message
+    );
 }
 
 #[test]

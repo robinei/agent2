@@ -87,6 +87,43 @@ impl VM {
         Ok(())
     }
 
+    /// Human-readable preview of a value for error messages. Strings are
+    /// quoted and truncated to ~40 chars; arrays/objects show a summary
+    /// like `[array of 12]` / `{object with keys a, b, …}`.
+    pub fn preview(&self, v: &Value) -> String {
+        match v {
+            Value::String(s) => {
+                let s = s.as_str();
+                if s.len() <= 42 {
+                    format!("\"{}\"", s.escape_debug())
+                } else {
+                    format!("\"{}…\"", s[..40].escape_debug())
+                }
+            }
+            Value::Array(p) => {
+                if let Some(arr) = self.arrays.get(*p as usize) {
+                    format!("[array of {}]", arr.len())
+                } else {
+                    "[array]".to_string()
+                }
+            }
+            Value::Object(p) => {
+                if let Some(obj) = self.objects.get(*p as usize) {
+                    let mut keys: Vec<&str> = obj.keys().map(|k| k.as_str()).collect();
+                    keys.sort();
+                    if keys.len() <= 4 {
+                        format!("{{object with keys {}}}", keys.join(", "))
+                    } else {
+                        format!("{{object with keys {}, …}}", keys[..3].join(", "))
+                    }
+                } else {
+                    "{object}".to_string()
+                }
+            }
+            other => other.type_name().to_string(),
+        }
+    }
+
     /// Render an error against the VM's source (when available). Falls back
     /// to a plain "at instruction {ip}" format when spans/source are empty
     /// (hand-assembled code via `VM::new`).
