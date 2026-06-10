@@ -71,6 +71,22 @@ const HOFS: &[Hof] = &[
         method: "reduce",
         source: "function __reduce(a, f, acc) {\n  for (let i = 0; i < a.length; i++) { acc = f(acc, a[i], i, a); }\n  return acc;\n}\nfunction __reduce1(a, f) {\n  let acc = a[0];\n  for (let i = 1; i < a.length; i++) { acc = f(acc, a[i], i, a); }\n  return acc;\n}",
     },
+    Hof {
+        method: "flatMap",
+        source: "function __flatMap(a, f) {\n  const r = [];\n  for (let i = 0; i < a.length; i++) { const v = f(a[i], i, a); for (let j = 0; j < v.length; j++) { r.push(v[j]); } }\n  return r;\n}",
+    },
+    Hof {
+        method: "findLast",
+        source: "function __findLast(a, f) {\n  for (let i = a.length - 1; i >= 0; i--) { const v = a[i]; if (f(v, i, a)) { return v; } }\n  return undefined;\n}",
+    },
+    Hof {
+        method: "findLastIndex",
+        source: "function __findLastIndex(a, f) {\n  for (let i = a.length - 1; i >= 0; i--) { if (f(a[i], i, a)) { return i; } }\n  return -1;\n}",
+    },
+    Hof {
+        method: "sort",
+        source: "function __sort(a, f) {\n  for (let i = 1; i < a.length; i++) {\n    const key = a[i];\n    let j = i - 1;\n    while (j >= 0 && f(a[j], key) > 0) { a[j + 1] = a[j]; j--; }\n    a[j + 1] = key;\n  }\n  return a;\n}\nfunction __sortDefault(a) {\n  for (let i = 1; i < a.length; i++) {\n    const key = a[i];\n    let j = i - 1;\n    while (j >= 0 && String(a[j]) > String(key)) { a[j + 1] = a[j]; j--; }\n    a[j + 1] = key;\n  }\n  return a;\n}",
+    },
 ];
 
 /// Build the prelude source to append to `user_source`: the concatenated source
@@ -145,5 +161,60 @@ mod tests {
         let p = assemble("state.r = a.reduce((s, x) => s + x, 0);");
         assert!(p.contains("function __reduce("));
         assert!(p.contains("function __reduce1("));
+    }
+
+    // ── Step 4d: prelude additions ────────────────────────────────────
+
+    #[test]
+    fn sort_default_comparison() {
+        // JS: [10, 9, 1].sort() → [1, 10, 9] (string comparison)
+        assert_eq!(
+            crate::testutil::run_ret("return [10,9,1].sort();"),
+            serde_json::json!([1, 10, 9])
+        );
+    }
+
+    #[test]
+    fn sort_with_comparator() {
+        // JS: [10, 9, 1].sort((x, y) => x - y) → [1, 9, 10]
+        assert_eq!(
+            crate::testutil::run_ret("return [10,9,1].sort((x, y) => x - y);"),
+            serde_json::json!([1, 9, 10])
+        );
+    }
+
+    #[test]
+    fn sort_returns_mutated_array() {
+        // Sort is in-place and returns the receiver.
+        assert_eq!(
+            crate::testutil::run_ret(
+                "const a = [3,1,2]; const r = a.sort((x,y)=>x-y); return [r === a, a];"
+            ),
+            serde_json::json!([true, [1, 2, 3]])
+        );
+    }
+
+    #[test]
+    fn flat_map() {
+        assert_eq!(
+            crate::testutil::run_ret("return [[1],[2,3]].flatMap(x => x);"),
+            serde_json::json!([1, 2, 3])
+        );
+    }
+
+    #[test]
+    fn find_last() {
+        assert_eq!(
+            crate::testutil::run_ret("return [1,2,3,2].findLast(x => x < 3);"),
+            serde_json::json!(2)
+        );
+    }
+
+    #[test]
+    fn find_last_index() {
+        assert_eq!(
+            crate::testutil::run_ret("return [1,2,3,2].findLastIndex(x => x < 3);"),
+            serde_json::json!(3)
+        );
     }
 }

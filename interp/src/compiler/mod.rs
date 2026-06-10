@@ -2273,6 +2273,12 @@ impl<'src> Compiler<'src> {
             "find" => return self.compile_hof(recv, argv, span, optional, "__find", 1),
             "findIndex" => return self.compile_hof(recv, argv, span, optional, "__findIndex", 1),
             "reduce" => return self.compile_reduce(recv, argv, span, optional),
+            "flatMap" => return self.compile_hof(recv, argv, span, optional, "__flatMap", 1),
+            "findLast" => return self.compile_hof(recv, argv, span, optional, "__findLast", 1),
+            "findLastIndex" => {
+                return self.compile_hof(recv, argv, span, optional, "__findLastIndex", 1);
+            }
+            "sort" => return self.compile_sort(recv, argv, span, optional),
             _ => {}
         }
         if let Some(builtin) = Builtin::for_method(method) {
@@ -2375,6 +2381,22 @@ impl<'src> Compiler<'src> {
                 span,
                 format!("`reduce` expects 1 or 2 argument(s), got {n}"),
             ),
+        }
+    }
+
+    /// `arr.sort([compareFn])`. With a comparator → `__sort(a, f)`;
+    /// without → `__sortDefault(a)` (the JS default string comparison).
+    fn compile_sort(
+        &mut self,
+        recv: &ast::Expression,
+        argv: &[&ast::Expression],
+        span: u32,
+        optional: bool,
+    ) {
+        match argv.len() {
+            1 => self.emit_prelude_call("__sort", recv, argv, span, optional),
+            0 => self.emit_prelude_call("__sortDefault", recv, argv, span, optional),
+            n => self.error(span, format!("`sort` expects 0 or 1 argument(s), got {n}")),
         }
     }
 
