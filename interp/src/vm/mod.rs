@@ -140,7 +140,9 @@ The remaining intentional divergences from JS — deferred or accepted, NOT bugs
     `arguments`, default, or rest-param holes).
   • Strings are UTF-8 byte sequences: `.length` and all index/offset string ops
     count/use UTF-8 *bytes*, not UTF-16 code units (`"é".length` is 2 here, 1 in
-    JS; "😀" is 4 here, 2 in JS). ASCII text is identical.
+    JS; "😀" is 4 here, 2 in JS). ASCII text is identical. Slicing at a
+    mid-codepoint byte offset errors rather than coercing to a codepoint
+    boundary.
   • Bitwise ops (`& | ^ << >> ~`) operate on full i64, not JS's 32-bit ToInt32
     semantics, and there is no unsigned right shift (`>>>`). Shift counts must be
     0..63 (JS masks to 0..31).

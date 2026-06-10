@@ -112,9 +112,7 @@ fn intrinsics_static() {
     assert_eq!(eval("Array.isArray([1])"), Value::Bool(true));
     assert_eq!(eval("Array.isArray(5)"), Value::Bool(false));
     // Constants
-    assert!(
-        matches!(eval("Math.PI"), Value::Float(f) if (f - std::f64::consts::PI).abs() < 0.001)
-    );
+    assert!(matches!(eval("Math.PI"), Value::Float(f) if (f - std::f64::consts::PI).abs() < 0.001));
     assert_eq!(
         eval("Number.MAX_SAFE_INTEGER"),
         Value::PosInt(9007199254740991)

@@ -1,6 +1,20 @@
 //! Builtins — the JS standard-library surface (`arr.push`, `Math.max`,
 //! `Object.keys`, `JSON.parse`, …) that is invoked with *call* syntax.
 //!
+//! # Adding a builtin
+//!
+//! 1. Add one row to the `builtins!` table below (variant name, kind, display
+//!    name, min/max args counting the receiver, handler function).
+//! 2. Write the handler `fn(vm: &mut VM, args: Args) -> Result<Value, VMError>`.
+//! 3. Add tests covering: the normal case, absent-arg (undefined-default) case,
+//!    and wrong-receiver-type TypeError.
+//! 4. For polymorphic (string+array) methods, dispatch on the receiver in the
+//!    handler and share the row.
+//!
+//! **Do not add a Builtin row for:** member-read constants (e.g. `Math.PI`) —
+//! fold those in the compiler (`compile_static_member`). Callback-taking array
+//! methods (`map`, `filter`, …) go in the prelude (`interp/src/prelude.rs`).
+//!
 //! The VM has no method/prototype objects, so these are recognized
 //! structurally by the compiler and lowered to a call against a `Builtin` id
 //! rather than to one dedicated instruction each. This keeps the instruction
@@ -551,8 +565,7 @@ fn array_flat(vm: &mut VM, args: Args) -> Result<Value, VMError> {
         Value::Undefined => 1usize,
         v => v
             .to_number()
-            .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?
-            as usize,
+            .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))? as usize,
     };
     let ip = vm.ip;
     let arr = vm
@@ -606,10 +619,12 @@ fn array_fill(vm: &mut VM, args: Args) -> Result<Value, VMError> {
         if matches!(v, Value::Undefined) {
             return default;
         }
-        v.to_number().map(|n| {
-            let i = n as i64;
-            if i < 0 { (i + len).max(0) } else { i.min(len) }
-        }).unwrap_or(default)
+        v.to_number()
+            .map(|n| {
+                let i = n as i64;
+                if i < 0 { (i + len).max(0) } else { i.min(len) }
+            })
+            .unwrap_or(default)
     };
     let start = to_idx(&start_arg, 0).max(0) as usize;
     let end = to_idx(&end_arg, len).max(0) as usize;
@@ -634,9 +649,7 @@ fn array_splice(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     } else {
         None
     };
-    let to_insert: SmallVec<[Value; 8]> = (3..args.argc)
-        .map(|i| args.get(vm, i).clone())
-        .collect();
+    let to_insert: SmallVec<[Value; 8]> = (3..args.argc).map(|i| args.get(vm, i).clone()).collect();
     let ip = vm.ip;
     let arr = vm
         .arrays
@@ -757,7 +770,9 @@ fn str_index_of(vm: &mut VM, args: Args) -> Result<Value, VMError> {
             .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?,
     };
     let start = clamp_start(haystack, start.max(0) as usize);
-    let pos = haystack[start..].find(needle.as_str()).map(|p| (p + start) as f64);
+    let pos = haystack[start..]
+        .find(needle.as_str())
+        .map(|p| (p + start) as f64);
     Ok(int_value(pos.unwrap_or(-1.0)))
 }
 
@@ -864,10 +879,9 @@ fn str_replace_all(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let s = vm.string_from(args.get(vm, 0))?;
     let pattern = vm.to_js_string(args.get(vm, 1), 0);
     let replacement = vm.to_js_string(args.get(vm, 2), 0);
-    Ok(Value::String(RcStr::from(s.replace(
-        pattern.as_str(),
-        replacement.as_str(),
-    ))))
+    Ok(Value::String(RcStr::from(
+        s.replace(pattern.as_str(), replacement.as_str()),
+    )))
 }
 
 /// `s.toLowerCase()` → lowercase string.
@@ -888,8 +902,7 @@ fn str_pad_start(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let len = args.get(vm, 1);
     let target_len = len
         .to_number()
-        .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?
-        as usize;
+        .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))? as usize;
     let pad: RcStr = match args.get(vm, 2) {
         Value::Undefined => RcStr::from(" "),
         v => vm.to_js_string(v, 0),
@@ -913,8 +926,7 @@ fn str_pad_end(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let len = args.get(vm, 1);
     let target_len = len
         .to_number()
-        .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?
-        as usize;
+        .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))? as usize;
     let pad: RcStr = match args.get(vm, 2) {
         Value::Undefined => RcStr::from(" "),
         v => vm.to_js_string(v, 0),
@@ -964,16 +976,13 @@ fn str_char_at(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let idx = args
         .get(vm, 1)
         .to_number()
-        .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?
-        as i64;
+        .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))? as i64;
     if idx < 0 || idx as usize >= s.len() {
         return Ok(Value::String(RcStr::from("")));
     }
     let byte = s.as_bytes()[idx as usize];
     // Return the single byte as a char (charAt is per-byte in our string model)
-    Ok(Value::String(RcStr::from(
-        (byte as char).to_string(),
-    )))
+    Ok(Value::String(RcStr::from((byte as char).to_string())))
 }
 
 /// `s.at(index)` → character at index (negative counts from end), or undefined.
@@ -984,14 +993,16 @@ fn str_at(vm: &mut VM, args: Args) -> Result<Value, VMError> {
         .to_number()
         .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?;
     let len = s.len() as i64;
-    let i = if idx < 0.0 { idx as i64 + len } else { idx as i64 };
+    let i = if idx < 0.0 {
+        idx as i64 + len
+    } else {
+        idx as i64
+    };
     if i < 0 || i as usize >= s.len() {
         return Ok(Value::Undefined);
     }
     let byte = s.as_bytes()[i as usize];
-    Ok(Value::String(RcStr::from(
-        (byte as char).to_string(),
-    )))
+    Ok(Value::String(RcStr::from((byte as char).to_string())))
 }
 
 /// `s.concat(str1, str2, …)` → concatenated string. Receiver must be a string.
@@ -1223,13 +1234,11 @@ fn console_write(vm: &mut VM, args: Args, prefix: &str) -> Result<Value, VMError
         }
         let s = match args.get(vm, i) {
             Value::String(s) => s.as_str().to_owned(),
-            other => {
-                match vm.stack_value_to_json(other, 2) {
-                    Ok(serde_json::Value::String(s)) => s,
-                    Ok(j) => serde_json::to_string(&j).unwrap_or_default(),
-                    Err(_) => "[unserializable]".to_string(),
-                }
-            }
+            other => match vm.stack_value_to_json(other, 2) {
+                Ok(serde_json::Value::String(s)) => s,
+                Ok(j) => serde_json::to_string(&j).unwrap_or_default(),
+                Err(_) => "[unserializable]".to_string(),
+            },
         };
         line.push_str(&s);
     }
@@ -1410,7 +1419,11 @@ fn array_at(vm: &mut VM, args: Args) -> Result<Value, VMError> {
         .get(arr_ptr as usize)
         .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?;
     let len = arr.len() as i64;
-    let i = if idx < 0.0 { idx as i64 + len } else { idx as i64 };
+    let i = if idx < 0.0 {
+        idx as i64 + len
+    } else {
+        idx as i64
+    };
     if i < 0 || i as usize >= arr.len() {
         return Ok(Value::Undefined);
     }
@@ -2273,13 +2286,19 @@ mod tests {
         // Static: 'a,b'.split(',', 2, 3) is still a compile error (surplus args).
         let errs = testutil::compile_errs("'a,b'.split(',', 2, 3);");
         let msg = errs.join("\n");
-        assert!(msg.contains("split"), "expected split arity error, got: {msg}");
+        assert!(
+            msg.contains("split"),
+            "expected split arity error, got: {msg}"
+        );
 
         // Static: 'abc'.split() is still a compile error (too few args).
         // The static compiler requires recv + delim for split.
         let errs = testutil::compile_errs("'abc'.split();");
         let msg = errs.join("\n");
-        assert!(msg.contains("split"), "expected split arity error, got: {msg}");
+        assert!(
+            msg.contains("split"),
+            "expected split arity error, got: {msg}"
+        );
 
         // Runtime: calling split with only a receiver via direct VM call.
         let out = run(vec![
@@ -2446,9 +2465,7 @@ mod tests {
     fn array_splice() {
         // splice(1, 2, 9) — delete 2 at index 1, insert 9.
         assert_eq!(
-            testutil::run_ret(
-                "const a=[1,2,3,4]; const r=a.splice(1,2,9); return [a,r];",
-            ),
+            testutil::run_ret("const a=[1,2,3,4]; const r=a.splice(1,2,9); return [a,r];",),
             serde_json::json!([[1, 9, 4], [2, 3]])
         );
     }
@@ -2503,9 +2520,8 @@ mod tests {
 
     #[test]
     fn console_buffer_readable_after_run() {
-        let prog = testutil::compile_ok(
-            "console.log('hello', 42); console.warn('oops'); return 1;",
-        );
+        let prog =
+            testutil::compile_ok("console.log('hello', 42); console.warn('oops'); return 1;");
         let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
         loop {
             match vm.step().unwrap() {
@@ -2516,7 +2532,15 @@ mod tests {
         // console_lines should have two entries.
         let lines = &vm.console_lines;
         assert_eq!(lines.len(), 2, "got: {lines:?}");
-        assert!(lines[0].contains("hello") && lines[0].contains("42"), "line 0: {}", lines[0]);
-        assert!(lines[1].contains("[warn]") && lines[1].contains("oops"), "line 1: {}", lines[1]);
+        assert!(
+            lines[0].contains("hello") && lines[0].contains("42"),
+            "line 0: {}",
+            lines[0]
+        );
+        assert!(
+            lines[1].contains("[warn]") && lines[1].contains("oops"),
+            "line 1: {}",
+            lines[1]
+        );
     }
 }
