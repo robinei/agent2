@@ -236,6 +236,8 @@ builtins! {
 
     // ── Number static ──
     NumberIsInteger,  BuiltinKind::Namespace("Number"), "isInteger",  1, 1, number_is_integer;
+    NumberIsFinite,   BuiltinKind::Namespace("Number"), "isFinite",   1, 1, number_is_finite;
+    NumberIsNaN,      BuiltinKind::Namespace("Number"), "isNaN",      1, 1, number_is_nan;
     NumberParseInt,   BuiltinKind::Namespace("Number"), "parseInt",   1, 2, number_parse_int;
     NumberParseFloat, BuiltinKind::Namespace("Number"), "parseFloat", 1, 1, number_parse_float;
 

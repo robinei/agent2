@@ -27,6 +27,26 @@ pub fn number_parse_int(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     Ok(Value::int_from_f64(js_parse_int(s.as_str(), radix)))
 }
 
+/// `Number.isFinite(x)` → true if x is a number (not coerced) and finite.
+pub fn number_is_finite(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let v = args.get(vm, 0);
+    // Number.isFinite does NOT coerce — only actual numbers.
+    let is_fin = match v {
+        Value::Float(n) => n.is_finite(),
+        Value::PosInt(_) | Value::NegInt(_) => true,
+        _ => false,
+    };
+    Ok(Value::Bool(is_fin))
+}
+
+/// `Number.isNaN(x)` → true if x is exactly NaN (not coerced).
+pub fn number_is_nan(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let v = args.get(vm, 0);
+    // Number.isNaN does NOT coerce — only actual NaN values.
+    let is_nan = matches!(v, Value::Float(n) if n.is_nan());
+    Ok(Value::Bool(is_nan))
+}
+
 /// `Number.parseFloat(s)` → float. JS semantics: skip leading whitespace, take
 /// the longest numeric prefix, return NaN on failure, accept `Infinity`.
 pub fn number_parse_float(vm: &mut VM, args: Args) -> Result<Value, VMError> {
@@ -160,7 +180,63 @@ mod tests {
         vm::Instr,
     };
 
-    // ── Number.isInteger / Number.parseInt / Number.parseFloat ─────────
+    // ── Number.isInteger / Number.isFinite / Number.isNaN / Number.parseInt / Number.parseFloat ─
+
+    // ── Step 4g: Number.isFinite / Number.isNaN ──────────────────────
+
+    #[test]
+    fn number_is_finite() {
+        let v = testutil::run_val("return Number.isFinite(5);");
+        assert_eq!(v, Value::Bool(true));
+        let v = testutil::run_val("return Number.isFinite('5');");
+        assert_eq!(v, Value::Bool(false));
+        let v = testutil::run_val("return Number.isFinite(Infinity);");
+        assert_eq!(v, Value::Bool(false));
+    }
+
+    #[test]
+    fn number_is_nan() {
+        let v = testutil::run_val("return Number.isNaN('x');");
+        assert_eq!(v, Value::Bool(false));
+        let v = testutil::run_val("return Number.isNaN(NaN);");
+        assert_eq!(v, Value::Bool(true));
+    }
+
+    #[test]
+    fn bare_parse_int() {
+        assert_eq!(
+            testutil::run_ret("return parseInt('42px');"),
+            serde_json::json!(42)
+        );
+    }
+
+    #[test]
+    fn bare_parse_float() {
+        assert_eq!(
+            testutil::run_ret("return parseFloat('3.14');"),
+            serde_json::json!(3.14)
+        );
+    }
+
+    #[test]
+    fn bare_is_nan() {
+        // isNaN coerces, so isNaN("x") → true
+        assert_eq!(testutil::run_val("return isNaN('x');"), Value::Bool(true));
+        assert_eq!(testutil::run_val("return isNaN(5);"), Value::Bool(false));
+    }
+
+    #[test]
+    fn bare_is_finite() {
+        // isFinite coerces, so isFinite("5") → true
+        assert_eq!(
+            testutil::run_val("return isFinite('5');"),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            testutil::run_val("return isFinite(Infinity);"),
+            Value::Bool(false)
+        );
+    }
 
     #[test]
     fn call_builtin_number_is_integer() {

@@ -2214,6 +2214,36 @@ impl<'src> Compiler<'src> {
                 self.compile_args(argv);
                 self.emit(Instr::ToBool, span);
             }
+            "parseInt" => {
+                // Delegate to Number.parseInt
+                self.compile_builtin_call(Builtin::NumberParseInt, None, argv, span, false);
+            }
+            "parseFloat" => {
+                // Delegate to Number.parseFloat
+                self.compile_builtin_call(Builtin::NumberParseFloat, None, argv, span, false);
+            }
+            "isNaN" => {
+                // Bare isNaN coerces to number first (unlike Number.isNaN):
+                // isNaN(x) ≡ Number.isNaN(Number(x))
+                if !self.arity(argv, 1, span, "isNaN") {
+                    return;
+                }
+                self.compile_args(argv);
+                self.emit(Instr::ToNum, span);
+                // NaN !== NaN is the canonical check.
+                self.emit(Instr::Pick(0), span);
+                self.emit(Instr::Neq, span); // [v !== v] = true only for NaN
+            }
+            "isFinite" => {
+                // Bare isFinite coerces to number first (unlike Number.isFinite).
+                if !self.arity(argv, 1, span, "isFinite") {
+                    return;
+                }
+                self.compile_args(argv);
+                self.emit(Instr::ToNum, span);
+                // After ToNum: coerce to Number.isFinite.
+                self.emit(Instr::CallBuiltin(Builtin::NumberIsFinite, 1), span);
+            }
             "raise" => {
                 // `raise("name")` → `Raise(name, 0)`, no payload.
                 // `raise("name", expr)` → `Raise(name, 1)`, payload = expr.
