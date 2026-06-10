@@ -3,7 +3,7 @@
 
 use crate::compiler::compile;
 use crate::testutil;
-use crate::vm::{StepResult, VM, Value};
+use crate::vm::{ErrorKind, StepResult, VM, Value};
 
 #[test]
 fn arguments_variadic_sum() {
@@ -20,6 +20,32 @@ fn arguments_beyond_declared_params() {
     assert_eq!(
         testutil::run_ret("function f(a) { return a + arguments.length; } return f(10, 20, 30);"),
         serde_json::json!(13)
+    );
+}
+
+#[test]
+fn calling_effectively_const_non_callable_errors_with_its_value() {
+    // Regression: the dynamic-call path read the callee with a raw `Local`
+    // load. For an effectively-const binding the initializer store is
+    // dead-eliminated, so that slot is never written — the call saw
+    // `undefined` instead of the propagated constant. The callee read must
+    // materialize the constant, so the error names the real value's type.
+    let err = testutil::run_runtime_err("let n = 5; return n(1, 2);");
+    assert_eq!(err.kind, ErrorKind::TypeError);
+    assert!(
+        err.message.contains("cannot call a number"),
+        "got: {}",
+        err.message
+    );
+}
+
+#[test]
+fn calling_effectively_const_builtin_binding() {
+    // The propagated-constant callee path must also work when the constant
+    // IS callable (a builtin stored in a never-reassigned `let`).
+    assert_eq!(
+        testutil::run_ret("let f = Math.sqrt; return f(16);"),
+        serde_json::json!(4)
     );
 }
 

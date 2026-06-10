@@ -611,6 +611,26 @@ impl<'src> Compiler<'src> {
             .copied()
     }
 
+    /// Emit the read of a slot-resolved identifier reference.
+    ///
+    /// Constant propagation: an immutable binding (a `const`, or an
+    /// effectively-const `let`/`var`) bound to a compile-time constant is
+    /// read as the literal directly (which then composes with const-folding),
+    /// rather than a `Local` load. This matters for correctness, not just
+    /// speed: when every read is propagated, the binding's initializer store
+    /// is dead-eliminated, so the slot is never written — a `Local` load
+    /// would read an uninitialized (undefined) slot. Every consumer of a
+    /// `RefSlot` read must go through here.
+    fn emit_slot_read(&mut self, r: &RefSlot, span: u32) {
+        if r.immutable {
+            if let Some(push) = self.const_env.get(&r.slot) {
+                self.emit(push.clone(), span);
+                return;
+            }
+        }
+        self.emit(Instr::Local(r.slot as LocalIndex), span);
+    }
+
     /// The `scopes` index of the function/arrow defined at `span`.
     fn scope_for_node(&self, span: u32) -> Option<usize> {
         self.analysis
@@ -1062,17 +1082,7 @@ impl<'src> Compiler<'src> {
             return;
         }
         if let Some(r) = self.ref_slot(span) {
-            // Constant propagation: an immutable binding (a `const`, or an
-            // effectively-const `let`/`var`) bound to a compile-time constant is
-            // read as the literal directly (which then composes with const-
-            // folding), rather than a `Local` load.
-            if r.immutable {
-                if let Some(push) = self.const_env.get(&r.slot) {
-                    self.emit(push.clone(), span);
-                    return;
-                }
-            }
-            self.emit(Instr::Local(r.slot as LocalIndex), span);
+            self.emit_slot_read(&r, span);
             return;
         }
         // `arguments` (when not shadowed by a real binding above) is the current
@@ -2471,9 +2481,13 @@ impl<'src> Compiler<'src> {
                 }
                 _ => {
                     // Dynamic call: push args, load callee, CallDyn (installs
-                    // upvals for captured/closure callees).
+                    // upvals for captured/closure callees). The callee read
+                    // goes through `emit_slot_read`: an effectively-const
+                    // binding's slot may be dead-eliminated, so a raw `Local`
+                    // load here would read undefined (and miscall) instead of
+                    // the propagated constant.
                     self.compile_args(argv);
-                    self.emit(Instr::Local(r.slot as LocalIndex), span);
+                    self.emit_slot_read(&r, span);
                     self.emit(Instr::CallDyn(argv.len() as u32), span);
                 }
             }

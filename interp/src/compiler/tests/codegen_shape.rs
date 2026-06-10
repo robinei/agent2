@@ -680,3 +680,21 @@ fn plain_loop_var_emits_no_fresh_cell() {
         prog.code
     );
 }
+
+#[test]
+fn effectively_const_callee_materializes_constant_not_dead_slot() {
+    // `n` is effectively const: every read is propagated and its initializer
+    // store is dead-eliminated. The dynamic-call callee read must emit the
+    // propagated constant, not a `Local` load of the never-written slot.
+    let prog = compile("let n = 5; return n(1, 2);").expect("compiles");
+    assert!(
+        prog.code.iter().any(|i| matches!(i, Instr::PushPosInt(5))),
+        "callee should be the propagated constant: {:?}",
+        prog.code
+    );
+    assert!(
+        !prog.code.iter().any(|i| matches!(i, Instr::Local(_))),
+        "no read of the dead slot should remain: {:?}",
+        prog.code
+    );
+}
