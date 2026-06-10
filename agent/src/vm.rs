@@ -270,7 +270,7 @@ pub struct VM {
     pub ip: CodeAddr,
     pub fp: StackAddr,
     /// Cache of the current (top) call frame's `local_count`, mirrored here so
-    /// the hottest instructions (`Local`/`SetLocal`/`Pop`/`Dup`/… and
+    /// the hottest instructions (`Local`/`SetLocal`/`Pop`/`Pick`/`Dig`/… and
     /// `frame_floor`) read a plain field instead of chasing `callstack.last()`
     /// every time. Kept in sync wherever a frame's `local_count` is set:
     /// `Call`/`CallDyn` (→ nargs), `EnterFrame` (→ final count), and `Return`
@@ -317,23 +317,21 @@ pub enum Instr {
     PushBuiltin(Builtin),
 
     Pop(usize),
-    Dup,
-    Swap, // any, any -> any, any
-    Rot,  // any, any, any -> any, any, any
 
     // Generalized stack reach (Forth-like), counting from the top (0 = top).
-    // Both reject reaching below the current frame's temporaries (frame_floor),
-    // like Dup/Swap/Rot. Pick is the read-modify-write workhorse (duplicate an
-    // lvalue's object/key for a load-then-store); Dig reorders without copying.
+    // Rejects reaching below the current frame's temporaries (frame_floor).
+    // Pick is the read-modify-write workhorse (duplicate an lvalue's object/key
+    // for a load-then-store); Dig reorders without copying. These subsume the
+    // former Dup/Swap/Rot (Pick(0) ≈ Dup, Dig(1) ≈ Swap, Dig(2) ≈ Rot).
     //
-    // Pick(n): copy the n-th-from-top value to the top. Pick(0) == Dup.
+    // Pick(n): copy the n-th-from-top value to the top.
     Pick(usize), // any^(n+1) -> any^(n+1), any
     // Dig(n): move the n-th-from-top value to the top, removing it from its
-    // old position. Dig(0) is a no-op, Dig(1) == Swap, Dig(2) == Rot.
+    // old position. Dig(0) is a no-op. Includes fast paths for n ≤ 2.
     Dig(usize), // any^(n+1) -> any^(n+1)
 
     // Drop `n` values directly below the top, leaving the top in place.
-    // Nip(1) ≡ Swap; Pop, Nip(n) is the symmetric inverse of Dig(n).
+    // Nip(1) ≡ Dig(1); Pop; Nip(n) is the symmetric inverse of Dig(n).
     Nip(usize), // any^(n+1) -> any
 
     // calls function starting at address. the N arguments are passed on the
@@ -401,7 +399,7 @@ pub enum Instr {
 
     // Stores the top of stack to a local without popping (like WASM's
     // `local.tee`): the value stays on the stack AND is written to the local
-    // slot. Replaces the common `Dup; SetLocal` pair.
+    // slot. Replaces the common `Pick(0); SetLocal` pair (formerly `Dup; SetLocal`).
     TeeLocal(LocalIndex), // any -> any
 
     // Re-box a (Boxed) local: allocate a fresh `cells` entry seeded with the
@@ -454,7 +452,7 @@ pub enum Instr {
     // PEEKS (does NOT pop) the topmost value; jumps to the address when it is
     // neither null nor undefined, leaving the value in place. The "not nullish"
     // jump that lowers `??`, optional chaining (`?.`), and optional calls in one
-    // instruction, instead of a Dup + Push(Null) + LooseEq + branch per check.
+    // instruction, instead of the former Dup + Push(Null) + LooseEq per check.
     JNotNullish(CodeAddr), // any -> any (peek)
 
     // EFFECT: invokes the named tool or function.
@@ -746,7 +744,7 @@ impl VM {
 
     /// Lowest stack index the current frame's expression temporaries may
     /// occupy. Args live below `fp`, locals in `[fp, fp + local_count)`, and
-    /// temporaries above that. Stack-manipulation ops (Dup/Swap/Rot/Pop) must
+    /// temporaries above that. Stack-manipulation ops (Pick/Dig/Nip/Pop) must
     /// not reach below this floor into locals, args, or the caller's stack.
     fn frame_floor(&self) -> usize {
         self.fp as usize + self.cur_local_count as usize
@@ -1328,34 +1326,6 @@ impl VM {
                     self.ip += 1;
                 }
 
-                Instr::Dup => {
-                    if self.stack.len() < self.frame_floor() + 1 {
-                        return Err(VMError::StackUnderflow);
-                    }
-                    let top = self.stack.last().unwrap().clone();
-                    self.stack.push(top);
-                    self.ip += 1;
-                }
-
-                Instr::Swap => {
-                    let len = self.stack.len();
-                    if len < self.frame_floor() + 2 {
-                        return Err(VMError::StackUnderflow);
-                    }
-                    self.stack.swap(len - 1, len - 2);
-                    self.ip += 1;
-                }
-
-                Instr::Rot => {
-                    let len = self.stack.len();
-                    if len < self.frame_floor() + 3 {
-                        return Err(VMError::StackUnderflow);
-                    }
-                    self.stack.swap(len - 3, len - 2);
-                    self.stack.swap(len - 2, len - 1);
-                    self.ip += 1;
-                }
-
                 Instr::Pick(n) => {
                     let n = *n;
                     let len = self.stack.len();
@@ -1375,9 +1345,20 @@ impl VM {
                     if len < self.frame_floor() + n + 1 {
                         return Err(VMError::StackUnderflow);
                     }
-                    // Remove the n-th-from-top value and re-push it on top.
-                    let val = self.stack.remove(len - 1 - n);
-                    self.stack.push(val);
+                    // Fast paths for the common small-n cases, matching the
+                    // performance of the former Dup/Swap/Rot dispatch.
+                    match n {
+                        0 => {} // no-op
+                        1 => self.stack.swap(len - 1, len - 2),
+                        2 => {
+                            self.stack.swap(len - 3, len - 2);
+                            self.stack.swap(len - 2, len - 1);
+                        }
+                        _ => {
+                            let val = self.stack.remove(len - 1 - n);
+                            self.stack.push(val);
+                        }
+                    }
                     self.ip += 1;
                 }
 
@@ -1388,7 +1369,7 @@ impl VM {
                         return Err(VMError::StackUnderflow);
                     }
                     // Remove n values directly below the top, leaving the top
-                    // in place. Nip(1) ≡ Swap; Pop, Nip(n) is the inverse of
+                    // in place. Nip(1) ≡ Dig(1); Pop; Nip(n) is the inverse of
                     // Dig(n): where Dig moves element len-1-n to the top,
                     // Nip drops it.
                     let start = len - 1 - n;
@@ -1733,7 +1714,7 @@ impl VM {
                     let slot = (self.fp + local) as usize;
                     // Like SetLocal but peeks: the value stays on the stack
                     // (assignment is an expression) while still writing to the
-                    // local. Replaces Dup; SetLocal.
+                    // local. Replaces Pick(0); SetLocal (formerly Dup; SetLocal).
                     match self.stack[slot] {
                         Value::Upval(c) => {
                             *self.cells.get_mut(c as usize).ok_or(VMError::ValueError)? = val;
@@ -2469,22 +2450,25 @@ mod tests {
 
     #[test]
     fn dup_swap_rot() {
-        assert_eq!(run(vec![PushFloat(1.0), Dup]), vec![n(1.0), n(1.0)]);
+        // Pick(0) = former Dup
+        assert_eq!(run(vec![PushFloat(1.0), Pick(0)]), vec![n(1.0), n(1.0)]);
+        // Dig(1) = former Swap
         assert_eq!(
-            run(vec![PushFloat(1.0), PushFloat(2.0), Swap]),
+            run(vec![PushFloat(1.0), PushFloat(2.0), Dig(1)]),
             vec![n(2.0), n(1.0)]
         );
+        // Dig(2) = former Rot
         assert_eq!(
-            run(vec![PushFloat(1.0), PushFloat(2.0), PushFloat(3.0), Rot]),
+            run(vec![PushFloat(1.0), PushFloat(2.0), PushFloat(3.0), Dig(2)]),
             vec![n(2.0), n(3.0), n(1.0)]
         );
-        assert!(matches!(run_err(vec![Swap]), VMError::StackUnderflow));
-        assert!(matches!(run_err(vec![Rot]), VMError::StackUnderflow));
+        assert!(matches!(run_err(vec![Dig(1)]), VMError::StackUnderflow));
+        assert!(matches!(run_err(vec![Dig(2)]), VMError::StackUnderflow));
     }
 
     #[test]
     fn pick() {
-        // Pick(0) is Dup; Pick(n) copies the n-th-from-top value to the top.
+        // Pick(0) was formerly Dup; Pick(n) copies the n-th-from-top value to the top.
         assert_eq!(run(vec![PushFloat(1.0), Pick(0)]), vec![n(1.0), n(1.0)]);
         assert_eq!(
             run(vec![PushFloat(1.0), PushFloat(2.0), Pick(1)]),
@@ -2508,7 +2492,7 @@ mod tests {
 
     #[test]
     fn dig() {
-        // Dig(0) no-op, Dig(1) == Swap, Dig(2) == Rot.
+        // Dig(0) no-op, Dig(1) was formerly Swap, Dig(2) was formerly Rot.
         assert_eq!(run(vec![PushFloat(1.0), Dig(0)]), vec![n(1.0)]);
         assert_eq!(
             run(vec![PushFloat(1.0), PushFloat(2.0), Dig(1)]),
@@ -3234,9 +3218,9 @@ mod tests {
         let mut code: Vec<Instr> = Vec::new();
         let call_mc = code.len();
         code.push(Call(0, 0)); // patched → makeCounter; leaves a closure
-        code.push(Dup);
+        code.push(Pick(0));
         code.push(CallDyn(0)); // first call → 1
-        code.push(Swap);
+        code.push(Dig(1));
         code.push(CallDyn(0)); // second call → 2
         code.push(Add);
         code.push(Return(1));
@@ -3394,7 +3378,7 @@ mod tests {
             PushFloat(1.0),
             SetLocal(0),
             MakeClosure(6, vec![0].into()),
-            Dup,
+            Pick(0),
             Eq,
             Return(1), // addr 6: also a valid (never-called) closure target
         ];
@@ -3517,13 +3501,13 @@ mod tests {
 
     #[test]
     fn arr_get_set_with_dup() {
-        // Keep ptr around with Dup before mutation.
+        // Keep ptr around with Pick(0) (formerly Dup) before mutation.
         let code = vec![
             PushFloat(10.0),
             PushFloat(20.0),
             PushFloat(30.0),
             ArrNew(3),
-            Dup,                    // save ptr for later
+            Pick(0),                // save ptr for later
             PushFloat(1.0),         // index
             PushFloat(99.0),        // value
             IndexSet(SetMode::New), // pops value, index, ptr_copy; leaves value → [ptr, 99]
@@ -3591,7 +3575,7 @@ mod tests {
             PushFloat(1.0),
             PushFloat(2.0),
             ObjNew(vec!["x".into(), "y".into()].into()), // x=1, y=2
-            Dup,                                         // keep ptr for verification
+            Pick(0),                                     // keep ptr for verification
             ps("y"),                                     // field "y" — pushed before val
             PushFloat(99.0),                             // val — on top
             IndexSet(SetMode::New),                      // obj.y = 99; leaves val → [ptr, 99]
@@ -3609,7 +3593,7 @@ mod tests {
             PushFloat(2.0),                              // x value
             PushFloat(1.0),                              // y value
             ObjNew(vec!["x".into(), "y".into()].into()), // x=2, y=1
-            Dup,             // keep ptr for verification after ObjSet consumes one
+            Pick(0),         // keep ptr for verification after ObjSet consumes one
             PushFloat(99.0), // value to set
             ObjSet("x".into(), SetMode::New), // obj.x = 99; leaves value → [ptr, 99]
             Pop(1),          // drop the result → [ptr]
@@ -3894,7 +3878,7 @@ mod tests {
         let code = vec![ps("abc"), ArrNew(1), ps("abc"), ArrNew(1), Eq];
         assert_eq!(run(code), vec![b(false)]);
         // But the SAME array (one allocation, duplicated handle) is equal.
-        let code = vec![ps("abc"), ArrNew(1), Dup, Eq];
+        let code = vec![ps("abc"), ArrNew(1), Pick(0), Eq];
         assert_eq!(run(code), vec![b(true)]);
         // Strings remain primitives: distinct allocations compare by content.
         assert_eq!(run(vec![ps("abc"), ps("abc"), Eq]), vec![b(true)]);
@@ -3958,7 +3942,7 @@ mod tests {
             Call(3, 1),
             Return(0),
             EnterFrame(0, false, plain(1).into()), // local 0; sp == floor
-            Dup,                                   // nothing above the floor -> underflow
+            Pick(0),                               // nothing above the floor -> underflow
             Return(0),
         ];
         assert!(matches!(run_err(code), VMError::StackUnderflow));
@@ -3966,15 +3950,15 @@ mod tests {
 
     #[test]
     fn swap_cannot_cross_frame_floor() {
-        // One local + one temporary: Swap needs two temporaries above the
-        // floor, but only one exists.
+        // One local + one temporary: Dig(1) (formerly Swap) needs two temporaries
+        // above the floor, but only one exists.
         let code = vec![
             PushFloat(1.0),
             Call(3, 1),
             Return(0),
             EnterFrame(0, false, plain(1).into()), // local 0
             PushFloat(9.0),                        // single temporary
-            Swap, // would swap the temp with the local -> underflow
+            Dig(1), // would swap the temp with the local -> underflow
             Return(0),
         ];
         assert!(matches!(run_err(code), VMError::StackUnderflow));
@@ -3987,9 +3971,9 @@ mod tests {
             Call(3, 1),
             Return(0),
             EnterFrame(0, false, plain(1).into()), // local 0
-            PushFloat(8.0),                        // two temporaries (need three for Rot)
+            PushFloat(8.0),                        // two temporaries (need three for Dig(2))
             PushFloat(9.0),
-            Rot,
+            Dig(2),
             Return(0),
         ];
         assert!(matches!(run_err(code), VMError::StackUnderflow));
@@ -4008,7 +3992,7 @@ mod tests {
             SetLocal(0),    // local 0 = 10
             PushFloat(1.0), // temporaries: [1, 2]
             PushFloat(2.0),
-            Swap,     // -> [2, 1]
+            Dig(1),   // -> [2, 1]
             Pop(1),   // -> [2]
             Local(0), // -> [2, 10]
             Add,      // -> [12]

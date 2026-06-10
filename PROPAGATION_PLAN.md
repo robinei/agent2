@@ -1,3 +1,11 @@
+> **Status: HISTORICAL.** This document records the plan as designed at the
+> time. The code has since evolved; where they disagree, the code and its
+> module docs win. Known drift: all marked phases (A, C, D, E.1, E.2, F)
+> shipped; Phase B (transient `local_env`) remains deferred. Some
+> implementation details (const resolution, slot compaction) evolved from
+> the sketched design; the analyzer (`analyzer.rs`) is the canonical
+> reference.
+
 # Constant / copy propagation — plan to "fully realized minus full dataflow"
 
 Builds on the shipped piece (`PERF.md §4b`): write-once `const` → literal

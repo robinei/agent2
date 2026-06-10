@@ -5,22 +5,14 @@ rough size, ordered by expected value. Pick items individually; do not start
 one without checking it still matches the code (Phases 0–3 may have shifted
 details).
 
-## 1. Transparent `await` / `async` (small)
+## 1. `await` / `async` — superseded
 
-LLMs reflexively write `await tools.fetch(...)` — async-wrapped tool calls
-are the most deeply trained JS pattern there is. `Invoke` is synchronous from
-the program's perspective, so fighting this prior buys nothing.
-
-- `ast::Expression::AwaitExpression` currently falls into "unsupported
-  expression". Compile it as its argument (`await x` ≡ `x`).
-- Accept the `async` flag on function declarations/expressions/arrows by
-  ignoring it (an async function here returns its value directly, not a
-  promise — document this in the divergence list in `vm/instr.rs`).
-- Reject `Promise`, `.then(...)` as today (undeclared variable / unsupported
-  method) — but consider a targeted diagnostic for `.then` suggesting plain
-  sequential code.
-- Tests: `state.x = await tools.f();` behaves identically to the non-await
-  form; `async function f() { return 1; } state.x = await f();` works.
+Superseded by `7_ASYNC.md` (real promises: outbox-batched tool calls,
+blocking re-executing `Await`, VM-side cascading, optional task strands).
+The transparent-await stopgap described here previously should **not** be
+implemented — it would change `await tools.f()` from "unsupported" to
+"silently synchronous" and then change semantics *again* when Phase 7
+lands. Go straight to 7_ASYNC Tier 1.
 
 ## 2. Memory bounds (medium)
 

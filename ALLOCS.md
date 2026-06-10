@@ -1,3 +1,11 @@
+> **Status: HISTORICAL.** This document records the plan as designed at the
+> time. The code has since evolved; where they disagree, the code and its
+> module docs win. Known drift: Phase 3's `ThinString` newtype design was
+> superseded by the `RcStr` approach (reference-counted inline string); same
+> allocation-reduction goals achieved through a different mechanism. Phases
+> 1, 2, 3, 4 all shipped; the post-phase baseline numbers reflect the
+> `RcStr` implementation, not `ThinString`.
+
 # Allocation reduction plan
 
 Goal: cut runtime heap allocations in the VM and builtins, building on the

@@ -78,7 +78,7 @@ impl Builtin {
             // ── array methods (receiver + args) ──
             Builtin::ArrayPush => BuiltinMeta {
                 name: "push",
-                min_args: 1, // recv
+                min_args: 1, // recv only (no element → no-op, returns length)
                 max_args: u32::MAX,
             },
             Builtin::ArrayPop => BuiltinMeta {
@@ -93,7 +93,7 @@ impl Builtin {
             },
             Builtin::ArrayUnshift => BuiltinMeta {
                 name: "unshift",
-                min_args: 1, // recv
+                min_args: 1, // recv only (no element → no-op, returns length)
                 max_args: u32::MAX,
             },
             Builtin::ArrayJoin => BuiltinMeta {
@@ -428,17 +428,19 @@ fn js_parse_int(input: &str, mut radix: i64) -> f64 {
 
 /// `arr.push(x)` → appends `x` and returns the new length.
 fn array_push(vm: &mut VM, argc: u32) -> Result<(), VMError> {
-    let args = check_arity!(vm, argc, 2)?;
+    let args = take_args::<2>(vm, argc)?;
     let arr_ptr = match &args[0] {
         Value::Array(p) => *p,
         _ => return Err(VMError::TypeError),
     };
-    let val = args[1].clone();
     let arr = vm
         .arrays
         .get_mut(arr_ptr as usize)
         .ok_or(VMError::TypeError)?;
-    arr.push(val);
+    // No element → no-op, just return length (JS `[].push()` returns 0).
+    if argc > 1 {
+        arr.push(args[1].clone());
+    }
     let len = arr.len();
     vm.stack.push(Value::Float(len as f64));
     Ok(())
@@ -481,17 +483,19 @@ fn array_shift(vm: &mut VM, argc: u32) -> Result<(), VMError> {
 
 /// `arr.unshift(x)` → prepends `x` and returns the new length.
 fn array_unshift(vm: &mut VM, argc: u32) -> Result<(), VMError> {
-    let args = check_arity!(vm, argc, 2)?;
+    let args = take_args::<2>(vm, argc)?;
     let arr_ptr = match &args[0] {
         Value::Array(p) => *p,
         _ => return Err(VMError::TypeError),
     };
-    let val = args[1].clone();
     let arr = vm
         .arrays
         .get_mut(arr_ptr as usize)
         .ok_or(VMError::TypeError)?;
-    arr.insert(0, val);
+    // No element → no-op, just return length.
+    if argc > 1 {
+        arr.insert(0, args[1].clone());
+    }
     let len = arr.len();
     vm.stack.push(Value::Float(len as f64));
     Ok(())
@@ -887,7 +891,7 @@ mod tests {
         let out = run(vec![
             Instr::PushFloat(10.0),
             Instr::ArrNew(1),
-            Instr::Dup,
+            Instr::Pick(0),
             Instr::PushFloat(20.0),
             Instr::CallBuiltin(Builtin::ArrayPush, 2),
         ]);
@@ -945,7 +949,7 @@ mod tests {
         let out = run(vec![
             Instr::PushFloat(2.0),
             Instr::ArrNew(1),
-            Instr::Dup,
+            Instr::Pick(0),
             Instr::PushFloat(1.0),
             Instr::CallBuiltin(Builtin::ArrayUnshift, 2),
         ]);

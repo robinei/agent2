@@ -245,12 +245,12 @@ fn pe_is_pure_push(i: &Instr) -> bool {
             | Instr::PushBuiltin(_)
             | Instr::PushStr(_)
             | Instr::Local(_)
-            | Instr::Dup
+            | Instr::Pick(_)
     )
 }
 
 /// True for a push of a compile-time *constant value* (a literal). Stricter than
-/// [`pe_is_pure_push`]: excludes `Local`/`Dup` (not constants) and `PushPtr`/
+/// [`pe_is_pure_push`]: excludes `Local`/`Pick` (not constants) and `PushPtr`/
 /// `PushFn`/`PushBuiltin` (heap/code references, and `PushFn` still carries an
 /// unresolved label id here). These are the only operands [`pe_try_constfold`]
 /// will evaluate.
@@ -446,10 +446,10 @@ enum Reduction {
 /// operand of any rule, and `a`/`b` are adjacent in the output, so no rewrite
 /// can cross a jump target. Patterns:
 ///
-///   • `Swap; Swap` → ∅                    (involution)
-///   • `Swap; Pop(1)` → `Nip(1)`           (drop the value below the top)
-///   • `Swap; Pop(n≥2)` → `Pop(n)`         (swap is moot if both are popped)
-///   • `Dup; SetLocal(x)` → `TeeLocal(x)`  (write without the extra copy/pop)
+///   • `Dig(1); Dig(1)` → ∅                (involution, formerly Swap;Swap)
+///   • `Dig(1); Pop(1)` → `Nip(1)`         (drop the value below the top)
+///   • `Dig(1); Pop(n≥2)` → `Pop(n)`       (swap is moot if both are popped)
+///   • `Pick(0); SetLocal(x)` → `TeeLocal(x)`  (write without the extra copy/pop)
 ///   • `Not; Not` → `ToBool`               (double negation is boolean coercion)
 ///   • `Not; JFalse(L)` → `JTrue(L)`,  `Not; JTrue(L)` → `JFalse(L)`
 ///   • `ToBool; {JFalse|JTrue|Not}` → drop the `ToBool` (the consumer coerces)
@@ -463,10 +463,10 @@ enum Reduction {
 ///     one of the discarded)
 fn pe_reduce(a: &Instr, b: &Instr) -> Reduction {
     match (a, b) {
-        (Instr::Swap, Instr::Swap) => Reduction::Cancel,
-        (Instr::Swap, Instr::Pop(n)) if *n == 1 => Reduction::Replace(Instr::Nip(1)),
-        (Instr::Swap, Instr::Pop(n)) => Reduction::Replace(Instr::Pop(*n)),
-        (Instr::Dup, Instr::SetLocal(x)) => Reduction::Replace(Instr::TeeLocal(*x)),
+        (Instr::Dig(1), Instr::Dig(1)) => Reduction::Cancel,
+        (Instr::Dig(1), Instr::Pop(n)) if *n == 1 => Reduction::Replace(Instr::Nip(1)),
+        (Instr::Dig(1), Instr::Pop(n)) => Reduction::Replace(Instr::Pop(*n)),
+        (Instr::Pick(0), Instr::SetLocal(x)) => Reduction::Replace(Instr::TeeLocal(*x)),
         (Instr::Not, Instr::Not) => Reduction::Replace(Instr::ToBool),
         (Instr::Not, Instr::JFalse(l)) => Reduction::Replace(Instr::JTrue(*l)),
         (Instr::Not, Instr::JTrue(l)) => Reduction::Replace(Instr::JFalse(*l)),
@@ -505,7 +505,7 @@ fn pe_reduce(a: &Instr, b: &Instr) -> Reduction {
 /// adjacent-pair rules ([`pe_reduce`]), then constant folding of a
 /// `[const-push…, op]` window ([`pe_try_constfold`]). Re-reducing after every
 /// push means a reduction's *result* is re-examined against what's now beneath
-/// it, so cascades collapse in any direction (`Swap;Swap;Swap;Swap`, nested
+/// it, so cascades collapse in any direction (e.g. `Dig(1);Dig(1)` cancels, nested
 /// `(1+2)*3`, `Pop;Pop;Pop`).
 ///
 /// Composed with the CFG passes under a fixpoint loop (see [`optimize`]).
@@ -632,9 +632,9 @@ mod tests {
 
     #[test]
     fn peephole_cancels_and_fuses() {
-        // Swap;Swap;Swap;Swap cancels fully.
+        // Dig(1);Dig(1);Dig(1);Dig(1) cancels fully.
         let (c, _) = peephole(
-            vec![Instr::Swap, Instr::Swap, Instr::Swap, Instr::Swap],
+            vec![Instr::Dig(1), Instr::Dig(1), Instr::Dig(1), Instr::Dig(1)],
             s0(4),
         );
         assert!(c.is_empty(), "{c:?}");
@@ -655,7 +655,7 @@ mod tests {
         );
 
         // A Label blocks a rewrite (control could enter between).
-        let code = vec![Instr::Swap, Instr::Label(0), Instr::Swap];
+        let code = vec![Instr::Dig(1), Instr::Label(0), Instr::Dig(1)];
         assert_eq!(peephole(code.clone(), s0(3)).0, code);
 
         // An effectful producer is not removed by the pure-push rule.
@@ -702,7 +702,7 @@ mod tests {
 
     #[test]
     fn peephole_dup_setlocal_to_tee() {
-        let (c, _) = peephole(vec![Instr::Dup, Instr::SetLocal(3)], s0(2));
+        let (c, _) = peephole(vec![Instr::Pick(0), Instr::SetLocal(3)], s0(2));
         assert_eq!(c, vec![Instr::TeeLocal(3)]);
     }
 
@@ -756,11 +756,11 @@ mod tests {
     #[test]
     fn peephole_swap_pop() {
         assert_eq!(
-            peephole(vec![Instr::Swap, Instr::Pop(1)], s0(2)).0,
+            peephole(vec![Instr::Dig(1), Instr::Pop(1)], s0(2)).0,
             vec![Instr::Nip(1)]
         );
         assert_eq!(
-            peephole(vec![Instr::Swap, Instr::Pop(2)], s0(2)).0,
+            peephole(vec![Instr::Dig(1), Instr::Pop(2)], s0(2)).0,
             vec![Instr::Pop(2)]
         );
     }

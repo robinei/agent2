@@ -246,7 +246,7 @@ impl<'src> Compiler<'src> {
             // Every expression statement leaves one value, popped to keep the
             // stack-discipline invariant (one value per expression). For
             // assignments and updates targeting locals, we lower directly in a
-            // "value-not-needed" mode, skipping the wasted Dup/Pop pair.
+            // "value-not-needed" mode, skipping the wasted Pick(0)/Pop pair (formerly Dup/Pop).
             ast::Statement::ExpressionStatement(es) => match &es.expression {
                 ast::Expression::AssignmentExpression(a) => {
                     self.compile_assignment(a, false);
@@ -448,7 +448,7 @@ impl<'src> Compiler<'src> {
                 }
                 for (i, el) in arr.elements.iter().enumerate() {
                     if let Some(el) = el {
-                        self.emit(Instr::Dup, span);
+                        self.emit(Instr::Pick(0), span);
                         self.emit(Instr::PushPosInt(i as u64), span);
                         self.emit(Instr::IndexGet, span);
                         self.destructure_binding(el, span);
@@ -464,7 +464,7 @@ impl<'src> Compiler<'src> {
                     );
                 }
                 for prop in &obj.properties {
-                    self.emit(Instr::Dup, span);
+                    self.emit(Instr::Pick(0), span);
                     self.emit_property_key_access(&prop.key, prop.computed, span);
                     self.destructure_binding(&prop.value, span);
                 }
@@ -508,7 +508,7 @@ impl<'src> Compiler<'src> {
     /// `null`.) Leaves exactly one value either way.
     fn emit_default(&mut self, default: &ast::Expression, span: u32) {
         let have = self.new_label();
-        self.emit(Instr::Dup, span);
+        self.emit(Instr::Pick(0), span);
         self.emit(Instr::PushUndefined, span);
         self.emit(Instr::Eq, span);
         self.emit(Instr::JFalse(have), span); // not undefined → keep the value
@@ -1098,12 +1098,12 @@ impl<'src> Compiler<'src> {
 
         // `key in obj` lowers to ObjHas, which pops the (string) key then the
         // object. Evaluate left (key) then right (obj) to keep JS eval order,
-        // then Swap into [obj, key]; ToStr coerces the key as JS `in` does.
+        // then Dig(1) (formerly Swap) into [obj, key]; ToStr coerces the key as JS `in` does.
         if bin.operator == Op::In {
             self.compile_expr(&bin.left);
             self.emit(Instr::ToStr, span);
             self.compile_expr(&bin.right);
-            self.emit(Instr::Swap, span);
+            self.emit(Instr::Dig(1), span);
             self.emit(Instr::ObjHas, span);
             return;
         }
@@ -1245,7 +1245,7 @@ impl<'src> Compiler<'src> {
             Op::And => {
                 // truthy: drop lhs, eval rhs; falsy: keep lhs.
                 let end = self.new_label();
-                self.emit(Instr::Dup, span);
+                self.emit(Instr::Pick(0), span);
                 self.emit(Instr::JFalse(end), span);
                 self.emit(Instr::Pop(1), span);
                 self.compile_expr(&log.right);
@@ -1254,7 +1254,7 @@ impl<'src> Compiler<'src> {
             Op::Or => {
                 // truthy: keep lhs; falsy: drop lhs, eval rhs.
                 let end = self.new_label();
-                self.emit(Instr::Dup, span);
+                self.emit(Instr::Pick(0), span);
                 self.emit(Instr::JTrue(end), span);
                 self.emit(Instr::Pop(1), span);
                 self.compile_expr(&log.right);
@@ -1429,7 +1429,7 @@ impl<'src> Compiler<'src> {
     /// emits next. Returns the `end` label to place after that access.
     ///
     /// The peeking `JNotNullish` keeps the value on the not-nullish path with no
-    /// `Dup`, so the whole guard is one branch plus the short-circuit tail.
+    /// `Pick(0)` (formerly `Dup`), so the whole guard is one branch plus the short-circuit tail.
     ///
     /// Per-link: a fully-`?.` chain (`a?.b?.c`) short-circuits correctly because
     /// each link re-checks; mixing `?.` then a plain `.` on a nullish base
@@ -1483,7 +1483,7 @@ impl<'src> Compiler<'src> {
                 }
                 self.compile_expr(&a.right);
                 if value_needed {
-                    self.emit(Instr::Dup, span); // one copy is the expression result
+                    self.emit(Instr::Pick(0), span); // one copy is the expression result
                 }
                 self.destructure_assign(&a.left, span);
                 if !value_needed {
@@ -1581,12 +1581,12 @@ impl<'src> Compiler<'src> {
                 // For `&&=`, need a copy of `old` to test truthiness without
                 // consuming it (the keep path needs it). In void context we
                 // can just peek (JFalse pops, but we'd lose old). We always
-                // Dup since the keep path or store path consumes `old`.
-                self.emit(Instr::Dup, span);
+                // Pick(0) (formerly Dup) since the keep path or store path consumes `old`.
+                self.emit(Instr::Pick(0), span);
                 self.emit(Instr::JFalse(keep), span); // falsy → keep old
             }
             Op::LogicalOr => {
-                self.emit(Instr::Dup, span);
+                self.emit(Instr::Pick(0), span);
                 self.emit(Instr::JTrue(keep), span); // truthy → keep old
             }
             _ => unreachable!("only logical operators reach here"),
@@ -1778,7 +1778,7 @@ impl<'src> Compiler<'src> {
         match lv {
             LValue::Local(slot) => self.emit(Instr::Local(*slot), span),
             LValue::Member(_, field) => {
-                self.emit(Instr::Dup, span); // copy the object
+                self.emit(Instr::Pick(0), span); // copy the object
                 self.emit(Instr::ObjGet(RcStr::from(field.as_str())), span);
             }
             LValue::Index(..) => {
@@ -1791,7 +1791,7 @@ impl<'src> Compiler<'src> {
 
     /// With `[address…, value]` on the stack, store `value` into the lvalue and
     /// leave it on the stack (assignment is an expression). For locals, uses
-    /// `TeeLocal` (the one-instruction equivalent of `Dup; SetLocal`).
+    /// `TeeLocal` (the one-instruction equivalent of `Pick(0); SetLocal`, formerly `Dup; SetLocal`).
     fn lvalue_emit_store(&mut self, lv: &LValue<'_, '_>, span: u32) {
         match lv {
             LValue::Local(slot) => {
@@ -1829,7 +1829,7 @@ impl<'src> Compiler<'src> {
     }
 
     /// Remove `n` values sitting directly below the top of the stack, leaving the
-    /// top in place. Uses `Nip(n)` (one instruction) rather than `Swap`+`Pop`
+    /// top in place. Uses `Nip(n)` (one instruction) rather than `Dig(1)`+`Pop` (formerly `Swap`+`Pop`)
     /// pairs.
     fn emit_drop_below_top(&mut self, n: usize, span: u32) {
         if n > 0 {
@@ -1853,7 +1853,7 @@ impl<'src> Compiler<'src> {
                 }
                 for (i, el) in arr.elements.iter().enumerate() {
                     if let Some(el) = el {
-                        self.emit(Instr::Dup, span);
+                        self.emit(Instr::Pick(0), span);
                         self.emit(Instr::PushPosInt(i as u64), span);
                         self.emit(Instr::IndexGet, span);
                         self.assign_maybe_default(el, span);
@@ -1873,7 +1873,7 @@ impl<'src> Compiler<'src> {
                         ast::AssignmentTargetProperty::AssignmentTargetPropertyIdentifier(p) => {
                             // Shorthand `{a}` / `{a = d}`: the key and the target
                             // are the same identifier.
-                            self.emit(Instr::Dup, span);
+                            self.emit(Instr::Pick(0), span);
                             self.emit(Instr::ObjGet(p.binding.name.as_str().into()), span);
                             if let Some(default) = &p.init {
                                 self.emit_default(default, span);
@@ -1885,7 +1885,7 @@ impl<'src> Compiler<'src> {
                             );
                         }
                         ast::AssignmentTargetProperty::AssignmentTargetPropertyProperty(p) => {
-                            self.emit(Instr::Dup, span);
+                            self.emit(Instr::Pick(0), span);
                             self.emit_property_key_access(&p.name, p.computed, span);
                             self.assign_maybe_default(&p.binding, span);
                         }
@@ -3506,7 +3506,7 @@ mod tests {
 
     #[test]
     fn for_program_seeds_state_at_heap0() {
-        // The blessed `state` object always lives at heap[0], even when seeded.
+        // The blessed `state` object always lives at objects[0], even when seeded.
         let prog = compile("1;").expect("compiles");
         let state = serde_json::json!({ "count": 7 });
         let vm = VM::for_program(prog, state).unwrap();
@@ -3534,7 +3534,7 @@ mod tests {
     // ── Phase 1: expressions ───────────────────────────────────────────
     //
     // Most expression behavior is exercised end-to-end: compile a program that
-    // writes its result into `state.r`, run it, then read `heap[0]["r"]`. This
+    // writes its result into `state.r`, run it, then read `objects[0]["r"]`. This
     // routes every expression through the real VM and the `state`/`Ptr(0)`
     // lowering at once.
 
@@ -3877,7 +3877,6 @@ mod tests {
             "Math.abs();",               // needs 1
             "\"x\".slice();",            // needs 1..2 args after receiver
             "\"x\".slice(1, 2, 3);",     // too many
-            "[1].push();",               // needs 1
             "[1].pop(2);",               // needs 0
             "Object.keys();",            // needs 1
             "Number.parseInt(1, 2, 3);", // needs 1..2
@@ -3887,6 +3886,9 @@ mod tests {
                 "expected `{src}` to fail arity check"
             );
         }
+
+        // push() with no element is a no-op (returns length).
+        assert!(compile("[1].push();").is_ok());
 
         // The diagnostic names the builtin and reports the receiver-free bounds.
         let errs = compile("\"x\".slice(1, 2, 3);").expect_err("too many args");
@@ -3901,7 +3903,7 @@ mod tests {
 
     #[test]
     fn state_is_ptr_zero() {
-        // Bare `state` is the heap[0] object pointer; the whole bag round-trips.
+        // Bare `state` is the objects[0] object pointer; the whole bag round-trips.
         let vm = run_vm("state.a = 1; state.r = JSON.stringify(state);");
         match state_val(&vm, "r") {
             // r was set last, so it appears in the serialized object too.

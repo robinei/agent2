@@ -1,3 +1,7 @@
+> **Status: HISTORICAL.** This document records the plan as designed at the
+> time. The code has since evolved; where they disagree, the code and its
+> module docs win. Known drift: `heap[0]`/`HeapValue::Object` → typed heaps with `objects[0]`; `ObjGetDyn`/`ObjSetDyn` → `IndexGet`/`IndexSet`; `Alloc` → `EnterFrame`; `PushStr(String)` → `PushStr(RcStr)`; `StackValue` → `Value`; `Read`/`Write`/`variables` removed. Still authoritative: §1 (variable model — everything → frame locals), §2 (state is the only durable surface, `state` is a blessed Object), §3 (tool calls → `Invoke`), §4 (raise → `Raise`), rewrite-from-top model, short-circuit/assignment lowering, label/backpatch mechanism, code layout.
+
 # Compiler Plan — `compile.rs` (JS source → VM instructions)
 
 Compiles a subset of JS into the stack VM defined in `agent/src/vm.rs`. Reads

@@ -1,3 +1,9 @@
+> **Status: HISTORICAL.** This document records the analysis at the time.
+> The code has since evolved; where they disagree, the code and its module
+> docs win. Known drift: instruction names have been canonicalized
+> (`Dup`/`Swap`/`Rot` → `Pick(0)`/`Dig(1)`/`Dig(2)`); the `RcStr` inline-
+> string work (not `ThinString`) delivered the Phase 3–4 allocation wins.
+
 # Performance analysis & optimization opportunities
 
 Investigation of the bytecode compiler (`compiler.rs`) and VM (`vm.rs`) for
