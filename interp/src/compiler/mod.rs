@@ -1363,7 +1363,8 @@ impl<'src> Compiler<'src> {
 
     /// Validate a static (non-spread) object literal property and extract its
     /// field name. Reports a compile error and returns `None` for getters/
-    /// setters, methods, computed keys, and unsupported key forms.
+    /// setters, methods, and unsupported key forms (computed keys return
+    /// `None` without error — the caller falls through to the IndexSet path).
     fn static_property_name(&mut self, p: &ast::ObjectProperty) -> Option<RcStr> {
         if p.kind != ast::PropertyKind::Init {
             self.error(p.span.start, "getters/setters are not supported");
@@ -1374,7 +1375,6 @@ impl<'src> Compiler<'src> {
             return None;
         }
         if p.computed {
-            self.error(p.span.start, "computed object keys are not supported");
             return None;
         }
         match &p.key {
@@ -1392,11 +1392,12 @@ impl<'src> Compiler<'src> {
 
     fn compile_object(&mut self, obj: &ast::ObjectExpression) {
         let span = obj.span.start;
-        // Fast path: no spread (byte-for-byte unchanged from before)
-        let has_spread = obj.properties.iter().any(|prop| {
+        // Fast path: no spread, no computed keys (byte-for-byte unchanged)
+        let needs_slow = obj.properties.iter().any(|prop| {
             matches!(prop, ast::ObjectPropertyKind::SpreadProperty(_))
+                || matches!(prop, ast::ObjectPropertyKind::ObjectProperty(p) if p.computed)
         });
-        if !has_spread {
+        if !needs_slow {
             let mut names: Vec<RcStr> = Vec::with_capacity(obj.properties.len());
             for prop in &obj.properties {
                 let p = match prop {
@@ -1411,10 +1412,14 @@ impl<'src> Compiler<'src> {
             return;
         }
 
-        // Slow path: incremental building with spread properties.
-        // Phase 1: emit ObjNew for the leading static segment (possibly empty).
+        // Slow path: incremental building with spreads and/or computed keys.
+        // Phase 1: emit ObjNew for the leading static segment (stop at first
+        // spread or computed key).
         let leading_count = obj.properties.iter().take_while(|prop| {
-            !matches!(prop, ast::ObjectPropertyKind::SpreadProperty(_))
+            match prop {
+                ast::ObjectPropertyKind::SpreadProperty(_) => false,
+                ast::ObjectPropertyKind::ObjectProperty(p) => !p.computed,
+            }
         }).count();
 
         let mut leading_names: Vec<RcStr> = Vec::with_capacity(leading_count);
@@ -1429,9 +1434,11 @@ impl<'src> Compiler<'src> {
         }
         self.emit(Instr::ObjNew(leading_names.into()), span);
 
-        // Phase 2: remaining properties — spreads and static fields after the
-        // object exists.  For a static field after a spread we use
-        // Pick(0) + ObjSet + Pop(1) to keep the object on the stack.
+        // Phase 2: remaining properties — spreads, computed keys, and static
+        // fields after a spread/computed key.  For a static field we use
+        // Pick(0) + ObjSet + Pop(1) to keep the object on the stack; for a
+        // computed key we use Pick(0) + compile key + compile value +
+        // IndexSet(New) + Pop(1) (IndexSet pops container, key, val).
         for prop in &obj.properties[leading_count..] {
             match prop {
                 ast::ObjectPropertyKind::SpreadProperty(s) => {
@@ -1439,11 +1446,19 @@ impl<'src> Compiler<'src> {
                     self.emit(Instr::ObjExtend, span);
                 }
                 ast::ObjectPropertyKind::ObjectProperty(p) => {
-                    let Some(name) = self.static_property_name(p) else { return };
-                    self.emit(Instr::Pick(0), span);
-                    self.compile_expr(&p.value);
-                    self.emit(Instr::ObjSet(name, SetMode::New), span);
-                    self.emit(Instr::Pop(1), span);
+                    if p.computed {
+                        self.emit(Instr::Pick(0), span);
+                        self.compile_expr(p.key.as_expression().expect("computed key must have expression"));
+                        self.compile_expr(&p.value);
+                        self.emit(Instr::IndexSet(SetMode::New), span);
+                        self.emit(Instr::Pop(1), span);
+                    } else {
+                        let Some(name) = self.static_property_name(p) else { return };
+                        self.emit(Instr::Pick(0), span);
+                        self.compile_expr(&p.value);
+                        self.emit(Instr::ObjSet(name, SetMode::New), span);
+                        self.emit(Instr::Pop(1), span);
+                    }
                 }
             }
         }

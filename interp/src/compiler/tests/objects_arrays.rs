@@ -365,6 +365,61 @@ fn no_spread_plain_calls_have_no_call_spread() {
     );
 }
 
+// ── computed object keys (A3) ────────────────────────────────────
+
+#[test]
+fn computed_object_key_basic() {
+    assert_eq!(eval("({ [\"a\"]: 1 }).a"), Value::PosInt(1));
+    assert_eq!(
+        testutil::run_val("let k = \"b\"; return ({ [k]: 2 }).b;"),
+        Value::PosInt(2)
+    );
+    assert_eq!(
+        testutil::run_val("let k = \"x\"; return ({ [k]: 42 })[k];"),
+        Value::PosInt(42)
+    );
+}
+
+#[test]
+fn computed_object_key_mixed_with_static() {
+    assert_eq!(
+        testutil::run_ret("let k = \"y\"; return JSON.stringify({ a: 1, [k]: 2, b: 3 });"),
+        serde_json::json!("{\"a\":1,\"y\":2,\"b\":3}")
+    );
+    let vm = testutil::run_vm(
+        "let k = \"k\"; input.obj = { [k]: 10, static: 20 }; input.r = input.obj.k;"
+    );
+    assert_eq!(input_val(&vm, "r"), Value::PosInt(10));
+}
+
+#[test]
+fn computed_object_key_with_spread() {
+    let vm = testutil::run_vm(
+        "let k = \"c\"; let base = { a: 1, b: 2 }; input.obj = { ...base, [k]: 3 }; input.r = JSON.stringify(input.obj);"
+    );
+    match input_val(&vm, "r") {
+        Value::String(s) => {
+            let json = s.as_str();
+            assert!(json.contains("\"a\":1"), "got {json}");
+            assert!(json.contains("\"b\":2"), "got {json}");
+            assert!(json.contains("\"c\":3"), "got {json}");
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn computed_object_key_expression() {
+    assert_eq!(
+        eval("({ [1 + 2]: \"three\" })[\"3\"]"),
+        eval("\"three\"")
+    );
+    assert_eq!(
+        eval("({ [\"hello \" + \"world\"]: true })[\"hello world\"]"),
+        Value::Bool(true)
+    );
+}
+
 // ── input pointer ────────────────────────────────────────────────
 
 #[test]
