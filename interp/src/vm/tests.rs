@@ -280,19 +280,20 @@ fn jtrue() {
 
 #[test]
 fn jnotnullish() {
-    // Not nullish: takes the jump and LEAVES the value (peek, no pop).
+    // Not nullish: takes the jump and LEAVES the value.
     assert_eq!(
         run(vec![PushFloat(5.0), JNotNullish(3), PushFloat(9.0)]),
         vec![n(5.0)]
     );
-    // null / undefined: fall through; the value stays for the short-circuit.
+    // null / undefined: the value is POPPED on fall-through (the emitter
+    // short-circuits past it).
     assert_eq!(
         run(vec![PushNull, JNotNullish(3), PushFloat(9.0)]),
-        vec![null(), n(9.0)]
+        vec![n(9.0)]
     );
     assert_eq!(
         run(vec![PushUndefined, JNotNullish(3), PushFloat(9.0)]),
-        vec![undef(), n(9.0)]
+        vec![n(9.0)]
     );
 }
 

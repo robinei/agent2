@@ -198,11 +198,13 @@ pub enum Instr {
     // The truthy-mirror of JFalse, so `||` lowers without an extra Jump.
     JTrue(CodeAddr), // () -> ()
 
-    // PEEKS (does NOT pop) the topmost value; jumps to the address when it is
-    // neither null nor undefined, leaving the value in place. The "not nullish"
-    // jump that lowers `??`, optional chaining (`?.`), and optional calls in one
-    // instruction, instead of the former Dup + Push(Null) + LooseEq per check.
-    JNotNullish(CodeAddr), // any -> any (peek)
+    // Jumps to the address when the topmost value is neither null nor
+    // undefined, leaving the value in place; on fall-through (nullish) the
+    // value is POPPED. Asymmetric on purpose: every emitter keeps the value
+    // when proceeding with it and discards it when short-circuiting, so the
+    // pop is folded in. The "not nullish" jump that lowers `??`, optional
+    // chaining (`?.`), and optional calls in one instruction.
+    JNotNullish(CodeAddr), // taken: any -> any; fall-through: any -> ()
 
     // EFFECT: invokes the named tool or function.
     // pops N arguments off the stack; args are taken in push order, so with

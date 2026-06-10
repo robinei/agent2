@@ -124,8 +124,10 @@ fn invert_branches(code: Vec<Instr>, spans: Vec<u32>) -> (Vec<Instr>, Vec<u32>) 
 ///   • **drops jump-to-next**: a jump whose own `Label(L)` is the next real
 ///     instruction targets where control falls through anyway — `Jump(L)` is
 ///     dropped, `JFalse/JTrue(L)` degenerates to `Pop(1)` (both arms reach the
-///     next instr, but the condition is still consumed), `JNotNullish(L)` is
-///     dropped (it *peeks*, so there's nothing to consume).
+///     next instr, but the condition is still consumed). `JNotNullish(L)` is
+///     kept as-is: its two paths differ in stack effect (taken keeps the
+///     value, fall-through pops it), so a jump-to-next form — which no
+///     lowering emits — has no single-instruction equivalent.
 ///
 /// One DFS is both simpler and strictly stronger than the old iterate-to-
 /// fixpoint rebuild: reachability prunes dead labeled blocks a linear "after an
@@ -213,7 +215,6 @@ fn simplify_cfg(code: Vec<Instr>, spans: Vec<u32>, next_label: u32) -> (Vec<Inst
     for (idx, instr) in kept.iter().enumerate() {
         match instr {
             Instr::Jump(l) if label_is_next(&kept, idx + 1, *l) => continue,
-            Instr::JNotNullish(l) if label_is_next(&kept, idx + 1, *l) => continue,
             Instr::JFalse(l) | Instr::JTrue(l) if label_is_next(&kept, idx + 1, *l) => {
                 out_code.push(Instr::Pop(1));
                 out_spans.push(kept_spans[idx]);

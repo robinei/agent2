@@ -439,7 +439,9 @@ impl VM {
                     if *addr as usize > self.code.len() {
                         return Err(self.fail(ErrorKind::BadCall, "bad call target"));
                     }
-                    // Peek: leave the value for the branch that proceeds with it.
+                    // Taken: leave the value for the branch that proceeds with
+                    // it. Fall-through: pop it — the emitter short-circuits
+                    // past the value (see the instruction doc).
                     let val = self
                         .stack
                         .last()
@@ -447,6 +449,7 @@ impl VM {
                     if !matches!(val, Value::Null | Value::Undefined) {
                         self.ip = *addr;
                     } else {
+                        self.stack.pop();
                         self.ip += 1;
                     }
                 }

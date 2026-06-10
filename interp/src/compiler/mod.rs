@@ -1273,11 +1273,10 @@ impl<'src> Compiler<'src> {
                 self.emit(Instr::Label(end), span);
             }
             Op::Coalesce => {
-                // not nullish: keep lhs (the peeking jump leaves it); nullish:
-                // drop lhs and evaluate rhs.
+                // not nullish: keep lhs (the taken jump leaves it); nullish:
+                // the fall-through pops the lhs, then evaluate rhs.
                 let end = self.new_label();
                 self.emit(Instr::JNotNullish(end), span);
-                self.emit(Instr::Pop(1), span);
                 self.compile_expr(&log.right);
                 self.emit(Instr::Label(end), span);
             }
@@ -1541,8 +1540,9 @@ impl<'src> Compiler<'src> {
     /// undefined); otherwise leave the value for the access/call that the caller
     /// emits next. Returns the `end` label to place after that access.
     ///
-    /// The peeking `JNotNullish` keeps the value on the not-nullish path with no
-    /// `Pick(0)` (formerly `Dup`), so the whole guard is one branch plus the short-circuit tail.
+    /// `JNotNullish` keeps the value on the not-nullish (taken) path with no
+    /// `Pick(0)` (formerly `Dup`) and pops it on the nullish fall-through, so
+    /// the whole guard is one branch plus the short-circuit tail.
     ///
     /// Per-link: a fully-`?.` chain (`a?.b?.c`) short-circuits correctly because
     /// each link re-checks; mixing `?.` then a plain `.` on a nullish base
@@ -1551,7 +1551,6 @@ impl<'src> Compiler<'src> {
         let cont = self.new_label();
         let end = self.new_label();
         self.emit(Instr::JNotNullish(cont), span);
-        self.emit(Instr::Pop(1), span);
         self.emit(Instr::PushUndefined, span);
         self.emit(Instr::Jump(end), span);
         self.emit(Instr::Label(cont), span);
@@ -1689,6 +1688,8 @@ impl<'src> Compiler<'src> {
         self.lvalue_emit_addr(lv, span);
         self.lvalue_emit_load(lv, span); // [addr…, old]
         match op {
+            // `JNotNullish` pops `old` on the nullish fall-through, so the
+            // store path starts with a clean stack and needs no explicit Pop.
             Op::LogicalNullish => self.emit(Instr::JNotNullish(keep), span),
             Op::LogicalAnd => {
                 // For `&&=`, need a copy of `old` to test truthiness without
@@ -1697,15 +1698,16 @@ impl<'src> Compiler<'src> {
                 // Pick(0) (formerly Dup) since the keep path or store path consumes `old`.
                 self.emit(Instr::Pick(0), span);
                 self.emit(Instr::JFalse(keep), span); // falsy → keep old
+                self.emit(Instr::Pop(1), span); // store path: discard old
             }
             Op::LogicalOr => {
                 self.emit(Instr::Pick(0), span);
                 self.emit(Instr::JTrue(keep), span); // truthy → keep old
+                self.emit(Instr::Pop(1), span); // store path: discard old
             }
             _ => unreachable!("only logical operators reach here"),
         }
-        // Store path: discard old, evaluate the RHS, store it.
-        self.emit(Instr::Pop(1), span);
+        // Store path: evaluate the RHS, store it.
         self.compile_expr(rhs);
         if value_needed {
             self.lvalue_emit_store(lv, span);
@@ -2316,8 +2318,8 @@ impl<'src> Compiler<'src> {
             );
             return;
         }
-        // Optional method call: guard on the receiver before the args/call. The
-        // peeking `JNotNullish` (via `begin_optional`) keeps the receiver on the
+        // Optional method call: guard on the receiver before the args/call.
+        // `JNotNullish` (via `begin_optional`) keeps the receiver on the
         // not-nullish path for the call to consume.
         let end = match (recv, optional) {
             (Some(recv), true) => {
