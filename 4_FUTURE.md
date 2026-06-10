@@ -65,9 +65,9 @@ update the divergence list when done:
 
 **`Map`/`Set` (evidence-gated, unlike `this`/`class` which are architectural):
 start without them.** IndexMap-backed plain objects already cover ordered
-string-keyed lookup, and Set's JSON lowering is type-unstable across the
-persist/recompile restart (a Set stored in `state` would come back as an
-array). The prior most likely to force the issue is `[...new Set(arr)]` as
+string-keyed lookup, and Set has no stable JSON form at the program's
+output boundary (a returned Set would come back as an array, or error).
+The prior most likely to force the issue is `[...new Set(arr)]` as
 dedup. If the repair-hint diagnostic plus the dialect prompt don't hold,
 add them as **transient-only** values: compiler special-cases `new Map()` /
 `new Set(x)` (no general `new`), full in-program behavior, but no JSON form —
@@ -80,9 +80,10 @@ diagnostics for rejected syntax.** LLMs reflexively write `new Map()` /
 them, but make the `new` diagnostic name the alternative per constructor:
 Map/Set → plain object or array, Date → ISO strings or a host time tool,
 Error → `raise`. Same treatment for `this`/`class`: suggest plain objects +
-functions, and note that durable `state` must be JSON-shaped (methods and
-prototypes would not survive the persist/recompile restart cycle anyway —
-that is *why* they are excluded, not just implementation cost).
+functions, and note that everything durable (program results, tool
+arguments, artifacts) is JSON-shaped — methods and prototypes would not
+survive the log/restart boundary anyway, which is *why* they are
+excluded, not just implementation cost.
 
 Non-goals, recorded so they aren't relitigated: `ToPrimitive` on objects,
 UTF-16 string semantics, `class`/`new`/`this`, prototype chains, generators,

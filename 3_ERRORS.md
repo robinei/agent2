@@ -98,7 +98,7 @@ moment of error:
   (instruction/site → classification → why), so future instruction authors
   follow the invariant.
 
-Add tests per classification: e.g. `state.x = [] - 1` (TypeError in Sub) →
+Add tests per classification: e.g. `return [] - 1;` (TypeError in Sub) →
 `resume_with(Float(0))` → program completes with the substituted value;
 OutOfFuel → top up fuel → completes; a `NotResumable` resume attempt errors.
 
@@ -136,10 +136,11 @@ short value previews:
 - Update the `StepResult::Raise` doc comment: remove the suggestion that the
   host may patch `code`/`ip` to arbitrary restart points. The supported
   restarts are (a) continue-with-value via `resume_raise`, and (b) abandon
-  this VM, persist `state_to_json()`, recompile a rewritten program, and
-  re-seed a fresh VM (`for_program`). In-place code patching is explicitly
-  unsupported (live `Fn`/`Closure` values hold code addresses that a
-  recompile invalidates).
+  this VM and run a rewritten program in a fresh VM (prior tool results
+  stay available to it via the event log — artifact ids / positional
+  replay, see 8_HARNESS decisions 5–7). In-place code patching is
+  explicitly unsupported (live `Fn`/`Closure` values hold code addresses
+  that a recompile invalidates).
 - Update existing Raise tests; add payload round-trip and resume tests.
 
 ## Ground rules

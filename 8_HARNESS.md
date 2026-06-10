@@ -1,0 +1,235 @@
+# Phase 8 — Agent harness
+
+The `agent` crate grows from stubs (`types.rs`, `tree.rs`) into the system
+the interpreter exists for: tree-backed conversations driving code-mode
+execution with the LLM as condition/restart handler.
+
+**Sequencing:** needs Phase 1 (interp public API). Milestones M0–M1 run on
+the current synchronous `Invoke` batching; M2 needs Phase 3 (enriched
+errors, `Raise` payloads, resume API); 7_ASYNC only changes which
+`StepResult` the executor handles — do not block on it. This phase should
+start **early**: what breaks here is the real test of the whole design, and
+should be allowed to reorder plans 3–7.
+
+## Locked design decisions
+
+1. **Tool-call-shaped LLM interface, minimal surface.** Models are heavily
+   conditioned on the tool_calls channel, so use it: the primary tool is
+   `run_program(source)` — the program arrives as a tool call, never parsed
+   out of prose. When a program is suspended on a condition, the offered
+   tools are the restarts: `resume(value)` and `run_program(source)`
+   (rewrite). An assistant turn with **no** tool call completes the frame
+   (its text is the frame's result). Prose and thinking accompany tool
+   calls as the APIs already encourage.
+2. **Subagents are tools; transcripts are branches.** A program calls
+   `tools.agent({ prompt, input })` like any other async tool. The child's
+   transcript is a branch: a `FrameStart` event whose parent is the
+   call-site event on the caller's spine; the caller's spine continues
+   independently and later records the result. Concurrent subagents are
+   just concurrent branches — the tree needs multiple active leaves, not a
+   concurrency mechanism. The "frame stack" is the chain of `FrameStart`
+   ancestors above a node (which `reconstruct_frames` essentially already
+   computes); inline `PushFrame`/`PopFrame` stack semantics are removed.
+3. **Child frames are clean-room.** A child sees its prompt, its JSON
+   `input`, and its tools — never ancestor transcripts (and never ancestor
+   artifacts: artifact ids are scoped to the requesting frame's spine).
+   Its result is a JSON value returned to the calling program as the tool
+   result. (Context-sharing policies can come later as explicit options;
+   the default stays hermetic.)
+4. **The restart loop is linear; forking is for users.** A condition does
+   not fork: the spine reads program → condition (as the `run_program`
+   tool result) → restart (the next tool call). Forking from an arbitrary
+   event remains the mechanism for user-driven retry, exploration, and
+   inspecting alternatives — it is UX, not control flow.
+5. **No `state`. Programs are functions; the log holds the artifacts.**
+   This supersedes COMPILER_PLAN §2 (the blessed `objects[0]` slot,
+   seeding, and `state_to_json` are removed from the interp). A program
+   receives its frame `input` as a const binding, ends with a top-level
+   `return <json-able value>` (a small interp change: top-level return
+   with a value, logged as a `ProgramResult` event), and has no ambient
+   mutable bag. Durable memory, if evidence ever demands it, returns as a
+   *tool* (`remember`/`recall`), not VM machinery.
+6. **Reuse is explicit: artifacts by event id.** Completed tool results
+   and program results are immutable, id-addressable artifacts. A program
+   fetches one with `tools.tool_result(id)` — which is *just a tool*
+   (flows through `Invoke`, served instantly from the log, batches,
+   awaits; zero VM changes). There is **no implicit args-matching cache**:
+   it is fragile for dynamically-computed args and dangerously wrong for
+   effectful tools (silently skipping a logged `send_email` repeat). The
+   condition/completion report lists the available artifacts; the LLM
+   chooses what to reuse.
+7. **Crash recovery is deterministic re-execution, not VM serialization.**
+   To resume a mid-program interruption of the *same* program: recompile
+   the source, re-execute, serve every `Invoke` positionally from the log
+   (in logged resolution order — the 7_ASYNC determinism commitment; args
+   compared as a consistency check, effectful calls included because they
+   really happened) until past the high-water mark. Positional replay is
+   sound only for identical source; rewritten programs reuse via artifact
+   ids (decision 6). VM snapshotting stays off the roadmap.
+
+## Step 0: Interp-side dialect change (do before/alongside Phase 2)
+
+Decision 5 changes the interpreter's program contract; land it early so the
+Phase 2 test harness is built on the final shape (assert on returned
+values, not `state.x`):
+
+- Allow top-level `return <expr>` (currently an error; root emits
+  `Return(0)`); the value is the program result, surfaced by
+  `StepResult::Done { value }`. A program ending without `return` yields
+  `undefined`.
+- Add the `input` const binding (host-seeded JSON, read-only — rebinding
+  is a compile error like `state` rebinding was).
+- Remove the `state` machinery: the blessed `objects[0]` slot, seeding in
+  `for_program`, `state_to_json`, and the compiler's `state` identifier
+  special-casing. Update tests to the `return`-based observable.
+- Update the divergence/docs blocks that present `state` as the durable
+  surface.
+
+## Step 1: Event vocabulary (`types.rs`)
+
+Two classes of event, distinguished because they render differently:
+
+- **Chat events** (rendered into LLM requests): `Message::{User, Assistant
+  {text, thinking, tool_calls}, System, Tool}` — the existing shapes,
+  where `tool_calls` carries `run_program`/`resume` and `Tool` carries
+  their results (completion summaries, condition reports).
+- **Execution events** (harness-internal; never sent to the LLM as
+  messages, queried for replay/artifacts/UI): `Invoke { name, args,
+  result }` one per tool call a program makes (parented on the spine
+  between the program's tool_call message and its tool result);
+  `ProgramResult { value }` — the program's top-level return, logged after
+  each successful run (an artifact like any tool result);
+  `FrameStart { prompt, input }` (replaces `PushFrame`; branch root);
+  `FrameResult { result }` (terminal event of a frame's spine);
+  `Label`. `PopFrame` is deleted. `TextChunk`/`ThinkingChunk` stay
+  live-only.
+
+Document per event type: parent rules, which spine it lands on, and
+whether it renders to chat.
+
+## Step 2: Tree with multiple active leaves (`tree.rs`)
+
+Replace the single `frames` + `leaf_id` cursor with spine handles:
+`Spine { leaf_id, frames }`, `tree.append(&mut spine, payload)`. Opening a
+file reconstructs the *set* of leaves (`list_leaves` exists); resuming
+picks one (or several — frames that never got their `FrameResult`).
+Single-process single-writer; ids stay globally monotonic across spines.
+Tests: interleaved appends on two branches; reconstruction of each;
+re-open with an in-flight subagent branch.
+
+## Step 3: Sans-io frame step machine (`AgentState::step`)
+
+Flesh out the `StepInput`/`StepOutput` stubs into a deterministic,
+IO-free core — testable with a scripted LLM:
+
+- Inputs: `UserTurn(text)`, `LlmResponse(message)`, `ToolResults(batch)`,
+  `SubagentResult { call_id, result }`.
+- Outputs: `LlmRequest { messages, tools }` (rendered from the frame),
+  `ToolCalls(Vec<InvokeCall>)` (a program's fan-out batch),
+  `SpawnFrames(Vec<{ call_id, prompt, input }>)` (from `tools.agent`
+  calls), `FrameDone(result)`.
+- Internal flow per frame: render → LLM → if no tool call: `FrameDone`;
+  if `run_program`: compile (compile errors return immediately as the
+  tool result — a cheap repair loop with no execution), bind the frame
+  `input`, drive the VM: `Invoke` batches → `ToolCalls` out / results in
+  (each logged as an `Invoke` event; `tool_result(id)` calls answered
+  from the log); `tools.agent` calls → `SpawnFrames`; `Raise`/trapped
+  error → render the condition report and finish the turn (the tool
+  result), offering restart tools; `Done` → log `ProgramResult`, tool
+  result = completion report (returned value + console output + new
+  artifact ids).
+- The host (separate module) owns: LLM API, tool execution, concurrent
+  subagent frame loops, scheduling. The core never blocks and never does
+  IO.
+
+## Step 4: The condition report (the thesis, make it good)
+
+The `run_program` tool result for a raise/trapped error is the product
+surface of the whole project. Structured sections, rendered compactly:
+
+- what happened: condition name + payload, or the Phase 3 rendered
+  diagnostic (source line, caret, operand values) — and for async, the
+  await-chain;
+- where: how far the program got, plus the program's `console` output so
+  far (the diagnostic stream survives failure precisely when the return
+  value doesn't — it is the trace of what the program observed before it
+  raised; tail-truncated);
+- the **artifact menu**: completed tool calls and prior program results
+  as `[#id] name(args-summary) → size/preview`, fetchable via
+  `tools.tool_result(id)` — with effectful calls explicitly flagged
+  ("already happened; calling again repeats the effect");
+- available restarts and exactly what each does: `resume(value)` —
+  continue as if the failed operation returned `value`; `run_program` —
+  replace the program (reuse prior work via the artifact menu).
+
+Iterate this format against a scripted LLM first, then real models; it is
+a prompt-engineering artifact as much as a data format, and deserves its
+own tests (golden renders).
+
+## Step 5: Host layer
+
+Tool registry (name, JSON-schema'd input/output, handler, an
+`effectful: bool` flag driving the artifact-menu warnings); the
+`tool_result` tool (log lookup, frame-scoped id validation); concurrent
+fan-out execution with logged resolution order; the `agent` tool mapping
+to frame spawn; result-size guards before anything enters the log; the
+real LLM client behind the same trait as the scripted one.
+
+## Step 6: System prompt / dialect card
+
+A generated-where-possible description of: the dialect (divergence list
+distilled), the program contract (`input` binding, top-level `return`,
+artifact ids and `tools.tool_result`), `raise` and what restarts mean,
+available tools (from the registry schemas), and the
+no-`this`/no-`class` guidance with alternatives. Keep it short; the
+condition report carries the per-incident detail.
+
+## Known holes (resolved in principle, specify during build)
+
+- **In-flight effects during a condition:** outstanding tool calls when a
+  program raises/traps run to completion and are logged as artifacts no
+  matter which restart the LLM picks — rewrite abandons the VM, never the
+  physics. The report's artifact menu includes late arrivals on the next
+  turn.
+- **User interruption / steering:** a `UserTurn` arriving mid-program is a
+  **host-injected condition** at the next `step()` boundary — same report
+  machinery, payload = the user's message, restarts = resume (continue,
+  message noted) or rewrite. No second interruption mechanism.
+- **Per-frame tool scoping:** `tools.agent` spawns take a tool allowlist
+  (default: caller's set minus effectful tools), enforced by the registry;
+  the child's dialect card lists only its own tools.
+- **Log versioning:** the event log carries the interp/harness version.
+  Positional replay (decision 7) requires a version match; on mismatch,
+  degrade to a condition reporting the interruption + artifact menu —
+  never replay across versions (scheduler/codegen changes silently break
+  invoke order).
+
+## Open question (deliberately deferred until M1/M2 contact)
+
+**Context growth.** Long frames accumulate programs, reports, and an
+ever-growing artifact menu; forking preserves history but never shrinks
+it. Cheap mitigations to apply from the start: hard size bounds on every
+report section, artifact menu pruned to recent + still-referenced entries
+(full list fetchable). The real mechanism (frame summarization as a
+checkpoint event? sub-frame hand-off?) should be designed from observed
+M1/M2 transcripts, not speculation.
+
+## Milestones
+
+- **M0**: scripted-LLM end-to-end — user turn → program → fan-out →
+  results → completion, all asserted on the event log. No network.
+- **M1**: real LLM, a few real tools (file read, HTTP fetch), single
+  frame. First honest contact with the dialect prompt.
+- **M2** (needs Phase 3): conditions round-trip — `raise` with payload and
+  a trapped TypeError both produce a report, and both restart paths
+  (resume / rewrite reusing artifacts by id) work against a real model.
+- **M3**: subagent branches — `Promise.all` over `tools.agent` spawning
+  concurrent child frames (or sequential awaits pre-7_ASYNC), results
+  joining the parent program.
+- **M4**: fork/label UX — list leaves, fork from any event, resume a
+  chosen spine (CLI is fine).
+- **M5**: the eval question — measure the thesis: success rate and token
+  cost on multi-step tasks with injected tool failures, versus (a) plain
+  tool loop, (b) code mode without conditions (failure = rerun whole
+  program). Design this when M2 works; it likely deserves its own plan
+  file.

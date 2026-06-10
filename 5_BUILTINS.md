@@ -166,6 +166,15 @@ order — LLM-likelihood weighted. Receiver-polymorphic where marked (P):
   0–10) or string via `serde_json` pretty printing with a custom indent;
   `replacer` must be `null`/`undefined` (anything else: TypeError,
   "replacer is not supported").
+- **console:** `console.log` / `warn` / `error` / `info` (all variadic,
+  all appending to one stream). NOT an `Invoke` effect: a builtin that
+  formats each arg (strings verbatim, everything else JSON-ish, depth- and
+  length-truncated) into a size-capped `Vec<String>` buffer on the VM,
+  returning `undefined`. The host reads the buffer for completion and
+  condition reports (see 8_HARNESS Step 4) — it is a diagnostic stream,
+  never a result channel, and never parsed for data. Exceeding the buffer
+  cap drops oldest lines with a marker (do not error: logging must never
+  kill a program). This is among the strongest LLM priors — prioritize it.
 
 Each addition: table row, handler, behavioral tests including the
 undefined-arg and wrong-receiver-type cases. For polymorphic ones, test both

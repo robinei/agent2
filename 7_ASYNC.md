@@ -81,7 +81,7 @@ No per-task state. Components:
 
 Tests: fan-out via map (one `Pending` yield carrying N calls), out-of-order
 host resolution, await-after-resolve (no yield), rejected promise →
-escalation/resume, promise stored in `state` → persistence error, property
+escalation/resume, promise in a returned/JSON-bound value → error, property
 access hint, fire-and-forget call still executes.
 
 ## Tier 2 — stackless continuations (interleaved async functions)

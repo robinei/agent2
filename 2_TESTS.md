@@ -24,9 +24,12 @@ mods (`run_program`, `run_effect`, `run_err`, `run_last_str`, `run_vm`,
 - `compile_ok(src) -> Program` — compile or panic with rendered diagnostics.
 - `compile_errs(src) -> Vec<String>` — rendered diagnostic strings.
 - `run(src) -> VM` — compile + run to `Done`, panicking on any effect/error.
-- `run_state(src) -> serde_json::Value` — `run` + `state_to_json`. This is
-  the workhorse: most end-to-end tests become
-  `assert_eq!(run_state("state.x = …"), json!({"x": …}))`.
+- `run_ret(src) -> serde_json::Value` — `run` + the program's top-level
+  return value as JSON. This is the workhorse: most end-to-end tests
+  become `assert_eq!(run_ret("return 1 + 2;"), json!(3))`.
+  (8_HARNESS Step 0 replaces the `state` object with top-level `return`;
+  if that hasn't landed yet, land it first — do not build the harness on
+  `state_to_json` and convert twice.)
 - `run_to_effect(src) -> (VM, StepResult)` — for Invoke/Raise tests.
 - `run_runtime_err(src) -> VMError` — for runtime-error tests.
 
