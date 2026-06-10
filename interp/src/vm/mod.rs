@@ -304,6 +304,7 @@ pub enum ErrorKind {
 /// | Add (string concat path) | TypeError | PushValueThenContinue | both ops popped before to_number |
 /// | BitNot, ToNum, TypeOf | TypeError/ValueError | PushValueThenContinue | operand popped first |
 /// | CallDyn non-callable | TypeError | PushValueThenContinue | callable popped, then args dropped before failing (pop-first normalization) |
+/// | CallSpread non-callable / non-array args | TypeError | PushValueThenContinue | callable+array popped first; dispatch same as CallDyn |
 /// | IndexGet (non-container, bad index, mid-codepoint) | TypeError/ValueError | PushValueThenContinue | container+key popped first |
 /// | IndexSet (non-container, negative/OOB index) | TypeError/ValueError | PushValueThenContinue | val+key+container popped first |
 /// | ObjHas / ObjDelete (non-object) | TypeError | PushValueThenContinue | field+object popped first |

@@ -1374,8 +1374,15 @@ impl Analyzer {
             ast::Expression::CallExpression(c) => {
                 self.analyze_expr(&c.callee, scope, block_scopes, scopes);
                 for arg in &c.arguments {
-                    if let Some(e) = arg.as_expression() {
-                        self.analyze_expr(e, scope, block_scopes, scopes);
+                    match arg {
+                        ast::Argument::SpreadElement(s) => {
+                            self.analyze_expr(&s.argument, scope, block_scopes, scopes);
+                        }
+                        _ => {
+                            if let Some(e) = arg.as_expression() {
+                                self.analyze_expr(e, scope, block_scopes, scopes);
+                            }
+                        }
                     }
                 }
             }
@@ -1613,8 +1620,15 @@ impl Analyzer {
             ast::ChainElement::CallExpression(c) => {
                 self.analyze_expr(&c.callee, scope, block_scopes, scopes);
                 for arg in &c.arguments {
-                    if let Some(e) = arg.as_expression() {
-                        self.analyze_expr(e, scope, block_scopes, scopes);
+                    match arg {
+                        ast::Argument::SpreadElement(s) => {
+                            self.analyze_expr(&s.argument, scope, block_scopes, scopes);
+                        }
+                        _ => {
+                            if let Some(e) = arg.as_expression() {
+                                self.analyze_expr(e, scope, block_scopes, scopes);
+                            }
+                        }
                     }
                 }
             }

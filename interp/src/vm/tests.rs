@@ -786,6 +786,71 @@ fn call_dyn_requires_fn() {
 }
 
 #[test]
+fn call_spread_with_builtin() {
+    // Math.max(...[3, 7]) — stack: [args_arr, callable] (callable on top)
+    let code = vec![
+        PushFloat(3.0),
+        PushFloat(7.0),
+        ArrNew(2),                    // args array
+        PushBuiltin(Builtin::MathMax),// callable on top
+        CallSpread,
+    ];
+    assert_eq!(run(code), vec![n(7.0)]);
+}
+
+#[test]
+fn call_spread_with_empty_array() {
+    // NumberParseInt(...[]) → NaN
+    let code = vec![
+        ArrNew(0),                    // empty args
+        PushBuiltin(Builtin::NumberParseInt),
+        CallSpread,
+    ];
+    let out = run(code);
+    assert!(matches!(out[0], Value::Float(f) if f.is_nan()));
+}
+
+#[test]
+fn call_spread_with_fn() {
+    // fn(a, b) = a - b, called as fn(...[10, 3])
+    let code = vec![
+        PushFloat(10.0),
+        PushFloat(3.0),
+        ArrNew(2),                    // args array
+        PushFn(6),                    // callable on top (addr of fn body)
+        CallSpread,
+        Return(1),
+        Local(0),
+        Local(1),
+        Sub,
+        Return(1),
+    ];
+    assert_eq!(run(code), vec![n(7.0)]);
+}
+
+#[test]
+fn call_spread_non_array_error() {
+    // CallSpread with a non-array args value → TypeError
+    let code = vec![
+        PushFloat(42.0),              // not an array
+        PushBuiltin(Builtin::MathMax),
+        CallSpread,
+    ];
+    assert!(matches!(run_err(code).kind, ErrorKind::TypeError));
+}
+
+#[test]
+fn call_spread_non_callable_error() {
+    // CallSpread with a non-callable → TypeError
+    let code = vec![
+        ArrNew(0),
+        PushFloat(42.0),              // not callable
+        CallSpread,
+    ];
+    assert!(matches!(run_err(code).kind, ErrorKind::TypeError));
+}
+
+#[test]
 fn arguments_builds_array_of_frame_args() {
     // Call a fn with 3 args; its body builds `arguments` and returns it.
     // [0..2] push args, [3] callable, [4] CallDyn(3), [5] Return(1)

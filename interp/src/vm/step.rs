@@ -1,6 +1,71 @@
 use super::*;
 
 impl VM {
+    /// Shared dispatch for `CallDyn` and `CallSpread`: the args are already
+    /// on the stack in left-to-right order (arg 0 deepest), with the callable
+    /// already popped.  Handles `Builtin`, `Fn`, `Closure`, and non-callable.
+    fn dispatch_call(&mut self, callable: Value, nargs: u32) -> Result<(), VMError> {
+        match callable {
+            Value::Builtin(b) => {
+                b.call(self, nargs)?;
+                self.ip += 1;
+            }
+            Value::Fn(addr) => {
+                if addr as usize >= self.code.len() {
+                    return Err(self.fail(ErrorKind::BadCall, "bad call target"));
+                }
+                if nargs as usize > self.stack.len() {
+                    return Err(self.fail(ErrorKind::StackUnderflow, "stack underflow"));
+                }
+                self.callstack.push(CallFrame {
+                    arg_count: nargs,
+                    local_count: nargs,
+                    return_addr: self.ip + 1,
+                    prev_fp: self.fp,
+                    arguments_cache: None,
+                    pending_upvals: SmallVec::new(),
+                });
+                self.fp = (self.stack.len() as u32) - nargs;
+                self.cur_local_count = nargs;
+                self.ip = addr;
+            }
+            Value::Closure(p) => {
+                let closure = self.closures.get(p as usize).ok_or_else(|| {
+                    self.fail_not_resumable(ErrorKind::ValueError, "bad closure pointer")
+                })?;
+                let addr = closure.addr;
+                let upvals: SmallVec<[Value; 8]> = closure.upvals.iter().cloned().collect();
+                if addr as usize >= self.code.len() {
+                    return Err(self.fail(ErrorKind::BadCall, "bad call target"));
+                }
+                if nargs as usize > self.stack.len() {
+                    return Err(self.fail(ErrorKind::StackUnderflow, "stack underflow"));
+                }
+                // Stash the captured environment; `EnterFrame` installs it as
+                // the upval locals after normalizing the args, so it lands at
+                // slots [nparams, nparams + K).
+                self.callstack.push(CallFrame {
+                    arg_count: nargs,
+                    local_count: nargs,
+                    return_addr: self.ip + 1,
+                    prev_fp: self.fp,
+                    arguments_cache: None,
+                    pending_upvals: upvals,
+                });
+                self.fp = (self.stack.len() as u32) - nargs;
+                self.cur_local_count = nargs;
+                self.ip = addr;
+            }
+            _ => {
+                let keep = self.stack.len().saturating_sub(nargs as usize);
+                self.stack.truncate(keep);
+                let msg = format!("cannot call a {} as a function", callable.type_name());
+                return Err(self.fail(ErrorKind::TypeError, msg));
+            }
+        }
+        Ok(())
+    }
+
     pub fn step(&mut self) -> Result<StepResult, VMError> {
         // ── macros for repetitive instruction shapes ─────────────────
 
@@ -238,79 +303,8 @@ impl VM {
 
                 Instr::CallDyn(nargs) => {
                     let nargs = *nargs;
-                    // The callable is on top, above its args; pop it, then the
-                    // args sit exactly where a static Call expects them. The
-                    // callable is either a bare Fn, a Builtin, or a Ptr to a
-                    // Closure (code + captures).
                     let callable = self.pop()?;
-                    match callable {
-                        Value::Builtin(b) => {
-                            // No-frame call: pop args, push result, advance ip.
-                            b.call(self, nargs)?;
-                            self.ip += 1;
-                        }
-                        Value::Fn(addr) => {
-                            if addr as usize >= self.code.len() {
-                                return Err(self.fail(ErrorKind::BadCall, "bad call target"));
-                            }
-                            if nargs as usize > self.stack.len() {
-                                return Err(self.fail(ErrorKind::StackUnderflow, "stack underflow"));
-                            }
-                            self.callstack.push(CallFrame {
-                                arg_count: nargs,
-                                local_count: nargs,
-                                return_addr: self.ip + 1,
-                                prev_fp: self.fp,
-                                arguments_cache: None,
-                                pending_upvals: SmallVec::new(),
-                            });
-                            self.fp = (self.stack.len() as u32) - nargs;
-                            self.cur_local_count = nargs;
-                            self.ip = addr;
-                        }
-                        Value::Closure(p) => {
-                            let closure = self.closures.get(p as usize).ok_or_else(|| {
-                                self.fail_not_resumable(
-                                    ErrorKind::ValueError,
-                                    "bad closure pointer",
-                                )
-                            })?;
-                            let addr = closure.addr;
-                            let upvals: SmallVec<[Value; 8]> =
-                                closure.upvals.iter().cloned().collect();
-                            if addr as usize >= self.code.len() {
-                                return Err(self.fail(ErrorKind::BadCall, "bad call target"));
-                            }
-                            if nargs as usize > self.stack.len() {
-                                return Err(self.fail(ErrorKind::StackUnderflow, "stack underflow"));
-                            }
-                            // Stash the captured environment; `EnterFrame` installs
-                            // it as the upval locals after normalizing the args, so
-                            // it lands at slots [nparams, nparams + K).
-                            self.callstack.push(CallFrame {
-                                arg_count: nargs,
-                                local_count: nargs,
-                                return_addr: self.ip + 1,
-                                prev_fp: self.fp,
-                                arguments_cache: None,
-                                pending_upvals: upvals,
-                            });
-                            self.fp = (self.stack.len() as u32) - nargs;
-                            self.cur_local_count = nargs;
-                            self.ip = addr;
-                        }
-                        _ => {
-                            // Pop-first normalization: the callable is popped
-                            // but the args still sit below it — drop them so
-                            // the conceptual stack effect (args…, callable) ->
-                            // result holds and `resume_with` stays sound.
-                            let keep = self.stack.len().saturating_sub(nargs as usize);
-                            self.stack.truncate(keep);
-                            let msg =
-                                format!("cannot call a {} as a function", callable.type_name());
-                            return Err(self.fail(ErrorKind::TypeError, msg));
-                        }
-                    }
+                    self.dispatch_call(callable, nargs)?;
                 }
 
                 Instr::CallBuiltin(b, argc) => {
@@ -318,6 +312,32 @@ impl VM {
                     let argc = *argc;
                     b.call(self, argc)?;
                     self.ip += 1;
+                }
+
+                Instr::CallSpread => {
+                    let callable = self.pop()?;
+                    let arr_ptr = match self.pop()? {
+                        Value::Array(p) => p,
+                        _ => {
+                            return Err(self.fail(
+                                ErrorKind::TypeError,
+                                "spread call arguments must be an array",
+                            ))
+                        }
+                    };
+                    let ip = self.ip;
+                    let elements: ThinVec<Value> = self
+                        .arrays
+                        .get(arr_ptr as usize)
+                        .ok_or_else(|| {
+                            VMError::fail_at(ip, ErrorKind::TypeError, "bad array pointer")
+                        })?
+                        .clone();
+                    let nargs = elements.len() as u32;
+                    for val in elements {
+                        self.stack.push(val);
+                    }
+                    self.dispatch_call(callable, nargs)?;
                 }
 
                 Instr::MakeClosure(addr, captures) => {

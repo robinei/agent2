@@ -97,6 +97,12 @@ pub enum Instr {
     // pushes exactly one result. No call frame is created. See builtin.rs.
     CallBuiltin(Builtin, ArgCount), // any, ... -> any
 
+    /// Dynamic call with spread arguments. Pops the callable (top) and an
+    /// args array, then dispatches exactly like `CallDyn` with the array's
+    /// elements as the arguments. Covers user functions, closures, and
+    /// builtins uniformly through the dynamic path.
+    CallSpread, // args_arr, callable -> result
+
     // build a closure over the listed local slots of the current frame and push
     // a Closure to the resulting value. Each captured slot is copied
     // verbatim: a Boxed slot yields its Upval handle (shared, by-reference), a

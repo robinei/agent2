@@ -2082,16 +2082,22 @@ impl<'src> Compiler<'src> {
     /// later phases.
     fn compile_call(&mut self, call: &ast::CallExpression) {
         let span = call.span.start;
-        // Collect non-spread argument expressions (spread clashes with the VM's
-        // strict arity).
+        // Check for spread arguments — if present, use `CallSpread` path.
+        let has_spread = call
+            .arguments
+            .iter()
+            .any(|arg| matches!(arg, ast::Argument::SpreadElement(_)));
+
+        if has_spread {
+            return self.compile_call_spread(call, span);
+        }
+
+        // Fast path: no spread — existing argument-collection logic.
         let mut argv: Vec<&ast::Expression> = Vec::with_capacity(call.arguments.len());
         for arg in &call.arguments {
             match arg.as_expression() {
                 Some(e) => argv.push(e),
-                None => {
-                    self.error(arg.span().start, "spread arguments are not supported");
-                    return;
-                }
+                None => unreachable!(),
             }
         }
 
@@ -2153,8 +2159,6 @@ impl<'src> Compiler<'src> {
                             // structurally; `tools` is valid only as the receiver
                             // of such a call (bare `tools` and `tools.foo` without
                             // a call are undeclared-identifier errors elsewhere).
-                            // An optional member (`tools?.foo()`) is meaningless —
-                            // `tools` always exists — so it lowers identically.
                             self.compile_args(&argv);
                             self.emit(Instr::Invoke(method.into(), argv.len() as u32), span);
                             return;
@@ -2172,6 +2176,75 @@ impl<'src> Compiler<'src> {
                 self.compile_user_call(id.name.as_str(), id.span.start, &argv, span)
             }
             other => self.error(other.span().start, "unsupported call target"),
+        }
+    }
+
+    /// Compile a call with spread arguments: lower to callee expression +
+    /// array of args + [`CallSpread`].
+    fn compile_call_spread(&mut self, call: &ast::CallExpression, span: u32) {
+        // `tools.foo(...args)` can't take the value path: `tools` is only
+        // valid structurally as an `Invoke` receiver (compiling it as an
+        // expression would give a misleading undeclared-variable error), and
+        // `Invoke` has a static arg count. Reject with a targeted error.
+        if let ast::Expression::StaticMemberExpression(m) = &call.callee {
+            if let ast::Expression::Identifier(obj) = &m.object {
+                if obj.name.as_str() == "tools" {
+                    self.error(span, "spread arguments are not supported on tool calls");
+                    return;
+                }
+            }
+        }
+
+        // Compile callee as a value expression (produces the callable on stack).
+        self.compile_expr(&call.callee);
+
+        if call.optional {
+            // optional call `f?.(...args)`: short-circuit to undefined when
+            // nullish, else compile args and dispatch.
+            let end = self.begin_optional(span);
+            self.compile_call_args_array(&call.arguments, span);
+            self.emit(Instr::Dig(1), span);
+            self.emit(Instr::CallSpread, span);
+            self.emit(Instr::Label(end), span);
+        } else {
+            self.compile_call_args_array(&call.arguments, span);
+            self.emit(Instr::Dig(1), span);
+            self.emit(Instr::CallSpread, span);
+        }
+    }
+
+    /// Compile call arguments into an array on the stack.  Supports spread
+    /// elements: leading static args + `ArrNew`, then `ArrExtend` for each
+    /// spread and `ArrPush` for each trailing static argument.
+    fn compile_call_args_array(&mut self, args: &oxc_allocator::Vec<'_, ast::Argument>, span: u32) {
+        // Count leading non-spread arguments.
+        let leading_count = args
+            .iter()
+            .take_while(|a| !matches!(a, ast::Argument::SpreadElement(_)))
+            .count();
+
+        // Emit values for leading static segment.
+        for arg in args.iter().take(leading_count) {
+            if let Some(e) = arg.as_expression() {
+                self.compile_expr(e);
+            }
+        }
+        self.emit(Instr::ArrNew(leading_count as u32), span);
+
+        // Remaining: alternates spreads and single-element pushes.
+        for arg in args.iter().skip(leading_count) {
+            match arg {
+                ast::Argument::SpreadElement(s) => {
+                    self.compile_expr(&s.argument);
+                    self.emit(Instr::ArrExtend, span);
+                }
+                _ => {
+                    if let Some(e) = arg.as_expression() {
+                        self.compile_expr(e);
+                        self.emit(Instr::ArrPush, span);
+                    }
+                }
+            }
         }
     }
 

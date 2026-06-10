@@ -286,6 +286,85 @@ fn no_spread_plain_literals_compile_unchanged() {
     );
 }
 
+// ── spread calls ─────────────────────────────────────────────────────
+
+#[test]
+fn call_spread_builtin() {
+    assert_eq!(
+        testutil::run_ret("return Math.max(...[3, 7]);"),
+        serde_json::json!(7)
+    );
+    assert_eq!(
+        testutil::run_ret("return Math.max(...[10, 2, 8]);"),
+        serde_json::json!(10)
+    );
+}
+
+#[test]
+fn call_spread_user_fn() {
+    assert_eq!(
+        testutil::run_ret("function f(a, b) { return a - b; } return f(...[10, 3]);"),
+        serde_json::json!(7)
+    );
+}
+
+#[test]
+fn call_spread_mixed_args() {
+    assert_eq!(
+        testutil::run_ret("function f(a, b, c) { return a + b + c; } return f(1, ...[2], 3);"),
+        serde_json::json!(6)
+    );
+}
+
+#[test]
+fn call_spread_closure() {
+    assert_eq!(
+        testutil::run_ret("let f = (a, b) => a * b; return f(...[5, 6]);"),
+        serde_json::json!(30)
+    );
+}
+
+#[test]
+fn call_spread_optional() {
+    // Non-nullish callee with optional spread call.
+    assert_eq!(
+        testutil::run_ret("let f = (a, b) => a + b; return f?.(...[3, 4]);"),
+        serde_json::json!(7)
+    );
+    // Nullish callee short-circuits to undefined.
+    assert_eq!(
+        testutil::run_val("return ({}).nope?.(...[1, 2]);"),
+        Value::Undefined
+    );
+    // Short-circuit: RHS must not evaluate when target is nullish.
+    assert_eq!(
+        testutil::run_val("let hit = 0; ({}).nope?.(...[hit = 1]); return hit;"),
+        Value::PosInt(0)
+    );
+}
+
+/// Spread on a tool call is a targeted compile error, not a misleading
+/// undeclared-variable error (`Invoke` has a static arg count).
+#[test]
+fn call_spread_on_tools_is_rejected() {
+    let errs = testutil::compile_errs("let a = [1]; tools.foo(...a);");
+    assert!(
+        errs.iter().any(|e| e.contains("spread arguments are not supported on tool calls")),
+        "expected targeted tool-call spread error, got: {errs:?}"
+    );
+}
+
+/// Plain calls (no spread) must not emit CallSpread.
+#[test]
+fn no_spread_plain_calls_have_no_call_spread() {
+    use crate::Instr;
+    let prog = crate::compile("return Math.max(1, 2);").expect("compiles");
+    assert!(
+        !prog.code.iter().any(|i| matches!(i, Instr::CallSpread)),
+        "no-spread call emitted CallSpread"
+    );
+}
+
 // ── input pointer ────────────────────────────────────────────────
 
 #[test]
