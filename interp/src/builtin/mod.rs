@@ -207,7 +207,7 @@ builtins! {
 
     // ── JSON static ──
     JSONParse,     BuiltinKind::Namespace("JSON"), "parse",     1, 1, json_parse;
-    JSONStringify, BuiltinKind::Namespace("JSON"), "stringify", 1, 1, json_stringify;
+    JSONStringify, BuiltinKind::Namespace("JSON"), "stringify", 1, 3, json_stringify;
 
     // ── Math ──
     MathAbs,   BuiltinKind::Namespace("Math"), "abs",   1, 1,      math_abs;

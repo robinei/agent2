@@ -100,7 +100,63 @@ metadata cleanup, JS-contract fixes, and the full coverage backlog
 (String/Array/Math/Object/Number/JSON). The only piece that stays here:
 `Math.random` is blocked on the determinism decision in item 3.
 
-## 6. Differential testing oracle (stretch)
+## 6. Label-bound prelude helpers (small–medium)
+
+Replace the prelude's textual `uses_method` source scan with exact,
+by-construction usage tracking: bind each HOF helper (`__map`, …) to a label
+id at its first call site, and compile the helper bodies at the end of the
+unit, before `optimizer::finalize`. Call sites already keep label ids in
+`Call` until the single backpatch pass, so referencing a helper's label
+before its body exists resolves through the normal path — no relocation.
+
+Design (settled 2026-06-10; the helper **JS sources stay exactly as they
+are** in `interp/src/prelude.rs` — only the front end changes):
+
+- **Lazy label memo, not a reserved id block.** Add a
+  `[Option<u32>; N_HELPERS]` memo to `Compiler`. First time `compile_hof`
+  needs a helper, allocate via `new_label()` and stash; later call sites
+  reuse it. A reserved block 0..N also works but couples to the shared
+  analyzer/compiler allocator (`compiler.next_label = result.next_label`,
+  compiler/mod.rs) and to enum discriminant order — avoid.
+- **Resolution by label, not name.** `emit_prelude_call` emits
+  `Call(memo_label, n)` instead of resolving `__map` via
+  `find_callee_label`. The `__`-named functions disappear from the
+  program's scope: a user `function __map()` can no longer collide/shadow.
+- **End-of-unit body emission.** After main compilation, for each used
+  helper: parse + analyze its source as a standalone mini-unit (helpers are
+  documented self-contained — no captures, no cross-helper calls — which is
+  the invariant making standalone analysis sound), thread `next_label`
+  through so mini-unit labels don't collide, emit `Instr::Label(memo_label)`
+  then the body into the same stream. Split `reduce`/`sort` source blocks
+  (currently two functions per block) into one source string per helper;
+  call-site argc dispatch in `compile_reduce`/`compile_sort` is unchanged.
+- **Span rebasing for diagnostics.** Append each compiled helper's source
+  text to the stored full source and rebase that helper's spans by the
+  append offset (known at emission time), so runtime errors inside a helper
+  still render against real text — same end state as today's concatenation.
+- **Delete** `prelude::assemble` and `uses_method`, and the pre-parse
+  source concatenation in `compile`.
+
+Wins: exact usage (no dead helper from `.map` in a comment or string
+literal), no shadowable `__` names, user source parsed once. Execution
+semantics byte-identical: same helper bodies, same static `Call` sites.
+
+Acceptance checklist (finish all before declaring done):
+
+- [ ] `cargo test -p interp` passes; `prelude.rs` tests for `assemble`/
+      `uses_method` replaced by: program with `.map` in a comment/string
+      compiles **without** the `__map` body; `findIndex` does not pull in
+      `find`; `reduce` one-arg vs two-arg forms both work.
+- [ ] New test: user program defining `function __map(a, f)` and also
+      calling `arr.map(cb)` — both work, no collision.
+- [ ] New test: runtime error raised inside a helper body (e.g. callback
+      arity abuse or receiver mutation) renders a diagnostic pointing into
+      the helper's source text (span rebasing correct).
+- [ ] A program using no HOFs compiles byte-for-byte unchanged
+      (existing tree-shaking guarantee preserved).
+- [ ] `compiler/tests/hof.rs` passes unchanged.
+
+## 7. Differential testing oracle (stretch)
 
 Already sketched as the stretch goal of Phase 2 step 3: run a snippet corpus
 through `node --eval` when available, compare final `state`. Valuable
