@@ -12,6 +12,9 @@ pub mod prelude;
 pub mod rc_str;
 pub mod vm;
 
+#[cfg(test)]
+pub(crate) mod testutil;
+
 pub use compiler::{Program, compile};
 pub use diag::Diagnostic;
 pub use rc_str::RcStr;

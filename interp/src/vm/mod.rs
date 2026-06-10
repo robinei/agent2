@@ -217,8 +217,10 @@ pub struct Closure {
 
 #[derive(Debug)]
 pub enum StepResult {
-    /// Program completed (root frame returned).
-    Done,
+    /// Program completed (root frame returned). The `value` is the program's
+    /// top-level return value, or `Undefined` when the program ends without a
+    /// `return` statement.
+    Done { value: Value },
     /// One or more tool/function calls to perform. `step()` batches a run of
     /// consecutive `Invoke` instructions into a single fan-out request so the
     /// host can run them concurrently. The host must push exactly one result

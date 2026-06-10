@@ -393,7 +393,7 @@ fn pe_try_constfold(out: &[Instr]) -> Option<(usize, Instr)> {
     // A single `step()` runs the whole jumpless program to `Done` (ip past the
     // end). An effect or error means "don't fold" — preserve runtime behavior.
     match vm.step() {
-        Ok(StepResult::Done) => {}
+        Ok(StepResult::Done { .. }) => {}
         _ => return None,
     }
     if vm.stack.len() != 1 {
@@ -423,7 +423,7 @@ pub(crate) fn const_eval(instrs: &[Instr]) -> Option<Instr> {
     }
     let mut vm = VM::new(instrs.to_vec());
     match vm.step() {
-        Ok(StepResult::Done) => {}
+        Ok(StepResult::Done { .. }) => {}
         _ => return None, // multi-step effect or runtime error → not a constant
     }
     if vm.stack.len() != 1 {

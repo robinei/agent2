@@ -11,7 +11,7 @@ mod tests {
         let mut vm = VM::new(code);
         loop {
             match vm.step().unwrap() {
-                StepResult::Done => return vm.stack.clone(),
+                StepResult::Done { .. } => return vm.stack.clone(),
                 other => panic!("unexpected effect: {other:?}"),
             }
         }
@@ -28,7 +28,7 @@ mod tests {
         let mut vm = VM::new(code);
         loop {
             match vm.step().unwrap() {
-                StepResult::Done => panic!("unexpected completion"),
+                StepResult::Done { .. } => panic!("unexpected completion"),
                 effect => return effect,
             }
         }
@@ -40,7 +40,7 @@ mod tests {
         loop {
             match vm.step() {
                 Err(e) => return e,
-                Ok(StepResult::Done) => panic!("unexpected completion"),
+                Ok(StepResult::Done { .. }) => panic!("unexpected completion"),
                 Ok(_) => panic!("unexpected effect"),
             }
         }
@@ -60,6 +60,7 @@ mod tests {
         }
     }
     /// A PosInt directly (for values above i64::MAX).
+    #[allow(dead_code)]
     fn u(v: u64) -> Value {
         Value::PosInt(v)
     }
@@ -77,6 +78,7 @@ mod tests {
         Value::Undefined
     }
     /// Object value at the given address.
+    #[allow(dead_code)]
     fn s(addr: u32) -> Value {
         Value::Object(addr)
     }
@@ -89,6 +91,7 @@ mod tests {
         vec![SlotKind::Plain; n]
     }
     /// `n` boxed (captured-by-ref) local slots, for `EnterFrame`.
+    #[allow(dead_code)]
     fn boxed(n: usize) -> Vec<SlotKind> {
         vec![SlotKind::Boxed; n]
     }
@@ -790,7 +793,7 @@ mod tests {
             Arguments,
             Return(1),
         ]);
-        while !matches!(vm.step().unwrap(), StepResult::Done) {}
+        while !matches!(vm.step().unwrap(), StepResult::Done { .. }) {}
         match vm.stack.as_slice() {
             [Value::Array(p)] => {
                 let a = &vm.arrays[*p as usize];
@@ -861,7 +864,7 @@ mod tests {
         let mut vm = VM::new(code);
         loop {
             match vm.step().unwrap() {
-                StepResult::Done => return vm,
+                StepResult::Done { .. } => return vm,
                 other => panic!("unexpected effect: {other:?}"),
             }
         }
@@ -1408,7 +1411,7 @@ mod tests {
         vm.stack.push(n(13.0));
         // Resume — should complete with the result on stack
         match vm.step().unwrap() {
-            StepResult::Done => {}
+            StepResult::Done { .. } => {}
             other => panic!("expected Done, got {other:?}"),
         }
         assert_eq!(vm.stack, vec![n(13.0)]);
@@ -1440,7 +1443,7 @@ mod tests {
         vm.stack.push(n(100.0)); // a's result
         vm.stack.push(n(200.0)); // b's result
         match vm.step().unwrap() {
-            StepResult::Done => {}
+            StepResult::Done { .. } => {}
             other => panic!("expected Done, got {other:?}"),
         }
         assert_eq!(vm.stack, vec![n(100.0), n(200.0)]);
@@ -1478,7 +1481,7 @@ mod tests {
     #[test]
     fn empty_program_done() {
         let mut vm = VM::new(vec![]);
-        assert!(matches!(vm.step().unwrap(), StepResult::Done));
+        assert!(matches!(vm.step().unwrap(), StepResult::Done { .. }));
     }
 
     #[test]
@@ -1507,7 +1510,7 @@ mod tests {
         let before = vm.fuel;
         loop {
             match vm.step().unwrap() {
-                StepResult::Done => break,
+                StepResult::Done { .. } => break,
                 _ => panic!(),
             }
         }
@@ -1748,7 +1751,7 @@ mod tests {
         alloc_counter::reset();
         loop {
             match vm.step().unwrap() {
-                StepResult::Done => break,
+                StepResult::Done { .. } => break,
                 other => panic!("unexpected effect: {other:?}"),
             }
         }
@@ -1785,7 +1788,7 @@ mod tests {
         alloc_counter::reset();
         loop {
             match vm.step().unwrap() {
-                StepResult::Done => break,
+                StepResult::Done { .. } => break,
                 other => panic!("unexpected effect: {other:?}"),
             }
         }
@@ -1798,7 +1801,7 @@ mod tests {
             let mut vm = VM::new(vec![PushFloat(-42.0), CallBuiltin(Builtin::MathAbs, 1)]);
             loop {
                 match vm.step().unwrap() {
-                    StepResult::Done => break,
+                    StepResult::Done { .. } => break,
                     other => panic!("unexpected effect: {other:?}"),
                 }
             }
@@ -1838,7 +1841,7 @@ mod tests {
             ]);
             loop {
                 match vm.step().unwrap() {
-                    StepResult::Done => break,
+                    StepResult::Done { .. } => break,
                     other => panic!("unexpected effect: {other:?}"),
                 }
             }
@@ -1860,7 +1863,7 @@ mod tests {
             ]);
             loop {
                 match vm.step().unwrap() {
-                    StepResult::Done => break,
+                    StepResult::Done { .. } => break,
                     other => panic!("unexpected effect: {other:?}"),
                 }
             }

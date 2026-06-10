@@ -203,7 +203,7 @@ pub(crate) struct ProgramAnalysis {
     /// target at every declaration site.
     pub(crate) binding_slot: HashMap<u32, u32>,
     /// Identifier-reference span → resolved frame slot. Absent means the name is
-    /// not a local (global/`state`/`undefined`/… or undeclared); codegen falls
+    /// not a local (global/`input`/`undefined`/… or undeclared); codegen falls
     /// back to name-based resolution.
     pub(crate) ref_resolution: HashMap<u32, RefSlot>,
     /// Binding occurrence span → whether the binding is immutable in fact (see
@@ -530,7 +530,7 @@ fn resolve_captures(scopes: &mut [FuncScope]) {
                 // `parent_nparams + idx` under the [params | upvals | locals] layout.
                 (parent_nparams + idx, is_const)
             } else {
-                // Not declared in any ancestor: a global/`state`/undeclared
+                // Not declared in any ancestor: a global/`input`/undeclared
                 // name — not an upval.
                 continue;
             };
@@ -662,7 +662,7 @@ fn finalize_tables(
                     },
                 );
             }
-            // Otherwise a global/`state`/undeclared name: leave absent so codegen
+            // Otherwise a global/`input`/undeclared name: leave absent so codegen
             // falls back to name-based resolution.
         }
     }
@@ -1115,10 +1115,10 @@ impl Analyzer {
             // Constant-binding elimination: `const x = <literal>` is a compile-time
             // binding — it occupies no slot and is never captured; references
             // resolve to the value. The literal initializer has no refs/effects,
-            // so it is not analyzed. (`state` may not be shadowed.)
+            // so it is not analyzed. (`input` may not be shadowed.)
             if is_const {
                 if let ast::BindingPattern::BindingIdentifier(id) = &d.id {
-                    if id.name != "state" {
+                    if id.name != "input" {
                         if let Some(value) = d.init.as_ref().and_then(literal_const_value) {
                             self.analyze_register_const(
                                 id.name.as_str(),
@@ -1291,8 +1291,8 @@ impl Analyzer {
         block_scopes: &mut BlockScopes,
         next_slot: &mut u32,
     ) -> u32 {
-        if name == "state" {
-            self.error(span, "cannot shadow the blessed `state` object");
+        if name == "input" {
+            self.error(span, "cannot shadow the host-seeded `input` object");
             return 0;
         }
         let slot = if is_var {

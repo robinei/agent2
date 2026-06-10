@@ -871,7 +871,7 @@ mod tests {
         let mut vm = VM::new(code);
         loop {
             match vm.step().unwrap() {
-                StepResult::Done => return vm.stack.clone(),
+                StepResult::Done { .. } => return vm.stack.clone(),
                 other => panic!("unexpected effect: {other:?}"),
             }
         }
@@ -1433,7 +1433,7 @@ mod tests {
     #[test]
     fn builtin_value_shape() {
         let mut vm = VM::new(vec![Instr::PushBuiltin(Builtin::MathMax), Instr::TypeOf]);
-        while !matches!(vm.step().unwrap(), StepResult::Done) {}
+        while !matches!(vm.step().unwrap(), StepResult::Done { .. }) {}
         match vm.stack.last() {
             Some(Value::String(s)) => assert_eq!(s.as_str(), "function"),
             other => panic!("{other:?}"),
@@ -1468,7 +1468,7 @@ mod tests {
         let err = loop {
             match vm.step() {
                 Err(e) => break e,
-                Ok(StepResult::Done) => panic!("expected error"),
+                Ok(StepResult::Done { .. }) => panic!("expected error"),
                 Ok(_) => {}
             }
         };

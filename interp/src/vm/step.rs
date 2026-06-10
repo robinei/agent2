@@ -71,7 +71,7 @@ impl VM {
 
         loop {
             if self.ip as usize >= self.code.len() {
-                return Ok(StepResult::Done);
+                return Ok(StepResult::Done { value: Value::Undefined });
             }
             if self.fuel == 0 {
                 return Err(VMError::OutOfFuel);
@@ -328,7 +328,10 @@ impl VM {
                     self.ip = frame.return_addr;
                     self.fp = frame.prev_fp;
                     if self.callstack.is_empty() {
-                        return Ok(StepResult::Done);
+                        // Root frame returned — capture the top-level value
+                        // (peek, so the stack is still inspectable after Done).
+                        let value = self.stack.last().cloned().unwrap_or(Value::Undefined);
+                        return Ok(StepResult::Done { value });
                     }
                     // Refresh the local-count cache from the restored caller
                     // frame (returns are far rarer than local accesses).

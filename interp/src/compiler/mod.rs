@@ -36,7 +36,10 @@ pub struct Program {
 /// rather than producing a partial program.
 pub fn compile(source: &str) -> Result<Program, Vec<Diagnostic>> {
     let allocator = Allocator::default();
-    let source_type = SourceType::default(); // JavaScript module
+    // Use script (non-module) mode so top-level `return` is allowed
+    // (8_HARNESS Step 0). Other module-vs-script differences (e.g. `with`)
+    // are already rejected explicitly by the compiler.
+    let source_type = SourceType::cjs();
 
     // Append only the higher-order-method helpers (`__map`, …) the program
     // actually uses. They are real JS compiled in the same unit (appended, so
@@ -287,10 +290,9 @@ impl<'src> Compiler<'src> {
                     .analysis
                     .as_ref()
                     .expect("analysis present during codegen");
-                if analysis.scopes[self.current_scope].parent == usize::MAX {
-                    self.error(r.span.start, "`return` outside a function");
-                    return;
-                }
+                // Top-level `return` is allowed (8_HARNESS Step 0); the root
+                // frame's Return pops it and yields Done { value }.
+                let _is_top_level = analysis.scopes[self.current_scope].parent == usize::MAX;
                 match &r.argument {
                     Some(expr) => {
                         self.compile_expr(expr);
@@ -430,7 +432,7 @@ impl<'src> Compiler<'src> {
                 match self.binding_slot(id.span.start) {
                     Some(slot) => self.emit(Instr::SetLocal(slot as LocalIndex), span),
                     None => {
-                        // No slot (an earlier error, e.g. shadowing `state`).
+                        // No slot (an earlier error, e.g. shadowing `input`).
                         self.emit(Instr::Pop(1), span);
                     }
                 }
@@ -1042,11 +1044,11 @@ impl<'src> Compiler<'src> {
         }
     }
 
-    /// A bare identifier resolves only to the blessed `state` object or the
+    /// A bare identifier resolves only to the host-seeded `input` object or the
     /// global literal-like names. Everything else is an undeclared variable —
-    /// a compile error, so typos can't silently become persistent state. (Local
-    /// variables arrive in Phase 2/3; namespace names like `Math`/`Object` are
-    /// recognized structurally as call/member receivers, never as bare values.)
+    /// a compile error. (Local variables arrive in Phase 2/3; namespace names
+    /// like `Math`/`Object` are recognized structurally as call/member
+    /// receivers, never as bare values.)
     fn compile_identifier(&mut self, name: &str, span: u32) {
         // A local/param/captured variable resolves to its frame slot (resolved
         // by analysis, keyed by this reference's span); `Local` dereferences a
@@ -1080,7 +1082,7 @@ impl<'src> Compiler<'src> {
             return;
         }
         match name {
-            "state" => self.emit(Instr::PushObject(0), span),
+            "input" => self.emit(Instr::PushObject(0), span),
             "undefined" => self.emit(Instr::PushUndefined, span),
             "NaN" => self.emit(Instr::PushFloat(f64::NAN), span),
             "Infinity" => self.emit(Instr::PushFloat(f64::INFINITY), span),
@@ -1737,8 +1739,8 @@ impl<'src> Compiler<'src> {
                 }
                 Some(LValue::Local(r.slot))
             }
-            None if name == "state" => {
-                self.error(span, "cannot reassign the blessed `state` object");
+            None if name == "input" => {
+                self.error(span, "cannot reassign `input` (it is a host-seeded const)");
                 None
             }
             None => {

@@ -25,23 +25,18 @@ impl VM {
         }
     }
 
-    /// Construct a VM to run a compiled `Program`, with the blessed `state`
-    /// object installed at `objects[0]`. `state` is seeded from the prior run's
-    /// durable JSON (an object); `Null`/non-object seeds yield an empty `state`.
-    /// All durable/host-context access lowers to ordinary object ops on
-    /// `Object(0)`, so the host persists by extracting `objects[0]` after the
-    /// run and re-seeding it here next time. String literals are not
-    /// heap-allocated — they ride inline in `PushStr` as `RcStr` — so
+    /// Construct a VM to run a compiled `Program`, with the host-seeded `input`
+    /// value installed at `objects[0]`. `input` is the read-only const available
+    /// to the program; `Null`/non-object seeds yield an empty object.
     /// `objects[0]` is the only pre-seeded slot and `Object(0)` stays stable
     /// for the whole program.
-    pub fn for_program(program: Program, state: serde_json::Value) -> Result<Self, VMError> {
+    pub fn for_program(program: Program, input: serde_json::Value) -> Result<Self, VMError> {
         let mut vm = VM::new(program.code);
-        // Reserve objects[0] for `state` (filled in just below). Strings no longer
-        // occupy heap slots, so this is the sole pre-allocation.
+        // Reserve objects[0] for `input` (filled in just below).
         vm.objects.push(IndexMap::new());
-        // Seed state's nested values (arrays/objects land at objects[1..]; their
-        // addresses are computed at runtime and stored in the state map).
-        if let serde_json::Value::Object(map) = state {
+        // Seed input's nested values (arrays/objects land at objects[1..]; their
+        // addresses are computed at runtime and stored in the input map).
+        if let serde_json::Value::Object(map) = input {
             let mut entries = IndexMap::with_capacity(map.len());
             for (k, v) in &map {
                 let sv = vm.json_to_stack_value(v, 0)?;
@@ -52,13 +47,6 @@ impl VM {
             }
         }
         Ok(vm)
-    }
-
-    /// Extract the blessed `state` object (objects[0]) as a JSON value. This is the
-    /// persistence boundary the host uses to save/restore durable state between
-    /// runs.
-    pub fn state_to_json(&self) -> Result<serde_json::Value, VMError> {
-        self.stack_value_to_json(&Value::Object(0), 0)
     }
 
     // ── heap access helpers ──────────────────────────────────────────
