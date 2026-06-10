@@ -1392,10 +1392,20 @@ impl<'src> Compiler<'src> {
     /// property literally named `length` reached via `.length`); anything else
     /// is `ObjGet`.
     fn compile_static_member(&mut self, m: &ast::StaticMemberExpression) {
-        // First-class reference to a namespaced builtin used as a *value* (e.g.
-        // `Math.sqrt` passed as a callback or invoked via `?.()`): push the
-        // `Builtin`. `?.` here is a no-op — a namespace is never nullish.
+        // Namespace constants and first-class builtin refs: handle before
+        // evaluating the object.
         if let ast::Expression::Identifier(obj) = &m.object {
+            // Constants: fold to compile-time values.
+            if let Some(val) = namespace_constant(obj.name.as_str(), m.property.name.as_str()) {
+                let span = m.span.start;
+                match val {
+                    ConstVal::Float(f) => self.emit(Instr::PushFloat(f), span),
+                    ConstVal::PosInt(n) => self.emit(Instr::PushPosInt(n), span),
+                }
+                return;
+            }
+            // First-class reference to a namespaced builtin used as a *value* (e.g.
+            // `Math.sqrt` passed as a callback): push the `Builtin`.
             if let Some(builtin) =
                 Builtin::for_namespace(obj.name.as_str(), m.property.name.as_str())
             {
@@ -2834,6 +2844,23 @@ impl<'src> Compiler<'src> {
             // Promote the plain arg value in the slot to a shared cell.
             self.emit(Instr::FreshCell(slot as LocalIndex), span);
         }
+    }
+}
+
+/// Represents a compile-time constant value (used for namespace member reads).
+enum ConstVal {
+    Float(f64),
+    PosInt(u64),
+}
+
+/// Map a namespace + member name to a compile-time constant, if any.
+fn namespace_constant(ns: &str, member: &str) -> Option<ConstVal> {
+    match (ns, member) {
+        ("Math", "PI") => Some(ConstVal::Float(std::f64::consts::PI)),
+        ("Math", "E") => Some(ConstVal::Float(std::f64::consts::E)),
+        ("Number", "MAX_SAFE_INTEGER") => Some(ConstVal::PosInt(9007199254740991)),
+        ("Number", "EPSILON") => Some(ConstVal::Float(f64::EPSILON)),
+        _ => None,
     }
 }
 

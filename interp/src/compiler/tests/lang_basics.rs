@@ -111,6 +111,17 @@ fn intrinsics_static() {
     assert_eq!(eval("Number.isInteger(4)"), Value::Bool(true));
     assert_eq!(eval("Array.isArray([1])"), Value::Bool(true));
     assert_eq!(eval("Array.isArray(5)"), Value::Bool(false));
+    // Constants
+    assert!(
+        matches!(eval("Math.PI"), Value::Float(f) if (f - std::f64::consts::PI).abs() < 0.001)
+    );
+    assert_eq!(
+        eval("Number.MAX_SAFE_INTEGER"),
+        Value::PosInt(9007199254740991)
+    );
+    // Member read in non-call position works.
+    let v = testutil::run_val("const x = Math.PI; return x * 2;");
+    assert!(matches!(v, Value::Float(f) if (f - 2.0 * std::f64::consts::PI).abs() < 0.01));
 }
 
 #[test]
