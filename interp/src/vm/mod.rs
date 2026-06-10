@@ -12,6 +12,8 @@ pub use instr::{
 pub use value::Value;
 pub(crate) use value::{float_is_int, js_number_to_string};
 
+use std::sync::Arc;
+
 use indexmap::IndexMap;
 use smallvec::SmallVec;
 use thin_vec::ThinVec;
@@ -188,6 +190,14 @@ pub struct VM {
     /// by design — programs are expected to be short-lived), so this is the
     /// primary backstop against runaway execution.
     pub fuel: u64,
+    /// Source byte offset per instruction (`spans[ip]`), populated by
+    /// `for_program` from `Program::spans`. Empty when constructed via
+    /// `VM::new` (hand-assembled instructions used by tests).
+    pub spans: Vec<u32>,
+    /// Source text the `spans` refer into, populated by `for_program` from
+    /// `Program::source`. Empty for `VM::new` programs, where error
+    /// rendering degrades gracefully to "at instruction N".
+    pub source: Arc<str>,
 }
 
 pub struct CallFrame {

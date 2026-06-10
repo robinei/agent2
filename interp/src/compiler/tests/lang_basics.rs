@@ -101,7 +101,10 @@ fn intrinsics_static() {
     assert_eq!(eval("Math.abs(-5)"), testutil::num(5.0));
     assert_eq!(eval("Math.floor(3.9)"), testutil::num(3.0));
     assert_eq!(eval("Math.pow(2, 5)"), testutil::num(32.0));
-    assert_eq!(eval("Object.keys({ a: 1, b: 2 }).length"), testutil::num(2.0));
+    assert_eq!(
+        eval("Object.keys({ a: 1, b: 2 }).length"),
+        testutil::num(2.0)
+    );
     assert_eq!(eval("Object.values({ a: 5 })[0]"), Value::PosInt(5));
     assert_eq!(eval("JSON.parse(\"[1,2,3]\").length"), testutil::num(3.0));
     assert_eq!(eval_str("JSON.stringify([1,2])"), "[1,2]");
@@ -154,7 +157,10 @@ fn top_level_return_object_values() {
         testutil::run_ret("return { a: 1, b: \"hi\" };"),
         serde_json::json!({"a": 1, "b": "hi"})
     );
-    assert_eq!(testutil::run_ret("return [1, 2, 3];"), serde_json::json!([1, 2, 3]));
+    assert_eq!(
+        testutil::run_ret("return [1, 2, 3];"),
+        serde_json::json!([1, 2, 3])
+    );
     assert_eq!(testutil::run_ret("return true;"), serde_json::json!(true));
     assert_eq!(testutil::run_ret("return null;"), serde_json::json!(null));
 }

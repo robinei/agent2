@@ -22,9 +22,18 @@ fn syntax_error_is_reported() {
 #[test]
 fn diagnostics_for_unsupported() {
     for src in [
-        "x;", "x = 1;", "i++;", "tools;", "tools.send;",
-        "raise(x);", "raise();", "Math.tan(1);", "Math.pow(1);",
-        "f(...args);", "new Foo();", "class C {}",
+        "x;",
+        "x = 1;",
+        "i++;",
+        "tools;",
+        "tools.send;",
+        "raise(x);",
+        "raise();",
+        "Math.tan(1);",
+        "Math.pow(1);",
+        "f(...args);",
+        "new Foo();",
+        "class C {}",
     ] {
         assert!(compile(src).is_err(), "expected `{src}` to fail to compile");
     }
@@ -33,11 +42,19 @@ fn diagnostics_for_unsupported() {
 #[test]
 fn builtin_arity_is_enforced_from_meta() {
     for src in [
-        "Math.pow(1);", "Math.pow(1, 2, 3);", "Math.abs();",
-        "\"x\".slice();", "\"x\".slice(1, 2, 3);", "[1].pop(2);",
-        "Object.keys();", "Number.parseInt(1, 2, 3);",
+        "Math.pow(1);",
+        "Math.pow(1, 2, 3);",
+        "Math.abs();",
+        "\"x\".slice();",
+        "\"x\".slice(1, 2, 3);",
+        "[1].pop(2);",
+        "Object.keys();",
+        "Number.parseInt(1, 2, 3);",
     ] {
-        assert!(compile(src).is_err(), "expected `{src}` to fail arity check");
+        assert!(
+            compile(src).is_err(),
+            "expected `{src}` to fail arity check"
+        );
     }
     assert!(compile("[1].push();").is_ok());
     let errs = compile("\"x\".slice(1, 2, 3);").expect_err("too many args");
@@ -50,10 +67,7 @@ fn builtin_arity_is_enforced_from_meta() {
 
 #[test]
 fn for_of_in_diagnostics() {
-    for src in [
-        "for (const [a, b] of [[1, 2]]) {}",
-        "for (x of [1]) {}",
-    ] {
+    for src in ["for (const [a, b] of [[1, 2]]) {}", "for (x of [1]) {}"] {
         assert!(compile(src).is_err(), "expected `{src}` to fail to compile");
     }
 }

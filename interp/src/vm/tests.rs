@@ -1616,7 +1616,7 @@ fn swap_cannot_cross_frame_floor() {
         Return(0),
         EnterFrame(0, false, plain(1).into()), // local 0
         PushFloat(9.0),                        // single temporary
-        Dig(1), // would swap the temp with the local -> underflow
+        Dig(1),                                // would swap the temp with the local -> underflow
         Return(0),
     ];
     assert!(matches!(run_err(code), VMError::StackUnderflow));
@@ -1949,10 +1949,10 @@ fn relational_non_coercion() {
 fn arr_index_negative_errors() {
     // Negative IndexGet on an array is a ValueError.
     let mut vm = VM::new(vec![
-        PushPosInt(0),    // dummy array element
-        ArrNew(1),        // create array (pops 1 value)
-        PushNegInt(-1),   // index -1
-        IndexGet,         // should error
+        PushPosInt(0),  // dummy array element
+        ArrNew(1),      // create array (pops 1 value)
+        PushNegInt(-1), // index -1
+        IndexGet,       // should error
     ]);
     match vm.step() {
         Err(VMError::ValueError) => {} // expected
@@ -1960,10 +1960,10 @@ fn arr_index_negative_errors() {
     }
     // Negative IndexSet on an array is also a ValueError.
     let mut vm = VM::new(vec![
-        PushPosInt(0),      // dummy array element
-        ArrNew(1),          // create array (pops 1 value)
-        PushNegInt(-1),     // index -1
-        PushPosInt(99),     // value to set
+        PushPosInt(0),  // dummy array element
+        ArrNew(1),      // create array (pops 1 value)
+        PushNegInt(-1), // index -1
+        PushPosInt(99), // value to set
         IndexSet(SetMode::New),
     ]);
     match vm.step() {
@@ -1978,15 +1978,9 @@ fn arr_index_negative_errors() {
 fn string_utf8_length() {
     // String `.length` returns byte count, not char count.
     // "é" is 2 bytes in UTF-8.
-    assert_eq!(
-        run(vec![ps("é"), ArrLength]),
-        vec![Value::Float(2.0)]
-    );
+    assert_eq!(run(vec![ps("é"), ArrLength]), vec![Value::Float(2.0)]);
     // "😀" is 4 bytes.
-    assert_eq!(
-        run(vec![ps("😀"), ArrLength]),
-        vec![Value::Float(4.0)]
-    );
+    assert_eq!(run(vec![ps("😀"), ArrLength]), vec![Value::Float(4.0)]);
 }
 
 // ── NaN in Math.min/max (JS divergence) ─────────────────────────
@@ -1994,37 +1988,45 @@ fn string_utf8_length() {
 #[test]
 fn math_min_max_nan_ignored() {
     // Math.min with NaN: NaN operand is ignored, non-NaN operand returned.
-    assert!(run(vec![
-        PushFloat(f64::NAN),
-        PushFloat(5.0),
-        CallBuiltin(Builtin::MathMin, 2),
-    ])[0]
-        .as_f64()
-        .map_or(false, |n| (n - 5.0).abs() < 0.01));
+    assert!(
+        run(vec![
+            PushFloat(f64::NAN),
+            PushFloat(5.0),
+            CallBuiltin(Builtin::MathMin, 2),
+        ])[0]
+            .as_f64()
+            .map_or(false, |n| (n - 5.0).abs() < 0.01)
+    );
     // Math.max with NaN: NaN operand is ignored.
-    assert!(run(vec![
-        PushFloat(f64::NAN),
-        PushFloat(3.0),
-        CallBuiltin(Builtin::MathMax, 2),
-    ])[0]
-        .as_f64()
-        .map_or(false, |n| (n - 3.0).abs() < 0.01));
+    assert!(
+        run(vec![
+            PushFloat(f64::NAN),
+            PushFloat(3.0),
+            CallBuiltin(Builtin::MathMax, 2),
+        ])[0]
+            .as_f64()
+            .map_or(false, |n| (n - 3.0).abs() < 0.01)
+    );
     // When all operands are NaN, min returns +Infinity, max returns -Infinity
     // (the seed values, since every NaN is ignored).
-    assert!(run(vec![
-        PushFloat(f64::NAN),
-        PushFloat(f64::NAN),
-        CallBuiltin(Builtin::MathMin, 2),
-    ])[0]
-        .as_f64()
-        .map_or(false, |n| n.is_infinite() && n.is_sign_positive()));
-    assert!(run(vec![
-        PushFloat(f64::NAN),
-        PushFloat(f64::NAN),
-        CallBuiltin(Builtin::MathMax, 2),
-    ])[0]
-        .as_f64()
-        .map_or(false, |n| n.is_infinite() && n.is_sign_negative()));
+    assert!(
+        run(vec![
+            PushFloat(f64::NAN),
+            PushFloat(f64::NAN),
+            CallBuiltin(Builtin::MathMin, 2),
+        ])[0]
+            .as_f64()
+            .map_or(false, |n| n.is_infinite() && n.is_sign_positive())
+    );
+    assert!(
+        run(vec![
+            PushFloat(f64::NAN),
+            PushFloat(f64::NAN),
+            CallBuiltin(Builtin::MathMax, 2),
+        ])[0]
+            .as_f64()
+            .map_or(false, |n| n.is_infinite() && n.is_sign_negative())
+    );
 }
 
 // ── Invoke interleaved with Raise ───────────────────────────────
@@ -2034,15 +2036,15 @@ fn invoke_interleaved_with_raise() {
     // Invoke(A) + Invoke(B) batch together (consecutive). Raise fires
     // separately. Then Invoke(C) fires alone after Raise.
     let mut vm = VM::new(vec![
-        PushPosInt(1),       // A arg0
-        PushPosInt(10),      // A arg1
-        PushPosInt(2),       // B arg0
-        PushPosInt(20),      // B arg1
+        PushPosInt(1),  // A arg0
+        PushPosInt(10), // A arg1
+        PushPosInt(2),  // B arg0
+        PushPosInt(20), // B arg1
         Invoke("A".into(), 2),
         Invoke("B".into(), 2),
         Raise("err".into()),
-        PushPosInt(3),       // C arg0
-        PushPosInt(30),      // C arg1
+        PushPosInt(3),  // C arg0
+        PushPosInt(30), // C arg1
         Invoke("C".into(), 2),
     ]);
     // First step: Invoke(A) + Invoke(B) batched together.
@@ -2081,8 +2083,8 @@ fn invoke_interleaved_with_raise() {
 fn fuel_charged_per_batched_invoke() {
     // Each call in a batched Invoke should independently consume fuel.
     let mut vm = VM::new(vec![
-        PushPosInt(1),       // X arg0
-        PushPosInt(2),       // Y arg0
+        PushPosInt(1), // X arg0
+        PushPosInt(2), // Y arg0
         Invoke("X".into(), 1),
         Invoke("Y".into(), 1),
     ]);
@@ -2099,7 +2101,10 @@ fn fuel_charged_per_batched_invoke() {
     // Fuel consumed: the batched Invoke step should charge per call.
     // After 2 calls, fuel should have dropped (exact count depends on
     // implementation, but a subsequent step should still have fuel).
-    assert!(vm.fuel > 0, "should have fuel remaining after batched invoke");
+    assert!(
+        vm.fuel > 0,
+        "should have fuel remaining after batched invoke"
+    );
     // One more step should succeed without OutOfFuel.
     match vm.step() {
         Ok(StepResult::Done { .. }) => {} // fine: ran to completion
@@ -2116,12 +2121,20 @@ fn fuel_charged_per_batched_invoke() {
 fn string_empty_needle_includes_starts_with() {
     // Empty-string `includes` returns true.
     assert_eq!(
-        run(vec![ps("hello"), ps(""), CallBuiltin(Builtin::StrIncludes, 2)]),
+        run(vec![
+            ps("hello"),
+            ps(""),
+            CallBuiltin(Builtin::StrIncludes, 2)
+        ]),
         vec![Value::Bool(true)]
     );
     // Empty-string `startsWith` returns true.
     assert_eq!(
-        run(vec![ps("hello"), ps(""), CallBuiltin(Builtin::StrStartsWith, 2)]),
+        run(vec![
+            ps("hello"),
+            ps(""),
+            CallBuiltin(Builtin::StrStartsWith, 2)
+        ]),
         vec![Value::Bool(true)]
     );
 }
@@ -2170,14 +2183,40 @@ fn json_to_value_depth_limit() {
     );
 }
 
+// ── Step 1: VM retains spans and source ──────────────────────────
+
+#[test]
+fn for_program_populates_spans_and_source() {
+    // After `for_program`, the VM's spans table has one entry per instruction
+    // and the source is non-empty.
+    let prog = crate::testutil::compile_ok("return 1 + 2;");
+    let vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
+    assert_eq!(
+        vm.spans.len(),
+        vm.code.len(),
+        "spans must have one entry per instruction"
+    );
+    assert!(!vm.source.is_empty(), "source must be non-empty");
+}
+
+#[test]
+fn vm_new_leaves_spans_and_source_empty() {
+    let vm = VM::new(vec![Instr::PushPosInt(0)]);
+    assert!(vm.spans.is_empty());
+    assert!(vm.source.is_empty());
+}
+
 #[test]
 fn cyclic_value_serialization_errors() {
     // A self-referential object must error, not hang, on serialization.
     // (Today the depth guard is what trips; this pins the no-hang contract
     // independently of how cycles are detected.)
     let mut vm = VM::new(vec![]);
-    vm.objects
-        .push([(RcStr::from("me"), Value::Object(0))].into_iter().collect());
+    vm.objects.push(
+        [(RcStr::from("me"), Value::Object(0))]
+            .into_iter()
+            .collect(),
+    );
     let result = vm.stack_value_to_json(&Value::Object(0), 0);
     assert!(
         matches!(result, Err(VMError::ValueError)),

@@ -64,8 +64,7 @@ fn raise_yields_effect_and_resumes_as_expression() {
 fn for_program_seeds_input_object() {
     // `testutil::run_ret` uses `Null` seed; test manual `for_program` seeding.
     let prog = crate::testutil::compile_ok("return input.x + input.y;");
-    let mut vm =
-        VM::for_program(prog, serde_json::json!({"x": 10, "y": 20})).unwrap();
+    let mut vm = VM::for_program(prog, serde_json::json!({"x": 10, "y": 20})).unwrap();
     match vm.step().unwrap() {
         StepResult::Done { value } => assert_eq!(value, Value::Float(30.0)),
         other => panic!("expected Done, got {other:?}"),

@@ -12,6 +12,17 @@ returns enriched errors. The *host* (the LLM loop) decides whether an error
 becomes a condition with restarts. Do not thread `StepResult` through
 internal helpers.
 
+## Execution protocol (read first)
+
+Steps land **strictly in order**, one commit per step (`errors:` prefix),
+with `cargo fmt && cargo clippy && cargo test` green before each commit.
+Every step ends with an **Acceptance** checklist. Run each check literally
+(the greps are commands, not suggestions) and paste the results into the
+commit message. **A step is not done until every one of its acceptance
+checks passes, and the next step must not be started before that.** If a
+check cannot pass, stop and record why in this doc next to the check — do
+not reinterpret the check, and do not skip ahead.
+
 ## Step 1: VM retains spans and source
 
 `VM::for_program` currently drops `Program.spans` and `Program.source`, so
@@ -19,6 +30,12 @@ runtime errors cannot be rendered against source. Store both on the `VM`
 (`spans: Vec<u32>`, `source: Arc<str>`; both cheap). `VM::new(code)` (the
 hand-assembled-instruction path used by tests) leaves them empty and
 rendering degrades gracefully to "at ip N".
+
+**Acceptance (Step 1):**
+- `VM` has `spans` + `source` fields; `for_program` populates them from the
+  `Program`; `VM::new` leaves them empty.
+- A test asserts that after `for_program`, `vm.spans.len() == vm.code.len()`.
+- No other behavior change; full suite green.
 
 ## Step 2: Enrich `VMError`
 
@@ -47,6 +64,25 @@ Mechanics:
   `Diagnostic::render` against `self.source`. Falls back to
   `"<message> (at instruction {ip})"` when spans/source are empty.
 - `OutOfFuel` keeps a fixed message; it is not a program bug.
+- **Test migration is part of this step**, not an afterthought: ~84
+  `VMError::<Variant>` references in test code break when the enum becomes
+  a struct. Decision (do not improvise an alternative mid-migration):
+  `testutil::run_runtime_err` and the `vm/tests.rs` `run_err` helper keep
+  returning the full `VMError`; assertions compare `err.kind` against
+  `ErrorKind::…`. Add `testutil::run_err_kind(src) -> ErrorKind` as sugar
+  for tests that only care about the kind.
+
+**Acceptance (Step 2):**
+- Every error construction goes through `fail`:
+  `grep -rn 'VMError {' interp/src` hits only the `fail` helper itself.
+- The unit variants are gone from call sites:
+  `grep -rn 'VMError::' interp/src` → zero hits (the variants live on
+  `ErrorKind` now).
+- `render_error` has tests for both paths: a compiled program's error
+  renders with the source line + caret; a `VM::new` program's error renders
+  as "at instruction {ip}".
+- **Which sites error is unchanged** — the pre-existing error tests pass
+  with only the mechanical `.kind` rename, no expectation changes.
 
 ## Step 3: Resume classification
 
@@ -78,10 +114,12 @@ impl VM {
 The core work is an **audit of every error site** for its stack state at the
 moment of error:
 
-- Classify `StackUnderflow`, `BadReturn`, `BadCall`, `BadLocal`, `BadAlloc`
-  as `NotResumable` (these indicate compiler bugs — codegen always produces
-  balanced stacks and valid indices).
-- For each `TypeError`/`ValueError` site in `step()` and `builtin.rs`,
+- Classify `StackUnderflow`, `BadReturn`, `BadCall`, `BadLocal`, `BadAlloc`,
+  and `BadArg` as `NotResumable` (these indicate compiler bugs or host
+  misuse — codegen always produces balanced stacks and valid indices).
+  That accounts for six of the nine kinds; `TypeError`/`ValueError` are
+  audited per-site below, and `OutOfFuel` is `RetrySameInstr`.
+- For each `TypeError`/`ValueError` site in `step()` and `builtin/mod.rs`,
   determine whether the instruction's operands are already popped when the
   error is constructed. The `unary_num!`/`binary_num!`/`binary_int!` macros
   and `take_args` pop first — those sites are `PushValueThenContinue` as-is.
@@ -102,6 +140,18 @@ Add tests per classification: e.g. `return [] - 1;` (TypeError in Sub) →
 `resume_with(Float(0))` → program completes with the substituted value;
 OutOfFuel → top up fuel → completes; a `NotResumable` resume attempt errors.
 
+**Acceptance (Step 3):**
+- All nine `ErrorKind`s have a classification; none is "unmentioned"
+  (`BadArg` included).
+- The audit table in the `vm/mod.rs` module doc has one row per error
+  site: row count matches `grep -rc 'fail(' interp/src/vm interp/src/builtin`
+  (state the two numbers in the commit message; explain any delta).
+- The pop-first invariant is documented at the `ResumeMode` definition.
+- At least one test per `ResumeMode` variant exists, including a
+  `resume_with` attempt on a `NotResumable` error returning an error.
+- Every pop-first normalization made during the audit has its own test and
+  its own audit-table row (per the ground rules).
+
 ## Step 4: Message quality
 
 Improve messages at the high-traffic sites with operation + operand types +
@@ -119,6 +169,15 @@ short value previews:
 - Example target quality:
   `cannot subtract: left operand is an array ([array of 3]), right is number (1)`
   rendered under the source line with a caret.
+
+**Acceptance (Step 4):**
+- For **each** target site in the priority list above, at least one test
+  asserts a message substring that includes the operand's type name (and
+  the preview where one is specified). One test per site, listed in the
+  commit message against the site it covers — a site with no test is not
+  done.
+- `type_name` and `preview` have direct unit tests (all `Value` variants;
+  string truncation at the boundary).
 
 ## Step 5: `raise` payloads and the blessed resume path
 
@@ -141,12 +200,26 @@ short value previews:
   replay, see 8_HARNESS decisions 5–7). In-place code patching is
   explicitly unsupported (live `Fn`/`Closure` values hold code addresses
   that a recompile invalidates).
-- Update existing Raise tests; add payload round-trip and resume tests.
+- Update existing Raise tests. The ones doing the manual `ip += 1` dance
+  this step obsoletes are `raise_yields_effect_and_resumes_as_expression`
+  (`compiler/tests/effects.rs`) and `invoke_interleaved_with_raise`
+  (`vm/tests.rs`) — both must switch to `resume_raise`. Add payload
+  round-trip and resume tests.
+
+**Acceptance (Step 5):**
+- No test manually fixes up ip after a Raise:
+  `grep -rn 'ip += 1' interp/src` → zero hits in test code.
+- Tests cover: `raise("name")` (no payload), `raise("name", expr)` (payload
+  arrives in `StepResult::Raise`), `raise("name", a, b)` → compile error,
+  non-literal condition name → compile error, and `resume_raise` feeding a
+  value back as the expression result.
+- The `StepResult::Raise` doc comment no longer suggests patching
+  `code`/`ip`: `grep -n 'modify vm state' interp/src/vm/mod.rs` → zero hits.
 
 ## Ground rules
 
-- Steps land in order; each is a separate commit (`errors:` prefix) with
-  green `cargo fmt && cargo clippy && cargo test`.
+(Sequencing and commit discipline live in "Execution protocol" at the top.)
+
 - Step 2's site migration must not change which sites error — only what the
   error carries. Step 3's pop-first normalizations are behavior-adjacent:
   each one needs a test showing the observable behavior (which error, what

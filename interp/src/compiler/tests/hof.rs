@@ -91,7 +91,9 @@ fn hof_callback_index_and_array_args() {
 #[test]
 fn hof_closure_callback_captures() {
     assert_eq!(
-        testutil::run_val("let k = 10; return [1, 2, 3].map(x => x + k).reduce((s, x) => s + x, 0);"),
+        testutil::run_val(
+            "let k = 10; return [1, 2, 3].map(x => x + k).reduce((s, x) => s + x, 0);"
+        ),
         testutil::num(36.0) // (1+10)+(2+10)+(3+10) = 36
     );
 }
@@ -109,7 +111,9 @@ fn hof_chained_and_nested() {
 #[test]
 fn hof_inside_user_function() {
     assert_eq!(
-        testutil::run_ret("function total(a) { return a.map(x => x + 1).reduce((s, x) => s + x, 0); } return total([1, 2, 3]);"),
+        testutil::run_ret(
+            "function total(a) { return a.map(x => x + 1).reduce((s, x) => s + x, 0); } return total([1, 2, 3]);"
+        ),
         serde_json::json!(9) // 2 + 3 + 4
     );
 }

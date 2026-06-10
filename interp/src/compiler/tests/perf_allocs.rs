@@ -3,8 +3,8 @@
 
 use super::*;
 use crate::alloc_counter;
-use crate::compiler::compile;
 use crate::compiler::Program;
+use crate::compiler::compile;
 use crate::vm::{StepResult, VM, Value};
 
 /// Run a compiled program and return the finished VM + allocation count.

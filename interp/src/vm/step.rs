@@ -71,7 +71,9 @@ impl VM {
 
         loop {
             if self.ip as usize >= self.code.len() {
-                return Ok(StepResult::Done { value: Value::Undefined });
+                return Ok(StepResult::Done {
+                    value: Value::Undefined,
+                });
             }
             if self.fuel == 0 {
                 return Err(VMError::OutOfFuel);

@@ -4,11 +4,11 @@
 //! are immune to compiler churn at the behavioral level.
 
 use super::*;
-use crate::compiler::compile;
-use crate::testutil;
 use crate::builtin::Builtin;
-use crate::vm::{Instr, SlotKind, VM, Value};
+use crate::compiler::compile;
 use crate::rc_str::RcStr;
+use crate::testutil;
+use crate::vm::{Instr, SlotKind, VM, Value};
 
 // ── core optimizer: const-fold / peephole / simplify_cfg ─────────
 
@@ -636,12 +636,19 @@ fn raise_lowers_to_raise_instr() {
 fn optional_call_reclaims_static_builtin() {
     let prog = compile("Math.max?.(3, 7);").expect("compiles");
     assert!(
-        prog.code.iter().any(|i| matches!(i, Instr::CallBuiltin(Builtin::MathMax, 2))),
-        "expected CallBuiltin(MathMax, 2), got {:?}", prog.code
+        prog.code
+            .iter()
+            .any(|i| matches!(i, Instr::CallBuiltin(Builtin::MathMax, 2))),
+        "expected CallBuiltin(MathMax, 2), got {:?}",
+        prog.code
     );
     assert!(
-        !prog.code.iter().any(|i| matches!(i, Instr::CallDyn(_) | Instr::JNotNullish(_))),
-        "guard/CallDyn should have been reclaimed: {:?}", prog.code
+        !prog
+            .code
+            .iter()
+            .any(|i| matches!(i, Instr::CallDyn(_) | Instr::JNotNullish(_))),
+        "guard/CallDyn should have been reclaimed: {:?}",
+        prog.code
     );
 }
 
@@ -649,14 +656,27 @@ fn optional_call_reclaims_static_builtin() {
 
 #[test]
 fn captured_loop_var_allocates_plain_not_boxed() {
-    let prog = compile("let fns = []; for (let i = 0; i < 3; i++) { fns.push(() => i); }").expect("compiles");
+    let prog = compile("let fns = []; for (let i = 0; i < 3; i++) { fns.push(() => i); }")
+        .expect("compiles");
     let has_boxed = prog.code.iter().any(|i| matches!(i, Instr::EnterFrame(_, _, kinds) if kinds.iter().any(|k| *k == SlotKind::Boxed)));
-    assert!(!has_boxed, "captured loop var should be Plain-allocated: {:?}", prog.code);
-    assert!(prog.code.iter().any(|i| matches!(i, Instr::FreshCell(_))), "captured loop var should still be re-boxed per iteration: {:?}", prog.code);
+    assert!(
+        !has_boxed,
+        "captured loop var should be Plain-allocated: {:?}",
+        prog.code
+    );
+    assert!(
+        prog.code.iter().any(|i| matches!(i, Instr::FreshCell(_))),
+        "captured loop var should still be re-boxed per iteration: {:?}",
+        prog.code
+    );
 }
 
 #[test]
 fn plain_loop_var_emits_no_fresh_cell() {
     let prog = compile("let s = 0; for (let i = 0; i < 3; i++) { s = s + i; }").expect("compiles");
-    assert!(!prog.code.iter().any(|i| matches!(i, Instr::FreshCell(_))), "uncaptured loop var should not emit FreshCell: {:?}", prog.code);
+    assert!(
+        !prog.code.iter().any(|i| matches!(i, Instr::FreshCell(_))),
+        "uncaptured loop var should not emit FreshCell: {:?}",
+        prog.code
+    );
 }

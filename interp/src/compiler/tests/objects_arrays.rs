@@ -3,10 +3,10 @@
 
 use super::*;
 use crate::compiler::compile;
+use crate::rc_str::RcStr;
 use crate::testutil;
 use crate::testutil::{eval, eval_str};
 use crate::vm::{StepResult, VM, Value};
-use crate::rc_str::RcStr;
 
 // ── arrays & objects ─────────────────────────────────────────────
 
@@ -120,7 +120,9 @@ fn in_and_delete() {
         serde_json::json!(false)
     );
     assert_eq!(
-        testutil::run_ret("let o = { a: 1 }; let r = delete o.a; let had = \"a\" in o; return { r, had };"),
+        testutil::run_ret(
+            "let o = { a: 1 }; let r = delete o.a; let had = \"a\" in o; return { r, had };"
+        ),
         serde_json::json!({"r": true, "had": false})
     );
 }
@@ -132,7 +134,11 @@ fn input_is_ptr_zero() {
     let vm = testutil::run("input.a = 1; input.r = JSON.stringify(input);");
     match input_val(&vm, "r") {
         Value::String(s) => {
-            assert!(s.as_str().contains("\"a\":1"), "got {}", s.as_str().to_owned())
+            assert!(
+                s.as_str().contains("\"a\":1"),
+                "got {}",
+                s.as_str().to_owned()
+            )
         }
         other => panic!("{other:?}"),
     }

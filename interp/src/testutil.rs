@@ -14,8 +14,7 @@ pub fn compile_ok(src: &str) -> Program {
     match compile(src) {
         Ok(prog) => prog,
         Err(errs) => {
-            let rendered: Vec<String> =
-                errs.iter().map(|d| d.render(src)).collect();
+            let rendered: Vec<String> = errs.iter().map(|d| d.render(src)).collect();
             panic!("compile failed:\n{}", rendered.join("\n"));
         }
     }

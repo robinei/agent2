@@ -22,6 +22,8 @@ impl VM {
             fp: 0,
             cur_local_count: 0,
             fuel: DEFAULT_FUEL,
+            spans: Vec::new(),
+            source: Arc::from(""),
         }
     }
 
@@ -32,6 +34,8 @@ impl VM {
     /// for the whole program.
     pub fn for_program(program: Program, input: serde_json::Value) -> Result<Self, VMError> {
         let mut vm = VM::new(program.code);
+        vm.spans = program.spans;
+        vm.source = program.source;
         // Reserve objects[0] for `input` (filled in just below).
         vm.objects.push(IndexMap::new());
         // Seed input's nested values (arrays/objects land at objects[1..]; their

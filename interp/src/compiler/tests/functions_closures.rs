@@ -8,7 +8,9 @@ use crate::vm::{StepResult, VM, Value};
 #[test]
 fn arguments_variadic_sum() {
     assert_eq!(
-        testutil::run_ret("function sum() { let t = 0; for (let i = 0; i < arguments.length; i++) { t += arguments[i]; } return t; } return sum(1, 2, 3, 4);"),
+        testutil::run_ret(
+            "function sum() { let t = 0; for (let i = 0; i < arguments.length; i++) { t += arguments[i]; } return t; } return sum(1, 2, 3, 4);"
+        ),
         serde_json::json!(10)
     );
 }
@@ -42,7 +44,9 @@ fn arguments_is_cached_per_frame() {
 #[test]
 fn arguments_can_be_shadowed() {
     assert_eq!(
-        testutil::run_val("function f() { let arguments = 42; return arguments; } return f(1, 2, 3);"),
+        testutil::run_val(
+            "function f() { let arguments = 42; return arguments; } return f(1, 2, 3);"
+        ),
         Value::PosInt(42)
     );
 }
@@ -73,12 +77,30 @@ fn hof_bare_builtin_callback() {
 
 #[test]
 fn compound_assignment() {
-    assert_eq!(testutil::run_val("let x = 5; x += 3; return x;"), testutil::num(8.0));
-    assert_eq!(testutil::run_val("let x = 5; x -= 2; return x;"), testutil::num(3.0));
-    assert_eq!(testutil::run_val("let x = 5; x *= 2; return x;"), testutil::num(10.0));
-    assert_eq!(testutil::run_val("let x = 2; x **= 3; return x;"), testutil::num(8.0));
-    assert_eq!(testutil::run_val("let x = 7; x %= 3; return x;"), testutil::num(1.0));
-    assert_eq!(testutil::run_val("let x = 1; x <<= 3; return x;"), testutil::num(8.0));
+    assert_eq!(
+        testutil::run_val("let x = 5; x += 3; return x;"),
+        testutil::num(8.0)
+    );
+    assert_eq!(
+        testutil::run_val("let x = 5; x -= 2; return x;"),
+        testutil::num(3.0)
+    );
+    assert_eq!(
+        testutil::run_val("let x = 5; x *= 2; return x;"),
+        testutil::num(10.0)
+    );
+    assert_eq!(
+        testutil::run_val("let x = 2; x **= 3; return x;"),
+        testutil::num(8.0)
+    );
+    assert_eq!(
+        testutil::run_val("let x = 7; x %= 3; return x;"),
+        testutil::num(1.0)
+    );
+    assert_eq!(
+        testutil::run_val("let x = 1; x <<= 3; return x;"),
+        testutil::num(8.0)
+    );
     match testutil::run_val("let s = \"a\"; s += \"b\"; return s;") {
         Value::String(s) => assert_eq!(s.as_str(), "ab"),
         other => panic!("not a string: {other:?}"),
@@ -91,17 +113,38 @@ fn compound_assignment() {
         testutil::run_val("let arr = [1, 2]; arr[0] += 10; return arr[0];"),
         testutil::num(11.0)
     );
-    assert_eq!(testutil::run_val("let x = 5; return (x += 5);"), testutil::num(10.0));
+    assert_eq!(
+        testutil::run_val("let x = 5; return (x += 5);"),
+        testutil::num(10.0)
+    );
 }
 
 #[test]
 fn logical_assignment() {
-    assert_eq!(testutil::run_val("let x = 0; x ||= 5; return x;"), Value::PosInt(5));
-    assert_eq!(testutil::run_val("let x = 3; x ||= 5; return x;"), Value::PosInt(3));
-    assert_eq!(testutil::run_val("let x = 3; x &&= 7; return x;"), Value::PosInt(7));
-    assert_eq!(testutil::run_val("let x = 0; x &&= 7; return x;"), Value::PosInt(0));
-    assert_eq!(testutil::run_val("let x = null; x ??= 9; return x;"), Value::PosInt(9));
-    assert_eq!(testutil::run_val("let x = 0; x ??= 9; return x;"), Value::PosInt(0));
+    assert_eq!(
+        testutil::run_val("let x = 0; x ||= 5; return x;"),
+        Value::PosInt(5)
+    );
+    assert_eq!(
+        testutil::run_val("let x = 3; x ||= 5; return x;"),
+        Value::PosInt(3)
+    );
+    assert_eq!(
+        testutil::run_val("let x = 3; x &&= 7; return x;"),
+        Value::PosInt(7)
+    );
+    assert_eq!(
+        testutil::run_val("let x = 0; x &&= 7; return x;"),
+        Value::PosInt(0)
+    );
+    assert_eq!(
+        testutil::run_val("let x = null; x ??= 9; return x;"),
+        Value::PosInt(9)
+    );
+    assert_eq!(
+        testutil::run_val("let x = 0; x ??= 9; return x;"),
+        Value::PosInt(0)
+    );
     // Short-circuit: RHS must not evaluate when LHS is truthy.
     assert_eq!(
         testutil::run_ret("let hit = 0; let x = 3; x ||= (hit = 1); return { hit, x };"),
@@ -127,9 +170,18 @@ fn increment_decrement() {
         testutil::run_ret("let x = 5; let a = x++; let b = x; return { a, b };"),
         serde_json::json!({"a": 5, "b": 6})
     );
-    assert_eq!(testutil::run_val("let x = 5; x--; return x;"), testutil::num(4.0));
-    assert_eq!(testutil::run_val("let x = 5; return --x;"), testutil::num(4.0));
-    assert_eq!(testutil::run_val("let x = \"5\"; x++; return x;"), testutil::num(6.0));
+    assert_eq!(
+        testutil::run_val("let x = 5; x--; return x;"),
+        testutil::num(4.0)
+    );
+    assert_eq!(
+        testutil::run_val("let x = 5; return --x;"),
+        testutil::num(4.0)
+    );
+    assert_eq!(
+        testutil::run_val("let x = \"5\"; x++; return x;"),
+        testutil::num(6.0)
+    );
 }
 
 #[test]
@@ -138,9 +190,18 @@ fn array_destructuring_declaration() {
         testutil::run_ret("let [a, b] = [10, 20]; return { a, b };"),
         serde_json::json!({"a": 10, "b": 20})
     );
-    assert_eq!(testutil::run_val("let [, b] = [1, 2]; return b;"), Value::PosInt(2));
-    assert_eq!(testutil::run_val("let [a = 5] = []; return a;"), Value::PosInt(5));
-    assert_eq!(testutil::run_val("let [a = 5] = [1]; return a;"), Value::PosInt(1));
+    assert_eq!(
+        testutil::run_val("let [, b] = [1, 2]; return b;"),
+        Value::PosInt(2)
+    );
+    assert_eq!(
+        testutil::run_val("let [a = 5] = []; return a;"),
+        Value::PosInt(5)
+    );
+    assert_eq!(
+        testutil::run_val("let [a = 5] = [1]; return a;"),
+        Value::PosInt(1)
+    );
 }
 
 #[test]
@@ -149,9 +210,18 @@ fn object_destructuring_declaration() {
         testutil::run_ret("let { x, y } = { x: 1, y: 2 }; return { x, y };"),
         serde_json::json!({"x": 1, "y": 2})
     );
-    assert_eq!(testutil::run_val("let { a: aa } = { a: 7 }; return aa;"), Value::PosInt(7));
-    assert_eq!(testutil::run_val("let { b = 3 } = {}; return b;"), Value::PosInt(3));
-    assert_eq!(testutil::run_val("let { b = 3 } = { b: 9 }; return b;"), Value::PosInt(9));
+    assert_eq!(
+        testutil::run_val("let { a: aa } = { a: 7 }; return aa;"),
+        Value::PosInt(7)
+    );
+    assert_eq!(
+        testutil::run_val("let { b = 3 } = {}; return b;"),
+        Value::PosInt(3)
+    );
+    assert_eq!(
+        testutil::run_val("let { b = 3 } = { b: 9 }; return b;"),
+        Value::PosInt(9)
+    );
 }
 
 #[test]
@@ -166,7 +236,9 @@ fn destructuring_assignment() {
 fn let_without_init_resets_each_iteration() {
     // `let x` without init in a loop body resets to undefined each iteration.
     assert_eq!(
-        testutil::run_val("let last; for (let i = 0; i < 2; i++) { let x; if (i === 0) x = 5; last = x; } return last;"),
+        testutil::run_val(
+            "let last; for (let i = 0; i < 2; i++) { let x; if (i === 0) x = 5; last = x; } return last;"
+        ),
         Value::Undefined
     );
 }
@@ -187,7 +259,11 @@ fn phase2_diagnostics() {
         assert!(compile(src).is_err(), "expected `{src}` to fail to compile");
     }
     let errs = compile("const x = 1; x = 2;").expect_err("const");
-    assert!(errs[0].message.contains("constant"), "got: {}", errs[0].message);
+    assert!(
+        errs[0].message.contains("constant"),
+        "got: {}",
+        errs[0].message
+    );
     let errs = compile("let [a, ...rest] = [1, 2];").expect_err("rest");
     assert!(errs[0].message.contains("rest"), "got: {}", errs[0].message);
 }
@@ -196,59 +272,98 @@ fn phase2_diagnostics() {
 
 #[test]
 fn function_declaration_and_call() {
-    assert_eq!(testutil::run_val("function add(a, b) { return a + b; } return add(3, 4);"), testutil::num(7.0));
+    assert_eq!(
+        testutil::run_val("function add(a, b) { return a + b; } return add(3, 4);"),
+        testutil::num(7.0)
+    );
 }
 
 #[test]
 fn function_hoisting_forward_reference() {
-    assert_eq!(testutil::run_val("return add(2, 3); function add(a, b) { return a + b; }"), testutil::num(5.0));
+    assert_eq!(
+        testutil::run_val("return add(2, 3); function add(a, b) { return a + b; }"),
+        testutil::num(5.0)
+    );
 }
 
 #[test]
 fn function_return_without_value() {
-    assert_eq!(testutil::run_val("function f() { return; } return f();"), Value::Undefined);
+    assert_eq!(
+        testutil::run_val("function f() { return; } return f();"),
+        Value::Undefined
+    );
 }
 
 #[test]
 fn function_implicit_return() {
-    assert_eq!(testutil::run_val("function f() {} return f();"), Value::Undefined);
+    assert_eq!(
+        testutil::run_val("function f() {} return f();"),
+        Value::Undefined
+    );
 }
 
 #[test]
 fn parameter_defaults() {
-    assert_eq!(testutil::run_val("function f(x = 5) { return x; } return f();"), Value::PosInt(5));
-    assert_eq!(testutil::run_val("function f(x = 5) { return x; } return f(9);"), Value::PosInt(9));
+    assert_eq!(
+        testutil::run_val("function f(x = 5) { return x; } return f();"),
+        Value::PosInt(5)
+    );
+    assert_eq!(
+        testutil::run_val("function f(x = 5) { return x; } return f(9);"),
+        Value::PosInt(9)
+    );
 }
 
 #[test]
 fn function_expression() {
-    assert_eq!(testutil::run_val("let add = function(a, b) { return a + b; }; return add(5, 6);"), testutil::num(11.0));
+    assert_eq!(
+        testutil::run_val("let add = function(a, b) { return a + b; }; return add(5, 6);"),
+        testutil::num(11.0)
+    );
 }
 
 #[test]
 fn arrow_expression_body() {
-    assert_eq!(testutil::run_val("let add = (a, b) => a + b; return add(3, 4);"), testutil::num(7.0));
+    assert_eq!(
+        testutil::run_val("let add = (a, b) => a + b; return add(3, 4);"),
+        testutil::num(7.0)
+    );
 }
 
 #[test]
 fn arrow_block_body() {
-    assert_eq!(testutil::run_val("let f = (x) => { return x * 2; }; return f(7);"), testutil::num(14.0));
+    assert_eq!(
+        testutil::run_val("let f = (x) => { return x * 2; }; return f(7);"),
+        testutil::num(14.0)
+    );
 }
 
 #[test]
 fn recursion() {
-    assert_eq!(testutil::run_val("function fact(n) { if (n <= 1) return 1; return n * fact(n - 1); } return fact(5);"), testutil::num(120.0));
+    assert_eq!(
+        testutil::run_val(
+            "function fact(n) { if (n <= 1) return 1; return n * fact(n - 1); } return fact(5);"
+        ),
+        testutil::num(120.0)
+    );
 }
 
 #[test]
 fn mutual_recursion() {
-    assert_eq!(testutil::run_val("function isEven(n) { if (n === 0) return true; return isOdd(n - 1); } function isOdd(n) { if (n === 0) return false; return isEven(n - 1); } return isEven(4);"), Value::Bool(true));
+    assert_eq!(
+        testutil::run_val(
+            "function isEven(n) { if (n === 0) return true; return isOdd(n - 1); } function isOdd(n) { if (n === 0) return false; return isEven(n - 1); } return isEven(4);"
+        ),
+        Value::Bool(true)
+    );
 }
 
 #[test]
 fn closure_captures_local() {
     assert_eq!(
-        testutil::run_ret("function makeAdder(x) { return function(y) { return x + y; }; } let add5 = makeAdder(5); return add5(3);"),
+        testutil::run_ret(
+            "function makeAdder(x) { return function(y) { return x + y; }; } let add5 = makeAdder(5); return add5(3);"
+        ),
         serde_json::json!(8)
     );
 }
@@ -256,7 +371,9 @@ fn closure_captures_local() {
 #[test]
 fn closure_mutation_visible() {
     assert_eq!(
-        testutil::run_ret("function makeCounter() { let count = 0; function inc() { count = count + 1; return count; } return inc; } let c = makeCounter(); c(); return c();"),
+        testutil::run_ret(
+            "function makeCounter() { let count = 0; function inc() { count = count + 1; return count; } return inc; } let c = makeCounter(); c(); return c();"
+        ),
         serde_json::json!(2)
     );
 }
@@ -266,7 +383,9 @@ fn closure_mutation_visible() {
 #[test]
 fn for_let_head_var_captured_per_iteration() {
     assert_eq!(
-        testutil::run_ret("let fns = []; for (let i = 0; i < 3; i++) { fns.push(() => i); } let a = fns[0], b = fns[1], c = fns[2]; return a() * 100 + b() * 10 + c();"),
+        testutil::run_ret(
+            "let fns = []; for (let i = 0; i < 3; i++) { fns.push(() => i); } let a = fns[0], b = fns[1], c = fns[2]; return a() * 100 + b() * 10 + c();"
+        ),
         serde_json::json!(12)
     );
 }
@@ -274,7 +393,9 @@ fn for_let_head_var_captured_per_iteration() {
 #[test]
 fn for_body_declared_var_captured_per_iteration() {
     assert_eq!(
-        testutil::run_ret("let fns = []; for (let i = 0; i < 3; i++) { let j = i * 2; fns.push(() => j); } let a = fns[0], b = fns[1], c = fns[2]; return a() * 100 + b() * 10 + c();"),
+        testutil::run_ret(
+            "let fns = []; for (let i = 0; i < 3; i++) { let j = i * 2; fns.push(() => j); } let a = fns[0], b = fns[1], c = fns[2]; return a() * 100 + b() * 10 + c();"
+        ),
         serde_json::json!(24)
     );
 }
@@ -282,7 +403,9 @@ fn for_body_declared_var_captured_per_iteration() {
 #[test]
 fn for_of_loop_var_captured_per_iteration() {
     assert_eq!(
-        testutil::run_ret("let fns = []; for (const x of [10, 20, 30]) { fns.push(() => x); } let a = fns[0], b = fns[1], c = fns[2]; return a() * 100 + b() * 10 + c();"),
+        testutil::run_ret(
+            "let fns = []; for (const x of [10, 20, 30]) { fns.push(() => x); } let a = fns[0], b = fns[1], c = fns[2]; return a() * 100 + b() * 10 + c();"
+        ),
         serde_json::json!(1230)
     );
 }
@@ -290,7 +413,9 @@ fn for_of_loop_var_captured_per_iteration() {
 #[test]
 fn for_in_loop_var_captured_per_iteration() {
     assert_eq!(
-        testutil::run_ret("let fns = []; let obj = { a: 1, b: 2 }; for (const k in obj) { fns.push(() => k); } let a = fns[0], b = fns[1]; return a() + b();"),
+        testutil::run_ret(
+            "let fns = []; let obj = { a: 1, b: 2 }; for (const k in obj) { fns.push(() => k); } let a = fns[0], b = fns[1]; return a() + b();"
+        ),
         serde_json::json!("ab")
     );
 }
@@ -298,7 +423,9 @@ fn for_in_loop_var_captured_per_iteration() {
 #[test]
 fn while_body_declared_var_captured_per_iteration() {
     assert_eq!(
-        testutil::run_ret("let fns = []; let i = 0; while (i < 3) { let j = i; fns.push(() => j); i = i + 1; } let a = fns[0], b = fns[1], c = fns[2]; return a() * 100 + b() * 10 + c();"),
+        testutil::run_ret(
+            "let fns = []; let i = 0; while (i < 3) { let j = i; fns.push(() => j); i = i + 1; } let a = fns[0], b = fns[1], c = fns[2]; return a() * 100 + b() * 10 + c();"
+        ),
         serde_json::json!(12)
     );
 }
@@ -306,7 +433,9 @@ fn while_body_declared_var_captured_per_iteration() {
 #[test]
 fn for_head_var_value_carries_forward() {
     assert_eq!(
-        testutil::run_ret("let sum = 0; for (let i = 0; i < 5; i++) { sum = sum + i; } return sum;"),
+        testutil::run_ret(
+            "let sum = 0; for (let i = 0; i < 5; i++) { sum = sum + i; } return sum;"
+        ),
         serde_json::json!(10)
     );
 }
@@ -314,7 +443,9 @@ fn for_head_var_value_carries_forward() {
 #[test]
 fn captured_var_in_loop_is_shared_not_per_iteration() {
     assert_eq!(
-        testutil::run_ret("let fns = []; for (var i = 0; i < 3; i++) { fns.push(() => i); } let a = fns[0], b = fns[1], c = fns[2]; return a() * 100 + b() * 10 + c();"),
+        testutil::run_ret(
+            "let fns = []; for (var i = 0; i < 3; i++) { fns.push(() => i); } let a = fns[0], b = fns[1], c = fns[2]; return a() * 100 + b() * 10 + c();"
+        ),
         serde_json::json!(333)
     );
 }
@@ -340,7 +471,9 @@ fn top_level_return_value() {
 #[test]
 fn capture_through_intermediate_function() {
     assert_eq!(
-        testutil::run_val("function outer() { let x = 10; function middle() { function inner() { return x; } return inner(); } return middle(); } return outer();"),
+        testutil::run_val(
+            "function outer() { let x = 10; function middle() { function inner() { return x; } return inner(); } return middle(); } return outer();"
+        ),
         Value::PosInt(10)
     );
 }
@@ -348,7 +481,9 @@ fn capture_through_intermediate_function() {
 #[test]
 fn sibling_block_shadowing_uses_distinct_bindings() {
     assert_eq!(
-        testutil::run_ret("let x = 1; let a; { let x = 2; a = x; } let b; { let x = 3; b = x; } let c = x; return { a, b, c };"),
+        testutil::run_ret(
+            "let x = 1; let a; { let x = 2; a = x; } let b; { let x = 3; b = x; } let c = x; return { a, b, c };"
+        ),
         serde_json::json!({"a": 2, "b": 3, "c": 1})
     );
 }
@@ -356,7 +491,9 @@ fn sibling_block_shadowing_uses_distinct_bindings() {
 #[test]
 fn write_only_capture_is_detected() {
     assert_eq!(
-        testutil::run_val("function make() { let v = 0; function setter(n) { v = n; } function getter() { return v; } setter(42); return getter(); } return make();"),
+        testutil::run_val(
+            "function make() { let v = 0; function setter(n) { v = n; } function getter() { return v; } setter(42); return getter(); } return make();"
+        ),
         Value::PosInt(42)
     );
 }
