@@ -242,8 +242,11 @@ builtins! {
     NumberParseFloat, BuiltinKind::Namespace("Number"), "parseFloat", 1, 1, number_parse_float;
 
     // ── Object static ──
-    ObjKeys,   BuiltinKind::Namespace("Object"), "keys",   1, 1, obj_keys;
-    ObjValues, BuiltinKind::Namespace("Object"), "values", 1, 1, obj_values;
+    ObjKeys,        BuiltinKind::Namespace("Object"), "keys",        1, 1,      obj_keys;
+    ObjValues,      BuiltinKind::Namespace("Object"), "values",      1, 1,      obj_values;
+    ObjEntries,     BuiltinKind::Namespace("Object"), "entries",     1, 1,      obj_entries;
+    ObjFromEntries, BuiltinKind::Namespace("Object"), "fromEntries", 1, 1,      obj_from_entries;
+    ObjAssign,      BuiltinKind::Namespace("Object"), "assign",      1, VARARG, obj_assign;
 
     // ── string methods ──
     StrSplit,       BuiltinKind::Method, "split",       2, 3, str_split;
