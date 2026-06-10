@@ -136,7 +136,7 @@ pub fn eval_str(expr: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vm::{StepResult, VMError};
+    use crate::vm::StepResult;
 
     #[test]
     fn compile_errs_renders_diagnostics() {
@@ -166,5 +166,7 @@ mod tests {
         // Accessing a property on a non-object is a runtime TypeError.
         let err = run_runtime_err("return null.foo;");
         assert!(err.kind == ErrorKind::TypeError, "got {err:?}");
+        // The kind-only sugar agrees.
+        assert_eq!(run_err_kind("return null.foo;"), ErrorKind::TypeError);
     }
 }

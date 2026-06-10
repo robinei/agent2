@@ -293,10 +293,12 @@ impl VM {
                             self.ip = addr;
                         }
                         Value::Closure(p) => {
-                            let closure = self
-                                .closures
-                                .get(p as usize)
-                                .ok_or_else(|| self.fail(ErrorKind::ValueError, "value error"))?;
+                            let closure = self.closures.get(p as usize).ok_or_else(|| {
+                                self.fail_not_resumable(
+                                    ErrorKind::ValueError,
+                                    "bad closure pointer",
+                                )
+                            })?;
                             let addr = closure.addr;
                             let upvals: SmallVec<[Value; 8]> =
                                 closure.upvals.iter().cloned().collect();
@@ -322,6 +324,12 @@ impl VM {
                             self.ip = addr;
                         }
                         _ => {
+                            // Pop-first normalization: the callable is popped
+                            // but the args still sit below it — drop them so
+                            // the conceptual stack effect (args…, callable) ->
+                            // result holds and `resume_with` stays sound.
+                            let keep = self.stack.len().saturating_sub(nargs as usize);
+                            self.stack.truncate(keep);
                             let msg =
                                 format!("cannot call a {} as a function", callable.type_name());
                             return Err(self.fail(ErrorKind::TypeError, msg));
@@ -590,7 +598,7 @@ impl VM {
                         Value::Upval(c) => {
                             let ip = self.ip;
                             *self.cells.get_mut(c as usize).ok_or_else(|| {
-                                VMError::fail_at(ip, ErrorKind::ValueError, "value error")
+                                VMError::fail_at(ip, ErrorKind::ValueError, "bad cell pointer")
                             })? = val;
                         }
                         _ => self.stack[slot] = val,
@@ -615,7 +623,7 @@ impl VM {
                         Value::Upval(c) => {
                             let ip = self.ip;
                             *self.cells.get_mut(c as usize).ok_or_else(|| {
-                                VMError::fail_at(ip, ErrorKind::ValueError, "value error")
+                                VMError::fail_at(ip, ErrorKind::ValueError, "bad cell pointer")
                             })? = val;
                         }
                         _ => self.stack[slot] = val,
@@ -633,7 +641,9 @@ impl VM {
                         Value::Upval(c) => self
                             .cells
                             .get(*c as usize)
-                            .ok_or_else(|| self.fail(ErrorKind::ValueError, "value error"))?
+                            .ok_or_else(|| {
+                                self.fail_not_resumable(ErrorKind::ValueError, "bad cell pointer")
+                            })?
                             .clone(),
                         other => other.clone(),
                     };
@@ -654,7 +664,9 @@ impl VM {
                         Value::Upval(c) => self
                             .cells
                             .get(*c as usize)
-                            .ok_or_else(|| self.fail(ErrorKind::ValueError, "value error"))?
+                            .ok_or_else(|| {
+                                self.fail_not_resumable(ErrorKind::ValueError, "bad cell pointer")
+                            })?
                             .clone(),
                         other => other.clone(),
                     };
@@ -671,7 +683,7 @@ impl VM {
                         Value::Upval(c) => {
                             let ip = self.ip;
                             *self.cells.get_mut(c as usize).ok_or_else(|| {
-                                VMError::fail_at(ip, ErrorKind::ValueError, "value error")
+                                VMError::fail_at(ip, ErrorKind::ValueError, "bad cell pointer")
                             })? = new_val;
                         }
                         _ => self.stack[slot] = new_val,
@@ -1242,10 +1254,16 @@ impl VM {
                         };
                         let ip = self.ip;
                         let arr = self.arrays.get_mut(p as usize).ok_or_else(|| {
-                            VMError::fail_at(ip, ErrorKind::TypeError, "type error")
+                            VMError::fail_at(ip, ErrorKind::TypeError, "bad array pointer")
                         })?;
                         if idx >= arr.len() {
-                            return Err(self.fail(ErrorKind::ValueError, "value error"));
+                            let len = arr.len();
+                            return Err(self.fail(
+                                ErrorKind::ValueError,
+                                format!(
+                                    "cannot write array index {idx}: out of bounds (length {len})"
+                                ),
+                            ));
                         }
                         arr[idx] = val;
                     } else {
@@ -1256,7 +1274,7 @@ impl VM {
                         };
                         let ip = self.ip;
                         let obj = self.objects.get_mut(p as usize).ok_or_else(|| {
-                            VMError::fail_at(ip, ErrorKind::TypeError, "type error")
+                            VMError::fail_at(ip, ErrorKind::TypeError, "bad object pointer")
                         })?;
                         obj.insert(field, val);
                     }
@@ -1276,7 +1294,9 @@ impl VM {
                     let has = self
                         .objects
                         .get(obj_ptr as usize)
-                        .ok_or_else(|| self.fail(ErrorKind::TypeError, "type error"))?
+                        .ok_or_else(|| {
+                            self.fail_not_resumable(ErrorKind::TypeError, "bad object pointer")
+                        })?
                         .contains_key(field.as_str());
                     self.stack.push(Value::Bool(has));
                     self.ip += 1;
@@ -1296,7 +1316,9 @@ impl VM {
                     let existed = self
                         .objects
                         .get_mut(obj_ptr as usize)
-                        .ok_or_else(|| VMError::fail_at(ip, ErrorKind::TypeError, "type error"))?
+                        .ok_or_else(|| {
+                            VMError::fail_at(ip, ErrorKind::TypeError, "bad object pointer")
+                        })?
                         .shift_remove(field.as_str())
                         .is_some();
                     self.stack.push(Value::Bool(existed));
@@ -1420,8 +1442,15 @@ impl VM {
 
                 Instr::Raise(condition, argc) => {
                     let argc = *argc;
-                    // Pop the payload value(s). Only 0 or 1 payload is
-                    // allowed by the compiler; the VM accepts any count.
+                    // Instruction contract: argc is 0 or 1 (the compiler
+                    // enforces this at the source level; hand-assembled code
+                    // violating it would leave stray values on the stack).
+                    if argc > 1 {
+                        return Err(self.fail(
+                            ErrorKind::BadArg,
+                            format!("Raise supports at most one payload, got {argc}"),
+                        ));
+                    }
                     let payload = if argc > 0 {
                         Some(self.stack.pop().ok_or_else(|| {
                             self.fail(ErrorKind::StackUnderflow, "stack underflow")

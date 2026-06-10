@@ -292,20 +292,24 @@ pub enum ErrorKind {
 /// |------|------|------|--------|
 /// | unary_num! / binary_num! / binary_int! / cmp_op! macros | TypeError | PushValueThenContinue | ops popped before coercion |
 /// | Add (string concat path) | TypeError | PushValueThenContinue | both ops popped before to_number |
-/// | BitNot, ToNum, TypeOf, IncLocal(cell) | TypeError/ValueError | PushValueThenContinue | operand popped first |
-/// | CallDyn non-callable | TypeError | PushValueThenContinue | callable popped before match |
+/// | BitNot, ToNum, TypeOf | TypeError/ValueError | PushValueThenContinue | operand popped first |
+/// | CallDyn non-callable | TypeError | PushValueThenContinue | callable popped, then args dropped before failing (pop-first normalization) |
 /// | IndexGet (non-container, bad index, mid-codepoint) | TypeError/ValueError | PushValueThenContinue | container+key popped first |
 /// | IndexSet (non-container, negative/OOB index) | TypeError/ValueError | PushValueThenContinue | val+key+container popped first |
 /// | ObjHas / ObjDelete (non-object) | TypeError | PushValueThenContinue | field+object popped first |
 /// | Builtin take_args / check_arity! bodies | TypeError/ValueError | PushValueThenContinue | args popped before type check |
+/// | JSON depth / unsupported type (JSON.stringify, to_json) | ValueError | PushValueThenContinue | args popped by builtin before conversion |
 /// | **ObjGet** (non-object peek) | TypeError | **NotResumable** | object peeked (not popped) before check |
-/// | **ObjSet** (non-object peek, bad heap slot) | TypeError | **NotResumable** | value popped, object peeked (not fully consumed) |
+/// | **ObjSet** (non-object peek) | TypeError | **NotResumable** | value popped, object peeked (not fully consumed) |
 /// | **IncLocal** (non-numeric local) | TypeError | **NotResumable** | reads local by peek (no stack consumption) |
+/// | bad heap/cell pointer (`get`/`get_mut` on arrays/objects/cells/closures) | TypeError/ValueError | **NotResumable** | corrupt heap = invariant violation; some sites also have no result slot (SetLocal) |
+/// | Raise with argc > 1 | BadArg | NotResumable | instruction contract violated (compiler emits 0 or 1) |
 /// | StackUnderflow, BadReturn, BadCall, BadAlloc, BadArg, BadLocal | — | NotResumable | invariant violation / compiler bug |
 /// | OutOfFuel | — | RetrySameInstr | nothing consumed; refuel and retry |
 ///
-/// All 9 `ErrorKind`s are covered. The three bolded sites are the only
-/// TypeError/ValueError sites that error before full operand consumption.
+/// All 9 `ErrorKind`s are covered. The bolded sites are the
+/// TypeError/ValueError sites that error before full operand consumption
+/// (or, for bad pointers, mid-mutation) and therefore must not be resumed.
 #[derive(Debug)]
 pub enum ResumeMode {
     /// Internal invariant broken (compiler bug / host misuse). Never resume.
@@ -327,25 +331,18 @@ pub struct VMError {
 }
 
 impl VMError {
-    /// Construct an error at a given ip without borrowing the VM. For use
-    /// when a mutable borrow of the VM is already active (e.g. after
-    /// `get_mut`).
+    /// Construct a `NotResumable` error at a given ip without borrowing the
+    /// VM, for sites where a mutable borrow is already active (e.g. inside
+    /// `ok_or_else` on a `get_mut`). Every such site is a bad heap/cell
+    /// pointer — an invariant violation — so this is always `NotResumable`;
+    /// resumable errors must go through `VM::fail`, which can see the
+    /// stack state the pop-first invariant depends on.
     pub fn fail_at(ip: CodeAddr, kind: ErrorKind, msg: impl Into<String>) -> Self {
-        let resume = match kind {
-            ErrorKind::StackUnderflow
-            | ErrorKind::BadReturn
-            | ErrorKind::BadCall
-            | ErrorKind::BadAlloc
-            | ErrorKind::BadArg
-            | ErrorKind::BadLocal => ResumeMode::NotResumable,
-            ErrorKind::OutOfFuel => ResumeMode::RetrySameInstr,
-            ErrorKind::TypeError | ErrorKind::ValueError => ResumeMode::PushValueThenContinue,
-        };
         VMError {
             kind,
             ip,
             message: msg.into(),
-            resume,
+            resume: ResumeMode::NotResumable,
         }
     }
 }

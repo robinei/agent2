@@ -166,6 +166,9 @@ short value previews:
   mid-codepoint), `ObjGet`/`ObjSet` on non-objects, `CallDyn` on a
   non-callable, builtin arity/type failures (use `BuiltinMeta::name`),
   `Invoke` result-shape errors, JSON depth/cycle errors.
+  *(Post-implementation note: there is no `Invoke` result-shape error site —
+  the host pushes results onto the stack directly, unvalidated. N/A until a
+  validating result API exists; the other listed sites are covered.)*
 - Example target quality:
   `cannot subtract: left operand is an array ([array of 3]), right is number (1)`
   rendered under the source line with a caret.

@@ -29,6 +29,7 @@ fn diagnostics_for_unsupported() {
         "tools.send;",
         "raise(x);",
         "raise();",
+        "raise(\"name\", 1, 2);", // at most one payload
         "Math.tan(1);",
         "Math.pow(1);",
         "f(...args);",

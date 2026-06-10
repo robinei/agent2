@@ -29,13 +29,11 @@ impl VM {
         }
     }
 
-    /// Construct an error from the current instruction pointer. Every runtime
-    /// error site must go through this helper so `ip` and `resume` are
-    /// captured consistently. The `resume` field defaults to `NotResumable`;
-    /// sites that qualify for a softer mode override it after the fact
-    /// (see Step 3 audit).
-    /// Like `fail` but always sets `NotResumable`. For sites that error before
-    /// consuming all instruction operands (peek-style checks, etc.).
+    /// Like `fail` but always sets `NotResumable`. For sites that error
+    /// before consuming all instruction operands (peek-style checks) and for
+    /// invariant violations (bad heap/cell pointers) where `fail`'s per-kind
+    /// default would wrongly mark the error resumable. See the Step 3 audit
+    /// table at `ResumeMode`.
     pub fn fail_not_resumable(&self, kind: ErrorKind, msg: impl Into<String>) -> VMError {
         VMError {
             kind,
@@ -45,6 +43,9 @@ impl VM {
         }
     }
 
+    /// Construct an error at the current instruction pointer. Every runtime
+    /// error site goes through this (or `fail_not_resumable` / the static
+    /// `VMError::fail_at`) so `ip` and `resume` are captured consistently.
     pub fn fail(&self, kind: ErrorKind, msg: impl Into<String>) -> VMError {
         let resume = match kind {
             // Invariant violations: compiler bug or host misuse — never resume.
@@ -103,7 +104,13 @@ impl VM {
                 if s.len() <= 42 {
                     format!("\"{}\"", s.escape_debug())
                 } else {
-                    format!("\"{}…\"", s[..40].escape_debug())
+                    // Floor the cut to a char boundary: a byte slice at 40
+                    // panics if it lands inside a multi-byte codepoint.
+                    let mut end = 40;
+                    while !s.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    format!("\"{}…\"", s[..end].escape_debug())
                 }
             }
             Value::Array(p) => {
@@ -320,7 +327,12 @@ impl VM {
         depth: usize,
     ) -> Result<serde_json::Value, VMError> {
         if depth > MAX_JSON_DEPTH {
-            return Err(self.fail(ErrorKind::ValueError, "value error"));
+            return Err(self.fail(
+                ErrorKind::ValueError,
+                format!(
+                    "cannot serialize to JSON: nesting exceeds max depth {MAX_JSON_DEPTH} (value is too deeply nested or cyclic)"
+                ),
+            ));
         }
         Ok(match val {
             Value::Null => serde_json::Value::Null,
@@ -333,7 +345,10 @@ impl VM {
             // is an internal indirection that should never reach here: fail
             // loudly rather than silently dropping it.
             Value::Fn(_) | Value::Builtin(_) | Value::Upval(_) => {
-                return Err(self.fail(ErrorKind::ValueError, "value error"));
+                return Err(self.fail(
+                    ErrorKind::ValueError,
+                    format!("cannot serialize a {} to JSON", val.type_name()),
+                ));
             }
             // `undefined` has no JSON form. Like JS `JSON.stringify`, it is
             // *dropped* in an object and coerced to *null* in an array (handled
@@ -400,7 +415,10 @@ impl VM {
         depth: usize,
     ) -> Result<Value, VMError> {
         if depth > MAX_JSON_DEPTH {
-            return Err(self.fail(ErrorKind::ValueError, "value error"));
+            return Err(self.fail(
+                ErrorKind::ValueError,
+                format!("cannot parse JSON: nesting exceeds max depth {MAX_JSON_DEPTH}"),
+            ));
         }
         Ok(match json {
             serde_json::Value::Null => Value::Null,

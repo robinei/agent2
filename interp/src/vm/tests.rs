@@ -2171,12 +2171,15 @@ fn stack_value_to_json_depth_limit() {
         );
         innermost = Value::Object(obj);
     }
-    // `stack_value_to_json` on the deeply nested value should error.
+    // `stack_value_to_json` on the deeply nested value should error,
+    // and the message should say so (Step 4: JSON depth message quality).
     let result = vm.stack_value_to_json(&innermost, 0);
     assert!(
         matches!(result, Err(ref e) if e.kind == ErrorKind::ValueError),
         "expected ValueError for depth > 128, got {result:?}"
     );
+    let msg = result.unwrap_err().message;
+    assert!(msg.contains("depth"), "got: {msg}");
 }
 
 #[test]
@@ -2186,13 +2189,16 @@ fn json_to_value_depth_limit() {
     for _ in 0..130 {
         val = serde_json::json!({"x": val});
     }
-    // `json_to_stack_value` on the deeply nested JSON should error.
+    // `json_to_stack_value` on the deeply nested JSON should error,
+    // and the message should say so.
     let mut vm = VM::new(vec![]);
     let result = vm.json_to_stack_value(&val, 0);
     assert!(
         matches!(result, Err(ref e) if e.kind == ErrorKind::ValueError),
         "expected ValueError for depth > 128, got {result:?}"
     );
+    let msg = result.unwrap_err().message;
+    assert!(msg.contains("depth"), "got: {msg}");
 }
 
 // ── Step 1: VM retains spans and source ──────────────────────────
@@ -2374,7 +2380,7 @@ fn type_name_covers_all_variants() {
 
 #[test]
 fn preview_string_truncation() {
-    let mut vm = VM::new(vec![]);
+    let vm = VM::new(vec![]);
     // Short string: quoted as-is.
     let short = Value::String("hello".into());
     assert!(
@@ -2387,6 +2393,11 @@ fn preview_string_truncation() {
     let prev = vm.preview(&long);
     assert!(prev.starts_with('\"') && prev.contains('…'), "got: {prev}");
     assert!(prev.len() <= 50, "too long: {prev}");
+    // Multi-byte codepoint straddling the truncation point: must floor to a
+    // char boundary, not panic (39 ASCII bytes + 4-byte emoji spans byte 40).
+    let tricky = format!("{}🎉🎉", "a".repeat(39));
+    let prev = vm.preview(&Value::String(tricky.into()));
+    assert!(prev.contains('…'), "got: {prev}");
 }
 
 #[test]
@@ -2479,6 +2490,81 @@ fn message_negative_index_includes_value() {
         "expected ValueError, got {:?}: {}",
         err.kind,
         err.message
+    );
+}
+
+#[test]
+fn message_calldyn_non_callable_and_resume() {
+    // CallDyn on a non-callable: message names the type, the args are
+    // dropped (pop-first normalization), and resume_with substitutes the
+    // call result so the program completes with a balanced stack.
+    // (A function-typed variable reassigned to a number forces the dynamic
+    // call path with a number callable — `let n = 5; n()` would resolve as
+    // an unknown global instead.)
+    let prog = crate::testutil::compile_ok("let f = () => 1; f = 5; return f(1, 2);");
+    let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
+    let err = loop {
+        match vm.step() {
+            Err(e) => break e,
+            Ok(StepResult::Done { .. }) => panic!("expected error"),
+            Ok(_) => {}
+        }
+    };
+    assert!(
+        err.message.contains("cannot call a number"),
+        "got: {}",
+        err.message
+    );
+    assert!(
+        matches!(err.resume, ResumeMode::PushValueThenContinue),
+        "got {:?}",
+        err.resume
+    );
+    vm.resume_with(&err, Value::PosInt(7)).unwrap();
+    let value = loop {
+        match vm.step().unwrap() {
+            StepResult::Done { value } => break value,
+            other => panic!("unexpected effect: {other:?}"),
+        }
+    };
+    assert_eq!(value, Value::PosInt(7));
+}
+
+#[test]
+fn message_builtin_error_includes_builtin_name() {
+    // Builtin failures identify themselves via BuiltinMeta::name.
+    let err = crate::testutil::run_runtime_err("return [].pop();");
+    assert!(err.message.contains("`pop`"), "got: {}", err.message);
+}
+
+#[test]
+fn bad_object_pointer_is_not_resumable() {
+    // A dangling heap pointer is an invariant violation: NotResumable even
+    // though the kind is TypeError.
+    let err = run_err(vec![
+        PushObject(99), // no such object
+        ps("k"),
+        ObjHas,
+    ]);
+    assert_eq!(err.kind, ErrorKind::TypeError);
+    assert!(
+        matches!(err.resume, ResumeMode::NotResumable),
+        "bad pointer must not be resumable, got {:?}",
+        err.resume
+    );
+}
+
+#[test]
+fn raise_with_two_payloads_is_bad_arg() {
+    // Instruction contract: Raise argc is 0 or 1. Hand-assembled argc=2
+    // errors instead of silently leaving a stray stack value.
+    let mut vm = VM::new(vec![PushPosInt(1), PushPosInt(2), Raise("err".into(), 2)]);
+    let err = vm.step().unwrap_err();
+    assert_eq!(err.kind, ErrorKind::BadArg);
+    assert!(
+        matches!(err.resume, ResumeMode::NotResumable),
+        "got {:?}",
+        err.resume
     );
 }
 

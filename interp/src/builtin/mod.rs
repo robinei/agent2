@@ -14,28 +14,14 @@
 //! result — assignment-style "leave a value" semantics, so every builtin call
 //! is a well-formed expression.
 
-use crate::vm::{CodeAddr, ErrorKind, RcStr, ResumeMode, VM, VMError, Value};
+use crate::vm::{CodeAddr, ErrorKind, RcStr, VM, VMError, Value};
 use thin_vec::ThinVec;
 
-/// Construct an error without borrowing `VM` (for use when a mutable borrow
-/// is active). Mirrors `VM::fail` but takes `ip` explicitly.
+/// Construct a `NotResumable` error without borrowing `VM` (for use when a
+/// mutable borrow is active). Every caller guards a heap-pointer lookup —
+/// an invariant violation — so this delegates to `VMError::fail_at`.
 fn fail_at(ip: CodeAddr, kind: ErrorKind, msg: &str) -> VMError {
-    let resume = match kind {
-        ErrorKind::StackUnderflow
-        | ErrorKind::BadReturn
-        | ErrorKind::BadCall
-        | ErrorKind::BadAlloc
-        | ErrorKind::BadArg
-        | ErrorKind::BadLocal => ResumeMode::NotResumable,
-        ErrorKind::OutOfFuel => ResumeMode::RetrySameInstr,
-        ErrorKind::TypeError | ErrorKind::ValueError => ResumeMode::PushValueThenContinue,
-    };
-    VMError {
-        kind,
-        ip,
-        message: msg.into(),
-        resume,
-    }
+    VMError::fail_at(ip, kind, msg)
 }
 
 /// A builtin's identity. Used both as the static call target
@@ -270,9 +256,15 @@ impl Builtin {
     /// needed here — only the lower bound is checked.
     pub fn call(self, vm: &mut VM, argc: u32) -> Result<(), VMError> {
         if argc < self.meta().min_args {
-            return Err(vm.fail(ErrorKind::BadArg, "bad argument"));
+            return Err(vm.fail(
+                ErrorKind::BadArg,
+                format!(
+                    "`{}` called with too few arguments ({argc})",
+                    self.meta().name
+                ),
+            ));
         }
-        match self {
+        let result = match self {
             // ── array methods ──
             Builtin::ArrayPush => array_push(vm, argc),
             Builtin::ArrayPop => array_pop(vm, argc),
@@ -310,7 +302,13 @@ impl Builtin {
             Builtin::MathMin => math_min(vm, argc),
             Builtin::MathMax => math_max(vm, argc),
             Builtin::MathPow => math_pow(vm, argc),
-        }
+        };
+        // Prefix failures with the builtin's name (Step 4: builtin failures
+        // identify themselves via `BuiltinMeta::name`).
+        result.map_err(|mut e| {
+            e.message = format!("in `{}`: {}", self.meta().name, e.message);
+            e
+        })
     }
 }
 
@@ -458,7 +456,7 @@ fn array_push(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     let arr = vm
         .arrays
         .get_mut(arr_ptr as usize)
-        .ok_or_else(|| fail_at(ip, ErrorKind::TypeError, "type error"))?;
+        .ok_or_else(|| fail_at(ip, ErrorKind::TypeError, "bad array pointer"))?;
     // No element → no-op, just return length (JS `[].push()` returns 0).
     if argc > 1 {
         arr.push(args[1].clone());
@@ -479,7 +477,7 @@ fn array_pop(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     let arr = vm
         .arrays
         .get_mut(arr_ptr as usize)
-        .ok_or_else(|| fail_at(ip, ErrorKind::TypeError, "type error"))?;
+        .ok_or_else(|| fail_at(ip, ErrorKind::TypeError, "bad array pointer"))?;
     let val = arr
         .pop()
         .ok_or_else(|| vm.fail(ErrorKind::ValueError, "value error"))?;
@@ -498,7 +496,7 @@ fn array_shift(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     let arr = vm
         .arrays
         .get_mut(arr_ptr as usize)
-        .ok_or_else(|| fail_at(ip, ErrorKind::TypeError, "type error"))?;
+        .ok_or_else(|| fail_at(ip, ErrorKind::TypeError, "bad array pointer"))?;
     if arr.is_empty() {
         return Err(vm.fail(ErrorKind::ValueError, "value error"));
     }
@@ -518,7 +516,7 @@ fn array_unshift(vm: &mut VM, argc: u32) -> Result<(), VMError> {
     let arr = vm
         .arrays
         .get_mut(arr_ptr as usize)
-        .ok_or_else(|| fail_at(ip, ErrorKind::TypeError, "type error"))?;
+        .ok_or_else(|| fail_at(ip, ErrorKind::TypeError, "bad array pointer"))?;
     // No element → no-op, just return length.
     if argc > 1 {
         arr.insert(0, args[1].clone());
