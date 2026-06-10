@@ -1418,11 +1418,25 @@ impl VM {
                     return Ok(StepResult::Invoke { calls });
                 }
 
-                Instr::Raise(condition) => {
-                    // Do NOT advance ip — host may choose a different
-                    // restart point (see Raise doc comment).
+                Instr::Raise(condition, argc) => {
+                    let argc = *argc;
+                    // Pop the payload value(s). Only 0 or 1 payload is
+                    // allowed by the compiler; the VM accepts any count.
+                    let payload = if argc > 0 {
+                        Some(self.stack.pop().ok_or_else(|| {
+                            self.fail(ErrorKind::StackUnderflow, "stack underflow")
+                        })?)
+                    } else {
+                        None
+                    };
+                    // Advance ip past the Raise before returning: the
+                    // conceptual stack effect is (payload?) -> result,
+                    // so the host resumes by pushing a result value and
+                    // calling step() again (or using VM::resume_raise).
+                    self.ip += 1;
                     return Ok(StepResult::Raise {
                         condition: condition.as_str().to_owned(),
+                        payload,
                     });
                 }
             }

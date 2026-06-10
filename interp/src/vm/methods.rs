@@ -69,6 +69,12 @@ impl VM {
         }
     }
 
+    /// Resume after a `Raise`: push the host-chosen result value (ip was
+    /// already advanced past the Raise by `step()`).
+    pub fn resume_raise(&mut self, value: Value) {
+        self.stack.push(value);
+    }
+
     /// Apply the resume fixup for a PushValueThenContinue error:
     /// push `value`, advance ip past the failed instruction.
     /// Errors if this error's resume mode is not `PushValueThenContinue`.

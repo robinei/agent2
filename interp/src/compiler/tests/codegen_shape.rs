@@ -624,7 +624,7 @@ fn tools_call_with_no_args() {
 fn raise_lowers_to_raise_instr() {
     let prog = compile("raise(\"need_input\");").expect("compiles");
     assert!(
-        prog.code.contains(&Instr::Raise("need_input".into())),
+        prog.code.contains(&Instr::Raise("need_input".into(), 0)),
         "expected Raise in {:?}",
         prog.code
     );

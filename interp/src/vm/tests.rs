@@ -1396,9 +1396,10 @@ fn invoke_yields() {
 
 #[test]
 fn raise_yields() {
-    match run_effect(vec![Raise("something_broke".into())]) {
-        StepResult::Raise { condition } => {
+    match run_effect(vec![Raise("something_broke".into(), 0)]) {
+        StepResult::Raise { condition, payload } => {
             assert_eq!(condition, "something_broke");
+            assert!(payload.is_none());
         }
         other => panic!("expected Raise, got {other:?}"),
     }
@@ -2054,7 +2055,7 @@ fn invoke_interleaved_with_raise() {
         PushPosInt(20), // B arg1
         Invoke("A".into(), 2),
         Invoke("B".into(), 2),
-        Raise("err".into()),
+        Raise("err".into(), 0),
         PushPosInt(3),  // C arg0
         PushPosInt(30), // C arg1
         Invoke("C".into(), 2),
@@ -2073,12 +2074,11 @@ fn invoke_interleaved_with_raise() {
     vm.stack.push(Value::PosInt(200));
     // Next step: Raise fires (separate — not batched with Invoke).
     match vm.step().unwrap() {
-        StepResult::Raise { condition } => assert_eq!(condition, "err"),
+        StepResult::Raise { condition, .. } => assert_eq!(condition, "err"),
         other => panic!("expected Raise, got {other:?}"),
     }
-    // Manual resume past Raise.
-    vm.ip += 1;
-    vm.stack.push(Value::PosInt(300)); // resumed value
+    // Resume via resume_raise (ip already advanced by step()).
+    vm.resume_raise(Value::PosInt(300));
     // Next step: Invoke(C) fires alone.
     match vm.step().unwrap() {
         StepResult::Invoke { calls } => {

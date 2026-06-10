@@ -239,9 +239,18 @@ pub enum StepResult {
     /// again. A lone `Invoke` is just the one-element case.
     Invoke { calls: Vec<InvokeCall> },
     /// A condition was raised; host (LLM) decides how to proceed.
-    /// Host may inspect/modify vm state (including ip, code, stack) before
-    /// calling step() again.
-    Raise { condition: String },
+    /// The payload (if any) is the value passed to `raise("name", expr)`.
+    /// ip has already advanced past the Raise instruction; the host may
+    /// resume execution by pushing a replacement result value and calling
+    /// `step()` again (or use `VM::resume_raise` for convenience).
+    /// In-place code/ip patching is unsupported: live Fn/Closure values
+    /// hold code addresses that a recompile invalidates. For complex
+    /// restart scenarios, abandon this VM and run a rewritten program
+    /// in a fresh VM (prior tool results stay available via the event log).
+    Raise {
+        condition: String,
+        payload: Option<Value>,
+    },
 }
 
 /// A single tool/function call requested by the program.

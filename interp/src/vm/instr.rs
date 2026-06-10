@@ -209,7 +209,7 @@ pub enum Instr {
     // EFFECT: raise condition (like Lisp condition system). used to ask LLM in calling frame
     // to decide how to proceed, using restarts like returning a value, aborting,
     // and even rewriting the program preserving already written variables with execution starting at arbitrary point.
-    Raise(RcStr), // () -> any
+    Raise(RcStr, ArgCount), // (payload?) -> result
 
     // pops N values where N is the number of field names, then pushes an
     // object with each field set to its corresponding value. Left-to-right:

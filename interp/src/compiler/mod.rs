@@ -2193,22 +2193,33 @@ impl<'src> Compiler<'src> {
                 self.emit(Instr::ToBool, span);
             }
             "raise" => {
-                // `raise("...")` → `Raise(String)`. The `Raise` instruction
-                // carries a compile-time string, so the argument must be a
-                // string literal. `raise(...)` is an expression: it leaves one
-                // value (the host pushes the resumed value back on the stack),
-                // satisfying the one-value-per-expression invariant.
-                if !self.arity(argv, 1, span, "raise") {
+                // `raise("name")` → `Raise(name, 0)`, no payload.
+                // `raise("name", expr)` → `Raise(name, 1)`, payload = expr.
+                // The condition name must be a string literal. More than one
+                // extra arg is a compile error.
+                if argv.is_empty() || argv.len() > 2 {
+                    self.error(
+                        span,
+                        "`raise` takes 1 or 2 arguments: raise(\"name\") or raise(\"name\", payload)",
+                    );
                     return;
                 }
-                match argv[0] {
-                    ast::Expression::StringLiteral(lit) => {
-                        self.emit(Instr::Raise(lit.value.as_str().into()), span);
+                let name = match &argv[0] {
+                    ast::Expression::StringLiteral(lit) => lit.value.as_str().into(),
+                    other => {
+                        self.error(
+                            other.span().start,
+                            "`raise` condition name must be a string literal",
+                        );
+                        return;
                     }
-                    other => self.error(
-                        other.span().start,
-                        "`raise` requires a string-literal argument",
-                    ),
+                };
+                if argv.len() >= 2 {
+                    // Payload: compile the expression, emit Raise with argc=1.
+                    self.compile_expr(&argv[1]);
+                    self.emit(Instr::Raise(name, 1), span);
+                } else {
+                    self.emit(Instr::Raise(name, 0), span);
                 }
             }
             _ => self.error(
