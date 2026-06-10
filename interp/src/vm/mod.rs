@@ -144,8 +144,10 @@ The remaining intentional divergences from JS — deferred or accepted, NOT bugs
   • Bitwise ops (`& | ^ << >> ~`) operate on full i64, not JS's 32-bit ToInt32
     semantics, and there is no unsigned right shift (`>>>`). Shift counts must be
     0..63 (JS masks to 0..31).
-  • `Math.min`/`Math.max` (Min/Max) follow Rust's `f64::min`/`max`, which ignore
-    a NaN operand; JS propagates NaN. `Math.sign` of ±0 is ±1 here (JS gives ±0).
+  • `s.split()`, `s.indexOf()`, etc. accept fewer arguments at runtime than the
+    compiler's static arity check allows (JS-coerced defaults: absent needle →
+    "undefined", absent start → 0). The compiler remains strict for the LLM's
+    benefit; the runtime relaxes to match JS.
   • Number→string uses Rust's float formatting for the non-integer path, so very
     large/small magnitudes are not rendered in JS's exponential form (`1e21`).
   • No exceptions/try/catch/throw: the `Raise` condition mechanism is for host

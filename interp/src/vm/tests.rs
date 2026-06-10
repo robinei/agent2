@@ -1999,47 +1999,21 @@ fn string_utf8_length() {
 // ── NaN in Math.min/max (JS divergence) ─────────────────────────
 
 #[test]
-fn math_min_max_nan_ignored() {
-    // Math.min with NaN: NaN operand is ignored, non-NaN operand returned.
-    assert!(
-        run(vec![
-            PushFloat(f64::NAN),
-            PushFloat(5.0),
-            CallBuiltin(Builtin::MathMin, 2),
-        ])[0]
-            .as_f64()
-            .map_or(false, |n| (n - 5.0).abs() < 0.01)
-    );
-    // Math.max with NaN: NaN operand is ignored.
-    assert!(
-        run(vec![
-            PushFloat(f64::NAN),
-            PushFloat(3.0),
-            CallBuiltin(Builtin::MathMax, 2),
-        ])[0]
-            .as_f64()
-            .map_or(false, |n| (n - 3.0).abs() < 0.01)
-    );
-    // When all operands are NaN, min returns +Infinity, max returns -Infinity
-    // (the seed values, since every NaN is ignored).
-    assert!(
-        run(vec![
-            PushFloat(f64::NAN),
-            PushFloat(f64::NAN),
-            CallBuiltin(Builtin::MathMin, 2),
-        ])[0]
-            .as_f64()
-            .map_or(false, |n| n.is_infinite() && n.is_sign_positive())
-    );
-    assert!(
-        run(vec![
-            PushFloat(f64::NAN),
-            PushFloat(f64::NAN),
-            CallBuiltin(Builtin::MathMax, 2),
-        ])[0]
-            .as_f64()
-            .map_or(false, |n| n.is_infinite() && n.is_sign_negative())
-    );
+fn math_min_max_nan_propagates() {
+    // JS: Math.min with NaN propagates NaN.
+    let out = run(vec![
+        PushFloat(f64::NAN),
+        PushFloat(5.0),
+        CallBuiltin(Builtin::MathMin, 2),
+    ]);
+    assert!(out[0].as_f64().map_or(false, |n| n.is_nan()), "got {out:?}");
+    // JS: Math.max with NaN propagates NaN.
+    let out = run(vec![
+        PushFloat(f64::NAN),
+        PushFloat(3.0),
+        CallBuiltin(Builtin::MathMax, 2),
+    ]);
+    assert!(out[0].as_f64().map_or(false, |n| n.is_nan()), "got {out:?}");
 }
 
 // ── Invoke interleaved with Raise ───────────────────────────────
@@ -2533,7 +2507,8 @@ fn message_calldyn_non_callable_and_resume() {
 #[test]
 fn message_builtin_error_includes_builtin_name() {
     // Builtin failures identify themselves via BuiltinMeta::name.
-    let err = crate::testutil::run_runtime_err("return [].pop();");
+    // Wrong receiver: number has no pop method → TypeError.
+    let err = crate::testutil::run_runtime_err("return (42).pop();");
     assert!(err.message.contains("`pop`"), "got: {}", err.message);
 }
 

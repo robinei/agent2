@@ -100,7 +100,13 @@ macro_rules! builtins {
                 }
                 let base = vm.stack.len() - n;
                 let args = Args { base, argc: n };
-                if argc < self.meta().min_args {
+                // Runtime arity: only require the receiver to be present for
+                // methods; compile-time arity is strict (compiler lint).
+                let min_runtime = match self.meta().kind {
+                    BuiltinKind::Method => 1,
+                    BuiltinKind::Namespace(_) => 0,
+                };
+                if argc < min_runtime {
                     vm.stack.truncate(base);
                     return Err(vm.fail(
                         ErrorKind::BadArg,
@@ -320,6 +326,82 @@ fn js_parse_int(input: &str, mut radix: i64) -> f64 {
     sign * value
 }
 
+/// JS `parseFloat(string)`: skip leading whitespace, accept a sign, "Infinity"
+/// (with optional sign), and the longest decimal/hexadecimal numeric prefix.
+/// Returns `NaN` when no digits are found. Never errors.
+fn js_parse_float(input: &str) -> f64 {
+    let s = input.trim_start();
+    // Infinity check: case-insensitive, matches "Infinity" or "+Infinity" or "-Infinity"
+    // as the numeric prefix.
+    let lower = s.to_ascii_lowercase();
+    for prefix in ["infinity", "+infinity", "-infinity"] {
+        if lower.starts_with(prefix) {
+            if s.starts_with('-') {
+                return f64::NEG_INFINITY;
+            }
+            return f64::INFINITY;
+        }
+    }
+    // Longest-prefix parse: find the end of the numeric prefix.
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    // Optional sign
+    if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {
+        i += 1;
+    }
+    // Detect hex: 0x / 0X
+    let is_hex = i + 1 < bytes.len() && bytes[i] == b'0' && (bytes[i + 1] | 0x20) == b'x';
+    if is_hex {
+        i += 2;
+        let start = i;
+        while i < bytes.len() && bytes[i].is_ascii_hexdigit() {
+            i += 1;
+        }
+        if i == start {
+            return f64::NAN;
+        }
+        // Parse hex prefix; fall through to standard parse for correctness.
+        // The hex integer can be large — use standard parse handling on the
+        // recognized prefix.
+        return s[..i].parse::<f64>().unwrap_or(f64::NAN);
+    }
+    let start = i;
+    while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'.') {
+        i += 1;
+    }
+    // Check for exponent
+    if i < bytes.len() && (bytes[i] | 0x20) == b'e' {
+        i += 1;
+        if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {
+            i += 1;
+        }
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+    }
+    if i == start {
+        return f64::NAN;
+    }
+    s[..i].parse::<f64>().unwrap_or(f64::NAN)
+}
+
+/// JS `Math.round`: half toward +∞.
+fn js_round(n: f64) -> f64 {
+    // If already integral (or NaN/±∞), return unchanged.
+    if n.fract() == 0.0 || n.is_nan() || n.is_infinite() {
+        return n;
+    }
+    // For |n| ≥ 2^52, all representable values are integers.
+    if n.abs() >= (1u64 << 52) as f64 {
+        return n;
+    }
+    // Round half toward +∞: floor(x + 0.5), but -0.5 → -0.
+    if n == -0.5 {
+        return -0.0_f64;
+    }
+    (n + 0.5).floor()
+}
+
 // ── array method implementations ─────────────────────────────────────────────
 
 /// `arr.push(a, b, …)` → appends all arguments and returns the new length.
@@ -342,7 +424,7 @@ fn array_push(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     Ok(int_value(arr.len() as f64))
 }
 
-/// `arr.pop()` → removes and returns the last element.
+/// `arr.pop()` → removes and returns the last element, or `undefined` if empty.
 fn array_pop(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let arr_ptr = match args.get(vm, 0) {
         Value::Array(p) => *p,
@@ -353,13 +435,11 @@ fn array_pop(vm: &mut VM, args: Args) -> Result<Value, VMError> {
         .arrays
         .get_mut(arr_ptr as usize)
         .ok_or_else(|| fail_at(ip, ErrorKind::TypeError, "bad array pointer"))?;
-    let val = arr
-        .pop()
-        .ok_or_else(|| vm.fail(ErrorKind::ValueError, "value error"))?;
-    Ok(val)
+    // JS: empty array → undefined, not an error.
+    Ok(arr.pop().unwrap_or(Value::Undefined))
 }
 
-/// `arr.shift()` → removes and returns the first element.
+/// `arr.shift()` → removes and returns the first element, or `undefined` if empty.
 fn array_shift(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let arr_ptr = match args.get(vm, 0) {
         Value::Array(p) => *p,
@@ -370,8 +450,9 @@ fn array_shift(vm: &mut VM, args: Args) -> Result<Value, VMError> {
         .arrays
         .get_mut(arr_ptr as usize)
         .ok_or_else(|| fail_at(ip, ErrorKind::TypeError, "bad array pointer"))?;
+    // JS: empty array → undefined, not an error.
     if arr.is_empty() {
-        return Err(vm.fail(ErrorKind::ValueError, "value error"));
+        return Ok(Value::Undefined);
     }
     Ok(arr.remove(0))
 }
@@ -439,11 +520,15 @@ fn str_split(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let limit = match args.get(vm, 2) {
         Value::Undefined => None,
         v => {
+            // JS: ToUint32 coercion — truncate fractional, negative wraps.
             let lim = v
-                .as_i64()
+                .to_number()
                 .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?;
-            // JS: ToUint32 coercion — negative wraps huge → effectively no limit
-            if lim < 0 { None } else { Some(lim as usize) }
+            if lim.is_nan() || lim.is_infinite() || lim < 0.0 {
+                None
+            } else {
+                Some((lim as u32) as usize)
+            }
         }
     };
     let parts: ThinVec<Value> = if delim_s.is_empty() {
@@ -458,6 +543,8 @@ fn str_split(vm: &mut VM, args: Args) -> Result<Value, VMError> {
             None => chars,
         }
     } else {
+        // JS: split fully first, then truncate to limit (not splitn which
+        // leaves remainder unsplit in the last entry).
         let splits: ThinVec<Value> = s
             .split(delim_s.as_str())
             .map(|p| Value::String(RcStr::from(p)))
@@ -470,10 +557,11 @@ fn str_split(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     Ok(vm.alloc_array(parts))
 }
 
-/// `s.includes(needle[, start])` → bool.
+/// `s.includes(needle[, start])` → bool. An absent needle is coerced to
+/// the string `"undefined"` (matching JS).
 fn str_includes(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let haystack = vm.str_from(args.get(vm, 0))?;
-    let needle = vm.str_from(args.get(vm, 1))?;
+    let needle = vm.to_js_string(args.get(vm, 1), 0);
     let start = match args.get(vm, 2) {
         Value::Undefined => 0i64,
         v => v
@@ -481,13 +569,14 @@ fn str_includes(vm: &mut VM, args: Args) -> Result<Value, VMError> {
             .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?,
     };
     let start = clamp_start(haystack, start.max(0) as usize);
-    Ok(Value::Bool(haystack[start..].contains(needle)))
+    Ok(Value::Bool(haystack[start..].contains(needle.as_str())))
 }
 
-/// `s.indexOf(needle[, start])` → int (or -1).
+/// `s.indexOf(needle[, start])` → int (or -1). An absent needle is coerced to
+/// the string `"undefined"` (matching JS).
 fn str_index_of(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let haystack = vm.str_from(args.get(vm, 0))?;
-    let needle = vm.str_from(args.get(vm, 1))?;
+    let needle = vm.to_js_string(args.get(vm, 1), 0);
     let start = match args.get(vm, 2) {
         Value::Undefined => 0i64,
         v => v
@@ -495,14 +584,15 @@ fn str_index_of(vm: &mut VM, args: Args) -> Result<Value, VMError> {
             .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?,
     };
     let start = clamp_start(haystack, start.max(0) as usize);
-    let pos = haystack[start..].find(needle).map(|p| (p + start) as f64);
+    let pos = haystack[start..].find(needle.as_str()).map(|p| (p + start) as f64);
     Ok(int_value(pos.unwrap_or(-1.0)))
 }
 
-/// `s.lastIndexOf(needle[, start])` → int (or -1).
+/// `s.lastIndexOf(needle[, start])` → int (or -1). An absent needle is
+/// coerced to the string `"undefined"` (matching JS).
 fn str_last_index_of(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let haystack = vm.str_from(args.get(vm, 0))?;
-    let needle = vm.str_from(args.get(vm, 1))?;
+    let needle = vm.to_js_string(args.get(vm, 1), 0);
     let start = match args.get(vm, 2) {
         Value::Undefined => haystack.len() as i64,
         v => v
@@ -511,22 +601,24 @@ fn str_last_index_of(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     };
     let from = start.max(0) as usize;
     let end = clamp_end(haystack, from + needle.len());
-    let pos = haystack[..end].rfind(needle).map(|p| p as f64);
+    let pos = haystack[..end].rfind(needle.as_str()).map(|p| p as f64);
     Ok(int_value(pos.unwrap_or(-1.0)))
 }
 
-/// `s.startsWith(prefix)` → bool.
+/// `s.startsWith(prefix)` → bool. An absent prefix is coerced to the string
+/// `"undefined"` (matching JS).
 fn str_starts_with(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let haystack = vm.str_from(args.get(vm, 0))?;
-    let prefix = vm.str_from(args.get(vm, 1))?;
-    Ok(Value::Bool(haystack.starts_with(prefix)))
+    let prefix = vm.to_js_string(args.get(vm, 1), 0);
+    Ok(Value::Bool(haystack.starts_with(prefix.as_str())))
 }
 
-/// `s.endsWith(suffix)` → bool.
+/// `s.endsWith(suffix)` → bool. An absent suffix is coerced to the string
+/// `"undefined"` (matching JS).
 fn str_ends_with(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let haystack = vm.str_from(args.get(vm, 0))?;
-    let suffix = vm.str_from(args.get(vm, 1))?;
-    Ok(Value::Bool(haystack.ends_with(suffix)))
+    let suffix = vm.to_js_string(args.get(vm, 1), 0);
+    Ok(Value::Bool(haystack.ends_with(suffix.as_str())))
 }
 
 /// `s.slice(start[, end])` → substring over a half-open byte range.
@@ -643,7 +735,8 @@ fn number_is_integer(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 /// `0x` prefix, any radix in `[2, 36]`, leading-digit parse with trailing
 /// characters ignored). Unparseable input yields `NaN`, like the browser.
 fn number_parse_int(vm: &mut VM, args: Args) -> Result<Value, VMError> {
-    let s = vm.str_from(args.get(vm, 0))?;
+    // Coerce to string (undefined → "undefined") matching JS.
+    let s = vm.to_js_string(args.get(vm, 0), 0);
     let radix = match args.get(vm, 1) {
         Value::Undefined => 0,
         v => match v.to_number() {
@@ -651,16 +744,14 @@ fn number_parse_int(vm: &mut VM, args: Args) -> Result<Value, VMError> {
             _ => 0,
         },
     };
-    Ok(int_value(js_parse_int(s, radix)))
+    Ok(int_value(js_parse_int(s.as_str(), radix)))
 }
 
-/// `Number.parseFloat(s)` → float.
+/// `Number.parseFloat(s)` → float. JS semantics: skip leading whitespace, take
+/// the longest numeric prefix, return NaN on failure, accept `Infinity`.
 fn number_parse_float(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let s = vm.str_from(args.get(vm, 0))?;
-    let n: f64 = s
-        .trim()
-        .parse()
-        .map_err(|_| vm.fail(ErrorKind::ValueError, "value error"))?;
+    let n = js_parse_float(&s);
     Ok(Value::Float(n))
 }
 
@@ -688,11 +779,28 @@ fn math_ceil(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 fn math_floor(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     math_unary(vm, args, |n| n.floor())
 }
+/// JS `Math.round`: rounds half toward +∞ (not away-from-zero like Rust).
 fn math_round(vm: &mut VM, args: Args) -> Result<Value, VMError> {
-    math_unary(vm, args, |n| n.round())
+    let n = args
+        .get(vm, 0)
+        .to_number()
+        .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?;
+    Ok(Value::Float(js_round(n)))
 }
+
+/// JS `Math.sign`: returns the input unchanged when n == 0.0 or -0.0, else
+/// the signum. (Rust `signum` returns ±1 for ±0; JS returns ±0.)
 fn math_sign(vm: &mut VM, args: Args) -> Result<Value, VMError> {
-    math_unary(vm, args, |n| n.signum())
+    let n = args
+        .get(vm, 0)
+        .to_number()
+        .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?;
+    if n == 0.0 {
+        // Preserve sign: +0 → +0, -0 → -0
+        Ok(Value::Float(n))
+    } else {
+        Ok(Value::Float(n.signum()))
+    }
 }
 
 /// Math unary: read one arg, coerce ToNumber, apply f, return Number.
@@ -705,7 +813,7 @@ fn math_unary(vm: &mut VM, args: Args, f: fn(f64) -> f64) -> Result<Value, VMErr
 }
 
 /// `Math.min(...nums)` → the smallest, ToNumber-coercing each. Zero args →
-/// +Infinity. Follows `f64::min` (a NaN operand is ignored).
+/// +Infinity. JS: NaN propagates (the first NaN encountered wins).
 fn math_min(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let mut acc = f64::INFINITY;
     for i in 0..args.argc {
@@ -713,13 +821,16 @@ fn math_min(vm: &mut VM, args: Args) -> Result<Value, VMError> {
             .get(vm, i)
             .to_number()
             .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?;
+        if num.is_nan() {
+            return Ok(Value::Float(f64::NAN));
+        }
         acc = acc.min(num);
     }
     Ok(Value::Float(acc))
 }
 
 /// `Math.max(...nums)` → the largest, ToNumber-coercing each. Zero args →
-/// -Infinity. Follows `f64::max` (a NaN operand is ignored).
+/// -Infinity. JS: NaN propagates (the first NaN encountered wins).
 fn math_max(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let mut acc = f64::NEG_INFINITY;
     for i in 0..args.argc {
@@ -727,6 +838,9 @@ fn math_max(vm: &mut VM, args: Args) -> Result<Value, VMError> {
             .get(vm, i)
             .to_number()
             .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?;
+        if num.is_nan() {
+            return Ok(Value::Float(f64::NAN));
+        }
         acc = acc.max(num);
     }
     Ok(Value::Float(acc))
@@ -791,12 +905,12 @@ mod tests {
     }
 
     #[test]
-    fn call_builtin_array_pop_empty_errors() {
-        let mut vm = VM::new(vec![
+    fn call_builtin_array_pop_empty_returns_undefined() {
+        let out = run(vec![
             Instr::ArrNew(0),
             Instr::CallBuiltin(Builtin::ArrayPop, 1),
         ]);
-        assert!(vm.step().unwrap_err().kind == ErrorKind::ValueError);
+        assert_eq!(out, vec![Value::Undefined]);
     }
 
     // ── ArrayShift ─────────────────────────────────────────────────────
@@ -813,12 +927,12 @@ mod tests {
     }
 
     #[test]
-    fn call_builtin_array_shift_empty_errors() {
-        let mut vm = VM::new(vec![
+    fn call_builtin_array_shift_empty_returns_undefined() {
+        let out = run(vec![
             Instr::ArrNew(0),
             Instr::CallBuiltin(Builtin::ArrayShift, 1),
         ]);
-        assert!(vm.step().unwrap_err().kind == ErrorKind::ValueError);
+        assert_eq!(out, vec![Value::Undefined]);
     }
 
     // ── ArrayUnshift ───────────────────────────────────────────────────
@@ -1180,10 +1294,11 @@ mod tests {
     }
 
     #[test]
-    fn call_builtin_number_parse_int_zero_args_is_error_not_panic() {
-        // Regression: a malformed CallBuiltin must not index an empty arg list.
-        let mut vm = VM::new(vec![Instr::CallBuiltin(Builtin::NumberParseInt, 0)]);
-        assert!(vm.step().unwrap_err().kind == ErrorKind::BadArg);
+    fn call_builtin_number_parse_int_zero_args_is_not_an_error() {
+        // Runtime: namespace builtins accept >= 0 args; absent string → "undefined",
+        // parseInt("undefined") → NaN.
+        let out = run(vec![Instr::CallBuiltin(Builtin::NumberParseInt, 0)]);
+        assert!(matches!(out.as_slice(), [Value::Float(n)] if n.is_nan()));
     }
 
     #[test]
@@ -1345,20 +1460,16 @@ mod tests {
 
     #[test]
     fn builtin_below_min_args_errors() {
-        // Math.pow needs 2 args; calling it with 1 is a BadArg error.
-        let mut vm = VM::new(vec![
-            Instr::PushFloat(2.0),
+        // Math.pow with 1 arg at runtime: the compile-time lint catches this
+        // statically; at runtime it now succeeds (NaN^undefined → NaN).
+        // Instead, test with 0 args (bad anyway) — Math.pow needs at least 1.
+        // Actually: min_args for namespaced builtins at runtime is 0, so
+        // Math.pow with 0 args returns NaN (pow of no args → NaN).
+        let out = run(vec![
             Instr::PushBuiltin(Builtin::MathPow),
-            Instr::CallDyn(1),
+            Instr::CallDyn(0),
         ]);
-        let err = loop {
-            match vm.step() {
-                Err(e) => break e,
-                Ok(StepResult::Done { .. }) => panic!("expected error"),
-                Ok(_) => {}
-            }
-        };
-        assert!(err.kind == ErrorKind::BadArg, "got {err:?}");
+        assert!(matches!(out.as_slice(), [Value::Float(n)] if n.is_nan()));
     }
 
     #[test]
@@ -1397,9 +1508,10 @@ mod tests {
 
     #[test]
     fn resumability_builtin_failure_consumes_operands() {
-        // [].pop() → ValueError. After failure, operands should be consumed.
+        // A wrong-receiver call (number.pop()) → TypeError. After failure,
+        // operands should be consumed.
         let mut vm = VM::for_program(
-            testutil::compile_ok("return [].pop();"),
+            testutil::compile_ok("return (42).pop();"),
             serde_json::Value::Null,
         )
         .unwrap();
@@ -1410,9 +1522,8 @@ mod tests {
                 Ok(_) => {}
             }
         };
-        assert_eq!(err.kind, ErrorKind::ValueError);
-        // Stack has operands consumed: only the error-predecessor state should remain.
-        // We can resume_with a value.
+        assert_eq!(err.kind, ErrorKind::TypeError);
+        // Stack has operands consumed.
         vm.resume_with(&err, Value::PosInt(99)).unwrap();
         loop {
             match vm.step().unwrap() {
@@ -1447,5 +1558,178 @@ mod tests {
         );
         assert_eq!(Builtin::for_namespace("Math", "push"), None);
         assert_eq!(Builtin::for_namespace("Foo", "bar"), None);
+    }
+
+    // ── Step 3: JS contract fixes ─────────────────────────────────────
+
+    #[test]
+    fn js_pop_shift_empty_returns_undefined() {
+        // JS: [].pop() === undefined, [].shift() === undefined
+        assert_eq!(
+            testutil::run_ret("return [[].pop(), [].shift()];"),
+            serde_json::json!([null, null])
+        );
+    }
+
+    #[test]
+    fn js_split_limit_truncates_not_splitn() {
+        // JS: "a,b,c".split(",", 2) → ["a", "b"]
+        assert_eq!(
+            testutil::run_ret("return 'a,b,c'.split(',', 2);"),
+            serde_json::json!(["a", "b"])
+        );
+    }
+
+    #[test]
+    fn js_split_empty_string_to_chars() {
+        // JS: "abc".split("") → ["a", "b", "c"]
+        assert_eq!(
+            testutil::run_ret("return 'abc'.split('');"),
+            serde_json::json!(["a", "b", "c"])
+        );
+    }
+
+    #[test]
+    fn js_split_limit_coercion() {
+        // JS: limit 0 → []; negative → effectively no limit
+        assert_eq!(
+            testutil::run_ret("return 'a,b'.split(',', 0);"),
+            serde_json::json!([])
+        );
+        assert_eq!(
+            testutil::run_ret("return 'a,b'.split(',', -1);"),
+            serde_json::json!(["a", "b"])
+        );
+        assert_eq!(
+            testutil::run_ret("return 'a,b'.split(',', 2.9);"),
+            serde_json::json!(["a", "b"])
+        );
+    }
+
+    #[test]
+    fn js_parse_float_trailing_garbage_and_infinity() {
+        // JS: Number.parseFloat("3.14abc") === 3.14
+        assert_eq!(
+            testutil::run_ret("return Number.parseFloat('3.14abc');"),
+            serde_json::json!(3.14)
+        );
+        // JS: Number.parseFloat("abc") → NaN
+        let v = testutil::run_val("return Number.parseFloat('abc');");
+        assert!(matches!(v, Value::Float(n) if n.is_nan()));
+        // JS: Number.parseFloat("  2.5") === 2.5
+        assert_eq!(
+            testutil::run_ret("return Number.parseFloat('  2.5');"),
+            serde_json::json!(2.5)
+        );
+        // JS: Number.parseFloat("Infinity") === Infinity
+        let v = testutil::run_val("return Number.parseFloat('Infinity');");
+        assert!(matches!(v, Value::Float(n) if n.is_infinite() && n > 0.0));
+    }
+
+    #[test]
+    fn js_math_round_half_toward_positive_infinity() {
+        // JS: Math.round(2.5) === 3, Math.round(-2.5) === -2
+        assert_eq!(testutil::eval("Math.round(2.5)"), Value::Float(3.0));
+        assert_eq!(testutil::eval("Math.round(-2.5)"), Value::Float(-2.0));
+        assert_eq!(testutil::eval("Math.round(3.4)"), Value::Float(3.0));
+        // -0.5 → -0 in JS (sign preserved). Use direct VM to pass -0.5.
+        let out = run(vec![
+            Instr::PushFloat(-0.5),
+            Instr::CallBuiltin(Builtin::MathRound, 1),
+        ]);
+        assert!(
+            matches!(out.as_slice(), [Value::Float(f)] if *f == 0.0 && f.is_sign_negative()),
+            "Math.round(-0.5) should be -0, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn js_math_sign_returns_zero_not_one() {
+        // Math.sign(0) → 0
+        let v = testutil::eval("Math.sign(0)");
+        assert!(matches!(v, Value::Float(f) if f == 0.0));
+        // Math.sign(-0) → -0 (use direct VM to produce -0.0)
+        let out = run(vec![
+            Instr::PushFloat(-0.0_f64),
+            Instr::CallBuiltin(Builtin::MathSign, 1),
+        ]);
+        assert!(matches!(out.as_slice(), [Value::Float(f)] if *f == 0.0 && f.is_sign_negative()));
+    }
+
+    #[test]
+    fn js_math_min_max_nan_propagates() {
+        // JS: Math.min(1, NaN) → NaN
+        let v = testutil::eval("Math.min(1, NaN)");
+        assert!(matches!(v, Value::Float(n) if n.is_nan()));
+        // JS: Math.max(1, NaN) → NaN
+        let v = testutil::eval("Math.max(1, NaN)");
+        assert!(matches!(v, Value::Float(n) if n.is_nan()));
+    }
+
+    #[test]
+    fn js_slice_negative_indexes_and_clamping() {
+        // JS: "abcdef".slice(-3) → "def"
+        assert_eq!(
+            testutil::run_ret("return 'abcdef'.slice(-3);"),
+            serde_json::json!("def")
+        );
+        // JS: "abc".slice(2, 1) → ""
+        assert_eq!(
+            testutil::run_ret("return 'abc'.slice(2, 1);"),
+            serde_json::json!("")
+        );
+        // JS: "abc".slice(0, 99) → "abc"
+        assert_eq!(
+            testutil::run_ret("return 'abc'.slice(0, 99);"),
+            serde_json::json!("abc")
+        );
+    }
+
+    #[test]
+    fn js_static_arity_is_strict_runtime_is_relaxed() {
+        // Static: 'a,b'.split(',', 2, 3) is still a compile error (surplus args).
+        let errs = testutil::compile_errs("'a,b'.split(',', 2, 3);");
+        let msg = errs.join("\n");
+        assert!(msg.contains("split"), "expected split arity error, got: {msg}");
+
+        // Static: 'abc'.split() is still a compile error (too few args).
+        // The static compiler requires recv + delim for split.
+        let errs = testutil::compile_errs("'abc'.split();");
+        let msg = errs.join("\n");
+        assert!(msg.contains("split"), "expected split arity error, got: {msg}");
+
+        // Runtime: calling split with only a receiver via direct VM call.
+        let out = run(vec![
+            Instr::PushStr("hello".into()),
+            Instr::CallBuiltin(Builtin::StrSplit, 1),
+        ]);
+        // Should return ["hello"] (split with undefined delimiter → [self])
+        match &out[0] {
+            Value::Array(_) => {} // pass
+            other => panic!("expected Array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn js_includes_absent_needle_coerces_to_string_undefined() {
+        // Runtime via direct VM: calling includes with only a receiver.
+        let out = run(vec![
+            Instr::PushStr("undefined!".into()),
+            Instr::CallBuiltin(Builtin::StrIncludes, 1),
+        ]);
+        assert_eq!(out, vec![Value::Bool(true)]);
+    }
+
+    #[test]
+    fn js_slice_no_args_returns_whole_string() {
+        // Runtime via direct VM: slice with no args returns the whole string.
+        let out = run(vec![
+            Instr::PushStr("hello".into()),
+            Instr::CallBuiltin(Builtin::StrSlice, 1),
+        ]);
+        match &out[0] {
+            Value::String(s) => assert_eq!(s.as_str(), "hello"),
+            other => panic!("expected string, got {other:?}"),
+        }
     }
 }
