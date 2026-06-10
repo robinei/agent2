@@ -77,6 +77,72 @@ pub fn math_max(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     Ok(Value::Float(acc))
 }
 
+pub fn math_trunc(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    math_unary(vm, args, |n| n.trunc())
+}
+pub fn math_cbrt(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    math_unary(vm, args, |n| n.cbrt())
+}
+pub fn math_exp(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    math_unary(vm, args, |n| n.exp())
+}
+pub fn math_log(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    math_unary(vm, args, |n| n.ln())
+}
+pub fn math_log2(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    math_unary(vm, args, |n| n.log2())
+}
+pub fn math_log10(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    math_unary(vm, args, |n| n.log10())
+}
+pub fn math_sin(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    math_unary(vm, args, |n| n.sin())
+}
+pub fn math_cos(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    math_unary(vm, args, |n| n.cos())
+}
+pub fn math_tan(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    math_unary(vm, args, |n| n.tan())
+}
+pub fn math_asin(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    math_unary(vm, args, |n| n.asin())
+}
+pub fn math_acos(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    math_unary(vm, args, |n| n.acos())
+}
+pub fn math_atan(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    math_unary(vm, args, |n| n.atan())
+}
+
+/// `Math.atan2(y, x)` → angle of (x, y).
+pub fn math_atan2(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let y = args
+        .get(vm, 0)
+        .to_number()
+        .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?;
+    let x = args
+        .get(vm, 1)
+        .to_number()
+        .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?;
+    Ok(Value::Float(y.atan2(x)))
+}
+
+/// `Math.hypot(...values)` → sqrt of sum of squares. Returns +0 if no args.
+pub fn math_hypot(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let mut sum = 0.0_f64;
+    for i in 0..args.argc {
+        let num = args
+            .get(vm, i)
+            .to_number()
+            .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?;
+        if num.is_infinite() {
+            return Ok(Value::Float(f64::INFINITY));
+        }
+        sum += num * num;
+    }
+    Ok(Value::Float(sum.sqrt()))
+}
+
 /// `Math.pow(base, exp)` → base^exp.
 pub fn math_pow(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let base = args
@@ -272,6 +338,92 @@ mod tests {
             Instr::CallDyn(0),
         ]);
         assert!(matches!(out.as_slice(), [Value::Float(n)] if n.is_nan()));
+    }
+
+    // ── Step 4e: new math functions ──────────────────────────────────
+
+    #[test]
+    fn js_math_trunc() {
+        let v = testutil::eval("Math.trunc(-1.9)");
+        assert_eq!(v, Value::Float(-1.0));
+    }
+
+    #[test]
+    fn js_math_log_e() {
+        assert_eq!(testutil::eval("Math.log(Math.E)"), Value::Float(1.0));
+    }
+
+    #[test]
+    fn js_math_hypot() {
+        assert_eq!(testutil::eval("Math.hypot(3,4)"), Value::Float(5.0));
+    }
+
+    #[test]
+    fn js_math_atan2() {
+        let v = testutil::eval("Math.atan2(1,1)");
+        // π/4
+        assert!((v.as_f64().unwrap() - std::f64::consts::FRAC_PI_4).abs() < 1e-15);
+    }
+
+    #[test]
+    fn js_math_cbrt() {
+        assert_eq!(testutil::eval("Math.cbrt(27)"), Value::Float(3.0));
+    }
+
+    #[test]
+    fn js_math_exp() {
+        assert_eq!(
+            testutil::eval("Math.exp(1)"),
+            Value::Float(std::f64::consts::E)
+        );
+    }
+
+    #[test]
+    fn js_math_log2() {
+        assert_eq!(testutil::eval("Math.log2(8)"), Value::Float(3.0));
+    }
+
+    #[test]
+    fn js_math_log10() {
+        assert_eq!(testutil::eval("Math.log10(100)"), Value::Float(2.0));
+    }
+
+    #[test]
+    fn js_math_sin_cos_tan() {
+        assert_eq!(testutil::eval("Math.sin(0)"), Value::Float(0.0));
+        assert_eq!(testutil::eval("Math.cos(0)"), Value::Float(1.0));
+        // tan(π/4) ≈ 0.9999999999999999 in JS due to floating point
+        let v = testutil::eval("Math.tan(Math.PI/4)");
+        assert!((v.as_f64().unwrap() - 1.0).abs() < 1e-15);
+    }
+
+    #[test]
+    fn js_math_asin_acos_atan() {
+        assert_eq!(
+            testutil::eval("Math.asin(1)"),
+            Value::Float(std::f64::consts::FRAC_PI_2)
+        );
+        assert_eq!(
+            testutil::eval("Math.acos(0)"),
+            Value::Float(std::f64::consts::FRAC_PI_2)
+        );
+        assert_eq!(
+            testutil::eval("Math.atan(1)"),
+            Value::Float(std::f64::consts::FRAC_PI_4)
+        );
+    }
+
+    #[test]
+    fn js_math_hypot_infinity() {
+        // hypot with Infinity → Infinity
+        let v = testutil::eval("Math.hypot(Infinity, 1)");
+        assert!(v.as_f64().unwrap().is_infinite());
+    }
+
+    #[test]
+    fn js_math_hypot_zero_args() {
+        let v = testutil::eval("Math.hypot()");
+        assert_eq!(v, Value::Float(0.0));
     }
 
     #[test]

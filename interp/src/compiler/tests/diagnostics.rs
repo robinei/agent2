@@ -30,7 +30,7 @@ fn diagnostics_for_unsupported() {
         "raise(x);",
         "raise();",
         "raise(\"name\", 1, 2);", // at most one payload
-        "Math.tan(1);",
+        "Math.random();",
         "Math.pow(1);",
         "f(...args);",
         "new Foo();",

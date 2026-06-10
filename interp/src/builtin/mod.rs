@@ -219,6 +219,20 @@ builtins! {
     MathMin,   BuiltinKind::Namespace("Math"), "min",   0, VARARG, math_min;
     MathMax,   BuiltinKind::Namespace("Math"), "max",   0, VARARG, math_max;
     MathPow,   BuiltinKind::Namespace("Math"), "pow",   2, 2,      math_pow;
+    MathTrunc, BuiltinKind::Namespace("Math"), "trunc", 1, 1,      math_trunc;
+    MathCbrt,  BuiltinKind::Namespace("Math"), "cbrt",  1, 1,      math_cbrt;
+    MathExp,   BuiltinKind::Namespace("Math"), "exp",   1, 1,      math_exp;
+    MathLog,   BuiltinKind::Namespace("Math"), "log",   1, 1,      math_log;
+    MathLog2,  BuiltinKind::Namespace("Math"), "log2",  1, 1,      math_log2;
+    MathLog10, BuiltinKind::Namespace("Math"), "log10", 1, 1,      math_log10;
+    MathSin,   BuiltinKind::Namespace("Math"), "sin",   1, 1,      math_sin;
+    MathCos,   BuiltinKind::Namespace("Math"), "cos",   1, 1,      math_cos;
+    MathTan,   BuiltinKind::Namespace("Math"), "tan",   1, 1,      math_tan;
+    MathAsin,  BuiltinKind::Namespace("Math"), "asin",  1, 1,      math_asin;
+    MathAcos,  BuiltinKind::Namespace("Math"), "acos",  1, 1,      math_acos;
+    MathAtan,  BuiltinKind::Namespace("Math"), "atan",  1, 1,      math_atan;
+    MathAtan2, BuiltinKind::Namespace("Math"), "atan2", 2, 2,      math_atan2;
+    MathHypot, BuiltinKind::Namespace("Math"), "hypot", 0, VARARG, math_hypot;
 
     // ── Number static ──
     NumberIsInteger,  BuiltinKind::Namespace("Number"), "isInteger",  1, 1, number_is_integer;
