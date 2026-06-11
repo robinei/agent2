@@ -185,8 +185,8 @@ fn simplify_cfg(code: Vec<Instr>, spans: Vec<u32>, next_label: u32) -> (Vec<Inst
                     work.push(idx);
                 }
             }
-            // Everything else (incl. Label, Call, Invoke, Raise, CallBuiltin,
-            // CallDyn) falls through to the next instruction.
+            // Everything else (incl. Label, Call, Invoke, Await, Raise,
+            // CallBuiltin, CallDyn) falls through to the next instruction.
             _ => work.push(i + 1),
         }
     }
@@ -313,8 +313,10 @@ fn pe_produces_bool(i: &Instr) -> bool {
 
 /// Operand count of a pure, deterministic, constant-foldable instruction (1 for
 /// unary, 2 for binary), or `None` if it isn't foldable. Excludes anything that
-/// touches the heap, frame, or host (`Local`, `ObjGet`, `Invoke`, builtins, …)
-/// and `And`/`Or` (rarely emitted; short-circuit lowers to jumps).
+/// touches the heap, frame, or host (`Local`, `ObjGet`, `Invoke`, `Await`,
+/// builtins, …) and `And`/`Or` (rarely emitted; short-circuit lowers to jumps).
+/// `Await` is an effect barrier exactly like `Invoke`: every pe_* table is an
+/// allow-list, so both are excluded from all of them by construction.
 fn pe_fold_arity(op: &Instr) -> Option<usize> {
     Some(match op {
         Instr::Neg

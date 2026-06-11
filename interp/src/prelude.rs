@@ -89,6 +89,15 @@ const HOFS: &[Hof] = &[
     },
 ];
 
+/// `Promise.all(xs)` lowers to `__all(xs)`: serial awaits over the input.
+/// Because every tool promise in `xs` was already started at its `tools.*`
+/// call site, awaiting them one by one IS full fan-out concurrency — the
+/// first pending await delivers the whole accumulated outbox to the host.
+/// `async` marks the body so `await` parses; in Tier 1 the flag is otherwise
+/// ignored (the body runs synchronously on the caller's stack).
+/// A non-promise element passes through `await` unchanged, like JS.
+const PROMISE_ALL: &str = "async function __all(ps) {\n  const r = [];\n  for (let i = 0; i < ps.length; i++) { r.push(await ps[i]); }\n  return r;\n}";
+
 /// Build the prelude source to append to `user_source`: the concatenated source
 /// of every helper whose method the program uses. Returns an empty string when
 /// the program uses no higher-order methods (so it compiles unchanged).
@@ -100,6 +109,14 @@ pub fn assemble(user_source: &str) -> String {
             out.push_str(hof.source);
             out.push('\n');
         }
+    }
+    // `Promise.all` is a namespace call, not a method on a receiver, so it
+    // gets its own (equally token-exact) detection. A false positive from
+    // `Promise.allSettled` is harmless: that call is a compile error anyway.
+    if uses_method(user_source, "all") && user_source.contains("Promise.all") {
+        out.push('\n');
+        out.push_str(PROMISE_ALL);
+        out.push('\n');
     }
     out
 }

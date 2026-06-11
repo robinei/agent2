@@ -1184,7 +1184,21 @@ impl<'src> Compiler<'src> {
             ast::Expression::ThisExpression(t) => {
                 self.error(t.span.start, "`this` is not supported")
             }
-            ast::Expression::NewExpression(n) => self.error(n.span.start, "`new` is not supported"),
+            ast::Expression::NewExpression(n) => {
+                // Targeted message for the misuse LLMs actually type: there is
+                // no executor pattern (7_ASYNC commitment 4) — every promise
+                // comes from a tool call or (Tier 2) an async function call,
+                // so all promises provably settle.
+                if matches!(&n.callee, ast::Expression::Identifier(id) if id.name == "Promise") {
+                    self.error(
+                        n.span.start,
+                        "`new Promise` is not supported: promises come only from `tools.*` calls \
+                         and async functions (there is no executor pattern)",
+                    )
+                } else {
+                    self.error(n.span.start, "`new` is not supported")
+                }
+            }
             other => self.error(other.span().start, "unsupported expression"),
         }
     }
@@ -2346,6 +2360,9 @@ impl<'src> Compiler<'src> {
                             self.emit(Instr::Invoke(method.into(), argv.len() as u32), span);
                             return;
                         }
+                        "Promise" => {
+                            return self.compile_promise_call(method, &argv, span);
+                        }
                         _ => {}
                     }
                 }
@@ -2532,6 +2549,40 @@ impl<'src> Compiler<'src> {
         match Builtin::for_namespace(ns, method) {
             Some(builtin) => self.compile_builtin_call(builtin, None, argv, span, false),
             None => self.error(span, format!("unsupported `{ns}.{method}`")),
+        }
+    }
+
+    /// `Promise.*` statics. Only `Promise.all(xs)` is supported (Phase 7
+    /// Tier 1), lowering to the prelude helper `__all(xs)` — serial awaits
+    /// over already-started promises, which is full fan-out concurrency
+    /// because every tool call in `xs` is already in flight. The rest are
+    /// rejected with diagnostics that say what to do instead.
+    fn compile_promise_call(&mut self, method: &str, argv: &[&ast::Expression], span: u32) {
+        match method {
+            "all" => {
+                if argv.len() != 1 {
+                    self.error(span, format!("`Promise.all` expects 1 argument, got {}", argv.len()));
+                    return;
+                }
+                self.emit_prelude_call("__all", argv[0], &[], span, false);
+            }
+            // Needs try/catch in the helper — follows once 6B lands.
+            "allSettled" => self.error(
+                span,
+                "`Promise.allSettled` is not supported yet (use `Promise.all`, or await each promise individually)",
+            ),
+            // Wait-any needs VM support — deferred until evidence demands it.
+            "race" | "any" => self.error(
+                span,
+                format!("`Promise.{method}` is not supported (await the promises you need directly)"),
+            ),
+            // Pointless wrappers in this dialect: `await` passes plain values
+            // through, and rejection is the error path, not a value.
+            "resolve" | "reject" => self.error(
+                span,
+                format!("`Promise.{method}` is not supported (`await` accepts plain values directly)"),
+            ),
+            _ => self.error(span, format!("unsupported `Promise.{method}`")),
         }
     }
 
