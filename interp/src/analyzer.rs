@@ -73,6 +73,8 @@ fn literal_const_value(expr: &ast::Expression) -> Option<ConstValue> {
 pub(crate) struct ParamInfo {
     pub(crate) name: String,
     pub(crate) has_default: bool,
+    /// True for the synthetic `...rest` parameter (the last entry when present).
+    pub(crate) is_rest: bool,
 }
 
 /// Pre-computed analysis for one function scope (including the top-level
@@ -266,6 +268,16 @@ impl FuncScope {
             slot_kinds: Vec::new(),
         }
     }
+
+    /// Caller-facing arity: declared params minus the trailing rest param (if
+    /// any). Callers must not pad an Undefined for the rest slot — the
+    /// prologue builds it from the surplus arguments.
+    pub(crate) fn declared_arity(&self) -> u32 {
+        match self.params.last() {
+            Some(p) if p.is_rest => (self.params.len() - 1) as u32,
+            _ => self.params.len() as u32,
+        }
+    }
 }
 
 /// Absolute frame slot for an own-local index under the `[params | upvals |
@@ -448,7 +460,7 @@ fn register_const_fns(scopes: &mut [FuncScope], const_fns: &HashSet<usize>) {
         };
         let val = ConstValue::Fn {
             label: scopes[sf].label,
-            arity: scopes[sf].params.len() as u32,
+            arity: scopes[sf].declared_arity(),
         };
         let slot = scopes[parent].names.get(&name).map(|i| i.slot);
         scopes[parent]
@@ -632,7 +644,7 @@ fn finalize_tables(
                         *span,
                         ConstValue::Fn {
                             label: s.label,
-                            arity: s.params.len() as u32,
+                            arity: s.declared_arity(),
                         },
                     );
                 } else {
@@ -1667,6 +1679,9 @@ impl Analyzer {
             self_name,
             is_declaration,
         );
+        if func.params.rest.is_some() {
+            scope.uses_arguments = true;
+        }
         let body = func.body.as_ref().map(|b| &b.statements[..]).unwrap_or(&[]);
         self.analyze_function_body(&mut scope, &func.params, body, scopes);
         self.push_scope(scope, scopes)
@@ -1681,6 +1696,9 @@ impl Analyzer {
         let label = self.new_label();
         let params = self.collect_params(&arrow.params);
         let mut scope = FuncScope::new(usize::MAX, label, arrow.span.start, params, None, false);
+        if arrow.params.rest.is_some() {
+            scope.uses_arguments = true;
+        }
         self.analyze_function_body(&mut scope, &arrow.params, &arrow.body.statements, scopes);
         self.push_scope(scope, scopes)
     }
@@ -1739,6 +1757,17 @@ impl Analyzer {
                 out.push(ParamInfo {
                     name: n,
                     has_default,
+                    is_rest: false,
+                });
+            }
+        }
+        if let Some(rest) = &params.rest {
+            let (names, _) = self.analyze_param_info(&rest.rest.argument);
+            for n in names {
+                out.push(ParamInfo {
+                    name: n,
+                    has_default: false,
+                    is_rest: true,
                 });
             }
         }

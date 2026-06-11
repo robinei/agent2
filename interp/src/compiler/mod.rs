@@ -442,12 +442,6 @@ impl<'src> Compiler<'src> {
                 self.destructure_binding(&ap.left, span);
             }
             ast::BindingPattern::ArrayPattern(arr) => {
-                if arr.rest.is_some() {
-                    self.error(
-                        arr.span.start,
-                        "rest elements in destructuring are not supported",
-                    );
-                }
                 for (i, el) in arr.elements.iter().enumerate() {
                     if let Some(el) = el {
                         self.emit(Instr::Pick(0), span);
@@ -456,13 +450,20 @@ impl<'src> Compiler<'src> {
                         self.destructure_binding(el, span);
                     }
                 }
+                if let Some(rest) = &arr.rest {
+                    // `arr.slice(elements.len())` gives remaining elements.
+                    self.emit(Instr::Pick(0), span);
+                    self.emit(Instr::PushPosInt(arr.elements.len() as u64), span);
+                    self.emit(Instr::CallBuiltin(Builtin::StrSlice, 2), span);
+                    self.destructure_binding(&rest.argument, span);
+                }
                 self.emit(Instr::Pop(1), span); // drop the source
             }
             ast::BindingPattern::ObjectPattern(obj) => {
                 if obj.rest.is_some() {
                     self.error(
                         obj.span.start,
-                        "rest elements in destructuring are not supported",
+                        "rest elements in object destructuring are not supported",
                     );
                 }
                 for prop in &obj.properties {
@@ -1974,12 +1975,6 @@ impl<'src> Compiler<'src> {
     fn destructure_assign(&mut self, target: &ast::AssignmentTarget, span: u32) {
         match target {
             ast::AssignmentTarget::ArrayAssignmentTarget(arr) => {
-                if arr.rest.is_some() {
-                    self.error(
-                        arr.span.start,
-                        "rest elements in destructuring are not supported",
-                    );
-                }
                 for (i, el) in arr.elements.iter().enumerate() {
                     if let Some(el) = el {
                         self.emit(Instr::Pick(0), span);
@@ -1987,6 +1982,12 @@ impl<'src> Compiler<'src> {
                         self.emit(Instr::IndexGet, span);
                         self.assign_maybe_default(el, span);
                     }
+                }
+                if let Some(rest) = &arr.rest {
+                    self.emit(Instr::Pick(0), span);
+                    self.emit(Instr::PushPosInt(arr.elements.len() as u64), span);
+                    self.emit(Instr::CallBuiltin(Builtin::StrSlice, 2), span);
+                    self.assign_target_leaf(&rest.target, span);
                 }
                 self.emit(Instr::Pop(1), span);
             }
@@ -2758,7 +2759,7 @@ impl<'src> Compiler<'src> {
         for &child_id in &scope.children {
             let child = &analysis.scopes[child_id];
             if child.is_declaration && child.self_name.as_deref() == Some(name) {
-                return child.params.len() as u32;
+                return child.declared_arity();
             }
         }
         0
@@ -2960,6 +2961,8 @@ impl<'src> Compiler<'src> {
             )
         };
         let nparams = params_info.len() as u32;
+        let has_rest = params_info.last().map(|p| p.is_rest).unwrap_or(false);
+        let nregular = if has_rest { nparams - 1 } else { nparams };
 
         let prev_scope = self.current_scope;
         self.current_scope = scope_id;
@@ -3003,12 +3006,33 @@ impl<'src> Compiler<'src> {
 
         // Per-parameter prologue: apply defaults (the arg is already in the slot)
         // and box captured params in place. Plain params with no default need no
-        // code — their value is already in the local slot.
+        // code — their value is already in the local slot.  Skip the rest param
+        // (if any) — it is handled separately below.
         for (p_idx, param_info) in params_info.iter().enumerate() {
+            if param_info.is_rest {
+                continue;
+            }
             let slot = p_idx as u32; // params occupy slots 0..nparams
             let needs_box = matches!(slot_kinds.get(p_idx).copied(), Some(SlotKind::Boxed));
             let default_expr = params.items[p_idx].initializer.as_ref().map(|v| &**v);
             self.emit_param_setup(slot, needs_box, param_info.has_default, default_expr, span);
+        }
+
+        // Rest parameter: build the rest array from `arguments.slice(nregular)`.
+        // `EnterFrame` eagerly built the arguments cache (see uses_arguments above)
+        // from ALL caller args before truncating to nparams, so `arguments` always
+        // holds the full argument list.  `arguments.slice(nregular)` gives the
+        // surplus elements that become the rest array.
+        if has_rest {
+            let rest_slot = nregular as u32;
+            let needs_box = matches!(slot_kinds.get(rest_slot as usize).copied(), Some(SlotKind::Boxed));
+            self.emit(Instr::Arguments, span);
+            self.emit(Instr::PushPosInt(nregular as u64), span);
+            self.emit(Instr::CallBuiltin(Builtin::StrSlice, 2), span);
+            self.emit(Instr::SetLocal(rest_slot as LocalIndex), span);
+            if needs_box {
+                self.emit(Instr::FreshCell(rest_slot as LocalIndex), span);
+            }
         }
 
         // Self-reference (named function expression / recursive declaration): the

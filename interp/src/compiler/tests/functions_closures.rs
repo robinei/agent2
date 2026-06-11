@@ -279,7 +279,6 @@ fn phase2_diagnostics() {
         "y = 1;",
         "break;",
         "continue;",
-        "let [a, ...rest] = [1, 2];",
         "outer: while (true) break outer;",
     ] {
         assert!(compile(src).is_err(), "expected `{src}` to fail to compile");
@@ -290,8 +289,6 @@ fn phase2_diagnostics() {
         "got: {}",
         errs[0].message
     );
-    let errs = compile("let [a, ...rest] = [1, 2];").expect_err("rest");
-    assert!(errs[0].message.contains("rest"), "got: {}", errs[0].message);
 }
 
 // ── Phase 3: functions / closures ─────────────────────────────────
@@ -511,6 +508,115 @@ fn sibling_block_shadowing_uses_distinct_bindings() {
             "let x = 1; let a; { let x = 2; a = x; } let b; { let x = 3; b = x; } let c = x; return { a, b, c };"
         ),
         serde_json::json!({"a": 2, "b": 3, "c": 1})
+    );
+}
+
+// ── rest parameters (A5) ────────────────────────────────────────────
+
+#[test]
+fn rest_param_basic() {
+    assert_eq!(
+        testutil::run_val("function f(...args) { return args.length; } return f(1, 2, 3);"),
+        testutil::num(3.0)
+    );
+    assert_eq!(
+        testutil::run_val("function f(...args) { return args[0]; } return f(10, 20);"),
+        Value::PosInt(10)
+    );
+}
+
+#[test]
+fn rest_param_with_regular_params() {
+    assert_eq!(
+        testutil::run_val("function f(a, b, ...rest) { return rest.length; } return f(1, 2, 3, 4, 5);"),
+        testutil::num(3.0)
+    );
+    assert_eq!(
+        testutil::run_val("function f(a, b, ...rest) { return rest[0]; } return f(1, 2, 3);"),
+        Value::PosInt(3)
+    );
+    assert_eq!(
+        testutil::run_val("function f(a, b, ...rest) { return rest[1]; } return f(1, 2, 3, 4);"),
+        Value::PosInt(4)
+    );
+}
+
+#[test]
+fn rest_param_no_surplus_args() {
+    // The caller must not pad an Undefined for the rest slot: `arguments`
+    // reflects only what was actually passed. Cover both the static-call
+    // path and the CallDyn path.
+    assert_eq!(
+        testutil::run_val("function f(...rest) { return arguments.length; } return f();"),
+        testutil::num(0.0)
+    );
+    assert_eq!(
+        testutil::run_val("function f(...rest) { return rest.length; } return f();"),
+        testutil::num(0.0)
+    );
+    assert_eq!(
+        testutil::run_val(
+            "function call(fn) { return fn(); } function f(...rest) { return arguments.length; } return call(f);"
+        ),
+        testutil::num(0.0)
+    );
+}
+
+#[test]
+fn rest_param_with_arguments() {
+    assert_eq!(
+        testutil::run_val("function f(...rest) { return arguments.length; } return f(1, 2, 3);"),
+        testutil::num(3.0)
+    );
+}
+
+// ── array destructuring rest (A5) ──────────────────────────────────
+
+#[test]
+fn array_destructuring_rest_declaration() {
+    assert_eq!(
+        testutil::run_val("let [a, ...rest] = [1, 2, 3, 4]; return a;"),
+        Value::PosInt(1)
+    );
+    assert_eq!(
+        testutil::run_val("let [a, ...rest] = [1, 2, 3, 4]; return rest.length;"),
+        testutil::num(3.0)
+    );
+    assert_eq!(
+        testutil::run_val("let [a, ...rest] = [1, 2, 3, 4]; return rest[0];"),
+        Value::PosInt(2)
+    );
+}
+
+#[test]
+fn array_destructuring_rest_empty() {
+    assert_eq!(
+        testutil::run_val("let [a, ...rest] = [1]; return a;"),
+        Value::PosInt(1)
+    );
+    assert_eq!(
+        testutil::run_val("let [a, ...rest] = [1]; return rest.length;"),
+        testutil::num(0.0)
+    );
+}
+
+#[test]
+fn array_destructuring_rest_only() {
+    assert_eq!(
+        testutil::run_val("let [...rest] = [1, 2, 3]; return rest.length;"),
+        testutil::num(3.0)
+    );
+    assert_eq!(
+        testutil::run_val("let [...rest] = [1, 2, 3]; return rest[0];"),
+        Value::PosInt(1)
+    );
+}
+
+#[test]
+fn array_destructuring_rest_assignment() {
+    assert_eq!(
+        testutil::run_ret("let a, rest; [a, ...rest] = [10, 20, 30]; return { a, rest };"),
+        serde_json::json!({"a": 10, "rest": [20, 30]})
     );
 }
 
