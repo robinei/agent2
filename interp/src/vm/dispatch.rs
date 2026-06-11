@@ -11,89 +11,7 @@ fn await_hint(v: &Value) -> &'static str {
 }
 
 impl VM {
-    /// Shared dispatch for `CallDyn` and `CallSpread`: the args are already
-    /// on the stack in left-to-right order (arg 0 deepest), with the callable
-    /// already popped.  Handles `Builtin`, `Fn`, `Closure`, and non-callable.
-    fn dispatch_call(&mut self, callable: Value, nargs: u32) -> Result<(), VMError> {
-        match callable {
-            Value::Builtin(b) => {
-                b.call(self, nargs)?;
-                self.ip += 1;
-            }
-            Value::Fn(addr) => self.static_call(addr, nargs, SmallVec::new())?,
-            Value::Closure(p) => {
-                let closure = self.closures.get(p as usize).ok_or_else(|| {
-                    self.fail_not_resumable(ErrorKind::ValueError, "bad closure pointer")
-                })?;
-                let addr = closure.addr;
-                let upvals: SmallVec<[Value; 8]> = closure.upvals.iter().cloned().collect();
-                self.static_call(addr, nargs, upvals)?
-            }
-            _ => {
-                let keep = self.stack.len().saturating_sub(nargs as usize);
-                self.stack.truncate(keep);
-                let msg = format!("cannot call a {} as a function", callable.type_name());
-                return Err(self.fail(ErrorKind::TypeError, msg));
-            }
-        }
-        Ok(())
-    }
-
-    fn static_call(
-        &mut self,
-        addr: CodeAddr,
-        nargs: u32,
-        upvals: SmallVec<[Value; 8]>,
-    ) -> Result<(), VMError> {
-        if addr as usize >= self.code.len() {
-            return Err(self.fail(ErrorKind::BadCall, "bad call target"));
-        }
-        if nargs as usize > self.stack.len() {
-            return Err(self.fail(ErrorKind::StackUnderflow, "stack underflow"));
-        }
-        // `fp` points at arg 0: the args ARE the callee's leading
-        // locals (slots 0..nargs). The prologue `EnterFrame` then
-        // normalizes them to exactly `nparams`. No copy.
-        self.callstack.push(CallFrame {
-            arg_count: nargs,
-            local_count: nargs,
-            return_addr: self.ip + 1,
-            prev_fp: self.fp,
-            arguments_cache: None,
-            pending_upvals: upvals,
-        });
-        self.ip = addr;
-        self.fp = (self.stack.len() as u32) - nargs;
-        self.cur_local_count = nargs;
-        Ok(())
-    }
-
-    /// Execute until an effect, completion, or error. A *catchable* error —
-    /// a `TypeError`/`ValueError` whose operands were fully consumed
-    /// (`PushValueThenContinue`, the Phase 3 pop-first invariant) — raised
-    /// while a `try` handler is active is materialized as a
-    /// `{ name, message }` error object and unwound to the handler instead
-    /// of escalating (6_LANGUAGE Part B). Everything else (`OutOfFuel`,
-    /// `NotResumable` invariant errors) escalates as before, so a program
-    /// cannot trap its own kill switch. `raise` is unaffected: it yields
-    /// `StepResult::Raise` (an `Ok`), never an error, so no `try` can
-    /// swallow it.
-    pub fn step(&mut self) -> Result<StepResult, VMError> {
-        loop {
-            match self.dispatch() {
-                Err(e)
-                    if matches!(e.resume, ResumeMode::PushValueThenContinue)
-                        && !self.handlers.is_empty() =>
-                {
-                    let thrown = self.error_to_thrown(&e);
-                    self.unwind_to_handler(thrown);
-                }
-                other => return other,
-            }
-        }
-    }
-
-    fn dispatch(&mut self) -> Result<StepResult, VMError> {
+    pub(crate) fn dispatch(&mut self) -> Result<StepResult, VMError> {
         // ── macros for repetitive instruction shapes ─────────────────
 
         /// Pop one operand, coerce ToNumber (JS), apply f64→f64, push Number.
@@ -172,12 +90,12 @@ impl VM {
 
         /// Pop rhs then lhs, compare with self.compare(), push Bool.
         macro_rules! cmp_op {
-            ($expected:ident) => {{
+            ($cmp:tt $expected:ident) => {{
                 let rhs = self.pop()?;
                 let lhs = self.pop()?;
                 let result = lhs
                     .compare(&rhs)
-                    .map(|ord| ord == std::cmp::Ordering::$expected)
+                    .map(|ord| ord $cmp std::cmp::Ordering::$expected)
                     .unwrap_or(false);
                 self.stack.push(Value::Bool(result));
                 self.ip += 1;
@@ -306,7 +224,7 @@ impl VM {
                 }
 
                 // ── control flow ─────────────────────────────────
-                Instr::Call(addr, nargs) => self.static_call(*addr, *nargs, SmallVec::new())?,
+                Instr::Call(addr, nargs) => self.call_function(*addr, *nargs, SmallVec::new())?,
 
                 Instr::CallDyn(nargs) => {
                     let nargs = *nargs;
@@ -346,10 +264,7 @@ impl VM {
                 }
 
                 Instr::MakeClosure(addr, captures) => {
-                    let addr = *addr;
-                    if addr as usize >= self.code.len() {
-                        return Err(self.fail(ErrorKind::BadCall, "bad call target"));
-                    }
+                    let addr = self.validate_func_addr(*addr)?;
                     // Collect into stack-allocated SmallVec instead of cloning
                     // the ThinVec from self.code. LocalIndex is u32 (Copy).
                     let captures: SmallVec<[LocalIndex; 8]> = captures.iter().copied().collect();
@@ -413,17 +328,11 @@ impl VM {
                 }
 
                 Instr::Jump(addr) => {
-                    if *addr as usize > self.code.len() {
-                        return Err(self.fail(ErrorKind::BadCall, "bad call target"));
-                    }
-                    self.ip = *addr;
+                    self.ip = self.validate_jump_addr(*addr)?;
                 }
 
                 Instr::JFalse(addr) => {
-                    let addr = *addr;
-                    if addr as usize > self.code.len() {
-                        return Err(self.fail(ErrorKind::BadCall, "bad call target"));
-                    }
+                    let addr = self.validate_jump_addr(*addr)?;
                     let val = self.pop()?;
                     if !val.is_truthy() {
                         self.ip = addr;
@@ -433,10 +342,7 @@ impl VM {
                 }
 
                 Instr::JTrue(addr) => {
-                    let addr = *addr;
-                    if addr as usize > self.code.len() {
-                        return Err(self.fail(ErrorKind::BadCall, "bad call target"));
-                    }
+                    let addr = self.validate_jump_addr(*addr)?;
                     let val = self.pop()?;
                     if val.is_truthy() {
                         self.ip = addr;
@@ -446,18 +352,13 @@ impl VM {
                 }
 
                 Instr::JNotNullish(addr) => {
-                    if *addr as usize > self.code.len() {
-                        return Err(self.fail(ErrorKind::BadCall, "bad call target"));
-                    }
+                    let addr = self.validate_jump_addr(*addr)?;
                     // Taken: leave the value for the branch that proceeds with
                     // it. Fall-through: pop it — the emitter short-circuits
                     // past the value (see the instruction doc).
-                    let val = self
-                        .stack
-                        .last()
-                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
+                    let val = self.peek()?;
                     if !matches!(val, Value::Null | Value::Undefined) {
-                        self.ip = *addr;
+                        self.ip = addr;
                     } else {
                         self.stack.pop();
                         self.ip += 1;
@@ -613,11 +514,7 @@ impl VM {
                     if (*local as u32) >= self.cur_local_count {
                         return Err(self.fail(ErrorKind::BadLocal, "bad local"));
                     }
-                    let val = self
-                        .stack
-                        .last()
-                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?
-                        .clone();
+                    let val = self.peek()?.clone();
                     let slot = (self.fp + *local as u32) as usize;
                     // Like SetLocal but peeks: the value stays on the stack
                     // (assignment is an expression) while still writing to the
@@ -858,28 +755,10 @@ impl VM {
                     self.ip += 1;
                 }
 
-                Instr::Lt => cmp_op!(Less),
-                Instr::Gt => cmp_op!(Greater),
-                Instr::LtEq => {
-                    let rhs = self.pop()?;
-                    let lhs = self.pop()?;
-                    let result = lhs
-                        .compare(&rhs)
-                        .map(|ord| ord != std::cmp::Ordering::Greater)
-                        .unwrap_or(false);
-                    self.stack.push(Value::Bool(result));
-                    self.ip += 1;
-                }
-                Instr::GtEq => {
-                    let rhs = self.pop()?;
-                    let lhs = self.pop()?;
-                    let result = lhs
-                        .compare(&rhs)
-                        .map(|ord| ord != std::cmp::Ordering::Less)
-                        .unwrap_or(false);
-                    self.stack.push(Value::Bool(result));
-                    self.ip += 1;
-                }
+                Instr::Lt => cmp_op!(== Less),
+                Instr::Gt => cmp_op!(== Greater),
+                Instr::LtEq => cmp_op!(!= Greater),
+                Instr::GtEq => cmp_op!(!= Less),
 
                 Instr::And => {
                     let rhs = self.pop()?;
@@ -1427,10 +1306,7 @@ impl VM {
                     // pending so the same Await can run again after the host
                     // settles the promise (`StepResult::Pending` leaves ip
                     // unchanged). A non-promise passes through unchanged.
-                    let top = self
-                        .stack
-                        .last()
-                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
+                    let top = self.peek()?;
                     let id = match top {
                         Value::Promise(id) => *id,
                         _ => {
@@ -1515,10 +1391,7 @@ impl VM {
 
                 // ── exceptions (6_LANGUAGE Part B) ──────────────
                 Instr::TryEnter(addr) => {
-                    let addr = *addr;
-                    if addr as usize > self.code.len() {
-                        return Err(self.fail(ErrorKind::BadCall, "bad call target"));
-                    }
+                    let addr = self.validate_jump_addr(*addr)?;
                     self.handlers.push(HandlerEntry {
                         catch_ip: addr,
                         stack_len: self.stack.len(),

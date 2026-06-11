@@ -372,6 +372,12 @@ impl VM {
         RcStr::from(out)
     }
 
+    pub(super) fn peek(&self) -> Result<&Value, VMError> {
+        self.stack
+            .last()
+            .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))
+    }
+
     pub(super) fn pop(&mut self) -> Result<Value, VMError> {
         self.stack
             .pop()
@@ -563,5 +569,101 @@ impl VM {
                 self.alloc_object(map)
             }
         })
+    }
+
+    #[inline]
+    pub(crate) fn validate_func_addr(&self, addr: CodeAddr) -> Result<CodeAddr, VMError> {
+        if addr as usize >= self.code.len() {
+            return Err(self.fail(ErrorKind::BadCall, "bad call target"));
+        }
+        Ok(addr)
+    }
+
+    #[inline]
+    pub(crate) fn validate_jump_addr(&self, addr: CodeAddr) -> Result<CodeAddr, VMError> {
+        if addr as usize > self.code.len() {
+            return Err(self.fail(ErrorKind::BadCall, "bad jump target"));
+        }
+        Ok(addr)
+    }
+
+    /// Shared dispatch for `CallDyn` and `CallSpread`: the args are already
+    /// on the stack in left-to-right order (arg 0 deepest), with the callable
+    /// already popped.  Handles `Builtin`, `Fn`, `Closure`, and non-callable.
+    pub(crate) fn dispatch_call(&mut self, callable: Value, nargs: u32) -> Result<(), VMError> {
+        match callable {
+            Value::Builtin(b) => {
+                b.call(self, nargs)?;
+                self.ip += 1;
+            }
+            Value::Fn(addr) => self.call_function(addr, nargs, SmallVec::new())?,
+            Value::Closure(p) => {
+                let closure = self.closures.get(p as usize).ok_or_else(|| {
+                    self.fail_not_resumable(ErrorKind::ValueError, "bad closure pointer")
+                })?;
+                let addr = closure.addr;
+                let upvals: SmallVec<[Value; 8]> = closure.upvals.iter().cloned().collect();
+                self.call_function(addr, nargs, upvals)?
+            }
+            _ => {
+                let keep = self.stack.len().saturating_sub(nargs as usize);
+                self.stack.truncate(keep);
+                let msg = format!("cannot call a {} as a function", callable.type_name());
+                return Err(self.fail(ErrorKind::TypeError, msg));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn call_function(
+        &mut self,
+        addr: CodeAddr,
+        nargs: u32,
+        upvals: SmallVec<[Value; 8]>,
+    ) -> Result<(), VMError> {
+        let addr = self.validate_func_addr(addr)?;
+        if nargs as usize > self.stack.len() {
+            return Err(self.fail(ErrorKind::StackUnderflow, "stack underflow"));
+        }
+        // `fp` points at arg 0: the args ARE the callee's leading
+        // locals (slots 0..nargs). The prologue `EnterFrame` then
+        // normalizes them to exactly `nparams`. No copy.
+        self.callstack.push(CallFrame {
+            arg_count: nargs,
+            local_count: nargs,
+            return_addr: self.ip + 1,
+            prev_fp: self.fp,
+            arguments_cache: None,
+            pending_upvals: upvals,
+        });
+        self.ip = addr;
+        self.fp = (self.stack.len() as u32) - nargs;
+        self.cur_local_count = nargs;
+        Ok(())
+    }
+
+    /// Execute until an effect, completion, or error. A *catchable* error —
+    /// a `TypeError`/`ValueError` whose operands were fully consumed
+    /// (`PushValueThenContinue`, the Phase 3 pop-first invariant) — raised
+    /// while a `try` handler is active is materialized as a
+    /// `{ name, message }` error object and unwound to the handler instead
+    /// of escalating (6_LANGUAGE Part B). Everything else (`OutOfFuel`,
+    /// `NotResumable` invariant errors) escalates as before, so a program
+    /// cannot trap its own kill switch. `raise` is unaffected: it yields
+    /// `StepResult::Raise` (an `Ok`), never an error, so no `try` can
+    /// swallow it.
+    pub fn step(&mut self) -> Result<StepResult, VMError> {
+        loop {
+            match self.dispatch() {
+                Err(e)
+                    if matches!(e.resume, ResumeMode::PushValueThenContinue)
+                        && !self.handlers.is_empty() =>
+                {
+                    let thrown = self.error_to_thrown(&e);
+                    self.unwind_to_handler(thrown);
+                }
+                other => return other,
+            }
+        }
     }
 }

@@ -472,5 +472,5 @@ impl VMError {
 
 // ── submodules ──────────────────────────────────────────────
 
+mod dispatch;
 mod methods;
-mod step;
