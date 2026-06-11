@@ -4,8 +4,30 @@
 > `compiler/tests/async_await.rs` and the effects section of `vm/tests.rs`
 > for the executable contract). One deliberate addition beyond this plan:
 > `new Promise(...)` gets a targeted compile diagnostic (commitment 4 made
-> visible to the LLM), and `Promise.resolve`/`reject` likewise. Tier 2 not
-> started.
+> visible to the LLM), and `Promise.resolve`/`reject` likewise.
+>
+> **Tier 2 is DEFERRED, evidence-gated (decided 2026-06-11).** Tier 1
+> already gives full tool-level fan-out (start calls, await after), and
+> fixed-depth pipelines restructure into phases with the same round-trip
+> count (`const as = await Promise.all(items.map(it => tools.f(it)));
+> const bs = await Promise.all(as.map(a => tools.g(a)));` — the documented
+> Tier 1 idiom). What Tier 2 uniquely adds is concurrency for per-item
+> chains with data-dependent control flow (retry loops / conditionals on
+> intermediate results inside `async it => …` callbacks), which in Tier 1
+> run correctly but serially. **Trigger to revisit:** real LLM-written
+> programs observed with such chains, where the serialized latency
+> actually hurts (the event log will show repeated single-call `Pending`
+> yields). The failure mode of deferral is latency only, never wrongness.
+>
+> **Sequencing decision: 6B (try/catch) lands BEFORE any Tier 2 work.**
+> 6B is unblocked (Phase 3 done), immediately lets programs catch rejected
+> awaits locally instead of escalating to the host, unlocks
+> `Promise.allSettled`, and means Tier 2's continuation records would be
+> built once against the final frame shape (handler-stack entries
+> designed in, not retrofitted). When 6B lands, extend the `Await`
+> rejected arm: dispatch to an active handler if one covers the frame,
+> else escalate via the Phase 3 path as today; update the resume-audit
+> table row accordingly.
 
 Real async/await, replacing both today's synchronous `Invoke` batching and
 the "transparent await" stopgap (4_FUTURE item 1, superseded by this file).
