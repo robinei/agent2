@@ -572,6 +572,138 @@ fn rest_param_with_arguments() {
     );
 }
 
+// ── parameter destructuring ─────────────────────────────────────────
+
+#[test]
+fn param_destructuring_object() {
+    assert_eq!(
+        testutil::run_val("function f({a, b}) { return a + b; } return f({a: 1, b: 2});"),
+        testutil::num(3.0)
+    );
+    // Renamed and nested bindings.
+    assert_eq!(
+        testutil::run_val(
+            "function f({a: x, c: {d}}) { return x + d; } return f({a: 1, c: {d: 2}});"
+        ),
+        testutil::num(3.0)
+    );
+    // Object rest inside a param pattern.
+    assert_eq!(
+        testutil::run_val(
+            "function f({a, ...rest}) { return rest.b + rest.c; } return f({a: 1, b: 2, c: 3});"
+        ),
+        testutil::num(5.0)
+    );
+}
+
+#[test]
+fn param_destructuring_array() {
+    assert_eq!(
+        testutil::run_val("function f([a, b]) { return a * 10 + b; } return f([1, 2]);"),
+        testutil::num(12.0)
+    );
+    // Skipped element and array rest.
+    assert_eq!(
+        testutil::run_val(
+            "function f([, b, ...rest]) { return b + rest.length; } return f([1, 2, 3, 4]);"
+        ),
+        testutil::num(4.0)
+    );
+}
+
+#[test]
+fn param_destructuring_arrow() {
+    // The single-binding arrow form used to silently bind the whole argument.
+    assert_eq!(
+        testutil::run_val("const f = ({a}) => a; return f({a: 7});"),
+        Value::PosInt(7)
+    );
+    assert_eq!(
+        testutil::run_val("const f = ([x], {y}) => x + y; return f([1], {y: 2});"),
+        testutil::num(3.0)
+    );
+}
+
+#[test]
+fn param_destructuring_defaults() {
+    // Whole-pattern default applies when the argument is missing/undefined…
+    assert_eq!(
+        testutil::run_val("function f({a} = {a: 5}) { return a; } return f();"),
+        Value::PosInt(5)
+    );
+    // …and is skipped when one is supplied.
+    assert_eq!(
+        testutil::run_val("function f({a} = {a: 5}) { return a; } return f({a: 9});"),
+        Value::PosInt(9)
+    );
+    // Inner pattern defaults.
+    assert_eq!(
+        testutil::run_val("function f({a = 1, b = 2}) { return a + b; } return f({a: 10});"),
+        testutil::num(12.0)
+    );
+    // An inner default may reference an earlier parameter.
+    assert_eq!(
+        testutil::run_val("function f(a, {b = a}) { return b; } return f(5, {});"),
+        Value::PosInt(5)
+    );
+}
+
+#[test]
+fn param_destructuring_positions_and_arity() {
+    // Pattern params keep one slot each, so surrounding positional params
+    // stay aligned — including through the dynamic-call path.
+    assert_eq!(
+        testutil::run_val(
+            "function f(x, {a, b}, y) { return x + a + b + y; } return f(1, {a: 2, b: 3}, 4);"
+        ),
+        testutil::num(10.0)
+    );
+    assert_eq!(
+        testutil::run_val(
+            "function call(fn) { return fn(1, {a: 2, b: 3}, 4); } \
+             function f(x, {a, b}, y) { return x + a + b + y; } return call(f);"
+        ),
+        testutil::num(10.0)
+    );
+    // A missing trailing pattern argument is padded undefined → default applies.
+    assert_eq!(
+        testutil::run_val("function f(x, {a} = {a: 3}) { return x + a; } return f(1);"),
+        testutil::num(4.0)
+    );
+}
+
+#[test]
+fn param_destructuring_rest_pattern() {
+    assert_eq!(
+        testutil::run_val("function f(...[a, b]) { return a + b; } return f(1, 2);"),
+        testutil::num(3.0)
+    );
+    assert_eq!(
+        testutil::run_val(
+            "function f(x, ...[a, ...rest]) { return x + a + rest.length; } return f(1, 2, 3, 4);"
+        ),
+        testutil::num(5.0)
+    );
+}
+
+#[test]
+fn param_destructuring_captured_bindings() {
+    // A captured pattern leaf is boxed (EnterFrame allocates its cell;
+    // the prologue destructure writes through it).
+    assert_eq!(
+        testutil::run_val("function f({a}) { return () => a; } const g = f({a: 42}); return g();"),
+        Value::PosInt(42)
+    );
+    // Mutation through the shared cell.
+    assert_eq!(
+        testutil::run_val(
+            "function f({n}) { return () => { n += 1; return n; }; } \
+             const g = f({n: 0}); g(); return g();"
+        ),
+        testutil::num(2.0)
+    );
+}
+
 // ── array destructuring rest (A5) ──────────────────────────────────
 
 #[test]

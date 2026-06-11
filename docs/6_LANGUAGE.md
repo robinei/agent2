@@ -94,11 +94,12 @@ Status: all three rest forms landed (object rest is copy-minus-keys via
 evaluate exactly once). Destructuring also works in `for-of`/`for-in`
 declaration heads (`for (const [k, v] of Object.entries(o))`), reusing the
 normal pattern lowering per iteration. Function-*parameter* destructuring
-(`function f({a, b})`) remains unsupported and is rejected with a clean
-diagnostic — it previously panicked the compiler (≥2 bindings) or silently
-bound the whole argument (1 binding). Implementing it needs the analyzer to
-keep one param slot per declared parameter and destructure in the prologue;
-add as a follow-up if evidence demands.
+(`function f({a, b})`, pattern rest `f(...[a, b])` included) also landed:
+the analyzer keeps one anonymous param slot per declared pattern (empty
+name — not a legal identifier, so never referenced or captured) and declares
+the pattern's bindings as ordinary own locals; the prologue loads the slot,
+applies the whole-pattern default, and reuses the normal pattern lowering.
+No new instructions; identifier-only param lists compile unchanged.
 
 ## Part B — try / catch / throw (after Phase 3)
 

@@ -1714,7 +1714,16 @@ impl Analyzer {
     ) {
         let mut block_scopes: BlockScopes = vec![IndexMap::new()];
         let mut next_slot = scope.params.len() as u32;
+        // A nested function is a fresh frame: its bindings are not per-iteration
+        // with respect to any loop enclosing the *definition*. Reset loop depth
+        // for the whole body walk (including pattern-param bindings, which must
+        // not be marked loop-declared) and restore it afterwards.
+        let saved_loop_depth = std::mem::replace(&mut self.loop_depth, 0);
         for (i, p) in scope.params.iter().enumerate() {
+            if p.name.is_empty() {
+                // Destructuring param: anonymous slot, bindings declared below.
+                continue;
+            }
             block_scopes[0].insert(
                 p.name.clone(),
                 NameRes::Slot {
@@ -1730,6 +1739,38 @@ impl Analyzer {
                 },
             );
         }
+        // Destructuring params: each pattern's bindings are ordinary own locals
+        // (the compiler's prologue destructures the anonymous param slot into
+        // them). This also analyzes inner pattern defaults (`{a = 1}`).
+        for p in &params.items {
+            if !matches!(&p.pattern, ast::BindingPattern::BindingIdentifier(_)) {
+                self.analyze_declare_pattern(
+                    &p.pattern,
+                    false,
+                    false,
+                    scope,
+                    &mut block_scopes,
+                    &mut next_slot,
+                    scopes,
+                );
+            }
+        }
+        if let Some(rest) = &params.rest {
+            if !matches!(
+                &rest.rest.argument,
+                ast::BindingPattern::BindingIdentifier(_)
+            ) {
+                self.analyze_declare_pattern(
+                    &rest.rest.argument,
+                    false,
+                    false,
+                    scope,
+                    &mut block_scopes,
+                    &mut next_slot,
+                    scopes,
+                );
+            }
+        }
         // Param default expressions (`function f(a, b = a)`) — params are now in
         // scope, so a default may reference an earlier one.
         for p in &params.items {
@@ -1738,72 +1779,39 @@ impl Analyzer {
             }
         }
         self.analyze_hoist(body, scope, &mut block_scopes, &mut next_slot);
-        // A nested function is a fresh frame: its bindings are not per-iteration
-        // with respect to any loop enclosing the *definition*. Reset loop depth
-        // for the body walk and restore it afterwards.
-        let saved_loop_depth = std::mem::replace(&mut self.loop_depth, 0);
         self.analyze_stmts(body, scope, &mut block_scopes, &mut next_slot, scopes);
         self.loop_depth = saved_loop_depth;
         scope.own_local_count = next_slot;
     }
 
-    /// Flatten formal parameters into ordered `ParamInfo` (one per binding name).
+    /// Build ordered `ParamInfo`, one slot per declared parameter (so the
+    /// caller's positional argument layout matches the callee's param slots).
+    /// A destructuring pattern gets an anonymous slot (empty name — not a legal
+    /// identifier, so it can never be referenced or captured); its bindings are
+    /// declared as ordinary own locals by `analyze_function_body` and filled by
+    /// the compiler's prologue destructuring.
     fn collect_params(&self, params: &ast::FormalParameters) -> Vec<ParamInfo> {
+        fn param_name(pat: &ast::BindingPattern) -> String {
+            match pat {
+                ast::BindingPattern::BindingIdentifier(id) => id.name.as_str().to_string(),
+                _ => String::new(),
+            }
+        }
         let mut out = Vec::new();
         for param in &params.items {
-            let has_default = param.initializer.is_some();
-            let (names, _) = self.analyze_param_info(&param.pattern);
-            for n in names {
-                out.push(ParamInfo {
-                    name: n,
-                    has_default,
-                    is_rest: false,
-                });
-            }
+            out.push(ParamInfo {
+                name: param_name(&param.pattern),
+                has_default: param.initializer.is_some(),
+                is_rest: false,
+            });
         }
         if let Some(rest) = &params.rest {
-            let (names, _) = self.analyze_param_info(&rest.rest.argument);
-            for n in names {
-                out.push(ParamInfo {
-                    name: n,
-                    has_default: false,
-                    is_rest: true,
-                });
-            }
+            out.push(ParamInfo {
+                name: param_name(&rest.rest.argument),
+                has_default: false,
+                is_rest: true,
+            });
         }
         out
-    }
-
-    /// Extract binding names (recursively) from a parameter pattern.
-    fn analyze_param_info(&self, pat: &ast::BindingPattern) -> (Vec<String>, bool) {
-        match pat {
-            ast::BindingPattern::BindingIdentifier(id) => {
-                (vec![id.name.as_str().to_string()], false)
-            }
-            ast::BindingPattern::AssignmentPattern(ap) => {
-                let (names, _) = self.analyze_param_info(&ap.left);
-                (names, true)
-            }
-            ast::BindingPattern::ArrayPattern(arr) => {
-                let mut names = Vec::new();
-                for el in arr.elements.iter().flatten() {
-                    names.extend(self.analyze_param_info(el).0);
-                }
-                if let Some(rest) = &arr.rest {
-                    names.extend(self.analyze_param_info(&rest.argument).0);
-                }
-                (names, false)
-            }
-            ast::BindingPattern::ObjectPattern(obj) => {
-                let mut names = Vec::new();
-                for prop in &obj.properties {
-                    names.extend(self.analyze_param_info(&prop.value).0);
-                }
-                if let Some(rest) = &obj.rest {
-                    names.extend(self.analyze_param_info(&rest.argument).0);
-                }
-                (names, false)
-            }
-        }
     }
 }

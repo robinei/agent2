@@ -3098,32 +3098,6 @@ impl<'src> Compiler<'src> {
                 scope.captures.clone(),
             )
         };
-        // Destructuring params are not supported: the analyzer flattens each
-        // pattern's bindings into separate param slots, which desyncs the
-        // caller's argument layout from the callee's. Reject cleanly (compile
-        // aborts on diagnostics, so bailing here leaves no dangling label).
-        for item in &params.items {
-            if !matches!(&item.pattern, ast::BindingPattern::BindingIdentifier(_)) {
-                self.error(
-                    item.pattern.span().start,
-                    "destructuring in function parameters is not supported",
-                );
-                return;
-            }
-        }
-        if let Some(rest) = &params.rest {
-            if !matches!(
-                &rest.rest.argument,
-                ast::BindingPattern::BindingIdentifier(_)
-            ) {
-                self.error(
-                    rest.rest.argument.span().start,
-                    "destructuring in function parameters is not supported",
-                );
-                return;
-            }
-        }
-
         let nparams = params_info.len() as u32;
         let has_rest = params_info.last().map(|p| p.is_rest).unwrap_or(false);
         let nregular = if has_rest { nparams - 1 } else { nparams };
@@ -3177,9 +3151,25 @@ impl<'src> Compiler<'src> {
                 continue;
             }
             let slot = p_idx as u32; // params occupy slots 0..nparams
-            let needs_box = matches!(slot_kinds.get(p_idx).copied(), Some(SlotKind::Boxed));
-            let default_expr = params.items[p_idx].initializer.as_ref().map(|v| &**v);
-            self.emit_param_setup(slot, needs_box, param_info.has_default, default_expr, span);
+            let item = &params.items[p_idx];
+            if matches!(&item.pattern, ast::BindingPattern::BindingIdentifier(_)) {
+                let needs_box = matches!(slot_kinds.get(p_idx).copied(), Some(SlotKind::Boxed));
+                let default_expr = item.initializer.as_ref().map(|v| &**v);
+                self.emit_param_setup(slot, needs_box, param_info.has_default, default_expr, span);
+            } else {
+                // Destructuring param: the argument sits in an anonymous slot
+                // (never captured — its name is not a legal identifier). Load
+                // it, apply the whole-pattern default, and run the normal
+                // pattern lowering into the leaf bindings (own locals; captured
+                // ones got their cells from `EnterFrame`, and `SetLocal`
+                // writes through cells).
+                let pat_span = item.span.start;
+                self.emit(Instr::Local(slot as LocalIndex), pat_span);
+                if let Some(default) = &item.initializer {
+                    self.emit_default(default, pat_span);
+                }
+                self.destructure_binding(&item.pattern, pat_span);
+            }
         }
 
         // Rest parameter: build the rest array from `arguments.slice(nregular)`.
@@ -3189,16 +3179,28 @@ impl<'src> Compiler<'src> {
         // surplus elements that become the rest array.
         if has_rest {
             let rest_slot = nregular as u32;
-            let needs_box = matches!(
-                slot_kinds.get(rest_slot as usize).copied(),
-                Some(SlotKind::Boxed)
-            );
             self.emit(Instr::Arguments, span);
             self.emit(Instr::PushPosInt(nregular as u64), span);
             self.emit(Instr::CallBuiltin(Builtin::StrSlice, 2), span);
-            self.emit(Instr::SetLocal(rest_slot as LocalIndex), span);
-            if needs_box {
-                self.emit(Instr::FreshCell(rest_slot as LocalIndex), span);
+            let rest_pat = &params
+                .rest
+                .as_ref()
+                .expect("has_rest implies rest")
+                .rest
+                .argument;
+            if matches!(rest_pat, ast::BindingPattern::BindingIdentifier(_)) {
+                let needs_box = matches!(
+                    slot_kinds.get(rest_slot as usize).copied(),
+                    Some(SlotKind::Boxed)
+                );
+                self.emit(Instr::SetLocal(rest_slot as LocalIndex), span);
+                if needs_box {
+                    self.emit(Instr::FreshCell(rest_slot as LocalIndex), span);
+                }
+            } else {
+                // Pattern rest (`...[a, b]`): destructure the freshly built
+                // array directly; the anonymous rest slot stays undefined.
+                self.destructure_binding(rest_pat, rest_pat.span().start);
             }
         }
 

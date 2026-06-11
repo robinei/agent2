@@ -80,7 +80,9 @@ fn for_of_in_diagnostics() {
 }
 
 #[test]
-fn destructuring_params_are_rejected() {
+fn destructuring_params_compile() {
+    // Previously rejected (and before that, a compiler panic) — now supported.
+    // Behavioral coverage lives in functions_closures.rs.
     for src in [
         "function f({a, b}) { return a; } return f({a: 1});",
         "function f([a]) { return a; } return f([1]);",
@@ -88,12 +90,7 @@ fn destructuring_params_are_rejected() {
         "const f = ({a}) => a; return f({a: 7});",
         "function f(...[a, b]) { return a; } return f(1, 2);",
     ] {
-        let errs = compile(src).expect_err("should fail");
-        assert!(
-            errs.iter().any(|d| d.message.contains("parameters")),
-            "expected param-destructuring rejection for `{src}`, got: {:?}",
-            errs.iter().map(|d| &d.message).collect::<Vec<_>>()
-        );
+        assert!(compile(src).is_ok(), "expected `{src}` to compile");
     }
 }
 
