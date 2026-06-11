@@ -171,6 +171,55 @@ fn for_of_string_chars() {
 }
 
 #[test]
+fn for_of_destructuring_array_pattern() {
+    assert_eq!(
+        testutil::run_val(
+            "let s = 0; for (const [a, b] of [[1, 2], [3, 4]]) { s += a * b; } return s;"
+        ),
+        testutil::num(14.0)
+    );
+    // The Object.entries idiom.
+    assert_eq!(
+        testutil::run_ret(
+            "let out = ''; for (const [k, v] of Object.entries({a: 1, b: 2})) { out += k + v; } return out;"
+        ),
+        serde_json::json!("a1b2")
+    );
+}
+
+#[test]
+fn for_of_destructuring_object_pattern() {
+    assert_eq!(
+        testutil::run_val(
+            "let s = 0; for (const {x, y = 10} of [{x: 1, y: 2}, {x: 3}]) { s += x + y; } return s;"
+        ),
+        testutil::num(16.0)
+    );
+}
+
+#[test]
+fn for_of_destructuring_with_rest() {
+    assert_eq!(
+        testutil::run_ret(
+            "let out = []; for (const [head, ...tail] of [[1, 2, 3], [4]]) { out.push([head, tail.length]); } return out;"
+        ),
+        serde_json::json!([[1, 2], [4, 0]])
+    );
+}
+
+#[test]
+fn for_of_destructured_bindings_fresh_per_iteration() {
+    // Captured pattern bindings get a fresh cell each iteration, like the
+    // single-identifier head form.
+    assert_eq!(
+        testutil::run_ret(
+            "let fns = []; for (const [v] of [[1], [2], [3]]) { fns.push(() => v); } let out = []; for (const f of fns) { out.push(f()); } return out;"
+        ),
+        serde_json::json!([1, 2, 3])
+    );
+}
+
+#[test]
 fn for_of_break_and_continue() {
     assert_eq!(
         testutil::run_val(

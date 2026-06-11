@@ -881,13 +881,13 @@ impl<'src> Compiler<'src> {
     /// non-array/string iterable is a runtime `TypeError` (from `ArrLength`).
     fn compile_for_of(&mut self, s: &ast::ForOfStatement) {
         let span = s.span.start;
-        let Some(slot) = self.for_loop_binding_slot(&s.left, span) else {
+        let Some(pat) = self.for_loop_binding_pattern(&s.left, span) else {
             return;
         };
         // Push the iterable; `compile_index_loop` adds the counter and consumes
         // both at the end.
         self.compile_expr(&s.right);
-        self.compile_index_loop(slot, &s.body, span);
+        self.compile_index_loop(pat, &s.body, span);
     }
 
     /// `for (let k in obj) body` — iterate the keys of an object (insertion
@@ -896,23 +896,23 @@ impl<'src> Compiler<'src> {
     /// key. Over `state` this enumerates the blessed object's keys.
     fn compile_for_in(&mut self, s: &ast::ForInStatement) {
         let span = s.span.start;
-        let Some(slot) = self.for_loop_binding_slot(&s.left, span) else {
+        let Some(pat) = self.for_loop_binding_pattern(&s.left, span) else {
             return;
         };
         self.compile_expr(&s.right);
         self.emit(Instr::CallBuiltin(Builtin::ObjKeys, 1), span);
-        self.compile_index_loop(slot, &s.body, span);
+        self.compile_index_loop(pat, &s.body, span);
     }
 
     /// Shared iteration scaffold for `for-of`/`for-in`. Expects the container to
     /// iterate already on the stack top. Pushes an index counter, then on each
-    /// step binds `slot` to `container[idx]` and runs `body`; `break`/`continue`
-    /// resolve through the loop-context stack. The container and counter
-    /// (`[container, idx]`) are maintained on the stack at constant depth across
-    /// the loop top, the `continue` target, and the exit — so `break` (→ end)
-    /// and `continue` (→ increment) both land where exactly those two values
-    /// are present, and the final `Pop(2)` cleans them up.
-    fn compile_index_loop(&mut self, slot: u32, body: &ast::Statement, span: u32) {
+    /// step binds the loop pattern to `container[idx]` and runs `body`;
+    /// `break`/`continue` resolve through the loop-context stack. The container
+    /// and counter (`[container, idx]`) are maintained on the stack at constant
+    /// depth across the loop top, the `continue` target, and the exit — so
+    /// `break` (→ end) and `continue` (→ increment) both land where exactly
+    /// those two values are present, and the final `Pop(2)` cleans them up.
+    fn compile_index_loop(&mut self, pat: &ast::BindingPattern, body: &ast::Statement, span: u32) {
         self.emit(Instr::PushPosInt(0), span); // [cont, idx]
         let top = self.new_label();
         let cont = self.new_label();
@@ -931,10 +931,20 @@ impl<'src> Compiler<'src> {
         // A captured loop variable gets a fresh cell each iteration so in-loop
         // closures capture per-iteration copies; the SetLocal then binds the
         // element into that fresh cell. (`var` heads stay shared.)
-        if self.slot_needs_fresh(slot) {
-            self.emit(Instr::FreshCell(slot as LocalIndex), span);
+        if let ast::BindingPattern::BindingIdentifier(id) = pat {
+            let slot = self
+                .binding_slot(id.span.start)
+                .expect("checked in for_loop_binding_pattern");
+            if self.slot_needs_fresh(slot) {
+                self.emit(Instr::FreshCell(slot as LocalIndex), span);
+            }
+            self.emit(Instr::SetLocal(slot as LocalIndex), span); // [cont, idx]
+        } else {
+            // Destructuring head: fresh-cell the captured pattern slots, then
+            // destructure the element (consumes it, restoring [cont, idx]).
+            self.emit_pattern_fresh_cells(pat, span);
+            self.destructure_binding(pat, span);
         }
-        self.emit(Instr::SetLocal(slot as LocalIndex), span); // [cont, idx]
         self.loops.push(LoopCtx {
             break_label: end,
             continue_label: Some(cont),
@@ -950,11 +960,15 @@ impl<'src> Compiler<'src> {
         self.emit(Instr::Pop(2), span); // drop [cont, idx]
     }
 
-    /// Resolve the loop variable of a `for-of`/`for-in` head to its frame slot.
-    /// Only the `let`/`const`/`var x` single-identifier form is supported;
-    /// destructuring, multiple declarators, and the bare-assignment-target form
-    /// (`for (x of …)`) record a diagnostic and return `None`.
-    fn for_loop_binding_slot(&mut self, left: &ast::ForStatementLeft, span: u32) -> Option<u32> {
+    /// Resolve the binding of a `for-of`/`for-in` head to its pattern — a
+    /// single identifier or a destructuring pattern, in the `let`/`const`/`var`
+    /// declaration form. Multiple declarators and the bare-assignment-target
+    /// form (`for (x of …)`) record a diagnostic and return `None`.
+    fn for_loop_binding_pattern<'b>(
+        &mut self,
+        left: &'b ast::ForStatementLeft<'b>,
+        span: u32,
+    ) -> Option<&'b ast::BindingPattern<'b>> {
         let decl = match left {
             ast::ForStatementLeft::VariableDeclaration(decl) => decl,
             _ => {
@@ -969,14 +983,45 @@ impl<'src> Compiler<'src> {
             self.error(span, "for-of/for-in needs exactly one loop variable");
             return None;
         }
-        match &decl.declarations[0].id {
-            ast::BindingPattern::BindingIdentifier(id) => self.binding_slot(id.span.start),
-            _ => {
-                self.error(
-                    span,
-                    "destructuring in a for-of/for-in binding is not supported",
-                );
-                None
+        let pat = &decl.declarations[0].id;
+        if let ast::BindingPattern::BindingIdentifier(id) = pat {
+            // An identifier without a slot is an earlier diagnostic (e.g.
+            // shadowing `input`) — bail like any other malformed head.
+            self.binding_slot(id.span.start)?;
+        }
+        Some(pat)
+    }
+
+    /// Emit `FreshCell` for every captured binding in a loop-head pattern, so
+    /// in-loop closures capture per-iteration copies (the single-identifier
+    /// form does the same inline in `compile_index_loop`).
+    fn emit_pattern_fresh_cells(&mut self, pat: &ast::BindingPattern, span: u32) {
+        match pat {
+            ast::BindingPattern::BindingIdentifier(id) => {
+                if let Some(slot) = self.binding_slot(id.span.start) {
+                    if self.slot_needs_fresh(slot) {
+                        self.emit(Instr::FreshCell(slot as LocalIndex), span);
+                    }
+                }
+            }
+            ast::BindingPattern::AssignmentPattern(ap) => {
+                self.emit_pattern_fresh_cells(&ap.left, span);
+            }
+            ast::BindingPattern::ArrayPattern(arr) => {
+                for el in arr.elements.iter().flatten() {
+                    self.emit_pattern_fresh_cells(el, span);
+                }
+                if let Some(rest) = &arr.rest {
+                    self.emit_pattern_fresh_cells(&rest.argument, span);
+                }
+            }
+            ast::BindingPattern::ObjectPattern(obj) => {
+                for prop in &obj.properties {
+                    self.emit_pattern_fresh_cells(&prop.value, span);
+                }
+                if let Some(rest) = &obj.rest {
+                    self.emit_pattern_fresh_cells(&rest.argument, span);
+                }
             }
         }
     }

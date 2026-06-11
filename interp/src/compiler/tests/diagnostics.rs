@@ -68,10 +68,17 @@ fn builtin_arity_is_enforced_from_meta() {
 
 #[test]
 fn for_of_in_diagnostics() {
-    for src in ["for (const [a, b] of [[1, 2]]) {}", "for (x of [1]) {}"] {
+    // The bare-assignment-target head form stays rejected (destructuring
+    // *declaration* heads compile — see control_flow.rs).
+    for src in [
+        "for (x of [1]) {}",
+        "let a, b; for ([a, b] of [[1, 2]]) {}",
+        "for (const x of [1], y = 2) {}",
+    ] {
         assert!(compile(src).is_err(), "expected `{src}` to fail to compile");
     }
 }
+
 
 #[test]
 fn switch_continue_outside_loop_errors() {
