@@ -916,6 +916,15 @@ impl Analyzer {
                     }
                 }
             }
+            ast::Statement::TryStatement(t) => {
+                self.analyze_hoist(&t.block.body, scope, block_scopes, next_slot);
+                if let Some(h) = &t.handler {
+                    self.analyze_hoist(&h.body.body, scope, block_scopes, next_slot);
+                }
+                if let Some(f) = &t.finalizer {
+                    self.analyze_hoist(&f.body, scope, block_scopes, next_slot);
+                }
+            }
             _ => {}
         }
     }
@@ -1090,6 +1099,41 @@ impl Analyzer {
                     }
                 }
                 block_scopes.pop();
+            }
+            ast::Statement::ThrowStatement(t) => {
+                self.analyze_expr(&t.argument, scope, block_scopes, scopes);
+            }
+            // `try`/`catch`: the try block, the catch body, and the finalizer
+            // are each their own lexical block. The catch binding (if any) is
+            // block-scoped to the catch body and declared like a `let` (a
+            // destructuring pattern declares its leaves the same way).
+            ast::Statement::TryStatement(t) => {
+                block_scopes.push(IndexMap::new());
+                self.analyze_stmts(&t.block.body, scope, block_scopes, next_slot, scopes);
+                block_scopes.pop();
+                if let Some(h) = &t.handler {
+                    block_scopes.push(IndexMap::new());
+                    if let Some(param) = &h.param {
+                        self.analyze_declare_pattern(
+                            &param.pattern,
+                            false,
+                            false,
+                            scope,
+                            block_scopes,
+                            next_slot,
+                            scopes,
+                        );
+                    }
+                    self.analyze_stmts(&h.body.body, scope, block_scopes, next_slot, scopes);
+                    block_scopes.pop();
+                }
+                // A finalizer is a compile error in codegen, but walk it so
+                // diagnostics aggregate sensibly.
+                if let Some(f) = &t.finalizer {
+                    block_scopes.push(IndexMap::new());
+                    self.analyze_stmts(&f.body, scope, block_scopes, next_slot, scopes);
+                    block_scopes.pop();
+                }
             }
             _ => {}
         }
@@ -1462,6 +1506,23 @@ impl Analyzer {
             ast::Expression::ArrowFunctionExpression(a) => {
                 let child = self.build_arrow_scope(a, scopes);
                 scope.children.push(child);
+            }
+            ast::Expression::NewExpression(n) => {
+                // Only the error-constructor form (`new Error(msg)`) compiles,
+                // but walk all `new` arguments so their references resolve.
+                // The callee is matched by name in codegen, never evaluated.
+                for arg in &n.arguments {
+                    match arg {
+                        ast::Argument::SpreadElement(s) => {
+                            self.analyze_expr(&s.argument, scope, block_scopes, scopes);
+                        }
+                        _ => {
+                            if let Some(e) = arg.as_expression() {
+                                self.analyze_expr(e, scope, block_scopes, scopes);
+                            }
+                        }
+                    }
+                }
             }
             _ => {}
         }

@@ -2559,6 +2559,41 @@ fn resume_with_not_resumable_errors() {
 }
 
 #[test]
+fn try_exit_without_handler_is_bad_arg() {
+    let err = run_err(vec![TryExit]);
+    assert!(matches!(err.kind, ErrorKind::BadArg));
+    assert!(matches!(err.resume, ResumeMode::NotResumable));
+}
+
+#[test]
+fn try_enter_throw_unwinds_to_handler() {
+    // TryEnter(3) guards Throw; the handler at ip 3 receives the value.
+    // 0: TryEnter(3)  1: PushStr("x")  2: Throw  3: (handler; "x" on stack)
+    let stack = run(vec![TryEnter(3), ps("x"), Throw]);
+    assert_eq!(stack, vec![Value::String("x".into())]);
+}
+
+#[test]
+fn throw_without_handler_is_uncaught_value_error() {
+    let err = run_err(vec![ps("boom"), Throw]);
+    assert!(matches!(err.kind, ErrorKind::ValueError));
+    assert!(matches!(err.resume, ResumeMode::NotResumable));
+    assert!(
+        err.message.contains("uncaught exception"),
+        "got: {}",
+        err.message
+    );
+}
+
+#[test]
+fn try_exit_after_clean_body_pops_handler() {
+    // A throw after TryExit must NOT be caught by the exited handler.
+    let err = run_err(vec![TryEnter(4), TryExit, ps("late"), Throw]);
+    assert!(matches!(err.kind, ErrorKind::ValueError));
+    assert!(err.message.contains("uncaught"), "got: {}", err.message);
+}
+
+#[test]
 fn objget_non_object_pops_receiver_and_resumes() {
     // Pop-first normalization: ObjGet on a non-object consumes the receiver,
     // so the error is PushValueThenContinue and resume_with works unchanged.

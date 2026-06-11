@@ -12,6 +12,7 @@ impl VM {
             cells: Vec::new(),
             promises: Vec::new(),
             outbox: Vec::new(),
+            handlers: Vec::new(),
             stack: Vec::new(),
             // Root frame so that Local is valid from the start.
             callstack: vec![CallFrame {
@@ -77,6 +78,72 @@ impl VM {
     /// already advanced past the Raise by `step()`).
     pub fn resume_raise(&mut self, value: Value) {
         self.stack.push(value);
+    }
+
+    /// Unwind to the innermost `try` handler with `value` as the thrown
+    /// value: pop the handler entry, truncate the value/call stacks to its
+    /// snapshot, restore `fp` (and the local-count mirror), push `value`
+    /// (the catch binding), and jump to the catch address. Returns `false` —
+    /// consuming `value` — when no handler is active; callers that need the
+    /// value back on failure check `handlers` first (see `throw_value`).
+    pub(super) fn unwind_to_handler(&mut self, value: Value) -> bool {
+        let Some(h) = self.handlers.pop() else {
+            return false;
+        };
+        self.stack.truncate(h.stack_len);
+        self.callstack.truncate(h.callstack_len);
+        self.fp = h.fp;
+        // The handler's frame is intact (TryEnter ran inside it after its
+        // EnterFrame), so its local_count is current.
+        self.cur_local_count = self.callstack.last().map_or(0, |f| f.local_count);
+        self.stack.push(value);
+        self.ip = h.catch_ip;
+        true
+    }
+
+    /// Host API: throw `value` into the program — the bridge between tool
+    /// failures and program-level handling. Unwinds to the nearest `try`
+    /// handler (resume with `step()`), or hands the value back as
+    /// `Uncaught` so the host can escalate per its policy.
+    pub fn throw_value(&mut self, value: Value) -> ThrowOutcome {
+        if self.handlers.is_empty() {
+            ThrowOutcome::Uncaught(value)
+        } else {
+            self.unwind_to_handler(value);
+            ThrowOutcome::Caught
+        }
+    }
+
+    /// Materialize a catchable VM error as the plain `{ name, message }`
+    /// object a `catch` binding receives: `name` from the error kind,
+    /// `message` the fully rendered diagnostic (line/col + source line).
+    pub(super) fn error_to_thrown(&mut self, e: &VMError) -> Value {
+        let mut obj = IndexMap::new();
+        obj.insert(
+            RcStr::from("name"),
+            Value::String(RcStr::from(format!("{:?}", e.kind).as_str())),
+        );
+        obj.insert(
+            RcStr::from("message"),
+            Value::String(RcStr::from(self.render_error(e).as_str())),
+        );
+        self.alloc_object(obj)
+    }
+
+    /// Render an uncaught thrown value: an `{ name, message }` error object
+    /// (the `new Error(...)` shape) formats as `uncaught {name}: {message}`;
+    /// anything else falls back to a preview of the value.
+    pub(super) fn uncaught_message(&self, value: &Value) -> String {
+        if let Value::Object(p) = value {
+            if let Some(obj) = self.objects.get(*p as usize) {
+                if let (Some(Value::String(name)), Some(Value::String(msg))) =
+                    (obj.get("name"), obj.get("message"))
+                {
+                    return format!("uncaught {}: {}", name.as_str(), msg.as_str());
+                }
+            }
+        }
+        format!("uncaught exception: {}", self.preview(value))
     }
 
     /// Apply the resume fixup for a PushValueThenContinue error:

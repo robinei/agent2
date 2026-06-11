@@ -172,14 +172,19 @@ fn simplify_cfg(code: Vec<Instr>, spans: Vec<u32>, next_label: u32) -> (Vec<Inst
         visited[i] = true;
         match &code[i] {
             // Unconditional transfer / terminator: no fall-through successor.
-            Instr::Return(_) => {}
+            // `Throw` never falls through — it unwinds to a handler (whose
+            // label `TryEnter` keeps reachable below) or escalates.
+            Instr::Return(_) | Instr::Throw => {}
             Instr::Jump(l) => {
                 if let Some(idx) = marker_idx(pe_thread(&code, &marker, *l)) {
                     work.push(idx);
                 }
             }
             // Two-way branch: fall through AND take the (threaded) target.
-            Instr::JFalse(l) | Instr::JTrue(l) | Instr::JNotNullish(l) => {
+            // `TryEnter` is one for reachability: its handler label is
+            // reached by unwinding, not by a control-flow edge — without
+            // this the catch block would be pruned as dead code.
+            Instr::JFalse(l) | Instr::JTrue(l) | Instr::JNotNullish(l) | Instr::TryEnter(l) => {
                 work.push(i + 1);
                 if let Some(idx) = marker_idx(pe_thread(&code, &marker, *l)) {
                     work.push(idx);
@@ -203,6 +208,10 @@ fn simplify_cfg(code: Vec<Instr>, spans: Vec<u32>, next_label: u32) -> (Vec<Inst
             Instr::JFalse(l) => Instr::JFalse(pe_thread(&code, &marker, *l)),
             Instr::JTrue(l) => Instr::JTrue(pe_thread(&code, &marker, *l)),
             Instr::JNotNullish(l) => Instr::JNotNullish(pe_thread(&code, &marker, *l)),
+            // Threading the handler address is safe: a `Jump` at the catch
+            // label touches no stack, and the unwinder pushes the thrown
+            // value before transferring.
+            Instr::TryEnter(l) => Instr::TryEnter(pe_thread(&code, &marker, *l)),
             other => other.clone(),
         };
         kept.push(instr);
@@ -316,7 +325,9 @@ fn pe_produces_bool(i: &Instr) -> bool {
 /// touches the heap, frame, or host (`Local`, `ObjGet`, `Invoke`, `Await`,
 /// builtins, …) and `And`/`Or` (rarely emitted; short-circuit lowers to jumps).
 /// `Await` is an effect barrier exactly like `Invoke`: every pe_* table is an
-/// allow-list, so both are excluded from all of them by construction.
+/// allow-list, so both are excluded from all of them by construction. The
+/// same goes for `TryEnter`/`TryExit`/`Throw` (handler-stack effects: not
+/// pure, not movable, never folded).
 fn pe_fold_arity(op: &Instr) -> Option<usize> {
     Some(match op {
         Instr::Neg
@@ -608,6 +619,7 @@ fn backpatch(code: Vec<Instr>, spans: Vec<u32>, next_label: u32) -> (Vec<Instr>,
             Instr::JFalse(l) => Instr::JFalse(label_offset[l as usize]),
             Instr::JTrue(l) => Instr::JTrue(label_offset[l as usize]),
             Instr::JNotNullish(l) => Instr::JNotNullish(label_offset[l as usize]),
+            Instr::TryEnter(l) => Instr::TryEnter(label_offset[l as usize]),
             Instr::Call(l, n) => Instr::Call(label_offset[l as usize], n),
             Instr::MakeClosure(l, caps) => Instr::MakeClosure(label_offset[l as usize], caps),
             Instr::PushFn(l) => Instr::PushFn(label_offset[l as usize]),

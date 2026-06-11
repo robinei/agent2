@@ -111,6 +111,11 @@ pub fn compile(source: &str) -> Result<Program, Vec<Diagnostic>> {
 struct LoopCtx {
     break_label: u32,
     continue_label: Option<u32>,
+    /// The compiler's `try_depth` when this context was pushed. A `break`/
+    /// `continue` targeting this context emits one `TryExit` per `try` block
+    /// it jumps out of (`current try_depth - this`), keeping the VM's handler
+    /// stack balanced.
+    try_depth: usize,
 }
 
 /// An assignment/update target resolved to its storage shape, so that `=`,
@@ -137,6 +142,11 @@ struct Compiler<'src> {
     next_label: u32,
     /// Loop-context stack for `break`/`continue` (innermost loop last).
     loops: Vec<LoopCtx>,
+    /// Number of enclosing `try` blocks at the current emission point, within
+    /// the current function body (saved/reset per function). Drives the
+    /// `TryExit`s that `break`/`continue`/`return` emit when jumping out of a
+    /// `try` block.
+    try_depth: usize,
     diagnostics: Vec<Diagnostic>,
     /// Scope/capture analysis pre-computed before codegen. `None` during the
     /// analysis pass itself; `Some` during codegen. Codegen resolves every
@@ -170,6 +180,7 @@ impl<'src> Compiler<'src> {
             spans: Vec::new(),
             next_label: 0,
             loops: Vec::new(),
+            try_depth: 0,
             diagnostics: Vec::new(),
             analysis: None,
             current_scope: 0,
@@ -303,10 +314,12 @@ impl<'src> Compiler<'src> {
                 match &r.argument {
                     Some(expr) => {
                         self.compile_expr(expr);
+                        self.emit_return_try_exits(r.span.start);
                         self.emit(Instr::Return(1), r.span.start);
                     }
                     None => {
                         self.emit(Instr::PushUndefined, r.span.start);
+                        self.emit_return_try_exits(r.span.start);
                         self.emit(Instr::Return(1), r.span.start);
                     }
                 }
@@ -317,13 +330,14 @@ impl<'src> Compiler<'src> {
 
             ast::Statement::SwitchStatement(s) => self.compile_switch(s),
 
-            // Later phases / out of scope — informative errors.
+            // ── Phase 6B: exceptions ──────────────────────────────────
             ast::Statement::ThrowStatement(s) => {
-                self.error(s.span.start, "`throw` is not supported (use `raise`)")
+                self.compile_expr(&s.argument);
+                self.emit(Instr::Throw, s.span.start);
             }
-            ast::Statement::TryStatement(s) => {
-                self.error(s.span.start, "`try`/`catch` is not supported (use `raise`)")
-            }
+            ast::Statement::TryStatement(s) => self.compile_try(s),
+
+            // Out of scope — informative errors.
             ast::Statement::ClassDeclaration(s) => {
                 self.error(s.span.start, "`class` is not supported")
             }
@@ -761,6 +775,7 @@ impl<'src> Compiler<'src> {
         self.loops.push(LoopCtx {
             break_label: end,
             continue_label: Some(top),
+            try_depth: self.try_depth,
         });
         self.compile_stmt(&s.body);
         self.loops.pop();
@@ -777,6 +792,7 @@ impl<'src> Compiler<'src> {
         self.loops.push(LoopCtx {
             break_label: end,
             continue_label: Some(cont),
+            try_depth: self.try_depth,
         });
         self.compile_stmt(&s.body);
         self.loops.pop();
@@ -834,6 +850,7 @@ impl<'src> Compiler<'src> {
         self.loops.push(LoopCtx {
             break_label: end,
             continue_label: Some(cont),
+            try_depth: self.try_depth,
         });
         self.compile_stmt(&s.body);
         self.loops.pop();
@@ -861,6 +878,11 @@ impl<'src> Compiler<'src> {
         match self.loops.last() {
             Some(ctx) => {
                 let target = ctx.break_label;
+                // Jumping out of `try` blocks must pop their handlers.
+                let exits = self.try_depth - ctx.try_depth;
+                for _ in 0..exits {
+                    self.emit(Instr::TryExit, s.span.start);
+                }
                 self.emit(Instr::Jump(target), s.span.start);
             }
             None => self.error(s.span.start, "`break` outside a loop"),
@@ -875,10 +897,108 @@ impl<'src> Compiler<'src> {
         // `continue` targets the innermost *loop* — break-only `switch` entries
         // (`continue_label: None`) are skipped, so `continue` inside a `switch`
         // escapes to the enclosing loop, as in JS.
-        match self.loops.iter().rev().find_map(|ctx| ctx.continue_label) {
-            Some(target) => self.emit(Instr::Jump(target), s.span.start),
+        let target = self
+            .loops
+            .iter()
+            .rev()
+            .find_map(|ctx| ctx.continue_label.map(|l| (l, ctx.try_depth)));
+        match target {
+            Some((target, loop_try_depth)) => {
+                // Jumping out of `try` blocks must pop their handlers.
+                let exits = self.try_depth - loop_try_depth;
+                for _ in 0..exits {
+                    self.emit(Instr::TryExit, s.span.start);
+                }
+                self.emit(Instr::Jump(target), s.span.start);
+            }
             None => self.error(s.span.start, "`continue` outside a loop"),
         }
+    }
+
+    /// Emit one `TryExit` per `try` block open in the current function body —
+    /// the handler cleanup a `return` needs before its `Return` pops the
+    /// frame (a frame must never leave handler entries behind).
+    fn emit_return_try_exits(&mut self, span: u32) {
+        for _ in 0..self.try_depth {
+            self.emit(Instr::TryExit, span);
+        }
+    }
+
+    /// `try { … } catch (e) { … }` (6_LANGUAGE Part B). Lowers to a handler
+    /// window:
+    ///
+    /// ```text
+    /// TryEnter(catch)
+    ///   …try body…
+    /// TryExit
+    /// Jump(end)
+    /// Label(catch)      ← unwinder lands here with the thrown value pushed
+    ///   <bind or Pop the catch binding>
+    ///   …catch body…
+    /// Label(end)
+    /// ```
+    ///
+    /// The unwinder pops the handler entry *before* jumping, so a throw
+    /// inside `catch` propagates outward. `break`/`continue`/`return`
+    /// leaving the try block emit their own `TryExit`s (tracked via
+    /// `try_depth`). `finally` is rejected (v1 — see 6_LANGUAGE Part B);
+    /// `raise()` is not catchable by design.
+    fn compile_try(&mut self, s: &ast::TryStatement) {
+        let span = s.span.start;
+        if let Some(fin) = &s.finalizer {
+            self.error(
+                fin.span.start,
+                "`finally` is not supported (run the cleanup after the `try`/`catch` statement instead)",
+            );
+            return;
+        }
+        let Some(handler) = &s.handler else {
+            // The parser requires `catch` or `finally`, so without `finally`
+            // support this is unreachable — but guard anyway.
+            self.error(span, "`try` requires a `catch` clause");
+            return;
+        };
+        let catch_label = self.new_label();
+        let end = self.new_label();
+        self.emit(Instr::TryEnter(catch_label), span);
+        self.try_depth += 1;
+        for stmt in &s.block.body {
+            self.compile_stmt(stmt);
+        }
+        self.try_depth -= 1;
+        self.emit(Instr::TryExit, span);
+        self.emit(Instr::Jump(end), span);
+
+        // Catch: the unwinder pushed the thrown value; bind or discard it.
+        let hspan = handler.span.start;
+        self.emit(Instr::Label(catch_label), hspan);
+        match &handler.param {
+            Some(param) => match &param.pattern {
+                ast::BindingPattern::BindingIdentifier(id) => {
+                    match self.binding_slot(id.span.start) {
+                        Some(slot) => {
+                            // A captured per-iteration binding gets a fresh
+                            // cell, like any in-loop `let` declaration.
+                            self.fresh_cell_if_needed(slot, hspan);
+                            self.emit(Instr::SetLocal(slot as LocalIndex), hspan);
+                        }
+                        // No slot: an earlier diagnostic (e.g. shadowing
+                        // `input`) — just discard the value.
+                        None => self.emit(Instr::Pop(1), hspan),
+                    }
+                }
+                pattern => {
+                    // `catch ({ message })` — destructure the thrown value.
+                    self.emit_pattern_fresh_cells(pattern, hspan);
+                    self.destructure_binding(pattern, hspan);
+                }
+            },
+            None => self.emit(Instr::Pop(1), hspan),
+        }
+        for stmt in &handler.body.body {
+            self.compile_stmt(stmt);
+        }
+        self.emit(Instr::Label(end), span);
     }
 
     /// `for (let x of iter) body` — iterate the values of an array/string. The
@@ -965,6 +1085,7 @@ impl<'src> Compiler<'src> {
         self.loops.push(LoopCtx {
             break_label: end,
             continue_label: Some(cont),
+            try_depth: self.try_depth,
         });
         self.compile_stmt(body);
         self.loops.pop();
@@ -1081,6 +1202,7 @@ impl<'src> Compiler<'src> {
         self.loops.push(LoopCtx {
             break_label: end,
             continue_label: None,
+            try_depth: self.try_depth,
         });
         for (i, case) in s.cases.iter().enumerate() {
             self.emit(Instr::Label(case_labels[i]), span);
@@ -1185,6 +1307,15 @@ impl<'src> Compiler<'src> {
                 self.error(t.span.start, "`this` is not supported")
             }
             ast::Expression::NewExpression(n) => {
+                // `new Error("…")` (and the standard subclasses) builds the
+                // plain `{ name, message }` error object (6B decision 3) —
+                // the universal LLM idiom `throw new Error("…")`. No general
+                // `new` machinery is implied.
+                if let ast::Expression::Identifier(id) = &n.callee {
+                    if is_error_ctor(id.name.as_str()) {
+                        return self.compile_error_ctor(id.name.as_str(), n);
+                    }
+                }
                 // Targeted message for the misuse LLMs actually type: there is
                 // no executor pattern (7_ASYNC commitment 4) — every promise
                 // comes from a tool call or (Tier 2) an async function call,
@@ -1201,6 +1332,46 @@ impl<'src> Compiler<'src> {
             }
             other => self.error(other.span().start, "unsupported expression"),
         }
+    }
+
+    /// `new Error(msg)` / `new TypeError(msg)` / …: build the `{ name,
+    /// message }` error object. The message coerces with ToString at
+    /// construction (`new Error(123)` → `"123"`, as in JS); absent → `""`.
+    fn compile_error_ctor(&mut self, name: &str, n: &ast::NewExpression) {
+        let span = n.span.start;
+        if n.arguments.len() > 1 {
+            // JS's `{ cause }` options bag is out of scope; stay strict.
+            self.error(
+                span,
+                format!("`new {name}` takes at most one (message) argument"),
+            );
+            return;
+        }
+        let name_str = self.intern_string(name);
+        self.emit(Instr::PushStr(name_str), span);
+        match n.arguments.first() {
+            None => {
+                let empty = self.intern_string("");
+                self.emit(Instr::PushStr(empty), span);
+            }
+            Some(arg) => match arg.as_expression() {
+                Some(msg) => {
+                    self.compile_expr(msg);
+                    self.emit(Instr::ToStr, span);
+                }
+                None => {
+                    self.error(
+                        span,
+                        format!("spread arguments are not supported in `new {name}`"),
+                    );
+                    return;
+                }
+            },
+        }
+        self.emit(
+            Instr::ObjNew(vec![RcStr::from("name"), RcStr::from("message")].into()),
+            span,
+        );
     }
 
     /// A bare identifier resolves only to the host-seeded `input` object or the
@@ -2566,7 +2737,8 @@ impl<'src> Compiler<'src> {
                 }
                 self.emit_prelude_call("__all", argv[0], &[], span, false);
             }
-            // Needs try/catch in the helper — follows once 6B lands.
+            // Needs try/catch in the helper — unblocked now that 6B has
+            // landed; add when evidence demands it.
             "allSettled" => self.error(
                 span,
                 "`Promise.allSettled` is not supported yet (use `Promise.all`, or await each promise individually)",
@@ -3040,6 +3212,21 @@ impl<'src> Compiler<'src> {
             ast::Statement::WhileStatement(s) => self.hoist_function_decl_in_stmt(&s.body),
             ast::Statement::DoWhileStatement(s) => self.hoist_function_decl_in_stmt(&s.body),
             ast::Statement::ForStatement(s) => self.hoist_function_decl_in_stmt(&s.body),
+            ast::Statement::TryStatement(t) => {
+                for s in &t.block.body {
+                    self.hoist_function_decl_in_stmt(s);
+                }
+                if let Some(h) = &t.handler {
+                    for s in &h.body.body {
+                        self.hoist_function_decl_in_stmt(s);
+                    }
+                }
+                if let Some(f) = &t.finalizer {
+                    for s in &f.body {
+                        self.hoist_function_decl_in_stmt(s);
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -3183,6 +3370,10 @@ impl<'src> Compiler<'src> {
 
         let prev_scope = self.current_scope;
         self.current_scope = scope_id;
+        // `try` blocks don't cross function boundaries: a `return` in this
+        // body must pop only THIS body's handlers, never the enclosing
+        // function's (those belong to a different frame).
+        let prev_try_depth = std::mem::replace(&mut self.try_depth, 0);
         // Slot numbers are frame-relative, so the callee gets its own const env.
         // Phase D: seed it with constants captured *by value* — a `const`/
         // effectively-const capture is an immutable snapshot, so the upval holds a
@@ -3312,6 +3503,7 @@ impl<'src> Compiler<'src> {
         self.emit(Instr::Label(after), span);
         self.current_scope = prev_scope;
         self.const_env = prev_const_env;
+        self.try_depth = prev_try_depth;
     }
 
     /// Emit per-parameter prologue code. The argument value is already in the
@@ -3353,6 +3545,16 @@ impl<'src> Compiler<'src> {
 enum ConstVal {
     Float(f64),
     PosInt(u64),
+}
+
+/// The standard error constructor names recognized by `new` (6B decision 3):
+/// each builds a plain `{ name, message }` object — there are no error
+/// classes, prototypes, or `instanceof`.
+fn is_error_ctor(name: &str) -> bool {
+    matches!(
+        name,
+        "Error" | "TypeError" | "RangeError" | "SyntaxError" | "ReferenceError" | "EvalError"
+    )
 }
 
 /// Map a namespace + member name to a compile-time constant, if any.

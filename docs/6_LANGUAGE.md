@@ -159,3 +159,28 @@ Mechanics:
 Update on completion: divergence list (remove "no exceptions" bullet),
 `try`/`throw` compile errors deleted, 4_FUTURE non-goals already amended to
 point here.
+
+Status: **landed.** All four locked decisions implemented as written. Notes
+on the open choices and deltas:
+
+- `finally` is deferred with the blessed honest diagnostic (codegen
+  duplication not attempted). `try` without `catch` therefore cannot occur
+  (the parser demands one of the two clauses).
+- Mechanics as specced: VM handler stack + `TryEnter(label)`/`TryExit`/
+  `Throw`; `vm.throw_value(v) -> ThrowOutcome` host API; optimizer treats
+  `TryEnter` as a two-way branch (catch label reachable) and threads/
+  backpatches its operand; all `pe_*` tables exclude the new instructions
+  by construction (allow-lists).
+- Catchability is exactly the Phase 3 `PushValueThenContinue` class. To
+  make `try { x.foo }` on null/undefined useful, `ObjGet`/`ObjSet`'s
+  non-object error arms were pop-first-normalized (they were peek-style
+  `NotResumable`); the audit table was updated.
+- `await` of a rejected promise inside `try` delivers the **raw rejection
+  value** to `catch` (JS semantics), not a wrapped `{name, message}`; the
+  no-handler escalation path is byte-for-byte unchanged.
+- `new Error(msg)` plus `TypeError`/`RangeError`/`SyntaxError`/
+  `ReferenceError`/`EvalError` are special-cased; message coerces ToString
+  at construction; a second argument (`{cause}`) is a compile error.
+- The compiler tracks per-function `try` depth and emits the balancing
+  `TryExit`s when `break`/`continue`/`return` jump out of a `try` block,
+  so a frame never leaves stale handlers behind.

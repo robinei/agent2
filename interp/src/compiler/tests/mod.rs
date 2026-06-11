@@ -6,6 +6,7 @@ pub mod codegen_shape;
 pub mod control_flow;
 pub mod diagnostics;
 pub mod effects;
+pub mod exceptions;
 pub mod functions_closures;
 pub mod hof;
 pub mod lang_basics;

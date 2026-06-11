@@ -76,7 +76,32 @@ impl VM {
         Ok(())
     }
 
+    /// Execute until an effect, completion, or error. A *catchable* error —
+    /// a `TypeError`/`ValueError` whose operands were fully consumed
+    /// (`PushValueThenContinue`, the Phase 3 pop-first invariant) — raised
+    /// while a `try` handler is active is materialized as a
+    /// `{ name, message }` error object and unwound to the handler instead
+    /// of escalating (6_LANGUAGE Part B). Everything else (`OutOfFuel`,
+    /// `NotResumable` invariant errors) escalates as before, so a program
+    /// cannot trap its own kill switch. `raise` is unaffected: it yields
+    /// `StepResult::Raise` (an `Ok`), never an error, so no `try` can
+    /// swallow it.
     pub fn step(&mut self) -> Result<StepResult, VMError> {
+        loop {
+            match self.dispatch() {
+                Err(e)
+                    if matches!(e.resume, ResumeMode::PushValueThenContinue)
+                        && !self.handlers.is_empty() =>
+                {
+                    let thrown = self.error_to_thrown(&e);
+                    self.unwind_to_handler(thrown);
+                }
+                other => return other,
+            }
+        }
+    }
+
+    fn dispatch(&mut self) -> Result<StepResult, VMError> {
         // ── macros for repetitive instruction shapes ─────────────────
 
         /// Pop one operand, coerce ToNumber (JS), apply f64→f64, push Number.
@@ -1457,6 +1482,16 @@ impl VM {
                             self.ip += 1;
                         }
                         PromiseState::Rejected(errval) => {
+                            // Inside a `try`, the rejection value itself is
+                            // what `catch` receives (JS semantics: the reason
+                            // passes through raw, not wrapped in an error
+                            // object).
+                            if !self.handlers.is_empty() {
+                                let errval = errval.clone();
+                                self.stack.pop(); // the promise operand
+                                self.unwind_to_handler(errval);
+                                continue;
+                            }
                             // Escalate via the Phase 3 path: pop the operand
                             // first (pop-first invariant), then fail resumably —
                             // the host may substitute a value for the rejection
@@ -1507,6 +1542,43 @@ impl VM {
                         condition: condition.as_str().to_owned(),
                         payload,
                     });
+                }
+
+                // ── exceptions (6_LANGUAGE Part B) ──────────────
+                Instr::TryEnter(addr) => {
+                    let addr = *addr;
+                    if addr as usize > self.code.len() {
+                        return Err(self.fail(ErrorKind::BadCall, "bad call target"));
+                    }
+                    self.handlers.push(HandlerEntry {
+                        catch_ip: addr,
+                        stack_len: self.stack.len(),
+                        callstack_len: self.callstack.len(),
+                        fp: self.fp,
+                    });
+                    self.ip += 1;
+                }
+
+                Instr::TryExit => {
+                    // An unmatched TryExit is a compiler bug (NotResumable).
+                    if self.handlers.pop().is_none() {
+                        return Err(
+                            self.fail(ErrorKind::BadArg, "TryExit without an active handler")
+                        );
+                    }
+                    self.ip += 1;
+                }
+
+                Instr::Throw => {
+                    let value = self.pop()?;
+                    if self.handlers.is_empty() {
+                        // NotResumable: the operand was consumed, but a
+                        // `throw` has no result slot — pushing a replacement
+                        // value would corrupt the statement-level stack.
+                        let msg = self.uncaught_message(&value);
+                        return Err(self.fail_not_resumable(ErrorKind::ValueError, msg));
+                    }
+                    self.unwind_to_handler(value);
                 }
             }
         }

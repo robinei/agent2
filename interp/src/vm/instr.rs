@@ -232,7 +232,32 @@ pub enum Instr {
     // EFFECT: raise condition (like Lisp condition system). used to ask LLM in calling frame
     // to decide how to proceed, using restarts like returning a value, aborting,
     // and even rewriting the program preserving already written variables with execution starting at arbitrary point.
+    // NOT catchable by `try`: conditions are addressed to the LLM, and a
+    // program must not be able to swallow them (6_LANGUAGE Part B).
     Raise(RcStr, ArgCount), // (payload?) -> result
+
+    // Enter a `try` block: push an entry onto the VM's handler stack,
+    // snapshotting the current stack height, call depth, and frame pointer.
+    // The operand is the catch handler's address (a label id until
+    // backpatch). A throw unwinds to the innermost handler: the entry is
+    // popped, `stack`/`callstack` are truncated to the snapshot, `fp` (and
+    // the local-count mirror) restored, the thrown value pushed, and control
+    // jumps to the handler. Paired with `TryExit` on the normal path; the
+    // compiler emits the matching `TryExit`s when `break`/`continue`/
+    // `return` jump out of the block. Optimizer: a barrier (in no `pe_*`
+    // allow-list); the CFG pass treats the handler address as a reachable
+    // branch target.
+    TryEnter(CodeAddr), // () -> ()
+
+    // Leave a `try` block on the normal (no-throw) path: pop the innermost
+    // handler entry. An empty handler stack is a compiler bug (BadArg).
+    TryExit, // () -> ()
+
+    // `throw expr`: pop the thrown value and unwind to the innermost handler
+    // (see `TryEnter`). With no active handler the throw escalates as an
+    // uncaught ValueError at the `step()` boundary — NotResumable, because a
+    // `throw` has no result slot a substituted value could fill.
+    Throw, // any -> ()
 
     // pops N values where N is the number of field names, then pushes an
     // object with each field set to its corresponding value. Left-to-right:

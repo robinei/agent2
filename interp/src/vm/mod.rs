@@ -152,8 +152,16 @@ The remaining intentional divergences from JS — deferred or accepted, NOT bugs
     benefit; the runtime relaxes to match JS.
   • Number→string uses Rust's float formatting for the non-integer path, so very
     large/small magnitudes are not rendered in JS's exponential form (`1e21`).
-  • No exceptions/try/catch/throw: the `Raise` condition mechanism is for host
-    (LLM) intervention, not JS error handling.
+  • Exceptions: `throw`/`try`/`catch` are supported (6_LANGUAGE Part B), but
+    `finally` is rejected at compile time. `raise()` is NOT catchable —
+    conditions are addressed to the LLM — and neither are `OutOfFuel` or
+    internal invariant errors, so a program cannot trap its own kill switch.
+    A caught runtime VM error materializes as a plain `{ name, message }`
+    object (message = the rendered diagnostic with line/col + source line);
+    `new Error(msg)` (and the standard subclass names) builds that same
+    shape — no general `new` machinery is implied. `await` of a rejected
+    promise inside `try` delivers the raw rejection value to `catch`, as in
+    JS.
   • Tool calls return *promises* (7_ASYNC Tier 1): `tools.f(args)` starts the
     call and pushes a promise; `await` is the only consumer. There is no
     `.then`/`.catch`/`.finally`, no `new Promise` (no executor pattern), and
@@ -200,6 +208,12 @@ pub struct VM {
     /// pending promise, or into `StepResult::Done` (as `unstarted`) when the
     /// program finishes without awaiting them.
     outbox: Vec<InvokeCall>,
+    /// Active `try` handlers, innermost last (see [`Instr::TryEnter`]). A
+    /// throw — or a catchable runtime error — unwinds to the top entry;
+    /// `TryExit` pops it on the normal path. The compiler guarantees entries
+    /// never outlive their frame (it emits `TryExit`s on every jump out of a
+    /// `try` block, including `return`).
+    handlers: Vec<HandlerEntry>,
     pub stack: Vec<Value>, // sp == stack.len()
     pub callstack: Vec<CallFrame>,
     pub ip: CodeAddr,
@@ -249,6 +263,32 @@ pub struct CallFrame {
     /// by later references, so repeated `arguments` uses don't re-materialize
     /// the array. `None` until first use (and for frames that never use it).
     arguments_cache: Option<ArrayPtr>,
+}
+
+/// One entry of the VM's handler stack: the `TryEnter` snapshot a throw
+/// restores when it unwinds to this handler.
+#[derive(Debug)]
+pub(super) struct HandlerEntry {
+    /// Where the catch block starts (the unwinder jumps here after pushing
+    /// the thrown value).
+    pub(super) catch_ip: CodeAddr,
+    /// `stack.len()` at `TryEnter`: the unwinder truncates back to this.
+    pub(super) stack_len: usize,
+    /// `callstack.len()` at `TryEnter`: frames entered inside the `try` are
+    /// discarded by truncating back to this.
+    pub(super) callstack_len: usize,
+    /// `fp` at `TryEnter`, restored on unwind.
+    pub(super) fp: StackAddr,
+}
+
+/// Result of [`VM::throw_value`]: whether a `try` handler caught the value.
+#[derive(Debug)]
+pub enum ThrowOutcome {
+    /// Unwound to a handler; resume execution with `step()`.
+    Caught,
+    /// No handler is active: the value is handed back so the host can
+    /// escalate per its policy (e.g. surface the failure to the LLM).
+    Uncaught(Value),
 }
 
 /// A heap-allocated closure value: a code address plus its captured
@@ -363,11 +403,14 @@ pub enum ErrorKind {
 /// | **ObjExtend** (non-object src) | TypeError | PushValueThenContinue | both src+obj popped first |
 /// | **ArrExtend** (non-array src) | TypeError | PushValueThenContinue | both src+arr popped first |
 /// | **ArrPush** (non-array target) | TypeError | PushValueThenContinue | both val+arr popped first |
-/// | Await (rejected promise) | ValueError | PushValueThenContinue | promise popped before failing; host may substitute a value for the rejection |
+/// | Await (rejected promise, no handler) | ValueError | PushValueThenContinue | promise popped before failing; host may substitute a value for the rejection (with a handler active the rejection value unwinds to `catch` instead of erroring) |
 /// | Await (bad promise pointer) | ValueError | **NotResumable** | corrupt heap = invariant violation |
 /// | **IncLocal** (non-numeric local) | TypeError | **NotResumable** | reads local by peek (no stack consumption) |
 /// | bad heap/cell pointer (`get`/`get_mut` on arrays/objects/cells/closures) | TypeError/ValueError | **NotResumable** | corrupt heap = invariant violation; some sites also have no result slot (SetLocal) |
 /// | Raise with argc > 1 | BadArg | NotResumable | instruction contract violated (compiler emits 0 or 1) |
+/// | Throw (no handler) | ValueError | **NotResumable** | operand popped, but a `throw` has no result slot a substituted value could fill |
+/// | TryEnter (bad handler address) | BadCall | NotResumable | invariant violation / compiler bug |
+/// | TryExit (empty handler stack) | BadArg | NotResumable | unmatched TryExit = compiler bug |
 /// | StackUnderflow, BadReturn, BadCall, BadAlloc, BadArg, BadLocal | — | NotResumable | invariant violation / compiler bug |
 /// | OutOfFuel | — | RetrySameInstr | nothing consumed; refuel and retry |
 ///
