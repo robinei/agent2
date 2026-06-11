@@ -8,29 +8,47 @@ use crate::vm::{StepResult, VM, Value};
 // ── effects (tools / raise) ───────────────────────────────────────
 
 #[test]
-fn tools_call_yields_invoke_effect() {
-    // End-to-end: a `tools.*` call yields an `Invoke` effect carrying the
-    // method name and the evaluated args; the host pushes a result to resume.
-    let prog = compile("return tools.add(10, 3);").expect("compiles");
+fn awaited_tools_call_yields_pending_effect() {
+    // End-to-end: an awaited `tools.*` call yields a `Pending` effect
+    // carrying the method name and evaluated args; the host settles the
+    // call's promise to resume.
+    let prog = compile("return await tools.add(10, 3);").expect("compiles");
     let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
-    match vm.step().unwrap() {
-        StepResult::Invoke { calls } => {
+    let id = match vm.step().unwrap() {
+        StepResult::Pending { calls } => {
             assert_eq!(calls.len(), 1);
             assert_eq!(calls[0].name, "add");
             assert_eq!(calls[0].args, vec![Value::PosInt(10), Value::PosInt(3)]);
+            calls[0].promise
         }
-        other => panic!("expected Invoke, got {other:?}"),
-    }
-    // Host resolves the call and pushes the result; the program returns it.
-    vm.stack.push(Value::PosInt(13));
+        other => panic!("expected Pending, got {other:?}"),
+    };
+    // Host resolves the call; the re-executed await returns its value.
+    vm.resolve_promise(id, Value::PosInt(13)).unwrap();
     loop {
         match vm.step().unwrap() {
-            StepResult::Done { value } => {
+            StepResult::Done { value, .. } => {
                 assert_eq!(value, Value::PosInt(13));
                 break;
             }
             other => panic!("unexpected effect: {other:?}"),
         }
+    }
+}
+
+#[test]
+fn unawaited_tools_call_is_fire_and_forget() {
+    // Without an await, the program runs to completion and the started call
+    // is reported in `Done::unstarted` (host decides whether to run it).
+    let prog = compile("tools.log(\"hi\"); return 1;").expect("compiles");
+    let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
+    match vm.step().unwrap() {
+        StepResult::Done { value, unstarted } => {
+            assert_eq!(value, Value::PosInt(1));
+            assert_eq!(unstarted.len(), 1);
+            assert_eq!(unstarted[0].name, "log");
+        }
+        other => panic!("expected Done, got {other:?}"),
     }
 }
 
@@ -51,7 +69,7 @@ fn raise_yields_effect_and_resumes_as_expression() {
     vm.resume_raise(Value::PosInt(42));
     loop {
         match vm.step().unwrap() {
-            StepResult::Done { value } => {
+            StepResult::Done { value, .. } => {
                 assert_eq!(value, Value::PosInt(42));
                 break;
             }
@@ -68,7 +86,7 @@ fn for_program_seeds_input_object() {
     let prog = crate::testutil::compile_ok("return input.x + input.y;");
     let mut vm = VM::for_program(prog, serde_json::json!({"x": 10, "y": 20})).unwrap();
     match vm.step().unwrap() {
-        StepResult::Done { value } => assert_eq!(value, Value::Float(30.0)),
+        StepResult::Done { value, .. } => assert_eq!(value, Value::Float(30.0)),
         other => panic!("expected Done, got {other:?}"),
     }
 }
@@ -79,7 +97,7 @@ fn input_with_null_seed_is_empty_object() {
     let prog = compile("return Object.keys(input).length;").expect("compiles");
     let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
     match vm.step().unwrap() {
-        StepResult::Done { value } => assert_eq!(value, Value::Float(0.0)),
+        StepResult::Done { value, .. } => assert_eq!(value, Value::Float(0.0)),
         other => panic!("expected Done, got {other:?}"),
     }
 }
@@ -114,7 +132,7 @@ fn raise_no_payload_resume_raise() {
     }
     vm.resume_raise(Value::String("answer".into()));
     match vm.step().unwrap() {
-        StepResult::Done { value } => {
+        StepResult::Done { value, .. } => {
             assert_eq!(value, Value::String("answer".into()));
         }
         other => panic!("expected Done, got {other:?}"),

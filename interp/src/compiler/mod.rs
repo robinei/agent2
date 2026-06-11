@@ -36,10 +36,12 @@ pub struct Program {
 /// rather than producing a partial program.
 pub fn compile(source: &str) -> Result<Program, Vec<Diagnostic>> {
     let allocator = Allocator::default();
-    // Use script (non-module) mode so top-level `return` is allowed
-    // (8_HARNESS Step 0). Other module-vs-script differences (e.g. `with`)
-    // are already rejected explicitly by the compiler.
-    let source_type = SourceType::cjs();
+    // Module mode, so top-level `await` parses (the primary pattern: the
+    // program is the main task — 7_ASYNC). Top-level `return` (8_HARNESS
+    // Step 0) is preserved via `allow_return_outside_function`. Other
+    // module-vs-script differences (e.g. `with`) are already rejected
+    // explicitly by the compiler.
+    let source_type = SourceType::mjs();
 
     // Append only the higher-order-method helpers (`__map`, …) the program
     // actually uses. They are real JS compiled in the same unit (appended, so
@@ -52,7 +54,12 @@ pub fn compile(source: &str) -> Result<Program, Vec<Diagnostic>> {
     } else {
         format!("{source}\n{prelude}")
     };
-    let ret = Parser::new(&allocator, &full_source, source_type).parse();
+    let ret = Parser::new(&allocator, &full_source, source_type)
+        .with_options(oxc_parser::ParseOptions {
+            allow_return_outside_function: true,
+            ..Default::default()
+        })
+        .parse();
 
     let mut compiler = Compiler::new(&full_source);
 
@@ -881,6 +888,16 @@ impl<'src> Compiler<'src> {
     /// non-array/string iterable is a runtime `TypeError` (from `ArrLength`).
     fn compile_for_of(&mut self, s: &ast::ForOfStatement) {
         let span = s.span.start;
+        // `for await (… of …)` consumes async iterables, which this dialect
+        // has no source of (tool calls return plain promises; arrays are the
+        // only iterable). Await the elements in the body instead.
+        if s.r#await {
+            self.error(
+                span,
+                "`for await` is not supported (await each element in the loop body instead)",
+            );
+            return;
+        }
         let Some(pat) = self.for_loop_binding_pattern(&s.left, span) else {
             return;
         };
@@ -1137,6 +1154,17 @@ impl<'src> Compiler<'src> {
             ast::Expression::ParenthesizedExpression(p) => self.compile_expr(&p.expression),
 
             ast::Expression::UpdateExpression(u) => self.compile_update(u, true),
+
+            // ── Phase 7: await ────────────────────────────────────────
+            // `await x` → evaluate x, `Await`. A non-promise value passes
+            // through unchanged; a pending promise yields to the host with
+            // ip parked on the Await (it re-executes after resolution).
+            // The parser confines `await` to async bodies and the top level
+            // (module mode), which Tier 2's suspension story relies on.
+            ast::Expression::AwaitExpression(a) => {
+                self.compile_expr(&a.argument);
+                self.emit(Instr::Await, a.span.start);
+            }
 
             // ── Phase 3: function expressions / arrows ────────────────
             ast::Expression::FunctionExpression(f) => {

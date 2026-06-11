@@ -21,7 +21,7 @@ fn ps(val: &str) -> Instr {
     Instr::PushStr(RcStr::from(val))
 }
 
-/// Run code to the first effect (Invoke/Raise), returning the StepResult.
+/// Run code to the first effect (Pending/Raise), returning the StepResult.
 fn run_effect(code: Vec<Instr>) -> StepResult {
     let mut vm = VM::new(code);
     loop {
@@ -1567,19 +1567,53 @@ fn typeof_heap_values() {
 // ── effects ───────────────────────────────────────────────────
 
 #[test]
-fn invoke_yields() {
-    match run_effect(vec![
+fn invoke_pushes_promise_and_continues() {
+    // Invoke no longer yields: it allocates a Pending promise, records the
+    // call in the outbox, and execution continues. A program that never
+    // awaits runs to Done, which reports the unstarted call.
+    let mut vm = VM::new(vec![
         PushFloat(1.0),
         PushFloat(2.0),
         Invoke("my_tool".into(), 2),
-    ]) {
-        StepResult::Invoke { calls } => {
-            assert_eq!(calls.len(), 1);
-            assert_eq!(calls[0].name, "my_tool");
+    ]);
+    match vm.step().unwrap() {
+        StepResult::Done { unstarted, .. } => {
+            assert_eq!(unstarted.len(), 1);
+            assert_eq!(unstarted[0].name, "my_tool");
             // push order = arg order: Push(1), Push(2) -> args [1, 2]
-            assert_eq!(calls[0].args, vec![n(1.0), n(2.0)]);
+            assert_eq!(unstarted[0].args, vec![n(1.0), n(2.0)]);
         }
-        other => panic!("expected Invoke, got {other:?}"),
+        other => panic!("expected Done, got {other:?}"),
+    }
+    assert_eq!(vm.stack, vec![Value::Promise(0)]);
+    assert!(matches!(vm.promises[0], PromiseState::Pending { .. }));
+}
+
+#[test]
+fn await_non_promise_passes_through() {
+    // `await 42` is the identity.
+    assert_eq!(run(vec![PushFloat(42.0), Await]), vec![n(42.0)]);
+}
+
+#[test]
+fn await_rejected_escalates_resumably() {
+    // A rejected promise escalates through the Phase 3 path: the promise is
+    // consumed and the error is PushValueThenContinue-resumable, so the host
+    // may substitute a value for the rejection.
+    let mut vm = VM::new(vec![Invoke("f".into(), 0), Await, Return(1)]);
+    let id = match vm.step().unwrap() {
+        StepResult::Pending { calls } => calls[0].promise,
+        other => panic!("expected Pending, got {other:?}"),
+    };
+    vm.reject_promise(id, Value::String("boom".into())).unwrap();
+    let err = vm.step().unwrap_err();
+    assert_eq!(err.kind, ErrorKind::ValueError);
+    assert!(err.message.contains("rejected"), "got: {}", err.message);
+    assert!(matches!(err.resume, ResumeMode::PushValueThenContinue));
+    vm.resume_with(&err, n(7.0)).unwrap();
+    match vm.step().unwrap() {
+        StepResult::Done { value, .. } => assert_eq!(value, n(7.0)),
+        other => panic!("expected Done, got {other:?}"),
     }
 }
 
@@ -1595,85 +1629,135 @@ fn raise_yields() {
 }
 
 #[test]
-fn resume_after_invoke() {
+fn await_pending_yields_and_resumes() {
     let mut vm = VM::new(vec![
         PushFloat(10.0),
         PushFloat(3.0),
         Invoke("add".into(), 2),
+        Await,
         Return(1), // return the result
     ]);
-    // First step should yield Invoke
+    // First step runs to the Await, which blocks and delivers the call.
+    let id = match vm.step().unwrap() {
+        StepResult::Pending { calls } => {
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].name, "add");
+            assert_eq!(calls[0].args, vec![n(10.0), n(3.0)]);
+            calls[0].promise
+        }
+        other => panic!("expected Pending, got {other:?}"),
+    };
+    vm.resolve_promise(id, n(13.0)).unwrap();
+    // Resume — the Await re-executes and completes with the result.
     match vm.step().unwrap() {
-        StepResult::Invoke { .. } => {}
-        other => panic!("expected Invoke, got {other:?}"),
-    }
-    // Host pushes result
-    vm.stack.push(n(13.0));
-    // Resume — should complete with the result on stack
-    match vm.step().unwrap() {
-        StepResult::Done { .. } => {}
+        StepResult::Done { value, unstarted } => {
+            assert_eq!(value, n(13.0));
+            assert!(unstarted.is_empty());
+        }
         other => panic!("expected Done, got {other:?}"),
     }
     assert_eq!(vm.stack, vec![n(13.0)]);
 }
 
 #[test]
-fn invoke_batches_consecutive() {
-    // Two consecutive Invokes fan out in one step. Left-to-right codegen:
-    // evaluate/push all calls' args in order — call 0 (a) deepest, and
-    // within a multi-arg call, arg 0 deepest. Here: a(1, 2), b(3).
+fn outbox_accumulates_across_other_ops() {
+    // Two Invokes separated by other instructions still land in ONE Pending
+    // yield: fan-out no longer depends on instruction adjacency.
     let mut vm = VM::new(vec![
-        PushFloat(1.0), // a's arg 0
-        PushFloat(2.0), // a's arg 1
-        PushFloat(3.0), // b's arg 0
+        PushFloat(1.0),
+        PushFloat(2.0),
         Invoke("a".into(), 2),
+        PushFloat(3.0),
         Invoke("b".into(), 1),
+        Await,  // b's promise (top of stack)
+        Dig(1), // bring a's promise to the top
+        Await,
     ]);
-    match vm.step().unwrap() {
-        StepResult::Invoke { calls } => {
+    let (pa, pb) = match vm.step().unwrap() {
+        StepResult::Pending { calls } => {
             assert_eq!(calls.len(), 2);
             assert_eq!(calls[0].name, "a");
             assert_eq!(calls[0].args, vec![n(1.0), n(2.0)]);
             assert_eq!(calls[1].name, "b");
             assert_eq!(calls[1].args, vec![n(3.0)]);
+            (calls[0].promise, calls[1].promise)
         }
-        other => panic!("expected Invoke, got {other:?}"),
-    }
-    // Host pushes one result per call, in call order.
-    vm.stack.push(n(100.0)); // a's result
-    vm.stack.push(n(200.0)); // b's result
+        other => panic!("expected Pending, got {other:?}"),
+    };
+    vm.resolve_promise(pa, n(100.0)).unwrap();
+    vm.resolve_promise(pb, n(200.0)).unwrap();
     match vm.step().unwrap() {
         StepResult::Done { .. } => {}
         other => panic!("expected Done, got {other:?}"),
     }
-    assert_eq!(vm.stack, vec![n(100.0), n(200.0)]);
+    assert_eq!(vm.stack, vec![n(200.0), n(100.0)]);
 }
 
 #[test]
-fn invoke_does_not_batch_across_other_ops() {
-    // A non-Invoke instruction between two Invokes breaks the batch.
+fn out_of_order_resolution() {
+    // The program awaits `a` first, but the host resolves `b` first: the
+    // re-executed Await yields a second Pending (with an empty calls list —
+    // everything was already delivered) until `a` is resolved.
     let mut vm = VM::new(vec![
         PushFloat(1.0),
         Invoke("a".into(), 1),
         PushFloat(2.0),
         Invoke("b".into(), 1),
+        Dig(1), // a's promise on top
+        Await,
+        Dig(1), // b's promise on top
+        Await,
     ]);
-    match vm.step().unwrap() {
-        StepResult::Invoke { calls } => {
-            assert_eq!(calls.len(), 1);
-            assert_eq!(calls[0].name, "a");
+    let (pa, pb) = match vm.step().unwrap() {
+        StepResult::Pending { calls } => {
+            assert_eq!(calls.len(), 2);
+            (calls[0].promise, calls[1].promise)
         }
-        other => panic!("expected Invoke, got {other:?}"),
-    }
-    vm.stack.push(n(11.0)); // a's result
+        other => panic!("expected Pending, got {other:?}"),
+    };
+    vm.resolve_promise(pb, n(22.0)).unwrap();
     match vm.step().unwrap() {
-        StepResult::Invoke { calls } => {
-            assert_eq!(calls.len(), 1);
-            assert_eq!(calls[0].name, "b");
-            assert_eq!(calls[0].args, vec![n(2.0)]);
-        }
-        other => panic!("expected Invoke, got {other:?}"),
+        StepResult::Pending { calls } => assert!(calls.is_empty()),
+        other => panic!("expected Pending, got {other:?}"),
     }
+    vm.resolve_promise(pa, n(11.0)).unwrap();
+    assert!(matches!(vm.step().unwrap(), StepResult::Done { .. }));
+    assert_eq!(vm.stack, vec![n(11.0), n(22.0)]);
+}
+
+#[test]
+fn await_already_resolved_does_not_yield() {
+    // Awaiting an already-settled promise proceeds without a host round-trip,
+    // and a second await of the same promise sees the same value.
+    let mut vm = VM::new(vec![
+        Invoke("f".into(), 0),
+        Pick(0), // duplicate the promise
+        Await,
+        Pop(1), // discard the first await's value
+        Await,  // promise underneath: still resolved
+    ]);
+    let id = match vm.step().unwrap() {
+        StepResult::Pending { calls } => calls[0].promise,
+        other => panic!("expected Pending, got {other:?}"),
+    };
+    vm.resolve_promise(id, n(5.0)).unwrap();
+    assert!(matches!(vm.step().unwrap(), StepResult::Done { .. }));
+    assert_eq!(vm.stack, vec![n(5.0)]);
+}
+
+#[test]
+fn settle_promise_misuse_errors() {
+    let mut vm = VM::new(vec![Invoke("f".into(), 0), Await]);
+    let id = match vm.step().unwrap() {
+        StepResult::Pending { calls } => calls[0].promise,
+        other => panic!("expected Pending, got {other:?}"),
+    };
+    // Bad id.
+    assert!(vm.resolve_promise(id + 1, Value::Null).is_err());
+    // Double settle.
+    vm.resolve_promise(id, n(1.0)).unwrap();
+    assert!(vm.resolve_promise(id, n(2.0)).is_err());
+    assert!(vm.reject_promise(id, Value::Null).is_err());
 }
 
 // ── edge cases ────────────────────────────────────────────────
@@ -2209,84 +2293,70 @@ fn math_min_max_nan_propagates() {
 
 #[test]
 fn invoke_interleaved_with_raise() {
-    // Invoke(A) + Invoke(B) batch together (consecutive). Raise fires
-    // separately. Then Invoke(C) fires alone after Raise.
+    // Invoke never yields; Raise still does. Calls started before the Raise
+    // are delivered (in start order) by the first Await after it.
     let mut vm = VM::new(vec![
         PushPosInt(1),  // A arg0
         PushPosInt(10), // A arg1
+        Invoke("A".into(), 2),
+        Raise("err".into(), 0),
+        Pop(1),         // discard the raise's resumed value
         PushPosInt(2),  // B arg0
         PushPosInt(20), // B arg1
-        Invoke("A".into(), 2),
         Invoke("B".into(), 2),
-        Raise("err".into(), 0),
-        PushPosInt(3),  // C arg0
-        PushPosInt(30), // C arg1
-        Invoke("C".into(), 2),
+        Await,  // B's promise (top)
+        Dig(1), // A's promise
+        Await,
     ]);
-    // First step: Invoke(A) + Invoke(B) batched together.
-    match vm.step().unwrap() {
-        StepResult::Invoke { calls } => {
-            assert_eq!(calls.len(), 2, "A and B should batch");
-            assert_eq!(calls[0].name, "A");
-            assert_eq!(calls[1].name, "B");
-        }
-        other => panic!("expected Invoke batch, got {other:?}"),
-    }
-    // Push results for A and B.
-    vm.stack.push(Value::PosInt(100));
-    vm.stack.push(Value::PosInt(200));
-    // Next step: Raise fires (separate — not batched with Invoke).
+    // First yield is the Raise — the started call A stays in the outbox.
     match vm.step().unwrap() {
         StepResult::Raise { condition, .. } => assert_eq!(condition, "err"),
         other => panic!("expected Raise, got {other:?}"),
     }
-    // Resume via resume_raise (ip already advanced by step()).
     vm.resume_raise(Value::PosInt(300));
-    // Next step: Invoke(C) fires alone.
-    match vm.step().unwrap() {
-        StepResult::Invoke { calls } => {
-            assert_eq!(calls.len(), 1, "C should fire alone after Raise");
-            assert_eq!(calls[0].name, "C");
+    // The Await delivers both A (pre-Raise) and B (post-Raise) together.
+    let (pa, pb) = match vm.step().unwrap() {
+        StepResult::Pending { calls } => {
+            assert_eq!(calls.len(), 2);
+            assert_eq!(calls[0].name, "A");
+            assert_eq!(calls[1].name, "B");
+            (calls[0].promise, calls[1].promise)
         }
-        other => panic!("expected Invoke, got {other:?}"),
-    }
+        other => panic!("expected Pending, got {other:?}"),
+    };
+    vm.resolve_promise(pa, Value::PosInt(100)).unwrap();
+    vm.resolve_promise(pb, Value::PosInt(200)).unwrap();
+    assert!(matches!(vm.step().unwrap(), StepResult::Done { .. }));
+    assert_eq!(vm.stack, vec![Value::PosInt(200), Value::PosInt(100)]);
 }
 
-// ── fuel charged per batched invoke ─────────────────────────────
+// ── fuel charged per invoke ─────────────────────────────────────
 
 #[test]
-fn fuel_charged_per_batched_invoke() {
-    // Each call in a batched Invoke should independently consume fuel.
-    let mut vm = VM::new(vec![
-        PushPosInt(1), // X arg0
-        PushPosInt(2), // Y arg0
-        Invoke("X".into(), 1),
-        Invoke("Y".into(), 1),
-    ]);
-    vm.fuel = 5; // enough for 2 Invoke fuel charges + Done step
+fn fuel_charged_per_invoke() {
+    // Each Invoke is one instruction = one fuel unit; starting many calls
+    // cannot bypass the budget.
+    let code = || {
+        vec![
+            PushPosInt(1),
+            Invoke("X".into(), 1),
+            PushPosInt(2),
+            Invoke("Y".into(), 1),
+        ]
+    };
+    let mut vm = VM::new(code());
+    vm.fuel = 4; // exactly one per instruction
     match vm.step().unwrap() {
-        StepResult::Invoke { calls } => {
-            assert_eq!(calls.len(), 2);
-            for _ in &calls {
-                vm.stack.push(Value::PosInt(0)); // dummy result per call
-            }
-        }
-        other => panic!("expected Invoke, got {other:?}"),
+        StepResult::Done { unstarted, .. } => assert_eq!(unstarted.len(), 2),
+        other => panic!("expected Done, got {other:?}"),
     }
-    // Fuel consumed: the batched Invoke step should charge per call.
-    // After 2 calls, fuel should have dropped (exact count depends on
-    // implementation, but a subsequent step should still have fuel).
-    assert!(
-        vm.fuel > 0,
-        "should have fuel remaining after batched invoke"
-    );
-    // One more step should succeed without OutOfFuel.
+    assert_eq!(vm.fuel, 0);
+    // One unit less runs out before the second Invoke.
+    let mut vm = VM::new(code());
+    vm.fuel = 3;
     match vm.step() {
-        Ok(StepResult::Done { .. }) => {} // fine: ran to completion
-        Err(e) if e.kind == ErrorKind::OutOfFuel => {
-            panic!("unexpected OutOfFuel; fuel left: {}", vm.fuel);
-        }
-        other => panic!("unexpected: {other:?}"),
+        Err(e) => assert_eq!(e.kind, ErrorKind::OutOfFuel),
+        other => panic!("expected OutOfFuel, got {other:?}"),
     }
 }
 
@@ -2452,7 +2522,7 @@ fn resume_with_push_value_then_continue() {
     // Feed 0.0 as the subtraction result; program should complete with 0.
     vm.resume_with(&err, Value::Float(0.0)).unwrap();
     match vm.step().unwrap() {
-        StepResult::Done { value } => {
+        StepResult::Done { value, .. } => {
             assert_eq!(value, Value::Float(0.0));
         }
         other => panic!("expected Done after resume, got {other:?}"),
@@ -2686,7 +2756,7 @@ fn message_calldyn_non_callable_and_resume() {
     vm.resume_with(&err, Value::PosInt(7)).unwrap();
     let value = loop {
         match vm.step().unwrap() {
-            StepResult::Done { value } => break value,
+            StepResult::Done { value, .. } => break value,
             other => panic!("unexpected effect: {other:?}"),
         }
     };

@@ -64,6 +64,11 @@ pub enum Value {
     /// The compiler's common path uses the static `Instr::CallBuiltin` instead;
     /// this variant exists for the rarer higher-order/callback use.
     Builtin(Builtin),
+    /// A promise: the future result of a tool call (`tools.f(...)` — the only
+    /// source; there is no `new Promise`). Indexes the VM's `promises` heap.
+    /// A transient value like `Fn`/`Closure`: no JSON form, "object" under
+    /// `typeof`, identity comparison only. Consumed by `Instr::Await`.
+    Promise(instr::PromisePtr),
 }
 
 // ── Value methods ────────────────────────────────────────────
@@ -82,12 +87,13 @@ impl Value {
             Value::NegInt(_) => true,
             // Empty string is falsy; any other string is truthy.
             Value::String(s) => !s.as_str().is_empty(),
-            // All arrays/objects/closures/functions are truthy.
+            // All arrays/objects/closures/functions/promises are truthy.
             Value::Array(_)
             | Value::Object(_)
             | Value::Closure(_)
             | Value::Fn(_)
-            | Value::Builtin(_) => true,
+            | Value::Builtin(_)
+            | Value::Promise(_) => true,
             // Internal indirection; never a legitimate operand.
             Value::Upval(_) => false,
         }
@@ -113,6 +119,7 @@ impl Value {
             | Value::Closure(_)
             | Value::Fn(_)
             | Value::Builtin(_)
+            | Value::Promise(_)
             | Value::Upval(_) => None,
         }
     }
@@ -181,6 +188,8 @@ impl Value {
             (Value::Array(p), Value::Array(q)) => p == q,
             (Value::Object(p), Value::Object(q)) => p == q,
             (Value::Closure(p), Value::Closure(q)) => p == q,
+            // Promises compare by identity: same heap entry, same promise.
+            (Value::Promise(p), Value::Promise(q)) => p == q,
             _ => false,
         }
     }
@@ -281,7 +290,7 @@ impl Value {
 
     /// Human-readable type name for error messages. Coarse JS-style tags:
     /// "undefined", "null", "boolean", "number", "string", "array",
-    /// "object", "function".
+    /// "object", "function", "promise".
     pub(crate) fn type_name(&self) -> &'static str {
         match self {
             Value::Undefined => "undefined",
@@ -292,6 +301,7 @@ impl Value {
             Value::Array(_) => "array",
             Value::Object(_) => "object",
             Value::Fn(_) | Value::Builtin(_) | Value::Closure(_) => "function",
+            Value::Promise(_) => "promise",
             Value::Upval(_) => "upval",
         }
     }

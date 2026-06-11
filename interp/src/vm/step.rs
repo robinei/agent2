@@ -1,5 +1,15 @@
 use super::*;
 
+/// The missing-`await` hint, appended to property/index access errors when
+/// the receiver is a promise — the misuse LLMs actually commit under this
+/// dialect (`tools.f(x).field` instead of `(await tools.f(x)).field`).
+fn await_hint(v: &Value) -> &'static str {
+    match v {
+        Value::Promise(_) => " (did you forget `await`?)",
+        _ => "",
+    }
+}
+
 impl VM {
     /// Shared dispatch for `CallDyn` and `CallSpread`: the args are already
     /// on the stack in left-to-right order (arg 0 deepest), with the callable
@@ -163,6 +173,7 @@ impl VM {
             if self.ip as usize >= self.code.len() {
                 return Ok(StepResult::Done {
                     value: Value::Undefined,
+                    unstarted: std::mem::take(&mut self.outbox),
                 });
             }
             if self.fuel == 0 {
@@ -394,8 +405,13 @@ impl VM {
                     if self.callstack.is_empty() {
                         // Root frame returned — capture the top-level value
                         // (peek, so the stack is still inspectable after Done).
+                        // Tool calls started but never awaited are reported as
+                        // `unstarted`; the host decides whether to run them.
                         let value = self.stack.last().cloned().unwrap_or(Value::Undefined);
-                        return Ok(StepResult::Done { value });
+                        return Ok(StepResult::Done {
+                            value,
+                            unstarted: std::mem::take(&mut self.outbox),
+                        });
                     }
                     // Refresh the local-count cache from the restored caller
                     // frame (returns are far rarer than local accesses).
@@ -702,7 +718,9 @@ impl VM {
                         Value::Float(_) | Value::PosInt(_) | Value::NegInt(_) => "number",
                         Value::String(_) => "string",
                         Value::Fn(_) | Value::Builtin(_) => "function",
-                        Value::Array(_) | Value::Object(_) => "object",
+                        // A promise is "object" in JS (Promise instances are
+                        // ordinary objects); the dialect keeps that tag.
+                        Value::Array(_) | Value::Object(_) | Value::Promise(_) => "object",
                         Value::Closure(_) => "function",
                         // Internal indirection; never a legitimate operand.
                         Value::Upval(_) => {
@@ -936,11 +954,12 @@ impl VM {
                         // NotResumable: errors before popping (peek-style check).
                         _ => {
                             let msg = format!(
-                                "cannot read property on {}",
+                                "cannot read property on {}{}",
                                 self.stack
                                     .last()
                                     .map(|v| v.type_name())
-                                    .unwrap_or("nothing")
+                                    .unwrap_or("nothing"),
+                                self.stack.last().map(await_hint).unwrap_or("")
                             );
                             return Err(self.fail_not_resumable(ErrorKind::TypeError, msg));
                         }
@@ -966,11 +985,12 @@ impl VM {
                         // NotResumable: errors before popping (peek-style check).
                         _ => {
                             let msg = format!(
-                                "cannot set property on {}",
+                                "cannot set property on {}{}",
                                 self.stack
                                     .last()
                                     .map(|v| v.type_name())
-                                    .unwrap_or("nothing")
+                                    .unwrap_or("nothing"),
+                                self.stack.last().map(await_hint).unwrap_or("")
                             );
                             return Err(self.fail_not_resumable(ErrorKind::TypeError, msg));
                         }
@@ -1068,9 +1088,10 @@ impl VM {
                             }
                             _ => {
                                 let msg = format!(
-                                    "cannot index into {} with {}",
+                                    "cannot index into {} with {}{}",
                                     container.type_name(),
-                                    self.preview(&key)
+                                    self.preview(&key),
+                                    await_hint(&container)
                                 );
                                 return Err(self.fail(ErrorKind::TypeError, msg));
                             }
@@ -1092,7 +1113,11 @@ impl VM {
                         Value::Object(_) => false,
                         // Strings are immutable; closures aren't indexable.
                         _ => {
-                            let msg = format!("cannot index-set on {}", container.type_name());
+                            let msg = format!(
+                                "cannot index-set on {}{}",
+                                container.type_name(),
+                                await_hint(&container)
+                            );
                             return Err(self.fail(ErrorKind::TypeError, msg));
                         }
                     };
@@ -1379,46 +1404,81 @@ impl VM {
                 }
 
                 // ── external effects ───────────────────────────
-                Instr::Invoke(..) => {
-                    // Gather the run of consecutive Invoke instructions into one
-                    // fan-out request. Args are laid out left-to-right (normal
-                    // codegen): across the batch, call 0's args are deepest and
-                    // the last call's args on top; within a call, arg 0 is
-                    // deepest. So we partition the arg region front-to-back in
-                    // call order — no reversal. The host resolves all calls and
-                    // pushes one result per call (in call order) before resuming.
-                    let mut sigs: Vec<(String, u32)> = Vec::new();
-                    let mut ip = self.ip;
-                    while let Some((name, nargs)) = self.invoke_at(ip) {
-                        // The outer loop already charged fuel for the first
-                        // invoke; charge each additional one here so a large
-                        // batch can't bypass the budget.
-                        if !sigs.is_empty() {
-                            if self.fuel == 0 {
-                                return Err(self.fail(ErrorKind::OutOfFuel, "fuel exhausted"));
-                            }
-                            self.fuel -= 1;
-                        }
-                        sigs.push((name, nargs));
-                        ip += 1;
-                    }
-                    self.ip = ip; // resume after the batch once host resolves
-
-                    let total: usize = sigs.iter().map(|(_, n)| *n as usize).sum();
-                    if total > self.stack.len() {
+                Instr::Invoke(name, nargs) => {
+                    // Start (don't perform) the tool call: allocate a Pending
+                    // promise, record the call in the outbox, push the promise,
+                    // and continue executing. The host sees the accumulated
+                    // outbox only when an `Await` blocks on a pending promise,
+                    // so fan-out composes across arbitrary control flow.
+                    let name = name.as_str().to_owned();
+                    let n = *nargs as usize;
+                    if n > self.stack.len() {
                         return Err(self.fail(ErrorKind::StackUnderflow, "stack underflow"));
                     }
-                    // Region in push order: region[0] is call 0's arg 0.
-                    let region = self.stack.split_off(self.stack.len() - total);
-                    let mut calls = Vec::with_capacity(sigs.len());
-                    let mut idx = 0;
-                    for (name, nargs) in sigs {
-                        let n = nargs as usize;
-                        let args = region[idx..idx + n].to_vec();
-                        idx += n;
-                        calls.push(InvokeCall { name, args });
+                    let args = self.stack.split_off(self.stack.len() - n);
+                    let id = self.promises.len() as PromisePtr;
+                    self.promises.push(PromiseState::Pending {
+                        waiters: Vec::new(),
+                    });
+                    self.outbox.push(InvokeCall {
+                        promise: id,
+                        name,
+                        args,
+                    });
+                    self.stack.push(Value::Promise(id));
+                    self.ip += 1;
+                }
+
+                Instr::Await => {
+                    // Re-executing instruction: the operand is PEEKED while
+                    // pending so the same Await can run again after the host
+                    // settles the promise (`StepResult::Pending` leaves ip
+                    // unchanged). A non-promise passes through unchanged.
+                    let top = self
+                        .stack
+                        .last()
+                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
+                    let id = match top {
+                        Value::Promise(id) => *id,
+                        _ => {
+                            // `await x` on a plain value: the value IS the
+                            // result; leave it in place.
+                            self.ip += 1;
+                            continue;
+                        }
+                    };
+                    let state = self.promises.get(id as usize).ok_or_else(|| {
+                        self.fail_not_resumable(ErrorKind::ValueError, "bad promise pointer")
+                    })?;
+                    match state {
+                        PromiseState::Resolved(v) => {
+                            let v = v.clone();
+                            self.stack.pop();
+                            self.stack.push(v);
+                            self.ip += 1;
+                        }
+                        PromiseState::Rejected(errval) => {
+                            // Escalate via the Phase 3 path: pop the operand
+                            // first (pop-first invariant), then fail resumably —
+                            // the host may substitute a value for the rejection
+                            // (`PushValueThenContinue`).
+                            let msg = format!(
+                                "awaited promise rejected with {} ({})",
+                                errval.type_name(),
+                                self.preview(errval)
+                            );
+                            self.stack.pop();
+                            return Err(self.fail(ErrorKind::ValueError, msg));
+                        }
+                        PromiseState::Pending { .. } => {
+                            // Block: hand the host everything started since the
+                            // last yield. ip is unchanged (RetrySameInstr
+                            // shape); the promise stays on the stack.
+                            return Ok(StepResult::Pending {
+                                calls: std::mem::take(&mut self.outbox),
+                            });
+                        }
                     }
-                    return Ok(StepResult::Invoke { calls });
                 }
 
                 Instr::Raise(condition, argc) => {

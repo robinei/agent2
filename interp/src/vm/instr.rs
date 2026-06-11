@@ -7,6 +7,10 @@ pub type StackAddr = u32;
 pub type ArrayPtr = u32;
 pub type ObjectPtr = u32;
 pub type ClosurePtr = u32;
+/// Index into the VM's `promises` heap. Promises originate only from tool
+/// calls (`Instr::Invoke`) — there is no `new Promise` — and are transient
+/// values: no JSON form, identity comparison only.
+pub type PromisePtr = u32;
 pub type LocalIndex = u16;
 pub type LocalCount = u16;
 pub type ArgCount = u32;
@@ -206,13 +210,24 @@ pub enum Instr {
     // chaining (`?.`), and optional calls in one instruction.
     JNotNullish(CodeAddr), // taken: any -> any; fall-through: any -> ()
 
-    // EFFECT: invokes the named tool or function.
-    // pops N arguments off the stack; args are taken in push order, so with
-    // left-to-right codegen arg 0 is the deepest of the group (the first one
-    // pushed). step() batches a run of consecutive Invoke instructions into one
-    // StepResult::Invoke (fan-out); the host runs them concurrently and pushes
-    // one result per call, in call order.
-    Invoke(RcStr, ArgCount), // any, ... -> any
+    // EFFECT: starts the named tool call. Pops N arguments (push order: arg 0
+    // deepest), allocates a Pending entry in the `promises` heap, records the
+    // call in the VM-side outbox, and pushes the promise — WITHOUT yielding
+    // to the host. The host sees the accumulated outbox only when the program
+    // awaits a still-pending promise (`Await` → `StepResult::Pending`), so
+    // fan-out composes across arbitrary control flow, not just adjacent
+    // instructions.
+    Invoke(RcStr, ArgCount), // any, ... -> promise
+
+    // Await the top of stack. A non-promise passes through unchanged (JS
+    // `await x` on a plain value). A Resolved promise is replaced by its
+    // value; a Rejected one consumes the promise and escalates the rejection
+    // value as a resumable error (Phase 3 path — the host may substitute a
+    // value). A Pending promise yields `StepResult::Pending` carrying the
+    // drained outbox with ip UNCHANGED (re-executing / `RetrySameInstr`
+    // shape): the host resolves/rejects at least one promise and calls
+    // step() again, and the Await re-executes.
+    Await, // promise|any -> any
 
     // EFFECT: raise condition (like Lisp condition system). used to ask LLM in calling frame
     // to decide how to proceed, using restarts like returning a value, aborting,

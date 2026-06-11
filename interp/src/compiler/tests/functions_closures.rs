@@ -486,7 +486,7 @@ fn top_level_return_value() {
     let prog = compile("return 1;").expect("top-level return compiles");
     let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
     match vm.step().unwrap() {
-        StepResult::Done { value } => assert_eq!(value, Value::PosInt(1)),
+        StepResult::Done { value, .. } => assert_eq!(value, Value::PosInt(1)),
         other => panic!("expected Done, got {other:?}"),
     }
 }

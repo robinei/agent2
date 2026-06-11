@@ -19,7 +19,8 @@ pub use compiler::{Program, compile};
 pub use diag::Diagnostic;
 pub use rc_str::RcStr;
 pub use vm::{
-    DEFAULT_FUEL, ErrorKind, Instr, InvokeCall, ResumeMode, StepResult, VM, VMError, Value,
+    DEFAULT_FUEL, ErrorKind, Instr, InvokeCall, PromisePtr, PromiseState, ResumeMode, StepResult,
+    VM, VMError, Value,
 };
 
 // ── test-only allocation counter ─────────────────────────────────────────────

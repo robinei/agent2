@@ -60,7 +60,7 @@ pub fn run_ret(src: &str) -> serde_json::Value {
     let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
     loop {
         match vm.step().unwrap() {
-            StepResult::Done { value } => {
+            StepResult::Done { value, .. } => {
                 return vm.stack_value_to_json(&value, 0).expect("value to JSON");
             }
             other => panic!("unexpected effect: {other:?}"),
@@ -76,13 +76,13 @@ pub fn run_val(src: &str) -> Value {
     let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
     loop {
         match vm.step().unwrap() {
-            StepResult::Done { value } => return value,
+            StepResult::Done { value, .. } => return value,
             other => panic!("unexpected effect: {other:?}"),
         }
     }
 }
 
-/// Compile + run until the first `Invoke` or `Raise` effect. Returns the
+/// Compile + run until the first `Pending` or `Raise` effect. Returns the
 /// paused VM and the effect. Panics on `Done` or runtime error.
 pub fn run_to_effect(src: &str) -> (VM, StepResult) {
     let prog = compile_ok(src);
@@ -90,11 +90,42 @@ pub fn run_to_effect(src: &str) -> (VM, StepResult) {
     loop {
         match vm.step().unwrap() {
             StepResult::Done { .. } => panic!("unexpected completion"),
-            effect @ (StepResult::Invoke { .. } | StepResult::Raise { .. }) => {
+            effect @ (StepResult::Pending { .. } | StepResult::Raise { .. }) => {
                 return (vm, effect);
             }
         }
     }
+}
+
+/// Compile + run to `Done`, resolving every tool call through `resolve`.
+/// Each `Pending` yield resolves all delivered calls (in delivery order)
+/// before stepping again. Returns the finished VM and the `Done` value;
+/// fire-and-forget calls left in the final `Done` are resolved through the
+/// same closure and discarded. Panics on `Raise` or runtime error.
+pub fn run_with_tools(src: &str, mut resolve: impl FnMut(&str, &[Value]) -> Value) -> (VM, Value) {
+    let prog = compile_ok(src);
+    let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
+    loop {
+        match vm.step().unwrap() {
+            StepResult::Done { value, .. } => return (vm, value),
+            StepResult::Pending { calls } => {
+                for call in calls {
+                    let result = resolve(&call.name, &call.args);
+                    vm.resolve_promise(call.promise, result).unwrap();
+                }
+            }
+            other => panic!("unexpected effect: {other:?}"),
+        }
+    }
+}
+
+/// Like [`run_with_tools`], returning the `Done` value as JSON.
+pub fn run_ret_with_tools(
+    src: &str,
+    resolve: impl FnMut(&str, &[Value]) -> Value,
+) -> serde_json::Value {
+    let (vm, value) = run_with_tools(src, resolve);
+    vm.stack_value_to_json(&value, 0).expect("value to JSON")
 }
 
 /// Compile + run until a runtime `VMError` occurs. Panics on `Done` or
@@ -159,14 +190,14 @@ mod tests {
     }
 
     #[test]
-    fn run_to_effect_yields_invoke() {
-        let (_vm, effect) = run_to_effect("tools.foo(1);");
+    fn run_to_effect_yields_pending() {
+        let (_vm, effect) = run_to_effect("await tools.foo(1);");
         match effect {
-            StepResult::Invoke { calls } => {
+            StepResult::Pending { calls } => {
                 assert_eq!(calls.len(), 1);
                 assert_eq!(calls[0].name, "foo");
             }
-            other => panic!("expected Invoke, got {other:?}"),
+            other => panic!("expected Pending, got {other:?}"),
         }
     }
 

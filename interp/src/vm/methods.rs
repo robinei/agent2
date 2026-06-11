@@ -10,6 +10,8 @@ impl VM {
             objects: Vec::new(),
             closures: Vec::new(),
             cells: Vec::new(),
+            promises: Vec::new(),
+            outbox: Vec::new(),
             stack: Vec::new(),
             // Root frame so that Local is valid from the start.
             callstack: vec![CallFrame {
@@ -191,13 +193,31 @@ impl VM {
         self.fp as usize + self.cur_local_count as usize
     }
 
-    /// If the instruction at `ip` is an `Invoke`, return its name and arg
-    /// count as owned values (releasing the borrow on `self.code` so the
-    /// caller can mutate the stack while batching consecutive invokes).
-    pub(super) fn invoke_at(&self, ip: CodeAddr) -> Option<(String, u32)> {
-        match self.code.get(ip as usize) {
-            Some(Instr::Invoke(name, nargs)) => Some((name.as_str().to_owned(), *nargs)),
-            _ => None,
+    /// Settle a promise with its tool call's result. Host API: called between
+    /// a `StepResult::Pending` yield and the next `step()`. Settling a
+    /// promise that is not `Pending` (already settled, or a bad id) is host
+    /// misuse and errors without changing anything.
+    pub fn resolve_promise(&mut self, id: PromisePtr, value: Value) -> Result<(), VMError> {
+        self.settle_promise(id, PromiseState::Resolved(value))
+    }
+
+    /// Settle a promise as rejected, with the error value the program's
+    /// `await` will escalate. Same contract as [`VM::resolve_promise`].
+    pub fn reject_promise(&mut self, id: PromisePtr, errval: Value) -> Result<(), VMError> {
+        self.settle_promise(id, PromiseState::Rejected(errval))
+    }
+
+    fn settle_promise(&mut self, id: PromisePtr, settled: PromiseState) -> Result<(), VMError> {
+        match self.promises.get_mut(id as usize) {
+            Some(state @ PromiseState::Pending { .. }) => {
+                *state = settled;
+                Ok(())
+            }
+            Some(_) => Err(self.fail_not_resumable(
+                ErrorKind::BadArg,
+                format!("promise {id} is already settled"),
+            )),
+            None => Err(self.fail_not_resumable(ErrorKind::BadArg, format!("bad promise id {id}"))),
         }
     }
 
@@ -260,6 +280,7 @@ impl VM {
                 }
             }
             Value::Object(_) => buf.push_str("[object Object]"),
+            Value::Promise(_) => buf.push_str("[object Promise]"),
             Value::Closure(_) => {
                 buf.push_str("function () { [native code] }");
             }
@@ -355,6 +376,15 @@ impl VM {
                 return Err(self.fail(
                     ErrorKind::ValueError,
                     format!("cannot serialize a {} to JSON", val.type_name()),
+                ));
+            }
+            // A promise is a transient value (like Fn/Closure) with no JSON
+            // form. Reaching the persistence boundary with one is the classic
+            // missing-`await` mistake, so say so.
+            Value::Promise(_) => {
+                return Err(self.fail(
+                    ErrorKind::ValueError,
+                    "cannot serialize a promise to JSON (did you forget `await`?)",
                 ));
             }
             // `undefined` has no JSON form. Like JS `JSON.stringify`, it is

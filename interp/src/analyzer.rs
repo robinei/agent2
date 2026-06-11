@@ -1449,6 +1449,9 @@ impl Analyzer {
             ast::Expression::ParenthesizedExpression(p) => {
                 self.analyze_expr(&p.expression, scope, block_scopes, scopes);
             }
+            ast::Expression::AwaitExpression(a) => {
+                self.analyze_expr(&a.argument, scope, block_scopes, scopes);
+            }
             ast::Expression::ChainExpression(chain) => {
                 self.analyze_chain_element(&chain.expression, scope, block_scopes, scopes);
             }

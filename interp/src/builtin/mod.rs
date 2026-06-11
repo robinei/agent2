@@ -376,7 +376,7 @@ mod tests {
         vm.resume_with(&err, Value::PosInt(99)).unwrap();
         loop {
             match vm.step().unwrap() {
-                StepResult::Done { value } => {
+                StepResult::Done { value, .. } => {
                     assert_eq!(value, Value::PosInt(99));
                     break;
                 }

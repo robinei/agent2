@@ -6,8 +6,8 @@ pub mod value;
 // Re-exports so external paths (`crate::vm::Value` etc.) are unchanged.
 pub use crate::rc_str::RcStr;
 pub use instr::{
-    ArrayPtr, CellIndex, ClosurePtr, CodeAddr, FieldName, Instr, LocalIndex, ObjectPtr, SetMode,
-    SlotKind, StackAddr, UpdateMode,
+    ArrayPtr, CellIndex, ClosurePtr, CodeAddr, FieldName, Instr, LocalIndex, ObjectPtr, PromisePtr,
+    SetMode, SlotKind, StackAddr, UpdateMode,
 };
 pub use value::Value;
 pub(crate) use value::{float_is_int, js_number_to_string};
@@ -176,6 +176,16 @@ pub struct VM {
     /// it has identity and outlives its frame; `Value::Upval` indexes it.
     /// Grows monotonically (no reclamation), like `heap`.
     pub cells: Vec<Value>,
+    /// Promise heap, indexed by `Value::Promise(PromisePtr)`. Entries are
+    /// allocated `Pending` by `Instr::Invoke` and transition exactly once to
+    /// `Resolved`/`Rejected` via the host APIs `resolve_promise` /
+    /// `reject_promise`. Grows monotonically, like the other heaps.
+    pub promises: Vec<PromiseState>,
+    /// Tool calls started (`Instr::Invoke`) but not yet handed to the host.
+    /// Drained into `StepResult::Pending` when the program blocks on a
+    /// pending promise, or into `StepResult::Done` (as `unstarted`) when the
+    /// program finishes without awaiting them.
+    outbox: Vec<InvokeCall>,
     pub stack: Vec<Value>, // sp == stack.len()
     pub callstack: Vec<CallFrame>,
     pub ip: CodeAddr,
@@ -235,19 +245,40 @@ pub struct Closure {
     pub upvals: ThinVec<Value>,
 }
 
+/// State of one entry in the VM's `promises` heap. A promise is born
+/// `Pending` (by `Instr::Invoke`) and transitions exactly once.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PromiseState {
+    /// Not yet settled. `waiters` is reserved for Tier 2 (suspended async
+    /// continuations registered on this promise); unused in Tier 1, where the
+    /// only waiter is the main strand re-executing its `Await`.
+    Pending {
+        waiters: Vec<u32>,
+    },
+    Resolved(Value),
+    Rejected(Value),
+}
+
 #[derive(Debug)]
 pub enum StepResult {
     /// Program completed (root frame returned). The `value` is the program's
     /// top-level return value, or `Undefined` when the program ends without a
-    /// `return` statement.
-    Done { value: Value },
-    /// One or more tool/function calls to perform. `step()` batches a run of
-    /// consecutive `Invoke` instructions into a single fan-out request so the
-    /// host can run them concurrently. The host must push exactly one result
-    /// per call back onto `vm.stack`, in the SAME order as `calls` (calls[0]'s
-    /// result first/deepest, calls.last()'s result on top), then call step()
-    /// again. A lone `Invoke` is just the one-element case.
-    Invoke { calls: Vec<InvokeCall> },
+    /// `return` statement. `unstarted` is the drained outbox: tool calls the
+    /// program started but never awaited (fire-and-forget); the host decides
+    /// whether to run or drop them — the program can no longer observe them.
+    Done {
+        value: Value,
+        unstarted: Vec<InvokeCall>,
+    },
+    /// The program is blocked awaiting a still-pending promise. `calls` is
+    /// the drained outbox: every tool call started since the last yield, each
+    /// tagged with the promise it settles. The host performs calls (in any
+    /// order / concurrently), settles at least one promise via
+    /// `vm.resolve_promise(id, value)` / `vm.reject_promise(id, errval)`, and
+    /// calls `step()` again; the blocking `Await` re-executes (`ip` is
+    /// unchanged). `calls` can be empty when everything the program is
+    /// waiting on was already handed over in an earlier `Pending`.
+    Pending { calls: Vec<InvokeCall> },
     /// A condition was raised; host (LLM) decides how to proceed.
     /// The payload (if any) is the value passed to `raise("name", expr)`.
     /// ip has already advanced past the Raise instruction; the host may
@@ -266,6 +297,9 @@ pub enum StepResult {
 /// A single tool/function call requested by the program.
 #[derive(Debug)]
 pub struct InvokeCall {
+    /// The promise this call settles: the host reports the call's outcome
+    /// with `vm.resolve_promise(promise, value)` / `vm.reject_promise(...)`.
+    pub promise: PromisePtr,
     pub name: String,
     /// Arguments in call order (`args[0]` is the first argument).
     pub args: Vec<Value>,
@@ -315,6 +349,8 @@ pub enum ErrorKind {
 /// | **ObjExtend** (non-object src) | TypeError | PushValueThenContinue | both src+obj popped first |
 /// | **ArrExtend** (non-array src) | TypeError | PushValueThenContinue | both src+arr popped first |
 /// | **ArrPush** (non-array target) | TypeError | PushValueThenContinue | both val+arr popped first |
+/// | Await (rejected promise) | ValueError | PushValueThenContinue | promise popped before failing; host may substitute a value for the rejection |
+/// | Await (bad promise pointer) | ValueError | **NotResumable** | corrupt heap = invariant violation |
 /// | **IncLocal** (non-numeric local) | TypeError | **NotResumable** | reads local by peek (no stack consumption) |
 /// | bad heap/cell pointer (`get`/`get_mut` on arrays/objects/cells/closures) | TypeError/ValueError | **NotResumable** | corrupt heap = invariant violation; some sites also have no result slot (SetLocal) |
 /// | Raise with argc > 1 | BadArg | NotResumable | instruction contract violated (compiler emits 0 or 1) |
