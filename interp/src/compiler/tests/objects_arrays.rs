@@ -212,15 +212,11 @@ fn object_spread_null_undefined() {
 #[test]
 fn object_spread_multiple() {
     assert_eq!(
-        testutil::run_ret(
-            "let a = { x: 1 }; let b = { y: 2 }; return { ...a, ...b, z: 3 }.z;"
-        ),
+        testutil::run_ret("let a = { x: 1 }; let b = { y: 2 }; return { ...a, ...b, z: 3 }.z;"),
         serde_json::json!(3)
     );
     assert_eq!(
-        testutil::run_ret(
-            "let a = { x: 1 }; let b = { y: 2 }; return { ...a, ...b }.y;"
-        ),
+        testutil::run_ret("let a = { x: 1 }; let b = { y: 2 }; return { ...a, ...b }.y;"),
         serde_json::json!(2)
     );
 }
@@ -349,7 +345,8 @@ fn call_spread_optional() {
 fn call_spread_on_tools_is_rejected() {
     let errs = testutil::compile_errs("let a = [1]; tools.foo(...a);");
     assert!(
-        errs.iter().any(|e| e.contains("spread arguments are not supported on tool calls")),
+        errs.iter()
+            .any(|e| e.contains("spread arguments are not supported on tool calls")),
         "expected targeted tool-call spread error, got: {errs:?}"
     );
 }
@@ -387,7 +384,7 @@ fn computed_object_key_mixed_with_static() {
         serde_json::json!("{\"a\":1,\"y\":2,\"b\":3}")
     );
     let vm = testutil::run_vm(
-        "let k = \"k\"; input.obj = { [k]: 10, static: 20 }; input.r = input.obj.k;"
+        "let k = \"k\"; input.obj = { [k]: 10, static: 20 }; input.r = input.obj.k;",
     );
     assert_eq!(input_val(&vm, "r"), Value::PosInt(10));
 }
@@ -395,7 +392,7 @@ fn computed_object_key_mixed_with_static() {
 #[test]
 fn computed_object_key_with_spread() {
     let vm = testutil::run_vm(
-        "let k = \"c\"; let base = { a: 1, b: 2 }; input.obj = { ...base, [k]: 3 }; input.r = JSON.stringify(input.obj);"
+        "let k = \"c\"; let base = { a: 1, b: 2 }; input.obj = { ...base, [k]: 3 }; input.r = JSON.stringify(input.obj);",
     );
     match input_val(&vm, "r") {
         Value::String(s) => {
@@ -410,10 +407,7 @@ fn computed_object_key_with_spread() {
 
 #[test]
 fn computed_object_key_expression() {
-    assert_eq!(
-        eval("({ [1 + 2]: \"three\" })[\"3\"]"),
-        eval("\"three\"")
-    );
+    assert_eq!(eval("({ [1 + 2]: \"three\" })[\"3\"]"), eval("\"three\""));
     assert_eq!(
         eval("({ [\"hello \" + \"world\"]: true })[\"hello world\"]"),
         Value::Bool(true)
@@ -447,7 +441,9 @@ fn object_method_shorthand_empty_body() {
 #[test]
 fn object_method_with_computed_key() {
     assert_eq!(
-        testutil::run_val("let k = \"inc\"; let obj = { [k](x) { return x + 1; } }; return obj.inc(9);"),
+        testutil::run_val(
+            "let k = \"inc\"; let obj = { [k](x) { return x + 1; } }; return obj.inc(9);"
+        ),
         testutil::num(10.0)
     );
 }
@@ -461,6 +457,82 @@ fn shorthand_properties_compile() {
     assert_eq!(
         testutil::run_val("let x = 7; let y = 3; let obj = { x, y }; return obj.x + obj.y;"),
         testutil::num(10.0)
+    );
+}
+
+// ── object destructuring rest ────────────────────────────────────
+
+#[test]
+fn object_rest_declaration() {
+    assert_eq!(
+        testutil::run_ret("let {a, ...rest} = {a: 1, b: 2, c: 3}; return { a, rest };"),
+        serde_json::json!({"a": 1, "rest": {"b": 2, "c": 3}})
+    );
+    // No surplus keys → empty rest.
+    assert_eq!(
+        testutil::run_ret("let {a, ...rest} = {a: 1}; return rest;"),
+        serde_json::json!({})
+    );
+    // Rest alone is a shallow copy, independent of the source.
+    assert_eq!(
+        testutil::run_ret("let src = {x: 1}; let {...r} = src; r.y = 2; return { src, r };"),
+        serde_json::json!({"src": {"x": 1}, "r": {"x": 1, "y": 2}})
+    );
+}
+
+#[test]
+fn object_rest_with_defaults_and_nesting() {
+    assert_eq!(
+        testutil::run_ret("let {a = 9, ...rest} = {b: 2}; return { a, rest };"),
+        serde_json::json!({"a": 9, "rest": {"b": 2}})
+    );
+    assert_eq!(
+        testutil::run_ret(
+            "let {p: {q, ...inner}, ...outer} = {p: {q: 1, r: 2}, s: 3}; return { q, inner, outer };"
+        ),
+        serde_json::json!({"q": 1, "inner": {"r": 2}, "outer": {"s": 3}})
+    );
+}
+
+#[test]
+fn object_rest_computed_key_evaluates_once() {
+    assert_eq!(
+        testutil::run_ret(
+            "let n = 0; function k() { n += 1; return 'a'; } let {[k()]: v, ...rest} = {a: 1, b: 2}; return { v, rest, n };"
+        ),
+        serde_json::json!({"v": 1, "rest": {"b": 2}, "n": 1})
+    );
+}
+
+#[test]
+fn object_rest_string_and_numeric_keys() {
+    assert_eq!(
+        testutil::run_ret(
+            "let {'a b': v, 1: w, ...rest} = {'a b': 1, '1': 2, c: 3}; return { v, w, rest };"
+        ),
+        serde_json::json!({"v": 1, "w": 2, "rest": {"c": 3}})
+    );
+}
+
+#[test]
+fn object_rest_assignment() {
+    assert_eq!(
+        testutil::run_ret("let a, rest; ({a, ...rest} = {a: 1, b: 2, c: 3}); return { a, rest };"),
+        serde_json::json!({"a": 1, "rest": {"b": 2, "c": 3}})
+    );
+    assert_eq!(
+        testutil::run_ret("let a, rest; ({a = 5, ...rest} = {b: 2}); return { a, rest };"),
+        serde_json::json!({"a": 5, "rest": {"b": 2}})
+    );
+}
+
+#[test]
+fn object_rest_null_source_divergence() {
+    // Inherits `ObjExtend` semantics (documented divergence for object
+    // spread): a null/undefined source gives an empty rest where JS throws.
+    assert_eq!(
+        testutil::run_ret("let {...r} = null; return r;"),
+        serde_json::json!({})
     );
 }
 

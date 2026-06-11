@@ -460,16 +460,26 @@ impl<'src> Compiler<'src> {
                 self.emit(Instr::Pop(1), span); // drop the source
             }
             ast::BindingPattern::ObjectPattern(obj) => {
-                if obj.rest.is_some() {
-                    self.error(
-                        obj.span.start,
-                        "rest elements in object destructuring are not supported",
-                    );
-                }
-                for prop in &obj.properties {
-                    self.emit(Instr::Pick(0), span);
-                    self.emit_property_key_access(&prop.key, prop.computed, span);
-                    self.destructure_binding(&prop.value, span);
+                if let Some(rest) = &obj.rest {
+                    // Rest: shallow-copy the source up front, then delete each
+                    // matched key from the copy as it is extracted — so every
+                    // key (computed ones included) evaluates exactly once.
+                    self.emit(Instr::ObjNew(Vec::new().into()), span);
+                    self.emit(Instr::Pick(1), span);
+                    self.emit(Instr::ObjExtend, span); // [src, rest]
+                    for prop in &obj.properties {
+                        self.emit(Instr::Pick(1), span); // [src, rest, src]
+                        self.emit_property_key_string(&prop.key, prop.computed, span);
+                        self.emit_rest_excluded_key_access(span); // [src, rest, val]
+                        self.destructure_binding(&prop.value, span);
+                    }
+                    self.destructure_binding(&rest.argument, span); // [src]
+                } else {
+                    for prop in &obj.properties {
+                        self.emit(Instr::Pick(0), span);
+                        self.emit_property_key_access(&prop.key, prop.computed, span);
+                        self.destructure_binding(&prop.value, span);
+                    }
                 }
                 self.emit(Instr::Pop(1), span); // drop the source
             }
@@ -503,6 +513,47 @@ impl<'src> Compiler<'src> {
             }
         };
         self.emit(Instr::ObjGet(RcStr::from(name.as_str())), span);
+    }
+
+    /// Push a pattern property's key as a string *value* (used to exclude
+    /// matched keys from an object-rest copy). A static key pushes the literal;
+    /// a computed key evaluates the expression and coerces with `ToStr`.
+    fn emit_property_key_string(&mut self, key: &ast::PropertyKey, computed: bool, span: u32) {
+        if computed {
+            if let Some(expr) = key.as_expression() {
+                self.compile_expr(expr);
+                self.emit(Instr::ToStr, span);
+                return;
+            }
+        }
+        let name = match key {
+            ast::PropertyKey::StaticIdentifier(id) => id.name.as_str().to_string(),
+            ast::PropertyKey::StringLiteral(s) => s.value.as_str().to_string(),
+            ast::PropertyKey::NumericLiteral(n) => number_key_to_string(n.value),
+            _ => {
+                if let Some(expr) = key.as_expression() {
+                    self.compile_expr(expr);
+                    self.emit(Instr::ToStr, span);
+                    return;
+                }
+                self.error(key.span().start, "unsupported destructuring key");
+                return;
+            }
+        };
+        self.emit(Instr::PushStr(RcStr::from(name.as_str())), span);
+    }
+
+    /// Object-rest plumbing: with `[src, rest, src, key]` on the stack (key a
+    /// string), delete `key` from the `rest` copy and read `src[key]`, leaving
+    /// `[src, rest, value]`. The key is consumed by both uses via one `Pick`,
+    /// so its expression never re-evaluates.
+    fn emit_rest_excluded_key_access(&mut self, span: u32) {
+        self.emit(Instr::Pick(0), span); //   [src, rest, src, key, key]
+        self.emit(Instr::Pick(3), span); //   [src, rest, src, key, key, rest]
+        self.emit(Instr::Dig(1), span); //    [src, rest, src, key, rest, key]
+        self.emit(Instr::ObjDelete, span); // [src, rest, src, key, existed]
+        self.emit(Instr::Pop(1), span); //    [src, rest, src, key]
+        self.emit(Instr::IndexGet, span); //  [src, rest, value]
     }
 
     /// Apply a destructuring/parameter default to the value on top of the stack:
@@ -1992,32 +2043,61 @@ impl<'src> Compiler<'src> {
                 self.emit(Instr::Pop(1), span);
             }
             ast::AssignmentTarget::ObjectAssignmentTarget(obj) => {
-                if obj.rest.is_some() {
-                    self.error(
-                        obj.span.start,
-                        "rest elements in destructuring are not supported",
-                    );
-                }
-                for prop in &obj.properties {
-                    match prop {
-                        ast::AssignmentTargetProperty::AssignmentTargetPropertyIdentifier(p) => {
-                            // Shorthand `{a}` / `{a = d}`: the key and the target
-                            // are the same identifier.
-                            self.emit(Instr::Pick(0), span);
-                            self.emit(Instr::ObjGet(p.binding.name.as_str().into()), span);
-                            if let Some(default) = &p.init {
-                                self.emit_default(default, span);
+                if let Some(rest) = &obj.rest {
+                    // Same copy-minus-keys lowering as the declaration form
+                    // (see `destructure_binding`).
+                    self.emit(Instr::ObjNew(Vec::new().into()), span);
+                    self.emit(Instr::Pick(1), span);
+                    self.emit(Instr::ObjExtend, span); // [src, rest]
+                    for prop in &obj.properties {
+                        self.emit(Instr::Pick(1), span); // [src, rest, src]
+                        match prop {
+                            ast::AssignmentTargetProperty::AssignmentTargetPropertyIdentifier(
+                                p,
+                            ) => {
+                                self.emit(Instr::PushStr(p.binding.name.as_str().into()), span);
+                                self.emit_rest_excluded_key_access(span);
+                                if let Some(default) = &p.init {
+                                    self.emit_default(default, span);
+                                }
+                                self.assign_to_identifier(
+                                    p.binding.name.as_str(),
+                                    p.binding.span.start,
+                                    span,
+                                );
                             }
-                            self.assign_to_identifier(
-                                p.binding.name.as_str(),
-                                p.binding.span.start,
-                                span,
-                            );
+                            ast::AssignmentTargetProperty::AssignmentTargetPropertyProperty(p) => {
+                                self.emit_property_key_string(&p.name, p.computed, span);
+                                self.emit_rest_excluded_key_access(span);
+                                self.assign_maybe_default(&p.binding, span);
+                            }
                         }
-                        ast::AssignmentTargetProperty::AssignmentTargetPropertyProperty(p) => {
-                            self.emit(Instr::Pick(0), span);
-                            self.emit_property_key_access(&p.name, p.computed, span);
-                            self.assign_maybe_default(&p.binding, span);
+                    }
+                    self.assign_target_leaf(&rest.target, span); // [src]
+                } else {
+                    for prop in &obj.properties {
+                        match prop {
+                            ast::AssignmentTargetProperty::AssignmentTargetPropertyIdentifier(
+                                p,
+                            ) => {
+                                // Shorthand `{a}` / `{a = d}`: the key and the target
+                                // are the same identifier.
+                                self.emit(Instr::Pick(0), span);
+                                self.emit(Instr::ObjGet(p.binding.name.as_str().into()), span);
+                                if let Some(default) = &p.init {
+                                    self.emit_default(default, span);
+                                }
+                                self.assign_to_identifier(
+                                    p.binding.name.as_str(),
+                                    p.binding.span.start,
+                                    span,
+                                );
+                            }
+                            ast::AssignmentTargetProperty::AssignmentTargetPropertyProperty(p) => {
+                                self.emit(Instr::Pick(0), span);
+                                self.emit_property_key_access(&p.name, p.computed, span);
+                                self.assign_maybe_default(&p.binding, span);
+                            }
                         }
                     }
                 }
