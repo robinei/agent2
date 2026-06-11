@@ -128,6 +128,29 @@ enum ExitKind {
     /// `break`/`continue`: jump to `target`, unwinding down to the loop
     /// context's barrier `floor`.
     Jump { target: u32, floor: usize },
+    /// `return`: unwind every barrier; the value waits in the function's
+    /// [`ReturnSpill`] slot, loaded by the final `Return(1)`. Residues are
+    /// never popped on this path — frame teardown discards the whole
+    /// operand stack, and overwriting the shared spill slot is exactly how
+    /// a `return` from a finally overrides a pending one.
+    Return,
+}
+
+/// Per-function bookkeeping for the return spill slot (see
+/// [`Compiler::return_spill`]). The slot sits just past every
+/// analyzer-allocated slot (`[params | upvals | own locals | self?]`) and
+/// is only materialized — by patching the already-emitted `EnterFrame`
+/// post-body — when some `return` actually crossed a finalizer; functions
+/// without one compile byte-for-byte as before.
+struct ReturnSpill {
+    /// Absolute frame slot index.
+    slot: u32,
+    /// `Ok(i)`: `code[i]` is this frame's `EnterFrame`, patch its kinds.
+    /// `Err(i)`: no `EnterFrame` was emitted (a root frame with no locals);
+    /// insert one at `i` if the slot is used (safe pre-backpatch: labels
+    /// are positional markers, jumps carry label ids).
+    enter_frame: Result<usize, usize>,
+    used: bool,
 }
 
 /// One entry of the compile-time barrier stack: everything an early exit
@@ -185,10 +208,13 @@ struct Compiler<'src> {
     /// `return` must emit when jumping out — balancing `TryExit`s, residue
     /// `Pop`s, and `finally` exit-stub detours (see [`Barrier`]).
     barriers: Vec<Barrier>,
-    /// Nesting depth of `finally`-copy compilation (saved/reset per
-    /// function). Part B2 Step 1: `return` inside a `finally` block is
-    /// still rejected (Step 2 lifts this via the return spill slot).
-    finally_copy_depth: usize,
+    /// The current function's return spill slot (saved/reset per function;
+    /// `None` only during analysis). A `return` crossing a `finally`
+    /// boundary parks its value here while the finally copies run — the
+    /// operand stack cannot carry it: pending residues beneath it could
+    /// not be discarded without popping under live handler snapshots, and
+    /// there is no pop-under instruction (nor is one wanted).
+    return_spill: Option<ReturnSpill>,
     diagnostics: Vec<Diagnostic>,
     /// Scope/capture analysis pre-computed before codegen. `None` during the
     /// analysis pass itself; `Some` during codegen. Codegen resolves every
@@ -223,7 +249,7 @@ impl<'src> Compiler<'src> {
             next_label: 0,
             loops: Vec::new(),
             barriers: Vec::new(),
-            finally_copy_depth: 0,
+            return_spill: None,
             diagnostics: Vec::new(),
             analysis: None,
             current_scope: 0,
@@ -284,7 +310,10 @@ impl<'src> Compiler<'src> {
         // Prologue. The root frame has no params and no upvals, so `EnterFrame`
         // just allocates its locals (and eagerly builds top-level `arguments` if
         // referenced). Skip it entirely when there is nothing to set up.
-        if !root.slot_kinds.is_empty() || root.uses_arguments {
+        let enter_frame_at = self.code.len();
+        let root_slot_count = root.slot_kinds.len() as u32;
+        let emitted_enter_frame = !root.slot_kinds.is_empty() || root.uses_arguments;
+        if emitted_enter_frame {
             let kinds = root.slot_kinds.clone();
             let uses_arguments = root.uses_arguments;
             self.emit(
@@ -292,6 +321,15 @@ impl<'src> Compiler<'src> {
                 program.span.start,
             );
         }
+        self.return_spill = Some(ReturnSpill {
+            slot: root_slot_count,
+            enter_frame: if emitted_enter_frame {
+                Ok(enter_frame_at)
+            } else {
+                Err(enter_frame_at)
+            },
+            used: false,
+        });
 
         // Hoist function declarations into the prologue (emit their bindings).
         self.hoist_function_decls(&program.body);
@@ -303,6 +341,9 @@ impl<'src> Compiler<'src> {
 
         // Root frame ends with Return(0) → StepResult::Done.
         self.emit(Instr::Return(0), program.span.end);
+        if let Some(spill) = self.return_spill.take() {
+            self.finalize_return_spill(spill, program.span.start);
+        }
     }
 
     fn compile_stmt(&mut self, stmt: &ast::Statement) {
@@ -355,17 +396,10 @@ impl<'src> Compiler<'src> {
                 // frame's Return pops it and yields Done { value }.
                 let _is_top_level = analysis.scopes[self.current_scope].parent == usize::MAX;
                 match &r.argument {
-                    Some(expr) => {
-                        self.compile_expr(expr);
-                        self.emit_return_try_exits(r.span.start);
-                        self.emit(Instr::Return(1), r.span.start);
-                    }
-                    None => {
-                        self.emit(Instr::PushUndefined, r.span.start);
-                        self.emit_return_try_exits(r.span.start);
-                        self.emit(Instr::Return(1), r.span.start);
-                    }
+                    Some(expr) => self.compile_expr(expr),
+                    None => self.emit(Instr::PushUndefined, r.span.start),
                 }
+                self.emit_return(r.span.start);
             }
 
             ast::Statement::ForOfStatement(s) => self.compile_for_of(s),
@@ -967,13 +1001,18 @@ impl<'src> Compiler<'src> {
     /// while a residue is open snapshots a stack that includes the residue
     /// slots, so popping them any earlier would desynchronize the snapshot.
     fn emit_exit(&mut self, kind: ExitKind, span: u32) {
-        let ExitKind::Jump { target, floor } = kind;
+        let floor = match kind {
+            ExitKind::Jump { floor, .. } => floor,
+            ExitKind::Return => 0,
+        };
         let mut depth = self.barriers.len();
         while depth > floor {
             depth -= 1;
             match self.barriers[depth] {
                 Barrier::Residue { slots } => {
-                    if slots > 0 {
+                    // `return` never pops residues: frame teardown discards
+                    // the whole operand stack (see [`ExitKind::Return`]).
+                    if slots > 0 && !matches!(kind, ExitKind::Return) {
                         self.emit(Instr::Pop(slots), span);
                     }
                 }
@@ -987,7 +1026,14 @@ impl<'src> Compiler<'src> {
                 }
             }
         }
-        self.emit(Instr::Jump(target), span);
+        match kind {
+            ExitKind::Jump { target, .. } => self.emit(Instr::Jump(target), span),
+            ExitKind::Return => {
+                let slot = self.return_spill.as_ref().expect("spill set up").slot;
+                self.emit(Instr::Local(slot as LocalIndex), span);
+                self.emit(Instr::Return(1), span);
+            }
+        }
     }
 
     /// The exit-stub label for destination `kind` on the finalizer entry at
@@ -1008,17 +1054,14 @@ impl<'src> Compiler<'src> {
         label
     }
 
-    /// Emit one `TryExit` per `try` entry open in the current function body —
-    /// the handler cleanup a `return` needs before its `Return` pops the
-    /// frame (a frame must never leave handler entries behind). A `return`
-    /// inside or crossing a `finally` is still rejected (Part B2 Step 2
-    /// lifts this via the return spill slot).
-    fn emit_return_try_exits(&mut self, span: u32) {
-        if self.finally_copy_depth > 0 {
-            self.error(span, "`return` inside a `finally` block is not supported");
-            return;
-        }
-        if self.barriers.iter().any(|b| {
+    /// Emit the exit for a `return` whose value is on top of the stack.
+    /// Without a finalizer to cross: one balancing `TryExit` per open `try`
+    /// entry (a frame must never leave handler entries behind), then
+    /// `Return(1)` — the value rides the stack, byte-for-byte the pre-B2
+    /// codegen. Crossing a finalizer: spill the value to the return slot
+    /// and take the exit walk through the finally stubs.
+    fn emit_return(&mut self, span: u32) {
+        let crosses_finalizer = self.barriers.iter().any(|b| {
             matches!(
                 b,
                 Barrier::Try {
@@ -1026,20 +1069,47 @@ impl<'src> Compiler<'src> {
                     ..
                 }
             )
-        }) {
-            self.error(
-                span,
-                "`return` cannot jump out of a `try` block that has a `finally` clause",
-            );
+        });
+        if !crosses_finalizer {
+            let try_exits = self
+                .barriers
+                .iter()
+                .filter(|b| matches!(b, Barrier::Try { .. }))
+                .count();
+            for _ in 0..try_exits {
+                self.emit(Instr::TryExit, span);
+            }
+            self.emit(Instr::Return(1), span);
             return;
         }
-        let try_exits = self
-            .barriers
-            .iter()
-            .filter(|b| matches!(b, Barrier::Try { .. }))
-            .count();
-        for _ in 0..try_exits {
-            self.emit(Instr::TryExit, span);
+        let spill = self.return_spill.as_mut().expect("spill set up");
+        spill.used = true;
+        let slot = spill.slot;
+        self.emit(Instr::SetLocal(slot as LocalIndex), span);
+        self.emit_exit(ExitKind::Return, span);
+    }
+
+    /// Post-body half of the spill-slot protocol (see [`ReturnSpill`]):
+    /// materialize the slot by patching (or, for a root frame that skipped
+    /// it, inserting) the `EnterFrame`, only if some `return` used it.
+    fn finalize_return_spill(&mut self, spill: ReturnSpill, span: u32) {
+        if !spill.used {
+            return;
+        }
+        match spill.enter_frame {
+            Ok(i) => {
+                let Instr::EnterFrame(nparams, build_args, kinds) = &self.code[i] else {
+                    unreachable!("ReturnSpill::enter_frame must point at an EnterFrame");
+                };
+                let mut kinds: Vec<SlotKind> = kinds.iter().copied().collect();
+                kinds.push(SlotKind::Plain);
+                self.code[i] = Instr::EnterFrame(*nparams, *build_args, kinds.into());
+            }
+            Err(i) => {
+                self.code
+                    .insert(i, Instr::EnterFrame(0, false, vec![SlotKind::Plain].into()));
+                self.spans.insert(i, span);
+            }
         }
     }
 
@@ -1060,7 +1130,7 @@ impl<'src> Compiler<'src> {
     /// The unwinder pops the handler entry *before* jumping, so a throw
     /// inside `catch` propagates outward. `break`/`continue`/`return`
     /// leaving the try block emit their own `TryExit`s (tracked via
-    /// `try_stack`). `raise()` is not catchable by design.
+    /// `barriers`). `raise()` is not catchable by design.
     ///
     /// A `finally` clause wraps the whole thing in an *outer* handler —
     /// `try B catch C finally F` ≡ `try { try B catch C } finally F` — so an
@@ -1158,11 +1228,9 @@ impl<'src> Compiler<'src> {
         self.barriers.push(Barrier::Residue {
             slots: pending_slots,
         });
-        self.finally_copy_depth += 1;
         for stmt in &fin.body {
             self.compile_stmt(stmt);
         }
-        self.finally_copy_depth -= 1;
         self.barriers.pop();
     }
 
@@ -3595,13 +3663,13 @@ impl<'src> Compiler<'src> {
 
         let prev_scope = self.current_scope;
         self.current_scope = scope_id;
-        // `try` blocks don't cross function boundaries: a `return` in this
-        // body must pop only THIS body's handlers, never the enclosing
-        // function's (those belong to a different frame). Likewise a body
-        // defined inside a `finally` block is a fresh frame: its `return`s
-        // are legal again.
+        // Barriers don't cross function boundaries: a `return` in this body
+        // must pop only THIS body's handlers, never the enclosing function's
+        // (those belong to a different frame), and a body defined inside a
+        // `finally` block is a fresh frame with no pending completion. The
+        // spill slot is per-frame for the same reason.
         let prev_barriers = std::mem::take(&mut self.barriers);
-        let prev_finally_copy_depth = std::mem::take(&mut self.finally_copy_depth);
+        let prev_return_spill = self.return_spill.take();
         // Slot numbers are frame-relative, so the callee gets its own const env.
         // Phase D: seed it with constants captured *by value* — a `const`/
         // effectively-const capture is an immutable snapshot, so the upval holds a
@@ -3635,6 +3703,15 @@ impl<'src> Compiler<'src> {
         if self_name.is_some() && !self.is_const_fn_scope(scope_id) {
             local_kinds.push(SlotKind::Plain);
         }
+        // The return spill slot would land just past everything; the
+        // `EnterFrame` emitted here is patched post-body to allocate it,
+        // only if some `return` crossing a `finally` actually used it.
+        let enter_frame_at = self.code.len();
+        self.return_spill = Some(ReturnSpill {
+            slot: nparams + upval_count + local_kinds.len() as u32,
+            enter_frame: Ok(enter_frame_at),
+            used: false,
+        });
         self.emit(
             Instr::EnterFrame(nparams as u16, uses_arguments, local_kinds.into()),
             span,
@@ -3729,10 +3806,13 @@ impl<'src> Compiler<'src> {
         }
 
         self.emit(Instr::Label(after), span);
+        if let Some(spill) = self.return_spill.take() {
+            self.finalize_return_spill(spill, span);
+        }
         self.current_scope = prev_scope;
         self.const_env = prev_const_env;
         self.barriers = prev_barriers;
-        self.finally_copy_depth = prev_finally_copy_depth;
+        self.return_spill = prev_return_spill;
     }
 
     /// Emit per-parameter prologue code. The argument value is already in the

@@ -950,25 +950,212 @@ fn continue_crossing_finally_then_switch() {
     );
 }
 
-// ── finally: rejected early exits (return — lifted in Part B2 Step 2) ─
+// ── finally: return across and inside `finally` (Part B2 Step 2) ─────
+//
+// A `return` crossing a finalizer spills its value to the reserved frame
+// slot and detours through the finally stubs; a `return` from inside a
+// finally block overrides whatever completion was pending.
 
 #[test]
-fn return_crossing_finally_rejected() {
-    let errs = compile_errs(r#"function f() { try { return 1; } finally {} } return f();"#);
-    assert!(
-        errs.iter()
-            .any(|e| e.contains("`return` cannot jump out of a `try` block")),
-        "got: {errs:?}"
+fn return_value_evaluated_before_finally_runs() {
+    // The classic: the return value is captured before the finally mutates
+    // the variable.
+    assert_eq!(
+        run_ret(r#"function f() { let x = 1; try { return x; } finally { x = 2; } } return f();"#),
+        json!(1)
     );
 }
 
 #[test]
-fn return_inside_finally_rejected() {
-    let errs = compile_errs(r#"function f() { try {} finally { return 1; } } return f();"#);
-    assert!(
-        errs.iter()
-            .any(|e| e.contains("`return` inside a `finally` block")),
-        "got: {errs:?}"
+fn return_crossing_two_finallys_innermost_first() {
+    assert_eq!(
+        run_ret(
+            r#"
+            const a = [];
+            function f() {
+                try {
+                    try { return "v"; } finally { a.push("inner"); }
+                } finally { a.push("outer"); }
+            }
+            const r = f();
+            return [a, r];
+            "#
+        ),
+        json!([["inner", "outer"], "v"])
+    );
+}
+
+#[test]
+fn finally_return_overrides_pending_return() {
+    assert_eq!(
+        run_ret(r#"function f() { try { return 1; } finally { return 2; } } return f();"#),
+        json!(2)
+    );
+}
+
+#[test]
+fn finally_return_swallows_pending_exception() {
+    assert_eq!(
+        run_ret(r#"function f() { try { throw "boom"; } finally { return 2; } } return f();"#),
+        json!(2)
+    );
+}
+
+#[test]
+fn finally_return_overrides_pending_break() {
+    assert_eq!(
+        run_ret(
+            r#"
+            function f() {
+                while (true) { try { break; } finally { return 1; } }
+                return 2;
+            }
+            return f();
+            "#
+        ),
+        json!(1)
+    );
+}
+
+#[test]
+fn throw_in_finally_overrides_pending_return() {
+    assert_eq!(
+        run_ret(
+            r#"
+            function f() { try { return 1; } finally { throw "e"; } }
+            let c = null;
+            try { f(); } catch (e) { c = e; }
+            return c;
+            "#
+        ),
+        json!("e")
+    );
+}
+
+#[test]
+fn return_inside_normal_path_finally() {
+    assert_eq!(
+        run_ret(r#"function f() { try {} finally { return 7; } } return f();"#),
+        json!(7)
+    );
+}
+
+#[test]
+fn failed_return_inside_unwind_finally_keeps_pending_value() {
+    // Spill soundness: evaluating the return value throws *before* the
+    // spill/exit, inside the unwind copy — the pending thrown value beneath
+    // must survive intact for the rethrow.
+    assert_eq!(
+        run_ret(
+            r#"
+            const a = [];
+            function g() { throw "g"; }
+            function f() {
+                try { throw "boom"; } finally {
+                    try { return g(); } catch (e) { a.push(e); }
+                    a.push("f");
+                }
+            }
+            let c = null;
+            try { f(); } catch (e) { c = e; }
+            return [a, c];
+            "#
+        ),
+        json!([["g", "f"], "boom"])
+    );
+}
+
+#[test]
+fn return_inside_finally_crossing_another_finally() {
+    // The override return spills over the pending one (shared slot,
+    // last-wins) and detours through the inner finalizer's stub.
+    assert_eq!(
+        run_ret(
+            r#"
+            const a = [];
+            function f() {
+                try { return 1; } finally {
+                    a.push("f1");
+                    try { return 2; } finally { a.push("f2"); }
+                }
+            }
+            return [f(), a];
+            "#
+        ),
+        json!([2, ["f1", "f2"]])
+    );
+}
+
+#[test]
+fn return_crossing_finally_inside_for_of() {
+    // The for-of's stack-resident [container, idx] state is dead on this
+    // path; frame teardown discards it along with any pending residues.
+    assert_eq!(
+        run_ret(
+            r#"
+            const a = [];
+            function f() {
+                for (const x of [1, 2, 3]) {
+                    try { if (x === 2) { return x * 10; } } finally { a.push("f"); }
+                }
+                return 0;
+            }
+            const r = f();
+            return [a, r];
+            "#
+        ),
+        json!([["f", "f"], 20])
+    );
+}
+
+#[test]
+fn top_level_return_crossing_finally_without_locals() {
+    // Root frame with no declared locals: the spill slot is materialized by
+    // inserting the prologue `EnterFrame` that was otherwise skipped.
+    assert_eq!(run_ret(r#"try { return 42; } finally {}"#), json!(42));
+}
+
+#[test]
+fn top_level_return_crossing_finally_with_locals() {
+    assert_eq!(
+        run_ret(
+            r#"
+            const a = [];
+            try { a.push(1); return a; } finally { a.push(2); }
+            "#
+        ),
+        json!([1, 2])
+    );
+}
+
+#[test]
+fn return_crossing_finally_in_closure_with_upvals() {
+    // The spill slot lands past the upval slots; the spilled value is the
+    // captured cell's value at return time, not after the finally mutates
+    // it.
+    assert_eq!(
+        run_ret(
+            r#"
+            function outer() {
+                let v = 5;
+                const inner = () => { try { return v; } finally { v = 6; } };
+                const r = inner();
+                return [r, v];
+            }
+            return outer();
+            "#
+        ),
+        json!([5, 6])
+    );
+}
+
+#[test]
+fn return_with_arguments_and_spill_slot() {
+    // `uses_arguments` frames build the args cache in EnterFrame; the
+    // patched-in spill slot must not disturb that.
+    assert_eq!(
+        run_ret(r#"function f(p) { try { return arguments[0] + p; } finally {} } return f(20);"#),
+        json!(40)
     );
 }
 

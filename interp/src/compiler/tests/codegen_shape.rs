@@ -698,3 +698,59 @@ fn effectively_const_callee_materializes_constant_not_dead_slot() {
         prog.code
     );
 }
+
+// ── Part B2: return spill slot is pay-for-what-you-use ───────────
+
+#[test]
+fn catch_only_return_allocates_no_spill_slot() {
+    // A return crossing only catch-only trys keeps the pre-B2 lowering:
+    // value on the stack, balancing TryExit, Return — and no spill slot is
+    // patched into any EnterFrame.
+    let prog = compile("function f() { try { return 1; } catch { return 2; } } return f();")
+        .expect("compiles");
+    assert!(
+        !prog
+            .code
+            .iter()
+            .any(|i| matches!(i, Instr::SetLocal(_) | Instr::Local(_))),
+        "no spill traffic expected: {:?}",
+        prog.code
+    );
+    assert!(
+        !prog
+            .code
+            .iter()
+            .any(|i| matches!(i, Instr::EnterFrame(_, _, kinds) if !kinds.is_empty())),
+        "no slot should be allocated: {:?}",
+        prog.code
+    );
+}
+
+#[test]
+fn return_crossing_finally_allocates_exactly_one_spill_slot() {
+    let prog =
+        compile("function f() { try { return 1; } finally {} } return f();").expect("compiles");
+    let frame_kinds: Vec<usize> = prog
+        .code
+        .iter()
+        .filter_map(|i| match i {
+            Instr::EnterFrame(_, _, kinds) => Some(kinds.len()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        frame_kinds,
+        vec![1],
+        "f's frame gets exactly the spill slot: {:?}",
+        prog.code
+    );
+    assert!(
+        matches!(
+            prog.code
+                .iter()
+                .find(|i| matches!(i, Instr::EnterFrame(..))),
+            Some(Instr::EnterFrame(_, _, kinds)) if kinds[0] == SlotKind::Plain
+        ),
+        "spill slot is a plain local"
+    );
+}
