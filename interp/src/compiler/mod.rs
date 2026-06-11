@@ -3016,26 +3016,25 @@ impl<'src> Compiler<'src> {
         }
     }
 
-    /// `Promise.*` statics. Only `Promise.all(xs)` is supported (Phase 7
-    /// Tier 1), lowering to the prelude helper `__all(xs)` — serial awaits
-    /// over already-started promises, which is full fan-out concurrency
-    /// because every tool call in `xs` is already in flight. The rest are
-    /// rejected with diagnostics that say what to do instead.
+    /// `Promise.*` statics. `Promise.all(xs)` and `Promise.allSettled(xs)`
+    /// are supported (Phase 7), lowering to the prelude helpers `__all(xs)`
+    /// / `__allSettled(xs)` — serial awaits over already-started promises,
+    /// which is full fan-out concurrency because every tool call in `xs` is
+    /// already in flight. The rest are rejected with diagnostics that say
+    /// what to do instead.
     fn compile_promise_call(&mut self, method: &str, argv: &[&ast::Expression], span: u32) {
         match method {
-            "all" => {
+            "all" | "allSettled" => {
                 if argv.len() != 1 {
-                    self.error(span, format!("`Promise.all` expects 1 argument, got {}", argv.len()));
+                    self.error(
+                        span,
+                        format!("`Promise.{method}` expects 1 argument, got {}", argv.len()),
+                    );
                     return;
                 }
-                self.emit_prelude_call("__all", argv[0], &[], span, false);
+                let helper = if method == "all" { "__all" } else { "__allSettled" };
+                self.emit_prelude_call(helper, argv[0], &[], span, false);
             }
-            // Needs try/catch in the helper — unblocked now that 6B has
-            // landed; add when evidence demands it.
-            "allSettled" => self.error(
-                span,
-                "`Promise.allSettled` is not supported yet (use `Promise.all`, or await each promise individually)",
-            ),
             // Wait-any needs VM support — deferred until evidence demands it.
             "race" | "any" => self.error(
                 span,

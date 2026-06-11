@@ -12,6 +12,7 @@ pub use instr::{
 pub use value::Value;
 pub(crate) use value::{float_is_int, js_number_to_string};
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use indexmap::IndexMap;
@@ -169,17 +170,26 @@ The remaining intentional divergences from JS — deferred or accepted, NOT bugs
   • Tool calls return *promises* (7_ASYNC Tier 1): `tools.f(args)` starts the
     call and pushes a promise; `await` is the only consumer. There is no
     `.then`/`.catch`/`.finally`, no `new Promise` (no executor pattern), and
-    no `Promise.race`/`any`/`allSettled` — only `Promise.all`. `await x` on a
+    no `Promise.race`/`any` — only `Promise.all` and `Promise.allSettled`
+    (which never rejects and yields JS's `{ status, value/reason }` entries,
+    with a non-promise element settling fulfilled). `await x` on a
     non-promise passes it through, as in JS. Promises are transient values:
     identity-only `===`, "object" under `typeof`, no JSON form (reaching the
     persistence boundary errors with a missing-`await` hint, as does property
     access on a promise).
-  • Tier 1 async limitation: an `async` function body runs synchronously on
-    the caller's stack, so an `await` inside it blocks the whole program
-    instead of suspending just that call (Tier 2 removes this). Consequently
-    an async function returns its plain value, not a wrapped promise —
-    observationally invisible, because `await` passes non-promises through
-    and is the only promise consumer in this dialect.
+  • Async functions are real (7_ASYNC Tier 2): a pending `await` inside an
+    async function suspends just that call (frame snapshot, zero stack), the
+    caller receives a promise and continues, and settled promises wake
+    suspended calls through a deterministic FIFO ready queue drained at
+    await points only. Two accepted divergences from JS: an async function
+    that completes without ever suspending returns its plain value, not a
+    wrapped promise (observationally invisible — `await` passes non-promises
+    through and is the only promise consumer in this dialect); and a throw
+    before the first suspension propagates synchronously to the caller
+    instead of rejecting. After the first suspension, an uncaught
+    throw/rejection rejects the call's promise, exactly as in JS. Circular
+    awaits are detected and reported as a dedicated `Deadlock` error naming
+    the await chain.
 
 */
 
@@ -212,6 +222,27 @@ pub struct VM {
     /// pending promise, or into `StepResult::Done` (as `unstarted`) when the
     /// program finishes without awaiting them.
     outbox: Vec<InvokeCall>,
+    /// Suspended async function calls (7_ASYNC Tier 2): each pending `await`
+    /// inside an async frame copies that frame off the stack into a
+    /// continuation record here. A slot is `None` once its continuation has
+    /// been resumed (each suspension allocates a fresh slot); the heap grows
+    /// monotonically like the others.
+    continuations: Vec<Option<Continuation>>,
+    /// Deterministic FIFO ready queue: continuations whose awaited promise
+    /// has settled, paired with the settlement they receive on resume.
+    /// Drained at await points only (no preemption), so the host's promise
+    /// resolution order is the sole nondeterminism source (commitment 6).
+    ready: VecDeque<(u32, ResumePayload)>,
+    /// `ip` of the root strand's blocking `Await` while continuations run
+    /// above the parked root region; the scheduler parks back here when the
+    /// ready queue empties. Only meaningful while a strand is live — the
+    /// root sets it immediately before launching one.
+    root_ip: CodeAddr,
+    /// Tool calls handed to the host (via `StepResult::Pending`) whose
+    /// promise the host has not yet settled. When the root strand blocks
+    /// with the ready queue, outbox, AND this all empty, no settlement can
+    /// ever arrive: deadlock (only reachable via circular awaits).
+    inflight: usize,
     /// Active `try` handlers, innermost last (see [`Instr::TryEnter`]). A
     /// throw — or a catchable runtime error — unwinds to the top entry;
     /// `TryExit` pops it on the normal path. The compiler guarantees entries
@@ -267,6 +298,69 @@ pub struct CallFrame {
     /// by later references, so repeated `arguments` uses don't re-materialize
     /// the array. `None` until first use (and for frames that never use it).
     arguments_cache: Option<ArrayPtr>,
+    /// How this frame completes (7_ASYNC Tier 2). Direct calls are `Normal`;
+    /// a scheduler-resumed async frame is `ResolvePromise` — it has no
+    /// caller below it on the stack.
+    completion: Completion,
+}
+
+/// How a frame's `Return` completes (7_ASYNC Tier 2).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) enum Completion {
+    /// Ordinary call: the return value lands on the caller's stack at `fp`
+    /// and execution continues at `return_addr`.
+    Normal,
+    /// Scheduler-resumed async frame: `Return` resolves this promise with
+    /// the return value (waking waiters) and falls through to the scheduler;
+    /// an uncaught throw rejects it instead.
+    ResolvePromise(PromisePtr),
+}
+
+/// A suspended async function call (7_ASYNC Tier 2): everything needed to
+/// re-create the frame at the stack top once the awaited promise settles.
+/// The load-bearing invariant is that a suspended computation occupies zero
+/// stack — established at runtime by copying the frame region out here
+/// (frame snapshotting), not by a compile-time state-machine transform.
+pub(super) struct Continuation {
+    /// The instruction after the suspending `Await` (which consumed its
+    /// operand at suspension; resume pushes the settled value in its place).
+    resume_ip: CodeAddr,
+    /// The frame's stack region `[fp, sp)` at suspension — args, locals,
+    /// temps — minus the awaited promise. Everything in it is fp-relative
+    /// (`Local`/`Pick`/`Dig`; heap values are pointers into the global
+    /// heaps), so the region survives relocation to any new stack top.
+    saved_stack: Vec<Value>,
+    arg_count: u32,
+    local_count: u32,
+    arguments_cache: Option<ArrayPtr>,
+    /// This frame's own active `try` handlers at suspension, outermost
+    /// first, with `stack_len` stored fp-relative for re-basing on resume.
+    /// Handlers of caller frames stay on the live handler stack (those
+    /// frames keep executing); dropping an unresumed continuation drops its
+    /// saved handlers with it — nothing leaks.
+    saved_handlers: Vec<SavedHandler>,
+    /// The promise this call settles when it completes — created at first
+    /// suspension (the caller received it as the call's return value) and
+    /// carried through re-suspensions via `Completion::ResolvePromise`.
+    promise: PromisePtr,
+    /// The promise this continuation waits on (await-chain rendering).
+    awaiting: PromisePtr,
+    /// Source span of the suspending `await` (await-chain rendering).
+    await_span: u32,
+}
+
+/// One re-basable handler-stack entry inside a [`Continuation`].
+pub(super) struct SavedHandler {
+    catch_ip: CodeAddr,
+    /// `HandlerEntry::stack_len - fp` at suspension.
+    rel_stack_len: usize,
+}
+
+/// What a woken continuation receives from its settled promise.
+#[derive(Debug, Clone)]
+pub(super) enum ResumePayload {
+    Resolved(Value),
+    Rejected(Value),
 }
 
 /// One entry of the VM's handler stack: the `TryEnter` snapshot a throw
@@ -307,9 +401,10 @@ pub struct Closure {
 /// `Pending` (by `Instr::Invoke`) and transitions exactly once.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PromiseState {
-    /// Not yet settled. `waiters` is reserved for Tier 2 (suspended async
-    /// continuations registered on this promise); unused in Tier 1, where the
-    /// only waiter is the main strand re-executing its `Await`.
+    /// Not yet settled. `waiters` holds the ids of suspended continuations
+    /// registered on this promise (Tier 2); settlement moves them onto the
+    /// ready queue. The root strand never registers — its blocking `Await`
+    /// simply re-executes.
     Pending {
         waiters: Vec<u32>,
     },
@@ -382,6 +477,11 @@ pub enum ErrorKind {
     /// Instruction budget exhausted (guards against infinite loops in
     /// LLM-generated programs).
     OutOfFuel,
+    /// The root strand is blocked on a promise that can never settle: the
+    /// ready queue, outbox, and in-flight host calls are all empty (7_ASYNC
+    /// Tier 2). Only reachable via circular awaits among async calls — the
+    /// message names the await chain. Never resumable.
+    Deadlock,
 }
 
 /// Whether the host can resume from this error by feeding a value (see
@@ -413,7 +513,7 @@ pub enum ErrorKind {
 /// | **ObjExtend** (non-object src) | TypeError | PushValueThenContinue | both src+obj popped first |
 /// | **ArrExtend** (non-array src) | TypeError | PushValueThenContinue | both src+arr popped first |
 /// | **ArrPush** (non-array target) | TypeError | PushValueThenContinue | both val+arr popped first |
-/// | Await (rejected promise, no handler) | ValueError | PushValueThenContinue | promise popped before failing; host may substitute a value for the rejection (with a handler active the rejection value unwinds to `catch` instead of erroring) |
+/// | Await (rejected promise, no handler, root strand) | ValueError | PushValueThenContinue | promise popped before failing; host may substitute a value for the rejection (with a reachable handler the rejection value unwinds to `catch`; inside a resumed strand it rejects the strand's promise — neither reaches the host) |
 /// | Await (bad promise pointer) | ValueError | **NotResumable** | corrupt heap = invariant violation |
 /// | **IncLocal** (non-numeric local) | TypeError | **NotResumable** | reads local by peek (no stack consumption) |
 /// | bad heap/cell pointer (`get`/`get_mut` on arrays/objects/cells/closures) | TypeError/ValueError | **NotResumable** | corrupt heap = invariant violation; some sites also have no result slot (SetLocal) |
@@ -423,8 +523,9 @@ pub enum ErrorKind {
 /// | TryExit (empty handler stack) | BadArg | NotResumable | unmatched TryExit = compiler bug |
 /// | StackUnderflow, BadReturn, BadCall, BadAlloc, BadArg, BadLocal | — | NotResumable | invariant violation / compiler bug |
 /// | OutOfFuel | — | RetrySameInstr | nothing consumed; refuel and retry |
+/// | Deadlock | — | NotResumable | circular awaits: every strand is parked and no settlement can arrive; there is no execution state a value could resume |
 ///
-/// All 10 `ErrorKind`s are covered. The bolded sites are the
+/// All 11 `ErrorKind`s are covered. The bolded sites are the
 /// TypeError/ValueError sites that error before full operand consumption
 /// (or, for bad pointers, mid-mutation) and therefore must not be resumed.
 #[derive(Debug)]

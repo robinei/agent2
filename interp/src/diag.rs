@@ -8,25 +8,30 @@ pub struct Diagnostic {
     pub message: String,
 }
 
+/// 1-based `(line, col)` of a byte offset in `source`, with the offset of the
+/// containing line's start (for caret rendering).
+pub fn line_col(source: &str, span: u32) -> (usize, usize, usize) {
+    let offset = (span as usize).min(source.len());
+    let mut line = 1;
+    let mut line_start = 0;
+    for (i, b) in source.bytes().enumerate() {
+        if i >= offset {
+            break;
+        }
+        if b == b'\n' {
+            line += 1;
+            line_start = i + 1;
+        }
+    }
+    (line, offset - line_start + 1, line_start)
+}
+
 impl Diagnostic {
     /// Render as `line:col: message` followed by the offending source line and
     /// a caret under the offending column.
     pub fn render(&self, source: &str) -> String {
         let offset = (self.span as usize).min(source.len());
-        // Find the start of the line containing `offset`, and the 1-based line
-        // number, by scanning newlines up to it.
-        let mut line = 1;
-        let mut line_start = 0;
-        for (i, b) in source.bytes().enumerate() {
-            if i >= offset {
-                break;
-            }
-            if b == b'\n' {
-                line += 1;
-                line_start = i + 1;
-            }
-        }
-        let col = offset - line_start + 1;
+        let (line, col, line_start) = line_col(source, self.span);
         let line_end = source[line_start..]
             .find('\n')
             .map(|p| line_start + p)

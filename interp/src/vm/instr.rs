@@ -221,12 +221,24 @@ pub enum Instr {
 
     // Await the top of stack. A non-promise passes through unchanged (JS
     // `await x` on a plain value). A Resolved promise is replaced by its
-    // value; a Rejected one consumes the promise and escalates the rejection
-    // value as a resumable error (Phase 3 path — the host may substitute a
-    // value). A Pending promise yields `StepResult::Pending` carrying the
-    // drained outbox with ip UNCHANGED (re-executing / `RetrySameInstr`
-    // shape): the host resolves/rejects at least one promise and calls
-    // step() again, and the Await re-executes.
+    // value (a promise resolved with a promise is adopted: the Await
+    // re-executes on the innermost one; a cycle is the JS "chaining cycle"
+    // TypeError). A Rejected one consumes the promise and unwinds to a
+    // reachable `try` handler, rejects the enclosing strand's promise
+    // (inside a resumed continuation), or escalates the rejection value as
+    // a resumable error (Phase 3 path — the host may substitute a value).
+    // A Pending promise depends on where the Await sits (7_ASYNC Tier 2):
+    //  - below top level it is inside an async function's own frame (the
+    //    parser confines `await` there) — that one frame is suspended into
+    //    a continuation record (zero stack left behind) and registered as
+    //    a waiter; a first suspension pushes a fresh promise to the caller
+    //    as the call's return value, a re-suspension falls through to the
+    //    scheduler;
+    //  - at top level the root strand parks in place: ready continuations
+    //    run above the parked region, and with nothing ready it yields
+    //    `StepResult::Pending` carrying the drained outbox with ip
+    //    UNCHANGED (re-executing / `RetrySameInstr` shape) — or fails with
+    //    the dedicated `Deadlock` error when nothing is in flight either.
     Await, // promise|any -> any
 
     // EFFECT: raise condition (like Lisp condition system). used to ask LLM in calling frame

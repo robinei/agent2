@@ -297,6 +297,23 @@ impl VM {
                     if self.stack.len() < keep_below + n {
                         return Err(self.fail(ErrorKind::StackUnderflow, "stack underflow"));
                     }
+                    if let Completion::ResolvePromise(pid) = frame.completion {
+                        // A scheduler-resumed async frame has no caller below:
+                        // resolve its promise with the return value (waking
+                        // waiters) and fall through to the scheduler.
+                        let value = if n == 0 {
+                            Value::Undefined
+                        } else {
+                            self.stack[self.stack.len() - n].clone()
+                        };
+                        self.stack.truncate(keep_below);
+                        self.fp = frame.prev_fp;
+                        self.cur_local_count =
+                            self.callstack.last().map_or(0, |f| f.local_count);
+                        self.settle_and_wake(pid, PromiseState::Resolved(value))?;
+                        self.schedule()?;
+                        continue;
+                    }
                     let ret_start = self.stack.len() - n;
                     // Move (don't clone) each return value down to the frame
                     // base; the source region is truncated away immediately, so
@@ -1288,10 +1305,7 @@ impl VM {
                         return Err(self.fail(ErrorKind::StackUnderflow, "stack underflow"));
                     }
                     let args = self.stack.split_off(self.stack.len() - n);
-                    let id = self.promises.len() as PromisePtr;
-                    self.promises.push(PromiseState::Pending {
-                        waiters: Vec::new(),
-                    });
+                    let id = self.alloc_promise();
                     self.outbox.push(InvokeCall {
                         promise: id,
                         name,
@@ -1321,6 +1335,33 @@ impl VM {
                     })?;
                     match state {
                         PromiseState::Resolved(v) => {
+                            // A promise resolved with a promise adopts it (JS:
+                            // an async function returning a promise chains —
+                            // a promise never resolves to a promise). Follow
+                            // the chain and re-await the innermost promise in
+                            // place; a cycle is the JS "chaining cycle" error.
+                            if let Value::Promise(inner) = v {
+                                let mut seen = vec![id];
+                                let mut cur = *inner;
+                                loop {
+                                    if seen.contains(&cur) {
+                                        self.stack.pop();
+                                        return Err(self.fail(
+                                            ErrorKind::TypeError,
+                                            "chaining cycle detected: promise resolves to itself",
+                                        ));
+                                    }
+                                    seen.push(cur);
+                                    match self.promises.get(cur as usize) {
+                                        Some(PromiseState::Resolved(Value::Promise(j))) => {
+                                            cur = *j;
+                                        }
+                                        _ => break,
+                                    }
+                                }
+                                *self.stack.last_mut().unwrap() = Value::Promise(cur);
+                                continue; // re-execute the Await on the adoptee
+                            }
                             let v = v.clone();
                             self.stack.pop();
                             self.stack.push(v);
@@ -1331,10 +1372,19 @@ impl VM {
                             // what `catch` receives (JS semantics: the reason
                             // passes through raw, not wrapped in an error
                             // object).
-                            if !self.handlers.is_empty() {
+                            if self.reachable_handler() {
                                 let errval = errval.clone();
                                 self.stack.pop(); // the promise operand
                                 self.unwind_to_handler(errval);
+                                continue;
+                            }
+                            // Unhandled inside a resumed strand: reject the
+                            // strand's own promise (propagation through an
+                            // awaiting chain, as in JS) — never the host.
+                            if self.in_strand() {
+                                let errval = errval.clone();
+                                self.stack.pop();
+                                self.reject_strand(errval)?;
                                 continue;
                             }
                             // Escalate via the Phase 3 path: pop the operand
@@ -1350,12 +1400,34 @@ impl VM {
                             return Err(self.fail(ErrorKind::ValueError, msg));
                         }
                         PromiseState::Pending { .. } => {
-                            // Block: hand the host everything started since the
-                            // last yield. ip is unchanged (RetrySameInstr
-                            // shape); the promise stays on the stack.
-                            return Ok(StepResult::Pending {
-                                calls: std::mem::take(&mut self.outbox),
-                            });
+                            // Below top level this Await is inside an async
+                            // function's own frame (the parser confines
+                            // `await` there): suspend exactly that frame —
+                            // Tier 2's single-frame snapshot.
+                            if self.callstack.len() > 1 {
+                                self.suspend_current_frame(id)?;
+                                continue;
+                            }
+                            // Top level: the root strand parks in place. Run
+                            // ready continuations above the parked region
+                            // first; the root's Await re-executes when the
+                            // queue drains.
+                            if !self.ready.is_empty() {
+                                self.root_ip = self.ip;
+                                self.schedule()?;
+                                continue;
+                            }
+                            // Nothing ready: yield to the host — everything
+                            // started since the last yield, ip unchanged
+                            // (RetrySameInstr shape), the promise stays on
+                            // the stack. With nothing in flight either, no
+                            // settlement can ever arrive: deadlock.
+                            if !self.outbox.is_empty() || self.inflight > 0 {
+                                let calls = std::mem::take(&mut self.outbox);
+                                self.inflight += calls.len();
+                                return Ok(StepResult::Pending { calls });
+                            }
+                            return Err(self.deadlock_error(id));
                         }
                     }
                 }
@@ -1413,20 +1485,29 @@ impl VM {
 
                 Instr::Throw => {
                     let value = self.pop()?;
-                    if self.handlers.is_empty() {
-                        // NotResumable (via `fail`'s kind classification):
-                        // the operand was consumed, but a `throw` has no
-                        // result slot — pushing a replacement value would
-                        // corrupt the statement-level stack. The thrown
-                        // value rides along in `payload` so the host gets
-                        // the program's own error structurally, not just a
-                        // rendering.
-                        let msg = self.uncaught_message(&value);
-                        let mut err = self.fail(ErrorKind::UncaughtException, msg);
-                        err.payload = Some(value);
-                        return Err(err);
+                    if self.reachable_handler() {
+                        self.unwind_to_handler(value);
+                        continue;
                     }
-                    self.unwind_to_handler(value);
+                    // A throw escaping a resumed strand rejects its promise
+                    // (7_ASYNC Tier 2) — it must not unwind into the parked
+                    // root strand's handlers, which belong to code that
+                    // isn't executing.
+                    if self.in_strand() {
+                        self.reject_strand(value)?;
+                        continue;
+                    }
+                    // NotResumable (via `fail`'s kind classification):
+                    // the operand was consumed, but a `throw` has no
+                    // result slot — pushing a replacement value would
+                    // corrupt the statement-level stack. The thrown
+                    // value rides along in `payload` so the host gets
+                    // the program's own error structurally, not just a
+                    // rendering.
+                    let msg = self.uncaught_message(&value);
+                    let mut err = self.fail(ErrorKind::UncaughtException, msg);
+                    err.payload = Some(value);
+                    return Err(err);
                 }
             }
         }

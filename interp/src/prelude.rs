@@ -93,10 +93,17 @@ const HOFS: &[Hof] = &[
 /// Because every tool promise in `xs` was already started at its `tools.*`
 /// call site, awaiting them one by one IS full fan-out concurrency — the
 /// first pending await delivers the whole accumulated outbox to the host.
-/// `async` marks the body so `await` parses; in Tier 1 the flag is otherwise
-/// ignored (the body runs synchronously on the caller's stack).
+/// As an async function, `__all` itself suspends on a pending element
+/// (7_ASYNC Tier 2), so per-element async chains in `xs` keep interleaving
+/// while it waits — see `canonical_chain_maximal_batching`.
 /// A non-promise element passes through `await` unchanged, like JS.
 const PROMISE_ALL: &str = "async function __all(ps) {\n  const r = [];\n  for (let i = 0; i < ps.length; i++) { r.push(await ps[i]); }\n  return r;\n}";
+
+/// `Promise.allSettled(xs)` lowers to `__allSettled(xs)`: like `__all`, but
+/// each await sits in a `try` (6B), so a rejection becomes a
+/// `{ status: "rejected", reason }` entry instead of propagating — the
+/// JS result shape. Never rejects; a non-promise element settles fulfilled.
+const PROMISE_ALL_SETTLED: &str = "async function __allSettled(ps) {\n  const r = [];\n  for (let i = 0; i < ps.length; i++) {\n    try { r.push({ status: \"fulfilled\", value: await ps[i] }); }\n    catch (e) { r.push({ status: \"rejected\", reason: e }); }\n  }\n  return r;\n}";
 
 /// Build the prelude source to append to `user_source`: the concatenated source
 /// of every helper whose method the program uses. Returns an empty string when
@@ -110,12 +117,18 @@ pub fn assemble(user_source: &str) -> String {
             out.push('\n');
         }
     }
-    // `Promise.all` is a namespace call, not a method on a receiver, so it
-    // gets its own (equally token-exact) detection. A false positive from
-    // `Promise.allSettled` is harmless: that call is a compile error anyway.
+    // `Promise.all`/`Promise.allSettled` are namespace calls, not methods on
+    // a receiver, so they get their own (equally token-exact) detection.
+    // `.allSettled` does not match the `all` token (boundary check), so each
+    // pulls in exactly its own helper.
     if uses_method(user_source, "all") && user_source.contains("Promise.all") {
         out.push('\n');
         out.push_str(PROMISE_ALL);
+        out.push('\n');
+    }
+    if uses_method(user_source, "allSettled") && user_source.contains("Promise.allSettled") {
+        out.push('\n');
+        out.push_str(PROMISE_ALL_SETTLED);
         out.push('\n');
     }
     out
@@ -171,6 +184,18 @@ mod tests {
     fn longer_identifier_does_not_trigger() {
         // `.mapping` is not a `map` call.
         assert!(assemble("state.r = obj.mapping;").is_empty());
+    }
+
+    #[test]
+    fn all_vs_all_settled_boundary() {
+        // Each Promise static pulls in exactly its own helper: `.allSettled`
+        // does not match the `all` token, and vice versa.
+        let p = assemble("return await Promise.allSettled(ps);");
+        assert!(p.contains("function __allSettled"));
+        assert!(!p.contains("function __all("));
+        let p = assemble("return await Promise.all(ps);");
+        assert!(p.contains("function __all("));
+        assert!(!p.contains("function __allSettled"));
     }
 
     #[test]

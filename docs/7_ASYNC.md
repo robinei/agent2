@@ -1,23 +1,30 @@
 # Phase 7 — Async/await
 
-> **Status:** Tier 1 landed 2026-06-11 (`async:` commits; see
-> `compiler/tests/async_await.rs` and the effects section of `vm/tests.rs`
-> for the executable contract). One deliberate addition beyond this plan:
-> `new Promise(...)` gets a targeted compile diagnostic (commitment 4 made
-> visible to the LLM), and `Promise.resolve`/`reject` likewise.
+> **Status: COMPLETE.** Tier 1 landed 2026-06-11 (`async:` commits), Tier 2
+> landed 2026-06-12, after 6B/6B2 (try/catch/finally) per the sequencing
+> decision below — continuation records were built once against the final
+> frame shape, handler-stack entries designed in. `Promise.allSettled`
+> (gated on 6B, per the Tier 1 section) landed 2026-06-12 as the
+> `__allSettled` prelude helper. See `compiler/tests/async_await.rs`
+> (Tier 2 section) for the executable contract. Deliberate additions
+> beyond this plan:
 >
-> **Tier 2 is DEFERRED, evidence-gated (decided 2026-06-11).** Tier 1
-> already gives full tool-level fan-out (start calls, await after), and
-> fixed-depth pipelines restructure into phases with the same round-trip
-> count (`const as = await Promise.all(items.map(it => tools.f(it)));
-> const bs = await Promise.all(as.map(a => tools.g(a)));` — the documented
-> Tier 1 idiom). What Tier 2 uniquely adds is concurrency for per-item
-> chains with data-dependent control flow (retry loops / conditionals on
-> intermediate results inside `async it => …` callbacks), which in Tier 1
-> run correctly but serially. **Trigger to revisit:** real LLM-written
-> programs observed with such chains, where the serialized latency
-> actually hurts (the event log will show repeated single-call `Pending`
-> yields). The failure mode of deferral is latency only, never wrongness.
+> - `new Promise(...)` gets a targeted compile diagnostic (commitment 4
+>   made visible to the LLM), and `Promise.resolve`/`reject` likewise.
+> - **Promise adoption**: an async function that returns a promise (after
+>   suspending) chains it, as in JS — a promise never observably resolves
+>   to a promise. Implemented at the two consumption sites (`Await`
+>   follows resolved-to-promise chains in place; the scheduler re-waits a
+>   continuation woken with a promise payload), not at the resolution
+>   site. A self-cycle is the JS "chaining cycle" TypeError.
+> - A rejection delivered to a continuation with no handler around its
+>   await propagates to that call's own promise without materializing the
+>   frame at all.
+> - The await-chain diagnostic renders in the `Deadlock` error message
+>   (the one place a suspended chain produces an error with no stack).
+>
+> The remaining banner content below is kept for the design rationale;
+> the section bodies match what was built.
 >
 > **Sequencing decision: 6B (try/catch) lands BEFORE any Tier 2 work.**
 > 6B is unblocked (Phase 3 done), immediately lets programs catch rejected
@@ -27,7 +34,9 @@
 > designed in, not retrofitted). When 6B lands, extend the `Await`
 > rejected arm: dispatch to an active handler if one covers the frame,
 > else escalate via the Phase 3 path as today; update the resume-audit
-> table row accordingly.
+> table row accordingly. *(Done: the rejected arm dispatches to a
+> reachable handler, rejects the enclosing strand's promise inside a
+> resumed continuation, and escalates resumably only at the root.)*
 
 Real async/await, replacing both today's synchronous `Invoke` batching and
 the "transparent await" stopgap (4_FUTURE item 1, superseded by this file).

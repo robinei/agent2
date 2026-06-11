@@ -12,6 +12,10 @@ impl VM {
             cells: Vec::new(),
             promises: Vec::new(),
             outbox: Vec::new(),
+            continuations: Vec::new(),
+            ready: VecDeque::new(),
+            root_ip: 0,
+            inflight: 0,
             handlers: Vec::new(),
             stack: Vec::new(),
             // Root frame so that Local is valid from the start.
@@ -22,6 +26,7 @@ impl VM {
                 prev_fp: 0,
                 arguments_cache: None,
                 pending_upvals: SmallVec::new(),
+                completion: Completion::Normal,
             }],
             ip: 0,
             fp: 0,
@@ -69,6 +74,9 @@ impl VM {
             // An escaped program-level throw: the operand was consumed, but
             // a `throw` has no result slot a substituted value could fill.
             ErrorKind::UncaughtException => ResumeMode::NotResumable,
+            // Circular awaits: every strand is parked, so there is no
+            // execution state a substituted value could resume.
+            ErrorKind::Deadlock => ResumeMode::NotResumable,
         };
         VMError {
             kind,
@@ -132,6 +140,15 @@ impl VM {
             RcStr::from("message"),
             Value::String(RcStr::from(self.render_error(e).as_str())),
         );
+        self.alloc_object(obj)
+    }
+
+    /// The `{ name: "TypeError", message }` object a promise-chaining cycle
+    /// rejects with (the scheduler-side mirror of the `Await` cycle check).
+    fn cycle_error_value(&mut self, msg: &str) -> Value {
+        let mut obj = IndexMap::new();
+        obj.insert(RcStr::from("name"), Value::String(RcStr::from("TypeError")));
+        obj.insert(RcStr::from("message"), Value::String(RcStr::from(msg)));
         self.alloc_object(obj)
     }
 
@@ -270,27 +287,350 @@ impl VM {
     /// promise that is not `Pending` (already settled, or a bad id) is host
     /// misuse and errors without changing anything.
     pub fn resolve_promise(&mut self, id: PromisePtr, value: Value) -> Result<(), VMError> {
-        self.settle_promise(id, PromiseState::Resolved(value))
+        self.settle_and_wake(id, PromiseState::Resolved(value))?;
+        self.inflight = self.inflight.saturating_sub(1);
+        Ok(())
     }
 
     /// Settle a promise as rejected, with the error value the program's
     /// `await` will escalate. Same contract as [`VM::resolve_promise`].
     pub fn reject_promise(&mut self, id: PromisePtr, errval: Value) -> Result<(), VMError> {
-        self.settle_promise(id, PromiseState::Rejected(errval))
+        self.settle_and_wake(id, PromiseState::Rejected(errval))?;
+        self.inflight = self.inflight.saturating_sub(1);
+        Ok(())
     }
 
-    fn settle_promise(&mut self, id: PromisePtr, settled: PromiseState) -> Result<(), VMError> {
-        match self.promises.get_mut(id as usize) {
-            Some(state @ PromiseState::Pending { .. }) => {
-                *state = settled;
-                Ok(())
+    /// Allocate a fresh `Pending` promise. Used by `Instr::Invoke` (leaf tool
+    /// promises) and by first suspension of an async call (Tier 2).
+    pub(super) fn alloc_promise(&mut self) -> PromisePtr {
+        let id = self.promises.len() as PromisePtr;
+        self.promises.push(PromiseState::Pending {
+            waiters: Vec::new(),
+        });
+        id
+    }
+
+    /// Settle a promise and move its waiters onto the ready queue (FIFO).
+    /// Every settlement — host APIs, async frame completion, strand
+    /// rejection — routes through here, so cascading stays VM-side
+    /// (commitment 3): the host only ever settles leaf tool promises.
+    pub(super) fn settle_and_wake(
+        &mut self,
+        id: PromisePtr,
+        settled: PromiseState,
+    ) -> Result<(), VMError> {
+        let payload = match &settled {
+            PromiseState::Resolved(v) => ResumePayload::Resolved(v.clone()),
+            PromiseState::Rejected(v) => ResumePayload::Rejected(v.clone()),
+            PromiseState::Pending { .. } => {
+                return Err(
+                    self.fail_not_resumable(ErrorKind::BadArg, "cannot settle a promise to Pending")
+                );
             }
-            Some(_) => Err(self.fail_not_resumable(
-                ErrorKind::BadArg,
-                format!("promise {id} is already settled"),
-            )),
-            None => Err(self.fail_not_resumable(ErrorKind::BadArg, format!("bad promise id {id}"))),
+        };
+        match self.promises.get(id as usize) {
+            Some(PromiseState::Pending { .. }) => {}
+            Some(_) => {
+                return Err(self.fail_not_resumable(
+                    ErrorKind::BadArg,
+                    format!("promise {id} is already settled"),
+                ));
+            }
+            None => {
+                return Err(
+                    self.fail_not_resumable(ErrorKind::BadArg, format!("bad promise id {id}"))
+                );
+            }
         }
+        let old = std::mem::replace(&mut self.promises[id as usize], settled);
+        let PromiseState::Pending { waiters } = old else {
+            unreachable!("checked Pending above");
+        };
+        for w in waiters {
+            self.ready.push_back((w, payload.clone()));
+        }
+        Ok(())
+    }
+
+    // ── Tier 2: suspend / resume / schedule ──────────────────────────
+
+    /// Whether execution is currently inside a scheduler-resumed strand.
+    /// Resumed frames are only ever pushed while the root frame alone is
+    /// live, so a strand's base — when one exists — is `callstack[1]`.
+    pub(super) fn in_strand(&self) -> bool {
+        self.callstack.len() > 1
+            && matches!(self.callstack[1].completion, Completion::ResolvePromise(_))
+    }
+
+    /// Whether the innermost `try` handler may catch a throw from the
+    /// current position. Inside a resumed strand, the parked root strand's
+    /// handlers (entries pushed at top level, `callstack_len == 1`) are
+    /// walled off: a throw escaping the strand rejects its promise instead
+    /// of unwinding into code that isn't executing.
+    pub(super) fn reachable_handler(&self) -> bool {
+        match self.handlers.last() {
+            None => false,
+            Some(h) => !self.in_strand() || h.callstack_len > 1,
+        }
+    }
+
+    /// Tier 2 suspension: at a pending `await` in an async function frame,
+    /// copy the frame (stack region + metadata + its own handler entries)
+    /// into a continuation record registered as a waiter on `awaiting`, and
+    /// pop the frame, reusing the `Return` machinery. On *first* suspension
+    /// (frame entered by a direct call) a fresh promise is pushed onto the
+    /// caller's stack as the call's return value — the caller, sync or
+    /// async, just continues. On *re-suspension* (frame entered by scheduler
+    /// resume) control falls through to the scheduler.
+    pub(super) fn suspend_current_frame(&mut self, awaiting: PromisePtr) -> Result<(), VMError> {
+        // The Await consumes its operand: the promise leaves the stack now;
+        // resume pushes the settled value in its place and continues past
+        // the Await.
+        self.stack.pop();
+        let resume_ip = self.ip + 1;
+        let await_span = self.spans.get(self.ip as usize).copied().unwrap_or(0);
+        // Split off this frame's own handler entries (a `TryEnter` in this
+        // frame snapshots `callstack_len` == the current depth), storing
+        // `stack_len` fp-relative so resume can re-base them.
+        let depth = self.callstack.len();
+        let fp = self.fp as usize;
+        let mut saved_handlers: Vec<SavedHandler> = Vec::new();
+        while self.handlers.last().is_some_and(|h| h.callstack_len == depth) {
+            let h = self.handlers.pop().unwrap();
+            saved_handlers.push(SavedHandler {
+                catch_ip: h.catch_ip,
+                rel_stack_len: h.stack_len - fp,
+            });
+        }
+        saved_handlers.reverse(); // outermost first: re-push order on resume
+        let saved_stack: Vec<Value> = self.stack.split_off(fp);
+        let frame = self
+            .callstack
+            .pop()
+            .ok_or_else(|| self.fail(ErrorKind::BadReturn, "suspend without a frame"))?;
+        self.fp = frame.prev_fp;
+        self.cur_local_count = self.callstack.last().map_or(0, |f| f.local_count);
+        let (promise, first_suspension) = match frame.completion {
+            Completion::Normal => (self.alloc_promise(), true),
+            Completion::ResolvePromise(pid) => (pid, false),
+        };
+        let cont_id = self.continuations.len() as u32;
+        self.continuations.push(Some(Continuation {
+            resume_ip,
+            saved_stack,
+            arg_count: frame.arg_count,
+            local_count: frame.local_count,
+            arguments_cache: frame.arguments_cache,
+            saved_handlers,
+            promise,
+            awaiting,
+            await_span,
+        }));
+        match self.promises.get_mut(awaiting as usize) {
+            Some(PromiseState::Pending { waiters }) => waiters.push(cont_id),
+            _ => {
+                return Err(
+                    self.fail_not_resumable(ErrorKind::ValueError, "bad awaited promise pointer")
+                );
+            }
+        }
+        if first_suspension {
+            self.stack.push(Value::Promise(promise));
+            self.ip = frame.return_addr;
+        } else {
+            self.schedule()?;
+        }
+        Ok(())
+    }
+
+    /// The scheduler: resume the next woken continuation (deterministic
+    /// FIFO), or — when nothing is ready — park back on the root strand's
+    /// blocking `Await`, which re-executes (yielding to the host, or
+    /// detecting deadlock). Called at await points and strand completion
+    /// only, never preempting synchronous code.
+    pub(super) fn schedule(&mut self) -> Result<(), VMError> {
+        'next: while let Some((id, mut payload)) = self.ready.pop_front() {
+            // Adoption (JS: a promise never resolves to a promise): a
+            // continuation woken with a promise value re-waits on the
+            // adoptee instead of resuming. Mirrors the `Await` chain-follow.
+            let mut seen: Vec<PromisePtr> = Vec::new();
+            while let ResumePayload::Resolved(Value::Promise(inner)) = payload {
+                if seen.contains(&inner) {
+                    let msg = "chaining cycle detected: promise resolves to itself";
+                    payload = ResumePayload::Rejected(self.cycle_error_value(msg));
+                    break;
+                }
+                seen.push(inner);
+                match self.promises.get_mut(inner as usize) {
+                    Some(PromiseState::Resolved(v)) => payload = ResumePayload::Resolved(v.clone()),
+                    Some(PromiseState::Rejected(v)) => payload = ResumePayload::Rejected(v.clone()),
+                    Some(PromiseState::Pending { waiters }) => {
+                        waiters.push(id);
+                        if let Some(Some(c)) = self.continuations.get_mut(id as usize) {
+                            c.awaiting = inner; // keep await-chain rendering true
+                        }
+                        continue 'next;
+                    }
+                    None => {
+                        return Err(self.fail_not_resumable(
+                            ErrorKind::ValueError,
+                            "bad adopted promise pointer",
+                        ));
+                    }
+                }
+            }
+            let cont = self
+                .continuations
+                .get_mut(id as usize)
+                .and_then(Option::take)
+                .ok_or_else(|| {
+                    self.fail_not_resumable(
+                        ErrorKind::ValueError,
+                        format!("bad continuation id {id}"),
+                    )
+                })?;
+            // A rejection arriving at a frame with no handler around its
+            // await needs no frame materialization: the rejection
+            // propagates straight to this call's own promise.
+            if let ResumePayload::Rejected(errval) = &payload {
+                if cont.saved_handlers.is_empty() {
+                    self.settle_and_wake(cont.promise, PromiseState::Rejected(errval.clone()))?;
+                    continue;
+                }
+            }
+            self.resume_continuation(cont, payload);
+            return Ok(());
+        }
+        // Nothing ready: the root's Await re-executes against its parked
+        // region (the zero-stack invariant guarantees it is intact).
+        self.ip = self.root_ip;
+        Ok(())
+    }
+
+    /// Resume = re-push and jump: re-create the suspended frame at the
+    /// current stack top in `ResolvePromise` completion mode (a resumed
+    /// frame has no caller below it), re-base its saved handler entries,
+    /// then push the resolved value and jump past the await — or unwind a
+    /// rejection to the innermost re-based handler. No `EnterFrame` runs.
+    fn resume_continuation(&mut self, cont: Continuation, payload: ResumePayload) {
+        let new_fp = self.stack.len() as u32;
+        self.stack.extend(cont.saved_stack);
+        self.callstack.push(CallFrame {
+            arg_count: cont.arg_count,
+            local_count: cont.local_count,
+            // Unused: a ResolvePromise frame falls through to the scheduler
+            // on Return instead of jumping back to a caller.
+            return_addr: 0,
+            prev_fp: self.fp,
+            pending_upvals: SmallVec::new(),
+            arguments_cache: cont.arguments_cache,
+            completion: Completion::ResolvePromise(cont.promise),
+        });
+        self.fp = new_fp;
+        self.cur_local_count = cont.local_count;
+        let depth = self.callstack.len();
+        for h in cont.saved_handlers {
+            self.handlers.push(HandlerEntry {
+                catch_ip: h.catch_ip,
+                stack_len: new_fp as usize + h.rel_stack_len,
+                callstack_len: depth,
+                fp: new_fp,
+            });
+        }
+        match payload {
+            ResumePayload::Resolved(v) => {
+                self.stack.push(v);
+                self.ip = cont.resume_ip;
+            }
+            // `saved_handlers` was non-empty (the scheduler short-circuits
+            // the handlerless case), so the innermost handler is this
+            // frame's own — `try { await p } catch` across a suspension.
+            ResumePayload::Rejected(errval) => {
+                self.unwind_to_handler(errval);
+            }
+        }
+    }
+
+    /// An uncaught throw / rejection / catchable VM error escaping a
+    /// resumed strand: reject the strand's promise (waking waiters),
+    /// discard the strand's frames and handler entries, and fall through
+    /// to the scheduler. The parked root region below is untouched.
+    pub(super) fn reject_strand(&mut self, errval: Value) -> Result<(), VMError> {
+        let Completion::ResolvePromise(pid) = self.callstack[1].completion else {
+            return Err(
+                self.fail_not_resumable(ErrorKind::BadReturn, "reject_strand outside a strand")
+            );
+        };
+        // The strand base frame's fp: the current fp when no sync frames
+        // sit above it, else the first such frame's saved prev_fp.
+        let strand_fp = if self.callstack.len() > 2 {
+            self.callstack[2].prev_fp
+        } else {
+            self.fp
+        };
+        self.stack.truncate(strand_fp as usize);
+        self.fp = self.callstack[1].prev_fp;
+        self.callstack.truncate(1);
+        self.cur_local_count = self.callstack.last().map_or(0, |f| f.local_count);
+        while self.handlers.last().is_some_and(|h| h.callstack_len > 1) {
+            self.handlers.pop();
+        }
+        self.settle_and_wake(pid, PromiseState::Rejected(errval))?;
+        self.schedule()
+    }
+
+    /// The dedicated deadlock error (commitment 4's payoff: promises only
+    /// come from tool calls and async calls, so a blocked root with nothing
+    /// ready, nothing in the outbox, and nothing in flight is *provably*
+    /// stuck — circular awaits). Names the await chain.
+    pub(super) fn deadlock_error(&self, awaiting: PromisePtr) -> VMError {
+        let chain = self.render_await_chain(awaiting);
+        self.fail(
+            ErrorKind::Deadlock,
+            format!("deadlock: circular await — {chain}"),
+        )
+    }
+
+    /// Reconstruct the await chain from promise waiter links and the
+    /// continuation records' await spans: there is no stack to read for a
+    /// suspended chain, so diagnostics walk the heap records instead.
+    pub(super) fn render_await_chain(&self, root: PromisePtr) -> String {
+        let mut out = String::from("top level awaits");
+        let mut seen: Vec<PromisePtr> = Vec::new();
+        let mut pid = root;
+        loop {
+            if seen.contains(&pid) {
+                out.push_str(&format!(" promise {pid} (the cycle)"));
+                break;
+            }
+            seen.push(pid);
+            // The continuation that would settle `pid`, if any (a leaf tool
+            // promise has none).
+            match self.continuations.iter().flatten().find(|c| c.promise == pid) {
+                Some(c) => {
+                    out.push_str(&format!(
+                        " promise {pid} (async call suspended at {}), which awaits",
+                        self.span_pos(c.await_span)
+                    ));
+                    pid = c.awaiting;
+                }
+                None => {
+                    out.push_str(&format!(" promise {pid}"));
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    /// `line:col` of a source span, degrading to `?` for hand-assembled
+    /// programs with no source.
+    fn span_pos(&self, span: u32) -> String {
+        if self.source.is_empty() {
+            return "?".to_string();
+        }
+        let (line, col, _) = crate::diag::line_col(&self.source, span);
+        format!("{line}:{col}")
     }
 
     /// Push a string value onto the stack. Strings live inline as `RcStr`, not
@@ -635,6 +975,7 @@ impl VM {
             prev_fp: self.fp,
             arguments_cache: None,
             pending_upvals: upvals,
+            completion: Completion::Normal,
         });
         self.ip = addr;
         self.fp = (self.stack.len() as u32) - nargs;
@@ -645,22 +986,29 @@ impl VM {
     /// Execute until an effect, completion, or error. A *catchable* error —
     /// a `TypeError`/`ValueError` whose operands were fully consumed
     /// (`PushValueThenContinue`, the Phase 3 pop-first invariant) — raised
-    /// while a `try` handler is active is materialized as a
+    /// while a *reachable* `try` handler is active is materialized as a
     /// `{ name, message }` error object and unwound to the handler instead
-    /// of escalating (6_LANGUAGE Part B). Everything else (`OutOfFuel`,
-    /// `NotResumable` invariant errors) escalates as before, so a program
-    /// cannot trap its own kill switch. `raise` is unaffected: it yields
-    /// `StepResult::Raise` (an `Ok`), never an error, so no `try` can
-    /// swallow it.
+    /// of escalating (6_LANGUAGE Part B). Inside a resumed strand with no
+    /// reachable handler, the same error rejects the strand's promise
+    /// (7_ASYNC Tier 2) — an async call's failure is its promise's
+    /// rejection, never an unwind into the parked code below. Everything
+    /// else (`OutOfFuel`, `NotResumable` invariant errors) escalates as
+    /// before, so a program cannot trap its own kill switch. `raise` is
+    /// unaffected: it yields `StepResult::Raise` (an `Ok`), never an error,
+    /// so no `try` can swallow it.
     pub fn step(&mut self) -> Result<StepResult, VMError> {
         loop {
             match self.dispatch() {
-                Err(e)
-                    if matches!(e.resume, ResumeMode::PushValueThenContinue)
-                        && !self.handlers.is_empty() =>
-                {
-                    let thrown = self.error_to_thrown(&e);
-                    self.unwind_to_handler(thrown);
+                Err(e) if matches!(e.resume, ResumeMode::PushValueThenContinue) => {
+                    if self.reachable_handler() {
+                        let thrown = self.error_to_thrown(&e);
+                        self.unwind_to_handler(thrown);
+                    } else if self.in_strand() {
+                        let thrown = self.error_to_thrown(&e);
+                        self.reject_strand(thrown)?;
+                    } else {
+                        return Err(e);
+                    }
                 }
                 other => return other,
             }
