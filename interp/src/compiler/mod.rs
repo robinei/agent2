@@ -3085,6 +3085,32 @@ impl<'src> Compiler<'src> {
                 scope.captures.clone(),
             )
         };
+        // Destructuring params are not supported: the analyzer flattens each
+        // pattern's bindings into separate param slots, which desyncs the
+        // caller's argument layout from the callee's. Reject cleanly (compile
+        // aborts on diagnostics, so bailing here leaves no dangling label).
+        for item in &params.items {
+            if !matches!(&item.pattern, ast::BindingPattern::BindingIdentifier(_)) {
+                self.error(
+                    item.pattern.span().start,
+                    "destructuring in function parameters is not supported",
+                );
+                return;
+            }
+        }
+        if let Some(rest) = &params.rest {
+            if !matches!(
+                &rest.rest.argument,
+                ast::BindingPattern::BindingIdentifier(_)
+            ) {
+                self.error(
+                    rest.rest.argument.span().start,
+                    "destructuring in function parameters is not supported",
+                );
+                return;
+            }
+        }
+
         let nparams = params_info.len() as u32;
         let has_rest = params_info.last().map(|p| p.is_rest).unwrap_or(false);
         let nregular = if has_rest { nparams - 1 } else { nparams };

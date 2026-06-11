@@ -89,6 +89,17 @@ through the normal function-expression path. Also verify shorthand
   builtin or instruction. Least common of the three — fine to defer if it
   drags.
 
+Status: all three rest forms landed (object rest is copy-minus-keys via
+`ObjExtend` + `ObjDelete`, no new primitives; keys — computed included —
+evaluate exactly once). Destructuring also works in `for-of`/`for-in`
+declaration heads (`for (const [k, v] of Object.entries(o))`), reusing the
+normal pattern lowering per iteration. Function-*parameter* destructuring
+(`function f({a, b})`) remains unsupported and is rejected with a clean
+diagnostic — it previously panicked the compiler (≥2 bindings) or silently
+bound the whole argument (1 binding). Implementing it needs the analyzer to
+keep one param slot per declared parameter and destructure in the prologue;
+add as a follow-up if evidence demands.
+
 ## Part B — try / catch / throw (after Phase 3)
 
 Position: in-program error handling is the **inner layer of the condition

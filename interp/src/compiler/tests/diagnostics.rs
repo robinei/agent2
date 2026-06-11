@@ -79,6 +79,23 @@ fn for_of_in_diagnostics() {
     }
 }
 
+#[test]
+fn destructuring_params_are_rejected() {
+    for src in [
+        "function f({a, b}) { return a; } return f({a: 1});",
+        "function f([a]) { return a; } return f([1]);",
+        "function f({a} = {a: 5}) { return a; } return f();",
+        "const f = ({a}) => a; return f({a: 7});",
+        "function f(...[a, b]) { return a; } return f(1, 2);",
+    ] {
+        let errs = compile(src).expect_err("should fail");
+        assert!(
+            errs.iter().any(|d| d.message.contains("parameters")),
+            "expected param-destructuring rejection for `{src}`, got: {:?}",
+            errs.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+}
 
 #[test]
 fn switch_continue_outside_loop_errors() {
