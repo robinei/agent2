@@ -792,8 +792,8 @@ fn call_spread_with_builtin() {
     let code = vec![
         PushFloat(3.0),
         PushFloat(7.0),
-        ArrNew(2),                    // args array
-        PushBuiltin(Builtin::MathMax),// callable on top
+        ArrNew(2),                     // args array
+        PushBuiltin(Builtin::MathMax), // callable on top
         CallSpread,
     ];
     assert_eq!(run(code), vec![n(7.0)]);
@@ -803,7 +803,7 @@ fn call_spread_with_builtin() {
 fn call_spread_with_empty_array() {
     // NumberParseInt(...[]) → NaN
     let code = vec![
-        ArrNew(0),                    // empty args
+        ArrNew(0), // empty args
         PushBuiltin(Builtin::NumberParseInt),
         CallSpread,
     ];
@@ -817,8 +817,8 @@ fn call_spread_with_fn() {
     let code = vec![
         PushFloat(10.0),
         PushFloat(3.0),
-        ArrNew(2),                    // args array
-        PushFn(6),                    // callable on top (addr of fn body)
+        ArrNew(2), // args array
+        PushFn(6), // callable on top (addr of fn body)
         CallSpread,
         Return(1),
         Local(0),
@@ -833,7 +833,7 @@ fn call_spread_with_fn() {
 fn call_spread_non_array_error() {
     // CallSpread with a non-array args value → TypeError
     let code = vec![
-        PushFloat(42.0),              // not an array
+        PushFloat(42.0), // not an array
         PushBuiltin(Builtin::MathMax),
         CallSpread,
     ];
@@ -845,7 +845,7 @@ fn call_spread_non_callable_error() {
     // CallSpread with a non-callable → TypeError
     let code = vec![
         ArrNew(0),
-        PushFloat(42.0),              // not callable
+        PushFloat(42.0), // not callable
         CallSpread,
     ];
     assert!(matches!(run_err(code).kind, ErrorKind::TypeError));
@@ -1281,14 +1281,14 @@ fn arr_set_oob() {
 fn arr_extend_and_push() {
     // Build [1, 2, 3] via ArrNew + ArrExtend + ArrPush, verify length.
     let code = vec![
-        PushFloat(1.0),           // leading element
-        ArrNew(1),                // [1]
+        PushFloat(1.0), // leading element
+        ArrNew(1),      // [1]
         PushFloat(10.0),
         PushFloat(20.0),
-        ArrNew(2),                // [10, 20] — the extend source
-        ArrExtend,                // [1, 10, 20]
-        PushFloat(99.0),          // trailing element
-        ArrPush,                  // [1, 10, 20, 99]
+        ArrNew(2),       // [10, 20] — the extend source
+        ArrExtend,       // [1, 10, 20]
+        PushFloat(99.0), // trailing element
+        ArrPush,         // [1, 10, 20, 99]
         ArrLength,
     ];
     assert_eq!(run(code), vec![n(4.0)]);
@@ -1298,11 +1298,11 @@ fn arr_extend_and_push() {
 fn arr_extend_empty_leading() {
     // Start with empty array then extend.
     let code = vec![
-        ArrNew(0),                // []
+        ArrNew(0), // []
         PushFloat(3.0),
         PushFloat(4.0),
-        ArrNew(2),                // [3, 4]
-        ArrExtend,                // [3, 4]
+        ArrNew(2), // [3, 4]
+        ArrExtend, // [3, 4]
         ArrLength,
     ];
     assert_eq!(run(code), vec![n(2.0)]);
@@ -1313,7 +1313,7 @@ fn arr_extend_non_array_error() {
     // ArrExtend on a non-array source is a TypeError.
     let code = vec![
         ArrNew(0),
-        PushFloat(42.0),          // not an array
+        PushFloat(42.0), // not an array
         ArrExtend,
     ];
     assert!(matches!(run_err(code).kind, ErrorKind::TypeError));
@@ -1410,16 +1410,16 @@ fn obj_get_missing_key() {
 fn obj_extend_merges_fields() {
     // Build {a:1} then extend with {b:2}, then {c:3} via ObjSet.
     let code = vec![
-        PushFloat(1.0),                           // a value
-        ObjNew(vec!["a".into()].into()),          // {a:1}
+        PushFloat(1.0),                  // a value
+        ObjNew(vec!["a".into()].into()), // {a:1}
         PushFloat(2.0),
-        ObjNew(vec!["b".into()].into()),          // {b:2}
-        ObjExtend,                                // {a:1, b:2}
-        Pick(0),                                  // dup for next read
-        PushFloat(3.0),                           // c value
-        ObjSet("c".into(), SetMode::New),         // {a:1, b:2, c:3}; leaves val
-        Pop(1),                                   // drop val, keep obj
-        ObjGet("a".into()),                       // → 1
+        ObjNew(vec!["b".into()].into()),  // {b:2}
+        ObjExtend,                        // {a:1, b:2}
+        Pick(0),                          // dup for next read
+        PushFloat(3.0),                   // c value
+        ObjSet("c".into(), SetMode::New), // {a:1, b:2, c:3}; leaves val
+        Pop(1),                           // drop val, keep obj
+        ObjGet("a".into()),               // → 1
     ];
     assert_eq!(run(code), vec![n(1.0)]);
 }
@@ -1429,18 +1429,18 @@ fn obj_extend_null_undefined_noop() {
     // null/undefined source is a no-op.
     let code = vec![
         PushFloat(1.0),
-        ObjNew(vec!["x".into()].into()),          // {x:1}
-        PushNull,                                 // src = null (no-op)
-        ObjExtend,                                // {x:1}
+        ObjNew(vec!["x".into()].into()), // {x:1}
+        PushNull,                        // src = null (no-op)
+        ObjExtend,                       // {x:1}
         ObjGet("x".into()),
     ];
     assert_eq!(run(code), vec![n(1.0)]);
 
     let code2 = vec![
         PushFloat(2.0),
-        ObjNew(vec!["y".into()].into()),          // {y:2}
-        PushUndefined,                            // src = undefined (no-op)
-        ObjExtend,                                // {y:2}
+        ObjNew(vec!["y".into()].into()), // {y:2}
+        PushUndefined,                   // src = undefined (no-op)
+        ObjExtend,                       // {y:2}
         ObjGet("y".into()),
     ];
     assert_eq!(run(code2), vec![n(2.0)]);
@@ -1450,8 +1450,8 @@ fn obj_extend_null_undefined_noop() {
 fn obj_extend_non_object_error() {
     // Non-object, non-null/undefined src is TypeError.
     let code = vec![
-        ObjNew(vec![].into()),                    // {}
-        PushFloat(42.0),                          // not an object
+        ObjNew(vec![].into()), // {}
+        PushFloat(42.0),       // not an object
         ObjExtend,
     ];
     assert!(matches!(run_err(code).kind, ErrorKind::TypeError));
@@ -1462,10 +1462,10 @@ fn obj_extend_later_wins() {
     // Later field wins on conflict (IndexMap insertion-order semantics).
     let code = vec![
         PushFloat(1.0),
-        ObjNew(vec!["x".into()].into()),          // {x:1}
+        ObjNew(vec!["x".into()].into()), // {x:1}
         PushFloat(2.0),
-        ObjNew(vec!["x".into()].into()),          // {x:2}
-        ObjExtend,                                // {x:2} (later wins)
+        ObjNew(vec!["x".into()].into()), // {x:2}
+        ObjExtend,                       // {x:2} (later wins)
         ObjGet("x".into()),
     ];
     assert_eq!(run(code), vec![n(2.0)]);

@@ -322,7 +322,7 @@ impl VM {
                             return Err(self.fail(
                                 ErrorKind::TypeError,
                                 "spread call arguments must be an array",
-                            ))
+                            ));
                         }
                     };
                     let ip = self.ip;
@@ -1228,7 +1228,7 @@ impl VM {
                             return Err(self.fail(
                                 ErrorKind::TypeError,
                                 "object spread target must be an object",
-                            ))
+                            ));
                         }
                     };
                     // null/undefined src is a no-op (JS semantics).
@@ -1256,7 +1256,7 @@ impl VM {
                             return Err(self.fail(
                                 ErrorKind::TypeError,
                                 "object spread source must be an object (or null/undefined)",
-                            ))
+                            ));
                         }
                     }
                     self.stack.push(Value::Object(obj_ptr));
@@ -1285,7 +1285,7 @@ impl VM {
                             return Err(self.fail(
                                 ErrorKind::TypeError,
                                 "array spread target must be an array",
-                            ))
+                            ));
                         }
                     };
                     let ip = self.ip;
@@ -1307,7 +1307,7 @@ impl VM {
                             return Err(self.fail(
                                 ErrorKind::TypeError,
                                 "array spread source must be an array",
-                            ))
+                            ));
                         }
                     }
                     self.stack.push(Value::Array(arr_ptr));
@@ -1319,10 +1319,8 @@ impl VM {
                     let arr_ptr = match self.pop()? {
                         Value::Array(p) => p,
                         _ => {
-                            return Err(self.fail(
-                                ErrorKind::TypeError,
-                                "array push target must be an array",
-                            ))
+                            return Err(self
+                                .fail(ErrorKind::TypeError, "array push target must be an array"));
                         }
                     };
                     let ip = self.ip;

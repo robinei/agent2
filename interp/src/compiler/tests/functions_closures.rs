@@ -528,7 +528,9 @@ fn rest_param_basic() {
 #[test]
 fn rest_param_with_regular_params() {
     assert_eq!(
-        testutil::run_val("function f(a, b, ...rest) { return rest.length; } return f(1, 2, 3, 4, 5);"),
+        testutil::run_val(
+            "function f(a, b, ...rest) { return rest.length; } return f(1, 2, 3, 4, 5);"
+        ),
         testutil::num(3.0)
     );
     assert_eq!(

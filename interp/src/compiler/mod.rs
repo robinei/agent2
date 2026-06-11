@@ -1398,9 +1398,10 @@ impl<'src> Compiler<'src> {
     fn compile_array(&mut self, arr: &ast::ArrayExpression) {
         let span = arr.span.start;
         // Fast path: no spread elements (byte-for-byte unchanged from before)
-        let has_spread = arr.elements.iter().any(|el| {
-            matches!(el, ast::ArrayExpressionElement::SpreadElement(_))
-        });
+        let has_spread = arr
+            .elements
+            .iter()
+            .any(|el| matches!(el, ast::ArrayExpressionElement::SpreadElement(_)));
         if !has_spread {
             let mut n = 0u32;
             for el in &arr.elements {
@@ -1500,7 +1501,9 @@ impl<'src> Compiler<'src> {
                     ast::ObjectPropertyKind::ObjectProperty(p) => p,
                     ast::ObjectPropertyKind::SpreadProperty(_) => unreachable!(),
                 };
-                let Some(name) = self.static_property_name(p) else { return };
+                let Some(name) = self.static_property_name(p) else {
+                    return;
+                };
                 self.compile_expr(&p.value);
                 names.push(name);
             }
@@ -1511,12 +1514,14 @@ impl<'src> Compiler<'src> {
         // Slow path: incremental building with spreads and/or computed keys.
         // Phase 1: emit ObjNew for the leading static segment (stop at first
         // spread or computed key).
-        let leading_count = obj.properties.iter().take_while(|prop| {
-            match prop {
+        let leading_count = obj
+            .properties
+            .iter()
+            .take_while(|prop| match prop {
                 ast::ObjectPropertyKind::SpreadProperty(_) => false,
                 ast::ObjectPropertyKind::ObjectProperty(p) => !p.computed,
-            }
-        }).count();
+            })
+            .count();
 
         let mut leading_names: Vec<RcStr> = Vec::with_capacity(leading_count);
         for prop in &obj.properties[..leading_count] {
@@ -1524,7 +1529,9 @@ impl<'src> Compiler<'src> {
                 ast::ObjectPropertyKind::ObjectProperty(p) => p,
                 ast::ObjectPropertyKind::SpreadProperty(_) => unreachable!(),
             };
-            let Some(name) = self.static_property_name(p) else { return };
+            let Some(name) = self.static_property_name(p) else {
+                return;
+            };
             self.compile_expr(&p.value);
             leading_names.push(name);
         }
@@ -1544,12 +1551,18 @@ impl<'src> Compiler<'src> {
                 ast::ObjectPropertyKind::ObjectProperty(p) => {
                     if p.computed {
                         self.emit(Instr::Pick(0), span);
-                        self.compile_expr(p.key.as_expression().expect("computed key must have expression"));
+                        self.compile_expr(
+                            p.key
+                                .as_expression()
+                                .expect("computed key must have expression"),
+                        );
                         self.compile_expr(&p.value);
                         self.emit(Instr::IndexSet(SetMode::New), span);
                         self.emit(Instr::Pop(1), span);
                     } else {
-                        let Some(name) = self.static_property_name(p) else { return };
+                        let Some(name) = self.static_property_name(p) else {
+                            return;
+                        };
                         self.emit(Instr::Pick(0), span);
                         self.compile_expr(&p.value);
                         self.emit(Instr::ObjSet(name, SetMode::New), span);
@@ -3176,7 +3189,10 @@ impl<'src> Compiler<'src> {
         // surplus elements that become the rest array.
         if has_rest {
             let rest_slot = nregular as u32;
-            let needs_box = matches!(slot_kinds.get(rest_slot as usize).copied(), Some(SlotKind::Boxed));
+            let needs_box = matches!(
+                slot_kinds.get(rest_slot as usize).copied(),
+                Some(SlotKind::Boxed)
+            );
             self.emit(Instr::Arguments, span);
             self.emit(Instr::PushPosInt(nregular as u64), span);
             self.emit(Instr::CallBuiltin(Builtin::StrSlice, 2), span);
