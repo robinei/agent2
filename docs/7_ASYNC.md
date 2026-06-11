@@ -1,5 +1,12 @@
 # Phase 7 — Async/await
 
+> **Status:** Tier 1 landed 2026-06-11 (`async:` commits; see
+> `compiler/tests/async_await.rs` and the effects section of `vm/tests.rs`
+> for the executable contract). One deliberate addition beyond this plan:
+> `new Promise(...)` gets a targeted compile diagnostic (commitment 4 made
+> visible to the LLM), and `Promise.resolve`/`reject` likewise. Tier 2 not
+> started.
+
 Real async/await, replacing both today's synchronous `Invoke` batching and
 the "transparent await" stopgap (4_FUTURE item 1, superseded by this file).
 Two tiers: Tier 1 needs no per-task execution state and delivers flat

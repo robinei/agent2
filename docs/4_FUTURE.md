@@ -12,7 +12,7 @@ blocking re-executing `Await`, VM-side cascading, optional task strands).
 The transparent-await stopgap described here previously should **not** be
 implemented — it would change `await tools.f()` from "unsupported" to
 "silently synchronous" and then change semantics *again* when Phase 7
-lands. Go straight to 7_ASYNC Tier 1.
+lands. Go straight to 7_ASYNC Tier 1. (Done: Tier 1 landed 2026-06-11.)
 
 ## 2. Memory bounds (medium)
 
@@ -87,7 +87,9 @@ excluded, not just implementation cost.
 
 Non-goals, recorded so they aren't relitigated: `ToPrimitive` on objects,
 UTF-16 string semantics, `class`/`new`/`this`, prototype chains, generators,
-real promises/event loop, heap reclamation / GC (programs are short-lived;
+a JS event loop / microtask queue (promises themselves exist as of 7_ASYNC
+Tier 1, but scheduling is the deterministic strand model, not an event
+loop), heap reclamation / GC (programs are short-lived;
 memory is bounded by item 2). (`try`/`catch` was originally a non-goal; that
 decision is reversed in `6_LANGUAGE.md` Part B — in-program handlers are the
 inner layer of the condition system, with `raise` explicitly uncatchable.

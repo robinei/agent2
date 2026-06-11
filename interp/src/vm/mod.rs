@@ -154,6 +154,20 @@ The remaining intentional divergences from JS — deferred or accepted, NOT bugs
     large/small magnitudes are not rendered in JS's exponential form (`1e21`).
   • No exceptions/try/catch/throw: the `Raise` condition mechanism is for host
     (LLM) intervention, not JS error handling.
+  • Tool calls return *promises* (7_ASYNC Tier 1): `tools.f(args)` starts the
+    call and pushes a promise; `await` is the only consumer. There is no
+    `.then`/`.catch`/`.finally`, no `new Promise` (no executor pattern), and
+    no `Promise.race`/`any`/`allSettled` — only `Promise.all`. `await x` on a
+    non-promise passes it through, as in JS. Promises are transient values:
+    identity-only `===`, "object" under `typeof`, no JSON form (reaching the
+    persistence boundary errors with a missing-`await` hint, as does property
+    access on a promise).
+  • Tier 1 async limitation: an `async` function body runs synchronously on
+    the caller's stack, so an `await` inside it blocks the whole program
+    instead of suspending just that call (Tier 2 removes this). Consequently
+    an async function returns its plain value, not a wrapped promise —
+    observationally invisible, because `await` passes non-promises through
+    and is the only promise consumer in this dialect.
 
 */
 
