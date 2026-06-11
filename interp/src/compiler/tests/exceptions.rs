@@ -182,26 +182,33 @@ fn new_non_error_still_rejected() {
 // ── uncaught propagation ─────────────────────────────────────────────
 
 #[test]
-fn uncaught_throw_escalates_as_value_error() {
+fn uncaught_throw_escalates_as_uncaught_exception() {
     let err = run_runtime_err(r#"throw new Error("boom");"#);
-    assert_eq!(err.kind, ErrorKind::ValueError);
+    assert_eq!(err.kind, ErrorKind::UncaughtException);
     assert!(matches!(err.resume, ResumeMode::NotResumable));
     assert!(
         err.message.contains("uncaught Error: boom"),
         "got: {}",
         err.message
     );
+    // The thrown value itself survives structurally, not just a rendering.
+    assert!(
+        matches!(err.payload, Some(Value::Object(_))),
+        "got: {:?}",
+        err.payload
+    );
 }
 
 #[test]
 fn uncaught_throw_of_plain_value() {
     let err = run_runtime_err(r#"throw 42;"#);
-    assert_eq!(err.kind, ErrorKind::ValueError);
+    assert_eq!(err.kind, ErrorKind::UncaughtException);
     assert!(
         err.message.contains("uncaught exception"),
         "got: {}",
         err.message
     );
+    assert_eq!(err.payload, Some(Value::PosInt(42)));
 }
 
 // ── catchable runtime errors ─────────────────────────────────────────

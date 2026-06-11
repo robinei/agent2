@@ -369,6 +369,12 @@ pub enum ErrorKind {
     BadLocal,
     TypeError,
     ValueError,
+    /// An uncaught program-level `throw` (no active `try` handler). Distinct
+    /// from the VM's own failures: the *program* produced this error value
+    /// deliberately, and the host's policy for it differs (show the LLM the
+    /// program's own error, not a VM diagnostic). The thrown value is
+    /// preserved in [`VMError::payload`]; the message carries a rendering.
+    UncaughtException,
     /// Instruction budget exhausted (guards against infinite loops in
     /// LLM-generated programs).
     OutOfFuel,
@@ -408,13 +414,13 @@ pub enum ErrorKind {
 /// | **IncLocal** (non-numeric local) | TypeError | **NotResumable** | reads local by peek (no stack consumption) |
 /// | bad heap/cell pointer (`get`/`get_mut` on arrays/objects/cells/closures) | TypeError/ValueError | **NotResumable** | corrupt heap = invariant violation; some sites also have no result slot (SetLocal) |
 /// | Raise with argc > 1 | BadArg | NotResumable | instruction contract violated (compiler emits 0 or 1) |
-/// | Throw (no handler) | ValueError | **NotResumable** | operand popped, but a `throw` has no result slot a substituted value could fill |
+/// | Throw (no handler) | UncaughtException | **NotResumable** | operand popped, but a `throw` has no result slot a substituted value could fill; the thrown value is preserved in `VMError::payload` |
 /// | TryEnter (bad handler address) | BadCall | NotResumable | invariant violation / compiler bug |
 /// | TryExit (empty handler stack) | BadArg | NotResumable | unmatched TryExit = compiler bug |
 /// | StackUnderflow, BadReturn, BadCall, BadAlloc, BadArg, BadLocal | — | NotResumable | invariant violation / compiler bug |
 /// | OutOfFuel | — | RetrySameInstr | nothing consumed; refuel and retry |
 ///
-/// All 9 `ErrorKind`s are covered. The bolded sites are the
+/// All 10 `ErrorKind`s are covered. The bolded sites are the
 /// TypeError/ValueError sites that error before full operand consumption
 /// (or, for bad pointers, mid-mutation) and therefore must not be resumed.
 #[derive(Debug)]
@@ -435,6 +441,11 @@ pub struct VMError {
     pub ip: CodeAddr,
     pub message: String,
     pub resume: ResumeMode,
+    /// The thrown program value, preserved for `UncaughtException` so the
+    /// host can inspect it structurally (or carry it into a rewritten
+    /// program) — the message only holds a rendering. `None` for every
+    /// other kind.
+    pub payload: Option<Value>,
 }
 
 impl VMError {
@@ -450,6 +461,7 @@ impl VMError {
             ip,
             message: msg.into(),
             resume: ResumeMode::NotResumable,
+            payload: None,
         }
     }
 }

@@ -178,6 +178,11 @@ on the open choices and deltas:
 - `await` of a rejected promise inside `try` delivers the **raw rejection
   value** to `catch` (JS semantics), not a wrapped `{name, message}`; the
   no-handler escalation path is byte-for-byte unchanged.
+- An uncaught `throw` escalates as the dedicated
+  `ErrorKind::UncaughtException` (not `ValueError`): the program produced
+  this error value deliberately, and the host's policy differs from a VM
+  failure. The thrown value is preserved structurally in
+  `VMError::payload`; the message carries the `uncaught …` rendering.
 - `new Error(msg)` plus `TypeError`/`RangeError`/`SyntaxError`/
   `ReferenceError`/`EvalError` are special-cased; message coerces ToString
   at construction; a second argument (`{cause}`) is a compile error.

@@ -2574,22 +2574,24 @@ fn try_enter_throw_unwinds_to_handler() {
 }
 
 #[test]
-fn throw_without_handler_is_uncaught_value_error() {
+fn throw_without_handler_is_uncaught_exception() {
     let err = run_err(vec![ps("boom"), Throw]);
-    assert!(matches!(err.kind, ErrorKind::ValueError));
+    assert!(matches!(err.kind, ErrorKind::UncaughtException));
     assert!(matches!(err.resume, ResumeMode::NotResumable));
     assert!(
         err.message.contains("uncaught exception"),
         "got: {}",
         err.message
     );
+    // The thrown value is preserved structurally.
+    assert_eq!(err.payload, Some(Value::String("boom".into())));
 }
 
 #[test]
 fn try_exit_after_clean_body_pops_handler() {
     // A throw after TryExit must NOT be caught by the exited handler.
     let err = run_err(vec![TryEnter(4), TryExit, ps("late"), Throw]);
-    assert!(matches!(err.kind, ErrorKind::ValueError));
+    assert!(matches!(err.kind, ErrorKind::UncaughtException));
     assert!(err.message.contains("uncaught"), "got: {}", err.message);
 }
 

@@ -255,8 +255,9 @@ pub enum Instr {
 
     // `throw expr`: pop the thrown value and unwind to the innermost handler
     // (see `TryEnter`). With no active handler the throw escalates as an
-    // uncaught ValueError at the `step()` boundary — NotResumable, because a
-    // `throw` has no result slot a substituted value could fill.
+    // `UncaughtException` at the `step()` boundary, with the thrown value
+    // preserved in `VMError::payload` — NotResumable, because a `throw` has
+    // no result slot a substituted value could fill.
     Throw, // any -> ()
 
     // pops N values where N is the number of field names, then pushes an

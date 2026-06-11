@@ -63,6 +63,24 @@ update the divergence list when done:
 - Out-of-range array write growing with holes instead of erroring (likelier
   fix: better error message, not JS semantics — the error catches real bugs).
 
+**JS-named error kinds for the program-visible `e.name` (post-6B).**
+`try`/`catch` (6_LANGUAGE Part B) materializes a caught VM error as
+`{ name, message }` with `name` taken from the `ErrorKind` Debug name — and
+`ValueError` is a *Python* name, not a JS one. JS-trained programs that
+branch on `e.name` expect `RangeError` (negative/OOB index, shift count out
+of range), `SyntaxError` (`JSON.parse` failure), etc.; only `TypeError`
+already matches. When a transcript shows a program actually branching on
+`e.name` (rather than inspecting `e.message` or catching blindly), split the
+catchable `ValueError` sites into JS-named kinds — `RangeError`,
+`SyntaxError`, keeping `ValueError` or an `Internal` kind for the
+corrupt-pointer invariant sites that are `NotResumable` anyway — or, more
+cheaply, map kinds to JS names per-site in `error_to_thrown`. Until that
+evidence exists the coarse kinds stand: the message carries the
+specificity, `ResumeMode` carries the actionability, and nothing host-side
+branches on `kind` yet. (Uncaught program throws already have their own
+`UncaughtException` kind, carrying the thrown value in `VMError::payload` —
+that split was structural, not cosmetic, and is done.)
+
 **`Map`/`Set` (evidence-gated, unlike `this`/`class` which are architectural):
 start without them.** IndexMap-backed plain objects already cover ordered
 string-keyed lookup, and Set has no stable JSON form at the program's
@@ -76,10 +94,11 @@ already do.
 
 Related small item, unconditional (not evidence-gated): **repair-hint
 diagnostics for rejected syntax.** LLMs reflexively write `new Map()` /
-`new Set()` / `new Date()` / `new Error(...)` in glue code. Keep rejecting
-them, but make the `new` diagnostic name the alternative per constructor:
-Map/Set → plain object or array, Date → ISO strings or a host time tool,
-Error → `raise`. Same treatment for `this`/`class`: suggest plain objects +
+`new Set()` / `new Date()` in glue code (`new Error(...)` is supported as
+of 6_LANGUAGE Part B). Keep rejecting them, but make the `new` diagnostic
+name the alternative per constructor: Map/Set → plain object or array,
+Date → ISO strings or a host time tool.
+Same treatment for `this`/`class`: suggest plain objects +
 functions, and note that everything durable (program results, tool
 arguments, artifacts) is JSON-shaped — methods and prototypes would not
 survive the log/restart boundary anyway, which is *why* they are

@@ -1572,11 +1572,17 @@ impl VM {
                 Instr::Throw => {
                     let value = self.pop()?;
                     if self.handlers.is_empty() {
-                        // NotResumable: the operand was consumed, but a
-                        // `throw` has no result slot — pushing a replacement
-                        // value would corrupt the statement-level stack.
+                        // NotResumable (via `fail`'s kind classification):
+                        // the operand was consumed, but a `throw` has no
+                        // result slot — pushing a replacement value would
+                        // corrupt the statement-level stack. The thrown
+                        // value rides along in `payload` so the host gets
+                        // the program's own error structurally, not just a
+                        // rendering.
                         let msg = self.uncaught_message(&value);
-                        return Err(self.fail_not_resumable(ErrorKind::ValueError, msg));
+                        let mut err = self.fail(ErrorKind::UncaughtException, msg);
+                        err.payload = Some(value);
+                        return Err(err);
                     }
                     self.unwind_to_handler(value);
                 }

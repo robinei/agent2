@@ -44,6 +44,7 @@ impl VM {
             ip: self.ip,
             message: msg.into(),
             resume: ResumeMode::NotResumable,
+            payload: None,
         }
     }
 
@@ -65,12 +66,16 @@ impl VM {
             // take_args, check_arity!). Default to PushValueThenContinue;
             // specific sites that error before popping override below.
             ErrorKind::TypeError | ErrorKind::ValueError => ResumeMode::PushValueThenContinue,
+            // An escaped program-level throw: the operand was consumed, but
+            // a `throw` has no result slot a substituted value could fill.
+            ErrorKind::UncaughtException => ResumeMode::NotResumable,
         };
         VMError {
             kind,
             ip: self.ip,
             message: msg.into(),
             resume,
+            payload: None,
         }
     }
 
