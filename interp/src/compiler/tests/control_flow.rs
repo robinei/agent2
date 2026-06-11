@@ -349,3 +349,43 @@ fn switch_break_only_continue_skips_to_enclosing_loop() {
     );
     // i=1: s=1, break. i=2: continue → skip increment. i=3: s=11.
 }
+
+#[test]
+fn continue_in_switch_inside_for_of_pops_discriminant() {
+    // `continue` jumps past the switch, whose discriminant is still on the
+    // operand stack — it must be popped on the way out, or the for-of's
+    // [container, idx] loop state (also stack-resident) is corrupted.
+    // Regression: this used to leak the discriminant and TypeError.
+    assert_eq!(
+        testutil::run_ret(
+            r#"
+            const a = [];
+            for (const x of [1, 2, 3]) {
+                switch (x) { case 1: continue; }
+                a.push(x);
+            }
+            return a;
+            "#
+        ),
+        serde_json::json!([2, 3])
+    );
+}
+
+#[test]
+fn continue_in_nested_switches_pops_both_discriminants() {
+    assert_eq!(
+        testutil::run_ret(
+            r#"
+            const a = [];
+            for (const x of [1, 2, 3]) {
+                switch (x) {
+                    case 1: switch (x + 10) { case 11: continue; }
+                }
+                a.push(x);
+            }
+            return a;
+            "#
+        ),
+        serde_json::json!([2, 3])
+    );
+}

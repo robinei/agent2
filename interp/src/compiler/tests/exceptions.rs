@@ -623,27 +623,334 @@ fn return_in_function_inside_finally_is_fine() {
     );
 }
 
-// ── finally: rejected early exits ────────────────────────────────────
+// ── finally: break/continue across and out of `finally` (Part B2) ────
+//
+// JS completion-value semantics: an early exit crossing a finalizer runs
+// the finally block on its way out (via the exit stub), and a jump *from*
+// a finally block overrides whatever completion was pending.
 
 #[test]
-fn break_crossing_finally_rejected() {
-    let errs = compile_errs(r#"while (true) { try { break; } finally {} }"#);
-    assert!(
-        errs.iter()
-            .any(|e| e.contains("`break` cannot jump out of a `try` block")),
-        "got: {errs:?}"
+fn break_crossing_finally_runs_block() {
+    assert_eq!(
+        run_ret(
+            r#"
+            const a = [];
+            while (true) { try { a.push("b"); break; } finally { a.push("f"); } }
+            return a;
+            "#
+        ),
+        json!(["b", "f"])
     );
 }
 
 #[test]
-fn continue_crossing_finally_rejected() {
-    let errs = compile_errs(r#"for (let i = 0; i < 2; i++) { try { continue; } finally {} }"#);
-    assert!(
-        errs.iter()
-            .any(|e| e.contains("`continue` cannot jump out of a `try` block")),
-        "got: {errs:?}"
+fn continue_crossing_finally_runs_block_each_iteration() {
+    assert_eq!(
+        run_ret(
+            r#"
+            const a = [];
+            for (let i = 0; i < 3; i++) {
+                try { if (i === 1) { continue; } a.push(i); } finally { a.push("f"); }
+            }
+            return a;
+            "#
+        ),
+        json!([0, "f", "f", 2, "f"])
     );
 }
+
+#[test]
+fn break_crossing_two_nested_finallys_innermost_first() {
+    assert_eq!(
+        run_ret(
+            r#"
+            const a = [];
+            while (true) {
+                try {
+                    try { break; } finally { a.push("inner"); }
+                } finally { a.push("outer"); }
+            }
+            return a;
+            "#
+        ),
+        json!(["inner", "outer"])
+    );
+}
+
+#[test]
+fn throw_in_exit_path_finally_overrides_break() {
+    // The finally on the break's way out throws: the exception wins (the
+    // break is abandoned) and is catchable by the enclosing handler.
+    assert_eq!(
+        run_ret(
+            r#"
+            const a = [];
+            while (true) {
+                try {
+                    try { break; } finally { throw "x"; }
+                } catch (e) { a.push(e); break; }
+            }
+            return a;
+            "#
+        ),
+        json!(["x"])
+    );
+}
+
+#[test]
+fn finally_break_swallows_pending_exception() {
+    // A jump out of the unwind-path copy discards the pending thrown value.
+    assert_eq!(
+        run_ret(
+            r#"
+            const a = [];
+            while (true) { try { throw "boom"; } finally { a.push("f"); break; } }
+            a.push("after");
+            return a;
+            "#
+        ),
+        json!(["f", "after"])
+    );
+}
+
+#[test]
+fn finally_continue_overrides_pending_break() {
+    assert_eq!(
+        run_ret(
+            r#"
+            const a = [];
+            for (let i = 0; i < 3; i++) { a.push(i); try { break; } finally { continue; } }
+            return a;
+            "#
+        ),
+        json!([0, 1, 2])
+    );
+}
+
+#[test]
+fn finally_break_overrides_pending_continue() {
+    assert_eq!(
+        run_ret(
+            r#"
+            const a = [];
+            for (let i = 0; i < 3; i++) { a.push(i); try { continue; } finally { break; } }
+            return a;
+            "#
+        ),
+        json!([0])
+    );
+}
+
+#[test]
+fn switch_break_crossing_finally() {
+    assert_eq!(
+        run_ret(
+            r#"
+            const a = [];
+            switch (1) {
+                case 1: try { a.push("b"); break; } finally { a.push("f"); }
+                case 2: a.push("fell");
+            }
+            return a;
+            "#
+        ),
+        json!(["b", "f"])
+    );
+}
+
+#[test]
+fn break_from_catch_crossing_finally() {
+    // The exit initiates in the catch clause; the finalizer entry is still
+    // open (it wraps the catch) and must run on the way out.
+    assert_eq!(
+        run_ret(
+            r#"
+            const a = [];
+            while (true) {
+                try { throw 1; } catch (e) { a.push("c"); break; } finally { a.push("f"); }
+            }
+            return a;
+            "#
+        ),
+        json!(["c", "f"])
+    );
+}
+
+#[test]
+fn break_inside_try_within_unwind_finally() {
+    // Pop-ordering soundness: the inner handler's snapshot includes the
+    // pending thrown value beneath the unwind copy, so the break must
+    // TryExit the inner entry *before* popping the pending value.
+    assert_eq!(
+        run_ret(
+            r#"
+            const a = [];
+            while (true) {
+                try { throw "t"; } finally {
+                    try { a.push("inner"); break; } catch (e) { a.push("nope"); }
+                }
+            }
+            a.push("after");
+            return a;
+            "#
+        ),
+        json!(["inner", "after"])
+    );
+}
+
+#[test]
+fn catch_inside_unwind_finally_keeps_pending_value_intact() {
+    // An inner try/catch fully handled inside the unwind copy must leave
+    // the pending thrown value untouched beneath it for the rethrow.
+    assert_eq!(
+        run_ret(
+            r#"
+            const a = [];
+            let caught = null;
+            try {
+                try { throw "boom"; } finally {
+                    try { throw "inner"; } catch (e) { a.push(e); }
+                    a.push("f");
+                }
+            } catch (e) { caught = e; }
+            return [a, caught];
+            "#
+        ),
+        json!([["inner", "f"], "boom"])
+    );
+}
+
+#[test]
+fn closure_in_finally_with_three_copies() {
+    // The finally block is emitted three times here (normal path, unwind
+    // path, and the break's exit stub); the closure inside resolves to the
+    // last-emitted body on every path (label maps are last-wins).
+    assert_eq!(
+        run_ret(
+            r#"
+            const a = [];
+            let caught = null;
+            try {
+                let i = 0;
+                while (true) {
+                    i = i + 1;
+                    try {
+                        if (i === 2) { throw "t"; }
+                        if (i === 3) { break; }
+                    } catch (e) {
+                        if (i === 2) { throw e; }
+                    } finally {
+                        const g = (x) => x * 10 + i;
+                        a.push(g(i));
+                    }
+                }
+            } catch (e) { caught = e; }
+            return [a, caught];
+            "#
+        ),
+        json!([[11, 22], "t"])
+    );
+}
+
+#[test]
+fn for_of_break_crossing_finally_keeps_loop_state() {
+    // for-of keeps [container, idx] on the operand stack across the body;
+    // routing the break through the exit stub must land at the loop end
+    // with exactly those slots intact.
+    assert_eq!(
+        run_ret(
+            r#"
+            const a = [];
+            for (const x of [1, 2, 3]) {
+                try { if (x === 2) { break; } a.push(x); } finally { a.push("f"); }
+            }
+            return a;
+            "#
+        ),
+        json!([1, "f", "f"])
+    );
+}
+
+#[test]
+fn for_of_continue_crossing_finally_keeps_loop_state() {
+    assert_eq!(
+        run_ret(
+            r#"
+            const a = [];
+            for (const x of [1, 2, 3]) {
+                try { if (x !== 2) { continue; } a.push(x); } finally { a.push("f"); }
+            }
+            return a;
+            "#
+        ),
+        json!(["f", 2, "f", "f"])
+    );
+}
+
+#[test]
+fn nested_try_finally_inside_exit_path_finally() {
+    // The exit-stub copy of F contains its own try/finally; the inner
+    // lowering (and its own copies) nest inside the stub.
+    assert_eq!(
+        run_ret(
+            r#"
+            const a = [];
+            while (true) {
+                try { break; } finally {
+                    try { a.push("x"); } finally { a.push("y"); }
+                    a.push("z");
+                }
+            }
+            return a;
+            "#
+        ),
+        json!(["x", "y", "z"])
+    );
+}
+
+#[test]
+fn continue_crossing_switch_then_finally() {
+    // continue from inside a switch inside a try/finally: pops the
+    // discriminant residue, then detours through the finally stub.
+    assert_eq!(
+        run_ret(
+            r#"
+            const a = [];
+            for (let i = 0; i < 3; i++) {
+                try {
+                    switch (i) { case 1: continue; }
+                    a.push(i);
+                } finally { a.push("f"); }
+            }
+            return a;
+            "#
+        ),
+        json!([0, "f", "f", 2, "f"])
+    );
+}
+
+#[test]
+fn continue_crossing_finally_then_switch() {
+    // The reverse nesting: try/finally inside a switch case. The stub's
+    // onward transfer pops the discriminant after the finally has run.
+    assert_eq!(
+        run_ret(
+            r#"
+            const a = [];
+            for (let i = 0; i < 3; i++) {
+                switch (i) {
+                    case 1: try { continue; } finally { a.push("f"); }
+                }
+                a.push(i);
+            }
+            return a;
+            "#
+        ),
+        json!([0, "f", 2])
+    );
+}
+
+// ── finally: rejected early exits (return — lifted in Part B2 Step 2) ─
 
 #[test]
 fn return_crossing_finally_rejected() {
@@ -666,12 +973,19 @@ fn return_inside_finally_rejected() {
 }
 
 #[test]
-fn break_escaping_finally_rejected() {
-    let errs = compile_errs(r#"while (true) { try {} finally { break; } }"#);
-    assert!(
-        errs.iter()
-            .any(|e| e.contains("`break` cannot jump out of a `finally` block")),
-        "got: {errs:?}"
+fn break_escaping_normal_path_finally() {
+    // A break out of the finally block on the normal path: nothing is
+    // pending; the block's trailing code is simply skipped.
+    assert_eq!(
+        run_ret(
+            r#"
+            const a = [];
+            while (true) { try { a.push("b"); } finally { a.push("f"); break; } }
+            a.push("after");
+            return a;
+            "#
+        ),
+        json!(["b", "f", "after"])
     );
 }
 

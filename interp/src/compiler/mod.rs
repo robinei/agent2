@@ -111,11 +111,48 @@ pub fn compile(source: &str) -> Result<Program, Vec<Diagnostic>> {
 struct LoopCtx {
     break_label: u32,
     continue_label: Option<u32>,
-    /// `try_stack.len()` when this context was pushed. A `break`/`continue`
-    /// targeting this context emits one `TryExit` per `try` block it jumps
-    /// out of (the entries above this mark), keeping the VM's handler stack
-    /// balanced; crossing a `finally` entry is a compile error instead.
-    try_depth: usize,
+    /// `barriers.len()` when this context was pushed. A `break`/`continue`
+    /// targeting this context unwinds every barrier above this mark: one
+    /// `TryExit` per `try` entry (keeping the VM's handler stack balanced),
+    /// a `Pop` per crossed stack residue, and a detour through the exit
+    /// stub of each crossed `finally` (see [`Compiler::emit_exit`]).
+    floor: usize,
+}
+
+/// The ultimate destination of an early exit that may cross `try` blocks
+/// and `finally` boundaries. Doubles as the identity of a `finally` exit
+/// stub: all exits with the same destination share one stub per crossed
+/// finalizer (6_LANGUAGE Part B2).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExitKind {
+    /// `break`/`continue`: jump to `target`, unwinding down to the loop
+    /// context's barrier `floor`.
+    Jump { target: u32, floor: usize },
+}
+
+/// One entry of the compile-time barrier stack: everything an early exit
+/// (`break`/`continue`, and in Part B2 Step 2 `return`) must unwind on its
+/// way out, in nesting order (innermost last).
+enum Barrier {
+    /// One runtime `TryEnter` handler entry — the exit emits a balancing
+    /// `TryExit`. If it is a `finally` wrapper, the exit then jumps to this
+    /// entry's stub for its destination (requested here during body
+    /// compilation, emitted by `compile_try` after the unwind copy), which
+    /// runs the finally block and continues the exit from there.
+    Try {
+        has_finalizer: bool,
+        stubs: Vec<(ExitKind, u32)>,
+    },
+    /// `slots` operand-stack slots that sit beneath the code compiled while
+    /// this barrier is open and are owned by an enclosing construct: a
+    /// `switch` discriminant, or the pending thrown value beneath a
+    /// `finally` unwind copy. A `break`/`continue` jumping past this
+    /// barrier pops them (its target label expects them gone — and popping
+    /// a pending exception is exactly JS's "finally's jump overrides the
+    /// pending completion"). A `return` never pops residues: frame teardown
+    /// discards the whole operand stack, and popping under live inner
+    /// handlers would desynchronize their stack snapshots.
+    Residue { slots: usize },
 }
 
 /// An assignment/update target resolved to its storage shape, so that `=`,
@@ -142,19 +179,16 @@ struct Compiler<'src> {
     next_label: u32,
     /// Loop-context stack for `break`/`continue` (innermost loop last).
     loops: Vec<LoopCtx>,
-    /// Open `try` contexts at the current emission point within the current
-    /// function body (innermost last; saved/reset per function). Each entry
-    /// is one runtime `TryEnter`; the flag records whether it is a `finally`
-    /// wrapper. Drives the balancing `TryExit`s that `break`/`continue`/
-    /// `return` emit when jumping out of a `try` block, and rejects early
-    /// exits that would cross a `finally` (which they would silently skip).
-    try_stack: Vec<bool>,
-    /// `Some(loops.len() at entry)` while compiling a `finally` block.
-    /// Jumps that escape the block (`break`/`continue` targeting an outer
-    /// loop, `return`) are rejected: the block is emitted twice (normal and
-    /// unwind paths), and on the unwind path the pending thrown value sits
-    /// on the stack beneath it.
-    finally_loops_floor: Option<usize>,
+    /// Exit barriers open at the current emission point within the current
+    /// function body (innermost last; saved/reset per function): `try`
+    /// entries and stack residues. Drives everything `break`/`continue`/
+    /// `return` must emit when jumping out — balancing `TryExit`s, residue
+    /// `Pop`s, and `finally` exit-stub detours (see [`Barrier`]).
+    barriers: Vec<Barrier>,
+    /// Nesting depth of `finally`-copy compilation (saved/reset per
+    /// function). Part B2 Step 1: `return` inside a `finally` block is
+    /// still rejected (Step 2 lifts this via the return spill slot).
+    finally_copy_depth: usize,
     diagnostics: Vec<Diagnostic>,
     /// Scope/capture analysis pre-computed before codegen. `None` during the
     /// analysis pass itself; `Some` during codegen. Codegen resolves every
@@ -188,8 +222,8 @@ impl<'src> Compiler<'src> {
             spans: Vec::new(),
             next_label: 0,
             loops: Vec::new(),
-            try_stack: Vec::new(),
-            finally_loops_floor: None,
+            barriers: Vec::new(),
+            finally_copy_depth: 0,
             diagnostics: Vec::new(),
             analysis: None,
             current_scope: 0,
@@ -784,7 +818,7 @@ impl<'src> Compiler<'src> {
         self.loops.push(LoopCtx {
             break_label: end,
             continue_label: Some(top),
-            try_depth: self.try_stack.len(),
+            floor: self.barriers.len(),
         });
         self.compile_stmt(&s.body);
         self.loops.pop();
@@ -801,7 +835,7 @@ impl<'src> Compiler<'src> {
         self.loops.push(LoopCtx {
             break_label: end,
             continue_label: Some(cont),
-            try_depth: self.try_stack.len(),
+            floor: self.barriers.len(),
         });
         self.compile_stmt(&s.body);
         self.loops.pop();
@@ -859,7 +893,7 @@ impl<'src> Compiler<'src> {
         self.loops.push(LoopCtx {
             break_label: end,
             continue_label: Some(cont),
-            try_depth: self.try_stack.len(),
+            floor: self.barriers.len(),
         });
         self.compile_stmt(&s.body);
         self.loops.pop();
@@ -886,22 +920,11 @@ impl<'src> Compiler<'src> {
         }
         match self.loops.last() {
             Some(ctx) => {
-                let target = ctx.break_label;
-                let ctx_try_depth = ctx.try_depth;
-                if self.rejected_finally_exit(
-                    self.loops.len() - 1,
-                    ctx_try_depth,
-                    s.span.start,
-                    "break",
-                ) {
-                    return;
-                }
-                // Jumping out of `try` blocks must pop their handlers.
-                let exits = self.try_stack.len() - ctx_try_depth;
-                for _ in 0..exits {
-                    self.emit(Instr::TryExit, s.span.start);
-                }
-                self.emit(Instr::Jump(target), s.span.start);
+                let kind = ExitKind::Jump {
+                    target: ctx.break_label,
+                    floor: ctx.floor,
+                };
+                self.emit_exit(kind, s.span.start);
             }
             None => self.error(s.span.start, "`break` outside a loop"),
         }
@@ -918,73 +941,104 @@ impl<'src> Compiler<'src> {
         let target = self
             .loops
             .iter()
-            .enumerate()
             .rev()
-            .find_map(|(i, ctx)| ctx.continue_label.map(|l| (i, l, ctx.try_depth)));
+            .find_map(|ctx| ctx.continue_label.map(|l| (l, ctx.floor)));
         match target {
-            Some((idx, target, loop_try_depth)) => {
-                if self.rejected_finally_exit(idx, loop_try_depth, s.span.start, "continue") {
-                    return;
-                }
-                // Jumping out of `try` blocks must pop their handlers.
-                let exits = self.try_stack.len() - loop_try_depth;
-                for _ in 0..exits {
-                    self.emit(Instr::TryExit, s.span.start);
-                }
-                self.emit(Instr::Jump(target), s.span.start);
+            Some((target, floor)) => {
+                self.emit_exit(ExitKind::Jump { target, floor }, s.span.start);
             }
             None => self.error(s.span.start, "`continue` outside a loop"),
         }
     }
 
-    /// Reject a `break`/`continue` that crosses a `finally` boundary — the
-    /// jump would silently skip the finally block (v1: no completion-value
-    /// semantics, see 6_LANGUAGE Part B). Two cases: a finalizer entry is
-    /// open above the targeted loop's `try_depth`, or the jump escapes the
-    /// `finally` block itself (the targeted loop is outside it). Records a
-    /// diagnostic and returns `true` when rejected.
-    fn rejected_finally_exit(
-        &mut self,
-        target_loop_idx: usize,
-        ctx_try_depth: usize,
-        span: u32,
-        what: &str,
-    ) -> bool {
-        if self.try_stack[ctx_try_depth..].contains(&true) {
-            self.error(
-                span,
-                format!("`{what}` cannot jump out of a `try` block that has a `finally` clause"),
-            );
-            return true;
+    /// Emit an early exit (`break`/`continue`), unwinding the barriers from
+    /// the current emission point down to the destination's `floor`,
+    /// innermost-out: a balancing `TryExit` per `try` entry, a `Pop` per
+    /// crossed stack residue (switch discriminants; the pending thrown
+    /// value beneath a `finally` unwind copy — discarding it is JS's
+    /// completion-override). At the innermost crossed *finalizer* entry the
+    /// exit instead jumps to that entry's stub for this destination
+    /// ([`Compiler::stub_label`]); the stub (emitted by `compile_try` in
+    /// the post-`try` compile context) runs the finally block and continues
+    /// the exit from there, so outer finallys chain recursively.
+    ///
+    /// Soundness of the pop ordering: a residue is popped only after every
+    /// handler entered above it has been `TryExit`ed; a handler entered
+    /// while a residue is open snapshots a stack that includes the residue
+    /// slots, so popping them any earlier would desynchronize the snapshot.
+    fn emit_exit(&mut self, kind: ExitKind, span: u32) {
+        let ExitKind::Jump { target, floor } = kind;
+        let mut depth = self.barriers.len();
+        while depth > floor {
+            depth -= 1;
+            match self.barriers[depth] {
+                Barrier::Residue { slots } => {
+                    if slots > 0 {
+                        self.emit(Instr::Pop(slots), span);
+                    }
+                }
+                Barrier::Try { has_finalizer, .. } => {
+                    self.emit(Instr::TryExit, span);
+                    if has_finalizer {
+                        let stub = self.stub_label(depth, kind);
+                        self.emit(Instr::Jump(stub), span);
+                        return;
+                    }
+                }
+            }
         }
-        if matches!(self.finally_loops_floor, Some(floor) if target_loop_idx < floor) {
-            self.error(
-                span,
-                format!("`{what}` cannot jump out of a `finally` block"),
-            );
-            return true;
-        }
-        false
+        self.emit(Instr::Jump(target), span);
     }
 
-    /// Emit one `TryExit` per `try` block open in the current function body —
+    /// The exit-stub label for destination `kind` on the finalizer entry at
+    /// `barrier_idx`, allocating it on first request. All exits with the
+    /// same destination through the same finalizer share one stub.
+    fn stub_label(&mut self, barrier_idx: usize, kind: ExitKind) -> u32 {
+        let Barrier::Try { stubs, .. } = &self.barriers[barrier_idx] else {
+            unreachable!("stub_label on a non-try barrier");
+        };
+        if let Some(&(_, label)) = stubs.iter().find(|&&(k, _)| k == kind) {
+            return label;
+        }
+        let label = self.new_label();
+        let Barrier::Try { stubs, .. } = &mut self.barriers[barrier_idx] else {
+            unreachable!()
+        };
+        stubs.push((kind, label));
+        label
+    }
+
+    /// Emit one `TryExit` per `try` entry open in the current function body —
     /// the handler cleanup a `return` needs before its `Return` pops the
     /// frame (a frame must never leave handler entries behind). A `return`
-    /// inside or crossing a `finally` is rejected: it would skip (or, on the
-    /// duplicated unwind copy, swallow) the finally semantics.
+    /// inside or crossing a `finally` is still rejected (Part B2 Step 2
+    /// lifts this via the return spill slot).
     fn emit_return_try_exits(&mut self, span: u32) {
-        if self.finally_loops_floor.is_some() {
+        if self.finally_copy_depth > 0 {
             self.error(span, "`return` inside a `finally` block is not supported");
             return;
         }
-        if self.try_stack.contains(&true) {
+        if self.barriers.iter().any(|b| {
+            matches!(
+                b,
+                Barrier::Try {
+                    has_finalizer: true,
+                    ..
+                }
+            )
+        }) {
             self.error(
                 span,
                 "`return` cannot jump out of a `try` block that has a `finally` clause",
             );
             return;
         }
-        for _ in 0..self.try_stack.len() {
+        let try_exits = self
+            .barriers
+            .iter()
+            .filter(|b| matches!(b, Barrier::Try { .. }))
+            .count();
+        for _ in 0..try_exits {
             self.emit(Instr::TryExit, span);
         }
     }
@@ -1010,9 +1064,12 @@ impl<'src> Compiler<'src> {
     ///
     /// A `finally` clause wraps the whole thing in an *outer* handler —
     /// `try B catch C finally F` ≡ `try { try B catch C } finally F` — so an
-    /// exception thrown from `C` still runs `F`. `F` is compiled twice (the
-    /// plan's codegen duplication): once on the normal path, once on the
-    /// unwind path followed by a rethrow `Throw`:
+    /// exception thrown from `C` still runs `F`. `F` is compiled once per
+    /// way of leaving the protected region (the Part B2 codegen
+    /// duplication): the normal path, the unwind path (above the pending
+    /// thrown value, ending in a rethrow `Throw`), and one *exit stub* per
+    /// distinct `break`/`continue` destination that crossed this finalizer
+    /// (requested via [`Compiler::emit_exit`] during body compilation):
     ///
     /// ```text
     /// TryEnter(fin)
@@ -1023,12 +1080,25 @@ impl<'src> Compiler<'src> {
     /// Label(fin)        ← unwinder lands here, thrown value pushed
     /// F                 ← unwind-path copy (runs above the thrown value)
     /// Throw             ← rethrow
+    /// Label(stub_k)     ← exit sites jump here after their TryExits
+    /// F                 ← exit-path copy
+    /// <continue the exit: Pop residues / TryExit / outer stub / Jump>
+    /// …one stub per destination…
     /// Label(end)
     /// ```
     ///
-    /// JS's completion-value semantics (`finally` overriding a pending
-    /// return/throw via its own jump) are out of scope: early exits that
-    /// would cross or escape a `finally` are compile errors.
+    /// Each copy statically knows what completion is pending, which is what
+    /// makes JS's completion-value override semantics straight-line code: a
+    /// jump out of a copy simply never reaches the copy's trailing
+    /// epilogue (rethrow / onward transfer) — and on the unwind path it
+    /// pops the pending thrown value when it crosses the copy's residue
+    /// barrier, swallowing the exception exactly as JS does. A `throw`
+    /// inside `F` needs nothing at all: the unwinder truncates to the outer
+    /// handler's snapshot, which predates the pending value.
+    ///
+    /// Stub requests accrue only during body compilation: exits inside the
+    /// `F` copies route to *outer* entries (this one is already popped), so
+    /// draining the requests after the unwind copy sees the complete set.
     fn compile_try(&mut self, s: &ast::TryStatement) {
         let span = s.span.start;
         match &s.finalizer {
@@ -1045,7 +1115,10 @@ impl<'src> Compiler<'src> {
                 let fin_label = self.new_label();
                 let end = self.new_label();
                 self.emit(Instr::TryEnter(fin_label), span);
-                self.try_stack.push(true);
+                self.barriers.push(Barrier::Try {
+                    has_finalizer: true,
+                    stubs: Vec::new(),
+                });
                 match &s.handler {
                     Some(handler) => self.compile_try_catch(&s.block, handler, span),
                     None => {
@@ -1054,30 +1127,43 @@ impl<'src> Compiler<'src> {
                         }
                     }
                 }
-                self.try_stack.pop();
+                let Some(Barrier::Try { stubs, .. }) = self.barriers.pop() else {
+                    unreachable!("unbalanced barrier stack");
+                };
                 self.emit(Instr::TryExit, span);
-                self.compile_finally_block(fin); // normal-path copy
+                self.compile_finally_copy(fin, 0); // normal-path copy
                 self.emit(Instr::Jump(end), span);
                 self.emit(Instr::Label(fin_label), fin.span.start);
-                self.compile_finally_block(fin); // unwind-path copy
+                self.compile_finally_copy(fin, 1); // unwind-path copy
                 self.emit(Instr::Throw, fin.span.start); // rethrow
+                for (kind, stub) in stubs {
+                    self.emit(Instr::Label(stub), fin.span.start);
+                    self.compile_finally_copy(fin, 0); // exit-path copy
+                    self.emit_exit(kind, fin.span.start); // continue outward
+                }
                 self.emit(Instr::Label(end), span);
             }
         }
     }
 
-    /// Compile one copy of a `finally` block. Function/arrow bodies inside it
-    /// are emitted once per copy under the *same* entry label; every
-    /// reference resolves to the last-emitted copy (label maps are last-wins)
-    /// and the earlier, never-targeted copy is pruned as unreachable — so
-    /// duplication is safe for closures too. `finally_loops_floor` makes
-    /// jumps escaping the block compile errors.
-    fn compile_finally_block(&mut self, fin: &ast::BlockStatement) {
-        let prev = self.finally_loops_floor.replace(self.loops.len());
+    /// Compile one copy of a `finally` block, `pending_slots` being the
+    /// operand-stack slots of the pending completion beneath it (1 on the
+    /// unwind path — the thrown value; 0 otherwise), pushed as a residue
+    /// barrier so exits escaping the copy discard them. Function/arrow
+    /// bodies inside `F` are emitted once per copy under the *same* entry
+    /// label; every reference resolves to the last-emitted copy (label maps
+    /// are last-wins) and the earlier, never-targeted copies are pruned as
+    /// unreachable — so duplication is safe for closures too.
+    fn compile_finally_copy(&mut self, fin: &ast::BlockStatement, pending_slots: usize) {
+        self.barriers.push(Barrier::Residue {
+            slots: pending_slots,
+        });
+        self.finally_copy_depth += 1;
         for stmt in &fin.body {
             self.compile_stmt(stmt);
         }
-        self.finally_loops_floor = prev;
+        self.finally_copy_depth -= 1;
+        self.barriers.pop();
     }
 
     /// The `try { … } catch (e) { … }` core (no finalizer at this level).
@@ -1090,11 +1176,14 @@ impl<'src> Compiler<'src> {
         let catch_label = self.new_label();
         let end = self.new_label();
         self.emit(Instr::TryEnter(catch_label), span);
-        self.try_stack.push(false);
+        self.barriers.push(Barrier::Try {
+            has_finalizer: false,
+            stubs: Vec::new(),
+        });
         for stmt in &block.body {
             self.compile_stmt(stmt);
         }
-        self.try_stack.pop();
+        self.barriers.pop();
         self.emit(Instr::TryExit, span);
         self.emit(Instr::Jump(end), span);
 
@@ -1214,7 +1303,7 @@ impl<'src> Compiler<'src> {
         self.loops.push(LoopCtx {
             break_label: end,
             continue_label: Some(cont),
-            try_depth: self.try_stack.len(),
+            floor: self.barriers.len(),
         });
         self.compile_stmt(body);
         self.loops.pop();
@@ -1328,10 +1417,16 @@ impl<'src> Compiler<'src> {
         }
 
         // Bodies in source order; consecutive bodies fall through. `break` → end.
+        // The discriminant stays on the stack across the bodies: a residue
+        // barrier makes a `continue` (which targets the enclosing loop, past
+        // this switch) pop it. The switch's own `break` lands at `end`, where
+        // the discriminant is expected (and popped below) — its loop context
+        // sits above the residue, so `break` never crosses it.
+        self.barriers.push(Barrier::Residue { slots: 1 });
         self.loops.push(LoopCtx {
             break_label: end,
             continue_label: None,
-            try_depth: self.try_stack.len(),
+            floor: self.barriers.len(),
         });
         for (i, case) in s.cases.iter().enumerate() {
             self.emit(Instr::Label(case_labels[i]), span);
@@ -1340,6 +1435,7 @@ impl<'src> Compiler<'src> {
             }
         }
         self.loops.pop();
+        self.barriers.pop();
         self.emit(Instr::Label(end), span);
         self.emit(Instr::Pop(1), span); // drop disc
     }
@@ -3504,8 +3600,8 @@ impl<'src> Compiler<'src> {
         // function's (those belong to a different frame). Likewise a body
         // defined inside a `finally` block is a fresh frame: its `return`s
         // are legal again.
-        let prev_try_stack = std::mem::take(&mut self.try_stack);
-        let prev_finally_floor = self.finally_loops_floor.take();
+        let prev_barriers = std::mem::take(&mut self.barriers);
+        let prev_finally_copy_depth = std::mem::take(&mut self.finally_copy_depth);
         // Slot numbers are frame-relative, so the callee gets its own const env.
         // Phase D: seed it with constants captured *by value* — a `const`/
         // effectively-const capture is an immutable snapshot, so the upval holds a
@@ -3635,8 +3731,8 @@ impl<'src> Compiler<'src> {
         self.emit(Instr::Label(after), span);
         self.current_scope = prev_scope;
         self.const_env = prev_const_env;
-        self.try_stack = prev_try_stack;
-        self.finally_loops_floor = prev_finally_floor;
+        self.barriers = prev_barriers;
+        self.finally_copy_depth = prev_finally_copy_depth;
     }
 
     /// Emit per-parameter prologue code. The argument value is already in the
