@@ -163,9 +163,17 @@ point here.
 Status: **landed.** All four locked decisions implemented as written. Notes
 on the open choices and deltas:
 
-- `finally` is deferred with the blessed honest diagnostic (codegen
-  duplication not attempted). `try` without `catch` therefore cannot occur
-  (the parser demands one of the two clauses).
+- `finally` is implemented via the blessed codegen duplication:
+  `try B catch C finally F` lowers as `try { try B catch C } finally F`
+  (an outer handler, so an exception in `C` still runs `F`), with `F`
+  emitted twice — normal path, and unwind path followed by a rethrow
+  `Throw`. JS's completion-value semantics are not attempted: a `break`/
+  `continue`/`return` that would cross a `finally` boundary (or escape the
+  `finally` block itself) is a compile error with an honest message.
+  Function bodies inside a duplicated `F` are emitted once per copy under
+  the same entry label; label resolution is last-wins and the earlier,
+  never-targeted copy is pruned as unreachable, so closures in `finally`
+  are safe.
 - Mechanics as specced: VM handler stack + `TryEnter(label)`/`TryExit`/
   `Throw`; `vm.throw_value(v) -> ThrowOutcome` host API; optimizer treats
   `TryEnter` as a two-way branch (catch label reachable) and threads/

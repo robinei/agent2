@@ -499,20 +499,194 @@ fn closures_capture_per_iteration_catch_binding() {
     );
 }
 
-// ── rejections that stay rejected ────────────────────────────────────
+// ── finally (codegen duplication: normal + unwind paths) ─────────────
 
 #[test]
-fn finally_is_a_compile_error() {
-    let errs = compile_errs(r#"try { f(); } catch (e) {} finally { g(); }"#);
+fn finally_runs_on_normal_path() {
+    assert_eq!(
+        run_ret(r#"const a = []; try { a.push(1); } finally { a.push(2); } return a;"#),
+        json!([1, 2])
+    );
+}
+
+#[test]
+fn finally_runs_after_catch() {
+    assert_eq!(
+        run_ret(
+            r#"
+            const a = [];
+            try { throw 1; } catch (e) { a.push("c"); } finally { a.push("f"); }
+            return a;
+            "#
+        ),
+        json!(["c", "f"])
+    );
+}
+
+#[test]
+fn finally_runs_on_normal_path_with_catch_not_taken() {
+    assert_eq!(
+        run_ret(
+            r#"
+            const a = [];
+            try { a.push("b"); } catch (e) { a.push("c"); } finally { a.push("f"); }
+            return a;
+            "#
+        ),
+        json!(["b", "f"])
+    );
+}
+
+#[test]
+fn finally_runs_then_rethrows_without_catch() {
+    assert_eq!(
+        run_ret(
+            r#"
+            const a = [];
+            try {
+                try { throw "x"; } finally { a.push("f"); }
+            } catch (e) { a.push(e); }
+            return a;
+            "#
+        ),
+        json!(["f", "x"])
+    );
+}
+
+#[test]
+fn exception_in_catch_still_runs_finally() {
+    assert_eq!(
+        run_ret(
+            r#"
+            const a = [];
+            try {
+                try { throw 1; } catch (e) { throw 2; } finally { a.push("f"); }
+            } catch (e) { a.push(e); }
+            return a;
+            "#
+        ),
+        json!(["f", 2])
+    );
+}
+
+#[test]
+fn uncaught_rethrow_after_finally() {
+    let err = run_runtime_err(r#"try { throw "boom"; } finally {}"#);
+    assert_eq!(err.kind, ErrorKind::UncaughtException);
+    assert_eq!(err.payload, Some(Value::String("boom".into())));
+}
+
+#[test]
+fn loop_with_break_inside_finally_is_fine() {
+    // break targeting a loop declared INSIDE the finally block is legal.
+    assert_eq!(
+        run_ret(
+            r#"
+            const a = [];
+            try {} finally {
+                for (let i = 0; i < 5; i++) { if (i === 1) { break; } a.push(i); }
+            }
+            return a;
+            "#
+        ),
+        json!([0])
+    );
+}
+
+#[test]
+fn closure_inside_finally_works_on_both_paths() {
+    // A function body inside a duplicated finally block is emitted twice
+    // under the same entry label; references resolve to one copy.
+    assert_eq!(
+        run_ret(
+            r#"
+            let r = 0;
+            try { throw 1; } catch (e) {} finally { const g = (x) => x + 1; r = g(41); }
+            return r;
+            "#
+        ),
+        json!(42)
+    );
+}
+
+#[test]
+fn return_in_function_inside_finally_is_fine() {
+    assert_eq!(
+        run_ret(
+            r#"
+            let r;
+            try {} finally { const f = () => { return 7; }; r = f(); }
+            return r;
+            "#
+        ),
+        json!(7)
+    );
+}
+
+// ── finally: rejected early exits ────────────────────────────────────
+
+#[test]
+fn break_crossing_finally_rejected() {
+    let errs = compile_errs(r#"while (true) { try { break; } finally {} }"#);
     assert!(
         errs.iter()
-            .any(|e| e.contains("`finally` is not supported")),
+            .any(|e| e.contains("`break` cannot jump out of a `try` block")),
         "got: {errs:?}"
     );
-    let errs = compile_errs(r#"try { f(); } finally { g(); }"#);
+}
+
+#[test]
+fn continue_crossing_finally_rejected() {
+    let errs = compile_errs(r#"for (let i = 0; i < 2; i++) { try { continue; } finally {} }"#);
     assert!(
         errs.iter()
-            .any(|e| e.contains("`finally` is not supported")),
+            .any(|e| e.contains("`continue` cannot jump out of a `try` block")),
         "got: {errs:?}"
+    );
+}
+
+#[test]
+fn return_crossing_finally_rejected() {
+    let errs = compile_errs(r#"function f() { try { return 1; } finally {} } return f();"#);
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("`return` cannot jump out of a `try` block")),
+        "got: {errs:?}"
+    );
+}
+
+#[test]
+fn return_inside_finally_rejected() {
+    let errs = compile_errs(r#"function f() { try {} finally { return 1; } } return f();"#);
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("`return` inside a `finally` block")),
+        "got: {errs:?}"
+    );
+}
+
+#[test]
+fn break_escaping_finally_rejected() {
+    let errs = compile_errs(r#"while (true) { try {} finally { break; } }"#);
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("`break` cannot jump out of a `finally` block")),
+        "got: {errs:?}"
+    );
+}
+
+#[test]
+fn break_crossing_plain_catch_still_works() {
+    // The restriction is finally-specific: crossing a catch-only try stays
+    // legal (covered more fully in the handler-balance tests above).
+    assert_eq!(
+        run_ret(
+            r#"
+            const a = [];
+            while (true) { try { a.push(1); break; } catch (e) {} }
+            return a;
+            "#
+        ),
+        json!([1])
     );
 }

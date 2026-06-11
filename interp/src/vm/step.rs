@@ -20,51 +20,14 @@ impl VM {
                 b.call(self, nargs)?;
                 self.ip += 1;
             }
-            Value::Fn(addr) => {
-                if addr as usize >= self.code.len() {
-                    return Err(self.fail(ErrorKind::BadCall, "bad call target"));
-                }
-                if nargs as usize > self.stack.len() {
-                    return Err(self.fail(ErrorKind::StackUnderflow, "stack underflow"));
-                }
-                self.callstack.push(CallFrame {
-                    arg_count: nargs,
-                    local_count: nargs,
-                    return_addr: self.ip + 1,
-                    prev_fp: self.fp,
-                    arguments_cache: None,
-                    pending_upvals: SmallVec::new(),
-                });
-                self.fp = (self.stack.len() as u32) - nargs;
-                self.cur_local_count = nargs;
-                self.ip = addr;
-            }
+            Value::Fn(addr) => self.static_call(addr, nargs, SmallVec::new())?,
             Value::Closure(p) => {
                 let closure = self.closures.get(p as usize).ok_or_else(|| {
                     self.fail_not_resumable(ErrorKind::ValueError, "bad closure pointer")
                 })?;
                 let addr = closure.addr;
                 let upvals: SmallVec<[Value; 8]> = closure.upvals.iter().cloned().collect();
-                if addr as usize >= self.code.len() {
-                    return Err(self.fail(ErrorKind::BadCall, "bad call target"));
-                }
-                if nargs as usize > self.stack.len() {
-                    return Err(self.fail(ErrorKind::StackUnderflow, "stack underflow"));
-                }
-                // Stash the captured environment; `EnterFrame` installs it as
-                // the upval locals after normalizing the args, so it lands at
-                // slots [nparams, nparams + K).
-                self.callstack.push(CallFrame {
-                    arg_count: nargs,
-                    local_count: nargs,
-                    return_addr: self.ip + 1,
-                    prev_fp: self.fp,
-                    arguments_cache: None,
-                    pending_upvals: upvals,
-                });
-                self.fp = (self.stack.len() as u32) - nargs;
-                self.cur_local_count = nargs;
-                self.ip = addr;
+                self.static_call(addr, nargs, upvals)?
             }
             _ => {
                 let keep = self.stack.len().saturating_sub(nargs as usize);
@@ -73,6 +36,35 @@ impl VM {
                 return Err(self.fail(ErrorKind::TypeError, msg));
             }
         }
+        Ok(())
+    }
+
+    fn static_call(
+        &mut self,
+        addr: CodeAddr,
+        nargs: u32,
+        upvals: SmallVec<[Value; 8]>,
+    ) -> Result<(), VMError> {
+        if addr as usize >= self.code.len() {
+            return Err(self.fail(ErrorKind::BadCall, "bad call target"));
+        }
+        if nargs as usize > self.stack.len() {
+            return Err(self.fail(ErrorKind::StackUnderflow, "stack underflow"));
+        }
+        // `fp` points at arg 0: the args ARE the callee's leading
+        // locals (slots 0..nargs). The prologue `EnterFrame` then
+        // normalizes them to exactly `nparams`. No copy.
+        self.callstack.push(CallFrame {
+            arg_count: nargs,
+            local_count: nargs,
+            return_addr: self.ip + 1,
+            prev_fp: self.fp,
+            arguments_cache: None,
+            pending_upvals: upvals,
+        });
+        self.ip = addr;
+        self.fp = (self.stack.len() as u32) - nargs;
+        self.cur_local_count = nargs;
         Ok(())
     }
 
@@ -314,28 +306,7 @@ impl VM {
                 }
 
                 // ── control flow ─────────────────────────────────
-                Instr::Call(addr, nargs) => {
-                    if *addr as usize >= self.code.len() {
-                        return Err(self.fail(ErrorKind::BadCall, "bad call target"));
-                    }
-                    if *nargs as usize > self.stack.len() {
-                        return Err(self.fail(ErrorKind::StackUnderflow, "stack underflow"));
-                    }
-                    // `fp` points at arg 0: the args ARE the callee's leading
-                    // locals (slots 0..nargs). The prologue `EnterFrame` then
-                    // normalizes them to exactly `nparams`. No copy.
-                    self.callstack.push(CallFrame {
-                        arg_count: *nargs,
-                        local_count: *nargs,
-                        return_addr: self.ip + 1,
-                        prev_fp: self.fp,
-                        arguments_cache: None,
-                        pending_upvals: SmallVec::new(),
-                    });
-                    self.ip = *addr;
-                    self.fp = (self.stack.len() as u32) - *nargs;
-                    self.cur_local_count = *nargs;
-                }
+                Instr::Call(addr, nargs) => self.static_call(*addr, *nargs, SmallVec::new())?,
 
                 Instr::CallDyn(nargs) => {
                     let nargs = *nargs;
@@ -344,9 +315,7 @@ impl VM {
                 }
 
                 Instr::CallBuiltin(b, argc) => {
-                    let b = *b;
-                    let argc = *argc;
-                    b.call(self, argc)?;
+                    b.call(self, *argc)?;
                     self.ip += 1;
                 }
 
