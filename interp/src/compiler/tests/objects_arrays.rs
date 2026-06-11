@@ -420,6 +420,50 @@ fn computed_object_key_expression() {
     );
 }
 
+// ── object method shorthand (A4) ─────────────────────────────────
+
+#[test]
+fn object_method_shorthand() {
+    assert_eq!(
+        testutil::run_val("let obj = { run(x) { return x + 1; } }; return obj.run(5);"),
+        testutil::num(6.0)
+    );
+    assert_eq!(
+        testutil::run_val(
+            "let obj = { greet(name) { return \"hello \" + name; } }; return obj.greet(\"world\");"
+        ),
+        testutil::run_val("return \"hello world\";")
+    );
+}
+
+#[test]
+fn object_method_shorthand_empty_body() {
+    assert_eq!(
+        testutil::run_val("let obj = { nop() { } }; return obj.nop();"),
+        Value::Undefined
+    );
+}
+
+#[test]
+fn object_method_with_computed_key() {
+    assert_eq!(
+        testutil::run_val("let k = \"inc\"; let obj = { [k](x) { return x + 1; } }; return obj.inc(9);"),
+        testutil::num(10.0)
+    );
+}
+
+#[test]
+fn shorthand_properties_compile() {
+    assert_eq!(
+        testutil::run_val("let a = 10; let obj = { a }; return obj.a;"),
+        Value::PosInt(10)
+    );
+    assert_eq!(
+        testutil::run_val("let x = 7; let y = 3; let obj = { x, y }; return obj.x + obj.y;"),
+        testutil::num(10.0)
+    );
+}
+
 // ── input pointer ────────────────────────────────────────────────
 
 #[test]

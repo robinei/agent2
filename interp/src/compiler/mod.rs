@@ -1370,10 +1370,9 @@ impl<'src> Compiler<'src> {
             self.error(p.span.start, "getters/setters are not supported");
             return None;
         }
-        if p.method {
-            self.error(p.span.start, "object methods are not supported");
-            return None;
-        }
+        // Method shorthand `{ run(x) { … } }` is not rejected — the value is a
+        // FunctionExpression compiled via the normal function-expression path.
+        // `this` inside the method body still errors with its existing message.
         if p.computed {
             return None;
         }
