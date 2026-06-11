@@ -166,14 +166,13 @@ on the open choices and deltas:
 - `finally` is implemented via the blessed codegen duplication:
   `try B catch C finally F` lowers as `try { try B catch C } finally F`
   (an outer handler, so an exception in `C` still runs `F`), with `F`
-  emitted twice — normal path, and unwind path followed by a rethrow
-  `Throw`. JS's completion-value semantics are not attempted: a `break`/
-  `continue`/`return` that would cross a `finally` boundary (or escape the
-  `finally` block itself) is a compile error with an honest message.
+  emitted once per way of leaving the protected region. The v1 compile
+  errors for early exits crossing/escaping a `finally` were lifted by
+  **Part B2** (below): full JS completion-value semantics now hold.
   Function bodies inside a duplicated `F` are emitted once per copy under
   the same entry label; label resolution is last-wins and the earlier,
-  never-targeted copy is pruned as unreachable, so closures in `finally`
-  are safe.
+  never-targeted copies are pruned as unreachable, so closures in
+  `finally` are safe.
 - Mechanics as specced: VM handler stack + `TryEnter(label)`/`TryExit`/
   `Throw`; `vm.throw_value(v) -> ThrowOutcome` host API; optimizer treats
   `TryEnter` as a two-way branch (catch label reachable) and threads/
@@ -362,4 +361,26 @@ reservation + `EnterFrame` patching (design pt. 2), `Return`-kind stubs,
 - [ ] Gate: `cargo fmt && cargo clippy && cargo test` green; commit per
       step, `lang:` prefix.
 
-Status: **not started.**
+Status: **landed** (Steps 1–3, commits `lang: 6B2 Step 1/2/3`). All pins
+green; both rejection edges deleted. As-built deltas from the locked
+design, all simplifications discovered during Step 1:
+
+- Design pts. 3–4 (copy frames + a separate `try_floor` ordering) were
+  unified into a single compile-time **barrier stack**: `Try` entries
+  (TryExit + optional stub detour) and `Residue` entries (operand-stack
+  slots a crossing jump must pop), interleaved in nesting order. The total
+  order makes the tie-breaking in pt. 4 structural, and the same `Residue`
+  mechanism turned out to cover `switch` discriminants — fixing a
+  **pre-existing bug**: `continue` from inside a `switch` never popped the
+  stack-resident discriminant, corrupting an enclosing `for-of`/`for-in`'s
+  `[container, idx]` loop state (TypeError) and leaking a slot per
+  iteration in plain loops (pinned in `control_flow.rs`).
+- On the `Return` path residues are **never popped**: frame teardown
+  discards the whole operand stack anyway, and pending slots interleaved
+  under loop state could not be popped soundly. The walk pops residues
+  only for `break`/`continue`, whose target labels expect exact stack
+  shapes — and those never cross a loop boundary (no labeled break), so
+  crossed residues are always the topmost slots, in order.
+- `return` inside a `finally` block needed no machinery at all once the
+  rejection was deleted: `Return(1)` takes the top of stack and teardown
+  collects any pending value beneath it — the override is free.

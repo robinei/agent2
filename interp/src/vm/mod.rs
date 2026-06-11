@@ -152,11 +152,12 @@ The remaining intentional divergences from JS — deferred or accepted, NOT bugs
     benefit; the runtime relaxes to match JS.
   • Number→string uses Rust's float formatting for the non-integer path, so very
     large/small magnitudes are not rendered in JS's exponential form (`1e21`).
-  • Exceptions: `throw`/`try`/`catch`/`finally` are supported (6_LANGUAGE
-    Part B). `finally` runs by code duplication on the normal and unwind
-    (rethrow) paths only: `break`/`continue`/`return` may not cross a
-    `finally` boundary or escape the block (compile errors), and JS's
-    completion-value overriding is out of scope. `raise()` is NOT catchable —
+  • Exceptions: `throw`/`try`/`catch`/`finally` are supported with full JS
+    completion-value semantics (6_LANGUAGE Part B + B2): `break`/
+    `continue`/`return` crossing a `finally` boundary run the block on the
+    way out, and a jump/return/throw from inside a `finally` overrides the
+    pending completion, exactly as in JS (implemented by per-exit-path code
+    duplication, not completion records). `raise()` is NOT catchable —
     conditions are addressed to the LLM — and neither are `OutOfFuel` or
     internal invariant errors, so a program cannot trap its own kill switch.
     A caught runtime VM error materializes as a plain `{ name, message }`
