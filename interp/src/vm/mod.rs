@@ -358,8 +358,8 @@ pub enum ErrorKind {
 /// | ObjHas / ObjDelete (non-object) | TypeError | PushValueThenContinue | field+object popped first |
 /// | Builtin handlers (args truncated by `Builtin::call` epilogue on the error path) | TypeError/ValueError | PushValueThenContinue | args truncated before error propagates |
 /// | JSON depth / unsupported type (JSON.stringify, to_json) | ValueError | PushValueThenContinue | args popped by builtin before conversion |
-/// | **ObjGet** (non-object peek) | TypeError | **NotResumable** | object peeked (not popped) before check |
-/// | **ObjSet** (non-object peek) | TypeError | **NotResumable** | value popped, object peeked (not fully consumed) |
+/// | ObjGet (non-object receiver) | TypeError | PushValueThenContinue | receiver popped in the error arm (pop-first normalized) |
+/// | ObjSet (non-object receiver) | TypeError | PushValueThenContinue | value popped, then receiver popped in the error arm (pop-first normalized) |
 /// | **ObjExtend** (non-object src) | TypeError | PushValueThenContinue | both src+obj popped first |
 /// | **ArrExtend** (non-array src) | TypeError | PushValueThenContinue | both src+arr popped first |
 /// | **ArrPush** (non-array target) | TypeError | PushValueThenContinue | both val+arr popped first |

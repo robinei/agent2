@@ -951,17 +951,16 @@ impl VM {
                     // without cloning.
                     let obj_ptr = match self.stack.last() {
                         Some(Value::Object(p)) => *p,
-                        // NotResumable: errors before popping (peek-style check).
+                        // Pop-first normalization: consume the receiver before
+                        // failing, so the error is resumable (and catchable).
                         _ => {
+                            let recv = self.pop()?;
                             let msg = format!(
                                 "cannot read property on {}{}",
-                                self.stack
-                                    .last()
-                                    .map(|v| v.type_name())
-                                    .unwrap_or("nothing"),
-                                self.stack.last().map(await_hint).unwrap_or("")
+                                recv.type_name(),
+                                await_hint(&recv)
                             );
-                            return Err(self.fail_not_resumable(ErrorKind::TypeError, msg));
+                            return Err(self.fail(ErrorKind::TypeError, msg));
                         }
                     };
                     // JS: a missing property reads as `undefined`, not `null`.
@@ -982,17 +981,17 @@ impl VM {
                     let val = self.pop()?;
                     let obj_ptr = match self.stack.last() {
                         Some(Value::Object(p)) => *p,
-                        // NotResumable: errors before popping (peek-style check).
+                        // Pop-first normalization: the value was popped above;
+                        // consume the receiver too, so the error is resumable
+                        // (and catchable).
                         _ => {
+                            let recv = self.pop()?;
                             let msg = format!(
                                 "cannot set property on {}{}",
-                                self.stack
-                                    .last()
-                                    .map(|v| v.type_name())
-                                    .unwrap_or("nothing"),
-                                self.stack.last().map(await_hint).unwrap_or("")
+                                recv.type_name(),
+                                await_hint(&recv)
                             );
-                            return Err(self.fail_not_resumable(ErrorKind::TypeError, msg));
+                            return Err(self.fail(ErrorKind::TypeError, msg));
                         }
                     };
                     let obj = match self.objects.get_mut(obj_ptr as usize) {

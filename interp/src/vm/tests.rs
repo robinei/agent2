@@ -2547,20 +2547,52 @@ fn resume_with_retry_same_instr_out_of_fuel() {
 
 #[test]
 fn resume_with_not_resumable_errors() {
-    // ObjGet on a non-object is NotResumable (peek check). resume_with must fail.
-    let mut vm = VM::new(vec![
-        PushPosInt(1),
-        PushStr("foo".into()),
-        ObjGet("foo".into()),
-    ]);
-    // Pop the extra value so only non-object is on stack (ObjGet peeks stack.last())
-    vm.stack.pop();
+    // A bad local index is an invariant violation: NotResumable. resume_with
+    // must fail.
+    let mut vm = VM::new(vec![Local(3)]);
     let err = vm.step().unwrap_err();
-    assert!(matches!(err.kind, ErrorKind::TypeError));
+    assert!(matches!(err.kind, ErrorKind::BadLocal));
     assert!(matches!(err.resume, ResumeMode::NotResumable));
     let result = vm.resume_with(&err, Value::Null);
     assert!(result.is_err(), "resume_with on NotResumable should error");
     assert!(matches!(result.unwrap_err().kind, ErrorKind::BadArg));
+}
+
+#[test]
+fn objget_non_object_pops_receiver_and_resumes() {
+    // Pop-first normalization: ObjGet on a non-object consumes the receiver,
+    // so the error is PushValueThenContinue and resume_with works unchanged.
+    let mut vm = VM::new(vec![PushPosInt(1), ObjGet("foo".into())]);
+    let err = vm.step().unwrap_err();
+    assert!(matches!(err.kind, ErrorKind::TypeError));
+    assert!(matches!(err.resume, ResumeMode::PushValueThenContinue));
+    assert_eq!(vm.stack.len(), 0, "receiver consumed before the error");
+    vm.resume_with(&err, Value::Null).unwrap();
+    match vm.step().unwrap() {
+        StepResult::Done { .. } => {}
+        other => panic!("expected Done, got {other:?}"),
+    }
+    assert_eq!(vm.stack, vec![Value::Null]);
+}
+
+#[test]
+fn objset_non_object_pops_operands_and_resumes() {
+    // ObjSet pops the value, then (in the error arm) the receiver: both
+    // operands consumed → PushValueThenContinue.
+    let mut vm = VM::new(vec![
+        PushPosInt(1),
+        PushPosInt(2),
+        ObjSet("foo".into(), SetMode::New),
+    ]);
+    let err = vm.step().unwrap_err();
+    assert!(matches!(err.kind, ErrorKind::TypeError));
+    assert!(matches!(err.resume, ResumeMode::PushValueThenContinue));
+    assert_eq!(vm.stack.len(), 0, "value and receiver both consumed");
+    vm.resume_with(&err, Value::Null).unwrap();
+    match vm.step().unwrap() {
+        StepResult::Done { .. } => {}
+        other => panic!("expected Done, got {other:?}"),
+    }
 }
 
 #[test]
