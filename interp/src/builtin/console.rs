@@ -24,6 +24,21 @@ pub fn console_info(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     console_write(vm, args, "")
 }
 
+pub fn console_assert(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    if args.argc == 0 {
+        return Ok(Value::Undefined);
+    }
+    let cond = args.get(vm, 0);
+    if cond.is_truthy() {
+        return Ok(Value::Undefined);
+    }
+    let msg_args = Args {
+        base: args.base + 1,
+        argc: args.argc.saturating_sub(1),
+    };
+    console_write(vm, msg_args, "Assertion failed: ")
+}
+
 fn console_write(vm: &mut VM, args: Args, prefix: &str) -> Result<Value, VMError> {
     let mut line = String::new();
     for i in 0..args.argc {
@@ -109,6 +124,34 @@ mod tests {
             lines[1].contains("[warn]") && lines[1].contains("oops"),
             "line 1: {}",
             lines[1]
+        );
+    }
+
+    #[test]
+    fn console_assert_passes_silently() {
+        let out = testutil::run_ret("console.assert(true, 'nope'); return 1;");
+        assert_eq!(out, serde_json::json!(1));
+    }
+
+    #[test]
+    fn console_assert_fails_writes_error() {
+        let prog = testutil::compile_ok(
+            "console.assert(false, 'bad', 42); return 1;",
+        );
+        let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
+        loop {
+            match vm.step(u64::MAX).unwrap() {
+                crate::vm::StepResult::Done { .. } => break,
+                _ => {}
+            }
+        }
+        assert_eq!(vm.console_lines.len(), 1);
+        assert!(
+            vm.console_lines[0].contains("Assertion failed")
+                && vm.console_lines[0].contains("bad")
+                && vm.console_lines[0].contains("42"),
+            "line: {}",
+            vm.console_lines[0]
         );
     }
 }

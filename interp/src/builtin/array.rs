@@ -10,6 +10,41 @@ pub fn array_is_array(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     Ok(Value::Bool(matches!(args.get(vm, 0), Value::Array(_))))
 }
 
+/// `Array.from(items)` → new array. Copies from an existing array, or
+/// creates an array of `length` undefineds from an array-like object.
+pub fn array_from(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let items = args.get(vm, 0);
+    match items {
+        Value::Array(p) => {
+            let arr = vm
+                .arrays
+                .get(*p as usize)
+                .ok_or_else(|| vm.fail(ErrorKind::ValueError, "value error"))?;
+            Ok(vm.alloc_array(arr.clone()))
+        }
+        Value::Object(p) => {
+            let obj = vm
+                .objects
+                .get(*p as usize)
+                .ok_or_else(|| vm.fail(ErrorKind::ValueError, "value error"))?;
+            let len = obj
+                .get("length")
+                .and_then(|v| v.to_number())
+                .unwrap_or(0.0);
+            let n = (len as usize).min(10_000_000);
+            let mut out: ThinVec<Value> = ThinVec::with_capacity(n);
+            for i in 0..n {
+                let key = crate::rc_str::RcStr::from(i.to_string());
+                let v = obj.get(&key).cloned().unwrap_or(Value::Undefined);
+                out.push(v);
+            }
+            Ok(vm.alloc_array(out))
+        }
+        Value::Undefined | Value::Null => Ok(vm.alloc_array(ThinVec::new())),
+        _ => Err(vm.fail(ErrorKind::TypeError, "type error")),
+    }
+}
+
 // ── array method implementations ─────────────────────────────────────────────
 
 /// `arr.push(a, b, …)` → appends all arguments and returns the new length.
@@ -623,6 +658,38 @@ mod tests {
         assert_eq!(
             testutil::run_ret("return [1,2].concat(3, [4]);"),
             serde_json::json!([1, 2, 3, 4])
+        );
+    }
+
+    #[test]
+    fn array_from_existing_array() {
+        assert_eq!(
+            testutil::run_ret("return Array.from([1, 2, 3]);"),
+            serde_json::json!([1, 2, 3])
+        );
+    }
+
+    #[test]
+    fn array_from_array_like() {
+        assert_eq!(
+            testutil::run_ret("return Array.from({length: 3, '0': 'a', '1': 'b', '2': 'c'});"),
+            serde_json::json!(["a", "b", "c"])
+        );
+    }
+
+    #[test]
+    fn array_from_empty_length() {
+        assert_eq!(
+            testutil::run_ret("return Array.from({length: 3});"),
+            serde_json::json!([null, null, null])
+        );
+    }
+
+    #[test]
+    fn array_from_empty() {
+        assert_eq!(
+            testutil::run_ret("return Array.from([]);"),
+            serde_json::json!([])
         );
     }
 }

@@ -179,6 +179,48 @@ pub fn str_slice(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     Ok(Value::String(RcStr::from(&s[start_clamped..end_clamped])))
 }
 
+/// `s.substring(start[, end])` → substring. Like `slice` but swaps
+/// arguments when `start > end` and treats negative values as 0.
+pub fn str_substring(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let s = vm.string_from(args.get(vm, 0))?;
+    let len = s.len() as i64;
+
+    let to_offset = |v: &Value, default: i64| -> i64 {
+        if matches!(v, Value::Undefined) {
+            return default;
+        }
+        v.to_number()
+            .map(|n| {
+                let i = n as i64;
+                i.max(0).min(len)
+            })
+            .unwrap_or(default)
+    };
+
+    let mut start = to_offset(args.get(vm, 1), 0);
+    let mut end = to_offset(args.get(vm, 2), len);
+
+    if start > end {
+        std::mem::swap(&mut start, &mut end);
+    }
+
+    let start = start as usize;
+    let end = end as usize;
+
+    if start >= end {
+        return Ok(Value::String(RcStr::from("")));
+    }
+
+    let start_clamped = clamp_start(&s, start.min(s.len()));
+    let end_clamped = clamp_end(&s, end.min(s.len()));
+
+    if start_clamped < start || end_clamped > end {
+        return Err(vm.fail(ErrorKind::ValueError, "value error"));
+    }
+
+    Ok(Value::String(RcStr::from(&s[start_clamped..end_clamped])))
+}
+
 /// `s.trim()` → trimmed string.
 pub fn str_trim(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let s = vm.string_from(args.get(vm, 0))?;
@@ -1020,6 +1062,26 @@ mod tests {
         assert_eq!(
             testutil::run_ret("return String.fromCodePoint();"),
             serde_json::json!("")
+        );
+    }
+
+    #[test]
+    fn string_substring() {
+        assert_eq!(
+            testutil::run_ret("return 'hello'.substring(1, 4);"),
+            serde_json::json!("ell")
+        );
+        assert_eq!(
+            testutil::run_ret("return 'hello'.substring(4, 1);"),
+            serde_json::json!("ell")
+        );
+        assert_eq!(
+            testutil::run_ret("return 'hello'.substring(1);"),
+            serde_json::json!("ello")
+        );
+        assert_eq!(
+            testutil::run_ret("return 'hello'.substring(-3, 2);"),
+            serde_json::json!("he")
         );
     }
 }

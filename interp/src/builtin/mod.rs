@@ -193,6 +193,7 @@ macro_rules! builtins {
 builtins! {
     // ── Array static ──
     ArrayIsArray, BuiltinKind::Namespace("Array"), "isArray", 1, 1, array_is_array;
+    ArrayFrom,    BuiltinKind::Namespace("Array"), "from",    1, 2, array_from;
 
     // ── array methods (Method, receiver + args) ──
     ArrayPush,    BuiltinKind::Method, "push",        1, VARARG, array_push;
@@ -210,6 +211,7 @@ builtins! {
     ConsoleWarn, BuiltinKind::Namespace("console"), "warn", 0, VARARG, console_warn;
     ConsoleError,BuiltinKind::Namespace("console"), "error",0, VARARG, console_error;
     ConsoleInfo, BuiltinKind::Namespace("console"), "info", 0, VARARG, console_info;
+    ConsoleAssert,BuiltinKind::Namespace("console"), "assert", 1, VARARG, console_assert;
 
     // ── JSON static ──
     JSONParse,     BuiltinKind::Namespace("JSON"), "parse",     1, 1, json_parse;
@@ -266,6 +268,7 @@ builtins! {
     StrStartsWith,  BuiltinKind::Method, "startsWith",  2, 2, str_starts_with;
     StrEndsWith,    BuiltinKind::Method, "endsWith",    2, 2, str_ends_with;
     StrSlice,       BuiltinKind::Method, "slice",       2, 3, slice_poly;
+    StrSubstring,   BuiltinKind::Method, "substring",   2, 3, str_substring;
     StrTrim,        BuiltinKind::Method, "trim",        1, 1, str_trim;
     StrReplace,      BuiltinKind::Method, "replace",      3, 3, str_replace;
     StrReplaceAll,   BuiltinKind::Method, "replaceAll",   3, 3, str_replace_all;
