@@ -154,12 +154,24 @@ toggles, quit; a help footer. Redraw throttled (~30ms). Acceptance:
 
 Acceptance:
 
-- [ ] Stepping the demo program shows the source highlight and disasm
+- [x] Stepping the demo program shows the source highlight and disasm
       cursor moving together and the stack pane growing/shrinking
-      across a call/return.
-- [ ] An awaited stub tool shows up in the invokes pane as pending,
-      then resolved.
-- [ ] Gate: `cargo fmt && cargo clippy && cargo test` green.
+      across a call/return (headless: `disasm_window` has exactly one
+      current row centered on `ip`; `stack_rows` shows `work`'s frame
+      with `acc = 42` mid-call; the visual pairing needs a manual
+      eyeball).
+- [x] An awaited stub tool shows up in the invokes pane as pending,
+      then resolved (`promise_rows_track_pending_then_resolved`).
+- [x] Gate: `cargo fmt && cargo clippy && cargo test` green.
+
+*(Built: panes toggle with `1`–`4` (source, disasm, stack, promises;
+promises off by default) and stack vertically on the right. Source is
+syntax-highlighted by a hand-rolled tokenizer (`highlight.rs`) — not
+AST-based: comments/keywords aren't AST nodes and oxc has no public
+lexer/highlighter, and the dialect is small. Pane content is built by
+terminal-free helpers in `panes.rs` (disasm window with function
+headers, stack rows with named locals + value previews incl. Upval
+cell deref, promise table), so it's all unit-testable.)*
 
 ## Step 4 — attached mode + frame switcher (needs 8 M0)
 

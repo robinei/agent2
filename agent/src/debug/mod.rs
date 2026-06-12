@@ -4,6 +4,8 @@
 //! between slices, redraws are throttled (~30ms).
 
 mod app;
+mod highlight;
+mod panes;
 mod runner;
 mod ui;
 

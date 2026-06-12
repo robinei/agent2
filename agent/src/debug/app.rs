@@ -10,6 +10,10 @@ pub struct App {
     /// Source path, shown in the title bar.
     pub path: String,
     pub quit: bool,
+    pub show_source: bool,
+    pub show_disasm: bool,
+    pub show_stack: bool,
+    pub show_promises: bool,
 }
 
 impl App {
@@ -18,6 +22,10 @@ impl App {
             runner,
             path,
             quit: false,
+            show_source: true,
+            show_disasm: true,
+            show_stack: true,
+            show_promises: false,
         }
     }
 
@@ -28,6 +36,10 @@ impl App {
             KeyCode::Char('s') => self.runner.step_instr(),
             KeyCode::Char('n') => self.runner.step_line(),
             KeyCode::Char('r') => self.runner.resume_condition(),
+            KeyCode::Char('1') => self.show_source = !self.show_source,
+            KeyCode::Char('2') => self.show_disasm = !self.show_disasm,
+            KeyCode::Char('3') => self.show_stack = !self.show_stack,
+            KeyCode::Char('4') => self.show_promises = !self.show_promises,
             _ => {}
         }
     }
