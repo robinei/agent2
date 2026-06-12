@@ -122,6 +122,22 @@ pub fn obj_assign(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     Ok(Value::Object(target_ptr))
 }
 
+/// `Object.hasOwn(obj, key)` → bool. Returns whether `obj` has its own
+/// property `key`. Since there is no prototype chain in this dialect,
+/// this is equivalent to `key in obj`.
+pub fn obj_has_own(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let obj_ptr = match args.get(vm, 0) {
+        Value::Object(p) => *p,
+        _ => return Err(vm.fail(ErrorKind::TypeError, "type error")),
+    };
+    let key = vm.to_js_string(args.get(vm, 1), 0);
+    let obj = vm
+        .objects
+        .get(obj_ptr as usize)
+        .ok_or_else(|| vm.fail(ErrorKind::ValueError, "value error"))?;
+    Ok(Value::Bool(obj.contains_key(key.as_str())))
+}
+
 // ── tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -206,6 +222,22 @@ mod tests {
         assert_eq!(
             testutil::run_ret("return Object.assign({a:1}, {a:2, b:3});"),
             serde_json::json!({"a": 2, "b": 3})
+        );
+    }
+
+    #[test]
+    fn obj_has_own() {
+        assert_eq!(
+            testutil::run_ret("return Object.hasOwn({a: 1}, 'a');"),
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            testutil::run_ret("return Object.hasOwn({a: 1}, 'b');"),
+            serde_json::json!(false)
+        );
+        assert_eq!(
+            testutil::run_ret("return Object.hasOwn({}, 'toString');"),
+            serde_json::json!(false)
         );
     }
 }

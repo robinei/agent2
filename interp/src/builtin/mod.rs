@@ -253,6 +253,7 @@ builtins! {
     ObjEntries,     BuiltinKind::Namespace("Object"), "entries",     1, 1,      obj_entries;
     ObjFromEntries, BuiltinKind::Namespace("Object"), "fromEntries", 1, 1,      obj_from_entries;
     ObjAssign,      BuiltinKind::Namespace("Object"), "assign",      1, VARARG, obj_assign;
+    ObjHasOwn,      BuiltinKind::Namespace("Object"), "hasOwn",      2, 2,      obj_has_own;
 
     // ── string methods ──
     StrSplit,       BuiltinKind::Method, "split",       2, 3, str_split;
@@ -284,6 +285,10 @@ builtins! {
     // ── string methods that accept RegExp ──
     StrMatch,  BuiltinKind::Method, "match",  2, 2, str_match;
     StrSearch, BuiltinKind::Method, "search", 2, 2, str_search;
+
+    // ── String static ──
+    StrFromCharCode,  BuiltinKind::Namespace("String"), "fromCharCode",  0, VARARG, str_from_char_code;
+    StrFromCodePoint, BuiltinKind::Namespace("String"), "fromCodePoint", 0, VARARG, str_from_code_point;
 
     // ── Map static ──
     MapIsMap, BuiltinKind::Namespace("Map"), "isMap", 1, 1, map_is_map;

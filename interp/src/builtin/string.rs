@@ -189,37 +189,34 @@ pub fn str_trim(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 /// With a string pattern, replaces only the first occurrence.
 /// With a RegExp without the `g` flag, replaces only the first match.
 /// With a RegExp with the `g` flag, replaces all matches.
+/// Supports JS replacement patterns: `$$`, `$&`, ``$` ``, `$'`, `$1`..`$9`.
 pub fn str_replace(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let s = vm.string_from(args.get(vm, 0))?;
     let replacement = vm.to_js_string(args.get(vm, 2), 0);
-    // RegExp pattern path.
     if let Some(rx) = try_reg_exp(vm, args.get(vm, 1)) {
         let text = s.as_str();
         if rx.flags.contains('g') {
-            // Global replace: find all matches, replace each.
             let mut out = String::new();
             let mut last = 0;
             for m in rx.compiled.find_iter(text) {
                 out.push_str(&text[last..m.range.start]);
-                out.push_str(replacement.as_str());
+                push_replacement(&mut out, replacement.as_str(), text, &m);
                 last = m.range.end;
             }
             out.push_str(&text[last..]);
             return Ok(Value::String(RcStr::from(out)));
         } else {
-            // Single replace.
             if let Some(m) = rx.compiled.find(text) {
                 let mut out =
-                    String::with_capacity(s.len() - (m.range.end - m.range.start) + replacement.len());
+                    String::with_capacity(s.len());
                 out.push_str(&text[..m.range.start]);
-                out.push_str(replacement.as_str());
+                push_replacement(&mut out, replacement.as_str(), text, &m);
                 out.push_str(&text[m.range.end..]);
                 return Ok(Value::String(RcStr::from(out)));
             }
             return Ok(Value::String(s));
         }
     }
-    // String pattern path.
     let pattern = vm.to_js_string(args.get(vm, 1), 0);
     if let Some(idx) = s.find(pattern.as_str()) {
         let mut out = String::with_capacity(s.len() - pattern.len() + replacement.len());
@@ -234,10 +231,10 @@ pub fn str_replace(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 
 /// `s.replaceAll(pattern, replacement)` — pattern may be a string or
 /// RegExp. If pattern is a RegExp, it must have the `g` flag (per JS spec).
+/// Supports JS replacement patterns: `$$`, `$&`, ``$` ``, `$'`, `$1`..`$9`.
 pub fn str_replace_all(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let s = vm.string_from(args.get(vm, 0))?;
     let replacement = vm.to_js_string(args.get(vm, 2), 0);
-    // RegExp pattern path.
     if let Some(rx) = try_reg_exp(vm, args.get(vm, 1)) {
         if !rx.flags.contains('g') {
             return Err(vm.fail(
@@ -250,17 +247,74 @@ pub fn str_replace_all(vm: &mut VM, args: Args) -> Result<Value, VMError> {
         let mut last = 0;
         for m in rx.compiled.find_iter(text) {
             out.push_str(&text[last..m.range.start]);
-            out.push_str(replacement.as_str());
+            push_replacement(&mut out, replacement.as_str(), text, &m);
             last = m.range.end;
         }
         out.push_str(&text[last..]);
         return Ok(Value::String(RcStr::from(out)));
     }
-    // String pattern path.
     let pattern = vm.to_js_string(args.get(vm, 1), 0);
     Ok(Value::String(RcStr::from(
         s.replace(pattern.as_str(), replacement.as_str()),
     )))
+}
+
+/// Append the JS replacement pattern to `out`, substituting `$n`, `$&`,
+/// ``$` ``, `$'`, and `$$` from the match's captures.
+fn push_replacement(out: &mut String, repl: &str, text: &str, m: &regress::Match) {
+    let mut chars = repl.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '$' {
+            out.push(c);
+            continue;
+        }
+        let next = match chars.peek() {
+            Some(&ch) => ch,
+            None => {
+                out.push('$');
+                break;
+            }
+        };
+        match next {
+            '$' => {
+                chars.next();
+                out.push('$');
+            }
+            '&' => {
+                chars.next();
+                out.push_str(&text[m.range.clone()]);
+            }
+            '`' => {
+                chars.next();
+                out.push_str(&text[..m.range.start]);
+            }
+            '\'' => {
+                chars.next();
+                out.push_str(&text[m.range.end..]);
+            }
+            '0'..='9' => {
+                chars.next();
+                let mut n = (next as u32 - '0' as u32) as usize;
+                while let Some(&c2) = chars.peek() {
+                    if !c2.is_ascii_digit() {
+                        break;
+                    }
+                    chars.next();
+                    n = n.saturating_mul(10).saturating_add((c2 as u32 - '0' as u32) as usize);
+                }
+                if n > 0 && n <= m.captures.len() {
+                    if let Some(cap) = m.captures.get(n - 1) {
+                        if let Some(range) = cap {
+                            out.push_str(&text[range.clone()]);
+                        }
+                    }
+                }
+            }
+            _ => {
+                out.push('$');
+            }
+        }
+    }
 }
 
 /// `s.match(pattern)` — pattern may be a string or RegExp.
@@ -452,6 +506,43 @@ pub fn str_concat(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     for i in 1..args.argc {
         let piece = vm.to_js_string(args.get(vm, i), 0);
         out.push_str(piece.as_str());
+    }
+    Ok(Value::String(RcStr::from(out)))
+}
+
+/// `String.fromCharCode(c1, c2, …)` → string from character codes.
+/// Each argument is truncated to a 16-bit value (expects UTF-16 code units).
+pub fn str_from_char_code(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let mut out = String::with_capacity(args.argc * 4);
+    for i in 0..args.argc {
+        let n = args
+            .get(vm, i)
+            .to_number()
+            .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?;
+        let code = (n as u32) & 0xFFFF;
+        if let Some(c) = char::from_u32(code) {
+            out.push(c);
+        }
+    }
+    Ok(Value::String(RcStr::from(out)))
+}
+
+/// `String.fromCodePoint(c1, c2, …)` → string from Unicode code points.
+/// Each argument must be a valid code point (0..=0x10FFFF, excluding surrogates).
+pub fn str_from_code_point(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let mut out = String::with_capacity(args.argc * 4);
+    for i in 0..args.argc {
+        let n = args
+            .get(vm, i)
+            .to_number()
+            .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?;
+        let code = n as u32;
+        if code > 0x10FFFF || (0xD800..=0xDFFF).contains(&code) {
+            return Err(vm.fail(ErrorKind::ValueError, "value error"));
+        }
+        if let Some(c) = char::from_u32(code) {
+            out.push(c);
+        }
     }
     Ok(Value::String(RcStr::from(out)))
 }
@@ -882,5 +973,53 @@ mod tests {
             Value::String(s) => assert_eq!(s.as_str(), "hello"),
             other => panic!("expected string, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn replace_with_dollar_references() {
+        assert_eq!(
+            testutil::run_ret("return 'hello world'.replace(/world/, '[$&]');"),
+            serde_json::json!("hello [world]")
+        );
+        assert_eq!(
+            testutil::run_ret("return 'abc def'.replace(/(\\w+)\\s+(\\w+)/, '$2 $1');"),
+            serde_json::json!("def abc")
+        );
+        assert_eq!(
+            testutil::run_ret("return 'cost: 5'.replace(/\\d+/, '$$$&');"),
+            serde_json::json!("cost: $5")
+        );
+    }
+
+    #[test]
+    fn replace_all_with_dollar_references() {
+        assert_eq!(
+            testutil::run_ret("return 'a,b,c'.replaceAll(/(\\w)/g, '[$1]');"),
+            serde_json::json!("[a],[b],[c]")
+        );
+    }
+
+    #[test]
+    fn string_from_char_code() {
+        assert_eq!(
+            testutil::run_ret("return String.fromCharCode(72, 105, 33);"),
+            serde_json::json!("Hi!")
+        );
+        assert_eq!(
+            testutil::run_ret("return String.fromCharCode();"),
+            serde_json::json!("")
+        );
+    }
+
+    #[test]
+    fn string_from_code_point() {
+        assert_eq!(
+            testutil::run_ret("return String.fromCodePoint(97, 98, 99);"),
+            serde_json::json!("abc")
+        );
+        assert_eq!(
+            testutil::run_ret("return String.fromCodePoint();"),
+            serde_json::json!("")
+        );
     }
 }
