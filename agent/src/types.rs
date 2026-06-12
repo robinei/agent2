@@ -24,16 +24,75 @@ impl Event {
     }
 }
 
+/// Event vocabulary (8_HARNESS Step 1). Two classes:
+///
+/// - **Chat events** render into LLM requests for their frame.
+/// - **Execution events** are harness-internal: queried for replay,
+///   artifacts, and UI — never sent to the LLM as messages.
+///
+/// Each variant documents its parent rule, which spine it lands on, and
+/// whether it renders to chat.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum EventPayload {
-    PushFrame(String),
-    PopFrame,
+    /// Chat event. Parent: the previous event on the owning frame's
+    /// spine. Renders to chat: yes — `Assistant.tool_calls` carries
+    /// `run_program`/`resume`, `Tool` carries their results (completion
+    /// summaries, condition reports).
     Message(Message),
+
+    /// Execution event; the branch root of a frame. Parent: the
+    /// call-site event on the caller's spine (`None` for the tree
+    /// root). Starts a new spine: the caller's spine continues past the
+    /// call site independently. Renders to chat: no — the child frame's
+    /// LLM request is rendered *from* `prompt`/`input`, and the child
+    /// never sees ancestor transcripts (clean-room, decision 3).
+    FrameStart {
+        prompt: String,
+        input: serde_json::Value,
+    },
+
+    /// Execution event; the terminal event of a frame's spine. Parent:
+    /// the frame's last event. Nothing may be appended after it.
+    /// Renders to chat: no — the caller records the result on its own
+    /// spine (as the `tools.agent` call's `Tool` message).
+    FrameResult { result: serde_json::Value },
+
+    /// Execution event; one per tool call a program makes, logged in
+    /// resolution order (decision 7). Parent: the owning frame's spine,
+    /// between the program's `run_program` tool-call message and its
+    /// `Tool` result. Renders to chat: no — queried for replay, the
+    /// artifact menu, and UI. Addressable via `tools.tool_result(id)`.
+    Invoke {
+        name: String,
+        args: serde_json::Value,
+        result: serde_json::Value,
+    },
+
+    /// Execution event; a program's top-level `return` value, logged
+    /// after each successful run. Parent: the owning frame's spine.
+    /// Renders to chat: no — an id-addressable artifact like any tool
+    /// result (the completion report quotes it).
+    ProgramResult { value: serde_json::Value },
+
+    /// Marker naming a branch for fork/leaf UX. Parent: the owning
+    /// frame's spine. Renders to chat: no.
     Label(String),
 
-    // not used for storage (only live streaming)
+    /// Live streaming only — never stored in the log.
     TextChunk(String),
+    /// Live streaming only — never stored in the log.
     ThinkingChunk(String),
+}
+
+impl EventPayload {
+    /// Whether this payload may be appended to the log (chunks are
+    /// live-only).
+    pub fn is_storable(&self) -> bool {
+        !matches!(
+            self,
+            EventPayload::TextChunk(_) | EventPayload::ThinkingChunk(_)
+        )
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -76,18 +135,41 @@ pub struct ToolCall {
     pub arguments: serde_json::Value,
 }
 
+/// One frame in a spine's `FrameStart`-ancestor chain: its prompt and
+/// input, the chat messages logged on its segment of the path, and the
+/// result if the frame has completed.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Frame {
     pub prompt: String,
-    pub leaf_id: EventId,
+    pub input: serde_json::Value,
     pub messages: Vec<Message>,
+    pub result: Option<serde_json::Value>,
+}
+
+/// A handle on one active leaf of the tree: the cursor appends go
+/// through, plus the reconstructed frame chain above it. The innermost
+/// frame (`frames.last()`) owns new events.
+#[derive(Clone, Debug)]
+pub struct Spine {
+    pub leaf_id: EventId,
+    pub frames: Vec<Frame>,
+}
+
+impl Spine {
+    /// The frame events on this spine belong to.
+    pub fn frame(&self) -> &Frame {
+        self.frames.last().expect("spine has no frames")
+    }
+
+    /// Whether this spine's frame has recorded its `FrameResult`.
+    pub fn is_complete(&self) -> bool {
+        self.frame().result.is_some()
+    }
 }
 
 pub struct Tree {
     pub id_counter: u64,
-    pub leaf_id: EventId,
     pub events: HashMap<EventId, Event>,
-    pub frames: Vec<Frame>,
     pub file: Option<std::fs::File>,
 }
 

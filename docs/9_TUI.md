@@ -55,6 +55,15 @@ works as soon as multiple leaves exist.
    registry, no LLM, no harness. Attached: the same panes over a live
    harness session. Standalone ships first; it is the interp debugging
    tool wanted *now* and blocks on nothing.
+6. **Attached mode *is* the harness TUI — the debugger is integral,
+   not bolted on.** "Planning as JS program creation" is the core of
+   the harness, so the program source earns screen space whenever a
+   program is running: the chat session is the default full-width
+   view, and the source + console panes auto-pop on the right when a
+   frame starts executing a `run_program`. A mode key switches to
+   full debugger mode (the standalone configuration: console/result
+   left, full debug pane stack right) and back. There is no separate
+   "harness UI" to build later.
 
 ## Step 0 — interp: `step(fuel)`
 
@@ -175,17 +184,44 @@ cell deref, promise table), so it's all unit-testable.)*
 
 ## Step 4 — attached mode + frame switcher (needs 8 M0)
 
-The same panes over a live harness session: chat pane renders
-`SessionEvent`s (chunks included); a frame-list pane shows active
-leaves; tab / `1`–`9` switch which frame's VM the debug panes borrow
-(pane selection is pure UI state — nothing in the host changes). User
-input goes through `SessionCommand` — steering an in-flight program
-remains Phase 8's host-injected condition, not a TUI mechanism.
+The same panes over a live harness session, per decision 6: this *is*
+the harness TUI. The chat pane renders `SessionEvent`s (chunks
+included); user input goes through `SessionCommand` — steering an
+in-flight program remains Phase 8's host-injected condition, not a
+TUI mechanism.
+
+Layout state machine (pure UI state — nothing in the host changes):
+
+- **Chat view** (default): full-width chat.
+- **Running view**: when the selected frame starts executing a
+  `run_program`, the source and console panes auto-pop as a right
+  column; chat stays left. Auto-popped panes are *sticky*: on program
+  completion (result or condition) they remain, showing final state
+  for post-mortem reading next to the report in chat. A collapse key
+  returns to full-width chat; the manual pane toggles (`1`–`4`) work
+  here and override the auto-pop set.
+- **Full debugger mode**: a mode key swaps to the standalone layout —
+  console/result left, full debug pane stack right, chat hidden —
+  and back. Run/pause/step keys apply to the selected frame's VM in
+  either view.
+
+Frame switcher: a frame-list pane shows active leaves; tab / `1`–`9`
+(in full debugger mode) switch which frame's VM the debug panes
+borrow. Auto-pop triggers off the *selected* frame; a busy indicator
+in the frame list covers the others.
+
 Acceptance:
 
-- [ ] Against the M0 scripted LLM: a session with two concurrent
-      frames (or two leaves pre-M3) renders both in the frame list;
-      switching retargets all debug panes.
+- [ ] Against the M0 scripted LLM: a `run_program` turn auto-pops
+      source + console (program text visible while running); on
+      completion the panes remain until the collapse key restores
+      full-width chat. Layout transitions unit-tested headlessly
+      (view-state enum in, pane set out); visuals eyeballed.
+- [ ] Full-debugger-mode key swaps to the standalone pane
+      configuration and back without disturbing the session.
+- [ ] A session with two concurrent frames (or two leaves pre-M3)
+      renders both in the frame list; switching retargets all debug
+      panes.
 - [ ] Chat pane is driven only by `SessionEvent`s (no privileged
       reads) — asserted by module visibility, not discipline.
 - [ ] Gate: `cargo fmt && cargo clippy && cargo test` green.

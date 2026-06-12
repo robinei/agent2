@@ -85,6 +85,18 @@ values, not `state.x`):
 - Update the divergence/docs blocks that present `state` as the durable
   surface.
 
+Acceptance:
+
+- [x] Top-level `return <expr>` compiles; value surfaces via
+      `StepResult::Done { value }`; no-`return` programs yield
+      `undefined`.
+- [x] `input` const binding seeded from host JSON; rebinding is a
+      compile error.
+- [x] `state_to_json`, `objects[0]` seeding, and `state`
+      special-casing gone from non-test code; divergence/docs blocks
+      updated.
+- [x] Gate: `cargo fmt && cargo clippy && cargo test` green.
+
 ## Step 1: Event vocabulary (`types.rs`)
 
 Two classes of event, distinguished because they render differently:
@@ -107,6 +119,14 @@ Two classes of event, distinguished because they render differently:
 Document per event type: parent rules, which spine it lands on, and
 whether it renders to chat.
 
+Acceptance:
+
+- [x] `EventPayload` has `Invoke`, `ProgramResult`, `FrameStart`,
+      `FrameResult`; `PushFrame`/`PopFrame` deleted; everything
+      serde round-trips (JSONL line per event).
+- [x] Doc comment per variant: parent rule, spine, renders-to-chat.
+- [x] Gate: `cargo fmt && cargo clippy && cargo test` green.
+
 ## Step 2: Tree with multiple active leaves (`tree.rs`)
 
 Replace the single `frames` + `leaf_id` cursor with spine handles:
@@ -116,6 +136,26 @@ picks one (or several — frames that never got their `FrameResult`).
 Single-process single-writer; ids stay globally monotonic across spines.
 Tests: interleaved appends on two branches; reconstruction of each;
 re-open with an in-flight subagent branch.
+
+Acceptance:
+
+- [x] `Tree` no longer holds `frames`/`leaf_id`; appends go through
+      `Spine` handles; ids monotonic across interleaved spines.
+- [x] `FrameStart` branches: child spine roots at a `FrameStart`
+      parented on the caller's call-site event; caller's spine
+      continues past it.
+- [x] Tests: interleaved appends on two branches reconstruct
+      independently; file re-open recovers both leaves (one an
+      in-flight subagent: `FrameStart` without `FrameResult`).
+- [x] Gate: `cargo fmt && cargo clippy && cargo test` green.
+
+*(Built: `Tree::start_frame(parent, prompt, input) -> Spine` is the
+only way to root a frame (appending a `FrameStart` via `append`
+panics), so a caller's spine handle never advances past the call
+site. A spine leaf is an event with no non-`FrameStart` children —
+that definition is what keeps the call-site event listed as the
+caller's resumable leaf while a subagent branch is in flight.
+`FrameResult` marks the spine complete; appending after it panics.)*
 
 ## Step 3: Sans-io frame step machine (`AgentState::step`)
 
@@ -192,7 +232,10 @@ client/server frontend is a new consumer, not a refactor. One
 exception: the debugger TUI (9_TUI) renders on the loop thread and
 borrows VMs/tree directly for its debug panes — its chat pane still
 consumes `SessionEvent`s, keeping the serializable boundary exactly
-the surface a remote client needs.
+the surface a remote client needs. That TUI in attached mode (9_TUI
+decision 6, Step 4) is the harness's primary frontend, not an add-on:
+chat left, source + console panes auto-popping while a program runs,
+a key for full debugger mode.
 
 ## Step 6: System prompt / dialect card
 
@@ -238,7 +281,9 @@ M1/M2 transcripts, not speculation.
 - **M0**: scripted-LLM end-to-end — user turn → program → fan-out →
   results → completion, all asserted on the event log. No network.
 - **M1**: real LLM, a few real tools (file read, HTTP fetch), single
-  frame. First honest contact with the dialect prompt.
+  frame. First honest contact with the dialect prompt. From here on,
+  drive sessions through the attached TUI (9_TUI Step 4) — it is the
+  observation instrument for iterating the condition report.
 - **M2** (needs Phase 3): conditions round-trip — `raise` with payload and
   a trapped TypeError both produce a report, and both restart paths
   (resume / rewrite reusing artifacts by id) work against a real model.
