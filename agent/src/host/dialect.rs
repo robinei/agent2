@@ -55,29 +55,26 @@ expression) — or run_program(source) — a rewrite in a fresh VM, with \
 all prior artifacts still fetchable by id.
 
 ## dialect (JavaScript, with differences)
-- No `this`, `class`, or `new`: use plain functions, closures, object \
-literals, and factory functions instead (`new Error(msg)` and \
-`new RegExp(pattern[, flags])` are the allowed `new` forms). \
-Also absent: BigInt, labeled statements, getters/setters.
+- No `this` or `class`. Use plain functions, closures, object literals, \
+and factory functions.
+- `new Error(msg)`, `new RegExp(...)`, `new Map()`, and `new Set()` are \
+the allowed `new` forms. Absent: BigInt, labeled statements, \
+getters/setters.
 - try/catch/finally work as in JS for `throw` and runtime errors; \
 `raise` is never catchable.
-- RegExp is supported: `/pattern/flags` literals, `new RegExp(...)`, \
-`.test(str)`, `.exec(str)`, `.toString()`, and properties `.source` / \
-`.flags` / `.global` / `.ignoreCase` / `.multiline` / `.dotAll` / \
-`.unicode` / `.sticky`. String methods `.match()`, `.search()`, \
-`.replace()`, `.replaceAll()`, and `.split()` accept RegExp arguments \
-(the `regress` engine — JS-compatible).
 - Promises exist only as tool-call results: no `new Promise`, no \
 `.then`/`.catch` — use `await`, `Promise.all`, `Promise.allSettled`. \
 `async function`s are supported.
+- `Map` and `Set` are available with standard methods: get/set/has/delete/ \
+clear/keys/values/entries/forEach, plus `.size`.
+- RegExp: `/pattern/flags`, `.test()`, `.exec()`. String `.replace()` / \
+`.replaceAll()` support `$1`..`$9` group references.
 - Strings are UTF-8 bytes: `.length` and all indices count bytes, not \
 UTF-16 units.
 - `<` `>` `<=` `>=` never coerce across types; objects/arrays never \
 coerce to primitives (`[5] == 5` is false, `[] + 1` is an error).
-- Calls are strict-arity: no `arguments`, default, or rest parameters; \
-reading a missing argument errors. Writing past an array's end errors \
-(use `push`).
-- Bitwise ops are 64-bit; `>>>` is absent.";
+- Calls are strict-arity; writing past an array's end errors (use \
+`push`). Bitwise ops are 64-bit; `>>>` is absent.";
 
 /// Render the full card: static head, the registry's tools (sorted,
 /// one line each), static tail.
@@ -173,8 +170,10 @@ mod tests {
             "tools.agent({ prompt, input })",
             "raise(name, payload)",
             "resume(value)",
-            "No `this`, `class`, or `new`",
-            "RegExp is supported",
+            "No `this` or `class`",
+            "`new Map()`",
+            "`Map` and `Set`",
+            "group references",
             "UTF-8 bytes",
         ] {
             assert!(card.contains(needle), "card missing: {needle}");
