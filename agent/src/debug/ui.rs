@@ -26,12 +26,18 @@ pub fn render(frame: &mut Frame, app: &App) {
         Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(right);
     render_status(frame, app, status);
 
-    type PaneFn = fn(&mut Frame, &App, Rect);
-    let enabled: Vec<PaneFn> = [
-        app.show_source.then_some(render_source as PaneFn),
-        app.show_disasm.then_some(render_disasm as PaneFn),
-        app.show_stack.then_some(render_stack as PaneFn),
-        app.show_promises.then_some(render_promises as PaneFn),
+    #[derive(Clone, Copy)]
+    enum P {
+        Source,
+        Disasm,
+        Stack,
+        Promises,
+    }
+    let enabled: Vec<P> = [
+        app.show_source.then_some(P::Source),
+        app.show_disasm.then_some(P::Disasm),
+        app.show_stack.then_some(P::Stack),
+        app.show_promises.then_some(P::Promises),
     ]
     .into_iter()
     .flatten()
@@ -42,9 +48,15 @@ pub fn render(frame: &mut Frame, app: &App) {
             panes_area,
         );
     } else {
+        let vm = &app.runner.vm;
         let slots = Layout::vertical(vec![Constraint::Fill(1); enabled.len()]).split(panes_area);
         for (pane, slot) in enabled.into_iter().zip(slots.iter()) {
-            pane(frame, app, *slot);
+            match pane {
+                P::Source => render_source(frame, vm, *slot),
+                P::Disasm => render_disasm(frame, vm, *slot),
+                P::Stack => render_stack(frame, vm, *slot),
+                P::Promises => render_promises(frame, vm, app.runner.next_timer(), *slot),
+            }
         }
     }
 
@@ -159,9 +171,9 @@ fn styled_source(src: &str) -> Vec<Line<'static>> {
     lines
 }
 
-fn render_source(frame: &mut Frame, app: &App, area: Rect) {
-    let src: &str = &app.runner.vm.source;
-    let cur_line = app.runner.current_line();
+pub(super) fn render_source(frame: &mut Frame, vm: &interp::VM, area: Rect) {
+    let src: &str = &vm.source;
+    let cur_line = panes::current_line(vm);
     let mut lines = styled_source(src);
     let num_style = Style::default().fg(Color::DarkGray);
     for (i, line) in lines.iter_mut().enumerate() {
@@ -192,9 +204,9 @@ fn op_style(op: &str) -> Style {
     }
 }
 
-fn render_disasm(frame: &mut Frame, app: &App, area: Rect) {
+pub(super) fn render_disasm(frame: &mut Frame, vm: &interp::VM, area: Rect) {
     let height = area.height.saturating_sub(2) as usize;
-    let rows = panes::disasm_window(&app.runner.vm, height);
+    let rows = panes::disasm_window(vm, height);
     let dim = Style::default().fg(Color::DarkGray);
     let lines: Vec<Line> = rows
         .into_iter()
@@ -239,14 +251,14 @@ fn render_disasm(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(para, area);
 }
 
-fn render_stack(frame: &mut Frame, app: &App, area: Rect) {
+pub(super) fn render_stack(frame: &mut Frame, vm: &interp::VM, area: Rect) {
     // Region backgrounds: the frame band (header + locals) on one shade,
     // the temporaries band on a lighter one. Rows are padded to the pane
     // width so the bands render solid.
     let frame_bg = Color::Indexed(235);
     let temp_bg = Color::Indexed(238);
     let width = area.width.saturating_sub(2) as usize;
-    let lines: Vec<Line> = panes::stack_rows(&app.runner.vm)
+    let lines: Vec<Line> = panes::stack_rows(vm)
         .into_iter()
         .map(|r| {
             let style = match r.kind {
@@ -268,12 +280,17 @@ fn render_stack(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(para, area);
 }
 
-fn render_promises(frame: &mut Frame, app: &App, area: Rect) {
-    let mut lines: Vec<Line> = panes::promise_rows(&app.runner.vm)
+pub(super) fn render_promises(
+    frame: &mut Frame,
+    vm: &interp::VM,
+    next_timer: Option<std::time::Instant>,
+    area: Rect,
+) {
+    let mut lines: Vec<Line> = panes::promise_rows(vm)
         .into_iter()
         .map(Line::from)
         .collect();
-    if let Some(due) = app.runner.next_timer() {
+    if let Some(due) = next_timer {
         let ms = due
             .saturating_duration_since(std::time::Instant::now())
             .as_millis();

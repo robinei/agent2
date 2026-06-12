@@ -212,19 +212,38 @@ in the frame list covers the others.
 
 Acceptance:
 
-- [ ] Against the M0 scripted LLM: a `run_program` turn auto-pops
+- [x] Against the M0 scripted LLM: a `run_program` turn auto-pops
       source + console (program text visible while running); on
       completion the panes remain until the collapse key restores
       full-width chat. Layout transitions unit-tested headlessly
-      (view-state enum in, pane set out); visuals eyeballed.
-- [ ] Full-debugger-mode key swaps to the standalone pane
-      configuration and back without disturbing the session.
-- [ ] A session with two concurrent frames (or two leaves pre-M3)
+      (view-state enum in, pane set out:
+      `m0_run_program_auto_pops_and_sticks` drives the real demo's
+      `SessionEvent`s); visuals eyeballed.
+- [x] Full-debugger-mode key swaps to the standalone pane
+      configuration and back without disturbing the session
+      (`full_debugger_mode_swaps_and_returns_without_session_actions`).
+- [x] A session with two concurrent frames (or two leaves pre-M3)
       renders both in the frame list; switching retargets all debug
-      panes.
-- [ ] Chat pane is driven only by `SessionEvent`s (no privileged
+      panes (`concurrent_frames_list_and_retarget`: caller + in-flight
+      subagent, each pane borrow resolving to its own VM).
+- [x] Chat pane is driven only by `SessionEvent`s (no privileged
       reads) — asserted by module visibility, not discipline.
-- [ ] Gate: `cargo fmt && cargo clippy && cargo test` green.
+- [x] Gate: `cargo fmt && cargo clippy && cargo test` green.
+
+*(Built: `agent/src/debug/attach.rs` + `chat.rs`; `agent session`
+opens it (`--headless` keeps the M0 event printer). The structural
+chat guarantee: `ChatState`'s fields are private to `chat.rs` and its
+only mutator is `apply(&SessionEvent)`, so the renderer can only show
+what crossed the serializable boundary. Keys are focus-modal so chat
+typing stays free: printable keys go to the input line, `Esc` swaps
+to debug-control focus where the doc's bare keys live (`c` collapse,
+`d` full debugger, `1`–`4` toggles, space/`s`/`n` VM control); Tab
+switches frames everywhere. Host support added for this step:
+`Session::pump_until` (inbox drain with render deadline; terminal
+input arrives as inbox messages per decision 4), per-frame
+pause/step (`set_paused`/`step_paused` — pausing parks the frame's
+fuel-slice continues), and `AgentState` keeps the last run's VM so
+the sticky panes show final program state post-mortem.)*
 
 ## Step 5 — docs sweep
 

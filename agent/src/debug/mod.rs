@@ -4,10 +4,14 @@
 //! between slices, redraws are throttled (~30ms).
 
 mod app;
+mod attach;
+mod chat;
 mod highlight;
 mod panes;
 mod runner;
 mod ui;
+
+pub use attach::run_attached;
 
 use std::time::{Duration, Instant};
 

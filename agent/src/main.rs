@@ -10,8 +10,9 @@ pub use types::*;
 use host::SessionEvent;
 
 const USAGE: &str = "usage: agent <command>
-  debug <file.js>                 standalone debugger TUI
-  session [--headless] [log.jsonl]  M0 scripted-LLM demo session";
+  debug <file.js>                   standalone debugger TUI
+  session [--headless] [log.jsonl]  scripted-LLM demo session
+                                    (attached TUI; --headless prints events)";
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -27,16 +28,20 @@ fn main() {
             }
         }
         Some("session") => {
+            let mut headless = false;
             let mut log_path: Option<String> = None;
             for arg in &args[2..] {
                 match arg.as_str() {
-                    // The attached TUI becomes the default with 9_TUI
-                    // Step 4; today both forms run headless.
-                    "--headless" => {}
+                    "--headless" => headless = true,
                     other => log_path = Some(other.to_string()),
                 }
             }
-            if let Err(e) = run_session(log_path) {
+            let result = if headless {
+                run_session_headless(log_path)
+            } else {
+                run_session_tui(log_path)
+            };
+            if let Err(e) = result {
                 eprintln!("{e}");
                 std::process::exit(1);
             }
@@ -48,11 +53,8 @@ fn main() {
     }
 }
 
-/// The headless M0 session: run the scripted demo, printing every
-/// `SessionEvent` from the channel — the CLI is just another consumer
-/// of the serializable UI boundary.
-fn run_session(log_path: Option<String>) -> Result<(), String> {
-    let tree = match log_path {
+fn open_tree(log_path: Option<String>) -> Result<Tree, String> {
+    match log_path {
         Some(path) => {
             let file = std::fs::OpenOptions::new()
                 .read(true)
@@ -61,11 +63,34 @@ fn run_session(log_path: Option<String>) -> Result<(), String> {
                 .truncate(false) // an existing log is resumed, not wiped
                 .open(&path)
                 .map_err(|e| format!("{path}: {e}"))?;
-            Tree::open(file).map_err(|e| format!("{path}: {e}"))?
+            Tree::open(file).map_err(|e| format!("{path}: {e}"))
         }
-        None => Tree::new(None),
-    };
+        None => Ok(Tree::new(None)),
+    }
+}
 
+/// The attached TUI (9_TUI Step 4) over the scripted demo session —
+/// the harness's primary frontend. Type a message to kick it off.
+fn run_session_tui(log_path: Option<String>) -> Result<(), String> {
+    let tree = open_tree(log_path)?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    let session = host::Session::new(
+        tree,
+        host::DEMO_PROMPT,
+        serde_json::Value::Null,
+        host::demo_registry(),
+        Box::new(host::demo_script()),
+        tx,
+    )
+    .map_err(|e| e.to_string())?;
+    debug::run_attached(session, rx)
+}
+
+/// The headless M0 session: run the scripted demo, printing every
+/// `SessionEvent` from the channel — the CLI is just another consumer
+/// of the serializable UI boundary.
+fn run_session_headless(log_path: Option<String>) -> Result<(), String> {
+    let tree = open_tree(log_path)?;
     let (tx, rx) = std::sync::mpsc::channel();
     let printer = std::thread::spawn(move || {
         for event in rx {

@@ -23,6 +23,16 @@ pub enum AsmRow {
     },
 }
 
+/// Source line (1-based) of the instruction at `vm.ip`, when known.
+pub fn current_line(vm: &VM) -> Option<usize> {
+    let span = *vm.spans.get(vm.ip as usize)?;
+    if vm.source.is_empty() {
+        return None;
+    }
+    let (line, _, _) = interp::diag::line_col(&vm.source, span);
+    Some(line)
+}
+
 /// A disassembly window of up to `height` rows centered on `vm.ip`, with
 /// function-name headers wherever the owning function changes.
 pub fn disasm_window(vm: &VM, height: usize) -> Vec<AsmRow> {

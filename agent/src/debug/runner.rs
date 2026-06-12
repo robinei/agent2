@@ -135,12 +135,7 @@ impl Runner {
 
     /// Source line (1-based) of the current instruction, when known.
     pub fn current_line(&self) -> Option<usize> {
-        let span = *self.vm.spans.get(self.vm.ip as usize)?;
-        if self.vm.source.is_empty() {
-            return None;
-        }
-        let (line, _, _) = interp::diag::line_col(&self.vm.source, span);
-        Some(line)
+        super::panes::current_line(&self.vm)
     }
 
     fn steppable(&self) -> bool {

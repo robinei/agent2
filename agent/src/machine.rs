@@ -138,6 +138,10 @@ pub struct AgentState {
     /// Tool names whose artifacts get the "already happened; calling
     /// again repeats the effect" warning in reports (registry-fed).
     effectful_tools: HashSet<String>,
+    /// The most recently finished/abandoned run's VM, kept so the
+    /// debugger's sticky panes can show final state post-mortem
+    /// (9_TUI Step 4). Never executed again.
+    last_vm: Option<VM>,
 }
 
 enum SuspendCause {
@@ -180,6 +184,7 @@ impl AgentState {
             generation: 0,
             pending: HashMap::new(),
             effectful_tools: HashSet::new(),
+            last_vm: None,
         }
     }
 
@@ -205,13 +210,20 @@ impl AgentState {
         }
     }
 
-    /// The live VM, while a program is running or suspended — the
-    /// privileged borrow the debugger TUI renders from (9_TUI dec. 4).
+    /// The VM the debugger TUI renders from (9_TUI dec. 4): the live
+    /// one while a program runs or is suspended, else the last run's
+    /// final state (sticky post-mortem panes).
     pub fn vm(&self) -> Option<&VM> {
         match &self.phase {
             Phase::Running(run) | Phase::Suspended(run, _) => Some(&run.vm),
-            _ => None,
+            _ => self.last_vm.as_ref(),
         }
+    }
+
+    /// Whether `vm()` is the live, executing program (vs a post-mortem
+    /// snapshot).
+    pub fn vm_is_live(&self) -> bool {
+        matches!(self.phase, Phase::Running(_) | Phase::Suspended(..))
     }
 
     /// Start the conversation without a user turn — how child frames
@@ -296,7 +308,11 @@ impl AgentState {
                 // A rewrite abandons any suspended VM — never the physics:
                 // in-flight calls stay pending and their results are still
                 // logged as artifacts when they arrive (the generation bump
-                // stops delivery to the dead VM).
+                // stops delivery to the dead VM). The abandoned VM is kept
+                // for post-mortem rendering.
+                if let Phase::Suspended(run, _) = std::mem::replace(&mut self.phase, Phase::Idle) {
+                    self.last_vm = Some(run.vm);
+                }
                 self.generation += 1;
                 match self.start_program(source, call.id.clone()) {
                     Ok(run) => {
@@ -698,6 +714,7 @@ impl AgentState {
         if !fire_and_forget.is_empty() {
             out.push(StepOutput::ToolCalls(fire_and_forget));
         }
+        self.last_vm = Some(run.vm);
         self.phase = Phase::AwaitingLlm;
         out.push(self.render_request());
         Ok(out)
@@ -754,6 +771,9 @@ impl AgentState {
     fn finish_frame(&mut self, tree: &mut Tree) -> io::Result<Vec<StepOutput>> {
         // Abandon any suspended program: a no-tool-call turn completes
         // the frame, its text is the result.
+        if let Phase::Suspended(run, _) = std::mem::replace(&mut self.phase, Phase::Done) {
+            self.last_vm = Some(run.vm);
+        }
         self.generation += 1;
         let result = match self.spine.frame().messages.last() {
             Some(Message::Assistant { text, .. }) => serde_json::Value::String(text.clone()),

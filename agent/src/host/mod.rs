@@ -24,11 +24,12 @@ pub use llm::*;
 pub use protocol::*;
 pub use registry::*;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Instant;
 
 use crate::machine::{
     AgentState, LlmRequest, OutCall, SpawnFrame, StepInput, StepOutput, ToolResult,
@@ -37,6 +38,12 @@ use crate::types::{EventId, EventPayload, Message, Tree};
 
 /// Instructions per VM slice on the loop thread (9_TUI decision 3).
 pub const FUEL_SLICE: u64 = 100_000;
+
+/// Raw terminal input. The attached TUI's input thread feeds these into
+/// the inbox (9_TUI decision 4) so key handling happens on the loop
+/// thread, between message drains; the loop hands them back out of
+/// `pump_until` untouched.
+pub type UiInput = ratatui::crossterm::event::Event;
 
 /// The unified inbox message. Every producer — UI, LLM worker, tool
 /// worker, the loop itself — sends this one enum.
@@ -60,6 +67,8 @@ pub(crate) enum LoopMsg {
     Continue {
         frame: FrameId,
     },
+    /// Terminal input for the embedding TUI; opaque to the loop.
+    Ui(UiInput),
 }
 
 /// A cloneable command channel into the loop — the only way UIs make
@@ -72,6 +81,12 @@ pub struct SessionHandle {
 impl SessionHandle {
     pub fn send(&self, command: SessionCommand) {
         let _ = self.tx.send(LoopMsg::Command(command));
+    }
+
+    /// Forward terminal input into the inbox; `false` once the session
+    /// is gone (the input thread should exit).
+    pub fn send_input(&self, input: UiInput) -> bool {
+        self.tx.send(LoopMsg::Ui(input)).is_ok()
     }
 }
 
@@ -88,6 +103,10 @@ pub struct Session {
     events: Sender<SessionEvent>,
     /// High-water mark of event ids already surfaced as `SessionEvent`s.
     emitted: u64,
+    /// Frames whose VM the debugger paused: their `Continue` messages
+    /// are parked in `starved` instead of ticking.
+    paused: HashSet<FrameId>,
+    starved: HashSet<FrameId>,
     done: bool,
 }
 
@@ -136,6 +155,8 @@ impl Session {
             tx,
             events,
             emitted,
+            paused: HashSet::new(),
+            starved: HashSet::new(),
             done: false,
         };
         session.emit_new(root); // a fresh tree's FrameStart
@@ -190,6 +211,58 @@ impl Session {
             }
             Err(_) => false,
         }
+    }
+
+    /// Drain the inbox until `deadline` (the embedding TUI's render
+    /// tick), handling session messages on this thread and collecting
+    /// terminal input into `inputs`. Returns early once input arrived
+    /// and the inbox went momentarily quiet, so keystrokes stay snappy.
+    pub fn pump_until(&mut self, deadline: Instant, inputs: &mut Vec<UiInput>) {
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                // Out of time even if messages are pending (a hot
+                // program enqueues a Continue per slice) — render now.
+                return;
+            }
+            match self.rx.recv_timeout(deadline - now) {
+                Ok(LoopMsg::Ui(input)) => {
+                    inputs.push(input);
+                    return;
+                }
+                Ok(msg) => self.on_msg(msg),
+                Err(RecvTimeoutError::Timeout) | Err(RecvTimeoutError::Disconnected) => return,
+            }
+        }
+    }
+
+    /// Whether the conversation is over (root frame done / `Shutdown`).
+    /// The attached TUI keeps rendering past this for post-mortem
+    /// reading; `run()` exits on it.
+    pub fn is_done(&self) -> bool {
+        self.done
+    }
+
+    // ── debugger controls (privileged: same thread as the loop) ──────
+
+    /// Pause/resume a frame's VM. Pausing parks its fuel-slice
+    /// continuations; resuming re-enqueues a parked one.
+    pub fn set_paused(&mut self, frame: FrameId, paused: bool) {
+        if paused {
+            self.paused.insert(frame);
+        } else if self.paused.remove(&frame) && self.starved.remove(&frame) {
+            let _ = self.tx.send(LoopMsg::Continue { frame });
+        }
+    }
+
+    pub fn is_paused(&self, frame: FrameId) -> bool {
+        self.paused.contains(&frame)
+    }
+
+    /// Run one slice of at most `fuel` instructions on a (paused)
+    /// frame — the debugger's step keys.
+    pub fn step_paused(&mut self, frame: FrameId, fuel: u64) {
+        let _ = self.step_frame(frame, StepInput::Tick { fuel });
     }
 
     fn on_msg(&mut self, msg: LoopMsg) {
@@ -266,8 +339,15 @@ impl Session {
                 StepInput::ToolResults(vec![ToolResult { invoke_id, result }]),
             ),
             LoopMsg::Continue { frame } => {
+                if self.paused.contains(&frame) {
+                    // Park the slice; `set_paused(false)` re-enqueues it.
+                    self.starved.insert(frame);
+                    return Ok(());
+                }
                 self.step_frame(frame, StepInput::Tick { fuel: FUEL_SLICE })
             }
+            // Handled by `pump_until`; harmless if one reaches `run()`.
+            LoopMsg::Ui(_) => Ok(()),
         }
     }
 
