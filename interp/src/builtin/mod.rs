@@ -320,7 +320,7 @@ impl Args {
 mod tests {
     use super::*;
     use crate::testutil::{self, run_instrs};
-    use crate::vm::{Instr, StepResult};
+    use crate::vm::{Instr, StepResult, VM};
 
     // ── first-class value tests ────────────────────────────────────────
 
@@ -418,5 +418,67 @@ mod tests {
         );
         assert_eq!(Builtin::for_namespace("Math", "push"), None);
         assert_eq!(Builtin::for_namespace("Foo", "bar"), None);
+    }
+
+    // ── method shadow tests ────────────────────────────────────────────
+
+    #[test]
+    fn object_own_property_takes_precedence_over_builtin_method() {
+        // An object with its own `push` function should call that
+        // function, not Array.push.
+        let out = testutil::run_ret(
+            r#"
+            const obj = { push(x) { return x + 1; } };
+            return obj.push(5);
+            "#,
+        );
+        assert_eq!(out, serde_json::json!(6));
+    }
+
+    #[test]
+    fn object_without_property_falls_back_to_builtin() {
+        // An object without a `push` property still gets the builtin
+        // error (since builtins validate their receiver type).
+        let prog = testutil::compile_ok(
+            r#"
+            const obj = { x: 1 };
+            return obj.push(5);
+            "#,
+        );
+        let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
+        let err = loop {
+            match vm.step(u64::MAX) {
+                Err(e) => break e,
+                Ok(StepResult::Done { .. }) => panic!("expected error"),
+                Ok(_) => {}
+            }
+        };
+        assert_eq!(err.kind, crate::vm::ErrorKind::TypeError);
+    }
+
+    #[test]
+    fn array_builtin_method_still_works() {
+        // Array.push should still work normally for arrays.
+        let out = testutil::run_ret("const a = [1,2]; a.push(3); return a;");
+        assert_eq!(out, serde_json::json!([1, 2, 3]));
+    }
+
+    #[test]
+    fn string_builtin_method_still_works() {
+        // String.trim should still work normally for strings.
+        let out = testutil::run_ret("return '  hi  '.trim();");
+        assert_eq!(out, serde_json::json!("hi"));
+    }
+
+    #[test]
+    fn object_shadows_string_method() {
+        // Object with its own `trim` property should shadow String.trim.
+        let out = testutil::run_ret(
+            r#"
+            const obj = { trim() { return 42; } };
+            return obj.trim();
+            "#,
+        );
+        assert_eq!(out, serde_json::json!(42));
     }
 }

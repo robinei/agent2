@@ -1,4 +1,5 @@
 use super::*;
+use crate::builtin::BuiltinKind;
 
 /// The missing-`await` hint, appended to property/index access errors when
 /// the receiver is a promise — the misuse LLMs actually commit under this
@@ -250,6 +251,31 @@ impl VM {
                 }
 
                 Instr::CallBuiltin(b, argc) => {
+                    // Method shadow check: if the receiver is an Object that
+                    // has its own property with the same name as this method
+                    // builtin, call that property dynamically instead of the
+                    // builtin. This prevents builtin names (push, trim, …)
+                    // from hijacking object property access.
+                    let meta = b.meta();
+                    if matches!(meta.kind, BuiltinKind::Method) {
+                        let argc = *argc;
+                        let base = self.stack.len().saturating_sub(argc as usize);
+                        if let Some(Value::Object(ptr)) = self.stack.get(base) {
+                            let obj_ptr = *ptr as usize;
+                            if let Some(obj) = self.objects.get(obj_ptr) {
+                                if let Some(prop_val) = obj.get(meta.name) {
+                                    // Remove the receiver (arg 0) — for
+                                    // dynamic calls the receiver was already
+                                    // consumed by ObjGet, leaving only the
+                                    // explicit arguments.
+                                    self.stack.remove(base);
+                                    let nargs = argc.saturating_sub(1);
+                                    self.dispatch_call(prop_val.clone(), nargs)?;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
                     b.call(self, *argc)?;
                     self.ip += 1;
                 }
