@@ -180,27 +180,6 @@ pub struct Agent {
     pub trees: HashMap<Uuid, Tree>,
 }
 
-pub struct AgentState {
-    pub tree: Tree,
-}
-
-pub enum StepInput {
-    UserTurn(String),
-    ToolResults(),
-    LlmResponse(),
-}
-
-pub enum StepOutput {
-    LlmRequest(),
-    ToolCalls(),
-}
-
-impl AgentState {
-    pub fn step(&mut self, input: StepInput) -> StepOutput {
-        todo!()
-    }
-}
-
 impl EventId {
     pub fn new(value: u64) -> Self {
         Self(NonZeroU64::try_from(value).expect("expected non-zero EventId!"))

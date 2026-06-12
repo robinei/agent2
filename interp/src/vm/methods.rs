@@ -965,7 +965,11 @@ impl VM {
         })
     }
 
-    pub(crate) fn json_to_stack_value(
+    /// Convert JSON to a stack `Value` (containers allocated in this VM's
+    /// heap). Public for the same reason as `stack_value_to_json`: hosts
+    /// feed JSON tool results back in via `resolve_promise`/
+    /// `reject_promise` (Phase 8 step machine). Start with `depth = 0`.
+    pub fn json_to_stack_value(
         &mut self,
         json: &serde_json::Value,
         depth: usize,

@@ -182,6 +182,42 @@ IO-free core — testable with a scripted LLM:
   subagent frame loops, scheduling. The core never blocks and never does
   IO.
 
+Acceptance:
+
+- [x] Scripted round-trip, asserted on the event log: `UserTurn` →
+      `LlmRequest`; a `run_program` response compiles and runs; an
+      await fan-out emits one `ToolCalls` batch; `ToolResults` resolve
+      promises and log `Invoke` events in resolution order; `Done`
+      logs `ProgramResult` and renders the completion report as the
+      tool result; a final no-tool-call response yields `FrameDone` +
+      a logged `FrameResult`.
+- [x] A compile error returns immediately as the tool result (repair
+      loop — no VM constructed, no execution events logged).
+- [x] `raise` with payload and a trapped TypeError each produce a
+      condition-report tool result offering restarts; both paths
+      work: `resume(value)` continues the same VM; `run_program`
+      rewrite reuses a prior artifact via `tools.tool_result(id)`
+      answered from the log (no new `ToolCalls` for it).
+- [x] `tools.agent` emits `SpawnFrames`; `SubagentResult` resolves
+      the call and logs its `Invoke` artifact.
+- [x] VM compute is host-fueled: a hot loop yields control every
+      tick (machine reports still-working; nothing blocks).
+- [x] Mid-program `UserTurn` injection is deferred to M2 (documented
+      panic until then).
+- [x] Gate: `cargo fmt && cargo clippy && cargo test` green.
+
+*(Built: `agent/src/machine.rs`. `Tick { fuel }` input + `Working`
+output carry the 9_TUI fuel-slice scheduling; host calls are keyed by
+machine-assigned `invoke_id`s with a per-run generation counter, so
+results of an abandoned (rewritten) run are still logged as artifacts
+but never delivered to the dead VM. `tools.tool_result(id)` is served
+synchronously from the frame's spine segment and not re-logged —
+positional replay re-answers it from the same log prefix. Interp
+change: `VM::json_to_stack_value` made `pub` so hosts can feed JSON
+results into `resolve_promise`/`reject_promise`. The condition/
+completion reports are deliberately minimal — Step 4 owns their real
+shape.)*
+
 ## Step 4: The condition report (the thesis, make it good)
 
 The `run_program` tool result for a raise/trapped error is the product

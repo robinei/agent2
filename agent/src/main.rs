@@ -1,7 +1,9 @@
 mod debug;
+mod machine;
 mod tree;
 mod types;
 
+pub use machine::*;
 pub use types::*;
 
 fn main() {
