@@ -125,18 +125,19 @@ so `Pending` and `Raise` paths are exercisable without a harness.
 Keybinds: run/pause, `s` step instruction, `n` step line, pane
 toggles, quit; a help footer. Redraw throttled (~30ms). Acceptance:
 
-- [ ] `cargo run -p agent -- debug samples/<demo>.js` opens the TUI;
-      the demo program (committed under `agent/samples/`) exercises a
-      call, a tool await, and a `raise`.
-- [ ] Step key advances exactly one instruction (visible in the
-      disasm pane once Step 3 lands; until then assert via a status
-      line showing `ip`).
-- [ ] Run mode stays responsive during a hot loop (slicing works):
-      pause takes effect within one slice.
-- [ ] Gate: `cargo fmt && cargo clippy && cargo test` green (TUI
-      logic that isn't terminal-bound — slicing driver, keybind
-      dispatch — unit-tested; rendering verified by the manual
-      checklist above).
+- [x] `cargo run -p agent -- debug agent/samples/demo.js` opens the
+      TUI; the demo exercises calls, echo/sleep/fail awaits, console
+      output, and a `raise` (headless-asserted end-to-end in
+      `runner::tests::demo_sample_runs_to_condition_then_done`).
+- [x] Step key advances exactly one instruction (unit test asserts
+      `ip + 1`; the status pane shows `ip` + current disasm line).
+- [x] Run mode stays responsive during a hot loop: ticks are
+      20k-instruction slices with input polled between, so pause takes
+      effect within one slice.
+- [x] Gate: `cargo fmt && cargo clippy && cargo test` green (slicing
+      driver, stub tools, condition resume, and keybind dispatch
+      unit-tested; the terminal rendering itself needs a manual
+      eyeball).
 
 ## Step 3 — debug panes
 

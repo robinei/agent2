@@ -865,7 +865,10 @@ impl VM {
 
     // ── JSON conversion helpers ──────────────────────────────────────
 
-    pub(crate) fn stack_value_to_json(
+    /// Convert a stack `Value` (heap refs resolved through this VM) to
+    /// JSON. Public: hosts render program results and condition payloads
+    /// with it (the debugger today, `ProgramResult` events in Phase 8).
+    pub fn stack_value_to_json(
         &self,
         val: &Value,
         depth: usize,
