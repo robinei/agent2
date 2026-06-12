@@ -255,6 +255,9 @@ builtins! {
     ObjAssign,      BuiltinKind::Namespace("Object"), "assign",      1, VARARG, obj_assign;
     ObjHasOwn,      BuiltinKind::Namespace("Object"), "hasOwn",      2, 2,      obj_has_own;
 
+    // ── object methods ──
+    ObjHasOwnProperty, BuiltinKind::Method, "hasOwnProperty", 2, 2, obj_has_own_property;
+
     // ── string methods ──
     StrSplit,       BuiltinKind::Method, "split",       2, 3, str_split;
     StrIncludes,    BuiltinKind::Method, "includes",    2, 3, includes_poly;
