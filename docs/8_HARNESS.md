@@ -476,7 +476,7 @@ M1/M2 transcripts, not speculation.
         `--real`; `--turn <text>` queues a first user turn (headless
         driving). The scripted client remains the default everywhere
         tests run.
-  - [ ] Manual M1 verification: one live
+  - [x] Manual M1 verification: one live
         `agent session --headless --real --turn …` run against
         api.deepseek.com; transcript eyeballed (program arrives via
         `run_program`, completion report consumed, final text turn).
@@ -487,11 +487,15 @@ M1/M2 transcripts, not speculation.
   with fixture tests), `host/tools.rs` (`read_file`, `http_fetch`,
   contents clipped via `report::clip` so truncation is visible to the
   program rather than a size-guard rejection), `ToolSpec` +
-  `run_program_spec()`/`resume_spec()` in `machine.rs`. The manual live
-  check is the only unchecked box: `DEEPSEEK_API_KEY` was not available
-  in the build environment — run
-  `cargo run -p agent -- session --headless --real --turn "<task>"`
-  with the key set and eyeball the transcript.)*
+  `run_program_spec()`/`resume_spec()` in `machine.rs`. Live-verified
+  2026-06-12 against api.deepseek.com ("fetch example.com, report its
+  title"): full arc User → run_program → Invoke → ProgramResult →
+  completion report → final text → FrameResult. Bonus datum: the model
+  opened with a regex literal despite the dialect card's divergence
+  line; the compile-error repair loop caught it (line + caret) and the
+  rewrite used `indexOf`/`slice` — the cheap repair loop works on a
+  real model, and card wording alone doesn't prevent the attempt.
+  Worth remembering when iterating the card from M2 transcripts.)*
 - **M2** (needs Phase 3): conditions round-trip — `raise` with payload and
   a trapped TypeError both produce a report, and both restart paths
   (resume / rewrite reusing artifacts by id) work against a real model.
