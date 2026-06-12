@@ -46,22 +46,30 @@ pub fn disasm_window(vm: &VM, height: usize) -> Vec<AsmRow> {
     rows
 }
 
+/// What a stack-pane row is, driving the region background: each frame
+/// renders as a header + locals band, then a (lighter) temporaries band.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum StackRowKind {
+    FrameHeader,
+    Local,
+    Temp,
+}
+
 /// One row of the stack pane.
 #[derive(Debug, PartialEq)]
 pub struct StackRow {
     pub text: String,
-    /// A frame header (`name  fp=N`), not a slot.
-    pub header: bool,
+    pub kind: StackRowKind,
 }
 
 /// Stack rows, innermost frame first: per frame a header, then named
-/// locals with value previews, then the temp range.
+/// locals with value previews, then one row per expression temporary.
 pub fn stack_rows(vm: &VM) -> Vec<StackRow> {
     let mut rows = Vec::new();
     for f in vm.frames().iter().rev() {
         rows.push(StackRow {
             text: format!("{}  fp={}", f.name(), f.fp),
-            header: true,
+            kind: StackRowKind::FrameHeader,
         });
         for (i, v) in f.locals.iter().enumerate() {
             let name = f
@@ -70,14 +78,13 @@ pub fn stack_rows(vm: &VM) -> Vec<StackRow> {
                 .unwrap_or_else(|| format!("#{i}"));
             rows.push(StackRow {
                 text: format!("  {name} = {}", preview(vm, v, 36)),
-                header: false,
+                kind: StackRowKind::Local,
             });
         }
-        if !f.temps.is_empty() {
-            let temps: Vec<String> = f.temps.iter().map(|v| preview(vm, v, 18)).collect();
+        for v in f.temps {
             rows.push(StackRow {
-                text: format!("  ~ [{}]", temps.join(", ")),
-                header: false,
+                text: format!("  {}", preview(vm, v, 36)),
+                kind: StackRowKind::Temp,
             });
         }
     }
@@ -191,8 +198,9 @@ mod tests {
             {
                 assert!(rows.iter().any(|x| x.text.contains("n = 41")), "{rows:?}");
                 assert!(
-                    rows.iter()
-                        .any(|x| x.header && x.text.starts_with("<root>")),
+                    rows.iter().any(
+                        |x| x.kind == StackRowKind::FrameHeader && x.text.starts_with("<root>")
+                    ),
                     "{rows:?}"
                 );
                 return;

@@ -210,23 +210,30 @@ fn render_disasm(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_stack(frame: &mut Frame, app: &App, area: Rect) {
+    // Region backgrounds: the frame band (header + locals) on one shade,
+    // the temporaries band on a lighter one. Rows are padded to the pane
+    // width so the bands render solid.
+    let frame_bg = Color::Indexed(235);
+    let temp_bg = Color::Indexed(238);
+    let width = area.width.saturating_sub(2) as usize;
     let lines: Vec<Line> = panes::stack_rows(&app.runner.vm)
         .into_iter()
         .map(|r| {
-            let style = if r.header {
-                Style::default()
+            let style = match r.kind {
+                panes::StackRowKind::FrameHeader => Style::default()
                     .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
+                    .bg(frame_bg)
+                    .add_modifier(Modifier::BOLD),
+                panes::StackRowKind::Local => Style::default().bg(frame_bg),
+                panes::StackRowKind::Temp => Style::default().bg(temp_bg),
             };
-            Line::from(r.text).style(style)
+            Line::from(format!("{:<width$}", r.text)).style(style)
         })
         .collect();
     let para = Paragraph::new(lines).block(
         Block::default()
             .borders(Borders::ALL)
-            .title(" stack (innermost first) [3] "),
+            .title(" stack (innermost first · dark frame · light temps) [3] "),
     );
     frame.render_widget(para, area);
 }
