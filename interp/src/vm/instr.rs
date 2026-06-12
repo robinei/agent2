@@ -370,6 +370,7 @@ pub enum Instr {
     BitXor,   // int, int -> int
     BitLhs,   // int, int -> int
     BitRhs,   // int, int -> int
+    BitURhs,  // int, int -> int (unsigned/zero-fill)
     Pow,      // num, num -> num
 
     // Pops a pattern string and a flags string, compiles a RegExp, pushes the

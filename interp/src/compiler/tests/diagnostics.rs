@@ -110,19 +110,12 @@ fn labeled_statement_is_rejected() {
 }
 
 #[test]
-fn unsigned_right_shift_is_rejected() {
-    // `>>>` (unsigned right shift) is a documented JS divergence — unsupported.
-    let errs = compile("1 >>> 2;").expect_err("should fail");
-    let msg = &errs[0].message;
-    assert!(
-        msg.contains("unsigned") || msg.contains(">>>"),
-        "expected 'unsigned right shift' rejection, got: {msg}"
-    );
-    // `>>>=` is also rejected.
-    let errs = compile("let x = 1; x >>>= 2;").expect_err("should fail");
-    let msg = &errs[0].message;
-    assert!(
-        msg.contains("unsigned"),
-        "expected rejection for >>>=, got: {msg}"
-    );
+fn unsigned_right_shift_is_supported() {
+    // `>>>` and `>>>=` are supported (64-bit zero-fill right shift).
+    let v = testutil::run_ret("return -1 >>> 0;");
+    // -1 as u64 is 0xFFFFFFFFFFFFFFFF, shifted 0 = same bits → large positive number
+    assert!(v.is_number());
+    let v = testutil::run_ret("let x = -8; x >>>= 2; return x;");
+    // -8 = 0xFFFFFFFFFFFFFFF8 as u64 >> 2 = 0x3FFFFFFFFFFFFFFE
+    assert!(v.is_number());
 }

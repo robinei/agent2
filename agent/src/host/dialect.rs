@@ -75,7 +75,7 @@ UTF-16 units.
 coerce to primitives (`[5] == 5` is false, `[] + 1` is an error).
 - Calls are strict-arity only for builtins (`Math.max`, `s.split`, etc.); \
 user functions may omit trailing arguments. Writing past an array's end \
-errors (use `push`). Bitwise ops are 64-bit; `>>>` is absent.";
+errors (use `push`). Bitwise ops are 64-bit.";
 
 /// Render the full card: static head, the registry's tools (sorted,
 /// one line each), static tail.

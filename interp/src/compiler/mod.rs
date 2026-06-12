@@ -1888,10 +1888,7 @@ impl<'src> Compiler<'src> {
             Op::BitwiseXOR => Instr::BitXor,
             Op::ShiftLeft => Instr::BitLhs,
             Op::ShiftRight => Instr::BitRhs,
-            Op::ShiftRightZeroFill => {
-                self.error(span, "unsigned right shift (`>>>`) is not supported");
-                return;
-            }
+            Op::ShiftRightZeroFill => Instr::BitURhs,
             Op::Instanceof => {
                 self.error(span, "`instanceof` is not supported");
                 return;
@@ -2430,10 +2427,7 @@ impl<'src> Compiler<'src> {
             Op::BitwiseOR => Instr::BitOr,
             Op::BitwiseXOR => Instr::BitXor,
             Op::BitwiseAnd => Instr::BitAnd,
-            Op::ShiftRightZeroFill => {
-                self.error(span, "unsigned right shift (`>>>=`) is not supported");
-                return None;
-            }
+            Op::ShiftRightZeroFill => Instr::BitURhs,
             Op::Assign | Op::LogicalAnd | Op::LogicalOr | Op::LogicalNullish => {
                 unreachable!("handled by dedicated paths")
             }

@@ -865,6 +865,15 @@ impl VM {
                     self.stack.push(Value::Float((a >> b) as f64));
                     self.ip += 1;
                 }
+                Instr::BitURhs => {
+                    let b = self.pop_int()?;
+                    let a = self.pop_int()?;
+                    if !(0..64).contains(&b) {
+                        return Err(self.fail(ErrorKind::ValueError, "value error"));
+                    }
+                    self.stack.push(Value::Float(((a as u64) >> (b as u32)) as f64));
+                    self.ip += 1;
+                }
 
                 // ── object operations ───────────────────────────
                 Instr::RegExpNew => {

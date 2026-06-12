@@ -146,9 +146,9 @@ The remaining intentional divergences from JS — deferred or accepted, NOT bugs
     JS; "😀" is 4 here, 2 in JS). ASCII text is identical. Slicing at a
     mid-codepoint byte offset errors rather than coercing to a codepoint
     boundary.
-  • Bitwise ops (`& | ^ << >> ~`) operate on full i64, not JS's 32-bit ToInt32
-    semantics, and there is no unsigned right shift (`>>>`). Shift counts must be
-    0..63 (JS masks to 0..31).
+  • Bitwise ops (`& | ^ << >> >>> ~`) operate on full i64, not JS's 32-bit
+    ToInt32 semantics. Shift counts must be 0..63 (JS masks to 0..31).
+    `>>>` is an unsigned (zero-fill) right shift on 64-bit values.
   • `s.split()`, `s.indexOf()`, etc. accept fewer arguments at runtime than the
     compiler's static arity check allows (JS-coerced defaults: absent needle →
     "undefined", absent start → 0). The compiler remains strict for the LLM's
