@@ -7,6 +7,9 @@ AGENT_CMD=(claude --allow-dangerously-skip-permissions --dangerously-skip-permis
 # Additional dirs outside the project the agent may write to.
 WRITABLE_DIRS=(
     "$HOME/.claude"
+    "$HOME/.local/share/claude"
+    "$HOME/.local/bin"
+    "$HOME/.cache/claude"
     "$HOME/.agents"
     "$HOME/.cargo"
 )
@@ -64,4 +67,4 @@ exec bwrap \
     --share-net \
     --new-session \
     --die-with-parent \
-    -- "${AGENT_CMD[@]}"
+    -- "${AGENT_CMD[@]}" "$@"
