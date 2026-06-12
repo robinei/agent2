@@ -273,6 +273,54 @@ decision 6, Step 4) is the harness's primary frontend, not an add-on:
 chat left, source + console panes auto-popping while a program runs,
 a key for full debugger mode.
 
+Acceptance (M0 scope — scripted LLM only, no network; the real client
+is M1):
+
+- [x] One main-loop thread owns the `Tree` + `AgentState`s and `recv()`s
+      a single `std::sync::mpsc` inbox of one unified message enum;
+      workers (LLM completion, spawn-per-call tool fan-out) only ever
+      hold a cloned `Sender`. VM compute runs on the loop thread in fuel
+      slices with a continue message re-enqueued between slices. Test: a
+      `while (true) {}` program keeps the loop live — a `Shutdown`
+      command queued behind the continue messages is still processed
+      (`hot_loop_keeps_the_inbox_responsive`).
+- [x] Tool registry: name, description, JSON-schema'd input/output, an
+      `effectful: bool` flag, handler. Fan-out executes concurrently on
+      worker threads; the single inbox arrival order is the logged
+      resolution order. Test: a slow tool called before a fast one logs
+      its `Invoke` second (`fanout_logs_in_completion_order`).
+- [x] `effectful` drives the artifact-menu warning ("already happened;
+      calling again repeats the effect") in reports.
+- [x] Result-size guard: an oversized tool result is replaced by an
+      error before anything enters the log; test asserts on the logged
+      `Invoke` artifact.
+- [x] The `agent` tool maps to frame spawn: `SpawnFrames` creates a
+      child `AgentState` on a branch; its `FrameDone` routes back to the
+      caller as `SubagentResult`; test asserts both spines' event logs
+      (`agent_tool_spawns_child_frame_and_joins`).
+- [x] The LLM sits behind a trait (scripted implementation first); the
+      session loop is client-agnostic.
+- [x] UIs reach the loop only via serializable `SessionCommand` /
+      `SessionEvent` enums (chunks included); the M0 CLI consumes that
+      channel pair.
+- [x] **M0**: `cargo run -p agent -- session --headless` runs the
+      scripted demo end-to-end; a test asserts the event log reads
+      `FrameStart → User → Assistant(run_program) → Invoke × 2 →
+      ProgramResult → Tool(report) → Assistant(text) → FrameResult`
+      (`m0_scripted_demo_end_to_end`).
+- [x] Gate: `cargo fmt && cargo clippy && cargo test` green.
+
+*(Built: `agent/src/host/` — `Session` (loop + `LoopMsg` inbox),
+`registry.rs`, `llm.rs` (trait + `ScriptedLlm`), `protocol.rs` (the
+serializable boundary), `demo.rs` (the M0 script, shared by CLI and
+test). A user turn arriving while the frame is busy is rejected with a
+`SessionEvent::Error` — the host-injected condition is M2. A re-opened
+log resumes its lowest incomplete leaf; richer resume/fork UX is M4.
+Late tool results for a frame that already logged `FrameResult` are
+dropped (the spine is sealed); a *suspended* frame still logs late
+arrivals as artifacts. `Session::pump_one` is the loop step the
+attached TUI (9_TUI Step 4) drives directly.)*
+
 ## Step 6: System prompt / dialect card
 
 A generated-where-possible description of: the dialect (divergence list

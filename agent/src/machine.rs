@@ -7,7 +7,7 @@
 //! one `step(fuel)` slice per `Tick` and reports `Working` when it
 //! wants another, so a hot program can't starve the host loop.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 
 use interp::{
@@ -135,6 +135,9 @@ pub struct AgentState {
     invoke_counter: u64,
     generation: u64,
     pending: HashMap<u64, PendingCall>,
+    /// Tool names whose artifacts get the "already happened; calling
+    /// again repeats the effect" warning in reports (registry-fed).
+    effectful_tools: HashSet<String>,
 }
 
 enum SuspendCause {
@@ -176,6 +179,38 @@ impl AgentState {
             invoke_counter: 0,
             generation: 0,
             pending: HashMap::new(),
+            effectful_tools: HashSet::new(),
+        }
+    }
+
+    /// Names whose artifact-menu lines carry the effectful warning
+    /// (the host feeds these from the tool registry).
+    pub fn set_effectful_tools(&mut self, names: HashSet<String>) {
+        self.effectful_tools = names;
+    }
+
+    /// Whether the frame can accept a `UserTurn` right now.
+    pub fn is_idle(&self) -> bool {
+        matches!(self.phase, Phase::Idle)
+    }
+
+    /// One-word phase description for frame lists / status lines.
+    pub fn status(&self) -> &'static str {
+        match self.phase {
+            Phase::Idle => "idle",
+            Phase::AwaitingLlm => "awaiting llm",
+            Phase::Running(_) => "running",
+            Phase::Suspended(..) => "suspended",
+            Phase::Done => "done",
+        }
+    }
+
+    /// The live VM, while a program is running or suspended — the
+    /// privileged borrow the debugger TUI renders from (9_TUI dec. 4).
+    pub fn vm(&self) -> Option<&VM> {
+        match &self.phase {
+            Phase::Running(run) | Phase::Suspended(run, _) => Some(&run.vm),
+            _ => None,
         }
     }
 
@@ -351,6 +386,11 @@ impl AgentState {
         tree: &mut Tree,
         batch: Vec<ToolResult>,
     ) -> io::Result<Vec<StepOutput>> {
+        if matches!(self.phase, Phase::Done) {
+            // The spine is complete (nothing may follow FrameResult);
+            // results of stragglers the frame outlived are dropped.
+            return Ok(Vec::new());
+        }
         let mut delivered = false;
         for tr in batch {
             let Some(p) = self.pending.remove(&tr.invoke_id) else {
@@ -790,7 +830,7 @@ impl AgentState {
     fn frame_artifacts(&self, tree: &Tree) -> Vec<String> {
         self.frame_segment(tree)
             .into_iter()
-            .filter_map(artifact_line)
+            .filter_map(|e| artifact_line(e, &self.effectful_tools))
             .collect()
     }
 
@@ -798,7 +838,7 @@ impl AgentState {
         self.frame_segment(tree)
             .into_iter()
             .filter(|e| e.id.as_u64() > since)
-            .filter_map(artifact_line)
+            .filter_map(|e| artifact_line(e, &self.effectful_tools))
             .collect()
     }
 }
@@ -845,14 +885,19 @@ fn preview(v: &serde_json::Value) -> String {
     format!("{}… ({} bytes)", &s[..end], s.len())
 }
 
-fn artifact_line(event: &Event) -> Option<String> {
+fn artifact_line(event: &Event, effectful: &HashSet<String>) -> Option<String> {
     match &event.payload {
         EventPayload::Invoke { name, args, result } => Some(format!(
-            "[#{}] {}({}) → {}",
+            "[#{}] {}({}) → {}{}",
             event.id.as_u64(),
             name,
             preview(args),
-            preview(result)
+            preview(result),
+            if effectful.contains(name.as_str()) {
+                " ⚠ effectful: already happened; calling again repeats the effect"
+            } else {
+                ""
+            }
         )),
         EventPayload::ProgramResult { value } => Some(format!(
             "[#{}] program result → {}",
