@@ -24,6 +24,57 @@ use crate::types::*;
 pub const TOOL_RUN_PROGRAM: &str = "run_program";
 pub const TOOL_RESUME: &str = "resume";
 
+/// A full tool definition offered to the LLM: what every client
+/// serializes into its wire format (name + JSON-schema'd parameters).
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct ToolSpec {
+    pub name: String,
+    pub description: String,
+    /// JSON schema of the tool-call arguments object.
+    pub parameters: serde_json::Value,
+}
+
+/// The `run_program` definition — the single place its schema lives.
+pub fn run_program_spec() -> ToolSpec {
+    ToolSpec {
+        name: TOOL_RUN_PROGRAM.into(),
+        description: "Run a complete JavaScript program (harness dialect, per the system \
+                      message). The tool result is a report: the returned value, or a \
+                      condition with restart options."
+            .into(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "source": {
+                    "type": "string",
+                    "description": "the complete program source"
+                }
+            },
+            "required": ["source"]
+        }),
+    }
+}
+
+/// The `resume` definition — offered only while suspended on a
+/// resumable condition.
+pub fn resume_spec() -> ToolSpec {
+    ToolSpec {
+        name: TOOL_RESUME.into(),
+        description: "Resume the suspended program: execution continues with `value` as \
+                      the result of the failed operation (or of the raise expression)."
+            .into(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "value": {
+                    "description": "the JSON value to resume with"
+                }
+            },
+            "required": ["value"]
+        }),
+    }
+}
+
 /// Iteration cap for one `Tick`: each extra round requires a synchronous
 /// artifact fetch (`tools.tool_result`) to have unblocked the program,
 /// but a pathological program could chain those forever.
@@ -70,7 +121,7 @@ pub enum StepOutput {
 #[derive(Debug)]
 pub struct LlmRequest {
     pub messages: Vec<Message>,
-    pub tools: Vec<String>,
+    pub tools: Vec<ToolSpec>,
 }
 
 #[derive(Debug)]
@@ -836,10 +887,10 @@ impl AgentState {
             Phase::Suspended(_, Suspension::Trapped(e))
                 if matches!(e.resume, ResumeMode::NotResumable) =>
             {
-                vec![TOOL_RUN_PROGRAM.to_owned()]
+                vec![run_program_spec()]
             }
-            Phase::Suspended(..) => vec![TOOL_RESUME.to_owned(), TOOL_RUN_PROGRAM.to_owned()],
-            _ => vec![TOOL_RUN_PROGRAM.to_owned()],
+            Phase::Suspended(..) => vec![resume_spec(), run_program_spec()],
+            _ => vec![run_program_spec()],
         };
         StepOutput::LlmRequest(LlmRequest { messages, tools })
     }
@@ -1054,6 +1105,10 @@ mod tests {
             .expect("an LlmRequest output")
     }
 
+    fn tool_names(req: &LlmRequest) -> Vec<&str> {
+        req.tools.iter().map(|t| t.name.as_str()).collect()
+    }
+
     fn expect_tool_calls(outputs: &[StepOutput]) -> &Vec<OutCall> {
         outputs
             .iter()
@@ -1077,7 +1132,10 @@ mod tests {
             matches!(&req.messages[0], Message::System { text } if text.contains("test agent"))
         );
         assert!(matches!(&req.messages[1], Message::User { text } if text == "compute 6*7"));
-        assert_eq!(req.tools, vec![TOOL_RUN_PROGRAM.to_owned()]);
+        assert_eq!(tool_names(req), [TOOL_RUN_PROGRAM]);
+        // The full definition rides along: schema'd parameters, not a name.
+        assert!(req.tools[0].parameters["properties"]["source"].is_object());
+        assert!(!req.tools[0].description.is_empty());
     }
 
     #[test]
@@ -1233,7 +1291,7 @@ mod tests {
         // No Working: nothing ran.
         assert!(!out.iter().any(|o| matches!(o, StepOutput::Working)));
         let req = expect_request(&out);
-        assert_eq!(req.tools, vec![TOOL_RUN_PROGRAM.to_owned()]);
+        assert_eq!(tool_names(req), [TOOL_RUN_PROGRAM]);
         assert!(last_tool_text(&state).contains("compile error"));
         // No execution events were logged.
         assert_eq!(
@@ -1267,12 +1325,10 @@ mod tests {
             .unwrap();
         let settled = drain(&mut state, &mut tree, out);
 
-        // Suspended: report + restart tools.
+        // Suspended: report + restart tools (full definitions).
         let req = expect_request(&settled);
-        assert_eq!(
-            req.tools,
-            vec![TOOL_RESUME.to_owned(), TOOL_RUN_PROGRAM.to_owned()]
-        );
+        assert_eq!(tool_names(req), [TOOL_RESUME, TOOL_RUN_PROGRAM]);
+        assert!(req.tools[0].parameters["properties"]["value"].is_object());
         let report = last_tool_text(&state);
         assert!(report.contains("condition `need_help`"), "{report}");
         assert!(report.contains(r#"{"got":41}"#), "{report}");
@@ -1305,10 +1361,7 @@ mod tests {
             .unwrap();
         let settled = drain(&mut state, &mut tree, out);
         let req = expect_request(&settled);
-        assert_eq!(
-            req.tools,
-            vec![TOOL_RESUME.to_owned(), TOOL_RUN_PROGRAM.to_owned()]
-        );
+        assert_eq!(tool_names(req), [TOOL_RESUME, TOOL_RUN_PROGRAM]);
 
         let out = state
             .step(

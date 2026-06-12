@@ -444,6 +444,54 @@ M1/M2 transcripts, not speculation.
   frame. First honest contact with the dialect prompt. From here on,
   drive sessions through the attached TUI (9_TUI Step 4) — it is the
   observation instrument for iterating the condition report.
+
+  M1 acceptance:
+
+  - [x] `LlmRequest.tools` upgraded from `Vec<String>` to full tool
+        definitions (`ToolSpec { name, description, parameters }`);
+        the `run_program`/`resume` schemas are serialized in exactly
+        one place (`machine.rs`), and `render_request` tests assert
+        names + non-empty parameter schemas for both phases (idle vs
+        suspended).
+  - [x] `agent/src/host/deepseek.rs`: `DeepSeekClient` implements
+        `LlmClient` over blocking `ureq` SSE — POST
+        `{base}/chat/completions`, OpenAI chat-completions format
+        (System/User/Assistant+tool_calls/Tool message mapping),
+        `stream: true`; `reasoning_content` deltas →
+        `LlmChunk::Thinking`, `content` → `Text`; tool-call argument
+        fragments accumulated by index. The request builder and SSE
+        parser are pure functions unit-tested on string fixtures —
+        nothing in `cargo test` opens a socket.
+  - [x] Config: key from `DEEPSEEK_API_KEY`, model from
+        `DEEPSEEK_MODEL` (default `deepseek-v4-pro`), base URL from
+        `DEEPSEEK_BASE_URL` (default `https://api.deepseek.com`).
+  - [x] Real tools (`host/tools.rs`): `read_file(path)` and
+        `http_fetch(url)`, contents clipped before the result-size
+        guard; blocking handlers on worker threads. `read_file` is
+        unit-tested with temp files; `http_fetch`'s handler is not
+        exercised by tests (network).
+  - [x] `agent session`: `--real` forces DeepSeek (clear error
+        without a key); the attached TUI auto-picks DeepSeek iff
+        `DEEPSEEK_API_KEY` is set; `--headless` stays scripted unless
+        `--real`; `--turn <text>` queues a first user turn (headless
+        driving). The scripted client remains the default everywhere
+        tests run.
+  - [ ] Manual M1 verification: one live
+        `agent session --headless --real --turn …` run against
+        api.deepseek.com; transcript eyeballed (program arrives via
+        `run_program`, completion report consumed, final text turn).
+  - [x] Gate: `cargo fmt && cargo clippy && cargo test` green, fully
+        offline.
+
+  *(Built: `host/deepseek.rs` (client + pure `request_body`/`parse_sse`
+  with fixture tests), `host/tools.rs` (`read_file`, `http_fetch`,
+  contents clipped via `report::clip` so truncation is visible to the
+  program rather than a size-guard rejection), `ToolSpec` +
+  `run_program_spec()`/`resume_spec()` in `machine.rs`. The manual live
+  check is the only unchecked box: `DEEPSEEK_API_KEY` was not available
+  in the build environment — run
+  `cargo run -p agent -- session --headless --real --turn "<task>"`
+  with the key set and eyeball the transcript.)*
 - **M2** (needs Phase 3): conditions round-trip — `raise` with payload and
   a trapped TypeError both produce a report, and both restart paths
   (resume / rewrite reusing artifacts by id) work against a real model.

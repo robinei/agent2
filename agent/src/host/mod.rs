@@ -14,17 +14,21 @@
 //! TUI additionally borrows VMs/tree directly because it renders on
 //! this same thread (9_TUI decision 4).
 
+mod deepseek;
 mod demo;
 mod dialect;
 mod llm;
 mod protocol;
 mod registry;
+mod tools;
 
+pub use deepseek::*;
 pub use demo::*;
 pub use dialect::*;
 pub use llm::*;
 pub use protocol::*;
 pub use registry::*;
+pub use tools::*;
 
 use std::collections::{HashMap, HashSet};
 use std::io;
