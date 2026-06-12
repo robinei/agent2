@@ -1,6 +1,7 @@
 mod debug;
 mod host;
 mod machine;
+mod report;
 mod tree;
 mod types;
 

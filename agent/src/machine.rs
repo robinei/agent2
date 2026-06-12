@@ -14,6 +14,9 @@ use interp::{
     Diagnostic, InvokeCall, PromisePtr, RcStr, ResumeMode, StepResult, VM, VMError, Value, compile,
 };
 
+use crate::report::{
+    Artifact, CompletionReport, ConditionReport, PAYLOAD_MAX_BYTES, ResumeKind, clip, preview,
+};
 use crate::types::*;
 
 /// Tool names offered to the LLM. `run_program` is the primary tool;
@@ -25,9 +28,6 @@ pub const TOOL_RESUME: &str = "resume";
 /// artifact fetch (`tools.tool_result`) to have unblocked the program,
 /// but a pathological program could chain those forever.
 const MAX_PUMP_ROUNDS: usize = 100;
-
-/// Console lines quoted in completion/condition reports (tail).
-const CONSOLE_TAIL: usize = 20;
 
 pub enum StepInput {
     /// A user message. Valid while idle; arriving mid-program it becomes
@@ -697,11 +697,12 @@ impl AgentState {
             },
         )?;
 
-        let report = completion_report(
-            &value_json,
-            &run.vm,
-            self.new_artifacts(tree, run.started_at),
-        );
+        let report = CompletionReport {
+            value: value_json.clone(),
+            console: run.vm.console_lines.clone(),
+            new_artifacts: self.new_artifacts(tree, run.started_at),
+        }
+        .render();
         tree.append(
             &mut self.spine,
             EventPayload::Message(Message::Tool {
@@ -730,7 +731,7 @@ impl AgentState {
             unreachable!()
         };
 
-        let (what, resumable, suspension) = match cause {
+        let (what, resume, suspension) = match cause {
             SuspendCause::Raise { condition, payload } => {
                 let payload = payload
                     .map(|v| {
@@ -740,20 +741,34 @@ impl AgentState {
                             .unwrap_or_else(|_| format!("{v:?}"))
                     })
                     .unwrap_or_else(|| "(none)".into());
-                (
-                    format!("condition `{condition}` raised\npayload: {payload}"),
-                    true,
-                    Suspension::Raise,
-                )
+                let mut what = raise_location(&run.vm, &condition);
+                what.push_str("\npayload: ");
+                what.push_str(&clip(&payload, PAYLOAD_MAX_BYTES));
+                (what, ResumeKind::Raise, Suspension::Raise)
             }
             SuspendCause::Trapped(e) => {
                 let what = run.vm.render_error(&e);
-                let resumable = matches!(e.resume, ResumeMode::PushValueThenContinue);
-                (what, resumable, Suspension::Trapped(e))
+                let resume = match e.resume {
+                    ResumeMode::PushValueThenContinue => ResumeKind::Operation,
+                    ResumeMode::NotResumable => ResumeKind::No,
+                };
+                (what, resume, Suspension::Trapped(e))
             }
         };
 
-        let report = condition_report(&what, resumable, &run.vm, self.frame_artifacts(tree));
+        let report = ConditionReport {
+            what,
+            stack: run
+                .vm
+                .frames()
+                .iter()
+                .map(|f| f.name().to_owned())
+                .collect(),
+            console: run.vm.console_lines.clone(),
+            artifacts: self.frame_artifacts(tree),
+            resume,
+        }
+        .render();
         let call_id = run.call_id.clone();
         self.phase = Phase::Suspended(run, suspension);
         tree.append(
@@ -846,19 +861,19 @@ impl AgentState {
         events
     }
 
-    /// `[#id] name(args) → preview` lines for the artifact menu.
-    fn frame_artifacts(&self, tree: &Tree) -> Vec<String> {
+    /// Artifact-menu entries for every artifact on this frame so far.
+    fn frame_artifacts(&self, tree: &Tree) -> Vec<Artifact> {
         self.frame_segment(tree)
             .into_iter()
-            .filter_map(|e| artifact_line(e, &self.effectful_tools))
+            .filter_map(|e| artifact_entry(e, &self.effectful_tools))
             .collect()
     }
 
-    fn new_artifacts(&self, tree: &Tree, since: u64) -> Vec<String> {
+    fn new_artifacts(&self, tree: &Tree, since: u64) -> Vec<Artifact> {
         self.frame_segment(tree)
             .into_iter()
             .filter(|e| e.id.as_u64() > since)
-            .filter_map(|e| artifact_line(e, &self.effectful_tools))
+            .filter_map(|e| artifact_entry(e, &self.effectful_tools))
             .collect()
     }
 }
@@ -884,80 +899,35 @@ fn render_diags(source: &str, diags: &[Diagnostic]) -> String {
     format!("compile error:\n{}", rendered.join("\n"))
 }
 
-fn console_tail(vm: &VM) -> String {
-    let lines = &vm.console_lines;
-    if lines.is_empty() {
-        return "(no console output)".into();
-    }
-    let start = lines.len().saturating_sub(CONSOLE_TAIL);
-    lines[start..].join("\n")
-}
-
-fn preview(v: &serde_json::Value) -> String {
-    let s = v.to_string();
-    if s.len() <= 80 {
-        return s;
-    }
-    let mut end = 77;
-    while !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}… ({} bytes)", &s[..end], s.len())
-}
-
-fn artifact_line(event: &Event, effectful: &HashSet<String>) -> Option<String> {
+/// One artifact-menu entry from a logged execution event.
+fn artifact_entry(event: &Event, effectful: &HashSet<String>) -> Option<Artifact> {
     match &event.payload {
-        EventPayload::Invoke { name, args, result } => Some(format!(
-            "[#{}] {}({}) → {}{}",
-            event.id.as_u64(),
-            name,
-            preview(args),
-            preview(result),
-            if effectful.contains(name.as_str()) {
-                " ⚠ effectful: already happened; calling again repeats the effect"
-            } else {
-                ""
-            }
-        )),
-        EventPayload::ProgramResult { value } => Some(format!(
-            "[#{}] program result → {}",
-            event.id.as_u64(),
-            preview(value)
-        )),
+        EventPayload::Invoke { name, args, result } => Some(Artifact {
+            id: event.id.as_u64(),
+            label: format!("{}({})", name, preview(args)),
+            result: result.clone(),
+            effectful: effectful.contains(name.as_str()),
+        }),
+        EventPayload::ProgramResult { value } => Some(Artifact {
+            id: event.id.as_u64(),
+            label: "program result".into(),
+            result: value.clone(),
+            effectful: false,
+        }),
         _ => None,
     }
 }
 
-/// The `run_program` tool result for a successful run. Minimal Step 3
-/// shape — Step 4 turns this into the real product surface.
-fn completion_report(value: &serde_json::Value, vm: &VM, new_artifacts: Vec<String>) -> String {
-    let mut report = format!(
-        "program completed\nreturned: {value}\n\nconsole:\n{}",
-        console_tail(vm)
-    );
-    if !new_artifacts.is_empty() {
-        report.push_str("\n\nnew artifacts (fetch with tools.tool_result(id)):\n");
-        report.push_str(&new_artifacts.join("\n"));
+/// "condition `name` raised" rendered at the raise site (source line +
+/// caret). `step()` advanced `ip` past the `Raise` instruction, so the
+/// raise site is the previous slot.
+fn raise_location(vm: &VM, condition: &str) -> String {
+    let message = format!("condition `{condition}` raised");
+    let ip = (vm.ip as usize).saturating_sub(1);
+    match vm.spans.get(ip) {
+        Some(&span) if !vm.source.is_empty() => Diagnostic { span, message }.render(&vm.source),
+        _ => message,
     }
-    report
-}
-
-/// The `run_program` tool result for a raise/trapped error. Minimal
-/// Step 3 shape — Step 4 makes it good.
-fn condition_report(what: &str, resumable: bool, vm: &VM, artifacts: Vec<String>) -> String {
-    let mut report = format!("{what}\n\nconsole:\n{}", console_tail(vm));
-    if !artifacts.is_empty() {
-        report.push_str("\n\nartifacts (fetch with tools.tool_result(id)):\n");
-        report.push_str(&artifacts.join("\n"));
-    }
-    report.push_str("\n\nrestarts:\n");
-    if resumable {
-        report.push_str("- resume(value): continue as if the failed operation returned `value`\n");
-    }
-    report.push_str(
-        "- run_program(source): replace the program (reuse prior work via the artifact ids above)",
-    );
-    report
 }
 
 #[cfg(test)]
@@ -1441,6 +1411,120 @@ mod tests {
                 "a hot loop keeps yielding, never blocks"
             );
         }
+    }
+
+    // ── golden renders (8_HARNESS Step 4) ───────────────────────────
+    //
+    // Exact full-string asserts: the reports are a prompt-engineering
+    // artifact, so format changes should be deliberate diffs here, not
+    // incidental. Driven through the real machine (real event ids,
+    // real console output).
+
+    #[test]
+    fn golden_condition_report_raise_with_payload() {
+        let (mut tree, mut state) = setup();
+        state.kickoff();
+        let src = "const x = await tools.fetch(\"a\");\nconsole.log(\"fetched: \" + x);\nraise(\"need_help\", { got: x });\nreturn x + 1;";
+        let out = state
+            .step(&mut tree, StepInput::LlmResponse(llm_program("c1", src)))
+            .unwrap();
+        let settled = drain(&mut state, &mut tree, out);
+        let id = expect_tool_calls(&settled)[0].invoke_id;
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::ToolResults(vec![ToolResult {
+                    invoke_id: id,
+                    result: Ok(json!(41)),
+                }]),
+            )
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+        assert_eq!(
+            last_tool_text(&state),
+            r#"## what happened
+3:1: condition `need_help` raised
+raise("need_help", { got: x });
+^
+payload: {"got":41}
+
+## where
+in <root>
+console (last 1 of 1 lines):
+fetched: 41
+
+## artifacts — fetch with tools.tool_result(id)
+[#3] fetch(["a"]) → 41
+
+## restarts
+- resume(value): continue past the raise; `value` becomes the result of the raise(...) expression
+- run_program(source): replace the program — new source runs in a fresh VM; results in the artifact menu stay fetchable via tools.tool_result(id), so reuse them instead of repeating calls (especially effectful ones)"#
+        );
+    }
+
+    #[test]
+    fn golden_condition_report_trapped_type_error() {
+        let (mut tree, mut state) = setup();
+        state.kickoff();
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(llm_program("c1", "const v = null;\nreturn v.x;")),
+            )
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+        assert_eq!(
+            last_tool_text(&state),
+            r#"## what happened
+2:10: cannot read property on null
+return v.x;
+         ^
+
+## where
+in <root>
+console: (no output)
+
+## artifacts — fetch with tools.tool_result(id)
+(none)
+
+## restarts
+- resume(value): continue as if the failed operation had produced `value`
+- run_program(source): replace the program — new source runs in a fresh VM; results in the artifact menu stay fetchable via tools.tool_result(id), so reuse them instead of repeating calls (especially effectful ones)"#
+        );
+    }
+
+    #[test]
+    fn golden_completion_report() {
+        let (mut tree, mut state) = setup();
+        state.kickoff();
+        let src = "const a = await tools.fetch(\"x\");\nconsole.log(\"got \" + a);\nreturn [a, 2];";
+        let out = state
+            .step(&mut tree, StepInput::LlmResponse(llm_program("c1", src)))
+            .unwrap();
+        let settled = drain(&mut state, &mut tree, out);
+        let id = expect_tool_calls(&settled)[0].invoke_id;
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::ToolResults(vec![ToolResult {
+                    invoke_id: id,
+                    result: Ok(json!("X")),
+                }]),
+            )
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+        assert_eq!(
+            last_tool_text(&state),
+            r#"## program completed
+returned: ["X",2]
+
+console (last 1 of 1 lines):
+got X
+
+## new artifacts — fetch with tools.tool_result(id)
+[#3] fetch(["x"]) → "X"
+[#4] program result → ["X",2]"#
+        );
     }
 
     #[test]

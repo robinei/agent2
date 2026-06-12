@@ -242,6 +242,46 @@ Iterate this format against a scripted LLM first, then real models; it is
 a prompt-engineering artifact as much as a data format, and deserves its
 own tests (golden renders).
 
+Acceptance (scripted LLM only — no network in this step):
+
+- [x] Reports live in `agent/src/report.rs` as pure renderers
+      (`ConditionReport`/`CompletionReport` structs → string, no
+      `Tree`/`VM` access inside the renderer); `machine.rs` only
+      assembles the structs from the suspended/finished run.
+- [x] Condition report sections, in order: **what happened** (raise:
+      diagnostic-rendered location with source line + caret, condition
+      name, payload preview; trapped error: `VM::render_error`'s
+      line/caret render), **where** (call-stack chain from
+      `VM::frames()` + console tail with `last X of Y` counts),
+      **artifact menu** (`[#id] name(args) → preview` per artifact,
+      effectful entries flagged "already happened; calling again
+      repeats the effect"), **restarts** (wording per suspension kind:
+      raise-resume vs operation-resume; `resume` absent and explicitly
+      noted when not resumable).
+- [x] Completion report gets the same machinery: returned-value
+      preview, console tail, new-artifact menu (artifacts logged since
+      the run started, the `ProgramResult` included).
+- [x] Hard size bounds on **every** section, as named consts in
+      `report.rs` (what/payload bytes, stack depth, console line count
+      + per-line clip, artifact entry count + per-entry preview bytes,
+      returned-value bytes); every truncation leaves an explicit
+      marker. Unit tests feed oversized inputs and assert bound +
+      marker (`report::tests`).
+- [x] Golden render tests, exact full-string asserts driven through
+      the scripted machine (real event ids, real console):
+      raise-with-payload, trapped TypeError, and a completion with new
+      artifacts (`machine::tests::golden_*`).
+- [x] Gate: `cargo fmt && cargo clippy && cargo test` green.
+
+*(Built: `agent/src/report.rs`. Both reports share the section
+renderers (console tail, artifact menu), so their bounds and wording
+can't drift apart. A raise renders through the same `Diagnostic`
+machinery as compile errors (`condition `name` raised` at the raise
+site with source line + caret) — one diagnostic shape everywhere the
+LLM reads. The Phase 3 items the doc names (operand values, async
+await-chain) slot into the **what happened** section when Phase 3
+lands; `VM::render_error` is already the seam.)*
+
 ## Step 5: Host layer
 
 Tool registry (name, JSON-schema'd input/output, handler, an
