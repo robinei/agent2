@@ -6,6 +6,7 @@
 pub mod analyzer;
 pub mod builtin;
 pub mod compiler;
+pub mod debuginfo;
 pub mod diag;
 pub mod optimizer;
 pub mod prelude;
@@ -16,11 +17,12 @@ pub mod vm;
 pub(crate) mod testutil;
 
 pub use compiler::{Program, compile};
+pub use debuginfo::{DebugTable, FnDebug};
 pub use diag::Diagnostic;
 pub use rc_str::RcStr;
 pub use vm::{
-    ErrorKind, Instr, InvokeCall, PromisePtr, PromiseState, ResumeMode, StepResult, VM, VMError,
-    Value,
+    ErrorKind, FrameView, Instr, InvokeCall, PromisePtr, PromiseState, ResumeMode, StepResult, VM,
+    VMError, Value,
 };
 
 // ── test-only allocation counter ─────────────────────────────────────────────

@@ -99,13 +99,21 @@ discards. Always-on (it's cheap and Phase 3 diagnostics want it too):
 
 Acceptance:
 
-- [ ] Golden test: compile a small program with named + anonymous
+- [x] Golden test: compile a small program with named + anonymous
       functions; assert function names and local names via the debug
-      table.
-- [ ] Mid-execution test: pause via a small fuel slice inside a call,
+      table (`compiler/tests/debuginfo.rs`).
+- [x] Mid-execution test: pause via a small fuel slice inside a call,
       assert `frames()` reports both frames with correct names and
       local values.
-- [ ] Gate: `cargo fmt && cargo clippy && cargo test` green.
+- [x] Gate: `cargo fmt && cargo clippy && cargo test` green.
+
+*(Built: `debuginfo::{DebugTable, FnDebug}`; attribution is span-based —
+instruction → innermost function whose source span contains `spans[ip]`
+— so it survives optimizer code motion with no parallel table. The
+analyzer records `own_slot_names` at slot allocation (remapped by
+const-fn slot compaction); `VM::frames()` returns `FrameView`s
+(name, named locals, temps); `VM::disasm` renders `── name ──` headers
+at function block starts.)*
 
 ## Step 2 — TUI shell + standalone mode
 

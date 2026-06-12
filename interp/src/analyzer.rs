@@ -92,6 +92,10 @@ pub(crate) struct FuncScope {
     /// Span of the defining function/arrow node (`u32::MAX` for the root), used
     /// to build `scope_by_span` so codegen can find this scope by AST node.
     node_span: u32,
+    /// End offset of the defining node's span (`u32::MAX` for the root).
+    /// With `node_span`, the source range backing span-based function
+    /// attribution in the debug table (see `crate::debuginfo`).
+    node_end: u32,
     /// Parameters in order: (name, has_default).
     pub(crate) params: Vec<ParamInfo>,
     /// For a named function expression, the function's own name (visible
@@ -140,6 +144,11 @@ pub(crate) struct FuncScope {
     /// into `ProgramAnalysis::binding_slot` (own-slot → absolute) after capture
     /// resolution fixes `upval_count`.
     binding_spans: Vec<(u32, u32, bool)>,
+    /// Own-local slot → declared name, recorded at slot allocation. Unlike
+    /// `names` this keeps shadowed re-declarations (each has its own slot).
+    /// Debug info only (see `debug_slot_names`); params are filled from
+    /// `params` there, so entries `< nparams` stay `None`.
+    own_slot_names: Vec<Option<String>>,
     /// Identifier references that resolved to an own local: (ref span, own-slot,
     /// is_const). Finalized into `ref_resolution`.
     local_refs: Vec<(u32, u32, bool)>,
@@ -233,6 +242,7 @@ impl FuncScope {
         parent: usize,
         label: u32,
         node_span: u32,
+        node_end: u32,
         params: Vec<ParamInfo>,
         self_name: Option<String>,
         is_declaration: bool,
@@ -242,6 +252,7 @@ impl FuncScope {
             parent,
             label,
             node_span,
+            node_end,
             params,
             self_name,
             binding_name: None,
@@ -254,6 +265,7 @@ impl FuncScope {
             children: Vec::new(),
             free_vars: IndexSet::new(),
             binding_spans: Vec::new(),
+            own_slot_names: Vec::new(),
             local_refs: Vec::new(),
             free_refs: Vec::new(),
             const_names: IndexMap::new(),
@@ -267,6 +279,51 @@ impl FuncScope {
             uses_arguments: false,
             slot_kinds: Vec::new(),
         }
+    }
+
+    /// Source range of the defining node, for the debug table.
+    pub(crate) fn node_range(&self) -> (u32, u32) {
+        (self.node_span, self.node_end)
+    }
+
+    /// Best-effort function name for the debug table: the declaration /
+    /// named-expression name, else the binding name (`const f = () => …`),
+    /// else `"<anonymous>"`.
+    pub(crate) fn debug_name(&self) -> String {
+        self.self_name
+            .as_ref()
+            .or(self.binding_name.as_ref())
+            .cloned()
+            .unwrap_or_else(|| "<anonymous>".to_string())
+    }
+
+    /// Frame-slot → name table for the debug table (9_TUI Step 1), under
+    /// the absolute `[params | upvals | own locals | self?]` layout.
+    /// `include_self` adds the self-reference slot's name; the caller
+    /// passes `false` for constant functions, whose self slot is never
+    /// allocated (they refer to themselves by their `Fn` constant).
+    pub(crate) fn debug_slot_names(&self, include_self: bool) -> Vec<Option<String>> {
+        let nparams = self.params.len() as u32;
+        let with_self = include_self && self.self_name.is_some();
+        let total = self.own_local_count + self.upval_count + with_self as u32;
+        let mut v: Vec<Option<String>> = vec![None; total as usize];
+        for (i, p) in self.params.iter().enumerate() {
+            if !p.name.is_empty() {
+                v[i] = Some(p.name.clone());
+            }
+        }
+        for (name, &(uidx, _)) in &self.upval_by_name {
+            v[(nparams + uidx) as usize] = Some(name.clone());
+        }
+        for (own, name) in self.own_slot_names.iter().enumerate() {
+            if let Some(n) = name {
+                v[frame_abs(own as u32, nparams, self.upval_count) as usize] = Some(n.clone());
+            }
+        }
+        if with_self {
+            v[(self.own_local_count + self.upval_count) as usize] = self.self_name.clone();
+        }
+        v
     }
 
     /// Caller-facing arity: declared params minus the trailing rest param (if
@@ -441,6 +498,20 @@ fn compact_const_fn_slots(scopes: &mut [FuncScope]) {
             .into_iter()
             .filter_map(|(span, slot, is_const)| remap(slot).map(|n| (span, n, is_const)))
             .collect();
+        let mut slot_names: Vec<Option<String>> = Vec::with_capacity(s.own_slot_names.len());
+        for (slot, name) in std::mem::take(&mut s.own_slot_names)
+            .into_iter()
+            .enumerate()
+        {
+            if let Some(n) = remap(slot as u32) {
+                let n = n as usize;
+                if slot_names.len() <= n {
+                    slot_names.resize(n + 1, None);
+                }
+                slot_names[n] = name;
+            }
+        }
+        s.own_slot_names = slot_names;
         s.reassigned = s.reassigned.iter().filter_map(|&sl| remap(sl)).collect();
         s.loop_declared = s.loop_declared.iter().filter_map(|&sl| remap(sl)).collect();
         s.own_local_count -= dead.len() as u32;
@@ -789,7 +860,15 @@ impl Analyzer {
     /// Build the root `FuncScope` and walk the top-level body.
     fn analyze_top_level(&mut self, program: &ast::Program, scopes: &mut Vec<FuncScope>) -> usize {
         let label = self.new_label();
-        let mut scope = FuncScope::new(usize::MAX, label, u32::MAX, Vec::new(), None, false);
+        let mut scope = FuncScope::new(
+            usize::MAX,
+            label,
+            u32::MAX,
+            u32::MAX,
+            Vec::new(),
+            None,
+            false,
+        );
         let mut block_scopes: BlockScopes = vec![IndexMap::new()];
         let mut next_slot = 0u32;
 
@@ -1389,6 +1468,12 @@ impl Analyzer {
             }
             slot
         };
+        // Record the slot's name for the debug table (keep the first name
+        // when `var` re-declarations reuse a slot).
+        if scope.own_slot_names.len() <= slot as usize {
+            scope.own_slot_names.resize(slot as usize + 1, None);
+        }
+        scope.own_slot_names[slot as usize].get_or_insert_with(|| name.to_string());
         scope.binding_spans.push((span, slot, is_const));
         slot
     }
@@ -1739,6 +1824,7 @@ impl Analyzer {
             usize::MAX,
             label,
             func.span.start,
+            func.span.end,
             params,
             self_name,
             is_declaration,
@@ -1759,7 +1845,15 @@ impl Analyzer {
     ) -> usize {
         let label = self.new_label();
         let params = self.collect_params(&arrow.params);
-        let mut scope = FuncScope::new(usize::MAX, label, arrow.span.start, params, None, false);
+        let mut scope = FuncScope::new(
+            usize::MAX,
+            label,
+            arrow.span.start,
+            arrow.span.end,
+            params,
+            None,
+            false,
+        );
         if arrow.params.rest.is_some() {
             scope.uses_arguments = true;
         }

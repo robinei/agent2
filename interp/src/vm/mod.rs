@@ -279,6 +279,41 @@ pub struct VM {
     /// is exceeded, the oldest line is dropped and replaced by a
     /// `[... N lines dropped]` marker.
     pub console_lines: Vec<String>,
+    /// Debug table (function names, source ranges, slot names — 9_TUI),
+    /// populated by `for_program` from `Program::debug`. Empty (no
+    /// entries) for `VM::new` programs; the introspection accessors
+    /// degrade gracefully.
+    pub debug: crate::debuginfo::DebugTable,
+}
+
+/// A read-only view of one live call frame, for the debugger
+/// (`VM::frames`). Innermost-last, matching the callstack.
+pub struct FrameView<'a> {
+    /// The owning function's debug-table index and entry, when the program
+    /// carries debug info.
+    pub fn_index: Option<usize>,
+    pub fn_debug: Option<&'a crate::debuginfo::FnDebug>,
+    /// Base stack index of the frame (arg 0 / local 0).
+    pub fp: usize,
+    /// The frame's locals: `[params | upvals | own locals | self? |
+    /// spill?]`. Boxed slots hold their `Upval` cell marker, not the
+    /// value; render via `VM::cells` if needed.
+    pub locals: &'a [Value],
+    /// Expression temporaries above the locals (for the top frame, up to
+    /// the stack top; below, up to the next frame's base).
+    pub temps: &'a [Value],
+}
+
+impl FrameView<'_> {
+    /// The owning function's name, or `"<unknown>"` without debug info.
+    pub fn name(&self) -> &str {
+        self.fn_debug.map_or("<unknown>", |f| f.name.as_str())
+    }
+
+    /// The declared name of local slot `i`, when known.
+    pub fn local_name(&self, i: usize) -> Option<&str> {
+        self.fn_debug?.slot_names.get(i)?.as_deref()
+    }
 }
 
 pub struct CallFrame {

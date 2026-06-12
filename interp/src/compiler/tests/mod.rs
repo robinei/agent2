@@ -4,6 +4,7 @@ use crate::vm::{StepResult, VM};
 pub mod async_await;
 pub mod codegen_shape;
 pub mod control_flow;
+pub mod debuginfo;
 pub mod diagnostics;
 pub mod effects;
 pub mod exceptions;

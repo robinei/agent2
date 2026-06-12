@@ -35,6 +35,7 @@ impl VM {
             spans: Vec::new(),
             source: Arc::from(""),
             console_lines: Vec::new(),
+            debug: crate::debuginfo::DebugTable::default(),
         }
     }
 
@@ -253,6 +254,7 @@ impl VM {
         let mut vm = VM::new(program.code);
         vm.spans = program.spans;
         vm.source = program.source;
+        vm.debug = program.debug;
         // Reserve objects[0] for `input` (filled in just below).
         vm.objects.push(IndexMap::new());
         // Seed input's nested values (arrays/objects land at objects[1..]; their
@@ -268,6 +270,96 @@ impl VM {
             }
         }
         Ok(vm)
+    }
+
+    // ── debugger introspection (9_TUI Step 1) ────────────────────────
+
+    /// The function owning the instruction at `ip` (debug-table index and
+    /// entry): the innermost function whose source span contains
+    /// `spans[ip]`. `None` without debug info (`VM::new` programs).
+    pub fn function_at(&self, ip: CodeAddr) -> Option<(usize, &crate::debuginfo::FnDebug)> {
+        let span = *self.spans.get(ip as usize)?;
+        let idx = self.debug.function_at_span(span)?;
+        Some((idx, &self.debug.functions[idx]))
+    }
+
+    /// Read-only views of the live call frames, outermost (root) first.
+    /// Parked async continuations are not on the callstack and do not
+    /// appear; this is the running strand's stack.
+    pub fn frames(&self) -> Vec<FrameView<'_>> {
+        let n = self.callstack.len();
+        // fp chain: the top frame's base is `self.fp`; each frame stores
+        // the previous frame's base.
+        let mut fps = vec![0usize; n];
+        let mut fp = self.fp;
+        for i in (0..n).rev() {
+            fps[i] = fp as usize;
+            fp = self.callstack[i].prev_fp;
+        }
+        (0..n)
+            .map(|i| {
+                let floor = (fps[i] + self.callstack[i].local_count as usize).min(self.stack.len());
+                let ceil = if i + 1 < n {
+                    fps[i + 1]
+                } else {
+                    self.stack.len()
+                }
+                .max(floor);
+                // A frame's code position: the resume address stored by the
+                // call above it; the top frame is at `self.ip`.
+                let code_pos = if i + 1 < n {
+                    self.callstack[i + 1].return_addr
+                } else {
+                    self.ip
+                };
+                let fn_at = self.function_at(code_pos);
+                FrameView {
+                    fn_index: fn_at.map(|(idx, _)| idx),
+                    fn_debug: fn_at.map(|(_, f)| f),
+                    fp: fps[i],
+                    locals: &self.stack[fps[i].min(floor)..floor],
+                    temps: &self.stack[floor..ceil],
+                }
+            })
+            .collect()
+    }
+
+    /// Render instructions `[start, end)` as `ip  instr  @line`, with a
+    /// `── name ──` header wherever the owning function changes — function
+    /// names at function block starts, for the disassembly pane.
+    pub fn disasm(&self, start: CodeAddr, end: CodeAddr) -> String {
+        let end = end.min(self.code.len() as CodeAddr);
+        let mut out = String::new();
+        let mut cur_fn = usize::MAX;
+        for ip in start..end {
+            if let Some((idx, f)) = self.function_at(ip) {
+                if idx != cur_fn {
+                    out.push_str("── ");
+                    out.push_str(&f.name);
+                    out.push_str(" ──\n");
+                    cur_fn = idx;
+                }
+            }
+            out.push_str(&self.disasm_line(ip));
+            out.push('\n');
+        }
+        out
+    }
+
+    /// One disassembly line: `ip  instr  @line` (the line annotation is
+    /// omitted without source/spans).
+    pub fn disasm_line(&self, ip: CodeAddr) -> String {
+        let instr = match self.code.get(ip as usize) {
+            Some(i) => format!("{i:?}"),
+            None => return format!("{ip:>5}  <out of range>"),
+        };
+        match self.spans.get(ip as usize) {
+            Some(&sp) if !self.source.is_empty() => {
+                let (line, _, _) = crate::diag::line_col(&self.source, sp);
+                format!("{ip:>5}  {instr:<32} @{line}")
+            }
+            _ => format!("{ip:>5}  {instr}"),
+        }
     }
 
     // ── heap access helpers ──────────────────────────────────────────

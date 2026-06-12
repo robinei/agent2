@@ -22,13 +22,15 @@ use crate::vm::RcStr;
 use crate::vm::{Instr, LocalIndex, SetMode, SlotKind, Value};
 
 /// A compiled program: the flat instruction stream, a parallel span table
-/// (`spans[ip]` = source byte offset of the instruction at `ip`), and the
-/// source it was compiled from (for rendering runtime diagnostics).
+/// (`spans[ip]` = source byte offset of the instruction at `ip`), the
+/// source it was compiled from (for rendering runtime diagnostics), and
+/// the debug table (function names, source ranges, slot names — 9_TUI).
 #[derive(Debug)]
 pub struct Program {
     pub code: Vec<Instr>,
     pub spans: Vec<u32>,
     pub source: Arc<str>,
+    pub debug: crate::debuginfo::DebugTable,
 }
 
 /// Compile JS source into a `Program`. Collects every diagnostic (oxc syntax
@@ -94,12 +96,49 @@ pub fn compile(source: &str) -> Result<Program, Vec<Diagnostic>> {
     // branch inversion — iterated to a fixpoint) and backpatch.
     let (code, spans) =
         crate::optimizer::finalize(compiler.code, compiler.spans, compiler.next_label);
+
+    // Debug table (9_TUI Step 1): one entry per analyzer scope, indexed by
+    // scope id. Built purely from the analysis tables — instruction →
+    // function attribution at runtime goes through spans, so nothing here
+    // depends on (or constrains) the optimizer's code motion.
+    let debug = {
+        let analysis = compiler.analysis.as_ref().expect("analysis present");
+        let functions = analysis
+            .scopes
+            .iter()
+            .enumerate()
+            .map(|(id, s)| {
+                let is_root = id == analysis.root;
+                let (span_start, span_end) = if is_root {
+                    (0, full_source.len() as u32)
+                } else {
+                    s.node_range()
+                };
+                crate::debuginfo::FnDebug {
+                    name: if is_root {
+                        "<root>".to_string()
+                    } else {
+                        s.debug_name()
+                    },
+                    span_start,
+                    span_end,
+                    slot_names: s.debug_slot_names(!analysis.const_fn_scopes.contains(&id)),
+                }
+            })
+            .collect();
+        crate::debuginfo::DebugTable {
+            functions,
+            root: analysis.root,
+        }
+    };
+
     Ok(Program {
         code,
         spans,
         // The full source (user code + any appended prelude) so runtime
         // diagnostics render against the same offsets the spans were taken from.
         source: Arc::from(full_source.as_str()),
+        debug,
     })
 }
 
