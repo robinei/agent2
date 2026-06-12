@@ -33,21 +33,25 @@ use crate::vm::{ErrorKind, VM, VMError, Value};
 mod array;
 mod console;
 mod json;
+mod map;
 mod math;
 mod number;
 mod object;
 mod poly;
 mod regexp;
+mod set;
 mod string;
 
 use array::*;
 use console::*;
 use json::*;
+use map::*;
 use math::*;
 use number::*;
 use object::*;
 use poly::*;
 use regexp::*;
+use set::*;
 use string::*;
 
 // ── declarative builtin registry ─────────────────────────────────────────────
@@ -280,6 +284,27 @@ builtins! {
     // ── string methods that accept RegExp ──
     StrMatch,  BuiltinKind::Method, "match",  2, 2, str_match;
     StrSearch, BuiltinKind::Method, "search", 2, 2, str_search;
+
+    // ── Map static ──
+    MapIsMap, BuiltinKind::Namespace("Map"), "isMap", 1, 1, map_is_map;
+
+    // ── Map methods ──
+    MapGet,    BuiltinKind::Method, "get",    2, 2, map_get;
+    MapSet,    BuiltinKind::Method, "set",    3, 3, map_set;
+
+    // ── Set static ──
+    SetIsSet, BuiltinKind::Namespace("Set"), "isSet", 1, 1, set_is_set;
+
+    // ── Set methods ──
+    SetAdd,    BuiltinKind::Method, "add",    2, 2, set_add;
+
+    // ── Map/Set shared methods (polymorphic dispatch) ──
+    MapSetHas,     BuiltinKind::Method, "has",     2, 2, map_set_has;
+    MapSetDelete,  BuiltinKind::Method, "delete",  2, 2, map_set_delete;
+    MapSetClear,   BuiltinKind::Method, "clear",   1, 1, map_set_clear;
+    MapSetKeys,    BuiltinKind::Method, "keys",    1, 1, map_set_keys;
+    MapSetValues,  BuiltinKind::Method, "values",  1, 1, map_set_values;
+    MapSetEntries, BuiltinKind::Method, "entries", 1, 1, map_set_entries;
 }
 
 // ── argument accessor ────────────────────────────────────────────────────────

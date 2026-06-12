@@ -1,8 +1,11 @@
+use std::hash::{Hash, Hasher};
+
 use crate::builtin::Builtin;
 pub use crate::rc_str::RcStr;
 
 use super::instr;
 use super::instr::CodeAddr;
+use super::instr::{MapPtr, SetPtr};
 pub(crate) use super::RcRegExp;
 
 /// Not `Copy`: the `String` variant owns an `RcStr` whose clone must bump a
@@ -75,6 +78,122 @@ pub enum Value {
     /// `===` compares by pointer identity (`/a/ === /a/` is false in JS).
     /// No JSON form. `typeof` returns `"object"`.
     RegExp(RcRegExp),
+    /// A Map: an insertion-ordered collection of key-value pairs with
+    /// SameValueZero key equality. Indexes the VM's `maps` heap.
+    Map(MapPtr),
+    /// A Set: an insertion-ordered collection of unique values with
+    /// SameValueZero equality. Indexes the VM's `sets` heap.
+    Set(SetPtr),
+}
+
+// ── MapKey: Value wrapper with SameValueZero Hash + Eq ──────
+
+/// JS SameValueZero equality: like `===` except NaN equals NaN.
+/// Used by Map key lookup and Set element check.
+pub(crate) fn same_value_zero(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Float(x), Value::Float(y)) => {
+            if x.is_nan() && y.is_nan() {
+                return true;
+            }
+            if *x == 0.0 && *y == 0.0 {
+                return x.signum() == y.signum() || true;
+                // SameValueZero: +0 and -0 are equal, so any zero equals any zero
+            }
+            x == y
+        }
+        _ => a.strict_equal(b),
+    }
+}
+
+/// Newtype around `Value` that implements `Hash` + `Eq` with SameValueZero
+/// semantics, for use as `IndexMap`/`IndexSet` keys in Map and Set.
+#[derive(Clone, Debug)]
+pub struct MapKey(pub Value);
+
+impl PartialEq for MapKey {
+    fn eq(&self, other: &Self) -> bool {
+        same_value_zero(&self.0, &other.0)
+    }
+}
+
+impl Eq for MapKey {}
+
+impl Hash for MapKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        use Value::*;
+        match &self.0 {
+            Null => 0u8.hash(state),
+            Undefined => 1u8.hash(state),
+            Bool(b) => {
+                2u8.hash(state);
+                b.hash(state);
+            }
+            PosInt(n) => {
+                3u8.hash(state);
+                n.hash(state);
+            }
+            NegInt(n) => {
+                4u8.hash(state);
+                n.hash(state);
+            }
+            Float(n) => {
+                5u8.hash(state);
+                let bits = if n.is_nan() {
+                    0x7FF8000000000000u64 // canonical quiet NaN
+                } else if *n == 0.0 {
+                    0u64 // +0 and -0 hash identically (SameValueZero)
+                } else {
+                    n.to_bits()
+                };
+                bits.hash(state);
+            }
+            String(s) => {
+                6u8.hash(state);
+                s.hash(state);
+            }
+            Array(p) => {
+                7u8.hash(state);
+                p.hash(state);
+            }
+            Object(p) => {
+                8u8.hash(state);
+                p.hash(state);
+            }
+            Upval(c) => {
+                9u8.hash(state);
+                c.hash(state);
+            }
+            Closure(p) => {
+                10u8.hash(state);
+                p.hash(state);
+            }
+            Fn(a) => {
+                11u8.hash(state);
+                a.hash(state);
+            }
+            Builtin(b) => {
+                12u8.hash(state);
+                (*b as u8).hash(state);
+            }
+            Promise(p) => {
+                13u8.hash(state);
+                p.hash(state);
+            }
+            RegExp(r) => {
+                14u8.hash(state);
+                std::ptr::hash(std::rc::Rc::as_ptr(&r.0), state);
+            }
+            Map(p) => {
+                15u8.hash(state);
+                p.hash(state);
+            }
+            Set(p) => {
+                16u8.hash(state);
+                p.hash(state);
+            }
+        }
+    }
 }
 
 // ── Value methods ────────────────────────────────────────────
@@ -100,7 +219,9 @@ impl Value {
             | Value::Fn(_)
             | Value::Builtin(_)
             | Value::Promise(_)
-            | Value::RegExp(_) => true,
+            | Value::RegExp(_)
+            | Value::Map(_)
+            | Value::Set(_) => true,
             // Internal indirection; never a legitimate operand.
             Value::Upval(_) => false,
         }
@@ -128,6 +249,8 @@ impl Value {
             | Value::Builtin(_)
             | Value::Promise(_)
             | Value::RegExp(_)
+            | Value::Map(_)
+            | Value::Set(_)
             | Value::Upval(_) => None,
         }
     }
@@ -201,6 +324,9 @@ impl Value {
             // RegExp compares by pointer identity (RcRegExp's PartialEq uses
             // Rc::ptr_eq), matching JS: /a/ === /a/ is false.
             (Value::RegExp(a), Value::RegExp(b)) => a == b,
+            // Map and Set compare by reference identity.
+            (Value::Map(p), Value::Map(q)) => p == q,
+            (Value::Set(p), Value::Set(q)) => p == q,
             _ => false,
         }
     }
@@ -314,6 +440,8 @@ impl Value {
             Value::Fn(_) | Value::Builtin(_) | Value::Closure(_) => "function",
             Value::Promise(_) => "promise",
             Value::RegExp(_) => "object",
+            Value::Map(_) => "map",
+            Value::Set(_) => "set",
             Value::Upval(_) => "upval",
         }
     }

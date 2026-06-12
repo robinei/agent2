@@ -1,6 +1,8 @@
 use super::*;
 
 use crate::diag::Diagnostic;
+use crate::vm::value::MapKey;
+use indexmap::IndexSet;
 
 impl VM {
     pub fn new(code: Vec<Instr>) -> Self {
@@ -9,6 +11,8 @@ impl VM {
             arrays: Vec::new(),
             objects: Vec::new(),
             closures: Vec::new(),
+            maps: Vec::new(),
+            sets: Vec::new(),
             cells: Vec::new(),
             promises: Vec::new(),
             outbox: Vec::new(),
@@ -753,6 +757,18 @@ impl VM {
         Value::Object(addr)
     }
 
+    pub(crate) fn alloc_map(&mut self, map: IndexMap<MapKey, Value>) -> Value {
+        let addr = self.maps.len() as MapPtr;
+        self.maps.push(map);
+        Value::Map(addr)
+    }
+
+    pub(crate) fn alloc_set(&mut self, set: IndexSet<MapKey>) -> Value {
+        let addr = self.sets.len() as SetPtr;
+        self.sets.push(set);
+        Value::Set(addr)
+    }
+
     pub(super) fn alloc_closure(&mut self, addr: CodeAddr, upvals: ThinVec<Value>) -> Value {
         let idx = self.closures.len() as ClosurePtr;
         self.closures.push(Closure { addr, upvals });
@@ -805,6 +821,8 @@ impl VM {
             Value::Closure(_) => {
                 buf.push_str("function () { [native code] }");
             }
+            Value::Map(_) => buf.push_str("[object Map]"),
+            Value::Set(_) => buf.push_str("[object Set]"),
         }
     }
 
@@ -978,6 +996,32 @@ impl VM {
                     ErrorKind::ValueError,
                     "cannot serialize a RegExp to JSON",
                 ));
+            }
+            Value::Map(p) => {
+                let map = self
+                    .maps
+                    .get(*p as usize)
+                    .ok_or_else(|| self.fail(ErrorKind::ValueError, "value error"))?;
+                let entries: Result<Vec<_>, _> = map
+                    .iter()
+                    .map(|(k, v)| {
+                        let key_json = self.stack_value_to_json(&k.0, depth + 1)?;
+                        let val_json = self.stack_value_to_json(v, depth + 1)?;
+                        Ok(serde_json::Value::Array(vec![key_json, val_json]))
+                    })
+                    .collect();
+                serde_json::Value::Array(entries?)
+            }
+            Value::Set(p) => {
+                let set = self
+                    .sets
+                    .get(*p as usize)
+                    .ok_or_else(|| self.fail(ErrorKind::ValueError, "value error"))?;
+                let entries: Result<Vec<_>, _> = set
+                    .iter()
+                    .map(|k| self.stack_value_to_json(&k.0, depth + 1))
+                    .collect();
+                serde_json::Value::Array(entries?)
             }
         })
     }

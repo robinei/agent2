@@ -666,7 +666,7 @@ impl VM {
                         Value::Float(_) | Value::PosInt(_) | Value::NegInt(_) => "number",
                         Value::String(_) => "string",
                         Value::Fn(_) | Value::Builtin(_) => "function",
-                        Value::Array(_) | Value::Object(_) | Value::Promise(_) | Value::RegExp(_) => "object",
+                        Value::Array(_) | Value::Object(_) | Value::Promise(_) | Value::RegExp(_) | Value::Map(_) | Value::Set(_) => "object",
                         Value::Closure(_) => "function",
                         Value::Upval(_) => {
                             return Err(self.fail(ErrorKind::ValueError, "value error"));
@@ -713,6 +713,16 @@ impl VM {
                     let val = self.pop()?;
                     let is_obj = matches!(val, Value::Object(_) | Value::RegExp(_));
                     self.stack.push(Value::Bool(is_obj));
+                    self.ip += 1;
+                }
+                Instr::IsMap => {
+                    let val = self.pop()?;
+                    self.stack.push(Value::Bool(matches!(val, Value::Map(_))));
+                    self.ip += 1;
+                }
+                Instr::IsSet => {
+                    let val = self.pop()?;
+                    self.stack.push(Value::Bool(matches!(val, Value::Set(_))));
                     self.ip += 1;
                 }
 
@@ -882,6 +892,57 @@ impl VM {
                         compiled,
                     };
                     self.stack.push(Value::RegExp(RcRegExp::new(rx_data)));
+                    self.ip += 1;
+                }
+
+                Instr::SetNew => {
+                    let arg = self.pop()?;
+                    let mut set: IndexSet<MapKey> = IndexSet::new();
+                    if let Value::Array(p) = arg {
+                        let arr = self
+                            .arrays
+                            .get(p as usize)
+                            .ok_or_else(|| self.fail(ErrorKind::ValueError, "value error"))?;
+                        for v in arr.iter() {
+                            set.insert(MapKey(v.clone()));
+                        }
+                    } else if !matches!(arg, Value::Undefined) {
+                        return Err(self.fail(ErrorKind::TypeError, "type error"));
+                    }
+                    let addr = self.sets.len() as SetPtr;
+                    self.sets.push(set);
+                    self.stack.push(Value::Set(addr));
+                    self.ip += 1;
+                }
+
+                Instr::MapNew => {
+                    let arg = self.pop()?;
+                    let mut map: IndexMap<MapKey, Value> = IndexMap::new();
+                    if let Value::Array(p) = arg {
+                        let entries = self
+                            .arrays
+                            .get(p as usize)
+                            .ok_or_else(|| self.fail(ErrorKind::ValueError, "value error"))?;
+                        for entry in entries.iter() {
+                            let pair_ptr = match entry {
+                                Value::Array(p) => *p,
+                                _ => return Err(self.fail(ErrorKind::TypeError, "type error")),
+                            };
+                            let pair = self
+                                .arrays
+                                .get(pair_ptr as usize)
+                                .ok_or_else(|| self.fail(ErrorKind::ValueError, "value error"))?;
+                            if pair.len() < 2 {
+                                continue;
+                            }
+                            map.insert(MapKey(pair[0].clone()), pair[1].clone());
+                        }
+                    } else if !matches!(arg, Value::Undefined) {
+                        return Err(self.fail(ErrorKind::TypeError, "type error"));
+                    }
+                    let addr = self.maps.len() as MapPtr;
+                    self.maps.push(map);
+                    self.stack.push(Value::Map(addr));
                     self.ip += 1;
                 }
 
@@ -1327,8 +1388,6 @@ impl VM {
                 Instr::ArrLength => {
                     let val = self.pop()?;
                     let len = match val {
-                        // String length is in UTF-8 *bytes* (consistent with the
-                        // byte-offset string ops below).
                         Value::String(s) => s.len(),
                         Value::Array(p) => self
                             .arrays
@@ -1337,6 +1396,16 @@ impl VM {
                             .len(),
                         Value::Object(p) => self
                             .objects
+                            .get(p as usize)
+                            .ok_or_else(|| self.fail(ErrorKind::ValueError, "value error"))?
+                            .len(),
+                        Value::Map(p) => self
+                            .maps
+                            .get(p as usize)
+                            .ok_or_else(|| self.fail(ErrorKind::ValueError, "value error"))?
+                            .len(),
+                        Value::Set(p) => self
+                            .sets
                             .get(p as usize)
                             .ok_or_else(|| self.fail(ErrorKind::ValueError, "value error"))?
                             .len(),

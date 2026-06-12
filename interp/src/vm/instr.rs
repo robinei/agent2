@@ -11,6 +11,10 @@ pub type ClosurePtr = u32;
 /// calls (`Instr::Invoke`) — there is no `new Promise` — and are transient
 /// values: no JSON form, identity comparison only.
 pub type PromisePtr = u32;
+/// Index into the VM's `maps` heap.
+pub type MapPtr = u32;
+/// Index into the VM's `sets` heap.
+pub type SetPtr = u32;
 pub type LocalIndex = u16;
 pub type LocalCount = u16;
 pub type ArgCount = u32;
@@ -341,6 +345,8 @@ pub enum Instr {
     Neg,    // num -> num
     Not,    // any -> bool
     BitNot, // int -> int
+    IsMap,  // any -> bool
+    IsSet,  // any -> bool
 
     // binary operators. first pops rhs then lhs off the stack,
     // then operates on them pushing result to the stack
@@ -370,4 +376,13 @@ pub enum Instr {
     // result as Value::RegExp. Flags string may be empty (no flags). Invalid
     // pattern or unknown flags → SyntaxError.
     RegExpNew, // str, str -> regexp
+
+    // Pops an iterable array (or undefined for empty), builds a Set with
+    // SameValueZero deduplication, pushes the result as Value::Set.
+    SetNew, // arr? -> set
+
+    // Pops an iterable array of [key, value] pairs (or undefined for empty),
+    // builds a Map with SameValueZero key equality, pushes the result as
+    // Value::Map.
+    MapNew, // entries? -> map
 }

@@ -1652,6 +1652,12 @@ impl<'src> Compiler<'src> {
                     if id.name == "RegExp" {
                         return self.compile_regexp_ctor(n);
                     }
+                    if id.name == "Map" {
+                        return self.compile_map_ctor(n);
+                    }
+                    if id.name == "Set" {
+                        return self.compile_set_ctor(n);
+                    }
                 }
                 // Targeted message for the misuse LLMs actually type: there is
                 // no executor pattern (7_ASYNC commitment 4) — every promise
@@ -1753,6 +1759,54 @@ impl<'src> Compiler<'src> {
             self.emit(Instr::PushStr(empty), span);
         }
         self.emit(Instr::RegExpNew, span);
+    }
+
+    /// `new Map([entries])`: if an argument is given it must be an array of
+    /// [key, value] pairs. No argument → empty Map.
+    fn compile_map_ctor(&mut self, n: &ast::NewExpression) {
+        let span = n.span.start;
+        if n.arguments.len() > 1 {
+            self.error(span, "`new Map` takes at most one (iterable) argument");
+            return;
+        }
+        if let Some(arg) = n.arguments.first() {
+            match arg.as_expression() {
+                Some(expr) => {
+                    self.compile_expr(expr);
+                }
+                None => {
+                    self.error(span, "spread arguments are not supported in `new Map`");
+                    return;
+                }
+            }
+        } else {
+            self.emit(Instr::PushUndefined, span);
+        }
+        self.emit(Instr::MapNew, span);
+    }
+
+    /// `new Set([iterable])`: if an argument is given it must be an array of
+    /// values. No argument → empty Set.
+    fn compile_set_ctor(&mut self, n: &ast::NewExpression) {
+        let span = n.span.start;
+        if n.arguments.len() > 1 {
+            self.error(span, "`new Set` takes at most one (iterable) argument");
+            return;
+        }
+        if let Some(arg) = n.arguments.first() {
+            match arg.as_expression() {
+                Some(expr) => {
+                    self.compile_expr(expr);
+                }
+                None => {
+                    self.error(span, "spread arguments are not supported in `new Set`");
+                    return;
+                }
+            }
+        } else {
+            self.emit(Instr::PushUndefined, span);
+        }
+        self.emit(Instr::SetNew, span);
     }
 
     /// A bare identifier resolves only to the host-seeded `input` object or the
@@ -2232,7 +2286,7 @@ impl<'src> Compiler<'src> {
     fn emit_static_access(&mut self, m: &ast::StaticMemberExpression) {
         let name = m.property.name.as_str();
         let span = m.property.span.start;
-        if name == "length" {
+        if name == "length" || name == "size" {
             self.emit(Instr::ArrLength, span);
         } else {
             self.emit(Instr::ObjGet(name.into()), span);
@@ -2895,7 +2949,7 @@ impl<'src> Compiler<'src> {
                 // intrinsic; otherwise it is a method on the receiver value.
                 if let ast::Expression::Identifier(obj) = &m.object {
                     match obj.name.as_str() {
-                        "Math" | "Object" | "JSON" | "Number" | "Array" | "console" => {
+                        "Math" | "Object" | "JSON" | "Number" | "Array" | "Map" | "Set" | "console" => {
                             return self.compile_namespace_call(
                                 obj.name.as_str(),
                                 method,

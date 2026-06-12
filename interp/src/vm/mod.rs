@@ -6,18 +6,18 @@ pub mod value;
 // Re-exports so external paths (`crate::vm::Value` etc.) are unchanged.
 pub use crate::rc_str::RcStr;
 pub use instr::{
-    ArrayPtr, CellIndex, ClosurePtr, CodeAddr, FieldName, Instr, LocalIndex, ObjectPtr, PromisePtr,
-    SetMode, SlotKind, StackAddr, UpdateMode,
+    ArrayPtr, CellIndex, ClosurePtr, CodeAddr, FieldName, Instr, LocalIndex, MapPtr, ObjectPtr,
+    PromisePtr, SetMode, SetPtr, SlotKind, StackAddr, UpdateMode,
 };
 pub use value::Value;
-pub(crate) use value::{float_is_int, js_number_to_string};
+pub(crate) use value::{float_is_int, js_number_to_string, MapKey};
 
 use std::collections::VecDeque;
 use std::sync::Arc;
 
 use std::rc::Rc;
 
-use indexmap::IndexMap;
+use indexmap::{IndexMap, IndexSet};
 use smallvec::SmallVec;
 use thin_vec::ThinVec;
 
@@ -240,6 +240,12 @@ pub struct VM {
     pub arrays: Vec<ThinVec<Value>>,
     pub objects: Vec<IndexMap<FieldName, Value>>,
     pub closures: Vec<Closure>,
+    /// Map heap, indexed by `Value::Map(MapPtr)`. Each entry is an
+    /// insertion-ordered map with SameValueZero key equality.
+    pub maps: Vec<IndexMap<MapKey, Value>>,
+    /// Set heap, indexed by `Value::Set(SetPtr)`. Each entry is an
+    /// insertion-ordered set with SameValueZero equality.
+    pub sets: Vec<IndexSet<MapKey>>,
     /// Side table of captured bindings (cells). A `Boxed` local lives here so
     /// it has identity and outlives its frame; `Value::Upval` indexes it.
     /// Grows monotonically (no reclamation), like `heap`.

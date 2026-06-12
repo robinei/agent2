@@ -46,7 +46,7 @@ const HOFS: &[Hof] = &[
     },
     Hof {
         method: "forEach",
-        source: "function __forEach(a, f) {\n  for (let i = 0; i < a.length; i++) { f(a[i], i, a); }\n  return undefined;\n}",
+        source: "function __forEach(a, f) {\n  if (Map.isMap(a)) {\n    const e = a.entries();\n    for (let i = 0; i < e.length; i++) { f(e[i][1], e[i][0], a); }\n  } else if (Set.isSet(a)) {\n    const v = a.values();\n    for (let i = 0; i < v.length; i++) { f(v[i], v[i], a); }\n  } else {\n    for (let i = 0; i < a.length; i++) { f(a[i], i, a); }\n  }\n  return undefined;\n}",
     },
     Hof {
         method: "some",
