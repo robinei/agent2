@@ -247,10 +247,22 @@ the sticky panes show final program state post-mortem.)*
 
 ## Step 5 — docs sweep
 
-- [ ] 8_HARNESS.md Step 5 concurrency paragraph: fuel-slice
+- [x] 8_HARNESS.md Step 5 concurrency paragraph: fuel-slice
       scheduling noted; privileged-TUI exception cross-referenced to
-      this file. *(Done alongside this plan's creation.)*
-- [ ] Divergence/docs blocks in `vm/mod.rs` consistent with Step 0's
+      this file. *(Done alongside this plan's creation; re-verified —
+      the paragraph names `step(fuel)` slices via 9_TUI Step 0 and the
+      9_TUI decision-4/Step-4 exception.)*
+- [x] Divergence/docs blocks in `vm/mod.rs` consistent with Step 0's
       fuel semantics (covered by Step 0 acceptance; re-check here).
-- [ ] DESIGN.md gains a one-line pointer to this phase if it lists
-      the plan files.
+      *(Re-checked: fuel appears only as the `step(fuel)` argument and
+      the `StepResult::OutOfFuel` docs; the divergence list states fuel
+      exhaustion is not an error and is invisible to programs. No
+      `DEFAULT_FUEL`/`RetrySameInstr`/`ErrorKind::OutOfFuel` references
+      remain in interp source. Stale mentions survive in *other plan
+      files* written pre-Step-0 — 3_ERRORS.md ("`OutOfFuel` is
+      `RetrySameInstr`"), 4_FUTURE.md, 7_ASYNC.md — those phases should
+      reconcile against the new fuel semantics when they are built.)*
+- [x] DESIGN.md gains a one-line pointer to this phase if it lists
+      the plan files. *(Added to the Product surface section: the TUI
+      is the observation instrument; attached mode is the harness
+      frontend.)*

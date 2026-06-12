@@ -73,4 +73,6 @@ The condition report (8_HARNESS Step 4) is where the thesis succeeds or
 fails — it is a prompt-engineering artifact with golden-render tests, not
 an error string. Its quality, and the M5 eval (conditions vs. plain tool
 loop vs. atomic code mode under injected failures), are how this project
-is judged.
+is judged. The debugger TUI (9_TUI) is the observation instrument for
+both: attached mode *is* the harness frontend, and the report iterates
+against live transcripts watched there.
