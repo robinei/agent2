@@ -184,3 +184,37 @@ through `node --eval` when available, compare final `state`. Valuable
 precisely because of the divergence list — the harness needs a per-snippet
 allowlist of expected divergences. Gate behind an env var so CI without node
 skips it.
+
+## 8. Optimizer pass: sort blocks by function (small, presentational)
+
+The compiler emits nested function bodies inline (`Jump(after); Label(f);
+body…; after:`), so a function's instructions are interleaved with its
+nested functions' bodies; the optimizer passes preserve order, so this
+survives to the final stream. The debugger's span-based attribution
+(9_TUI Step 1) renders the interleaving correctly — repeated `── name ──`
+headers where a parent resumes — but a contiguous-per-function layout
+would give one header per function and a disasm window that shows more
+of the *current* function.
+
+Mechanism (in `optimizer::finalize`, before backpatch, while targets are
+still label ids): stable-sort instructions by owning function — root
+first, then functions by source-span start — preserving original order
+within each function. Correct because:
+
+- within a function, the only discontinuities in the emitted stream are
+  exactly the nested bodies being cut out; at each seam the parent's
+  `Jump(after)` and `Label(after)` become adjacent — a degenerate
+  jump-to-next that `simplify_cfg` already deletes;
+- the `Jump(after)` carries the function-node span, so attribution drags
+  it along with the extracted child body, where it lands unreachable
+  (the preceding block ends in `Return`) — so the pipeline is
+  sort → re-run `simplify_cfg` → backpatch;
+- root sorts first, keeping the entry at address 0.
+
+Cost: `codegen_shape.rs` asserts exact instruction sequences, so every
+expectation involving a function needs regenerating — mechanical churn,
+which is why this should land in its own commit, ideally when shape
+tests are being touched anyway. Acceptance: a new shape test asserting
+each function's instructions form one contiguous range (derivable from
+the debug table); disasm of the demo shows exactly one header per
+function; full suite green.
