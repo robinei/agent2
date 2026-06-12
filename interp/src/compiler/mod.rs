@@ -1633,19 +1633,24 @@ impl<'src> Compiler<'src> {
                 self.error(b.span.start, "BigInt is not supported")
             }
             ast::Expression::RegExpLiteral(r) => {
-                self.error(r.span.start, "regular expressions are not supported")
+                let span = r.span.start;
+                let pattern = self.intern_string(r.regex.pattern.text.as_str());
+                let flags_str = regexp_flags_to_str(r.regex.flags);
+                let flags = self.intern_string(&flags_str);
+                self.emit(Instr::PushStr(pattern), span);
+                self.emit(Instr::PushStr(flags), span);
+                self.emit(Instr::RegExpNew, span);
             }
             ast::Expression::ThisExpression(t) => {
                 self.error(t.span.start, "`this` is not supported")
             }
             ast::Expression::NewExpression(n) => {
-                // `new Error("…")` (and the standard subclasses) builds the
-                // plain `{ name, message }` error object (6B decision 3) —
-                // the universal LLM idiom `throw new Error("…")`. No general
-                // `new` machinery is implied.
                 if let ast::Expression::Identifier(id) = &n.callee {
                     if is_error_ctor(id.name.as_str()) {
                         return self.compile_error_ctor(id.name.as_str(), n);
+                    }
+                    if id.name == "RegExp" {
+                        return self.compile_regexp_ctor(n);
                     }
                 }
                 // Targeted message for the misuse LLMs actually type: there is
@@ -1704,6 +1709,50 @@ impl<'src> Compiler<'src> {
             Instr::ObjNew(vec![RcStr::from("name"), RcStr::from("message")].into()),
             span,
         );
+    }
+
+    /// `new RegExp(pattern[, flags])` — compile pattern and flags, emit
+    /// `RegExpNew`. Pattern coerces to string; flags default to `""`.
+    fn compile_regexp_ctor(&mut self, n: &ast::NewExpression) {
+        let span = n.span.start;
+        if n.arguments.len() > 2 {
+            self.error(span, "`new RegExp` takes at most two arguments");
+            return;
+        }
+        // First argument: pattern (required, coerced to string).
+        match n.arguments.first() {
+            None => {
+                let empty = self.intern_string("");
+                self.emit(Instr::PushStr(empty), span);
+            }
+            Some(arg) => match arg.as_expression() {
+                Some(expr) => {
+                    self.compile_expr(expr);
+                    self.emit(Instr::ToStr, span);
+                }
+                None => {
+                    self.error(span, "spread arguments are not supported in `new RegExp`");
+                    return;
+                }
+            },
+        }
+        // Second argument: flags (optional, coerced to string, default "").
+        if n.arguments.len() >= 2 {
+            match n.arguments[1].as_expression() {
+                Some(expr) => {
+                    self.compile_expr(expr);
+                    self.emit(Instr::ToStr, span);
+                }
+                None => {
+                    self.error(span, "spread arguments are not supported in `new RegExp`");
+                    return;
+                }
+            }
+        } else {
+            let empty = self.intern_string("");
+            self.emit(Instr::PushStr(empty), span);
+        }
+        self.emit(Instr::RegExpNew, span);
     }
 
     /// A bare identifier resolves only to the host-seeded `input` object or the
@@ -3910,6 +3959,36 @@ fn is_error_ctor(name: &str) -> bool {
         name,
         "Error" | "TypeError" | "RangeError" | "SyntaxError" | "ReferenceError" | "EvalError"
     )
+}
+
+/// Build a flags string (e.g. `"gi"`) from an oxc [`RegExpFlags`] bitmask.
+fn regexp_flags_to_str(flags: ast::RegExpFlags) -> String {
+    let mut s = String::with_capacity(4);
+    if flags.contains(ast::RegExpFlags::G) {
+        s.push('g');
+    }
+    if flags.contains(ast::RegExpFlags::I) {
+        s.push('i');
+    }
+    if flags.contains(ast::RegExpFlags::M) {
+        s.push('m');
+    }
+    if flags.contains(ast::RegExpFlags::S) {
+        s.push('s');
+    }
+    if flags.contains(ast::RegExpFlags::U) {
+        s.push('u');
+    }
+    if flags.contains(ast::RegExpFlags::Y) {
+        s.push('y');
+    }
+    if flags.contains(ast::RegExpFlags::D) {
+        s.push('d');
+    }
+    if flags.contains(ast::RegExpFlags::V) {
+        s.push('v');
+    }
+    s
 }
 
 /// Map a namespace + member name to a compile-time constant, if any.

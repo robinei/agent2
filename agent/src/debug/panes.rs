@@ -212,6 +212,7 @@ pub fn preview(vm: &VM, v: &Value, max: usize) -> String {
             };
             format!("Promise#{p}({state})")
         }
+        Value::RegExp(r) => format!("/{}/{}", r.pattern.as_str(), r.flags.as_str()),
     };
     truncate(s, max)
 }

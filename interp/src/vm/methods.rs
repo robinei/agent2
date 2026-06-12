@@ -224,6 +224,9 @@ impl VM {
                     "{object}".to_string()
                 }
             }
+            Value::RegExp(r) => {
+                format!("/{}/{}", r.pattern.as_str(), r.flags.as_str())
+            }
             other => other.type_name().to_string(),
         }
     }
@@ -744,7 +747,7 @@ impl VM {
         Value::Array(addr)
     }
 
-    pub(super) fn alloc_object(&mut self, obj: IndexMap<FieldName, Value>) -> Value {
+    pub(crate) fn alloc_object(&mut self, obj: IndexMap<FieldName, Value>) -> Value {
         let addr = self.objects.len() as ObjectPtr;
         self.objects.push(obj);
         Value::Object(addr)
@@ -791,6 +794,14 @@ impl VM {
             }
             Value::Object(_) => buf.push_str("[object Object]"),
             Value::Promise(_) => buf.push_str("[object Promise]"),
+            Value::RegExp(r) => {
+                buf.push('/');
+                buf.push_str(r.pattern.as_str());
+                buf.push('/');
+                if !r.flags.as_str().is_empty() {
+                    buf.push_str(r.flags.as_str());
+                }
+            }
             Value::Closure(_) => {
                 buf.push_str("function () { [native code] }");
             }
@@ -962,6 +973,12 @@ impl VM {
             }
             // A closure has no JSON representation (see Fn above).
             Value::Closure(_) => return Err(self.fail(ErrorKind::ValueError, "value error")),
+            Value::RegExp(_) => {
+                return Err(self.fail(
+                    ErrorKind::ValueError,
+                    "cannot serialize a RegExp to JSON",
+                ));
+            }
         })
     }
 

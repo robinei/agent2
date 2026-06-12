@@ -3,6 +3,7 @@ pub use crate::rc_str::RcStr;
 
 use super::instr;
 use super::instr::CodeAddr;
+pub(crate) use super::RcRegExp;
 
 /// Not `Copy`: the `String` variant owns an `RcStr` whose clone must bump a
 /// refcount and whose drop must release one. Every other variant is a trivial
@@ -69,6 +70,11 @@ pub enum Value {
     /// A transient value like `Fn`/`Closure`: no JSON form, "object" under
     /// `typeof`, identity comparison only. Consumed by `Instr::Await`.
     Promise(instr::PromisePtr),
+    /// A compiled regular expression. Immutable leaf value stored inline as a
+    /// thin refcounted handle (`RcRegExp`). Cloning is a refcount bump;
+    /// `===` compares by pointer identity (`/a/ === /a/` is false in JS).
+    /// No JSON form. `typeof` returns `"object"`.
+    RegExp(RcRegExp),
 }
 
 // ── Value methods ────────────────────────────────────────────
@@ -93,7 +99,8 @@ impl Value {
             | Value::Closure(_)
             | Value::Fn(_)
             | Value::Builtin(_)
-            | Value::Promise(_) => true,
+            | Value::Promise(_)
+            | Value::RegExp(_) => true,
             // Internal indirection; never a legitimate operand.
             Value::Upval(_) => false,
         }
@@ -120,6 +127,7 @@ impl Value {
             | Value::Fn(_)
             | Value::Builtin(_)
             | Value::Promise(_)
+            | Value::RegExp(_)
             | Value::Upval(_) => None,
         }
     }
@@ -190,6 +198,9 @@ impl Value {
             (Value::Closure(p), Value::Closure(q)) => p == q,
             // Promises compare by identity: same heap entry, same promise.
             (Value::Promise(p), Value::Promise(q)) => p == q,
+            // RegExp compares by pointer identity (RcRegExp's PartialEq uses
+            // Rc::ptr_eq), matching JS: /a/ === /a/ is false.
+            (Value::RegExp(a), Value::RegExp(b)) => a == b,
             _ => false,
         }
     }
@@ -302,6 +313,7 @@ impl Value {
             Value::Object(_) => "object",
             Value::Fn(_) | Value::Builtin(_) | Value::Closure(_) => "function",
             Value::Promise(_) => "promise",
+            Value::RegExp(_) => "object",
             Value::Upval(_) => "upval",
         }
     }

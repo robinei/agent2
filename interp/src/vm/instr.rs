@@ -365,4 +365,9 @@ pub enum Instr {
     BitLhs,   // int, int -> int
     BitRhs,   // int, int -> int
     Pow,      // num, num -> num
+
+    // Pops a pattern string and a flags string, compiles a RegExp, pushes the
+    // result as Value::RegExp. Flags string may be empty (no flags). Invalid
+    // pattern or unknown flags → SyntaxError.
+    RegExpNew, // str, str -> regexp
 }

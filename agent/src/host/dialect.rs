@@ -56,11 +56,17 @@ all prior artifacts still fetchable by id.
 
 ## dialect (JavaScript, with differences)
 - No `this`, `class`, or `new`: use plain functions, closures, object \
-literals, and factory functions instead (`new Error(msg)` is the one \
-allowed `new`). Also absent: regex literals, BigInt, labeled \
-statements, getters/setters.
+literals, and factory functions instead (`new Error(msg)` and \
+`new RegExp(pattern[, flags])` are the allowed `new` forms). \
+Also absent: BigInt, labeled statements, getters/setters.
 - try/catch/finally work as in JS for `throw` and runtime errors; \
 `raise` is never catchable.
+- RegExp is supported: `/pattern/flags` literals, `new RegExp(...)`, \
+`.test(str)`, `.exec(str)`, `.toString()`, and properties `.source` / \
+`.flags` / `.global` / `.ignoreCase` / `.multiline` / `.dotAll` / \
+`.unicode` / `.sticky`. String methods `.match()`, `.search()`, \
+`.replace()`, `.replaceAll()`, and `.split()` accept RegExp arguments \
+(the `regress` engine — JS-compatible).
 - Promises exist only as tool-call results: no `new Promise`, no \
 `.then`/`.catch` — use `await`, `Promise.all`, `Promise.allSettled`. \
 `async function`s are supported.
@@ -168,6 +174,7 @@ mod tests {
             "raise(name, payload)",
             "resume(value)",
             "No `this`, `class`, or `new`",
+            "RegExp is supported",
             "UTF-8 bytes",
         ] {
             assert!(card.contains(needle), "card missing: {needle}");

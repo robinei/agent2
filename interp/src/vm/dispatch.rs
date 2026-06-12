@@ -5,8 +5,25 @@ use super::*;
 /// dialect (`tools.f(x).field` instead of `(await tools.f(x)).field`).
 fn await_hint(v: &Value) -> &'static str {
     match v {
-        Value::Promise(_) => " (did you forget `await`?)",
+        Value::Promise(_) => " (did you forget `await`?)?",
         _ => "",
+    }
+}
+
+/// Look up a named property on a RegExp value. Returns the JS-standard
+/// properties that would be on `RegExp.prototype`.
+fn regexp_prop(r: &RcRegExp, field: &str) -> Value {
+    match field {
+        "source" => Value::String(r.pattern.clone()),
+        "flags" => Value::String(r.flags.clone()),
+        "global" => Value::Bool(r.flags.contains('g')),
+        "ignoreCase" => Value::Bool(r.flags.contains('i')),
+        "multiline" => Value::Bool(r.flags.contains('m')),
+        "dotAll" => Value::Bool(r.flags.contains('s')),
+        "unicode" => Value::Bool(r.flags.contains('u')),
+        "sticky" => Value::Bool(r.flags.contains('y')),
+        "lastIndex" => Value::PosInt(0),
+        _ => Value::Undefined,
     }
 }
 
@@ -616,8 +633,6 @@ impl VM {
                 // ── type queries ────────────────────────────────
                 Instr::TypeOf => {
                     let val = self.pop()?;
-                    // JS typeof tags. Note the coarseness: null/array/object all
-                    // report "object"; int and float both "number".
                     let tag = match val {
                         Value::Undefined => "undefined",
                         Value::Null => "object",
@@ -625,11 +640,8 @@ impl VM {
                         Value::Float(_) | Value::PosInt(_) | Value::NegInt(_) => "number",
                         Value::String(_) => "string",
                         Value::Fn(_) | Value::Builtin(_) => "function",
-                        // A promise is "object" in JS (Promise instances are
-                        // ordinary objects); the dialect keeps that tag.
-                        Value::Array(_) | Value::Object(_) | Value::Promise(_) => "object",
+                        Value::Array(_) | Value::Object(_) | Value::Promise(_) | Value::RegExp(_) => "object",
                         Value::Closure(_) => "function",
-                        // Internal indirection; never a legitimate operand.
                         Value::Upval(_) => {
                             return Err(self.fail(ErrorKind::ValueError, "value error"));
                         }
@@ -673,7 +685,7 @@ impl VM {
                 }
                 Instr::IsObj => {
                     let val = self.pop()?;
-                    let is_obj = matches!(val, Value::Object(_));
+                    let is_obj = matches!(val, Value::Object(_) | Value::RegExp(_));
                     self.stack.push(Value::Bool(is_obj));
                     self.ip += 1;
                 }
@@ -814,6 +826,39 @@ impl VM {
                 }
 
                 // ── object operations ───────────────────────────
+                Instr::RegExpNew => {
+                    // Stack: [..., pattern_str, flags_str] (flags on top).
+                    let flags_val = self.pop()?;
+                    let pattern_val = self.pop()?;
+                    let pattern = self.str_from(&pattern_val)?;
+                    let flags_str = self.str_from(&flags_val)?;
+                    // Validate flags: only g, i, m, s, u, y, d, v are valid.
+                    for c in flags_str.chars() {
+                        if !matches!(c, 'g' | 'i' | 'm' | 's' | 'u' | 'y' | 'd' | 'v') {
+                            return Err(self.fail(
+                                ErrorKind::ValueError,
+                                format!("invalid regular expression flags: {flags_str}"),
+                            ));
+                        }
+                    }
+                    let compiled = match regress::Regex::with_flags(pattern, flags_str) {
+                        Ok(re) => re,
+                        Err(e) => {
+                            return Err(self.fail(
+                                ErrorKind::ValueError,
+                                format!("invalid regular expression: {e}"),
+                            ));
+                        }
+                    };
+                    let rx_data = RegExpData {
+                        pattern: self.string_from(&pattern_val)?,
+                        flags: self.string_from(&flags_val)?,
+                        compiled,
+                    };
+                    self.stack.push(Value::RegExp(RcRegExp::new(rx_data)));
+                    self.ip += 1;
+                }
+
                 Instr::ObjNew(fields) => {
                     let n = fields.len();
                     if n > self.stack.len() {
@@ -835,13 +880,25 @@ impl VM {
 
                 Instr::ObjGet(field) => {
                     let field_str = field.as_str(); // borrows self.code
-                    // Peek the object pointer instead of popping, so we can
-                    // use field_str (which borrows self.code) for the lookup
-                    // without cloning.
-                    let obj_ptr = match self.stack.last() {
-                        Some(Value::Object(p)) => *p,
-                        // Pop-first normalization: consume the receiver before
-                        // failing, so the error is resumable (and catchable).
+                    // Check for RegExp first: properties are computed from
+                    // the RegExpData without a backing object in self.objects.
+                    match self.stack.last() {
+                        Some(Value::RegExp(r)) => {
+                            let val = regexp_prop(r, field_str);
+                            self.stack.pop();
+                            self.stack.push(val);
+                            self.ip += 1;
+                        }
+                        Some(Value::Object(p)) => {
+                            let obj_ptr = *p;
+                            let val = match self.objects.get(obj_ptr as usize) {
+                                Some(obj) => obj.get(field_str).cloned().unwrap_or(Value::Undefined),
+                                _ => Value::Undefined,
+                            };
+                            self.stack.pop();
+                            self.stack.push(val);
+                            self.ip += 1;
+                        }
                         _ => {
                             let recv = self.pop()?;
                             let msg = format!(
@@ -851,28 +908,60 @@ impl VM {
                             );
                             return Err(self.fail(ErrorKind::TypeError, msg));
                         }
-                    };
-                    // JS: a missing property reads as `undefined`, not `null`.
-                    let val = match self.objects.get(obj_ptr as usize) {
-                        Some(obj) => obj.get(field_str).cloned().unwrap_or(Value::Undefined),
-                        _ => Value::Undefined,
-                    };
-                    self.stack.pop(); // discard the object pointer
-                    self.stack.push(val);
-                    self.ip += 1;
+                    }
                 }
 
                 Instr::ObjSet(field, mode) => {
-                    // borrows self.code
                     let field = field.clone();
                     let mode = *mode;
-                    // Stack: [..., obj_ptr, val] (val on top).
                     let val = self.pop()?;
-                    let obj_ptr = match self.stack.last() {
-                        Some(Value::Object(p)) => *p,
-                        // Pop-first normalization: the value was popped above;
-                        // consume the receiver too, so the error is resumable
-                        // (and catchable).
+                    // Peek the receiver to check type.
+                    match self.stack.last() {
+                        Some(Value::RegExp(_r)) => {
+                            // RegExp properties are immutable for now; accept
+                            // assignment silently (matching lastIndex write).
+                            let result = match mode {
+                                SetMode::Old => val,
+                                SetMode::New => val,
+                            };
+                            self.stack.pop();
+                            self.stack.push(result);
+                            self.ip += 1;
+                        }
+                        Some(Value::Object(p)) => {
+                            let obj_ptr = *p;
+                            let obj = match self.objects.get_mut(obj_ptr as usize) {
+                                Some(o) => o,
+                                _ => {
+                                    return Err(
+                                        self.fail_not_resumable(ErrorKind::TypeError, "bad object pointer")
+                                    );
+                                }
+                            };
+                            let result = match mode {
+                                SetMode::Old => {
+                                    let old = obj.get(&field).cloned().unwrap_or(Value::Undefined);
+                                    if let Some(slot) = obj.get_mut(&field) {
+                                        *slot = val;
+                                    } else {
+                                        obj.insert(field, val);
+                                    }
+                                    old
+                                }
+                                SetMode::New => {
+                                    let result = val.clone();
+                                    if let Some(slot) = obj.get_mut(&field) {
+                                        *slot = val;
+                                    } else {
+                                        obj.insert(field, val);
+                                    }
+                                    result
+                                }
+                            };
+                            self.stack.pop();
+                            self.stack.push(result);
+                            self.ip += 1;
+                        }
                         _ => {
                             let recv = self.pop()?;
                             let msg = format!(
@@ -882,43 +971,7 @@ impl VM {
                             );
                             return Err(self.fail(ErrorKind::TypeError, msg));
                         }
-                    };
-                    let obj = match self.objects.get_mut(obj_ptr as usize) {
-                        Some(o) => o,
-                        // NotResumable: object peeked, not fully consumed.
-                        _ => {
-                            return Err(
-                                self.fail_not_resumable(ErrorKind::TypeError, "bad object pointer")
-                            );
-                        }
-                    };
-                    // Read the old value before overwriting, then write through
-                    // get_mut (avoids cloning the key when it already exists).
-                    let result = match mode {
-                        SetMode::Old => {
-                            let old = obj.get(&field).cloned().unwrap_or(Value::Undefined);
-                            if let Some(slot) = obj.get_mut(&field) {
-                                *slot = val;
-                            } else {
-                                obj.insert(field, val);
-                            }
-                            old
-                        }
-                        SetMode::New => {
-                            // `New` returns the assigned value; clone (a refcount
-                            // bump for strings) since the slot takes ownership.
-                            let result = val.clone();
-                            if let Some(slot) = obj.get_mut(&field) {
-                                *slot = val;
-                            } else {
-                                obj.insert(field, val);
-                            }
-                            result
-                        }
-                    };
-                    self.stack.pop(); // discard the object pointer
-                    self.stack.push(result);
-                    self.ip += 1;
+                    }
                 }
 
                 // Runtime-polymorphic computed read. Dispatch on the container

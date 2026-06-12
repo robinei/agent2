@@ -15,6 +15,8 @@ pub(crate) use value::{float_is_int, js_number_to_string};
 use std::collections::VecDeque;
 use std::sync::Arc;
 
+use std::rc::Rc;
+
 use indexmap::IndexMap;
 use smallvec::SmallVec;
 use thin_vec::ThinVec;
@@ -198,6 +200,40 @@ The remaining intentional divergences from JS — deferred or accepted, NOT bugs
 /// Maximum nesting depth for JSON <-> value conversion. Bounds native
 /// recursion so adversarial tool output cannot overflow the Rust stack.
 const MAX_JSON_DEPTH: usize = 128;
+
+/// Compiled regular expression (JS-compatible via the `regress` crate).
+/// Immutable; stored behind `Rc` and cloned via refcount bump.
+#[derive(Debug)]
+pub struct RegExpData {
+    pub pattern: RcStr,
+    pub flags: RcStr,
+    pub compiled: regress::Regex,
+}
+
+/// Reference-counted handle to a [`RegExpData`]. `Clone` is a refcount bump.
+/// `PartialEq` uses pointer identity (`Rc::ptr_eq`) — matching JS semantics
+/// where `/a/ === /a/` is `false`.
+#[derive(Clone, Debug)]
+pub struct RcRegExp(Rc<RegExpData>);
+
+impl PartialEq for RcRegExp {
+    fn eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl std::ops::Deref for RcRegExp {
+    type Target = RegExpData;
+    fn deref(&self) -> &RegExpData {
+        &self.0
+    }
+}
+
+impl RcRegExp {
+    pub fn new(data: RegExpData) -> Self {
+        RcRegExp(Rc::new(data))
+    }
+}
 
 pub struct VM {
     pub code: Vec<Instr>,

@@ -1,24 +1,23 @@
 use thin_vec::ThinVec;
 
 use crate::builtin::Args;
+use crate::builtin::regexp::{try_reg_exp, build_exec_result};
 use crate::vm::{ErrorKind, RcStr, VM, VMError, Value};
 
 // ── string method implementations ────────────────────────────────────────────
 
-/// `s.split(delim[, limit])` → array of substrings.
+/// `s.split(delim[, limit])` → array of substrings. Delimiter may be a
+/// string or RegExp; capturing groups in a RegExp are omitted.
 pub fn str_split(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let s = vm.string_from(args.get(vm, 0))?;
-    // split() / split(undefined) → [s]
     let delim = args.get(vm, 1);
     if matches!(delim, Value::Undefined) {
         let parts: ThinVec<Value> = thin_vec::thin_vec![Value::String(s)];
         return Ok(vm.alloc_array(parts));
     }
-    let delim_s = vm.string_from(delim)?;
     let limit = match args.get(vm, 2) {
         Value::Undefined => None,
         v => {
-            // JS: ToUint32 coercion — truncate fractional, negative wraps.
             let lim = v
                 .to_number()
                 .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?;
@@ -29,9 +28,29 @@ pub fn str_split(vm: &mut VM, args: Args) -> Result<Value, VMError> {
             }
         }
     };
+    // RegExp delimiter path.
+    if let Some(rx) = try_reg_exp(vm, delim) {
+        let text = s.as_str();
+        let mut parts: ThinVec<Value> = ThinVec::new();
+        let mut last = 0;
+        for m in rx.compiled.find_iter(text) {
+            if let Some(lim) = limit {
+                if parts.len() >= lim {
+                    break;
+                }
+            }
+            parts.push(Value::String(RcStr::from(&text[last..m.range.start])));
+            last = m.range.end;
+        }
+        // Push the remainder.
+        if limit.map_or(true, |lim| parts.len() < lim) {
+            parts.push(Value::String(RcStr::from(&text[last..])));
+        }
+        return Ok(vm.alloc_array(parts));
+    }
+    // String delimiter path.
+    let delim_s = vm.string_from(delim)?;
     let parts: ThinVec<Value> = if delim_s.is_empty() {
-        // split("") → array of characters (per UTF-8 char here — byte-string
-        // divergence). No leading/trailing empty entries.
         let chars: ThinVec<Value> = s
             .chars()
             .map(|c| Value::String(RcStr::from(c.to_string())))
@@ -41,8 +60,6 @@ pub fn str_split(vm: &mut VM, args: Args) -> Result<Value, VMError> {
             None => chars,
         }
     } else {
-        // JS: split fully first, then truncate to limit (not splitn which
-        // leaves remainder unsplit in the last entry).
         let splits: ThinVec<Value> = s
             .split(delim_s.as_str())
             .map(|p| Value::String(RcStr::from(p)))
@@ -168,13 +185,42 @@ pub fn str_trim(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     Ok(Value::String(RcStr::from(s.trim())))
 }
 
-/// `s.replace(pattern, replacement)` — string-only patterns.
+/// `s.replace(pattern, replacement)` — pattern may be a string or RegExp.
+/// With a string pattern, replaces only the first occurrence.
+/// With a RegExp without the `g` flag, replaces only the first match.
+/// With a RegExp with the `g` flag, replaces all matches.
 pub fn str_replace(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let s = vm.string_from(args.get(vm, 0))?;
-    // JS: pattern must be a string; regex is unsupported.
-    let pattern = vm.to_js_string(args.get(vm, 1), 0);
     let replacement = vm.to_js_string(args.get(vm, 2), 0);
-    // Replace only the first occurrence.
+    // RegExp pattern path.
+    if let Some(rx) = try_reg_exp(vm, args.get(vm, 1)) {
+        let text = s.as_str();
+        if rx.flags.contains('g') {
+            // Global replace: find all matches, replace each.
+            let mut out = String::new();
+            let mut last = 0;
+            for m in rx.compiled.find_iter(text) {
+                out.push_str(&text[last..m.range.start]);
+                out.push_str(replacement.as_str());
+                last = m.range.end;
+            }
+            out.push_str(&text[last..]);
+            return Ok(Value::String(RcStr::from(out)));
+        } else {
+            // Single replace.
+            if let Some(m) = rx.compiled.find(text) {
+                let mut out =
+                    String::with_capacity(s.len() - (m.range.end - m.range.start) + replacement.len());
+                out.push_str(&text[..m.range.start]);
+                out.push_str(replacement.as_str());
+                out.push_str(&text[m.range.end..]);
+                return Ok(Value::String(RcStr::from(out)));
+            }
+            return Ok(Value::String(s));
+        }
+    }
+    // String pattern path.
+    let pattern = vm.to_js_string(args.get(vm, 1), 0);
     if let Some(idx) = s.find(pattern.as_str()) {
         let mut out = String::with_capacity(s.len() - pattern.len() + replacement.len());
         out.push_str(&s[..idx]);
@@ -186,14 +232,97 @@ pub fn str_replace(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     }
 }
 
-/// `s.replaceAll(pattern, replacement)` — string-only patterns.
+/// `s.replaceAll(pattern, replacement)` — pattern may be a string or
+/// RegExp. If pattern is a RegExp, it must have the `g` flag (per JS spec).
 pub fn str_replace_all(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let s = vm.string_from(args.get(vm, 0))?;
-    let pattern = vm.to_js_string(args.get(vm, 1), 0);
     let replacement = vm.to_js_string(args.get(vm, 2), 0);
+    // RegExp pattern path.
+    if let Some(rx) = try_reg_exp(vm, args.get(vm, 1)) {
+        if !rx.flags.contains('g') {
+            return Err(vm.fail(
+                ErrorKind::TypeError,
+                "replaceAll must be called with a global RegExp",
+            ));
+        }
+        let text = s.as_str();
+        let mut out = String::new();
+        let mut last = 0;
+        for m in rx.compiled.find_iter(text) {
+            out.push_str(&text[last..m.range.start]);
+            out.push_str(replacement.as_str());
+            last = m.range.end;
+        }
+        out.push_str(&text[last..]);
+        return Ok(Value::String(RcStr::from(out)));
+    }
+    // String pattern path.
+    let pattern = vm.to_js_string(args.get(vm, 1), 0);
     Ok(Value::String(RcStr::from(
         s.replace(pattern.as_str(), replacement.as_str()),
     )))
+}
+
+/// `s.match(pattern)` — pattern may be a string or RegExp.
+/// Without the `g` flag: returns the same as `pattern.exec(s)`.
+/// With the `g` flag: returns an array of all full-match strings (no captures).
+pub fn str_match(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let s = vm.string_from(args.get(vm, 0))?;
+    if let Some(rx) = try_reg_exp(vm, args.get(vm, 1)) {
+        let text = s.as_str();
+        if rx.flags.contains('g') {
+            let matches: ThinVec<Value> = rx
+                .compiled
+                .find_iter(text)
+                .map(|m| Value::String(RcStr::from(&text[m.range])))
+                .collect();
+            if matches.is_empty() {
+                return Ok(Value::Null);
+            }
+            return Ok(vm.alloc_array(matches));
+        } else {
+            // Non-global: same result shape as exec().
+            let m = match rx.compiled.find(text) {
+                Some(m) => m,
+                None => return Ok(Value::Null),
+            };
+            let obj = build_exec_result(&m, s.clone());
+            return Ok(vm.alloc_object(obj));
+        }
+    }
+    // String pattern: treat as a literal (not a RegExp).
+    let pattern = vm.to_js_string(args.get(vm, 1), 0);
+    let pat = pattern.as_str();
+    if pat.is_empty() {
+        // Empty string: return [""] (JS: empty string matches at start of string).
+        return Ok(vm.alloc_array(thin_vec::thin_vec![Value::String(RcStr::from(""))]));
+    }
+    if let Some(idx) = s.find(pat) {
+        return Ok(vm.alloc_array(thin_vec::thin_vec![Value::String(RcStr::from(&s[idx..idx + pat.len()]))]));
+    }
+    Ok(Value::Null)
+}
+
+/// `s.search(pattern)` — pattern may be a string or RegExp.
+/// Returns the index of the first match, or -1 if not found.
+pub fn str_search(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let s = vm.string_from(args.get(vm, 0))?;
+    let idx: i64 = if let Some(rx) = try_reg_exp(vm, args.get(vm, 1)) {
+        rx.compiled
+            .find(s.as_str())
+            .map(|m| m.range.start as i64)
+            .unwrap_or(-1)
+    } else {
+        let pattern = vm.to_js_string(args.get(vm, 1), 0);
+        s.find(pattern.as_str())
+            .map(|i| i as i64)
+            .unwrap_or(-1)
+    };
+    if idx >= 0 {
+        Ok(Value::PosInt(idx as u64))
+    } else {
+        Ok(Value::NegInt(idx))
+    }
 }
 
 /// `s.toLowerCase()` → lowercase string.
