@@ -175,6 +175,25 @@ fan-out execution with logged resolution order; the `agent` tool mapping
 to frame spawn; result-size guards before anything enters the log; the
 real LLM client behind the same trait as the scripted one.
 
+Concurrency model: synchronous, no async runtime, std only. One main
+loop thread owns the tree and the frame step machines and `recv()`s a
+single `std::sync::mpsc` inbox — one unified message enum (LLM chunk,
+tool result, frame result, user command), every worker thread a cloned
+`Sender`. Workers: one thread per in-flight LLM stream (blocking HTTP
+reads), spawn-per-call for tool fan-out. VM compute also runs on the
+loop thread, in fuel slices (`step(fuel)`, 9_TUI Step 0) with a
+continue message re-enqueued between slices, so a hot program never
+starves other frames. The single inbox gives one total arrival order,
+which *is* the logged resolution order (decision 7) — no select
+fairness in the loop. UIs talk to the loop only through serializable
+message enums (`SessionCommand` into the inbox, `SessionEvent` out —
+chunks included); the M4 CLI uses the same channel pair, so a later
+client/server frontend is a new consumer, not a refactor. One
+exception: the debugger TUI (9_TUI) renders on the loop thread and
+borrows VMs/tree directly for its debug panes — its chat pane still
+consumes `SessionEvent`s, keeping the serializable boundary exactly
+the surface a remote client needs.
+
 ## Step 6: System prompt / dialect card
 
 A generated-where-possible description of: the dialect (divergence list

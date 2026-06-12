@@ -8,7 +8,7 @@ use crate::vm::*;
 fn run(code: Vec<Instr>) -> Vec<Value> {
     let mut vm = VM::new(code);
     loop {
-        match vm.step().unwrap() {
+        match vm.step(u64::MAX).unwrap() {
             StepResult::Done { .. } => return vm.stack.clone(),
             other => panic!("unexpected effect: {other:?}"),
         }
@@ -25,7 +25,7 @@ fn ps(val: &str) -> Instr {
 fn run_effect(code: Vec<Instr>) -> StepResult {
     let mut vm = VM::new(code);
     loop {
-        match vm.step().unwrap() {
+        match vm.step(u64::MAX).unwrap() {
             StepResult::Done { .. } => panic!("unexpected completion"),
             effect => return effect,
         }
@@ -36,7 +36,7 @@ fn run_effect(code: Vec<Instr>) -> StepResult {
 fn run_err(code: Vec<Instr>) -> VMError {
     let mut vm = VM::new(code);
     loop {
-        match vm.step() {
+        match vm.step(u64::MAX) {
             Err(e) => return e,
             Ok(StepResult::Done { .. }) => panic!("unexpected completion"),
             Ok(_) => panic!("unexpected effect"),
@@ -866,7 +866,7 @@ fn arguments_builds_array_of_frame_args() {
         Arguments,
         Return(1),
     ]);
-    while !matches!(vm.step().unwrap(), StepResult::Done { .. }) {}
+    while !matches!(vm.step(u64::MAX).unwrap(), StepResult::Done { .. }) {}
     match vm.stack.as_slice() {
         [Value::Array(p)] => {
             let a = &vm.arrays[*p as usize];
@@ -936,7 +936,7 @@ fn append_counter(code: &mut Vec<Instr>) -> u32 {
 fn run_vm(code: Vec<Instr>) -> VM {
     let mut vm = VM::new(code);
     loop {
-        match vm.step().unwrap() {
+        match vm.step(u64::MAX).unwrap() {
             StepResult::Done { .. } => return vm,
             other => panic!("unexpected effect: {other:?}"),
         }
@@ -1576,7 +1576,7 @@ fn invoke_pushes_promise_and_continues() {
         PushFloat(2.0),
         Invoke("my_tool".into(), 2),
     ]);
-    match vm.step().unwrap() {
+    match vm.step(u64::MAX).unwrap() {
         StepResult::Done { unstarted, .. } => {
             assert_eq!(unstarted.len(), 1);
             assert_eq!(unstarted[0].name, "my_tool");
@@ -1601,17 +1601,17 @@ fn await_rejected_escalates_resumably() {
     // consumed and the error is PushValueThenContinue-resumable, so the host
     // may substitute a value for the rejection.
     let mut vm = VM::new(vec![Invoke("f".into(), 0), Await, Return(1)]);
-    let id = match vm.step().unwrap() {
+    let id = match vm.step(u64::MAX).unwrap() {
         StepResult::Pending { calls } => calls[0].promise,
         other => panic!("expected Pending, got {other:?}"),
     };
     vm.reject_promise(id, Value::String("boom".into())).unwrap();
-    let err = vm.step().unwrap_err();
+    let err = vm.step(u64::MAX).unwrap_err();
     assert_eq!(err.kind, ErrorKind::ValueError);
     assert!(err.message.contains("rejected"), "got: {}", err.message);
     assert!(matches!(err.resume, ResumeMode::PushValueThenContinue));
     vm.resume_with(&err, n(7.0)).unwrap();
-    match vm.step().unwrap() {
+    match vm.step(u64::MAX).unwrap() {
         StepResult::Done { value, .. } => assert_eq!(value, n(7.0)),
         other => panic!("expected Done, got {other:?}"),
     }
@@ -1638,7 +1638,7 @@ fn await_pending_yields_and_resumes() {
         Return(1), // return the result
     ]);
     // First step runs to the Await, which blocks and delivers the call.
-    let id = match vm.step().unwrap() {
+    let id = match vm.step(u64::MAX).unwrap() {
         StepResult::Pending { calls } => {
             assert_eq!(calls.len(), 1);
             assert_eq!(calls[0].name, "add");
@@ -1649,7 +1649,7 @@ fn await_pending_yields_and_resumes() {
     };
     vm.resolve_promise(id, n(13.0)).unwrap();
     // Resume — the Await re-executes and completes with the result.
-    match vm.step().unwrap() {
+    match vm.step(u64::MAX).unwrap() {
         StepResult::Done { value, unstarted } => {
             assert_eq!(value, n(13.0));
             assert!(unstarted.is_empty());
@@ -1673,7 +1673,7 @@ fn outbox_accumulates_across_other_ops() {
         Dig(1), // bring a's promise to the top
         Await,
     ]);
-    let (pa, pb) = match vm.step().unwrap() {
+    let (pa, pb) = match vm.step(u64::MAX).unwrap() {
         StepResult::Pending { calls } => {
             assert_eq!(calls.len(), 2);
             assert_eq!(calls[0].name, "a");
@@ -1686,7 +1686,7 @@ fn outbox_accumulates_across_other_ops() {
     };
     vm.resolve_promise(pa, n(100.0)).unwrap();
     vm.resolve_promise(pb, n(200.0)).unwrap();
-    match vm.step().unwrap() {
+    match vm.step(u64::MAX).unwrap() {
         StepResult::Done { .. } => {}
         other => panic!("expected Done, got {other:?}"),
     }
@@ -1708,7 +1708,7 @@ fn out_of_order_resolution() {
         Dig(1), // b's promise on top
         Await,
     ]);
-    let (pa, pb) = match vm.step().unwrap() {
+    let (pa, pb) = match vm.step(u64::MAX).unwrap() {
         StepResult::Pending { calls } => {
             assert_eq!(calls.len(), 2);
             (calls[0].promise, calls[1].promise)
@@ -1716,12 +1716,15 @@ fn out_of_order_resolution() {
         other => panic!("expected Pending, got {other:?}"),
     };
     vm.resolve_promise(pb, n(22.0)).unwrap();
-    match vm.step().unwrap() {
+    match vm.step(u64::MAX).unwrap() {
         StepResult::Pending { calls } => assert!(calls.is_empty()),
         other => panic!("expected Pending, got {other:?}"),
     }
     vm.resolve_promise(pa, n(11.0)).unwrap();
-    assert!(matches!(vm.step().unwrap(), StepResult::Done { .. }));
+    assert!(matches!(
+        vm.step(u64::MAX).unwrap(),
+        StepResult::Done { .. }
+    ));
     assert_eq!(vm.stack, vec![n(11.0), n(22.0)]);
 }
 
@@ -1736,19 +1739,22 @@ fn await_already_resolved_does_not_yield() {
         Pop(1), // discard the first await's value
         Await,  // promise underneath: still resolved
     ]);
-    let id = match vm.step().unwrap() {
+    let id = match vm.step(u64::MAX).unwrap() {
         StepResult::Pending { calls } => calls[0].promise,
         other => panic!("expected Pending, got {other:?}"),
     };
     vm.resolve_promise(id, n(5.0)).unwrap();
-    assert!(matches!(vm.step().unwrap(), StepResult::Done { .. }));
+    assert!(matches!(
+        vm.step(u64::MAX).unwrap(),
+        StepResult::Done { .. }
+    ));
     assert_eq!(vm.stack, vec![n(5.0)]);
 }
 
 #[test]
 fn settle_promise_misuse_errors() {
     let mut vm = VM::new(vec![Invoke("f".into(), 0), Await]);
-    let id = match vm.step().unwrap() {
+    let id = match vm.step(u64::MAX).unwrap() {
         StepResult::Pending { calls } => calls[0].promise,
         other => panic!("expected Pending, got {other:?}"),
     };
@@ -1765,7 +1771,10 @@ fn settle_promise_misuse_errors() {
 #[test]
 fn empty_program_done() {
     let mut vm = VM::new(vec![]);
-    assert!(matches!(vm.step().unwrap(), StepResult::Done { .. }));
+    assert!(matches!(
+        vm.step(u64::MAX).unwrap(),
+        StepResult::Done { .. }
+    ));
 }
 
 #[test]
@@ -1781,24 +1790,17 @@ fn number_signed_zero() {
 
 #[test]
 fn fuel_stops_infinite_loop() {
-    // [Jump(0)] loops forever; the fuel budget must break it.
+    // [Jump(0)] loops forever; the fuel slice must break it.
     let mut vm = VM::new(vec![Jump(0)]);
-    vm.fuel = 1000;
-    assert!(matches!(vm.step().unwrap_err().kind, ErrorKind::OutOfFuel));
-    assert_eq!(vm.fuel, 0);
+    assert!(matches!(vm.step(1000).unwrap(), StepResult::OutOfFuel));
 }
 
 #[test]
 fn fuel_is_consumed_per_instruction() {
+    // Three instructions: a 2-fuel slice runs dry, one more unit finishes.
     let mut vm = VM::new(vec![PushFloat(1.0), PushFloat(2.0), Add]);
-    let before = vm.fuel;
-    loop {
-        match vm.step().unwrap() {
-            StepResult::Done { .. } => break,
-            _ => panic!(),
-        }
-    }
-    assert_eq!(before - vm.fuel, 3); // three instructions executed
+    assert!(matches!(vm.step(2).unwrap(), StepResult::OutOfFuel));
+    assert!(matches!(vm.step(1).unwrap(), StepResult::Done { .. }));
 }
 
 #[test]
@@ -2034,7 +2036,7 @@ fn alloc_baseline_hot_loop() {
     let mut vm = VM::new(code);
     alloc_counter::reset();
     loop {
-        match vm.step().unwrap() {
+        match vm.step(u64::MAX).unwrap() {
             StepResult::Done { .. } => break,
             other => panic!("unexpected effect: {other:?}"),
         }
@@ -2071,7 +2073,7 @@ fn alloc_breakdown() {
     let mut vm = VM::new(code);
     alloc_counter::reset();
     loop {
-        match vm.step().unwrap() {
+        match vm.step(u64::MAX).unwrap() {
             StepResult::Done { .. } => break,
             other => panic!("unexpected effect: {other:?}"),
         }
@@ -2084,7 +2086,7 @@ fn alloc_breakdown() {
     {
         let mut vm = VM::new(vec![PushFloat(-42.0), CallBuiltin(Builtin::MathAbs, 1)]);
         loop {
-            match vm.step().unwrap() {
+            match vm.step(u64::MAX).unwrap() {
                 StepResult::Done { .. } => break,
                 other => panic!("unexpected effect: {other:?}"),
             }
@@ -2124,7 +2126,7 @@ fn alloc_breakdown() {
             Return(1),
         ]);
         loop {
-            match vm.step().unwrap() {
+            match vm.step(u64::MAX).unwrap() {
                 StepResult::Done { .. } => break,
                 other => panic!("unexpected effect: {other:?}"),
             }
@@ -2146,7 +2148,7 @@ fn alloc_breakdown() {
             Return(1),
         ]);
         loop {
-            match vm.step().unwrap() {
+            match vm.step(u64::MAX).unwrap() {
                 StepResult::Done { .. } => break,
                 other => panic!("unexpected effect: {other:?}"),
             }
@@ -2171,7 +2173,7 @@ fn string_mid_codepoint_index_errors() {
         PushPosInt(1),       // middle of codepoint
         IndexGet,
     ]);
-    match vm.step() {
+    match vm.step(u64::MAX) {
         Err(e) if e.kind == ErrorKind::ValueError => {} // expected
         other => panic!("expected ValueError, got {other:?}"),
     }
@@ -2186,7 +2188,7 @@ fn string_empty_needle_index_of() {
         CallBuiltin(Builtin::StrIndexOf, 2),
     ]);
     loop {
-        match vm.step().unwrap() {
+        match vm.step(u64::MAX).unwrap() {
             StepResult::Done { .. } => break,
             other => panic!("unexpected effect: {other:?}"),
         }
@@ -2201,15 +2203,9 @@ fn out_of_fuel_stops_infinite_loop() {
     let mut vm = VM::new(vec![
         Jump(0), // infinite loop
     ]);
-    vm.fuel = 5; // tiny budget
-    let err = loop {
-        match vm.step() {
-            Err(e) => break e,
-            Ok(StepResult::Done { .. }) => panic!("unexpected completion"),
-            Ok(_) => {}
-        }
-    };
-    assert!(matches!(err.kind, ErrorKind::OutOfFuel));
+    // A tiny slice yields OutOfFuel every time; the loop never escapes.
+    assert!(matches!(vm.step(5).unwrap(), StepResult::OutOfFuel));
+    assert!(matches!(vm.step(5).unwrap(), StepResult::OutOfFuel));
 }
 
 // ── relational non-coercion (JS divergence) ─────────────────────
@@ -2240,7 +2236,7 @@ fn arr_index_negative_errors() {
         PushNegInt(-1), // index -1
         IndexGet,       // should error
     ]);
-    match vm.step() {
+    match vm.step(u64::MAX) {
         Err(e) if e.kind == ErrorKind::ValueError => {} // expected
         other => panic!("expected ValueError, got {other:?}"),
     }
@@ -2252,7 +2248,7 @@ fn arr_index_negative_errors() {
         PushPosInt(99), // value to set
         IndexSet(SetMode::New),
     ]);
-    match vm.step() {
+    match vm.step(u64::MAX) {
         Err(e) if e.kind == ErrorKind::ValueError => {} // expected
         other => panic!("expected ValueError, got {other:?}"),
     }
@@ -2309,13 +2305,13 @@ fn invoke_interleaved_with_raise() {
         Await,
     ]);
     // First yield is the Raise — the started call A stays in the outbox.
-    match vm.step().unwrap() {
+    match vm.step(u64::MAX).unwrap() {
         StepResult::Raise { condition, .. } => assert_eq!(condition, "err"),
         other => panic!("expected Raise, got {other:?}"),
     }
     vm.resume_raise(Value::PosInt(300));
     // The Await delivers both A (pre-Raise) and B (post-Raise) together.
-    let (pa, pb) = match vm.step().unwrap() {
+    let (pa, pb) = match vm.step(u64::MAX).unwrap() {
         StepResult::Pending { calls } => {
             assert_eq!(calls.len(), 2);
             assert_eq!(calls[0].name, "A");
@@ -2326,7 +2322,10 @@ fn invoke_interleaved_with_raise() {
     };
     vm.resolve_promise(pa, Value::PosInt(100)).unwrap();
     vm.resolve_promise(pb, Value::PosInt(200)).unwrap();
-    assert!(matches!(vm.step().unwrap(), StepResult::Done { .. }));
+    assert!(matches!(
+        vm.step(u64::MAX).unwrap(),
+        StepResult::Done { .. }
+    ));
     assert_eq!(vm.stack, vec![Value::PosInt(200), Value::PosInt(100)]);
 }
 
@@ -2345,17 +2344,15 @@ fn fuel_charged_per_invoke() {
         ]
     };
     let mut vm = VM::new(code());
-    vm.fuel = 4; // exactly one per instruction
-    match vm.step().unwrap() {
+    // Exactly one fuel unit per instruction.
+    match vm.step(4).unwrap() {
         StepResult::Done { unstarted, .. } => assert_eq!(unstarted.len(), 2),
         other => panic!("expected Done, got {other:?}"),
     }
-    assert_eq!(vm.fuel, 0);
     // One unit less runs out before the second Invoke.
     let mut vm = VM::new(code());
-    vm.fuel = 3;
-    match vm.step() {
-        Err(e) => assert_eq!(e.kind, ErrorKind::OutOfFuel),
+    match vm.step(3).unwrap() {
+        StepResult::OutOfFuel => {}
         other => panic!("expected OutOfFuel, got {other:?}"),
     }
 }
@@ -2465,7 +2462,7 @@ fn render_error_with_source_and_spans() {
     let prog = crate::testutil::compile_ok("return [] - 1;");
     let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
     let err = loop {
-        match vm.step() {
+        match vm.step(u64::MAX) {
             Err(e) => break e,
             Ok(StepResult::Done { .. }) => panic!("expected error"),
             Ok(_) => {}
@@ -2490,7 +2487,7 @@ fn render_error_with_source_and_spans() {
 fn render_error_without_source_falls_back() {
     // A VM::new error (no spans/source) should render as "at instruction N".
     let mut vm = VM::new(vec![Instr::Pop(1)]); // will StackUnderflow
-    let err = vm.step().unwrap_err();
+    let err = vm.step(u64::MAX).unwrap_err();
     let rendered = vm.render_error(&err);
     assert!(
         rendered.contains("at instruction 0"),
@@ -2511,7 +2508,7 @@ fn resume_with_push_value_then_continue() {
     let prog = crate::testutil::compile_ok("return [] - 1;");
     let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
     let err = loop {
-        match vm.step() {
+        match vm.step(u64::MAX) {
             Err(e) => break e,
             Ok(StepResult::Done { .. }) => panic!("expected error"),
             Ok(_) => {}
@@ -2521,7 +2518,7 @@ fn resume_with_push_value_then_continue() {
     assert!(matches!(err.resume, ResumeMode::PushValueThenContinue));
     // Feed 0.0 as the subtraction result; program should complete with 0.
     vm.resume_with(&err, Value::Float(0.0)).unwrap();
-    match vm.step().unwrap() {
+    match vm.step(u64::MAX).unwrap() {
         StepResult::Done { value, .. } => {
             assert_eq!(value, Value::Float(0.0));
         }
@@ -2530,19 +2527,25 @@ fn resume_with_push_value_then_continue() {
 }
 
 #[test]
-fn resume_with_retry_same_instr_out_of_fuel() {
-    // OutOfFuel is RetrySameInstr: refuel and re-step.
+fn out_of_fuel_slices_resume() {
+    // OutOfFuel consumes nothing: a zero-fuel slice yields immediately,
+    // a later slice continues where it left off, and driving the whole
+    // program with `step(1)` completes like one big slice.
     let mut vm = VM::new(vec![PushPosInt(1), PushPosInt(2), Add]);
-    vm.fuel = 0; // force immediate OutOfFuel
-    let err = vm.step().unwrap_err();
-    assert!(matches!(err.kind, ErrorKind::OutOfFuel));
-    assert!(matches!(err.resume, ResumeMode::RetrySameInstr));
-    // Refuel and re-step: should succeed now.
-    vm.fuel = 10;
-    match vm.step().unwrap() {
+    assert!(matches!(vm.step(0).unwrap(), StepResult::OutOfFuel));
+    match vm.step(10).unwrap() {
         StepResult::Done { .. } => {} // fine
         other => panic!("expected Done, got {other:?}"),
     }
+    let mut vm = VM::new(vec![PushPosInt(1), PushPosInt(2), Add]);
+    loop {
+        match vm.step(1).unwrap() {
+            StepResult::OutOfFuel => continue,
+            StepResult::Done { .. } => break,
+            other => panic!("expected Done, got {other:?}"),
+        }
+    }
+    assert_eq!(vm.stack, vec![Value::Float(3.0)]);
 }
 
 #[test]
@@ -2550,7 +2553,7 @@ fn resume_with_not_resumable_errors() {
     // A bad local index is an invariant violation: NotResumable. resume_with
     // must fail.
     let mut vm = VM::new(vec![Local(3)]);
-    let err = vm.step().unwrap_err();
+    let err = vm.step(u64::MAX).unwrap_err();
     assert!(matches!(err.kind, ErrorKind::BadLocal));
     assert!(matches!(err.resume, ResumeMode::NotResumable));
     let result = vm.resume_with(&err, Value::Null);
@@ -2600,12 +2603,12 @@ fn objget_non_object_pops_receiver_and_resumes() {
     // Pop-first normalization: ObjGet on a non-object consumes the receiver,
     // so the error is PushValueThenContinue and resume_with works unchanged.
     let mut vm = VM::new(vec![PushPosInt(1), ObjGet("foo".into())]);
-    let err = vm.step().unwrap_err();
+    let err = vm.step(u64::MAX).unwrap_err();
     assert!(matches!(err.kind, ErrorKind::TypeError));
     assert!(matches!(err.resume, ResumeMode::PushValueThenContinue));
     assert_eq!(vm.stack.len(), 0, "receiver consumed before the error");
     vm.resume_with(&err, Value::Null).unwrap();
-    match vm.step().unwrap() {
+    match vm.step(u64::MAX).unwrap() {
         StepResult::Done { .. } => {}
         other => panic!("expected Done, got {other:?}"),
     }
@@ -2621,12 +2624,12 @@ fn objset_non_object_pops_operands_and_resumes() {
         PushPosInt(2),
         ObjSet("foo".into(), SetMode::New),
     ]);
-    let err = vm.step().unwrap_err();
+    let err = vm.step(u64::MAX).unwrap_err();
     assert!(matches!(err.kind, ErrorKind::TypeError));
     assert!(matches!(err.resume, ResumeMode::PushValueThenContinue));
     assert_eq!(vm.stack.len(), 0, "value and receiver both consumed");
     vm.resume_with(&err, Value::Null).unwrap();
-    match vm.step().unwrap() {
+    match vm.step(u64::MAX).unwrap() {
         StepResult::Done { .. } => {}
         other => panic!("expected Done, got {other:?}"),
     }
@@ -2644,7 +2647,7 @@ fn push_value_then_continue_pop_first_invariant() {
     ]);
     // Stack: [42, "notanum"]
     let err = loop {
-        match vm.step() {
+        match vm.step(u64::MAX) {
             Err(e) => break e,
             Ok(StepResult::Done { .. }) => panic!("expected error"),
             Ok(_) => {}
@@ -2657,7 +2660,7 @@ fn push_value_then_continue_pop_first_invariant() {
     vm.resume_with(&err, Value::Float(99.0)).unwrap();
     assert_eq!(vm.stack.len(), 2);
     // Continue stepping — should reach Done.
-    match vm.step().unwrap() {
+    match vm.step(u64::MAX).unwrap() {
         StepResult::Done { .. } => {}
         other => panic!("expected Done, got {other:?}"),
     }
@@ -2731,7 +2734,7 @@ fn message_coercion_includes_type_name() {
     let prog = crate::testutil::compile_ok("return [] + 1;");
     let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
     let err = loop {
-        match vm.step() {
+        match vm.step(u64::MAX) {
             Err(e) => break e,
             Ok(StepResult::Done { .. }) => panic!("expected error"),
             Ok(_) => {}
@@ -2786,7 +2789,7 @@ fn message_negative_index_includes_value() {
         IndexGet,
     ]);
     vm.arrays.push(vec![].into());
-    let err = vm.step().unwrap_err();
+    let err = vm.step(u64::MAX).unwrap_err();
     assert!(
         err.kind == ErrorKind::ValueError,
         "expected ValueError, got {:?}: {}",
@@ -2806,7 +2809,7 @@ fn message_calldyn_non_callable_and_resume() {
     let prog = crate::testutil::compile_ok("let f = () => 1; f = 5; return f(1, 2);");
     let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
     let err = loop {
-        match vm.step() {
+        match vm.step(u64::MAX) {
             Err(e) => break e,
             Ok(StepResult::Done { .. }) => panic!("expected error"),
             Ok(_) => {}
@@ -2824,7 +2827,7 @@ fn message_calldyn_non_callable_and_resume() {
     );
     vm.resume_with(&err, Value::PosInt(7)).unwrap();
     let value = loop {
-        match vm.step().unwrap() {
+        match vm.step(u64::MAX).unwrap() {
             StepResult::Done { value, .. } => break value,
             other => panic!("unexpected effect: {other:?}"),
         }
@@ -2862,7 +2865,7 @@ fn raise_with_two_payloads_is_bad_arg() {
     // Instruction contract: Raise argc is 0 or 1. Hand-assembled argc=2
     // errors instead of silently leaving a stray stack value.
     let mut vm = VM::new(vec![PushPosInt(1), PushPosInt(2), Raise("err".into(), 2)]);
-    let err = vm.step().unwrap_err();
+    let err = vm.step(u64::MAX).unwrap_err();
     assert_eq!(err.kind, ErrorKind::BadArg);
     assert!(
         matches!(err.resume, ResumeMode::NotResumable),

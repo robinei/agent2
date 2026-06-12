@@ -31,7 +31,7 @@ impl VM {
             ip: 0,
             fp: 0,
             cur_local_count: 0,
-            fuel: DEFAULT_FUEL,
+            fuel: 0,
             spans: Vec::new(),
             source: Arc::from(""),
             console_lines: Vec::new(),
@@ -65,8 +65,6 @@ impl VM {
             | ErrorKind::BadAlloc
             | ErrorKind::BadArg
             | ErrorKind::BadLocal => ResumeMode::NotResumable,
-            // OutOfFuel: nothing was consumed; fix fuel and step() again.
-            ErrorKind::OutOfFuel => ResumeMode::RetrySameInstr,
             // TypeError / ValueError: most sites pop operands first (macros,
             // take_args, check_arity!). Default to PushValueThenContinue;
             // specific sites that error before popping override below.
@@ -323,9 +321,8 @@ impl VM {
             PromiseState::Resolved(v) => ResumePayload::Resolved(v.clone()),
             PromiseState::Rejected(v) => ResumePayload::Rejected(v.clone()),
             PromiseState::Pending { .. } => {
-                return Err(
-                    self.fail_not_resumable(ErrorKind::BadArg, "cannot settle a promise to Pending")
-                );
+                return Err(self
+                    .fail_not_resumable(ErrorKind::BadArg, "cannot settle a promise to Pending"));
             }
         };
         match self.promises.get(id as usize) {
@@ -395,7 +392,11 @@ impl VM {
         let depth = self.callstack.len();
         let fp = self.fp as usize;
         let mut saved_handlers: Vec<SavedHandler> = Vec::new();
-        while self.handlers.last().is_some_and(|h| h.callstack_len == depth) {
+        while self
+            .handlers
+            .last()
+            .is_some_and(|h| h.callstack_len == depth)
+        {
             let h = self.handlers.pop().unwrap();
             saved_handlers.push(SavedHandler {
                 catch_ip: h.catch_ip,
@@ -606,7 +607,12 @@ impl VM {
             seen.push(pid);
             // The continuation that would settle `pid`, if any (a leaf tool
             // promise has none).
-            match self.continuations.iter().flatten().find(|c| c.promise == pid) {
+            match self
+                .continuations
+                .iter()
+                .flatten()
+                .find(|c| c.promise == pid)
+            {
                 Some(c) => {
                     out.push_str(&format!(
                         " promise {pid} (async call suspended at {}), which awaits",
@@ -992,11 +998,18 @@ impl VM {
     /// reachable handler, the same error rejects the strand's promise
     /// (7_ASYNC Tier 2) — an async call's failure is its promise's
     /// rejection, never an unwind into the parked code below. Everything
-    /// else (`OutOfFuel`, `NotResumable` invariant errors) escalates as
-    /// before, so a program cannot trap its own kill switch. `raise` is
-    /// unaffected: it yields `StepResult::Raise` (an `Ok`), never an error,
-    /// so no `try` can swallow it.
-    pub fn step(&mut self) -> Result<StepResult, VMError> {
+    /// else (`NotResumable` invariant errors) escalates as before, so a
+    /// program cannot trap its own kill switch. `raise` is unaffected: it
+    /// yields `StepResult::Raise` (an `Ok`), never an error, so no `try`
+    /// can swallow it.
+    ///
+    /// `fuel` is this call's instruction budget — a slice, not a total.
+    /// Running dry yields `Ok(StepResult::OutOfFuel)` with nothing
+    /// consumed; call `step` again to continue (`fuel = 0` yields
+    /// immediately). The host owns the total per-program budget by
+    /// counting slices; debuggers single-step with `fuel = 1` (9_TUI).
+    pub fn step(&mut self, fuel: u64) -> Result<StepResult, VMError> {
+        self.fuel = fuel;
         loop {
             match self.dispatch() {
                 Err(e) if matches!(e.resume, ResumeMode::PushValueThenContinue) => {

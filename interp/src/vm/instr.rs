@@ -237,8 +237,9 @@ pub enum Instr {
     //  - at top level the root strand parks in place: ready continuations
     //    run above the parked region, and with nothing ready it yields
     //    `StepResult::Pending` carrying the drained outbox with ip
-    //    UNCHANGED (re-executing / `RetrySameInstr` shape) — or fails with
-    //    the dedicated `Deadlock` error when nothing is in flight either.
+    //    UNCHANGED (the blocking `Await` re-executes on the next `step`) —
+    //    or fails with the dedicated `Deadlock` error when nothing is in
+    //    flight either.
     Await, // promise|any -> any
 
     // EFFECT: raise condition (like Lisp condition system). used to ask LLM in calling frame

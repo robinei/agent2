@@ -159,8 +159,10 @@ The remaining intentional divergences from JS — deferred or accepted, NOT bugs
     way out, and a jump/return/throw from inside a `finally` overrides the
     pending completion, exactly as in JS (implemented by per-exit-path code
     duplication, not completion records). `raise()` is NOT catchable —
-    conditions are addressed to the LLM — and neither are `OutOfFuel` or
-    internal invariant errors, so a program cannot trap its own kill switch.
+    conditions are addressed to the LLM — and neither are internal invariant
+    errors, so a program cannot trap its own kill switch. (Fuel exhaustion
+    is not even an error: `step(fuel)` running dry yields
+    `StepResult::OutOfFuel` to the host, invisible to the program.)
     A caught runtime VM error materializes as a plain `{ name, message }`
     object (message = the rendered diagnostic with line/col + source line);
     `new Error(msg)` (and the standard subclass names) builds that same
@@ -192,12 +194,6 @@ The remaining intentional divergences from JS — deferred or accepted, NOT bugs
     the await chain.
 
 */
-
-/// Default instruction budget for a freshly constructed VM. The host can
-/// override `VM::fuel` before/after stepping. Chosen high enough that any
-/// realistic orchestration program completes, low enough that a runaway
-/// loop is caught in well under a second.
-pub const DEFAULT_FUEL: u64 = 10_000_000;
 
 /// Maximum nesting depth for JSON <-> value conversion. Bounds native
 /// recursion so adversarial tool output cannot overflow the Rust stack.
@@ -261,12 +257,14 @@ pub struct VM {
     /// (→ the restored caller frame's count). `local_count` only changes at
     /// those four sites, so the mirror is always current.
     cur_local_count: u32,
-    /// Remaining instruction budget. Decremented once per executed
-    /// instruction across all `step()` calls; reaching zero yields
-    /// `VMError::OutOfFuel`. The heap grows monotonically (no reclamation,
-    /// by design — programs are expected to be short-lived), so this is the
-    /// primary backstop against runaway execution.
-    pub fuel: u64,
+    /// Remaining instruction budget for the current `step(fuel)` call: set
+    /// from the argument at entry, decremented once per executed
+    /// instruction; reaching zero yields `StepResult::OutOfFuel`. Per-slice
+    /// state only — the total per-program budget is host policy (the host
+    /// counts slices), and that budget is the primary backstop against
+    /// runaway execution since the heap grows monotonically (no
+    /// reclamation, by design — programs are expected to be short-lived).
+    fuel: u64,
     /// Source byte offset per instruction (`spans[ip]`), populated by
     /// `for_program` from `Program::spans`. Empty when constructed via
     /// `VM::new` (hand-assembled instructions used by tests).
@@ -432,6 +430,13 @@ pub enum StepResult {
     /// unchanged). `calls` can be empty when everything the program is
     /// waiting on was already handed over in an earlier `Pending`.
     Pending { calls: Vec<InvokeCall> },
+    /// The `step(fuel)` instruction budget ran out before an effect,
+    /// completion, or error. Nothing was consumed (`ip` is at the next
+    /// unexecuted instruction); call `step` again to continue. This is the
+    /// cooperative-scheduling yield (9_TUI): hosts run the VM in slices so
+    /// a hot program can't starve the loop, debuggers single-step with
+    /// `fuel = 1`. Never observable by the program — no `try` can trap it.
+    OutOfFuel,
     /// A condition was raised; host (LLM) decides how to proceed.
     /// The payload (if any) is the value passed to `raise("name", expr)`.
     /// ip has already advanced past the Raise instruction; the host may
@@ -474,9 +479,6 @@ pub enum ErrorKind {
     /// program's own error, not a VM diagnostic). The thrown value is
     /// preserved in [`VMError::payload`]; the message carries a rendering.
     UncaughtException,
-    /// Instruction budget exhausted (guards against infinite loops in
-    /// LLM-generated programs).
-    OutOfFuel,
     /// The root strand is blocked on a promise that can never settle: the
     /// ready queue, outbox, and in-flight host calls are all empty (7_ASYNC
     /// Tier 2). Only reachable via circular awaits among async calls — the
@@ -522,10 +524,11 @@ pub enum ErrorKind {
 /// | TryEnter (bad handler address) | BadCall | NotResumable | invariant violation / compiler bug |
 /// | TryExit (empty handler stack) | BadArg | NotResumable | unmatched TryExit = compiler bug |
 /// | StackUnderflow, BadReturn, BadCall, BadAlloc, BadArg, BadLocal | — | NotResumable | invariant violation / compiler bug |
-/// | OutOfFuel | — | RetrySameInstr | nothing consumed; refuel and retry |
 /// | Deadlock | — | NotResumable | circular awaits: every strand is parked and no settlement can arrive; there is no execution state a value could resume |
 ///
-/// All 11 `ErrorKind`s are covered. The bolded sites are the
+/// All 10 `ErrorKind`s are covered. (Fuel exhaustion is not an error:
+/// `step(fuel)` running dry yields `StepResult::OutOfFuel` — nothing
+/// consumed, call `step` again to continue.) The bolded sites are the
 /// TypeError/ValueError sites that error before full operand consumption
 /// (or, for bad pointers, mid-mutation) and therefore must not be resumed.
 #[derive(Debug)]
@@ -535,9 +538,6 @@ pub enum ResumeMode {
     /// The failed instruction's operands were consumed; pushing a
     /// replacement result and advancing ip resumes as if it succeeded.
     PushValueThenContinue,
-    /// Nothing was consumed; fix the budget/input and step() again
-    /// (ip unchanged). Currently: OutOfFuel.
-    RetrySameInstr,
 }
 
 #[derive(Debug)]

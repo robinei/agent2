@@ -112,7 +112,7 @@ impl VM {
                 });
             }
             if self.fuel == 0 {
-                return Err(self.fail(ErrorKind::OutOfFuel, "fuel exhausted"));
+                return Ok(StepResult::OutOfFuel);
             }
             self.fuel -= 1;
             match &self.code[self.ip as usize] {
@@ -308,8 +308,7 @@ impl VM {
                         };
                         self.stack.truncate(keep_below);
                         self.fp = frame.prev_fp;
-                        self.cur_local_count =
-                            self.callstack.last().map_or(0, |f| f.local_count);
+                        self.cur_local_count = self.callstack.last().map_or(0, |f| f.local_count);
                         self.settle_and_wake(pid, PromiseState::Resolved(value))?;
                         self.schedule()?;
                         continue;
@@ -1419,9 +1418,10 @@ impl VM {
                             }
                             // Nothing ready: yield to the host — everything
                             // started since the last yield, ip unchanged
-                            // (RetrySameInstr shape), the promise stays on
-                            // the stack. With nothing in flight either, no
-                            // settlement can ever arrive: deadlock.
+                            // (this Await re-executes on the next step),
+                            // the promise stays on the stack. With nothing
+                            // in flight either, no settlement can ever
+                            // arrive: deadlock.
                             if !self.outbox.is_empty() || self.inflight > 0 {
                                 let calls = std::mem::take(&mut self.outbox);
                                 self.inflight += calls.len();

@@ -327,7 +327,7 @@ mod tests {
     #[test]
     fn builtin_value_shape() {
         let mut vm = VM::new(vec![Instr::PushBuiltin(Builtin::MathMax), Instr::TypeOf]);
-        while !matches!(vm.step().unwrap(), StepResult::Done { .. }) {}
+        while !matches!(vm.step(u64::MAX).unwrap(), StepResult::Done { .. }) {}
         match vm.stack.last() {
             Some(Value::String(s)) => assert_eq!(s.as_str(), "function"),
             other => panic!("{other:?}"),
@@ -365,7 +365,7 @@ mod tests {
         )
         .unwrap();
         let err = loop {
-            match vm.step() {
+            match vm.step(u64::MAX) {
                 Err(e) => break e,
                 Ok(StepResult::Done { .. }) => panic!("expected error"),
                 Ok(_) => {}
@@ -375,7 +375,7 @@ mod tests {
         // Stack has operands consumed.
         vm.resume_with(&err, Value::PosInt(99)).unwrap();
         loop {
-            match vm.step().unwrap() {
+            match vm.step(u64::MAX).unwrap() {
                 StepResult::Done { value, .. } => {
                     assert_eq!(value, Value::PosInt(99));
                     break;

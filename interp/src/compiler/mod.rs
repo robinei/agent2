@@ -3032,19 +3032,27 @@ impl<'src> Compiler<'src> {
                     );
                     return;
                 }
-                let helper = if method == "all" { "__all" } else { "__allSettled" };
+                let helper = if method == "all" {
+                    "__all"
+                } else {
+                    "__allSettled"
+                };
                 self.emit_prelude_call(helper, argv[0], &[], span, false);
             }
             // Wait-any needs VM support — deferred until evidence demands it.
             "race" | "any" => self.error(
                 span,
-                format!("`Promise.{method}` is not supported (await the promises you need directly)"),
+                format!(
+                    "`Promise.{method}` is not supported (await the promises you need directly)"
+                ),
             ),
             // Pointless wrappers in this dialect: `await` passes plain values
             // through, and rejection is the error path, not a value.
             "resolve" | "reject" => self.error(
                 span,
-                format!("`Promise.{method}` is not supported (`await` accepts plain values directly)"),
+                format!(
+                    "`Promise.{method}` is not supported (`await` accepts plain values directly)"
+                ),
             ),
             _ => self.error(span, format!("unsupported `Promise.{method}`")),
         }

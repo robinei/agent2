@@ -12,7 +12,7 @@ fn run_counted(prog: Program) -> (VM, usize) {
     alloc_counter::reset();
     let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
     loop {
-        match vm.step().unwrap() {
+        match vm.step(u64::MAX).unwrap() {
             StepResult::Done { .. } => break,
             other => panic!("unexpected effect: {other:?}"),
         }

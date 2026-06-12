@@ -18,7 +18,7 @@ pub mod perf_allocs;
 pub(super) fn run_program(prog: Program) -> VM {
     let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
     loop {
-        match vm.step().unwrap() {
+        match vm.step(u64::MAX).unwrap() {
             StepResult::Done { .. } => return vm,
             other => panic!("unexpected effect: {other:?}"),
         }

@@ -23,7 +23,7 @@ fn fanout_via_map_single_yield() {
     "#;
     let prog = compile_ok(src);
     let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
-    let calls = match vm.step().unwrap() {
+    let calls = match vm.step(u64::MAX).unwrap() {
         StepResult::Pending { calls } => calls,
         other => panic!("expected Pending, got {other:?}"),
     };
@@ -40,7 +40,7 @@ fn fanout_via_map_single_yield() {
         vm.resolve_promise(call.promise, Value::String(format!("got:{arg}").into()))
             .unwrap();
     }
-    match vm.step().unwrap() {
+    match vm.step(u64::MAX).unwrap() {
         StepResult::Done { value, unstarted } => {
             assert!(unstarted.is_empty());
             assert_eq!(
@@ -102,13 +102,13 @@ fn await_same_promise_twice() {
 fn rejected_await_escalates_and_is_resumable() {
     let prog = compile_ok("return await tools.f();");
     let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
-    let id = match vm.step().unwrap() {
+    let id = match vm.step(u64::MAX).unwrap() {
         StepResult::Pending { calls } => calls[0].promise,
         other => panic!("expected Pending, got {other:?}"),
     };
     vm.reject_promise(id, Value::String("tool exploded".into()))
         .unwrap();
-    let err = vm.step().unwrap_err();
+    let err = vm.step(u64::MAX).unwrap_err();
     assert_eq!(err.kind, ErrorKind::ValueError);
     assert!(
         err.message.contains("rejected") && err.message.contains("tool exploded"),
@@ -118,7 +118,7 @@ fn rejected_await_escalates_and_is_resumable() {
     // Phase 3 path: the host substitutes a value and execution continues.
     assert!(matches!(err.resume, ResumeMode::PushValueThenContinue));
     vm.resume_with(&err, Value::PosInt(0)).unwrap();
-    match vm.step().unwrap() {
+    match vm.step(u64::MAX).unwrap() {
         StepResult::Done { value, .. } => assert_eq!(value, Value::PosInt(0)),
         other => panic!("expected Done, got {other:?}"),
     }
@@ -158,7 +158,7 @@ fn unawaited_calls_reported_in_done() {
     // Done::unstarted), preserving fire-and-forget effects like logging.
     let prog = compile_ok("tools.audit(\"step1\"); tools.audit(\"step2\"); return 1;");
     let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
-    match vm.step().unwrap() {
+    match vm.step(u64::MAX).unwrap() {
         StepResult::Done { value, unstarted } => {
             assert_eq!(value, Value::PosInt(1));
             let args: Vec<&str> = unstarted.iter().map(|c| str_arg(&c.args[0])).collect();
@@ -178,7 +178,7 @@ fn mixed_awaited_and_unawaited() {
          return a;",
     );
     let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
-    let id = match vm.step().unwrap() {
+    let id = match vm.step(u64::MAX).unwrap() {
         StepResult::Pending { calls } => {
             assert_eq!(calls.len(), 1);
             calls[0].promise
@@ -186,7 +186,7 @@ fn mixed_awaited_and_unawaited() {
         other => panic!("expected Pending, got {other:?}"),
     };
     vm.resolve_promise(id, Value::PosInt(5)).unwrap();
-    match vm.step().unwrap() {
+    match vm.step(u64::MAX).unwrap() {
         StepResult::Done { value, unstarted } => {
             assert_eq!(value, Value::PosInt(5));
             assert_eq!(unstarted.len(), 1);
@@ -215,7 +215,7 @@ fn promise_has_no_json_form() {
     // missing-await hint (host-side conversion).
     let prog = compile_ok("return tools.f();");
     let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
-    let value = match vm.step().unwrap() {
+    let value = match vm.step(u64::MAX).unwrap() {
         StepResult::Done { value, .. } => value,
         other => panic!("expected Done, got {other:?}"),
     };
@@ -309,7 +309,8 @@ fn canonical_chain_maximal_batching() {
     assert_eq!(names, ["f", "f", "f"], "first yield carries all f calls");
     for c in &calls {
         let x = c.args[0].as_f64().unwrap();
-        vm.resolve_promise(c.promise, Value::Float(x * 10.0)).unwrap();
+        vm.resolve_promise(c.promise, Value::Float(x * 10.0))
+            .unwrap();
     }
     let calls = expect_pending(&mut vm);
     let names: Vec<&str> = calls.iter().map(|c| c.name.as_str()).collect();
@@ -318,7 +319,8 @@ fn canonical_chain_maximal_batching() {
     assert_eq!(args, [10.0, 20.0, 30.0], "g sees f's results");
     for c in &calls {
         let x = c.args[0].as_f64().unwrap();
-        vm.resolve_promise(c.promise, Value::Float(x + 1.0)).unwrap();
+        vm.resolve_promise(c.promise, Value::Float(x + 1.0))
+            .unwrap();
     }
     assert_eq!(expect_done_json(&mut vm), serde_json::json!([11, 21, 31]));
 }
@@ -337,8 +339,13 @@ fn caller_continues_after_async_call_suspends() {
     let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
     let calls = expect_pending(&mut vm);
     let names: Vec<&str> = calls.iter().map(|c| c.name.as_str()).collect();
-    assert_eq!(names, ["f", "fire"], "root kept executing past the suspension");
-    vm.resolve_promise(calls[0].promise, Value::PosInt(9)).unwrap();
+    assert_eq!(
+        names,
+        ["f", "fire"],
+        "root kept executing past the suspension"
+    );
+    vm.resolve_promise(calls[0].promise, Value::PosInt(9))
+        .unwrap();
     vm.resolve_promise(calls[1].promise, Value::Null).unwrap();
     assert_eq!(expect_done_json(&mut vm), serde_json::json!(9));
 }
@@ -495,7 +502,8 @@ fn rejection_propagates_through_awaiting_chain() {
     let prog = compile_ok(src);
     let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
     let calls = expect_pending(&mut vm);
-    vm.reject_promise(calls[0].promise, Value::String("boom".into())).unwrap();
+    vm.reject_promise(calls[0].promise, Value::String("boom".into()))
+        .unwrap();
     assert_eq!(expect_done_json(&mut vm), serde_json::json!("caught:boom"));
 }
 
@@ -513,7 +521,8 @@ fn catch_across_await_handles_rejection_on_resume() {
     let prog = compile_ok(src);
     let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
     let calls = expect_pending(&mut vm);
-    vm.reject_promise(calls[0].promise, Value::String("bad".into())).unwrap();
+    vm.reject_promise(calls[0].promise, Value::String("bad".into()))
+        .unwrap();
     assert_eq!(expect_done_json(&mut vm), serde_json::json!("caught:bad"));
 }
 
@@ -532,7 +541,8 @@ fn nested_try_rejection_hits_inner_handler() {
     let prog = compile_ok(src);
     let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
     let calls = expect_pending(&mut vm);
-    vm.reject_promise(calls[0].promise, Value::String("boom".into())).unwrap();
+    vm.reject_promise(calls[0].promise, Value::String("boom".into()))
+        .unwrap();
     assert_eq!(expect_done_json(&mut vm), serde_json::json!("inner:boom"));
 }
 
@@ -547,7 +557,7 @@ fn suspended_handler_does_not_leak_into_root() {
     "#;
     let prog = compile_ok(src);
     let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
-    let err = vm.step().unwrap_err();
+    let err = vm.step(u64::MAX).unwrap_err();
     assert_eq!(err.kind, ErrorKind::UncaughtException);
     assert!(err.message.contains("escapes"), "got: {}", err.message);
 }
@@ -598,7 +608,10 @@ fn vm_error_in_strand_rejects_promise() {
     let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
     let calls = expect_pending(&mut vm);
     vm.resolve_promise(calls[0].promise, Value::Null).unwrap();
-    assert_eq!(expect_done_json(&mut vm), serde_json::json!("name:TypeError"));
+    assert_eq!(
+        expect_done_json(&mut vm),
+        serde_json::json!("name:TypeError")
+    );
 }
 
 #[test]
@@ -614,8 +627,10 @@ fn promise_all_settled_mixed_outcomes() {
     let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
     let calls = expect_pending(&mut vm);
     assert_eq!(calls.len(), 2);
-    vm.resolve_promise(calls[0].promise, Value::PosInt(1)).unwrap();
-    vm.reject_promise(calls[1].promise, Value::String("boom".into())).unwrap();
+    vm.resolve_promise(calls[0].promise, Value::PosInt(1))
+        .unwrap();
+    vm.reject_promise(calls[1].promise, Value::String("boom".into()))
+        .unwrap();
     assert_eq!(
         expect_done_json(&mut vm),
         serde_json::json!([
@@ -669,10 +684,14 @@ fn circular_await_is_deadlock_error() {
     let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
     let calls = expect_pending(&mut vm);
     vm.resolve_promise(calls[0].promise, Value::Null).unwrap();
-    let err = vm.step().unwrap_err();
+    let err = vm.step(u64::MAX).unwrap_err();
     assert_eq!(err.kind, ErrorKind::Deadlock);
     assert!(matches!(err.resume, ResumeMode::NotResumable));
-    assert!(err.message.contains("circular await"), "got: {}", err.message);
+    assert!(
+        err.message.contains("circular await"),
+        "got: {}",
+        err.message
+    );
     assert!(err.message.contains("which awaits"), "got: {}", err.message);
     assert!(err.message.contains("suspended at"), "got: {}", err.message);
 }
@@ -691,22 +710,26 @@ fn chaining_cycle_is_type_error() {
     let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
     let calls = expect_pending(&mut vm);
     vm.resolve_promise(calls[0].promise, Value::Null).unwrap();
-    let err = vm.step().unwrap_err();
+    let err = vm.step(u64::MAX).unwrap_err();
     assert_eq!(err.kind, ErrorKind::TypeError);
-    assert!(err.message.contains("chaining cycle"), "got: {}", err.message);
+    assert!(
+        err.message.contains("chaining cycle"),
+        "got: {}",
+        err.message
+    );
 }
 
 // ── helpers ────────────────────────────────────────────────────────
 
 fn expect_pending(vm: &mut VM) -> Vec<InvokeCall> {
-    match vm.step().unwrap() {
+    match vm.step(u64::MAX).unwrap() {
         StepResult::Pending { calls } => calls,
         other => panic!("expected Pending, got {other:?}"),
     }
 }
 
 fn expect_done_json(vm: &mut VM) -> serde_json::Value {
-    match vm.step().unwrap() {
+    match vm.step(u64::MAX).unwrap() {
         StepResult::Done { value, .. } => vm.stack_value_to_json(&value, 0).unwrap(),
         other => panic!("expected Done, got {other:?}"),
     }

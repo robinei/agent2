@@ -98,7 +98,7 @@ fn optional_invocation_calls() {
     let prog = compile("let x = 5; x?.();").expect("compiles");
     let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
     let err = loop {
-        match vm.step() {
+        match vm.step(u64::MAX) {
             Ok(StepResult::Done { .. }) => panic!("expected a runtime error"),
             Ok(_) => continue,
             Err(e) => break e,

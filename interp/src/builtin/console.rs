@@ -92,7 +92,7 @@ mod tests {
             testutil::compile_ok("console.log('hello', 42); console.warn('oops'); return 1;");
         let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
         loop {
-            match vm.step().unwrap() {
+            match vm.step(u64::MAX).unwrap() {
                 crate::vm::StepResult::Done { .. } => break,
                 _ => {}
             }

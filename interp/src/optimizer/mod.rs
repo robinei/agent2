@@ -406,7 +406,7 @@ fn pe_try_constfold(out: &[Instr]) -> Option<(usize, Instr)> {
     let mut vm = VM::new(prog);
     // A single `step()` runs the whole jumpless program to `Done` (ip past the
     // end). An effect or error means "don't fold" — preserve runtime behavior.
-    match vm.step() {
+    match vm.step(u64::MAX) {
         Ok(StepResult::Done { .. }) => {}
         _ => return None,
     }
@@ -436,7 +436,7 @@ pub(crate) fn const_eval(instrs: &[Instr]) -> Option<Instr> {
         return None;
     }
     let mut vm = VM::new(instrs.to_vec());
-    match vm.step() {
+    match vm.step(u64::MAX) {
         Ok(StepResult::Done { .. }) => {}
         _ => return None, // multi-step effect or runtime error → not a constant
     }

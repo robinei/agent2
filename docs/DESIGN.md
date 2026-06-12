@@ -3,7 +3,7 @@
 A code-mode agent system: the LLM writes JS programs that orchestrate tool
 calls; the programs run on a bespoke deterministic VM; and a Lisp-style
 condition system makes the LLM (and above it, the user) the interactive
-restart handler. The numbered plan files (`0_…` – `8_…`) are the roadmap;
+restart handler. The numbered plan files (`0_…` – `9_…`) are the roadmap;
 this file is the rationale they all serve. Where a plan file and this file
 disagree, surface it — that's a design change, not a detail.
 

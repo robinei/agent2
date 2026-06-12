@@ -33,7 +33,7 @@ pub fn compile_errs(src: &str) -> Vec<String> {
 
 pub fn run_instrs(code: Vec<Instr>) -> Vec<Value> {
     let mut vm = VM::new(code);
-    match vm.step().unwrap() {
+    match vm.step(u64::MAX).unwrap() {
         StepResult::Done { .. } => return vm.stack.clone(),
         other => panic!("unexpected effect: {other:?}"),
     }
@@ -45,7 +45,7 @@ pub fn run_vm(src: &str) -> VM {
     let prog = compile_ok(src);
     let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
     loop {
-        match vm.step().unwrap() {
+        match vm.step(u64::MAX).unwrap() {
             StepResult::Done { .. } => return vm,
             other => panic!("unexpected effect: {other:?}"),
         }
@@ -59,7 +59,7 @@ pub fn run_ret(src: &str) -> serde_json::Value {
     let prog = compile_ok(src);
     let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
     loop {
-        match vm.step().unwrap() {
+        match vm.step(u64::MAX).unwrap() {
             StepResult::Done { value, .. } => {
                 return vm.stack_value_to_json(&value, 0).expect("value to JSON");
             }
@@ -75,7 +75,7 @@ pub fn run_val(src: &str) -> Value {
     let prog = compile_ok(src);
     let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
     loop {
-        match vm.step().unwrap() {
+        match vm.step(u64::MAX).unwrap() {
             StepResult::Done { value, .. } => return value,
             other => panic!("unexpected effect: {other:?}"),
         }
@@ -88,11 +88,11 @@ pub fn run_to_effect(src: &str) -> (VM, StepResult) {
     let prog = compile_ok(src);
     let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
     loop {
-        match vm.step().unwrap() {
-            StepResult::Done { .. } => panic!("unexpected completion"),
+        match vm.step(u64::MAX).unwrap() {
             effect @ (StepResult::Pending { .. } | StepResult::Raise { .. }) => {
                 return (vm, effect);
             }
+            other => panic!("unexpected completion: {other:?}"),
         }
     }
 }
@@ -106,7 +106,7 @@ pub fn run_with_tools(src: &str, mut resolve: impl FnMut(&str, &[Value]) -> Valu
     let prog = compile_ok(src);
     let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
     loop {
-        match vm.step().unwrap() {
+        match vm.step(u64::MAX).unwrap() {
             StepResult::Done { value, .. } => return (vm, value),
             StepResult::Pending { calls } => {
                 for call in calls {
@@ -134,7 +134,7 @@ pub fn run_runtime_err(src: &str) -> VMError {
     let prog = compile_ok(src);
     let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
     loop {
-        match vm.step() {
+        match vm.step(u64::MAX) {
             Err(e) => return e,
             Ok(StepResult::Done { .. }) => panic!("expected runtime error, got Done"),
             Ok(other) => panic!("expected runtime error, got effect: {other:?}"),

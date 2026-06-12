@@ -2,7 +2,8 @@
 //!
 //! Covers: throw/catch of arbitrary values, the `new Error(...)` object
 //! shape, catchable runtime errors (materialized `{ name, message }`),
-//! await-rejection delivery, the uncatchable set (`raise`, `OutOfFuel`),
+//! await-rejection delivery, the uncatchable set (`raise`; fuel
+//! exhaustion is a `StepResult`, invisible to programs),
 //! handler-stack balance across `break`/`continue`/`return`, and the
 //! `vm.throw_value` host API.
 
@@ -274,7 +275,7 @@ fn raise_is_not_catchable() {
     // Resuming continues past the raise — the catch never runs.
     vm.resume_raise(Value::Null);
     loop {
-        match vm.step().unwrap() {
+        match vm.step(u64::MAX).unwrap() {
             StepResult::Done { value, .. } => {
                 assert_eq!(value, Value::String("after".into()));
                 break;
@@ -285,18 +286,29 @@ fn raise_is_not_catchable() {
 }
 
 #[test]
-fn out_of_fuel_is_not_catchable() {
-    let prog = compile_ok(r#"try { while (true) {} } catch (e) { return "caught"; }"#);
+fn out_of_fuel_is_invisible_to_programs() {
+    // Fuel exhaustion is a StepResult, not an error: running dry inside a
+    // `try` never reaches the `catch`, and the next slice resumes exactly
+    // where the last one left off.
+    let prog = compile_ok(
+        r#"
+        let n = 0;
+        try { for (let i = 0; i < 100; i++) { n += 1; } } catch (e) { return "caught"; }
+        return n;
+        "#,
+    );
     let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
-    vm.fuel = 1000;
-    let err = loop {
-        match vm.step() {
-            Err(e) => break e,
-            Ok(StepResult::Done { .. }) => panic!("the kill switch was trapped"),
-            Ok(other) => panic!("unexpected effect: {other:?}"),
+    let value = loop {
+        match vm.step(7).unwrap() {
+            StepResult::OutOfFuel => continue,
+            StepResult::Done { value, .. } => break value,
+            other => panic!("unexpected effect: {other:?}"),
         }
     };
-    assert_eq!(err.kind, ErrorKind::OutOfFuel);
+    assert_eq!(
+        vm.stack_value_to_json(&value, 0).unwrap(),
+        serde_json::json!(100)
+    );
 }
 
 // ── handler-stack balance across jumps ───────────────────────────────
@@ -383,7 +395,7 @@ fn await_rejection_delivers_raw_reason_to_catch() {
         "#,
     );
     let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
-    let calls = match vm.step().unwrap() {
+    let calls = match vm.step(u64::MAX).unwrap() {
         StepResult::Pending { calls } => calls,
         other => panic!("expected Pending, got {other:?}"),
     };
@@ -391,7 +403,7 @@ fn await_rejection_delivers_raw_reason_to_catch() {
         .json_to_stack_value(&json!({ "reason": "down" }), 0)
         .unwrap();
     vm.reject_promise(calls[0].promise, reason).unwrap();
-    match vm.step().unwrap() {
+    match vm.step(u64::MAX).unwrap() {
         StepResult::Done { value, .. } => assert_eq!(value, Value::String("down".into())),
         other => panic!("expected Done, got {other:?}"),
     }
@@ -401,13 +413,13 @@ fn await_rejection_delivers_raw_reason_to_catch() {
 fn await_rejection_without_try_escalates_unchanged() {
     let prog = compile_ok(r#"return await tools.f();"#);
     let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
-    let calls = match vm.step().unwrap() {
+    let calls = match vm.step(u64::MAX).unwrap() {
         StepResult::Pending { calls } => calls,
         other => panic!("expected Pending, got {other:?}"),
     };
     vm.reject_promise(calls[0].promise, Value::String("down".into()))
         .unwrap();
-    let err = vm.step().unwrap_err();
+    let err = vm.step(u64::MAX).unwrap_err();
     assert_eq!(err.kind, ErrorKind::ValueError);
     assert!(matches!(err.resume, ResumeMode::PushValueThenContinue));
     assert!(err.message.contains("rejected"), "got: {}", err.message);
@@ -422,7 +434,7 @@ fn host_throw_value_caught_by_program() {
         "#,
     );
     let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
-    match vm.step().unwrap() {
+    match vm.step(u64::MAX).unwrap() {
         StepResult::Pending { .. } => {}
         other => panic!("expected Pending, got {other:?}"),
     }
@@ -431,7 +443,7 @@ fn host_throw_value_caught_by_program() {
         ThrowOutcome::Caught => {}
         ThrowOutcome::Uncaught(_) => panic!("expected the handler to catch"),
     }
-    match vm.step().unwrap() {
+    match vm.step(u64::MAX).unwrap() {
         StepResult::Done { value, .. } => assert_eq!(value, Value::String("caught:X".into())),
         other => panic!("expected Done, got {other:?}"),
     }
@@ -441,7 +453,7 @@ fn host_throw_value_caught_by_program() {
 fn host_throw_value_uncaught_reports_back() {
     let prog = compile_ok(r#"return await tools.f();"#);
     let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
-    match vm.step().unwrap() {
+    match vm.step(u64::MAX).unwrap() {
         StepResult::Pending { .. } => {}
         other => panic!("expected Pending, got {other:?}"),
     }
