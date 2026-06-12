@@ -666,7 +666,12 @@ impl VM {
                         Value::Float(_) | Value::PosInt(_) | Value::NegInt(_) => "number",
                         Value::String(_) => "string",
                         Value::Fn(_) | Value::Builtin(_) => "function",
-                        Value::Array(_) | Value::Object(_) | Value::Promise(_) | Value::RegExp(_) | Value::Map(_) | Value::Set(_) => "object",
+                        Value::Array(_)
+                        | Value::Object(_)
+                        | Value::Promise(_)
+                        | Value::RegExp(_)
+                        | Value::Map(_)
+                        | Value::Set(_) => "object",
                         Value::Closure(_) => "function",
                         Value::Upval(_) => {
                             return Err(self.fail(ErrorKind::ValueError, "value error"));
@@ -979,7 +984,9 @@ impl VM {
                         Some(Value::Object(p)) => {
                             let obj_ptr = *p;
                             let val = match self.objects.get(obj_ptr as usize) {
-                                Some(obj) => obj.get(field_str).cloned().unwrap_or(Value::Undefined),
+                                Some(obj) => {
+                                    obj.get(field_str).cloned().unwrap_or(Value::Undefined)
+                                }
                                 _ => Value::Undefined,
                             };
                             self.stack.pop();
@@ -1020,9 +1027,10 @@ impl VM {
                             let obj = match self.objects.get_mut(obj_ptr as usize) {
                                 Some(o) => o,
                                 _ => {
-                                    return Err(
-                                        self.fail_not_resumable(ErrorKind::TypeError, "bad object pointer")
-                                    );
+                                    return Err(self.fail_not_resumable(
+                                        ErrorKind::TypeError,
+                                        "bad object pointer",
+                                    ));
                                 }
                             };
                             let result = match mode {

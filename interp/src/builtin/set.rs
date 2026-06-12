@@ -89,26 +89,20 @@ mod tests {
 
     #[test]
     fn set_new_empty() {
-        let out = run_instrs(vec![
-            Instr::PushUndefined,
-            Instr::SetNew,
-        ]);
+        let out = run_instrs(vec![Instr::PushUndefined, Instr::SetNew]);
         assert!(matches!(&out[0], Value::Set(_)));
     }
 
     #[test]
     fn set_add_and_has() {
-        let out = testutil::run_ret(
-            "const s = new Set(); s.add(1); return [s.has(1), s.has(2)];",
-        );
+        let out = testutil::run_ret("const s = new Set(); s.add(1); return [s.has(1), s.has(2)];");
         assert_eq!(out, serde_json::json!([true, false]));
     }
 
     #[test]
     fn set_deduplication() {
-        let out = testutil::run_ret(
-            "const s = new Set(); s.add(1); s.add(1); return s.values().length;",
-        );
+        let out =
+            testutil::run_ret("const s = new Set(); s.add(1); s.add(1); return s.values().length;");
         assert_eq!(out, serde_json::json!(1));
     }
 
@@ -122,41 +116,32 @@ mod tests {
 
     #[test]
     fn set_clear() {
-        let out = testutil::run_ret(
-            "const s = new Set([1, 2, 3]); s.clear(); return s.has(1);",
-        );
+        let out = testutil::run_ret("const s = new Set([1, 2, 3]); s.clear(); return s.has(1);");
         assert_eq!(out, serde_json::json!(false));
     }
 
     #[test]
     fn set_values() {
-        let out = testutil::run_ret(
-            "const s = new Set([1, 2, 3]); return s.values();",
-        );
+        let out = testutil::run_ret("const s = new Set([1, 2, 3]); return s.values();");
         assert_eq!(out, serde_json::json!([1, 2, 3]));
     }
 
     #[test]
     fn set_is_set() {
-        let out = testutil::run_ret(
-            "const s = new Set(); return [Set.isSet(s), Set.isSet([1,2])];",
-        );
+        let out =
+            testutil::run_ret("const s = new Set(); return [Set.isSet(s), Set.isSet([1,2])];");
         assert_eq!(out, serde_json::json!([true, false]));
     }
 
     #[test]
     fn set_size() {
-        let out = testutil::run_ret(
-            "const s = new Set([1, 2, 3]); return s.size;",
-        );
+        let out = testutil::run_ret("const s = new Set([1, 2, 3]); return s.size;");
         assert_eq!(out, serde_json::json!(3));
     }
 
     #[test]
     fn map_size() {
-        let out = testutil::run_ret(
-            "const m = new Map([['a', 1], ['b', 2]]); return m.size;",
-        );
+        let out = testutil::run_ret("const m = new Map([['a', 1], ['b', 2]]); return m.size;");
         assert_eq!(out, serde_json::json!(2));
     }
 }

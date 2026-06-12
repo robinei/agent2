@@ -27,10 +27,7 @@ pub fn array_from(vm: &mut VM, args: Args) -> Result<Value, VMError> {
                 .objects
                 .get(*p as usize)
                 .ok_or_else(|| vm.fail(ErrorKind::ValueError, "value error"))?;
-            let len = obj
-                .get("length")
-                .and_then(|v| v.to_number())
-                .unwrap_or(0.0);
+            let len = obj.get("length").and_then(|v| v.to_number()).unwrap_or(0.0);
             let n = (len as usize).min(10_000_000);
             let mut out: ThinVec<Value> = ThinVec::with_capacity(n);
             for i in 0..n {

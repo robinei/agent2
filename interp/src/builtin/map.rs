@@ -207,10 +207,7 @@ mod tests {
 
     #[test]
     fn map_new_empty() {
-        let out = run_instrs(vec![
-            Instr::PushUndefined,
-            Instr::MapNew,
-        ]);
+        let out = run_instrs(vec![Instr::PushUndefined, Instr::MapNew]);
         assert!(matches!(&out[0], Value::Map(_)));
     }
 
@@ -267,9 +264,7 @@ mod tests {
 
     #[test]
     fn map_is_map() {
-        let out = testutil::run_ret(
-            "const m = new Map(); return [Map.isMap(m), Map.isMap({})];",
-        );
+        let out = testutil::run_ret("const m = new Map(); return [Map.isMap(m), Map.isMap({})];");
         assert_eq!(out, serde_json::json!([true, false]));
     }
 }

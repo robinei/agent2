@@ -10,7 +10,7 @@ pub use instr::{
     PromisePtr, SetMode, SetPtr, SlotKind, StackAddr, UpdateMode,
 };
 pub use value::Value;
-pub(crate) use value::{float_is_int, js_number_to_string, MapKey};
+pub(crate) use value::{MapKey, float_is_int, js_number_to_string};
 
 use std::collections::VecDeque;
 use std::sync::Arc;

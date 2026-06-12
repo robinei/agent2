@@ -992,10 +992,7 @@ impl VM {
             // A closure has no JSON representation (see Fn above).
             Value::Closure(_) => return Err(self.fail(ErrorKind::ValueError, "value error")),
             Value::RegExp(_) => {
-                return Err(self.fail(
-                    ErrorKind::ValueError,
-                    "cannot serialize a RegExp to JSON",
-                ));
+                return Err(self.fail(ErrorKind::ValueError, "cannot serialize a RegExp to JSON"));
             }
             Value::Map(p) => {
                 let map = self

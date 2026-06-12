@@ -4,14 +4,14 @@ use indexmap::IndexMap;
 
 /// Build the result object for `exec()` / non-global `match()`:
 /// `{ "0": full, "1": cap1, ..., "index": start, "input": input }`.
-pub(crate) fn build_exec_result(
-    m: &regress::Match,
-    input: RcStr,
-) -> IndexMap<RcStr, Value> {
+pub(crate) fn build_exec_result(m: &regress::Match, input: RcStr) -> IndexMap<RcStr, Value> {
     let text = input.as_str();
     let n_captures = m.captures.len();
     let mut obj = IndexMap::with_capacity(4 + n_captures);
-    obj.insert(RcStr::from("0"), Value::String(RcStr::from(&text[m.range.clone()])));
+    obj.insert(
+        RcStr::from("0"),
+        Value::String(RcStr::from(&text[m.range.clone()])),
+    );
     for (i, cap) in m.captures.iter().enumerate() {
         let key = RcStr::from((i + 1).to_string());
         let val = match cap {
@@ -22,7 +22,10 @@ pub(crate) fn build_exec_result(
     }
     obj.insert(RcStr::from("index"), Value::PosInt(m.range.start as u64));
     obj.insert(RcStr::from("input"), Value::String(input));
-    obj.insert(RcStr::from("length"), Value::PosInt((1 + n_captures) as u64));
+    obj.insert(
+        RcStr::from("length"),
+        Value::PosInt((1 + n_captures) as u64),
+    );
     obj
 }
 

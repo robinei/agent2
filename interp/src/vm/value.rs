@@ -3,10 +3,10 @@ use std::hash::{Hash, Hasher};
 use crate::builtin::Builtin;
 pub use crate::rc_str::RcStr;
 
+pub(crate) use super::RcRegExp;
 use super::instr;
 use super::instr::CodeAddr;
 use super::instr::{MapPtr, SetPtr};
-pub(crate) use super::RcRegExp;
 
 /// Not `Copy`: the `String` variant owns an `RcStr` whose clone must bump a
 /// refcount and whose drop must release one. Every other variant is a trivial

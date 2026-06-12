@@ -135,9 +135,7 @@ mod tests {
 
     #[test]
     fn console_assert_fails_writes_error() {
-        let prog = testutil::compile_ok(
-            "console.assert(false, 'bad', 42); return 1;",
-        );
+        let prog = testutil::compile_ok("console.assert(false, 'bad', 42); return 1;");
         let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
         loop {
             match vm.step(u64::MAX).unwrap() {
