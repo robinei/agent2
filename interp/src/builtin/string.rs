@@ -1,7 +1,7 @@
 use thin_vec::ThinVec;
 
 use crate::builtin::Args;
-use crate::builtin::regexp::{try_reg_exp, build_exec_result};
+use crate::builtin::regexp::{build_exec_result, try_reg_exp};
 use crate::vm::{ErrorKind, RcStr, VM, VMError, Value};
 
 // ── string method implementations ────────────────────────────────────────────
@@ -161,22 +161,7 @@ pub fn str_slice(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 
     let start = to_offset(args.get(vm, 1), 0)? as usize;
     let end = to_offset(args.get(vm, 2), len)?.max(0) as usize;
-
-    // JS: start ≥ end → ""
-    if start >= end {
-        return Ok(Value::String(RcStr::from("")));
-    }
-
-    let end = end.min(s.len());
-    let start_clamped = clamp_start(&s, start.min(s.len()));
-    let end_clamped = clamp_end(&s, end);
-
-    // Mid-codepoint error (only error case)
-    if start_clamped < start || end_clamped > end {
-        return Err(vm.fail(ErrorKind::ValueError, "value error"));
-    }
-
-    Ok(Value::String(RcStr::from(&s[start_clamped..end_clamped])))
+    extract_substring(vm, &s, start, end)
 }
 
 /// `s.substring(start[, end])` → substring. Like `slice` but swaps
@@ -197,28 +182,14 @@ pub fn str_substring(vm: &mut VM, args: Args) -> Result<Value, VMError> {
             .unwrap_or(default)
     };
 
-    let mut start = to_offset(args.get(vm, 1), 0);
-    let mut end = to_offset(args.get(vm, 2), len);
+    let mut start = to_offset(args.get(vm, 1), 0) as usize;
+    let mut end = to_offset(args.get(vm, 2), len) as usize;
 
     if start > end {
         std::mem::swap(&mut start, &mut end);
     }
 
-    let start = start as usize;
-    let end = end as usize;
-
-    if start >= end {
-        return Ok(Value::String(RcStr::from("")));
-    }
-
-    let start_clamped = clamp_start(&s, start.min(s.len()));
-    let end_clamped = clamp_end(&s, end.min(s.len()));
-
-    if start_clamped < start || end_clamped > end {
-        return Err(vm.fail(ErrorKind::ValueError, "value error"));
-    }
-
-    Ok(Value::String(RcStr::from(&s[start_clamped..end_clamped])))
+    extract_substring(vm, &s, start, end)
 }
 
 /// `s.trim()` → trimmed string.
@@ -249,8 +220,7 @@ pub fn str_replace(vm: &mut VM, args: Args) -> Result<Value, VMError> {
             return Ok(Value::String(RcStr::from(out)));
         } else {
             if let Some(m) = rx.compiled.find(text) {
-                let mut out =
-                    String::with_capacity(s.len());
+                let mut out = String::with_capacity(s.len());
                 out.push_str(&text[..m.range.start]);
                 push_replacement(&mut out, replacement.as_str(), text, &m);
                 out.push_str(&text[m.range.end..]);
@@ -342,7 +312,9 @@ fn push_replacement(out: &mut String, repl: &str, text: &str, m: &regress::Match
                         break;
                     }
                     chars.next();
-                    n = n.saturating_mul(10).saturating_add((c2 as u32 - '0' as u32) as usize);
+                    n = n
+                        .saturating_mul(10)
+                        .saturating_add((c2 as u32 - '0' as u32) as usize);
                 }
                 if n > 0 && n <= m.captures.len() {
                     if let Some(cap) = m.captures.get(n - 1) {
@@ -394,7 +366,11 @@ pub fn str_match(vm: &mut VM, args: Args) -> Result<Value, VMError> {
         return Ok(vm.alloc_array(thin_vec::thin_vec![Value::String(RcStr::from(""))]));
     }
     if let Some(idx) = s.find(pat) {
-        return Ok(vm.alloc_array(thin_vec::thin_vec![Value::String(RcStr::from(&s[idx..idx + pat.len()]))]));
+        return Ok(
+            vm.alloc_array(thin_vec::thin_vec![Value::String(RcStr::from(
+                &s[idx..idx + pat.len()]
+            ))]),
+        );
     }
     Ok(Value::Null)
 }
@@ -410,9 +386,7 @@ pub fn str_search(vm: &mut VM, args: Args) -> Result<Value, VMError> {
             .unwrap_or(-1)
     } else {
         let pattern = vm.to_js_string(args.get(vm, 1), 0);
-        s.find(pattern.as_str())
-            .map(|i| i as i64)
-            .unwrap_or(-1)
+        s.find(pattern.as_str()).map(|i| i as i64).unwrap_or(-1)
     };
     if idx >= 0 {
         Ok(Value::PosInt(idx as u64))
@@ -611,6 +585,21 @@ fn clamp_end(s: &str, idx: usize) -> usize {
         i -= 1;
     }
     i
+}
+
+fn extract_substring(vm: &mut VM, s: &str, start: usize, end: usize) -> Result<Value, VMError> {
+    if start >= end {
+        return Ok(Value::String(RcStr::from("")));
+    }
+
+    let start_clamped = clamp_start(s, start.min(s.len()));
+    let end_clamped = clamp_end(s, end.min(s.len()));
+
+    if start_clamped < start || end_clamped > end {
+        return Err(vm.fail(ErrorKind::ValueError, "value error"));
+    }
+
+    Ok(Value::String(RcStr::from(&s[start_clamped..end_clamped])))
 }
 
 // ── tests ────────────────────────────────────────────────────────────────────
