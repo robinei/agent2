@@ -5,14 +5,22 @@
 
 use interp::{PromiseState, VM, Value};
 
-/// One row of the disassembly pane.
+/// One row of the disassembly pane. Instruction text is synthesized in
+/// parts (opcode / operands / source line) so the UI can color it without
+/// any tokenization.
 #[derive(Debug, PartialEq)]
-pub struct AsmRow {
-    pub text: String,
-    /// The instruction at `vm.ip`.
-    pub current: bool,
-    /// A `── name ──` function header (block start), not an instruction.
-    pub header: bool,
+pub enum AsmRow {
+    /// A `── name ──` function header (block start).
+    Header(String),
+    Instr {
+        ip: u32,
+        op: String,
+        /// The operand text inside the opcode's parentheses, if any.
+        args: String,
+        line: Option<usize>,
+        /// The instruction at `vm.ip`.
+        current: bool,
+    },
 }
 
 /// A disassembly window of up to `height` rows centered on `vm.ip`, with
@@ -29,21 +37,70 @@ pub fn disasm_window(vm: &VM, height: usize) -> Vec<AsmRow> {
     for ip in start as u32..end as u32 {
         if let Some((idx, f)) = vm.function_at(ip) {
             if cur_fn != Some(idx) {
-                rows.push(AsmRow {
-                    text: format!("── {} ──", f.name),
-                    current: false,
-                    header: true,
-                });
+                rows.push(AsmRow::Header(format!("── {} ──", f.name)));
                 cur_fn = Some(idx);
             }
         }
-        rows.push(AsmRow {
-            text: vm.disasm_line(ip),
+        let debug = format!("{:?}", vm.code[ip as usize]);
+        let (op, args) = match debug.split_once('(') {
+            Some((op, rest)) => (
+                op.to_string(),
+                rest.strip_suffix(')').unwrap_or(rest).to_string(),
+            ),
+            None => (debug, String::new()),
+        };
+        let line = vm.spans.get(ip as usize).and_then(|&sp| {
+            if vm.source.is_empty() {
+                None
+            } else {
+                Some(interp::diag::line_col(&vm.source, sp).0)
+            }
+        });
+        rows.push(AsmRow::Instr {
+            ip,
+            op,
+            args,
+            line,
             current: ip == vm.ip,
-            header: false,
         });
     }
     rows
+}
+
+/// Opcode category for disasm coloring — purely synthesized from the
+/// opcode name, no tokenization.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum OpKind {
+    /// Pushes a literal/constant.
+    Push,
+    /// Control flow: jumps, labels, return, frame entry.
+    Control,
+    /// Calls and host effects (tools, await, raise).
+    Effect,
+    Other,
+}
+
+pub fn op_kind(op: &str) -> OpKind {
+    if op.starts_with("Push") {
+        OpKind::Push
+    } else if matches!(
+        op,
+        "Jump"
+            | "JFalse"
+            | "JTrue"
+            | "JNotNullish"
+            | "Return"
+            | "EnterFrame"
+            | "TryEnter"
+            | "TryExit"
+            | "Throw"
+    ) {
+        OpKind::Control
+    } else if op.starts_with("Call") || matches!(op, "Invoke" | "Await" | "Raise" | "MakeClosure") {
+        OpKind::Effect
+    } else {
+        OpKind::Other
+    }
 }
 
 /// What a stack-pane row is, driving the region background: each frame
@@ -177,8 +234,23 @@ mod tests {
         }
         let rows = disasm_window(&r.vm, 9);
         assert!(rows.len() >= 5, "{rows:?}");
-        assert_eq!(rows.iter().filter(|r| r.current).count(), 1, "{rows:?}");
-        assert!(rows.iter().any(|r| r.header), "{rows:?}");
+        assert_eq!(
+            rows.iter()
+                .filter(|r| matches!(r, AsmRow::Instr { current: true, .. }))
+                .count(),
+            1,
+            "{rows:?}"
+        );
+        assert!(
+            rows.iter().any(|r| matches!(r, AsmRow::Header(_))),
+            "{rows:?}"
+        );
+        // Parts are synthesized: every instruction row has an opcode and a
+        // source line, and opcodes categorize.
+        let has_categorized_op = rows.iter().any(|r| {
+            matches!(r, AsmRow::Instr { op, line: Some(_), .. } if op_kind(op) != OpKind::Other)
+        });
+        assert!(has_categorized_op, "{rows:?}");
     }
 
     #[test]

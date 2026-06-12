@@ -183,22 +183,52 @@ fn render_source(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(para, area);
 }
 
+fn op_style(op: &str) -> Style {
+    match panes::op_kind(op) {
+        panes::OpKind::Push => Style::default().fg(Color::Magenta),
+        panes::OpKind::Control => Style::default().fg(Color::Cyan),
+        panes::OpKind::Effect => Style::default().fg(Color::Yellow),
+        panes::OpKind::Other => Style::default().fg(Color::White),
+    }
+}
+
 fn render_disasm(frame: &mut Frame, app: &App, area: Rect) {
     let height = area.height.saturating_sub(2) as usize;
     let rows = panes::disasm_window(&app.runner.vm, height);
+    let dim = Style::default().fg(Color::DarkGray);
     let lines: Vec<Line> = rows
         .into_iter()
-        .map(|r| {
-            let style = if r.current {
-                Style::default().add_modifier(Modifier::REVERSED)
-            } else if r.header {
+        .map(|r| match r {
+            panes::AsmRow::Header(text) => Line::from(text).style(
                 Style::default()
                     .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
-            };
-            Line::from(r.text).style(style)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            panes::AsmRow::Instr {
+                ip,
+                op,
+                args,
+                line,
+                current,
+            } => {
+                let mut spans = vec![
+                    Span::styled(format!("{ip:>5}  "), dim),
+                    Span::styled(op.clone(), op_style(&op)),
+                ];
+                if !args.is_empty() {
+                    spans.push(Span::raw("("));
+                    spans.push(Span::styled(args, Style::default().fg(Color::Green)));
+                    spans.push(Span::raw(")"));
+                }
+                if let Some(l) = line {
+                    spans.push(Span::styled(format!("  @{l}"), dim));
+                }
+                let mut out = Line::from(spans);
+                if current {
+                    out = out.style(Style::default().add_modifier(Modifier::REVERSED));
+                }
+                out
+            }
         })
         .collect();
     let para = Paragraph::new(lines).block(
