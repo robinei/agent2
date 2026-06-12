@@ -138,6 +138,9 @@ pub struct AgentState {
     /// Tool names whose artifacts get the "already happened; calling
     /// again repeats the effect" warning in reports (registry-fed).
     effectful_tools: HashSet<String>,
+    /// The dialect card (8_HARNESS Step 6), prepended to every system
+    /// message ahead of the frame prompt (host-fed, registry-generated).
+    dialect_card: String,
     /// The most recently finished/abandoned run's VM, kept so the
     /// debugger's sticky panes can show final state post-mortem
     /// (9_TUI Step 4). Never executed again.
@@ -184,6 +187,7 @@ impl AgentState {
             generation: 0,
             pending: HashMap::new(),
             effectful_tools: HashSet::new(),
+            dialect_card: String::new(),
             last_vm: None,
         }
     }
@@ -192,6 +196,12 @@ impl AgentState {
     /// (the host feeds these from the tool registry).
     pub fn set_effectful_tools(&mut self, names: HashSet<String>) {
         self.effectful_tools = names;
+    }
+
+    /// The dialect card rendered as the root of the system message
+    /// (the host generates it from the tool registry).
+    pub fn set_dialect_card(&mut self, card: String) {
+        self.dialect_card = card;
     }
 
     /// Whether the frame can accept a `UserTurn` right now.
@@ -808,7 +818,12 @@ impl AgentState {
 
     fn render_request(&self) -> StepOutput {
         let frame = self.spine.frame();
-        let mut system = frame.prompt.clone();
+        let mut system = String::new();
+        if !self.dialect_card.is_empty() {
+            system.push_str(&self.dialect_card);
+            system.push_str("\n\n");
+        }
+        system.push_str(&frame.prompt);
         if !frame.input.is_null() {
             system.push_str("\n\nInput:\n```json\n");
             system.push_str(&frame.input.to_string());
@@ -1063,6 +1078,24 @@ mod tests {
         );
         assert!(matches!(&req.messages[1], Message::User { text } if text == "compute 6*7"));
         assert_eq!(req.tools, vec![TOOL_RUN_PROGRAM.to_owned()]);
+    }
+
+    #[test]
+    fn dialect_card_roots_the_system_message() {
+        let (mut tree, mut state) = setup();
+        state.set_dialect_card("THE DIALECT CARD".into());
+        let out = state
+            .step(&mut tree, StepInput::UserTurn("go".into()))
+            .unwrap();
+        let req = expect_request(&out);
+        let Message::System { text } = &req.messages[0] else {
+            panic!("first message must be the system message");
+        };
+        assert!(text.starts_with("THE DIALECT CARD\n\n"), "{text}");
+        assert!(
+            text.contains("you are a test agent"),
+            "frame prompt follows the card: {text}"
+        );
     }
 
     #[test]

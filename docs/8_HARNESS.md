@@ -370,6 +370,42 @@ available tools (from the registry schemas), and the
 no-`this`/no-`class` guidance with alternatives. Keep it short; the
 condition report carries the per-incident detail.
 
+Acceptance:
+
+- [x] `agent/src/host/dialect.rs`: `dialect_card(&ToolRegistry) ->
+      String`. The tool list is generated from registry schemas — one
+      line per tool consuming `ToolDef.description` + `input_schema`,
+      effectful tools flagged — with the built-ins
+      `tools.tool_result(id)` and `tools.agent({prompt, input})`
+      documented alongside.
+- [x] Card covers: how to act (`run_program` is the only way to do
+      anything; a no-tool-call reply ends the frame), the program
+      contract (`input` const, top-level `return` of a JSON-able value,
+      console as the surviving diagnostic trace, artifact reuse),
+      `raise` + restart semantics (resume vs rewrite), the distilled
+      dialect divergences, and no-`this`/no-`class`/no-`new` guidance
+      with alternatives.
+- [x] Short by construction: a test bounds the static text
+      (`dialect::tests`); one line per registered tool, schema clipped.
+- [x] Wired as the root of the system message:
+      `AgentState::set_dialect_card` + `render_request` prepend it
+      before the frame prompt; `Session::new` and `spawn_child` feed it
+      from the registry. Tests: machine-level (system message starts
+      with the card, frame prompt follows) and host-level (a capturing
+      `LlmClient` sees the card with the registered tool's line).
+- [x] Gate: `cargo fmt && cargo clippy && cargo test` green.
+
+*(Built: `agent/src/host/dialect.rs` — static head (acting, program
+contract, tools intro + built-ins) ++ generated tool lines ++ static
+tail (conditions/restarts, dialect divergences). The divergence section
+is the `vm/mod.rs` list distilled to what changes how one writes a
+program: no `this`/`class`/`new` (plain functions + object literals,
+`new Error` excepted), promises only from `tools.*` with
+`await`/`Promise.all`, UTF-8 string semantics, non-coercing
+relationals, strict arity, 64-bit bitwise. The card is per-`AgentState`
+(`set_dialect_card`), so the per-frame tool-scoping hole can later feed
+children a narrower card without new plumbing.)*
+
 ## Known holes (resolved in principle, specify during build)
 
 - **In-flight effects during a condition:** outstanding tool calls when a

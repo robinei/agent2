@@ -15,11 +15,13 @@
 //! this same thread (9_TUI decision 4).
 
 mod demo;
+mod dialect;
 mod llm;
 mod protocol;
 mod registry;
 
 pub use demo::*;
+pub use dialect::*;
 pub use llm::*;
 pub use protocol::*;
 pub use registry::*;
@@ -141,6 +143,7 @@ impl Session {
             AgentState::with_spine(tree.spine_at(leaf))
         };
         state.set_effectful_tools(registry.effectful_names());
+        state.set_dialect_card(dialect_card(&registry));
         let root = frame_start_id(&tree, state.spine.leaf_id);
 
         let (tx, rx) = channel();
@@ -453,6 +456,7 @@ impl Session {
         let call_site = self.states[&parent].spine.leaf_id;
         let mut child = AgentState::new_child(&mut self.tree, call_site, prompt, input)?;
         child.set_effectful_tools(self.registry.effectful_names());
+        child.set_dialect_card(dialect_card(&self.registry));
         let child_id = child.spine.leaf_id; // the FrameStart it was rooted at
         self.emit_new(child_id);
         self.parents.insert(child_id, (parent, invoke_id));
@@ -654,6 +658,58 @@ mod tests {
             let json = serde_json::to_string(event).unwrap();
             let _: SessionEvent = serde_json::from_str(&json).unwrap();
         }
+    }
+
+    /// Records each request's system message before delegating to the
+    /// scripted client — asserts on what actually crosses the LLM trait.
+    struct CapturingLlm {
+        inner: ScriptedLlm,
+        seen: std::sync::Arc<Mutex<Vec<String>>>,
+    }
+
+    impl LlmClient for CapturingLlm {
+        fn complete(
+            &mut self,
+            request: &LlmRequest,
+            chunk: &mut dyn FnMut(LlmChunk),
+        ) -> Result<Message, String> {
+            if let Some(Message::System { text }) = request.messages.first() {
+                self.seen.lock().unwrap().push(text.clone());
+            }
+            self.inner.complete(request, chunk)
+        }
+    }
+
+    #[test]
+    fn dialect_card_reaches_the_llm_with_the_tool_list() {
+        let mut registry = ToolRegistry::new();
+        registry.register(tool("fetch_page", false, |_| Ok(json!(null))));
+        let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let llm = CapturingLlm {
+            inner: ScriptedLlm::new([scripted_text("done")]),
+            seen: std::sync::Arc::clone(&seen),
+        };
+        let (tx, _rx) = channel();
+        let session = Session::new(
+            Tree::new(None),
+            "frame prompt here",
+            json!(null),
+            registry,
+            Box::new(llm),
+            tx,
+        )
+        .unwrap();
+        session.handle().send(SessionCommand::UserTurn("go".into()));
+        session.run();
+
+        let seen = seen.lock().unwrap();
+        let system = seen.first().expect("a system message");
+        assert!(system.starts_with("You act by writing JavaScript programs"));
+        assert!(system.contains("- tools.fetch_page"), "{system}");
+        assert!(
+            system.contains("frame prompt here"),
+            "frame prompt follows the card"
+        );
     }
 
     #[test]
