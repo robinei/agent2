@@ -90,6 +90,36 @@ fn template_literals() {
         testutil::run_ret("let name = \"bob\"; return `hi ${name}, ${1 + 2}!`;"),
         serde_json::json!("hi bob, 3!")
     );
+    // Bare template (no interpolations).
+    assert_eq!(
+        testutil::run_ret("return `hello`;"),
+        serde_json::json!("hello")
+    );
+    // Single expression.
+    assert_eq!(
+        testutil::run_ret("return `<${1}>`;"),
+        serde_json::json!("<1>")
+    );
+    // Multiple consecutive expressions.
+    assert_eq!(
+        testutil::run_ret("return `${1}${2}${3}`;"),
+        serde_json::json!("123")
+    );
+    // Interpolation of undefined and null.
+    assert_eq!(
+        testutil::run_ret("return `a${undefined}b${null}c`;"),
+        serde_json::json!("aundefinedbnullc")
+    );
+    // Object interpolation → ToString.
+    assert_eq!(
+        testutil::run_ret("return `[${({x:1})}]`;"),
+        serde_json::json!("[[object Object]]")
+    );
+    // Nested template-like content (escaped backtick).
+    assert_eq!(
+        testutil::run_ret(r#"return `\`${1}\``;"#),
+        serde_json::json!("`1`")
+    );
 }
 
 // ── intrinsics ───────────────────────────────────────────────────

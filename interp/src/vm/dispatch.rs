@@ -871,7 +871,8 @@ impl VM {
                     if !(0..64).contains(&b) {
                         return Err(self.fail(ErrorKind::ValueError, "value error"));
                     }
-                    self.stack.push(Value::Float(((a as u64) >> (b as u32)) as f64));
+                    self.stack
+                        .push(Value::Float(((a as u64) >> (b as u32)) as f64));
                     self.ip += 1;
                 }
 
