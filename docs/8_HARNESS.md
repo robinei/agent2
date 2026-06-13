@@ -560,10 +560,12 @@ M1/M2 transcripts, not speculation.
         (`host::tests::promise_all_over_concurrent_agents_joins_both`).
   - [x] Both `tools.agent` calls join as `Invoke` artifacts on the
         caller's spine (reuse/inspection works the same as any tool).
-  - [ ] Manual M3 verification against a real model (needs
-        `DEEPSEEK_API_KEY`): one live run delegating two concurrent
-        subtasks via `Promise.all` over `tools.agent`, both results
-        joining the parent. *Deferred: no key in the build environment.*
+  - [x] Manual M3 verification against a real model (DeepSeek,
+        2026-06-13): `Promise.all([tools.agent(A), tools.agent(B)])`
+        emitted both child `FrameStart`s before either child replied
+        (one batch, concurrent), each child ran its own branch to a
+        `FrameResult` (ALPHA / BETA), both joined as `Invoke` artifacts
+        on the parent, and the program returned `["ALPHA","BETA"]`.
   - [x] Gate: `cargo fmt && cargo clippy && cargo test` green, fully
         offline (the concurrent test ran 15× without flaking).
 
