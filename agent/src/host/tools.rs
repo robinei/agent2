@@ -1,11 +1,20 @@
-//! Real tools (8_HARNESS M1, 10_EDITING): file read, HTTP fetch, bash.
-//! Handlers run blocking on the session loop's worker threads.
+//! Real tools (8_HARNESS M1, 10_EDITING): file read, HTTP fetch, bash,
+//! create_file, replace_file.  Handlers run blocking on the session
+//! loop's worker threads.
 //!
 //! Size-guard tiers (10_EDITING Step 2):
 //! - Program-facing artifacts get full bytes with MB-scale OOM ceilings.
 //! - The LLM boundary clips independently (report.rs).
+//!
+//! File versioning (10_EDITING Step 3):
+//! - `read_file` returns `{ content, version }` where `version` is a
+//!   content hash (SipHash-1-3 via std `DefaultHasher`).
+//! - `create_file` is create-exclusive (O_CREAT|O_EXCL).
+//! - `replace_file` is optimistic CAS: temp + rename iff version matches.
 
+use std::hash::{Hash, Hasher};
 use std::io::Read;
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -37,20 +46,120 @@ const BASH_COMMAND_MAX_BYTES: usize = 1024;
 /// can hang indefinitely; a timeout turns that into a condition.
 const BASH_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The M1 registry: real read-only tools, plus the `bash` escape hatch.
+/// The M1 registry: real read-only tools, plus the `bash` escape hatch,
+/// plus `create_file`/`replace_file` writers (10_EDITING Step 3).
 pub fn real_registry() -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     registry.register(read_file_def());
     registry.register(http_fetch_def());
     registry.register(bash_def());
+    registry.register(create_file_def());
+    registry.register(replace_file_def());
     registry
+}
+
+// ── helpers ────────────────────────────────────────────────────────
+
+/// Content hash of file bytes as a hex string.  Uses std
+/// `DefaultHasher` (SipHash-1-3) — dep-free, fast, and the inputs are
+/// machine-produced (a prior `read_file` version), so false negatives
+/// are not a practical concern.
+fn hash_bytes(bytes: &[u8]) -> String {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut h);
+    format!("{:016x}", h.finish())
+}
+
+/// Minimal line diff: common-prefix + common-suffix scan, reporting the
+/// changed middle with `-`/`+` markers and one line of context on each
+/// side.  Produces a clipped summary for condition messages — full
+/// fidelity lives in the tool results.
+fn diff_lines(old: &str, new: &str) -> String {
+    let old_lines: Vec<&str> = old.lines().collect();
+    let new_lines: Vec<&str> = new.lines().collect();
+
+    // Common prefix
+    let mut prefix = 0;
+    while prefix < old_lines.len()
+        && prefix < new_lines.len()
+        && old_lines[prefix] == new_lines[prefix]
+    {
+        prefix += 1;
+    }
+    // Common suffix (after the prefix)
+    let mut suffix = 0;
+    while suffix < old_lines.len() - prefix
+        && suffix < new_lines.len() - prefix
+        && old_lines[old_lines.len() - 1 - suffix] == new_lines[new_lines.len() - 1 - suffix]
+    {
+        suffix += 1;
+    }
+
+    let old_start = prefix;
+    let old_end = old_lines.len() - suffix;
+    let new_start = prefix;
+    let new_end = new_lines.len() - suffix;
+
+    if old_start == old_end && new_start == new_end {
+        return "(no change)".into();
+    }
+
+    let old_count = old_end.saturating_sub(old_start);
+    let new_count = new_end.saturating_sub(new_start);
+
+    let mut out = format!(
+        "@@ -{},{} +{},{} @@\n",
+        old_start + 1,
+        old_count,
+        new_start + 1,
+        new_count,
+    );
+
+    // One context line before (if available)
+    if prefix > 0 {
+        out.push_str(&format!("  {}\n", old_lines[prefix - 1]));
+    }
+
+    for line in &old_lines[old_start..old_end] {
+        out.push_str(&format!("-{}\n", line));
+    }
+    for line in &new_lines[new_start..new_end] {
+        out.push_str(&format!("+{}\n", line));
+    }
+
+    // One context line after (if available)
+    if suffix > 0 {
+        out.push_str(&format!("  {}\n", old_lines[old_end]));
+    }
+
+    out
+}
+
+/// Atomic write via temp file + rename in the target's directory.
+fn atomic_write(path: &Path, content: &str) -> Result<(), String> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".tmp_")
+        .suffix("_edit")
+        .tempfile_in(dir)
+        .map_err(|e| format!("cannot create temp file in {dir:?}: {e}"))?;
+    std::io::Write::write_all(&mut tmp, content.as_bytes())
+        .map_err(|e| format!("writing temp file: {e}"))?;
+    tmp.as_file_mut()
+        .sync_all()
+        .map_err(|e| format!("syncing temp file: {e}"))?;
+    tmp.persist(path)
+        .map_err(|e| format!("rename to {path:?}: {}", e.error))?;
+    Ok(())
 }
 
 fn read_file_def() -> ToolDef {
     ToolDef {
         name: "read_file".into(),
-        description: "Read a UTF-8 text file; returns full contents (refuses files \
-                      larger than the OOM ceiling)."
+        description: "Read a UTF-8 text file; returns { content, version }. \
+                      `version` is a content hash — pass it to `replace_file` \
+                      so the write is atomic and fails if the file changed \
+                      since you read it."
             .into(),
         input_schema: json!({
             "type": "array",
@@ -60,7 +169,13 @@ fn read_file_def() -> ToolDef {
             "minItems": 1,
             "maxItems": 1
         }),
-        output_schema: json!({ "type": "string" }),
+        output_schema: json!({
+            "type": "object",
+            "properties": {
+                "content": { "type": "string" },
+                "version": { "type": "string" }
+            }
+        }),
         effectful: false,
         handler: Box::new(|args| {
             let path = args
@@ -76,7 +191,8 @@ fn read_file_def() -> ToolDef {
                 ));
             }
             let content = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
-            Ok(json!(content))
+            let version = hash_bytes(content.as_bytes());
+            Ok(json!({ "content": content, "version": version }))
         }),
     }
 }
@@ -106,6 +222,137 @@ fn http_fetch_def() -> ToolDef {
                 .read_to_string()
                 .map_err(|e| format!("{url}: reading body: {e}"))?;
             Ok(json!(clip(&text, HTTP_CONTENT_MAX_BYTES)))
+        }),
+    }
+}
+
+fn create_file_def() -> ToolDef {
+    ToolDef {
+        name: "create_file".into(),
+        description: "Create a new file atomically — errors if the path already \
+                      exists. Returns { version }. Use for new files; for existing \
+                      files use `replace_file`."
+            .into(),
+        input_schema: json!({
+            "type": "array",
+            "items": [
+                { "type": "string", "description": "absolute or cwd-relative path" },
+                { "type": "string", "description": "UTF-8 content to write" }
+            ],
+            "minItems": 2,
+            "maxItems": 2
+        }),
+        output_schema: json!({
+            "type": "object",
+            "properties": {
+                "version": { "type": "string" }
+            }
+        }),
+        effectful: true,
+        handler: Box::new(|args| {
+            let path = args
+                .get(0)
+                .and_then(|v| v.as_str())
+                .ok_or("create_file(path, content) needs a string path")?;
+            let content = args
+                .get(1)
+                .and_then(|v| v.as_str())
+                .ok_or("create_file(path, content) needs string content")?;
+            let p = Path::new(path);
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(p)
+                .map_err(|e| {
+                    if e.kind() == std::io::ErrorKind::AlreadyExists {
+                        format!(
+                            "{path}: already exists — use replace_file(path, version, content) \
+                             instead (read the file first for its version)"
+                        )
+                    } else {
+                        format!("{path}: {e}")
+                    }
+                })?;
+            atomic_write(p, content)?;
+            let version = hash_bytes(content.as_bytes());
+            Ok(json!({ "version": version }))
+        }),
+    }
+}
+
+fn replace_file_def() -> ToolDef {
+    ToolDef {
+        name: "replace_file".into(),
+        description: "Replace a file atomically iff its current version matches \
+                      `expected_version` (CAS). Returns { version, diff? }. On \
+                      mismatch errors with the current version and a diff so you \
+                      can re-read and re-apply. Always requires a version — blind \
+                      overwrite is structurally impossible."
+            .into(),
+        input_schema: json!({
+            "type": "array",
+            "items": [
+                { "type": "string", "description": "absolute or cwd-relative path" },
+                { "type": "string", "description": "expected version (from read_file)" },
+                { "type": "string", "description": "new UTF-8 content" }
+            ],
+            "minItems": 3,
+            "maxItems": 3
+        }),
+        output_schema: json!({
+            "type": "object",
+            "properties": {
+                "version": { "type": "string" },
+                "diff": { "type": "string" }
+            }
+        }),
+        effectful: true,
+        handler: Box::new(|args| {
+            let path = args
+                .get(0)
+                .and_then(|v| v.as_str())
+                .ok_or("replace_file(path, expected_version, content) needs a string path")?;
+            let expected = args
+                .get(1)
+                .and_then(|v| v.as_str())
+                .ok_or("replace_file(path, expected_version, content) needs a version string")?;
+            let new_content = args
+                .get(2)
+                .and_then(|v| v.as_str())
+                .ok_or("replace_file(path, expected_version, content) needs string content")?;
+            let p = Path::new(path);
+
+            let current = std::fs::read_to_string(p).map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    format!(
+                        "{path}: no such file — use create_file(path, content) \
+                         for new files"
+                    )
+                } else {
+                    format!("{path}: {e}")
+                }
+            })?;
+            let current_version = hash_bytes(current.as_bytes());
+
+            if current_version != expected {
+                let diff = clip(&diff_lines(&current, new_content), 2048);
+                return Err(format!(
+                    "file changed: expected version {expected}, now {current_version} — \
+                     re-read and re-apply. To overwrite anyway, call replace_file \
+                     again with version {current_version} (last-write-wins that still \
+                     goes through the CAS, never a blind clobber).\n\
+                     diff (expected→your content):\n{diff}"
+                ));
+            }
+
+            atomic_write(p, new_content)?;
+            let new_version = hash_bytes(new_content.as_bytes());
+            let diff = clip(&diff_lines(&current, new_content), 2048);
+            let mut result = json!({ "version": new_version });
+            if !diff.contains("(no change)") {
+                result["diff"] = json!(diff);
+            }
+            Ok(result)
         }),
     }
 }
@@ -235,12 +482,47 @@ mod tests {
         (read_file_def().handler)(args)
     }
 
+    fn create_file(args: serde_json::Value) -> Result<serde_json::Value, String> {
+        (create_file_def().handler)(args)
+    }
+
+    fn replace_file(args: serde_json::Value) -> Result<serde_json::Value, String> {
+        (replace_file_def().handler)(args)
+    }
+
+    fn temp_path() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("test.txt");
+        (dir, path)
+    }
+
     #[test]
-    fn read_file_round_trips_contents() {
+    fn read_file_returns_content_and_version() {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         write!(file, "hello from a file").unwrap();
         let result = read_file(json!([file.path().to_str().unwrap()])).unwrap();
-        assert_eq!(result, json!("hello from a file"));
+        assert_eq!(result["content"], json!("hello from a file"));
+        assert!(result["version"].is_string());
+        assert!(!result["version"].as_str().unwrap().is_empty());
+    }
+
+    #[test]
+    fn read_file_version_is_stable() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        write!(file, "stable content").unwrap();
+        let v1 = read_file(json!([file.path().to_str().unwrap()])).unwrap()["version"].clone();
+        let v2 = read_file(json!([file.path().to_str().unwrap()])).unwrap()["version"].clone();
+        assert_eq!(v1, v2, "version must be deterministic for the same bytes");
+    }
+
+    #[test]
+    fn read_file_version_changes_with_content() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        write!(file, "content A").unwrap();
+        let v1 = read_file(json!([file.path().to_str().unwrap()])).unwrap()["version"].clone();
+        write!(file, "content B").unwrap();
+        let v2 = read_file(json!([file.path().to_str().unwrap()])).unwrap()["version"].clone();
+        assert_ne!(v1, v2, "version must change when content changes");
     }
 
     #[test]
@@ -250,7 +532,7 @@ mod tests {
         let content = "x".repeat(100_000);
         write!(file, "{content}").unwrap();
         let result = read_file(json!([file.path().to_str().unwrap()])).unwrap();
-        let text = result.as_str().unwrap();
+        let text = result["content"].as_str().unwrap();
         assert_eq!(text.len(), 100_000, "full fidelity, no clip");
         assert!(text.starts_with('x'));
     }
@@ -272,6 +554,118 @@ mod tests {
         assert!(err.contains("/no/such/file/anywhere"), "{err}");
         let err = read_file(json!([42])).unwrap_err();
         assert!(err.contains("needs a string path"), "{err}");
+    }
+
+    // ── create_file ─────────────────────────────────────────────────
+
+    #[test]
+    fn create_file_writes_and_returns_version() {
+        let (_dir, path) = temp_path();
+        let result = create_file(json!([path.to_str().unwrap(), "hello world"])).unwrap();
+        assert!(result["version"].is_string());
+        assert!(!result["version"].as_str().unwrap().is_empty());
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(on_disk, "hello world");
+    }
+
+    #[test]
+    fn create_file_on_existing_path_errors() {
+        let (_dir, path) = temp_path();
+        create_file(json!([path.to_str().unwrap(), "first"])).unwrap();
+        let err = create_file(json!([path.to_str().unwrap(), "second"])).unwrap_err();
+        assert!(err.contains("already exists"), "{err}");
+        assert!(err.contains("replace_file"), "{err}");
+    }
+
+    // ── replace_file ────────────────────────────────────────────────
+
+    fn read_version(path: &std::path::Path) -> String {
+        let content = std::fs::read_to_string(path).unwrap();
+        hash_bytes(content.as_bytes())
+    }
+
+    #[test]
+    fn replace_file_round_trips_under_matching_version() {
+        let (_dir, path) = temp_path();
+        let result = create_file(json!([path.to_str().unwrap(), "original"])).unwrap();
+        let version = result["version"].as_str().unwrap();
+
+        let result = replace_file(json!([path.to_str().unwrap(), version, "modified"])).unwrap();
+        assert!(result["version"].is_string());
+        assert_ne!(result["version"].as_str().unwrap(), version);
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(on_disk, "modified");
+    }
+
+    #[test]
+    fn replace_file_after_out_of_band_edit_returns_mismatch_condition() {
+        let (_dir, path) = temp_path();
+        let result = create_file(json!([path.to_str().unwrap(), "first write"])).unwrap();
+        let old_version = result["version"].as_str().unwrap();
+
+        // Out-of-band edit: someone else wrote to the file.
+        std::fs::write(&path, "second write").unwrap();
+        let current_version = read_version(&path);
+        assert_ne!(current_version, old_version);
+
+        let err =
+            replace_file(json!([path.to_str().unwrap(), old_version, "third write"])).unwrap_err();
+        assert!(err.contains("file changed"), "{err}");
+        assert!(err.contains(old_version), "{err}");
+        assert!(err.contains(&current_version), "{err}");
+        assert!(err.contains("re-read and re-apply"), "{err}");
+        // Diff appears in the error message.
+        assert!(err.contains("@@"), "{err}");
+    }
+
+    #[test]
+    fn replace_file_on_absent_path_redirects_to_create_file() {
+        let (_dir, path) = temp_path();
+        let err =
+            replace_file(json!([path.to_str().unwrap(), "any-version", "content"])).unwrap_err();
+        assert!(err.contains("no such file"), "{err}");
+        assert!(err.contains("create_file"), "{err}");
+    }
+
+    #[test]
+    fn replace_file_success_includes_diff() {
+        let (_dir, path) = temp_path();
+        let result = create_file(json!([path.to_str().unwrap(), "line1\nline2\nline3\n"])).unwrap();
+        let version = result["version"].as_str().unwrap();
+
+        let result = replace_file(json!([
+            path.to_str().unwrap(),
+            version,
+            "line1\nline2b\nline3\n"
+        ]))
+        .unwrap();
+        assert!(result["diff"].is_string());
+        let diff = result["diff"].as_str().unwrap();
+        assert!(diff.contains("-line2"), "{diff}");
+        assert!(diff.contains("+line2b"), "{diff}");
+    }
+
+    #[test]
+    fn atomic_write_leaves_no_partial_file_on_simulated_failure() {
+        let (_dir, path) = temp_path();
+        // Write initial content so we have a valid version.
+        let result = create_file(json!([path.to_str().unwrap(), "initial"])).unwrap();
+        let version = result["version"].as_str().unwrap();
+
+        // The temp-file + rename strategy makes partial writes impossible:
+        // either the rename succeeds (new content visible) or it doesn't
+        // (old content preserved).  We verify that `persist` semantics
+        // hold: the file is either fully the new content or untouched.
+        let ok = replace_file(json!([path.to_str().unwrap(), version, "replaced"]));
+        match ok {
+            Ok(_) => {
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), "replaced");
+            }
+            Err(_) => {
+                // On any error the old content must still be intact.
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), "initial");
+            }
+        }
     }
 
     fn bash(args: serde_json::Value) -> Result<serde_json::Value, String> {

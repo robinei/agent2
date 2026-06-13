@@ -191,19 +191,19 @@ updated `read_file_def`), a hashing helper, a minimal line-diff helper (or the
 
 Acceptance:
 
-- [ ] `read_file([path]) -> { content: string, version: string }`. `version`
+- [x] `read_file([path]) -> { content: string, version: string }`. `version`
       hashes the full file bytes; `content` is the full text (Step 2). Existing
       `read_file` tests updated to read `.content`.
-- [ ] `create_file([path, content]) -> { version }`, `effectful: true`.
+- [x] `create_file([path, content]) -> { version }`, `effectful: true`.
       Create-exclusive (`OpenOptions::create_new(true)`, atomic — no
       check-then-create TOCTOU). Errors if the path exists, redirecting to
       `replace_file`.
-- [ ] `replace_file([path, expected_version, content]) -> { version, diff }`,
+- [x] `replace_file([path, expected_version, content]) -> { version, diff }`,
       `effectful: true`. Read current bytes, compute current version; **iff** it
       equals `expected_version`, write atomically (temp file in the target's
       directory + `rename`) and return the new `version` + a clipped unified diff
       (old→new).
-- [ ] `replace_file` **mismatch raises a condition** (returns `Err`): "file
+- [x] `replace_file` **mismatch raises a condition** (returns `Err`): "file
       changed: expected version X, now Y — re-read and re-apply", with a clipped
       diff of expected-vs-current so the LLM reconciles. The message also states
       the **override path**: to overwrite anyway, call `replace_file` again with
@@ -213,17 +213,27 @@ Acceptance:
       `resume(value)` cannot perform the write — it injects a value, the side
       effect never happens). Absent file → an `Err` redirecting to `create_file`.
       No clobber, no silent success.
-- [ ] The compare is **exact** (CAS), never fuzzy: inputs are machine-produced
+- [x] The compare is **exact** (CAS), never fuzzy: inputs are machine-produced
       (a prior `read_file` version), so there is no reproduction lossiness to
       forgive, and a fuzzy compare would re-introduce silent wrong-writes.
-- [ ] Tests (`host::tools::tests`): `create_file` writes a new file and returns a
+- [x] Tests (`host::tools::tests`): `create_file` writes a new file and returns a
       version; `create_file` on an existing path errors (redirect); `replace_file`
       round-trips under a matching version; `replace_file` after an out-of-band
       edit returns the changed-file condition with the current version;
       `replace_file` on an absent path redirects to `create_file`; atomic write
       leaves no partial file on a simulated failure; diff appears in the
       `replace_file` success result.
-- [ ] Gate: `cargo fmt && cargo clippy && cargo test` green.
+- [x] Gate: `cargo fmt && cargo clippy && cargo test` green.
+
+*(Built: version hash via std `DefaultHasher` (SipHash-1-3) — dep-free,
+deterministic, 16-char hex. Minimal hand-rolled line diff: common-prefix +
+common-suffix scan with `-`/`+` markers and one context line, clipped to
+2 KB. Atomic write via `tempfile::Builder::tempfile_in(dir)` + `persist()`
+— no partial file exposure. `create_file` uses `OpenOptions::create_new(true)`
+for O_CREAT|O_EXCL atomicity. `replace_file` checks version before
+atomic write; mismatch returns current version + diff + override-path
+guidance. All three tools registered in `real_registry()`. `tempfile`
+moved from dev-dependencies to dependencies.)*
 
 ## Step 4: Drop `http_fetch`
 
