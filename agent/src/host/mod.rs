@@ -145,8 +145,12 @@ impl Session {
     /// generalizing `new`'s auto-pick). The root frame is the one `leaf`
     /// belongs to; if `leaf`'s spine is already complete the session
     /// opens idle (a direct `UserTurn` is rejected — fork to continue).
+    ///
+    /// If the leaf's last assistant turn is an unanswered `run_program`
+    /// (the program was interrupted mid-execution), a synthesized report
+    /// is appended so the LLM receives it as that call's tool result.
     pub fn open_at(
-        tree: Tree,
+        mut tree: Tree,
         leaf: EventId,
         registry: ToolRegistry,
         llm: Box<dyn LlmClient>,
@@ -158,7 +162,8 @@ impl Session {
                 format!("cannot open at {leaf:?}: not in the log"),
             ));
         }
-        let emitted = tree.id_counter; // re-opened log: nothing new to emit
+        let leaf = synthesize_if_interrupted(&mut tree, leaf)?;
+        let emitted = tree.id_counter;
         let state = AgentState::with_spine(tree.spine_at(leaf));
         Self::assemble(tree, state, registry, llm, events, emitted)
     }
@@ -661,6 +666,89 @@ impl Session {
     }
 }
 
+/// If the leaf is an unanswered `run_program` (the program was
+/// interrupted before completing), synthesize a tool result so the LLM
+/// receives it as that call's response and can rewrite.
+/// Returns the (possibly updated) leaf id.
+fn synthesize_if_interrupted(tree: &mut Tree, leaf: EventId) -> io::Result<EventId> {
+    let spine = tree.spine_at(leaf);
+    let msgs = &spine.frame().messages;
+    let Some(Message::Assistant { tool_calls, .. }) = msgs.last() else {
+        return Ok(leaf);
+    };
+    let Some(call) = tool_calls.first() else {
+        return Ok(leaf);
+    };
+    if call.name.as_str() != crate::machine::TOOL_RUN_PROGRAM {
+        return Ok(leaf);
+    }
+    // Already answered? (Tool message with matching call_id)
+    if msgs
+        .iter()
+        .any(|m| matches!(m, Message::Tool { call_id, .. } if *call_id == call.id))
+    {
+        return Ok(leaf);
+    }
+
+    // Collect artifacts from the frame's spine segment.
+    let mut artifacts = Vec::new();
+    let mut current = leaf;
+    loop {
+        let Some(event) = tree.events.get(&current) else {
+            break;
+        };
+        match &event.payload {
+            EventPayload::Invoke { name, args, .. } => {
+                artifacts.push(format!(
+                    "[#{}] {}({})",
+                    event.id.as_u64(),
+                    name,
+                    crate::report::preview(args)
+                ));
+            }
+            EventPayload::FrameStart { .. } => break,
+            _ => {}
+        }
+        match event.parent_id {
+            Some(parent) => current = parent,
+            None => break,
+        }
+    }
+    artifacts.reverse();
+
+    let mut report = String::from("## program interrupted\n");
+    report.push_str(
+        "This program was interrupted before completing. The artifacts \
+         below are still fetchable by id — rewrite to continue.\n",
+    );
+    report.push_str("\n## artifacts — fetch with tools.tool_result(id)\n");
+    if artifacts.is_empty() {
+        report.push_str("(none)\n");
+    } else {
+        for a in &artifacts {
+            report.push_str(&a);
+            report.push('\n');
+        }
+    }
+    report.push_str("\n## restarts\n");
+    report.push_str(
+        "- run_program(source): rewrite the program to continue from \
+         where it left off; all artifacts above are still valid.\n",
+    );
+
+    let mut spine = tree.spine_at(leaf);
+    let new_leaf = tree.append(
+        &mut spine,
+        EventPayload::Message(Message::Tool {
+            name: crate::machine::TOOL_RUN_PROGRAM.into(),
+            call_id: call.id.clone(),
+            text: report,
+        }),
+    )?;
+
+    Ok(new_leaf)
+}
+
 /// Auto-pick a resume anchor for a re-opened log: the lowest-id
 /// incomplete leaf, or — every spine complete — the lowest-id leaf
 /// (so the loop still lives for `ListLeaves`/`Fork`/`Resume`). Errors
@@ -728,6 +816,8 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::time::Duration;
+
+    use crate::types::ToolCall;
 
     fn tool(
         name: &str,
@@ -1563,6 +1653,92 @@ mod tests {
             Ok(_) => panic!("open_at on an unknown id must error"),
             Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::NotFound),
         }
+    }
+
+    #[test]
+    fn interrupted_run_program_synthesizes_report_and_rewrite_continues() {
+        // Build a tree with an unanswered run_program: the program was
+        // interrupted before completing. Event ids are deterministic:
+        // FrameStart 1, User 2, Assistant 3 (run_program, no result).
+        let mut tree = Tree::new(None);
+        let mut spine = tree
+            .start_frame(None, "you are an agent", json!(null))
+            .unwrap();
+        tree.append(
+            &mut spine,
+            EventPayload::Message(Message::User {
+                text: "do something".into(),
+            }),
+        )
+        .unwrap();
+        tree.append(
+            &mut spine,
+            EventPayload::Message(Message::Assistant {
+                text: String::new(),
+                thinking: None,
+                tool_calls: vec![ToolCall {
+                    id: "c1".into(),
+                    name: "run_program".into(),
+                    arguments: json!({ "source": "return 42;" }),
+                }],
+            }),
+        )
+        .unwrap();
+        // No Tool/ProgramResult/FrameResult — the VM was lost.
+
+        // Open the log; pick_resume_leaf finds leaf #3.
+        let (tx, rx) = channel();
+        let session = Session::new(
+            tree,
+            "ignored",
+            json!(null),
+            ToolRegistry::new(),
+            Box::new(ScriptedLlm::new(vec![
+                scripted_program("c2", "return 999;"),
+                scripted_text("final"),
+            ])),
+            tx,
+        )
+        .expect("opens the interrupted log");
+
+        let tools = tool_texts(&session);
+        let interrupted_report = tools
+            .first()
+            .expect("a synthesized tool result for the interrupted run_program");
+        assert!(
+            interrupted_report.contains("program interrupted"),
+            "{interrupted_report}"
+        );
+        assert!(
+            interrupted_report.contains("fetchable by id"),
+            "{interrupted_report}"
+        );
+        assert!(
+            interrupted_report.contains("restarts"),
+            "{interrupted_report}"
+        );
+
+        // Now send a user turn; the LLM sees the interrupted report and
+        // responds with a run_program rewrite.
+        session
+            .handle()
+            .send(SessionCommand::UserTurn("continue".into()));
+        let session = session.run();
+
+        // The rewrite should have produced a completion report, then a
+        // final text turn, then FrameResult.
+        let all_tools = tool_texts(&session);
+        assert!(
+            all_tools.iter().any(|t| t.contains("program completed")),
+            "rewrite completed: {all_tools:?}"
+        );
+        let kinds = kinds(session.tree(), root_leaf(&session));
+        assert!(
+            kinds.last() == Some(&"FrameResult"),
+            "frame finished: {kinds:?}"
+        );
+
+        let _events: Vec<SessionEvent> = rx.try_iter().collect();
     }
 
     #[test]

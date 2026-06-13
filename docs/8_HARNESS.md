@@ -61,14 +61,18 @@ should be allowed to reorder plans 3–7.
     visible tool-call name and decides whether repeating it would repeat
     the effect — there is no per-tool effectful flag (removed 10_EDITING
     Step 6).
-7. **Crash recovery is deterministic re-execution, not VM serialization.**
-   To resume a mid-program interruption of the *same* program: recompile
-   the source, re-execute, serve every `Invoke` positionally from the log
-   (in logged resolution order — the 7_ASYNC determinism commitment; args
-   compared as a consistency check, effectful calls included because they
-   really happened) until past the high-water mark. Positional replay is
-   sound only for identical source; rewritten programs reuse via artifact
-   ids (decision 6). VM snapshotting stays off the roadmap.
+7. **Crash-resume is conversational re-entry + artifact reuse by id, not
+    deterministic VM replay.** This **supersedes the prior decision 7** (positional
+    replay). No positional re-execution exists in the code: `dispatch_calls`
+    serves only explicit `tool_result(id)` by keyed lookup and otherwise
+    dispatches a real call; the `VM` lives only in `Phase::Running` and is dropped
+    on crash; the `Tree` reconstructs the *spine* (chat + completed artifacts),
+    and resume re-enters the session loop at the lowest incomplete leaf with a
+    fresh `AgentState`. A frame interrupted mid-`run_program` resumes by
+    **synthesizing the interrupted-program tool result as a rewrite prompt**
+    (artifacts still fetchable by id), which is on-thesis (a crash is just another
+    condition) and reuses existing machinery with no determinism/version-match tax.
+    VM snapshotting stays off the roadmap; so does positional replay.
 
 ## Step 0: Interp-side dialect change (do before/alongside Phase 2)
 

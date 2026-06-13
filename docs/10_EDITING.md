@@ -360,23 +360,36 @@ Targets: `docs/8_HARNESS.md` (decision 7), `agent/src/host/mod.rs`
 
 Acceptance:
 
-- [ ] **8_HARNESS decision 7 rewritten** to: crash-resume reconstructs the spine
+- [x] **8_HARNESS decision 7 rewritten** to: crash-resume reconstructs the spine
       (chat + artifacts), re-enters the loop at the lowest incomplete leaf, and a
       mid-program interruption resumes via a synthesized rewrite prompt — *not*
       deterministic re-execution. Drop the positional-replay / version-match /
       determinism-tax language (VM snapshotting stays off the roadmap; so does
       positional replay). Cross-reference this file's decision 6.
-- [ ] On re-open, a leaf whose last assistant turn is an unanswered `run_program`
+- [x] On re-open, a leaf whose last assistant turn is an unanswered `run_program`
       (no `ProgramResult`/`FrameResult`) is delivered a **synthesized interrupted
       report** as that call's tool result: "your program was interrupted before
       completing; the artifacts below are still fetchable by id — rewrite to
       continue", listing the frame's artifacts.
-- [ ] Test (`host::tests`): log a frame through `FrameStart → User →
+- [x] Test (`host::tests`): log a frame through `FrameStart → User →
       Assistant(run_program)` with no result; `Tree::open` + resume; assert the
       interrupted report is delivered and a `run_program` rewrite continues the
       frame to `FrameResult` (clean leaf-boundary resume, already covered, stays
       green).
-- [ ] Gate: `cargo fmt && cargo clippy && cargo test` green.
+- [x] Gate: `cargo fmt && cargo clippy && cargo test` green.
+
+*(Built: `synthesize_if_interrupted` in `mod.rs` — on re-open, checks if the
+spine leaf is an unanswered `run_program` (Assistant with `run_program` tool call
+but no matching `Tool` message). If so, collects frame artifacts from the spine
+segment, builds an interrupted-program report with artifact list and restart
+options, appends it as a `Tool` message, and returns the new leaf id so
+`AgentState` is constructed from the updated spine. `open_at` uses the returned
+leaf. `Session::new` benefits via `pick_resume_leaf → open_at`. Test:
+`interrupted_run_program_synthesizes_report_and_rewrite_continues` builds a tree
+with FrameStart→User→Assistant(run_program) (no result), opens it, asserts the
+interrupted report appears, and verifies a rewrite→completion→FrameResult arc.
+`8_HARNESS.md` decision 7 rewritten to describe conversational re-entry, not
+deterministic replay.)*
 
 ## Deferred (resolved in principle; build only on evidence)
 
