@@ -166,8 +166,57 @@ coerce to primitives (`[5] == 5` is false, `[] + 1` is an error).
 user functions may omit trailing arguments. Writing past an array's end \
 errors (use `push`). Bitwise ops are 64-bit.";
 
+/// Worked programs — the shapes the prose describes, shown concretely.
+/// A raw string so the JS (quotes, backticks, `${}`) needs no escaping;
+/// indentation is literal, so the code sits at the source's left margin.
+const CARD_EXAMPLES: &str = r####"
+
+## examples
+Good programs orchestrate and self-check in *one* run.
+
+Write files (bodies in `attachments`) and verify them in the SAME program —
+never split the check into a second run_program:
+```
+await tools.bash("mkdir -p /app");
+for (const [path, body] of [["/app/game.js", attachments.game],
+                            ["/app/index.html", attachments.html]]) {
+  await tools.create_file(path, body);
+}
+const checks = await Promise.all([
+  tools.parse_errors("/app/game.js"),
+  tools.parse_errors("/app/index.html"),  // .html soft-skips → { ok: null }
+]);
+const bad = checks.find(c => c.ok === false);
+if (bad) raise("syntax_error", bad);   // stop and hand it to me, don't guess
+return "wrote + verified 2 files";
+```
+
+Edit an existing file — read the version, transform, write it back, re-check:
+```
+const f = await tools.read_file("/app/util.js");
+const next = Edit.replaceOnce(f.content, "const MAX = 10;", "const MAX = 100;");
+await tools.replace_file("/app/util.js", f.version, next);  // version from the read
+const c = await tools.parse_errors("/app/util.js");
+if (c.ok === false) raise("syntax_error", c);
+return "bumped MAX to 100";
+```
+
+Many independent files — delegate one subagent per file so the bodies
+generate concurrently; you pin the interfaces and own the cross-file check:
+```
+const specs = {
+  "/app/api.js": "export async fetchUser(id) -> { id, name }; uses global fetch",
+  "/app/ui.js":  "export render(user) -> html string; imports fetchUser from ./api.js",
+};
+await Promise.all(Object.entries(specs).map(([path, contract]) =>
+  tools.agent({ prompt: `Write ${path}; create_file then parse_errors it. Contract: ${contract}`, input: null })));
+const c = await tools.bash("cd /app && node --check api.js && node --check ui.js");
+return c.status === 0 ? "delegated + checked 2 files" : c.stderr;
+```
+"####;
+
 /// Render the full card: static head, the registry's tools (sorted,
-/// one line each), static tail.
+/// one line each), static tail, worked examples.
 pub fn dialect_card(registry: &ToolRegistry) -> String {
     let mut card = String::from(CARD_HEAD);
     let mut tools: Vec<_> = registry.iter().collect();
@@ -182,6 +231,7 @@ pub fn dialect_card(registry: &ToolRegistry) -> String {
     }
     card.push_str("\n\n");
     card.push_str(CARD_TAIL);
+    card.push_str(CARD_EXAMPLES);
     card
 }
 
@@ -191,13 +241,12 @@ mod tests {
     use crate::host::registry::ToolDef;
     use serde_json::json;
 
-    /// Bound on the static (non-tool-list) card text — keep it lean.
-    /// The card carries the always-true contract (acting strategy,
-    /// editing recipe, dialect divergences); per-incident detail belongs
-    /// in the reports. Grown deliberately as load-bearing guidance landed
-    /// (Edit.* signatures, structural tools, orchestration + per-file
-    /// subagent delegation).
-    const CARD_STATIC_MAX_BYTES: usize = 10_240;
+    /// Bound on the static (non-tool-list) card text. The card carries the
+    /// always-true contract (acting strategy, editing recipe, dialect
+    /// divergences) plus worked examples; per-incident detail belongs in
+    /// the reports. Roomy on purpose — concrete examples earn their bytes
+    /// (they shift first-try behavior where prose alone did not).
+    const CARD_STATIC_MAX_BYTES: usize = 30_720;
 
     fn registry_with_tools() -> ToolRegistry {
         let mut registry = ToolRegistry::new();
@@ -220,10 +269,11 @@ mod tests {
 
     #[test]
     fn card_stays_short() {
+        let static_bytes = CARD_HEAD.len() + CARD_TAIL.len() + CARD_EXAMPLES.len();
         assert!(
-            CARD_HEAD.len() + CARD_TAIL.len() <= CARD_STATIC_MAX_BYTES,
-            "static card text grew past {CARD_STATIC_MAX_BYTES} bytes — \
-             the card must stay short; move detail into the reports"
+            static_bytes <= CARD_STATIC_MAX_BYTES,
+            "static card text ({static_bytes} bytes) grew past \
+             {CARD_STATIC_MAX_BYTES} — keep it bounded; move detail into the reports"
         );
     }
 
@@ -259,6 +309,11 @@ mod tests {
             "`attachments` is a read-only const",
             "attachments: { app:",
             "top-level `return <value>`",
+            // Worked examples (CARD_EXAMPLES):
+            "## examples",
+            "verify them in the SAME program",
+            "Edit.replaceOnce(f.content",
+            "one subagent per file",
             "console.log",
             "tools.tool_result(id)",
             "Call tools **positionally**",
