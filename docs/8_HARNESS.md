@@ -517,13 +517,16 @@ M1/M2 transcripts, not speculation.
         `scripted_program`/`scripted_text` so the restart turn is
         scriptable offline (the machine-level golden reports already cover
         the report *rendering* — these host tests cover the loop *routing*).
-  - [ ] Manual M2 verification against a real model (needs
-        `DEEPSEEK_API_KEY`): one `agent session --headless --real --turn …`
-        run that raises and one that trips a TypeError, each resumed and
-        rewritten from the live transcript. *Deferred: no key in the build
-        environment — run with `DEEPSEEK_API_KEY=… cargo run -p agent --
-        session --headless --real --turn '<task that raises>'` and eyeball
-        the report → restart arc.*
+  - [x] Manual M2 verification against a real model (DeepSeek,
+        2026-06-13): a `raise("need_value", payload)` run round-trips
+        report → `resume(10)` → `returned: 11` → final text; a separate run
+        does `http_fetch` (logged `#4`) → trapped TypeError (caret on
+        `x.length`) → `run_program` rewrite calling `tools.tool_result(4)`
+        with **no** second fetch → `returned: 559`. The first live attempt
+        surfaced a real bug — the post-`resume` report answered the
+        original `run_program` call id, not the `resume`, so the next chat
+        request 400'd ("tool_call_ids did not have response messages");
+        fixed by carrying the resume's call id onto the `Run`.
   - [x] Gate: `cargo fmt && cargo clippy && cargo test` green, fully
         offline.
 
