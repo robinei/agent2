@@ -51,7 +51,14 @@ few lines MUST be passed in `attachments` and read as `attachments.<name>` \
 — never inlined into `source`.** Inlined content bloats the program, has \
 to be JS-escaped (backtick/`${` hazards that silently corrupt it), and \
 buries the logic; an attachment is inert string data. Inline a literal \
-only for a line or two.
+only for a line or two. So to write two files, the run_program call is:
+```
+{ source: `await tools.create_file(\"/x/app.js\", attachments.app);
+           await tools.create_file(\"/x/page.html\", attachments.page);
+           return \"wrote 2 files\";`,
+  attachments: { app: \"<the whole app.js body>\",
+                 page: \"<the whole page.html body>\" } }
+```
 - End with a top-level `return <value>`; the value must be JSON-able \
 (no functions or promises). Without `return` the result is undefined.
 - `console.log(...)` is your diagnostic trace: it is quoted back in \
@@ -250,6 +257,7 @@ mod tests {
             "keeps a long orchestration alive",
             "`input` is a read-only const",
             "`attachments` is a read-only const",
+            "attachments: { app:",
             "top-level `return <value>`",
             "console.log",
             "tools.tool_result(id)",
