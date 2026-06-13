@@ -97,8 +97,8 @@ pub(crate) fn same_value_zero(a: &Value, b: &Value) -> bool {
                 return true;
             }
             if *x == 0.0 && *y == 0.0 {
-                return x.signum() == y.signum() || true;
-                // SameValueZero: +0 and -0 are equal, so any zero equals any zero
+                // SameValueZero: +0 and -0 are equal, so any zero equals any zero.
+                return true;
             }
             x == y
         }
