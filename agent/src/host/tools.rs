@@ -329,11 +329,11 @@ fn bash_def() -> ToolDef {
     ToolDef {
         name: "bash".into(),
         description: "Run one short shell command — a single pipeline, no loops or \
-                      multi-line scripts; do control flow in JS. Command is one string \
-                      — bash(\"mkdir -p /x && ls /x\") — or an argv array joined with \
-                      spaces. Resolves to { status, stdout, stderr, truncated? } \
-                      (a non-zero status is a result, not an error); times out after \
-                      30s; output capped at 4MB/stream."
+                      multi-line scripts; do control flow in JS. The command is one \
+                      string: bash(\"mkdir -p /x && ls /x\"). (An argv array is also \
+                      tolerated, joined with spaces.) Resolves to { status, stdout, \
+                      stderr, truncated? } (a non-zero status is a result, not an \
+                      error); times out after 30s; output capped at 4MB/stream."
             .into(),
         input_schema: json!({
             "type": "array",

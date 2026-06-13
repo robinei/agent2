@@ -107,8 +107,12 @@ disjoint, applied right-to-left. Errors naming the offender.
 `replace_file` → optional `bash` build/test verify.
 
 ## tools
-Call as `tools.<name>(args...)`. Every call returns a promise; `await` \
-it. Calls started before awaiting run in parallel (`Promise.all` works).
+Call tools **positionally**, each argument separate: \
+`create_file(path, content)`, `bash(cmd)` — never bundle the arguments \
+into one array (`create_file([path, content])` is wrong). A tool's \
+`array` input schema describes its positional argument *list*, not a \
+single array parameter. Every call returns a promise; `await` it. Calls \
+started before awaiting run in parallel (`Promise.all` works).
 - tools.tool_result(id) — re-fetch artifact [#id] from the log \
 (instant, free).
 - tools.agent({ prompt, input }) — delegate a subtask to a fresh \
@@ -246,6 +250,8 @@ mod tests {
             "top-level `return <value>`",
             "console.log",
             "tools.tool_result(id)",
+            "Call tools **positionally**",
+            "not a single array parameter",
             "tools.agent({ prompt, input })",
             "raise(name, payload)",
             "resume(value)",
