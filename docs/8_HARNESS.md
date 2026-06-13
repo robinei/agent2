@@ -541,6 +541,38 @@ M1/M2 transcripts, not speculation.
 - **M3**: subagent branches — `Promise.all` over `tools.agent` spawning
   concurrent child frames (or sequential awaits pre-7_ASYNC), results
   joining the parent program.
+
+  M3 acceptance:
+
+  - [x] `Promise.all([tools.agent(a), tools.agent(b)])` dispatches both
+        agent calls in **one** fan-out batch (the array literal evaluates
+        before `__all` awaits), which `dispatch_calls` splits into a
+        single `SpawnFrames` carrying both — so the two children are
+        spawned concurrently, not serialized.
+  - [x] Host-level through the full `Session` loop: both children root on
+        their own branches (three leaves total), each runs its frame to
+        completion independently, and both results join back into the
+        parent program's returned array — asserted order-independently
+        because the two children race for the shared scripted client
+        (`host::tests::promise_all_over_concurrent_agents_joins_both`).
+  - [x] Both `tools.agent` calls join as `Invoke` artifacts on the
+        caller's spine (reuse/inspection works the same as any tool).
+  - [ ] Manual M3 verification against a real model (needs
+        `DEEPSEEK_API_KEY`): one live run delegating two concurrent
+        subtasks via `Promise.all` over `tools.agent`, both results
+        joining the parent. *Deferred: no key in the build environment.*
+  - [x] Gate: `cargo fmt && cargo clippy && cargo test` green, fully
+        offline (the concurrent test ran 15× without flaking).
+
+  *(Built: no new machinery — Step 3's `dispatch_calls` already routes a
+  mixed batch (`agent` → `SpawnFrames`, `tool_result` → log, rest →
+  `ToolCalls`) and Step 5's host already spawns a child per `SpawnFrame`
+  and joins its `FrameDone` back as a `SubagentResult`. M3 is the test
+  that proves the **concurrent** path: `Promise.all` over two agents, two
+  live branches, both joined. The shared `Arc<Mutex<dyn LlmClient>>` means
+  the two children pop scripted turns in race order, so the test asserts
+  on the joined *set*, not position — exactly the property a real model
+  has too.)*
 - **M4**: fork/label UX — list leaves, fork from any event, resume a
   chosen spine (CLI is fine).
 - **M5**: the eval question — measure the thesis: success rate and token

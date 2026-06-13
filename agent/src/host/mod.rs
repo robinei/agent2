@@ -947,6 +947,82 @@ mod tests {
         )));
     }
 
+    /// M3: `Promise.all` over two `tools.agent` calls spawns both child
+    /// frames concurrently (one fan-out batch, two branches) and joins
+    /// both results back into the parent program.
+    #[test]
+    fn promise_all_over_concurrent_agents_joins_both() {
+        let script = vec![
+            scripted_program(
+                "c1",
+                r#"return await Promise.all([
+                    tools.agent({ prompt: "task A", input: { id: 1 } }),
+                    tools.agent({ prompt: "task B", input: { id: 2 } }),
+                ]);"#,
+            ),
+            // Two child turns; which child pops which is race-dependent
+            // (shared scripted client), so the assertions below are
+            // order-independent (set membership, not position).
+            scripted_text("done: A"),
+            scripted_text("done: B"),
+            scripted_text("both back"),
+        ];
+        let (session, _) = run_session(ToolRegistry::new(), script, "delegate two");
+        let tree = session.tree();
+
+        // Three spines: the caller plus the two (completed) children.
+        assert_eq!(tree.list_leaves().len(), 3);
+
+        // Both child frames were rooted, each with the prompt it was given.
+        let child_prompts: HashSet<String> = tree
+            .events
+            .values()
+            .filter_map(|e| match &e.payload {
+                EventPayload::FrameStart { prompt, .. } => Some(prompt.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(child_prompts.contains("task A") && child_prompts.contains("task B"));
+
+        // Each child spine ran to completion independently.
+        for (leaf, _) in tree.list_leaves() {
+            if leaf == root_leaf(&session) {
+                continue;
+            }
+            assert_eq!(
+                kinds(tree, leaf),
+                ["FrameStart", "Assistant", "FrameResult"]
+            );
+        }
+
+        // The caller logged both agent calls as artifacts on its spine…
+        let invokes = kinds(tree, root_leaf(&session))
+            .iter()
+            .filter(|k| **k == "Invoke")
+            .count();
+        assert_eq!(invokes, 2, "both agent calls join as artifacts");
+
+        // …and both results joined into the program's returned array.
+        let result = tree
+            .events
+            .values()
+            .find_map(|e| match &e.payload {
+                EventPayload::ProgramResult { value } => Some(value.clone()),
+                _ => None,
+            })
+            .expect("a ProgramResult");
+        let joined: HashSet<String> = result
+            .as_array()
+            .expect("an array result")
+            .iter()
+            .map(|v| v.as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            joined,
+            HashSet::from(["done: A".to_owned(), "done: B".to_owned()])
+        );
+    }
+
     #[test]
     fn hot_loop_keeps_the_inbox_responsive() {
         let (tx, _rx) = channel();
