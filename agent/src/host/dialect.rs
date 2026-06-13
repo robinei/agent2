@@ -52,9 +52,12 @@ re-read / run the build via `bash`) and only `raise` on surprise.
 - `create_file(path, content)` for new files; `replace_file(path, \
 expected_version, content)` passes the `version` from `read_file` — a \
 changed-file condition means re-read and re-apply.
-- `extractBlock(text, headIndex) -> { start, end }` is a pure helper \
-recipe: brace-balance for `{}` languages, dedent for Python — \
-whole-function replacement is computed, not retyped.
+- Pure string helpers in the `Edit` namespace (like `Math`): \
+`Edit.replaceOnce`, `Edit.replaceCount`, `Edit.count`, \
+`Edit.extractBlock`, `Edit.extractByIndent`, `Edit.extractEnclosing`, \
+`Edit.replaceLines`, `Edit.insertAt`, `Edit.applyEdits`. Every helper \
+errors on ambiguity (0/N matches, out-of-range, overlapping) as a \
+catchable runtime error — use try/catch when ambiguity is expected.
 
 ## tools
 Call as `tools.<name>(args...)`. Every call returns a promise; `await` \

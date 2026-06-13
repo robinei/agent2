@@ -32,6 +32,7 @@ use crate::vm::{ErrorKind, VM, VMError, Value};
 
 mod array;
 mod console;
+mod edit;
 mod json;
 mod map;
 mod math;
@@ -44,6 +45,7 @@ mod string;
 
 use array::*;
 use console::*;
+use edit::*;
 use json::*;
 use map::*;
 use math::*;
@@ -295,6 +297,17 @@ builtins! {
     // ── String static ──
     StrFromCharCode,  BuiltinKind::Namespace("String"), "fromCharCode",  0, VARARG, str_from_char_code;
     StrFromCodePoint, BuiltinKind::Namespace("String"), "fromCodePoint", 0, VARARG, str_from_code_point;
+
+    // ── Edit static ──
+    EditReplaceOnce,       BuiltinKind::Namespace("Edit"), "replaceOnce",    3, 3, edit_replace_once;
+    EditReplaceCount,      BuiltinKind::Namespace("Edit"), "replaceCount",   3, 3, edit_replace_count;
+    EditCount,             BuiltinKind::Namespace("Edit"), "count",          2, 2, edit_count;
+    EditExtractBlock,      BuiltinKind::Namespace("Edit"), "extractBlock",   2, 2, edit_extract_block;
+    EditExtractByIndent,   BuiltinKind::Namespace("Edit"), "extractByIndent",    2, 2, edit_extract_by_indent;
+    EditExtractEnclosing,  BuiltinKind::Namespace("Edit"), "extractEnclosing",   4, 4, edit_extract_enclosing;
+    EditReplaceLines,      BuiltinKind::Namespace("Edit"), "replaceLines",   4, 4, edit_replace_lines;
+    EditInsertAt,          BuiltinKind::Namespace("Edit"), "insertAt",       3, 3, edit_insert_at;
+    EditApplyEdits,        BuiltinKind::Namespace("Edit"), "applyEdits",     2, 2, edit_apply_edits;
 
     // ── Map static ──
     MapIsMap, BuiltinKind::Namespace("Map"), "isMap", 1, 1, map_is_map;

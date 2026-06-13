@@ -423,3 +423,126 @@ deterministic replay.)*
   (re-call with the returned version), so this is not needed. Do **not**
   approximate it with a versionless/`force` write tool: that is the blind-clobber
   hole decision 3 removed.
+
+---
+
+# Followup phase — Editing primitives (capability lift)
+
+Phase 10 (Steps 1–7, **implemented**) settled the *toolset*; this followup adds
+the *primitives* that make a code-editing agent materially better at locating,
+applying, and trusting edits. It builds on the implemented
+`read_file`/`create_file`/`replace_file`/`bash` set and changes none of it — it
+is purely additive, sequenced after Phase 10.
+
+## Principle
+
+Editing primitives **report what they did and refuse ambiguity** — the lift is
+feedback, not magic. A bare `text.replace(old, new)` silently takes the first of
+N matches and says nothing; every primitive here instead errors on ambiguity
+(0/N matches where 1 was meant, an out-of-range splice, overlapping multi-edits)
+as a **catchable** runtime error. Division of labor follows where the call stack
+must live:
+
+- **Pure first-order ops → namespaced Rust builtins** (`Edit.*`, wired like
+  `Math.*`/`JSON.*` via `for_namespace`). They take no user callback, so their
+  stack need not run in the VM; the JS prelude (`interp/src/prelude.rs`) stays
+  reserved for callback-taking higher-order helpers (`map`/`filter`/…) whose
+  whole stack must.
+- **Parser-backed structure → read-only tools** (tree-sitter): `outline`
+  (locate) and `parse_errors` (verify).
+- **No semantic/LSP tier** — slow and unreliable; string + structure covers the
+  80%, and rename stays grep-and-`Edit.applyEdits`-then-assert, which fails loud
+  where a string-replace in a costume fails silent.
+
+## Step F1: `Edit.*` builtins — fail-loud pure helpers
+
+The model should not re-derive a brace scanner or a match counter inline every
+program (wasteful, and buggy under pressure). Add a tested `Edit` namespace of
+first-order pure helpers as Rust builtins, resolved by the compiler via
+`for_namespace("Edit", …)` exactly like `Math.*`/`JSON.*`. Each reports and
+refuses ambiguity by returning an error that surfaces as a **catchable** runtime
+error (the program may `try/catch` an expected-ambiguous case, or let it become a
+condition for the LLM). Not the prelude: these take no callback, so their stack
+need not live in the VM (Principle).
+
+Targets: a new `interp/src/builtin/edit.rs` + the builtin macro/enum in
+`interp/src/builtin/mod.rs` (`BuiltinKind::Namespace("Edit")`); compiler
+namespace resolution (`for_namespace`); `agent/src/host/dialect.rs` (card);
+interp builtin tests.
+
+Acceptance:
+
+- [x] `Edit` namespace resolves at compile time, arity-checked/linted like other
+      namespaced builtins; documented in the dialect card.
+- [x] **Replace, guarded:** `Edit.replaceOnce(text, old, new)` errors with the
+      actual count if matches != 1; `Edit.replaceCount(text, old, new) ->
+      { result, count }` for an intended-N replace; `Edit.count(text, needle) ->
+      number`. `RegExp` forms accepted where they make sense.
+- [x] **Extract, computed not retyped:** `Edit.extractBlock(text, headIndex) ->
+      { start, end }` (brace balance), `Edit.extractByIndent(text, lineIndex)`
+      (dedent), `Edit.extractEnclosing(text, index, open, close)`. Unbalanced /
+      out-of-range input errors.
+- [x] **Splice, bounds-checked:** `Edit.replaceLines(text, start, end, newText)`
+      and `Edit.insertAt(text, lineNo, newText)` — 1-indexed, error on a bad range.
+- [x] **Multi-edit, atomic + disjoint:** `Edit.applyEdits(text, edits)` validates
+      each `old` matches exactly once and the spans are disjoint, applies
+      right-to-left so offsets stay stable, and errors naming the offender.
+- [x] Tests (interp builtin tests): each helper's success and its
+      error-on-ambiguity path; arity/lint parity with existing namespaced builtins.
+- [x] Gate: `cargo fmt && cargo clippy && cargo test` green.
+
+*(Built: `Edit` namespace wired via `for_namespace` like `Math`/`JSON` — 9**
+*builtins in `interp/src/builtin/edit.rs`: `replaceOnce`, `replaceCount`,**
+*`count`, `extractBlock`, `extractByIndent`, `extractEnclosing`, `replaceLines`,*
+*`insertAt`, `applyEdits`. All error on ambiguity as catchable `ValueError`.**
+*Brace + delimiter balancing skips JS string literals and comments to avoid**
+*false positives. `Edit` added to the compiler namespace match table in*
+*`interp/src/compiler/call.rs`. Documented in the dialect card's editing-files**
+*section. Tests: 32 tests covering success, ambiguity-error, out-of-range,**
+*arity/lint, and catchable-error paths. Gate: 704 interp + 115 agent tests**
+*green.)*
+
+## Step F2: Structural tools — `outline` + `parse_errors` (tree-sitter)
+
+Read-side structure and verify-side parsing are the two things a program cannot
+cheaply reconstruct over strings. Back both with the `tree-sitter` crate
+(https://docs.rs/tree-sitter) + per-language grammar crates, selected by file
+extension. Read-only, so no version/CAS.
+
+Targets: a new `agent/src/host/structural.rs` (registered in `real_registry`),
+`agent/Cargo.toml` (`tree-sitter` + `tree-sitter-rust`,
+`tree-sitter-javascript`/`-typescript`, `tree-sitter-python` to start),
+`agent/src/host/dialect.rs`.
+
+Acceptance:
+
+- [ ] `outline([path]) -> [{ name, kind, start_line, end_line, signature? }]`
+      (read-only). Definitions extracted via each grammar's tags query; language
+      inferred from the extension; an unsupported extension returns an explicit
+      error, not a silent empty list. Node ranges are exact even when braces
+      appear in strings/comments — the correctness fallback for
+      `Edit.extractBlock`.
+- [ ] `parse_errors` verifies syntax: `parse_errors([path]) ->
+      { ok, errors: [{ line, col, message }] }` reads + infers language; a second
+      form `parse_errors([null, source, lang])` checks **candidate content the
+      program computed before writing**. Collects tree-sitter `ERROR`/`MISSING`
+      nodes with positions.
+- [ ] Card documents the loop: read → transform → `parse_errors(candidate, lang)`
+      → `replace_file` (catch a broken edit before it lands, not three build steps
+      later) → optional `bash` build/test verify.
+- [ ] Tests: `outline` on a fixture lists its definitions with correct ranges;
+      `parse_errors` returns `ok` for valid source and positioned errors for a
+      broken brace; the pre-write `source` form works without touching disk.
+- [ ] Gate: `cargo fmt && cargo clippy && cargo test` green.
+
+## Step F3 (optional): Structured search — `search`
+
+Ergonomics only; `bash` + `grep`/`rg` already covers the capability. Add it when
+parsing raw grep output in JS proves a recurring papercut — build on evidence,
+not speculatively.
+
+Acceptance:
+
+- [ ] `search([pattern, opts?]) -> [{ file, line, col, text }]` via `rg --json`,
+      result count bounded; read-only; documented in the card.
+- [ ] Gate: `cargo fmt && cargo clippy && cargo test` green.
