@@ -268,7 +268,9 @@ pub fn parse_errors_def() -> ToolDef {
         description: "Verify syntax: `parse_errors([path])` reads a file and \
                       checks it; `parse_errors([null, source, lang])` checks \
                       candidate content the program computed **before writing** — \
-                      no disk touch. Returns { ok, errors: [{ line, col, message }] }. \
+                      no disk touch. Returns { ok, errors: [{ line, col, message }] }; \
+                      a path with no structural parser (e.g. .html, .css) returns \
+                      { ok: null, skipped } so a sweep over mixed files is safe. \
                       Supported languages: rust, javascript, typescript, python."
             .into(),
         input_schema: json!({
@@ -321,7 +323,28 @@ pub fn parse_errors_def() -> ToolDef {
                 let path = first
                     .and_then(|v| v.as_str())
                     .ok_or("parse_errors(path) needs a string path")?;
-                let lang = lang_from_path(path)?;
+                let lang = match lang_from_path(path) {
+                    Ok(lang) => lang,
+                    // `parse_errors` is "verify what I just wrote", and a
+                    // validation sweep routinely includes non-code files
+                    // (HTML, CSS, JSON, …). Soft-skip those instead of
+                    // rejecting the whole program — `outline` stays strict
+                    // (you asked for structure of a file we can't parse),
+                    // but a sweep should degrade gracefully, not detonate.
+                    Err(_) => {
+                        let ext = Path::new(path)
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .unwrap_or("");
+                        return Ok(json!({
+                            "ok": null,
+                            "skipped": format!(
+                                "no structural parser for .{ext}; syntax not checked \
+                                 (supported: rust, javascript, typescript, python)"
+                            )
+                        }));
+                    }
+                };
                 let source = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
                 run_parse_errors(&source, lang)
             }
@@ -431,6 +454,20 @@ mod tests {
         let result = call_handler(&parse_errors_def(), json!([path.to_str().unwrap()])).unwrap();
         assert_eq!(result["ok"], json!(true));
         assert!(result["errors"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_errors_soft_skips_unsupported_extension() {
+        // A validation sweep over mixed files must not detonate on a
+        // non-code file: `parse_errors` soft-skips (vs. `outline`, strict).
+        let (_dir, path) = temp_path_with_ext("html");
+        std::fs::write(&path, "<!DOCTYPE html><html></html>").unwrap();
+        let result = call_handler(&parse_errors_def(), json!([path.to_str().unwrap()])).unwrap();
+        assert_eq!(result["ok"], json!(null));
+        assert!(
+            result["skipped"].as_str().unwrap().contains(".html"),
+            "got: {result}"
+        );
     }
 
     #[test]

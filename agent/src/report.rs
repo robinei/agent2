@@ -117,8 +117,49 @@ impl CompletionReport {
         out.push_str(&render_console(&self.console));
         out.push_str("\n\n");
         out.push_str(&render_menu("new artifacts", &self.new_artifacts));
+        if self.wrote_without_verifying() {
+            out.push_str(
+                "\n\n## note\nThis program wrote files but didn't check them. \
+                 Don't report success unverified — verify now (`parse_errors`, a \
+                 re-read, or a `bash` build/test). Next time, fold that check into \
+                 the same program that does the writing, not a separate one.",
+            );
+        }
         out
     }
+
+    /// Whether this run created or replaced files but never inspected
+    /// them in the same program — the nudge condition: validation of a
+    /// write belongs in the program that wrote it, not a follow-up
+    /// `run_program` (the split-validation habit the card warns against).
+    fn wrote_without_verifying(&self) -> bool {
+        let mut wrote = false;
+        let mut verified = false;
+        for a in &self.new_artifacts {
+            let l = &a.label;
+            if l.starts_with("create_file(") || l.starts_with("replace_file(") {
+                wrote = true;
+            } else if l.starts_with("parse_errors(")
+                || l.starts_with("outline(")
+                || l.starts_with("read_file(")
+                || (l.starts_with("bash(") && looks_like_build(l))
+            {
+                verified = true;
+            }
+        }
+        wrote && !verified
+    }
+}
+
+/// Build/test-ish `bash` commands count as verifying a write; setup
+/// commands (mkdir, cp, mv, touch) do not. Best-effort over the clipped
+/// args preview — a missed match only yields a soft, advisory nudge.
+fn looks_like_build(label: &str) -> bool {
+    const TOKENS: [&str; 14] = [
+        "build", "test", "lint", "check", "tsc", "node ", "cargo", "npm", "pnpm", "yarn", "pytest",
+        "python", "make", "eslint",
+    ];
+    TOKENS.iter().any(|t| label.contains(t))
 }
 
 // ── section renderers (each enforces its own bound) ─────────────────
@@ -308,6 +349,55 @@ mod tests {
             pv
         );
         assert!(pv.contains("[truncated; 2000002 bytes total]"));
+    }
+
+    fn completion(artifacts: Vec<Artifact>) -> String {
+        CompletionReport {
+            value: json!({ "status": "done" }),
+            console: Vec::new(),
+            new_artifacts: artifacts,
+        }
+        .render()
+    }
+
+    #[test]
+    fn write_without_verify_gets_a_nudge() {
+        // Wrote two files, no inspection in the same program → nudge.
+        let rendered = completion(vec![
+            artifact(4, "bash([\"mkdir -p /x\"])", json!({ "status": 0 })),
+            artifact(5, "create_file([\"/x/index.html\", \"…\"])", json!({ "version": "a" })),
+            artifact(6, "create_file([\"/x/game.js\", \"…\"])", json!({ "version": "b" })),
+        ]);
+        assert!(rendered.contains("## note"), "{rendered}");
+        assert!(rendered.contains("wrote files but didn't check them"));
+    }
+
+    #[test]
+    fn write_then_verify_in_program_has_no_nudge() {
+        // parse_errors, a re-read, or a bash build each count as the
+        // in-program check — no nudge.
+        for verify in [
+            artifact(7, "parse_errors([\"/x/game.js\"])", json!({ "ok": true })),
+            artifact(7, "read_file([\"/x/game.js\"])", json!({ "content": "…" })),
+            artifact(7, "bash([\"cargo build\"])", json!({ "status": 0 })),
+        ] {
+            let rendered = completion(vec![
+                artifact(5, "create_file([\"/x/game.js\", \"…\"])", json!({ "version": "b" })),
+                verify,
+            ]);
+            assert!(!rendered.contains("## note"), "unexpected nudge: {rendered}");
+        }
+    }
+
+    #[test]
+    fn no_write_no_nudge() {
+        // A pure read/compute program never gets the write nudge, even
+        // with a setup-only bash call.
+        let rendered = completion(vec![
+            artifact(4, "bash([\"mkdir -p /x\"])", json!({ "status": 0 })),
+            artifact(5, "read_file([\"/x/a.js\"])", json!({ "content": "…" })),
+        ]);
+        assert!(!rendered.contains("## note"), "{rendered}");
     }
 
     #[test]
