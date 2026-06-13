@@ -1166,6 +1166,56 @@ mod tests {
         );
     }
 
+    /// A large file body inlined into `source` (no `attachments`) draws
+    /// the attachments nudge in the completion report.
+    #[test]
+    fn inlined_large_body_nudges_toward_attachments() {
+        let mut registry = ToolRegistry::new();
+        registry.register(tool("create_file", |_| Ok(json!({ "version": "v1" }))));
+        let big = "x".repeat(600); // > INLINE_BODY_ADVICE_BYTES
+        let script = vec![
+            scripted_program(
+                "c1",
+                &format!(r#"await tools.create_file("/x/a.js", "{big}"); return "ok";"#),
+            ),
+            scripted_text("done"),
+        ];
+        let (session, _) = run_session(registry, script, "write it");
+        let report = tool_texts(&session)
+            .into_iter()
+            .find(|t| t.contains("program completed"))
+            .expect("a completion report");
+        assert!(report.contains("inlined into `source`"), "{report}");
+    }
+
+    /// The same large body, passed through `attachments` and referenced
+    /// from `source`, is rewarded: no nudge even though the written content
+    /// is large (the model is using the channel).
+    #[test]
+    fn attachments_suppress_the_inline_nudge() {
+        let mut registry = ToolRegistry::new();
+        registry.register(tool("create_file", |_| Ok(json!({ "version": "v1" }))));
+        let prog = Message::Assistant {
+            text: String::new(),
+            thinking: None,
+            tool_calls: vec![ToolCall {
+                id: "c1".into(),
+                name: "run_program".into(),
+                arguments: json!({
+                    "source": r#"await tools.create_file("/x/a.js", attachments.body); return "ok";"#,
+                    "attachments": { "body": "x".repeat(600) },
+                }),
+            }],
+        };
+        let script = vec![prog, scripted_text("done")];
+        let (session, _) = run_session(registry, script, "write it");
+        let report = tool_texts(&session)
+            .into_iter()
+            .find(|t| t.contains("program completed"))
+            .expect("a completion report");
+        assert!(!report.contains("inlined into `source`"), "{report}");
+    }
+
     #[test]
     fn oversized_result_is_guarded_before_the_log() {
         let mut registry = ToolRegistry::new();

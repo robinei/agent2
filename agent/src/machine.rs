@@ -94,6 +94,11 @@ const MAX_PUMP_ROUNDS: usize = 100;
 /// data" — the discipline that replaces the silent clip.
 const PROGRAM_RESULT_MAX_BYTES: usize = 4096;
 
+/// A `create_file`/`replace_file` whose inline content exceeds this draws
+/// the attachments nudge (when the run passed no `attachments`): more than
+/// a snippet belongs in the `attachments` channel, not the program source.
+const INLINE_BODY_ADVICE_BYTES: usize = 512;
+
 pub enum StepInput {
     /// A user message. Valid while idle; arriving mid-program it becomes
     /// a host-injected condition — deferred to M2 (panics until then).
@@ -166,6 +171,9 @@ struct Run {
     /// Event-id high-water mark when the run started: artifacts logged
     /// after it are "new" in this run's completion report.
     started_at: u64,
+    /// Whether this run was given a non-empty `attachments` map — used to
+    /// suppress the inline-body nudge once the model is using the channel.
+    had_attachments: bool,
 }
 
 /// Why a run is suspended, and how `resume(value)` re-enters it.
@@ -572,12 +580,14 @@ impl AgentState {
         call_id: String,
     ) -> Result<Run, String> {
         let program = compile(source).map_err(|diags| render_diags(source, &diags))?;
+        let had_attachments = attachments.as_object().is_some_and(|m| !m.is_empty());
         let vm = VM::for_program_with(program, self.spine.frame().input.clone(), attachments)
             .map_err(|e| format!("program setup failed: {}", e.message))?;
         Ok(Run {
             call_id,
             vm,
             started_at: self.spine.leaf_id.as_u64(),
+            had_attachments,
         })
     }
 
@@ -816,10 +826,13 @@ impl AgentState {
             },
         )?;
 
+        let advise_attachments =
+            !run.had_attachments && self.run_inlined_large_body(tree, run.started_at);
         let report = CompletionReport {
             value: completion_value,
             console: run.vm.console_lines.clone(),
             new_artifacts: self.new_artifacts(tree, run.started_at),
+            advise_attachments,
         }
         .render();
         tree.append(
@@ -1007,6 +1020,26 @@ impl AgentState {
             .filter(|e| e.id.as_u64() > since)
             .filter_map(artifact_entry)
             .collect()
+    }
+
+    /// Whether any `create_file`/`replace_file` logged by this run inlined
+    /// a content body past [`INLINE_BODY_ADVICE_BYTES`]. Content is the last
+    /// positional arg; the full (unclipped) args live on the `Invoke` event.
+    fn run_inlined_large_body(&self, tree: &Tree, since: u64) -> bool {
+        self.frame_segment(tree)
+            .into_iter()
+            .filter(|e| e.id.as_u64() > since)
+            .any(|e| match &e.payload {
+                EventPayload::Invoke { name, args, .. }
+                    if name == "create_file" || name == "replace_file" =>
+                {
+                    args.as_array()
+                        .and_then(|a| a.last())
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|content| content.len() > INLINE_BODY_ADVICE_BYTES)
+                }
+                _ => false,
+            })
     }
 }
 

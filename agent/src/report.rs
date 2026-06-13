@@ -105,6 +105,10 @@ pub struct CompletionReport {
     /// Artifacts logged since the run started (its `ProgramResult`
     /// included), oldest first.
     pub new_artifacts: Vec<Artifact>,
+    /// A file body longer than a snippet was inlined into `source` while
+    /// this run passed no `attachments` — nudge toward the attachments
+    /// channel. Computed by the machine (it has the full, unclipped args).
+    pub advise_attachments: bool,
 }
 
 impl CompletionReport {
@@ -117,13 +121,30 @@ impl CompletionReport {
         out.push_str(&render_console(&self.console));
         out.push_str("\n\n");
         out.push_str(&render_menu("new artifacts", &self.new_artifacts));
+
+        let mut notes: Vec<&str> = Vec::new();
         if self.wrote_without_verifying() {
-            out.push_str(
-                "\n\n## note\nThis program wrote files but didn't check them. \
-                 Don't report success unverified — verify now (`parse_errors`, a \
-                 re-read, or a `bash` build/test). Next time, fold that check into \
-                 the same program that does the writing, not a separate one.",
+            notes.push(
+                "This program wrote files but didn't check them. Don't report success \
+                 unverified — verify now (`parse_errors`, a re-read, or a `bash` \
+                 build/test). Next time, fold that check into the same program that \
+                 does the writing, not a separate one.",
             );
+        }
+        if self.advise_attachments {
+            notes.push(
+                "A file body longer than a few lines was inlined into `source`. Pass \
+                 it through run_program's `attachments` map instead and read it as \
+                 `attachments.<name>` — keeps `source` small and the content inert \
+                 (no JS-string escaping, no backtick/${} corruption).",
+            );
+        }
+        if !notes.is_empty() {
+            out.push_str("\n\n## note");
+            for note in notes {
+                out.push_str("\n\n");
+                out.push_str(note);
+            }
         }
         out
     }
@@ -316,6 +337,7 @@ mod tests {
             value: json!("z".repeat(50_000)),
             console: Vec::new(),
             new_artifacts: Vec::new(),
+            advise_attachments: false,
         };
         let rendered = report.render();
         let line = rendered.lines().nth(1).unwrap();
@@ -356,6 +378,7 @@ mod tests {
             value: json!({ "status": "done" }),
             console: Vec::new(),
             new_artifacts: artifacts,
+            advise_attachments: false,
         }
         .render()
     }
@@ -387,6 +410,20 @@ mod tests {
             ]);
             assert!(!rendered.contains("## note"), "unexpected nudge: {rendered}");
         }
+    }
+
+    #[test]
+    fn inlined_body_draws_the_attachments_nudge() {
+        let report = CompletionReport {
+            value: json!("done"),
+            console: Vec::new(),
+            new_artifacts: vec![artifact(5, "create_file([\"/x/a.js\", \"…\"])", json!({}))],
+            advise_attachments: true,
+        }
+        .render();
+        assert!(report.contains("## note"), "{report}");
+        assert!(report.contains("inlined into `source`"), "{report}");
+        assert!(report.contains("attachments"), "{report}");
     }
 
     #[test]
