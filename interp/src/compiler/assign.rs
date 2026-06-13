@@ -288,8 +288,11 @@ impl<'src> super::Compiler<'src> {
                 }
                 Some(super::LValue::Local(r.slot))
             }
-            None if name == "input" => {
-                self.error(span, "cannot reassign `input` (it is a host-seeded const)");
+            None if crate::is_host_const(name) => {
+                self.error(
+                    span,
+                    format!("cannot reassign `{name}` (it is a host-seeded const)"),
+                );
                 None
             }
             None => {

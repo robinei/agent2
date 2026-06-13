@@ -45,6 +45,11 @@ answer.
 
 ## program contract
 - `input` is a read-only const holding this frame's JSON input.
+- `attachments` is a read-only const holding the optional name→string map \
+you pass as run_program's second argument. Put authored bodies (file \
+contents, large blobs) there and read them as `attachments.<name>` — they \
+stay inert (no JS-string escaping, no backtick/`${` hazard) and `source` \
+stays small. Inline a literal only for short strings.
 - End with a top-level `return <value>`; the value must be JSON-able \
 (no functions or promises). Without `return` the result is undefined.
 - `console.log(...)` is your diagnostic trace: it is quoted back in \
@@ -237,6 +242,7 @@ mod tests {
             "one `tools.agent` per file",
             "keeps a long orchestration alive",
             "`input` is a read-only const",
+            "`attachments` is a read-only const",
             "top-level `return <value>`",
             "console.log",
             "tools.tool_result(id)",

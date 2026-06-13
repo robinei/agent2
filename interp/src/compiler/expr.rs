@@ -295,7 +295,9 @@ impl<'src> super::Compiler<'src> {
             return;
         }
         match name {
+            // Host-seeded consts at fixed object slots (see `is_host_const`).
             "input" => self.emit(Instr::PushObject(0), span),
+            "attachments" => self.emit(Instr::PushObject(1), span),
             "undefined" => self.emit(Instr::PushUndefined, span),
             "NaN" => self.emit(Instr::PushFloat(f64::NAN), span),
             "Infinity" => self.emit(Instr::PushFloat(f64::INFINITY), span),

@@ -252,31 +252,54 @@ impl VM {
         }
     }
 
-    /// Construct a VM to run a compiled `Program`, with the host-seeded `input`
-    /// value installed at `objects[0]`. `input` is the read-only const available
-    /// to the program; `Null`/non-object seeds yield an empty object.
-    /// `objects[0]` is the only pre-seeded slot and `Object(0)` stays stable
-    /// for the whole program.
+    /// Construct a VM to run a compiled `Program`, seeding the host const
+    /// `input` (the frame's caller-provided JSON) at `objects[0]` and an
+    /// empty `attachments`. See [`for_program_with`](Self::for_program_with).
     pub fn for_program(program: Program, input: serde_json::Value) -> Result<Self, VMError> {
+        Self::for_program_with(program, input, serde_json::Value::Null)
+    }
+
+    /// Construct a VM with both host-seeded read-only consts: `input` (the
+    /// frame's caller-provided JSON) at `objects[0]`, and `attachments`
+    /// (this run's authored content) at `objects[1]`. Each `Null`/non-object
+    /// seed yields an empty object. Both slots are reserved up front, before
+    /// any nested seeding, so the compiler's fixed `Object(0)`/`Object(1)`
+    /// references stay stable; nested values land at `objects[2..]`.
+    pub fn for_program_with(
+        program: Program,
+        input: serde_json::Value,
+        attachments: serde_json::Value,
+    ) -> Result<Self, VMError> {
         let mut vm = VM::new(program.code);
         vm.spans = program.spans;
         vm.source = program.source;
         vm.debug = program.debug;
-        // Reserve objects[0] for `input` (filled in just below).
-        vm.objects.push(IndexMap::new());
-        // Seed input's nested values (arrays/objects land at objects[1..]; their
-        // addresses are computed at runtime and stored in the input map).
-        if let serde_json::Value::Object(map) = input {
-            let mut entries = IndexMap::with_capacity(map.len());
-            for (k, v) in &map {
-                let sv = vm.json_to_stack_value(v, 0)?;
-                entries.insert(RcStr::from(k.as_str()), sv);
-            }
-            if let Some(o) = vm.objects.get_mut(0) {
-                *o = entries;
-            }
-        }
+        // Reserve the two fixed slots before seeding either's nested values.
+        vm.objects.push(IndexMap::new()); // objects[0] = input
+        vm.objects.push(IndexMap::new()); // objects[1] = attachments
+        let input_entries = vm.seed_const_object(input)?;
+        let attachment_entries = vm.seed_const_object(attachments)?;
+        vm.objects[0] = input_entries;
+        vm.objects[1] = attachment_entries;
         Ok(vm)
+    }
+
+    /// Build the entry map for a host-seeded const from a JSON object;
+    /// nested arrays/objects allocate into `objects` (addresses computed at
+    /// runtime). A `Null`/non-object seed yields an empty map.
+    fn seed_const_object(
+        &mut self,
+        json: serde_json::Value,
+    ) -> Result<IndexMap<RcStr, Value>, VMError> {
+        let serde_json::Value::Object(map) = json else {
+            return Ok(IndexMap::new());
+        };
+        let mut entries = IndexMap::with_capacity(map.len());
+        for (k, v) in &map {
+            let sv = self.json_to_stack_value(v, 0)?;
+            entries.insert(RcStr::from(k.as_str()), sv);
+        }
+        Ok(entries)
     }
 
     // ── debugger introspection (9_TUI Step 1) ────────────────────────

@@ -125,6 +125,57 @@ fn input_with_null_seed_is_empty_object() {
     }
 }
 
+#[test]
+fn for_program_with_seeds_both_input_and_attachments() {
+    // The two host consts are bound from independent seeds and read
+    // side by side; their fixed slots don't collide with nested values.
+    let prog = crate::testutil::compile_ok(
+        "return input.who + \" wrote \" + attachments.file + \" (\" + input.n + \")\";",
+    );
+    let mut vm = VM::for_program_with(
+        prog,
+        serde_json::json!({ "who": "me", "n": 3 }),
+        serde_json::json!({ "file": "<body>" }),
+    )
+    .unwrap();
+    match vm.step(u64::MAX).unwrap() {
+        StepResult::Done { value, .. } => {
+            assert_eq!(value, Value::String("me wrote <body> (3)".into()))
+        }
+        other => panic!("expected Done, got {other:?}"),
+    }
+}
+
+#[test]
+fn attachments_empty_when_unseeded() {
+    // `for_program` (no attachments arg) and a Null seed both yield an
+    // empty `attachments` object — `attachments.<name>` is undefined, not
+    // a crash on the fixed slot.
+    let prog = compile("return Object.keys(attachments).length;").expect("compiles");
+    let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
+    match vm.step(u64::MAX).unwrap() {
+        StepResult::Done { value, .. } => assert_eq!(value, Value::Float(0.0)),
+        other => panic!("expected Done, got {other:?}"),
+    }
+}
+
+#[test]
+fn attachments_is_a_read_only_host_const() {
+    // Same protections as `input`: cannot reassign or shadow.
+    let reassign = compile("attachments = {};").unwrap_err();
+    assert!(
+        reassign.iter().any(|d| d.message.contains("reassign")
+            && d.message.contains("attachments")),
+        "got: {reassign:?}"
+    );
+    let shadow = compile("const attachments = 1; return attachments;").unwrap_err();
+    assert!(
+        shadow.iter().any(|d| d.message.contains("shadow")
+            && d.message.contains("attachments")),
+        "got: {shadow:?}"
+    );
+}
+
 // ── Step 5: raise payload and resume_raise ───────────────────────
 
 #[test]

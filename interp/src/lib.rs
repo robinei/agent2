@@ -25,6 +25,16 @@ pub use vm::{
     VMError, Value,
 };
 
+/// Host-seeded read-only consts available to every program by name:
+/// `input` (the frame's caller-provided JSON, `objects[0]`) and
+/// `attachments` (this run's authored content, `objects[1]`). They may
+/// not be shadowed or reassigned, and the compiler maps each name to its
+/// fixed object slot. Single source of truth for the compiler/analyzer
+/// checks and the VM's slot reservation.
+pub(crate) fn is_host_const(name: &str) -> bool {
+    matches!(name, "input" | "attachments")
+}
+
 // ── test-only allocation counter ─────────────────────────────────────────────
 
 #[cfg(test)]

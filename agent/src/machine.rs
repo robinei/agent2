@@ -48,6 +48,15 @@ pub fn run_program_spec() -> ToolSpec {
                 "source": {
                     "type": "string",
                     "description": "the complete program source"
+                },
+                "attachments": {
+                    "type": "object",
+                    "additionalProperties": { "type": "string" },
+                    "description": "optional name→content map for authored bodies \
+                                    (file contents, large blobs). The program reads \
+                                    them as the read-only const `attachments.<name>` — \
+                                    keep them out of `source` so it stays small and \
+                                    the content is inert (no JS escaping)."
                 }
             },
             "required": ["source"]
@@ -376,6 +385,17 @@ impl AgentState {
                     self.phase = Phase::AwaitingLlm;
                     return Ok(vec![self.render_request()]);
                 };
+                // `attachments` is this run's authored content (name → string),
+                // seeded as the program's `attachments` const. A malformed
+                // shape is a cheap repair loop, like a missing source.
+                let attachments = match attachments_from_args(&call.arguments) {
+                    Ok(a) => a,
+                    Err(msg) => {
+                        self.log_tool_error(tree, &call, &msg)?;
+                        self.phase = Phase::AwaitingLlm;
+                        return Ok(vec![self.render_request()]);
+                    }
+                };
                 // A rewrite abandons any suspended VM — never the physics:
                 // in-flight calls stay pending and their results are still
                 // logged as artifacts when they arrive (the generation bump
@@ -385,7 +405,7 @@ impl AgentState {
                     self.last_vm = Some(run.vm);
                 }
                 self.generation += 1;
-                match self.start_program(source, call.id.clone()) {
+                match self.start_program(source, attachments, call.id.clone()) {
                     Ok(run) => {
                         self.phase = Phase::Running(run);
                         Ok(vec![StepOutput::Working])
@@ -543,10 +563,16 @@ impl AgentState {
 
     // ── program driving ─────────────────────────────────────────────
 
-    /// Compile + bind input. `Err` is the rendered repair-loop report.
-    fn start_program(&mut self, source: &str, call_id: String) -> Result<Run, String> {
+    /// Compile + bind the host consts (`input` from the frame, `attachments`
+    /// from this run). `Err` is the rendered repair-loop report.
+    fn start_program(
+        &mut self,
+        source: &str,
+        attachments: serde_json::Value,
+        call_id: String,
+    ) -> Result<Run, String> {
         let program = compile(source).map_err(|diags| render_diags(source, &diags))?;
-        let vm = VM::for_program(program, self.spine.frame().input.clone())
+        let vm = VM::for_program_with(program, self.spine.frame().input.clone(), attachments)
             .map_err(|e| format!("program setup failed: {}", e.message))?;
         Ok(Run {
             call_id,
@@ -986,6 +1012,29 @@ impl AgentState {
 
 // ── helpers ─────────────────────────────────────────────────────────
 
+/// Extract + validate the optional `attachments` map from a `run_program`
+/// call: an object of name → content string (this run's authored bodies).
+/// Absent/null yields an empty object. A malformed shape returns a message
+/// for the repair loop (the LLM fixes the call) rather than crashing.
+fn attachments_from_args(args: &serde_json::Value) -> Result<serde_json::Value, String> {
+    match args.get("attachments") {
+        None | Some(serde_json::Value::Null) => Ok(serde_json::Value::Object(Default::default())),
+        Some(serde_json::Value::Object(map)) => {
+            if let Some((k, _)) = map.iter().find(|(_, v)| !v.is_string()) {
+                return Err(format!(
+                    "run_program `attachments.{k}` must be a string — each attachment is \
+                     content text (e.g. a file body), read in the program as attachments.{k}"
+                ));
+            }
+            Ok(serde_json::Value::Object(map.clone()))
+        }
+        Some(_) => Err("run_program `attachments` must be an object mapping names to content \
+                        strings, e.g. {\"gameJs\": \"...\"}; read them in the program as \
+                        attachments.<name>"
+            .into()),
+    }
+}
+
 fn json_arg(vm: &mut VM, json: &serde_json::Value) -> Value {
     vm.json_to_stack_value(json, 0).unwrap_or(Value::Null)
 }
@@ -1207,6 +1256,55 @@ mod tests {
             .unwrap();
         drain(&mut state, &mut tree, out);
         assert!(last_tool_text(&state).contains("returned: 7"));
+    }
+
+    #[test]
+    fn attachments_reach_the_program_as_a_const() {
+        let (mut tree, mut state) = setup();
+        state.kickoff();
+        // A run_program carrying authored content in `attachments`; the
+        // program reads it as the `attachments` const, never embedding it
+        // in `source`.
+        let msg = Message::Assistant {
+            text: String::new(),
+            thinking: None,
+            tool_calls: vec![ToolCall {
+                id: "c1".into(),
+                name: TOOL_RUN_PROGRAM.into(),
+                arguments: json!({
+                    "source": "return attachments.greeting.length;",
+                    "attachments": { "greeting": "hello world" },
+                }),
+            }],
+        };
+        let out = state.step(&mut tree, StepInput::LlmResponse(msg)).unwrap();
+        drain(&mut state, &mut tree, out);
+        // "hello world" is 11 bytes.
+        assert!(last_tool_text(&state).contains("returned: 11"), "{}", last_tool_text(&state));
+    }
+
+    #[test]
+    fn malformed_attachments_is_a_repair_loop() {
+        let (mut tree, mut state) = setup();
+        state.kickoff();
+        let msg = Message::Assistant {
+            text: String::new(),
+            thinking: None,
+            tool_calls: vec![ToolCall {
+                id: "c1".into(),
+                name: TOOL_RUN_PROGRAM.into(),
+                arguments: json!({
+                    "source": "return 1;",
+                    "attachments": { "body": 42 }, // not a string
+                }),
+            }],
+        };
+        let out = state.step(&mut tree, StepInput::LlmResponse(msg)).unwrap();
+        // No program ran; the error is the tool result and a fresh request
+        // follows (the repair loop), exactly like a missing `source`.
+        let report = last_tool_text(&state);
+        assert!(report.contains("attachments.body") && report.contains("must be a string"), "{report}");
+        assert!(expect_request(&out).messages.last().is_some());
     }
 
     #[test]
