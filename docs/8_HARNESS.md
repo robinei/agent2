@@ -580,6 +580,60 @@ M1/M2 transcripts, not speculation.
   has too.)*
 - **M4**: fork/label UX — list leaves, fork from any event, resume a
   chosen spine (CLI is fine).
+
+  A root frame runs once to completion (a no-tool-call reply logs its
+  `FrameResult` and ends the session), so fork/resume is inherently
+  log-navigation: open an existing log, see its leaves, pick where to
+  continue, or fork off a mid-spine event. The clean flow is open *idle*
+  → `ListLeaves` → `Fork`/`Resume` → `UserTurn` continues the chosen
+  branch. Fork/resume re-anchor the root `AgentState` at the chosen
+  event; the superseded branch stays in the tree (re-listable), one
+  active in-memory state per frame. The mutating commands require the
+  root **idle** (rejected-when-busy, like `UserTurn`).
+
+  M4 acceptance (offline-testable — no network; CLI/tree UX):
+
+  - [ ] **Tree (`tree.rs`)**: `Tree::fork(&self, from) -> io::Result<Spine>`
+        reconstructs the spine at any event and returns an appendable
+        handle — a later `append` creates a *sibling* of `from`'s
+        existing child (a divergent branch). Errors on an unknown id and
+        on a complete spine (`from` is/under a `FrameResult`). Tests:
+        fork mid-spine leaves the original branch untouched and both
+        reconstruct independently; fork from a `FrameResult` errors; fork
+        from an unknown id errors (`tree::tests`).
+  - [ ] **Protocol (`protocol.rs`)**: `SessionCommand` gains
+        `ListLeaves`, `Label(String)`, `Fork { from, label }`,
+        `Resume(EventId)`; `SessionEvent` gains `Leaves(Vec<LeafInfo>)`;
+        `LeafInfo { leaf, frame, label, complete, active, summary }` is
+        serializable. All new variants serde round-trip.
+  - [ ] **Session (`mod.rs`)** — generalizes the "resume lowest
+        incomplete leaf" seam: `Session::open_at(tree, leaf, …)` anchors
+        the root at a chosen leaf; `Session::new` keeps the auto-pick
+        default but no longer errors on an all-complete log (opens idle
+        at the lowest-id leaf so the loop lives for fork/resume).
+        `ListLeaves` emits `Leaves` with the current root leaf flagged
+        `active`. `Label(text)` (idle) logs a `Label` on the root spine,
+        surfaced in `Leaves`; rejected when busy. `Fork { from, label }`
+        (idle) re-anchors the root at `fork(from)`, applies the optional
+        label, emits refreshed `Leaves`; a following `UserTurn` continues
+        the *forked* branch leaving the original leaf intact (test
+        asserts two divergent leaves in the same frame). `Resume(leaf)`
+        (idle) re-anchors the root at an existing leaf, emits refreshed
+        `Leaves`; rejects a complete leaf and an unknown id. `UserTurn`
+        on a complete spine is rejected (no append-after-`FrameResult`
+        panic).
+  - [ ] **CLI (`main.rs`)**: `agent session --list-leaves [log]` prints
+        the leaf list and exits; `--resume <id>` / `--fork <id>` /
+        `--label <text>` choose the opening anchor for a driven
+        (`--turn`) headless run. Glue only — coverage lives on Tree +
+        Session.
+  - [ ] **(Live, optional — user-driven)** one `agent session` run that
+        opens a real prior log, lists leaves, forks an earlier event, and
+        continues. Left unchecked; M4 is fully offline-verified, so this
+        is confirmation only.
+  - [ ] Gate: `cargo fmt && cargo clippy && cargo test` green, fully
+        offline. Commit each step (tree / protocol / session / CLI)
+        separately.
 - **M5**: the eval question — measure the thesis: success rate and token
   cost on multi-step tasks with injected tool failures, versus (a) plain
   tool loop, (b) code mode without conditions (failure = rerun whole
