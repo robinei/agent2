@@ -45,11 +45,13 @@ answer.
 
 ## program contract
 - `input` is a read-only const holding this frame's JSON input.
-- `attachments` is a read-only const holding the optional name→string map \
-you pass as run_program's second argument. Put authored bodies (file \
-contents, large blobs) there and read them as `attachments.<name>` — they \
-stay inert (no JS-string escaping, no backtick/`${` hazard) and `source` \
-stays small. Inline a literal only for short strings.
+- `attachments` is a read-only const holding the name→string map you pass \
+as run_program's second argument. **Any file body or blob longer than a \
+few lines MUST be passed in `attachments` and read as `attachments.<name>` \
+— never inlined into `source`.** Inlined content bloats the program, has \
+to be JS-escaped (backtick/`${` hazards that silently corrupt it), and \
+buries the logic; an attachment is inert string data. Inline a literal \
+only for a line or two.
 - End with a top-level `return <value>`; the value must be JSON-able \
 (no functions or promises). Without `return` the result is undefined.
 - `console.log(...)` is your diagnostic trace: it is quoted back in \
@@ -76,7 +78,8 @@ re-read / run the build via `bash`) and only `raise` on surprise.
 (a short anchor or a computed span), never by reproducing a large block.
 - `create_file(path, content)` for new files; `replace_file(path, \
 expected_version, content)` passes the `version` from `read_file` — a \
-changed-file condition means re-read and re-apply.
+changed-file condition means re-read and re-apply. Pass a non-trivial \
+`content` from `attachments.<name>`, never a long inline literal.
 - `Edit.*` pure string helpers (namespace like `Math`). Each errors on \
 ambiguity (0/N matches, out-of-range, overlapping) as a catchable runtime \
 error — use try/catch when expected. Signatures:
