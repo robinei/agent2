@@ -18,7 +18,13 @@ const USAGE: &str = "usage: agent <command>
                                     the TUI picks it automatically when the
                                     key is set — --headless stays scripted
                                     unless --real is given
-    --turn <text>                   queue a first user turn (headless)";
+    --turn <text>                   queue a first user turn (headless)
+    --list-leaves                   print the log's leaf set and exit
+    --resume <id>                   open anchored at leaf <id> (else the
+                                    lowest incomplete leaf)
+    --fork <id>                     fork a divergent branch from event <id>
+    --label <text>                  name the branch (with --fork) / label
+                                    the active leaf";
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -38,18 +44,40 @@ fn main() {
             let mut real = false;
             let mut turn: Option<String> = None;
             let mut log_path: Option<String> = None;
+            let mut list_leaves = false;
+            let mut resume: Option<u64> = None;
+            let mut fork: Option<u64> = None;
+            let mut label: Option<String> = None;
             let mut rest = args[2..].iter();
+            let next_val = |rest: &mut std::slice::Iter<String>, flag: &str| -> String {
+                match rest.next() {
+                    Some(v) => v.clone(),
+                    None => {
+                        eprintln!("{flag} needs a value");
+                        std::process::exit(2);
+                    }
+                }
+            };
+            let parse_id = |raw: String, flag: &str| -> u64 {
+                match raw.trim_start_matches('#').parse::<u64>() {
+                    Ok(n) if n > 0 => n,
+                    _ => {
+                        eprintln!("{flag} needs a positive event id, got `{raw}`");
+                        std::process::exit(2);
+                    }
+                }
+            };
             while let Some(arg) = rest.next() {
                 match arg.as_str() {
                     "--headless" => headless = true,
                     "--real" => real = true,
-                    "--turn" => match rest.next() {
-                        Some(text) => turn = Some(text.clone()),
-                        None => {
-                            eprintln!("--turn needs a message");
-                            std::process::exit(2);
-                        }
-                    },
+                    "--turn" => turn = Some(next_val(&mut rest, "--turn")),
+                    "--list-leaves" => list_leaves = true,
+                    "--resume" => {
+                        resume = Some(parse_id(next_val(&mut rest, "--resume"), "--resume"))
+                    }
+                    "--fork" => fork = Some(parse_id(next_val(&mut rest, "--fork"), "--fork")),
+                    "--label" => label = Some(next_val(&mut rest, "--label")),
                     other => log_path = Some(other.to_string()),
                 }
             }
@@ -57,10 +85,17 @@ fn main() {
             // real client automatically when a key is present.
             // Headless stays the scripted M0 demo unless --real.
             let use_real = real || (!headless && std::env::var("DEEPSEEK_API_KEY").is_ok());
+            let nav = SessionNav {
+                list_leaves,
+                resume,
+                fork,
+                label,
+                turn,
+            };
             let result = if headless {
-                run_session_headless(log_path, use_real, turn)
+                run_session_headless(log_path, use_real, nav)
             } else {
-                run_session_tui(log_path, use_real)
+                run_session_tui(log_path, use_real, nav.resume)
             };
             if let Err(e) = result {
                 eprintln!("{e}");
@@ -112,42 +147,94 @@ fn build_brain(
     }
 }
 
-/// The attached TUI (9_TUI Step 4) — the harness's primary frontend.
-/// Type a message to kick it off.
-fn run_session_tui(log_path: Option<String>, real: bool) -> Result<(), String> {
+/// Fork/label/resume navigation (M4), shared by the CLI front-ends.
+struct SessionNav {
+    list_leaves: bool,
+    resume: Option<u64>,
+    fork: Option<u64>,
+    label: Option<String>,
+    turn: Option<String>,
+}
+
+/// Build a session over the log, anchoring at `--resume <id>` when given
+/// (else `Session::new`'s auto-pick).
+fn build_session(
+    log_path: Option<String>,
+    real: bool,
+    resume: Option<u64>,
+    tx: std::sync::mpsc::Sender<SessionEvent>,
+) -> Result<host::Session, String> {
     let tree = open_tree(log_path)?;
     let (registry, llm, prompt) = build_brain(real)?;
+    let session = match resume {
+        Some(id) => host::Session::open_at(tree, EventId::new(id), registry, llm, tx),
+        None => host::Session::new(tree, prompt, serde_json::Value::Null, registry, llm, tx),
+    };
+    session.map_err(|e| e.to_string())
+}
+
+/// Queue the M4 navigation commands (fork/label) ahead of an optional
+/// first user turn — all FIFO on the one inbox, so order is preserved.
+fn queue_nav(session: &host::Session, nav: &SessionNav) {
+    let h = session.handle();
+    if let Some(from) = nav.fork {
+        h.send(host::SessionCommand::Fork {
+            from: EventId::new(from),
+            label: nav.label.clone(),
+        });
+    } else if let Some(text) = nav.label.clone() {
+        h.send(host::SessionCommand::Label(text));
+    }
+    if let Some(text) = nav.turn.clone() {
+        h.send(host::SessionCommand::UserTurn(text));
+    }
+}
+
+/// The attached TUI (9_TUI Step 4) — the harness's primary frontend.
+/// Type a message to kick it off.
+fn run_session_tui(
+    log_path: Option<String>,
+    real: bool,
+    resume: Option<u64>,
+) -> Result<(), String> {
     let (tx, rx) = std::sync::mpsc::channel();
-    let session = host::Session::new(tree, prompt, serde_json::Value::Null, registry, llm, tx)
-        .map_err(|e| e.to_string())?;
+    let session = build_session(log_path, real, resume, tx)?;
     debug::run_attached(session, rx)
 }
 
 /// The headless session: print every `SessionEvent` from the channel —
 /// the CLI is just another consumer of the serializable UI boundary.
-/// Scripted (default) runs the M0 demo; `--real --turn <text>` drives
-/// one real conversation to completion.
+/// With no navigation flags, scripted runs the M0 demo; otherwise the
+/// session is driven by the queued `--list-leaves`/`--fork`/`--label`/
+/// `--turn` commands.
 fn run_session_headless(
     log_path: Option<String>,
     real: bool,
-    turn: Option<String>,
+    nav: SessionNav,
 ) -> Result<(), String> {
-    let tree = open_tree(log_path)?;
     let (tx, rx) = std::sync::mpsc::channel();
     let printer = std::thread::spawn(move || {
         for event in rx {
             print_session_event(&event);
         }
     });
-    let session = if real {
-        let (registry, llm, prompt) = build_brain(true)?;
-        let session = host::Session::new(tree, prompt, serde_json::Value::Null, registry, llm, tx)
-            .map_err(|e| e.to_string())?;
-        let turn = turn.ok_or("a real headless session needs --turn <text>")?;
-        session.handle().send(host::SessionCommand::UserTurn(turn));
+
+    let driven = nav.list_leaves || nav.fork.is_some() || nav.label.is_some() || nav.turn.is_some();
+    let session = if nav.list_leaves {
+        // Open, ask for the leaf set, exit — no LLM contact.
+        let session = build_session(log_path, real, nav.resume, tx)?;
+        session.handle().send(host::SessionCommand::ListLeaves);
+        session.handle().send(host::SessionCommand::Shutdown);
+        session.run()
+    } else if real || driven || nav.resume.is_some() {
+        let session = build_session(log_path, real, nav.resume, tx)?;
+        if real && !driven {
+            return Err("a real headless session needs --turn <text>".into());
+        }
+        queue_nav(&session, &nav);
         session.run()
     } else {
-        host::run_demo(tree, tx).map_err(|e| e.to_string())?
+        host::run_demo(open_tree(log_path)?, tx).map_err(|e| e.to_string())?
     };
     drop(session); // closes the event channel; the printer drains and exits
     printer.join().map_err(|_| "printer thread panicked")?;
