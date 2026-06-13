@@ -32,9 +32,6 @@ pub struct Artifact {
     /// `name(args-preview)` for tool calls, `program result` otherwise.
     pub label: String,
     pub result: serde_json::Value,
-    /// Flagged in the menu: the call already happened; calling again
-    /// repeats the effect.
-    pub effectful: bool,
 }
 
 /// What `resume(value)` means for this suspension — the restart section
@@ -93,8 +90,7 @@ impl ConditionReport {
         out.push_str(
             "- run_program(source): replace the program — new source runs in a \
              fresh VM; results in the artifact menu stay fetchable via \
-             tools.tool_result(id), so reuse them instead of repeating calls \
-             (especially effectful ones)",
+             tools.tool_result(id), so reuse them instead of repeating calls",
         );
         out
     }
@@ -175,9 +171,6 @@ fn render_menu(title: &str, artifacts: &[Artifact]) -> String {
             a.label,
             preview(&a.result)
         ));
-        if a.effectful {
-            out.push_str(" ⚠ effectful: already happened; calling again repeats the effect");
-        }
     }
     out
 }
@@ -213,7 +206,6 @@ mod tests {
             id,
             label: label.into(),
             result,
-            effectful: false,
         }
     }
 
@@ -316,14 +308,6 @@ mod tests {
             pv
         );
         assert!(pv.contains("[truncated; 2000002 bytes total]"));
-    }
-
-    #[test]
-    fn effectful_entries_carry_the_warning() {
-        let mut a = artifact(3, "send_email([\"hi\"])", json!({ "sent": true }));
-        a.effectful = true;
-        let rendered = render_menu("artifacts", &[a]);
-        assert!(rendered.contains("already happened; calling again repeats the effect"));
     }
 
     #[test]

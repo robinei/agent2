@@ -174,7 +174,6 @@ impl Session {
         events: Sender<SessionEvent>,
         emitted: u64,
     ) -> io::Result<Self> {
-        state.set_effectful_tools(registry.effectful_names());
         state.set_dialect_card(dialect_card(&registry));
         let root = frame_start_id(&tree, state.spine.leaf_id);
 
@@ -499,7 +498,6 @@ impl Session {
     /// events (a fork's `Label`) are surfaced.
     fn reanchor_root(&mut self, spine: Spine) {
         let mut state = AgentState::with_spine(spine);
-        state.set_effectful_tools(self.registry.effectful_names());
         state.set_dialect_card(dialect_card(&self.registry));
         let root = frame_start_id(&self.tree, state.spine.leaf_id);
         self.states.insert(root, state);
@@ -627,7 +625,6 @@ impl Session {
         } = spawn;
         let call_site = self.states[&parent].spine.leaf_id;
         let mut child = AgentState::new_child(&mut self.tree, call_site, prompt, input)?;
-        child.set_effectful_tools(self.registry.effectful_names());
         child.set_dialect_card(dialect_card(&self.registry));
         let child_id = child.spine.leaf_id; // the FrameStart it was rooted at
         self.emit_new(child_id);
@@ -734,7 +731,6 @@ mod tests {
 
     fn tool(
         name: &str,
-        effectful: bool,
         handler: impl Fn(serde_json::Value) -> Result<serde_json::Value, String> + Send + Sync + 'static,
     ) -> ToolDef {
         ToolDef {
@@ -742,7 +738,6 @@ mod tests {
             description: String::new(),
             input_schema: json!({ "type": "array" }),
             output_schema: json!({}),
-            effectful,
             handler: Box::new(handler),
         }
     }
@@ -900,7 +895,7 @@ mod tests {
     #[test]
     fn dialect_card_reaches_the_llm_with_the_tool_list() {
         let mut registry = ToolRegistry::new();
-        registry.register(tool("fetch_page", false, |_| Ok(json!(null))));
+        registry.register(tool("fetch_page", |_| Ok(json!(null))));
         let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
         let llm = CapturingLlm {
             inner: ScriptedLlm::new([scripted_text("done")]),
@@ -932,11 +927,11 @@ mod tests {
     #[test]
     fn fanout_logs_in_completion_order() {
         let mut registry = ToolRegistry::new();
-        registry.register(tool("slow", false, |_| {
+        registry.register(tool("slow", |_| {
             std::thread::sleep(Duration::from_millis(40));
             Ok(json!("slow"))
         }));
-        registry.register(tool("fast", false, |_| Ok(json!("fast"))));
+        registry.register(tool("fast", |_| Ok(json!("fast"))));
         let script = vec![
             scripted_program(
                 "c1",
@@ -967,9 +962,9 @@ mod tests {
     }
 
     #[test]
-    fn effectful_flag_warns_in_artifact_menu() {
+    fn menu_has_no_effectful_warning() {
         let mut registry = ToolRegistry::new();
-        registry.register(tool("send_email", true, |_| Ok(json!({ "sent": true }))));
+        registry.register(tool("send_email", |_| Ok(json!({ "sent": true }))));
         let script = vec![
             scripted_program(
                 "c1",
@@ -984,8 +979,12 @@ mod tests {
             .find(|t| t.contains("send_email"))
             .expect("a report listing the artifact");
         assert!(
-            report.contains("already happened; calling again repeats the effect"),
-            "{report}"
+            !report.contains("effectful"),
+            "effectful flag removed: {report}"
+        );
+        assert!(
+            !report.contains("already happened; calling again"),
+            "effectful warning gone: {report}"
         );
     }
 
@@ -993,9 +992,7 @@ mod tests {
     fn oversized_result_is_guarded_before_the_log() {
         let mut registry = ToolRegistry::new();
         // MAX_RESULT_BYTES is now MB-scale (16 MB); trigger it.
-        registry.register(tool("big", false, |_| {
-            Ok(json!("x".repeat(MAX_RESULT_BYTES + 1)))
-        }));
+        registry.register(tool("big", |_| Ok(json!("x".repeat(MAX_RESULT_BYTES + 1)))));
         let script = vec![
             scripted_program(
                 "c1",
@@ -1089,7 +1086,7 @@ mod tests {
     #[test]
     fn trapped_error_rewrite_reuses_artifact_through_the_session() {
         let mut registry = ToolRegistry::new();
-        registry.register(tool("fetch", false, |_| Ok(json!("DATA"))));
+        registry.register(tool("fetch", |_| Ok(json!("DATA"))));
         // Event ids are deterministic: FrameStart 1, User 2, Assistant 3,
         // the fetch Invoke 4 — so the rewrite can name `tool_result(4)`.
         let script = vec![

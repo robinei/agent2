@@ -7,7 +7,7 @@
 //! one `step(fuel)` slice per `Tick` and reports `Working` when it
 //! wants another, so a hot program can't starve the host loop.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io;
 
 use interp::{
@@ -191,9 +191,6 @@ pub struct AgentState {
     invoke_counter: u64,
     generation: u64,
     pending: HashMap<u64, PendingCall>,
-    /// Tool names whose artifacts get the "already happened; calling
-    /// again repeats the effect" warning in reports (registry-fed).
-    effectful_tools: HashSet<String>,
     /// The dialect card (8_HARNESS Step 6), prepended to every system
     /// message ahead of the frame prompt (host-fed, registry-generated).
     dialect_card: String,
@@ -242,16 +239,9 @@ impl AgentState {
             invoke_counter: 0,
             generation: 0,
             pending: HashMap::new(),
-            effectful_tools: HashSet::new(),
             dialect_card: String::new(),
             last_vm: None,
         }
-    }
-
-    /// Names whose artifact-menu lines carry the effectful warning
-    /// (the host feeds these from the tool registry).
-    pub fn set_effectful_tools(&mut self, names: HashSet<String>) {
-        self.effectful_tools = names;
     }
 
     /// The dialect card rendered as the root of the system message
@@ -958,7 +948,7 @@ impl AgentState {
     fn frame_artifacts(&self, tree: &Tree) -> Vec<Artifact> {
         self.frame_segment(tree)
             .into_iter()
-            .filter_map(|e| artifact_entry(e, &self.effectful_tools))
+            .filter_map(artifact_entry)
             .collect()
     }
 
@@ -966,7 +956,7 @@ impl AgentState {
         self.frame_segment(tree)
             .into_iter()
             .filter(|e| e.id.as_u64() > since)
-            .filter_map(|e| artifact_entry(e, &self.effectful_tools))
+            .filter_map(artifact_entry)
             .collect()
     }
 }
@@ -993,19 +983,17 @@ fn render_diags(source: &str, diags: &[Diagnostic]) -> String {
 }
 
 /// One artifact-menu entry from a logged execution event.
-fn artifact_entry(event: &Event, effectful: &HashSet<String>) -> Option<Artifact> {
+fn artifact_entry(event: &Event) -> Option<Artifact> {
     match &event.payload {
         EventPayload::Invoke { name, args, result } => Some(Artifact {
             id: event.id.as_u64(),
             label: format!("{}({})", name, preview(args)),
             result: result.clone(),
-            effectful: effectful.contains(name.as_str()),
         }),
         EventPayload::ProgramResult { value } => Some(Artifact {
             id: event.id.as_u64(),
             label: "program result".into(),
             result: value.clone(),
-            effectful: false,
         }),
         _ => None,
     }
@@ -1571,7 +1559,7 @@ fetched: 41
 
 ## restarts
 - resume(value): continue past the raise; `value` becomes the result of the raise(...) expression
-- run_program(source): replace the program — new source runs in a fresh VM; results in the artifact menu stay fetchable via tools.tool_result(id), so reuse them instead of repeating calls (especially effectful ones)"#
+- run_program(source): replace the program — new source runs in a fresh VM; results in the artifact menu stay fetchable via tools.tool_result(id), so reuse them instead of repeating calls"#
         );
     }
 
@@ -1602,7 +1590,7 @@ console: (no output)
 
 ## restarts
 - resume(value): continue as if the failed operation had produced `value`
-- run_program(source): replace the program — new source runs in a fresh VM; results in the artifact menu stay fetchable via tools.tool_result(id), so reuse them instead of repeating calls (especially effectful ones)"#
+- run_program(source): replace the program — new source runs in a fresh VM; results in the artifact menu stay fetchable via tools.tool_result(id), so reuse them instead of repeating calls"#
         );
     }
 

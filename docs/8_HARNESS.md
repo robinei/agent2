@@ -50,14 +50,17 @@ should be allowed to reorder plans 3–7.
    mutable bag. Durable memory, if evidence ever demands it, returns as a
    *tool* (`remember`/`recall`), not VM machinery.
 6. **Reuse is explicit: artifacts by event id.** Completed tool results
-   and program results are immutable, id-addressable artifacts. A program
-   fetches one with `tools.tool_result(id)` — which is *just a tool*
-   (flows through `Invoke`, served instantly from the log, batches,
-   awaits; zero VM changes). There is **no implicit args-matching cache**:
-   it is fragile for dynamically-computed args and dangerously wrong for
-   effectful tools (silently skipping a logged `send_email` repeat). The
-   condition/completion report lists the available artifacts; the LLM
-   chooses what to reuse.
+    and program results are immutable, id-addressable artifacts. A program
+    fetches one with `tools.tool_result(id)` — which is *just a tool*
+    (flows through `Invoke`, served instantly from the log, batches,
+    awaits; zero VM changes). There is **no implicit args-matching cache**:
+    it is fragile for dynamically-computed args and dangerously wrong for
+    effectful tools (silently skipping a logged `send_email` repeat). The
+    condition/completion report lists the available artifacts; the LLM
+    chooses what to reuse. Judgment lives in the card: the LLM reads the
+    visible tool-call name and decides whether repeating it would repeat
+    the effect — there is no per-tool effectful flag (removed 10_EDITING
+    Step 6).
 7. **Crash recovery is deterministic re-execution, not VM serialization.**
    To resume a mid-program interruption of the *same* program: recompile
    the source, re-execute, serve every `Invoke` positionally from the log

@@ -1,8 +1,7 @@
 //! Tool registry (8_HARNESS Step 5): JSON-schema'd tool definitions
-//! with an `effectful` flag (drives the artifact-menu warning) and a
-//! handler the session loop runs on a worker thread per call.
+//! with a handler the session loop runs on a worker thread per call.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Hard cap on a tool/subagent result before it enters the log — an OOM
@@ -20,9 +19,6 @@ pub struct ToolDef {
     pub input_schema: serde_json::Value,
     /// JSON schema of the result value.
     pub output_schema: serde_json::Value,
-    /// Effectful artifacts are flagged in reports: already happened;
-    /// calling again repeats the effect.
-    pub effectful: bool,
     pub handler: Box<ToolHandler>,
 }
 
@@ -42,14 +38,6 @@ impl ToolRegistry {
 
     pub fn get(&self, name: &str) -> Option<&Arc<ToolDef>> {
         self.tools.get(name)
-    }
-
-    pub fn effectful_names(&self) -> HashSet<String> {
-        self.tools
-            .values()
-            .filter(|d| d.effectful)
-            .map(|d| d.name.clone())
-            .collect()
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &Arc<ToolDef>> {

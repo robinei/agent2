@@ -322,19 +322,30 @@ rendering), `agent/src/host/tools.rs` + `demo.rs` + `debug/attach.rs` (drop
 
 Acceptance:
 
-- [ ] `ToolDef.effectful`, `effectful_names()`, `set_effectful_tools`,
+- [x] `ToolDef.effectful`, `effectful_names()`, `set_effectful_tools`,
       `effectful_tools`, and `Artifact.effectful` removed; `artifact_entry` no
       longer takes the effectful set; `render_menu` lists `[#id] label → preview`
       with no warning; the `[effectful: …]` branch is gone from `dialect_card`.
-- [ ] The card carries the effect-judgment line (the same one added in Step 5):
+- [x] The card carries the effect-judgment line (the same one added in Step 5):
       "before repeating a menu call, read it — if it wrote/sent/deleted it already
       happened; reuse via `tool_result(id)`; pure reads are free to repeat."
-- [ ] Tests updated: drop `effectful_flag_warns_in_artifact_menu` /
+- [x] Tests updated: drop `effectful_flag_warns_in_artifact_menu` /
       `effectful_entries_carry_the_warning`; menu/dialect tests assert no warning
       text and no `[effectful]` rendering.
-- [ ] 8_HARNESS decision 6 reworded so it no longer implies an effectful flag
+- [x] 8_HARNESS decision 6 reworded so it no longer implies an effectful flag
       guards reuse/replay; reuse is the LLM's judgment over the visible call.
-- [ ] Gate: `cargo fmt && cargo clippy && cargo test` green.
+- [x] Gate: `cargo fmt && cargo clippy && cargo test` green.
+
+*(Built: `ToolDef.effectful` removed from `registry.rs` along with
+`effectful_names()`. `AgentState.effectful_tools` field + `set_effectful_tools`
+method removed. `Artifact.effectful` removed from `report.rs` + warning
+rendering in `render_menu`. `artifact_entry` simplified to single-arg.
+`dialect_card` no longer appends `[effectful: …]`. All `effectful:` fields
+stripped from `ToolDef` literals in `tools.rs`, `demo.rs`, `debug/attach.rs`,
+and test helpers in `dialect.rs` + `mod.rs`. Tests replaced: 
+`effectful_flag_warns_in_artifact_menu` → `menu_has_no_effectful_warning`;
+`effectful_entries_carry_the_warning` removed. Golden test strings updated.
+`8_HARNESS.md` decision 6 rewritten.)*
 
 ## Step 7: Crash-resume reframe + interrupted-`run_program` handling
 

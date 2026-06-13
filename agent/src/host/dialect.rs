@@ -110,15 +110,10 @@ pub fn dialect_card(registry: &ToolRegistry) -> String {
     tools.sort_by(|a, b| a.name.cmp(&b.name));
     for def in tools {
         card.push_str(&format!(
-            "\n- tools.{} — {} args schema: {}{}",
+            "\n- tools.{} — {} args schema: {}",
             def.name,
             def.description,
             clip(&def.input_schema.to_string(), SCHEMA_MAX_BYTES),
-            if def.effectful {
-                " [effectful: every call repeats the effect]"
-            } else {
-                ""
-            }
         ));
     }
     card.push_str("\n\n");
@@ -142,7 +137,6 @@ mod tests {
             description: "Fetch a URL and return its body text.".into(),
             input_schema: json!({ "type": "array", "items": [{ "type": "string" }] }),
             output_schema: json!({ "type": "string" }),
-            effectful: false,
             handler: Box::new(|_| Ok(json!(null))),
         });
         registry.register(ToolDef {
@@ -150,7 +144,6 @@ mod tests {
             description: "Send an email.".into(),
             input_schema: json!({ "type": "array" }),
             output_schema: json!({}),
-            effectful: true,
             handler: Box::new(|_| Ok(json!(null))),
         });
         registry
@@ -175,12 +168,13 @@ mod tests {
             .expect("a fetch_page line");
         assert!(fetch_line.contains("Fetch a URL and return its body text."));
         assert!(fetch_line.contains(r#"{"type":"array","items":[{"type":"string"}]}"#));
-        // Effectful tools are flagged; others are not.
         let email_line = card
             .lines()
             .find(|l| l.starts_with("- tools.send_email"))
             .expect("a send_email line");
-        assert!(email_line.contains("[effectful: every call repeats the effect]"));
+        assert!(email_line.contains("Send an email."));
+        // No effectful flag rendering — the flag is gone (10_EDITING Step 6).
+        assert!(!email_line.contains("effectful"));
         assert!(!fetch_line.contains("effectful"));
     }
 

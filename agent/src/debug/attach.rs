@@ -710,7 +710,6 @@ mod tests {
             description: String::new(),
             input_schema: json!({}),
             output_schema: json!({}),
-            effectful: false,
             handler: Box::new(|_| {
                 std::thread::sleep(std::time::Duration::from_millis(100));
                 Ok(json!("done"))

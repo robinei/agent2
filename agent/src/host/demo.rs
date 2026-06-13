@@ -34,7 +34,6 @@ pub fn demo_registry() -> ToolRegistry {
             "items": [{ "description": "the value to echo" }]
         }),
         output_schema: json!({ "description": "the argument, unchanged" }),
-        effectful: false,
         handler: Box::new(|args| Ok(args.get(0).cloned().unwrap_or(serde_json::Value::Null))),
     });
     registry

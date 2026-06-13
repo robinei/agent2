@@ -173,7 +173,6 @@ fn read_file_def() -> ToolDef {
                 "version": { "type": "string" }
             }
         }),
-        effectful: false,
         handler: Box::new(|args| {
             let path = args
                 .get(0)
@@ -216,7 +215,6 @@ fn create_file_def() -> ToolDef {
                 "version": { "type": "string" }
             }
         }),
-        effectful: true,
         handler: Box::new(|args| {
             let path = args
                 .get(0)
@@ -274,7 +272,6 @@ fn replace_file_def() -> ToolDef {
                 "diff": { "type": "string" }
             }
         }),
-        effectful: true,
         handler: Box::new(|args| {
             let path = args
                 .get(0)
@@ -351,7 +348,6 @@ fn bash_def() -> ToolDef {
                 "truncated": { "type": "boolean" }
             }
         }),
-        effectful: true,
         handler: Box::new(|args| {
             let command = args
                 .get(0)
