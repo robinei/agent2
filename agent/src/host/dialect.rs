@@ -24,7 +24,9 @@ everything (compute, call tools, orchestrate).
 iteration over a worklist in a single `run_program` beat one small program \
 per step. Each `run_program` is a round-trip through you (an LLM turn), so \
 batching N independent steps costs one turn, not N — reading three files, \
-editing each, and running the build is *one* program.
+editing each, and verifying the result is *one* program. Validation of \
+what you just wrote (`parse_errors`, a `bash` build / tests) belongs in \
+the program that wrote it, never a follow-up `run_program`.
 - Need a decision or missing input partway? `raise(name, payload)` and \
 continue the *same* program with `resume(value)`; don't return a final \
 answer just to start over with a fresh `run_program`. A `raise` keeps a \
