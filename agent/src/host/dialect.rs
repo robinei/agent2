@@ -29,6 +29,12 @@ a step truly needs a result you couldn't predict. Reading three files, \
 editing each, and verifying is *one* program. Validation of what you just \
 wrote (`parse_errors`, a `bash` build / tests) belongs in the program that \
 wrote it, never a follow-up `run_program`.
+- Generating several independent files? Pin the interfaces first (paths, \
+signatures, shared types), then spawn one `tools.agent` per file carrying \
+those contracts and `await` them together. The bodies generate \
+concurrently in the subagents instead of serially inside your program \
+text, your orchestrator stays small, and you still own the final \
+cross-file build / test.
 - Need a decision or missing input partway? `raise(name, payload)` and \
 continue the *same* program with `resume(value)`; don't return a final \
 answer just to start over with a fresh `run_program`. A `raise` keeps a \
@@ -166,12 +172,13 @@ mod tests {
     use crate::host::registry::ToolDef;
     use serde_json::json;
 
-    /// Bound on the static (non-tool-list) card text — keep it short.
+    /// Bound on the static (non-tool-list) card text — keep it lean.
     /// The card carries the always-true contract (acting strategy,
     /// editing recipe, dialect divergences); per-incident detail belongs
     /// in the reports. Grown deliberately as load-bearing guidance landed
-    /// (Edit.* signatures, structural tools, one-program orchestration).
-    const CARD_STATIC_MAX_BYTES: usize = 7168;
+    /// (Edit.* signatures, structural tools, orchestration + per-file
+    /// subagent delegation).
+    const CARD_STATIC_MAX_BYTES: usize = 10_240;
 
     fn registry_with_tools() -> ToolRegistry {
         let mut registry = ToolRegistry::new();
@@ -227,6 +234,7 @@ mod tests {
         for needle in [
             "run_program(source)",
             "Plan ahead and write the plan",
+            "one `tools.agent` per file",
             "keeps a long orchestration alive",
             "`input` is a read-only const",
             "top-level `return <value>`",
