@@ -70,6 +70,30 @@ impl Tree {
         Ok(self.spine_at(id))
     }
 
+    /// Fork from any event: reconstruct the spine at `from` and return
+    /// an appendable handle. The first `append` on the returned spine
+    /// creates a *sibling* of `from`'s existing spine child — a
+    /// divergent branch within the same frame (user-driven retry /
+    /// exploration, decision 4). Errors if `from` is unknown or its
+    /// spine is already complete (a `FrameResult` is on the path, so
+    /// nothing may follow it).
+    pub fn fork(&self, from: EventId) -> io::Result<Spine> {
+        if !self.events.contains_key(&from) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("cannot fork: event {from:?} not in tree"),
+            ));
+        }
+        let spine = self.spine_at(from);
+        if spine.is_complete() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("cannot fork from a completed spine at {from:?}"),
+            ));
+        }
+        Ok(spine)
+    }
+
     /// Append an event to a spine. The spine's leaf advances; the
     /// innermost frame absorbs chat messages. `FrameStart` must go
     /// through `start_frame`; nothing may follow a `FrameResult`.
@@ -433,6 +457,55 @@ mod tests {
         leaves.sort_by_key(|id| id.as_u64());
         assert_eq!(leaves, vec![call_site, child.leaf_id]);
         Ok(())
+    }
+
+    // --- Forking ---
+
+    #[test]
+    fn test_fork_mid_spine_diverges_leaving_original_intact() -> io::Result<()> {
+        let mut tree = Tree::new(None);
+        let mut spine = tree.start_frame(None, "root", json!(null))?;
+        tree.append(&mut spine, user_msg("q"))?;
+        let fork_point = tree.append(&mut spine, assistant_msg("first answer"))?;
+        let original_leaf = tree.append(&mut spine, user_msg("follow-up A"))?;
+
+        // Fork from the assistant turn and take a different path.
+        let mut forked = tree.fork(fork_point)?;
+        assert_eq!(forked.leaf_id, fork_point);
+        let forked_leaf = tree.append(&mut forked, user_msg("follow-up B"))?;
+
+        // Two leaves now hang off the same fork point; neither path saw
+        // the other's append.
+        assert_ne!(original_leaf, forked_leaf);
+        let texts = |leaf: EventId| -> Vec<String> {
+            tree.spine_at(leaf)
+                .frame()
+                .messages
+                .iter()
+                .map(|m| m.text().to_owned())
+                .collect()
+        };
+        assert_eq!(texts(original_leaf), ["q", "first answer", "follow-up A"]);
+        assert_eq!(texts(forked_leaf), ["q", "first answer", "follow-up B"]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_fork_from_completed_spine_errors() -> io::Result<()> {
+        let mut tree = Tree::new(None);
+        let mut spine = tree.start_frame(None, "root", json!(null))?;
+        tree.append(&mut spine, assistant_msg("done"))?;
+        let result_id = tree.append(&mut spine, EventPayload::FrameResult { result: json!(1) })?;
+        let err = tree.fork(result_id).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        Ok(())
+    }
+
+    #[test]
+    fn test_fork_from_unknown_id_errors() {
+        let tree = Tree::new(None);
+        let err = tree.fork(EventId::new(99)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
     }
 
     // --- Labels ---
