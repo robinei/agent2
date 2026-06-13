@@ -812,6 +812,96 @@ mod tests {
         assert!(program_result.starts_with("rejected: result too large"));
     }
 
+    /// M2: a `raise` with payload round-trips through the full session
+    /// loop — condition report logged as a `Tool` event, the LLM's
+    /// `resume(value)` re-enters the *same* VM, and the resumed value
+    /// becomes the raise expression's result.
+    #[test]
+    fn raise_round_trips_resume_through_the_session() {
+        let script = vec![
+            scripted_program(
+                "c1",
+                r#"const x = raise("need_value", { why: "no default" }); return x + 1;"#,
+            ),
+            scripted_resume("c2", json!(41)),
+            scripted_text("got it"),
+        ];
+        let (session, _) = run_session(ToolRegistry::new(), script, "compute it");
+
+        // The condition report reached the log as a Tool event naming the
+        // condition and previewing its payload.
+        let reports = tool_texts(&session);
+        assert!(
+            reports[0].contains("need_value") && reports[0].contains("no default"),
+            "{}",
+            reports[0]
+        );
+        // Resume continued the same VM: x = 41, so it returned 42.
+        assert!(
+            reports.iter().any(|t| t.contains("returned: 42")),
+            "{reports:?}"
+        );
+        // A raise consumes no tools, so the spine carries no Invoke; the
+        // arc is program → condition → resume → completion → text.
+        let spine = kinds(session.tree(), root_leaf(&session));
+        assert!(!spine.contains(&"Invoke"), "{spine:?}");
+        assert_eq!(spine.last(), Some(&"FrameResult"));
+    }
+
+    /// M2: a trapped runtime error reports, and the rewrite restart reuses
+    /// the already-logged tool result by id (`tools.tool_result`) instead
+    /// of repeating the call — served from the log, no second Invoke.
+    #[test]
+    fn trapped_error_rewrite_reuses_artifact_through_the_session() {
+        let mut registry = ToolRegistry::new();
+        registry.register(tool("fetch", false, |_| Ok(json!("DATA"))));
+        // Event ids are deterministic: FrameStart 1, User 2, Assistant 3,
+        // the fetch Invoke 4 — so the rewrite can name `tool_result(4)`.
+        let script = vec![
+            scripted_program(
+                "c1",
+                r#"await tools.fetch("expensive"); const v = null; return v.x;"#,
+            ),
+            scripted_program("c2", "return await tools.tool_result(4);"),
+            scripted_text("done"),
+        ];
+        let (session, _) = run_session(registry, script, "fetch then trip");
+
+        // The fetch really is artifact #4 (guards the hardcoded id above).
+        let fetch_invoke = session
+            .tree()
+            .events
+            .values()
+            .find(|e| matches!(&e.payload, EventPayload::Invoke { name, .. } if name == "fetch"))
+            .expect("the fetch Invoke");
+        assert_eq!(fetch_invoke.id.as_u64(), 4);
+
+        // The condition report rendered the trapped error and the menu.
+        let reports = tool_texts(&session);
+        assert!(
+            reports[0].contains("[#4]") && reports[0].contains("fetch"),
+            "{}",
+            reports[0]
+        );
+
+        // The rewrite reused the artifact: exactly one fetch Invoke on the
+        // spine (no repeat), and the completion returns the reused value.
+        let fetch_invokes = session
+            .tree()
+            .events
+            .values()
+            .filter(|e| matches!(&e.payload, EventPayload::Invoke { name, .. } if name == "fetch"))
+            .count();
+        assert_eq!(
+            fetch_invokes, 1,
+            "fetch must not be repeated by the rewrite"
+        );
+        assert!(
+            reports.iter().any(|t| t.contains(r#"returned: "DATA""#)),
+            "{reports:?}"
+        );
+    }
+
     #[test]
     fn agent_tool_spawns_child_frame_and_joins() {
         let script = vec![

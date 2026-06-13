@@ -499,6 +499,45 @@ M1/M2 transcripts, not speculation.
 - **M2** (needs Phase 3): conditions round-trip — `raise` with payload and
   a trapped TypeError both produce a report, and both restart paths
   (resume / rewrite reusing artifacts by id) work against a real model.
+
+  M2 acceptance:
+
+  - [x] Host-level round-trip through the full `Session` loop, not just
+        the machine: `raise(name, payload)` → condition report logged as
+        a `Tool` event → the LLM's `resume(value)` re-enters the *same*
+        VM → the resumed value becomes the raise expression's result →
+        completion report → frame-completing text turn
+        (`host::tests::raise_round_trips_resume_through_the_session`).
+  - [x] Trapped runtime error → condition report → `run_program` rewrite
+        that reuses the already-logged tool result by id
+        (`tools.tool_result(#id)`), served from the log with **no** second
+        `Invoke` for the original call
+        (`host::tests::trapped_error_rewrite_reuses_artifact_through_the_session`).
+  - [x] `scripted_resume(call_id, value)` added beside
+        `scripted_program`/`scripted_text` so the restart turn is
+        scriptable offline (the machine-level golden reports already cover
+        the report *rendering* — these host tests cover the loop *routing*).
+  - [ ] Manual M2 verification against a real model (needs
+        `DEEPSEEK_API_KEY`): one `agent session --headless --real --turn …`
+        run that raises and one that trips a TypeError, each resumed and
+        rewritten from the live transcript. *Deferred: no key in the build
+        environment — run with `DEEPSEEK_API_KEY=… cargo run -p agent --
+        session --headless --real --turn '<task that raises>'` and eyeball
+        the report → restart arc.*
+  - [x] Gate: `cargo fmt && cargo clippy && cargo test` green, fully
+        offline.
+
+  *(Built: the machine already round-trips conditions (Step 3) and renders
+  the reports (Step 4); M2 adds the missing **host-loop** coverage —
+  proving a `resume`/`run_program` restart turn dispatched by the `Session`
+  re-enters or rewrites the suspended frame end-to-end. The rewrite test
+  leans on deterministic event ids (FrameStart 1 … fetch Invoke 4) and
+  asserts the id it hardcodes, so a numbering change fails loudly rather
+  than silently fetching the wrong artifact. The one open box is the live
+  run, which needs a network key this environment lacks; M1's live arc
+  already exercised `run_program` → report on a real model, so the
+  remaining unknown is only how the *restart* tools land — left for the
+  user to drive.)*
 - **M3**: subagent branches — `Promise.all` over `tools.agent` spawning
   concurrent child frames (or sequential awaits pre-7_ASYNC), results
   joining the parent program.
