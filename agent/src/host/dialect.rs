@@ -204,17 +204,22 @@ if (c.ok === false) raise("syntax_error", c);
 return "bumped MAX to 100";
 ```
 
-Many independent files — delegate one subagent per file so the bodies
-generate concurrently; you pin the interfaces and own the cross-file check:
+Many files — author ONE detailed plan (it's a big string, so an attachment),
+hand the *same* plan to every subagent, and have each build just its slice.
+Shared spec → the independently-written files compose into a coherent whole:
 ```
-const specs = {
-  "/app/api.js": "export async fetchUser(id) -> { id, name }; uses global fetch",
-  "/app/ui.js":  "export render(user) -> html string; imports fetchUser from ./api.js",
-};
-await Promise.all(Object.entries(specs).map(([path, contract]) =>
-  tools.agent({ prompt: `Write ${path}; create_file then parse_errors it. Contract: ${contract}`, input: null })));
-const c = await tools.bash("cd /app && node --check api.js && node --check ui.js");
-return c.status === 0 ? "delegated + checked 2 files" : c.stderr;
+// attachments.plan = the full architecture: every file's role, the exact
+// shared interfaces/signatures/names, conventions. Authored once.
+const files = ["/app/game.js", "/app/render.js", "/app/input.js"];
+await Promise.all(files.map(file =>
+  tools.agent({
+    prompt: `Implement only ${file}, exactly to the plan. Honor the shared ` +
+            `interfaces and names verbatim so it composes with its siblings. ` +
+            `create_file it, then parse_errors it.`,
+    input: { plan: attachments.plan, file },   // every agent sees the whole plan
+  })));
+const c = await tools.bash("cd /app && node --check game.js render.js input.js");
+return c.status === 0 ? "all slices built against one shared plan" : c.stderr;
 ```
 "####;
 
@@ -316,7 +321,7 @@ mod tests {
             "## examples",
             "verify them in the SAME program",
             "Edit.replaceOnce(f.content",
-            "one subagent per file",
+            "every agent sees the whole plan",
             "console.log",
             "tools.tool_result(id)",
             "Call tools **positionally**",
