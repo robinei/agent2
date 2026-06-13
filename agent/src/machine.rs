@@ -119,6 +119,11 @@ pub enum StepOutput {
     SpawnFrames(Vec<SpawnFrame>),
     /// The frame completed; its `FrameResult` is logged.
     FrameDone(serde_json::Value),
+    /// The root frame produced a final answer but does *not* complete:
+    /// the top conversation never ends, it yields the turn back to the
+    /// user. No `FrameResult` is logged (the spine stays appendable); the
+    /// frame goes idle awaiting the next `UserTurn`.
+    Yielded,
     /// The VM wants another `Tick`.
     Working,
 }
@@ -187,6 +192,11 @@ struct PendingCall {
 
 pub struct AgentState {
     pub spine: Spine,
+    /// The session's top frame: the user-facing conversation. It never
+    /// completes — a final no-tool-call turn *yields* to the user
+    /// instead of logging a `FrameResult`. Child (subagent) frames are
+    /// not root: they complete and return to their caller.
+    is_root: bool,
     phase: Phase,
     invoke_counter: u64,
     generation: u64,
@@ -228,13 +238,18 @@ impl AgentState {
         input: serde_json::Value,
     ) -> io::Result<Self> {
         let spine = tree.start_frame(Some(call_site), prompt, input)?;
-        Ok(Self::with_spine(spine))
+        let mut state = Self::with_spine(spine);
+        state.is_root = false; // a subagent frame completes and returns
+        Ok(state)
     }
 
-    /// Resume an existing spine (re-opened log).
+    /// Resume an existing spine (re-opened log). This is the session's
+    /// top frame — `is_root` — whether freshly rooted (`new_root`) or
+    /// re-anchored on resume (`open_at`); `new_child` clears the flag.
     pub fn with_spine(spine: Spine) -> Self {
         AgentState {
             spine,
+            is_root: true,
             phase: Phase::Idle,
             invoke_counter: 0,
             generation: 0,
@@ -864,7 +879,7 @@ impl AgentState {
     fn finish_frame(&mut self, tree: &mut Tree) -> io::Result<Vec<StepOutput>> {
         // Abandon any suspended program: a no-tool-call turn completes
         // the frame, its text is the result.
-        if let Phase::Suspended(run, _) = std::mem::replace(&mut self.phase, Phase::Done) {
+        if let Phase::Suspended(run, _) = std::mem::replace(&mut self.phase, Phase::Idle) {
             self.last_vm = Some(run.vm);
         }
         self.generation += 1;
@@ -872,6 +887,14 @@ impl AgentState {
             Some(Message::Assistant { text, .. }) => serde_json::Value::String(text.clone()),
             _ => serde_json::Value::Null,
         };
+        if self.is_root {
+            // The top conversation never ends: yield the turn to the user
+            // without logging a `FrameResult`, so the spine stays
+            // appendable for the next `UserTurn`. The assistant's final
+            // text is already on the spine as the answer.
+            self.phase = Phase::Idle;
+            return Ok(vec![StepOutput::Yielded]);
+        }
         tree.append(
             &mut self.spine,
             EventPayload::FrameResult {
@@ -1187,7 +1210,7 @@ mod tests {
     }
 
     #[test]
-    fn program_completion_then_frame_done() {
+    fn program_completion_then_root_yields() {
         let (mut tree, mut state) = setup();
         state
             .step(&mut tree, StepInput::UserTurn("go".into()))
@@ -1210,18 +1233,18 @@ mod tests {
         let req = expect_request(&settled);
         assert!(matches!(req.messages.last(), Some(Message::Tool { .. })));
 
-        // Final text turn completes the frame.
+        // Final text turn on the *root* frame yields to the user — the
+        // top conversation never ends, so no `FrameResult` is logged and
+        // the frame stays idle, ready for the next turn.
         let out = state
             .step(
                 &mut tree,
                 StepInput::LlmResponse(llm_text("the answer is 42")),
             )
             .unwrap();
-        assert!(matches!(
-            &out[..],
-            [StepOutput::FrameDone(v)] if v == &json!("the answer is 42")
-        ));
-        assert!(state.is_done());
+        assert!(matches!(&out[..], [StepOutput::Yielded]), "{out:?}");
+        assert!(!state.is_done());
+        assert!(state.is_idle());
         assert_eq!(
             payload_kinds(&state, &tree),
             [
@@ -1231,9 +1254,17 @@ mod tests {
                 "ProgramResult",
                 "Tool",
                 "Assistant",
-                "FrameResult"
             ]
         );
+
+        // A follow-up turn appends onto the same spine and runs again.
+        state
+            .step(&mut tree, StepInput::UserTurn("more".into()))
+            .unwrap();
+        assert!(matches!(
+            payload_kinds(&state, &tree).last(),
+            Some(&"User")
+        ));
     }
 
     #[test]

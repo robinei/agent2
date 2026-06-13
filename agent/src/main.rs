@@ -109,20 +109,48 @@ fn main() {
     }
 }
 
-fn open_tree(log_path: Option<String>) -> Result<Tree, String> {
-    match log_path {
-        Some(path) => {
-            let file = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false) // an existing log is resumed, not wiped
-                .open(&path)
-                .map_err(|e| format!("{path}: {e}"))?;
-            Tree::open(file).map_err(|e| format!("{path}: {e}"))
-        }
-        None => Ok(Tree::new(None)),
+/// The state directory: `$AGENT2_STATE_DIR`, else `$HOME/.agent2`. Trees,
+/// and later other durable session state, live under it.
+fn state_dir() -> Result<std::path::PathBuf, String> {
+    if let Ok(dir) = std::env::var("AGENT2_STATE_DIR") {
+        return Ok(std::path::PathBuf::from(dir));
     }
+    let home =
+        std::env::var("HOME").map_err(|_| "neither AGENT2_STATE_DIR nor HOME is set".to_string())?;
+    Ok(std::path::PathBuf::from(home).join(".agent2"))
+}
+
+/// A fresh tree log for a new session: `<state>/trees/<uuid>/tree.jsonl`.
+/// The per-session directory leaves room for sidecar artifacts later.
+fn new_tree_path() -> Result<std::path::PathBuf, String> {
+    let dir = state_dir()?
+        .join("trees")
+        .join(uuid::Uuid::new_v4().to_string());
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    Ok(dir.join("tree.jsonl"))
+}
+
+/// Open the session log. An explicit path is opened/created in place and
+/// resumed; with no path a fresh persistent log is minted under the state
+/// directory (the default is durable now, not in-memory) and its location
+/// is announced so the session can be resumed later.
+fn open_tree(log_path: Option<String>) -> Result<Tree, String> {
+    let path = match log_path {
+        Some(path) => std::path::PathBuf::from(path),
+        None => {
+            let path = new_tree_path()?;
+            eprintln!("agent: new session log at {}", path.display());
+            path
+        }
+    };
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false) // an existing log is resumed, not wiped
+        .open(&path)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    Tree::open(file).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// Frame prompt for real (M1) sessions; the dialect card carries the

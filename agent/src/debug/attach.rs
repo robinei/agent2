@@ -757,8 +757,9 @@ mod tests {
         assert!(sources[0].contains("tools.agent"), "{sources:?}");
         assert!(sources[1].contains("tools.slow"), "{sources:?}");
 
-        // And the whole thing still finishes cleanly.
+        // And the whole thing still settles cleanly: the root yields its
+        // final answer back to the user (the top conversation never ends).
         while session.pump_one() {}
-        assert!(session.is_done());
+        assert!(session.is_awaiting_user());
     }
 }

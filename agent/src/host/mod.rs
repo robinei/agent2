@@ -115,6 +115,11 @@ pub struct Session {
     paused: HashSet<FrameId>,
     starved: HashSet<FrameId>,
     done: bool,
+    /// The root frame yielded its turn back to the user (it produced a
+    /// final answer but, being the top conversation, did not complete).
+    /// `run()` stops here; interactive front-ends keep going and clear it
+    /// on the next `UserTurn`.
+    awaiting_user: bool,
 }
 
 impl Session {
@@ -198,6 +203,7 @@ impl Session {
             paused: HashSet::new(),
             starved: HashSet::new(),
             done: false,
+            awaiting_user: false,
         };
         session.emit_new(root);
         Ok(session)
@@ -232,22 +238,26 @@ impl Session {
         out
     }
 
-    /// Run to completion: until the root frame finishes or `Shutdown`.
+    /// Run until the root frame yields the turn back to the user or
+    /// `Shutdown`. The root never *completes* (the top conversation
+    /// never ends); `run()` is the one-shot convenience that stops at the
+    /// yield. Interactive front-ends drive `pump_until` instead and keep
+    /// going across turns.
     pub fn run(mut self) -> Self {
         while self.pump_one() {}
         self
     }
 
     /// Block for one inbox message and handle it; `false` once the
-    /// session is over.
+    /// session is over (`Shutdown`) or the root has yielded its turn.
     pub fn pump_one(&mut self) -> bool {
-        if self.done {
+        if self.done || self.awaiting_user {
             return false;
         }
         match self.rx.recv() {
             Ok(msg) => {
                 self.on_msg(msg);
-                !self.done
+                !(self.done || self.awaiting_user)
             }
             Err(_) => false,
         }
@@ -281,6 +291,13 @@ impl Session {
     /// reading; `run()` exits on it.
     pub fn is_done(&self) -> bool {
         self.done
+    }
+
+    /// Whether the root frame has yielded its turn back to the user (a
+    /// final answer is on the spine and the frame is idle, awaiting the
+    /// next `UserTurn`). Distinct from `is_done`: the conversation lives.
+    pub fn is_awaiting_user(&self) -> bool {
+        self.awaiting_user
     }
 
     // ── debugger controls (privileged: same thread as the loop) ──────
@@ -344,6 +361,7 @@ impl Session {
                     });
                     return Ok(());
                 }
+                self.awaiting_user = false; // the user took their turn
                 self.step_frame(root, StepInput::UserTurn(text))
             }
             LoopMsg::Command(SessionCommand::ListLeaves) => {
@@ -557,8 +575,15 @@ impl Session {
                             result: guard_size(Ok(result)),
                         });
                     }
+                    // A parentless frame finishing is the root; it yields
+                    // rather than completing (see `StepOutput::Yielded`).
+                    // Reaching here means a non-root frame had no caller —
+                    // end the session rather than strand it.
                     None => self.done = true,
                 },
+                // The root produced a final answer and yielded the turn:
+                // the conversation stays open, idle, awaiting the user.
+                StepOutput::Yielded => self.awaiting_user = true,
                 StepOutput::Working => {
                     let _ = self.tx.send(LoopMsg::Continue { frame });
                 }
@@ -925,7 +950,8 @@ mod tests {
                 "ProgramResult",
                 "Tool",
                 "Assistant",
-                "FrameResult"
+                // The root yields its final answer to the user; the top
+                // conversation never ends, so no `FrameResult` is logged.
             ]
         );
         // Both fan-out results landed (order is completion order).
@@ -1149,7 +1175,9 @@ mod tests {
         // arc is program → condition → resume → completion → text.
         let spine = kinds(session.tree(), root_leaf(&session));
         assert!(!spine.contains(&"Invoke"), "{spine:?}");
-        assert_eq!(spine.last(), Some(&"FrameResult"));
+        // Root yields its final answer (no `FrameResult`); the top
+        // conversation never ends.
+        assert_eq!(spine.last(), Some(&"Assistant"));
 
         // The completion report must answer the *resume* call ("c2"), not
         // the original run_program ("c1") — otherwise the next chat
@@ -1523,7 +1551,7 @@ mod tests {
             label: Some("retry".into()),
         });
         h.send(SessionCommand::UserTurn("forked follow-up".into()));
-        let session = drain(session); // forked frame runs to completion → done
+        let session = drain(session); // forked frame yields the turn back
         let tree = session.tree();
 
         // Two leaves, both under the root frame (FrameStart #1).
@@ -1534,15 +1562,17 @@ mod tests {
         }
         // The original assistant leaf (#3) survived untouched.
         assert!(leaves.iter().any(|(id, _)| *id == EventId::new(3)));
-        // The forked branch diverged off #2 (never saw "a1") and ran to a
-        // FrameResult.
+        // The forked branch diverged off #2 (never saw "a1"). It is the
+        // root conversation, so it yields rather than completing — no
+        // `FrameResult`, the spine stays open.
         let forked_leaf = leaves
             .iter()
             .map(|(id, _)| *id)
             .find(|id| *id != EventId::new(3))
             .unwrap();
         let forked = tree.spine_at(forked_leaf);
-        assert!(forked.is_complete());
+        assert!(!forked.is_complete());
+        assert!(session.is_awaiting_user());
         let msgs: Vec<&str> = forked.frame().messages.iter().map(|m| m.text()).collect();
         assert_eq!(msgs, ["q", "forked follow-up", "forked done"]);
         // The fork's label sits on the new branch, not the original.
@@ -1727,7 +1757,8 @@ mod tests {
         let session = session.run();
 
         // The rewrite should have produced a completion report, then a
-        // final text turn, then FrameResult.
+        // final text turn that yields the root's turn back to the user
+        // (no `FrameResult` — the top conversation never ends).
         let all_tools = tool_texts(&session);
         assert!(
             all_tools.iter().any(|t| t.contains("program completed")),
@@ -1735,9 +1766,10 @@ mod tests {
         );
         let kinds = kinds(session.tree(), root_leaf(&session));
         assert!(
-            kinds.last() == Some(&"FrameResult"),
-            "frame finished: {kinds:?}"
+            kinds.last() == Some(&"Assistant"),
+            "frame yielded its final answer: {kinds:?}"
         );
+        assert!(session.is_awaiting_user());
 
         let _events: Vec<SessionEvent> = rx.try_iter().collect();
     }

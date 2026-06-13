@@ -20,7 +20,17 @@ result.
 ## acting
 - run_program(source): submit a complete program — this is how you do \
 everything (compute, call tools, orchestrate).
-- A reply with *no* tool call ends the task; its text is your final \
+- Orchestrate the whole job in one program: loops, conditionals, and \
+iteration over a worklist in a single `run_program` beat one small program \
+per step. Each `run_program` is a round-trip through you (an LLM turn), so \
+batching N independent steps costs one turn, not N — reading three files, \
+editing each, and running the build is *one* program.
+- Need a decision or missing input partway? `raise(name, payload)` and \
+continue the *same* program with `resume(value)`; don't return a final \
+answer just to start over with a fresh `run_program`. A `raise` keeps a \
+long orchestration alive — restarting from the top discards its progress \
+(variables, in-flight reads).
+- A reply with *no* tool call ends your turn; its text is your final \
 answer.
 
 ## program contract
@@ -153,7 +163,11 @@ mod tests {
     use serde_json::json;
 
     /// Bound on the static (non-tool-list) card text — keep it short.
-    const CARD_STATIC_MAX_BYTES: usize = 6144;
+    /// The card carries the always-true contract (acting strategy,
+    /// editing recipe, dialect divergences); per-incident detail belongs
+    /// in the reports. Grown deliberately as load-bearing guidance landed
+    /// (Edit.* signatures, structural tools, one-program orchestration).
+    const CARD_STATIC_MAX_BYTES: usize = 7168;
 
     fn registry_with_tools() -> ToolRegistry {
         let mut registry = ToolRegistry::new();
@@ -208,6 +222,8 @@ mod tests {
         let card = dialect_card(&ToolRegistry::new());
         for needle in [
             "run_program(source)",
+            "Orchestrate the whole job in one program",
+            "keeps a long orchestration alive",
             "`input` is a read-only const",
             "top-level `return <value>`",
             "console.log",
