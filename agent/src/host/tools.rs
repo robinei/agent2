@@ -329,10 +329,11 @@ fn bash_def() -> ToolDef {
     ToolDef {
         name: "bash".into(),
         description: "Run one short shell command — a single pipeline, no loops or \
-                      multi-line scripts; do control flow in JS. Resolves to \
-                      { status, stdout, stderr, truncated? } (a non-zero status is a \
-                      result, not an error); times out after 30s; output capped at \
-                      4MB/stream."
+                      multi-line scripts; do control flow in JS. Command is one string \
+                      — bash(\"mkdir -p /x && ls /x\") — or an argv array joined with \
+                      spaces. Resolves to { status, stdout, stderr, truncated? } \
+                      (a non-zero status is a result, not an error); times out after \
+                      30s; output capped at 4MB/stream."
             .into(),
         input_schema: json!({
             "type": "array",
@@ -352,10 +353,34 @@ fn bash_def() -> ToolDef {
             }
         }),
         handler: Box::new(|args| {
-            let command = args
-                .get(0)
-                .and_then(|v| v.as_str())
-                .ok_or("bash(command) needs a string command")?;
+            // Accept the command as a string, or as an argv array joined
+            // with spaces (`bash(["mkdir","-p","/x"])` → "mkdir -p /x") —
+            // a common reflex from Node's spawn/execFile, including the
+            // wrapped-string `bash(["mkdir -p /x"])`. Plain tokens are the
+            // norm, so joining removes a sharp edge rather than failing.
+            let command: String = match args.get(0) {
+                Some(v) if v.is_string() => v.as_str().unwrap().to_owned(),
+                Some(v) if v.is_array() => {
+                    let mut words = Vec::new();
+                    for part in v.as_array().unwrap() {
+                        match part.as_str() {
+                            Some(w) => words.push(w),
+                            None => {
+                                return Err("bash([...]) array must hold only \
+                                            strings (argv words)"
+                                    .into());
+                            }
+                        }
+                    }
+                    words.join(" ")
+                }
+                _ => {
+                    return Err("bash takes the command as a string — \
+                                e.g. tools.bash(\"mkdir -p /x && ls /x\") — or an \
+                                array of words joined with spaces"
+                        .into());
+                }
+            };
             if command.len() > BASH_COMMAND_MAX_BYTES {
                 return Err(format!(
                     "command is {} bytes (limit {BASH_COMMAND_MAX_BYTES}): keep bash to \
@@ -364,7 +389,7 @@ fn bash_def() -> ToolDef {
                     command.len()
                 ));
             }
-            run_bash(command, BASH_TIMEOUT)
+            run_bash(&command, BASH_TIMEOUT)
         }),
     }
 }
@@ -651,6 +676,20 @@ mod tests {
     fn bash_nonzero_exit_is_a_result_not_an_error() {
         let result = bash(json!(["exit 3"])).unwrap();
         assert_eq!(result["status"], json!(3));
+    }
+
+    #[test]
+    fn bash_accepts_argv_array_joined_with_spaces() {
+        // The observed reflex: passing the command as an argv array, or a
+        // string wrapped in one. Both are accepted, joined with spaces, and
+        // run identically to the bare-string form.
+        let argv = bash(json!([["echo", "hi", "there"]])).unwrap();
+        assert_eq!(argv["stdout"], json!("hi there\n"));
+        let wrapped = bash(json!([["echo wrapped"]])).unwrap();
+        assert_eq!(wrapped["stdout"], json!("wrapped\n"));
+        // A non-string element is still a loud error.
+        let err = bash(json!([["echo", 7]])).unwrap_err();
+        assert!(err.contains("only strings"), "{err}");
     }
 
     #[test]
