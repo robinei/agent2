@@ -80,6 +80,11 @@ pub fn resume_spec() -> ToolSpec {
 /// but a pathological program could chain those forever.
 const MAX_PUMP_ROUNDS: usize = 100;
 
+/// KB-scale loud guard on a program's `return` value.  Oversized returns
+/// are rejected with "return something smaller — status-shaped, not
+/// data" — the discipline that replaces the silent clip.
+const PROGRAM_RESULT_MAX_BYTES: usize = 4096;
+
 pub enum StepInput {
     /// A user message. Valid while idle; arriving mid-program it becomes
     /// a host-injected condition — deferred to M2 (panics until then).
@@ -731,10 +736,26 @@ impl AgentState {
         let Phase::Running(run) = std::mem::replace(&mut self.phase, Phase::Idle) else {
             unreachable!()
         };
-        let value_json = run
+        let mut value_json = run
             .vm
             .stack_value_to_json(&value, 0)
             .unwrap_or_else(|_| serde_json::Value::String(format!("{value:?}")));
+
+        // Loud refusal on oversized returns: the discipline that replaces
+        // the silent clip.  Tool results (which may hold the real data)
+        // are still fetchable by id.
+        let size = serde_json::to_string(&value_json)
+            .map(|s| s.len())
+            .unwrap_or(0);
+        let return_rejected = size > PROGRAM_RESULT_MAX_BYTES;
+        let mut completion_value = value_json.clone();
+        if return_rejected {
+            value_json = serde_json::Value::String(format!(
+                "return value too large: {size} bytes (limit {PROGRAM_RESULT_MAX_BYTES}); \
+                 return something smaller — status-shaped, not data"
+            ));
+            completion_value = value_json.clone();
+        }
 
         // Fire-and-forget calls the program never awaited: the host
         // decides whether to run them; results are logged as late
@@ -765,7 +786,7 @@ impl AgentState {
         )?;
 
         let report = CompletionReport {
-            value: value_json.clone(),
+            value: completion_value,
             console: run.vm.console_lines.clone(),
             new_artifacts: self.new_artifacts(tree, run.started_at),
         }
@@ -1631,5 +1652,40 @@ got X
             )
             .unwrap();
         let _ = state.step(&mut tree, StepInput::UserTurn("are you done?".into()));
+    }
+
+    #[test]
+    fn oversized_program_return_is_rejected() {
+        let (mut tree, mut state) = setup();
+        state.kickoff();
+        // Return a large string — bigger than PROGRAM_RESULT_MAX_BYTES (4096).
+        let src = "return \"x\".repeat(5000);";
+        let out = state
+            .step(&mut tree, StepInput::LlmResponse(llm_program("c1", src)))
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+        let report = last_tool_text(&state);
+        assert!(
+            report.contains("return value too large"),
+            "rejection in report: {report}"
+        );
+        assert!(
+            report.contains("status-shaped, not data"),
+            "discipline message: {report}"
+        );
+        // The ProgramResult event logged the refusal, not the 5KB string.
+        let pr_value = state
+            .frame_segment(&tree)
+            .iter()
+            .find_map(|e| match &e.payload {
+                EventPayload::ProgramResult { value } => Some(value.clone()),
+                _ => None,
+            })
+            .expect("a ProgramResult");
+        let logged = pr_value.as_str().unwrap();
+        assert!(
+            logged.contains("return value too large"),
+            "logged refusal, not the data: {logged}"
+        );
     }
 }

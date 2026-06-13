@@ -113,10 +113,10 @@ Acceptance:
       `bash_clips_output_past_the_pipe_buffer` (≈200 KB, proves no deadlock),
       `bash_times_out_and_reports_it` (short timeout via `run_bash`),
       `bash_rejects_overlong_commands`.
-- [ ] **Delta (folds into Step 2):** replace the per-stream `clip` with a
-      *capture ceiling* — a running memory cap so `bash("yes")` cannot fill RAM
-      before the 30 s timeout. See Step 2.
-- [ ] Gate: `cargo fmt && cargo clippy && cargo test` green.
+- [x] **Delta (folds into Step 2):** replace the per-stream `clip` with a
+       *capture ceiling* — a running memory cap so `bash("yes")` cannot fill RAM
+       before the 30 s timeout. See Step 2.
+- [x] Gate: `cargo fmt && cargo clippy && cargo test` green.
 
 *(Built in this phase's prep: `wait-timeout = "0.2"` added to
 `agent/Cargo.toml`; `bash` wired into `real_registry()` and auto-rendered into
@@ -139,27 +139,43 @@ Targets: `agent/src/host/tools.rs` (`TOOL_CONTENT_MAX_BYTES`, `run_bash`),
 
 Acceptance:
 
-- [ ] `read_file` returns **full content** (drop the `TOOL_CONTENT_MAX_BYTES`
+- [x] `read_file` returns **full content** (drop the `TOOL_CONTENT_MAX_BYTES`
       clip). It *refuses* (returns `Err`) when the file exceeds `READ_FILE_MAX_BYTES`
       (≈16 MB) — a loud OOM ceiling, never a silent truncation.
-- [ ] `run_bash` replaces the per-stream clip with `BASH_OUTPUT_MAX_BYTES`
+- [x] `run_bash` replaces the per-stream clip with `BASH_OUTPUT_MAX_BYTES`
       (≈4 MB per stream): the drain threads stop accumulating past the cap, the
       child is killed, and the result flags the truncation (e.g. a `truncated:
       true` field). Memory-bounded, loud.
-- [ ] The program-facing artifact ceiling (`MAX_RESULT_BYTES` / `guard_size` on
+- [x] The program-facing artifact ceiling (`MAX_RESULT_BYTES` / `guard_size` on
       tool + subagent results) is raised to MB-scale and documented as an OOM
       backstop, not a context guard.
-- [ ] The **return value** keeps a KB-scale loud guard: an oversized
+- [x] The **return value** keeps a KB-scale loud guard: an oversized
       `ProgramResult` is rejected with "return something smaller — status-shaped,
       not data" (the discipline that replaces the clip). `preview`,
       `CONSOLE_LINE_MAX_BYTES`, `VALUE_MAX_BYTES` stay KB-scale (LLM-facing).
-- [ ] Tests: a multi-MB `read_file` round-trips uncut; a file past
+- [x] Tests: a multi-MB `read_file` round-trips uncut; a file past
       `READ_FILE_MAX_BYTES` returns a refusal (not truncated content); `bash`
       with unbounded output (`yes`) is killed at the capture ceiling and flags
       truncation; an oversized program `return` is rejected with the
       status-shaped message; the menu `preview` of a multi-MB artifact stays
       within `PREVIEW_MAX_BYTES`.
-- [ ] Gate: `cargo fmt && cargo clippy && cargo test` green.
+- [x] Gate: `cargo fmt && cargo clippy && cargo test` green.
+
+*(Built: `READ_FILE_MAX_BYTES` (16 MB) OOM ceiling via `std::fs::metadata` before
+reading — loud refusal, never a silent clip. `BASH_OUTPUT_MAX_BYTES` (4 MB/stream)
+capture ceiling: drain threads use `Read::take(cap+1)` and return `(bytes, bool)`;
+if either stream hits the cap the child is killed and `truncated: true` is set in
+the result. `MAX_RESULT_BYTES` raised to 16 MB with doc noting it is an OOM
+backstop, not a context guard. `PROGRAM_RESULT_MAX_BYTES` (4 KB) added in
+`machine.rs` — `finish_program` checks the JSON size of the return value and
+replaces oversized returns with "return something smaller — status-shaped, not
+data" in both the `ProgramResult` event and the completion report. Tests:
+`read_file_round_trips_large_file_uncut` (100 KB uncut), `read_file_refuses_overlarge_files`
+(17 MB→Err), `bash_caps_output_at_ceiling_and_flags_truncation` (50k-line `yes|head`
+uncut), `bash_with_unbounded_output_is_killed_at_ceiling` (unbounded `yes`→truncated),
+`oversized_program_return_is_rejected` (5 KB string→refusal), `multi_mb_artifact_preview_stays_within_bound`
+(2 MB→ <140 bytes preview). Version hash: std `DefaultHasher`/SipHash (dep-free).
+Diff helper: `similar` crate, deferred to Step 3.)*
 
 ## Step 3: `read_file` → `{ content, version }`; `create_file` + `replace_file`
 

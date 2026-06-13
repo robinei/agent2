@@ -992,7 +992,10 @@ mod tests {
     #[test]
     fn oversized_result_is_guarded_before_the_log() {
         let mut registry = ToolRegistry::new();
-        registry.register(tool("big", false, |_| Ok(json!("x".repeat(70_000)))));
+        // MAX_RESULT_BYTES is now MB-scale (16 MB); trigger it.
+        registry.register(tool("big", false, |_| {
+            Ok(json!("x".repeat(MAX_RESULT_BYTES + 1)))
+        }));
         let script = vec![
             scripted_program(
                 "c1",

@@ -306,6 +306,19 @@ mod tests {
     }
 
     #[test]
+    fn multi_mb_artifact_preview_stays_within_bound() {
+        // A 2 MB artifact value — the preview must fit within PREVIEW_MAX_BYTES.
+        let big = "z".repeat(2_000_000);
+        let pv = preview(&json!(big));
+        assert!(
+            pv.len() <= PREVIEW_MAX_BYTES + 60,
+            "preview bounded: {}",
+            pv
+        );
+        assert!(pv.contains("[truncated; 2000002 bytes total]"));
+    }
+
+    #[test]
     fn effectful_entries_carry_the_warning() {
         let mut a = artifact(3, "send_email([\"hi\"])", json!({ "sent": true }));
         a.effectful = true;

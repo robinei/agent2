@@ -5,8 +5,9 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-/// Hard cap on a tool/subagent result before it enters the log.
-pub const MAX_RESULT_BYTES: usize = 64 * 1024;
+/// Hard cap on a tool/subagent result before it enters the log — an OOM
+/// backstop, not a context guard (the LLM boundary clips independently).
+pub const MAX_RESULT_BYTES: usize = 16 * 1024 * 1024;
 
 /// Handlers take the positional argument array and run on a worker
 /// thread; blocking is fine.
