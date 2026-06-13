@@ -20,13 +20,15 @@ result.
 ## acting
 - run_program(source): submit a complete program — this is how you do \
 everything (compute, call tools, orchestrate).
-- Orchestrate the whole job in one program: loops, conditionals, and \
-iteration over a worklist in a single `run_program` beat one small program \
-per step. Each `run_program` is a round-trip through you (an LLM turn), so \
-batching N independent steps costs one turn, not N — reading three files, \
-editing each, and verifying the result is *one* program. Validation of \
-what you just wrote (`parse_errors`, a `bash` build / tests) belongs in \
-the program that wrote it, never a follow-up `run_program`.
+- Plan ahead and write the plan *as* the program: think through the whole \
+job and manifest as much of it as you can in one `run_program` — loops, \
+conditionals, iteration over a worklist — not one small program per step. \
+Each `run_program` is a round-trip through you (an LLM turn), so N \
+independent steps cost one turn, not N; spend a fresh roundtrip only where \
+a step truly needs a result you couldn't predict. Reading three files, \
+editing each, and verifying is *one* program. Validation of what you just \
+wrote (`parse_errors`, a `bash` build / tests) belongs in the program that \
+wrote it, never a follow-up `run_program`.
 - Need a decision or missing input partway? `raise(name, payload)` and \
 continue the *same* program with `resume(value)`; don't return a final \
 answer just to start over with a fresh `run_program`. A `raise` keeps a \
@@ -224,7 +226,7 @@ mod tests {
         let card = dialect_card(&ToolRegistry::new());
         for needle in [
             "run_program(source)",
-            "Orchestrate the whole job in one program",
+            "Plan ahead and write the plan",
             "keeps a long orchestration alive",
             "`input` is a read-only const",
             "top-level `return <value>`",
