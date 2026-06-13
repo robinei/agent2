@@ -9,18 +9,22 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
-use super::app::App;
+use super::app::{App, PaneId, PaneInfo};
 use super::highlight::{self, Kind};
 use super::panes;
 use super::runner::RunState;
 
-pub fn render(frame: &mut Frame, app: &App) {
+pub fn render(frame: &mut Frame, app: &mut App) {
+    app.pane_rects.clear();
+
     let [main, footer] =
         Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(frame.area());
     let [left, right] =
         Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)]).areas(main);
 
-    render_console(frame, app, left);
+    let console_top = render_console(frame, app, left, app.console_scroll);
+    app.pane_rects
+        .push((PaneId::Console, PaneInfo { area: left, scroll_top: console_top }));
 
     let [status, panes_area] =
         Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(right);
@@ -52,10 +56,28 @@ pub fn render(frame: &mut Frame, app: &App) {
         let slots = Layout::vertical(vec![Constraint::Fill(1); enabled.len()]).split(panes_area);
         for (pane, slot) in enabled.into_iter().zip(slots.iter()) {
             match pane {
-                P::Source => render_source(frame, vm, *slot),
-                P::Disasm => render_disasm(frame, vm, *slot),
-                P::Stack => render_stack(frame, vm, *slot),
-                P::Promises => render_promises(frame, vm, app.runner.next_timer(), *slot),
+                P::Source => {
+                    let top = render_source(frame, vm, *slot, app.source_scroll);
+                    app.pane_rects
+                        .push((PaneId::Source, PaneInfo { area: *slot, scroll_top: top }));
+                }
+                P::Disasm => {
+                    let top = render_disasm(frame, vm, *slot, app.disasm_scroll);
+                    app.pane_rects.push((PaneId::Disasm, PaneInfo { area: *slot, scroll_top: top }));
+                }
+                P::Stack => {
+                    let top = render_stack(frame, vm, *slot, app.stack_scroll);
+                    app.pane_rects
+                        .push((PaneId::Stack, PaneInfo { area: *slot, scroll_top: top }));
+                }
+                P::Promises => {
+                    let top =
+                        render_promises(frame, vm, app.runner.next_timer(), *slot, app.promises_scroll);
+                    app.pane_rects.push((
+                        PaneId::Promises,
+                        PaneInfo { area: *slot, scroll_top: top },
+                    ));
+                }
             }
         }
     }
@@ -68,7 +90,7 @@ pub fn render(frame: &mut Frame, app: &App) {
     );
 }
 
-fn render_console(frame: &mut Frame, app: &App, area: Rect) {
+fn render_console(frame: &mut Frame, app: &App, area: Rect, scroll: Option<usize>) -> usize {
     let mut lines: Vec<Line> = app
         .runner
         .vm
@@ -95,13 +117,16 @@ fn render_console(frame: &mut Frame, app: &App, area: Rect) {
         _ => {}
     }
     let visible = area.height.saturating_sub(2) as usize;
-    let skip = lines.len().saturating_sub(visible);
-    let para = Paragraph::new(lines[skip..].to_vec()).block(
+    let default_top = lines.len().saturating_sub(visible);
+    let top = scroll.unwrap_or(default_top).min(default_top);
+    let end = (top + visible).min(lines.len());
+    let para = Paragraph::new(lines[top..end].to_vec()).block(
         Block::default()
             .borders(Borders::ALL)
             .title(format!(" console — {} ", app.path)),
     );
     frame.render_widget(para, area);
+    top
 }
 
 fn render_status(frame: &mut Frame, app: &App, area: Rect) {
@@ -171,7 +196,7 @@ fn styled_source(src: &str) -> Vec<Line<'static>> {
     lines
 }
 
-pub(super) fn render_source(frame: &mut Frame, vm: &interp::VM, area: Rect) {
+pub(super) fn render_source(frame: &mut Frame, vm: &interp::VM, area: Rect, scroll: Option<usize>) -> usize {
     let src: &str = &vm.source;
     let cur_line = panes::current_line(vm);
     let mut lines = styled_source(src);
@@ -185,14 +210,16 @@ pub(super) fn render_source(frame: &mut Frame, vm: &interp::VM, area: Rect) {
         }
     }
     let height = area.height.saturating_sub(2) as usize;
-    let top = cur_line
+    let default_top = cur_line
         .unwrap_or(1)
         .saturating_sub(height / 2 + 1)
         .min(lines.len().saturating_sub(height));
+    let top = scroll.unwrap_or(default_top).min(default_top.max(0));
     let end = (top + height).min(lines.len());
     let para = Paragraph::new(lines[top..end].to_vec())
         .block(Block::default().borders(Borders::ALL).title(" source [1] "));
     frame.render_widget(para, area);
+    top
 }
 
 fn op_style(op: &str) -> Style {
@@ -204,9 +231,12 @@ fn op_style(op: &str) -> Style {
     }
 }
 
-pub(super) fn render_disasm(frame: &mut Frame, vm: &interp::VM, area: Rect) {
+pub(super) fn render_disasm(frame: &mut Frame, vm: &interp::VM, area: Rect, scroll: Option<usize>) -> usize {
     let height = area.height.saturating_sub(2) as usize;
-    let rows = panes::disasm_window(vm, height);
+    let default_top =
+        ((vm.ip as i64 - (height / 2) as i64).max(0) as usize).min(vm.code.len().saturating_sub(1));
+    let top = scroll.unwrap_or(default_top).min(vm.code.len().saturating_sub(1));
+    let rows = panes::disasm_window(vm, height, Some(top));
     let dim = Style::default().fg(Color::DarkGray);
     let lines: Vec<Line> = rows
         .into_iter()
@@ -249,17 +279,19 @@ pub(super) fn render_disasm(frame: &mut Frame, vm: &interp::VM, area: Rect) {
             .title(" disassembly [2] "),
     );
     frame.render_widget(para, area);
+    top
 }
 
-pub(super) fn render_stack(frame: &mut Frame, vm: &interp::VM, area: Rect) {
-    // Region backgrounds: the frame band (header + locals) on one shade,
-    // the temporaries band on a lighter one. Rows are padded to the pane
-    // width so the bands render solid.
+pub(super) fn render_stack(frame: &mut Frame, vm: &interp::VM, area: Rect, scroll: Option<usize>) -> usize {
     let frame_bg = Color::Indexed(235);
     let temp_bg = Color::Indexed(238);
     let width = area.width.saturating_sub(2) as usize;
-    let lines: Vec<Line> = panes::stack_rows(vm)
-        .into_iter()
+    let height = area.height.saturating_sub(2) as usize;
+    let all_rows = panes::stack_rows(vm);
+    let top = scroll.unwrap_or(0).min(all_rows.len().saturating_sub(1));
+    let end = (top + height).min(all_rows.len());
+    let lines: Vec<Line> = all_rows[top..end]
+        .iter()
         .map(|r| {
             let style = match r.kind {
                 panes::StackRowKind::FrameHeader => Style::default()
@@ -278,6 +310,7 @@ pub(super) fn render_stack(frame: &mut Frame, vm: &interp::VM, area: Rect) {
             .title(" stack (innermost first · dark frame · light temps) [3] "),
     );
     frame.render_widget(para, area);
+    top
 }
 
 pub(super) fn render_promises(
@@ -285,8 +318,10 @@ pub(super) fn render_promises(
     vm: &interp::VM,
     next_timer: Option<std::time::Instant>,
     area: Rect,
-) {
-    let mut lines: Vec<Line> = panes::promise_rows(vm)
+    scroll: Option<usize>,
+) -> usize {
+    let height = area.height.saturating_sub(2) as usize;
+    let mut all_lines: Vec<Line> = panes::promise_rows(vm)
         .into_iter()
         .map(Line::from)
         .collect();
@@ -294,18 +329,22 @@ pub(super) fn render_promises(
         let ms = due
             .saturating_duration_since(std::time::Instant::now())
             .as_millis();
-        lines.push(
+        all_lines.push(
             Line::from(format!("⏲ sleep resolves in {ms}ms"))
                 .style(Style::default().fg(Color::DarkGray)),
         );
     }
-    if lines.is_empty() {
-        lines.push(Line::from("(no promises yet)").style(Style::default().fg(Color::DarkGray)));
+    if all_lines.is_empty() {
+        all_lines.push(Line::from("(no promises yet)").style(Style::default().fg(Color::DarkGray)));
     }
+    let top = scroll.unwrap_or(0).min(all_lines.len().saturating_sub(1));
+    let end = (top + height).min(all_lines.len());
+    let lines = all_lines[top..end].to_vec();
     let para = Paragraph::new(lines).block(
         Block::default()
             .borders(Borders::ALL)
             .title(" promises [4] "),
     );
     frame.render_widget(para, area);
+    top
 }

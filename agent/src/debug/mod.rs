@@ -34,7 +34,17 @@ pub fn run(path: &str) -> Result<(), String> {
     let mut app = App::new(runner, path.to_string());
 
     let mut terminal = ratatui::init();
+    ratatui::crossterm::execute!(
+        std::io::stdout(),
+        ratatui::crossterm::event::EnableMouseCapture
+    )
+    .map_err(|e| e.to_string())?;
     let result = event_loop(&mut terminal, &mut app);
+    ratatui::crossterm::execute!(
+        std::io::stdout(),
+        ratatui::crossterm::event::DisableMouseCapture
+    )
+    .map_err(|e| e.to_string())?;
     ratatui::restore();
     result
 }
@@ -48,6 +58,8 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<
         app.runner.poll_timers();
         app.runner.tick();
 
+        app.auto_reset_console_scroll();
+
         if last_draw.elapsed() >= REDRAW_EVERY {
             terminal
                 .draw(|frame| ui::render(frame, app))
@@ -55,8 +67,6 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<
             last_draw = Instant::now();
         }
 
-        // While running, poll briefly so slices keep coming; while idle,
-        // wait up to the next timer (or a UI heartbeat) for a key.
         let timeout = if app.runner.state == RunState::Running {
             Duration::from_millis(1)
         } else {
@@ -69,6 +79,7 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<
         if event::poll(timeout).map_err(|e| e.to_string())? {
             match event::read().map_err(|e| e.to_string())? {
                 Event::Key(key) if key.is_press() => app.on_key(key.code),
+                Event::Mouse(mouse) => app.on_mouse(mouse),
                 _ => {}
             }
         }

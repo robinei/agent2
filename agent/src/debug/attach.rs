@@ -23,12 +23,13 @@ use std::thread;
 use std::time::Instant;
 
 use ratatui::Frame;
-use ratatui::crossterm::event::{Event as CtEvent, KeyCode};
+use ratatui::crossterm::event::{Event as CtEvent, KeyCode, MouseEventKind};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Paragraph};
 
+use super::app::PaneInfo;
 use super::chat::{ChatKind, ChatState};
 use super::ui;
 use crate::host::{FrameId, Session, SessionCommand, SessionEvent};
@@ -56,6 +57,7 @@ pub enum Focus {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Pane {
+    Chat,
     FrameList,
     Source,
     Disasm,
@@ -88,18 +90,23 @@ pub enum KeyAction {
 pub struct AttachedApp {
     pub chat: ChatState,
     pub view: View,
-    /// Where `d` returns to from FullDebug.
     prev_view: View,
     pub focus: Focus,
     pub selected: Option<FrameId>,
     pub input: String,
     pub quit: bool,
-    // Running-view pane toggles; console is part of the auto-pop set
-    // and stays.
     pub show_source: bool,
     pub show_disasm: bool,
     pub show_stack: bool,
     pub show_promises: bool,
+    pub chat_scroll: Option<usize>,
+    pub console_scroll: Option<usize>,
+    pub source_scroll: Option<usize>,
+    pub disasm_scroll: Option<usize>,
+    pub stack_scroll: Option<usize>,
+    pub promises_scroll: Option<usize>,
+    pub pane_rects: Vec<(Pane, PaneInfo)>,
+    last_chat_lines: usize,
 }
 
 impl AttachedApp {
@@ -116,6 +123,14 @@ impl AttachedApp {
             show_disasm: false,
             show_stack: false,
             show_promises: false,
+            chat_scroll: None,
+            console_scroll: None,
+            source_scroll: None,
+            disasm_scroll: None,
+            stack_scroll: None,
+            promises_scroll: None,
+            pane_rects: Vec::new(),
+            last_chat_lines: 0,
         }
     }
 
@@ -141,6 +156,52 @@ impl AttachedApp {
             self.show_promises = false;
         }
         self.chat.apply(event);
+    }
+
+    pub fn reset_scrolls(&mut self) {
+        self.chat_scroll = None;
+        self.console_scroll = None;
+        self.source_scroll = None;
+        self.disasm_scroll = None;
+        self.stack_scroll = None;
+        self.promises_scroll = None;
+    }
+
+    pub fn auto_reset_chat_scroll(&mut self) {
+        let current = self.chat.rows().len();
+        if current != self.last_chat_lines {
+            self.chat_scroll = None;
+            self.last_chat_lines = current;
+        }
+    }
+
+    pub fn on_mouse(&mut self, column: u16, row: u16, kind: MouseEventKind) {
+        let delta: i64 = match kind {
+            MouseEventKind::ScrollDown => 3,
+            MouseEventKind::ScrollUp => -3,
+            _ => return,
+        };
+        for (pane, info) in &self.pane_rects {
+            if column < info.area.x
+                || column >= info.area.right()
+                || row < info.area.y
+                || row >= info.area.bottom()
+            {
+                continue;
+            }
+            let current = info.scroll_top as i64;
+            let new = (current + delta).max(0) as usize;
+            match pane {
+                Pane::Chat => self.chat_scroll = Some(new),
+                Pane::Console => self.console_scroll = Some(new),
+                Pane::Source => self.source_scroll = Some(new),
+                Pane::Disasm => self.disasm_scroll = Some(new),
+                Pane::Stack => self.stack_scroll = Some(new),
+                Pane::Promises => self.promises_scroll = Some(new),
+                Pane::FrameList => {}
+            }
+            return;
+        }
     }
 
     /// The layout state machine's output: view state in, pane set out.
@@ -316,43 +377,64 @@ pub fn run_attached(mut session: Session, events_rx: Receiver<SessionEvent>) -> 
 
     let mut app = AttachedApp::new(session.root());
     let mut terminal = ratatui::init();
+    ratatui::crossterm::execute!(
+        std::io::stdout(),
+        ratatui::crossterm::event::EnableMouseCapture
+    )
+    .map_err(|e| e.to_string())?;
     let result = loop {
         let mut inputs = Vec::new();
         session.pump_until(Instant::now() + super::REDRAW_EVERY, &mut inputs);
         for event in events_rx.try_iter() {
             app.apply(&event);
         }
+        app.auto_reset_chat_scroll();
         let frames: Vec<FrameId> = session.frames().iter().map(|(id, _)| *id).collect();
         for input in inputs {
-            let CtEvent::Key(key) = input else { continue };
-            if !key.is_press() {
-                continue;
-            }
-            let action = app.on_key(key.code, &frames);
-            let Some(selected) = app.selected else {
-                continue;
-            };
-            match action {
-                KeyAction::None => {}
-                KeyAction::Submit(text) => handle.send(SessionCommand::UserTurn(text)),
-                KeyAction::TogglePause => {
-                    let paused = session.is_paused(selected);
-                    session.set_paused(selected, !paused);
+            match input {
+                CtEvent::Key(key) if key.is_press() => {
+                    let action = app.on_key(key.code, &frames);
+                    let Some(selected) = app.selected else {
+                        continue;
+                    };
+                    match action {
+                        KeyAction::None => {}
+                        KeyAction::Submit(text) => {
+                            handle.send(SessionCommand::UserTurn(text));
+                            app.reset_scrolls();
+                        }
+                        KeyAction::TogglePause => {
+                            let paused = session.is_paused(selected);
+                            session.set_paused(selected, !paused);
+                            app.reset_scrolls();
+                        }
+                        KeyAction::StepInstr => {
+                            session.set_paused(selected, true);
+                            session.step_paused(selected, 1);
+                            app.reset_scrolls();
+                        }
+                        KeyAction::StepLine => {
+                            step_line(&mut session, selected);
+                            app.reset_scrolls();
+                        }
+                    }
                 }
-                KeyAction::StepInstr => {
-                    session.set_paused(selected, true);
-                    session.step_paused(selected, 1);
-                }
-                KeyAction::StepLine => step_line(&mut session, selected),
+                CtEvent::Mouse(mouse) => app.on_mouse(mouse.column, mouse.row, mouse.kind),
+                _ => {}
             }
         }
         if app.quit {
             break Ok(());
         }
-        if let Err(e) = terminal.draw(|frame| render(frame, &app, &session)) {
+        if let Err(e) = terminal.draw(|frame| render(frame, &mut app, &session)) {
             break Err(e.to_string());
         }
     };
+    ratatui::crossterm::execute!(
+        std::io::stdout(),
+        ratatui::crossterm::event::DisableMouseCapture
+    )
+    .map_err(|e| e.to_string())?;
     ratatui::restore();
     result
 }
@@ -382,7 +464,9 @@ fn step_line(session: &mut Session, frame: FrameId) {
 
 // ── rendering ───────────────────────────────────────────────────────
 
-fn render(frame: &mut Frame, app: &AttachedApp, session: &Session) {
+fn render(frame: &mut Frame, app: &mut AttachedApp, session: &Session) {
+    app.pane_rects.clear();
+
     let [main, footer] =
         Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(frame.area());
 
@@ -396,9 +480,11 @@ fn render(frame: &mut Frame, app: &AttachedApp, session: &Session) {
     };
 
     if panes.chat {
-        render_chat(frame, app, left);
+        let (top, chat_area) = render_chat(frame, app, left, app.chat_scroll);
+        app.pane_rects.push((Pane::Chat, PaneInfo { area: chat_area, scroll_top: top }));
     } else if panes.console_left {
-        render_attached_console(frame, app, session, left);
+        let (top, area) = render_attached_console(frame, app, session, left, app.console_scroll);
+        app.pane_rects.push((Pane::Console, PaneInfo { area, scroll_top: top }));
     }
 
     if let Some(right) = right {
@@ -413,12 +499,32 @@ fn render(frame: &mut Frame, app: &AttachedApp, session: &Session) {
         .split(right);
         for (pane, slot) in panes.right.iter().zip(slots.iter()) {
             match (pane, vm) {
-                (Pane::FrameList, _) => render_frame_list(frame, app, session, *slot),
-                (Pane::Console, _) => render_attached_console(frame, app, session, *slot),
-                (Pane::Source, Some(vm)) => ui::render_source(frame, vm, *slot),
-                (Pane::Disasm, Some(vm)) => ui::render_disasm(frame, vm, *slot),
-                (Pane::Stack, Some(vm)) => ui::render_stack(frame, vm, *slot),
-                (Pane::Promises, Some(vm)) => ui::render_promises(frame, vm, None, *slot),
+                (Pane::FrameList, _) => {
+                    render_frame_list(frame, app, session, *slot);
+                    app.pane_rects.push((Pane::FrameList, PaneInfo { area: *slot, scroll_top: 0 }));
+                }
+                (Pane::Console, _) => {
+                    let (top, area) =
+                        render_attached_console(frame, app, session, *slot, app.console_scroll);
+                    app.pane_rects.push((Pane::Console, PaneInfo { area, scroll_top: top }));
+                }
+                (Pane::Source, Some(vm)) => {
+                    let top = ui::render_source(frame, vm, *slot, app.source_scroll);
+                    app.pane_rects.push((Pane::Source, PaneInfo { area: *slot, scroll_top: top }));
+                }
+                (Pane::Disasm, Some(vm)) => {
+                    let top = ui::render_disasm(frame, vm, *slot, app.disasm_scroll);
+                    app.pane_rects.push((Pane::Disasm, PaneInfo { area: *slot, scroll_top: top }));
+                }
+                (Pane::Stack, Some(vm)) => {
+                    let top = ui::render_stack(frame, vm, *slot, app.stack_scroll);
+                    app.pane_rects.push((Pane::Stack, PaneInfo { area: *slot, scroll_top: top }));
+                }
+                (Pane::Promises, Some(vm)) => {
+                    let top = ui::render_promises(frame, vm, None, *slot, app.promises_scroll);
+                    app.pane_rects.push((Pane::Promises, PaneInfo { area: *slot, scroll_top: top }));
+                }
+                (Pane::Chat, _) => render_placeholder(frame, Pane::Chat, *slot),
                 (pane, None) => render_placeholder(frame, *pane, *slot),
             }
         }
@@ -458,7 +564,7 @@ fn chat_style(kind: ChatKind) -> Style {
     }
 }
 
-fn render_chat(frame: &mut Frame, app: &AttachedApp, area: Rect) {
+fn render_chat(frame: &mut Frame, app: &AttachedApp, area: Rect, scroll: Option<usize>) -> (usize, Rect) {
     let [transcript_area, input_area] =
         Layout::vertical([Constraint::Min(1), Constraint::Length(3)]).areas(area);
 
@@ -469,9 +575,11 @@ fn render_chat(frame: &mut Frame, app: &AttachedApp, area: Rect) {
         .map(|(kind, text)| Line::from(text).style(chat_style(kind)))
         .collect();
     let visible = transcript_area.height.saturating_sub(2) as usize;
-    let skip = lines.len().saturating_sub(visible);
+    let default_top = lines.len().saturating_sub(visible);
+    let top = scroll.unwrap_or(default_top).min(default_top);
+    let end = (top + visible).min(lines.len());
     frame.render_widget(
-        Paragraph::new(lines[skip..].to_vec())
+        Paragraph::new(lines[top..end].to_vec())
             .block(Block::default().borders(Borders::ALL).title(" chat ")),
         transcript_area,
     );
@@ -489,6 +597,7 @@ fn render_chat(frame: &mut Frame, app: &AttachedApp, area: Rect) {
         ),
         input_area,
     );
+    (top, area)
 }
 
 fn render_frame_list(frame: &mut Frame, app: &AttachedApp, session: &Session, area: Rect) {
@@ -529,7 +638,13 @@ fn render_frame_list(frame: &mut Frame, app: &AttachedApp, session: &Session, ar
 }
 
 /// Console + status for the selected frame's VM (live or post-mortem).
-fn render_attached_console(frame: &mut Frame, app: &AttachedApp, session: &Session, area: Rect) {
+fn render_attached_console(
+    frame: &mut Frame,
+    app: &AttachedApp,
+    session: &Session,
+    area: Rect,
+    scroll: Option<usize>,
+) -> (usize, Rect) {
     let state = app.selected.and_then(|f| session.state(f));
     let mut lines: Vec<Line> = Vec::new();
     if let Some(state) = state {
@@ -548,16 +663,20 @@ fn render_attached_console(frame: &mut Frame, app: &AttachedApp, session: &Sessi
         lines.push(Line::from(status).style(Style::default().fg(Color::DarkGray)));
     }
     let visible = area.height.saturating_sub(2) as usize;
-    let skip = lines.len().saturating_sub(visible);
+    let default_top = lines.len().saturating_sub(visible);
+    let top = scroll.unwrap_or(default_top).min(default_top);
+    let end = (top + visible).min(lines.len());
     frame.render_widget(
-        Paragraph::new(lines[skip..].to_vec())
+        Paragraph::new(lines[top..end].to_vec())
             .block(Block::default().borders(Borders::ALL).title(" console ")),
         area,
     );
+    (top, area)
 }
 
 fn render_placeholder(frame: &mut Frame, pane: Pane, area: Rect) {
     let title = match pane {
+        Pane::Chat => " chat ",
         Pane::Source => " source [1] ",
         Pane::Disasm => " disassembly [2] ",
         Pane::Stack => " stack [3] ",

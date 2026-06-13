@@ -35,12 +35,15 @@ pub fn current_line(vm: &VM) -> Option<usize> {
 
 /// A disassembly window of up to `height` rows centered on `vm.ip`, with
 /// function-name headers wherever the owning function changes.
-pub fn disasm_window(vm: &VM, height: usize) -> Vec<AsmRow> {
+pub fn disasm_window(vm: &VM, height: usize, scroll_top: Option<usize>) -> Vec<AsmRow> {
     if vm.code.is_empty() || height == 0 {
         return Vec::new();
     }
-    let half = (height / 2) as i64;
-    let start = (vm.ip as i64 - half).max(0) as usize;
+    let start = scroll_top.unwrap_or_else(|| {
+        let half = (height / 2) as i64;
+        (vm.ip as i64 - half).max(0) as usize
+    });
+    let start = start.min(vm.code.len().saturating_sub(1));
     let end = (start + height).min(vm.code.len());
     let mut rows = Vec::with_capacity(end - start);
     let mut cur_fn = None;
@@ -247,7 +250,7 @@ mod tests {
         for _ in 0..4 {
             r.step_instr();
         }
-        let rows = disasm_window(&r.vm, 9);
+        let rows = disasm_window(&r.vm, 9, None);
         assert!(rows.len() >= 5, "{rows:?}");
         assert_eq!(
             rows.iter()
