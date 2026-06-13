@@ -269,35 +269,44 @@ Targets: `agent/src/host/dialect.rs` (`CARD_HEAD`/`CARD_TAIL`); the
 
 Acceptance:
 
-- [ ] **Editing recipe** (one short block): read into a variable → locate
+- [x] **Editing recipe** (one short block): read into a variable → locate
       structurally (`grep -n`, an outline, or the brace/dedent scan) → compute the
       exact span → `replace_file` with the `version` from the read → **verify in
       the same program** (re-grep / re-read / run the build via `bash`) and only
       `raise` on surprise. "Author new content freely; locate with the smallest
       reliable handle (a short anchor or a computed span), never by reproducing a
       large block."
-- [ ] `extractBlock(text, headIndex) -> { start, end }` documented as a pure
+- [x] `extractBlock(text, headIndex) -> { start, end }` documented as a pure
       helper recipe (brace-balance for `{}` languages, dedent for Python) so
       whole-function replacement is computed, not retyped.
-- [ ] **Status-result discipline:** "Tool results can be large; they live in
+- [x] **Status-result discipline:** "Tool results can be large; they live in
       variables and the log, not your context — keep them there. `return` /
       `console.log` only small, status-shaped values. Oversized returns are
       rejected."
-- [ ] **`tool_result` point-in-time wording:** "`tool_result(id)` returns what
+- [x] **`tool_result` point-in-time wording:** "`tool_result(id)` returns what
       call `#id` returned *then* — a record, not a re-run. If the world may have
       changed since (a later call wrote to it), make a fresh call instead."
-- [ ] **Effect-judgment line** (replaces the removed `effectful` warning): "before
+- [x] **Effect-judgment line** (replaces the removed `effectful` warning): "before
       repeating a call shown in the menu, read the call — if it wrote, sent, or
       deleted, it already happened; reuse its result with `tool_result(id)` instead
       of re-running. Pure reads are free to repeat."
-- [ ] `create_file`/`replace_file` usage documented (`create_file` for new paths;
+- [x] `create_file`/`replace_file` usage documented (`create_file` for new paths;
       `replace_file` passes the `version` from the read; a changed-file condition
       means re-read and re-apply).
-- [ ] Tests (`dialect::tests`): card contains the recipe, the status discipline,
+- [x] Tests (`dialect::tests`): card contains the recipe, the status discipline,
       the point-in-time `tool_result` line, and
       `create_file`/`replace_file`/`extractBlock`; the static-size bound test
       still passes.
-- [ ] Gate: `cargo fmt && cargo clippy && cargo test` green.
+- [x] Gate: `cargo fmt && cargo clippy && cargo test` green.
+
+*(Built: `CARD_HEAD` expanded with three new sections: **status-result**
+discipline" (tool results live in variables, return/console.log small),
+**editing files** (read→locate→replace→verify recipe, create_file/replace_file
+usage, extractBlock helper), and effect-judgment line (check call before
+repeating — wrote/sent/deleted means reuse via tool_result). Program contract
+section updated with point-in-time `tool_result` wording. `CARD_STATIC_MAX_BYTES`
+bumped 4096→6144 to accommodate the additions. `card_covers_the_contract` test
+extended with 9 new needle assertions.)*
 
 ## Step 6: Remove the `effectful` flag
 

@@ -32,7 +32,29 @@ every report and survives failures (the return value does not).
 - No state persists between programs. Reuse prior work via artifacts: \
 reports list every completed call as `[#id] ...`, and \
 `await tools.tool_result(id)` re-fetches one instantly from the log. \
-Never repeat a call flagged effectful — it already happened.
+`tool_result(id)` returns what call `#id` returned *then* — a record, \
+not a re-run. If the world may have changed since, make a fresh call \
+instead.
+
+## status-result discipline
+- Tool results can be large; they live in variables and the log, not \
+your context — keep them there.
+- `return` and `console.log` only small, status-shaped values. \
+Oversized returns are rejected.
+
+## editing files
+- Read into a variable → locate structurally (`grep -n`, an outline, \
+or a brace/dedent scan) → compute the exact span → `replace_file` with \
+the `version` from the read → **verify in the same program** (re-grep / \
+re-read / run the build via `bash`) and only `raise` on surprise.
+- Author new content freely; locate with the smallest reliable handle \
+(a short anchor or a computed span), never by reproducing a large block.
+- `create_file(path, content)` for new files; `replace_file(path, \
+expected_version, content)` passes the `version` from `read_file` — a \
+changed-file condition means re-read and re-apply.
+- `extractBlock(text, headIndex) -> { start, end }` is a pure helper \
+recipe: brace-balance for `{}` languages, dedent for Python — \
+whole-function replacement is computed, not retyped.
 
 ## tools
 Call as `tools.<name>(args...)`. Every call returns a promise; `await` \
@@ -40,7 +62,10 @@ it. Calls started before awaiting run in parallel (`Promise.all` works).
 - tools.tool_result(id) — re-fetch artifact [#id] from the log \
 (instant, free).
 - tools.agent({ prompt, input }) — delegate a subtask to a fresh \
-subagent; resolves to its JSON result. It sees only what you pass it.";
+subagent; resolves to its JSON result. It sees only what you pass it.
+- Before repeating a call shown in the menu, read the call — if it \
+wrote, sent, or deleted, it already happened; reuse its result with \
+`tool_result(id)` instead of re-running. Pure reads are free to repeat.";
 
 const CARD_TAIL: &str = "\
 ## conditions and restarts
@@ -108,7 +133,7 @@ mod tests {
     use serde_json::json;
 
     /// Bound on the static (non-tool-list) card text — keep it short.
-    const CARD_STATIC_MAX_BYTES: usize = 4096;
+    const CARD_STATIC_MAX_BYTES: usize = 6144;
 
     fn registry_with_tools() -> ToolRegistry {
         let mut registry = ToolRegistry::new();
@@ -176,6 +201,18 @@ mod tests {
             "`Map` and `Set`",
             "group references",
             "UTF-8 bytes",
+            // Step 5 additions:
+            "editing files",
+            "extractBlock",
+            "create_file(path, content)",
+            "replace_file(path,",
+            "verify in the same program",
+            "status-result discipline",
+            "Tool results can be large",
+            "status-shaped",
+            "returned *then*",
+            "Before repeating a call",
+            "if it wrote, sent, or deleted, it already happened",
         ] {
             assert!(card.contains(needle), "card missing: {needle}");
         }
