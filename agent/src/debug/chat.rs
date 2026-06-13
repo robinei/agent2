@@ -69,6 +69,8 @@ impl ChatState {
             SessionEvent::Event { frame, event } => {
                 self.apply_payload(*frame, &event.payload);
             }
+            // Leaf-list data is for the fork/leaf UI, not the chat pane.
+            SessionEvent::Leaves(_) => {}
         }
     }
 

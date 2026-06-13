@@ -40,7 +40,7 @@ use std::time::Instant;
 use crate::machine::{
     AgentState, LlmRequest, OutCall, SpawnFrame, StepInput, StepOutput, ToolResult,
 };
-use crate::types::{EventId, EventPayload, Message, Tree};
+use crate::types::{EventId, EventPayload, Message, Spine, Tree};
 
 /// Instructions per VM slice on the loop thread (9_TUI decision 3).
 pub const FUEL_SLICE: u64 = 100_000;
@@ -118,8 +118,11 @@ pub struct Session {
 
 impl Session {
     /// Open a session over `tree`: a fresh tree roots a new frame with
-    /// `prompt`/`input`; a re-opened log resumes its lowest incomplete
-    /// leaf (richer resume/fork UX is M4).
+    /// `prompt`/`input`; a re-opened log auto-picks a resume anchor
+    /// (`pick_resume_leaf`: lowest incomplete leaf, else — every spine
+    /// complete — the lowest-id leaf, so the loop still lives for
+    /// `ListLeaves`/`Fork`/`Resume`). M4's `open_at` anchors a chosen
+    /// leaf instead.
     pub fn new(
         mut tree: Tree,
         prompt: &str,
@@ -128,24 +131,49 @@ impl Session {
         llm: Box<dyn LlmClient>,
         events: Sender<SessionEvent>,
     ) -> io::Result<Self> {
-        let emitted = tree.id_counter;
-        let mut state = if tree.events.is_empty() {
-            AgentState::new_root(&mut tree, prompt, input)?
+        if tree.events.is_empty() {
+            let emitted = tree.id_counter;
+            let state = AgentState::new_root(&mut tree, prompt, input)?;
+            Self::assemble(tree, state, registry, llm, events, emitted)
         } else {
-            let mut leaves: Vec<EventId> =
-                tree.list_leaves().into_iter().map(|(id, _)| id).collect();
-            leaves.sort_by_key(|id| id.as_u64());
-            let leaf = leaves
-                .into_iter()
-                .find(|id| !tree.spine_at(*id).is_complete())
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "every spine in this log is complete",
-                    )
-                })?;
-            AgentState::with_spine(tree.spine_at(leaf))
-        };
+            let leaf = pick_resume_leaf(&tree)?;
+            Self::open_at(tree, leaf, registry, llm, events)
+        }
+    }
+
+    /// Open a re-loaded log anchored at a chosen `leaf` (M4 resume seam,
+    /// generalizing `new`'s auto-pick). The root frame is the one `leaf`
+    /// belongs to; if `leaf`'s spine is already complete the session
+    /// opens idle (a direct `UserTurn` is rejected — fork to continue).
+    pub fn open_at(
+        tree: Tree,
+        leaf: EventId,
+        registry: ToolRegistry,
+        llm: Box<dyn LlmClient>,
+        events: Sender<SessionEvent>,
+    ) -> io::Result<Self> {
+        if !tree.events.contains_key(&leaf) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("cannot open at {leaf:?}: not in the log"),
+            ));
+        }
+        let emitted = tree.id_counter; // re-opened log: nothing new to emit
+        let state = AgentState::with_spine(tree.spine_at(leaf));
+        Self::assemble(tree, state, registry, llm, events, emitted)
+    }
+
+    /// Shared construction for `new`/`open_at`: card the state, derive
+    /// the root frame, wire the inbox, and surface any freshly logged
+    /// events (a fresh tree's `FrameStart`; nothing for a re-open).
+    fn assemble(
+        tree: Tree,
+        mut state: AgentState,
+        registry: ToolRegistry,
+        llm: Box<dyn LlmClient>,
+        events: Sender<SessionEvent>,
+        emitted: u64,
+    ) -> io::Result<Self> {
         state.set_effectful_tools(registry.effectful_names());
         state.set_dialect_card(dialect_card(&registry));
         let root = frame_start_id(&tree, state.spine.leaf_id);
@@ -166,7 +194,7 @@ impl Session {
             starved: HashSet::new(),
             done: false,
         };
-        session.emit_new(root); // a fresh tree's FrameStart
+        session.emit_new(root);
         Ok(session)
     }
 
@@ -302,8 +330,25 @@ impl Session {
                     });
                     return Ok(());
                 }
+                if state.spine.is_complete() {
+                    // Nothing may follow a `FrameResult`; fork from an
+                    // earlier event to continue past a finished spine.
+                    self.emit(SessionEvent::Error {
+                        frame: Some(root),
+                        message: "spine is complete; fork from an earlier event to continue".into(),
+                    });
+                    return Ok(());
+                }
                 self.step_frame(root, StepInput::UserTurn(text))
             }
+            LoopMsg::Command(SessionCommand::ListLeaves) => {
+                let leaves = self.leaf_infos();
+                self.emit(SessionEvent::Leaves(leaves));
+                Ok(())
+            }
+            LoopMsg::Command(SessionCommand::Label(text)) => self.cmd_label(text),
+            LoopMsg::Command(SessionCommand::Fork { from, label }) => self.cmd_fork(from, label),
+            LoopMsg::Command(SessionCommand::Resume(leaf)) => self.cmd_resume(leaf),
             LoopMsg::LlmChunk {
                 frame,
                 thinking,
@@ -356,6 +401,129 @@ impl Session {
             // Handled by `pump_until`; harmless if one reaches `run()`.
             LoopMsg::Ui(_) => Ok(()),
         }
+    }
+
+    /// The active root frame's id if it is idle; otherwise emit a
+    /// rejection and return `None`. Fork/label/resume re-anchor the root
+    /// and must not tear down a running VM (like `UserTurn`).
+    fn idle_root(&mut self) -> Option<FrameId> {
+        let root = self.root;
+        match self.states.get(&root) {
+            Some(state) if state.is_idle() => Some(root),
+            Some(state) => {
+                let status = state.status();
+                self.emit(SessionEvent::Error {
+                    frame: Some(root),
+                    message: format!("frame is busy ({status})"),
+                });
+                None
+            }
+            None => None,
+        }
+    }
+
+    fn cmd_label(&mut self, text: String) -> io::Result<()> {
+        let Some(root) = self.idle_root() else {
+            return Ok(());
+        };
+        let state = self.states.get_mut(&root).expect("idle_root checked");
+        if state.spine.is_complete() {
+            self.emit(SessionEvent::Error {
+                frame: Some(root),
+                message: "spine is complete; cannot label past a FrameResult".into(),
+            });
+            return Ok(());
+        }
+        self.tree
+            .append(&mut state.spine, EventPayload::Label(text))?;
+        self.emit_new(root);
+        let leaves = self.leaf_infos();
+        self.emit(SessionEvent::Leaves(leaves));
+        Ok(())
+    }
+
+    fn cmd_fork(&mut self, from: EventId, label: Option<String>) -> io::Result<()> {
+        if self.idle_root().is_none() {
+            return Ok(());
+        }
+        let mut spine = match self.tree.fork(from) {
+            Ok(spine) => spine,
+            Err(e) => {
+                self.emit(SessionEvent::Error {
+                    frame: None,
+                    message: format!("fork failed: {e}"),
+                });
+                return Ok(());
+            }
+        };
+        if let Some(text) = label {
+            self.tree.append(&mut spine, EventPayload::Label(text))?;
+        }
+        self.reanchor_root(spine);
+        let leaves = self.leaf_infos();
+        self.emit(SessionEvent::Leaves(leaves));
+        Ok(())
+    }
+
+    fn cmd_resume(&mut self, leaf: EventId) -> io::Result<()> {
+        if self.idle_root().is_none() {
+            return Ok(());
+        }
+        if !self.tree.events.contains_key(&leaf) {
+            self.emit(SessionEvent::Error {
+                frame: None,
+                message: format!("cannot resume {leaf:?}: not in the log"),
+            });
+            return Ok(());
+        }
+        let spine = self.tree.spine_at(leaf);
+        if spine.is_complete() {
+            self.emit(SessionEvent::Error {
+                frame: None,
+                message: format!(
+                    "{leaf:?} is a completed spine; fork from an earlier event to continue"
+                ),
+            });
+            return Ok(());
+        }
+        self.reanchor_root(spine);
+        let leaves = self.leaf_infos();
+        self.emit(SessionEvent::Leaves(leaves));
+        Ok(())
+    }
+
+    /// Make `spine` the active root: card a fresh `AgentState`, key it by
+    /// its frame's `FrameStart` (replacing any prior in-memory state for
+    /// that frame — the superseded branch stays in the tree, re-listable
+    /// via `ListLeaves`), and point `root` at it. Any freshly logged
+    /// events (a fork's `Label`) are surfaced.
+    fn reanchor_root(&mut self, spine: Spine) {
+        let mut state = AgentState::with_spine(spine);
+        state.set_effectful_tools(self.registry.effectful_names());
+        state.set_dialect_card(dialect_card(&self.registry));
+        let root = frame_start_id(&self.tree, state.spine.leaf_id);
+        self.states.insert(root, state);
+        self.root = root;
+        self.emit_new(root);
+    }
+
+    /// The tree's leaves as serializable `LeafInfo`s, lowest id first,
+    /// the current active root leaf flagged.
+    fn leaf_infos(&self) -> Vec<LeafInfo> {
+        let active = self.states.get(&self.root).map(|s| s.spine.leaf_id);
+        let mut leaves = self.tree.list_leaves();
+        leaves.sort_by_key(|(id, _)| id.as_u64());
+        leaves
+            .into_iter()
+            .map(|(leaf, label)| LeafInfo {
+                leaf,
+                frame: frame_start_id(&self.tree, leaf),
+                label,
+                complete: self.tree.spine_at(leaf).is_complete(),
+                active: Some(leaf) == active,
+                summary: leaf_summary(&self.tree, leaf),
+            })
+            .collect()
     }
 
     fn step_frame(&mut self, frame: FrameId, input: StepInput) -> io::Result<()> {
@@ -494,6 +662,51 @@ impl Session {
     fn emit(&mut self, event: SessionEvent) {
         let _ = self.events.send(event);
     }
+}
+
+/// Auto-pick a resume anchor for a re-opened log: the lowest-id
+/// incomplete leaf, or — every spine complete — the lowest-id leaf
+/// (so the loop still lives for `ListLeaves`/`Fork`/`Resume`). Errors
+/// only on a non-empty log with no leaves at all (corrupt).
+fn pick_resume_leaf(tree: &Tree) -> io::Result<EventId> {
+    let mut leaves: Vec<EventId> = tree.list_leaves().into_iter().map(|(id, _)| id).collect();
+    leaves.sort_by_key(|id| id.as_u64());
+    leaves
+        .iter()
+        .copied()
+        .find(|id| !tree.spine_at(*id).is_complete())
+        .or_else(|| leaves.first().copied())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "log has no leaves"))
+}
+
+/// One-line preview of an event for the leaf list, clipped to the
+/// report preview bound.
+fn leaf_summary(tree: &Tree, leaf: EventId) -> String {
+    let Some(event) = tree.events.get(&leaf) else {
+        return String::new();
+    };
+    let s = match &event.payload {
+        EventPayload::FrameStart { prompt, .. } => format!("FrameStart: {prompt}"),
+        EventPayload::FrameResult { result } => format!("FrameResult: {result}"),
+        EventPayload::Message(Message::User { text }) => format!("User: {text}"),
+        EventPayload::Message(Message::Assistant {
+            text, tool_calls, ..
+        }) => {
+            if tool_calls.is_empty() {
+                format!("Assistant: {text}")
+            } else {
+                let names: Vec<&str> = tool_calls.iter().map(|c| c.name.as_str()).collect();
+                format!("Assistant: ⚙ {}", names.join(", "))
+            }
+        }
+        EventPayload::Message(Message::System { .. }) => "System".into(),
+        EventPayload::Message(Message::Tool { name, .. }) => format!("Tool: {name}"),
+        EventPayload::Invoke { name, .. } => format!("Invoke: {name}"),
+        EventPayload::ProgramResult { value } => format!("ProgramResult: {value}"),
+        EventPayload::Label(label) => format!("Label: {label}"),
+        EventPayload::TextChunk(_) | EventPayload::ThinkingChunk(_) => "chunk".into(),
+    };
+    crate::report::clip(&s, crate::report::PREVIEW_MAX_BYTES)
 }
 
 /// The innermost `FrameStart` at or above `leaf`.
@@ -1105,5 +1318,274 @@ mod tests {
         assert!(saw_rejection);
         handle.send(SessionCommand::Shutdown);
         while session.pump_one() {}
+    }
+
+    // --- M4: fork / label / resume / list-leaves ---
+
+    fn user(text: &str) -> EventPayload {
+        EventPayload::Message(Message::User { text: text.into() })
+    }
+
+    fn assistant(text: &str) -> EventPayload {
+        EventPayload::Message(Message::Assistant {
+            text: text.into(),
+            thinking: None,
+            tool_calls: Vec::new(),
+        })
+    }
+
+    /// An incomplete root frame: FrameStart(1), User(2 "q"),
+    /// Assistant(3 "a1"). Leaf = #3 — open, so resumable and forkable.
+    fn tree_with_open_root() -> Tree {
+        let mut tree = Tree::new(None);
+        let mut spine = tree.start_frame(None, "root", json!(null)).unwrap();
+        tree.append(&mut spine, user("q")).unwrap();
+        tree.append(&mut spine, assistant("a1")).unwrap();
+        tree
+    }
+
+    fn open(tree: Tree, script: Vec<Message>) -> (Session, Receiver<SessionEvent>) {
+        let (tx, rx) = channel();
+        let session = Session::new(
+            tree,
+            "ignored on resume",
+            json!(null),
+            ToolRegistry::new(),
+            Box::new(ScriptedLlm::new(script)),
+            tx,
+        )
+        .unwrap();
+        (session, rx)
+    }
+
+    fn drain(mut session: Session) -> Session {
+        while session.pump_one() {}
+        session
+    }
+
+    fn last_leaves(events: &[SessionEvent]) -> Vec<LeafInfo> {
+        events
+            .iter()
+            .rev()
+            .find_map(|e| match e {
+                SessionEvent::Leaves(l) => Some(l.clone()),
+                _ => None,
+            })
+            .expect("a Leaves event")
+    }
+
+    fn errors(events: &[SessionEvent]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                SessionEvent::Error { message, .. } => Some(message.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn list_leaves_reports_the_active_root() {
+        let (session, rx) = open(tree_with_open_root(), vec![]);
+        session.handle().send(SessionCommand::ListLeaves);
+        session.handle().send(SessionCommand::Shutdown);
+        let _ = drain(session);
+
+        let leaves = last_leaves(&rx.try_iter().collect::<Vec<_>>());
+        assert_eq!(leaves.len(), 1);
+        assert_eq!(leaves[0].leaf, EventId::new(3));
+        assert_eq!(leaves[0].frame, EventId::new(1));
+        assert!(leaves[0].active && !leaves[0].complete);
+        assert_eq!(leaves[0].summary, "Assistant: a1");
+    }
+
+    #[test]
+    fn label_logs_on_the_active_leaf_and_surfaces() {
+        let (session, rx) = open(tree_with_open_root(), vec![]);
+        let h = session.handle();
+        h.send(SessionCommand::Label("my-branch".into()));
+        h.send(SessionCommand::Shutdown);
+        let session = drain(session);
+
+        // A Label event was logged on the root spine.
+        assert!(
+            session
+                .tree()
+                .events
+                .values()
+                .any(|e| matches!(&e.payload, EventPayload::Label(l) if l == "my-branch"))
+        );
+        // …and the refreshed leaf list carries it as the active leaf's label.
+        let leaves = last_leaves(&rx.try_iter().collect::<Vec<_>>());
+        assert_eq!(leaves.len(), 1);
+        assert!(leaves[0].active);
+        assert_eq!(leaves[0].label.as_deref(), Some("my-branch"));
+    }
+
+    #[test]
+    fn fork_then_user_turn_diverges_in_the_same_frame() {
+        let (session, rx) = open(tree_with_open_root(), vec![scripted_text("forked done")]);
+        let h = session.handle();
+        // Fork off the user message (#2), dropping the original a1 reply.
+        h.send(SessionCommand::Fork {
+            from: EventId::new(2),
+            label: Some("retry".into()),
+        });
+        h.send(SessionCommand::UserTurn("forked follow-up".into()));
+        let session = drain(session); // forked frame runs to completion → done
+        let tree = session.tree();
+
+        // Two leaves, both under the root frame (FrameStart #1).
+        let leaves = tree.list_leaves();
+        assert_eq!(leaves.len(), 2);
+        for (leaf, _) in &leaves {
+            assert_eq!(frame_start_id(tree, *leaf), EventId::new(1));
+        }
+        // The original assistant leaf (#3) survived untouched.
+        assert!(leaves.iter().any(|(id, _)| *id == EventId::new(3)));
+        // The forked branch diverged off #2 (never saw "a1") and ran to a
+        // FrameResult.
+        let forked_leaf = leaves
+            .iter()
+            .map(|(id, _)| *id)
+            .find(|id| *id != EventId::new(3))
+            .unwrap();
+        let forked = tree.spine_at(forked_leaf);
+        assert!(forked.is_complete());
+        let msgs: Vec<&str> = forked.frame().messages.iter().map(|m| m.text()).collect();
+        assert_eq!(msgs, ["q", "forked follow-up", "forked done"]);
+        // The fork's label sits on the new branch, not the original.
+        assert_eq!(
+            last_leaves(&rx.try_iter().collect::<Vec<_>>())
+                .iter()
+                .find(|l| l.label.is_some())
+                .and_then(|l| l.label.clone()),
+            Some("retry".into())
+        );
+    }
+
+    #[test]
+    fn resume_switches_root_and_rejects_complete_and_unknown() {
+        // Open root (#3) plus a completed sibling branch forked off #2.
+        let mut tree = tree_with_open_root();
+        let mut branch = tree.fork(EventId::new(2)).unwrap();
+        tree.append(&mut branch, user("other")).unwrap();
+        let complete_leaf = tree
+            .append(
+                &mut branch,
+                EventPayload::FrameResult { result: json!("x") },
+            )
+            .unwrap();
+
+        let (session, rx) = open(tree, vec![]);
+        let h = session.handle();
+        h.send(SessionCommand::Resume(EventId::new(3))); // open branch — ok
+        h.send(SessionCommand::Resume(complete_leaf)); // completed — rejected
+        h.send(SessionCommand::Resume(EventId::new(99))); // unknown — rejected
+        h.send(SessionCommand::Shutdown);
+        let session = drain(session);
+
+        let events: Vec<SessionEvent> = rx.try_iter().collect();
+        let errs = errors(&events);
+        assert_eq!(errs.len(), 2, "{errs:?}");
+        assert!(errs.iter().any(|m| m.contains("completed spine")));
+        assert!(errs.iter().any(|m| m.contains("not in the log")));
+        // The one accepted resume left the active root on the open leaf.
+        assert_eq!(
+            session.state(session.root()).unwrap().spine.leaf_id,
+            EventId::new(3)
+        );
+    }
+
+    #[test]
+    fn mutating_commands_are_rejected_while_the_frame_is_busy() {
+        let (mut session, rx) = open(
+            tree_with_open_root(),
+            vec![scripted_program("c1", "while (true) {}")],
+        );
+        let h = session.handle();
+        h.send(SessionCommand::UserTurn("spin".into()));
+        for _ in 0..6 {
+            session.pump_one();
+        }
+        // The frame is now Running; every mutating command bounces.
+        h.send(SessionCommand::Label("late".into()));
+        h.send(SessionCommand::Fork {
+            from: EventId::new(2),
+            label: None,
+        });
+        h.send(SessionCommand::Resume(EventId::new(2)));
+        for _ in 0..6 {
+            session.pump_one();
+        }
+        let busy = rx
+            .try_iter()
+            .filter(
+                |e| matches!(e, SessionEvent::Error { message, .. } if message.contains("busy")),
+            )
+            .count();
+        assert_eq!(busy, 3, "label/fork/resume each rejected while busy");
+        h.send(SessionCommand::Shutdown);
+        while session.pump_one() {}
+    }
+
+    #[test]
+    fn open_at_anchors_the_chosen_leaf_not_the_auto_pick() {
+        // Two open leaves: #3 (auto-pick) and a second forked branch.
+        let mut tree = tree_with_open_root();
+        let mut branch = tree.fork(EventId::new(2)).unwrap();
+        let other_leaf = tree.append(&mut branch, assistant("branch2")).unwrap();
+
+        let (tx, _rx) = channel();
+        let session = Session::open_at(
+            tree,
+            other_leaf,
+            ToolRegistry::new(),
+            Box::new(ScriptedLlm::new(vec![])),
+            tx,
+        )
+        .unwrap();
+        // `new` would auto-pick #3; `open_at` honours the chosen leaf.
+        assert_eq!(
+            session.state(session.root()).unwrap().spine.leaf_id,
+            other_leaf
+        );
+
+        let (tx, _rx) = channel();
+        let result = Session::open_at(
+            tree_with_open_root(),
+            EventId::new(99),
+            ToolRegistry::new(),
+            Box::new(ScriptedLlm::new(vec![])),
+            tx,
+        );
+        match result {
+            Ok(_) => panic!("open_at on an unknown id must error"),
+            Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::NotFound),
+        }
+    }
+
+    #[test]
+    fn all_complete_log_opens_idle_for_fork() {
+        // A fully completed single-frame log: previously `new` errored.
+        let mut tree = Tree::new(None);
+        let mut spine = tree.start_frame(None, "root", json!(null)).unwrap();
+        tree.append(&mut spine, assistant("done")).unwrap();
+        tree.append(&mut spine, EventPayload::FrameResult { result: json!(1) })
+            .unwrap();
+
+        let (tx, _rx) = channel();
+        let session = Session::new(
+            tree,
+            "ignored",
+            json!(null),
+            ToolRegistry::new(),
+            Box::new(ScriptedLlm::new(vec![])),
+            tx,
+        )
+        .expect("an all-complete log opens idle, not an error");
+        assert_eq!(session.root(), EventId::new(1));
+        let state = session.state(session.root()).unwrap();
+        assert!(state.is_idle() && state.spine.is_complete());
     }
 }

@@ -163,6 +163,24 @@ fn print_session_event(event: &SessionEvent) {
             Some(f) => eprintln!("!! [frame {}] {message}", f.as_u64()),
             None => eprintln!("!! {message}"),
         },
+        SessionEvent::Leaves(leaves) => {
+            println!("leaves ({}):", leaves.len());
+            for leaf in leaves {
+                let mark = if leaf.active { "*" } else { " " };
+                let state = if leaf.complete { "done" } else { "open" };
+                let label = leaf
+                    .label
+                    .as_deref()
+                    .map(|l| format!(" «{l}»"))
+                    .unwrap_or_default();
+                println!(
+                    "  {mark} #{} [frame {} · {state}]{label}  {}",
+                    leaf.leaf.as_u64(),
+                    leaf.frame.as_u64(),
+                    leaf.summary,
+                );
+            }
+        }
         SessionEvent::Event { frame, event } => {
             let head = format!("[frame {} · #{}]", frame.as_u64(), event.id.as_u64());
             match &event.payload {
