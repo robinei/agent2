@@ -34,7 +34,7 @@ pub use tools::*;
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Instant;
 
@@ -45,6 +45,61 @@ use crate::types::{EventId, EventPayload, Message, Spine, Tree};
 
 /// Instructions per VM slice on the loop thread (9_TUI decision 3).
 pub const FUEL_SLICE: u64 = 100_000;
+
+/// Default cap on LLM completions running at once across all frames
+/// (root + subagents). Overridable via `AGENT2_LLM_CONCURRENCY`.
+pub const DEFAULT_LLM_CONCURRENCY: usize = 4;
+
+/// How many LLM completions may run concurrently — env override, else
+/// the default. Floored at 1 (a parse of 0/garbage falls back).
+fn llm_concurrency() -> usize {
+    std::env::var("AGENT2_LLM_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n >= 1)
+        .unwrap_or(DEFAULT_LLM_CONCURRENCY)
+}
+
+/// A counting semaphore (std-only) bounding concurrent LLM completions.
+/// LLM worker threads block in `acquire` until a permit frees; the
+/// returned `Permit` returns it on drop. A permit is held only for the
+/// duration of one `complete()` call — never while a frame is parked
+/// awaiting tool/subagent results — so it cannot deadlock a join.
+struct Semaphore {
+    permits: Mutex<usize>,
+    available: Condvar,
+}
+
+impl Semaphore {
+    fn new(n: usize) -> Self {
+        Self {
+            permits: Mutex::new(n.max(1)),
+            available: Condvar::new(),
+        }
+    }
+
+    fn acquire(self: &Arc<Self>) -> Permit {
+        let mut n = self.permits.lock().unwrap();
+        while *n == 0 {
+            n = self.available.wait(n).unwrap();
+        }
+        *n -= 1;
+        Permit {
+            sem: Arc::clone(self),
+        }
+    }
+}
+
+struct Permit {
+    sem: Arc<Semaphore>,
+}
+
+impl Drop for Permit {
+    fn drop(&mut self) {
+        *self.sem.permits.lock().unwrap() += 1;
+        self.sem.available.notify_one();
+    }
+}
 
 /// Raw terminal input. The attached TUI's input thread feeds these into
 /// the inbox (9_TUI decision 4) so key handling happens on the loop
@@ -104,7 +159,11 @@ pub struct Session {
     /// Child frame → (caller frame, the caller's `agent` invoke id).
     parents: HashMap<FrameId, (FrameId, u64)>,
     registry: ToolRegistry,
-    llm: Arc<Mutex<Box<dyn LlmClient>>>,
+    /// Shared client: `complete(&self)` lets several frames think at
+    /// once. Concurrency is bounded by `llm_permits`, not by the client.
+    llm: Arc<dyn LlmClient>,
+    /// Caps concurrent LLM completions (root + subagents).
+    llm_permits: Arc<Semaphore>,
     rx: Receiver<LoopMsg>,
     tx: Sender<LoopMsg>,
     events: Sender<SessionEvent>,
@@ -195,7 +254,8 @@ impl Session {
             root,
             parents: HashMap::new(),
             registry,
-            llm: Arc::new(Mutex::new(llm)),
+            llm: Arc::from(llm),
+            llm_permits: Arc::new(Semaphore::new(llm_concurrency())),
             rx,
             tx,
             events,
@@ -596,8 +656,12 @@ impl Session {
     /// there; chunks and the final message come back through the inbox).
     fn spawn_llm(&self, frame: FrameId, request: LlmRequest) {
         let llm = Arc::clone(&self.llm);
+        let permits = Arc::clone(&self.llm_permits);
         let tx = self.tx.clone();
         thread::spawn(move || {
+            // Block off-loop until a completion slot is free; the permit
+            // is held only for this `complete()` call and released on drop.
+            let _permit = permits.acquire();
             let mut on_chunk = |chunk: LlmChunk| {
                 let (thinking, text) = match chunk {
                     LlmChunk::Text(t) => (false, t),
@@ -609,10 +673,7 @@ impl Session {
                     text,
                 });
             };
-            let result = match llm.lock() {
-                Ok(mut client) => client.complete(&request, &mut on_chunk),
-                Err(_) => Err("llm client mutex poisoned".into()),
-            };
+            let result = llm.complete(&request, &mut on_chunk);
             let _ = tx.send(LoopMsg::LlmDone { frame, result });
         });
     }
@@ -998,7 +1059,7 @@ mod tests {
 
     impl LlmClient for CapturingLlm {
         fn complete(
-            &mut self,
+            &self,
             request: &LlmRequest,
             chunk: &mut dyn FnMut(LlmChunk),
         ) -> Result<Message, String> {
@@ -1372,6 +1433,110 @@ mod tests {
             joined,
             HashSet::from(["done: A".to_owned(), "done: B".to_owned()])
         );
+    }
+
+    /// Records peak concurrent `complete()` calls, sleeping inside the
+    /// call so overlapping requests are caught in the act.
+    struct ConcurrencyProbe {
+        inner: ScriptedLlm,
+        inflight: Arc<Mutex<usize>>,
+        peak: Arc<Mutex<usize>>,
+    }
+
+    impl LlmClient for ConcurrencyProbe {
+        fn complete(
+            &self,
+            request: &LlmRequest,
+            chunk: &mut dyn FnMut(LlmChunk),
+        ) -> Result<Message, String> {
+            {
+                let mut n = self.inflight.lock().unwrap();
+                *n += 1;
+                let mut p = self.peak.lock().unwrap();
+                *p = (*p).max(*n);
+            }
+            thread::sleep(Duration::from_millis(50));
+            let result = self.inner.complete(request, chunk);
+            *self.inflight.lock().unwrap() -= 1;
+            result
+        }
+    }
+
+    /// Two subagents spawned by one `Promise.all` think *concurrently*:
+    /// their `complete()` calls overlap (peak in-flight ≥ 2), not
+    /// serialized behind a single client lock.
+    #[test]
+    fn subagent_completions_run_concurrently() {
+        let peak = Arc::new(Mutex::new(0usize));
+        let llm = ConcurrencyProbe {
+            inner: ScriptedLlm::new(vec![
+                scripted_program(
+                    "c1",
+                    r#"return await Promise.all([
+                        tools.agent({ prompt: "A", input: null }),
+                        tools.agent({ prompt: "B", input: null }),
+                    ]);"#,
+                ),
+                scripted_text("child one"),
+                scripted_text("child two"),
+                scripted_text("both back"),
+            ]),
+            inflight: Arc::new(Mutex::new(0)),
+            peak: Arc::clone(&peak),
+        };
+        let (tx, _rx) = channel();
+        let session = Session::new(
+            Tree::new(None),
+            "test agent",
+            json!(null),
+            ToolRegistry::new(),
+            Box::new(llm),
+            tx,
+        )
+        .unwrap();
+        session
+            .handle()
+            .send(SessionCommand::UserTurn("delegate two".into()));
+        session.run();
+
+        assert!(
+            *peak.lock().unwrap() >= 2,
+            "two subagents should think at once; peak in-flight was {}",
+            *peak.lock().unwrap()
+        );
+    }
+
+    /// The semaphore bounds concurrency to its permit count: cap=1
+    /// serializes (peak 1), cap=3 lets three of six workers overlap.
+    /// Deterministic and env-free (the integration proof above uses the
+    /// default cap; this pins the mechanism the `AGENT2_LLM_CONCURRENCY`
+    /// override feeds).
+    #[test]
+    fn semaphore_bounds_concurrency() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for (cap, expected_peak) in [(1usize, 1usize), (3, 3)] {
+            let sem = Arc::new(Semaphore::new(cap));
+            let inflight = Arc::new(AtomicUsize::new(0));
+            let peak = Arc::new(AtomicUsize::new(0));
+            let handles: Vec<_> = (0..6)
+                .map(|_| {
+                    let sem = Arc::clone(&sem);
+                    let inflight = Arc::clone(&inflight);
+                    let peak = Arc::clone(&peak);
+                    thread::spawn(move || {
+                        let _permit = sem.acquire();
+                        let n = inflight.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(n, Ordering::SeqCst);
+                        thread::sleep(Duration::from_millis(20));
+                        inflight.fetch_sub(1, Ordering::SeqCst);
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.join().unwrap();
+            }
+            assert_eq!(peak.load(Ordering::SeqCst), expected_peak, "cap {cap}");
+        }
     }
 
     #[test]

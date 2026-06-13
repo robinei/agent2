@@ -581,10 +581,11 @@ M1/M2 transcripts, not speculation.
   `ToolCalls`) and Step 5's host already spawns a child per `SpawnFrame`
   and joins its `FrameDone` back as a `SubagentResult`. M3 is the test
   that proves the **concurrent** path: `Promise.all` over two agents, two
-  live branches, both joined. The shared `Arc<Mutex<dyn LlmClient>>` means
-  the two children pop scripted turns in race order, so the test asserts
-  on the joined *set*, not position — exactly the property a real model
-  has too.)*
+  live branches, both joined. The client is shared as `Arc<dyn LlmClient>`
+  with `complete(&self)`, so the two children's completions run *at once*
+  (bounded by the loop's `Semaphore`, default `AGENT2_LLM_CONCURRENCY`=4);
+  they pop scripted turns in race order, so the test asserts on the joined
+  *set*, not position — exactly the property a real model has too.)*
 - **M4**: fork/label UX — list leaves, fork from any event, resume a
   chosen spine (CLI is fine).
 

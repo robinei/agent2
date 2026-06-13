@@ -54,7 +54,7 @@ impl DeepSeekClient {
 
 impl LlmClient for DeepSeekClient {
     fn complete(
-        &mut self,
+        &self,
         request: &LlmRequest,
         chunk: &mut dyn FnMut(LlmChunk),
     ) -> Result<Message, String> {

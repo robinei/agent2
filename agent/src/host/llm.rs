@@ -3,6 +3,7 @@
 //! trait, so the session loop never knows the difference.
 
 use std::collections::VecDeque;
+use std::sync::Mutex;
 
 use crate::machine::LlmRequest;
 use crate::types::Message;
@@ -16,9 +17,15 @@ pub enum LlmChunk {
 /// One blocking completion per call; runs on a worker thread owned by
 /// the session loop. Chunks go through `chunk` as they arrive; the
 /// returned `Message` is the complete assistant turn.
-pub trait LlmClient: Send {
+///
+/// `complete` takes `&self` so the session loop can share one client
+/// (`Arc<dyn LlmClient>`) and run several completions concurrently —
+/// subagents think in parallel, bounded by the loop's semaphore. Any
+/// per-call mutable state lives behind the client's own interior
+/// mutability (`Send + Sync`).
+pub trait LlmClient: Send + Sync {
     fn complete(
-        &mut self,
+        &self,
         request: &LlmRequest,
         chunk: &mut dyn FnMut(LlmChunk),
     ) -> Result<Message, String>;
@@ -26,15 +33,16 @@ pub trait LlmClient: Send {
 
 /// Scripted client: pops canned assistant turns in order. Each turn's
 /// text is also streamed as a single chunk so the chunk path is
-/// exercised end-to-end without a network.
+/// exercised end-to-end without a network. The queue is behind a `Mutex`
+/// so the shared `&self` client stays `Sync` under concurrent pops.
 pub struct ScriptedLlm {
-    responses: VecDeque<Message>,
+    responses: Mutex<VecDeque<Message>>,
 }
 
 impl ScriptedLlm {
     pub fn new(responses: impl IntoIterator<Item = Message>) -> Self {
         ScriptedLlm {
-            responses: responses.into_iter().collect(),
+            responses: Mutex::new(responses.into_iter().collect()),
         }
     }
 }
@@ -77,12 +85,14 @@ pub fn scripted_text(text: &str) -> Message {
 
 impl LlmClient for ScriptedLlm {
     fn complete(
-        &mut self,
+        &self,
         _request: &LlmRequest,
         chunk: &mut dyn FnMut(LlmChunk),
     ) -> Result<Message, String> {
         let message = self
             .responses
+            .lock()
+            .unwrap()
             .pop_front()
             .ok_or("scripted LLM ran out of responses")?;
         if let Message::Assistant { text, thinking, .. } = &message {
