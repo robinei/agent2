@@ -29,12 +29,15 @@ a step truly needs a result you couldn't predict. Reading three files, \
 editing each, and verifying is *one* program. Validation of what you just \
 wrote (`parse_errors`, a `bash` build / tests) belongs in the program that \
 wrote it, never a follow-up `run_program`.
-- Generating several independent files? Pin the interfaces first (paths, \
-signatures, shared types), then spawn one `tools.agent` per file carrying \
-those contracts and `await` them together. The bodies generate \
-concurrently in the subagents instead of serially inside your program \
-text, your orchestrator stays small, and you still own the final \
-cross-file build / test.
+- Writing more than a couple of files, or any large body? Delegate — don't \
+pack every body into one call. Pin the interfaces (paths, signatures, \
+shared types), spawn one `tools.agent` per file with those contracts, and \
+`await` them together. Two payoffs: the bodies generate concurrently \
+(not serially in your program text), and the work stays *visible* — each \
+file is its own progressing frame. One `run_program` carrying many large \
+attachments is the opposite: it emits silently while you write every body, \
+then lands everything at once with no progress in between. Keep the \
+orchestrator small; own the final cross-file check.
 - Need a decision or missing input partway? `raise(name, payload)` and \
 continue the *same* program with `resume(value)`; don't return a final \
 answer just to start over with a fresh `run_program`. A `raise` keeps a \
