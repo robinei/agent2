@@ -29,9 +29,6 @@ use crate::report::clip;
 /// sees full bytes.
 pub const READ_FILE_MAX_BYTES: usize = 16 * 1024 * 1024;
 
-/// Content clip for `http_fetch` (to be removed in Step 4).
-const HTTP_CONTENT_MAX_BYTES: usize = 48 * 1024;
-
 /// Per-stream capture ceiling for `bash` stdout/stderr.  The drain
 /// threads stop accumulating past this and the child is killed.
 const BASH_OUTPUT_MAX_BYTES: usize = 4 * 1024 * 1024;
@@ -46,12 +43,12 @@ const BASH_COMMAND_MAX_BYTES: usize = 1024;
 /// can hang indefinitely; a timeout turns that into a condition.
 const BASH_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The M1 registry: real read-only tools, plus the `bash` escape hatch,
-/// plus `create_file`/`replace_file` writers (10_EDITING Step 3).
+/// The M1 registry: file tools + `bash` escape hatch + `create_file`/
+/// `replace_file` writers (10_EDITING Step 3).  Network access is via
+/// `bash` (curl/wget).
 pub fn real_registry() -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     registry.register(read_file_def());
-    registry.register(http_fetch_def());
     registry.register(bash_def());
     registry.register(create_file_def());
     registry.register(replace_file_def());
@@ -193,35 +190,6 @@ fn read_file_def() -> ToolDef {
             let content = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
             let version = hash_bytes(content.as_bytes());
             Ok(json!({ "content": content, "version": version }))
-        }),
-    }
-}
-
-fn http_fetch_def() -> ToolDef {
-    ToolDef {
-        name: "http_fetch".into(),
-        description: "GET a URL; returns the response body as text (clipped if large).".into(),
-        input_schema: json!({
-            "type": "array",
-            "items": [
-                { "type": "string", "description": "http(s) URL" }
-            ],
-            "minItems": 1,
-            "maxItems": 1
-        }),
-        output_schema: json!({ "type": "string" }),
-        effectful: false,
-        handler: Box::new(|args| {
-            let url = args
-                .get(0)
-                .and_then(|v| v.as_str())
-                .ok_or("http_fetch(url) needs a string URL")?;
-            let mut response = ureq::get(url).call().map_err(|e| format!("{url}: {e}"))?;
-            let text = response
-                .body_mut()
-                .read_to_string()
-                .map_err(|e| format!("{url}: reading body: {e}"))?;
-            Ok(json!(clip(&text, HTTP_CONTENT_MAX_BYTES)))
         }),
     }
 }

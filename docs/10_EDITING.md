@@ -248,11 +248,15 @@ Targets: `agent/src/host/tools.rs` (`http_fetch_def`, `real_registry`),
 
 Acceptance:
 
-- [ ] `http_fetch_def` removed; `real_registry()` no longer registers it; its
+- [x] `http_fetch_def` removed; `real_registry()` no longer registers it; its
       tests removed.
-- [ ] The dialect card notes network access is via `bash` (curl/wget). If `ureq`
+- [x] The dialect card notes network access is via `bash` (curl/wget). If `ureq`
       has no other user, drop the dependency.
-- [ ] Gate: `cargo fmt && cargo clippy && cargo test` green.
+- [x] Gate: `cargo fmt && cargo clippy && cargo test` green.
+
+*(Built: `http_fetch_def` and `HTTP_CONTENT_MAX_BYTES` removed. `ureq` stays
+— still used by `deepseek.rs`. `real_registry()` comment notes network via
+`bash (curl/wget)`. Step 2's `read_file` and bash tests still pass.)*
 
 ## Step 5: Dialect card — the editing recipe and the status-result discipline
 
