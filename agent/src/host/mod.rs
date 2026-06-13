@@ -846,6 +846,25 @@ mod tests {
         let spine = kinds(session.tree(), root_leaf(&session));
         assert!(!spine.contains(&"Invoke"), "{spine:?}");
         assert_eq!(spine.last(), Some(&"FrameResult"));
+
+        // The completion report must answer the *resume* call ("c2"), not
+        // the original run_program ("c1") — otherwise the next chat
+        // request has an assistant tool_call with no matching tool reply
+        // and the provider 400s.
+        let completion_call_id = session
+            .tree()
+            .events
+            .values()
+            .find_map(|e| match &e.payload {
+                EventPayload::Message(Message::Tool { call_id, text, .. })
+                    if text.contains("returned: 42") =>
+                {
+                    Some(call_id.clone())
+                }
+                _ => None,
+            })
+            .expect("a completion report");
+        assert_eq!(completion_call_id, "c2");
     }
 
     /// M2: a trapped runtime error reports, and the rewrite restart reuses

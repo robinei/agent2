@@ -422,6 +422,12 @@ impl AgentState {
                             },
                         };
                         if resumed {
+                            // The next report (completion or re-suspension)
+                            // answers *this* resume call, not the original
+                            // run_program — the chat transcript requires every
+                            // assistant tool_call to be followed by a tool
+                            // message bearing its id.
+                            run.call_id = call.id.clone();
                             self.phase = Phase::Running(run);
                             Ok(vec![StepOutput::Working])
                         } else {
