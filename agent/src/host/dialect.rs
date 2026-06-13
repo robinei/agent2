@@ -52,12 +52,30 @@ re-read / run the build via `bash`) and only `raise` on surprise.
 - `create_file(path, content)` for new files; `replace_file(path, \
 expected_version, content)` passes the `version` from `read_file` — a \
 changed-file condition means re-read and re-apply.
-- Pure string helpers in the `Edit` namespace (like `Math`): \
-`Edit.replaceOnce`, `Edit.replaceCount`, `Edit.count`, \
-`Edit.extractBlock`, `Edit.extractByIndent`, `Edit.extractEnclosing`, \
-`Edit.replaceLines`, `Edit.insertAt`, `Edit.applyEdits`. Every helper \
-errors on ambiguity (0/N matches, out-of-range, overlapping) as a \
-catchable runtime error — use try/catch when ambiguity is expected.
+- `Edit.*` pure string helpers (namespace like `Math`). Each errors on \
+ambiguity (0/N matches, out-of-range, overlapping) as a catchable runtime \
+error — use try/catch when expected. Signatures:
+  `Edit.replaceOnce(text, old, new)` → string — replace old (string or \
+RegExp) iff it matches exactly once in text; errors with the actual count.
+  `Edit.replaceCount(text, old, new)` → { result, count } — replace every \
+occurrence; returns modified string and match count.
+  `Edit.count(text, needle)` → number — count non-overlapping matches of \
+needle (string or RegExp) in text.
+  `Edit.extractBlock(text, headIndex)` → { start, end } — find nearest \
+`{` at/after headIndex, balance braces, return span (exclusive end). \
+Errors no-brace or unbalanced.
+  `Edit.extractByIndent(text, lineIndex)` → { start, end } — from \
+0-indexed lineIndex, collect lines with greater indent until a non-blank \
+dedent. Blank lines included. Errors out-of-range.
+  `Edit.extractEnclosing(text, index, open, close)` → { start, end } — \
+innermost pair of single-char delimiters enclosing byte index. Errors if none.
+  `Edit.replaceLines(text, start, end, newText)` → string — replace \
+1-indexed inclusive line range. Errors on invalid range.
+  `Edit.insertAt(text, lineNo, newText)` → string — insert before \
+1-indexed lineNo; lineNo = last-line+1 appends. Errors out-of-range.
+  `Edit.applyEdits(text, edits)` → string — atomic multi-replace. edits \
+is `[{ old, new }]`; each old must match exactly once, spans must be \
+disjoint, applied right-to-left. Errors naming the offender.
 - Tools: `outline(path)` lists definitions via tree-sitter; \
 `parse_errors(path)` / `parse_errors(null, source, lang)` verifies syntax \
 **before writing** — the loop: read → transform → `parse_errors` → \
