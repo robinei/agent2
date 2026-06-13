@@ -516,24 +516,35 @@ Targets: a new `agent/src/host/structural.rs` (registered in `real_registry`),
 
 Acceptance:
 
-- [ ] `outline([path]) -> [{ name, kind, start_line, end_line, signature? }]`
+- [x] `outline([path]) -> [{ name, kind, start_line, end_line, signature? }]`
       (read-only). Definitions extracted via each grammar's tags query; language
       inferred from the extension; an unsupported extension returns an explicit
       error, not a silent empty list. Node ranges are exact even when braces
       appear in strings/comments — the correctness fallback for
       `Edit.extractBlock`.
-- [ ] `parse_errors` verifies syntax: `parse_errors([path]) ->
+- [x] `parse_errors` verifies syntax: `parse_errors([path]) ->
       { ok, errors: [{ line, col, message }] }` reads + infers language; a second
       form `parse_errors([null, source, lang])` checks **candidate content the
       program computed before writing**. Collects tree-sitter `ERROR`/`MISSING`
       nodes with positions.
-- [ ] Card documents the loop: read → transform → `parse_errors(candidate, lang)`
+- [x] Card documents the loop: read → transform → `parse_errors(candidate, lang)`
       → `replace_file` (catch a broken edit before it lands, not three build steps
       later) → optional `bash` build/test verify.
-- [ ] Tests: `outline` on a fixture lists its definitions with correct ranges;
+- [x] Tests: `outline` on a fixture lists its definitions with correct ranges;
       `parse_errors` returns `ok` for valid source and positioned errors for a
       broken brace; the pre-write `source` form works without touching disk.
-- [ ] Gate: `cargo fmt && cargo clippy && cargo test` green.
+- [x] Gate: `cargo fmt && cargo clippy && cargo test` green.
+
+*(Built: `agent/src/host/structural.rs` with two read-only tools:**
+*`outline` and `parse_errors`, backed by tree-sitter 0.24 + grammar crates*
+*for Rust (0.23), JavaScript (0.23), TypeScript (0.23), and Python (0.23).*
+*Language is inferred from file extension; unsupported extensions produce an*
+*explicit error. `parse_errors` dual form (`[null, source, lang]`) checks*
+*candidate source without touching disk. Both tools registered in*
+*`real_registry()`. Dialect card documents the verify-before-write loop.**
+*7 tests covering outline on Rust fixtures, unsupported-extension error,**
+*parse_errors ok/error/pre-write-form/positions/unknown-language.**
+*Gate: 122 agent + 704 interp tests green.)*
 
 ## Step F3 (optional): Structured search — `search`
 

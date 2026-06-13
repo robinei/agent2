@@ -44,7 +44,8 @@ const BASH_COMMAND_MAX_BYTES: usize = 1024;
 const BASH_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The M1 registry: file tools + `bash` escape hatch + `create_file`/
-/// `replace_file` writers (10_EDITING Step 3).  Network access is via
+/// `replace_file` writers (10_EDITING Step 3), plus the structural tools
+/// `outline` + `parse_errors` (10_EDITING F2).  Network access is via
 /// `bash` (curl/wget).
 pub fn real_registry() -> ToolRegistry {
     let mut registry = ToolRegistry::new();
@@ -52,6 +53,8 @@ pub fn real_registry() -> ToolRegistry {
     registry.register(bash_def());
     registry.register(create_file_def());
     registry.register(replace_file_def());
+    registry.register(super::structural::outline_def());
+    registry.register(super::structural::parse_errors_def());
     registry
 }
 

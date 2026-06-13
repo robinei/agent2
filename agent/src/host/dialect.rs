@@ -58,6 +58,10 @@ changed-file condition means re-read and re-apply.
 `Edit.replaceLines`, `Edit.insertAt`, `Edit.applyEdits`. Every helper \
 errors on ambiguity (0/N matches, out-of-range, overlapping) as a \
 catchable runtime error — use try/catch when ambiguity is expected.
+- Tools: `outline(path)` lists definitions via tree-sitter; \
+`parse_errors(path)` / `parse_errors(null, source, lang)` verifies syntax \
+**before writing** — the loop: read → transform → `parse_errors` → \
+`replace_file` → optional `bash` build/test verify.
 
 ## tools
 Call as `tools.<name>(args...)`. Every call returns a promise; `await` \

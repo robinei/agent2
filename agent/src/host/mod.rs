@@ -20,6 +20,7 @@ mod dialect;
 mod llm;
 mod protocol;
 mod registry;
+mod structural;
 mod tools;
 
 pub use deepseek::*;
