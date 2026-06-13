@@ -593,7 +593,7 @@ M1/M2 transcripts, not speculation.
 
   M4 acceptance (offline-testable — no network; CLI/tree UX):
 
-  - [ ] **Tree (`tree.rs`)**: `Tree::fork(&self, from) -> io::Result<Spine>`
+  - [x] **Tree (`tree.rs`)**: `Tree::fork(&self, from) -> io::Result<Spine>`
         reconstructs the spine at any event and returns an appendable
         handle — a later `append` creates a *sibling* of `from`'s
         existing child (a divergent branch). Errors on an unknown id and
@@ -601,12 +601,12 @@ M1/M2 transcripts, not speculation.
         fork mid-spine leaves the original branch untouched and both
         reconstruct independently; fork from a `FrameResult` errors; fork
         from an unknown id errors (`tree::tests`).
-  - [ ] **Protocol (`protocol.rs`)**: `SessionCommand` gains
+  - [x] **Protocol (`protocol.rs`)**: `SessionCommand` gains
         `ListLeaves`, `Label(String)`, `Fork { from, label }`,
         `Resume(EventId)`; `SessionEvent` gains `Leaves(Vec<LeafInfo>)`;
         `LeafInfo { leaf, frame, label, complete, active, summary }` is
         serializable. All new variants serde round-trip.
-  - [ ] **Session (`mod.rs`)** — generalizes the "resume lowest
+  - [x] **Session (`mod.rs`)** — generalizes the "resume lowest
         incomplete leaf" seam: `Session::open_at(tree, leaf, …)` anchors
         the root at a chosen leaf; `Session::new` keeps the auto-pick
         default but no longer errors on an all-complete log (opens idle
@@ -622,7 +622,7 @@ M1/M2 transcripts, not speculation.
         `Leaves`; rejects a complete leaf and an unknown id. `UserTurn`
         on a complete spine is rejected (no append-after-`FrameResult`
         panic).
-  - [ ] **CLI (`main.rs`)**: `agent session --list-leaves [log]` prints
+  - [x] **CLI (`main.rs`)**: `agent session --list-leaves [log]` prints
         the leaf list and exits; `--resume <id>` / `--fork <id>` /
         `--label <text>` choose the opening anchor for a driven
         (`--turn`) headless run. Glue only — coverage lives on Tree +
@@ -631,9 +631,25 @@ M1/M2 transcripts, not speculation.
         opens a real prior log, lists leaves, forks an earlier event, and
         continues. Left unchecked; M4 is fully offline-verified, so this
         is confirmation only.
-  - [ ] Gate: `cargo fmt && cargo clippy && cargo test` green, fully
+  - [x] Gate: `cargo fmt && cargo clippy && cargo test` green, fully
         offline. Commit each step (tree / protocol / session / CLI)
         separately.
+
+  *(Built: `Tree::fork` is `spine_at` + validation — the seam decision 4
+  named as "forking is for users." The Session model keeps one active
+  in-memory `AgentState` per frame keyed by `FrameStart` id; fork/resume
+  re-anchor the root by *replacing* that entry, so the superseded branch
+  isn't held in memory but stays in the log, re-listable via
+  `ListLeaves` (the tree is the source of truth, not the state map).
+  Because a root frame runs once to completion, the loop's live use is
+  the open→`ListLeaves`→`Fork`/`Resume`→`UserTurn` flow before the
+  continuing turn; the CLI flags are thin FIFO sugar over the same
+  commands. The one behaviour change to an existing seam:
+  `pick_resume_leaf` falls back to the lowest-id leaf instead of erroring
+  when every spine is complete, so a finished log still opens idle for
+  forking. The `--fork`/`--list-leaves` arc was smoke-tested on a real
+  demo log: forking off the user turn produced a second labelled leaf in
+  the same frame with the original intact.)*
 - **M5**: the eval question — measure the thesis: success rate and token
   cost on multi-step tasks with injected tool failures, versus (a) plain
   tool loop, (b) code mode without conditions (failure = rerun whole
