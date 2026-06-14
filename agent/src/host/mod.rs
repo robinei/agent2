@@ -613,7 +613,15 @@ impl Session {
             return Ok(());
         };
         let outputs = state.step(&mut self.tree, input)?;
+        let transitions = state.take_status_transitions();
         self.emit_new(frame);
+        for (program, status) in transitions {
+            self.emit(SessionEvent::ProgramStatus {
+                frame,
+                program,
+                status,
+            });
+        }
         self.process(frame, outputs)
     }
 
@@ -721,7 +729,7 @@ impl Session {
         let child_id = child.spine.leaf_id; // the FrameStart it was rooted at
         self.emit_new(child_id);
         self.parents.insert(child_id, (parent, invoke_id));
-        let outputs = child.kickoff();
+        let outputs = child.kickoff(&mut self.tree)?;
         self.states.insert(child_id, child);
         self.process(child_id, outputs)
     }
@@ -1004,6 +1012,7 @@ mod tests {
             kinds(session.tree(), root_leaf(&session)),
             [
                 "FrameStart",
+                "System",
                 "User",
                 "Assistant",
                 "Invoke",
@@ -1311,6 +1320,90 @@ mod tests {
         assert_eq!(completion_call_id, "c2");
     }
 
+    /// The `run_program` Assistant event id — the program block key
+    /// (decision 2) the `ProgramStatus` events reference.
+    fn run_program_id(tree: &Tree) -> EventId {
+        tree.events
+            .values()
+            .find(|e| {
+                matches!(&e.payload,
+                    EventPayload::Message(Message::Assistant { tool_calls, .. })
+                        if tool_calls.first().is_some_and(|c| c.name == crate::machine::TOOL_RUN_PROGRAM))
+            })
+            .map(|e| e.id)
+            .expect("a run_program Assistant event")
+    }
+
+    /// The `ProgramStatus` statuses emitted for `program`, in order.
+    fn statuses_for(events: &[SessionEvent], program: EventId) -> Vec<ProgramStatus> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                SessionEvent::ProgramStatus {
+                    program: p, status, ..
+                } if *p == program => Some(*status),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Step 2 (decision 5): a plain program emits `Running → Completed`
+    /// for its block's id (the `run_program` Assistant event).
+    #[test]
+    fn program_status_runs_then_completes() {
+        let script = vec![
+            scripted_program("c1", "return 1 + 1;"),
+            scripted_text("done"),
+        ];
+        let (session, events) = run_session(ToolRegistry::new(), script, "go");
+        let program = run_program_id(session.tree());
+        assert_eq!(
+            statuses_for(&events, program),
+            [ProgramStatus::Running, ProgramStatus::Completed]
+        );
+    }
+
+    /// Step 2 (decision 5): a raise+resume folds into one block whose
+    /// status walks `Running → Suspended → Running → Completed`, all under
+    /// the original `run_program` id (the `resume` keeps it).
+    #[test]
+    fn program_status_tracks_raise_and_resume() {
+        let script = vec![
+            scripted_program("c1", r#"const x = raise("need", null); return x;"#),
+            scripted_resume("c2", json!(7)),
+            scripted_text("done"),
+        ];
+        let (session, events) = run_session(ToolRegistry::new(), script, "go");
+        let program = run_program_id(session.tree());
+        assert_eq!(
+            statuses_for(&events, program),
+            [
+                ProgramStatus::Running,
+                ProgramStatus::Suspended,
+                ProgramStatus::Running,
+                ProgramStatus::Completed,
+            ]
+        );
+    }
+
+    /// Step 2 (decision 4): the first event after a frame's `FrameStart`
+    /// is the stored `Message::System` — the assembled card + prompt.
+    #[test]
+    fn frame_start_is_followed_by_the_stored_system_prompt() {
+        let mut registry = ToolRegistry::new();
+        registry.register(tool("fetch_page", |_| Ok(json!(null))));
+        let (session, _) = run_session(registry, vec![scripted_text("done")], "go");
+        let tree = session.tree();
+        // FrameStart is #1; the system prompt is the next event, #2.
+        let system = &tree.events[&EventId::new(2)];
+        assert_eq!(system.parent_id, Some(EventId::new(1)));
+        let EventPayload::Message(Message::System { text }) = &system.payload else {
+            panic!("the event after FrameStart must be the system prompt");
+        };
+        assert!(text.contains("- tools.fetch_page"), "card present: {text}");
+        assert!(text.contains("test agent"), "frame prompt follows the card");
+    }
+
     /// M2: a trapped runtime error reports, and the rewrite restart reuses
     /// the already-logged tool result by id (`tools.tool_result`) instead
     /// of repeating the call — served from the log, no second Invoke.
@@ -1318,31 +1411,32 @@ mod tests {
     fn trapped_error_rewrite_reuses_artifact_through_the_session() {
         let mut registry = ToolRegistry::new();
         registry.register(tool("fetch", |_| Ok(json!("DATA"))));
-        // Event ids are deterministic: FrameStart 1, User 2, Assistant 3,
-        // the fetch Invoke 4 — so the rewrite can name `tool_result(4)`.
+        // Event ids are deterministic: FrameStart 1, System 2, User 3,
+        // Assistant 4, the fetch Invoke 5 — so the rewrite names
+        // `tool_result(5)` (the stored system prompt is id 2, decision 4).
         let script = vec![
             scripted_program(
                 "c1",
                 r#"await tools.fetch("expensive"); const v = null; return v.x;"#,
             ),
-            scripted_program("c2", "return await tools.tool_result(4);"),
+            scripted_program("c2", "return await tools.tool_result(5);"),
             scripted_text("done"),
         ];
         let (session, _) = run_session(registry, script, "fetch then trip");
 
-        // The fetch really is artifact #4 (guards the hardcoded id above).
+        // The fetch really is artifact #5 (guards the hardcoded id above).
         let fetch_invoke = session
             .tree()
             .events
             .values()
             .find(|e| matches!(&e.payload, EventPayload::Invoke { name, .. } if name == "fetch"))
             .expect("the fetch Invoke");
-        assert_eq!(fetch_invoke.id.as_u64(), 4);
+        assert_eq!(fetch_invoke.id.as_u64(), 5);
 
         // The condition report rendered the trapped error and the menu.
         let reports = tool_texts(&session);
         assert!(
-            reports[0].contains("[#4]") && reports[0].contains("fetch"),
+            reports[0].contains("[#5]") && reports[0].contains("fetch"),
             "{}",
             reports[0]
         );
@@ -1395,7 +1489,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             kinds(tree, child_leaf),
-            ["FrameStart", "Assistant", "FrameResult"]
+            ["FrameStart", "System", "Assistant", "FrameResult"]
         );
 
         // The join: the child's result is the caller's logged artifact
@@ -1454,7 +1548,7 @@ mod tests {
             }
             assert_eq!(
                 kinds(tree, leaf),
-                ["FrameStart", "Assistant", "FrameResult"]
+                ["FrameStart", "System", "Assistant", "FrameResult"]
             );
         }
 
@@ -1789,7 +1883,15 @@ mod tests {
         let forked = tree.spine_at(forked_leaf);
         assert!(!forked.is_complete());
         assert!(session.is_awaiting_user());
-        let msgs: Vec<&str> = forked.frame().messages.iter().map(|m| m.text()).collect();
+        // Chat messages, minus the materialized system prompt (decision 4;
+        // this legacy tree had none, so it's inserted on the first turn).
+        let msgs: Vec<&str> = forked
+            .frame()
+            .messages
+            .iter()
+            .filter(|m| !matches!(m, Message::System { .. }))
+            .map(|m| m.text())
+            .collect();
         assert_eq!(msgs, ["q", "forked follow-up", "forked done"]);
         // The fork's label sits on the new branch, not the original.
         assert_eq!(

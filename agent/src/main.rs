@@ -274,6 +274,17 @@ fn print_session_event(event: &SessionEvent) {
         // Chunks stream live; the headless printer shows the logged
         // message instead of interleaving partial text.
         SessionEvent::Chunk { .. } => {}
+        SessionEvent::ProgramStatus {
+            frame,
+            program,
+            status,
+        } => {
+            println!(
+                "[frame {} · #{}] program status: {status:?}",
+                frame.as_u64(),
+                program.as_u64(),
+            );
+        }
         SessionEvent::Error { frame, message } => match frame {
             Some(f) => eprintln!("!! [frame {}] {message}", f.as_u64()),
             None => eprintln!("!! {message}"),

@@ -192,16 +192,16 @@ Two pieces (decisions 4 and 5):
 
 Acceptance:
 
-- [ ] `ProgramStatus` round-trips; a scripted run emits
+- [x] `ProgramStatus` round-trips; a scripted run emits
       `Running → Completed` (and `… → Suspended → Running → Completed`
       for a raise+resume) for the right `program` id.
-- [ ] The first event after a frame's `FrameStart` is a
+- [x] The first event after a frame's `FrameStart` is a
       `Message::System` carrying the dialect card + prompt + input;
       `render_request` returns it verbatim as `messages[0]`.
-- [ ] Re-opening a saved log shows the *stored* system prompt, not a
+- [x] Re-opening a saved log shows the *stored* system prompt, not a
       re-derivation (swap the registry card between save and load; the
       logged text is unchanged).
-- [ ] Gate: `cargo fmt && cargo clippy && cargo test` green.
+- [x] Gate: `cargo fmt && cargo clippy && cargo test` green.
 
 ## Step 3 — chat: program blocks + system block + per-frame focus (`chat.rs`)
 

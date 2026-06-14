@@ -69,6 +69,8 @@ impl ChatState {
             SessionEvent::Event { frame, event } => {
                 self.apply_payload(*frame, &event.payload);
             }
+            // Live program-block status (Step 3 titles blocks from it).
+            SessionEvent::ProgramStatus { .. } => {}
             // Leaf-list data is for the fork/leaf UI, not the chat pane.
             SessionEvent::Leaves(_) => {}
         }

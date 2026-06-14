@@ -14,6 +14,7 @@ use interp::{
     Diagnostic, InvokeCall, PromisePtr, RcStr, ResumeMode, StepResult, VM, VMError, Value, compile,
 };
 
+use crate::host::ProgramStatus;
 use crate::report::{
     Artifact, CompletionReport, ConditionReport, PAYLOAD_MAX_BYTES, ResumeKind, clip, preview,
 };
@@ -165,6 +166,9 @@ pub struct SpawnFrame {
 
 /// One program execution: the `run_program` tool call being served.
 struct Run {
+    /// The `run_program` Assistant event id — the program block's stable
+    /// key across `resume` (decision 2), carried by `ProgramStatus`.
+    program_id: EventId,
     /// LLM tool-call id the eventual tool result answers.
     call_id: String,
     vm: VM,
@@ -225,6 +229,12 @@ pub struct AgentState {
     /// debugger's sticky panes can show final state post-mortem
     /// (9_TUI Step 4). Never executed again.
     last_vm: Option<VM>,
+    /// Program-block status transitions logged during the current
+    /// `step`, drained by the host into `SessionEvent::ProgramStatus`
+    /// (decision 5). Buffered (not a `StepOutput`) so two transitions in
+    /// one step — a rewrite abandoning the old run as a new one starts —
+    /// both surface, and so the sans-io output set is untouched.
+    status_transitions: Vec<(EventId, ProgramStatus)>,
 }
 
 enum SuspendCause {
@@ -273,6 +283,7 @@ impl AgentState {
             pending: HashMap::new(),
             dialect_card: String::new(),
             last_vm: None,
+            status_transitions: Vec::new(),
         }
     }
 
@@ -280,6 +291,55 @@ impl AgentState {
     /// (the host generates it from the tool registry).
     pub fn set_dialect_card(&mut self, card: String) {
         self.dialect_card = card;
+    }
+
+    /// Drain the program-status transitions logged during the just-run
+    /// `step`; the host turns each into a `SessionEvent::ProgramStatus`.
+    pub fn take_status_transitions(&mut self) -> Vec<(EventId, ProgramStatus)> {
+        std::mem::take(&mut self.status_transitions)
+    }
+
+    /// Record a program-block status transition for the host to surface.
+    fn note_status(&mut self, program: EventId, status: ProgramStatus) {
+        self.status_transitions.push((program, status));
+    }
+
+    /// Materialize this frame's system prompt once (decision 4): the
+    /// assembled dialect card + prompt + input, logged as the spine's
+    /// first `Message::System`. Idempotent — a spine that already carries
+    /// a leading `System` (a re-opened log) is left untouched, so the
+    /// stored prompt replays verbatim even as the registry's card evolves.
+    fn ensure_system(&mut self, tree: &mut Tree) -> io::Result<()> {
+        if matches!(
+            self.spine.frame().messages.first(),
+            Some(Message::System { .. })
+        ) {
+            return Ok(());
+        }
+        let text = self.assemble_system();
+        tree.append(
+            &mut self.spine,
+            EventPayload::Message(Message::System { text }),
+        )?;
+        Ok(())
+    }
+
+    /// Assemble the system prompt string: the dialect card, the frame
+    /// prompt, then the frame input as a fenced JSON block.
+    fn assemble_system(&self) -> String {
+        let frame = self.spine.frame();
+        let mut system = String::new();
+        if !self.dialect_card.is_empty() {
+            system.push_str(&self.dialect_card);
+            system.push_str("\n\n");
+        }
+        system.push_str(&frame.prompt);
+        if !frame.input.is_null() {
+            system.push_str("\n\nInput:\n```json\n");
+            system.push_str(&frame.input.to_string());
+            system.push_str("\n```");
+        }
+        system
     }
 
     /// Whether the frame can accept a `UserTurn` right now.
@@ -316,10 +376,11 @@ impl AgentState {
 
     /// Start the conversation without a user turn — how child frames
     /// begin (their input arrived in `FrameStart`).
-    pub fn kickoff(&mut self) -> Vec<StepOutput> {
+    pub fn kickoff(&mut self, tree: &mut Tree) -> io::Result<Vec<StepOutput>> {
         assert!(matches!(self.phase, Phase::Idle), "kickoff on a busy frame");
+        self.ensure_system(tree)?;
         self.phase = Phase::AwaitingLlm;
-        vec![self.render_request()]
+        Ok(vec![self.render_request()])
     }
 
     pub fn is_done(&self) -> bool {
@@ -355,6 +416,7 @@ impl AgentState {
             Phase::AwaitingLlm => panic!("user turn while an LLM request is in flight"),
             Phase::Done => panic!("user turn on a completed frame"),
         }
+        self.ensure_system(tree)?;
         tree.append(
             &mut self.spine,
             EventPayload::Message(Message::User { text }),
@@ -376,7 +438,7 @@ impl AgentState {
             Message::Assistant { tool_calls, .. } => tool_calls.clone(),
             other => panic!("LlmResponse must be an Assistant message, got {other:?}"),
         };
-        tree.append(&mut self.spine, EventPayload::Message(message))?;
+        let assistant_id = tree.append(&mut self.spine, EventPayload::Message(message))?;
 
         let Some(call) = tool_calls.first().cloned() else {
             // No tool call: the assistant's text completes the frame.
@@ -410,12 +472,15 @@ impl AgentState {
                 // stops delivery to the dead VM). The abandoned VM is kept
                 // for post-mortem rendering.
                 if let Phase::Suspended(run, _) = std::mem::replace(&mut self.phase, Phase::Idle) {
+                    // The abandoned program never completed — Failed.
+                    self.note_status(run.program_id, ProgramStatus::Failed);
                     self.last_vm = Some(run.vm);
                 }
                 self.generation += 1;
-                match self.start_program(source, attachments, call.id.clone()) {
+                match self.start_program(assistant_id, source, attachments, call.id.clone()) {
                     Ok(run) => {
                         self.phase = Phase::Running(run);
+                        self.note_status(assistant_id, ProgramStatus::Running);
                         Ok(vec![StepOutput::Working])
                     }
                     Err(report) => {
@@ -466,7 +531,10 @@ impl AgentState {
                             // assistant tool_call to be followed by a tool
                             // message bearing its id.
                             run.call_id = call.id.clone();
+                            let program_id = run.program_id;
                             self.phase = Phase::Running(run);
+                            // Same block resumes — keep the originating id.
+                            self.note_status(program_id, ProgramStatus::Running);
                             Ok(vec![StepOutput::Working])
                         } else {
                             self.phase = Phase::Suspended(run, suspension);
@@ -575,6 +643,7 @@ impl AgentState {
     /// from this run). `Err` is the rendered repair-loop report.
     fn start_program(
         &mut self,
+        program_id: EventId,
         source: &str,
         attachments: serde_json::Value,
         call_id: String,
@@ -584,6 +653,7 @@ impl AgentState {
         let vm = VM::for_program_with(program, self.spine.frame().input.clone(), attachments)
             .map_err(|e| format!("program setup failed: {}", e.message))?;
         Ok(Run {
+            program_id,
             call_id,
             vm,
             started_at: self.spine.leaf_id.as_u64(),
@@ -855,6 +925,7 @@ impl AgentState {
         if !fire_and_forget.is_empty() {
             out.push(StepOutput::ToolCalls(fire_and_forget));
         }
+        self.note_status(run.program_id, ProgramStatus::Completed);
         self.last_vm = Some(run.vm);
         self.phase = Phase::AwaitingLlm;
         out.push(self.render_request());
@@ -911,7 +982,9 @@ impl AgentState {
         .render();
         let console = run.vm.console_lines.clone();
         let call_id = run.call_id.clone();
+        let program_id = run.program_id;
         self.phase = Phase::Suspended(run, suspension);
+        self.note_status(program_id, ProgramStatus::Suspended);
         tree.append(
             &mut self.spine,
             EventPayload::Message(Message::Tool {
@@ -930,6 +1003,7 @@ impl AgentState {
         // Abandon any suspended program: a no-tool-call turn completes
         // the frame, its text is the result.
         if let Phase::Suspended(run, _) = std::mem::replace(&mut self.phase, Phase::Idle) {
+            self.note_status(run.program_id, ProgramStatus::Failed);
             self.last_vm = Some(run.vm);
         }
         self.generation += 1;
@@ -958,20 +1032,10 @@ impl AgentState {
     // ── rendering ───────────────────────────────────────────────────
 
     fn render_request(&self) -> StepOutput {
-        let frame = self.spine.frame();
-        let mut system = String::new();
-        if !self.dialect_card.is_empty() {
-            system.push_str(&self.dialect_card);
-            system.push_str("\n\n");
-        }
-        system.push_str(&frame.prompt);
-        if !frame.input.is_null() {
-            system.push_str("\n\nInput:\n```json\n");
-            system.push_str(&frame.input.to_string());
-            system.push_str("\n```");
-        }
-        let mut messages = vec![Message::System { text: system }];
-        messages.extend(frame.messages.iter().cloned());
+        // The system prompt is the spine's first message (materialized
+        // once by `ensure_system`, decision 4); send the frame's messages
+        // verbatim — no synthesized prepend.
+        let messages = self.spine.frame().messages.clone();
 
         let tools = match &self.phase {
             Phase::Suspended(_, Suspension::Trapped(e))
@@ -1283,9 +1347,46 @@ mod tests {
             panic!("first message must be the system message");
         };
         assert!(text.starts_with("THE DIALECT CARD\n\n"), "{text}");
+        // The stored prompt is the spine's first event after FrameStart.
+        assert_eq!(payload_kinds(&state, &tree).first(), Some(&"FrameStart"));
+        assert_eq!(payload_kinds(&state, &tree).get(1), Some(&"System"));
         assert!(
             text.contains("you are a test agent"),
             "frame prompt follows the card: {text}"
+        );
+    }
+
+    /// Step 2 (decision 4): the system prompt is materialized once and
+    /// replays verbatim. Re-opening the spine with a *different* card does
+    /// not re-derive it — `render_request` sends the stored `System` as-is.
+    #[test]
+    fn reopened_spine_replays_the_stored_system_prompt() {
+        let mut tree = Tree::new(None);
+        let mut state = AgentState::new_root(&mut tree, "agent", json!({ "n": 1 })).unwrap();
+        state.set_dialect_card("CARD A".into());
+        state.kickoff(&mut tree).unwrap(); // logs the System (#2) with CARD A
+        let stored = match &tree.events[&EventId::new(2)].payload {
+            EventPayload::Message(Message::System { text }) => text.clone(),
+            other => panic!("expected a System at #2, got {other:?}"),
+        };
+        assert!(stored.starts_with("CARD A"));
+
+        // Re-anchor a fresh state on the logged spine, card the registry
+        // differently, take a new turn — the request's system message is
+        // the stored CARD A prompt, not a CARD B re-derivation.
+        let mut reopened = AgentState::with_spine(tree.spine_at(EventId::new(2)));
+        reopened.set_dialect_card("CARD B — evolved".into());
+        let out = reopened
+            .step(&mut tree, StepInput::UserTurn("more".into()))
+            .unwrap();
+        let req = expect_request(&out);
+        let Message::System { text } = &req.messages[0] else {
+            panic!("first message must be the stored system prompt");
+        };
+        assert_eq!(text, &stored, "stored prompt replays verbatim");
+        assert!(
+            !text.contains("CARD B"),
+            "the evolved card must not leak in"
         );
     }
 
@@ -1293,7 +1394,7 @@ mod tests {
     fn input_binding_reaches_the_program() {
         let mut tree = Tree::new(None);
         let mut state = AgentState::new_root(&mut tree, "agent", json!({ "n": 7 })).unwrap();
-        state.kickoff();
+        state.kickoff(&mut tree).unwrap();
         let out = state
             .step(
                 &mut tree,
@@ -1307,7 +1408,7 @@ mod tests {
     #[test]
     fn attachments_reach_the_program_as_a_const() {
         let (mut tree, mut state) = setup();
-        state.kickoff();
+        state.kickoff(&mut tree).unwrap();
         // A run_program carrying authored content in `attachments`; the
         // program reads it as the `attachments` const, never embedding it
         // in `source`.
@@ -1336,7 +1437,7 @@ mod tests {
     #[test]
     fn malformed_attachments_is_a_repair_loop() {
         let (mut tree, mut state) = setup();
-        state.kickoff();
+        state.kickoff(&mut tree).unwrap();
         let msg = Message::Assistant {
             text: String::new(),
             thinking: None,
@@ -1400,6 +1501,7 @@ mod tests {
             payload_kinds(&state, &tree),
             [
                 "FrameStart",
+                "System",
                 "User",
                 "Assistant",
                 "ProgramResult",
@@ -1419,7 +1521,7 @@ mod tests {
     #[test]
     fn fanout_batch_and_resolution_order() {
         let (mut tree, mut state) = setup();
-        state.kickoff();
+        state.kickoff(&mut tree).unwrap();
         let src = r#"
             const a = tools.fetch("x");
             const b = tools.fetch("y");
@@ -1476,7 +1578,7 @@ mod tests {
     #[test]
     fn compile_error_is_a_repair_loop() {
         let (mut tree, mut state) = setup();
-        state.kickoff();
+        state.kickoff(&mut tree).unwrap();
         let out = state
             .step(
                 &mut tree,
@@ -1491,14 +1593,14 @@ mod tests {
         // No execution events were logged.
         assert_eq!(
             payload_kinds(&state, &tree),
-            ["FrameStart", "Assistant", "Tool"]
+            ["FrameStart", "System", "Assistant", "Tool"]
         );
     }
 
     #[test]
     fn raise_reports_and_resume_continues() {
         let (mut tree, mut state) = setup();
-        state.kickoff();
+        state.kickoff(&mut tree).unwrap();
         let src = r#"
             const x = await tools.fetch("a");
             raise("need_help", { got: x });
@@ -1547,7 +1649,7 @@ mod tests {
     #[test]
     fn trapped_type_error_resumes_with_value() {
         let (mut tree, mut state) = setup();
-        state.kickoff();
+        state.kickoff(&mut tree).unwrap();
         let out = state
             .step(
                 &mut tree,
@@ -1571,7 +1673,7 @@ mod tests {
     #[test]
     fn rewrite_reuses_artifact_from_the_log() {
         let (mut tree, mut state) = setup();
-        state.kickoff();
+        state.kickoff(&mut tree).unwrap();
         let src = r#"
             const a = await tools.fetch("expensive");
             raise("stop", null);
@@ -1625,7 +1727,7 @@ mod tests {
     #[test]
     fn agent_call_spawns_child_frame() {
         let (mut tree, mut state) = setup();
-        state.kickoff();
+        state.kickoff(&mut tree).unwrap();
         let src = r#"return await tools.agent({ prompt: "summarize", input: { n: 1 } });"#;
         let out = state
             .step(&mut tree, StepInput::LlmResponse(llm_program("c1", src)))
@@ -1650,7 +1752,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(tree.list_leaves().len(), 2, "caller + in-flight child");
-        child.kickoff();
+        child.kickoff(&mut tree).unwrap();
         let out = child
             .step(&mut tree, StepInput::LlmResponse(llm_text("child says hi")))
             .unwrap();
@@ -1675,7 +1777,7 @@ mod tests {
     #[test]
     fn hot_loop_yields_per_tick() {
         let (mut tree, mut state) = setup();
-        state.kickoff();
+        state.kickoff(&mut tree).unwrap();
         let out = state
             .step(
                 &mut tree,
@@ -1704,7 +1806,7 @@ mod tests {
     #[test]
     fn golden_condition_report_raise_with_payload() {
         let (mut tree, mut state) = setup();
-        state.kickoff();
+        state.kickoff(&mut tree).unwrap();
         let src = "const x = await tools.fetch(\"a\");\nconsole.log(\"fetched: \" + x);\nraise(\"need_help\", { got: x });\nreturn x + 1;";
         let out = state
             .step(&mut tree, StepInput::LlmResponse(llm_program("c1", src)))
@@ -1735,7 +1837,7 @@ console (last 1 of 1 lines):
 fetched: 41
 
 ## artifacts — fetch with tools.tool_result(id)
-[#3] fetch(["a"]) → 41
+[#4] fetch(["a"]) → 41
 
 ## restarts
 - resume(value): continue past the raise; `value` becomes the result of the raise(...) expression
@@ -1746,7 +1848,7 @@ fetched: 41
     #[test]
     fn golden_condition_report_trapped_type_error() {
         let (mut tree, mut state) = setup();
-        state.kickoff();
+        state.kickoff(&mut tree).unwrap();
         let out = state
             .step(
                 &mut tree,
@@ -1777,7 +1879,7 @@ console: (no output)
     #[test]
     fn golden_completion_report() {
         let (mut tree, mut state) = setup();
-        state.kickoff();
+        state.kickoff(&mut tree).unwrap();
         let src = "const a = await tools.fetch(\"x\");\nconsole.log(\"got \" + a);\nreturn [a, 2];";
         let out = state
             .step(&mut tree, StepInput::LlmResponse(llm_program("c1", src)))
@@ -1803,8 +1905,8 @@ console (last 1 of 1 lines):
 got X
 
 ## new artifacts — fetch with tools.tool_result(id)
-[#3] fetch(["x"]) → "X"
-[#4] program result → ["X",2]"#
+[#4] fetch(["x"]) → "X"
+[#5] program result → ["X",2]"#
         );
     }
 
@@ -1812,7 +1914,7 @@ got X
     #[should_panic(expected = "mid-program user turns")]
     fn mid_program_user_turn_panics_for_now() {
         let (mut tree, mut state) = setup();
-        state.kickoff();
+        state.kickoff(&mut tree).unwrap();
         state
             .step(
                 &mut tree,
@@ -1825,7 +1927,7 @@ got X
     #[test]
     fn oversized_program_return_is_rejected() {
         let (mut tree, mut state) = setup();
-        state.kickoff();
+        state.kickoff(&mut tree).unwrap();
         // Return a large string — bigger than PROGRAM_RESULT_MAX_BYTES (4096).
         let src = "return \"x\".repeat(5000);";
         let out = state

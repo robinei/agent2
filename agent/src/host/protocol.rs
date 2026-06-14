@@ -10,6 +10,22 @@ use crate::types::{Event, EventId};
 /// A frame is identified by its `FrameStart` event id.
 pub type FrameId = EventId;
 
+/// The live status of a program block (decision 5). Carried by
+/// `SessionEvent::ProgramStatus` so the chat pane — which is VM-free and
+/// cannot read `Phase` — can title each `run_program` block precisely
+/// (suspended-vs-failed is not inferable from the report text).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProgramStatus {
+    /// Executing (or resumed and executing again).
+    Running,
+    /// Raised a condition / trapped; awaiting a `resume` or rewrite.
+    Suspended,
+    /// Returned a value (ran to completion).
+    Completed,
+    /// Abandoned — rewritten away or left suspended when the frame ended.
+    Failed,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum SessionCommand {
     /// A user message for the root frame (rejected with an error event
@@ -42,6 +58,15 @@ pub enum SessionEvent {
         frame: FrameId,
         thinking: bool,
         text: String,
+    },
+    /// A program block's live status changed (decision 5). Live-only,
+    /// like `Chunk`; `program` is the `run_program` Assistant event id
+    /// that keys the clickable block to its record (a `resume` keeps the
+    /// originating program's id).
+    ProgramStatus {
+        frame: FrameId,
+        program: EventId,
+        status: ProgramStatus,
     },
     /// Something went wrong outside a frame's own condition machinery
     /// (LLM client failure, rejected command).
@@ -101,6 +126,11 @@ mod tests {
         roundtrip_cmd(SessionCommand::Resume(id));
         roundtrip_cmd(SessionCommand::Shutdown);
 
+        roundtrip_evt(SessionEvent::ProgramStatus {
+            frame: EventId::new(1),
+            program: id,
+            status: ProgramStatus::Completed,
+        });
         roundtrip_evt(SessionEvent::Leaves(vec![LeafInfo {
             leaf: id,
             frame: EventId::new(1),
