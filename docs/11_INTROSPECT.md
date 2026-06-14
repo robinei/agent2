@@ -220,16 +220,16 @@ Acceptance:
 
 Acceptance:
 
-- [ ] A `run_program` with two inner tool calls renders as a `run_program:
+- [x] A `run_program` with two inner tool calls renders as a `run_program:
       <status>` header + two `⚙` lines, the header tracking
       `ProgramStatus`; no report body in the rows.
-- [ ] `Message::System` renders as the leading `system` row of its
+- [x] `Message::System` renders as the leading `system` row of its
       frame; execution events (`ProgramResult`/`Label`) still never reach
       chat.
-- [ ] Selecting frame B shows B's transcript (its own system block),
+- [x] Selecting frame B shows B's transcript (its own system block),
       not the root's; structural guarantee test still holds (sole mutator
       `apply`).
-- [ ] Gate: `cargo fmt && cargo clippy && cargo test` green.
+- [x] Gate: `cargo fmt && cargo clippy && cargo test` green.
 
 ## Step 4 — TUI: frames-always layout + click + program axis (`attach.rs`)
 

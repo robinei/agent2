@@ -168,7 +168,7 @@ impl AttachedApp {
     }
 
     pub fn auto_reset_chat_scroll(&mut self) {
-        let current = self.chat.rows().len();
+        let current = self.chat.rows(self.selected).len();
         if current != self.last_chat_lines {
             self.chat_scroll = None;
             self.last_chat_lines = current;
@@ -596,6 +596,9 @@ fn render(frame: &mut Frame, app: &mut AttachedApp, session: &Session) {
 
 fn chat_style(kind: ChatKind) -> Style {
     match kind {
+        ChatKind::System => Style::default()
+            .fg(Color::Magenta)
+            .add_modifier(Modifier::DIM),
         ChatKind::User => Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
@@ -604,7 +607,6 @@ fn chat_style(kind: ChatKind) -> Style {
             .fg(Color::Gray)
             .add_modifier(Modifier::ITALIC),
         ChatKind::ToolCall => Style::default().fg(Color::Yellow),
-        ChatKind::ToolResult => Style::default().fg(Color::DarkGray),
         ChatKind::Marker => Style::default()
             .fg(Color::DarkGray)
             .add_modifier(Modifier::ITALIC),
@@ -623,9 +625,9 @@ fn render_chat(
 
     let lines: Vec<Line> = app
         .chat
-        .rows()
+        .rows(app.selected)
         .into_iter()
-        .map(|(kind, text)| Line::from(text).style(chat_style(kind)))
+        .map(|(kind, text, _program)| Line::from(text).style(chat_style(kind)))
         .collect();
     let visible = transcript_area.height.saturating_sub(2) as usize;
     let default_top = lines.len().saturating_sub(visible);

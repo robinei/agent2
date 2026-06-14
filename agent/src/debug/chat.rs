@@ -1,46 +1,70 @@
-//! Chat transcript state (9_TUI Step 4), driven **exclusively** by
-//! `SessionEvent`s — the serializable boundary a remote client would
-//! consume. Enforced structurally, not by discipline: `ChatState`'s
-//! fields are private to this module and its only mutator is
-//! `apply(&SessionEvent)`, so nothing privileged (VMs, tree, session)
-//! can leak into what this pane shows. Do not add imports from
-//! `crate::host` beyond the protocol types, and none from `interp`.
+//! Chat transcript state (9_TUI Step 4 · 11_INTROSPECT Step 3), driven
+//! **exclusively** by `SessionEvent`s — the serializable boundary a
+//! remote client would consume. Enforced structurally, not by
+//! discipline: `ChatState`'s fields are private to this module and its
+//! only mutator is `apply(&SessionEvent)`, so nothing privileged (VMs,
+//! tree, session) can leak into what this pane shows. Do not add imports
+//! from `crate::host` beyond the protocol types, and none from `interp`.
+//!
+//! A `run_program` execution renders as one **block** (decision 2): a
+//! `run_program: <status>` header (status tracked live from
+//! `ProgramStatus`) with the program's inner `Invoke`s listed beneath as
+//! `⚙` lines; a `resume` folds into the same block. The completion/
+//! condition report body is *not* inlined — it lives in the right
+//! console/result pane. The transcript is **per-frame** (decision 6):
+//! `rows(frame)` renders just that frame's slice, including its own
+//! clean-room `System` prompt.
 
-use crate::host::{FrameId, SessionEvent};
-use crate::types::{EventPayload, Message};
+use std::collections::HashMap;
+
+use crate::host::{FrameId, ProgramStatus, SessionEvent};
+use crate::types::{EventId, EventPayload, Message};
 
 /// What a transcript row is, for styling by the renderer.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ChatKind {
+    /// The frame's stored system prompt (a collapsible header).
+    System,
     User,
     Assistant,
     /// In-flight streamed text (replaced by the logged message).
     Streaming,
-    /// A `run_program`/`resume` tool call header.
+    /// A `run_program` block header or one of its `⚙` inner-call lines.
     ToolCall,
-    /// A tool result body (completion/condition report).
-    ToolResult,
     /// Frame lifecycle markers.
     Marker,
     Error,
 }
 
-#[derive(Debug)]
-pub struct ChatItem {
-    pub frame: Option<FrameId>,
-    pub kind: ChatKind,
-    pub text: String,
+/// One transcript entry. A `Header` computes its text live from the
+/// program's `ProgramStatus`; every other entry is a fixed line.
+enum Entry {
+    Line {
+        frame: FrameId,
+        kind: ChatKind,
+        text: String,
+        /// The program this row belongs to (for click hit-testing): the
+        /// `run_program` event id for block rows, the `System` event id
+        /// for the system header, else `None`.
+        program: Option<EventId>,
+    },
+    /// A `run_program` block header, keyed by the program's event id.
+    Header { frame: FrameId, program: EventId },
 }
 
 #[derive(Default)]
 pub struct ChatState {
-    items: Vec<ChatItem>,
+    entries: Vec<Entry>,
     /// Accumulating streamed text per frame, shown until the logged
     /// assistant message replaces it.
     streaming: Vec<(FrameId, String)>,
-    /// The first frame seen is "the" conversation; others get a
-    /// `[frame N]` prefix.
+    /// The first frame seen — the default transcript when none is selected.
     main_frame: Option<FrameId>,
+    /// The open `run_program` block per frame: its inner `Invoke`s and a
+    /// folding `resume` attach here.
+    current_program: HashMap<FrameId, EventId>,
+    /// Live status per program block, titling its header.
+    program_status: HashMap<EventId, ProgramStatus>,
 }
 
 impl ChatState {
@@ -64,120 +88,208 @@ impl ChatState {
                 }
             }
             SessionEvent::Error { frame, message } => {
-                self.push(*frame, ChatKind::Error, format!("error: {message}"));
+                if let Some(f) = frame.or(self.main_frame) {
+                    self.entries.push(Entry::Line {
+                        frame: f,
+                        kind: ChatKind::Error,
+                        text: format!("error: {message}"),
+                        program: None,
+                    });
+                }
             }
             SessionEvent::Event { frame, event } => {
-                self.apply_payload(*frame, &event.payload);
+                self.apply_payload(*frame, event.id, &event.payload);
             }
-            // Live program-block status (Step 3 titles blocks from it).
-            SessionEvent::ProgramStatus { .. } => {}
+            // Live program-block status titles the matching header.
+            SessionEvent::ProgramStatus {
+                program, status, ..
+            } => {
+                self.program_status.insert(*program, *status);
+            }
             // Leaf-list data is for the fork/leaf UI, not the chat pane.
             SessionEvent::Leaves(_) => {}
         }
     }
 
-    fn apply_payload(&mut self, frame: FrameId, payload: &EventPayload) {
+    fn apply_payload(&mut self, frame: FrameId, id: EventId, payload: &EventPayload) {
         match payload {
-            EventPayload::FrameStart { prompt, .. } => {
-                if self.main_frame.is_none() {
-                    self.main_frame = Some(frame);
-                    self.push(Some(frame), ChatKind::Marker, format!("session: {prompt}"));
-                } else {
-                    self.push(
-                        Some(frame),
-                        ChatKind::Marker,
-                        format!("subagent started: {prompt}"),
-                    );
-                }
+            EventPayload::FrameStart { .. } => {
+                // The frame's prompt renders via its `System` block; the
+                // frames pane carries its identity. Just track the main one.
+                self.main_frame.get_or_insert(frame);
             }
             EventPayload::FrameResult { result } => {
                 if Some(frame) != self.main_frame {
-                    self.push(
-                        Some(frame),
-                        ChatKind::Marker,
-                        format!("subagent finished: {result}"),
-                    );
+                    self.entries.push(Entry::Line {
+                        frame,
+                        kind: ChatKind::Marker,
+                        text: format!("subagent finished: {result}"),
+                        program: None,
+                    });
                 }
             }
+            EventPayload::Message(Message::System { text }) => {
+                self.entries.push(Entry::Line {
+                    frame,
+                    kind: ChatKind::System,
+                    text: text.clone(),
+                    program: Some(id),
+                });
+            }
             EventPayload::Message(Message::User { text }) => {
-                self.push(Some(frame), ChatKind::User, text.clone());
+                self.entries.push(Entry::Line {
+                    frame,
+                    kind: ChatKind::User,
+                    text: text.clone(),
+                    program: None,
+                });
             }
             EventPayload::Message(Message::Assistant {
                 text, tool_calls, ..
             }) => {
                 self.streaming.retain(|(f, _)| *f != frame);
                 if !text.is_empty() {
-                    self.push(Some(frame), ChatKind::Assistant, text.clone());
+                    self.entries.push(Entry::Line {
+                        frame,
+                        kind: ChatKind::Assistant,
+                        text: text.clone(),
+                        program: None,
+                    });
                 }
-                for call in tool_calls {
-                    self.push(Some(frame), ChatKind::ToolCall, format!("⚙ {}", call.name));
+                // A `run_program` opens a new block keyed by this event;
+                // a `resume` folds into the open one (decision 2).
+                if let Some(call) = tool_calls.first()
+                    && call.name == crate::machine::TOOL_RUN_PROGRAM
+                {
+                    self.entries.push(Entry::Header { frame, program: id });
+                    self.current_program.insert(frame, id);
                 }
             }
-            EventPayload::Message(Message::Tool { name, text, .. }) => {
-                self.push(
-                    Some(frame),
-                    ChatKind::ToolResult,
-                    format!("{name}:\n{text}"),
-                );
+            // The report body lives in the right console/result pane, not
+            // the transcript (decision 2).
+            EventPayload::Message(Message::Tool { .. }) => {}
+            EventPayload::Invoke { name, result, .. } => {
+                if let Some(&program) = self.current_program.get(&frame) {
+                    self.entries.push(Entry::Line {
+                        frame,
+                        kind: ChatKind::ToolCall,
+                        text: format!("⚙ {name} → {}", short(result)),
+                        program: Some(program),
+                    });
+                }
             }
-            // System prompts render via the FrameStart marker; execution
-            // events (Invoke/ProgramResult/Label) are debug-pane data,
-            // not transcript (they never render to chat — Step 1 rules).
-            EventPayload::Message(Message::System { .. })
-            | EventPayload::Invoke { .. }
-            | EventPayload::ProgramResult { .. }
-            | EventPayload::Console { .. }
-            | EventPayload::Label(_) => {}
+            // Execution/marker events are debug-pane data, never transcript.
+            EventPayload::ProgramResult { .. } | EventPayload::Console { .. } => {}
+            EventPayload::Label(_) => {}
         }
     }
 
-    fn push(&mut self, frame: Option<FrameId>, kind: ChatKind, text: String) {
-        self.items.push(ChatItem { frame, kind, text });
-    }
-
-    /// Transcript rows for rendering: one `(kind, line)` per visual
-    /// line, multi-line items split, off-main frames prefixed.
-    pub fn rows(&self) -> Vec<(ChatKind, String)> {
+    /// Transcript rows for `frame` (or the main frame when `None`): one
+    /// `(kind, line, program)` per visual line. `program` is the program
+    /// id the row belongs to (or the system header's event id), for click
+    /// hit-testing. Multi-line items split; the system prompt collapses
+    /// to a single header row.
+    pub fn rows(&self, frame: Option<FrameId>) -> Vec<(ChatKind, String, Option<EventId>)> {
+        let Some(target) = frame.or(self.main_frame) else {
+            return Vec::new();
+        };
         let mut out = Vec::new();
-        for item in &self.items {
-            let prefix = match (item.frame, self.main_frame) {
-                (Some(f), Some(main)) if f != main => format!("[frame {}] ", f.as_u64()),
-                _ => String::new(),
-            };
-            let label = match item.kind {
-                ChatKind::User => "you ❯ ",
-                ChatKind::Assistant => "agent ❯ ",
-                _ => "",
-            };
-            for (i, line) in item.text.lines().enumerate() {
-                let head = if i == 0 {
-                    format!("{prefix}{label}")
-                } else {
-                    " ".repeat(prefix.chars().count() + label.chars().count())
-                };
-                out.push((item.kind, format!("{head}{line}")));
-            }
-            if item.text.is_empty() {
-                out.push((item.kind, format!("{prefix}{label}")));
+        for entry in &self.entries {
+            match entry {
+                Entry::Header { frame, program } if *frame == target => {
+                    let status = self
+                        .program_status
+                        .get(program)
+                        .map(|s| status_label(*s))
+                        .unwrap_or("running");
+                    out.push((
+                        ChatKind::ToolCall,
+                        format!("run_program: {status}"),
+                        Some(*program),
+                    ));
+                }
+                Entry::Line {
+                    frame,
+                    kind,
+                    text,
+                    program,
+                } if *frame == target => {
+                    if *kind == ChatKind::System {
+                        // Collapsed to a single header (Step 4 expands it).
+                        out.push((ChatKind::System, "system".into(), *program));
+                        continue;
+                    }
+                    push_wrapped(&mut out, *kind, text, *program);
+                }
+                _ => {}
             }
         }
-        for (frame, buf) in &self.streaming {
-            let prefix = match self.main_frame {
-                Some(main) if *frame != main => format!("[frame {}] ", frame.as_u64()),
-                _ => String::new(),
-            };
+        for (f, buf) in &self.streaming {
+            if *f != target {
+                continue;
+            }
             for line in buf.lines() {
-                out.push((ChatKind::Streaming, format!("{prefix}{line}")));
+                out.push((ChatKind::Streaming, line.to_owned(), None));
             }
         }
         out
     }
 }
 
+/// Push an item's visual lines, labelling user/assistant prose and
+/// indenting continuation lines under the label.
+fn push_wrapped(
+    out: &mut Vec<(ChatKind, String, Option<EventId>)>,
+    kind: ChatKind,
+    text: &str,
+    program: Option<EventId>,
+) {
+    let label = match kind {
+        ChatKind::User => "you ❯ ",
+        ChatKind::Assistant => "agent ❯ ",
+        _ => "",
+    };
+    let mut any = false;
+    for (i, line) in text.lines().enumerate() {
+        any = true;
+        let head = if i == 0 {
+            label.to_owned()
+        } else {
+            " ".repeat(label.chars().count())
+        };
+        out.push((kind, format!("{head}{line}"), program));
+    }
+    if !any {
+        out.push((kind, label.to_owned(), program));
+    }
+}
+
+fn status_label(status: ProgramStatus) -> &'static str {
+    match status {
+        ProgramStatus::Running => "running",
+        ProgramStatus::Suspended => "suspended",
+        ProgramStatus::Completed => "completed",
+        ProgramStatus::Failed => "failed",
+    }
+}
+
+/// A compact one-line preview of an inner call's result.
+fn short(v: &serde_json::Value) -> String {
+    let s = v.to_string();
+    if s.len() <= 40 {
+        return s;
+    }
+    let mut end = 40;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Event, EventId, ToolCall};
+    use crate::types::{Event, ToolCall};
     use jiff::Timestamp;
 
     fn ev(id: u64, payload: EventPayload) -> SessionEvent {
@@ -190,6 +302,32 @@ mod tests {
                 payload,
             },
         }
+    }
+
+    fn run_program(id: u64) -> SessionEvent {
+        ev(
+            id,
+            EventPayload::Message(Message::Assistant {
+                text: String::new(),
+                thinking: None,
+                tool_calls: vec![ToolCall {
+                    id: "c1".into(),
+                    name: "run_program".into(),
+                    arguments: serde_json::json!({}),
+                }],
+            }),
+        )
+    }
+
+    fn invoke(id: u64, name: &str, result: serde_json::Value) -> SessionEvent {
+        ev(
+            id,
+            EventPayload::Invoke {
+                name: name.into(),
+                args: serde_json::json!([]),
+                result,
+            },
+        )
     }
 
     #[test]
@@ -211,45 +349,165 @@ mod tests {
             thinking: false,
             text: "thinki".into(),
         });
-        let rows = chat.rows();
+        let rows = chat.rows(None);
         assert!(
             rows.iter()
-                .any(|(k, t)| *k == ChatKind::User && t.contains("hi"))
+                .any(|(k, t, _)| *k == ChatKind::User && t.contains("hi"))
         );
         assert!(
             rows.iter()
-                .any(|(k, t)| *k == ChatKind::Streaming && t.contains("thinki"))
+                .any(|(k, t, _)| *k == ChatKind::Streaming && t.contains("thinki"))
         );
 
         // The logged assistant message replaces the stream.
-        chat.apply(&ev(
-            3,
-            EventPayload::Message(Message::Assistant {
-                text: "thinking done".into(),
-                thinking: None,
-                tool_calls: vec![ToolCall {
-                    id: "c1".into(),
-                    name: "run_program".into(),
-                    arguments: serde_json::json!({}),
-                }],
-            }),
-        ));
-        let rows = chat.rows();
-        assert!(!rows.iter().any(|(k, _)| *k == ChatKind::Streaming));
-        assert!(
-            rows.iter()
-                .any(|(k, t)| *k == ChatKind::ToolCall && t.contains("run_program"))
-        );
+        chat.apply(&run_program(3));
+        let rows = chat.rows(None);
+        assert!(!rows.iter().any(|(k, _, _)| *k == ChatKind::Streaming));
+        // A run_program renders as a status-titled block header.
+        assert!(rows.iter().any(|(k, t, p)| *k == ChatKind::ToolCall
+            && t == "run_program: running"
+            && *p == Some(EventId::new(3))));
 
-        // Execution events never reach the transcript.
+        // ProgramResult/Label never reach the transcript.
+        let before = chat.rows(None).len();
         chat.apply(&ev(
-            4,
-            EventPayload::Invoke {
-                name: "fetch".into(),
-                args: serde_json::json!([]),
-                result: serde_json::json!("x"),
+            5,
+            EventPayload::ProgramResult {
+                value: serde_json::json!("done"),
             },
         ));
-        assert_eq!(chat.rows().len(), rows.len());
+        chat.apply(&ev(6, EventPayload::Label("note".into())));
+        assert_eq!(chat.rows(None).len(), before);
+    }
+
+    /// A run_program with two inner calls renders as one block: a
+    /// status-titled header + two `⚙` lines, the header tracking
+    /// `ProgramStatus`. No report body in the rows.
+    #[test]
+    fn run_program_block_lists_inner_calls_and_tracks_status() {
+        let mut chat = ChatState::new();
+        chat.apply(&ev(
+            1,
+            EventPayload::FrameStart {
+                prompt: "p".into(),
+                input: serde_json::Value::Null,
+            },
+        ));
+        chat.apply(&run_program(2));
+        chat.apply(&invoke(3, "fetch", serde_json::json!("A")));
+        chat.apply(&invoke(4, "store", serde_json::json!(true)));
+
+        let rows = chat.rows(None);
+        let glyphs: Vec<&(ChatKind, String, Option<EventId>)> = rows
+            .iter()
+            .filter(|(k, t, _)| *k == ChatKind::ToolCall && t.starts_with('⚙'))
+            .collect();
+        assert_eq!(glyphs.len(), 2, "two inner-call lines");
+        // Each ⚙ line carries the program id for hit-testing.
+        assert!(glyphs.iter().all(|(_, _, p)| *p == Some(EventId::new(2))));
+
+        // Header starts at running…
+        assert!(
+            chat.rows(None)
+                .iter()
+                .any(|(_, t, _)| t == "run_program: running")
+        );
+        // …and tracks ProgramStatus to completed.
+        chat.apply(&SessionEvent::ProgramStatus {
+            frame: EventId::new(1),
+            program: EventId::new(2),
+            status: ProgramStatus::Completed,
+        });
+        assert!(
+            chat.rows(None)
+                .iter()
+                .any(|(_, t, _)| t == "run_program: completed")
+        );
+
+        // The completion report body is not inlined.
+        chat.apply(&ev(
+            5,
+            EventPayload::Message(Message::Tool {
+                name: "run_program".into(),
+                call_id: "c1".into(),
+                text: "## program completed\nreturned: 1".into(),
+            }),
+        ));
+        assert!(
+            !chat
+                .rows(None)
+                .iter()
+                .any(|(_, t, _)| t.contains("program completed"))
+        );
+    }
+
+    /// The stored `System` renders as the leading `system` row of its
+    /// frame, and selecting another frame shows that frame's slice (its
+    /// own system block), not the root's.
+    #[test]
+    fn system_block_is_leading_and_per_frame() {
+        let mut chat = ChatState::new();
+        // Root frame #1.
+        chat.apply(&ev(
+            1,
+            EventPayload::FrameStart {
+                prompt: "root".into(),
+                input: serde_json::Value::Null,
+            },
+        ));
+        chat.apply(&ev(
+            2,
+            EventPayload::Message(Message::System {
+                text: "ROOT SYSTEM PROMPT".into(),
+            }),
+        ));
+        chat.apply(&ev(
+            3,
+            EventPayload::Message(Message::User {
+                text: "root q".into(),
+            }),
+        ));
+        // Subagent frame #4 with its own system prompt.
+        let child = EventId::new(4);
+        let child_event = |id: u64, payload| SessionEvent::Event {
+            frame: child,
+            event: Event {
+                id: EventId::new(id),
+                parent_id: None,
+                timestamp: Timestamp::now(),
+                payload,
+            },
+        };
+        chat.apply(&child_event(
+            4,
+            EventPayload::FrameStart {
+                prompt: "child".into(),
+                input: serde_json::Value::Null,
+            },
+        ));
+        chat.apply(&child_event(
+            5,
+            EventPayload::Message(Message::System {
+                text: "CHILD SYSTEM PROMPT".into(),
+            }),
+        ));
+
+        // Root's slice: leading system row, then the user message.
+        let root_rows = chat.rows(Some(EventId::new(1)));
+        assert_eq!(root_rows[0].0, ChatKind::System);
+        assert_eq!(root_rows[0].2, Some(EventId::new(2)));
+        assert!(
+            root_rows
+                .iter()
+                .any(|(k, t, _)| *k == ChatKind::User && t.contains("root q"))
+        );
+        // The child's content is not in the root's slice.
+        assert!(!root_rows.iter().any(|(_, t, _)| t.contains("CHILD")));
+
+        // The child's slice leads with its own system header.
+        let child_rows = chat.rows(Some(child));
+        assert_eq!(child_rows[0].0, ChatKind::System);
+        assert_eq!(child_rows[0].2, Some(EventId::new(5)));
+        assert!(!child_rows.iter().any(|(_, t, _)| t.contains("root q")));
     }
 }
