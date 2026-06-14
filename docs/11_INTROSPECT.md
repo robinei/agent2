@@ -250,12 +250,12 @@ Acceptance:
 
 Acceptance:
 
-- [ ] Headless: clicking a frame row retargets `selected`; clicking an
+- [x] Headless: clicking a frame row retargets `selected`; clicking an
       older block's row retargets `selected_program` to that block's id;
       clicking a `system` header toggles `collapsed`.
-- [ ] Frames pane is present in the default (chat) view; root is row 0.
-- [ ] Tab / `1`–`9` keyboard selection still works alongside clicks.
-- [ ] Gate: `cargo fmt && cargo clippy && cargo test` green.
+- [x] Frames pane is present in the default (chat) view; root is row 0.
+- [x] Tab / `1`–`9` keyboard selection still works alongside clicks.
+- [x] Gate: `cargo fmt && cargo clippy && cargo test` green.
 
 ## Step 5 — TUI: reduced introspection for old programs (`attach.rs`, `ui.rs`)
 
@@ -270,10 +270,10 @@ Acceptance:
 
 Acceptance:
 
-- [ ] Selecting a finished program shows its source + console + result
+- [x] Selecting a finished program shows its source + console + result
       footer; disasm/stack/promises panes are absent (no stale live VM).
-- [ ] Selecting the live program restores the full pane set.
-- [ ] Gate: `cargo fmt && cargo clippy && cargo test` green.
+- [x] Selecting the live program restores the full pane set.
+- [x] Gate: `cargo fmt && cargo clippy && cargo test` green.
 
 ## Step 6 — docs sweep
 

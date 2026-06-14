@@ -18,12 +18,13 @@
 //! Keys are focus-modal so chat typing stays free: printable keys go
 //! to the input line; `Esc` swaps to debug-control focus (and back).
 
+use std::collections::HashSet;
 use std::sync::mpsc::Receiver;
 use std::thread;
 use std::time::Instant;
 
 use ratatui::Frame;
-use ratatui::crossterm::event::{Event as CtEvent, KeyCode, MouseEventKind};
+use ratatui::crossterm::event::{Event as CtEvent, KeyCode, MouseButton, MouseEventKind};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
@@ -34,7 +35,8 @@ use super::chat::{ChatKind, ChatState};
 use super::ui;
 use crate::host::{FrameId, Session, SessionCommand, SessionEvent};
 use crate::machine::TOOL_RUN_PROGRAM;
-use crate::types::{EventPayload, Message};
+use crate::tree::ProgramView;
+use crate::types::{EventId, EventPayload, Message};
 
 /// Cap for one step-line key, so a hot loop on one source line cannot
 /// wedge the UI (mirrors the standalone runner).
@@ -93,6 +95,12 @@ pub struct AttachedApp {
     prev_view: View,
     pub focus: Focus,
     pub selected: Option<FrameId>,
+    /// Which program the right-hand panes show (decision 1). `None` ⇒ the
+    /// selected frame's most-recent program (the default); a click on an
+    /// older chat block pins a specific one by its `run_program` event id.
+    pub selected_program: Option<EventId>,
+    /// Frames whose `System` block is folded to its header (decision 7).
+    collapsed: HashSet<FrameId>,
     pub input: String,
     pub quit: bool,
     pub show_source: bool,
@@ -117,6 +125,8 @@ impl AttachedApp {
             prev_view: View::Chat,
             focus: Focus::Input,
             selected: Some(root),
+            selected_program: None,
+            collapsed: HashSet::new(),
             input: String::new(),
             quit: false,
             show_source: true,
@@ -145,15 +155,19 @@ impl AttachedApp {
                 EventPayload::Message(Message::Assistant { tool_calls, .. })
                     if tool_calls.iter().any(|c| c.name == TOOL_RUN_PROGRAM)
             )
-            && self.view == View::Chat
         {
-            self.view = View::Running;
-            // A fresh pop resets to the auto-pop set; later manual
-            // toggles override it until the next pop.
-            self.show_source = true;
-            self.show_disasm = false;
-            self.show_stack = false;
-            self.show_promises = false;
+            // Follow the live program: a fresh run on the selected frame
+            // drops any pinned older program.
+            self.selected_program = None;
+            if self.view == View::Chat {
+                self.view = View::Running;
+                // A fresh pop resets to the auto-pop set; later manual
+                // toggles override it until the next pop.
+                self.show_source = true;
+                self.show_disasm = false;
+                self.show_stack = false;
+                self.show_promises = false;
+            }
         }
         self.chat.apply(event);
     }
@@ -175,42 +189,98 @@ impl AttachedApp {
         }
     }
 
-    pub fn on_mouse(&mut self, column: u16, row: u16, kind: MouseEventKind) {
+    pub fn on_mouse(&mut self, column: u16, row: u16, kind: MouseEventKind, frames: &[FrameId]) {
+        if matches!(kind, MouseEventKind::Down(MouseButton::Left)) {
+            self.on_click(column, row, frames);
+            return;
+        }
         let delta: i64 = match kind {
             MouseEventKind::ScrollDown => 3,
             MouseEventKind::ScrollUp => -3,
             _ => return,
         };
-        for (pane, info) in &self.pane_rects {
-            if column < info.area.x
-                || column >= info.area.right()
-                || row < info.area.y
-                || row >= info.area.bottom()
-            {
-                continue;
-            }
-            let current = info.scroll_top as i64;
-            let new = (current + delta).max(0) as usize;
-            match pane {
-                Pane::Chat => self.chat_scroll = Some(new),
-                Pane::Console => self.console_scroll = Some(new),
-                Pane::Source => self.source_scroll = Some(new),
-                Pane::Disasm => self.disasm_scroll = Some(new),
-                Pane::Stack => self.stack_scroll = Some(new),
-                Pane::Promises => self.promises_scroll = Some(new),
-                Pane::FrameList => {}
-            }
+        let Some((pane, info)) = self.pane_at(column, row) else {
             return;
+        };
+        let new = (info.scroll_top as i64 + delta).max(0) as usize;
+        match pane {
+            Pane::Chat => self.chat_scroll = Some(new),
+            Pane::Console => self.console_scroll = Some(new),
+            Pane::Source => self.source_scroll = Some(new),
+            Pane::Disasm => self.disasm_scroll = Some(new),
+            Pane::Stack => self.stack_scroll = Some(new),
+            Pane::Promises => self.promises_scroll = Some(new),
+            Pane::FrameList => {}
         }
+    }
+
+    /// The pane (and its last-rendered geometry) under a cell, if any.
+    fn pane_at(&self, column: u16, row: u16) -> Option<(Pane, PaneInfo)> {
+        self.pane_rects
+            .iter()
+            .find(|(_, info)| {
+                column >= info.area.x
+                    && column < info.area.right()
+                    && row >= info.area.y
+                    && row < info.area.bottom()
+            })
+            .copied()
+    }
+
+    /// Left-click hit-testing (decision 7): a frames-pane row retargets
+    /// the frame; a chat-block row pins the program; a `system` header
+    /// toggles its frame's fold.
+    fn on_click(&mut self, column: u16, row: u16, frames: &[FrameId]) {
+        let Some((pane, info)) = self.pane_at(column, row) else {
+            return;
+        };
+        // Row within the bordered pane body (the top border is row 0).
+        let body = (row as usize).checked_sub(info.area.y as usize + 1);
+        match pane {
+            Pane::FrameList => {
+                if let Some(idx) = body
+                    && let Some(&fid) = frames.get(idx)
+                {
+                    self.select_frame(fid);
+                }
+            }
+            Pane::Chat => {
+                let Some(body) = body else { return };
+                let line = info.scroll_top + body;
+                let rows = self.chat.rows(self.selected);
+                if let Some((kind, _text, program)) = rows.get(line) {
+                    if *kind == ChatKind::System {
+                        if let Some(frame) = self.selected
+                            && !self.collapsed.remove(&frame)
+                        {
+                            self.collapsed.insert(frame);
+                        }
+                    } else if let Some(program) = program {
+                        self.selected_program = Some(*program);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Point both selection axes at `frame`: it becomes the chat focus and
+    /// the panes fall back to its most-recent program (decision 1).
+    fn select_frame(&mut self, frame: FrameId) {
+        self.selected = Some(frame);
+        self.selected_program = None;
     }
 
     /// The layout state machine's output: view state in, pane set out.
     pub fn pane_set(&self) -> PaneSet {
         match self.view {
+            // The frames pane is persistent top-right in every view
+            // (decision 7); Step 5 fills the rest of the column from
+            // `selected_program`.
             View::Chat => PaneSet {
                 chat: true,
                 console_left: false,
-                right: Vec::new(),
+                right: vec![Pane::FrameList],
             },
             View::Running => {
                 let mut right = vec![Pane::FrameList];
@@ -326,7 +396,7 @@ impl AttachedApp {
                 if self.view == View::FullDebug {
                     // 1–9 switch which frame the panes borrow.
                     if let Some(id) = frames.get(idx) {
-                        self.selected = Some(*id);
+                        self.select_frame(*id);
                     }
                 } else if self.view == View::Running {
                     // 1–4 override the auto-pop set.
@@ -355,8 +425,62 @@ impl AttachedApp {
             Some(i) => (i + 1) % frames.len(),
             None => 0,
         };
-        self.selected = Some(frames[next]);
+        self.select_frame(frames[next]);
     }
+}
+
+/// The current spine leaf for `frame` — from the live state if available
+/// (resume-friendly session), or the first leaf in the frame's subtree
+/// from the tree projection (log-only, decision 8).
+fn find_leaf(session: &Session, frame: FrameId) -> Option<EventId> {
+    if let Some(state) = session.state(frame) {
+        return Some(state.spine.leaf_id);
+    }
+    session.tree().list_leaves().iter().find_map(|(id, _)| {
+        session
+            .tree()
+            .enclosing_frame(*id)
+            .filter(|ef| *ef == frame)?;
+        Some(*id)
+    })
+}
+
+/// If `program` is the current (or most-recently-completed) program in
+/// `frame`, returns the VM for rich introspection — otherwise `None` (it
+/// is an older program rendered from the log projection, Step 5).
+fn vm_for_program(session: &Session, frame: FrameId, program: EventId) -> Option<&interp::VM> {
+    let state = session.state(frame)?;
+    let vm = state.vm()?;
+    let leaf = state.spine.leaf_id;
+    let programs = session.tree().programs_for(frame, leaf);
+    if programs.last().map(|p| p.id) == Some(program) {
+        Some(vm)
+    } else {
+        None
+    }
+}
+
+/// Resolve the selected program for `app` into its VM (for the running/
+/// just-completed program) and its `ProgramView` (for old programs).
+/// `vm` is `Some` only for the current program; `pv` is `Some` for any
+/// program (current or old) that exists in the log projection.
+fn resolve_program<'a>(
+    app: &AttachedApp,
+    session: &'a Session,
+) -> (Option<&'a interp::VM>, Option<ProgramView>) {
+    let Some(frame) = app.selected else {
+        return (None, None);
+    };
+    let Some(leaf) = find_leaf(session, frame) else {
+        return (None, None);
+    };
+    let programs = session.tree().programs_for(frame, leaf);
+    let effective = app
+        .selected_program
+        .or_else(|| programs.last().map(|p| p.id));
+    let pv = effective.and_then(|id| programs.into_iter().find(|p| p.id == id));
+    let vm = effective.and_then(|prog_id| vm_for_program(session, frame, prog_id));
+    (vm, pv)
 }
 
 /// Run the attached TUI over `session`. The session loop *is* this
@@ -389,7 +513,9 @@ pub fn run_attached(mut session: Session, events_rx: Receiver<SessionEvent>) -> 
             app.apply(&event);
         }
         app.auto_reset_chat_scroll();
-        let frames: Vec<FrameId> = session.frames().iter().map(|(id, _)| *id).collect();
+        // All frames root-first, from the log projection so the navigator
+        // survives resume (decision 8), not just the live `states`.
+        let frames: Vec<FrameId> = session.tree().frame_list().iter().map(|fv| fv.id).collect();
         for input in inputs {
             match input {
                 CtEvent::Key(key) if key.is_press() => {
@@ -419,7 +545,7 @@ pub fn run_attached(mut session: Session, events_rx: Receiver<SessionEvent>) -> 
                         }
                     }
                 }
-                CtEvent::Mouse(mouse) => app.on_mouse(mouse.column, mouse.row, mouse.kind),
+                CtEvent::Mouse(mouse) => app.on_mouse(mouse.column, mouse.row, mouse.kind, &frames),
                 _ => {}
             }
         }
@@ -500,18 +626,20 @@ fn render(frame: &mut Frame, app: &mut AttachedApp, session: &Session) {
     }
 
     if let Some(right) = right {
-        let vm = app
-            .selected
-            .and_then(|f| session.state(f))
-            .and_then(|s| s.vm());
-        let slots = Layout::vertical(panes.right.iter().map(|p| match p {
-            Pane::FrameList => Constraint::Length(session.frames().len() as u16 + 2),
+        let (vm, pv) = resolve_program(app, session);
+        // Old programs (no live VM, from the log) strip VM-only panes.
+        let mut right_panes = panes.right.clone();
+        if vm.is_none() && pv.is_some() {
+            right_panes.retain(|p| matches!(p, Pane::FrameList | Pane::Source | Pane::Console));
+        }
+        let slots = Layout::vertical(right_panes.iter().map(|p| match p {
+            Pane::FrameList => Constraint::Length(session.tree().frame_list().len() as u16 + 2),
             _ => Constraint::Fill(1),
         }))
         .split(right);
-        for (pane, slot) in panes.right.iter().zip(slots.iter()) {
-            match (pane, vm) {
-                (Pane::FrameList, _) => {
+        for (pane, slot) in right_panes.iter().zip(slots.iter()) {
+            match pane {
+                Pane::FrameList => {
                     render_frame_list(frame, app, session, *slot);
                     app.pane_rects.push((
                         Pane::FrameList,
@@ -521,9 +649,12 @@ fn render(frame: &mut Frame, app: &mut AttachedApp, session: &Session) {
                         },
                     ));
                 }
-                (Pane::Console, _) => {
-                    let (top, area) =
-                        render_attached_console(frame, app, session, *slot, app.console_scroll);
+                Pane::Console => {
+                    let (top, area) = if let Some(ref pv) = pv {
+                        render_console_from_pv(frame, pv, *slot, app.console_scroll)
+                    } else {
+                        render_attached_console(frame, app, session, *slot, app.console_scroll)
+                    };
                     app.pane_rects.push((
                         Pane::Console,
                         PaneInfo {
@@ -532,8 +663,15 @@ fn render(frame: &mut Frame, app: &mut AttachedApp, session: &Session) {
                         },
                     ));
                 }
-                (Pane::Source, Some(vm)) => {
-                    let top = ui::render_source(frame, vm, *slot, app.source_scroll);
+                Pane::Source => {
+                    let top = if let Some(vm) = vm {
+                        ui::render_source(frame, vm, *slot, app.source_scroll)
+                    } else if let Some(ref pv) = pv {
+                        ui::render_source_str(frame, &pv.source, *slot, app.source_scroll)
+                    } else {
+                        render_placeholder(frame, Pane::Source, *slot);
+                        0
+                    };
                     app.pane_rects.push((
                         Pane::Source,
                         PaneInfo {
@@ -542,38 +680,49 @@ fn render(frame: &mut Frame, app: &mut AttachedApp, session: &Session) {
                         },
                     ));
                 }
-                (Pane::Disasm, Some(vm)) => {
-                    let top = ui::render_disasm(frame, vm, *slot, app.disasm_scroll);
-                    app.pane_rects.push((
-                        Pane::Disasm,
-                        PaneInfo {
-                            area: *slot,
-                            scroll_top: top,
-                        },
-                    ));
+                Pane::Disasm => {
+                    if let Some(vm) = vm {
+                        let top = ui::render_disasm(frame, vm, *slot, app.disasm_scroll);
+                        app.pane_rects.push((
+                            Pane::Disasm,
+                            PaneInfo {
+                                area: *slot,
+                                scroll_top: top,
+                            },
+                        ));
+                    } else {
+                        render_placeholder(frame, Pane::Disasm, *slot);
+                    }
                 }
-                (Pane::Stack, Some(vm)) => {
-                    let top = ui::render_stack(frame, vm, *slot, app.stack_scroll);
-                    app.pane_rects.push((
-                        Pane::Stack,
-                        PaneInfo {
-                            area: *slot,
-                            scroll_top: top,
-                        },
-                    ));
+                Pane::Stack => {
+                    if let Some(vm) = vm {
+                        let top = ui::render_stack(frame, vm, *slot, app.stack_scroll);
+                        app.pane_rects.push((
+                            Pane::Stack,
+                            PaneInfo {
+                                area: *slot,
+                                scroll_top: top,
+                            },
+                        ));
+                    } else {
+                        render_placeholder(frame, Pane::Stack, *slot);
+                    }
                 }
-                (Pane::Promises, Some(vm)) => {
-                    let top = ui::render_promises(frame, vm, None, *slot, app.promises_scroll);
-                    app.pane_rects.push((
-                        Pane::Promises,
-                        PaneInfo {
-                            area: *slot,
-                            scroll_top: top,
-                        },
-                    ));
+                Pane::Promises => {
+                    if let Some(vm) = vm {
+                        let top = ui::render_promises(frame, vm, None, *slot, app.promises_scroll);
+                        app.pane_rects.push((
+                            Pane::Promises,
+                            PaneInfo {
+                                area: *slot,
+                                scroll_top: top,
+                            },
+                        ));
+                    } else {
+                        render_placeholder(frame, Pane::Promises, *slot);
+                    }
                 }
-                (Pane::Chat, _) => render_placeholder(frame, Pane::Chat, *slot),
-                (pane, None) => render_placeholder(frame, *pane, *slot),
+                Pane::Chat => render_placeholder(frame, Pane::Chat, *slot),
             }
         }
     }
@@ -656,19 +805,26 @@ fn render_chat(
 }
 
 fn render_frame_list(frame: &mut Frame, app: &AttachedApp, session: &Session, area: Rect) {
+    // Frames from the log projection so the navigator survives resume
+    // (decision 8), with live status overlayed from `session.frames()`.
+    let live: std::collections::HashMap<FrameId, &'static str> =
+        session.frames().into_iter().collect();
     let lines: Vec<Line> = session
-        .frames()
+        .tree()
+        .frame_list()
         .iter()
         .enumerate()
-        .map(|(i, (id, status))| {
-            let selected = app.selected == Some(*id);
-            let busy = matches!(*status, "running" | "awaiting llm");
-            let paused = session.is_paused(*id);
+        .map(|(i, fv)| {
+            let selected = app.selected == Some(fv.id);
+            let live_status = live.get(&fv.id).copied();
+            let status = live_status.unwrap_or(if fv.complete { "done" } else { "idle" });
+            let paused = live_status.is_some() && session.is_paused(fv.id);
+            let busy = matches!(live_status, Some("running" | "awaiting llm"));
             let text = format!(
                 "{} {} frame #{} · {}{}",
                 if selected { "▶" } else { " " },
                 i + 1,
-                id.as_u64(),
+                fv.id.as_u64(),
                 status,
                 if paused {
                     " ⏸"
@@ -716,6 +872,33 @@ fn render_attached_console(
             }
         );
         lines.push(Line::from(status).style(Style::default().fg(Color::DarkGray)));
+    }
+    let visible = area.height.saturating_sub(2) as usize;
+    let default_top = lines.len().saturating_sub(visible);
+    let top = scroll.unwrap_or(default_top).min(default_top);
+    let end = (top + visible).min(lines.len());
+    frame.render_widget(
+        Paragraph::new(lines[top..end].to_vec())
+            .block(Block::default().borders(Borders::ALL).title(" console ")),
+        area,
+    );
+    (top, area)
+}
+
+/// Console + result/condition footer from the log projection (Step 5
+/// — no live VM, program view from the tree).
+fn render_console_from_pv(
+    frame: &mut Frame,
+    pv: &ProgramView,
+    area: Rect,
+    scroll: Option<usize>,
+) -> (usize, Rect) {
+    let mut lines: Vec<Line> = pv.console.iter().map(|l| Line::from(l.as_str())).collect();
+    if let Some(ref result) = pv.result {
+        lines.push(Line::from(format!("⇒ {result}")).style(Style::default().fg(Color::Green)));
+    } else if let Some(ref report) = pv.report {
+        let first = report.lines().next().unwrap_or("");
+        lines.push(Line::from(format!("⚡ {first}")).style(Style::default().fg(Color::Yellow)));
     }
     let visible = area.height.saturating_sub(2) as usize;
     let default_top = lines.len().saturating_sub(visible);
@@ -798,7 +981,7 @@ mod tests {
             PaneSet {
                 chat: true,
                 console_left: false,
-                right: vec![]
+                right: vec![Pane::FrameList]
             }
         );
     }
