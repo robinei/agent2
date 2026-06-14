@@ -257,6 +257,7 @@ impl AttachedApp {
                         }
                     } else if let Some(program) = program {
                         self.selected_program = Some(*program);
+                        self.reset_program_scrolls();
                     }
                 }
             }
@@ -269,6 +270,17 @@ impl AttachedApp {
     fn select_frame(&mut self, frame: FrameId) {
         self.selected = Some(frame);
         self.selected_program = None;
+        self.reset_program_scrolls();
+    }
+
+    /// Reset scrolls for the right-hand panes (program-specific content
+    /// that should re-anchor when the visible program changes).
+    fn reset_program_scrolls(&mut self) {
+        self.source_scroll = None;
+        self.console_scroll = None;
+        self.disasm_scroll = None;
+        self.stack_scroll = None;
+        self.promises_scroll = None;
     }
 
     /// The layout state machine's output: view state in, pane set out.
@@ -627,10 +639,14 @@ fn render(frame: &mut Frame, app: &mut AttachedApp, session: &Session) {
 
     if let Some(right) = right {
         let (vm, pv) = resolve_program(app, session);
-        // Old programs (no live VM, from the log) strip VM-only panes.
+        // Old programs (no live VM, from the log) strip VM-only panes
+        // and force source + console (plan Step 5).
         let mut right_panes = panes.right.clone();
         if vm.is_none() && pv.is_some() {
             right_panes.retain(|p| matches!(p, Pane::FrameList | Pane::Source | Pane::Console));
+            if !right_panes.contains(&Pane::Source) {
+                right_panes.insert(1, Pane::Source);
+            }
         }
         let slots = Layout::vertical(right_panes.iter().map(|p| match p {
             Pane::FrameList => Constraint::Length(session.tree().frame_list().len() as u16 + 2),
