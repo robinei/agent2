@@ -843,6 +843,14 @@ impl AgentState {
                 text: report,
             }),
         )?;
+        // Faithful, unclipped console for the log/UI (decision 8): the
+        // report above carries only a clipped tail for the LLM.
+        tree.append(
+            &mut self.spine,
+            EventPayload::Console {
+                lines: run.vm.console_lines.clone(),
+            },
+        )?;
 
         if !fire_and_forget.is_empty() {
             out.push(StepOutput::ToolCalls(fire_and_forget));
@@ -901,6 +909,7 @@ impl AgentState {
             resume,
         }
         .render();
+        let console = run.vm.console_lines.clone();
         let call_id = run.call_id.clone();
         self.phase = Phase::Suspended(run, suspension);
         tree.append(
@@ -911,6 +920,8 @@ impl AgentState {
                 text: report,
             }),
         )?;
+        // Faithful, unclipped console for the log/UI (decision 8).
+        tree.append(&mut self.spine, EventPayload::Console { lines: console })?;
         out.push(self.render_request());
         Ok(out)
     }
@@ -1061,10 +1072,12 @@ fn attachments_from_args(args: &serde_json::Value) -> Result<serde_json::Value, 
             }
             Ok(serde_json::Value::Object(map.clone()))
         }
-        Some(_) => Err("run_program `attachments` must be an object mapping names to content \
+        Some(_) => Err(
+            "run_program `attachments` must be an object mapping names to content \
                         strings, e.g. {\"gameJs\": \"...\"}; read them in the program as \
                         attachments.<name>"
-            .into()),
+                .into(),
+        ),
     }
 }
 
@@ -1209,8 +1222,8 @@ mod tests {
                 EventPayload::Message(Message::Tool { .. }) => "Tool",
                 EventPayload::Invoke { .. } => "Invoke",
                 EventPayload::ProgramResult { .. } => "ProgramResult",
+                EventPayload::Console { .. } => "Console",
                 EventPayload::Label(_) => "Label",
-                EventPayload::TextChunk(_) | EventPayload::ThinkingChunk(_) => "Chunk",
             })
             .collect()
     }
@@ -1313,7 +1326,11 @@ mod tests {
         let out = state.step(&mut tree, StepInput::LlmResponse(msg)).unwrap();
         drain(&mut state, &mut tree, out);
         // "hello world" is 11 bytes.
-        assert!(last_tool_text(&state).contains("returned: 11"), "{}", last_tool_text(&state));
+        assert!(
+            last_tool_text(&state).contains("returned: 11"),
+            "{}",
+            last_tool_text(&state)
+        );
     }
 
     #[test]
@@ -1336,7 +1353,10 @@ mod tests {
         // No program ran; the error is the tool result and a fresh request
         // follows (the repair loop), exactly like a missing `source`.
         let report = last_tool_text(&state);
-        assert!(report.contains("attachments.body") && report.contains("must be a string"), "{report}");
+        assert!(
+            report.contains("attachments.body") && report.contains("must be a string"),
+            "{report}"
+        );
         assert!(expect_request(&out).messages.last().is_some());
     }
 
@@ -1384,6 +1404,7 @@ mod tests {
                 "Assistant",
                 "ProgramResult",
                 "Tool",
+                "Console",
                 "Assistant",
             ]
         );
@@ -1392,10 +1413,7 @@ mod tests {
         state
             .step(&mut tree, StepInput::UserTurn("more".into()))
             .unwrap();
-        assert!(matches!(
-            payload_kinds(&state, &tree).last(),
-            Some(&"User")
-        ));
+        assert!(matches!(payload_kinds(&state, &tree).last(), Some(&"User")));
     }
 
     #[test]

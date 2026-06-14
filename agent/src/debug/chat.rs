@@ -124,9 +124,8 @@ impl ChatState {
             EventPayload::Message(Message::System { .. })
             | EventPayload::Invoke { .. }
             | EventPayload::ProgramResult { .. }
-            | EventPayload::Label(_)
-            | EventPayload::TextChunk(_)
-            | EventPayload::ThinkingChunk(_) => {}
+            | EventPayload::Console { .. }
+            | EventPayload::Label(_) => {}
         }
     }
 

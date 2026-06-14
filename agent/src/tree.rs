@@ -5,6 +5,56 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 
 use jiff::Timestamp;
 
+/// One frame for the navigator pane, projected from the log (decision 8).
+#[derive(Debug, Clone, PartialEq)]
+pub struct FrameView {
+    pub id: EventId,
+    /// The enclosing frame of this frame's call site (`None` for root).
+    pub parent: Option<EventId>,
+    pub prompt: String,
+    /// A `FrameResult` was logged on this frame's spine.
+    pub complete: bool,
+}
+
+/// One inner tool call a program made.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InvokeView {
+    pub name: String,
+    pub args: serde_json::Value,
+    pub result: serde_json::Value,
+}
+
+/// One program execution, projected from the log: everything its panes
+/// need without a live VM (decision 8). `id` is the `run_program`
+/// Assistant event id; a `resume` folds into the same view.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProgramView {
+    pub id: EventId,
+    pub source: String,
+    pub invokes: Vec<InvokeView>,
+    /// The top-level `return` value (`Some` ⇒ ran to completion).
+    pub result: Option<serde_json::Value>,
+    /// The run's `Tool` result text (completion or condition report).
+    pub report: Option<String>,
+    /// Full, unclipped console (from the `Console` event).
+    pub console: Vec<String>,
+}
+
+impl ProgramView {
+    /// Log-derived status for the program-list display. The precise
+    /// suspended-vs-failed split for a *live* program comes from
+    /// `SessionEvent::ProgramStatus`; this is what the log alone shows.
+    pub fn status_label(&self) -> &'static str {
+        if self.result.is_some() {
+            "completed"
+        } else if self.report.is_some() {
+            "condition" // ended on a raise/trap (suspended or failed)
+        } else {
+            "running" // no tool result yet — in flight / interrupted
+        }
+    }
+}
+
 impl Tree {
     pub fn new(file: Option<File>) -> Self {
         Self {
@@ -98,10 +148,6 @@ impl Tree {
     /// innermost frame absorbs chat messages. `FrameStart` must go
     /// through `start_frame`; nothing may follow a `FrameResult`.
     pub fn append(&mut self, spine: &mut Spine, payload: EventPayload) -> io::Result<EventId> {
-        assert!(
-            payload.is_storable(),
-            "live-only chunk appended to log: {payload:?}"
-        );
         assert!(
             !matches!(payload, EventPayload::FrameStart { .. }),
             "FrameStart must go through start_frame"
@@ -199,10 +245,141 @@ impl Tree {
             // are queried from `events` by id (artifacts, replay, UI).
             EventPayload::Invoke { .. }
             | EventPayload::ProgramResult { .. }
+            | EventPayload::Console { .. }
             | EventPayload::Label(_) => {}
-            // Never stored (asserted in append).
-            EventPayload::TextChunk(_) | EventPayload::ThinkingChunk(_) => {}
         }
+    }
+
+    /// Events on `leaf`'s path, root-first (the ordered spine the UI
+    /// projections fold over). Mirrors `spine_at`'s walk but keeps every
+    /// event, including the execution events `spine_at` discards.
+    pub fn path_events(&self, leaf: EventId) -> Vec<&Event> {
+        let mut path = Vec::new();
+        let mut current = Some(leaf);
+        let mut visited: HashSet<EventId> = HashSet::new();
+        while let Some(cur) = current {
+            if !visited.insert(cur) {
+                break; // cycle guard
+            }
+            let Some(event) = self.events.get(&cur) else {
+                break;
+            };
+            path.push(event);
+            current = event.parent_id;
+        }
+        path.reverse();
+        path
+    }
+
+    /// The innermost `FrameStart` at or above `event` — which frame an
+    /// event belongs to.
+    pub fn enclosing_frame(&self, event: EventId) -> Option<EventId> {
+        let mut current = Some(event);
+        while let Some(cur) = current {
+            let ev = self.events.get(&cur)?;
+            if matches!(ev.payload, EventPayload::FrameStart { .. }) {
+                return Some(cur);
+            }
+            current = ev.parent_id;
+        }
+        None
+    }
+
+    /// Every frame in the log, root-first (by id): the frame-navigator
+    /// projection (decision 8). `complete` is whether a `FrameResult` was
+    /// logged on the frame's spine.
+    pub fn frame_list(&self) -> Vec<FrameView> {
+        let mut completed: HashSet<EventId> = HashSet::new();
+        for event in self.events.values() {
+            if let EventPayload::FrameResult { .. } = event.payload
+                && let Some(frame) = event.parent_id.and_then(|p| self.enclosing_frame(p))
+            {
+                completed.insert(frame);
+            }
+        }
+        let mut frames: Vec<FrameView> = self
+            .events
+            .values()
+            .filter_map(|event| match &event.payload {
+                EventPayload::FrameStart { prompt, .. } => Some(FrameView {
+                    id: event.id,
+                    parent: event.parent_id.and_then(|p| self.enclosing_frame(p)),
+                    prompt: prompt.clone(),
+                    complete: completed.contains(&event.id),
+                }),
+                _ => None,
+            })
+            .collect();
+        frames.sort_by_key(|f| f.id.as_u64());
+        frames
+    }
+
+    /// `frame`'s programs along `leaf`'s path, in order — the program-list
+    /// projection (decision 8). Each `run_program` opens a program; a
+    /// `resume` folds into the open one (same VM, one entry); `Invoke`,
+    /// `ProgramResult`, `Console`, and the run's `Tool` result attach to
+    /// it. Everything a finished program's panes need, no live VM.
+    pub fn programs_for(&self, frame: EventId, leaf: EventId) -> Vec<ProgramView> {
+        let mut cur_frame: Option<EventId> = None;
+        let mut programs: Vec<ProgramView> = Vec::new();
+        for ev in self.path_events(leaf) {
+            if let EventPayload::FrameStart { .. } = ev.payload {
+                cur_frame = Some(ev.id);
+                continue;
+            }
+            if cur_frame != Some(frame) {
+                continue;
+            }
+            match &ev.payload {
+                EventPayload::Message(Message::Assistant { tool_calls, .. }) => {
+                    for call in tool_calls {
+                        if call.name == crate::machine::TOOL_RUN_PROGRAM {
+                            let source = call
+                                .arguments
+                                .get("source")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            programs.push(ProgramView {
+                                id: ev.id,
+                                source,
+                                invokes: Vec::new(),
+                                result: None,
+                                report: None,
+                                console: Vec::new(),
+                            });
+                        }
+                        // `resume` continues the open program — no new entry.
+                    }
+                }
+                EventPayload::Invoke { name, args, result } => {
+                    if let Some(p) = programs.last_mut() {
+                        p.invokes.push(InvokeView {
+                            name: name.clone(),
+                            args: args.clone(),
+                            result: result.clone(),
+                        });
+                    }
+                }
+                EventPayload::ProgramResult { value } => {
+                    if let Some(p) = programs.last_mut() {
+                        p.result = Some(value.clone());
+                    }
+                }
+                EventPayload::Console { lines } => {
+                    if let Some(p) = programs.last_mut() {
+                        p.console = lines.clone();
+                    }
+                }
+                EventPayload::Message(Message::Tool { text, .. }) => {
+                    if let Some(p) = programs.last_mut() {
+                        p.report = Some(text.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+        programs
     }
 
     /// The set of spine leaves. A leaf is an event no *spine* event
@@ -266,6 +443,145 @@ mod tests {
         })
     }
 
+    fn run_program_call(id: &str, source: &str) -> EventPayload {
+        EventPayload::Message(Message::Assistant {
+            text: String::new(),
+            thinking: None,
+            tool_calls: vec![ToolCall {
+                id: id.into(),
+                name: "run_program".into(),
+                arguments: json!({ "source": source }),
+            }],
+        })
+    }
+
+    fn resume_call(id: &str) -> EventPayload {
+        EventPayload::Message(Message::Assistant {
+            text: String::new(),
+            thinking: None,
+            tool_calls: vec![ToolCall {
+                id: id.into(),
+                name: "resume".into(),
+                arguments: json!({ "value": null }),
+            }],
+        })
+    }
+
+    fn tool_result(call_id: &str, text: &str) -> EventPayload {
+        EventPayload::Message(Message::Tool {
+            name: "run_program".into(),
+            call_id: call_id.into(),
+            text: text.into(),
+        })
+    }
+
+    // --- Log projections (decision 8: reconstructible from the log) ---
+
+    /// A full program — source, inner tool calls, result, console — round
+    /// trips through a saved-and-reloaded log with no live VM.
+    #[test]
+    fn programs_reconstruct_from_reloaded_log() -> io::Result<()> {
+        let file = NamedTempFile::new()?;
+        let open = || -> io::Result<Tree> {
+            Tree::open(
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(file.path())?,
+            )
+        };
+        let (frame, leaf);
+        {
+            let mut tree = open()?;
+            let mut spine = tree.start_frame(None, "root", json!(null))?;
+            frame = spine.leaf_id; // the FrameStart id is the frame id
+            tree.append(
+                &mut spine,
+                run_program_call("c1", "console.log('hi'); return 42;"),
+            )?;
+            tree.append(
+                &mut spine,
+                EventPayload::Invoke {
+                    name: "bash".into(),
+                    args: json!(["ls"]),
+                    result: json!("file.txt"),
+                },
+            )?;
+            tree.append(&mut spine, EventPayload::ProgramResult { value: json!(42) })?;
+            tree.append(
+                &mut spine,
+                tool_result("c1", "completed: 42 (clipped console…)"),
+            )?;
+            tree.append(
+                &mut spine,
+                EventPayload::Console {
+                    lines: vec!["hi".into()],
+                },
+            )?;
+            leaf = spine.leaf_id;
+        }
+
+        // Reload from disk — nothing live survives, only the log.
+        let tree = open()?;
+        let frames = tree.frame_list();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].id, frame);
+        assert_eq!(frames[0].prompt, "root");
+        assert!(!frames[0].complete, "root never logs a FrameResult");
+
+        let progs = tree.programs_for(frame, leaf);
+        assert_eq!(progs.len(), 1);
+        let p = &progs[0];
+        assert_eq!(p.id, EventId::new(frame.as_u64() + 1)); // the run_program assistant event
+        assert!(p.source.contains("return 42"));
+        assert_eq!(p.invokes.len(), 1);
+        assert_eq!(p.invokes[0].name, "bash");
+        assert_eq!(p.result, Some(json!(42)));
+        assert_eq!(
+            p.console,
+            vec!["hi".to_string()],
+            "full console, not the clipped report"
+        );
+        assert_eq!(p.status_label(), "completed");
+        Ok(())
+    }
+
+    /// A raise that is later resumed to completion is one program; its
+    /// console spans both segments and the latest result wins.
+    #[test]
+    fn raise_then_resume_is_one_program() -> io::Result<()> {
+        let mut tree = Tree::new(None);
+        let mut spine = tree.start_frame(None, "root", json!(null))?;
+        let frame = spine.leaf_id;
+        tree.append(&mut spine, run_program_call("c1", "raise('x');"))?;
+        tree.append(&mut spine, tool_result("c1", "condition: x"))?; // suspend
+        tree.append(&mut spine, resume_call("c2"))?; // continues the same program
+        tree.append(
+            &mut spine,
+            EventPayload::ProgramResult {
+                value: json!("done"),
+            },
+        )?;
+        tree.append(&mut spine, tool_result("c2", "completed: done"))?;
+        tree.append(
+            &mut spine,
+            EventPayload::Console {
+                lines: vec!["before".into(), "after".into()],
+            },
+        )?;
+        let leaf = spine.leaf_id;
+
+        let progs = tree.programs_for(frame, leaf);
+        assert_eq!(progs.len(), 1, "resume folds into one program");
+        assert_eq!(progs[0].result, Some(json!("done")));
+        assert_eq!(
+            progs[0].console,
+            vec!["before".to_string(), "after".to_string()]
+        );
+        assert_eq!(progs[0].status_label(), "completed");
+        Ok(())
+    }
+
     // --- Bootstrap & linear flow ---
 
     #[test]
@@ -313,14 +629,6 @@ mod tests {
                 input: json!(null),
             },
         );
-    }
-
-    #[test]
-    #[should_panic(expected = "live-only chunk")]
-    fn test_append_chunk_panics() {
-        let mut tree = Tree::new(None);
-        let mut spine = tree.start_frame(None, "root", json!(null)).unwrap();
-        let _ = tree.append(&mut spine, EventPayload::TextChunk("hi".into()));
     }
 
     // --- Frame completion ---

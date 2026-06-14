@@ -876,7 +876,7 @@ fn leaf_summary(tree: &Tree, leaf: EventId) -> String {
         EventPayload::Invoke { name, .. } => format!("Invoke: {name}"),
         EventPayload::ProgramResult { value } => format!("ProgramResult: {value}"),
         EventPayload::Label(label) => format!("Label: {label}"),
-        EventPayload::TextChunk(_) | EventPayload::ThinkingChunk(_) => "chunk".into(),
+        EventPayload::Console { lines } => format!("Console: {} lines", lines.len()),
     };
     crate::report::clip(&s, crate::report::PREVIEW_MAX_BYTES)
 }
@@ -959,8 +959,8 @@ mod tests {
                 EventPayload::Message(Message::Tool { .. }) => "Tool",
                 EventPayload::Invoke { .. } => "Invoke",
                 EventPayload::ProgramResult { .. } => "ProgramResult",
+                EventPayload::Console { .. } => "Console",
                 EventPayload::Label(_) => "Label",
-                EventPayload::TextChunk(_) | EventPayload::ThinkingChunk(_) => "Chunk",
             });
             if matches!(event.payload, EventPayload::FrameStart { .. }) {
                 break;
@@ -1010,6 +1010,7 @@ mod tests {
                 "Invoke",
                 "ProgramResult",
                 "Tool",
+                "Console",
                 "Assistant",
                 // The root yields its final answer to the user; the top
                 // conversation never ends, so no `FrameResult` is logged.

@@ -115,8 +115,8 @@ fn state_dir() -> Result<std::path::PathBuf, String> {
     if let Ok(dir) = std::env::var("AGENT2_STATE_DIR") {
         return Ok(std::path::PathBuf::from(dir));
     }
-    let home =
-        std::env::var("HOME").map_err(|_| "neither AGENT2_STATE_DIR nor HOME is set".to_string())?;
+    let home = std::env::var("HOME")
+        .map_err(|_| "neither AGENT2_STATE_DIR nor HOME is set".to_string())?;
     Ok(std::path::PathBuf::from(home).join(".agent2"))
 }
 
@@ -333,7 +333,9 @@ fn print_session_event(event: &SessionEvent) {
                     println!("{head} program result: {value}");
                 }
                 EventPayload::Label(label) => println!("{head} label: {label}"),
-                EventPayload::TextChunk(_) | EventPayload::ThinkingChunk(_) => {}
+                EventPayload::Console { lines } => {
+                    println!("{head} console: {} lines", lines.len());
+                }
             }
         }
     }

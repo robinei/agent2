@@ -78,21 +78,13 @@ pub enum EventPayload {
     /// frame's spine. Renders to chat: no.
     Label(String),
 
-    /// Live streaming only — never stored in the log.
-    TextChunk(String),
-    /// Live streaming only — never stored in the log.
-    ThinkingChunk(String),
-}
-
-impl EventPayload {
-    /// Whether this payload may be appended to the log (chunks are
-    /// live-only).
-    pub fn is_storable(&self) -> bool {
-        !matches!(
-            self,
-            EventPayload::TextChunk(_) | EventPayload::ThinkingChunk(_)
-        )
-    }
+    /// Execution event; the full, unclipped console output of one program
+    /// run, logged at its terminal (success/suspend/abandon). Parent: the
+    /// owning frame's spine, by the run's `Tool` result. Renders to chat:
+    /// no — it is the faithful console for the log and the debugger panes
+    /// (the completion/condition report carries only a clipped tail), so
+    /// a finished program's console survives reload. Never sent to the LLM.
+    Console { lines: Vec<String> },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
