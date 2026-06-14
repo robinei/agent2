@@ -23,8 +23,13 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)]).areas(main);
 
     let console_top = render_console(frame, app, left, app.console_scroll);
-    app.pane_rects
-        .push((PaneId::Console, PaneInfo { area: left, scroll_top: console_top }));
+    app.pane_rects.push((
+        PaneId::Console,
+        PaneInfo {
+            area: left,
+            scroll_top: console_top,
+        },
+    ));
 
     let [status, panes_area] =
         Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(right);
@@ -58,24 +63,48 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             match pane {
                 P::Source => {
                     let top = render_source(frame, vm, *slot, app.source_scroll);
-                    app.pane_rects
-                        .push((PaneId::Source, PaneInfo { area: *slot, scroll_top: top }));
+                    app.pane_rects.push((
+                        PaneId::Source,
+                        PaneInfo {
+                            area: *slot,
+                            scroll_top: top,
+                        },
+                    ));
                 }
                 P::Disasm => {
                     let top = render_disasm(frame, vm, *slot, app.disasm_scroll);
-                    app.pane_rects.push((PaneId::Disasm, PaneInfo { area: *slot, scroll_top: top }));
+                    app.pane_rects.push((
+                        PaneId::Disasm,
+                        PaneInfo {
+                            area: *slot,
+                            scroll_top: top,
+                        },
+                    ));
                 }
                 P::Stack => {
                     let top = render_stack(frame, vm, *slot, app.stack_scroll);
-                    app.pane_rects
-                        .push((PaneId::Stack, PaneInfo { area: *slot, scroll_top: top }));
+                    app.pane_rects.push((
+                        PaneId::Stack,
+                        PaneInfo {
+                            area: *slot,
+                            scroll_top: top,
+                        },
+                    ));
                 }
                 P::Promises => {
-                    let top =
-                        render_promises(frame, vm, app.runner.next_timer(), *slot, app.promises_scroll);
+                    let top = render_promises(
+                        frame,
+                        vm,
+                        app.runner.next_timer(),
+                        *slot,
+                        app.promises_scroll,
+                    );
                     app.pane_rects.push((
                         PaneId::Promises,
-                        PaneInfo { area: *slot, scroll_top: top },
+                        PaneInfo {
+                            area: *slot,
+                            scroll_top: top,
+                        },
                     ));
                 }
             }
@@ -196,7 +225,12 @@ fn styled_source(src: &str) -> Vec<Line<'static>> {
     lines
 }
 
-pub(super) fn render_source(frame: &mut Frame, vm: &interp::VM, area: Rect, scroll: Option<usize>) -> usize {
+pub(super) fn render_source(
+    frame: &mut Frame,
+    vm: &interp::VM,
+    area: Rect,
+    scroll: Option<usize>,
+) -> usize {
     let src: &str = &vm.source;
     let cur_line = panes::current_line(vm);
     let mut lines = styled_source(src);
@@ -231,11 +265,18 @@ fn op_style(op: &str) -> Style {
     }
 }
 
-pub(super) fn render_disasm(frame: &mut Frame, vm: &interp::VM, area: Rect, scroll: Option<usize>) -> usize {
+pub(super) fn render_disasm(
+    frame: &mut Frame,
+    vm: &interp::VM,
+    area: Rect,
+    scroll: Option<usize>,
+) -> usize {
     let height = area.height.saturating_sub(2) as usize;
     let default_top =
         ((vm.ip as i64 - (height / 2) as i64).max(0) as usize).min(vm.code.len().saturating_sub(1));
-    let top = scroll.unwrap_or(default_top).min(vm.code.len().saturating_sub(1));
+    let top = scroll
+        .unwrap_or(default_top)
+        .min(vm.code.len().saturating_sub(1));
     let rows = panes::disasm_window(vm, height, Some(top));
     let dim = Style::default().fg(Color::DarkGray);
     let lines: Vec<Line> = rows
@@ -282,7 +323,12 @@ pub(super) fn render_disasm(frame: &mut Frame, vm: &interp::VM, area: Rect, scro
     top
 }
 
-pub(super) fn render_stack(frame: &mut Frame, vm: &interp::VM, area: Rect, scroll: Option<usize>) -> usize {
+pub(super) fn render_stack(
+    frame: &mut Frame,
+    vm: &interp::VM,
+    area: Rect,
+    scroll: Option<usize>,
+) -> usize {
     let frame_bg = Color::Indexed(235);
     let temp_bg = Color::Indexed(238);
     let width = area.width.saturating_sub(2) as usize;

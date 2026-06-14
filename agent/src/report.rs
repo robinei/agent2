@@ -388,8 +388,16 @@ mod tests {
         // Wrote two files, no inspection in the same program → nudge.
         let rendered = completion(vec![
             artifact(4, "bash([\"mkdir -p /x\"])", json!({ "status": 0 })),
-            artifact(5, "create_file([\"/x/index.html\", \"…\"])", json!({ "version": "a" })),
-            artifact(6, "create_file([\"/x/game.js\", \"…\"])", json!({ "version": "b" })),
+            artifact(
+                5,
+                "create_file([\"/x/index.html\", \"…\"])",
+                json!({ "version": "a" }),
+            ),
+            artifact(
+                6,
+                "create_file([\"/x/game.js\", \"…\"])",
+                json!({ "version": "b" }),
+            ),
         ]);
         assert!(rendered.contains("## note"), "{rendered}");
         assert!(rendered.contains("wrote files but didn't check them"));
@@ -405,10 +413,17 @@ mod tests {
             artifact(7, "bash([\"cargo build\"])", json!({ "status": 0 })),
         ] {
             let rendered = completion(vec![
-                artifact(5, "create_file([\"/x/game.js\", \"…\"])", json!({ "version": "b" })),
+                artifact(
+                    5,
+                    "create_file([\"/x/game.js\", \"…\"])",
+                    json!({ "version": "b" }),
+                ),
                 verify,
             ]);
-            assert!(!rendered.contains("## note"), "unexpected nudge: {rendered}");
+            assert!(
+                !rendered.contains("## note"),
+                "unexpected nudge: {rendered}"
+            );
         }
     }
 

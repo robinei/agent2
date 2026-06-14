@@ -481,10 +481,22 @@ fn render(frame: &mut Frame, app: &mut AttachedApp, session: &Session) {
 
     if panes.chat {
         let (top, chat_area) = render_chat(frame, app, left, app.chat_scroll);
-        app.pane_rects.push((Pane::Chat, PaneInfo { area: chat_area, scroll_top: top }));
+        app.pane_rects.push((
+            Pane::Chat,
+            PaneInfo {
+                area: chat_area,
+                scroll_top: top,
+            },
+        ));
     } else if panes.console_left {
         let (top, area) = render_attached_console(frame, app, session, left, app.console_scroll);
-        app.pane_rects.push((Pane::Console, PaneInfo { area, scroll_top: top }));
+        app.pane_rects.push((
+            Pane::Console,
+            PaneInfo {
+                area,
+                scroll_top: top,
+            },
+        ));
     }
 
     if let Some(right) = right {
@@ -501,28 +513,64 @@ fn render(frame: &mut Frame, app: &mut AttachedApp, session: &Session) {
             match (pane, vm) {
                 (Pane::FrameList, _) => {
                     render_frame_list(frame, app, session, *slot);
-                    app.pane_rects.push((Pane::FrameList, PaneInfo { area: *slot, scroll_top: 0 }));
+                    app.pane_rects.push((
+                        Pane::FrameList,
+                        PaneInfo {
+                            area: *slot,
+                            scroll_top: 0,
+                        },
+                    ));
                 }
                 (Pane::Console, _) => {
                     let (top, area) =
                         render_attached_console(frame, app, session, *slot, app.console_scroll);
-                    app.pane_rects.push((Pane::Console, PaneInfo { area, scroll_top: top }));
+                    app.pane_rects.push((
+                        Pane::Console,
+                        PaneInfo {
+                            area,
+                            scroll_top: top,
+                        },
+                    ));
                 }
                 (Pane::Source, Some(vm)) => {
                     let top = ui::render_source(frame, vm, *slot, app.source_scroll);
-                    app.pane_rects.push((Pane::Source, PaneInfo { area: *slot, scroll_top: top }));
+                    app.pane_rects.push((
+                        Pane::Source,
+                        PaneInfo {
+                            area: *slot,
+                            scroll_top: top,
+                        },
+                    ));
                 }
                 (Pane::Disasm, Some(vm)) => {
                     let top = ui::render_disasm(frame, vm, *slot, app.disasm_scroll);
-                    app.pane_rects.push((Pane::Disasm, PaneInfo { area: *slot, scroll_top: top }));
+                    app.pane_rects.push((
+                        Pane::Disasm,
+                        PaneInfo {
+                            area: *slot,
+                            scroll_top: top,
+                        },
+                    ));
                 }
                 (Pane::Stack, Some(vm)) => {
                     let top = ui::render_stack(frame, vm, *slot, app.stack_scroll);
-                    app.pane_rects.push((Pane::Stack, PaneInfo { area: *slot, scroll_top: top }));
+                    app.pane_rects.push((
+                        Pane::Stack,
+                        PaneInfo {
+                            area: *slot,
+                            scroll_top: top,
+                        },
+                    ));
                 }
                 (Pane::Promises, Some(vm)) => {
                     let top = ui::render_promises(frame, vm, None, *slot, app.promises_scroll);
-                    app.pane_rects.push((Pane::Promises, PaneInfo { area: *slot, scroll_top: top }));
+                    app.pane_rects.push((
+                        Pane::Promises,
+                        PaneInfo {
+                            area: *slot,
+                            scroll_top: top,
+                        },
+                    ));
                 }
                 (Pane::Chat, _) => render_placeholder(frame, Pane::Chat, *slot),
                 (pane, None) => render_placeholder(frame, *pane, *slot),
@@ -564,7 +612,12 @@ fn chat_style(kind: ChatKind) -> Style {
     }
 }
 
-fn render_chat(frame: &mut Frame, app: &AttachedApp, area: Rect, scroll: Option<usize>) -> (usize, Rect) {
+fn render_chat(
+    frame: &mut Frame,
+    app: &AttachedApp,
+    area: Rect,
+    scroll: Option<usize>,
+) -> (usize, Rect) {
     let [transcript_area, input_area] =
         Layout::vertical([Constraint::Min(1), Constraint::Length(3)]).areas(area);
 

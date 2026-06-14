@@ -164,14 +164,16 @@ fn attachments_is_a_read_only_host_const() {
     // Same protections as `input`: cannot reassign or shadow.
     let reassign = compile("attachments = {};").unwrap_err();
     assert!(
-        reassign.iter().any(|d| d.message.contains("reassign")
-            && d.message.contains("attachments")),
+        reassign
+            .iter()
+            .any(|d| d.message.contains("reassign") && d.message.contains("attachments")),
         "got: {reassign:?}"
     );
     let shadow = compile("const attachments = 1; return attachments;").unwrap_err();
     assert!(
-        shadow.iter().any(|d| d.message.contains("shadow")
-            && d.message.contains("attachments")),
+        shadow
+            .iter()
+            .any(|d| d.message.contains("shadow") && d.message.contains("attachments")),
         "got: {shadow:?}"
     );
 }
