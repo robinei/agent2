@@ -21,9 +21,7 @@ pub const CONSOLE_LINE_MAX_BYTES: usize = 200;
 /// Artifact-menu entries shown (most recent kept; older ids stay valid).
 pub const MENU_MAX_ENTRIES: usize = 20;
 /// Per-entry preview bytes in the artifact menu.
-pub const PREVIEW_MAX_BYTES: usize = 80;
-/// Max bytes of the completion report's returned-value preview.
-pub const VALUE_MAX_BYTES: usize = 1024;
+pub const PREVIEW_MAX_BYTES: usize = 256;
 
 /// One artifact-menu entry: an `Invoke` or `ProgramResult` event,
 /// fetchable in full via `tools.tool_result(id)`.
@@ -98,8 +96,13 @@ impl ConditionReport {
 
 /// The `run_program` tool result for a successful run.
 pub struct CompletionReport {
-    /// The program's top-level return value.
+    /// The program's top-level return value — the frame's *answer* into
+    /// context, rendered up to [`Self::budget`] with the full value kept
+    /// as a fetchable `ProgramResult` artifact.
     pub value: serde_json::Value,
+    /// Byte budget for the returned-value section (the frame's answer
+    /// budget). Replaces the fixed `VALUE_MAX_BYTES` clip.
+    pub budget: usize,
     /// Full console log (the renderer tails it).
     pub console: Vec<String>,
     /// Artifacts logged since the run started (its `ProgramResult`
@@ -116,7 +119,11 @@ impl CompletionReport {
         let mut out = String::new();
         out.push_str("## program completed\n");
         out.push_str("returned: ");
-        out.push_str(&clip(&self.value.to_string(), VALUE_MAX_BYTES));
+        out.push_str(&clip_answer(
+            &self.value.to_string(),
+            self.budget,
+            self.result_id(),
+        ));
         out.push_str("\n\n");
         out.push_str(&render_console(&self.console));
         out.push_str("\n\n");
@@ -147,6 +154,18 @@ impl CompletionReport {
             }
         }
         out
+    }
+
+    /// The `ProgramResult` artifact id (this run's full return value),
+    /// named in the truncation marker so an over-budget answer stays
+    /// fetchable. It is the `program result`-labelled entry among the
+    /// run's new artifacts (`machine.rs` logs exactly one).
+    fn result_id(&self) -> Option<u64> {
+        self.new_artifacts
+            .iter()
+            .rev()
+            .find(|a| a.label == "program result")
+            .map(|a| a.id)
     }
 
     /// Whether this run created or replaced files but never inspected
@@ -258,6 +277,29 @@ pub fn clip(s: &str, max: usize) -> String {
     format!("{}… [truncated; {} bytes total]", &s[..end], s.len())
 }
 
+/// Clip a frame's *answer* (the returned value) to its budget. Unlike
+/// [`clip`], an over-budget answer's marker names the fetch id so the full
+/// value stays reachable (`tools.tool_result(#id)`) — the answer is the
+/// one value the model may genuinely need in full (12_ANSWERS).
+pub fn clip_answer(s: &str, max: usize, id: Option<u64>) -> String {
+    if s.len() <= max {
+        return s.to_owned();
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    match id {
+        Some(id) => format!(
+            "{}… [+{} B — tools.tool_result(#{})]",
+            &s[..end],
+            s.len() - end,
+            id
+        ),
+        None => format!("{}… [truncated; {} bytes total]", &s[..end], s.len()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -332,17 +374,39 @@ mod tests {
     }
 
     #[test]
-    fn returned_value_is_bounded() {
+    fn answer_within_budget_is_verbatim() {
+        // An answer that fits the budget is delivered in full — the read /
+        // summarize happy path (12_ANSWERS).
         let report = CompletionReport {
-            value: json!("z".repeat(50_000)),
+            value: json!("z".repeat(5_000)),
+            budget: 64 * 1024,
             console: Vec::new(),
             new_artifacts: Vec::new(),
             advise_attachments: false,
         };
         let rendered = report.render();
         let line = rendered.lines().nth(1).unwrap();
-        assert!(line.len() < VALUE_MAX_BYTES + 100);
-        assert!(line.contains("[truncated; 50002 bytes total]"));
+        assert!(line.contains(&"z".repeat(5_000)), "delivered in full");
+        assert!(
+            !line.contains("tools.tool_result"),
+            "no spill marker: {line}"
+        );
+    }
+
+    #[test]
+    fn over_budget_answer_names_fetch_id() {
+        // Past budget the context copy is truncated, but the marker names
+        // the `ProgramResult` id so the full value stays fetchable.
+        let report = CompletionReport {
+            value: json!("z".repeat(5_000)),
+            budget: 1_000,
+            console: Vec::new(),
+            new_artifacts: vec![artifact(9, "program result", json!("z".repeat(5_000)))],
+            advise_attachments: false,
+        };
+        let rendered = report.render();
+        let line = rendered.lines().nth(1).unwrap();
+        assert!(line.contains("tools.tool_result(#9)"), "{line}");
     }
 
     #[test]
@@ -356,7 +420,7 @@ mod tests {
         };
         let rendered = report.render();
         let menu_line = rendered.lines().find(|l| l.starts_with("[#7]")).unwrap();
-        assert!(menu_line.len() < 300, "{menu_line}");
+        assert!(menu_line.len() < PREVIEW_MAX_BYTES + 100, "{menu_line}");
         assert!(menu_line.contains("[truncated; 9002 bytes total]"));
     }
 
@@ -376,6 +440,7 @@ mod tests {
     fn completion(artifacts: Vec<Artifact>) -> String {
         CompletionReport {
             value: json!({ "status": "done" }),
+            budget: 64 * 1024,
             console: Vec::new(),
             new_artifacts: artifacts,
             advise_attachments: false,
@@ -431,6 +496,7 @@ mod tests {
     fn inlined_body_draws_the_attachments_nudge() {
         let report = CompletionReport {
             value: json!("done"),
+            budget: 64 * 1024,
             console: Vec::new(),
             new_artifacts: vec![artifact(5, "create_file([\"/x/a.js\", \"…\"])", json!({}))],
             advise_attachments: true,

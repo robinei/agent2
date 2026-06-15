@@ -722,9 +722,10 @@ impl Session {
             invoke_id,
             prompt,
             input,
+            budget,
         } = spawn;
         let call_site = self.states[&parent].spine.leaf_id;
-        let mut child = AgentState::new_child(&mut self.tree, call_site, prompt, input)?;
+        let mut child = AgentState::new_child(&mut self.tree, call_site, prompt, input, budget)?;
         child.set_dialect_card(dialect_card(&self.registry));
         let child_id = child.spine.leaf_id; // the FrameStart it was rooted at
         self.emit_new(child_id);

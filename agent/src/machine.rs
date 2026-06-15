@@ -90,10 +90,18 @@ pub fn resume_spec() -> ToolSpec {
 /// but a pathological program could chain those forever.
 const MAX_PUMP_ROUNDS: usize = 100;
 
-/// KB-scale loud guard on a program's `return` value.  Oversized returns
-/// are rejected with "return something smaller — status-shaped, not
-/// data" — the discipline that replaces the silent clip.
-const PROGRAM_RESULT_MAX_BYTES: usize = 4096;
+/// Default budget for a frame's *answer* — the one value that deliberately
+/// crosses into a mind's context: a program's `return` (into its own
+/// frame) and a subagent's final turn (into its caller). Sized to a
+/// typical source file so an ordinary read or summary lands in one shot
+/// (DESIGN.md "The one exception"; 12_ANSWERS). The full value is always a
+/// fetchable artifact; only the context copy is truncated past this. A
+/// caller may raise a child's budget via `agent({ budget })`.
+const DEFAULT_ANSWER_BUDGET: usize = 64 * 1024;
+
+/// How many times a subagent whose final answer exceeds its budget is
+/// re-prompted to tighten it before the host truncates it deterministically.
+const ANSWER_RETRY_LIMIT: u8 = 1;
 
 /// A `create_file`/`replace_file` whose inline content exceeds this draws
 /// the attachments nudge (when the run passed no `attachments`): more than
@@ -162,6 +170,8 @@ pub struct SpawnFrame {
     pub invoke_id: u64,
     pub prompt: String,
     pub input: serde_json::Value,
+    /// The child's answer budget (`agent({ budget })`); `None` → default.
+    pub budget: Option<usize>,
 }
 
 /// One program execution: the `run_program` tool call being served.
@@ -235,6 +245,12 @@ pub struct AgentState {
     /// one step — a rewrite abandoning the old run as a new one starts —
     /// both surface, and so the sans-io output set is untouched.
     status_transitions: Vec<(EventId, ProgramStatus)>,
+    /// Byte budget for this frame's *answer* into context (decisions 2, 6):
+    /// program `return`s and (for a subagent) the final turn. Seeded from
+    /// the spawning `agent({ budget })` or `DEFAULT_ANSWER_BUDGET`.
+    answer_budget: usize,
+    /// Re-prompts spent tightening an over-budget final answer (decision 4).
+    answer_retries: u8,
 }
 
 enum SuspendCause {
@@ -263,10 +279,12 @@ impl AgentState {
         call_site: EventId,
         prompt: impl Into<String>,
         input: serde_json::Value,
+        budget: Option<usize>,
     ) -> io::Result<Self> {
         let spine = tree.start_frame(Some(call_site), prompt, input)?;
         let mut state = Self::with_spine(spine);
         state.is_root = false; // a subagent frame completes and returns
+        state.answer_budget = budget.unwrap_or(DEFAULT_ANSWER_BUDGET);
         Ok(state)
     }
 
@@ -284,6 +302,8 @@ impl AgentState {
             dialect_card: String::new(),
             last_vm: None,
             status_transitions: Vec::new(),
+            answer_budget: DEFAULT_ANSWER_BUDGET,
+            answer_retries: 0,
         }
     }
 
@@ -744,6 +764,10 @@ impl AgentState {
                         Some(prompt) => {
                             let input =
                                 arg.get("input").cloned().unwrap_or(serde_json::Value::Null);
+                            let budget = arg
+                                .get("budget")
+                                .and_then(|b| b.as_u64())
+                                .map(|b| b as usize);
                             let id = self.register_pending(
                                 "agent",
                                 serde_json::json!([arg]),
@@ -753,6 +777,7 @@ impl AgentState {
                                 invoke_id: id,
                                 prompt,
                                 input,
+                                budget,
                             });
                         }
                         None => {
@@ -847,26 +872,17 @@ impl AgentState {
         let Phase::Running(run) = std::mem::replace(&mut self.phase, Phase::Idle) else {
             unreachable!()
         };
-        let mut value_json = run
+        let value_json = run
             .vm
             .stack_value_to_json(&value, 0)
             .unwrap_or_else(|_| serde_json::Value::String(format!("{value:?}")));
 
-        // Loud refusal on oversized returns: the discipline that replaces
-        // the silent clip.  Tool results (which may hold the real data)
-        // are still fetchable by id.
-        let size = serde_json::to_string(&value_json)
-            .map(|s| s.len())
-            .unwrap_or(0);
-        let return_rejected = size > PROGRAM_RESULT_MAX_BYTES;
-        let mut completion_value = value_json.clone();
-        if return_rejected {
-            value_json = serde_json::Value::String(format!(
-                "return value too large: {size} bytes (limit {PROGRAM_RESULT_MAX_BYTES}); \
-                 return something smaller — status-shaped, not data"
-            ));
-            completion_value = value_json.clone();
-        }
+        // The return is the program's *answer* into this frame's context —
+        // the one value that deliberately crosses into a mind (DESIGN.md
+        // "The one exception"). It is budgeted, not rejected: the full
+        // value is logged as a fetchable `ProgramResult` below, and only
+        // the context copy is truncated (naming its id) by the report.
+        let completion_value = value_json.clone();
 
         // Fire-and-forget calls the program never awaited: the host
         // decides whether to run them; results are logged as late
@@ -900,6 +916,7 @@ impl AgentState {
             !run.had_attachments && self.run_inlined_large_body(tree, run.started_at);
         let report = CompletionReport {
             value: completion_value,
+            budget: self.answer_budget,
             console: run.vm.console_lines.clone(),
             new_artifacts: self.new_artifacts(tree, run.started_at),
             advise_attachments,
@@ -1007,18 +1024,45 @@ impl AgentState {
             self.last_vm = Some(run.vm);
         }
         self.generation += 1;
-        let result = match self.spine.frame().messages.last() {
-            Some(Message::Assistant { text, .. }) => serde_json::Value::String(text.clone()),
-            _ => serde_json::Value::Null,
+        let text = match self.spine.frame().messages.last() {
+            Some(Message::Assistant { text, .. }) => text.clone(),
+            _ => String::new(),
         };
         if self.is_root {
             // The top conversation never ends: yield the turn to the user
             // without logging a `FrameResult`, so the spine stays
-            // appendable for the next `UserTurn`. The assistant's final
-            // text is already on the spine as the answer.
+            // appendable for the next `UserTurn`. The root's answer goes to
+            // the *user*, not into another context — human-bound, delivered
+            // in full (the answer budget governs mind-bound answers only).
             self.phase = Phase::Idle;
             return Ok(vec![StepOutput::Yielded]);
         }
+        // A subagent's final answer crosses into its caller's context — the
+        // one mind-bound deliverable (decision 4). Budget it: re-prompt
+        // once to tighten, then truncate-with-note. The full prose stays on
+        // the spine as the Assistant message regardless.
+        if text.len() > self.answer_budget && self.answer_retries < ANSWER_RETRY_LIMIT {
+            self.answer_retries += 1;
+            let nudge = format!(
+                "[harness] Your answer is {} bytes; the budget is {}. Tighten it to a \
+                 digest, or write a large product with create_file and report its path.",
+                text.len(),
+                self.answer_budget
+            );
+            tree.append(
+                &mut self.spine,
+                EventPayload::Message(Message::User { text: nudge }),
+            )?;
+            self.phase = Phase::AwaitingLlm;
+            return Ok(vec![self.render_request()]);
+        }
+        let result = if text.is_empty() {
+            serde_json::Value::Null
+        } else if text.len() > self.answer_budget {
+            serde_json::Value::String(truncate_answer(&text, self.answer_budget))
+        } else {
+            serde_json::Value::String(text)
+        };
         tree.append(
             &mut self.spine,
             EventPayload::FrameResult {
@@ -1157,6 +1201,22 @@ fn value_json(vm: &VM, v: &Value) -> serde_json::Value {
 // Alias for call sites where `value_json` would shadow a local.
 fn value_json_of(vm: &VM, v: &Value) -> serde_json::Value {
     value_json(vm, v)
+}
+
+/// Truncate an over-budget subagent answer for delivery to its caller,
+/// with a note pointing at the two sound moves (ask for less / write a
+/// file). The full prose remains on the child's spine for the log/TUI.
+fn truncate_answer(text: &str, budget: usize) -> String {
+    let mut end = budget.min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "{}… [answer truncated to {} of {} bytes — ask for less, or have me write a file]",
+        &text[..end],
+        end,
+        text.len()
+    )
 }
 
 fn render_diags(source: &str, diags: &[Diagnostic]) -> String {
@@ -1749,6 +1809,7 @@ mod tests {
             state.spine.leaf_id,
             &spawn.prompt,
             spawn.input.clone(),
+            spawn.budget,
         )
         .unwrap();
         assert_eq!(tree.list_leaves().len(), 2, "caller + in-flight child");
@@ -1924,38 +1985,102 @@ got X
         let _ = state.step(&mut tree, StepInput::UserTurn("are you done?".into()));
     }
 
+    fn program_result_value(state: &AgentState, tree: &Tree) -> serde_json::Value {
+        state
+            .frame_segment(tree)
+            .iter()
+            .find_map(|e| match &e.payload {
+                EventPayload::ProgramResult { value } => Some(value.clone()),
+                _ => None,
+            })
+            .expect("a ProgramResult")
+    }
+
     #[test]
-    fn oversized_program_return_is_rejected() {
+    fn program_return_is_delivered_up_to_budget() {
         let (mut tree, mut state) = setup();
         state.kickoff(&mut tree).unwrap();
-        // Return a large string — bigger than PROGRAM_RESULT_MAX_BYTES (4096).
+        // A moderate return (well under the 64 KB answer budget) is
+        // delivered in full and logged in full — the read/summarize happy
+        // path that the old 4 KB reject broke (12_ANSWERS).
         let src = "return \"x\".repeat(5000);";
         let out = state
             .step(&mut tree, StepInput::LlmResponse(llm_program("c1", src)))
             .unwrap();
         drain(&mut state, &mut tree, out);
         let report = last_tool_text(&state);
-        assert!(
-            report.contains("return value too large"),
-            "rejection in report: {report}"
+        assert!(report.contains(&"x".repeat(5000)), "delivered in full");
+        assert!(!report.contains("tools.tool_result(#"), "no spill marker");
+        assert_eq!(
+            program_result_value(&state, &tree).as_str().unwrap().len(),
+            5000,
+            "full value logged"
         );
+    }
+
+    #[test]
+    fn over_budget_return_truncates_with_fetch_id() {
+        let (mut tree, mut state) = setup();
+        state.kickoff(&mut tree).unwrap();
+        // Force a tiny budget so a modest return is over it deterministically
+        // (the VM caps `String.repeat` at 10 KB, well under the default).
+        state.answer_budget = 100;
+        let src = "return \"x\".repeat(5000);";
+        let out = state
+            .step(&mut tree, StepInput::LlmResponse(llm_program("c1", src)))
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+        let report = last_tool_text(&state);
+        // The returned-value line is truncated with a marker naming the id.
+        let returned = report.lines().nth(1).unwrap();
         assert!(
-            report.contains("status-shaped, not data"),
-            "discipline message: {report}"
+            returned.contains("tools.tool_result(#"),
+            "spill marker on returned line: {returned}"
         );
-        // The ProgramResult event logged the refusal, not the 5KB string.
-        let pr_value = state
-            .frame_segment(&tree)
-            .iter()
-            .find_map(|e| match &e.payload {
-                EventPayload::ProgramResult { value } => Some(value.clone()),
-                _ => None,
-            })
-            .expect("a ProgramResult");
-        let logged = pr_value.as_str().unwrap();
+        // The full value is logged for fetching.
+        assert_eq!(
+            program_result_value(&state, &tree).as_str().unwrap().len(),
+            5000,
+            "full value logged"
+        );
+    }
+
+    #[test]
+    fn over_budget_subagent_answer_reprompts_then_truncates() {
+        let (mut tree, root) = setup();
+        let call_site = root.spine.leaf_id;
+        let mut child =
+            AgentState::new_child(&mut tree, call_site, "summarize", json!({}), Some(50)).unwrap();
+        child.kickoff(&mut tree).unwrap();
+        let long = "y".repeat(500);
+        // First over-budget final answer → one re-prompt, not completion.
+        let out = child
+            .step(&mut tree, StepInput::LlmResponse(llm_text(&long)))
+            .unwrap();
         assert!(
-            logged.contains("return value too large"),
-            "logged refusal, not the data: {logged}"
+            matches!(out[..], [StepOutput::LlmRequest(_)]),
+            "re-prompted once: {out:?}"
+        );
+        // Second over-budget answer → deterministic truncate-with-note.
+        let out = child
+            .step(&mut tree, StepInput::LlmResponse(llm_text(&long)))
+            .unwrap();
+        let result = match &out[..] {
+            [StepOutput::FrameDone(v)] => v.clone(),
+            other => panic!("expected FrameDone, got {other:?}"),
+        };
+        let delivered = result.as_str().unwrap();
+        assert!(delivered.contains("answer truncated"), "note: {delivered}");
+        assert!(delivered.len() < long.len(), "delivered value is bounded");
+        // The full prose stays on the child's spine (last Assistant message).
+        assert!(
+            child
+                .spine
+                .frame()
+                .messages
+                .iter()
+                .any(|m| matches!(m, Message::Assistant { text, .. } if text.len() == 500)),
+            "full prose retained on spine"
         );
     }
 }

@@ -3,7 +3,7 @@
 A code-mode agent system: the LLM writes JS programs that orchestrate tool
 calls; the programs run on a bespoke deterministic VM; and a Lisp-style
 condition system makes the LLM (and above it, the user) the interactive
-restart handler. The numbered plan files (`0_…` – `9_…`) are the roadmap;
+restart handler. The numbered plan files (`0_…` – `12_…`) are the roadmap;
 this file is the rationale they all serve. Where a plan file and this file
 disagree, surface it — that's a design change, not a detail.
 
@@ -66,6 +66,33 @@ Parallel spine for concurrency: it lives in the **program layer**
 (promises + outbox, 7_ASYNC), so the conversation tree never needs a
 concurrency mechanism — subagents are tools, transcripts are branches,
 the tree just allows multiple active leaves.
+
+## The one exception: the answer crosses into context
+
+The spine keeps the LLM out of the *data* path — tool output lives in
+variables and the log, reachable by id, never re-sent in context. That
+invariant holds for everything except the one value that is the LLM's own
+deliverable: the **answer** a frame was asked to produce. Reading and
+summarizing are not orchestration; their product *is* data the model must
+take into its head and re-author. So the answer — a program's `return`
+rendered into the completion report, and a subagent's final turn rendered
+to its caller — is the sole channel by which bytes deliberately enter a
+context. It is **budgeted, not clipped to a token**: generous enough that
+an ordinary file read or summary lands in one shot, with the full value
+always kept as a fetchable artifact and only the context copy truncated
+(naming its id) past the budget.
+
+This supersedes the earlier "`return` only small, status-shaped values"
+discipline, which was right about orchestration data and wrong about
+deliverables — it forced read/summarize tasks to smuggle content through
+`/tmp` chunking (12_ANSWERS). The rule that replaces it: **machine-bound
+data travels by reference and never enters a context; mind-bound data is
+exactly the answer, and its budget rides in the request.** A model never
+opts into this — the obvious path (return what you want to read; write a
+large product with `create_file`) *is* the correct one, and the budget
+only fails safe when an answer is genuinely oversized. The test for any
+mechanism on this path: if the model has to *know it exists* to get the
+obvious task right, that is a smell, not a feature.
 
 ## Product surface
 

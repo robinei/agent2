@@ -73,11 +73,20 @@ reports list every completed call as `[#id] ...`, and \
 not a re-run. If the world may have changed since, make a fresh call \
 instead.
 
-## status-result discipline
+## answers and results
 - Tool results can be large; they live in variables and the log, not \
-your context — keep them there.
-- `return` and `console.log` only small, status-shaped values. \
-Oversized returns are rejected.
+your context — keep them there, work on them in the program, and reuse \
+them by id.
+- To bring content into your *reasoning*, `return` it: returns are \
+budgeted (~64 KB by default; a caller may raise a subagent's via \
+`agent(task, {budget})`), delivered into your context up to that budget, \
+with the full value always fetchable by id. Reading three files to \
+summarize them is one program that returns the summary — never \
+`bash sed`/`tool_result` content into `/tmp` to read it back in slices.
+- To digest many large files, spawn one `agent` per file — each *returns \
+its summary*. If your answer is a large *product* (a verbatim file, a \
+full report), `create_file` it and report the path; don't try to shrink \
+it into the return.
 
 ## editing files
 - Read into a variable → locate structurally (`grep -n`, an outline, \
@@ -128,8 +137,10 @@ single array parameter. Every call returns a promise; `await` it. Calls \
 started before awaiting run in parallel (`Promise.all` works).
 - tools.tool_result(id) — re-fetch artifact [#id] from the log \
 (instant, free).
-- tools.agent({ prompt, input }) — delegate a subtask to a fresh \
-subagent; resolves to its JSON result. It sees only what you pass it.
+- tools.agent({ prompt, input, budget? }) — delegate a subtask to a \
+fresh subagent; resolves to its JSON result. It sees only what you pass \
+it. `budget` (bytes) caps the answer it delivers into your context \
+(default ~64 KB); raise it when you want a large result back.
 - Before repeating a call shown in the menu, read the call — if it \
 wrote, sent, or deleted, it already happened; reuse its result with \
 `tool_result(id)` instead of re-running. Pure reads are free to repeat.";
@@ -326,7 +337,7 @@ mod tests {
             "tools.tool_result(id)",
             "Call tools **positionally**",
             "not a single array parameter",
-            "tools.agent({ prompt, input })",
+            "tools.agent({ prompt, input, budget? })",
             "raise(name, payload)",
             "resume(value)",
             "No `this` or `class`",
@@ -340,9 +351,9 @@ mod tests {
             "create_file(path, content)",
             "replace_file(path,",
             "verify in the same program",
-            "status-result discipline",
+            "answers and results",
             "Tool results can be large",
-            "status-shaped",
+            "returns are budgeted",
             "returned *then*",
             "Before repeating a call",
             "if it wrote, sent, or deleted, it already happened",

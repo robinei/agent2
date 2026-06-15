@@ -268,6 +268,14 @@ Acceptance (scripted LLM only — no network in this step):
 - [x] Completion report gets the same machinery: returned-value
       preview, console tail, new-artifact menu (artifacts logged since
       the run started, the `ProgramResult` included).
+      - **Superseded by 12_ANSWERS:** the returned value is the frame's
+        *answer* into context, so it is bounded by the per-frame
+        **answer budget** (`answer_budget`, ~64 KB default), not the
+        fixed `VALUE_MAX_BYTES` clip; past budget the context copy
+        truncates with a marker naming the `ProgramResult` id
+        (`tools.tool_result(#id)`) and the full value stays logged. The
+        old 4 KB "status-shaped, not data" *rejection* of oversized
+        returns is gone.
 - [x] Hard size bounds on **every** section, as named consts in
       `report.rs` (what/payload bytes, stack depth, console line count
       + per-line clip, artifact entry count + per-entry preview bytes,
