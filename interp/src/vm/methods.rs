@@ -35,7 +35,6 @@ impl VM {
             ip: 0,
             fp: 0,
             cur_local_count: 0,
-            fuel: 0,
             spans: Vec::new(),
             source: Arc::from(""),
             console_lines: Vec::new(),
@@ -1189,9 +1188,8 @@ impl VM {
     /// immediately). The host owns the total per-program budget by
     /// counting slices; debuggers single-step with `fuel = 1` (9_TUI).
     pub fn step(&mut self, fuel: u64) -> Result<StepResult, VMError> {
-        self.fuel = fuel;
         loop {
-            match self.dispatch() {
+            match self.dispatch(fuel) {
                 Err(e) if matches!(e.resume, ResumeMode::PushValueThenContinue) => {
                     if self.reachable_handler() {
                         let thrown = self.error_to_thrown(&e);

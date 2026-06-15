@@ -306,14 +306,6 @@ pub struct VM {
     /// (→ the restored caller frame's count). `local_count` only changes at
     /// those four sites, so the mirror is always current.
     cur_local_count: u32,
-    /// Remaining instruction budget for the current `step(fuel)` call: set
-    /// from the argument at entry, decremented once per executed
-    /// instruction; reaching zero yields `StepResult::OutOfFuel`. Per-slice
-    /// state only — the total per-program budget is host policy (the host
-    /// counts slices), and that budget is the primary backstop against
-    /// runaway execution since the heap grows monotonically (no
-    /// reclamation, by design — programs are expected to be short-lived).
-    fuel: u64,
     /// Source byte offset per instruction (`spans[ip]`), populated by
     /// `for_program` from `Program::spans`. Empty when constructed via
     /// `VM::new` (hand-assembled instructions used by tests).

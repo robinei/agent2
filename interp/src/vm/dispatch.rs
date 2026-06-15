@@ -29,7 +29,7 @@ fn regexp_prop(r: &RcRegExp, field: &str) -> Value {
 }
 
 impl VM {
-    pub(crate) fn dispatch(&mut self) -> Result<StepResult, VMError> {
+    pub(crate) fn dispatch(&mut self, mut fuel: u64) -> Result<StepResult, VMError> {
         // ── macros for repetitive instruction shapes ─────────────────
 
         /// Pop one operand, coerce ToNumber (JS), apply f64→f64, push Number.
@@ -129,10 +129,10 @@ impl VM {
                     unstarted: std::mem::take(&mut self.outbox),
                 });
             }
-            if self.fuel == 0 {
+            if fuel == 0 {
                 return Ok(StepResult::OutOfFuel);
             }
-            self.fuel -= 1;
+            fuel -= 1;
             match &self.code[self.ip as usize] {
                 // ── stack manipulation ───────────────────────────
                 Instr::PushUndefined => {
