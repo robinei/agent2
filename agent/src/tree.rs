@@ -285,9 +285,10 @@ impl Tree {
         None
     }
 
-    /// Every frame in the log, root-first (by id): the frame-navigator
-    /// projection (decision 8). `complete` is whether a `FrameResult` was
-    /// logged on the frame's spine.
+    /// Every frame in the log, in DFS tree order (root-first, children
+    /// grouped under their parent and sorted by id): the frame-navigator
+    /// projection (decision 8). `complete` is whether a `FrameResult`
+    /// was logged on the frame's spine.
     pub fn frame_list(&self) -> Vec<FrameView> {
         let mut completed: HashSet<EventId> = HashSet::new();
         for event in self.events.values() {
@@ -297,7 +298,7 @@ impl Tree {
                 completed.insert(frame);
             }
         }
-        let mut frames: Vec<FrameView> = self
+        let frames: Vec<FrameView> = self
             .events
             .values()
             .filter_map(|event| match &event.payload {
@@ -310,8 +311,32 @@ impl Tree {
                 _ => None,
             })
             .collect();
-        frames.sort_by_key(|f| f.id.as_u64());
-        frames
+
+        let mut children: HashMap<Option<EventId>, Vec<&FrameView>> = HashMap::new();
+        for fv in &frames {
+            children.entry(fv.parent).or_default().push(fv);
+        }
+        for list in children.values_mut() {
+            list.sort_by_key(|fv| fv.id.as_u64());
+        }
+
+        let mut ordered = Vec::with_capacity(frames.len());
+        let mut stack: Vec<&FrameView> = children
+            .get(&None)
+            .into_iter()
+            .flatten()
+            .copied()
+            .collect();
+        stack.reverse();
+        while let Some(fv) = stack.pop() {
+            ordered.push(fv.clone());
+            if let Some(kids) = children.get(&Some(fv.id)) {
+                for kid in kids.iter().rev() {
+                    stack.push(kid);
+                }
+            }
+        }
+        ordered
     }
 
     /// `frame`'s programs along `leaf`'s path, in order — the program-list

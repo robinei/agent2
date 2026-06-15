@@ -35,7 +35,7 @@ use super::chat::{ChatKind, ChatState};
 use super::ui;
 use crate::host::{FrameId, Session, SessionCommand, SessionEvent};
 use crate::machine::TOOL_RUN_PROGRAM;
-use crate::tree::ProgramView;
+use crate::tree::{FrameView, ProgramView};
 use crate::types::{EventId, EventPayload, Message};
 
 /// Cap for one step-line key, so a hot loop on one source line cannot
@@ -820,26 +820,73 @@ fn render_chat(
     (top, area)
 }
 
+fn build_frame_tree_lines(frames: &[FrameView]) -> Vec<(FrameView, String)> {
+    let mut children: std::collections::HashMap<Option<FrameId>, Vec<&FrameView>> =
+        std::collections::HashMap::new();
+    for fv in frames {
+        children.entry(fv.parent).or_default().push(fv);
+    }
+    for list in children.values_mut() {
+        list.sort_by_key(|fv| fv.id.as_u64());
+    }
+
+    let mut result = Vec::with_capacity(frames.len());
+    fn dfs(
+        parent: Option<FrameId>,
+        children: &std::collections::HashMap<Option<FrameId>, Vec<&FrameView>>,
+        ancestors_last: &mut Vec<bool>,
+        result: &mut Vec<(FrameView, String)>,
+    ) {
+        let Some(kids) = children.get(&parent) else {
+            return;
+        };
+        let len = kids.len();
+        for (i, fv) in kids.iter().enumerate() {
+            let is_last = i == len - 1;
+            let mut prefix = String::new();
+            for &ancestor_last in ancestors_last.iter() {
+                if !ancestor_last {
+                    prefix.push_str("│   ");
+                } else {
+                    prefix.push_str("    ");
+                }
+            }
+            if is_last {
+                prefix.push_str("└── ");
+            } else {
+                prefix.push_str("├── ");
+            }
+            result.push(((*fv).clone(), prefix));
+            ancestors_last.push(is_last);
+            dfs(Some(fv.id), children, ancestors_last, result);
+            ancestors_last.pop();
+        }
+    }
+
+    let mut ancestors_last = Vec::new();
+    dfs(None, &children, &mut ancestors_last, &mut result);
+    result
+}
+
 fn render_frame_list(frame: &mut Frame, app: &AttachedApp, session: &Session, area: Rect) {
     // Frames from the log projection so the navigator survives resume
     // (decision 8), with live status overlayed from `session.frames()`.
     let live: std::collections::HashMap<FrameId, &'static str> =
         session.frames().into_iter().collect();
-    let lines: Vec<Line> = session
-        .tree()
-        .frame_list()
+    let frame_views = session.tree().frame_list();
+    let tree_lines = build_frame_tree_lines(&frame_views);
+    let lines: Vec<Line> = tree_lines
         .iter()
-        .enumerate()
-        .map(|(i, fv)| {
+        .map(|(fv, prefix)| {
             let selected = app.selected == Some(fv.id);
             let live_status = live.get(&fv.id).copied();
             let status = live_status.unwrap_or(if fv.complete { "done" } else { "idle" });
             let paused = live_status.is_some() && session.is_paused(fv.id);
             let busy = matches!(live_status, Some("running" | "awaiting llm"));
             let text = format!(
-                "{} {} frame #{} · {}{}",
+                "{} {}frame #{} · {}{}",
                 if selected { "▶" } else { " " },
-                i + 1,
+                prefix,
                 fv.id.as_u64(),
                 status,
                 if paused {
@@ -851,7 +898,13 @@ fn render_frame_list(frame: &mut Frame, app: &AttachedApp, session: &Session, ar
                 },
             );
             let style = if selected {
-                Style::default().add_modifier(Modifier::BOLD)
+                if fv.complete {
+                    Style::default().add_modifier(Modifier::BOLD).fg(Color::DarkGray)
+                } else {
+                    Style::default().add_modifier(Modifier::BOLD)
+                }
+            } else if fv.complete {
+                Style::default().fg(Color::DarkGray)
             } else {
                 Style::default().fg(Color::Gray)
             };
