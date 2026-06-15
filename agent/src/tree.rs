@@ -323,12 +323,8 @@ impl Tree {
         }
 
         let mut ordered = Vec::with_capacity(frames.len());
-        let mut stack: Vec<&FrameView> = children
-            .get(&None)
-            .into_iter()
-            .flatten()
-            .copied()
-            .collect();
+        let mut stack: Vec<&FrameView> =
+            children.get(&None).into_iter().flatten().copied().collect();
         stack.reverse();
         while let Some(fv) = stack.pop() {
             ordered.push(fv.clone());

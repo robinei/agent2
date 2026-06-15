@@ -195,9 +195,7 @@ impl ChatState {
                         .and_then(|v| v.as_object())
                         .map(|obj| {
                             obj.iter()
-                                .filter_map(|(k, v)| {
-                                    v.as_str().map(|s| (k.clone(), s.to_string()))
-                                })
+                                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
                                 .collect()
                         })
                         .unwrap_or_default();
@@ -474,7 +472,11 @@ mod tests {
             .collect();
         assert_eq!(glyphs.len(), 2, "two inner-call lines");
         // Each ⚙ line carries the program id + invoke index for hit-testing.
-        assert!(glyphs.iter().all(|(_, _, p)| matches!(p, RowDetail::Invoke(_, _))));
+        assert!(
+            glyphs
+                .iter()
+                .all(|(_, _, p)| matches!(p, RowDetail::Invoke(_, _)))
+        );
         assert!(
             glyphs
                 .iter()

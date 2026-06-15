@@ -277,14 +277,12 @@ impl AttachedApp {
                         }
                         RowDetail::Attachment(pid, name) => {
                             let toggle_off = self.selected_program == Some(*pid)
-                                && self.selected_subitem
-                                    == Some(Subitem::Attachment(name.clone()));
+                                && self.selected_subitem == Some(Subitem::Attachment(name.clone()));
                             self.selected_program = Some(*pid);
                             if toggle_off {
                                 self.selected_subitem = None;
                             } else {
-                                self.selected_subitem =
-                                    Some(Subitem::Attachment(name.clone()));
+                                self.selected_subitem = Some(Subitem::Attachment(name.clone()));
                             }
                             self.reset_program_scrolls();
                         }
@@ -811,7 +809,11 @@ fn chat_style(kind: ChatKind, even: bool) -> Style {
     let dim = |r, g, b| Color::Rgb((r * 3 / 4) as u8, (g * 3 / 4) as u8, (b * 3 / 4) as u8);
     match kind {
         ChatKind::System => {
-            let fg = if even { Color::Magenta } else { dim(255, 0, 255) };
+            let fg = if even {
+                Color::Magenta
+            } else {
+                dim(255, 0, 255)
+            };
             Style::default().fg(fg).add_modifier(Modifier::DIM)
         }
         ChatKind::User => {
@@ -881,8 +883,7 @@ fn render_chat(
     let mut prev_kind: Option<ChatKind> = None;
     for (kind, text, detail) in &rows {
         let even = match detail {
-            RowDetail::Program(pid) | RowDetail::Attachment(pid, _) | RowDetail::Invoke(pid, _) =>
-            {
+            RowDetail::Program(pid) | RowDetail::Attachment(pid, _) | RowDetail::Invoke(pid, _) => {
                 if in_program != Some(*pid) {
                     in_program = Some(*pid);
                     let e = parity.entry(ChatKind::ToolCall).or_insert(true);
@@ -1027,7 +1028,9 @@ fn render_frame_list(frame: &mut Frame, app: &AttachedApp, session: &Session, ar
             );
             let style = if selected {
                 if fv.complete {
-                    Style::default().add_modifier(Modifier::BOLD).fg(Color::DarkGray)
+                    Style::default()
+                        .add_modifier(Modifier::BOLD)
+                        .fg(Color::DarkGray)
                 } else {
                     Style::default().add_modifier(Modifier::BOLD)
                 }
@@ -1131,8 +1134,10 @@ fn render_subitem(
         }
         Some(Subitem::Invoke(idx)) => {
             if let Some(invoke) = pv.invokes.get(*idx) {
-                lines.push(Line::from(format!("⚙ {}", invoke.name))
-                    .style(Style::default().fg(Color::Yellow)));
+                lines.push(
+                    Line::from(format!("⚙ {}", invoke.name))
+                        .style(Style::default().fg(Color::Yellow)),
+                );
                 lines.push(Line::from(""));
                 lines.push(Line::from("args:").style(Style::default().fg(Color::DarkGray)));
                 let args_str = serde_json::to_string_pretty(&invoke.args)

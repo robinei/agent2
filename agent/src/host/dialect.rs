@@ -170,8 +170,14 @@ getters/setters.
 `async function`s are supported.
 - `Map` and `Set` are available with standard methods: get/set/has/delete/ \
 clear/keys/values/entries/forEach, plus `.size`.
-- RegExp: `/pattern/flags`, `.test()`, `.exec()`. String `.replace()` / \
-`.replaceAll()` support `$1`..`$9` group references.
+- RegExp: `/pattern/flags`, `.test()`, `.exec()` (a `/g` regex is \
+stateful: `.exec()` advances `.lastIndex`, so the `while ((m = \
+re.exec(s)) !== null)` loop terminates). For all matches with capture \
+groups in one call, prefer `str.matchAll(/…/g)` → array of match \
+objects. Named groups `(?<name>…)` show up on a match's `.groups`. \
+`.replace()` / `.replaceAll()` take a string replacement (`$1`..`$n`, \
+`$<name>`, `$&` tokens) or a function replacer \
+(`(match, ...groups, offset, str) => …`).
 - Strings are UTF-8 bytes: `.length` and all indices count bytes, not \
 UTF-16 units.
 - `<` `>` `<=` `>=` never coerce across types; objects/arrays never \
@@ -343,7 +349,7 @@ mod tests {
             "No `this` or `class`",
             "`new Map()`",
             "`Map` and `Set`",
-            "group references",
+            "$<name>",
             "UTF-8 bytes",
             // Step 5 additions:
             "editing files",

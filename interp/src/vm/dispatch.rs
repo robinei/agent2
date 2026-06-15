@@ -23,7 +23,7 @@ fn regexp_prop(r: &RcRegExp, field: &str) -> Value {
         "dotAll" => Value::Bool(r.flags.contains('s')),
         "unicode" => Value::Bool(r.flags.contains('u')),
         "sticky" => Value::Bool(r.flags.contains('y')),
-        "lastIndex" => Value::PosInt(0),
+        "lastIndex" => Value::PosInt(r.last_index.get() as u64),
         _ => Value::Undefined,
     }
 }
@@ -905,6 +905,7 @@ impl VM {
                         pattern: self.string_from(&pattern_val)?,
                         flags: self.string_from(&flags_val)?,
                         compiled,
+                        last_index: std::cell::Cell::new(0),
                     };
                     self.stack.push(Value::RegExp(RcRegExp::new(rx_data)));
                     self.ip += 1;
@@ -1021,9 +1022,19 @@ impl VM {
                     let val = self.pop()?;
                     // Peek the receiver to check type.
                     match self.stack.last() {
-                        Some(Value::RegExp(_r)) => {
-                            // RegExp properties are immutable for now; accept
-                            // assignment silently (matching lastIndex write).
+                        Some(Value::RegExp(r)) => {
+                            // `lastIndex` is writable (the `/g` cursor); every
+                            // other RegExp property is read-only and the write
+                            // is accepted silently.
+                            if field.as_str() == "lastIndex" {
+                                let n = val.to_number().unwrap_or(0.0);
+                                let n = if n.is_finite() && n >= 0.0 {
+                                    n as usize
+                                } else {
+                                    0
+                                };
+                                r.last_index.set(n);
+                            }
                             let result = match mode {
                                 SetMode::Old => val,
                                 SetMode::New => val,
@@ -1405,31 +1416,60 @@ impl VM {
 
                 Instr::ArrLength => {
                     let val = self.pop()?;
-                    let len = match val {
-                        Value::String(s) => s.len(),
-                        Value::Array(p) => self
-                            .arrays
-                            .get(p as usize)
-                            .ok_or_else(|| self.fail(ErrorKind::ValueError, "value error"))?
-                            .len(),
+                    // `.length`: intrinsic byte/element count for strings and
+                    // arrays; on an *object* a plain property read (JS — e.g. a
+                    // RegExp match result stores its own `length`), `undefined`
+                    // when absent. Anything else (incl. map/set) is a
+                    // `TypeError` — for-of lowering relies on that (it iterates
+                    // only array/string, via `idx < ArrLength`).
+                    let result = match val {
+                        Value::String(s) => Value::Float(s.len() as f64),
+                        Value::Array(p) => Value::Float(
+                            self.arrays
+                                .get(p as usize)
+                                .ok_or_else(|| self.fail(ErrorKind::ValueError, "value error"))?
+                                .len() as f64,
+                        ),
                         Value::Object(p) => self
                             .objects
                             .get(p as usize)
                             .ok_or_else(|| self.fail(ErrorKind::ValueError, "value error"))?
-                            .len(),
-                        Value::Map(p) => self
-                            .maps
-                            .get(p as usize)
-                            .ok_or_else(|| self.fail(ErrorKind::ValueError, "value error"))?
-                            .len(),
-                        Value::Set(p) => self
-                            .sets
-                            .get(p as usize)
-                            .ok_or_else(|| self.fail(ErrorKind::ValueError, "value error"))?
-                            .len(),
+                            .get("length")
+                            .cloned()
+                            .unwrap_or(Value::Undefined),
                         _ => return Err(self.fail(ErrorKind::TypeError, "type error")),
                     };
-                    self.stack.push(Value::Float(len as f64));
+                    self.stack.push(result);
+                    self.ip += 1;
+                }
+
+                Instr::MapSetSize => {
+                    let val = self.pop()?;
+                    // `.size`: intrinsic entry count for maps and sets; on an
+                    // *object* the `size` property (`undefined` when absent).
+                    let result = match val {
+                        Value::Map(p) => Value::Float(
+                            self.maps
+                                .get(p as usize)
+                                .ok_or_else(|| self.fail(ErrorKind::ValueError, "value error"))?
+                                .len() as f64,
+                        ),
+                        Value::Set(p) => Value::Float(
+                            self.sets
+                                .get(p as usize)
+                                .ok_or_else(|| self.fail(ErrorKind::ValueError, "value error"))?
+                                .len() as f64,
+                        ),
+                        Value::Object(p) => self
+                            .objects
+                            .get(p as usize)
+                            .ok_or_else(|| self.fail(ErrorKind::ValueError, "value error"))?
+                            .get("size")
+                            .cloned()
+                            .unwrap_or(Value::Undefined),
+                        _ => return Err(self.fail(ErrorKind::TypeError, "type error")),
+                    };
+                    self.stack.push(result);
                     self.ip += 1;
                 }
 

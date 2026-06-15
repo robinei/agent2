@@ -7,7 +7,8 @@ use crate::vm::{ErrorKind, RcStr, VM, VMError, Value};
 // ── string method implementations ────────────────────────────────────────────
 
 /// `s.split(delim[, limit])` → array of substrings. Delimiter may be a
-/// string or RegExp; capturing groups in a RegExp are omitted.
+/// string or RegExp; capturing groups in a RegExp delimiter are spliced
+/// into the result (JS semantics).
 pub fn str_split(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let s = vm.string_from(args.get(vm, 0))?;
     let delim = args.get(vm, 1);
@@ -28,22 +29,30 @@ pub fn str_split(vm: &mut VM, args: Args) -> Result<Value, VMError> {
             }
         }
     };
-    // RegExp delimiter path.
+    // RegExp delimiter path. Capturing groups in the delimiter are spliced
+    // into the result (JS semantics: `"a1b".split(/(\d)/)` → ["a","1","b"]).
     if let Some(rx) = try_reg_exp(vm, delim) {
         let text = s.as_str();
         let mut parts: ThinVec<Value> = ThinVec::new();
         let mut last = 0;
-        for m in rx.compiled.find_iter(text) {
-            if let Some(lim) = limit {
-                if parts.len() >= lim {
-                    break;
-                }
+        'outer: for m in rx.compiled.find_iter(text) {
+            if limit.is_some_and(|lim| parts.len() >= lim) {
+                break;
             }
             parts.push(Value::String(RcStr::from(&text[last..m.range.start])));
+            for cap in &m.captures {
+                if limit.is_some_and(|lim| parts.len() >= lim) {
+                    break 'outer;
+                }
+                parts.push(match cap {
+                    Some(r) => Value::String(RcStr::from(&text[r.clone()])),
+                    None => Value::Undefined,
+                });
+            }
             last = m.range.end;
         }
         // Push the remainder.
-        if limit.map_or(true, |lim| parts.len() < lim) {
+        if limit.is_none_or(|lim| parts.len() < lim) {
             parts.push(Value::String(RcStr::from(&text[last..])));
         }
         return Ok(vm.alloc_array(parts));
@@ -271,8 +280,8 @@ pub fn str_replace_all(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     )))
 }
 
-/// Append the JS replacement pattern to `out`, substituting `$n`, `$&`,
-/// ``$` ``, `$'`, and `$$` from the match's captures.
+/// Append the JS replacement pattern to `out`, substituting `$n`, `$<name>`,
+/// `$&`, ``$` ``, `$'`, and `$$` from the match's captures.
 fn push_replacement(out: &mut String, repl: &str, text: &str, m: &regress::Match) {
     let mut chars = repl.chars().peekable();
     while let Some(c) = chars.next() {
@@ -324,6 +333,28 @@ fn push_replacement(out: &mut String, repl: &str, text: &str, m: &regress::Match
                     }
                 }
             }
+            '<' => {
+                // `$<name>` — named group reference. If unterminated, emit
+                // the consumed text literally (matching JS leniency).
+                chars.next(); // consume '<'
+                let mut name = String::new();
+                let mut closed = false;
+                for c2 in chars.by_ref() {
+                    if c2 == '>' {
+                        closed = true;
+                        break;
+                    }
+                    name.push(c2);
+                }
+                if closed {
+                    if let Some(range) = m.named_group(&name) {
+                        out.push_str(&text[range]);
+                    }
+                } else {
+                    out.push_str("$<");
+                    out.push_str(&name);
+                }
+            }
             _ => {
                 out.push('$');
             }
@@ -334,6 +365,39 @@ fn push_replacement(out: &mut String, repl: &str, text: &str, m: &regress::Match
 /// `s.match(pattern)` — pattern may be a string or RegExp.
 /// Without the `g` flag: returns the same as `pattern.exec(s)`.
 /// With the `g` flag: returns an array of all full-match strings (no captures).
+/// `s.matchAll(re)` → an **array** of exec-shaped match objects (each
+/// `{ "0": full, "1": cap1, …, index, input }`), one per non-overlapping
+/// match — the capture-aware, single-call, always-terminating counterpart
+/// to the stateful `exec` loop. JS returns a lazy iterator, but this
+/// dialect has no generators, so an array is the faithful shape. Requires
+/// a global (`/g`) RegExp, like JS; it does not consult or mutate
+/// `lastIndex`.
+pub fn str_match_all(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let s = vm.string_from(args.get(vm, 0))?;
+    let rx = match try_reg_exp(vm, args.get(vm, 1)) {
+        Some(rx) => rx.clone(),
+        None => {
+            return Err(vm.fail(
+                ErrorKind::TypeError,
+                "matchAll must be called with a global RegExp",
+            ));
+        }
+    };
+    if !rx.flags.contains('g') {
+        return Err(vm.fail(
+            ErrorKind::TypeError,
+            "matchAll must be called with a global RegExp",
+        ));
+    }
+    let matches: Vec<regress::Match> = rx.compiled.find_iter(s.as_str()).collect();
+    let mut out: ThinVec<Value> = ThinVec::with_capacity(matches.len());
+    for m in matches {
+        let obj = build_exec_result(vm, &m, s.clone());
+        out.push(vm.alloc_object(obj));
+    }
+    Ok(vm.alloc_array(out))
+}
+
 pub fn str_match(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let s = vm.string_from(args.get(vm, 0))?;
     if let Some(rx) = try_reg_exp(vm, args.get(vm, 1)) {
@@ -354,7 +418,7 @@ pub fn str_match(vm: &mut VM, args: Args) -> Result<Value, VMError> {
                 Some(m) => m,
                 None => return Ok(Value::Null),
             };
-            let obj = build_exec_result(&m, s.clone());
+            let obj = build_exec_result(vm, &m, s.clone());
             return Ok(vm.alloc_object(obj));
         }
     }
@@ -465,7 +529,16 @@ pub fn str_repeat(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     if count < 0.0 || count.is_infinite() {
         return Err(vm.fail(ErrorKind::ValueError, "value error"));
     }
-    let n = (count as usize).min(10_000); // reasonable cap
+    // Bound the allocation, but raise loudly instead of silently truncating
+    // (a silent cap produces a wrong-length string with no signal).
+    const REPEAT_MAX: usize = 1_000_000;
+    let n = count as usize;
+    if n > REPEAT_MAX {
+        return Err(vm.fail(
+            ErrorKind::ValueError,
+            "repeat count too large (max 1000000)",
+        ));
+    }
     Ok(Value::String(RcStr::from(s.as_str().repeat(n))))
 }
 
@@ -893,6 +966,99 @@ mod tests {
         assert_eq!(
             testutil::run_err_kind("return 'ab'.repeat(-1);"),
             ErrorKind::ValueError
+        );
+        // Over the cap → loud ValueError, not a silently-truncated string.
+        assert_eq!(
+            testutil::run_err_kind("return 'x'.repeat(2000000);"),
+            ErrorKind::ValueError
+        );
+        // A large-but-allowed count still works.
+        assert_eq!(
+            testutil::run_ret("return 'x'.repeat(20000).length;"),
+            serde_json::json!(20000)
+        );
+    }
+
+    #[test]
+    fn split_includes_capture_groups() {
+        // JS: a capturing delimiter splices its groups into the result.
+        assert_eq!(
+            testutil::run_ret(r"return 'a1b2c'.split(/(\d)/);"),
+            serde_json::json!(["a", "1", "b", "2", "c"])
+        );
+        // Non-capturing delimiter: gaps only (unchanged behavior).
+        assert_eq!(
+            testutil::run_ret(r"return 'a1b2c'.split(/\d/);"),
+            serde_json::json!(["a", "b", "c"])
+        );
+        // Limit counts total array elements, captures included.
+        assert_eq!(
+            testutil::run_ret(r"return 'a1b2c'.split(/(\d)/, 3);"),
+            serde_json::json!(["a", "1", "b"])
+        );
+    }
+
+    #[test]
+    fn replace_supports_named_group_token() {
+        assert_eq!(
+            testutil::run_ret(r"return 'x5'.replace(/(?<d>\d)/, '[$<d>]');"),
+            serde_json::json!("x[5]")
+        );
+    }
+
+    #[test]
+    fn replace_with_function_replacer() {
+        // Regex, non-global → first match; callback gets (match, ...caps, index, str).
+        assert_eq!(
+            testutil::run_ret(r"return 'a1b2'.replace(/(\d)/, (m, d) => '[' + d + ']');"),
+            serde_json::json!("a[1]b2")
+        );
+        // Global regex → every match.
+        assert_eq!(
+            testutil::run_ret(r"return 'a1b2'.replace(/\d/g, m => '#');"),
+            serde_json::json!("a#b#")
+        );
+        // String pattern → first occurrence; callback gets (match, index, str).
+        assert_eq!(
+            testutil::run_ret("return 'a.a'.replace('a', (m, i) => i);"),
+            serde_json::json!("0.a")
+        );
+        // The callback's offset/input args are correct.
+        assert_eq!(
+            testutil::run_ret(r"return 'xy'.replace(/y/, (m, i, s) => i + ':' + s);"),
+            serde_json::json!("x1:xy")
+        );
+    }
+
+    #[test]
+    fn replace_all_with_function_replacer() {
+        // Global regex with a capture group.
+        assert_eq!(
+            testutil::run_ret(r"return 'a1b2'.replaceAll(/(\d)/g, (m, d) => d + d);"),
+            serde_json::json!("a11b22")
+        );
+        // String pattern → all occurrences.
+        assert_eq!(
+            testutil::run_ret("return 'aaa'.replaceAll('a', (m, i) => i);"),
+            serde_json::json!("012")
+        );
+        // A non-global regex to replaceAll still throws (matchAll enforces it).
+        assert_eq!(
+            testutil::run_err_kind("return 'ab'.replaceAll(/a/, m => m);"),
+            ErrorKind::TypeError
+        );
+    }
+
+    #[test]
+    fn replace_string_replacer_still_works() {
+        // The string-replacer path (delegated to the builtin) is unchanged.
+        assert_eq!(
+            testutil::run_ret(r"return 'a1b2'.replace(/(\d)/, '<$1>');"),
+            serde_json::json!("a<1>b2")
+        );
+        assert_eq!(
+            testutil::run_ret(r"return 'a1b2'.replaceAll(/(\d)/g, '<$1>');"),
+            serde_json::json!("a<1>b<2>")
         );
     }
 

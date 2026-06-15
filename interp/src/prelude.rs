@@ -105,6 +105,79 @@ const PROMISE_ALL: &str = "async function __all(ps) {\n  const r = [];\n  for (l
 /// JS result shape. Never rejects; a non-promise element settles fulfilled.
 const PROMISE_ALL_SETTLED: &str = "async function __allSettled(ps) {\n  const r = [];\n  for (let i = 0; i < ps.length; i++) {\n    try { r.push({ status: \"fulfilled\", value: await ps[i] }); }\n    catch (e) { r.push({ status: \"rejected\", reason: e }); }\n  }\n  return r;\n}";
 
+/// `str.replace(pat, rep)` lowers to `__replace(s, pat, rep)`. A *string*
+/// replacer is handed to the `__replaceStr` builtin (the optimized Rust path
+/// with `$1`/`$&`/`$<name>` token expansion); a *function* replacer is
+/// invoked from JS — the whole reason this lives in the prelude, since a
+/// builtin cannot call back into the VM. A global regex replaces every match
+/// (JS), a non-global regex / string pattern replaces the first.
+const REPLACE: &str = r#"function __replace(s, pat, rep) {
+  if (typeof rep !== "function") { return s.__replaceStr(pat, rep); }
+  if (typeof pat === "string") {
+    const i = s.indexOf(pat);
+    if (i < 0) { return s; }
+    return s.slice(0, i) + String(rep(pat, i, s)) + s.slice(i + pat.length);
+  }
+  if (pat.global) {
+    const ms = s.matchAll(pat);
+    let out = "";
+    let last = 0;
+    for (let j = 0; j < ms.length; j++) {
+      const m = ms[j];
+      out += s.slice(last, m.index);
+      const args = [m[0]];
+      for (let k = 1; k < m.length; k++) { args.push(m[k]); }
+      args.push(m.index);
+      args.push(s);
+      out += String(rep(...args));
+      last = m.index + m[0].length;
+    }
+    return out + s.slice(last);
+  }
+  const m = pat.exec(s);
+  if (m === null) { return s; }
+  pat.lastIndex = 0;
+  const args = [m[0]];
+  for (let k = 1; k < m.length; k++) { args.push(m[k]); }
+  args.push(m.index);
+  args.push(s);
+  return s.slice(0, m.index) + String(rep(...args)) + s.slice(m.index + m[0].length);
+}"#;
+
+/// `str.replaceAll(pat, rep)` lowers to `__replaceAll(s, pat, rep)`. Like
+/// `__replace` but always replaces every occurrence; a string replacer goes
+/// to the `__replaceAllStr` builtin, a regex pattern must be global (enforced
+/// by `matchAll`).
+const REPLACE_ALL: &str = r#"function __replaceAll(s, pat, rep) {
+  if (typeof rep !== "function") { return s.__replaceAllStr(pat, rep); }
+  if (typeof pat === "string") {
+    if (pat.length === 0) { return s; }
+    let out = "";
+    let last = 0;
+    let i = s.indexOf(pat);
+    while (i >= 0) {
+      out += s.slice(last, i) + String(rep(pat, i, s));
+      last = i + pat.length;
+      i = s.indexOf(pat, last);
+    }
+    return out + s.slice(last);
+  }
+  const ms = s.matchAll(pat);
+  let out = "";
+  let last = 0;
+  for (let j = 0; j < ms.length; j++) {
+    const m = ms[j];
+    out += s.slice(last, m.index);
+    const args = [m[0]];
+    for (let k = 1; k < m.length; k++) { args.push(m[k]); }
+    args.push(m.index);
+    args.push(s);
+    out += String(rep(...args));
+    last = m.index + m[0].length;
+  }
+  return out + s.slice(last);
+}"#;
+
 /// Build the prelude source to append to `user_source`: the concatenated source
 /// of every helper whose method the program uses. Returns an empty string when
 /// the program uses no higher-order methods (so it compiles unchanged).
@@ -129,6 +202,18 @@ pub fn assemble(user_source: &str) -> String {
     if uses_method(user_source, "allSettled") && user_source.contains("Promise.allSettled") {
         out.push('\n');
         out.push_str(PROMISE_ALL_SETTLED);
+        out.push('\n');
+    }
+    // `.replace` / `.replaceAll` (the boundary check keeps `.replace` from
+    // matching `.replaceAll`, like `all`/`allSettled`).
+    if uses_method(user_source, "replace") {
+        out.push('\n');
+        out.push_str(REPLACE);
+        out.push('\n');
+    }
+    if uses_method(user_source, "replaceAll") {
+        out.push('\n');
+        out.push_str(REPLACE_ALL);
         out.push('\n');
     }
     out

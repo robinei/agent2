@@ -463,6 +463,13 @@ impl<'src> super::Compiler<'src> {
                 return self.compile_hof(recv, argv, span, optional, "__findLastIndex", 1);
             }
             "sort" => return self.compile_sort(recv, argv, span, optional),
+            // `replace`/`replaceAll` are prelude helpers so a *function*
+            // replacer can be invoked from JS; they fall back to the
+            // `__replaceStr`/`__replaceAllStr` builtins for string replacers.
+            "replace" => return self.compile_hof(recv, argv, span, optional, "__replace", 2),
+            "replaceAll" => {
+                return self.compile_hof(recv, argv, span, optional, "__replaceAll", 2);
+            }
             _ => {}
         }
         if let Some(builtin) = Builtin::for_method(method) {

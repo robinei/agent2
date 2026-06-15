@@ -202,12 +202,19 @@ The remaining intentional divergences from JS — deferred or accepted, NOT bugs
 const MAX_JSON_DEPTH: usize = 128;
 
 /// Compiled regular expression (JS-compatible via the `regress` crate).
-/// Immutable; stored behind `Rc` and cloned via refcount bump.
+/// Stored behind `Rc` and cloned via refcount bump. The pattern is
+/// immutable; `last_index` is the one mutable bit — the `/g` iteration
+/// cursor (a byte offset), held in a `Cell` so a shared handle can advance
+/// it without the borrow overhead/panic risk of a `RefCell`. Each *literal
+/// evaluation* allocates a fresh instance (`Instr::RegExpNew`), so the
+/// cursor never leaks across unrelated uses — matching JS object identity.
 #[derive(Debug)]
 pub struct RegExpData {
     pub pattern: RcStr,
     pub flags: RcStr,
     pub compiled: regress::Regex,
+    /// `lastIndex`: where the next `/g` `exec`/`test` resumes (bytes).
+    pub last_index: std::cell::Cell<usize>,
 }
 
 /// Reference-counted handle to a [`RegExpData`]. `Clone` is a refcount bump.

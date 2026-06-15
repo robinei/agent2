@@ -5,9 +5,9 @@ use crate::vm::Instr;
 
 impl<'src> super::Compiler<'src> {
     /// `obj.foo` (and `state.foo`, since `state` lowers to `Ptr(0)`). `.length`
-    /// is the static intrinsic `ArrLength` (the accepted divergence: an object
-    /// property literally named `length` reached via `.length`); anything else
-    /// is `ObjGet`.
+    /// lowers to `ArrLength` (str/arr intrinsic; on an object, the `length`
+    /// property) and `.size` to `MapSetSize` (map/set intrinsic; on an object,
+    /// the `size` property); anything else is `ObjGet`.
     pub(super) fn compile_static_member(&mut self, m: &ast::StaticMemberExpression) {
         // Namespace constants and first-class builtin refs: handle before
         // evaluating the object.
@@ -45,8 +45,10 @@ impl<'src> super::Compiler<'src> {
     pub(super) fn emit_static_access(&mut self, m: &ast::StaticMemberExpression) {
         let name = m.property.name.as_str();
         let span = m.property.span.start;
-        if name == "length" || name == "size" {
+        if name == "length" {
             self.emit(Instr::ArrLength, span);
+        } else if name == "size" {
+            self.emit(Instr::MapSetSize, span);
         } else {
             self.emit(Instr::ObjGet(name.into()), span);
         }

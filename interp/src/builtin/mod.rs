@@ -272,8 +272,11 @@ builtins! {
     StrSlice,       BuiltinKind::Method, "slice",       2, 3, slice_poly;
     StrSubstring,   BuiltinKind::Method, "substring",   2, 3, str_substring;
     StrTrim,        BuiltinKind::Method, "trim",        1, 1, str_trim;
-    StrReplace,      BuiltinKind::Method, "replace",      3, 3, str_replace;
-    StrReplaceAll,   BuiltinKind::Method, "replaceAll",   3, 3, str_replace_all;
+    // Public `replace`/`replaceAll` are prelude functions (`__replace`/
+    // `__replaceAll`) so a *function* replacer can be invoked from JS; they
+    // delegate the string-replacement work to these internal primitives.
+    StrReplace,      BuiltinKind::Method, "__replaceStr",    3, 3, str_replace;
+    StrReplaceAll,   BuiltinKind::Method, "__replaceAllStr", 3, 3, str_replace_all;
     StrToLowerCase,  BuiltinKind::Method, "toLowerCase",  1, 1, str_to_lower_case;
     StrToUpperCase,  BuiltinKind::Method, "toUpperCase",  1, 1, str_to_upper_case;
     StrPadStart,     BuiltinKind::Method, "padStart",     2, 3, str_pad_start;
@@ -291,8 +294,9 @@ builtins! {
     RegExpToString, BuiltinKind::Method, "toString", 1, 1, regexp_to_string;
 
     // ── string methods that accept RegExp ──
-    StrMatch,  BuiltinKind::Method, "match",  2, 2, str_match;
-    StrSearch, BuiltinKind::Method, "search", 2, 2, str_search;
+    StrMatch,    BuiltinKind::Method, "match",    2, 2, str_match;
+    StrMatchAll, BuiltinKind::Method, "matchAll", 2, 2, str_match_all;
+    StrSearch,   BuiltinKind::Method, "search",   2, 2, str_search;
 
     // ── String static ──
     StrFromCharCode,  BuiltinKind::Namespace("String"), "fromCharCode",  0, VARARG, str_from_char_code;

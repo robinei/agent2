@@ -322,7 +322,8 @@ pub enum Instr {
     /// Push a single value to the end of an array. Pops the value, pops
     /// the array, pushes the array back.
     ArrPush, // arr, val -> arr
-    ArrLength,        // arr|str -> int
+    ArrLength,        // `.length`: str|arr intrinsic; obj -> `length` property | undefined
+    MapSetSize,       // `.size`: map|set intrinsic; obj -> `size` property | undefined
 
     // JS `String(x)` / ToString: pops any value, pushes its string form. Unlike
     // StrFromJson (which emits JSON, and rejects non-JSON values), this matches
