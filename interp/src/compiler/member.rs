@@ -46,9 +46,9 @@ impl<'src> super::Compiler<'src> {
         let name = m.property.name.as_str();
         let span = m.property.span.start;
         if name == "length" {
-            self.emit(Instr::ArrLength, span);
+            self.emit(Instr::GetLength, span);
         } else if name == "size" {
-            self.emit(Instr::MapSetSize, span);
+            self.emit(Instr::GetSize, span);
         } else {
             self.emit(Instr::ObjGet(name.into()), span);
         }

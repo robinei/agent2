@@ -214,7 +214,7 @@ impl<'src> super::Compiler<'src> {
             super::ExitKind::Jump { target, .. } => self.emit(Instr::Jump(target), span),
             super::ExitKind::Return => {
                 let slot = self.return_spill.as_ref().expect("spill set up").slot;
-                self.emit(Instr::Local(slot as LocalIndex), span);
+                self.emit(Instr::GetLocal(slot as LocalIndex), span);
                 self.emit(Instr::Return(1), span);
             }
         }
@@ -482,7 +482,7 @@ impl<'src> super::Compiler<'src> {
         // idx < length(container) ?
         self.emit(Instr::Pick(0), span); // [cont, idx, idx]
         self.emit(Instr::Pick(2), span); // [cont, idx, idx, cont]
-        self.emit(Instr::ArrLength, span); // [cont, idx, idx, len]
+        self.emit(Instr::GetLength, span); // [cont, idx, idx, len]
         self.emit(Instr::Lt, span); // [cont, idx, idx<len]
         self.emit(Instr::JFalse(end), span); // [cont, idx]
         // Bind loop var = container[idx].

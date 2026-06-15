@@ -74,7 +74,7 @@ fn peephole_constant_branch_folding() {
         vec![Instr::Jump(0)]
     );
     // A non-constant condition is untouched.
-    let code = vec![Instr::Local(0), Instr::JFalse(0)];
+    let code = vec![Instr::GetLocal(0), Instr::JFalse(0)];
     assert_eq!(peephole(code.clone(), s0(2)).0, code);
 }
 
@@ -200,7 +200,7 @@ fn constfold_preserves_runtime_errors() {
 #[test]
 fn constfold_skips_non_constant_operands() {
     // A `Local` operand is not a compile-time constant.
-    let code = vec![Instr::Local(0), Instr::PushPosInt(1), Instr::Add];
+    let code = vec![Instr::GetLocal(0), Instr::PushPosInt(1), Instr::Add];
     assert_eq!(peephole(code.clone(), s0(3)).0, code);
 }
 

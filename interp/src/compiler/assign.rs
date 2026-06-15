@@ -330,7 +330,7 @@ impl<'src> super::Compiler<'src> {
     /// copy the buried object/key for the read.
     pub(super) fn lvalue_emit_load(&mut self, lv: &super::LValue<'_, '_>, span: u32) {
         match lv {
-            super::LValue::Local(slot) => self.emit(Instr::Local(*slot as LocalIndex), span),
+            super::LValue::Local(slot) => self.emit(Instr::GetLocal(*slot as LocalIndex), span),
             super::LValue::Member(_, field) => {
                 self.emit(Instr::Pick(0), span); // copy the object
                 self.emit(Instr::ObjGet(RcStr::from(field.as_str())), span);

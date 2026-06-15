@@ -109,7 +109,7 @@ impl<'src> super::Compiler<'src> {
                 return;
             }
         }
-        self.emit(Instr::Local(r.slot as LocalIndex), span);
+        self.emit(Instr::GetLocal(r.slot as LocalIndex), span);
     }
 
     /// The `scopes` index of the function/arrow defined at `span`.

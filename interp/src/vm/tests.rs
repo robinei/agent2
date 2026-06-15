@@ -215,7 +215,7 @@ fn tee_local() {
             PushFloat(7.0),
             TeeLocal(0),
             Pop(1),
-            Local(0),
+            GetLocal(0),
         ]),
         vec![n(7.0), n(7.0)]
     );
@@ -257,7 +257,7 @@ fn inc_local() {
             SetLocal(0),
             IncLocal(0, 1.0, UpdateMode::Postfix),
             Pop(1), // drop old value
-            Local(0),
+            GetLocal(0),
         ]),
         vec![n(4.0), n(4.0)]
     );
@@ -722,8 +722,8 @@ fn call_and_return() {
             PushFloat(20.0),
             Call(4, 2),
             Return(1),
-            Local(0),
-            Local(1),
+            GetLocal(0),
+            GetLocal(1),
             Add,
             Return(1),
         ]),
@@ -741,8 +741,8 @@ fn arg_order_is_left_to_right() {
             PushFloat(3.0),
             Call(4, 2),
             Return(1),
-            Local(0),
-            Local(1),
+            GetLocal(0),
+            GetLocal(1),
             Sub,
             Return(1),
         ]),
@@ -770,8 +770,8 @@ fn call_dyn_indirect() {
             PushFn(5),
             CallDyn(2),
             Return(1),
-            Local(0),
-            Local(1),
+            GetLocal(0),
+            GetLocal(1),
             Sub,
             Return(1),
         ]),
@@ -821,8 +821,8 @@ fn call_spread_with_fn() {
         PushFn(6), // callable on top (addr of fn body)
         CallSpread,
         Return(1),
-        Local(0),
-        Local(1),
+        GetLocal(0),
+        GetLocal(1),
         Sub,
         Return(1),
     ];
@@ -917,18 +917,18 @@ fn append_counter(code: &mut Vec<Instr>) -> u32 {
     code.push(PushFloat(0.0));
     code.push(SetLocal(0)); // count = 0 (writes through the cell)
     let mk = code.len();
-    code.push(MakeClosure(0, vec![0].into())); // patched: capture count
+    code.push(ClosureNew(0, vec![0].into())); // patched: capture count
     code.push(Return(1));
     let inner = code.len() as u32;
     // 0 params, 1 upval → EnterFrame installs the captured cell at slot 0.
     code.push(EnterFrame(0, false, vec![].into()));
-    code.push(Local(0)); // count  (slot 0 = captured upval)
+    code.push(GetLocal(0)); // count  (slot 0 = captured upval)
     code.push(PushFloat(1.0));
     code.push(Add);
     code.push(SetLocal(0)); // count = count + 1 (through the shared cell)
-    code.push(Local(0));
+    code.push(GetLocal(0));
     code.push(Return(1)); // return count
-    code[mk] = MakeClosure(inner, vec![0].into());
+    code[mk] = ClosureNew(inner, vec![0].into());
     mc
 }
 
@@ -974,11 +974,11 @@ fn closures_have_independent_cells() {
     let call2 = code.len();
     code.push(Call(0, 0));
     code.push(SetLocal(1));
-    code.push(Local(0));
+    code.push(GetLocal(0));
     code.push(CallDyn(0)); // c1() → 1
-    code.push(Local(0));
+    code.push(GetLocal(0));
     code.push(CallDyn(0)); // c1() → 2
-    code.push(Local(1));
+    code.push(GetLocal(1));
     code.push(CallDyn(0)); // c2() → 1
     code.push(ArrNew(3));
     code.push(Return(1));
@@ -1009,16 +1009,16 @@ fn closure_captures_plain_slot_by_value() {
     code.push(PushFloat(5.0));
     code.push(SetLocal(0));
     let mk = code.len();
-    code.push(MakeClosure(0, vec![0].into())); // snapshot x = 5
+    code.push(ClosureNew(0, vec![0].into())); // snapshot x = 5
     code.push(PushFloat(99.0));
     code.push(SetLocal(0)); // x = 99 AFTER capture (must not be seen)
     code.push(Return(1));
     let inner = code.len() as u32;
     code.push(EnterFrame(0, false, vec![].into())); // install the by-value upval at slot 0
-    code.push(Local(0)); // return captured snapshot
+    code.push(GetLocal(0)); // return captured snapshot
     code.push(Return(1));
     code[call] = Call(maker, 0);
-    code[mk] = MakeClosure(inner, vec![0].into());
+    code[mk] = ClosureNew(inner, vec![0].into());
     assert_eq!(run(code), vec![n(5.0)]);
 }
 
@@ -1033,11 +1033,11 @@ fn two_closures_share_one_cell() {
     code.push(Call(0, 0));
     code.push(SetLocal(0));
     code.push(PushFloat(42.0)); // setter's arg
-    code.push(Local(0));
+    code.push(GetLocal(0));
     code.push(PushFloat(1.0));
     code.push(IndexGet); // setter
     code.push(CallDyn(1)); // setter(42) → (no result)
-    code.push(Local(0));
+    code.push(GetLocal(0));
     code.push(PushFloat(0.0));
     code.push(IndexGet); // getter
     code.push(CallDyn(0)); // getter() → 42
@@ -1048,24 +1048,24 @@ fn two_closures_share_one_cell() {
     code.push(PushFloat(0.0));
     code.push(SetLocal(0));
     let mk_get = code.len();
-    code.push(MakeClosure(0, vec![0].into()));
+    code.push(ClosureNew(0, vec![0].into()));
     let mk_set = code.len();
-    code.push(MakeClosure(0, vec![0].into()));
+    code.push(ClosureNew(0, vec![0].into()));
     code.push(ArrNew(2)); // [getter, setter]
     code.push(Return(1));
     let getter = code.len() as u32;
     code.push(EnterFrame(0, false, vec![].into())); // upval x at slot 0
-    code.push(Local(0));
+    code.push(GetLocal(0));
     code.push(Return(1));
     let setter = code.len() as u32;
     // 1 param (slot 0) + 1 upval x (slot 1): write the param into x's cell.
     code.push(EnterFrame(1, false, vec![].into()));
-    code.push(Local(0)); // the arg
+    code.push(GetLocal(0)); // the arg
     code.push(SetLocal(1)); // x = arg (through the shared cell)
     code.push(Return(0));
     code[call] = Call(maker, 0);
-    code[mk_get] = MakeClosure(getter, vec![0].into());
-    code[mk_set] = MakeClosure(setter, vec![0].into());
+    code[mk_get] = ClosureNew(getter, vec![0].into());
+    code[mk_set] = ClosureNew(setter, vec![0].into());
     assert_eq!(run(code), vec![n(42.0)]);
 }
 
@@ -1085,21 +1085,21 @@ fn nested_capture_forwards_same_cell() {
     code.push(PushFloat(7.0));
     code.push(SetLocal(0));
     let mk_mid = code.len();
-    code.push(MakeClosure(0, vec![0].into()));
+    code.push(ClosureNew(0, vec![0].into()));
     code.push(Return(1));
     let middle = code.len() as u32;
     // middle's slot 0 is x (installed upval); forward it to inner.
     code.push(EnterFrame(0, false, vec![].into()));
     let mk_in = code.len();
-    code.push(MakeClosure(0, vec![0].into()));
+    code.push(ClosureNew(0, vec![0].into()));
     code.push(Return(1));
     let inner = code.len() as u32;
     code.push(EnterFrame(0, false, vec![].into()));
-    code.push(Local(0));
+    code.push(GetLocal(0));
     code.push(Return(1));
     code[call] = Call(outer, 0);
-    code[mk_mid] = MakeClosure(middle, vec![0].into());
-    code[mk_in] = MakeClosure(inner, vec![0].into());
+    code[mk_mid] = ClosureNew(middle, vec![0].into());
+    code[mk_in] = ClosureNew(inner, vec![0].into());
     assert_eq!(run(code), vec![n(7.0)]);
 }
 
@@ -1110,7 +1110,7 @@ fn closure_identity_equality() {
         EnterFrame(0, false, vec![SlotKind::Boxed].into()),
         PushFloat(1.0),
         SetLocal(0),
-        MakeClosure(6, vec![0].into()),
+        ClosureNew(6, vec![0].into()),
         Pick(0),
         Eq,
         Return(1), // addr 6: also a valid (never-called) closure target
@@ -1121,8 +1121,8 @@ fn closure_identity_equality() {
         EnterFrame(0, false, vec![SlotKind::Boxed].into()),
         PushFloat(1.0),
         SetLocal(0),
-        MakeClosure(7, vec![0].into()),
-        MakeClosure(7, vec![0].into()),
+        ClosureNew(7, vec![0].into()),
+        ClosureNew(7, vec![0].into()),
         Eq,
         Return(1),
         Return(1), // addr 7
@@ -1137,7 +1137,7 @@ fn make_closure_rejects_out_of_range_capture() {
         Call(2, 0),
         Return(0),
         EnterFrame(0, false, plain(1).into()),
-        MakeClosure(0, vec![5].into()), // only slot 0 exists
+        ClosureNew(0, vec![5].into()), // only slot 0 exists
         Return(1),
     ];
     assert!(matches!(run_err(code).kind, ErrorKind::BadLocal));
@@ -1169,11 +1169,11 @@ fn call_with_locals() {
             Call(4, 2),
             Return(1),
             EnterFrame(2, false, plain(1).into()),
-            Local(0),
-            Local(1),
+            GetLocal(0),
+            GetLocal(1),
             Add,
             SetLocal(2),
-            Local(2),
+            GetLocal(2),
             Return(1),
         ]),
         vec![n(15.0)]
@@ -1189,7 +1189,7 @@ fn local_oob() {
         PushFloat(1.0),
         Call(3, 1),
         Return(0),
-        Local(1), // only local 0 (the arg) exists
+        GetLocal(1), // only local 0 (the arg) exists
         Return(0),
     ];
     assert!(matches!(run_err(code).kind, ErrorKind::BadLocal));
@@ -1213,7 +1213,7 @@ fn arr_new_and_length() {
             PushFloat(2.0),
             PushFloat(3.0),
             ArrNew(3),
-            ArrLength
+            GetLength
         ]),
         vec![n(3.0)]
     );
@@ -1289,7 +1289,7 @@ fn arr_extend_and_push() {
         ArrExtend,       // [1, 10, 20]
         PushFloat(99.0), // trailing element
         ArrPush,         // [1, 10, 20, 99]
-        ArrLength,
+        GetLength,
     ];
     assert_eq!(run(code), vec![n(4.0)]);
 }
@@ -1303,7 +1303,7 @@ fn arr_extend_empty_leading() {
         PushFloat(4.0),
         ArrNew(2), // [3, 4]
         ArrExtend, // [3, 4]
-        ArrLength,
+        GetLength,
     ];
     assert_eq!(run(code), vec![n(2.0)]);
 }
@@ -1330,7 +1330,7 @@ fn arr_push_twice() {
         ArrPush,
         PushFloat(3.0),
         ArrPush,
-        ArrLength,
+        GetLength,
     ];
     assert_eq!(run(code), vec![n(3.0)]);
 }
@@ -1504,7 +1504,7 @@ fn uninitialized_local_is_undefined() {
     // `let x;` then read x -> undefined.
     let code = vec![
         EnterFrame(0, false, vec![SlotKind::Plain].into()),
-        Local(0),
+        GetLocal(0),
         Return(1),
     ];
     assert_eq!(run(code), vec![undef()]);
@@ -1807,7 +1807,7 @@ fn fuel_is_consumed_per_instruction() {
 fn dangling_pointer_does_not_panic() {
     // A PushPtr with no backing heap cell must error, not panic.
     assert!(matches!(
-        run_err(vec![PushObject(99), ArrLength]).kind,
+        run_err(vec![PushObject(99), GetLength]).kind,
         ErrorKind::ValueError
     ));
     // Type predicates stay total (false) on a dangling pointer.
@@ -1842,8 +1842,8 @@ fn frame_allocates_multiple_locals() {
         SetLocal(0),
         PushFloat(8.0),
         SetLocal(1),
-        Local(0),
-        Local(1),
+        GetLocal(0),
+        GetLocal(1),
         Add,
         Return(1),
     ];
@@ -1938,10 +1938,10 @@ fn stack_ops_work_within_frame() {
         SetLocal(0),    // local 0 = 10
         PushFloat(1.0), // temporaries: [1, 2]
         PushFloat(2.0),
-        Dig(1),   // -> [2, 1]
-        Pop(1),   // -> [2]
-        Local(0), // -> [2, 10]
-        Add,      // -> [12]
+        Dig(1),      // -> [2, 1]
+        Pop(1),      // -> [2]
+        GetLocal(0), // -> [2, 10]
+        Add,         // -> [12]
         Return(1),
     ];
     assert_eq!(run(code), vec![n(12.0)]);
@@ -2260,9 +2260,9 @@ fn arr_index_negative_errors() {
 fn string_utf8_length() {
     // String `.length` returns byte count, not char count.
     // "é" is 2 bytes in UTF-8.
-    assert_eq!(run(vec![ps("é"), ArrLength]), vec![Value::Float(2.0)]);
+    assert_eq!(run(vec![ps("é"), GetLength]), vec![Value::Float(2.0)]);
     // "😀" is 4 bytes.
-    assert_eq!(run(vec![ps("😀"), ArrLength]), vec![Value::Float(4.0)]);
+    assert_eq!(run(vec![ps("😀"), GetLength]), vec![Value::Float(4.0)]);
 }
 
 // ── NaN in Math.min/max (JS divergence) ─────────────────────────
@@ -2552,7 +2552,7 @@ fn out_of_fuel_slices_resume() {
 fn resume_with_not_resumable_errors() {
     // A bad local index is an invariant violation: NotResumable. resume_with
     // must fail.
-    let mut vm = VM::new(vec![Local(3)]);
+    let mut vm = VM::new(vec![GetLocal(3)]);
     let err = vm.step(u64::MAX).unwrap_err();
     assert!(matches!(err.kind, ErrorKind::BadLocal));
     assert!(matches!(err.resume, ResumeMode::NotResumable));

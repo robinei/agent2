@@ -41,7 +41,7 @@ impl<'src> super::Compiler<'src> {
                             self.emit(Instr::PushFn(label), span);
                         } else {
                             self.emit(
-                                Instr::MakeClosure(
+                                Instr::ClosureNew(
                                     label,
                                     captures.iter().map(|&c| c as LocalIndex).collect(),
                                 ),
@@ -174,7 +174,7 @@ impl<'src> super::Compiler<'src> {
             self.emit(Instr::PushFn(label), span);
         } else {
             self.emit(
-                Instr::MakeClosure(label, captures.iter().map(|&c| c as LocalIndex).collect()),
+                Instr::ClosureNew(label, captures.iter().map(|&c| c as LocalIndex).collect()),
                 span,
             );
         }
@@ -301,7 +301,7 @@ impl<'src> super::Compiler<'src> {
                 // ones got their cells from `EnterFrame`, and `SetLocal`
                 // writes through cells).
                 let pat_span = item.span.start;
-                self.emit(Instr::Local(slot as LocalIndex), pat_span);
+                self.emit(Instr::GetLocal(slot as LocalIndex), pat_span);
                 if let Some(default) = &item.initializer {
                     self.emit_default(default, pat_span);
                 }
@@ -396,7 +396,7 @@ impl<'src> super::Compiler<'src> {
             if let Some(default) = default_expr {
                 // if Local(slot) === undefined { slot = default }
                 let skip_default = self.new_label();
-                self.emit(Instr::Local(slot as LocalIndex), span);
+                self.emit(Instr::GetLocal(slot as LocalIndex), span);
                 self.emit(Instr::PushUndefined, span);
                 self.emit(Instr::Eq, span);
                 self.emit(Instr::JFalse(skip_default), span);

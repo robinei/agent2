@@ -149,7 +149,7 @@ fn const_propagation_folds_uses() {
         !prog
             .code
             .iter()
-            .any(|i| matches!(i, Instr::Mul | Instr::Local(_))),
+            .any(|i| matches!(i, Instr::Mul | Instr::GetLocal(_))),
         "N should be propagated and folded: {:?}",
         prog.code
     );
@@ -181,7 +181,7 @@ fn let_is_not_propagated() {
     // A reassigned `let` must read its slot, never a stale literal.
     let prog = compile("let y = 5; y = 6; input.x = y;").expect("compiles");
     assert!(
-        prog.code.iter().any(|i| matches!(i, Instr::Local(_))),
+        prog.code.iter().any(|i| matches!(i, Instr::GetLocal(_))),
         "reassigned let must load: {:?}",
         prog.code
     );
@@ -249,7 +249,7 @@ fn effectively_const_let_propagates() {
         !prog
             .code
             .iter()
-            .any(|i| matches!(i, Instr::Mul | Instr::Local(_))),
+            .any(|i| matches!(i, Instr::Mul | Instr::GetLocal(_))),
         "effectively-const let should fold: {:?}",
         prog.code
     );
@@ -263,7 +263,7 @@ fn later_reassignment_defeats_propagation_everywhere() {
     // use *before* it loads the slot (sound without dataflow).
     let prog = compile("let N = 5; input.x = N; N = 9; input.y = N;").expect("ok");
     assert!(
-        prog.code.iter().any(|i| matches!(i, Instr::Local(_))),
+        prog.code.iter().any(|i| matches!(i, Instr::GetLocal(_))),
         "a reassigned let must load: {:?}",
         prog.code
     );
@@ -299,7 +299,7 @@ fn literal_const_has_no_slot_or_store() {
         !prog
             .code
             .iter()
-            .any(|i| matches!(i, Instr::SetLocal(_) | Instr::Local(_))),
+            .any(|i| matches!(i, Instr::SetLocal(_) | Instr::GetLocal(_))),
         "literal const should occupy no slot: {:?}",
         prog.code
     );
@@ -313,10 +313,7 @@ fn const_only_closure_demotes_to_fn() {
     // captures nothing and is a bare `Fn` (no `MakeClosure`, no heap closure).
     let prog = compile("const k = 5; const f = () => k; input.x = f();").expect("ok");
     assert!(
-        !prog
-            .code
-            .iter()
-            .any(|i| matches!(i, Instr::MakeClosure(..))),
+        !prog.code.iter().any(|i| matches!(i, Instr::ClosureNew(..))),
         "const-only closure should demote to Fn: {:?}",
         prog.code
     );
@@ -330,10 +327,7 @@ fn const_only_closure_in_loop_demotes_to_fn() {
     // closure allocation (bare `Fn`, not `MakeClosure`).
     let prog = compile("const f = 2; input.r = [1, 2, 3].map(x => x * f);").expect("ok");
     assert!(
-        !prog
-            .code
-            .iter()
-            .any(|i| matches!(i, Instr::MakeClosure(..))),
+        !prog.code.iter().any(|i| matches!(i, Instr::ClosureNew(..))),
         "callback over a const should not allocate a closure: {:?}",
         prog.code
     );
@@ -358,11 +352,7 @@ fn non_literal_captured_const_keeps_its_store() {
         "non-literal captured const must keep its store: {:?}",
         prog.code
     );
-    assert!(
-        prog.code
-            .iter()
-            .any(|i| matches!(i, Instr::MakeClosure(..)))
-    );
+    assert!(prog.code.iter().any(|i| matches!(i, Instr::ClosureNew(..))));
     let vm = run_program(prog);
     assert_eq!(input_val(&vm, "x"), Value::PosInt(5));
 }
@@ -414,10 +404,7 @@ fn mutual_recursion_allocates_no_closures() {
     )
     .expect("ok");
     assert!(
-        !prog
-            .code
-            .iter()
-            .any(|i| matches!(i, Instr::MakeClosure(..))),
+        !prog.code.iter().any(|i| matches!(i, Instr::ClosureNew(..))),
         "mutual recursion should allocate no closures: {:?}",
         prog.code
     );
@@ -434,7 +421,7 @@ fn self_recursion_is_static_with_no_slot() {
         !prog
             .code
             .iter()
-            .any(|i| matches!(i, Instr::CallDyn(_) | Instr::MakeClosure(..))),
+            .any(|i| matches!(i, Instr::CallDyn(_) | Instr::ClosureNew(..))),
         "self-recursion should be static: {:?}",
         prog.code
     );
@@ -447,12 +434,7 @@ fn function_passed_as_value_is_fn_constant() {
     let prog =
         compile("function dbl(x){ return x * 2; } input.r = [1, 2, 3].map(dbl);").expect("ok");
     assert!(prog.code.iter().any(|i| matches!(i, Instr::PushFn(_))));
-    assert!(
-        !prog
-            .code
-            .iter()
-            .any(|i| matches!(i, Instr::MakeClosure(..)))
-    );
+    assert!(!prog.code.iter().any(|i| matches!(i, Instr::ClosureNew(..))));
     let vm = run_program(prog);
     match input_val(&vm, "r") {
         Value::Array(p) => {
@@ -492,10 +474,7 @@ fn const_arrow_is_a_constant_function() {
     let prog = compile("const dbl = (x) => x * 2; input.r = [1, 2, 3].map(dbl); input.y = dbl(5);")
         .expect("ok");
     assert!(
-        !prog
-            .code
-            .iter()
-            .any(|i| matches!(i, Instr::MakeClosure(..))),
+        !prog.code.iter().any(|i| matches!(i, Instr::ClosureNew(..))),
         "const arrow should be a Fn constant: {:?}",
         prog.code
     );
@@ -517,7 +496,7 @@ fn const_named_fn_expr_self_recursion_is_static() {
         !prog
             .code
             .iter()
-            .any(|i| matches!(i, Instr::CallDyn(_) | Instr::MakeClosure(..))),
+            .any(|i| matches!(i, Instr::CallDyn(_) | Instr::ClosureNew(..))),
         "named const fn-expr self-recursion should be static: {:?}",
         prog.code
     );
@@ -564,10 +543,7 @@ fn const_fn_between_locals_renumbers_correctly() {
 fn never_reassigned_let_function_is_constant() {
     let prog = compile("let dbl = (x) => x * 2; input.r = [1, 2, 3].map(dbl);").expect("ok");
     assert!(
-        !prog
-            .code
-            .iter()
-            .any(|i| matches!(i, Instr::MakeClosure(..))),
+        !prog.code.iter().any(|i| matches!(i, Instr::ClosureNew(..))),
         "never-reassigned let function should be a Fn constant: {:?}",
         prog.code
     );
@@ -693,7 +669,7 @@ fn effectively_const_callee_materializes_constant_not_dead_slot() {
         prog.code
     );
     assert!(
-        !prog.code.iter().any(|i| matches!(i, Instr::Local(_))),
+        !prog.code.iter().any(|i| matches!(i, Instr::GetLocal(_))),
         "no read of the dead slot should remain: {:?}",
         prog.code
     );
@@ -712,7 +688,7 @@ fn catch_only_return_allocates_no_spill_slot() {
         !prog
             .code
             .iter()
-            .any(|i| matches!(i, Instr::SetLocal(_) | Instr::Local(_))),
+            .any(|i| matches!(i, Instr::SetLocal(_) | Instr::GetLocal(_))),
         "no spill traffic expected: {:?}",
         prog.code
     );

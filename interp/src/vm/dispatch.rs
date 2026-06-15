@@ -306,21 +306,19 @@ impl VM {
                     self.dispatch_call(callable, nargs)?;
                 }
 
-                Instr::MakeClosure(addr, captures) => {
+                Instr::ClosureNew(addr, captures) => {
                     let addr = self.validate_func_addr(*addr)?;
                     // Collect into stack-allocated SmallVec instead of cloning
                     // the ThinVec from self.code. LocalIndex is u32 (Copy).
-                    let captures: SmallVec<[LocalIndex; 8]> = captures.iter().copied().collect();
-                    let local_count = self.cur_local_count;
                     let mut upvals: SmallVec<[Value; 8]> = SmallVec::new();
-                    for slot in captures {
-                        if (slot as u32) >= local_count {
+                    for slot in captures.iter() {
+                        if (*slot as u32) >= self.cur_local_count {
                             return Err(self.fail(ErrorKind::BadLocal, "bad local"));
                         }
                         // Copy the slot verbatim: a Boxed slot carries its Upval
                         // handle (shared, by-reference), a Plain slot its value
                         // (a by-value snapshot).
-                        upvals.push(self.stack[(self.fp + slot as u32) as usize].clone());
+                        upvals.push(self.stack[(self.fp + *slot as u32) as usize].clone());
                     }
                     let closure = self.alloc_closure(addr, ThinVec::from(upvals.as_slice()));
                     self.stack.push(closure);
@@ -530,7 +528,7 @@ impl VM {
                     self.ip += 1;
                 }
 
-                Instr::Local(local) => {
+                Instr::GetLocal(local) => {
                     if (*local as u32) >= self.cur_local_count {
                         return Err(self.fail(ErrorKind::BadLocal, "bad local"));
                     }
@@ -1414,7 +1412,7 @@ impl VM {
                     self.ip += 1;
                 }
 
-                Instr::ArrLength => {
+                Instr::GetLength => {
                     let val = self.pop()?;
                     // `.length`: intrinsic byte/element count for strings and
                     // arrays; on an *object* a plain property read (JS — e.g. a
@@ -1443,7 +1441,7 @@ impl VM {
                     self.ip += 1;
                 }
 
-                Instr::MapSetSize => {
+                Instr::GetSize => {
                     let val = self.pop()?;
                     // `.size`: intrinsic entry count for maps and sets; on an
                     // *object* the `size` property (`undefined` when absent).
