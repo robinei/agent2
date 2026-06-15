@@ -21,7 +21,7 @@ use crate::host::{FrameId, ProgramStatus, SessionEvent};
 use crate::types::{EventId, EventPayload, Message};
 
 /// What a transcript row is, for styling by the renderer.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ChatKind {
     /// The frame's stored system prompt (a collapsible header).
     System,
@@ -31,9 +31,24 @@ pub enum ChatKind {
     Streaming,
     /// A `run_program` block header or one of its `⚙` inner-call lines.
     ToolCall,
+    /// An attachment line within a program block.
+    Attachment,
     /// Frame lifecycle markers.
     Marker,
     Error,
+}
+
+/// Click-hit metadata for a transcript row.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RowDetail {
+    /// No special click target.
+    None,
+    /// A program block header row — clicking selects the program.
+    Program(EventId),
+    /// An attachment row — clicking selects the program + that attachment.
+    Attachment(EventId, String),
+    /// An invoke row — clicking selects the program + that invoke.
+    Invoke(EventId, usize),
 }
 
 /// One transcript entry. A `Header` computes its text live from the
@@ -49,7 +64,12 @@ enum Entry {
         program: Option<EventId>,
     },
     /// A `run_program` block header, keyed by the program's event id.
-    Header { frame: FrameId, program: EventId },
+    Header {
+        frame: FrameId,
+        program: EventId,
+        /// Attachment names in definition order.
+        attachments: Vec<String>,
+    },
 }
 
 #[derive(Default)]
@@ -65,6 +85,8 @@ pub struct ChatState {
     current_program: HashMap<FrameId, EventId>,
     /// Live status per program block, titling its header.
     program_status: HashMap<EventId, ProgramStatus>,
+    /// Attachment content per program: program_id → (name → content).
+    pub attachment_content: HashMap<EventId, HashMap<String, String>>,
 }
 
 impl ChatState {
@@ -161,8 +183,33 @@ impl ChatState {
                 if let Some(call) = tool_calls.first()
                     && call.name == crate::machine::TOOL_RUN_PROGRAM
                 {
-                    self.entries.push(Entry::Header { frame, program: id });
+                    let attachment_names: Vec<String> = call
+                        .arguments
+                        .get("attachments")
+                        .and_then(|v| v.as_object())
+                        .map(|obj| obj.keys().cloned().collect())
+                        .unwrap_or_default();
+                    let attachments: HashMap<String, String> = call
+                        .arguments
+                        .get("attachments")
+                        .and_then(|v| v.as_object())
+                        .map(|obj| {
+                            obj.iter()
+                                .filter_map(|(k, v)| {
+                                    v.as_str().map(|s| (k.clone(), s.to_string()))
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    self.entries.push(Entry::Header {
+                        frame,
+                        program: id,
+                        attachments: attachment_names,
+                    });
                     self.current_program.insert(frame, id);
+                    if !attachments.is_empty() {
+                        self.attachment_content.insert(id, attachments);
+                    }
                 }
             }
             // The report body lives in the right console/result pane, not
@@ -185,18 +232,23 @@ impl ChatState {
     }
 
     /// Transcript rows for `frame` (or the main frame when `None`): one
-    /// `(kind, line, program)` per visual line. `program` is the program
-    /// id the row belongs to (or the system header's event id), for click
-    /// hit-testing. Multi-line items split; the system prompt collapses
-    /// to a single header row.
-    pub fn rows(&self, frame: Option<FrameId>) -> Vec<(ChatKind, String, Option<EventId>)> {
+    /// `(kind, line, detail)` per visual line. `detail` carries click-hit
+    /// metadata: which program, attachment, or invoke a row targets.
+    /// Multi-line items split; the system prompt collapses to a single
+    /// header row.
+    pub fn rows(&self, frame: Option<FrameId>) -> Vec<(ChatKind, String, RowDetail)> {
         let Some(target) = frame.or(self.main_frame) else {
             return Vec::new();
         };
         let mut out = Vec::new();
+        let mut invoke_index: HashMap<EventId, usize> = HashMap::new();
         for entry in &self.entries {
             match entry {
-                Entry::Header { frame, program } if *frame == target => {
+                Entry::Header {
+                    frame,
+                    program,
+                    attachments,
+                } if *frame == target => {
                     let status = self
                         .program_status
                         .get(program)
@@ -205,8 +257,15 @@ impl ChatState {
                     out.push((
                         ChatKind::ToolCall,
                         format!("run_program: {status}"),
-                        Some(*program),
+                        RowDetail::Program(*program),
                     ));
+                    for name in attachments {
+                        out.push((
+                            ChatKind::Attachment,
+                            format!("⬡ attachment: {name}"),
+                            RowDetail::Attachment(*program, name.clone()),
+                        ));
+                    }
                 }
                 Entry::Line {
                     frame,
@@ -215,11 +274,22 @@ impl ChatState {
                     program,
                 } if *frame == target => {
                     if *kind == ChatKind::System {
-                        // Collapsed to a single header (Step 4 expands it).
-                        out.push((ChatKind::System, "system".into(), *program));
+                        out.push((ChatKind::System, "system".into(), RowDetail::None));
                         continue;
                     }
-                    push_wrapped(&mut out, *kind, text, *program);
+                    let detail = if *kind == ChatKind::ToolCall {
+                        if let Some(pid) = program {
+                            let idx = invoke_index.entry(*pid).or_insert(0);
+                            let d = RowDetail::Invoke(*pid, *idx);
+                            *idx += 1;
+                            d
+                        } else {
+                            RowDetail::None
+                        }
+                    } else {
+                        RowDetail::None
+                    };
+                    push_wrapped(&mut out, *kind, text, detail);
                 }
                 _ => {}
             }
@@ -229,7 +299,7 @@ impl ChatState {
                 continue;
             }
             for line in buf.lines() {
-                out.push((ChatKind::Streaming, line.to_owned(), None));
+                out.push((ChatKind::Streaming, line.to_owned(), RowDetail::None));
             }
         }
         out
@@ -239,10 +309,10 @@ impl ChatState {
 /// Push an item's visual lines, labelling user/assistant prose and
 /// indenting continuation lines under the label.
 fn push_wrapped(
-    out: &mut Vec<(ChatKind, String, Option<EventId>)>,
+    out: &mut Vec<(ChatKind, String, RowDetail)>,
     kind: ChatKind,
     text: &str,
-    program: Option<EventId>,
+    detail: RowDetail,
 ) {
     let label = match kind {
         ChatKind::User => "you ❯ ",
@@ -257,10 +327,10 @@ fn push_wrapped(
         } else {
             " ".repeat(label.chars().count())
         };
-        out.push((kind, format!("{head}{line}"), program));
+        out.push((kind, format!("{head}{line}"), detail.clone()));
     }
     if !any {
-        out.push((kind, label.to_owned(), program));
+        out.push((kind, label.to_owned(), detail));
     }
 }
 
@@ -366,7 +436,7 @@ mod tests {
         // A run_program renders as a status-titled block header.
         assert!(rows.iter().any(|(k, t, p)| *k == ChatKind::ToolCall
             && t == "run_program: running"
-            && *p == Some(EventId::new(3))));
+            && *p == RowDetail::Program(EventId::new(3))));
 
         // ProgramResult/Label never reach the transcript.
         let before = chat.rows(None).len();
@@ -398,13 +468,23 @@ mod tests {
         chat.apply(&invoke(4, "store", serde_json::json!(true)));
 
         let rows = chat.rows(None);
-        let glyphs: Vec<&(ChatKind, String, Option<EventId>)> = rows
+        let glyphs: Vec<&(ChatKind, String, RowDetail)> = rows
             .iter()
             .filter(|(k, t, _)| *k == ChatKind::ToolCall && t.starts_with('⚙'))
             .collect();
         assert_eq!(glyphs.len(), 2, "two inner-call lines");
-        // Each ⚙ line carries the program id for hit-testing.
-        assert!(glyphs.iter().all(|(_, _, p)| *p == Some(EventId::new(2))));
+        // Each ⚙ line carries the program id + invoke index for hit-testing.
+        assert!(glyphs.iter().all(|(_, _, p)| matches!(p, RowDetail::Invoke(_, _))));
+        assert!(
+            glyphs
+                .iter()
+                .any(|(_, _, p)| *p == RowDetail::Invoke(EventId::new(2), 0))
+        );
+        assert!(
+            glyphs
+                .iter()
+                .any(|(_, _, p)| *p == RowDetail::Invoke(EventId::new(2), 1))
+        );
 
         // Header starts at running…
         assert!(
@@ -495,7 +575,7 @@ mod tests {
         // Root's slice: leading system row, then the user message.
         let root_rows = chat.rows(Some(EventId::new(1)));
         assert_eq!(root_rows[0].0, ChatKind::System);
-        assert_eq!(root_rows[0].2, Some(EventId::new(2)));
+        assert_eq!(root_rows[0].2, RowDetail::None);
         assert!(
             root_rows
                 .iter()
@@ -507,7 +587,7 @@ mod tests {
         // The child's slice leads with its own system header.
         let child_rows = chat.rows(Some(child));
         assert_eq!(child_rows[0].0, ChatKind::System);
-        assert_eq!(child_rows[0].2, Some(EventId::new(5)));
+        assert_eq!(child_rows[0].2, RowDetail::None);
         assert!(!child_rows.iter().any(|(_, t, _)| t.contains("root q")));
     }
 }

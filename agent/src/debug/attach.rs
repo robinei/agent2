@@ -18,7 +18,7 @@
 //! Keys are focus-modal so chat typing stays free: printable keys go
 //! to the input line; `Esc` swaps to debug-control focus (and back).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::Receiver;
 use std::thread;
 use std::time::Instant;
@@ -31,7 +31,7 @@ use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 use super::app::PaneInfo;
-use super::chat::{ChatKind, ChatState};
+use super::chat::{ChatKind, ChatState, RowDetail};
 use super::ui;
 use crate::host::{FrameId, Session, SessionCommand, SessionEvent};
 use crate::machine::TOOL_RUN_PROGRAM;
@@ -89,6 +89,13 @@ pub enum KeyAction {
     StepLine,
 }
 
+/// A subitem selected within a program block.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Subitem {
+    Attachment(String),
+    Invoke(usize),
+}
+
 pub struct AttachedApp {
     pub chat: ChatState,
     pub view: View,
@@ -99,6 +106,9 @@ pub struct AttachedApp {
     /// selected frame's most-recent program (the default); a click on an
     /// older chat block pins a specific one by its `run_program` event id.
     pub selected_program: Option<EventId>,
+    /// A subitem within the selected program: an attachment or invoke to
+    /// show in the right panel instead of the program console.
+    pub selected_subitem: Option<Subitem>,
     /// Frames whose `System` block is folded to its header (decision 7).
     collapsed: HashSet<FrameId>,
     pub input: String,
@@ -126,6 +136,7 @@ impl AttachedApp {
             focus: Focus::Input,
             selected: Some(root),
             selected_program: None,
+            selected_subitem: None,
             collapsed: HashSet::new(),
             input: String::new(),
             quit: false,
@@ -248,16 +259,46 @@ impl AttachedApp {
                 let Some(body) = body else { return };
                 let line = info.scroll_top + body;
                 let rows = self.chat.rows(self.selected);
-                if let Some((kind, _text, program)) = rows.get(line) {
+                if let Some((kind, _text, detail)) = rows.get(line) {
                     if *kind == ChatKind::System {
                         if let Some(frame) = self.selected
                             && !self.collapsed.remove(&frame)
                         {
                             self.collapsed.insert(frame);
                         }
-                    } else if let Some(program) = program {
-                        self.selected_program = Some(*program);
-                        self.reset_program_scrolls();
+                        return;
+                    }
+                    match detail {
+                        RowDetail::None => {}
+                        RowDetail::Program(pid) => {
+                            self.selected_program = Some(*pid);
+                            self.selected_subitem = None;
+                            self.reset_program_scrolls();
+                        }
+                        RowDetail::Attachment(pid, name) => {
+                            let toggle_off = self.selected_program == Some(*pid)
+                                && self.selected_subitem
+                                    == Some(Subitem::Attachment(name.clone()));
+                            self.selected_program = Some(*pid);
+                            if toggle_off {
+                                self.selected_subitem = None;
+                            } else {
+                                self.selected_subitem =
+                                    Some(Subitem::Attachment(name.clone()));
+                            }
+                            self.reset_program_scrolls();
+                        }
+                        RowDetail::Invoke(pid, idx) => {
+                            let toggle_off = self.selected_program == Some(*pid)
+                                && self.selected_subitem == Some(Subitem::Invoke(*idx));
+                            self.selected_program = Some(*pid);
+                            if toggle_off {
+                                self.selected_subitem = None;
+                            } else {
+                                self.selected_subitem = Some(Subitem::Invoke(*idx));
+                            }
+                            self.reset_program_scrolls();
+                        }
                     }
                 }
             }
@@ -666,7 +707,14 @@ fn render(frame: &mut Frame, app: &mut AttachedApp, session: &Session) {
                     ));
                 }
                 Pane::Console => {
-                    let (top, area) = if let Some(ref pv) = pv {
+                    let (top, area) = if app.selected_subitem.is_some() {
+                        if let Some(ref pv) = pv {
+                            render_subitem(frame, app, pv, *slot, app.console_scroll)
+                        } else {
+                            render_placeholder(frame, Pane::Console, *slot);
+                            (0, *slot)
+                        }
+                    } else if let Some(ref pv) = pv {
                         render_console_from_pv(frame, pv, *slot, app.console_scroll)
                     } else {
                         render_attached_console(frame, app, session, *slot, app.console_scroll)
@@ -759,23 +807,61 @@ fn render(frame: &mut Frame, app: &mut AttachedApp, session: &Session) {
     );
 }
 
-fn chat_style(kind: ChatKind) -> Style {
+fn chat_style(kind: ChatKind, even: bool) -> Style {
+    let dim = |r, g, b| Color::Rgb((r * 3 / 4) as u8, (g * 3 / 4) as u8, (b * 3 / 4) as u8);
     match kind {
-        ChatKind::System => Style::default()
-            .fg(Color::Magenta)
-            .add_modifier(Modifier::DIM),
-        ChatKind::User => Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-        ChatKind::Assistant => Style::default(),
-        ChatKind::Streaming => Style::default()
-            .fg(Color::Gray)
-            .add_modifier(Modifier::ITALIC),
-        ChatKind::ToolCall => Style::default().fg(Color::Yellow),
-        ChatKind::Marker => Style::default()
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::ITALIC),
-        ChatKind::Error => Style::default().fg(Color::Red),
+        ChatKind::System => {
+            let fg = if even { Color::Magenta } else { dim(255, 0, 255) };
+            Style::default().fg(fg).add_modifier(Modifier::DIM)
+        }
+        ChatKind::User => {
+            let fg = if even { Color::Cyan } else { dim(0, 220, 220) };
+            Style::default().fg(fg).add_modifier(Modifier::BOLD)
+        }
+        ChatKind::Assistant => {
+            let fg = if even {
+                Color::Rgb(220, 220, 220)
+            } else {
+                Color::Rgb(155, 155, 155)
+            };
+            Style::default().fg(fg)
+        }
+        ChatKind::Streaming => {
+            let fg = if even {
+                Color::Rgb(140, 140, 140)
+            } else {
+                Color::Rgb(90, 90, 90)
+            };
+            Style::default().fg(fg).add_modifier(Modifier::ITALIC)
+        }
+        ChatKind::ToolCall => {
+            let fg = if even {
+                Color::Yellow
+            } else {
+                Color::Rgb(180, 170, 0)
+            };
+            Style::default().fg(fg)
+        }
+        ChatKind::Attachment => {
+            let fg = if even {
+                Color::Rgb(120, 200, 255)
+            } else {
+                Color::Rgb(80, 140, 200)
+            };
+            Style::default().fg(fg)
+        }
+        ChatKind::Marker => {
+            let fg = if even {
+                Color::DarkGray
+            } else {
+                Color::Rgb(70, 70, 70)
+            };
+            Style::default().fg(fg).add_modifier(Modifier::ITALIC)
+        }
+        ChatKind::Error => {
+            let fg = if even { Color::Red } else { dim(240, 0, 0) };
+            Style::default().fg(fg)
+        }
     }
 }
 
@@ -788,12 +874,54 @@ fn render_chat(
     let [transcript_area, input_area] =
         Layout::vertical([Constraint::Min(1), Constraint::Length(3)]).areas(area);
 
-    let lines: Vec<Line> = app
-        .chat
-        .rows(app.selected)
-        .into_iter()
-        .map(|(kind, text, _program)| Line::from(text).style(chat_style(kind)))
-        .collect();
+    let rows = app.chat.rows(app.selected);
+    let mut lines: Vec<Line> = Vec::with_capacity(rows.len());
+    let mut parity: HashMap<ChatKind, bool> = HashMap::new();
+    let mut in_program: Option<EventId> = None;
+    let mut prev_kind: Option<ChatKind> = None;
+    for (kind, text, detail) in &rows {
+        let even = match detail {
+            RowDetail::Program(pid) | RowDetail::Attachment(pid, _) | RowDetail::Invoke(pid, _) =>
+            {
+                if in_program != Some(*pid) {
+                    in_program = Some(*pid);
+                    let e = parity.entry(ChatKind::ToolCall).or_insert(true);
+                    *e = !*e;
+                }
+                *parity.get(&ChatKind::ToolCall).unwrap_or(&true)
+            }
+            RowDetail::None => {
+                in_program = None;
+                if prev_kind != Some(*kind) {
+                    let e = parity.entry(*kind).or_insert(true);
+                    *e = !*e;
+                }
+                *parity.get(kind).unwrap_or(&true)
+            }
+        };
+        prev_kind = Some(*kind);
+        let mut style = chat_style(*kind, even);
+        // Highlight the selected subitem line.
+        if let Some(ref sel) = app.selected_subitem {
+            let highlight = match (detail, sel) {
+                (RowDetail::Attachment(pid, name), Subitem::Attachment(s))
+                    if app.selected_program == Some(*pid) && name == s =>
+                {
+                    true
+                }
+                (RowDetail::Invoke(pid, idx), Subitem::Invoke(i))
+                    if app.selected_program == Some(*pid) && idx == i =>
+                {
+                    true
+                }
+                _ => false,
+            };
+            if highlight {
+                style = style.add_modifier(Modifier::REVERSED);
+            }
+        }
+        lines.push(Line::from(text.as_str()).style(style));
+    }
     let visible = transcript_area.height.saturating_sub(2) as usize;
     let default_top = lines.len().saturating_sub(visible);
     let top = scroll.unwrap_or(default_top).min(default_top);
@@ -976,6 +1104,67 @@ fn render_console_from_pv(
     frame.render_widget(
         Paragraph::new(lines[top..end].to_vec())
             .block(Block::default().borders(Borders::ALL).title(" console ")),
+        area,
+    );
+    (top, area)
+}
+
+fn render_subitem(
+    frame: &mut Frame,
+    app: &AttachedApp,
+    pv: &ProgramView,
+    area: Rect,
+    scroll: Option<usize>,
+) -> (usize, Rect) {
+    let mut lines: Vec<Line> = Vec::new();
+    let title = match &app.selected_subitem {
+        Some(Subitem::Attachment(name)) => {
+            let content = pv
+                .attachments
+                .get(name)
+                .map(|s| s.as_str())
+                .unwrap_or("(attachment not found)");
+            for l in content.lines() {
+                lines.push(Line::from(l.to_owned()));
+            }
+            format!(" attachment: {name} ")
+        }
+        Some(Subitem::Invoke(idx)) => {
+            if let Some(invoke) = pv.invokes.get(*idx) {
+                lines.push(Line::from(format!("⚙ {}", invoke.name))
+                    .style(Style::default().fg(Color::Yellow)));
+                lines.push(Line::from(""));
+                lines.push(Line::from("args:").style(Style::default().fg(Color::DarkGray)));
+                let args_str = serde_json::to_string_pretty(&invoke.args)
+                    .unwrap_or_else(|_| format!("{:?}", invoke.args));
+                for l in args_str.lines() {
+                    lines.push(Line::from(l.to_owned()));
+                }
+                lines.push(Line::from(""));
+                lines.push(Line::from("result:").style(Style::default().fg(Color::DarkGray)));
+                let result_str = serde_json::to_string_pretty(&invoke.result)
+                    .unwrap_or_else(|_| format!("{:?}", invoke.result));
+                for l in result_str.lines() {
+                    lines.push(Line::from(l.to_owned()));
+                }
+                format!(" ⚙ {} ", invoke.name)
+            } else {
+                lines.push(Line::from("(invoke not found)"));
+                " invoke ".to_string()
+            }
+        }
+        None => {
+            lines.push(Line::from("(no subitem)"));
+            " subitem ".to_string()
+        }
+    };
+    let visible = area.height.saturating_sub(2) as usize;
+    let default_top = lines.len().saturating_sub(visible);
+    let top = scroll.unwrap_or(default_top).min(default_top);
+    let end = (top + visible).min(lines.len());
+    frame.render_widget(
+        Paragraph::new(lines[top..end].to_vec())
+            .block(Block::default().borders(Borders::ALL).title(title)),
         area,
     );
     (top, area)

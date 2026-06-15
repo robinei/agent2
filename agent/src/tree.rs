@@ -31,6 +31,8 @@ pub struct InvokeView {
 pub struct ProgramView {
     pub id: EventId,
     pub source: String,
+    /// Attachment content: name → content string (from run_program args).
+    pub attachments: HashMap<String, String>,
     pub invokes: Vec<InvokeView>,
     /// The top-level `return` value (`Some` ⇒ ran to completion).
     pub result: Option<serde_json::Value>,
@@ -365,9 +367,22 @@ impl Tree {
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("")
                                 .to_string();
+                            let attachments: std::collections::HashMap<String, String> = call
+                                .arguments
+                                .get("attachments")
+                                .and_then(|v| v.as_object())
+                                .map(|obj| {
+                                    obj.iter()
+                                        .filter_map(|(k, v)| {
+                                            v.as_str().map(|s| (k.clone(), s.to_string()))
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default();
                             programs.push(ProgramView {
                                 id: ev.id,
                                 source,
+                                attachments,
                                 invokes: Vec::new(),
                                 result: None,
                                 report: None,

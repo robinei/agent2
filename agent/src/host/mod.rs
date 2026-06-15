@@ -228,14 +228,13 @@ impl Session {
             ));
         }
         let leaf = synthesize_if_interrupted(&mut tree, leaf)?;
-        let emitted = tree.id_counter;
+        let emitted = 0; // replay all existing events into the chat pane
         let state = AgentState::with_spine(tree.spine_at(leaf));
         Self::assemble(tree, state, registry, llm, events, emitted)
     }
 
     /// Shared construction for `new`/`open_at`: card the state, derive
-    /// the root frame, wire the inbox, and surface any freshly logged
-    /// events (a fresh tree's `FrameStart`; nothing for a re-open).
+    /// the root frame, wire the inbox, and surface any logged events.
     fn assemble(
         tree: Tree,
         mut state: AgentState,
