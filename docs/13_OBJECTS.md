@@ -325,9 +325,15 @@ Make `recv.m(args)` bind `this` for user methods, across both call paths:
     load (`obj.x += 1` does `Pick(0); ObjGet`), so `ObjPeek` earns its keep on two
     hot paths. Because resolution stays `ObjGet`'s, a missing `greet` yields
     `Undefined` and the *call* raises "not a function" — JS-faithful (JS errors at
-    the call, not the read). (A dynamic-key counterpart `ObjPeekDyn` can wait
-    until `obj[expr](…)` / `obj[k] += 1` prove common; `Pick(0); ObjGetDyn`
-    covers them meanwhile.)
+    the call, not the read).
+  - **`ObjPeekDyn` = `ObjGetDyn` minus the obj-pop** (`obj, key -> obj, value`):
+    the dynamic-key counterpart, for **computed** method calls `recv[expr](…)`.
+    It consumes the key, keeps the receiver, pushes the property — shares
+    `ObjGetDyn`'s helper/classification, same fusion rationale as `ObjPeek`.
+    **This lifts a current hard error:** `call.rs:106` rejects computed method
+    calls outright ("`computed method calls (obj[expr](...)` are not supported");
+    replace that arm. Computed method calls are real method calls and **must bind
+    `this`** — `has_this = true`, the same as the static form.
   - **`has_this` bit on `CallDyn(ArgCount, has_this)` / `CallSpread(has_this)`** —
     "a receiver sits just below the callee; route it." Dispatch forks on the
     resolved callee's kind, via a shared helper: a **user function/closure** →
@@ -343,6 +349,8 @@ Make `recv.m(args)` bind `this` for user methods, across both call paths:
     `CallDyn` one uniform layout.
   - Lowerings: `recv.greet(a,b)` → `ObjPeek(greet)` + `CallDyn(2, true)`;
     `recv.greet(...xs)` → `ObjPeek(greet)` + `CallSpread(true)`;
+    `recv[k](a)` → `<recv>; <k>; ObjPeekDyn` + `CallDyn(1, true)` (and the
+    spread/optional variants likewise);
     `recv?.greet(…)` guards with the existing `begin_optional` after evaluating
     `recv`, exactly like the `ObjGet` path today.
 - `f(args)` (no receiver) → callee-below-args `Call`/`CallDyn(argc,
@@ -357,6 +365,12 @@ Acceptance:
 - [ ] `const f = obj.greet; f()` runs with `this === undefined` (detachment).
 - [ ] `recv.greet(...xs)` (spread) binds `this === recv` via `ObjPeek` +
       `CallSpread(has_this=true)` — **no `CallMethodSpread` opcode exists**.
+- [ ] `recv[k]()` (computed) now compiles (the `call.rs:106` hard error is gone)
+      and binds `this === recv` via `ObjPeekDyn` + `CallDyn(has_this=true)`;
+      `recv[k](...xs)` likewise via `CallSpread`.
+- [ ] A computed key naming a *builtin* method (`arr["push"](x)`) resolves to
+      `undefined` → "not a function" (documented divergence — builtins aren't
+      stored properties).
 - [ ] `recv?.greet()` on a nullish `recv` short-circuits (no `ObjPeek`, no call,
       no arg evaluation); on a present `recv` binds `this`.
 - [ ] A missing / non-callable `greet` raises "not a function" **at the call**
@@ -600,6 +614,10 @@ folded into the same substrate so they never become one-off bolt-ons.
   the prototype function. Accepted.
 - **No `[[Set]]` traps / accessors.** Own-property assignment only; no
   getters/setters in the MVP.
+- **Computed keys reach only own/proto properties.** `recv[k](…)` binds `this`
+  and resolves user methods on `Object` receivers, but a computed key naming a
+  *builtin* method (`arr["push"]()`) fails — builtins aren't stored properties,
+  so only the static form (`arr.push()`, compiler-resolved) reaches them.
 - **`ToPrimitive` on objects stays unperformed** (the existing divergence):
   arithmetic/`==` against a plain or constructed object is still a `TypeError`,
   not a `toString`/`valueOf` coercion.
