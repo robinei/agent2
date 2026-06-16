@@ -98,6 +98,15 @@ function**, not re-derived per call site. Implementing `this` is then "the JS
 Reference rule": `this_val` = the base of the callee's member reference,
 `Undefined` when it has none.
 
+**Args are uniform too.** `dispatch_call` consumes the **top `nargs` stack
+values** as the argument list, so each call form's only job is to compute
+`(callable, this_val)` and leave its final args as that top-`N` region — using at
+most one shared transform: the **array-expansion helper shared by `CallSpread`
+and `.apply`** (a Rust fn, not the bytecode instruction), or `bind`'s **prepend**
+(insert below the current top-`n` region, so it composes with an already-spread
+region as in `g(...xs)`). No form re-implements spreading or invents its own
+argc/return discipline.
+
 `dispatch_call` is the sole site of the *runtime* kind fork — for a callable
 **value** of unknown kind. **Compile-time-resolved calls deliberately bypass it,
 and should**: static `Call`/`new` go straight to `call_function` (kind is a
@@ -486,8 +495,10 @@ Value::Bound(Rc<BoundFn>)
   entire safety argument. (`ThinVec` keeps the common `f.bind(obj)` case — empty
   `bound_args` — to a single pointer, no heap alloc.)
 - `dispatch_call` gains a `Value::Bound` arm: prepend `inner.bound_args` to the
-  call-site args and **recurse** — `dispatch_call(inner.callable, inner.this_val,
-  …)`. No new routing: the recursion lands on the same chokepoint, so a bound user
+  call-site args (whichever they are — fixed, or already spread by `g(...xs)`,
+  since prepend inserts below the current top-`n` arg region) and **recurse** —
+  `dispatch_call(inner.callable, inner.this_val, …)`. No new routing: the
+  recursion lands on the same chokepoint, so a bound user
   function/closure gets `this_val = inner.this_val` in its frame field and a bound
   *builtin* (`[].push.bind(arr)`) gets it spliced as arg 0 — automatically. The
   Bound arm *overrides* a call-site receiver (`obj.g()` where `g` is bound ignores
@@ -522,11 +533,23 @@ Value::Bound(Rc<BoundFn>)
 *no new value type* — they invoke immediately rather than producing a value, so
 they are strictly cheaper than `bind`:
 
-- `f.call(thisArg, a, b)` → `dispatch_call(f, this = thisArg, [a, b])`.
-- `f.apply(thisArg, argsArray)` → spread `argsArray` (reuse `CallSpread`), then
-  the same. A non-array (and non-nullish) `argsArray` is a `TypeError`.
+- Both terminate at the **one tail** `dispatch_call(callable, this_val, nargs)`,
+  so they re-derive **no** routing — they only extract
+  `(callable = receiver, this_val = thisArg)` and arrange the args:
+  - `f.call(thisArg, a, b)` → `dispatch_call(f, thisArg, 2)` over the `[a, b]`
+    already on the stack above `thisArg`.
+  - `f.apply(thisArg, argsArray)` → expand `argsArray` via the **same
+    array-expansion helper `CallSpread` uses** ("reuse `CallSpread`" = reuse its
+    shared Rust helper; a builtin can't emit the bytecode instruction, so do
+    *not* re-implement spreading), then `dispatch_call(f, thisArg,
+    spread_count)`. A non-array, non-nullish `argsArray` is a `TypeError`.
 - Register both as `Method`-kind builtins whose receiver is callable
   (`Fn`/`Closure`/`Builtin`/`Bound`); a non-callable receiver is a `TypeError`.
+  Like the shadow reroute (`reroute_method_to_object`, `methods.rs:1142`), these
+  are builtins that **re-enter `dispatch_call`** — reuse that established hand-off
+  (the invoked callee's frame yields the result in the `.call`/`.apply`
+  expression's place; `f` and `thisArg` sit below the args and are consumed)
+  rather than inventing a new builtin return discipline.
 - Note the `this`-free use of `.apply` (variadic spread, `f.apply(null, xs)`)
   is **already** covered by `f(...xs)` (Phase 6 `CallSpread`); these earn their
   keep only once `this` exists.
@@ -543,6 +566,15 @@ Acceptance:
 - [ ] `f.call(t, a)` and `f.apply(t, [a])` both run `f` with `this === t`;
       `.apply` with a non-array second arg is a `TypeError`.
 - [ ] `.call`/`.apply` on a non-callable receiver is a `TypeError`.
+- [ ] Bound ∘ spread composes: a bound function called with a spread
+      (`g(...xs)` where `g = f.bind(null, p)`) runs `f(p, ...xs)` — bound args
+      precede the spread args.
+- [ ] `f.apply(null, xs)` yields the same result as `f(...xs)` for the same `xs`
+      (confirms `.apply` and `CallSpread` share one array-expansion helper, not
+      two implementations).
+- [ ] `f.call`/`f.apply` route through `dispatch_call` (the callee's result is
+      the `.call`/`.apply` value; no separate return path) — exercised with both
+      a user-fn and a builtin `f`.
 - [ ] Gate: `cargo fmt && cargo clippy && cargo test` green.
 
 ## Step 6 — method values off a receiver (`[].push`, `obj.m` uncalled)
