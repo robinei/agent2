@@ -647,3 +647,38 @@ fn shadowing_is_uniform_across_receiver_types() {
         testutil::num(42.0)
     );
 }
+
+/// The general `x.toString()` method: one renderer (`to_js_string`) behind
+/// `String(x)`, template interpolation, and this method — including regexp,
+/// which is no longer a special-cased builtin. An object's own `toString`
+/// shadows the default `"[object Object]"`.
+#[test]
+fn general_to_string_method() {
+    assert_eq!(testutil::run_val("return (42).toString();"), eval("'42'"));
+    assert_eq!(
+        testutil::run_val("return [1, 2, 3].toString();"),
+        eval("'1,2,3'")
+    );
+    assert_eq!(
+        testutil::run_val("return /ab/gi.toString();"),
+        eval("'/ab/gi'")
+    );
+    assert_eq!(
+        testutil::run_val("return (true).toString();"),
+        eval("'true'")
+    );
+    // Plain object → default; an own `toString` shadows it.
+    assert_eq!(
+        testutil::run_val("return ({}).toString();"),
+        eval("'[object Object]'")
+    );
+    assert_eq!(
+        testutil::run_val("return ({ toString: () => 'custom' }).toString();"),
+        eval("'custom'")
+    );
+    // Identical to the String()/template renderer.
+    assert_eq!(
+        testutil::run_val("return String([1, 2]) === [1, 2].toString();"),
+        Value::Bool(true)
+    );
+}

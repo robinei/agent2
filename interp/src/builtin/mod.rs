@@ -307,7 +307,9 @@ builtins! {
     // ── RegExp methods ──
     RegExpTest,     BuiltinKind::Method, "test",     2, 2, regexp_test;
     RegExpExec,     BuiltinKind::Method, "exec",     2, 2, regexp_exec;
-    RegExpToString, BuiltinKind::Method, "toString", 1, 1, regexp_to_string;
+
+    // ── universal methods (any receiver) ──
+    ToString, BuiltinKind::Method, "toString", 1, 1, value_to_string;
 
     // ── string methods that accept RegExp ──
     StrMatch,    BuiltinKind::Method, "match",    2, 2, str_match;

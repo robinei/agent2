@@ -116,18 +116,6 @@ pub fn regexp_exec(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     }
 }
 
-/// `regexp.toString()` — returns `"/pattern/flags"`.
-pub fn regexp_to_string(vm: &mut VM, args: Args) -> Result<Value, VMError> {
-    let rx = args.regexp_receiver(vm)?;
-    let mut s = String::from("/");
-    s.push_str(rx.pattern.as_str());
-    s.push('/');
-    if !rx.flags.as_str().is_empty() {
-        s.push_str(rx.flags.as_str());
-    }
-    Ok(Value::String(RcStr::from(s)))
-}
-
 /// Extract a RegExp from a value, failing with a TypeError on mismatch.
 pub(crate) fn try_reg_exp<'a>(_vm: &VM, val: &'a Value) -> Option<&'a crate::vm::RcRegExp> {
     match val {
