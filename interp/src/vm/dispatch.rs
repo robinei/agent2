@@ -243,9 +243,10 @@ impl VM {
                 // ── control flow ─────────────────────────────────
                 Instr::Call(addr, nargs) => self.call_function(*addr, *nargs, SmallVec::new())?,
 
-                Instr::CallDyn(nargs) => {
+                Instr::CallDyn(nargs, _has_this) => {
                     let nargs = *nargs;
-                    let callable = self.pop()?;
+                    let idx = self.stack.len() - 1 - nargs as usize;
+                    let callable = self.stack.remove(idx);
                     self.dispatch_call(callable, nargs)?;
                 }
 
@@ -266,8 +267,9 @@ impl VM {
                     }
                 }
 
-                Instr::CallSpread => {
-                    let callable = self.pop()?;
+                Instr::CallSpread(_has_this) => {
+                    // Callee sits below the args array (at depth 1).
+                    let callable = self.stack.remove(self.stack.len() - 2);
                     let arr_ptr = match self.pop()? {
                         Value::Array(p) => p,
                         _ => {

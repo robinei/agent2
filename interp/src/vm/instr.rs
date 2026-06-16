@@ -91,13 +91,14 @@ pub enum Instr {
     /// on stack after it returns.
     Call(CodeAddr, ArgCount), // any, ... -> [any]
 
-    /// indirect call: the callable sits on top, above its N args (left-to-right,
-    /// so arg 0 is deepest). The callable is either a bare `Fn` value or a `Ptr`
-    /// to a `Value::Closure`; pops it and calls with the same convention as
-    /// Call. For a closure, its captured environment is installed as the
-    /// callee's leading locals (slots 0..K) before the body runs. Errors if the
-    /// top value is neither a Fn nor a closure.
-    CallDyn(ArgCount), // any, ..., fn -> [any]
+    /// indirect call: the callable sits *below* its N args (left-to-right,
+    /// arg 0 deepest, callable at depth N). The callable is either a bare `Fn`
+    /// value or a `Ptr` to a `Value::Closure`; pops it and calls with the same
+    /// convention as Call. For a closure, its captured environment is installed
+    /// as the callee's leading locals (slots 0..K) before the body runs. Errors
+    /// if the callable is neither a Fn nor a closure. When `has_this` is true,
+    /// a receiver sits one deeper (depth N+1) and is threaded as `this`.
+    CallDyn(ArgCount, bool), // any, ..., fn -> [any]
 
     /// static call to a known builtin (the compiler's fast path, analogous to
     /// Call for user functions). The N arguments sit on the stack left-to-right
@@ -105,11 +106,12 @@ pub enum Instr {
     /// pushes exactly one result. No call frame is created. See builtin.rs.
     CallBuiltin(Builtin, ArgCount), // any, ... -> any
 
-    /// Dynamic call with spread arguments. Pops the callable (top) and an
-    /// args array, then dispatches exactly like `CallDyn` with the array's
-    /// elements as the arguments. Covers user functions, closures, and
-    /// builtins uniformly through the dynamic path.
-    CallSpread, // args_arr, callable -> result
+    /// Dynamic call with spread arguments. The callable sits *below* the args
+    /// array; pops both, expands the array elements over the callable's old
+    /// position, then dispatches exactly like `CallDyn`. When `has_this` is
+    /// true, a receiver sits one deeper below the callable and is threaded
+    /// as `this`. Covers user functions, closures, and builtins uniformly.
+    CallSpread(bool), // args_arr, callable -> result
 
     /// return from in-program function Call, returning the top N values (in
     /// push order, so the first-pushed return value stays first).

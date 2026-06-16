@@ -421,7 +421,7 @@ fn self_recursion_is_static_with_no_slot() {
         !prog
             .code
             .iter()
-            .any(|i| matches!(i, Instr::CallDyn(_) | Instr::ClosureNew(..))),
+            .any(|i| matches!(i, Instr::CallDyn(..) | Instr::ClosureNew(..))),
         "self-recursion should be static: {:?}",
         prog.code
     );
@@ -496,7 +496,7 @@ fn const_named_fn_expr_self_recursion_is_static() {
         !prog
             .code
             .iter()
-            .any(|i| matches!(i, Instr::CallDyn(_) | Instr::ClosureNew(..))),
+            .any(|i| matches!(i, Instr::CallDyn(..) | Instr::ClosureNew(..))),
         "named const fn-expr self-recursion should be static: {:?}",
         prog.code
     );
@@ -622,7 +622,7 @@ fn optional_call_reclaims_static_builtin() {
         !prog
             .code
             .iter()
-            .any(|i| matches!(i, Instr::CallDyn(_) | Instr::JNotNullish(_))),
+            .any(|i| matches!(i, Instr::CallDyn(..) | Instr::JNotNullish(_))),
         "guard/CallDyn should have been reclaimed: {:?}",
         prog.code
     );

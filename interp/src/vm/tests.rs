@@ -753,11 +753,11 @@ fn arg_order_is_left_to_right() {
 #[test]
 fn call_dyn_indirect() {
     // Indirect call through a Fn value. Function at [4] computes arg0 - arg1.
-    // Layout: push args left-to-right, then the callable on top.
-    // [0] Push(10)       arg 0
-    // [1] Push(3)        arg 1
-    // [2] Push(Fn(5))    callable on top
-    // [3] CallDyn(2)
+    // Layout: push callable below the args.
+    // [0] Push(Fn(5))    callable below
+    // [1] Push(10)       arg 0
+    // [2] Push(3)        arg 1
+    // [3] CallDyn(2, false)
     // [4] Return(1)      main returns the result
     // [5] Local(0)       fn body: args arrive in place as locals
     // [6] Local(1)
@@ -765,10 +765,10 @@ fn call_dyn_indirect() {
     // [8] Return(1)
     assert_eq!(
         run(vec![
+            PushFn(5),
             PushFloat(10.0),
             PushFloat(3.0),
-            PushFn(5),
-            CallDyn(2),
+            CallDyn(2, false),
             Return(1),
             GetLocal(0),
             GetLocal(1),
@@ -781,20 +781,20 @@ fn call_dyn_indirect() {
 
 #[test]
 fn call_dyn_requires_fn() {
-    // Top of stack must be a Fn, not some other value.
-    let code = vec![PushFloat(1.0), PushFloat(2.0), CallDyn(1)];
+    // Callee (below args) must be a Fn, not some other value.
+    let code = vec![PushFloat(2.0), PushFloat(1.0), CallDyn(1, false)];
     assert!(matches!(run_err(code).kind, ErrorKind::TypeError));
 }
 
 #[test]
 fn call_spread_with_builtin() {
-    // Math.max(...[3, 7]) — stack: [args_arr, callable] (callable on top)
+    // Math.max(...[3, 7]) — stack: [callable, args_arr] (callable below)
     let code = vec![
+        PushBuiltin(Builtin::MathMax), // callable below
         PushFloat(3.0),
         PushFloat(7.0),
-        ArrNew(2),                     // args array
-        PushBuiltin(Builtin::MathMax), // callable on top
-        CallSpread,
+        ArrNew(2), // args array
+        CallSpread(false),
     ];
     assert_eq!(run(code), vec![n(7.0)]);
 }
@@ -803,9 +803,9 @@ fn call_spread_with_builtin() {
 fn call_spread_with_empty_array() {
     // NumberParseInt(...[]) → NaN
     let code = vec![
-        ArrNew(0), // empty args
         PushBuiltin(Builtin::NumberParseInt),
-        CallSpread,
+        ArrNew(0), // empty args
+        CallSpread(false),
     ];
     let out = run(code);
     assert!(matches!(out[0], Value::Float(f) if f.is_nan()));
@@ -815,11 +815,11 @@ fn call_spread_with_empty_array() {
 fn call_spread_with_fn() {
     // fn(a, b) = a - b, called as fn(...[10, 3])
     let code = vec![
+        PushFn(6), // callable below args array (addr of fn body)
         PushFloat(10.0),
         PushFloat(3.0),
         ArrNew(2), // args array
-        PushFn(6), // callable on top (addr of fn body)
-        CallSpread,
+        CallSpread(false),
         Return(1),
         GetLocal(0),
         GetLocal(1),
@@ -831,22 +831,22 @@ fn call_spread_with_fn() {
 
 #[test]
 fn call_spread_non_array_error() {
-    // CallSpread with a non-array args value → TypeError
+    // CallSpread(false) with a non-array args value → TypeError
     let code = vec![
-        PushFloat(42.0), // not an array
         PushBuiltin(Builtin::MathMax),
-        CallSpread,
+        PushFloat(42.0), // not an array
+        CallSpread(false),
     ];
     assert!(matches!(run_err(code).kind, ErrorKind::TypeError));
 }
 
 #[test]
 fn call_spread_non_callable_error() {
-    // CallSpread with a non-callable → TypeError
+    // CallSpread(false) with a non-callable → TypeError
     let code = vec![
-        ArrNew(0),
         PushFloat(42.0), // not callable
-        CallSpread,
+        ArrNew(0),
+        CallSpread(false),
     ];
     assert!(matches!(run_err(code).kind, ErrorKind::TypeError));
 }
@@ -854,14 +854,14 @@ fn call_spread_non_callable_error() {
 #[test]
 fn arguments_builds_array_of_frame_args() {
     // Call a fn with 3 args; its body builds `arguments` and returns it.
-    // [0..2] push args, [3] callable, [4] CallDyn(3), [5] Return(1)
+    // [0] callable, [1..3] args, [4] CallDyn(3, false), [5] Return(1)
     // [6] Arguments (fn body), [7] Return(1)
     let mut vm = VM::new(vec![
+        PushFn(6),
         PushFloat(10.0),
         PushFloat(20.0),
         PushFloat(30.0),
-        PushFn(6),
-        CallDyn(3),
+        CallDyn(3, false),
         Return(1),
         Arguments,
         Return(1),
@@ -881,9 +881,9 @@ fn arguments_is_cached_within_a_frame() {
     // Two `Arguments` in the same frame yield the SAME heap pointer (the
     // per-frame cache), so `Eq` (reference equality for arrays) is true.
     let out = run(vec![
-        PushFloat(1.0),
         PushFn(4),
-        CallDyn(1),
+        PushFloat(1.0),
+        CallDyn(1, false),
         Return(1),
         Arguments, // fn body: build (and cache)
         Arguments, // reuse the cached array
@@ -895,7 +895,7 @@ fn arguments_is_cached_within_a_frame() {
 
 #[test]
 fn call_dyn_bad_addr() {
-    let code = vec![PushFn(999), CallDyn(0)];
+    let code = vec![PushFn(999), CallDyn(0, false)];
     assert!(matches!(run_err(code).kind, ErrorKind::BadCall));
 }
 
@@ -952,9 +952,9 @@ fn closure_captures_by_reference_across_calls() {
     let call_mc = code.len();
     code.push(Call(0, 0)); // patched → makeCounter; leaves a closure
     code.push(Pick(0));
-    code.push(CallDyn(0)); // first call → 1
+    code.push(CallDyn(0, false)); // first call → 1
     code.push(Dig(1));
-    code.push(CallDyn(0)); // second call → 2
+    code.push(CallDyn(0, false)); // second call → 2
     code.push(Add);
     code.push(Return(1));
     let mc = append_counter(&mut code);
@@ -975,11 +975,11 @@ fn closures_have_independent_cells() {
     code.push(Call(0, 0));
     code.push(SetLocal(1));
     code.push(GetLocal(0));
-    code.push(CallDyn(0)); // c1() → 1
+    code.push(CallDyn(0, false)); // c1() → 1
     code.push(GetLocal(0));
-    code.push(CallDyn(0)); // c1() → 2
+    code.push(CallDyn(0, false)); // c1() → 2
     code.push(GetLocal(1));
-    code.push(CallDyn(0)); // c2() → 1
+    code.push(CallDyn(0, false)); // c2() → 1
     code.push(ArrNew(3));
     code.push(Return(1));
     let mc = append_counter(&mut code);
@@ -1001,7 +1001,7 @@ fn closure_captures_plain_slot_by_value() {
     let mut code: Vec<Instr> = Vec::new();
     let call = code.len();
     code.push(Call(0, 0)); // patched → maker; leaves a closure
-    code.push(CallDyn(0));
+    code.push(CallDyn(0, false));
     code.push(Return(1));
     // maker
     let maker = code.len() as u32;
@@ -1032,15 +1032,15 @@ fn two_closures_share_one_cell() {
     let call = code.len();
     code.push(Call(0, 0));
     code.push(SetLocal(0));
-    code.push(PushFloat(42.0)); // setter's arg
     code.push(GetLocal(0));
     code.push(PushFloat(1.0));
     code.push(IndexGet); // setter
-    code.push(CallDyn(1)); // setter(42) → (no result)
+    code.push(PushFloat(42.0)); // setter's arg — goes above callee
+    code.push(CallDyn(1, false)); // setter(42) → (no result)
     code.push(GetLocal(0));
     code.push(PushFloat(0.0));
     code.push(IndexGet); // getter
-    code.push(CallDyn(0)); // getter() → 42
+    code.push(CallDyn(0, false)); // getter() → 42
     code.push(Return(1));
     // maker
     let maker = code.len() as u32;
@@ -1077,8 +1077,8 @@ fn nested_capture_forwards_same_cell() {
     let mut code: Vec<Instr> = Vec::new();
     let call = code.len();
     code.push(Call(0, 0)); // → middle closure
-    code.push(CallDyn(0)); // → inner closure
-    code.push(CallDyn(0)); // → 7
+    code.push(CallDyn(0, false)); // → inner closure
+    code.push(CallDyn(0, false)); // → 7
     code.push(Return(1));
     let outer = code.len() as u32;
     code.push(EnterFrame(0, false, vec![SlotKind::Boxed].into()));
@@ -1146,7 +1146,7 @@ fn make_closure_rejects_out_of_range_capture() {
 #[test]
 fn call_dyn_rejects_non_closure_pointer() {
     // A Ptr to a non-closure heap value (here an array) is not callable.
-    let code = vec![ArrNew(0), CallDyn(0)];
+    let code = vec![ArrNew(0), CallDyn(0, false)];
     assert!(matches!(run_err(code).kind, ErrorKind::TypeError));
 }
 
@@ -2117,10 +2117,10 @@ fn alloc_breakdown() {
     // 7. Per-instruction: CallDyn on a bare Fn (no closure, no upvals).
     alloc_counter::reset();
     {
-        // Program: push Fn(3), CallDyn(0), Return(0) | PushPosInt(42), Return(1)
+        // Program: push Fn(3), CallDyn(0, false), Return(0) | PushPosInt(42), Return(1)
         let mut vm = VM::new(vec![
             PushFn(3),
-            CallDyn(0),
+            CallDyn(0, false),
             Return(0),
             PushPosInt(42),
             Return(1),
@@ -2140,9 +2140,9 @@ fn alloc_breakdown() {
     {
         let mut vm = VM::new(vec![
             PushFn(5),
-            CallDyn(0),
+            CallDyn(0, false),
             PushFn(5),
-            CallDyn(0),
+            CallDyn(0, false),
             Return(0),
             PushPosInt(42),
             Return(1),

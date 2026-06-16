@@ -455,10 +455,10 @@ mod tests {
     #[test]
     fn builtin_as_first_class_value_via_calldyn() {
         let out = run_instrs(vec![
+            Instr::PushBuiltin(Builtin::MathMax),
             Instr::PushFloat(2.0),
             Instr::PushFloat(7.0),
-            Instr::PushBuiltin(Builtin::MathMax),
-            Instr::CallDyn(2),
+            Instr::CallDyn(2, false),
         ]);
         assert_eq!(out, vec![Value::Float(7.0)]);
     }

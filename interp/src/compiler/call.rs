@@ -60,12 +60,7 @@ impl<'src> super::Compiler<'src> {
             self.compile_expr(&call.callee);
             let end = self.begin_optional(span);
             self.compile_args(&argv);
-            if !argv.is_empty() {
-                // The callee sits below its args; bring it back to the top where
-                // `CallDyn` expects it.
-                self.emit(Instr::Dig(argv.len()), span);
-            }
-            self.emit(Instr::CallDyn(argv.len() as u32), span);
+            self.emit(Instr::CallDyn(argv.len() as u32, false), span);
             self.emit(Instr::Label(end), span);
             return;
         }
@@ -138,13 +133,11 @@ impl<'src> super::Compiler<'src> {
             // nullish, else compile args and dispatch.
             let end = self.begin_optional(span);
             self.compile_call_args_array(&call.arguments, span);
-            self.emit(Instr::Dig(1), span);
-            self.emit(Instr::CallSpread, span);
+            self.emit(Instr::CallSpread(false), span);
             self.emit(Instr::Label(end), span);
         } else {
             self.compile_call_args_array(&call.arguments, span);
-            self.emit(Instr::Dig(1), span);
-            self.emit(Instr::CallSpread, span);
+            self.emit(Instr::CallSpread(false), span);
         }
     }
 
@@ -503,24 +496,14 @@ impl<'src> super::Compiler<'src> {
             self.emit(Instr::ObjGet(method.into()), span);
             // Evaluate args.
             self.compile_args(argv);
-            let argc = argv.len();
-            if argc > 0 {
-                self.emit(Instr::Dig(argc), span);
-            }
-            self.emit(Instr::CallDyn(argc as u32), span);
+            self.emit(Instr::CallDyn(argv.len() as u32, false), span);
             self.emit(Instr::Label(end), span);
         } else {
             // Get the property (consumes receiver, pushes property value).
             self.emit(Instr::ObjGet(method.into()), span);
             // Evaluate args.
             self.compile_args(argv);
-            let argc = argv.len();
-            if argc > 0 {
-                // The callee sits below the args; Dig brings it to the top
-                // where CallDyn expects it.
-                self.emit(Instr::Dig(argc), span);
-            }
-            self.emit(Instr::CallDyn(argc as u32), span);
+            self.emit(Instr::CallDyn(argv.len() as u32, false), span);
         }
     }
 
@@ -686,15 +669,15 @@ impl<'src> super::Compiler<'src> {
                     self.emit(Instr::Call(l, passed.max(expected_arity)), span);
                 }
                 _ => {
-                    // Dynamic call: push args, load callee, CallDyn (installs
-                    // upvals for captured/closure callees). The callee read
-                    // goes through `emit_slot_read`: an effectively-const
-                    // binding's slot may be dead-eliminated, so a raw `Local`
-                    // load here would read undefined (and miscall) instead of
-                    // the propagated constant.
-                    self.compile_args(argv);
+                    // Dynamic call: load callee below args, then CallDyn
+                    // (installs upvals for captured/closure callees). The
+                    // callee read goes through `emit_slot_read`: an
+                    // effectively-const binding's slot may be dead-eliminated,
+                    // so a raw `Local` load here would read undefined (and
+                    // miscall) instead of the propagated constant.
                     self.emit_slot_read(&r, span);
-                    self.emit(Instr::CallDyn(argv.len() as u32), span);
+                    self.compile_args(argv);
+                    self.emit(Instr::CallDyn(argv.len() as u32, false), span);
                 }
             }
             return;

@@ -357,7 +357,7 @@ fn no_spread_plain_calls_have_no_call_spread() {
     use crate::Instr;
     let prog = crate::compile("return Math.max(1, 2);").expect("compiles");
     assert!(
-        !prog.code.iter().any(|i| matches!(i, Instr::CallSpread)),
+        !prog.code.iter().any(|i| matches!(i, Instr::CallSpread(..))),
         "no-spread call emitted CallSpread"
     );
 }

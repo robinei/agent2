@@ -322,11 +322,11 @@ mod tests {
         // (as a callback would be: `(element, index, array)`) drops the surplus
         // and uses only the first argument.
         let out = run_instrs(vec![
+            Instr::PushBuiltin(Builtin::MathSqrt),
             Instr::PushFloat(9.0), // the element
             Instr::PushFloat(1.0), // index — ignored
             Instr::PushFloat(7.0), // array stand-in — ignored
-            Instr::PushBuiltin(Builtin::MathSqrt),
-            Instr::CallDyn(3),
+            Instr::CallDyn(3, false),
         ]);
         assert_eq!(out, vec![Value::Float(3.0)]);
     }
@@ -335,7 +335,7 @@ mod tests {
     fn builtin_math_sqrt_pow_no_args_gives_nan() {
         let out = run_instrs(vec![
             Instr::PushBuiltin(Builtin::MathPow),
-            Instr::CallDyn(0),
+            Instr::CallDyn(0, false),
         ]);
         assert!(matches!(out.as_slice(), [Value::Float(n)] if n.is_nan()));
     }
@@ -430,11 +430,11 @@ mod tests {
     fn variadic_builtin_math_max_keeps_all_args() {
         // Math.max is variadic (max = u32::MAX): surplus is never trimmed.
         let out = run_instrs(vec![
+            Instr::PushBuiltin(Builtin::MathMax),
             Instr::PushFloat(1.0),
             Instr::PushFloat(9.0),
             Instr::PushFloat(4.0),
-            Instr::PushBuiltin(Builtin::MathMax),
-            Instr::CallDyn(3),
+            Instr::CallDyn(3, false),
         ]);
         assert_eq!(out, vec![Value::Float(9.0)]);
     }
