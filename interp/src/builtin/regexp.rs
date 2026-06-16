@@ -1,5 +1,5 @@
 use crate::builtin::Args;
-use crate::vm::{ErrorKind, RcStr, VM, VMError, Value};
+use crate::vm::{RcStr, VM, VMError, Value};
 use indexmap::IndexMap;
 
 /// Build the result object for `exec()` / non-global `match()`:
@@ -94,7 +94,7 @@ fn next_match(rx: &crate::vm::RcRegExp, text: &str) -> Option<regress::Match> {
 /// `regexp.test(str)` — returns `true` if the pattern matches. A `/g`
 /// regex tests from `lastIndex` and advances it, like `exec`.
 pub fn regexp_test(vm: &mut VM, args: Args) -> Result<Value, VMError> {
-    let rx = regexp_receiver(vm, args.get(vm, 0))?.clone();
+    let rx = args.regexp_receiver(vm)?.clone();
     let input = vm.string_from(args.get(vm, 1))?;
     Ok(Value::Bool(next_match(&rx, input.as_str()).is_some()))
 }
@@ -105,7 +105,7 @@ pub fn regexp_test(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 /// toStrings the key and looks it up in the object. For a `/g` regex the
 /// search resumes at `lastIndex` and advances it (`next_match`).
 pub fn regexp_exec(vm: &mut VM, args: Args) -> Result<Value, VMError> {
-    let rx = regexp_receiver(vm, args.get(vm, 0))?.clone();
+    let rx = args.regexp_receiver(vm)?.clone();
     let input = vm.string_from(args.get(vm, 1))?;
     match next_match(&rx, input.as_str()) {
         Some(m) => {
@@ -118,7 +118,7 @@ pub fn regexp_exec(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 
 /// `regexp.toString()` — returns `"/pattern/flags"`.
 pub fn regexp_to_string(vm: &mut VM, args: Args) -> Result<Value, VMError> {
-    let rx = regexp_receiver(vm, args.get(vm, 0))?;
+    let rx = args.regexp_receiver(vm)?;
     let mut s = String::from("/");
     s.push_str(rx.pattern.as_str());
     s.push('/');
@@ -133,17 +133,6 @@ pub(crate) fn try_reg_exp<'a>(_vm: &VM, val: &'a Value) -> Option<&'a crate::vm:
     match val {
         Value::RegExp(rx) => Some(rx),
         _ => None,
-    }
-}
-
-/// Extract the RegExp receiver from arg 0, failing with a TypeError otherwise.
-fn regexp_receiver<'a>(vm: &VM, val: &'a Value) -> Result<&'a crate::vm::RcRegExp, VMError> {
-    match val {
-        Value::RegExp(rx) => Ok(rx),
-        _ => Err(vm.fail(
-            ErrorKind::TypeError,
-            "RegExp.prototype method called on incompatible receiver",
-        )),
     }
 }
 

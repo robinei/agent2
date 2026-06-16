@@ -552,3 +552,98 @@ fn input_is_ptr_zero() {
         other => panic!("{other:?}"),
     }
 }
+
+// ── method-builtin shadowing by object properties ──────────────────────────
+
+/// An object's own property whose name collides with a builtin method
+/// (`push`, `trim`, …) shadows the builtin: `obj.push(x)` calls the property,
+/// not the array builtin. The receiver flows through `Instr::CallBuiltin`,
+/// whose handler declines an Object receiver and re-routes to the property.
+#[test]
+fn object_property_shadows_method_builtin() {
+    // Own `push` wins over the array builtin. (`x + 100` promotes to Float.)
+    assert_eq!(
+        testutil::run_val("const o = { push: (x) => x + 100 }; return o.push(5);"),
+        testutil::num(105.0)
+    );
+    // A real array receiver still hits the builtin (returns the new length).
+    assert_eq!(
+        testutil::run_val("const a = [1, 2]; a.push(3); return a.length;"),
+        testutil::num(3.0)
+    );
+    // Works for a string-method name too, via a captured closure.
+    assert_eq!(
+        testutil::run_val("const n = 7; const o = { trim: () => n }; return o.trim();"),
+        Value::PosInt(7)
+    );
+}
+
+/// Calling a builtin-method name on an object that lacks that property is a
+/// TypeError naming the method — the re-route finds no own property to call.
+#[test]
+fn missing_method_on_object_is_type_error() {
+    let err = testutil::run_runtime_err("const o = { a: 1 }; return o.push(5);");
+    assert!(
+        err.message.contains("push"),
+        "expected message to name `push`, got: {}",
+        err.message
+    );
+}
+
+/// `hasOwnProperty` is the one method builtin that *accepts* an Object receiver,
+/// so it stays on the builtin fast path: it succeeds without consulting the
+/// object's own properties. An own `hasOwnProperty` therefore does **not**
+/// shadow the builtin — a deliberate divergence from JS and from the other
+/// method builtins' shadowing (see `obj_has_own_property`).
+#[test]
+fn has_own_property_is_not_shadowed() {
+    // Own `hasOwnProperty` does NOT win: the builtin runs (`'a'` is present).
+    assert_eq!(
+        testutil::run_val(
+            "const o = { a: 1, hasOwnProperty: () => 999 }; return o.hasOwnProperty('a');"
+        ),
+        Value::Bool(true)
+    );
+    // And the builtin behaves normally on a plain object.
+    assert_eq!(
+        testutil::run_val("return ({ a: 1 }).hasOwnProperty('b');"),
+        Value::Bool(false)
+    );
+}
+
+/// Shadowing is uniform across every receiver type that routes through a
+/// `*_receiver` getter: map (`map_receiver`), set (`set_receiver`), regexp
+/// (`regexp_receiver`), and the polymorphic string/array methods. An own
+/// property of the builtin's name wins in every case.
+#[test]
+fn shadowing_is_uniform_across_receiver_types() {
+    // Map method (`get`/`has` → map_receiver via the map_set_* dispatchers).
+    assert_eq!(
+        testutil::run_val("const o = { get: (k) => 'shadowed' }; return o.get('x');"),
+        eval("'shadowed'")
+    );
+    assert_eq!(
+        testutil::run_val("const o = { has: () => 42 }; return o.has('x');"),
+        Value::PosInt(42)
+    );
+    // Set method (`add` → set_receiver).
+    assert_eq!(
+        testutil::run_val("const o = { add: (x) => x + 1 }; return o.add(9);"),
+        testutil::num(10.0)
+    );
+    // RegExp method (`test` → regexp_receiver).
+    assert_eq!(
+        testutil::run_val("const o = { test: (s) => s + '!' }; return o.test('hi');"),
+        eval("'hi!'")
+    );
+    // Polymorphic method (`slice` → slice_poly's fallthrough) and varargs
+    // poly (`concat`).
+    assert_eq!(
+        testutil::run_val("const o = { slice: (a, b) => a + b }; return o.slice(2, 3);"),
+        testutil::num(5.0)
+    );
+    assert_eq!(
+        testutil::run_val("const o = { concat: (x) => x * 2 }; return o.concat(21);"),
+        testutil::num(42.0)
+    );
+}

@@ -7,10 +7,7 @@ pub fn set_is_set(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 }
 
 pub fn set_add(vm: &mut VM, args: Args) -> Result<Value, VMError> {
-    let set_ptr = match args.get(vm, 0) {
-        Value::Set(p) => *p,
-        _ => return Err(vm.fail(ErrorKind::TypeError, "type error")),
-    };
+    let set_ptr = args.set_receiver(vm)?;
     let value = args.get(vm, 1).clone();
     let ip = vm.ip;
     let set = vm
@@ -22,10 +19,7 @@ pub fn set_add(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 }
 
 pub fn set_has(vm: &mut VM, args: Args) -> Result<Value, VMError> {
-    let set_ptr = match args.get(vm, 0) {
-        Value::Set(p) => *p,
-        _ => return Err(vm.fail(ErrorKind::TypeError, "type error")),
-    };
+    let set_ptr = args.set_receiver(vm)?;
     let value = args.get(vm, 1).clone();
     let set = vm
         .sets
@@ -35,10 +29,7 @@ pub fn set_has(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 }
 
 pub fn set_delete(vm: &mut VM, args: Args) -> Result<Value, VMError> {
-    let set_ptr = match args.get(vm, 0) {
-        Value::Set(p) => *p,
-        _ => return Err(vm.fail(ErrorKind::TypeError, "type error")),
-    };
+    let set_ptr = args.set_receiver(vm)?;
     let value = args.get(vm, 1).clone();
     let ip = vm.ip;
     let set = vm
@@ -50,10 +41,7 @@ pub fn set_delete(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 }
 
 pub fn set_clear(vm: &mut VM, args: Args) -> Result<Value, VMError> {
-    let set_ptr = match args.get(vm, 0) {
-        Value::Set(p) => *p,
-        _ => return Err(vm.fail(ErrorKind::TypeError, "type error")),
-    };
+    let set_ptr = args.set_receiver(vm)?;
     let ip = vm.ip;
     let set = vm
         .sets
@@ -64,10 +52,7 @@ pub fn set_clear(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 }
 
 pub fn set_values(vm: &mut VM, args: Args) -> Result<Value, VMError> {
-    let set_ptr = match args.get(vm, 0) {
-        Value::Set(p) => *p,
-        _ => return Err(vm.fail(ErrorKind::TypeError, "type error")),
-    };
+    let set_ptr = args.set_receiver(vm)?;
     let set = vm
         .sets
         .get(set_ptr as usize)
@@ -82,7 +67,6 @@ pub fn set_values(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 mod tests {
     use crate::{
         Value,
-        builtin::Builtin,
         testutil::{self, run_instrs},
         vm::Instr,
     };

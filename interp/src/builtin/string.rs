@@ -10,7 +10,7 @@ use crate::vm::{ErrorKind, RcStr, VM, VMError, Value};
 /// string or RegExp; capturing groups in a RegExp delimiter are spliced
 /// into the result (JS semantics).
 pub fn str_split(vm: &mut VM, args: Args) -> Result<Value, VMError> {
-    let s = vm.string_from(args.get(vm, 0))?;
+    let s = args.string_receiver(vm)?;
     let delim = args.get(vm, 1);
     if matches!(delim, Value::Undefined) {
         let parts: ThinVec<Value> = thin_vec::thin_vec![Value::String(s)];
@@ -84,7 +84,7 @@ pub fn str_split(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 /// `s.includes(needle[, start])` → bool. An absent needle is coerced to
 /// the string `"undefined"` (matching JS).
 pub fn str_includes(vm: &mut VM, args: Args) -> Result<Value, VMError> {
-    let haystack = vm.str_from(args.get(vm, 0))?;
+    let haystack = args.str_receiver(vm)?;
     let needle = vm.to_js_string(args.get(vm, 1), 0);
     let start = match args.get(vm, 2) {
         Value::Undefined => 0i64,
@@ -99,7 +99,7 @@ pub fn str_includes(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 /// `s.indexOf(needle[, start])` → int (or -1). An absent needle is coerced to
 /// the string `"undefined"` (matching JS).
 pub fn str_index_of(vm: &mut VM, args: Args) -> Result<Value, VMError> {
-    let haystack = vm.str_from(args.get(vm, 0))?;
+    let haystack = args.str_receiver(vm)?;
     let needle = vm.to_js_string(args.get(vm, 1), 0);
     let start = match args.get(vm, 2) {
         Value::Undefined => 0i64,
@@ -117,7 +117,7 @@ pub fn str_index_of(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 /// `s.lastIndexOf(needle[, start])` → int (or -1). An absent needle is
 /// coerced to the string `"undefined"` (matching JS).
 pub fn str_last_index_of(vm: &mut VM, args: Args) -> Result<Value, VMError> {
-    let haystack = vm.str_from(args.get(vm, 0))?;
+    let haystack = args.str_receiver(vm)?;
     let needle = vm.to_js_string(args.get(vm, 1), 0);
     let start = match args.get(vm, 2) {
         Value::Undefined => haystack.len() as i64,
@@ -134,7 +134,7 @@ pub fn str_last_index_of(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 /// `s.startsWith(prefix)` → bool. An absent prefix is coerced to the string
 /// `"undefined"` (matching JS).
 pub fn str_starts_with(vm: &mut VM, args: Args) -> Result<Value, VMError> {
-    let haystack = vm.str_from(args.get(vm, 0))?;
+    let haystack = args.str_receiver(vm)?;
     let prefix = vm.to_js_string(args.get(vm, 1), 0);
     Ok(Value::Bool(haystack.starts_with(prefix.as_str())))
 }
@@ -142,7 +142,7 @@ pub fn str_starts_with(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 /// `s.endsWith(suffix)` → bool. An absent suffix is coerced to the string
 /// `"undefined"` (matching JS).
 pub fn str_ends_with(vm: &mut VM, args: Args) -> Result<Value, VMError> {
-    let haystack = vm.str_from(args.get(vm, 0))?;
+    let haystack = args.str_receiver(vm)?;
     let suffix = vm.to_js_string(args.get(vm, 1), 0);
     Ok(Value::Bool(haystack.ends_with(suffix.as_str())))
 }
@@ -151,7 +151,7 @@ pub fn str_ends_with(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 /// JS semantics: negative indices count from end, everything clamps,
 /// `start ≥ end` → `""`. Only mid-codepoint is an error (byte-string divergence).
 pub fn str_slice(vm: &mut VM, args: Args) -> Result<Value, VMError> {
-    let s = vm.string_from(args.get(vm, 0))?;
+    let s = args.string_receiver(vm)?;
     let len = s.len() as i64;
 
     let to_offset = |v: &Value, default: i64| -> Result<i64, VMError> {
@@ -176,7 +176,7 @@ pub fn str_slice(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 /// `s.substring(start[, end])` → substring. Like `slice` but swaps
 /// arguments when `start > end` and treats negative values as 0.
 pub fn str_substring(vm: &mut VM, args: Args) -> Result<Value, VMError> {
-    let s = vm.string_from(args.get(vm, 0))?;
+    let s = args.string_receiver(vm)?;
     let len = s.len() as i64;
 
     let to_offset = |v: &Value, default: i64| -> i64 {
@@ -203,7 +203,7 @@ pub fn str_substring(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 
 /// `s.trim()` → trimmed string.
 pub fn str_trim(vm: &mut VM, args: Args) -> Result<Value, VMError> {
-    let s = vm.string_from(args.get(vm, 0))?;
+    let s = args.string_receiver(vm)?;
     Ok(Value::String(RcStr::from(s.trim())))
 }
 
@@ -213,7 +213,7 @@ pub fn str_trim(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 /// With a RegExp with the `g` flag, replaces all matches.
 /// Supports JS replacement patterns: `$$`, `$&`, ``$` ``, `$'`, `$1`..`$9`.
 pub fn str_replace(vm: &mut VM, args: Args) -> Result<Value, VMError> {
-    let s = vm.string_from(args.get(vm, 0))?;
+    let s = args.string_receiver(vm)?;
     let replacement = vm.to_js_string(args.get(vm, 2), 0);
     if let Some(rx) = try_reg_exp(vm, args.get(vm, 1)) {
         let text = s.as_str();
@@ -254,7 +254,7 @@ pub fn str_replace(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 /// RegExp. If pattern is a RegExp, it must have the `g` flag (per JS spec).
 /// Supports JS replacement patterns: `$$`, `$&`, ``$` ``, `$'`, `$1`..`$9`.
 pub fn str_replace_all(vm: &mut VM, args: Args) -> Result<Value, VMError> {
-    let s = vm.string_from(args.get(vm, 0))?;
+    let s = args.string_receiver(vm)?;
     let replacement = vm.to_js_string(args.get(vm, 2), 0);
     if let Some(rx) = try_reg_exp(vm, args.get(vm, 1)) {
         if !rx.flags.contains('g') {
@@ -373,7 +373,7 @@ fn push_replacement(out: &mut String, repl: &str, text: &str, m: &regress::Match
 /// a global (`/g`) RegExp, like JS; it does not consult or mutate
 /// `lastIndex`.
 pub fn str_match_all(vm: &mut VM, args: Args) -> Result<Value, VMError> {
-    let s = vm.string_from(args.get(vm, 0))?;
+    let s = args.string_receiver(vm)?;
     let rx = match try_reg_exp(vm, args.get(vm, 1)) {
         Some(rx) => rx.clone(),
         None => {
@@ -399,7 +399,7 @@ pub fn str_match_all(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 }
 
 pub fn str_match(vm: &mut VM, args: Args) -> Result<Value, VMError> {
-    let s = vm.string_from(args.get(vm, 0))?;
+    let s = args.string_receiver(vm)?;
     if let Some(rx) = try_reg_exp(vm, args.get(vm, 1)) {
         let text = s.as_str();
         if rx.flags.contains('g') {
@@ -442,7 +442,7 @@ pub fn str_match(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 /// `s.search(pattern)` — pattern may be a string or RegExp.
 /// Returns the index of the first match, or -1 if not found.
 pub fn str_search(vm: &mut VM, args: Args) -> Result<Value, VMError> {
-    let s = vm.string_from(args.get(vm, 0))?;
+    let s = args.string_receiver(vm)?;
     let idx: i64 = if let Some(rx) = try_reg_exp(vm, args.get(vm, 1)) {
         rx.compiled
             .find(s.as_str())
@@ -461,19 +461,19 @@ pub fn str_search(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 
 /// `s.toLowerCase()` → lowercase string.
 pub fn str_to_lower_case(vm: &mut VM, args: Args) -> Result<Value, VMError> {
-    let s = vm.string_from(args.get(vm, 0))?;
+    let s = args.string_receiver(vm)?;
     Ok(Value::String(RcStr::from(s.to_lowercase())))
 }
 
 /// `s.toUpperCase()` → uppercase string.
 pub fn str_to_upper_case(vm: &mut VM, args: Args) -> Result<Value, VMError> {
-    let s = vm.string_from(args.get(vm, 0))?;
+    let s = args.string_receiver(vm)?;
     Ok(Value::String(RcStr::from(s.to_uppercase())))
 }
 
 /// `s.padStart(targetLength[, padString])` → padded string.
 pub fn str_pad_start(vm: &mut VM, args: Args) -> Result<Value, VMError> {
-    let s = vm.string_from(args.get(vm, 0))?;
+    let s = args.string_receiver(vm)?;
     let len = args.get(vm, 1);
     let target_len = len
         .to_number()
@@ -497,7 +497,7 @@ pub fn str_pad_start(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 
 /// `s.padEnd(targetLength[, padString])` → padded string.
 pub fn str_pad_end(vm: &mut VM, args: Args) -> Result<Value, VMError> {
-    let s = vm.string_from(args.get(vm, 0))?;
+    let s = args.string_receiver(vm)?;
     let len = args.get(vm, 1);
     let target_len = len
         .to_number()
@@ -521,7 +521,7 @@ pub fn str_pad_end(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 
 /// `s.repeat(count)` → repeated string. Negative counts → ValueError.
 pub fn str_repeat(vm: &mut VM, args: Args) -> Result<Value, VMError> {
-    let s = vm.string_from(args.get(vm, 0))?;
+    let s = args.string_receiver(vm)?;
     let count = args
         .get(vm, 1)
         .to_number()
@@ -544,19 +544,19 @@ pub fn str_repeat(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 
 /// `s.trimStart()` → left-trimmed string.
 pub fn str_trim_start(vm: &mut VM, args: Args) -> Result<Value, VMError> {
-    let s = vm.string_from(args.get(vm, 0))?;
+    let s = args.string_receiver(vm)?;
     Ok(Value::String(RcStr::from(s.trim_start())))
 }
 
 /// `s.trimEnd()` → right-trimmed string.
 pub fn str_trim_end(vm: &mut VM, args: Args) -> Result<Value, VMError> {
-    let s = vm.string_from(args.get(vm, 0))?;
+    let s = args.string_receiver(vm)?;
     Ok(Value::String(RcStr::from(s.trim_end())))
 }
 
 /// `s.charAt(index)` → single character (UTF-8 byte range) or empty string.
 pub fn str_char_at(vm: &mut VM, args: Args) -> Result<Value, VMError> {
-    let s = vm.string_from(args.get(vm, 0))?;
+    let s = args.string_receiver(vm)?;
     let idx = args
         .get(vm, 1)
         .to_number()
@@ -571,7 +571,7 @@ pub fn str_char_at(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 
 /// `s.at(index)` → character at index (negative counts from end), or undefined.
 pub fn str_at(vm: &mut VM, args: Args) -> Result<Value, VMError> {
-    let s = vm.string_from(args.get(vm, 0))?;
+    let s = args.string_receiver(vm)?;
     let idx = args
         .get(vm, 1)
         .to_number()
@@ -591,7 +591,9 @@ pub fn str_at(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 
 /// `s.concat(str1, str2, …)` → concatenated string. Receiver must be a string.
 pub fn str_concat(vm: &mut VM, args: Args) -> Result<Value, VMError> {
-    let mut out = vm.to_js_string(args.get(vm, 0), 0).to_string();
+    // Receiver must be a string (the getter defers an Object receiver); the
+    // *arguments* are coerced, matching JS `concat`.
+    let mut out = args.str_receiver(vm)?.to_string();
     for i in 1..args.argc {
         let piece = vm.to_js_string(args.get(vm, i), 0);
         out.push_str(piece.as_str());

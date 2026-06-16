@@ -46,10 +46,7 @@ pub fn array_from(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 
 /// `arr.push(a, b, …)` → appends all arguments and returns the new length.
 pub fn array_push(vm: &mut VM, args: Args) -> Result<Value, VMError> {
-    let arr_ptr = match args.get(vm, 0) {
-        Value::Array(p) => *p,
-        _ => return Err(vm.fail(ErrorKind::TypeError, "type error")),
-    };
+    let arr_ptr = args.array_receiver(vm)?;
     let ip = vm.ip;
     // Clone the values to push first (immutable borrow of vm.stack), then
     // mutate the array.
@@ -66,10 +63,7 @@ pub fn array_push(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 
 /// `arr.pop()` → removes and returns the last element, or `undefined` if empty.
 pub fn array_pop(vm: &mut VM, args: Args) -> Result<Value, VMError> {
-    let arr_ptr = match args.get(vm, 0) {
-        Value::Array(p) => *p,
-        _ => return Err(vm.fail(ErrorKind::TypeError, "type error")),
-    };
+    let arr_ptr = args.array_receiver(vm)?;
     let ip = vm.ip;
     let arr = vm
         .arrays
@@ -81,10 +75,7 @@ pub fn array_pop(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 
 /// `arr.shift()` → removes and returns the first element, or `undefined` if empty.
 pub fn array_shift(vm: &mut VM, args: Args) -> Result<Value, VMError> {
-    let arr_ptr = match args.get(vm, 0) {
-        Value::Array(p) => *p,
-        _ => return Err(vm.fail(ErrorKind::TypeError, "type error")),
-    };
+    let arr_ptr = args.array_receiver(vm)?;
     let ip = vm.ip;
     let arr = vm
         .arrays
@@ -100,10 +91,7 @@ pub fn array_shift(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 /// `arr.unshift(a, b, …)` → prepends all arguments (preserving order) and
 /// returns the new length.
 pub fn array_unshift(vm: &mut VM, args: Args) -> Result<Value, VMError> {
-    let arr_ptr = match args.get(vm, 0) {
-        Value::Array(p) => *p,
-        _ => return Err(vm.fail(ErrorKind::TypeError, "type error")),
-    };
+    let arr_ptr = args.array_receiver(vm)?;
     let ip = vm.ip;
     // Clone the values first (immutable borrow), then mutate.
     let to_insert: SmallVec<[Value; 8]> = args.slice(vm)[1..].iter().cloned().collect();
@@ -120,10 +108,7 @@ pub fn array_unshift(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 
 /// `arr.join([sep])` → joins with sep (default ",").
 pub fn array_join(vm: &mut VM, args: Args) -> Result<Value, VMError> {
-    let arr_ptr = match args.get(vm, 0) {
-        Value::Array(p) => *p,
-        _ => return Err(vm.fail(ErrorKind::TypeError, "type error")),
-    };
+    let arr_ptr = args.array_receiver(vm)?;
     let sep = match args.get(vm, 1) {
         Value::Undefined => RcStr::from(","),
         v => vm.to_js_string(v, 0),
@@ -147,10 +132,7 @@ pub fn array_join(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 
 /// `arr.reverse()` → reverses in-place, returns the receiver.
 pub fn array_reverse(vm: &mut VM, args: Args) -> Result<Value, VMError> {
-    let arr_ptr = match args.get(vm, 0) {
-        Value::Array(p) => *p,
-        _ => return Err(vm.fail(ErrorKind::TypeError, "type error")),
-    };
+    let arr_ptr = args.array_receiver(vm)?;
     let ip = vm.ip;
     let arr = vm
         .arrays
@@ -162,10 +144,7 @@ pub fn array_reverse(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 
 /// `arr.flat([depth])` → flattens nested arrays to the given depth (default 1).
 pub fn array_flat(vm: &mut VM, args: Args) -> Result<Value, VMError> {
-    let arr_ptr = match args.get(vm, 0) {
-        Value::Array(p) => *p,
-        _ => return Err(vm.fail(ErrorKind::TypeError, "type error")),
-    };
+    let arr_ptr = args.array_receiver(vm)?;
     let depth = match args.get(vm, 1) {
         Value::Undefined => 1usize,
         v => v
@@ -206,10 +185,7 @@ pub fn flatten_into(
 
 /// `arr.fill(value[, start[, end]])` → fills in-place, returns the receiver.
 pub fn array_fill(vm: &mut VM, args: Args) -> Result<Value, VMError> {
-    let arr_ptr = match args.get(vm, 0) {
-        Value::Array(p) => *p,
-        _ => return Err(vm.fail(ErrorKind::TypeError, "type error")),
-    };
+    let arr_ptr = args.array_receiver(vm)?;
     let value = args.get(vm, 1).clone();
     // Extract start/end values before borrowing arr.
     let start_arg = args.get(vm, 2).clone();
@@ -243,10 +219,7 @@ pub fn array_fill(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 /// `arr.splice(start[, deleteCount[, ...items]])` → mutates in-place, returns
 /// the removed elements.
 pub fn array_splice(vm: &mut VM, args: Args) -> Result<Value, VMError> {
-    let arr_ptr = match args.get(vm, 0) {
-        Value::Array(p) => *p,
-        _ => return Err(vm.fail(ErrorKind::TypeError, "type error")),
-    };
+    let arr_ptr = args.array_receiver(vm)?;
     // Extract all args before mutable borrow.
     let start_val = args.get(vm, 1).clone();
     let del_val = if args.argc >= 3 {
@@ -298,10 +271,7 @@ pub fn array_splice(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 
 /// `arr.slice(start[, end])` → new array, subset of the original.
 pub fn array_slice_builtin(vm: &mut VM, args: Args) -> Result<Value, VMError> {
-    let arr_ptr = match args.get(vm, 0) {
-        Value::Array(p) => *p,
-        _ => return Err(vm.fail(ErrorKind::TypeError, "type error")),
-    };
+    let arr_ptr = args.array_receiver(vm)?;
     let arr = vm
         .arrays
         .get(arr_ptr as usize)
@@ -329,10 +299,7 @@ pub fn array_slice_builtin(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 }
 
 pub fn array_includes(vm: &mut VM, args: Args) -> Result<Value, VMError> {
-    let arr_ptr = match args.get(vm, 0) {
-        Value::Array(p) => *p,
-        _ => return Err(vm.fail(ErrorKind::TypeError, "type error")),
-    };
+    let arr_ptr = args.array_receiver(vm)?;
     let needle = args.get(vm, 1);
     let start = args.get(vm, 2).to_number().unwrap_or(0.0) as usize;
     let arr = vm
@@ -348,10 +315,7 @@ pub fn array_includes(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 }
 
 pub fn array_index_of(vm: &mut VM, args: Args) -> Result<Value, VMError> {
-    let arr_ptr = match args.get(vm, 0) {
-        Value::Array(p) => *p,
-        _ => return Err(vm.fail(ErrorKind::TypeError, "type error")),
-    };
+    let arr_ptr = args.array_receiver(vm)?;
     let needle = args.get(vm, 1);
     let start = args.get(vm, 2).to_number().unwrap_or(0.0) as i64;
     let arr = vm
@@ -368,10 +332,7 @@ pub fn array_index_of(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 }
 
 pub fn array_last_index_of(vm: &mut VM, args: Args) -> Result<Value, VMError> {
-    let arr_ptr = match args.get(vm, 0) {
-        Value::Array(p) => *p,
-        _ => return Err(vm.fail(ErrorKind::TypeError, "type error")),
-    };
+    let arr_ptr = args.array_receiver(vm)?;
     let needle = args.get(vm, 1);
     let arr = vm
         .arrays
@@ -392,10 +353,7 @@ pub fn array_last_index_of(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 }
 
 pub fn array_at(vm: &mut VM, args: Args) -> Result<Value, VMError> {
-    let arr_ptr = match args.get(vm, 0) {
-        Value::Array(p) => *p,
-        _ => return Err(vm.fail(ErrorKind::TypeError, "type error")),
-    };
+    let arr_ptr = args.array_receiver(vm)?;
     let idx = args.get(vm, 1).to_number().unwrap_or(0.0);
     let arr = vm
         .arrays
@@ -414,10 +372,7 @@ pub fn array_at(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 }
 
 pub fn array_concat(vm: &mut VM, args: Args) -> Result<Value, VMError> {
-    let arr_ptr = match args.get(vm, 0) {
-        Value::Array(p) => *p,
-        _ => return Err(vm.fail(ErrorKind::TypeError, "type error")),
-    };
+    let arr_ptr = args.array_receiver(vm)?;
     let arr = vm
         .arrays
         .get(arr_ptr as usize)

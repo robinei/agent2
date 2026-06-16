@@ -28,7 +28,8 @@
 //! result — assignment-style "leave a value" semantics, so every builtin call
 //! is a well-formed expression.
 
-use crate::vm::{ErrorKind, VM, VMError, Value};
+use crate::vm::instr::{ArrayPtr, MapPtr, SetPtr};
+use crate::vm::{ErrorKind, RcStr, VM, VMError, Value};
 
 mod array;
 mod console;
@@ -152,14 +153,29 @@ macro_rules! builtins {
                         Builtin::$variant => $handler(vm, args),
                     )*
                 };
-                // Epilogue: truncate args on both paths, push result on Ok.
-                vm.stack.truncate(args.base);
+                // Epilogue: drop the args and push the result on success; on
+                // error, drop the args and tag the message.
+                //
+                // Exception: a method builtin whose receiver (arg 0) is an
+                // `Object` raises the `MethodOnObject` signal at its receiver
+                // check (`VM::method_receiver_error`). Forward it verbatim with
+                // the args left on the stack so the call site
+                // (`reroute_method_to_object`) can dispatch the object's own
+                // property. We key off the error *kind* — the signal is raised
+                // exactly where the object receiver is detected, never inferred
+                // from some other error. (`hasOwnProperty` is the one method
+                // builtin that accepts an Object receiver; it just succeeds, so
+                // an own `hasOwnProperty` does not shadow it — a deliberate
+                // divergence, see `obj_has_own_property`.)
                 match result {
                     Ok(val) => {
+                        vm.stack.truncate(args.base);
                         vm.stack.push(val);
                         Ok(())
                     }
+                    Err(e) if e.kind == ErrorKind::MethodOnObject => Err(e),
                     Err(mut e) => {
+                        vm.stack.truncate(args.base);
                         e.message = format!("in `{}`: {}", self.meta().name, e.message);
                         Err(e)
                     }
@@ -364,6 +380,63 @@ impl Args {
     #[allow(dead_code)]
     fn slice<'a>(&self, vm: &'a VM) -> &'a [Value] {
         &vm.stack[self.base..self.base + self.argc]
+    }
+
+    // ── method-receiver extraction ──────────────────────────────────────────
+    //
+    // Each method builtin validates its receiver (arg 0) through one of these.
+    // A non-matching receiver routes through `VM::method_receiver_error`, which
+    // raises the `MethodOnObject` re-route signal for an `Object` and a real
+    // `TypeError` for anything else — so the signal is produced *at* the
+    // receiver check, never inferred downstream.
+
+    /// Receiver as an array pointer (else the method-receiver error).
+    fn array_receiver(&self, vm: &VM) -> Result<ArrayPtr, VMError> {
+        match self.get(vm, 0) {
+            Value::Array(p) => Ok(*p),
+            recv => Err(vm.method_receiver_error(recv)),
+        }
+    }
+
+    /// Receiver as a map pointer (else the method-receiver error).
+    fn map_receiver(&self, vm: &VM) -> Result<MapPtr, VMError> {
+        match self.get(vm, 0) {
+            Value::Map(p) => Ok(*p),
+            recv => Err(vm.method_receiver_error(recv)),
+        }
+    }
+
+    /// Receiver as a set pointer (else the method-receiver error).
+    fn set_receiver(&self, vm: &VM) -> Result<SetPtr, VMError> {
+        match self.get(vm, 0) {
+            Value::Set(p) => Ok(*p),
+            recv => Err(vm.method_receiver_error(recv)),
+        }
+    }
+
+    /// Receiver as a borrowed string slice (else the method-receiver error).
+    fn str_receiver<'a>(&self, vm: &'a VM) -> Result<&'a str, VMError> {
+        match self.get(vm, 0) {
+            Value::String(s) => Ok(s.as_str()),
+            recv => Err(vm.method_receiver_error(recv)),
+        }
+    }
+
+    /// Receiver as an owned `RcStr` (a refcount bump; for handlers that retain
+    /// the string past a borrow of the VM). Else the method-receiver error.
+    fn string_receiver(&self, vm: &VM) -> Result<RcStr, VMError> {
+        match self.get(vm, 0) {
+            Value::String(s) => Ok(s.clone()),
+            recv => Err(vm.method_receiver_error(recv)),
+        }
+    }
+
+    /// Receiver as a borrowed compiled regexp (else the method-receiver error).
+    fn regexp_receiver<'a>(&self, vm: &'a VM) -> Result<&'a crate::vm::RcRegExp, VMError> {
+        match self.get(vm, 0) {
+            Value::RegExp(rx) => Ok(rx),
+            recv => Err(vm.method_receiver_error(recv)),
+        }
     }
 }
 

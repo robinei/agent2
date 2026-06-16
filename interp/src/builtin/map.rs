@@ -7,10 +7,7 @@ pub fn map_is_map(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 }
 
 pub fn map_get(vm: &mut VM, args: Args) -> Result<Value, VMError> {
-    let map_ptr = match args.get(vm, 0) {
-        Value::Map(p) => *p,
-        _ => return Err(vm.fail(ErrorKind::TypeError, "type error")),
-    };
+    let map_ptr = args.map_receiver(vm)?;
     let key = args.get(vm, 1).clone();
     let map = vm
         .maps
@@ -20,10 +17,7 @@ pub fn map_get(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 }
 
 pub fn map_set(vm: &mut VM, args: Args) -> Result<Value, VMError> {
-    let map_ptr = match args.get(vm, 0) {
-        Value::Map(p) => *p,
-        _ => return Err(vm.fail(ErrorKind::TypeError, "type error")),
-    };
+    let map_ptr = args.map_receiver(vm)?;
     let key = args.get(vm, 1).clone();
     let value = args.get(vm, 2).clone();
     let ip = vm.ip;
@@ -36,10 +30,7 @@ pub fn map_set(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 }
 
 pub fn map_has(vm: &mut VM, args: Args) -> Result<Value, VMError> {
-    let map_ptr = match args.get(vm, 0) {
-        Value::Map(p) => *p,
-        _ => return Err(vm.fail(ErrorKind::TypeError, "type error")),
-    };
+    let map_ptr = args.map_receiver(vm)?;
     let key = args.get(vm, 1).clone();
     let map = vm
         .maps
@@ -49,10 +40,7 @@ pub fn map_has(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 }
 
 pub fn map_delete(vm: &mut VM, args: Args) -> Result<Value, VMError> {
-    let map_ptr = match args.get(vm, 0) {
-        Value::Map(p) => *p,
-        _ => return Err(vm.fail(ErrorKind::TypeError, "type error")),
-    };
+    let map_ptr = args.map_receiver(vm)?;
     let key = args.get(vm, 1).clone();
     let ip = vm.ip;
     let map = vm
@@ -64,10 +52,7 @@ pub fn map_delete(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 }
 
 pub fn map_clear(vm: &mut VM, args: Args) -> Result<Value, VMError> {
-    let map_ptr = match args.get(vm, 0) {
-        Value::Map(p) => *p,
-        _ => return Err(vm.fail(ErrorKind::TypeError, "type error")),
-    };
+    let map_ptr = args.map_receiver(vm)?;
     let ip = vm.ip;
     let map = vm
         .maps
@@ -78,10 +63,7 @@ pub fn map_clear(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 }
 
 pub fn map_keys(vm: &mut VM, args: Args) -> Result<Value, VMError> {
-    let map_ptr = match args.get(vm, 0) {
-        Value::Map(p) => *p,
-        _ => return Err(vm.fail(ErrorKind::TypeError, "type error")),
-    };
+    let map_ptr = args.map_receiver(vm)?;
     let map = vm
         .maps
         .get(map_ptr as usize)
@@ -91,10 +73,7 @@ pub fn map_keys(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 }
 
 pub fn map_values(vm: &mut VM, args: Args) -> Result<Value, VMError> {
-    let map_ptr = match args.get(vm, 0) {
-        Value::Map(p) => *p,
-        _ => return Err(vm.fail(ErrorKind::TypeError, "type error")),
-    };
+    let map_ptr = args.map_receiver(vm)?;
     let map = vm
         .maps
         .get(map_ptr as usize)
@@ -104,10 +83,7 @@ pub fn map_values(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 }
 
 pub fn map_entries(vm: &mut VM, args: Args) -> Result<Value, VMError> {
-    let map_ptr = match args.get(vm, 0) {
-        Value::Map(p) => *p,
-        _ => return Err(vm.fail(ErrorKind::TypeError, "type error")),
-    };
+    let map_ptr = args.map_receiver(vm)?;
     let pairs: Vec<(Value, Value)> = {
         let map = vm
             .maps
@@ -129,7 +105,7 @@ pub fn map_set_has(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     match args.get(vm, 0) {
         Value::Map(_) => map_has(vm, args),
         Value::Set(_) => super::set_has(vm, args),
-        _ => Err(vm.fail(ErrorKind::TypeError, "type error")),
+        recv => Err(vm.method_receiver_error(recv)),
     }
 }
 
@@ -137,7 +113,7 @@ pub fn map_set_delete(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     match args.get(vm, 0) {
         Value::Map(_) => map_delete(vm, args),
         Value::Set(_) => super::set_delete(vm, args),
-        _ => Err(vm.fail(ErrorKind::TypeError, "type error")),
+        recv => Err(vm.method_receiver_error(recv)),
     }
 }
 
@@ -145,7 +121,7 @@ pub fn map_set_clear(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     match args.get(vm, 0) {
         Value::Map(_) => map_clear(vm, args),
         Value::Set(_) => super::set_clear(vm, args),
-        _ => Err(vm.fail(ErrorKind::TypeError, "type error")),
+        recv => Err(vm.method_receiver_error(recv)),
     }
 }
 
@@ -161,7 +137,7 @@ pub fn map_set_keys(vm: &mut VM, args: Args) -> Result<Value, VMError> {
             let values: ThinVec<Value> = set.iter().map(|k| k.0.clone()).collect();
             Ok(vm.alloc_array(values))
         }
-        _ => Err(vm.fail(ErrorKind::TypeError, "type error")),
+        recv => Err(vm.method_receiver_error(recv)),
     }
 }
 
@@ -169,7 +145,7 @@ pub fn map_set_values(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     match args.get(vm, 0) {
         Value::Map(_) => map_values(vm, args),
         Value::Set(_) => super::set_values(vm, args),
-        _ => Err(vm.fail(ErrorKind::TypeError, "type error")),
+        recv => Err(vm.method_receiver_error(recv)),
     }
 }
 
@@ -190,7 +166,7 @@ pub fn map_set_entries(vm: &mut VM, args: Args) -> Result<Value, VMError> {
             }
             Ok(vm.alloc_array(result))
         }
-        _ => Err(vm.fail(ErrorKind::TypeError, "type error")),
+        recv => Err(vm.method_receiver_error(recv)),
     }
 }
 
@@ -200,7 +176,6 @@ pub fn map_set_entries(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 mod tests {
     use crate::{
         Value,
-        builtin::Builtin,
         testutil::{self, run_instrs},
         vm::Instr,
     };

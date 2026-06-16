@@ -139,6 +139,16 @@ pub fn obj_has_own(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 }
 
 /// `obj.hasOwnProperty(key)` → bool. Instance version of `Object.hasOwn`.
+///
+/// Deliberate divergence from JS / from the other method builtins' shadowing:
+/// this is the one method builtin that *accepts* an `Object` receiver, so it
+/// just succeeds — an object's own `hasOwnProperty` property does **not**
+/// shadow it (in JS it would). We accept that to keep this builtin on the fast
+/// path: overriding `hasOwnProperty` is never a useful pattern here, and the
+/// alternative (a self-shadow `contains_key` on every call) would tax the
+/// common case to honor one nobody wants. The generic "Object receiver ⇒
+/// re-route" signal in the `call()` epilogue only fires on *error*, which this
+/// builtin never raises for an Object, so nothing special is needed.
 pub fn obj_has_own_property(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let obj_ptr = match args.get(vm, 0) {
         Value::Object(p) => *p,

@@ -1,5 +1,4 @@
 use super::*;
-use crate::builtin::BuiltinKind;
 
 /// The missing-`await` hint, appended to property/index access errors when
 /// the receiver is a promise — the misuse LLMs actually commit under this
@@ -29,7 +28,7 @@ fn regexp_prop(r: &RcRegExp, field: &str) -> Value {
 }
 
 impl VM {
-    pub(crate) fn dispatch(&mut self, mut fuel: u64) -> Result<StepResult, VMError> {
+    pub(crate) fn dispatch(&mut self, fuel: &mut u64) -> Result<StepResult, VMError> {
         // ── macros for repetitive instruction shapes ─────────────────
 
         /// Pop one operand, coerce ToNumber (JS), apply f64→f64, push Number.
@@ -129,10 +128,10 @@ impl VM {
                     unstarted: std::mem::take(&mut self.outbox),
                 });
             }
-            if fuel == 0 {
+            if *fuel == 0 {
                 return Ok(StepResult::OutOfFuel);
             }
-            fuel -= 1;
+            *fuel -= 1;
             match &self.code[self.ip as usize] {
                 // ── stack manipulation ───────────────────────────
                 Instr::PushUndefined => {
@@ -251,33 +250,20 @@ impl VM {
                 }
 
                 Instr::CallBuiltin(b, argc) => {
-                    // Method shadow check: if the receiver is an Object that
-                    // has its own property with the same name as this method
-                    // builtin, call that property dynamically instead of the
-                    // builtin. This prevents builtin names (push, trim, …)
-                    // from hijacking object property access.
-                    let meta = b.meta();
-                    if matches!(meta.kind, BuiltinKind::Method) {
-                        let argc = *argc;
-                        let base = self.stack.len().saturating_sub(argc as usize);
-                        if let Some(Value::Object(ptr)) = self.stack.get(base) {
-                            let obj_ptr = *ptr as usize;
-                            if let Some(obj) = self.objects.get(obj_ptr) {
-                                if let Some(prop_val) = obj.get(meta.name) {
-                                    // Remove the receiver (arg 0) — for
-                                    // dynamic calls the receiver was already
-                                    // consumed by ObjGet, leaving only the
-                                    // explicit arguments.
-                                    self.stack.remove(base);
-                                    let nargs = argc.saturating_sub(1);
-                                    self.dispatch_call(prop_val.clone(), nargs)?;
-                                    continue;
-                                }
-                            }
+                    let b = *b;
+                    let argc = *argc;
+                    // Happy path: the builtin runs. If it lands on an Object
+                    // receiver (the `MethodOnObject` signal), the args are still
+                    // on the stack — re-route the call to the object's own
+                    // same-named property so user properties shadow builtin
+                    // method names (push, trim, …). `reroute` sets `ip`.
+                    match b.call(self, argc) {
+                        Ok(()) => self.ip += 1,
+                        Err(e) if e.kind == ErrorKind::MethodOnObject => {
+                            self.reroute_method_to_object(b, argc)?;
                         }
+                        Err(e) => return Err(e),
                     }
-                    b.call(self, *argc)?;
-                    self.ip += 1;
                 }
 
                 Instr::CallSpread => {

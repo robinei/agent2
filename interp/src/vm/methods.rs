@@ -79,6 +79,9 @@ impl VM {
             // Circular awaits: every strand is parked, so there is no
             // execution state a substituted value could resume.
             ErrorKind::Deadlock => ResumeMode::NotResumable,
+            // Internal control-flow signal, always intercepted at the call site
+            // and never surfaced; the mode is irrelevant.
+            ErrorKind::MethodOnObject => ResumeMode::NotResumable,
         };
         VMError {
             kind,
@@ -86,6 +89,21 @@ impl VM {
             message: msg.into(),
             resume,
             payload: None,
+        }
+    }
+
+    /// The error for a method builtin whose receiver (arg 0) is not the type it
+    /// handles. If the receiver is an `Object`, raise the
+    /// [`ErrorKind::MethodOnObject`] control signal so the call site re-routes
+    /// to the object's own same-named property; otherwise a genuine
+    /// `TypeError`. Every method-builtin receiver check routes its mismatch arm
+    /// through here (directly or via the `Args::*_receiver` helpers), so the
+    /// signal is raised *exactly* where we know the receiver is an object —
+    /// never inferred from an arbitrary error.
+    pub(crate) fn method_receiver_error(&self, recv: &Value) -> VMError {
+        match recv {
+            Value::Object(_) => self.fail(ErrorKind::MethodOnObject, ""),
+            _ => self.fail(ErrorKind::TypeError, "type error"),
         }
     }
 
@@ -1112,15 +1130,69 @@ impl VM {
         Ok(addr)
     }
 
+    /// Re-route a method-builtin call that landed on an `Object` receiver to
+    /// that object's own same-named property. Invoked when `Builtin::call`
+    /// raised [`ErrorKind::MethodOnObject`]: the receiver (arg 0) is an
+    /// `Object`, and the args `[recv, arg1, …]` are still on the stack (the
+    /// builtin epilogue forwarded the signal without truncating). Drops the
+    /// receiver and dispatches the property as a function — this is where
+    /// shadowing is actually confirmed — or, if the object has no such
+    /// property, raises a real `TypeError`. Delegates `ip` management to
+    /// `dispatch_call`, so both call sites compose correctly.
+    pub(crate) fn reroute_method_to_object(
+        &mut self,
+        b: crate::builtin::Builtin,
+        argc: u32,
+    ) -> Result<(), VMError> {
+        // Invariant: the signalling handler raised `MethodOnObject` at its
+        // receiver check, before touching the stack — so all `argc` args
+        // (receiver + explicit args) are still present. If a handler ever
+        // mutates the stack before signalling, this underflows; assert loudly
+        // in debug builds rather than silently rerouting a corrupt frame.
+        debug_assert!(
+            self.stack.len() >= argc as usize,
+            "method handler must raise MethodOnObject before mutating the stack"
+        );
+        let base = self.stack.len() - argc as usize;
+        let name = b.meta().name;
+        let recv_ptr = match &self.stack[base] {
+            Value::Object(p) => *p,
+            // The signal is only ever raised for an Object receiver.
+            _ => return Err(self.fail_not_resumable(ErrorKind::BadCall, "reroute: non-object")),
+        };
+        let method = self
+            .objects
+            .get(recv_ptr as usize)
+            .and_then(|o| o.get(name))
+            .cloned();
+        match method {
+            Some(f) => {
+                self.stack.remove(base); // drop the receiver; arg1.. shift down
+                self.dispatch_call(f, argc - 1)
+            }
+            None => {
+                self.stack.truncate(base);
+                let msg = format!("'{name}' is not a method of this object");
+                Err(self.fail(ErrorKind::TypeError, msg))
+            }
+        }
+    }
+
     /// Shared dispatch for `CallDyn` and `CallSpread`: the args are already
     /// on the stack in left-to-right order (arg 0 deepest), with the callable
     /// already popped.  Handles `Builtin`, `Fn`, `Closure`, and non-callable.
     pub(crate) fn dispatch_call(&mut self, callable: Value, nargs: u32) -> Result<(), VMError> {
         match callable {
-            Value::Builtin(b) => {
-                b.call(self, nargs)?;
-                self.ip += 1;
-            }
+            Value::Builtin(b) => match b.call(self, nargs) {
+                Ok(()) => self.ip += 1,
+                // Method builtin landed on an Object receiver: re-route to the
+                // object's own property. `reroute` (via `dispatch_call`) sets
+                // `ip`, so we must not advance it here.
+                Err(e) if e.kind == ErrorKind::MethodOnObject => {
+                    self.reroute_method_to_object(b, nargs)?;
+                }
+                Err(e) => return Err(e),
+            },
             Value::Fn(addr) => self.call_function(addr, nargs, SmallVec::new())?,
             Value::Closure(p) => {
                 let closure = self.closures.get(p as usize).ok_or_else(|| {
@@ -1187,9 +1259,9 @@ impl VM {
     /// consumed; call `step` again to continue (`fuel = 0` yields
     /// immediately). The host owns the total per-program budget by
     /// counting slices; debuggers single-step with `fuel = 1` (9_TUI).
-    pub fn step(&mut self, fuel: u64) -> Result<StepResult, VMError> {
+    pub fn step(&mut self, mut fuel: u64) -> Result<StepResult, VMError> {
         loop {
-            match self.dispatch(fuel) {
+            match self.dispatch(&mut fuel) {
                 Err(e) if matches!(e.resume, ResumeMode::PushValueThenContinue) => {
                     if self.reachable_handler() {
                         let thrown = self.error_to_thrown(&e);
