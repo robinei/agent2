@@ -94,10 +94,22 @@ Every call form then reduces to *compute `this_val`, dispatch once*: plain call 
 `Undefined`; `has_this` method call → the popped receiver; the shadow reroute →
 `recv`; `new` → the fresh instance; `bind` → `BoundFn.this_val`; `.call`/`.apply`
 → `thisArg`. The user-fn-vs-builtin distinction thus exists in **exactly one
-function**, not re-derived per call site. (Static `Call` and `new` may call
-`call_function` directly with a known `this_val` — no callable-kind ambiguity to
-fork on.) Implementing `this` is then "the JS Reference rule": `this_val` = the
-base of the callee's member reference, `Undefined` when it has none.
+function**, not re-derived per call site. Implementing `this` is then "the JS
+Reference rule": `this_val` = the base of the callee's member reference,
+`Undefined` when it has none.
+
+`dispatch_call` is the sole site of the *runtime* kind fork — for a callable
+**value** of unknown kind. **Compile-time-resolved calls deliberately bypass it,
+and should**: static `Call`/`new` go straight to `call_function` (kind is a
+known user `Fn`), and `CallBuiltin` / namespace calls go straight to `b.call`
+(kind is a known builtin, receiver at arg 0). These aren't exceptions to "one
+fork site" — they're the "kind already known, nothing to fork" fast paths.
+`CallBuiltin` in particular stays **essential, not just an optimization**:
+builtins aren't stored properties, so `ObjPeek`/`ObjGet` can't reach them; the
+compiler resolving `arr.push`/`Math.max` by name to a `Builtin` is the *only*
+path to a builtin method. (`dispatch_call` keeps a `Builtin` arm only for the
+rarer builtin-arrived-as-a-value case — a bound builtin, or `[].push` read as a
+value in Step 6.)
 
 ---
 
