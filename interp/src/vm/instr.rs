@@ -168,6 +168,11 @@ pub enum Instr {
     /// local variables; member/index targets fall back to load-sub-store.
     IncLocal(LocalIndex, f64, UpdateMode), // () -> any
 
+    /// Push the `this` binding from the current call frame. This is the only
+    /// way to read `this`; emitted only in functions that lexically reference
+    /// it. () -> any
+    LoadThis,
+
     /// temporary block markers. initially Jump and JFalse Addr refer to specific Label Addr(id),
     /// but will get rewritten as code offset in a pass which eliminates Label instructions
     Label(CodeAddr), // () -> ()

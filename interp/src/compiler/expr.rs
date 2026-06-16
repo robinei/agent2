@@ -100,7 +100,7 @@ impl<'src> super::Compiler<'src> {
                 self.emit(Instr::RegExpNew, span);
             }
             ast::Expression::ThisExpression(t) => {
-                self.error(t.span.start, "`this` is not supported")
+                self.emit(Instr::LoadThis, t.span.start);
             }
             ast::Expression::NewExpression(n) => {
                 if let ast::Expression::Identifier(id) = &n.callee {

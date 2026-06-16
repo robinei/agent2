@@ -532,6 +532,12 @@ impl VM {
                     self.ip += 1;
                 }
 
+                Instr::LoadThis => {
+                    let this_val = self.callstack.last().unwrap().this_val.clone();
+                    self.stack.push(this_val);
+                    self.ip += 1;
+                }
+
                 Instr::SetLocal(local) => {
                     let local = *local;
                     if (local as u32) >= self.cur_local_count {

@@ -30,6 +30,7 @@ impl VM {
                 prev_fp: 0,
                 arguments_cache: None,
                 pending_upvals: SmallVec::new(),
+                this_val: Value::Undefined,
                 completion: Completion::Normal,
             }],
             ip: 0,
@@ -664,6 +665,7 @@ impl VM {
             prev_fp: self.fp,
             pending_upvals: SmallVec::new(),
             arguments_cache: cont.arguments_cache,
+            this_val: Value::Undefined,
             completion: Completion::ResolvePromise(cont.promise),
         });
         self.fp = new_fp;
@@ -1232,6 +1234,7 @@ impl VM {
             prev_fp: self.fp,
             arguments_cache: None,
             pending_upvals: upvals,
+            this_val: Value::Undefined,
             completion: Completion::Normal,
         });
         self.ip = addr;

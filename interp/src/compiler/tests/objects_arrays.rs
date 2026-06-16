@@ -682,3 +682,78 @@ fn general_to_string_method() {
         Value::Bool(true)
     );
 }
+
+// ── Phase 13 OO: Step 1a — `this` as a frame field ─────────────────────
+
+#[test]
+fn this_at_top_level_is_undefined() {
+    assert_eq!(testutil::run_val("return this;"), Value::Undefined);
+}
+
+#[test]
+fn this_in_plain_call_is_undefined() {
+    assert_eq!(
+        testutil::run_val("function f() { return this; } return f();"),
+        Value::Undefined
+    );
+}
+
+#[test]
+fn this_in_arrow_is_undefined() {
+    assert_eq!(
+        testutil::run_val("const f = () => this; return f();"),
+        Value::Undefined
+    );
+}
+
+#[test]
+fn this_in_method_is_undefined_pre_step_3() {
+    // Until step 3 no call form sets a non-undefined `this`, so a method call
+    // like `obj.m()` still reads `undefined` — correct for this step.
+    assert_eq!(
+        testutil::run_val(
+            "const obj = { greet: function() { return this; } }; return obj.greet();"
+        ),
+        Value::Undefined
+    );
+}
+
+#[test]
+fn this_is_not_a_compile_error() {
+    let prog = compile("return this;").expect("this should compile now");
+    assert!(
+        !prog.code.is_empty(),
+        "program compiled but has no instructions"
+    );
+}
+
+#[test]
+fn this_preserves_call_conventions() {
+    // No slot layout changed: default params, arguments, closures
+    // all unaffected.
+    assert_eq!(
+        testutil::run_val("function f(a = 1) { return a + arguments[0]; } return f(2);"),
+        testutil::num(4.0)
+    );
+    assert_eq!(
+        testutil::run_val(
+            "function make() { let x = 42; return function() { return x; }; } let g = make(); return g();"
+        ),
+        Value::PosInt(42)
+    );
+}
+
+#[test]
+fn loadthis_is_classified_pure() {
+    use crate::vm::Instr;
+    let prog = compile("return this;").expect("compiles");
+    let has_loadthis = prog.code.iter().any(|i| matches!(i, Instr::LoadThis));
+    assert!(has_loadthis, "expected LoadThis in code, got {:?}", prog.code);
+    // Pure-push: `this;` (bare expression statement) reduces to a no-op.
+    let prog = compile("this; return 1;").expect("compiles");
+    assert!(
+        !prog.code.iter().any(|i| matches!(i, Instr::LoadThis)),
+        "bare `this;` should be optimized away, got {:?}",
+        prog.code
+    );
+}

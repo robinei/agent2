@@ -372,6 +372,10 @@ pub struct CallFrame {
     /// by later references, so repeated `arguments` uses don't re-materialize
     /// the array. `None` until first use (and for frames that never use it).
     arguments_cache: Option<ArrayPtr>,
+    /// The `this` binding for this function call, stored outside the capturable
+    /// local-slot space. Defaults to `Undefined`; set by method dispatch,
+    /// `new`, `bind`, `.call`, and `.apply` (Phase 13 OO).
+    pub(super) this_val: Value,
     /// How this frame completes (7_ASYNC Tier 2). Direct calls are `Normal`;
     /// a scheduler-resumed async frame is `ResolvePromise` — it has no
     /// caller below it on the stack.
