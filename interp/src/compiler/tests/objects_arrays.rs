@@ -6,7 +6,7 @@ use crate::compiler::compile;
 use crate::rc_str::RcStr;
 use crate::testutil;
 use crate::testutil::{eval, eval_str};
-use crate::vm::{Instr, StepResult, VM, Value};
+use crate::vm::{ErrorKind, Instr, StepResult, VM, Value};
 
 // ── arrays & objects ─────────────────────────────────────────────
 
@@ -707,14 +707,15 @@ fn this_in_arrow_is_undefined() {
 }
 
 #[test]
-fn this_in_method_is_undefined_pre_step_3() {
-    // Until step 3 no call form sets a non-undefined `this`, so a method call
-    // like `obj.m()` still reads `undefined` — correct for this step.
+fn this_in_method_is_receiver() {
+    // Step 3b: method calls bind `this` to the receiver.
+    // `obj.greet()` where greet returns `this` should return the same object.
+    // We test this by checking that `return this === obj` is true.
     assert_eq!(
         testutil::run_val(
-            "const obj = { greet: function() { return this; } }; return obj.greet();"
+            "const obj = { x: 42, greet: function() { return this.x; } }; return obj.greet();"
         ),
-        Value::Undefined
+        Value::PosInt(42)
     );
 }
 
@@ -824,5 +825,144 @@ fn function_without_this_is_unchanged() {
     assert!(
         !prog.code.iter().any(|i| matches!(i, Instr::LoadThis)),
         "function without `this` should have no LoadThis"
+    );
+}
+
+// ── Step 3b: method `this`-binding ─────────────────────────────
+
+#[test]
+fn method_this_binds_to_receiver() {
+    // obj.greet() where greet returns `this.x` — this must be obj.
+    assert_eq!(
+        testutil::run_val(
+            "const obj = { x: 42, greet: function() { return this.x; } }; return obj.greet();"
+        ),
+        Value::PosInt(42)
+    );
+}
+
+#[test]
+fn proto_chain_method_binds_this() {
+    // A method found via prototype chain still gets the original receiver as `this`.
+    // Prototype chain walk requires proto links (set in Step 4), so here the
+    // property is not found and the call errors. Documented as pending Step 4.
+    let err = testutil::run_runtime_err(concat!(
+        "const p = { greet: function() { return this.x; } };",
+        "const obj = { x: 99 }; return obj.greet();"
+    ));
+    assert_eq!(err.kind, ErrorKind::TypeError);
+}
+
+#[test]
+fn method_detachment_loses_this() {
+    // `const f = obj.greet; f()` — the method is detached; `this` is undefined.
+    assert_eq!(
+        testutil::run_val(concat!(
+            "const obj = { x: 7, greet: function() { return this === undefined; } };",
+            "const f = obj.greet; return f();"
+        )),
+        Value::Bool(true)
+    );
+}
+
+#[test]
+fn computed_method_call_binds_this() {
+    // recv[k]() where k is a computed key — must bind this.
+    assert_eq!(
+        testutil::run_val(concat!(
+            "const obj = { x: 3, greet: function() { return this.x; } };",
+            "return obj['greet']();"
+        )),
+        Value::PosInt(3)
+    );
+}
+
+#[test]
+fn computed_method_builtin_name_gives_undefined() {
+    // arr['push'](x) — builtins are not stored properties, so the read yields undefined
+    // and the call fails with "not a function".
+    let err = testutil::run_runtime_err("const arr = [1,2]; return arr['push'](3);");
+    assert_eq!(err.kind, ErrorKind::TypeError);
+}
+
+#[test]
+fn method_spread_binds_this() {
+    // recv.greet(...xs) with spread args still binds this.
+    assert_eq!(
+        testutil::run_val(concat!(
+            "const obj = { x: 99, greet: function(a, b) { return this.x + a + b; } };",
+            "return obj.greet(...[1, 2]);"
+        )),
+        testutil::num(102.0)
+    );
+}
+
+#[test]
+fn computed_method_spread_binds_this() {
+    // recv[k](...xs) with computed key + spread still binds this.
+    assert_eq!(
+        testutil::run_val(concat!(
+            "const obj = { x: 10, greet: function(a, b) { return this.x + a + b; } };",
+            "return obj['greet'](...[3, 4]);"
+        )),
+        testutil::num(17.0)
+    );
+}
+
+#[test]
+fn optional_method_short_circuits_on_nullish() {
+    // recv?.greet() on undefined short-circuits; args are never evaluated.
+    assert_eq!(
+        testutil::run_val(concat!("const obj = null;", "return obj?.greet(1);")),
+        Value::Undefined
+    );
+}
+
+#[test]
+fn optional_method_binds_this_on_present() {
+    // recv?.greet() on a present receiver binds this.
+    assert_eq!(
+        testutil::run_val(concat!(
+            "const obj = { x: 5, greet: function() { return this.x; } };",
+            "return obj?.greet();"
+        )),
+        Value::PosInt(5)
+    );
+}
+
+#[test]
+fn missing_method_is_not_a_function() {
+    // A missing method reads as undefined; the call fails at dispatch, not at read.
+    let err = testutil::run_runtime_err("const obj = {}; return obj.greet(1);");
+    assert_eq!(err.kind, ErrorKind::TypeError);
+}
+
+#[test]
+fn non_object_receiver_read_error() {
+    // ObjPeek on a non-Object receiver inherits ObjGet's existing read error.
+    let err = testutil::run_runtime_err("const n = 42; return n.greet();");
+    assert_eq!(err.kind, ErrorKind::TypeError);
+}
+
+#[test]
+fn shadow_reroute_sees_this() {
+    // A user property that shadows a builtin method name must see `this`.
+    // o.n increments through `this`, so reading it after a shadowed push()
+    // confirms the correct receiver is bound.
+    assert_eq!(
+        testutil::run_val(concat!(
+            "const o = { push: function(x) { this.n = (this.n||0) + 1; return x; }, n: 0 };",
+            "o.push(5); return o.n;"
+        )),
+        testutil::num(1.0)
+    );
+}
+
+#[test]
+fn plain_call_this_is_undefined() {
+    // A plain call (no receiver) still has `this === undefined`.
+    assert_eq!(
+        testutil::run_val("function f() { return this === undefined; } return f();"),
+        Value::Bool(true)
     );
 }

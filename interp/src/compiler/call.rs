@@ -98,10 +98,14 @@ impl<'src> super::Compiler<'src> {
                 }
                 self.compile_method_call(&m.object, method, &argv, span, m.optional);
             }
-            ast::Expression::ComputedMemberExpression(_) => self.error(
-                span,
-                "computed method calls (`obj[expr](...)`) are not supported",
-            ),
+            ast::Expression::ComputedMemberExpression(m) => {
+                // recv[k](args) → ObjPeekDyn + CallDyn(has_this=true)
+                self.compile_expr(&m.object);
+                self.compile_expr(&m.expression);
+                self.emit(Instr::ObjPeekDyn, span);
+                self.compile_args(&argv);
+                self.emit(Instr::CallDyn(argv.len() as u32, true), span);
+            }
             ast::Expression::Identifier(id) => {
                 self.compile_user_call(id.name.as_str(), id.span.start, &argv, span)
             }
@@ -125,19 +129,60 @@ impl<'src> super::Compiler<'src> {
             }
         }
 
-        // Compile callee as a value expression (produces the callable on stack).
-        self.compile_expr(&call.callee);
+        // Detect a method callee so we emit ObjPeek/ObjPeekDyn (keeping the
+        // receiver) instead of ObjGet/IndexGet (consuming it), and thread
+        // has_this=true to CallSpread.  Skip namespaces (Math.max) — those
+        // are builtins accessed via ObjGet.
+        let has_this = match &call.callee {
+            ast::Expression::StaticMemberExpression(m) => {
+                if let ast::Expression::Identifier(obj) = &m.object {
+                    !matches!(
+                        obj.name.as_str(),
+                        "Math"
+                            | "Object"
+                            | "JSON"
+                            | "Number"
+                            | "Array"
+                            | "String"
+                            | "Map"
+                            | "Set"
+                            | "console"
+                            | "Edit"
+                    )
+                } else {
+                    true
+                }
+            }
+            ast::Expression::ComputedMemberExpression(_) => true,
+            _ => false,
+        };
+        if has_this {
+            // Emit receiver + property as a method access, keeping the receiver.
+            match &call.callee {
+                ast::Expression::StaticMemberExpression(m) => {
+                    self.compile_expr(&m.object);
+                    self.emit(Instr::ObjPeek(m.property.name.as_str().into()), span);
+                }
+                ast::Expression::ComputedMemberExpression(m) => {
+                    self.compile_expr(&m.object);
+                    self.compile_expr(&m.expression);
+                    self.emit(Instr::ObjPeekDyn, span);
+                }
+                _ => unreachable!(),
+            }
+        } else {
+            // Compile callee as a value expression (produces the callable on stack).
+            self.compile_expr(&call.callee);
+        }
 
         if call.optional {
-            // optional call `f?.(...args)`: short-circuit to undefined when
-            // nullish, else compile args and dispatch.
             let end = self.begin_optional(span);
             self.compile_call_args_array(&call.arguments, span);
-            self.emit(Instr::CallSpread(false), span);
+            self.emit(Instr::CallSpread(has_this), span);
             self.emit(Instr::Label(end), span);
         } else {
             self.compile_call_args_array(&call.arguments, span);
-            self.emit(Instr::CallSpread(false), span);
+            self.emit(Instr::CallSpread(has_this), span);
         }
     }
 
@@ -492,18 +537,18 @@ impl<'src> super::Compiler<'src> {
         if optional {
             // Optional call: guard on the receiver before reading the property.
             let end = self.begin_optional(span);
-            // Get the property from the non-nullish receiver.
-            self.emit(Instr::ObjGet(method.into()), span);
+            // Peek the property: keep recv below for has_this binding.
+            self.emit(Instr::ObjPeek(method.into()), span);
             // Evaluate args.
             self.compile_args(argv);
-            self.emit(Instr::CallDyn(argv.len() as u32, false), span);
+            self.emit(Instr::CallDyn(argv.len() as u32, true), span);
             self.emit(Instr::Label(end), span);
         } else {
-            // Get the property (consumes receiver, pushes property value).
-            self.emit(Instr::ObjGet(method.into()), span);
+            // Peek the property: keep recv below for has_this binding.
+            self.emit(Instr::ObjPeek(method.into()), span);
             // Evaluate args.
             self.compile_args(argv);
-            self.emit(Instr::CallDyn(argv.len() as u32, false), span);
+            self.emit(Instr::CallDyn(argv.len() as u32, true), span);
         }
     }
 

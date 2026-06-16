@@ -1186,6 +1186,7 @@ impl VM {
         &mut self,
         b: crate::builtin::Builtin,
         argc: u32,
+        _this_val: Value,
     ) -> Result<(), VMError> {
         // Invariant: the signalling handler raised `MethodOnObject` at its
         // receiver check, before touching the stack — so all `argc` args
@@ -1210,8 +1211,8 @@ impl VM {
             .cloned();
         match method {
             Some(f) => {
-                self.stack.remove(base); // drop the receiver; arg1.. shift down
-                self.dispatch_call(f, argc - 1)
+                let recv = self.stack.remove(base); // drop the receiver; args shift down
+                self.dispatch_call(f, recv, argc - 1)
             }
             None => {
                 self.stack.truncate(base);
@@ -1223,27 +1224,44 @@ impl VM {
 
     /// Shared dispatch for `CallDyn` and `CallSpread`: the args are already
     /// on the stack in left-to-right order (arg 0 deepest), with the callable
-    /// already popped.  Handles `Builtin`, `Fn`, `Closure`, and non-callable.
-    pub(crate) fn dispatch_call(&mut self, callable: Value, nargs: u32) -> Result<(), VMError> {
+    /// already popped.  `this_val` is the receiver for user functions/closures
+    /// (set as the frame field); for builtins it is spliced as arg 0.
+    /// Handles `Builtin`, `Fn`, `Closure`, and non-callable.
+    pub(crate) fn dispatch_call(
+        &mut self,
+        callable: Value,
+        this_val: Value,
+        nargs: u32,
+    ) -> Result<(), VMError> {
         match callable {
-            Value::Builtin(b) => match b.call(self, nargs) {
-                Ok(()) => self.ip += 1,
-                // Method builtin landed on an Object receiver: re-route to the
-                // object's own property. `reroute` (via `dispatch_call`) sets
-                // `ip`, so we must not advance it here.
-                Err(e) if e.kind == ErrorKind::MethodOnObject => {
-                    self.reroute_method_to_object(b, nargs)?;
+            Value::Builtin(b) => {
+                // Splice this_val as arg 0 for the builtin (structural convention).
+                let nargs_with_recv = if matches!(this_val, Value::Undefined) {
+                    nargs
+                } else {
+                    let insert_idx = self.stack.len() - nargs as usize;
+                    self.stack.insert(insert_idx, this_val.clone());
+                    nargs + 1
+                };
+                match b.call(self, nargs_with_recv) {
+                    Ok(()) => self.ip += 1,
+                    // Method builtin landed on an Object receiver: re-route to the
+                    // object's own property. `reroute` (via `dispatch_call`) sets
+                    // `ip`, so we must not advance it here.
+                    Err(e) if e.kind == ErrorKind::MethodOnObject => {
+                        self.reroute_method_to_object(b, nargs, this_val)?;
+                    }
+                    Err(e) => return Err(e),
                 }
-                Err(e) => return Err(e),
-            },
-            Value::Fn(addr) => self.call_function(addr, nargs, SmallVec::new())?,
+            }
+            Value::Fn(addr) => self.call_function(addr, nargs, SmallVec::new(), this_val)?,
             Value::Closure(p) => {
                 let closure = self.closures.get(p as usize).ok_or_else(|| {
                     self.fail_not_resumable(ErrorKind::ValueError, "bad closure pointer")
                 })?;
                 let addr = closure.addr;
                 let upvals: SmallVec<[Value; 8]> = closure.upvals.iter().cloned().collect();
-                self.call_function(addr, nargs, upvals)?
+                self.call_function(addr, nargs, upvals, this_val)?
             }
             _ => {
                 let keep = self.stack.len().saturating_sub(nargs as usize);
@@ -1260,6 +1278,7 @@ impl VM {
         addr: CodeAddr,
         nargs: u32,
         upvals: SmallVec<[Value; 8]>,
+        this_val: Value,
     ) -> Result<(), VMError> {
         let addr = self.validate_func_addr(addr)?;
         if nargs as usize > self.stack.len() {
@@ -1275,7 +1294,7 @@ impl VM {
             prev_fp: self.fp,
             arguments_cache: None,
             pending_upvals: upvals,
-            this_val: Value::Undefined,
+            this_val,
             completion: Completion::Normal,
         });
         self.ip = addr;

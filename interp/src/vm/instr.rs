@@ -287,6 +287,16 @@ pub enum Instr {
     /// field 0's value is the first/deepest pushed.
     ObjNew(ThinVec<FieldName>), // [any, ...] -> obj
     ObjGet(FieldName), // obj -> any
+    /// Read property `name` off the receiver but **keep the receiver** below the
+    /// result. Semantically identical to `ObjGet` (same own→proto walk, same
+    /// `Undefined` on a miss), sharing `ObjGet`'s resolution helper. Used by
+    /// method calls (`recv.m(args)`) so the receiver remains available for
+    /// has_this binding. Also emitted for compound-assignment loads
+    /// (`obj.x += 1`). obj -> obj, any
+    ObjPeek(FieldName),
+    /// `ObjGetDyn` minus the obj-pop: keep the receiver below the resolved
+    /// property. obj, key -> obj, value
+    ObjPeekDyn,
     /// Sets the field and leaves a value on the stack (assignment is an
     /// expression). In `New` mode leaves the assigned value; in `Old` mode
     /// reads and leaves the previous value. Statement-context callers follow

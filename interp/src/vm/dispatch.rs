@@ -28,6 +28,81 @@ fn regexp_prop(r: &RcRegExp, field: &str) -> Value {
 }
 
 impl VM {
+    /// Shared property resolution for `ObjGet`/`ObjPeek`: inspects the
+    /// top-of-stack as the receiver and returns the resolved property value.
+    /// Used by both instructions so the only difference is whether the
+    /// receiver is popped (ObjGet) or kept (ObjPeek).
+    fn resolve_property_from_top(&self, field_str: &str) -> Result<Value, VMError> {
+        match self.stack.last() {
+            Some(Value::RegExp(r)) => Ok(regexp_prop(r, field_str)),
+            Some(Value::Object(p)) => self.resolve_proto_chain(*p, field_str),
+            _ => {
+                let recv = self.stack.last();
+                let msg = format!(
+                    "cannot read property on {}{}",
+                    recv.map(|v| v.type_name()).unwrap_or("unknown"),
+                    recv.map(|v| await_hint(v)).unwrap_or("")
+                );
+                Err(self.fail(ErrorKind::TypeError, msg))
+            }
+        }
+    }
+
+    /// Shared computed-property resolution for `IndexGet`/`ObjPeekDyn`:
+    /// inspects `container` (the object/array/string being indexed) and
+    /// resolves `key` against it. String→char, Array→int-index,
+    /// Object→string-key.
+    fn resolve_computed_property(&self, container: &Value, key: &Value) -> Result<Value, VMError> {
+        match container {
+            Value::String(s) => {
+                let s = s.as_str();
+                let idx = key
+                    .as_i64()
+                    .ok_or_else(|| self.fail(ErrorKind::TypeError, "type error"))?;
+                if idx < 0 {
+                    return Err(self.fail(ErrorKind::ValueError, "value error"));
+                }
+                let idx = idx as usize;
+                if idx >= s.len() {
+                    Ok(Value::Undefined)
+                } else if !s.is_char_boundary(idx) {
+                    Err(self.fail(ErrorKind::ValueError, "value error"))
+                } else {
+                    let ch = s[idx..].chars().next().unwrap();
+                    Ok(Value::String(RcStr::from(ch.to_string())))
+                }
+            }
+            Value::Array(p) => {
+                let arr = self
+                    .arrays
+                    .get(*p as usize)
+                    .ok_or_else(|| self.fail(ErrorKind::ValueError, "value error"))?;
+                let idx = key
+                    .as_i64()
+                    .ok_or_else(|| self.fail(ErrorKind::TypeError, "type error"))?;
+                if idx < 0 {
+                    return Err(self.fail(ErrorKind::ValueError, "value error"));
+                }
+                Ok(arr.get(idx as usize).cloned().unwrap_or(Value::Undefined))
+            }
+            Value::Object(p) => {
+                let field = self.to_js_string(key, 0);
+                self.resolve_proto_chain(*p, field.as_str())
+            }
+            _ => {
+                let msg = format!(
+                    "cannot index into {} with {}{}",
+                    container.type_name(),
+                    self.preview(key),
+                    await_hint(container)
+                );
+                Err(self.fail(ErrorKind::TypeError, msg))
+            }
+        }
+    }
+}
+
+impl VM {
     pub(crate) fn dispatch(&mut self, fuel: &mut u64) -> Result<StepResult, VMError> {
         // ── macros for repetitive instruction shapes ─────────────────
 
@@ -241,13 +316,22 @@ impl VM {
                 }
 
                 // ── control flow ─────────────────────────────────
-                Instr::Call(addr, nargs) => self.call_function(*addr, *nargs, SmallVec::new())?,
+                Instr::Call(addr, nargs) => {
+                    self.call_function(*addr, *nargs, SmallVec::new(), Value::Undefined)?
+                }
 
-                Instr::CallDyn(nargs, _has_this) => {
+                Instr::CallDyn(nargs, has_this) => {
                     let nargs = *nargs;
+                    let has_this = *has_this;
+                    let this_val = if has_this {
+                        let recv_idx = self.stack.len().saturating_sub(2 + nargs as usize);
+                        self.stack.remove(recv_idx)
+                    } else {
+                        Value::Undefined
+                    };
                     let idx = self.stack.len() - 1 - nargs as usize;
                     let callable = self.stack.remove(idx);
-                    self.dispatch_call(callable, nargs)?;
+                    self.dispatch_call(callable, this_val, nargs)?;
                 }
 
                 Instr::CallBuiltin(b, argc) => {
@@ -261,14 +345,21 @@ impl VM {
                     match b.call(self, argc) {
                         Ok(()) => self.ip += 1,
                         Err(e) if e.kind == ErrorKind::MethodOnObject => {
-                            self.reroute_method_to_object(b, argc)?;
+                            self.reroute_method_to_object(b, argc, Value::Undefined)?;
                         }
                         Err(e) => return Err(e),
                     }
                 }
 
-                Instr::CallSpread(_has_this) => {
-                    // Callee sits below the args array (at depth 1).
+                Instr::CallSpread(has_this) => {
+                    let has_this = *has_this;
+                    // Callee sits below the args array, receiver (if has_this)
+                    // sits below the callee.
+                    let this_val = if has_this {
+                        self.stack.remove(self.stack.len() - 3)
+                    } else {
+                        Value::Undefined
+                    };
                     let callable = self.stack.remove(self.stack.len() - 2);
                     let arr_ptr = match self.pop()? {
                         Value::Array(p) => p,
@@ -291,7 +382,7 @@ impl VM {
                     for val in elements {
                         self.stack.push(val);
                     }
-                    self.dispatch_call(callable, nargs)?;
+                    self.dispatch_call(callable, this_val, nargs)?;
                 }
 
                 Instr::ClosureNew(addr, captures) => {
@@ -974,33 +1065,40 @@ impl VM {
                 }
 
                 Instr::ObjGet(field) => {
-                    let field_str = field.as_str(); // borrows self.code
-                    // Check for RegExp first: properties are computed from
-                    // the RegExpData without a backing object in self.objects.
-                    match self.stack.last() {
-                        Some(Value::RegExp(r)) => {
-                            let val = regexp_prop(r, field_str);
+                    let field_str = field.as_str();
+                    match self.resolve_property_from_top(field_str) {
+                        Ok(val) => {
                             self.stack.pop();
                             self.stack.push(val);
                             self.ip += 1;
                         }
-                        Some(Value::Object(p)) => {
-                            let obj_ptr = *p;
-                            let val = self.resolve_proto_chain(obj_ptr, field_str)?;
+                        Err(e) => {
                             self.stack.pop();
-                            self.stack.push(val);
-                            self.ip += 1;
-                        }
-                        _ => {
-                            let recv = self.pop()?;
-                            let msg = format!(
-                                "cannot read property on {}{}",
-                                recv.type_name(),
-                                await_hint(&recv)
-                            );
-                            return Err(self.fail(ErrorKind::TypeError, msg));
+                            return Err(e);
                         }
                     }
+                }
+
+                // ObjGet minus the pop: reads the property but keeps the
+                // receiver below it. Same resolution (own→proto chain) as
+                // ObjGet, shared helper. obj -> obj, any
+                Instr::ObjPeek(field) => {
+                    let field_str = field.as_str();
+                    let val = self.resolve_property_from_top(field_str)?;
+                    self.stack.push(val);
+                    self.ip += 1;
+                }
+
+                // ObjGetDyn minus the obj-pop: `Pick(0); IndexGet` fused.
+                // Resolves the property via the same type dispatch as IndexGet
+                // (Array→int, Object→key, String→char) but keeps the container
+                // below the result. obj, key -> obj, value
+                Instr::ObjPeekDyn => {
+                    let key = self.pop()?;
+                    let container = self.stack.last().cloned().unwrap_or(Value::Undefined);
+                    let val = self.resolve_computed_property(&container, &key)?;
+                    self.stack.push(val);
+                    self.ip += 1;
                 }
 
                 Instr::ObjSet(field, mode) => {
@@ -1085,59 +1183,7 @@ impl VM {
                 Instr::IndexGet => {
                     let key = self.pop()?;
                     let container = self.pop()?;
-                    let val = match &container {
-                        // String char-indexing: strings are inline values now, so
-                        // this no longer routes through the heap. The single-char
-                        // result is a fresh `RcStr`.
-                        Value::String(s) => {
-                            let s = s.as_str();
-                            let idx = key
-                                .as_i64()
-                                .ok_or_else(|| self.fail(ErrorKind::TypeError, "type error"))?;
-                            if idx < 0 {
-                                return Err(self.fail(ErrorKind::ValueError, "value error"));
-                            }
-                            let idx = idx as usize;
-                            if idx >= s.len() {
-                                // JS: an out-of-range char index is `undefined`.
-                                Value::Undefined
-                            } else if !s.is_char_boundary(idx) {
-                                return Err(self.fail(ErrorKind::ValueError, "value error"));
-                            } else {
-                                let ch = s[idx..].chars().next().unwrap();
-                                Value::String(RcStr::from(ch.to_string()))
-                            }
-                        }
-                        Value::Array(p) => {
-                            let arr = self
-                                .arrays
-                                .get(*p as usize)
-                                .ok_or_else(|| self.fail(ErrorKind::ValueError, "value error"))?;
-                            let idx = key
-                                .as_i64()
-                                .ok_or_else(|| self.fail(ErrorKind::TypeError, "type error"))?;
-                            if idx < 0 {
-                                return Err(self.fail(ErrorKind::ValueError, "value error"));
-                            }
-                            // JS: an out-of-bounds index reads as `undefined`.
-                            arr.get(idx as usize).cloned().unwrap_or(Value::Undefined)
-                        }
-                        Value::Object(p) => {
-                            // JS coerces a computed key with ToString.
-                            let field = self.to_js_string(&key, 0);
-                            // Walk own → proto chain (JS [[Get]]).
-                            self.resolve_proto_chain(*p, field.as_str())?
-                        }
-                        _ => {
-                            let msg = format!(
-                                "cannot index into {} with {}{}",
-                                container.type_name(),
-                                self.preview(&key),
-                                await_hint(&container)
-                            );
-                            return Err(self.fail(ErrorKind::TypeError, msg));
-                        }
-                    };
+                    let val = self.resolve_computed_property(&container, &key)?;
                     self.stack.push(val);
                     self.ip += 1;
                 }
