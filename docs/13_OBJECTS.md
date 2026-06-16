@@ -178,7 +178,17 @@ non-arrow function's) `this`. In a slot-0 design `this` is a real local, so an
 arrow captures it for free through the existing `Upval`-by-slot machinery. Here
 `this_val` is a **frame field, not a local slot**, so `Upval` (which captures
 cells that back local slots) cannot reach it. Capture therefore needs a bridge —
-**reify-on-capture**:
+**reify-on-capture**.
+
+This is not a novel mechanism: it is the classic `var self = this;` idiom, and
+*precisely* Babel's arrow-function lowering — emit `var _this = this` once at
+function entry, rewrite each `this` inside the arrow to `_this`, and let ordinary
+closure capture take `_this`. We do exactly that, only (a) by the compiler, (b)
+*conditionally* — solely when a nested arrow needs it (a direct `this` use stays a
+bare `LoadThis`, no slot) — and (c) into a hidden synthetic slot (no name to
+shadow). So the *concept* is battle-tested at industrial scale; the only work
+here is detecting the condition and threading the synthetic binding through the
+existing capture pass.
 
 When analysis finds that a function has a **nested arrow that references `this`**,
 the compiler reifies `this` into a synthetic local of that (nearest enclosing
