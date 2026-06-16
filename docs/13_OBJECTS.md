@@ -67,7 +67,7 @@ routed to wherever the *resolved* callee reads `this`:
 | resolved `m`                         | receiver delivered as | path                                  |
 |--------------------------------------|-----------------------|---------------------------------------|
 | builtin (arr/str/map/set/regexp)     | arg 0 (today)         | structural `CallBuiltin`, unchanged   |
-| object **own** property that's a fn  | `this_val` field      | `CallMethod` sets `this_val = recv`   |
+| object **own** property that's a fn  | `this_val` field      | `GetMethod` + `has_this` call → `this_val = recv` |
 | object **prototype-chain** fn        | `this_val` field      | same, found by walking `proto`        |
 | not found / non-callable             | `TypeError`           | —                                     |
 
@@ -75,7 +75,7 @@ routed to wherever the *resolved* callee reads `this`:
 `f.bind(x)(args)` → `this_val = x`, ignoring the call-site receiver. The split is
 the cost of this representation: a **builtin reads its receiver as arg 0 on the
 stack**, a **user function reads `this_val` off the frame** — so the dispatch
-layer *forks* on callable kind wherever a receiver is supplied (`CallMethod`,
+layer *forks* on callable kind wherever a receiver is supplied (method calls,
 `bind`, `.call`/`.apply`). Neither convention leaks to the surface language.
 
 ---
@@ -94,12 +94,14 @@ struct CallFrame {
 }
 ```
 
-The entire appeal is that **non-OO code is byte-for-byte unchanged and there is
-no ABI split**: `call_function` writes `this_val = Undefined` as one
-unconditional store during frame construction — no extra instruction, no
-`PushUndefined`, no slot move, no `EnterFrame` change, no callee-first, no
-`has_receiver` plumbing. Params stay at slot 0 for *every* function. The frame
-just carries one more `Value` field.
+The entire appeal is that **the frame model is unchanged and there is no ABI
+split**: `call_function` writes `this_val = Undefined` as one unconditional store
+during frame construction — no `PushUndefined`, no slot move, no `EnterFrame`
+reconciliation, no per-function ABI class. Params stay at slot 0 for *every*
+function; the frame just carries one more `Value` field. (Method calls do adopt a
+callee-first operand order and a `has_this` routing bit on `CallDyn`/`CallSpread`
+— Step 3 — but that is operand-stack arrangement plus a dispatch-time fork, **not**
+a change to how the frame itself is built. The plain-call frame is untouched.)
 
 The price — paid entirely by OO code — is twofold, and both are spelled out
 below: reads need a dedicated instruction (`LoadThis`), and arrow `this`-capture
@@ -120,9 +122,10 @@ isolated in 1b and must land before Step 3 (which sets the first non-undefined
   user code; classify with the `Local` family: frame-relative but
   side-effect-free), and a `ResumeMode` (same as `Local`).
 - **Method dispatch / `new` / `bind` set the field, not the stack** (Steps
-  3/4/5): `CallMethod` sets `this_val = recv`; `new` sets it to the fresh
-  instance; a `Bound` user-fn call sets it from `BoundFn.this_val`. Plain
-  `Call`/`CallDyn` leave the `Undefined` default.
+  3/4/5): the method path (`GetMethod` + a `has_this` call, Step 3) sets
+  `this_val = recv` for a user-fn callee; `new` sets it to the fresh instance; a
+  `Bound` user-fn call sets it from `BoundFn.this_val`. Plain `Call`/`CallDyn`
+  leave the `Undefined` default.
 - **Builtins are untouched.** A method builtin reads its receiver as arg 0 on the
   stack exactly as today; it has no frame and never touches `this_val`.
 
@@ -307,29 +310,39 @@ Make `recv.m(args)` bind `this` for user methods, across both call paths:
   builtin, `recv` stays as arg 0 exactly as today. Shadowing becomes "call the
   user method with `this`".
 - **Non-builtin method names** (`recv.greet(…)`): today this lowers to
-  `ObjGet(greet)` + `CallDyn`, which calls the property with no receiver.
-  **Decision: add one instruction `CallMethod(FieldName, ArgCount)`.** The stack
-  is `[recv, args…]`. **Resolution:** `name` is resolved on `recv` only when
-  `recv` is a `Value::Object` (own map → proto chain, Step 2 — proto chains are
-  `Object`-only); any other receiver type, or a missing / non-callable property,
-  is a `TypeError` (`recv.name is not a function`). Builtin method names never
-  reach here (the compiler emits `CallBuiltin` for those), so `CallMethod` is
-  purely the Object-method path. **Dispatch forks on the resolved callee's kind**,
-  via the shared helper below:
-  - user function/closure → capture `recv` into `this_val`, then **drop `recv`
-    from the value stack** so `args…` become the frame at the base (`fp` at the
-    first arg). This is the *same* `recv`-removal the reroute already performs
-    today — no new stack scheme; `recv` is not an `arguments` entry.
-  - builtin → leave `recv` as arg 0 (the existing positional convention);
-    nothing moves.
-  - `Bound` → defer to its own `this_val` (Step 5).
-  `compile_method_call` emits `CallMethod` for a non-namespace method name instead
-  of `ObjGet`+`CallDyn`, which also removes the `Dig` that path uses today.
-  Classify it impure (`pe_*`, it calls user code) and give it a `ResumeMode`.
-  (Both call paths — the reroute and `CallMethod` — share the one "set `this_val`
-  for a user fn / keep arg 0 for a builtin" fork; factor it into a single helper.)
-- `f(args)` (no receiver, `Call`/`CallDyn`) stays `this_val = undefined` (the
-  frame default; no instruction change).
+  `ObjGet(greet)` + `CallDyn`, calling the property with no receiver. **Decision:
+  separate resolution from arg-delivery — a `GetMethod` read plus a `has_this`
+  bit on the existing call instructions — so no `CallMethod`/`CallMethodSpread`
+  opcodes are needed and spread/optional fall out for free.**
+  - **`GetMethod(FieldName)`** — a *read*. Resolves `name` on `recv` (own map →
+    proto chain, Step 2) **only when `recv` is a `Value::Object`**; any other
+    receiver type, or a missing / non-callable property, is a `TypeError`
+    (`recv.name is not a function`). Builtin method names never reach here (the
+    compiler emits `CallBuiltin` for those), so this is purely the Object-method
+    path. It leaves the callee on the stack while **keeping `recv`** (which a bare
+    `ObjGet` would consume). Impure-free (a bounded proto walk, no user code), but
+    give it a `pe_*` entry and `ResumeMode` like any new instruction.
+  - **`has_this` bit on `CallDyn(ArgCount, has_this)` / `CallSpread(has_this)`** —
+    "a receiver is on the stack; route it." Dispatch forks on the resolved
+    callee's kind, via a shared helper: a **user function/closure** → capture
+    `recv` into `this_val`, then drop it so `args…` are the frame (recv is not an
+    `arguments` entry — the *same* removal the reroute does); a **builtin** →
+    leave `recv` as arg 0; a **`Bound`** → defer to its own `this_val` (Step 5).
+    This is a dispatch-time routing fork only — **no `EnterFrame` reconciliation,
+    no slot move** (the frame model is untouched, which is the point of
+    frame-field).
+  - **Callee-first arrangement** (so no `Dig`): push *callee → recv → args*, and
+    `CallDyn`/`CallSpread` read the callee below the args (`top - argc - 1 -
+    has_this`). Plain calls flip to the same callee-first order (`has_this =
+    false`), which removes the `Dig` the dynamic-method path uses today and gives
+    `CallDyn` one uniform layout.
+  - Lowerings: `recv.greet(a,b)` → `GetMethod(greet)` + `CallDyn(2, true)`;
+    `recv.greet(...xs)` → `GetMethod(greet)` + `CallSpread(true)`;
+    `recv?.greet(…)` wraps `GetMethod` in the existing `begin_optional` guard,
+    exactly like `ObjGet` today.
+- `f(args)` (no receiver) → callee-first `Call`/`CallDyn(argc, has_this=false)` /
+  `CallSpread(false)`; `this_val` stays the frame default `undefined`. No frame
+  change.
 
 Acceptance:
 - [ ] `obj.greet()` where `greet` is an own function property runs with
@@ -337,8 +350,15 @@ Acceptance:
 - [ ] An own property still shadows a builtin method name *and* now sees `this`
       (extend the Phase-`4ea0249` shadow tests to assert `this`).
 - [ ] `const f = obj.greet; f()` runs with `this === undefined` (detachment).
-- [ ] Method dispatch is classified impure in the `pe_*` tables (calls user
-      code) and given a `ResumeMode`.
+- [ ] `recv.greet(...xs)` (spread) binds `this === recv` via `GetMethod` +
+      `CallSpread(has_this=true)` — **no `CallMethodSpread` opcode exists**.
+- [ ] `recv?.greet()` on a nullish `recv` short-circuits (no `GetMethod`, no
+      call, no arg evaluation); on a present `recv` binds `this`.
+- [ ] `recv.greet()` on a non-`Object` receiver, or a missing/non-callable
+      `greet`, is a `TypeError`.
+- [ ] `GetMethod` classified in the `pe_*` tables and `ResumeMode`; the
+      `has_this` dispatch fork (user-fn → `this_val`, builtin → arg 0) is exercised
+      both ways.
 - [ ] Gate: `cargo fmt && cargo clippy && cargo test` green.
 
 ## Step 4 — `new F(args)`
@@ -405,8 +425,9 @@ Value::Bound(Rc<BoundFn>)
   `this_val = inner.this_val`; a bound *builtin* (`[].push.bind(arr)`) gets
   `inner.this_val` spliced in as arg 0. The Bound arm *overrides* a call-site
   receiver (`obj.g()` where `g` is bound ignores `obj`), since it supplies its own
-  `this_val`; a `CallMethod` that resolves to a `Bound` must therefore defer to
-  the Bound's `this_val` rather than setting `this_val = recv`. Mechanic for the
+  `this_val`; a method call (`GetMethod` + `has_this`) that resolves to a `Bound`
+  must therefore defer to the Bound's `this_val` rather than setting
+  `this_val = recv`. Mechanic for the
   builtin case: splice `[this_val, bound_args…]` below the call-site args; for the
   user-fn case set the frame field and prepend `bound_args` (rare path; cost
   irrelevant). Binding is composable: `g = f.bind(a, x); g.bind(b, y)` pre-pends
