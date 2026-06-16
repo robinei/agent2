@@ -170,9 +170,18 @@ here.
 Additive and behavior-preserving: nothing sets a non-undefined `this` yet, so
 every read is `undefined`. No slot layout and no call convention change.
 
-- **`vm/mod.rs`** — add `CallFrame.this_val: Value`.
-- **`vm/methods.rs`** — `call_function` initializes `this_val = Undefined` (one
-  store; plain calls never set it otherwise).
+- **`vm/mod.rs`** — add `CallFrame.this_val: Value`. **Every `CallFrame {…}`
+  literal must initialize it**; the compiler will flag each. The sites are the
+  root frame (`methods.rs:26`, `callstack: vec![CallFrame{…}]`), `call_function`'s
+  frame push (`methods.rs:1228`), the continuation/strand frame (`methods.rs:658`),
+  and any in `dispatch.rs`. Default `Undefined` everywhere; only the method /
+  `new` / `bind` paths (Steps 3/4/5) write a non-undefined value.
+- **`vm/methods.rs` / `vm/dispatch.rs`** — `Instr::LoadThis` reads
+  `self.callstack.last().this_val`. **No empty-frame case to handle:** the VM is
+  constructed with the root frame already on `callstack` (`methods.rs:26`), and
+  the callstack is empty only *after* the root returns (`dispatch.rs:357`), when
+  no instruction runs — so `LoadThis` always has a frame. Top-level `this` is the
+  root frame's `Undefined`.
 - **`vm/instr.rs` / `vm/dispatch.rs`** — `Instr::LoadThis` + its `step()` arm,
   `pe_*` entry, and `ResumeMode`.
 - **`compiler/stmt.rs`/`expr.rs`** — `ThisExpression` lowers to `LoadThis`
@@ -194,28 +203,60 @@ Acceptance (1a):
 
 ### Step 1b — reify-on-capture (arrows capture lexical `this`)
 
-- **`compiler/analysis.rs`** — in the capture pass, flag every (non-arrow)
-  function that has a nested arrow referencing `this`. For each, allocate
-  `this_slot`, mark it captured, and record that arrows referencing `this` bind
-  to it.
-- **`compiler/function.rs`** (the function-prologue emitter) — prepend
-  `LoadThis; SetLocal(this_slot)` for flagged functions.
-- **`compiler/expr.rs`** — a `this` reference *inside an arrow whose lexical
-  owner reified* compiles to the captured-cell read, not `LoadThis`.
+Lexical `this` rides the **existing name-keyed capture machinery** — `analyzer.rs`
+scopes carry `names` / `free` / `captures`, capture propagates bottom-up by free
+*name*, and each function scope is a binding boundary — with two additions:
 
-Still reads `undefined` until Step 3, but the capture *wiring* is in place and
-testable now.
+- **`is_arrow: bool` on `Scope`.** The analyzer already distinguishes
+  `ArrowFunctionExpression` from `FunctionExpression` at scope creation
+  (`analyzer.rs:1590`/`1846`); record the flag there.
+- **A synthetic binding name for `this`** — a reserved sentinel that cannot
+  collide with a user identifier (e.g. `"<this>"`; `<`/`>` are illegal in JS
+  identifiers). It flows through `free`/`captures` like any name, with the **one**
+  difference being the boundary:
+  - a `ThisExpression` in scope `S` contributes `"<this>"` to `S.free`;
+  - `"<this>"` is treated as **declared by every non-arrow scope (and the root),
+    never by an arrow scope.** So `this` used *directly* in a non-arrow function
+    resolves to that function's own synthetic binding → **not captured** → emits
+    `LoadThis`. `this` used inside one or more nested arrows passes *through* the
+    arrow scopes (they don't declare it) and resolves to the **nearest enclosing
+    non-arrow** scope → **captured**, flowing down as an upval exactly like a
+    captured `let`, via the existing `MakeClosure`/`ClosureNew` + `Upval` path.
+
+  That boundary rule is the *only* deviation from normal name resolution (normal
+  names stop at any declaring scope; `"<this>"` stops only at non-arrow scopes —
+  arrows are transparent to it).
+
+**Reify** is then exactly "a non-arrow scope has `"<this>"` in its captured set":
+
+- **`compiler/analysis.rs`** — allocate a synthetic own-local `this_slot` in that
+  scope and mark it captured, so the existing rule boxes it (captured slots are
+  `Boxed`; include `this_slot` in the scope's `SlotKind` list so `EnterFrame`
+  allocates its cell). Map the scope's `"<this>"` references to `this_slot`.
+- **`compiler/function.rs`** — prepend `LoadThis; SetLocal(this_slot)` to the
+  body, emitted **after** `EnterFrame` (the cell must exist) and before user code.
+  `SetLocal` into a `Boxed` slot writes the cell, exactly like storing a captured
+  `let`.
+- **`compiler/expr.rs`** — `ThisExpression` lowering forks on the resolution
+  above: direct/own-scope → `LoadThis`; captured → the existing captured-binding
+  read (`ref_slot`/`emit_slot_read`, which reads the installed upval local).
+
+The root scope is non-arrow, so a top-level arrow capturing `this` reifies the
+root's `this_slot` from its `Undefined` `this_val`. Still reads `undefined` until
+Step 3, but the wiring is in place and testable now.
 
 Acceptance (1b):
-- [ ] An arrow referencing `this` compiles to a capture of the enclosing
-      function's reified `this` slot (codegen-shape: an `Upval`/captured-cell
-      read in the arrow body, not a `LoadThis`).
-- [ ] A function that references `this` directly (no nested arrow) emits **no**
-      reify prologue (codegen-shape).
-- [ ] Arrow-within-arrow over `this` resolves to the nearest non-arrow owner
-      (transitive capture), reading `undefined` at this step.
-- [ ] A function with neither direct nor nested-arrow `this` is byte-for-byte
-      unchanged vs. pre-Phase-13 codegen.
+- [ ] An arrow referencing `this` reads via the captured-binding path (an
+      installed upval local) of the **nearest non-arrow** enclosing scope's
+      reified slot — **not** a `LoadThis` in the arrow body (codegen-shape).
+- [ ] A non-arrow function that references `this` directly, with no
+      this-capturing nested arrow, emits **no** reify prologue and reads via
+      `LoadThis` (codegen-shape).
+- [ ] Arrow-within-arrow over `this` resolves transitively through the inner
+      arrow to the nearest non-arrow owner, reading `undefined` at this step.
+- [ ] A top-level arrow referencing `this` reads `undefined` (root reify).
+- [ ] A function with no `this` (neither direct nor via a nested arrow) is
+      byte-for-byte unchanged vs. pre-Phase-13 codegen.
 - [ ] Gate: `cargo fmt && cargo clippy && cargo test` green.
 
 ## Step 2 — object prototype representation
@@ -268,16 +309,25 @@ Make `recv.m(args)` bind `this` for user methods, across both call paths:
 - **Non-builtin method names** (`recv.greet(…)`): today this lowers to
   `ObjGet(greet)` + `CallDyn`, which calls the property with no receiver.
   **Decision: add one instruction `CallMethod(FieldName, ArgCount)`.** The stack
-  is `[recv, args…]`; `CallMethod` resolves `name` on `recv` (own map → proto
-  chain, Step 2) and dispatches the resolved callee, **forking on its kind**: a
-  user function/closure runs with `this_val = recv` and the arg region = `args…`
-  (recv consumed, not an arg); a builtin runs with `recv` as arg 0; a `Bound`
-  defers to its own `this_val` (Step 5). `compile_method_call` emits `CallMethod`
-  for a non-namespace method name instead of `ObjGet`+`CallDyn` — which also
-  removes the `Dig` that path uses today. Classify it impure (`pe_*`, it calls
-  user code) and give it a `ResumeMode`. (Both call paths — the reroute and
-  `CallMethod` — share the one "set `this_val` for a user fn / keep arg 0 for a
-  builtin" fork; factor it into a single helper.)
+  is `[recv, args…]`. **Resolution:** `name` is resolved on `recv` only when
+  `recv` is a `Value::Object` (own map → proto chain, Step 2 — proto chains are
+  `Object`-only); any other receiver type, or a missing / non-callable property,
+  is a `TypeError` (`recv.name is not a function`). Builtin method names never
+  reach here (the compiler emits `CallBuiltin` for those), so `CallMethod` is
+  purely the Object-method path. **Dispatch forks on the resolved callee's kind**,
+  via the shared helper below:
+  - user function/closure → capture `recv` into `this_val`, then **drop `recv`
+    from the value stack** so `args…` become the frame at the base (`fp` at the
+    first arg). This is the *same* `recv`-removal the reroute already performs
+    today — no new stack scheme; `recv` is not an `arguments` entry.
+  - builtin → leave `recv` as arg 0 (the existing positional convention);
+    nothing moves.
+  - `Bound` → defer to its own `this_val` (Step 5).
+  `compile_method_call` emits `CallMethod` for a non-namespace method name instead
+  of `ObjGet`+`CallDyn`, which also removes the `Dig` that path uses today.
+  Classify it impure (`pe_*`, it calls user code) and give it a `ResumeMode`.
+  (Both call paths — the reroute and `CallMethod` — share the one "set `this_val`
+  for a user fn / keep arg 0 for a builtin" fork; factor it into a single helper.)
 - `f(args)` (no receiver, `Call`/`CallDyn`) stays `this_val = undefined` (the
   frame default; no instruction change).
 
