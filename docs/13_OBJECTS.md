@@ -299,7 +299,20 @@ Acceptance:
 
 ## Step 3 — unified method dispatch (generalize the reroute)
 
-Make `recv.m(args)` bind `this` for user methods, across both call paths:
+Make `recv.m(args)` bind `this` for user methods, across both call paths.
+
+**How the keep-receiver form is selected** — purely by syntactic position, no new
+logic. `compile_call` already matches on `call.callee` (`call.rs:73`): a
+`StaticMemberExpression` / `ComputedMemberExpression` callee routes to the
+method path (emit `ObjPeek`/`ObjPeekDyn` + `has_this=true`); an `Identifier` or
+any other callee routes to a plain call (`this = undefined`). A member expression
+that is *not* a call's callee (`const f = obj.greet;`, an argument, …) goes
+through `compile_expr` → plain `ObjGet`, **consuming** the receiver — which is
+exactly what makes `const f = obj.greet; f()` detach to `this = undefined`. So the
+read never decides on its own; the call site decides, because only it knows the
+result is about to be invoked with the receiver. (Edge: a *parenthesized*
+member callee `(obj.m)()` still binds `this` in JS — ensure the match sees
+through a `ParenthesizedExpression`, or rely on oxc having stripped it.)
 
 - **Builtin-named methods** (`recv.push(…)`): the existing
   `reroute_method_to_object` already has `[recv, args…]` on the stack and today
