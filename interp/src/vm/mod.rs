@@ -242,10 +242,23 @@ impl RcRegExp {
     }
 }
 
+/// An object stored in the `objects` heap. The `map` is the own-property
+/// insertion-ordered store; `proto` is the optional prototype link (only
+/// `Object` receivers carry a proto — primitives, arrays, maps, and sets
+/// keep their structural builtin dispatch). `proto: None` is the common
+/// case (plain object literals, `new F()` before `.prototype` is given a
+/// proto, and all objects created by the existing VM code); only `proto:
+/// Some(_)` triggers the chain walk in `ObjGet`/`ObjHas`.
+#[derive(Debug)]
+pub struct ObjData {
+    pub proto: Option<ObjectPtr>,
+    pub map: IndexMap<FieldName, Value>,
+}
+
 pub struct VM {
     pub code: Vec<Instr>,
     pub arrays: Vec<ThinVec<Value>>,
-    pub objects: Vec<IndexMap<FieldName, Value>>,
+    pub objects: Vec<ObjData>,
     pub closures: Vec<Closure>,
     /// Map heap, indexed by `Value::Map(MapPtr)`. Each entry is an
     /// insertion-ordered map with SameValueZero key equality.

@@ -1,5 +1,5 @@
 use crate::builtin::Args;
-use crate::vm::{ErrorKind, RcStr, VM, VMError, Value};
+use crate::vm::{ErrorKind, ObjData, RcStr, VM, VMError, Value};
 use indexmap::IndexMap;
 use thin_vec::ThinVec;
 
@@ -16,7 +16,7 @@ pub fn obj_keys(vm: &mut VM, args: Args) -> Result<Value, VMError> {
             .objects
             .get(obj_ptr as usize)
             .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?;
-        obj.keys().cloned().collect()
+        obj.map.keys().cloned().collect()
     };
     let arr: ThinVec<Value> = keys.into_iter().map(Value::String).collect();
     Ok(vm.alloc_array(arr))
@@ -33,7 +33,7 @@ pub fn obj_values(vm: &mut VM, args: Args) -> Result<Value, VMError> {
             .objects
             .get(obj_ptr as usize)
             .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?;
-        obj.values().cloned().collect()
+        obj.map.values().cloned().collect()
     };
     Ok(vm.alloc_array(vals))
 }
@@ -49,7 +49,10 @@ pub fn obj_entries(vm: &mut VM, args: Args) -> Result<Value, VMError> {
             .objects
             .get(obj_ptr as usize)
             .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?;
-        obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+        obj.map
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
     };
     let mut result: ThinVec<Value> = ThinVec::with_capacity(pairs.len());
     for (k, v) in pairs {
@@ -86,7 +89,7 @@ pub fn obj_from_entries(vm: &mut VM, args: Args) -> Result<Value, VMError> {
         map.insert(key, pair[1].clone());
     }
     let addr = vm.objects.len() as u32;
-    vm.objects.push(map);
+    vm.objects.push(ObjData { proto: None, map });
     Ok(Value::Object(addr))
 }
 
@@ -110,14 +113,14 @@ pub fn obj_assign(vm: &mut VM, args: Args) -> Result<Value, VMError> {
             .objects
             .get(source_ptr as usize)
             .ok_or_else(|| VMError::fail_at(ip, ErrorKind::TypeError, "bad object pointer"))?;
-        entries.extend(source.iter().map(|(k, v)| (k.clone(), v.clone())));
+        entries.extend(source.map.iter().map(|(k, v)| (k.clone(), v.clone())));
     }
     let target = vm
         .objects
         .get_mut(target_ptr as usize)
         .ok_or_else(|| VMError::fail_at(ip, ErrorKind::TypeError, "bad object pointer"))?;
     for (k, v) in entries {
-        target.insert(k, v);
+        target.map.insert(k, v);
     }
     Ok(Value::Object(target_ptr))
 }
@@ -135,7 +138,7 @@ pub fn obj_has_own(vm: &mut VM, args: Args) -> Result<Value, VMError> {
         .objects
         .get(obj_ptr as usize)
         .ok_or_else(|| vm.fail(ErrorKind::ValueError, "value error"))?;
-    Ok(Value::Bool(obj.contains_key(key.as_str())))
+    Ok(Value::Bool(obj.map.contains_key(key.as_str())))
 }
 
 /// `obj.hasOwnProperty(key)` → bool. Instance version of `Object.hasOwn`.
@@ -159,7 +162,7 @@ pub fn obj_has_own_property(vm: &mut VM, args: Args) -> Result<Value, VMError> {
         .objects
         .get(obj_ptr as usize)
         .ok_or_else(|| vm.fail(ErrorKind::ValueError, "value error"))?;
-    Ok(Value::Bool(obj.contains_key(key.as_str())))
+    Ok(Value::Bool(obj.map.contains_key(key.as_str())))
 }
 
 // ── tests ────────────────────────────────────────────────────────────────────

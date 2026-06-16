@@ -47,7 +47,7 @@ fn peephole_folds_not_into_branch() {
     // And it still behaves correctly: `c` is true, so the body is skipped.
     let vm = run_program(prog);
     let o = &vm.objects[0];
-    assert_eq!(o.get(&RcStr::from("x")), None, "body must not run");
+    assert_eq!(o.map.get(&RcStr::from("x")), None, "body must not run");
 }
 
 #[test]
@@ -57,7 +57,7 @@ fn peephole_not_fold_preserves_semantics_when_taken() {
     assert!(!prog.code.iter().any(|i| matches!(i, Instr::Not)));
     let vm = run_program(prog);
     let o = &vm.objects[0];
-    assert_eq!(o.get(&RcStr::from("x")), Some(&Value::PosInt(1)));
+    assert_eq!(o.map.get(&RcStr::from("x")), Some(&Value::PosInt(1)));
 }
 
 #[test]
@@ -76,7 +76,7 @@ fn simplify_cfg_eliminates_dead_code_after_return() {
     );
     let vm = run_program(prog);
     let o = &vm.objects[0];
-    assert_eq!(o.get(&RcStr::from("r")), Some(&Value::PosInt(1)));
+    assert_eq!(o.map.get(&RcStr::from("r")), Some(&Value::PosInt(1)));
 }
 
 #[test]
@@ -96,7 +96,7 @@ fn simplify_cfg_preserves_loop_semantics() {
     let vm = run_program(prog);
     // 0+1+2 + 4+5+6 = 18 (3 skipped, break at 7).
     let o = &vm.objects[0];
-    assert_eq!(o.get(&RcStr::from("sum")), Some(&Value::Float(18.0)));
+    assert_eq!(o.map.get(&RcStr::from("sum")), Some(&Value::Float(18.0)));
 }
 
 #[test]
@@ -113,7 +113,7 @@ fn peephole_double_negation_compiles_to_tobool() {
     // `input.c` is undefined here → `!!undefined` is `false`.
     let vm = run_program(prog);
     let o = &vm.objects[0];
-    assert_eq!(o.get(&RcStr::from("b")), Some(&Value::Bool(false)));
+    assert_eq!(o.map.get(&RcStr::from("b")), Some(&Value::Bool(false)));
 }
 
 #[test]
@@ -219,8 +219,8 @@ fn const_branch_folds_dead_arm() {
     );
     let vm = run_program(prog);
     let o = &vm.objects[0];
-    assert_eq!(o.get(&RcStr::from("x")), None);
-    assert_eq!(o.get(&RcStr::from("y")), Some(&Value::PosInt(2)));
+    assert_eq!(o.map.get(&RcStr::from("x")), None);
+    assert_eq!(o.map.get(&RcStr::from("y")), Some(&Value::PosInt(2)));
 }
 
 #[test]
@@ -574,7 +574,7 @@ fn for_program_seeds_input_at_heap0() {
     let state = serde_json::json!({ "count": 7 });
     let vm = VM::for_program(prog, state).unwrap();
     let o = &vm.objects[0];
-    assert_eq!(o.get(&RcStr::from("count")), Some(&Value::PosInt(7)));
+    assert_eq!(o.map.get(&RcStr::from("count")), Some(&Value::PosInt(7)));
 }
 
 // ── effects lowering ──────────────────────────────────────────────

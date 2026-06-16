@@ -28,7 +28,7 @@ fn member_and_index_assignment() {
     match input_val(&vm, "obj") {
         Value::Object(p) => {
             let o = &vm.objects[p as usize];
-            assert_eq!(o.get(&RcStr::from("a")), Some(&Value::PosInt(9)))
+            assert_eq!(o.map.get(&RcStr::from("a")), Some(&Value::PosInt(9)))
         }
         other => panic!("{other:?}"),
     }

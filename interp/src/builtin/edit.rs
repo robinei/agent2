@@ -586,6 +586,7 @@ fn parse_edits<'a>(vm: &'a VM, val: &'a Value) -> Result<Vec<(RcStr, RcStr)>, VM
             .ok_or_else(|| vm.fail(ErrorKind::ValueError, "applyEdits: bad object pointer"))?;
 
         let old = obj
+            .map
             .get("old")
             .and_then(|v| match v {
                 Value::String(s) => Some(s.clone()),
@@ -598,6 +599,7 @@ fn parse_edits<'a>(vm: &'a VM, val: &'a Value) -> Result<Vec<(RcStr, RcStr)>, VM
                 )
             })?;
         let new = obj
+            .map
             .get("new")
             .and_then(|v| match v {
                 Value::String(s) => Some(s.clone()),

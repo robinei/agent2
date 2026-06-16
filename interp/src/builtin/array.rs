@@ -27,12 +27,16 @@ pub fn array_from(vm: &mut VM, args: Args) -> Result<Value, VMError> {
                 .objects
                 .get(*p as usize)
                 .ok_or_else(|| vm.fail(ErrorKind::ValueError, "value error"))?;
-            let len = obj.get("length").and_then(|v| v.to_number()).unwrap_or(0.0);
+            let len = obj
+                .map
+                .get("length")
+                .and_then(|v| v.to_number())
+                .unwrap_or(0.0);
             let n = (len as usize).min(10_000_000);
             let mut out: ThinVec<Value> = ThinVec::with_capacity(n);
             for i in 0..n {
                 let key = crate::rc_str::RcStr::from(i.to_string());
-                let v = obj.get(&key).cloned().unwrap_or(Value::Undefined);
+                let v = obj.map.get(&key).cloned().unwrap_or(Value::Undefined);
                 out.push(v);
             }
             Ok(vm.alloc_array(out))

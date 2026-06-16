@@ -2391,14 +2391,15 @@ fn stack_value_to_json_depth_limit() {
     let mut innermost = Value::Null;
     for _ in 0..130 {
         let obj = vm.objects.len() as u32;
-        vm.objects.push(
-            [(
+        vm.objects.push(ObjData {
+            proto: None,
+            map: [(
                 RcStr::from("x"),
                 std::mem::replace(&mut innermost, Value::Null),
             )]
             .into_iter()
             .collect(),
-        );
+        });
         innermost = Value::Object(obj);
     }
     // `stack_value_to_json` on the deeply nested value should error,
@@ -2880,14 +2881,295 @@ fn cyclic_value_serialization_errors() {
     // (Today the depth guard is what trips; this pins the no-hang contract
     // independently of how cycles are detected.)
     let mut vm = VM::new(vec![]);
-    vm.objects.push(
-        [(RcStr::from("me"), Value::Object(0))]
+    vm.objects.push(ObjData {
+        proto: None,
+        map: [(RcStr::from("me"), Value::Object(0))]
             .into_iter()
             .collect(),
-    );
+    });
     let result = vm.stack_value_to_json(&Value::Object(0), 0);
     assert!(
         matches!(result, Err(ref e) if e.kind == ErrorKind::ValueError),
         "expected ValueError for cyclic value, got {result:?}"
     );
+}
+
+// ── Step 2: prototype chain ───────────────────────────────────────
+
+#[test]
+fn proto_chain_own_hit() {
+    // An own property is resolved immediately, without walking the chain.
+    let mut vm = VM::new(vec![]);
+    let mut map = IndexMap::new();
+    map.insert(RcStr::from("x"), Value::PosInt(42));
+    vm.objects.push(ObjData { proto: None, map });
+    let val = vm.resolve_proto_chain(0, "x").unwrap();
+    assert_eq!(val, Value::PosInt(42));
+}
+
+#[test]
+fn proto_chain_proto_hit() {
+    // A property not on own map is found by walking the proto chain.
+    let mut vm = VM::new(vec![]);
+    // Parent (proto): has "x"
+    let mut parent = IndexMap::new();
+    parent.insert(RcStr::from("x"), Value::PosInt(99));
+    let parent_ptr = 0u32;
+    vm.objects.push(ObjData {
+        proto: None,
+        map: parent,
+    });
+    // Child: has no "x", but proto links to parent
+    let mut child = IndexMap::new();
+    child.insert(RcStr::from("y"), Value::PosInt(1));
+    vm.objects.push(ObjData {
+        proto: Some(parent_ptr),
+        map: child,
+    });
+    let val = vm.resolve_proto_chain(1, "x").unwrap();
+    assert_eq!(val, Value::PosInt(99));
+}
+
+#[test]
+fn proto_chain_miss() {
+    // A property not found anywhere on the chain returns Undefined.
+    let mut vm = VM::new(vec![]);
+    vm.objects.push(ObjData {
+        proto: None,
+        map: IndexMap::new(),
+    });
+    let val = vm.resolve_proto_chain(0, "nope").unwrap();
+    assert_eq!(val, Value::Undefined);
+}
+
+#[test]
+fn proto_chain_none_short_circuit() {
+    // An object with proto: None returns Undefined on a miss with one
+    // branch (no loop entry). Sanity: the call doesn't hang.
+    let mut vm = VM::new(vec![]);
+    vm.objects.push(ObjData {
+        proto: None,
+        map: IndexMap::new(),
+    });
+    let val = vm.resolve_proto_chain(0, "missing").unwrap();
+    assert_eq!(val, Value::Undefined);
+}
+
+#[test]
+fn proto_chain_own_shadows_proto() {
+    // An own property takes precedence over a same-named proto property.
+    let mut vm = VM::new(vec![]);
+    // Parent: x = 1
+    let mut parent = IndexMap::new();
+    parent.insert(RcStr::from("x"), Value::PosInt(1));
+    vm.objects.push(ObjData {
+        proto: None,
+        map: parent,
+    });
+    // Child: x = 2, proto = parent
+    let mut child = IndexMap::new();
+    child.insert(RcStr::from("x"), Value::PosInt(2));
+    vm.objects.push(ObjData {
+        proto: Some(0),
+        map: child,
+    });
+    let val = vm.resolve_proto_chain(1, "x").unwrap();
+    assert_eq!(val, Value::PosInt(2), "own must shadow proto");
+}
+
+#[test]
+fn proto_chain_self_referential_no_hang() {
+    // A self-referential proto chain terminates via the depth cap; the
+    // VM must not hang or overflow.
+    let mut vm = VM::new(vec![]);
+    let mut map = IndexMap::new();
+    map.insert(RcStr::from("self"), Value::PosInt(1));
+    vm.objects.push(ObjData {
+        proto: Some(0), // points to itself
+        map,
+    });
+    let val = vm.resolve_proto_chain(0, "nope").unwrap();
+    assert_eq!(val, Value::Undefined);
+}
+
+#[test]
+fn obj_has_walks_proto_chain() {
+    // The `in` operator (ObjHas instruction) walks the proto chain.
+    let mut vm = VM::new(vec![]);
+    // Parent: has "a"
+    let mut parent = IndexMap::new();
+    parent.insert(RcStr::from("a"), Value::PosInt(1));
+    vm.objects.push(ObjData {
+        proto: None,
+        map: parent,
+    });
+    // Child: no "a", proto = parent
+    vm.objects.push(ObjData {
+        proto: Some(0),
+        map: IndexMap::new(),
+    });
+    let val = vm.resolve_proto_chain(1, "a").unwrap();
+    assert_eq!(val, Value::PosInt(1), "proto-chain hit via resolve");
+}
+
+#[test]
+fn obj_has_own_vs_proto() {
+    // `in` walks the chain, yielding true for a proto property.
+    // Manual instruction test using ObjHas with a proto-linked object.
+    let mut vm = VM::new(vec![
+        PushObject(1), // child with proto
+        ps("a"),
+        ObjHas,
+    ]);
+    // Build heap by hand
+    vm.objects.clear();
+    let mut parent = IndexMap::new();
+    parent.insert(RcStr::from("a"), Value::PosInt(1));
+    vm.objects.push(ObjData {
+        proto: None,
+        map: parent,
+    }); // 0: parent
+    vm.objects.push(ObjData {
+        proto: Some(0),
+        map: IndexMap::new(),
+    }); // 1: child
+    loop {
+        match vm.step(u64::MAX).unwrap() {
+            StepResult::Done { .. } => {
+                assert_eq!(
+                    vm.stack,
+                    vec![Value::Bool(true)],
+                    "a in child -> true via proto"
+                );
+                break;
+            }
+            other => panic!("unexpected effect: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn obj_set_only_affects_own() {
+    // Assignment touches only the own map; it does not write through
+    // to the prototype.
+    let mut vm = VM::new(vec![
+        PushObject(1), // child
+        PushPosInt(99),
+        ObjSet(RcStr::from("a"), SetMode::New),
+        // Now read child's "a" — should be 99 (own)
+        PushObject(1),
+        ObjGet(RcStr::from("a")),
+        // Next, read parent's "a" — should still be 1 (unchanged)
+        PushObject(0),
+        ObjGet(RcStr::from("a")),
+    ]);
+    vm.objects.clear();
+    let mut parent = IndexMap::new();
+    parent.insert(RcStr::from("a"), Value::PosInt(1));
+    vm.objects.push(ObjData {
+        proto: None,
+        map: parent,
+    }); // 0: parent
+    vm.objects.push(ObjData {
+        proto: Some(0),
+        map: IndexMap::new(),
+    }); // 1: child
+    loop {
+        match vm.step(u64::MAX).unwrap() {
+            StepResult::Done { .. } => {
+                assert_eq!(vm.stack.len(), 3);
+                assert_eq!(vm.stack[0], Value::PosInt(99), "ObjSet result");
+                assert_eq!(vm.stack[1], Value::PosInt(99), "child.a after set");
+                assert_eq!(vm.stack[2], Value::PosInt(1), "parent.a unchanged");
+                break;
+            }
+            other => panic!("unexpected effect: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn obj_delete_only_affects_own() {
+    // `delete` only touches own properties, not proto ones.
+    let mut vm = VM::new(vec![
+        PushObject(1), // child
+        ps("a"),
+        ObjDelete, // delete child.a (should be false — not own)
+        // Then demonstrate: child still inherits "a" from parent
+        PushObject(1),
+        ps("a"),
+        ObjHas,
+    ]);
+    vm.objects.clear();
+    let mut parent = IndexMap::new();
+    parent.insert(RcStr::from("a"), Value::PosInt(1));
+    vm.objects.push(ObjData {
+        proto: None,
+        map: parent,
+    }); // 0: parent
+    vm.objects.push(ObjData {
+        proto: Some(0),
+        map: IndexMap::new(),
+    }); // 1: child
+    loop {
+        match vm.step(u64::MAX).unwrap() {
+            StepResult::Done { .. } => {
+                assert_eq!(vm.stack.len(), 2);
+                assert_eq!(
+                    vm.stack[0],
+                    Value::Bool(false),
+                    "delete non-own yields false"
+                );
+                assert_eq!(
+                    vm.stack[1],
+                    Value::Bool(true),
+                    "a in child walk-proto -> true"
+                );
+                break;
+            }
+            other => panic!("unexpected effect: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn obj_extend_reads_proto() {
+    // Object spread copies *own* properties from the source only; proto
+    // properties are not enumerable and are not included.
+    let mut vm = VM::new(vec![
+        PushObject(0), // empty target
+        PushObject(2), // child with proto parent
+        ObjExtend,     // → pops src and target, extends, pushes target back
+        // Target is now on stack; read its "own_only" property
+        ObjGet(RcStr::from("own_only")),
+    ]);
+    vm.objects.clear();
+    // Target
+    vm.objects.push(ObjData {
+        proto: None,
+        map: IndexMap::new(),
+    }); // 0
+    // Parent
+    let mut parent = IndexMap::new();
+    parent.insert(RcStr::from("proto_only"), Value::PosInt(1));
+    vm.objects.push(ObjData {
+        proto: None,
+        map: parent,
+    }); // 1: parent
+    // Child: own "own_only", proto = parent
+    let mut child = IndexMap::new();
+    child.insert(RcStr::from("own_only"), Value::PosInt(2));
+    vm.objects.push(ObjData {
+        proto: Some(1),
+        map: child,
+    }); // 2: child
+    loop {
+        match vm.step(u64::MAX).unwrap() {
+            StepResult::Done { .. } => {
+                assert_eq!(vm.stack, vec![Value::PosInt(2)], "own_only was copied");
+                break;
+            }
+            other => panic!("unexpected effect: {other:?}"),
+        }
+    }
 }

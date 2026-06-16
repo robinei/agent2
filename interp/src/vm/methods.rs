@@ -180,7 +180,7 @@ impl VM {
         if let Value::Object(p) = value {
             if let Some(obj) = self.objects.get(*p as usize) {
                 if let (Some(Value::String(name)), Some(Value::String(msg))) =
-                    (obj.get("name"), obj.get("message"))
+                    (obj.map.get("name"), obj.map.get("message"))
                 {
                     return format!("uncaught {}: {}", name.as_str(), msg.as_str());
                 }
@@ -235,7 +235,7 @@ impl VM {
             }
             Value::Object(p) => {
                 if let Some(obj) = self.objects.get(*p as usize) {
-                    let mut keys: Vec<&str> = obj.keys().map(|k| k.as_str()).collect();
+                    let mut keys: Vec<&str> = obj.map.keys().map(|k| k.as_str()).collect();
                     keys.sort();
                     if keys.len() <= 4 {
                         format!("{{object with keys {}}}", keys.join(", "))
@@ -293,12 +293,24 @@ impl VM {
         vm.source = program.source;
         vm.debug = program.debug;
         // Reserve the two fixed slots before seeding either's nested values.
-        vm.objects.push(IndexMap::new()); // objects[0] = input
-        vm.objects.push(IndexMap::new()); // objects[1] = attachments
+        vm.objects.push(ObjData {
+            proto: None,
+            map: IndexMap::new(),
+        }); // objects[0] = input
+        vm.objects.push(ObjData {
+            proto: None,
+            map: IndexMap::new(),
+        }); // objects[1] = attachments
         let input_entries = vm.seed_const_object(input)?;
         let attachment_entries = vm.seed_const_object(attachments)?;
-        vm.objects[0] = input_entries;
-        vm.objects[1] = attachment_entries;
+        vm.objects[0] = ObjData {
+            proto: None,
+            map: input_entries,
+        };
+        vm.objects[1] = ObjData {
+            proto: None,
+            map: attachment_entries,
+        };
         Ok(vm)
     }
 
@@ -795,8 +807,37 @@ impl VM {
 
     pub(crate) fn alloc_object(&mut self, obj: IndexMap<FieldName, Value>) -> Value {
         let addr = self.objects.len() as ObjectPtr;
-        self.objects.push(obj);
+        self.objects.push(ObjData {
+            proto: None,
+            map: obj,
+        });
         Value::Object(addr)
+    }
+
+    /// Walk own `map` → `proto` chain → `Undefined`. Own hit returns
+    /// immediately; `proto: None` returns `Undefined` with one branch and
+    /// never enters the loop. A depth cap guards against malformed cycles.
+    /// Stack effect: none (pure property resolution).
+    pub(crate) fn resolve_proto_chain(
+        &self,
+        obj_ptr: ObjectPtr,
+        field: &str,
+    ) -> Result<Value, VMError> {
+        const MAX_PROTO_DEPTH: u32 = 100;
+        let mut cur = obj_ptr;
+        for _depth in 0..MAX_PROTO_DEPTH {
+            let obj = self.objects.get(cur as usize).ok_or_else(|| {
+                self.fail_not_resumable(ErrorKind::TypeError, "bad object pointer")
+            })?;
+            if let Some(v) = obj.map.get(field) {
+                return Ok(v.clone());
+            }
+            match obj.proto {
+                Some(parent) => cur = parent,
+                None => return Ok(Value::Undefined),
+            }
+        }
+        Ok(Value::Undefined)
     }
 
     pub(crate) fn alloc_map(&mut self, map: IndexMap<MapKey, Value>) -> Value {
@@ -1019,7 +1060,7 @@ impl VM {
                     .get(*p as usize)
                     .ok_or_else(|| self.fail(ErrorKind::ValueError, "value error"))?;
                 let mut map = serde_json::Map::new();
-                for (k, v) in obj.iter() {
+                for (k, v) in obj.map.iter() {
                     // JS: properties whose value is `undefined` are omitted.
                     if matches!(v, Value::Undefined) {
                         continue;
@@ -1165,7 +1206,7 @@ impl VM {
         let method = self
             .objects
             .get(recv_ptr as usize)
-            .and_then(|o| o.get(name))
+            .and_then(|o| o.map.get(name))
             .cloned();
         match method {
             Some(f) => {

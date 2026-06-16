@@ -984,12 +984,7 @@ impl VM {
                         }
                         Some(Value::Object(p)) => {
                             let obj_ptr = *p;
-                            let val = match self.objects.get(obj_ptr as usize) {
-                                Some(obj) => {
-                                    obj.get(field_str).cloned().unwrap_or(Value::Undefined)
-                                }
-                                _ => Value::Undefined,
-                            };
+                            let val = self.resolve_proto_chain(obj_ptr, field_str)?;
                             self.stack.pop();
                             self.stack.push(val);
                             self.ip += 1;
@@ -1046,20 +1041,21 @@ impl VM {
                             };
                             let result = match mode {
                                 SetMode::Old => {
-                                    let old = obj.get(&field).cloned().unwrap_or(Value::Undefined);
-                                    if let Some(slot) = obj.get_mut(&field) {
+                                    let old =
+                                        obj.map.get(&field).cloned().unwrap_or(Value::Undefined);
+                                    if let Some(slot) = obj.map.get_mut(&field) {
                                         *slot = val;
                                     } else {
-                                        obj.insert(field, val);
+                                        obj.map.insert(field, val);
                                     }
                                     old
                                 }
                                 SetMode::New => {
                                     let result = val.clone();
-                                    if let Some(slot) = obj.get_mut(&field) {
+                                    if let Some(slot) = obj.map.get_mut(&field) {
                                         *slot = val;
                                     } else {
-                                        obj.insert(field, val);
+                                        obj.map.insert(field, val);
                                     }
                                     result
                                 }
@@ -1087,62 +1083,59 @@ impl VM {
                 Instr::IndexGet => {
                     let key = self.pop()?;
                     let container = self.pop()?;
-                    let val =
-                        match &container {
-                            // String char-indexing: strings are inline values now, so
-                            // this no longer routes through the heap. The single-char
-                            // result is a fresh `RcStr`.
-                            Value::String(s) => {
-                                let s = s.as_str();
-                                let idx = key
-                                    .as_i64()
-                                    .ok_or_else(|| self.fail(ErrorKind::TypeError, "type error"))?;
-                                if idx < 0 {
-                                    return Err(self.fail(ErrorKind::ValueError, "value error"));
-                                }
-                                let idx = idx as usize;
-                                if idx >= s.len() {
-                                    // JS: an out-of-range char index is `undefined`.
-                                    Value::Undefined
-                                } else if !s.is_char_boundary(idx) {
-                                    return Err(self.fail(ErrorKind::ValueError, "value error"));
-                                } else {
-                                    let ch = s[idx..].chars().next().unwrap();
-                                    Value::String(RcStr::from(ch.to_string()))
-                                }
+                    let val = match &container {
+                        // String char-indexing: strings are inline values now, so
+                        // this no longer routes through the heap. The single-char
+                        // result is a fresh `RcStr`.
+                        Value::String(s) => {
+                            let s = s.as_str();
+                            let idx = key
+                                .as_i64()
+                                .ok_or_else(|| self.fail(ErrorKind::TypeError, "type error"))?;
+                            if idx < 0 {
+                                return Err(self.fail(ErrorKind::ValueError, "value error"));
                             }
-                            Value::Array(p) => {
-                                let arr = self.arrays.get(*p as usize).ok_or_else(|| {
-                                    self.fail(ErrorKind::ValueError, "value error")
-                                })?;
-                                let idx = key
-                                    .as_i64()
-                                    .ok_or_else(|| self.fail(ErrorKind::TypeError, "type error"))?;
-                                if idx < 0 {
-                                    return Err(self.fail(ErrorKind::ValueError, "value error"));
-                                }
-                                // JS: an out-of-bounds index reads as `undefined`.
-                                arr.get(idx as usize).cloned().unwrap_or(Value::Undefined)
+                            let idx = idx as usize;
+                            if idx >= s.len() {
+                                // JS: an out-of-range char index is `undefined`.
+                                Value::Undefined
+                            } else if !s.is_char_boundary(idx) {
+                                return Err(self.fail(ErrorKind::ValueError, "value error"));
+                            } else {
+                                let ch = s[idx..].chars().next().unwrap();
+                                Value::String(RcStr::from(ch.to_string()))
                             }
-                            Value::Object(p) => {
-                                let obj = self.objects.get(*p as usize).ok_or_else(|| {
-                                    self.fail(ErrorKind::ValueError, "value error")
-                                })?;
-                                // JS coerces a computed key with ToString.
-                                let field = self.to_js_string(&key, 0);
-                                // JS: a missing property reads as `undefined`.
-                                obj.get(field.as_str()).cloned().unwrap_or(Value::Undefined)
+                        }
+                        Value::Array(p) => {
+                            let arr = self
+                                .arrays
+                                .get(*p as usize)
+                                .ok_or_else(|| self.fail(ErrorKind::ValueError, "value error"))?;
+                            let idx = key
+                                .as_i64()
+                                .ok_or_else(|| self.fail(ErrorKind::TypeError, "type error"))?;
+                            if idx < 0 {
+                                return Err(self.fail(ErrorKind::ValueError, "value error"));
                             }
-                            _ => {
-                                let msg = format!(
-                                    "cannot index into {} with {}{}",
-                                    container.type_name(),
-                                    self.preview(&key),
-                                    await_hint(&container)
-                                );
-                                return Err(self.fail(ErrorKind::TypeError, msg));
-                            }
-                        };
+                            // JS: an out-of-bounds index reads as `undefined`.
+                            arr.get(idx as usize).cloned().unwrap_or(Value::Undefined)
+                        }
+                        Value::Object(p) => {
+                            // JS coerces a computed key with ToString.
+                            let field = self.to_js_string(&key, 0);
+                            // Walk own → proto chain (JS [[Get]]).
+                            self.resolve_proto_chain(*p, field.as_str())?
+                        }
+                        _ => {
+                            let msg = format!(
+                                "cannot index into {} with {}{}",
+                                container.type_name(),
+                                self.preview(&key),
+                                await_hint(&container)
+                            );
+                            return Err(self.fail(ErrorKind::TypeError, msg));
+                        }
+                    };
                     self.stack.push(val);
                     self.ip += 1;
                 }
@@ -1192,7 +1185,7 @@ impl VM {
                                 Value::Object(p) => self
                                     .objects
                                     .get(*p as usize)
-                                    .and_then(|o| o.get(field.as_str()).cloned())
+                                    .and_then(|o| o.map.get(field.as_str()).cloned())
                                     .unwrap_or(Value::Undefined),
                                 _ => unreachable!(),
                             }
@@ -1243,7 +1236,7 @@ impl VM {
                         let obj = self.objects.get_mut(p as usize).ok_or_else(|| {
                             VMError::fail_at(ip, ErrorKind::TypeError, "bad object pointer")
                         })?;
-                        obj.insert(field, val);
+                        obj.map.insert(field, val);
                     }
                     self.stack.push(result);
                     self.ip += 1;
@@ -1258,13 +1251,10 @@ impl VM {
                             Value::Object(p) => p,
                             _ => return Err(self.fail(ErrorKind::TypeError, "type error")),
                         };
-                    let has = self
-                        .objects
-                        .get(obj_ptr as usize)
-                        .ok_or_else(|| {
-                            self.fail_not_resumable(ErrorKind::TypeError, "bad object pointer")
-                        })?
-                        .contains_key(field.as_str());
+                    let has = !matches!(
+                        self.resolve_proto_chain(obj_ptr, field.as_str())?,
+                        Value::Undefined
+                    );
                     self.stack.push(Value::Bool(has));
                     self.ip += 1;
                 }
@@ -1286,6 +1276,7 @@ impl VM {
                         .ok_or_else(|| {
                             VMError::fail_at(ip, ErrorKind::TypeError, "bad object pointer")
                         })?
+                        .map
                         .shift_remove(field.as_str())
                         .is_some();
                     self.stack.push(Value::Bool(existed));
@@ -1316,13 +1307,14 @@ impl VM {
                                 .ok_or_else(|| {
                                     VMError::fail_at(ip, ErrorKind::TypeError, "bad object pointer")
                                 })?
+                                .map
                                 .iter()
                                 .map(|(k, v)| (k.clone(), v.clone()))
                                 .collect();
                             let obj = self.objects.get_mut(obj_ptr as usize).ok_or_else(|| {
                                 VMError::fail_at(ip, ErrorKind::TypeError, "bad object pointer")
                             })?;
-                            obj.extend(entries);
+                            obj.map.extend(entries);
                         }
                         _ => {
                             return Err(self.fail(
@@ -1424,6 +1416,7 @@ impl VM {
                             .objects
                             .get(p as usize)
                             .ok_or_else(|| self.fail(ErrorKind::ValueError, "value error"))?
+                            .map
                             .get("length")
                             .cloned()
                             .unwrap_or(Value::Undefined),
@@ -1454,6 +1447,7 @@ impl VM {
                             .objects
                             .get(p as usize)
                             .ok_or_else(|| self.fail(ErrorKind::ValueError, "value error"))?
+                            .map
                             .get("size")
                             .cloned()
                             .unwrap_or(Value::Undefined),

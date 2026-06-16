@@ -25,7 +25,7 @@ pub fn value_to_string(vm: &mut VM, args: Args) -> Result<Value, VMError> {
         if vm
             .objects
             .get(*p as usize)
-            .is_some_and(|o| o.contains_key("toString"))
+            .is_some_and(|o| o.map.contains_key("toString"))
         {
             return Err(vm.fail(ErrorKind::MethodOnObject, ""));
         }
