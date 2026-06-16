@@ -351,7 +351,47 @@ Acceptance:
 
 ## Step 3 — unified method dispatch (generalize the reroute)
 
-Make `recv.m(args)` bind `this` for user methods, across both call paths.
+Make `recv.m(args)` bind `this` for user methods. It splits into **3a** (the
+callee-below-args convention move — behavior-preserving, suite green) and **3b**
+(the `this`-binding semantics on top), mirroring 1a/1b: isolate the mechanical
+stack-layout change from the new semantics so a suite break localizes cleanly.
+
+### Step 3a — callee-below-args convention (no behavior change)
+
+Today `CallDyn`/`CallSpread` expect the callee on *top* of the args, so the
+dynamic-method path (`compile_dynamic_method_call`) emits `Dig(argc)` to lift the
+callee back over the args. Flip the convention — callee *below* the args — and
+add a `has_this` bool that is **always `false`** in 3a:
+
+- **`vm/instr.rs`** — `CallDyn(ArgCount, has_this)`, `CallSpread(has_this)`; doc
+  the layout (callee at depth `argc`, with `recv` at depth `argc+1` once
+  `has_this` is used in 3b). Verify `Instr` size unchanged by the bool.
+- **`vm/dispatch.rs` / `vm/methods.rs`** — `CallDyn`/`CallSpread` locate the callee
+  *below* the args. With `has_this = false` there is no receiver to route, so
+  dispatch is identical to today (no `dispatch_call` signature change yet).
+- **`compiler/call.rs`** — push the callee *before* the args at every emit site:
+  the `compile_user_call` dynamic path loads the callee first; the dynamic-method
+  path **drops its `Dig`** (the callee already sits below the args after
+  `ObjGet`). Thread `has_this = false`.
+
+Behavior-preserving — same callee, same args, same dispatch, just no `Dig`. This
+is the riskiest mechanical change in the step, isolated as its own green
+checkpoint.
+
+Acceptance (3a):
+- [ ] Full suite green, incl. the dynamic-method path (`state.add5(3)` with
+      `add5` a stored function) now that its `Dig` is gone.
+- [ ] `Dig` no longer emitted by `compile_dynamic_method_call` (codegen-shape).
+- [ ] No `this` bound anywhere (`has_this` always `false`; `dispatch_call`
+      unchanged).
+- [ ] `Instr` size unchanged by the added `has_this` bool.
+- [ ] Gate: `cargo fmt && cargo clippy && cargo test` green.
+
+### Step 3b — method `this`-binding (the semantics)
+
+3b sets `has_this = true` on the method paths and threads `this_val` through
+`dispatch_call`/`call_function` (the chokepoint from the unified picture) so the
+popped receiver reaches the callee.
 
 **How the keep-receiver form is selected** — purely by syntactic position, no new
 logic. `compile_call` already matches on `call.callee` (`call.rs:73`): a
@@ -376,8 +416,8 @@ through a `ParenthesizedExpression`, or rely on oxc having stripped it.)
   user method with `this`".
 - **Non-builtin method names** (`recv.greet(…)`): today this lowers to
   `ObjGet(greet)` + `CallDyn`, calling the property with no receiver. **Decision:
-  fuse the receiver-keeping read into one instruction `ObjPeek(name)` and add a
-  `has_this` bit to the call.** No `CallMethod`/`CallMethodSpread` opcodes, and
+  fuse the receiver-keeping read into one instruction `ObjPeek(name)` and set the
+  3a `has_this` bit `true`.** No `CallMethod`/`CallMethodSpread` opcodes, and
   spread/optional fall out for free.
   - **`ObjPeek(FieldName)` = `Pick(0); ObjGet` fused** (`obj -> obj, any`): read
     property `name` off the receiver but **keep the receiver** below the result
@@ -399,30 +439,24 @@ through a `ParenthesizedExpression`, or rely on oxc having stripped it.)
     calls outright ("`computed method calls (obj[expr](...)` are not supported");
     replace that arm. Computed method calls are real method calls and **must bind
     `this`** — `has_this = true`, the same as the static form.
-  - **`has_this` bit on `CallDyn(ArgCount, has_this)` / `CallSpread(has_this)`** —
-    "a receiver sits just below the callee; pop it and pass it as `this_val` to
-    `dispatch_call`." All the routing then happens at the **one chokepoint** (see
-    the unified picture): a **user function/closure** gets `this_val` in its frame
+  - **The `has_this` fork** (the bit added in 3a, now exercised): `CallDyn`/
+    `CallSpread` pop the receiver from below the callee and pass it as `this_val`
+    to `dispatch_call`. All routing happens at the **one chokepoint** (see the
+    unified picture): a **user function/closure** gets `this_val` in its frame
     field (recv is not an `arguments` entry); a **builtin** gets it spliced as
     arg 0; a **`Bound`** defers to its own `this_val` (Step 5). A dispatch-time
     routing fork only — **no `EnterFrame` reconciliation, no slot move**; the
     frame model is untouched, which is the point of frame-field.
-  - **Callee-below-args layout** (so no `Dig`): operands sit `[recv?, callee,
-    args…]` — callee at depth `argc`, `recv` (when `has_this`) at depth `argc+1`.
-    Plain calls adopt the same callee-below-args order (`has_this = false`, no
-    `recv`), which removes the `Dig` the dynamic-method path uses today and gives
-    `CallDyn` one uniform layout.
   - Lowerings: `recv.greet(a,b)` → `ObjPeek(greet)` + `CallDyn(2, true)`;
     `recv.greet(...xs)` → `ObjPeek(greet)` + `CallSpread(true)`;
     `recv[k](a)` → `<recv>; <k>; ObjPeekDyn` + `CallDyn(1, true)` (and the
     spread/optional variants likewise);
     `recv?.greet(…)` guards with the existing `begin_optional` after evaluating
     `recv`, exactly like the `ObjGet` path today.
-- `f(args)` (no receiver) → callee-below-args `Call`/`CallDyn(argc,
-  has_this=false)` / `CallSpread(false)`; `this_val` stays the frame default
-  `undefined`. No frame change.
+- `f(args)` (no receiver) stays `has_this = false` from 3a; `this_val` is the
+  frame default `undefined`. Unchanged.
 
-Acceptance:
+Acceptance (3b):
 - [ ] `obj.greet()` where `greet` is an own function property runs with
       `this === obj`; a prototype-chain `greet` likewise.
 - [ ] An own property still shadows a builtin method name *and* now sees `this`
