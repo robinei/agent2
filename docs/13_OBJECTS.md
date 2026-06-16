@@ -74,9 +74,30 @@ routed to wherever the *resolved* callee reads `this`:
 `f(args)` with no receiver → `this_val = undefined` (the frame default).
 `f.bind(x)(args)` → `this_val = x`, ignoring the call-site receiver. The split is
 the cost of this representation: a **builtin reads its receiver as arg 0 on the
-stack**, a **user function reads `this_val` off the frame** — so the dispatch
-layer *forks* on callable kind wherever a receiver is supplied (method calls,
-`bind`, `.call`/`.apply`). Neither convention leaks to the surface language.
+stack**, a **user function reads `this_val` off the frame**. Neither convention
+leaks to the surface language.
+
+**One chokepoint (the generality invariant).** `dispatch_call`
+(`methods.rs:1184`) already forks on callable kind (`Fn`/`Closure`/`Builtin`,
+plus `Bound` in Step 5) and is where the reroute funnels back (`:1171`). Thread
+**`this_val: Value` through `dispatch_call` and `call_function`** and that fork
+becomes the *sole* place the receiver routing lives:
+
+```
+dispatch_call(callable, this_val, nargs)
+  Fn/Closure → call_function(addr, nargs, upvals, this_val)  // → frame field
+  Builtin    → splice this_val as arg 0, then b.call
+  Bound      → dispatch_call(inner.callable, inner.this_val, …)
+```
+
+Every call form then reduces to *compute `this_val`, dispatch once*: plain call →
+`Undefined`; `has_this` method call → the popped receiver; the shadow reroute →
+`recv`; `new` → the fresh instance; `bind` → `BoundFn.this_val`; `.call`/`.apply`
+→ `thisArg`. The user-fn-vs-builtin distinction thus exists in **exactly one
+function**, not re-derived per call site. (Static `Call` and `new` may call
+`call_function` directly with a known `this_val` — no callable-kind ambiguity to
+fork on.) Implementing `this` is then "the JS Reference rule": `this_val` = the
+base of the callee's member reference, `Undefined` when it has none.
 
 ---
 
@@ -348,13 +369,13 @@ through a `ParenthesizedExpression`, or rely on oxc having stripped it.)
     replace that arm. Computed method calls are real method calls and **must bind
     `this`** — `has_this = true`, the same as the static form.
   - **`has_this` bit on `CallDyn(ArgCount, has_this)` / `CallSpread(has_this)`** —
-    "a receiver sits just below the callee; route it." Dispatch forks on the
-    resolved callee's kind, via a shared helper: a **user function/closure** →
-    move `recv` into `this_val`, dropping it so `args…` are the frame (recv is not
-    an `arguments` entry — the *same* removal the reroute does); a **builtin** →
-    leave `recv` as arg 0; a **`Bound`** → defer to its own `this_val` (Step 5).
-    A dispatch-time routing fork only — **no `EnterFrame` reconciliation, no slot
-    move**; the frame model is untouched, which is the point of frame-field.
+    "a receiver sits just below the callee; pop it and pass it as `this_val` to
+    `dispatch_call`." All the routing then happens at the **one chokepoint** (see
+    the unified picture): a **user function/closure** gets `this_val` in its frame
+    field (recv is not an `arguments` entry); a **builtin** gets it spliced as
+    arg 0; a **`Bound`** defers to its own `this_val` (Step 5). A dispatch-time
+    routing fork only — **no `EnterFrame` reconciliation, no slot move**; the
+    frame model is untouched, which is the point of frame-field.
   - **Callee-below-args layout** (so no `Dig`): operands sit `[recv?, callee,
     args…]` — callee at depth `argc`, `recv` (when `has_this`) at depth `argc+1`.
     Plain calls adopt the same callee-below-args order (`has_this = false`, no
@@ -453,17 +474,16 @@ Value::Bound(Rc<BoundFn>)
   entire safety argument. (`ThinVec` keeps the common `f.bind(obj)` case — empty
   `bound_args` — to a single pointer, no heap alloc.)
 - `dispatch_call` gains a `Value::Bound` arm: prepend `inner.bound_args` to the
-  call-site args and dispatch `inner.callable`, **forking on its kind** (the same
-  fork Step 3 factored out): a bound user function/closure runs with
-  `this_val = inner.this_val`; a bound *builtin* (`[].push.bind(arr)`) gets
-  `inner.this_val` spliced in as arg 0. The Bound arm *overrides* a call-site
-  receiver (`obj.g()` where `g` is bound ignores `obj`), since it supplies its own
-  `this_val`; a method call (`ObjPeek` + `has_this`) that resolves to a
-  `Bound` must therefore defer to the Bound's `this_val` rather than setting
-  `this_val = recv`. Mechanic for the
-  builtin case: splice `[this_val, bound_args…]` below the call-site args; for the
-  user-fn case set the frame field and prepend `bound_args` (rare path; cost
-  irrelevant). Binding is composable: `g = f.bind(a, x); g.bind(b, y)` pre-pends
+  call-site args and **recurse** — `dispatch_call(inner.callable, inner.this_val,
+  …)`. No new routing: the recursion lands on the same chokepoint, so a bound user
+  function/closure gets `this_val = inner.this_val` in its frame field and a bound
+  *builtin* (`[].push.bind(arr)`) gets it spliced as arg 0 — automatically. The
+  Bound arm *overrides* a call-site receiver (`obj.g()` where `g` is bound ignores
+  `obj`), since it supplies its own `this_val`; a method call (`ObjPeek` +
+  `has_this`) that resolves to a `Bound` therefore defers to the Bound's
+  `this_val` rather than `recv` — which is automatic once `dispatch_call` takes
+  `this_val`, because the `Bound` arm overwrites it on recursion. Binding is
+  composable: `g = f.bind(a, x); g.bind(b, y)` pre-pends
   `x` then `y` and keeps the *first* `this` (JS: re-binding `this` is a no-op) —
   implement by flattening into a fresh `BoundFn` over `f`.
 - **`Value::Bound` match-arm checklist.** Adding the variant makes the compiler
