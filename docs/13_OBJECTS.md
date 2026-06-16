@@ -59,190 +59,163 @@ it is not throwaway. Do not duplicate it; generalize it.
 
 ## The unified picture (read before the steps)
 
-`this` lives at **slot 0 of a user frame, but only when the function uses it**
-(its ABI class; Step 1). Class-P functions (no `this`) reserve no slot and are
-byte-for-byte what they are today; class-T functions put `this` at slot 0 and
-params at slot 1. The receiver is routed to wherever the *resolved* callee
-expects it:
+`this` lives in a **per-frame field, `CallFrame.this_val`**, outside the
+local-slot space (Step 1). The call machinery sets it; the bytecode and slot
+layout of every call are otherwise **unchanged from today**. The receiver is
+routed to wherever the *resolved* callee reads `this`:
 
-| resolved `m`                         | receiver delivered as | path                                      |
-|--------------------------------------|-----------------------|-------------------------------------------|
-| builtin (arr/str/map/set/regexp)     | arg 0 (today)         | structural `CallBuiltin`, unchanged       |
-| object **own** property that's a fn  | slot 0 (if class T)   | keep recv, dispatch via provided-receiver |
-| object **prototype-chain** fn        | slot 0 (if class T)   | same, found by walking `proto`            |
-| not found / non-callable             | `TypeError`           | —                                         |
+| resolved `m`                         | receiver delivered as | path                                  |
+|--------------------------------------|-----------------------|---------------------------------------|
+| builtin (arr/str/map/set/regexp)     | arg 0 (today)         | structural `CallBuiltin`, unchanged   |
+| object **own** property that's a fn  | `this_val` field      | `CallMethod` sets `this_val = recv`   |
+| object **prototype-chain** fn        | `this_val` field      | same, found by walking `proto`        |
+| not found / non-callable             | `TypeError`           | —                                     |
 
-`f(args)` with no receiver → `this = undefined` (a class-T callee gets it from
-frame setup; a class-P callee has no `this` to set). `f.bind(x)(args)` →
-`this = x`, ignoring the call-site receiver. Builtins keep "receiver = arg 0";
-class-T user functions read slot 0; the dispatch layer (a compile-time layout for
-static calls, `EnterFrame` reconciliation for dynamic ones) is the only place
-that knows the difference, so neither convention leaks to the surface language.
+`f(args)` with no receiver → `this_val = undefined` (the frame default).
+`f.bind(x)(args)` → `this_val = x`, ignoring the call-site receiver. The split is
+the cost of this representation: a **builtin reads its receiver as arg 0 on the
+stack**, a **user function reads `this_val` off the frame** — so the dispatch
+layer *forks* on callable kind wherever a receiver is supplied (`CallMethod`,
+`bind`, `.call`/`.apply`). Neither convention leaks to the surface language.
 
 ---
 
-## Step 1 — `this` at slot 0, gated by ABI class (keystone)
+## Step 1 — `this` as a frame field (keystone)
 
 `ThisExpression` currently hard-errors (`compiler/stmt.rs`/`expr.rs`,
 "`this` is not supported"). The design (settled across the slot-0 / this-last /
-frame-field evaluation — do not re-litigate) keeps the one property worth having
-from slot-0 — **`this` is a genuine local, so reads and arrow-capture are
-free** — while honoring the hard constraint that **non-OO code pays no extra
-instruction**. Both come from making the `this` slot *conditional* on use.
+frame-field evaluation — do not re-litigate) stores `this` in a **new
+`CallFrame` field**, outside the capturable local-slot space:
 
-**ABI class, per function, decided at compile time (a `uses_this` bit in
-function metadata):**
+```rust
+struct CallFrame {
+    // … existing fields …
+    this_val: Value,   // NEW — defaults to Undefined
+}
+```
 
-- **Class P (plain)** — the body does not reference `this` and no nested arrow
-  references `this`. Params/locals start at **slot 0**; there is **no `this`
-  slot**. This is every function that exists today, so the convention move is a
-  no-op for them (slot 0 = arg 0 = today).
-- **Class T (this-bearing)** — the body references `this`, *or* a nested arrow
-  does (lexical `this` is reified into this function's slot 0 so the arrow can
-  capture it). `this` is **slot 0**; params/locals start at **slot 1**.
-- **Arrows are always class P** — an arrow has no own `this`; `this` inside an
-  arrow is the *enclosing* non-arrow function's `this`, captured lexically. So
-  an arrow never reserves slot 0 for itself; it forces its nearest enclosing
-  non-arrow function to class T.
+The entire appeal is that **non-OO code is byte-for-byte unchanged and there is
+no ABI split**: `call_function` writes `this_val = Undefined` as one
+unconditional store during frame construction — no extra instruction, no
+`PushUndefined`, no slot move, no `EnterFrame` change, no callee-first, no
+`has_receiver` plumbing. Params stay at slot 0 for *every* function. The frame
+just carries one more `Value` field.
 
-Because the class is exactly "does this function use `this`," the slot-0
-reservation is paid only where it's used. **Capture stays free:** `this` is
-local 0 of a class-T function, so an arrow referencing it captures local 0
-through the existing `MakeClosure`/`ClosureNew` + `Upval` path — no bespoke
-capture, no `CallFrame.this_val` field. **Reads are `Instr::Local(0)`** — no new
-instruction. These two are the entire reason to prefer slot-0 over a frame
-field; the ABI class is what buys them back without taxing plain calls.
+The price — paid entirely by OO code — is twofold, and both are spelled out
+below: reads need a dedicated instruction (`LoadThis`), and arrow `this`-capture
+needs a bespoke **reify-on-capture** path, because `this_val` is not a local slot
+the `Upval` machinery can reach.
 
-(Determining `uses_this` — own `this`-reference *or* nested-arrow
-`this`-reference — must run in the analysis pass *before* slot allocation, since
-it shifts params to slot 1. The capture pass already walks nested references;
-fold the `this`-reference flag into it.)
+It splits into **1a** (the field + direct `this` reads) and **1b** (reify so
+arrows capture lexical `this`). The reify path is the novel, risky part, so it is
+isolated in 1b and must land before Step 3 (which sets the first non-undefined
+`this`).
 
-The receiver/`this` funnels to **one place** (slot 0) for class-T user methods,
-`new`, and `bind`; method builtins keep receiver = arg 0; class-P functions are
-untouched. It is the most coupled change in the phase, so it splits into **1a**
-(class machinery + dynamic ABI, no `this` reads, every function still class P →
-suite green) and **1b** (mint class-T functions, read `this`). Land 1a green
-first.
+### Reading `this`
 
-### Establishing the receiver — static vs dynamic
+- A new `Instr::LoadThis` pushes `self.frames.last().this_val.clone()`. It is the
+  only way to read `this`; emitted only in functions that lexically reference it.
+  New instruction → give it a doc comment with its stack effect (`-> any`), a
+  `step()` arm, a `pe_*` classification (**pure** — reads a frame field, runs no
+  user code; classify with the `Local` family: frame-relative but
+  side-effect-free), and a `ResumeMode` (same as `Local`).
+- **Method dispatch / `new` / `bind` set the field, not the stack** (Steps
+  3/4/5): `CallMethod` sets `this_val = recv`; `new` sets it to the fresh
+  instance; a `Bound` user-fn call sets it from `BoundFn.this_val`. Plain
+  `Call`/`CallDyn` leave the `Undefined` default.
+- **Builtins are untouched.** A method builtin reads its receiver as arg 0 on the
+  stack exactly as today; it has no frame and never touches `this_val`.
 
-The receiver must reach slot 0 of a class-T frame (and be absent from a class-P
-frame) without taxing plain calls.
+### The capturing story (the part that earns its own section)
 
-**Static `Call` (callee known — the `call.rs` const-fn / prelude / non-capturing
-named-fn sites).** The compiler knows the callee's class *and* the call shape, so
-it emits the exact layout with no runtime reconciliation:
+Arrow functions have no own `this`; an arrow's `this` is the *lexical* (enclosing
+non-arrow function's) `this`. In a slot-0 design `this` is a real local, so an
+arrow captures it for free through the existing `Upval`-by-slot machinery. Here
+`this_val` is a **frame field, not a local slot**, so `Upval` (which captures
+cells that back local slots) cannot reach it. Capture therefore needs a bridge —
+**reify-on-capture**:
 
-| call                      | layout emitted                                              |
-|---------------------------|-------------------------------------------------------------|
-| plain call, **P** callee  | push args only — **no `this`, zero tax** (most code)        |
-| plain call, **T** callee  | push `undefined`, then args (rare: this-using fn, no recv)  |
-| method call, **T** callee | push receiver, then args (receiver = slot 0)                |
-| method call, **P** callee | evaluate receiver for effect, discard; push args            |
+When analysis finds that a function has a **nested arrow that references `this`**,
+the compiler reifies `this` into a synthetic local of that (nearest enclosing
+non-arrow) function:
 
-**Dynamic `CallDyn`/`CallSpread` (callee unknown — the reason it's dynamic).**
-Two coordinated changes:
+1. Allocate a hidden local slot, `this_slot`, in the enclosing function.
+2. Emit a prologue `LoadThis; SetLocal(this_slot)` at function entry — copy the
+   frame field into the slot once.
+3. Mark `this_slot` **captured**, so it is boxed into a `cell` like any captured
+   local; arrows capture it through the **standard `MakeClosure`/`ClosureNew` +
+   `Upval` path** — no new closure machinery.
+4. Inside such an arrow, a `this` reference compiles to the captured-cell read
+   (`GetUpval`/the existing captured-`Local` path) — **not** `LoadThis` (an arrow
+   has no own `this_val` worth reading).
 
-1. **Callee-first.** `CallDyn`/`CallSpread` expect the callee *below* the args
-   (`top - argc - 1`), pushed before them. This removes the `Dig(argc)` in
-   `compile_dynamic_method_call:521` and unifies both dynamic emit paths to
-   *push callee → [push receiver] → push args → call*. (`CallBuiltin` is
-   unaffected — its callee is baked into the instruction, nothing is on the
-   stack.)
-2. **`has_receiver` flag.** `CallDyn(ArgCount, has_receiver)` /
-   `CallSpread(has_receiver)` carry one compile-time bit: was a receiver value
-   pushed between callee and args (method-call site → `true`, plain → `false`).
-   Encode it as a **field, not** a separate `CallMethodDyn`/`CallMethodSpread`
-   opcode — the bit reaches the callee either way, a field avoids the 2×2 opcode
-   explosion, `Instr` size is unaffected (the bool fits existing padding — verify
-   against `EnterFrame`'s `ThinVec` variant), and the branch is per-site
-   consistent. Do **not** encode it by pushing a sentinel value — that is a
-   per-call push, the very tax we are removing.
+Properties to get right:
+- The reify target is the **nearest enclosing non-arrow function**; intermediate
+  arrows just pass the binding through, so arrow-within-arrow rides the existing
+  transitive-capture logic with no special case.
+- An arrow referencing `this` at module top level reifies into the **root frame**
+  (whose `this_val` is `Undefined`) — same path, yielding `undefined`.
+- A function that references `this` *directly* (not via a nested arrow) needs
+  **no reify** — it just emits `LoadThis` at the use site. Reify is only for
+  functions whose *arrows* need the lexical `this`.
 
-`EnterFrame` reconciles its own class (a runtime fact it knows) against
-`has_receiver` — the only place they can disagree and the only place a shift
-occurs:
+The cost is two prologue instructions, emitted only in functions whose nested
+arrows reference `this` — and it funnels arrow capture back onto the one capture
+path that already exists, rather than adding a second capture kind (capturing a
+frame field directly). That trade is the entire reason to accept a bespoke path
+here.
 
-| dynamic site            | callee P          | callee T                       |
-|-------------------------|-------------------|--------------------------------|
-| `has_receiver` (method) | drop receiver     | receiver = slot 0 ✓            |
-| no receiver (plain)     | nothing ✓         | insert `undefined` at slot 0   |
+### Step 1a — the field + direct `this` reads
 
-Diagonal cells are free; off-diagonal cells do a one-slot shift folded into the
-arg-region normalization `EnterFrame` already performs. Both off-diagonal cases
-are semantic mismatches (method-calling a non-`this` function; plainly calling a
-`this`-using function) and rare. There is deliberately **no `PushThis`/pre-args
-instruction**: `EnterFrame` already holds the callee, so a second inspection only
-adds a dispatch to the common plain→P (arrow-callback) case it cannot help.
+Additive and behavior-preserving: nothing sets a non-undefined `this` yet, so
+every read is `undefined`. No slot layout and no call convention change.
 
-**Builtins unchanged.** Method builtins read receiver = arg 0 positionally; they
-have no user frame and no slot 0. `arr.push(x)` pushes `[arr, x]`, `CallBuiltin`
-reads `arg0 = arr` — exactly as today. Namespace builtins (`Math.max`) have no
-receiver.
-
-### Step 1a — class machinery + dynamic ABI (no behavior change)
-
-Every function that exists today is class P (none reference `this`), so this step
-**must not move any existing function's slots** — slot 0 stays arg 0. The new
-machinery is dormant until 1b mints the first class-T function, and
-`has_receiver` is plumbed but always `false` in 1a (no method call sets it yet).
-This is what makes 1a low-risk — contrast the abandoned "shift every function to
-slot 1" attempt, which changed every frame and crashed.
-
-- **`compiler/analysis.rs`** — compute the `uses_this` bit (own `this` OR
-  nested-arrow `this`) in the existing capture pass, *before* slot allocation.
-  Class-P functions allocate params from slot 0 (unchanged); class-T from slot 1
-  (none exist in 1a).
-- **`compiler/call.rs`** — callee-first for both `CallDyn`/`CallSpread` paths:
-  the dynamic slot-call path (`compile_user_call:695`) loads the callee *before*
-  the args; the dynamic-method path (`compile_dynamic_method_call`) simply drops
-  its `Dig` (the callee already sits below the args after `ObjGet`). Thread
-  `has_receiver` = `false` everywhere in 1a. No `this` push on plain calls.
-- **`vm/instr.rs`** — `CallDyn(ArgCount, bool)`, `CallSpread(bool)`; doc the
-  stack effect (callee at `top - argc - 1`) and the `has_receiver` bit. Verify
-  `Instr` size unchanged.
-- **`vm/dispatch.rs` / `vm/methods.rs`** — `CallDyn`/`CallSpread` locate the
-  callee below the args; `call_function`/`EnterFrame` carry the reconciliation
-  table but, with every callee class P and `has_receiver` always `false`, only
-  the "plain → P: nothing" cell is ever hit — i.e. today's behavior exactly.
+- **`vm/mod.rs`** — add `CallFrame.this_val: Value`.
+- **`vm/methods.rs`** — `call_function` initializes `this_val = Undefined` (one
+  store; plain calls never set it otherwise).
+- **`vm/instr.rs` / `vm/dispatch.rs`** — `Instr::LoadThis` + its `step()` arm,
+  `pe_*` entry, and `ResumeMode`.
+- **`compiler/stmt.rs`/`expr.rs`** — `ThisExpression` lowers to `LoadThis`
+  (replace the hard-error arm). In 1a this is correct for direct `this`; an arrow
+  referencing `this` *also* lowers to `LoadThis` here and reads its own frame's
+  `this_val` — which is **coincidentally** `undefined` (the right lexical answer)
+  only because nothing sets a real `this` yet. 1b fixes the wiring before that
+  coincidence breaks (Step 3).
 
 Acceptance (1a):
-- [ ] Full suite green, including the dynamic-method path (`state.add5(3)` where
-      `add5` is a stored function) now that its `Dig` is gone: default params,
-      `arguments`, destructured params, varargs, closures over params, method
-      builtins (`arr.push`, `s.trim`), namespace builtins (`Math.max`).
-- [ ] No `this`-reads anywhere; method/namespace builtins untouched.
-- [ ] No `PushUndefined`/`PushThis`/sentinel added to plain-call lowering
-      (codegen-shape test); `Dig` no longer emitted by
-      `compile_dynamic_method_call` (codegen-shape test).
-- [ ] `Instr` size unchanged by the added `bool` fields (size assertion).
+- [ ] `this` at top level / in a plain call / in a method (pre-Step-3) is
+      `undefined`, not a compile error.
+- [ ] Full suite green; no slot layout changed, no call convention changed
+      (default params, `arguments`, destructured params, varargs, closures,
+      method/namespace builtins all unaffected — this is the no-op guarantee).
+- [ ] `LoadThis` classified in the `pe_*` tables and `ResumeMode`.
+- [ ] `CallFrame` size delta recorded (one `Value` = 16 bytes added per frame).
 - [ ] Gate: `cargo fmt && cargo clippy && cargo test` green.
 
-### Step 1b — class T + read `this`
+### Step 1b — reify-on-capture (arrows capture lexical `this`)
 
-- A function whose `uses_this` bit is set is class T: slot 0 = `this`, params
-  from slot 1. `Local`/`SetLocal`, default params, the optimizer's
-  index-relative analysis, and debuginfo's slot→name map ride the allocator's
-  assignment (offset by one **for that function only**).
-- `ThisExpression` → `Instr::Local(0)` (no new instruction; already classified
-  in the `pe_*` tables and `ResumeMode` as a plain `Local`). Reads `undefined`
-  until Step 3/4 supply a real receiver.
-- Top-level `this` = `undefined` (the root frame is class T iff top-level code
-  references `this`; slot 0 = `undefined`).
-- An arrow referencing `this` forces its enclosing non-arrow function to class T
-  (1a's analysis already set the bit) and captures local 0 via the existing
-  `Upval` path — no new code. Becomes *observable* once Step 3 sets a
-  non-undefined `this`; for now it captures `undefined`.
+- **`compiler/analysis.rs`** — in the capture pass, flag every (non-arrow)
+  function that has a nested arrow referencing `this`. For each, allocate
+  `this_slot`, mark it captured, and record that arrows referencing `this` bind
+  to it.
+- **`compiler/function.rs`** (the function-prologue emitter) — prepend
+  `LoadThis; SetLocal(this_slot)` for flagged functions.
+- **`compiler/expr.rs`** — a `this` reference *inside an arrow whose lexical
+  owner reified* compiles to the captured-cell read, not `LoadThis`.
+
+Still reads `undefined` until Step 3, but the capture *wiring* is in place and
+testable now.
 
 Acceptance (1b):
-- [ ] `this` at top level / in a plain call is `undefined`, not a compile error.
-- [ ] A class-T function with params reads its params correctly at slot 1
-      (regression guard for the one-slot offset): a `this`-referencing function
-      with two params returns them unchanged.
-- [ ] An arrow referencing `this` compiles to an `Upval` capture of local 0
-      (codegen-shape test), reading `undefined` at this step.
-- [ ] A class-P function is byte-for-byte unchanged vs. pre-Phase-13 codegen.
+- [ ] An arrow referencing `this` compiles to a capture of the enclosing
+      function's reified `this` slot (codegen-shape: an `Upval`/captured-cell
+      read in the arrow body, not a `LoadThis`).
+- [ ] A function that references `this` directly (no nested arrow) emits **no**
+      reify prologue (codegen-shape).
+- [ ] Arrow-within-arrow over `this` resolves to the nearest non-arrow owner
+      (transitive capture), reading `undefined` at this step.
+- [ ] A function with neither direct nor nested-arrow `this` is byte-for-byte
+      unchanged vs. pre-Phase-13 codegen.
 - [ ] Gate: `cargo fmt && cargo clippy && cargo test` green.
 
 ## Step 2 — object prototype representation
@@ -286,27 +259,27 @@ Make `recv.m(args)` bind `this` for user methods, across both call paths:
 
 - **Builtin-named methods** (`recv.push(…)`): the existing
   `reroute_method_to_object` already has `[recv, args…]` on the stack and today
-  *removes* `recv` before dispatching the object's own property. The change is to
-  dispatch that property via Step 1's provided-receiver path (`has_receiver`),
-  passing `recv` as the receiver instead of removing it: reconciliation then
-  binds it as `this` (slot 0) for a class-T method or drops it for a class-P one.
-  Shadowing becomes "call the user method with `this`", reusing the one
-  reconciliation path rather than doing bespoke stack surgery.
+  *removes* `recv` before dispatching the object's own property. Under
+  frame-field the reroute **forks on the shadowing property's kind**: a user
+  function/closure is dispatched with `this_val = recv` and `recv` removed from
+  the arg region (it is not an arg to a user method); if it resolves back to the
+  builtin, `recv` stays as arg 0 exactly as today. Shadowing becomes "call the
+  user method with `this`".
 - **Non-builtin method names** (`recv.greet(…)`): today this lowers to
-  `ObjGet(greet)` + `CallDyn(has_receiver=false)`, which calls the property with
-  no receiver. **Decision: reuse Step 1's dynamic ABI — no new *call* opcode.**
-  Add a receiver-preserving *read*, `GetMethod(FieldName)`: it takes `recv` on
-  top, resolves `name` on it (own map → proto chain, Step 2), and leaves
-  `[callee, recv]` (callee-first) so the receiver survives as the `this` the
-  property read would otherwise consume. `compile_method_call` then emits
-  `recv` → `GetMethod(name)` → args → `CallDyn(argc, has_receiver=true)`. With
-  Step 1's reconciliation a class-T `greet` gets `recv` at slot 0; a class-P
-  `greet` ignores it (dropped) — the *same* reconciliation the builtin reroute
-  rides. Classify `GetMethod`'s purity by its resolution only (a bounded proto
-  walk, no user code) and give it a `ResumeMode`. (No parallel `this`-setting
-  call opcode — the `has_receiver` bit is the one mechanism, shared by this path,
-  the reroute, `new`, and `bind`.)
-- `f(args)` (no receiver, `CallDyn`) stays `this = undefined`.
+  `ObjGet(greet)` + `CallDyn`, which calls the property with no receiver.
+  **Decision: add one instruction `CallMethod(FieldName, ArgCount)`.** The stack
+  is `[recv, args…]`; `CallMethod` resolves `name` on `recv` (own map → proto
+  chain, Step 2) and dispatches the resolved callee, **forking on its kind**: a
+  user function/closure runs with `this_val = recv` and the arg region = `args…`
+  (recv consumed, not an arg); a builtin runs with `recv` as arg 0; a `Bound`
+  defers to its own `this_val` (Step 5). `compile_method_call` emits `CallMethod`
+  for a non-namespace method name instead of `ObjGet`+`CallDyn` — which also
+  removes the `Dig` that path uses today. Classify it impure (`pe_*`, it calls
+  user code) and give it a `ResumeMode`. (Both call paths — the reroute and
+  `CallMethod` — share the one "set `this_val` for a user fn / keep arg 0 for a
+  builtin" fork; factor it into a single helper.)
+- `f(args)` (no receiver, `Call`/`CallDyn`) stays `this_val = undefined` (the
+  frame default; no instruction change).
 
 Acceptance:
 - [ ] `obj.greet()` where `greet` is an own function property runs with
@@ -330,7 +303,7 @@ proto_of: HashMap<CodeAddr, ObjectPtr>   // F.prototype, created on first access
 
 - `F.prototype` (read) → look up or lazily allocate the prototype object.
 - `new F(args)` → alloc object `O` with `proto = proto_of[F]`; `call_function`
-  with `this = O` and `args`; the result is `O` unless `F` returned an object
+  with `this_val = O` and `args`; the result is `O` unless `F` returned an object
   (JS: a constructor returning a non-object is ignored).
 - `ThisExpression` inside `F` now reads `O`. `this.x = …` writes own properties
   on `O` (Step 2's own-`ObjSet`).
@@ -376,22 +349,19 @@ Value::Bound(Rc<BoundFn>)
   this `BoundFn`. Cement the invariant in the type's doc comment; it is the
   entire safety argument. (`ThinVec` keeps the common `f.bind(obj)` case — empty
   `bound_args` — to a single pointer, no heap alloc.)
-- `dispatch_call` gains a `Value::Bound` arm: dispatch `inner.callable` via
-  Step 1's **provided-receiver path** — `inner.this_val` is supplied as the
-  receiver (`has_receiver` semantics) and `inner.bound_args` are prepended to the
-  call-site args. Because the receiver funnels to one place, this is **one path
-  with no callable-kind fork**: a bound class-T user function gets `this_val` at
-  slot 0; a bound *builtin* (`[].push.bind(arr)`) reads the same `this_val` as
-  arg 0; a bound class-P function simply ignores it (dropped by reconciliation) —
-  all automatic. The Bound arm *overrides* a call-site receiver (`obj.g()` where
-  `g` is bound ignores `obj`), since it supplies the receiver itself; a method
-  call (`GetMethod` + `CallDyn(has_receiver=true)`) that resolves to a `Bound`
-  must therefore defer to the Bound's `this_val` rather than binding
-  `this = recv`. Mechanic: splice `[this_val (as receiver), bound_args…]` below
-  the call-site args (rare path; cost irrelevant). Binding is composable:
-  `g = f.bind(a, x); g.bind(b, y)` pre-pends `x` then `y` and keeps the *first*
-  `this` (JS: re-binding `this` is a no-op) — implement by flattening into a
-  fresh `BoundFn` over `f`.
+- `dispatch_call` gains a `Value::Bound` arm: prepend `inner.bound_args` to the
+  call-site args and dispatch `inner.callable`, **forking on its kind** (the same
+  fork Step 3 factored out): a bound user function/closure runs with
+  `this_val = inner.this_val`; a bound *builtin* (`[].push.bind(arr)`) gets
+  `inner.this_val` spliced in as arg 0. The Bound arm *overrides* a call-site
+  receiver (`obj.g()` where `g` is bound ignores `obj`), since it supplies its own
+  `this_val`; a `CallMethod` that resolves to a `Bound` must therefore defer to
+  the Bound's `this_val` rather than setting `this_val = recv`. Mechanic for the
+  builtin case: splice `[this_val, bound_args…]` below the call-site args; for the
+  user-fn case set the frame field and prepend `bound_args` (rare path; cost
+  irrelevant). Binding is composable: `g = f.bind(a, x); g.bind(b, y)` pre-pends
+  `x` then `y` and keeps the *first* `this` (JS: re-binding `this` is a no-op) —
+  implement by flattening into a fresh `BoundFn` over `f`.
 - **`Value::Bound` match-arm checklist.** Adding the variant makes the compiler
   flag every exhaustive `match` on `Value`. Most need a *specific* arm, not a
   catch-all — fill exactly these (the compiler will point at each; this is the
@@ -534,16 +504,17 @@ Acceptance:
 
 ## Sequencing
 
-**1a → 1b** is a hard order. 1a is now the *low-risk* half — every function is
-class P, so slot 0 = arg 0 and no frame layout moves; its only observable change
-is callee-first (the `Dig` removal), which is behavior-preserving. The risk moved
-to **1b** (class-T params shift to slot 1) and **3** (receiver plumbing through
-`GetMethod` + `has_receiver`), so keep each behind its acceptance gate. 1b and 2
-are independent and can land in either order, but both precede 3. 3 depends on
-1b+2. 4 depends on 3. 5 depends on 3. 6 depends on 3+5. 7 depends on 4 (and 5 if
-methods-as-values appear in class bodies). The **minimum coherent system** is
-Steps 1–4; 5–7 are the deferred items folded into the same substrate so they
-never become one-off bolt-ons.
+**1a → 1b** is a hard order, but neither half moves a slot or changes a call
+convention — `this` is a frame field, so 1a is purely additive (add the field +
+`LoadThis`, every read `undefined`) and 1b adds only the reify-on-capture wiring.
+The novel/risky surface is concentrated in **1b** (reify-on-capture for arrows)
+and **3** (the user-fn-vs-builtin receiver fork), so keep each behind its
+acceptance gate. 1b and 2 are independent and can land in either order, but both
+precede 3 (3 sets the first non-undefined `this`, which is when 1b's capture
+wiring must already be correct). 3 depends on 1b+2. 4 depends on 3. 5 depends on
+3. 6 depends on 3+5. 7 depends on 4 (and 5 if methods-as-values appear in class
+bodies). The **minimum coherent system** is Steps 1–4; 5–7 are the deferred items
+folded into the same substrate so they never become one-off bolt-ons.
 
 ## Divergences from JS (record in the divergence list as they land)
 
