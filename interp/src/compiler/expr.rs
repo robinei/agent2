@@ -100,7 +100,16 @@ impl<'src> super::Compiler<'src> {
                 self.emit(Instr::RegExpNew, span);
             }
             ast::Expression::ThisExpression(t) => {
-                self.emit(Instr::LoadThis, t.span.start);
+                // A `this` inside an arrow resolves to the nearest non-arrow's
+                // reified captured slot (the analyzer recorded it as a free var
+                // resolved through the upval chain).  A direct `this` in a
+                // non-arrow function has no slot resolution and falls through
+                // to LoadThis.
+                if let Some(r) = self.ref_slot(t.span.start) {
+                    self.emit_slot_read(&r, t.span.start);
+                } else {
+                    self.emit(Instr::LoadThis, t.span.start);
+                }
             }
             ast::Expression::NewExpression(n) => {
                 if let ast::Expression::Identifier(id) = &n.callee {

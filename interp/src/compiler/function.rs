@@ -205,6 +205,7 @@ impl<'src> super::Compiler<'src> {
             own_local_count,
             uses_arguments,
             captures,
+            this_slot,
         ) = {
             let analysis = self.analysis.as_ref().expect("analysis present");
             let scope = &analysis.scopes[scope_id];
@@ -217,6 +218,7 @@ impl<'src> super::Compiler<'src> {
                 scope.own_local_count,
                 scope.uses_arguments,
                 scope.captures.clone(),
+                scope.this_slot,
             )
         };
         let nparams = params_info.len() as u32;
@@ -278,6 +280,15 @@ impl<'src> super::Compiler<'src> {
             Instr::EnterFrame(nparams as u16, uses_arguments, local_kinds.into()),
             span,
         );
+
+        // Reify `this` for arrow capture: copy frame.this_val into a captured
+        // Boxed local so nested arrows can capture it through the standard upval
+        // path. Emitted only when a nested arrow references `this`.
+        if let Some(ts) = this_slot {
+            let abs_slot = frame_abs(ts, nparams, upval_count);
+            self.emit(Instr::LoadThis, span);
+            self.emit(Instr::SetLocal(abs_slot as LocalIndex), span);
+        }
 
         // Per-parameter prologue: apply defaults (the arg is already in the slot)
         // and box captured params in place. Plain params with no default need no

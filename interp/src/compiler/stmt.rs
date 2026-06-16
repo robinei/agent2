@@ -23,6 +23,7 @@ impl<'src> super::Compiler<'src> {
         let enter_frame_at = self.code.len();
         let root_slot_count = root.slot_kinds.len() as u32;
         let emitted_enter_frame = !root.slot_kinds.is_empty() || root.uses_arguments;
+        let root_this_slot = root.this_slot;
         if emitted_enter_frame {
             let kinds = root.slot_kinds.clone();
             let uses_arguments = root.uses_arguments;
@@ -40,6 +41,14 @@ impl<'src> super::Compiler<'src> {
             },
             used: false,
         });
+
+        // Reify `this` for arrow capture at top level: copy the root frame's
+        // `this_val` (undefined) into a captured Boxed local so top-level arrows
+        // can capture it through the standard upval path.
+        if let Some(ts) = root_this_slot {
+            self.emit(Instr::LoadThis, program.span.start);
+            self.emit(Instr::SetLocal(ts as LocalIndex), program.span.start);
+        }
 
         // Hoist function declarations into the prologue (emit their bindings).
         self.hoist_function_decls(&program.body);

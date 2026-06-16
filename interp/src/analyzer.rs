@@ -191,6 +191,17 @@ pub(crate) struct FuncScope {
     /// compiler routes the declared kinds into `EnterFrame`'s `local_kinds` and
     /// boxes any captured params in place via `FreshCell`.
     pub(crate) slot_kinds: Vec<SlotKind>,
+    /// Whether this function scope is an arrow function (no own `this`).
+    pub(crate) is_arrow: bool,
+    /// If this non-arrow scope reifies `this` for arrow capture, the own-local
+    /// slot index that holds the reified `this` value. `None` otherwise.
+    pub(crate) this_slot: Option<u32>,
+    /// Whether a nested arrow scope propagated `<this>` into this scope's
+    /// free_vars, requiring reification.  Set during Phase A propagation;
+    /// cleared by the fixpoint reset.  A non-arrow scope with `<this>` in its
+    /// own free_vars from a *direct* `ThisExpression` (not arrows) does NOT set
+    /// this flag and does NOT reify — it just emits `LoadThis`.
+    pub(crate) needs_this_reify: bool,
 }
 
 /// How an identifier reference resolves to a frame slot.
@@ -278,6 +289,9 @@ impl FuncScope {
             own_local_count: 0,
             uses_arguments: false,
             slot_kinds: Vec::new(),
+            is_arrow: false,
+            this_slot: None,
+            needs_this_reify: false,
         }
     }
 
@@ -370,6 +384,10 @@ fn resolve_const_functions(scopes: &mut Vec<FuncScope>) -> HashSet<usize> {
     let direct_free: Vec<IndexSet<String>> = scopes.iter().map(|s| s.free_vars.clone()).collect();
     let direct_consts: Vec<IndexMap<String, ConstValue>> =
         scopes.iter().map(|s| s.const_names.clone()).collect();
+    // Snapshot own_local_count — the reify pass in resolve_captures increments
+    // it for the synthetic <this> slot; each fixpoint iteration must start from
+    // the original count.
+    let mut base_own_count: Vec<u32> = scopes.iter().map(|s| s.own_local_count).collect();
 
     let mut const_fns: HashSet<usize> = HashSet::new();
     for (id, s) in scopes.iter().enumerate() {
@@ -400,10 +418,13 @@ fn resolve_const_functions(scopes: &mut Vec<FuncScope>) -> HashSet<usize> {
             s.upval_count = 0;
             s.slot_kinds.clear();
             s.fresh_owns.clear();
+            s.own_local_count = base_own_count[i];
+            s.this_slot = None;
+            s.needs_this_reify = false;
+            s.names.shift_remove("<this>");
         }
         register_const_fns(scopes, &const_fns);
         resolve_captures(scopes);
-        // A "constant" function that still captures a real slot isn't one.
         let demoted: Vec<usize> = const_fns
             .iter()
             .copied()
@@ -430,6 +451,12 @@ fn resolve_const_functions(scopes: &mut Vec<FuncScope>) -> HashSet<usize> {
         s.upval_count = 0;
         s.slot_kinds.clear();
         s.fresh_owns.clear();
+        // After compact, own_local_count may have shrunk; use the new
+        // (compacted) value as the base for the final resolve_captures.
+        base_own_count[i] = s.own_local_count;
+        s.this_slot = None;
+        s.needs_this_reify = false;
+        s.names.shift_remove("<this>");
     }
     register_const_fns(scopes, &const_fns);
     resolve_captures(scopes);
@@ -515,6 +542,7 @@ fn compact_const_fn_slots(scopes: &mut [FuncScope]) {
         s.reassigned = s.reassigned.iter().filter_map(|&sl| remap(sl)).collect();
         s.loop_declared = s.loop_declared.iter().filter_map(|&sl| remap(sl)).collect();
         s.own_local_count -= dead.len() as u32;
+        s.this_slot = s.this_slot.and_then(remap);
         s.const_fn_slots.clear();
     }
 }
@@ -565,6 +593,18 @@ fn resolve_captures(scopes: &mut [FuncScope]) {
             if self_name.as_deref() == Some(fv.as_str()) {
                 continue;
             }
+            // <this> boundary: a non-arrow child "declares" <this> — don't
+            // propagate. An arrow child is transparent — propagate upward and
+            // flag the parent for reification if it is non-arrow.
+            if fv == "<this>" {
+                if scopes[i].is_arrow {
+                    if !scopes[parent].is_arrow {
+                        scopes[parent].needs_this_reify = true;
+                    }
+                    scopes[parent].free_vars.insert(fv);
+                }
+                continue;
+            }
             // Don't propagate a name the parent resolves: a slot (`names`) is
             // captured below; a const (`const_names`) resolves to a value here.
             if !scopes[parent].names.contains_key(&fv)
@@ -573,6 +613,36 @@ fn resolve_captures(scopes: &mut [FuncScope]) {
                 scopes[parent].free_vars.insert(fv);
             }
         }
+    }
+
+    // Reify `this` for non-arrow scopes whose arrow descendants reference
+    // `<this>`.  Only scopes with `needs_this_reify` set (by Phase A from an
+    // arrow child) are reified; a direct `this` in a non-arrow scope with no
+    // capturing arrows does not need a slot and emits `LoadThis` directly.
+    for i in (0..n).rev() {
+        let s = &mut scopes[i];
+        if s.is_arrow || !s.needs_this_reify {
+            continue;
+        }
+        s.free_vars.shift_remove("<this>");
+        s.this_slot = Some(s.own_local_count);
+        s.names.insert(
+            "<this>".to_string(),
+            SlotInfo {
+                slot: s.own_local_count,
+                is_const: false,
+            },
+        );
+        // Ensure slot_names is large enough for debug info.
+        if s.own_slot_names.len() <= s.own_local_count as usize {
+            s.own_slot_names
+                .resize(s.own_local_count as usize + 1, None);
+        }
+        s.own_slot_names[s.own_local_count as usize] = Some("<this>".to_string());
+        // Increment own_local_count so the slot is allocated and appears in
+        // slot_kinds. Mark it captured (→ Boxed) so closures capture the cell.
+        s.captured.insert(s.own_local_count);
+        s.own_local_count += 1;
     }
 
     // Phase B: assign upvals and capture lists (parents before children).
@@ -1612,6 +1682,10 @@ impl Analyzer {
                     }
                 }
             }
+            ast::Expression::ThisExpression(t) => {
+                scope.free_refs.push((t.span.start, "<this>".to_string()));
+                scope.free_vars.insert("<this>".to_string());
+            }
             _ => {}
         }
     }
@@ -1857,6 +1931,7 @@ impl Analyzer {
             None,
             false,
         );
+        scope.is_arrow = true;
         if arrow.params.rest.is_some() {
             scope.uses_arguments = true;
         }
