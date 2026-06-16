@@ -67,7 +67,7 @@ routed to wherever the *resolved* callee reads `this`:
 | resolved `m`                         | receiver delivered as | path                                  |
 |--------------------------------------|-----------------------|---------------------------------------|
 | builtin (arr/str/map/set/regexp)     | arg 0 (today)         | structural `CallBuiltin`, unchanged   |
-| object **own** property that's a fn  | `this_val` field      | `Pick(0); ObjGet` + `has_this` call → `this_val = recv` |
+| object **own** property that's a fn  | `this_val` field      | `ObjPeek` + `has_this` call → `this_val = recv` |
 | object **prototype-chain** fn        | `this_val` field      | same, found by walking `proto`        |
 | not found / non-callable             | `TypeError`           | —                                     |
 
@@ -122,7 +122,7 @@ isolated in 1b and must land before Step 3 (which sets the first non-undefined
   user code; classify with the `Local` family: frame-relative but
   side-effect-free), and a `ResumeMode` (same as `Local`).
 - **Method dispatch / `new` / `bind` set the field, not the stack** (Steps
-  3/4/5): the method path (`Pick(0); ObjGet` + a `has_this` call, Step 3) sets
+  3/4/5): the method path (`ObjPeek` + a `has_this` call, Step 3) sets
   `this_val = recv` for a user-fn callee; `new` sets it to the fresh instance; a
   `Bound` user-fn call sets it from `BoundFn.this_val`. Plain `Call`/`CallDyn`
   leave the `Undefined` default.
@@ -311,19 +311,23 @@ Make `recv.m(args)` bind `this` for user methods, across both call paths:
   user method with `this`".
 - **Non-builtin method names** (`recv.greet(…)`): today this lowers to
   `ObjGet(greet)` + `CallDyn`, calling the property with no receiver. **Decision:
-  add no read instruction — `ObjGet` already resolves; keep the receiver with a
-  `Pick(0)` (the VM's dup) and add a `has_this` bit to the call.** No
-  `CallMethod`/`CallMethodSpread` opcodes, and spread/optional fall out for free.
-  - **Resolution is `ObjGet` itself.** After Step 2, `ObjGet` walks own → proto
-    and returns the property (or `Undefined` on a miss) for an `Object` receiver,
-    and a non-`Object` receiver already errors ("cannot read property on …").
-    That *is* method resolution: a missing `greet` yields `Undefined`, and the
-    *call* then raises "not a function" — JS-faithful (JS errors at the call, not
-    the read). A dedicated `GetMethod` would only duplicate `ObjGet`'s walk (and
-    cost a fresh `pe_*`/`ResumeMode`); don't add it.
-  - **Keep the receiver with `Pick(0)`.** `recv` → `Pick(0)` → `ObjGet(greet)`
-    leaves `[recv, callee]`; `recv` survives for `this`-routing (a bare `ObjGet`
-    consumes it).
+  fuse the receiver-keeping read into one instruction `ObjPeek(name)` and add a
+  `has_this` bit to the call.** No `CallMethod`/`CallMethodSpread` opcodes, and
+  spread/optional fall out for free.
+  - **`ObjPeek(FieldName)` = `Pick(0); ObjGet` fused** (`obj -> obj, any`): read
+    property `name` off the receiver but **keep the receiver** below the result
+    rather than consuming it. Semantically *identical* to `ObjGet` — same
+    own → proto walk (Step 2), same `Undefined` on a miss, same non-`Object` read
+    error — so it **shares `ObjGet`'s resolution helper** (it is `ObjGet` minus
+    the `pop`) and inherits its `pe_*`/`ResumeMode` classification; a fusion, not
+    a second resolver. This matches the codebase's existing `Pick(0); SetLocal`
+    fusion (`instr.rs:151`), and the *same* pattern is the compound-assignment
+    load (`obj.x += 1` does `Pick(0); ObjGet`), so `ObjPeek` earns its keep on two
+    hot paths. Because resolution stays `ObjGet`'s, a missing `greet` yields
+    `Undefined` and the *call* raises "not a function" — JS-faithful (JS errors at
+    the call, not the read). (A dynamic-key counterpart `ObjPeekDyn` can wait
+    until `obj[expr](…)` / `obj[k] += 1` prove common; `Pick(0); ObjGetDyn`
+    covers them meanwhile.)
   - **`has_this` bit on `CallDyn(ArgCount, has_this)` / `CallSpread(has_this)`** —
     "a receiver sits just below the callee; route it." Dispatch forks on the
     resolved callee's kind, via a shared helper: a **user function/closure** →
@@ -337,8 +341,8 @@ Make `recv.m(args)` bind `this` for user methods, across both call paths:
     Plain calls adopt the same callee-below-args order (`has_this = false`, no
     `recv`), which removes the `Dig` the dynamic-method path uses today and gives
     `CallDyn` one uniform layout.
-  - Lowerings: `recv.greet(a,b)` → `Pick(0); ObjGet(greet)` + `CallDyn(2, true)`;
-    `recv.greet(...xs)` → `Pick(0); ObjGet(greet)` + `CallSpread(true)`;
+  - Lowerings: `recv.greet(a,b)` → `ObjPeek(greet)` + `CallDyn(2, true)`;
+    `recv.greet(...xs)` → `ObjPeek(greet)` + `CallSpread(true)`;
     `recv?.greet(…)` guards with the existing `begin_optional` after evaluating
     `recv`, exactly like the `ObjGet` path today.
 - `f(args)` (no receiver) → callee-below-args `Call`/`CallDyn(argc,
@@ -351,15 +355,16 @@ Acceptance:
 - [ ] An own property still shadows a builtin method name *and* now sees `this`
       (extend the Phase-`4ea0249` shadow tests to assert `this`).
 - [ ] `const f = obj.greet; f()` runs with `this === undefined` (detachment).
-- [ ] `recv.greet(...xs)` (spread) binds `this === recv` via `Pick(0); ObjGet`
-      + `CallSpread(has_this=true)` — **no `CallMethodSpread` opcode exists**.
-- [ ] `recv?.greet()` on a nullish `recv` short-circuits (no `ObjGet`, no call,
+- [ ] `recv.greet(...xs)` (spread) binds `this === recv` via `ObjPeek` +
+      `CallSpread(has_this=true)` — **no `CallMethodSpread` opcode exists**.
+- [ ] `recv?.greet()` on a nullish `recv` short-circuits (no `ObjPeek`, no call,
       no arg evaluation); on a present `recv` binds `this`.
 - [ ] A missing / non-callable `greet` raises "not a function" **at the call**
       (not at the read); a non-`Object` receiver inherits `ObjGet`'s existing
-      read error.
-- [ ] No new read instruction added; the `has_this` dispatch fork (user-fn →
-      `this_val`, builtin → arg 0) is exercised both ways.
+      read error (`ObjPeek` shares it).
+- [ ] `ObjPeek` is `ObjGet` minus the `pop` (shared helper, same `pe_*`/
+      `ResumeMode`); the `has_this` dispatch fork (user-fn → `this_val`, builtin →
+      arg 0) is exercised both ways.
 - [ ] Gate: `cargo fmt && cargo clippy && cargo test` green.
 
 ## Step 4 — `new F(args)`
@@ -426,7 +431,7 @@ Value::Bound(Rc<BoundFn>)
   `this_val = inner.this_val`; a bound *builtin* (`[].push.bind(arr)`) gets
   `inner.this_val` spliced in as arg 0. The Bound arm *overrides* a call-site
   receiver (`obj.g()` where `g` is bound ignores `obj`), since it supplies its own
-  `this_val`; a method call (`Pick(0); ObjGet` + `has_this`) that resolves to a
+  `this_val`; a method call (`ObjPeek` + `has_this`) that resolves to a
   `Bound` must therefore defer to the Bound's `this_val` rather than setting
   `this_val = recv`. Mechanic for the
   builtin case: splice `[this_val, bound_args…]` below the call-site args; for the
