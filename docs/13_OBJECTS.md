@@ -485,39 +485,100 @@ Acceptance (3b):
       arg 0) is exercised both ways.
 - [ ] Gate: `cargo fmt && cargo clippy && cargo test` green.
 
-## Step 4 — `new F(args)`
+## Step 4 — `new F(args)` (on a unified function representation)
 
-Constructors. Functions are not property-bearing (`Value::Fn`/`Closure` are a
-code address / heap index), so a constructor's `.prototype` lives in a lazy
-side table rather than on the value:
+A function needs a per-*value* home for its prototype, which `Value::Fn(CodeAddr)`
+— a bare address — doesn't have. So Step 4 first **unifies the function
+representation** (4a, behavior-preserving), then builds `new` + `F.prototype` on
+it (4b). This drops the `proto_of` side table entirely and gives each function
+value its own prototype (JS-faithful: two closures from the same code get
+distinct prototypes, where a `CodeAddr`-keyed table would have shared one).
 
-```rust
-proto_of: HashMap<CodeAddr, ObjectPtr>   // F.prototype, created on first access
-```
+### Step 4a — unify `Fn` into `Closure` (no behavior change)
 
-- `F.prototype` (read) → look up or lazily allocate the prototype object.
-- `new F(args)` → alloc object `O` with `proto = proto_of[F]`; `call_function`
-  with `this_val = O` and `args`; the result is `O` unless `F` returned an object
-  (JS: a constructor returning a non-object is ignored).
-- `ThisExpression` inside `F` now reads `O`. `this.x = …` writes own properties
-  on `O` (Step 2's own-`ObjSet`).
-- Shared methods: `F.prototype.m = function(){…}` puts `m` on the shared
-  prototype; `new F().m()` finds it via Step 3's chain walk with `this` bound.
+Today there are two callable code-values: `Value::Fn(CodeAddr)` (no captures,
+addr inline, no heap entry) and `Value::Closure(ClosurePtr)` (heap entry
+`{ addr, upvals }`, `mod.rs:486`). Collapse them into one.
 
-Update the `new` diagnostic: `new F(...)` for a user `F` now compiles; keep
-rejecting `new Map()`/`new Set()`/`new Date()` with their existing
-alternative-naming messages (those remain special-cased per `4_FUTURE`).
+- **`Value::Closure { addr: CodeAddr, ptr: ClosurePtr }`** — both `u32`, 8 bytes,
+  so `Value` stays **16**; remove `Value::Fn`. The inline `addr` means `CallDyn`
+  jumps directly; `ptr` is dereferenced only to install upvals, and only when the
+  function captures (the count is known from the `addr`'s metadata, so a
+  non-capturing call never touches `ptr`). This *removes* the deref `Closure`
+  pays today just to fetch its `addr`.
+- **Heap `Closure` becomes `{ upvals: ThinVec<Value>, prototype: Option<ObjectPtr> }`**
+  — drop `addr` (now in the `Value`); add a **dormant** `prototype` (`None` until
+  4b; most functions never allocate one).
+- **One canonical `Closure` per non-capturing function.** Identity requires
+  `f === f`, so a non-capturing function gets a single canonical `Closure` (same
+  `ptr` on every push). Allocate it at link/init time and bake the `ptr` into
+  `PushFn`'s lowering (→ push `Closure { addr, canonical_ptr }`) — no runtime
+  `addr→ptr` map. Capturing functions keep allocating per-instantiation via
+  `ClosureNew` (distinct `ptr` → distinct identity, also correct). Static
+  `Call(addr)` is untouched (addr baked in the instruction); the canonical
+  `Closure` is materialized only when a function is used as a *value*.
+- **Match-arm migration** (the compiler flags each): collapse every `Fn | Closure`
+  arm to a single `Closure` (`value.rs:218/247/440`); `strict_equal` becomes
+  `Closure` `ptr`-equality (the canonical-per-addr scheme preserves today's
+  `Fn(a)==Fn(b)` ⇔ same addr); `type_name` → `"function"`; the `dispatch_call`
+  `Fn`/`Closure` arms **merge into one**; `EnterFrame` reads upvals from
+  `closures[ptr]`.
 
-Acceptance:
+Behavior-preserving — functions dispatch, compare, and print exactly as before;
+`prototype` is dormant. Isolated as its own green checkpoint.
+
+Acceptance (4a):
+- [ ] Full suite green: first-class functions, closures, recursion, `typeof`,
+      and equality (`f === f`, `f !== g`, a captured closure `!==` another
+      instance) all unchanged.
+- [ ] `Value` still 16 bytes (size assertion); `Value::Fn` removed.
+- [ ] A non-capturing function pushed twice has the **same** `ptr` (identity);
+      `dispatch_call` no longer derefs to fetch `addr` (it's inline).
+- [ ] Gate: `cargo fmt && cargo clippy && cargo test` green.
+
+### Step 4b — `new F(args)` + `F.prototype`
+
+With the unified `Closure`, the prototype is a field on the function value — no
+side table.
+
+- **`F.prototype` (read):** `ObjGet` on a `Closure` receiver + `"prototype"` →
+  `closures[ptr].prototype`, lazily allocating an empty object on first access and
+  storing it back. (`ObjGet` *errors* on a callable receiver today,
+  `dispatch.rs:42` — add this arm.) `F.prototype.m = fn` is then an ordinary
+  `ObjSet` on that object. **`F.prototype = wholeObj` reassignment is not
+  supported** (recorded divergence — classes forbid it anyway).
+- **`new F(args)`** needs a `New` mechanism (none exists — `NewExpression` today
+  only routes to the `Error`/`RegExp`/`Map`/`Set` special forms, `expr.rs:114`):
+  1. resolve `F` to its `Closure` value; alloc instance `O` with
+     `O.proto = F.prototype` (lazily allocated as above);
+  2. `dispatch_call(F, this_val = O, args)` — the unified chokepoint, `O` as
+     `this_val`;
+  3. **post-check the return** — if `F` returned an object, that is the result;
+     else the result is `O` (JS ignores a non-object return). This runs *after*
+     the call, so it is the one genuinely new bit: a `New`-wrapping op that does
+     the alloc + `this_val` set-up and the post-return fixup.
+- `this.x = …` inside `F` writes own properties on `O` via `LoadThis` + `ObjSet`
+  (Steps 1 + 2). Shared methods: `F.prototype.m = …`, then `new F().m()` resolves
+  `m` by Step 2's chain walk with `this = O` (Step 3b).
+- Update the diagnostic: `new F(...)` for a user `F` now compiles; keep rejecting
+  `new Map()`/`new Set()`/`new Date()` (special-cased per `4_FUTURE`). Dynamic
+  `new (expr)()` over a non-constant callee: the MVP **requires a statically
+  resolvable `F`** (reject otherwise) unless `dispatch_call` already holds the
+  value — decide and state.
+
+Acceptance (4b):
 - [ ] `function P(x){ this.x = x } new P(5).x === 5`.
 - [ ] `P.prototype.get = function(){ return this.x }; new P(7).get() === 7`
       (shared prototype method, `this` bound to the instance).
 - [ ] A constructor returning an object yields that object; returning a
-      primitive yields the new instance.
+      primitive/undefined yields the new instance.
+- [ ] `F.prototype` lazily-allocates once (same object on repeat reads); two
+      functions from the **same code** (distinct closure values) get **distinct**
+      prototypes.
 - [ ] `new Map()`/`new Set()` still rejected with the alternative-naming
-      diagnostic; the `Object`/`Error` constructors unaffected.
-- [ ] Instances and prototypes have **no JSON form** (`JSON.stringify` of an
-      instance serializes its own enumerable data only — confirm/define).
+      diagnostic; `Object`/`Error` constructors unaffected.
+- [ ] Instances serialize own enumerable data only (no JSON form for the
+      prototype link or methods).
 - [ ] Gate: `cargo fmt && cargo clippy && cargo test` green.
 
 ## Step 5 — `bind` (the only receiver-carrying value), plus `call`/`apply`
@@ -570,7 +631,7 @@ Value::Bound(Rc<BoundFn>)
   - `vm/value.rs` `MapKey`'s `Hash` → a **new tag byte** + `std::ptr::hash`
     on the `Rc` pointer (mirror the `RegExp` arm).
   - `vm/methods.rs` `write_js_string` → `"function () { [native code] }"`
-    (same as `Fn`/`Builtin`/`Closure`).
+    (same as the other callables — `Closure`/`Builtin`; `Fn` is gone after 4a).
   - `vm/methods.rs` `stack_value_to_json` → reject, exactly like `Closure`.
   - Arms with a `_` catch-all (`compare`, `loose_equal`, `is_string`,
     `as_f64`/`as_i64`/`is_number`, `str_byte_len`) need **no** edit — verify,
@@ -593,7 +654,8 @@ they are strictly cheaper than `bind`:
     *not* re-implement spreading), then `dispatch_call(f, thisArg,
     spread_count)`. A non-array, non-nullish `argsArray` is a `TypeError`.
 - Register both as `Method`-kind builtins whose receiver is callable
-  (`Fn`/`Closure`/`Builtin`/`Bound`); a non-callable receiver is a `TypeError`.
+  (`Closure`/`Builtin`/`Bound` — `Fn` is unified into `Closure` in 4a); a
+  non-callable receiver is a `TypeError`.
   Like the shadow reroute (`reroute_method_to_object`, `methods.rs:1142`), these
   are builtins that **re-enter `dispatch_call`** — reuse that established hand-off
   (the invoked callee's frame yields the result in the `.call`/`.apply`
@@ -653,7 +715,7 @@ the same `this`/`bind` substrate rather than as a one-off.
 on a callable should return its **expected parameter count** (JS `fn.length`),
 not error. Extend `Instr::GetLength`'s polymorphic dispatch with a callable arm:
 
-- `Fn`/`Closure` → declared param count *before the first default/rest param*
+- `Closure` → declared param count *before the first default/rest param*
   (JS semantics). The compiler knows this; expose it via a `CodeAddr → arity`
   lookup (a slot in the existing function metadata / debug table, not a new
   heap).
@@ -729,14 +791,17 @@ novel/risky surface is concentrated in **1b** (reify-on-capture for arrows) and
 **3b** (the user-fn-vs-builtin receiver fork + threading `this_val` through the
 chokepoint), so keep each behind its gate.
 
-**3a is independent** — a pure call-convention refactor that touches neither
-`this` nor the proto chain, so it can land *first*, even before 1/2, as a
-warm-up. 1b and 2 are independent and can land in either order, but both precede
-**3b** (3b sets the first non-undefined `this`, which is when 1b's capture wiring
-must already be correct): 3b depends on 1b + 2 + 3a. 4 depends on 3b. 5 depends
-on 3b. 6 depends on 3b + 5. 7 depends on 4 (and 5 if methods-as-values appear in
-class bodies). The **minimum coherent system** is Steps 1–4; 5–7 are the deferred
-items folded into the same substrate so they never become one-off bolt-ons.
+Two steps are **independent, behavior-preserving refactors that can land first,
+even before 1/2**, as warm-ups: **3a** (callee-below-args, touches neither `this`
+nor the proto chain) and **4a** (unify `Fn`→`Closure`, touches only the function
+value model). 1b and 2 are independent and can land in either order, but both
+precede **3b** (3b sets the first non-undefined `this`, which is when 1b's capture
+wiring must already be correct): 3b depends on 1b + 2 + 3a. **4b** depends on
+4a + 3b. **5** depends on 3b + 4a (its `Bound` checklist and `.call`/`.apply`
+receiver test assume the unified `Closure`). 6 depends on 3b + 5. 7 depends on 4b
+(and 5 if methods-as-values appear in class bodies). The **minimum coherent
+system** is Steps 1–4; 5–7 are the deferred items folded into the same substrate
+so they never become one-off bolt-ons.
 
 ## Divergences from JS (record in the divergence list as they land)
 
@@ -745,6 +810,15 @@ items folded into the same substrate so they never become one-off bolt-ons.
   the prototype function. Accepted.
 - **No `[[Set]]` traps / accessors.** Own-property assignment only; no
   getters/setters in the MVP.
+- **`F.prototype` is mutable but not reassignable.** `F.prototype.m = …` works
+  (mutating the prototype object); `F.prototype = wholeObj` is unsupported. JS
+  allows the latter for plain functions but forbids it for classes (non-writable),
+  so the MVP follows the class rule uniformly.
+- **Prototype methods are enumerable.** `ObjData.map` has no enumerability flag,
+  so methods placed on a prototype are enumerable — unlike JS class methods
+  (non-enumerable). Invisible to `JSON.stringify` (methods aren't *own*
+  properties), but a chain-walking `for-in`/key enumeration over an instance would
+  surface them, where JS hides them.
 - **Computed keys reach only own/proto properties.** `recv[k](…)` binds `this`
   and resolves user methods on `Object` receivers, but a computed key naming a
   *builtin* method (`arr["push"]()`) fails — builtins aren't stored properties,
