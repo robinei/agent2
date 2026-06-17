@@ -7,9 +7,9 @@ use crate::testutil::eval;
 
 #[test]
 fn unsupported_statement_errors() {
-    let errs = compile("class C {}").expect_err("should not compile");
+    let errs = compile("foo: for (;;) {}").expect_err("should not compile");
     assert_eq!(errs.len(), 1);
-    let rendered = errs[0].render("class C {}");
+    let rendered = errs[0].render("foo: for (;;) {}");
     assert!(rendered.starts_with("1:1: "), "got: {rendered}");
 }
 
@@ -34,7 +34,7 @@ fn diagnostics_for_unsupported() {
         "Math.pow(1);",
         "f(...args);",
         "new Foo();",
-        "class C {}",
+        "class C extends B {}",
     ] {
         assert!(compile(src).is_err(), "expected `{src}` to fail to compile");
     }

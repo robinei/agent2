@@ -133,10 +133,10 @@ impl<'src> super::Compiler<'src> {
             }
             ast::Statement::TryStatement(s) => self.compile_try(s),
 
+            // Phase 13 Step 7a — plain class (constructor + methods + fields).
+            ast::Statement::ClassDeclaration(c) => self.compile_class_decl(c),
+
             // Out of scope — informative errors.
-            ast::Statement::ClassDeclaration(s) => {
-                self.error(s.span.start, "`class` is not supported")
-            }
             ast::Statement::LabeledStatement(s) => {
                 self.error(s.span.start, "labeled statements are not supported")
             }

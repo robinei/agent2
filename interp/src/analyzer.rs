@@ -1150,6 +1150,23 @@ impl Analyzer {
                 let child = self.build_function_scope(f, true, scopes);
                 scope.children.push(child);
             }
+            ast::Statement::ClassDeclaration(c) => {
+                // A class declaration binds its name (block-scoped, like `let`)
+                // in the enclosing scope, then builds its constructor/method
+                // scopes.
+                if let Some(id) = &c.id {
+                    self.analyze_register_name(
+                        id.name.as_str(),
+                        id.span.start,
+                        false,
+                        false,
+                        scope,
+                        block_scopes,
+                        next_slot,
+                    );
+                }
+                self.build_class_scopes(c, scope, scopes);
+            }
             ast::Statement::BlockStatement(block) => {
                 block_scopes.push(IndexMap::new());
                 self.analyze_stmts(&block.body, scope, block_scopes, next_slot, scopes);
@@ -1665,6 +1682,11 @@ impl Analyzer {
                 let child = self.build_arrow_scope(a, scopes);
                 scope.children.push(child);
             }
+            ast::Expression::ClassExpression(c) => {
+                // A class expression binds no name in the enclosing scope; just
+                // build its constructor/method scopes.
+                self.build_class_scopes(c, scope, scopes);
+            }
             ast::Expression::NewExpression(n) => {
                 // Visit the callee (Step 4b: user functions can now appear in
                 // `new` expressions) and all arguments so their references
@@ -1911,7 +1933,7 @@ impl Analyzer {
             scope.uses_arguments = true;
         }
         let body = func.body.as_ref().map(|b| &b.statements[..]).unwrap_or(&[]);
-        self.analyze_function_body(&mut scope, &func.params, body, scopes);
+        self.analyze_function_body(&mut scope, Some(&func.params), body, &[], scopes);
         self.push_scope(scope, scopes)
     }
 
@@ -1936,8 +1958,115 @@ impl Analyzer {
         if arrow.params.rest.is_some() {
             scope.uses_arguments = true;
         }
-        self.analyze_function_body(&mut scope, &arrow.params, &arrow.body.statements, scopes);
+        self.analyze_function_body(
+            &mut scope,
+            Some(&arrow.params),
+            &arrow.body.statements,
+            &[],
+            scopes,
+        );
         self.push_scope(scope, scopes)
+    }
+
+    /// Build the constructor and method `FuncScope`s for a class and attach them
+    /// as children of the enclosing `scope` (so capture/parent resolution treats
+    /// them like any nested function). Instance fields are gathered here and their
+    /// initializers analyzed inside the constructor scope. The class *name* (if
+    /// any) is registered by the caller; this only builds the function scopes.
+    fn build_class_scopes(
+        &mut self,
+        class: &ast::Class,
+        scope: &mut FuncScope,
+        scopes: &mut Vec<FuncScope>,
+    ) {
+        // Gather the explicit constructor (if any) and the instance-field
+        // initializer expressions, in declaration order.
+        let mut ctor: Option<&ast::Function> = None;
+        let mut field_inits: Vec<&ast::Expression> = Vec::new();
+        for el in &class.body.body {
+            match el {
+                ast::ClassElement::MethodDefinition(m)
+                    if m.kind == ast::MethodDefinitionKind::Constructor =>
+                {
+                    ctor = Some(&m.value);
+                }
+                ast::ClassElement::PropertyDefinition(p) if !p.r#static => {
+                    if let Some(init) = &p.value {
+                        field_inits.push(init);
+                    }
+                }
+                _ => {}
+            }
+        }
+        // The constructor (explicit, or synthetic with just the field inits).
+        let ctor_scope = self.build_constructor_scope(class, ctor, &field_inits, scopes);
+        scope.children.push(ctor_scope);
+        // Each non-constructor method is an ordinary (non-arrow) function scope.
+        for el in &class.body.body {
+            if let ast::ClassElement::MethodDefinition(m) = el
+                && m.kind != ast::MethodDefinitionKind::Constructor
+            {
+                let child = self.build_function_scope(&m.value, false, scopes);
+                scope.children.push(child);
+            }
+        }
+    }
+
+    /// Build the constructor `FuncScope` for a class. With an explicit
+    /// `constructor` method, it is that method's function scope; otherwise a
+    /// synthetic zero-param scope keyed by the class node's span (so codegen can
+    /// find it via `scope_for_node(class.span)`). Instance-field initializers are
+    /// analyzed *in the constructor scope* (they run as a prologue with `this`
+    /// bound), so a field initializer's `this`/captures resolve there — including
+    /// reify-on-capture when a field's nested arrow references `this`.
+    fn build_constructor_scope(
+        &mut self,
+        class: &ast::Class,
+        ctor: Option<&ast::Function>,
+        field_inits: &[&ast::Expression],
+        scopes: &mut Vec<FuncScope>,
+    ) -> usize {
+        let label = self.new_label();
+        match ctor {
+            Some(func) => {
+                let params = self.collect_params(&func.params);
+                let mut scope = FuncScope::new(
+                    usize::MAX,
+                    label,
+                    func.span.start,
+                    func.span.end,
+                    params,
+                    None,
+                    false,
+                );
+                if func.params.rest.is_some() {
+                    scope.uses_arguments = true;
+                }
+                let body = func.body.as_ref().map(|b| &b.statements[..]).unwrap_or(&[]);
+                self.analyze_function_body(
+                    &mut scope,
+                    Some(&func.params),
+                    body,
+                    field_inits,
+                    scopes,
+                );
+                self.push_scope(scope, scopes)
+            }
+            None => {
+                // Default constructor: no params, no body — just the field inits.
+                let mut scope = FuncScope::new(
+                    usize::MAX,
+                    label,
+                    class.span.start,
+                    class.span.end,
+                    Vec::new(),
+                    None,
+                    false,
+                );
+                self.analyze_function_body(&mut scope, None, &[], field_inits, scopes);
+                self.push_scope(scope, scopes)
+            }
+        }
     }
 
     /// Shared body of `build_function_scope` / `build_arrow_scope`: seed the
@@ -1945,8 +2074,9 @@ impl Analyzer {
     fn analyze_function_body(
         &mut self,
         scope: &mut FuncScope,
-        params: &ast::FormalParameters,
+        params: Option<&ast::FormalParameters>,
         body: &[ast::Statement],
+        field_inits: &[&ast::Expression],
         scopes: &mut Vec<FuncScope>,
     ) {
         let mut block_scopes: BlockScopes = vec![IndexMap::new()];
@@ -1976,47 +2106,58 @@ impl Analyzer {
                 },
             );
         }
-        // Destructuring params: each pattern's bindings are ordinary own locals
-        // (the compiler's prologue destructures the anonymous param slot into
-        // them). This also analyzes inner pattern defaults (`{a = 1}`).
-        for p in &params.items {
-            if !matches!(&p.pattern, ast::BindingPattern::BindingIdentifier(_)) {
-                self.analyze_declare_pattern(
-                    &p.pattern,
-                    false,
-                    false,
-                    scope,
-                    &mut block_scopes,
-                    &mut next_slot,
-                    scopes,
-                );
+        // Param patterns (skipped entirely for a default constructor, which has
+        // no params node).
+        if let Some(params) = params {
+            // Destructuring params: each pattern's bindings are ordinary own
+            // locals (the compiler's prologue destructures the anonymous param
+            // slot into them). This also analyzes inner pattern defaults
+            // (`{a = 1}`).
+            for p in &params.items {
+                if !matches!(&p.pattern, ast::BindingPattern::BindingIdentifier(_)) {
+                    self.analyze_declare_pattern(
+                        &p.pattern,
+                        false,
+                        false,
+                        scope,
+                        &mut block_scopes,
+                        &mut next_slot,
+                        scopes,
+                    );
+                }
             }
-        }
-        if let Some(rest) = &params.rest {
-            if !matches!(
-                &rest.rest.argument,
-                ast::BindingPattern::BindingIdentifier(_)
-            ) {
-                self.analyze_declare_pattern(
+            if let Some(rest) = &params.rest {
+                if !matches!(
                     &rest.rest.argument,
-                    false,
-                    false,
-                    scope,
-                    &mut block_scopes,
-                    &mut next_slot,
-                    scopes,
-                );
+                    ast::BindingPattern::BindingIdentifier(_)
+                ) {
+                    self.analyze_declare_pattern(
+                        &rest.rest.argument,
+                        false,
+                        false,
+                        scope,
+                        &mut block_scopes,
+                        &mut next_slot,
+                        scopes,
+                    );
+                }
             }
-        }
-        // Param default expressions (`function f(a, b = a)`) — params are now in
-        // scope, so a default may reference an earlier one.
-        for p in &params.items {
-            if let Some(init) = &p.initializer {
-                self.analyze_expr(init, scope, &mut block_scopes, scopes);
+            // Param default expressions (`function f(a, b = a)`) — params are now
+            // in scope, so a default may reference an earlier one.
+            for p in &params.items {
+                if let Some(init) = &p.initializer {
+                    self.analyze_expr(init, scope, &mut block_scopes, scopes);
+                }
             }
         }
         self.analyze_hoist(body, scope, &mut block_scopes, &mut next_slot);
         self.analyze_stmts(body, scope, &mut block_scopes, &mut next_slot, scopes);
+        // Instance-field initializers (class only): analyzed in the constructor
+        // scope, after the body's bindings, so a field's `this`/captures resolve
+        // here. They declare no locals of their own.
+        for init in field_inits {
+            self.analyze_expr(init, scope, &mut block_scopes, scopes);
+        }
         self.loop_depth = saved_loop_depth;
         scope.own_local_count = next_slot;
     }

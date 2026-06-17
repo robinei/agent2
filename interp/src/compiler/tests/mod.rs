@@ -2,6 +2,7 @@ use super::*;
 use crate::vm::{StepResult, VM};
 
 pub mod async_await;
+pub mod classes;
 pub mod codegen_shape;
 pub mod control_flow;
 pub mod debuginfo;

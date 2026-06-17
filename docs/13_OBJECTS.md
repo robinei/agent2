@@ -799,19 +799,25 @@ with `instanceof`** — land **Step 8** alongside it.
   `C.prototype` via 4b's callable-`ObjGet` arm, lazily allocating it).
 - **Fields** (`x = 1`): prepend `this.x = <init>` to the *front* of the
   constructor body, in field order (`LoadThis` + `ObjSet`; no synthetic AST).
+  Because the inits are prepended *into the constructor scope*, a field
+  initializer's references (and any nested-arrow `this` capture) resolve there —
+  one consequence is that an initializer can see the constructor's params, where
+  JS evaluates instance fields in their own scope with no param access. Accepted
+  MVP divergence (the direct-prepend lowering is the point).
 - **`static` / getters / setters:** **reject in the MVP** with an
   alternative-naming diagnostic. Keeps the surface small; revisit on evidence.
+  Computed (`[expr]`) and private (`#x`) member names are likewise rejected.
 
 Acceptance (7a):
-- [ ] A `class` with a constructor + method compiles to bytecode behaving
+- [x] A `class` with a constructor + method compiles to bytecode behaving
       identically to its hand-written `function`+`prototype` form (shared test
       body run both ways).
-- [ ] Fields initialize on construction, in declaration order, before the
+- [x] Fields initialize on construction, in declaration order, before the
       constructor body.
-- [ ] `new C() instanceof C` is `true` (with Step 8).
-- [ ] Rejected sugar (`static`, get/set) has an alternative-naming diagnostic,
+- [x] `new C() instanceof C` is `true` (with Step 8).
+- [x] Rejected sugar (`static`, get/set) has an alternative-naming diagnostic,
       not a parser panic; diagnostics carry the real class-node spans.
-- [ ] Gate: `cargo fmt && cargo clippy && cargo test` green.
+- [x] Gate: `cargo fmt && cargo clippy && cargo test` green.
 
 ### Step 7b — `extends` / `super`
 

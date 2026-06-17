@@ -5,7 +5,7 @@ use oxc_span::GetSpan;
 
 use crate::analyzer::frame_abs;
 use crate::builtin::Builtin;
-use crate::vm::{Instr, LocalIndex, SlotKind};
+use crate::vm::{Instr, LocalIndex, RcStr, SetMode, SlotKind};
 
 impl<'src> super::Compiler<'src> {
     /// Hoist function declarations in the current scope's prologue: emit each
@@ -96,7 +96,14 @@ impl<'src> super::Compiler<'src> {
             return;
         };
         if let Some(body) = &f.body {
-            self.emit_function_def(scope_id, &body.statements, &f.params, f.span.start, false);
+            self.emit_function_def(
+                scope_id,
+                &body.statements,
+                Some(&f.params),
+                &[],
+                f.span.start,
+                false,
+            );
         }
     }
 
@@ -111,7 +118,14 @@ impl<'src> super::Compiler<'src> {
         };
         self.emit_closure_value(scope_id, span);
         if let Some(body) = &func.body {
-            self.emit_function_def(scope_id, &body.statements, &func.params, span, false);
+            self.emit_function_def(
+                scope_id,
+                &body.statements,
+                Some(&func.params),
+                &[],
+                span,
+                false,
+            );
         }
     }
 
@@ -127,7 +141,8 @@ impl<'src> super::Compiler<'src> {
         self.emit_function_def(
             scope_id,
             &arrow.body.statements,
-            &arrow.params,
+            Some(&arrow.params),
+            &[],
             span,
             is_expression_body,
         );
@@ -150,11 +165,25 @@ impl<'src> super::Compiler<'src> {
         }
         match init {
             ast::Expression::ArrowFunctionExpression(a) => {
-                self.emit_function_def(scope_id, &a.body.statements, &a.params, span, a.expression);
+                self.emit_function_def(
+                    scope_id,
+                    &a.body.statements,
+                    Some(&a.params),
+                    &[],
+                    span,
+                    a.expression,
+                );
             }
             ast::Expression::FunctionExpression(f) => {
                 if let Some(body) = &f.body {
-                    self.emit_function_def(scope_id, &body.statements, &f.params, span, false);
+                    self.emit_function_def(
+                        scope_id,
+                        &body.statements,
+                        Some(&f.params),
+                        &[],
+                        span,
+                        false,
+                    );
                 }
             }
             _ => unreachable!(),
@@ -192,7 +221,8 @@ impl<'src> super::Compiler<'src> {
         &mut self,
         scope_id: usize,
         body_stmts: &[ast::Statement],
-        params: &ast::FormalParameters,
+        params: Option<&ast::FormalParameters>,
+        field_inits: &[(RcStr, Option<&ast::Expression>)],
         span: u32,
         is_expression_body: bool,
     ) {
@@ -290,65 +320,76 @@ impl<'src> super::Compiler<'src> {
             self.emit(Instr::SetLocal(abs_slot as LocalIndex), span);
         }
 
-        // Per-parameter prologue: apply defaults (the arg is already in the slot)
-        // and box captured params in place. Plain params with no default need no
-        // code — their value is already in the local slot.  Skip the rest param
-        // (if any) — it is handled separately below.
-        for (p_idx, param_info) in params_info.iter().enumerate() {
-            if param_info.is_rest {
-                continue;
-            }
-            let slot = p_idx as u32; // params occupy slots 0..nparams
-            let item = &params.items[p_idx];
-            if matches!(&item.pattern, ast::BindingPattern::BindingIdentifier(_)) {
-                let needs_box = matches!(slot_kinds.get(p_idx).copied(), Some(SlotKind::Boxed));
-                let default_expr = item.initializer.as_ref().map(|v| &**v);
-                self.emit_param_setup(slot, needs_box, param_info.has_default, default_expr, span);
-            } else {
-                // Destructuring param: the argument sits in an anonymous slot
-                // (never captured — its name is not a legal identifier). Load
-                // it, apply the whole-pattern default, and run the normal
-                // pattern lowering into the leaf bindings (own locals; captured
-                // ones got their cells from `EnterFrame`, and `SetLocal`
-                // writes through cells).
-                let pat_span = item.span.start;
-                self.emit(Instr::GetLocal(slot as LocalIndex), pat_span);
-                if let Some(default) = &item.initializer {
-                    self.emit_default(default, pat_span);
+        // Per-parameter prologue (only when there is a params node; a synthetic
+        // default constructor has none, and `params_info` is empty). Apply
+        // defaults (the arg is already in the slot) and box captured params in
+        // place. Plain params with no default need no code — their value is
+        // already in the local slot.  Skip the rest param (if any) — it is
+        // handled separately below.
+        if let Some(params) = params {
+            for (p_idx, param_info) in params_info.iter().enumerate() {
+                if param_info.is_rest {
+                    continue;
                 }
-                self.destructure_binding(&item.pattern, pat_span);
+                let slot = p_idx as u32; // params occupy slots 0..nparams
+                let item = &params.items[p_idx];
+                if matches!(&item.pattern, ast::BindingPattern::BindingIdentifier(_)) {
+                    let needs_box = matches!(slot_kinds.get(p_idx).copied(), Some(SlotKind::Boxed));
+                    let default_expr = item.initializer.as_ref().map(|v| &**v);
+                    self.emit_param_setup(
+                        slot,
+                        needs_box,
+                        param_info.has_default,
+                        default_expr,
+                        span,
+                    );
+                } else {
+                    // Destructuring param: the argument sits in an anonymous slot
+                    // (never captured — its name is not a legal identifier). Load
+                    // it, apply the whole-pattern default, and run the normal
+                    // pattern lowering into the leaf bindings (own locals; captured
+                    // ones got their cells from `EnterFrame`, and `SetLocal`
+                    // writes through cells).
+                    let pat_span = item.span.start;
+                    self.emit(Instr::GetLocal(slot as LocalIndex), pat_span);
+                    if let Some(default) = &item.initializer {
+                        self.emit_default(default, pat_span);
+                    }
+                    self.destructure_binding(&item.pattern, pat_span);
+                }
             }
-        }
 
-        // Rest parameter: build the rest array from `arguments.slice(nregular)`.
-        // `EnterFrame` eagerly built the arguments cache (see uses_arguments above)
-        // from ALL caller args before truncating to nparams, so `arguments` always
-        // holds the full argument list.  `arguments.slice(nregular)` gives the
-        // surplus elements that become the rest array.
-        if has_rest {
-            let rest_slot = nregular as u32;
-            self.emit(Instr::Arguments, span);
-            self.emit(Instr::PushPosInt(nregular as u64), span);
-            self.emit(Instr::CallBuiltin(Builtin::StrSlice, 2), span);
-            let rest_pat = &params
-                .rest
-                .as_ref()
-                .expect("has_rest implies rest")
-                .rest
-                .argument;
-            if matches!(rest_pat, ast::BindingPattern::BindingIdentifier(_)) {
-                let needs_box = matches!(
-                    slot_kinds.get(rest_slot as usize).copied(),
-                    Some(SlotKind::Boxed)
-                );
-                self.emit(Instr::SetLocal(rest_slot as LocalIndex), span);
-                if needs_box {
-                    self.emit(Instr::FreshCell(rest_slot as LocalIndex), span);
+            // Rest parameter: build the rest array from `arguments.slice(nregular)`.
+            // `EnterFrame` eagerly built the arguments cache (see uses_arguments
+            // above) from ALL caller args before truncating to nparams, so
+            // `arguments` always holds the full argument list.
+            // `arguments.slice(nregular)` gives the surplus elements that become
+            // the rest array.
+            if has_rest {
+                let rest_slot = nregular as u32;
+                self.emit(Instr::Arguments, span);
+                self.emit(Instr::PushPosInt(nregular as u64), span);
+                self.emit(Instr::CallBuiltin(Builtin::StrSlice, 2), span);
+                let rest_pat = &params
+                    .rest
+                    .as_ref()
+                    .expect("has_rest implies rest")
+                    .rest
+                    .argument;
+                if matches!(rest_pat, ast::BindingPattern::BindingIdentifier(_)) {
+                    let needs_box = matches!(
+                        slot_kinds.get(rest_slot as usize).copied(),
+                        Some(SlotKind::Boxed)
+                    );
+                    self.emit(Instr::SetLocal(rest_slot as LocalIndex), span);
+                    if needs_box {
+                        self.emit(Instr::FreshCell(rest_slot as LocalIndex), span);
+                    }
+                } else {
+                    // Pattern rest (`...[a, b]`): destructure the freshly built
+                    // array directly; the anonymous rest slot stays undefined.
+                    self.destructure_binding(rest_pat, rest_pat.span().start);
                 }
-            } else {
-                // Pattern rest (`...[a, b]`): destructure the freshly built
-                // array directly; the anonymous rest slot stays undefined.
-                self.destructure_binding(rest_pat, rest_pat.span().start);
             }
         }
 
@@ -364,6 +405,20 @@ impl<'src> super::Compiler<'src> {
 
         // Inner function declarations: emit their bindings in this prologue.
         self.hoist_function_decls(body_stmts);
+
+        // Instance-field initializers (class constructors only): `this.<name> =
+        // <init>`, in declaration order, prepended to the constructor body (after
+        // params are set up, before user statements). `ObjSet` leaves the value,
+        // so discard it.
+        for (name, init) in field_inits {
+            self.emit(Instr::LoadThis, span);
+            match init {
+                Some(e) => self.compile_expr(e),
+                None => self.emit(Instr::PushUndefined, span),
+            }
+            self.emit(Instr::ObjSet(name.clone(), SetMode::New), span);
+            self.emit(Instr::Pop(1), span);
+        }
 
         if is_expression_body && body_stmts.len() == 1 {
             if let ast::Statement::ExpressionStatement(es) = &body_stmts[0] {

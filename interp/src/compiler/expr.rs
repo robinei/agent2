@@ -140,6 +140,7 @@ impl<'src> super::Compiler<'src> {
                     self.compile_new_call(n);
                 }
             }
+            ast::Expression::ClassExpression(c) => self.compile_class_expr(c, c.span.start),
             other => self.error(other.span().start, "unsupported expression"),
         }
     }
