@@ -38,7 +38,7 @@ impl<'src> super::Compiler<'src> {
                     if let Some(slot) = self.binding_slot(id.span.start) {
                         let span = f.span.start;
                         if captures.is_empty() {
-                            self.emit(Instr::PushFn(label), span);
+                            self.emit(Instr::PushFn(label, u32::MAX), span);
                         } else {
                             self.emit(
                                 Instr::ClosureNew(
@@ -171,7 +171,7 @@ impl<'src> super::Compiler<'src> {
             (child.label, child.captures.clone())
         };
         if captures.is_empty() {
-            self.emit(Instr::PushFn(label), span);
+            self.emit(Instr::PushFn(label, u32::MAX), span);
         } else {
             self.emit(
                 Instr::ClosureNew(label, captures.iter().map(|&c| c as LocalIndex).collect()),
@@ -358,7 +358,7 @@ impl<'src> super::Compiler<'src> {
         // (static self-recursion), so the self-slot is dead — skip the setup.
         if self_name.is_some() && !self.is_const_fn_scope(scope_id) {
             let self_slot = frame_abs(own_local_count, nparams, upval_count);
-            self.emit(Instr::PushFn(label), span);
+            self.emit(Instr::PushFn(label, u32::MAX), span);
             self.emit(Instr::SetLocal(self_slot as LocalIndex), span);
         }
 

@@ -75,8 +75,9 @@ impl<'src> super::Compiler<'src> {
                 Value::Float(f) => Instr::PushFloat(f),
                 _ => unreachable!("f64_to_value yields an int or float"),
             },
-            // A constant function (Phase F): its value is its code address.
-            ConstValue::Fn { label, .. } => Instr::PushFn(*label),
+            // A constant function (Phase F): its value is its code address,
+            // with the canonical closure ptr patched during `for_program_with`.
+            ConstValue::Fn { label, .. } => Instr::PushFn(*label, 0),
         }
     }
 

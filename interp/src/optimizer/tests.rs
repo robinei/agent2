@@ -243,7 +243,7 @@ fn cfg_collapses_chain_of_empty_blocks() {
 #[test]
 fn cfg_keeps_call_referenced_block() {
     let code = vec![
-        Instr::PushFn(0),
+        Instr::PushFn(0, u32::MAX),
         Instr::Pop(1),
         Instr::Return(0),
         Instr::Label(0),

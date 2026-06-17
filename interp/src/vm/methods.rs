@@ -3,6 +3,7 @@ use super::*;
 use crate::diag::Diagnostic;
 use crate::vm::value::MapKey;
 use indexmap::IndexSet;
+use std::collections::HashMap;
 
 impl VM {
     pub fn new(code: Vec<Instr>) -> Self {
@@ -29,7 +30,7 @@ impl VM {
                 return_addr: 0,
                 prev_fp: 0,
                 arguments_cache: None,
-                pending_upvals: SmallVec::new(),
+                pending_closure: u32::MAX,
                 this_val: Value::Undefined,
                 completion: Completion::Normal,
             }],
@@ -289,6 +290,26 @@ impl VM {
         attachments: serde_json::Value,
     ) -> Result<Self, VMError> {
         let mut vm = VM::new(program.code);
+        // Allocate one canonical `Closure` per unique `PushFn` code address
+        // for non-capturing functions, so that `f === f` holds (same ptr every
+        // push). The ptr is baked into the instruction; no runtime addr→ptr map.
+        {
+            let mut canonical: std::collections::HashMap<CodeAddr, ClosurePtr> =
+                std::collections::HashMap::new();
+            for instr in &mut vm.code {
+                if let Instr::PushFn(addr, ptr) = instr {
+                    let cptr = *canonical.entry(*addr).or_insert_with(|| {
+                        let idx = vm.closures.len() as ClosurePtr;
+                        vm.closures.push(Closure {
+                            upvals: ThinVec::new(),
+                            prototype: None,
+                        });
+                        idx
+                    });
+                    *ptr = cptr;
+                }
+            }
+        }
         vm.spans = program.spans;
         vm.source = program.source;
         vm.debug = program.debug;
@@ -671,11 +692,9 @@ impl VM {
         self.callstack.push(CallFrame {
             arg_count: cont.arg_count,
             local_count: cont.local_count,
-            // Unused: a ResolvePromise frame falls through to the scheduler
-            // on Return instead of jumping back to a caller.
             return_addr: 0,
             prev_fp: self.fp,
-            pending_upvals: SmallVec::new(),
+            pending_closure: u32::MAX,
             arguments_cache: cont.arguments_cache,
             this_val: Value::Undefined,
             completion: Completion::ResolvePromise(cont.promise),
@@ -854,8 +873,11 @@ impl VM {
 
     pub(super) fn alloc_closure(&mut self, addr: CodeAddr, upvals: ThinVec<Value>) -> Value {
         let idx = self.closures.len() as ClosurePtr;
-        self.closures.push(Closure { addr, upvals });
-        Value::Closure(idx)
+        self.closures.push(Closure {
+            upvals,
+            prototype: None,
+        });
+        Value::Closure { addr, ptr: idx }
     }
 
     /// Write the JS `ToString` representation of `val` into `buf`. Strings in
@@ -874,7 +896,7 @@ impl VM {
             Value::NegInt(i) => buf.push_str(&i.to_string()),
             Value::Float(n) => buf.push_str(&js_number_to_string(*n)),
             Value::String(s) => buf.push_str(s.as_str()),
-            Value::Fn(_) | Value::Builtin(_) => {
+            Value::Closure { .. } | Value::Builtin(_) => {
                 buf.push_str("function () { [native code] }");
             }
             Value::Upval(_) => {}
@@ -900,9 +922,6 @@ impl VM {
                 if !r.flags.as_str().is_empty() {
                     buf.push_str(r.flags.as_str());
                 }
-            }
-            Value::Closure(_) => {
-                buf.push_str("function () { [native code] }");
             }
             Value::Map(_) => buf.push_str("[object Map]"),
             Value::Set(_) => buf.push_str("[object Set]"),
@@ -1003,13 +1022,13 @@ impl VM {
             // A function/closure has no JSON representation, and an Upval marker
             // is an internal indirection that should never reach here: fail
             // loudly rather than silently dropping it.
-            Value::Fn(_) | Value::Builtin(_) | Value::Upval(_) => {
+            Value::Closure { .. } | Value::Builtin(_) | Value::Upval(_) => {
                 return Err(self.fail(
                     ErrorKind::ValueError,
                     format!("cannot serialize a {} to JSON", val.type_name()),
                 ));
             }
-            // A promise is a transient value (like Fn/Closure) with no JSON
+            // A promise is a transient value (like Closure) with no JSON
             // form. Reaching the persistence boundary with one is the classic
             // missing-`await` mistake, so say so.
             Value::Promise(_) => {
@@ -1072,8 +1091,6 @@ impl VM {
                 }
                 serde_json::Value::Object(map)
             }
-            // A closure has no JSON representation (see Fn above).
-            Value::Closure(_) => return Err(self.fail(ErrorKind::ValueError, "value error")),
             Value::RegExp(_) => {
                 return Err(self.fail(ErrorKind::ValueError, "cannot serialize a RegExp to JSON"));
             }
@@ -1226,7 +1243,7 @@ impl VM {
     /// on the stack in left-to-right order (arg 0 deepest), with the callable
     /// already popped.  `this_val` is the receiver for user functions/closures
     /// (set as the frame field); for builtins it is spliced as arg 0.
-    /// Handles `Builtin`, `Fn`, `Closure`, and non-callable.
+    /// Handles `Builtin`, `Closure`, and non-callable.
     pub(crate) fn dispatch_call(
         &mut self,
         callable: Value,
@@ -1235,7 +1252,6 @@ impl VM {
     ) -> Result<(), VMError> {
         match callable {
             Value::Builtin(b) => {
-                // Splice this_val as arg 0 for the builtin (structural convention).
                 let nargs_with_recv = if matches!(this_val, Value::Undefined) {
                     nargs
                 } else {
@@ -1245,24 +1261,13 @@ impl VM {
                 };
                 match b.call(self, nargs_with_recv) {
                     Ok(()) => self.ip += 1,
-                    // Method builtin landed on an Object receiver: re-route to the
-                    // object's own property. `reroute` (via `dispatch_call`) sets
-                    // `ip`, so we must not advance it here.
                     Err(e) if e.kind == ErrorKind::MethodOnObject => {
                         self.reroute_method_to_object(b, nargs, this_val)?;
                     }
                     Err(e) => return Err(e),
                 }
             }
-            Value::Fn(addr) => self.call_function(addr, nargs, SmallVec::new(), this_val)?,
-            Value::Closure(p) => {
-                let closure = self.closures.get(p as usize).ok_or_else(|| {
-                    self.fail_not_resumable(ErrorKind::ValueError, "bad closure pointer")
-                })?;
-                let addr = closure.addr;
-                let upvals: SmallVec<[Value; 8]> = closure.upvals.iter().cloned().collect();
-                self.call_function(addr, nargs, upvals, this_val)?
-            }
+            Value::Closure { addr, ptr } => self.call_function(addr, nargs, ptr, this_val)?,
             _ => {
                 let keep = self.stack.len().saturating_sub(nargs as usize);
                 self.stack.truncate(keep);
@@ -1277,23 +1282,20 @@ impl VM {
         &mut self,
         addr: CodeAddr,
         nargs: u32,
-        upvals: SmallVec<[Value; 8]>,
+        closure_ptr: ClosurePtr,
         this_val: Value,
     ) -> Result<(), VMError> {
         let addr = self.validate_func_addr(addr)?;
         if nargs as usize > self.stack.len() {
             return Err(self.fail(ErrorKind::StackUnderflow, "stack underflow"));
         }
-        // `fp` points at arg 0: the args ARE the callee's leading
-        // locals (slots 0..nargs). The prologue `EnterFrame` then
-        // normalizes them to exactly `nparams`. No copy.
         self.callstack.push(CallFrame {
             arg_count: nargs,
             local_count: nargs,
             return_addr: self.ip + 1,
             prev_fp: self.fp,
             arguments_cache: None,
-            pending_upvals: upvals,
+            pending_closure: closure_ptr,
             this_val,
             completion: Completion::Normal,
         });

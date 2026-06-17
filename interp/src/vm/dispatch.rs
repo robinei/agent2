@@ -1,4 +1,5 @@
 use super::*;
+use smallvec::SmallVec;
 
 /// The missing-`await` hint, appended to property/index access errors when
 /// the receiver is a promise — the misuse LLMs actually commit under this
@@ -245,8 +246,11 @@ impl VM {
                     self.stack.push(Value::Object(*h));
                     self.ip += 1;
                 }
-                Instr::PushFn(addr) => {
-                    self.stack.push(Value::Fn(*addr));
+                Instr::PushFn(addr, ptr) => {
+                    self.stack.push(Value::Closure {
+                        addr: *addr,
+                        ptr: *ptr,
+                    });
                     self.ip += 1;
                 }
                 Instr::PushBuiltin(b) => {
@@ -317,7 +321,7 @@ impl VM {
 
                 // ── control flow ─────────────────────────────────
                 Instr::Call(addr, nargs) => {
-                    self.call_function(*addr, *nargs, SmallVec::new(), Value::Undefined)?
+                    self.call_function(*addr, *nargs, u32::MAX, Value::Undefined)?
                 }
 
                 Instr::CallDyn(nargs, has_this) => {
@@ -387,16 +391,11 @@ impl VM {
 
                 Instr::ClosureNew(addr, captures) => {
                     let addr = self.validate_func_addr(*addr)?;
-                    // Collect into stack-allocated SmallVec instead of cloning
-                    // the ThinVec from self.code. LocalIndex is u32 (Copy).
                     let mut upvals: SmallVec<[Value; 8]> = SmallVec::new();
                     for slot in captures.iter() {
                         if (*slot as u32) >= self.cur_local_count {
                             return Err(self.fail(ErrorKind::BadLocal, "bad local"));
                         }
-                        // Copy the slot verbatim: a Boxed slot carries its Upval
-                        // handle (shared, by-reference), a Plain slot its value
-                        // (a by-value snapshot).
                         upvals.push(self.stack[(self.fp + *slot as u32) as usize].clone());
                     }
                     let closure = self.alloc_closure(addr, ThinVec::from(upvals.as_slice()));
@@ -547,11 +546,21 @@ impl VM {
                     }
                     // 3. Install the closure's captured environment as the upval
                     //    locals, now landing at [fp + nparams, fp + nparams + K).
-                    let upvals =
-                        std::mem::take(&mut self.callstack.last_mut().unwrap().pending_upvals);
-                    let k = upvals.len() as u32;
-                    for uv in upvals {
-                        self.stack.push(uv);
+                    //    Read from `closures[ptr]` only when the callee has upvals
+                    //    (a non-capturing function has empty upvals; the sentinel 0
+                    //    is used for bare-addressed calls that have no heap entry).
+                    let ptr = self
+                        .callstack
+                        .last()
+                        .map_or(u32::MAX, |f| f.pending_closure);
+                    let mut k: u32 = 0;
+                    if ptr != u32::MAX {
+                        if let Some(closure) = self.closures.get(ptr as usize) {
+                            for uv in &closure.upvals {
+                                self.stack.push(uv.clone());
+                            }
+                            k = closure.upvals.len() as u32;
+                        }
                     }
                     // 4. Allocate the declared (non-param) own locals + self-ref
                     // slot (Boxed → fresh cell + Upval).
@@ -748,14 +757,13 @@ impl VM {
                         Value::Bool(_) => "boolean",
                         Value::Float(_) | Value::PosInt(_) | Value::NegInt(_) => "number",
                         Value::String(_) => "string",
-                        Value::Fn(_) | Value::Builtin(_) => "function",
+                        Value::Closure { .. } | Value::Builtin(_) => "function",
                         Value::Array(_)
                         | Value::Object(_)
                         | Value::Promise(_)
                         | Value::RegExp(_)
                         | Value::Map(_)
                         | Value::Set(_) => "object",
-                        Value::Closure(_) => "function",
                         Value::Upval(_) => {
                             return Err(self.fail(ErrorKind::ValueError, "value error"));
                         }

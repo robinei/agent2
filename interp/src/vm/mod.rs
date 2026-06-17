@@ -18,7 +18,6 @@ use std::sync::Arc;
 use std::rc::Rc;
 
 use indexmap::{IndexMap, IndexSet};
-use smallvec::SmallVec;
 use thin_vec::ThinVec;
 
 use crate::compiler::Program;
@@ -375,11 +374,13 @@ pub struct CallFrame {
     local_count: u32,
     return_addr: CodeAddr,
     prev_fp: StackAddr,
-    /// A closure's captured environment, stashed by `CallDyn` and installed as
-    /// the callee's upval locals by the prologue `EnterFrame` (after the arg
-    /// region is normalized to `nparams`, so the upvals land at the right slots).
-    /// Empty for static `Call` and bare-`Fn` calls (no captures).
-    pending_upvals: SmallVec<[Value; 8]>,
+    /// A closure's captured environment, stashed by `CallDyn`/`Call` and
+    /// installed as the callee's upval locals by the prologue `EnterFrame`
+    /// (after the arg region is normalized to `nparams`). Points into
+    /// `closures`; the upvals are read lazily and only when the callee's
+    /// static upval count > 0. `u32::MAX` for bare-address calls and
+    /// non-capturing canonical closures (their heap entry has empty upvals).
+    pending_closure: ClosurePtr,
     /// Lazily-built, per-frame cache for the `arguments` array (its heap
     /// address). Built on the first `Instr::Arguments` in this frame and reused
     /// by later references, so repeated `arguments` uses don't re-materialize
@@ -480,12 +481,16 @@ pub enum ThrowOutcome {
     Uncaught(Value),
 }
 
-/// A heap-allocated closure value: a code address plus its captured
-/// environment. Built by `MakeClosure` and called through `CallDyn`.
+/// A heap-allocated closure value. `upvals` is the captured environment;
+/// `prototype` is lazily allocated on first `F.prototype` access (Stage 4b),
+/// `None` until then. The code address (`addr`) lives inline in
+/// `Value::Closure` so dispatch can jump directly without dereferencing
+/// this entry; this entry is read only by `EnterFrame` to install upvals
+/// (and only when the callee's static upval count > 0).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Closure {
-    pub addr: CodeAddr,
     pub upvals: ThinVec<Value>,
+    pub prototype: Option<ObjectPtr>,
 }
 
 /// State of one entry in the VM's `promises` heap. A promise is born

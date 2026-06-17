@@ -54,14 +54,17 @@ pub enum Value {
     /// `Local`/`SetLocal` dereference it transparently, so the marker never
     /// surfaces in expression temporaries, heap collections, or variables.
     Upval(instr::CellIndex),
-    Closure(instr::ClosurePtr),
-    /// A first-class function value: just a code address, with no captured
-    /// environment. Covers non-capturing lambdas and named functions passed as
-    /// values (dispatch tables, `map`/`filter` callbacks, etc.). Capturing
-    /// lambdas instead become a `Value::Closure` (a code address plus a
-    /// captured environment), built by `MakeClosure` and likewise called
-    /// through `CallDyn`.
-    Fn(CodeAddr),
+    /// A first-class function value. The inline `addr` enables `CallDyn` to
+    /// jump directly without a heap deref; `ptr` indexes into `closures` and
+    /// is dereferenced only to install upvals (and only when the function
+    /// captures — the count is known from the callee's metadata). Non-capturing
+    /// functions share a single canonical heap entry (same `ptr` on every
+    /// push, preserving `f === f` identity). Capturing functions get a fresh
+    /// `ptr` per instantiation via `ClosureNew`.
+    Closure {
+        addr: CodeAddr,
+        ptr: instr::ClosurePtr,
+    },
     /// A builtin stdlib function as a first-class value (`Math.max`, `arr.push`
     /// passed as a callback). Like `Fn`, it is callable (via `CallDyn`), is a
     /// "function" under `typeof`, compares by identity, and has no JSON form.
@@ -85,6 +88,10 @@ pub enum Value {
     /// SameValueZero equality. Indexes the VM's `sets` heap.
     Set(SetPtr),
 }
+
+// Value size is load-bearing: it determines max call size and stack density,
+// and Ptr-variant payloads must fit in 8 bytes alongside the 8-byte tag.
+const _: () = assert!(std::mem::size_of::<Value>() == 16);
 
 // ── MapKey: Value wrapper with SameValueZero Hash + Eq ──────
 
@@ -164,32 +171,28 @@ impl Hash for MapKey {
                 9u8.hash(state);
                 c.hash(state);
             }
-            Closure(p) => {
+            Closure { ptr, .. } => {
                 10u8.hash(state);
-                p.hash(state);
-            }
-            Fn(a) => {
-                11u8.hash(state);
-                a.hash(state);
+                ptr.hash(state);
             }
             Builtin(b) => {
-                12u8.hash(state);
+                11u8.hash(state);
                 (*b as u8).hash(state);
             }
             Promise(p) => {
-                13u8.hash(state);
+                12u8.hash(state);
                 p.hash(state);
             }
             RegExp(r) => {
-                14u8.hash(state);
+                13u8.hash(state);
                 std::ptr::hash(std::rc::Rc::as_ptr(&r.0), state);
             }
             Map(p) => {
-                15u8.hash(state);
+                14u8.hash(state);
                 p.hash(state);
             }
             Set(p) => {
-                16u8.hash(state);
+                15u8.hash(state);
                 p.hash(state);
             }
         }
@@ -215,8 +218,7 @@ impl Value {
             // All arrays/objects/closures/functions/promises are truthy.
             Value::Array(_)
             | Value::Object(_)
-            | Value::Closure(_)
-            | Value::Fn(_)
+            | Value::Closure { .. }
             | Value::Builtin(_)
             | Value::Promise(_)
             | Value::RegExp(_)
@@ -244,8 +246,7 @@ impl Value {
             Value::String(s) => Some(js_str_to_number(s)),
             Value::Array(_)
             | Value::Object(_)
-            | Value::Closure(_)
-            | Value::Fn(_)
+            | Value::Closure { .. }
             | Value::Builtin(_)
             | Value::Promise(_)
             | Value::RegExp(_)
@@ -305,8 +306,13 @@ impl Value {
             (Value::Float(a), Value::PosInt(b)) => !a.is_nan() && *a == (*b as f64),
             (Value::NegInt(a), Value::Float(b)) => !b.is_nan() && (*a as f64) == *b,
             (Value::Float(a), Value::NegInt(b)) => !a.is_nan() && *a == (*b as f64),
-            // Function values are equal iff they point at the same code address.
-            (Value::Fn(a), Value::Fn(b)) => a == b,
+            // Function values are equal iff they have the same code address
+            // and the same heap entry (the canonical-per-addr scheme gives
+            // identical ptrs for non-capturing functions; capturing functions
+            // get distinct ptrs per instantiation).
+            (Value::Closure { addr: a1, ptr: p1 }, Value::Closure { addr: a2, ptr: p2 }) => {
+                a1 == a2 && p1 == p2
+            }
             // Builtins compare by identity, like Fn.
             (Value::Builtin(a), Value::Builtin(b)) => a == b,
             // Strings are primitives: equal by *content*. `RcStr`'s `==` short-
@@ -314,11 +320,9 @@ impl Value {
             // (e.g. two clones of one literal) is O(1).
             (Value::String(a), Value::String(b)) => a == b,
             // Same heap address is the same object — JS reference identity, the
-            // only equality arrays/objects/closures get (`{a:1} === {a:1}` is
-            // false). A correct program never dangles (the heap only grows).
+            // only equality arrays/objects get (`{a:1} === {a:1}` is false).
             (Value::Array(p), Value::Array(q)) => p == q,
             (Value::Object(p), Value::Object(q)) => p == q,
-            (Value::Closure(p), Value::Closure(q)) => p == q,
             // Promises compare by identity: same heap entry, same promise.
             (Value::Promise(p), Value::Promise(q)) => p == q,
             // RegExp compares by pointer identity (RcRegExp's PartialEq uses
@@ -437,7 +441,7 @@ impl Value {
             Value::String(_) => "string",
             Value::Array(_) => "array",
             Value::Object(_) => "object",
-            Value::Fn(_) | Value::Builtin(_) | Value::Closure(_) => "function",
+            Value::Closure { .. } | Value::Builtin(_) => "function",
             Value::Promise(_) => "promise",
             Value::RegExp(_) => "object",
             Value::Map(_) => "map",

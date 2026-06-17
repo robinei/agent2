@@ -64,7 +64,7 @@ fn u(v: u64) -> Value {
 }
 /// A function value pointing at a code address.
 fn f(addr: u32) -> Value {
-    Value::Fn(addr)
+    Value::Closure { addr, ptr: addr }
 }
 fn b(v: bool) -> Value {
     Value::Bool(v)
@@ -765,7 +765,7 @@ fn call_dyn_indirect() {
     // [8] Return(1)
     assert_eq!(
         run(vec![
-            PushFn(5),
+            PushFn(5, u32::MAX),
             PushFloat(10.0),
             PushFloat(3.0),
             CallDyn(2, false),
@@ -815,7 +815,7 @@ fn call_spread_with_empty_array() {
 fn call_spread_with_fn() {
     // fn(a, b) = a - b, called as fn(...[10, 3])
     let code = vec![
-        PushFn(6), // callable below args array (addr of fn body)
+        PushFn(6, u32::MAX), // callable below args array (addr of fn body)
         PushFloat(10.0),
         PushFloat(3.0),
         ArrNew(2), // args array
@@ -857,7 +857,7 @@ fn arguments_builds_array_of_frame_args() {
     // [0] callable, [1..3] args, [4] CallDyn(3, false), [5] Return(1)
     // [6] Arguments (fn body), [7] Return(1)
     let mut vm = VM::new(vec![
-        PushFn(6),
+        PushFn(6, u32::MAX),
         PushFloat(10.0),
         PushFloat(20.0),
         PushFloat(30.0),
@@ -881,7 +881,7 @@ fn arguments_is_cached_within_a_frame() {
     // Two `Arguments` in the same frame yield the SAME heap pointer (the
     // per-frame cache), so `Eq` (reference equality for arrays) is true.
     let out = run(vec![
-        PushFn(4),
+        PushFn(4, u32::MAX),
         PushFloat(1.0),
         CallDyn(1, false),
         Return(1),
@@ -895,15 +895,21 @@ fn arguments_is_cached_within_a_frame() {
 
 #[test]
 fn call_dyn_bad_addr() {
-    let code = vec![PushFn(999), CallDyn(0, false)];
+    let code = vec![PushFn(999, u32::MAX), CallDyn(0, false)];
     assert!(matches!(run_err(code).kind, ErrorKind::BadCall));
 }
 
 #[test]
 fn fn_value_equality_and_json() {
     // Same address -> equal; different -> not.
-    assert_eq!(run(vec![PushFn(3), PushFn(3), Eq]), vec![b(true)]);
-    assert_eq!(run(vec![PushFn(3), PushFn(4), Eq]), vec![b(false)]);
+    assert_eq!(
+        run(vec![PushFn(3, u32::MAX), PushFn(3, u32::MAX), Eq]),
+        vec![b(true)]
+    );
+    assert_eq!(
+        run(vec![PushFn(3, u32::MAX), PushFn(4, u32::MAX), Eq]),
+        vec![b(false)]
+    );
 }
 
 // ── closures ──────────────────────────────────────────────────
@@ -1529,7 +1535,7 @@ fn typeof_tags() {
             Value::Float(f) => PushFloat(*f),
             Value::PosInt(u) => PushPosInt(*u),
             Value::NegInt(i) => PushNegInt(*i),
-            Value::Fn(a) => PushFn(*a),
+            Value::Closure { addr, .. } => PushFn(*addr, u32::MAX),
             _ => panic!("unexpected stack value"),
         };
         let out = run(vec![instr, TypeOf, ps(tag), Eq]);
@@ -2119,7 +2125,7 @@ fn alloc_breakdown() {
     {
         // Program: push Fn(3), CallDyn(0, false), Return(0) | PushPosInt(42), Return(1)
         let mut vm = VM::new(vec![
-            PushFn(3),
+            PushFn(3, u32::MAX),
             CallDyn(0, false),
             Return(0),
             PushPosInt(42),
@@ -2139,9 +2145,9 @@ fn alloc_breakdown() {
     alloc_counter::reset();
     {
         let mut vm = VM::new(vec![
-            PushFn(5),
+            PushFn(5, u32::MAX),
             CallDyn(0, false),
-            PushFn(5),
+            PushFn(5, u32::MAX),
             CallDyn(0, false),
             Return(0),
             PushPosInt(42),
@@ -2681,7 +2687,7 @@ fn type_name_covers_all_variants() {
     assert_eq!(Value::String("hi".into()).type_name(), "string");
     assert_eq!(Value::Array(0).type_name(), "array");
     assert_eq!(Value::Object(0).type_name(), "object");
-    assert_eq!(Value::Fn(0).type_name(), "function");
+    assert_eq!(Value::Closure { addr: 0, ptr: 0 }.type_name(), "function");
 }
 
 #[test]

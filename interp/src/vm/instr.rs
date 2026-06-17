@@ -55,17 +55,17 @@ pub enum SetMode {
 /// Instructions for a stack based language used for LLM composition of complex tool flows.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Instr {
-    PushUndefined,         // () -> undefined
-    PushNull,              // () -> null
-    PushBool(bool),        // () -> bool
-    PushPosInt(u64),       // () -> num
-    PushNegInt(i64),       // () -> num
-    PushFloat(f64),        // () -> num
-    PushStr(RcStr),        // () -> str
-    PushArray(ArrayPtr),   // () -> arr
-    PushObject(ObjectPtr), // () -> obj
-    PushFn(CodeAddr),      // () -> fn
-    PushBuiltin(Builtin),  // () -> builtin
+    PushUndefined,                // () -> undefined
+    PushNull,                     // () -> null
+    PushBool(bool),               // () -> bool
+    PushPosInt(u64),              // () -> num
+    PushNegInt(i64),              // () -> num
+    PushFloat(f64),               // () -> num
+    PushStr(RcStr),               // () -> str
+    PushArray(ArrayPtr),          // () -> arr
+    PushObject(ObjectPtr),        // () -> obj
+    PushFn(CodeAddr, ClosurePtr), // () -> fn
+    PushBuiltin(Builtin),         // () -> builtin
 
     Pop(usize),
 

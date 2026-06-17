@@ -203,8 +203,7 @@ pub fn preview(vm: &VM, v: &Value, max: usize) -> String {
             .stack_value_to_json(v, 0)
             .map(|j| j.to_string())
             .unwrap_or_else(|_| "<unrepresentable>".to_string()),
-        Value::Fn(a) => format!("fn@{a}"),
-        Value::Closure(p) => format!("closure#{p}"),
+        Value::Closure { addr, ptr } => format!("fn@{addr}#{ptr}"),
         Value::Builtin(b) => format!("{b:?}"),
         Value::Promise(p) => {
             let state = match vm.promises.get(*p as usize) {

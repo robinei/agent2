@@ -433,7 +433,7 @@ fn self_recursion_is_static_with_no_slot() {
 fn function_passed_as_value_is_fn_constant() {
     let prog =
         compile("function dbl(x){ return x * 2; } input.r = [1, 2, 3].map(dbl);").expect("ok");
-    assert!(prog.code.iter().any(|i| matches!(i, Instr::PushFn(_))));
+    assert!(prog.code.iter().any(|i| matches!(i, Instr::PushFn(..))));
     assert!(!prog.code.iter().any(|i| matches!(i, Instr::ClosureNew(..))));
     let vm = run_program(prog);
     match input_val(&vm, "r") {
