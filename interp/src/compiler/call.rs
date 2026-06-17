@@ -275,7 +275,15 @@ impl<'src> super::Compiler<'src> {
         let base = recv.is_some() as u32; // the receiver occupies one arity slot
         let argc = base + argv.len() as u32;
         let meta = builtin.meta();
-        if argc < meta.min_args || argc > meta.max_args {
+        // Compile-time arity lint — only for receiver-less builtins (namespace /
+        // global, e.g. `Math.max`). A *method* call's receiver type isn't known
+        // here: it may be an `Object` with a same-named own/proto property that
+        // shadows the builtin (with its own arity), so method arity is left to
+        // runtime — the handler runs for a matching receiver (leniently, as the
+        // runtime already does for `split`/`indexOf`…) and an `Object` receiver
+        // reroutes. This is why a wrong-arity method call no longer hard-errors
+        // at compile time.
+        if recv.is_none() && (argc < meta.min_args || argc > meta.max_args) {
             // Report the bounds without the implicit receiver, so the message
             // matches how the call is written in source.
             let lo = meta.min_args.saturating_sub(base);
@@ -511,15 +519,16 @@ impl<'src> super::Compiler<'src> {
             _ => {}
         }
         if let Some(builtin) = Builtin::for_method(method) {
-            let meta = builtin.meta();
-            let argc = 1 + argv.len() as u32; // receiver + explicit args
-            if argc >= meta.min_args && argc <= meta.max_args {
-                self.compile_builtin_call(builtin, Some(recv), argv, span, optional);
-                return;
-            }
-            // Arity doesn't match the builtin — the receiver may be an Object
-            // with a same-named own/proto property that shadows the builtin.
-            // Fall through to the dynamic path so the VM can reroute at runtime.
+            // Always emit the builtin call, regardless of arity. The runtime
+            // decides by receiver *type* (unknown here): a matching receiver runs
+            // the builtin (its own lenient/error behavior — the proper builtin
+            // arity error for a structural receiver, not a property-read error);
+            // an `Object` receiver reroutes (`MethodOnObject`) to a same-named
+            // own/proto property, which carries its own arity. So a prototype
+            // method sharing a builtin's name but not its arity still works
+            // without diverting structural-receiver calls to the dynamic path.
+            self.compile_builtin_call(builtin, Some(recv), argv, span, optional);
+            return;
         }
         // Not a known builtin method — treat as property access
         // followed by dynamic call (e.g. `state.add5(3)` where

@@ -1122,15 +1122,20 @@ mod tests {
 
     #[test]
     fn js_static_arity_is_strict_runtime_is_relaxed() {
-        // 'a,b'.split(',', 2, 3) still reaches a builtin — argc=4 > max=3 falls
-        // through to dynamic dispatch, errors at runtime.
-        let err = testutil::run_runtime_err("'a,b'.split(',', 2, 3);");
-        assert_eq!(err.kind, ErrorKind::TypeError);
-
-        // 'abc'.split() — acr=1 < min=2 falls through to dynamic dispatch,
-        // errors at runtime.
-        let err = testutil::run_runtime_err("'abc'.split();");
-        assert_eq!(err.kind, ErrorKind::TypeError);
+        // A method-name builtin call defers arity to runtime: for a matching
+        // (string) receiver it just runs the builtin, which is lenient
+        // (JS-faithful) — extra args ignored, missing optional args default.
+        // No compile error, no dynamic property-read error.
+        assert_eq!(
+            // extra 4th arg ignored; limit 2 keeps both parts
+            testutil::run_ret("return 'a,b'.split(',', 2, 3);"),
+            serde_json::json!(["a", "b"])
+        );
+        assert_eq!(
+            // missing separator → split yields [self]
+            testutil::run_ret("return 'abc'.split();"),
+            serde_json::json!(["abc"])
+        );
 
         // Runtime: calling split with only a receiver via direct VM call.
         let out = run_instrs(vec![

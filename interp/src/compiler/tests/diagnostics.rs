@@ -4,7 +4,6 @@
 use crate::compiler::compile;
 use crate::testutil;
 use crate::testutil::eval;
-use crate::vm::ErrorKind;
 
 #[test]
 fn unsupported_statement_errors() {
@@ -56,16 +55,21 @@ fn builtin_arity_is_enforced_from_meta() {
             "expected `{src}` to fail arity check"
         );
     }
-    // Receiver-based method calls that mismatch arity fall through to
-    // dynamic dispatch (the receiver may be an Object with a shadowing
-    // property). They no longer fail at compile time but error at runtime.
-    for src in ["\"x\".slice();", "\"x\".slice(1, 2, 3);", "[1].pop(2);"] {
-        assert!(
-            testutil::run_runtime_err(src).kind == ErrorKind::TypeError,
-            "expected `{src}` to fail at runtime"
-        );
+    // Receiver-based method calls defer arity to runtime (the receiver type —
+    // possibly an Object with a shadowing property — isn't known at compile
+    // time). For a matching structural receiver the builtin just runs,
+    // JS-leniently (extra args ignored, missing optional args default), so these
+    // compile *and* run without error — no compile-time arity error, no dynamic
+    // property-read error.
+    for src in [
+        "\"x\".slice();",
+        "\"x\".slice(1, 2, 3);",
+        "[1].pop(2);",
+        "[1].push();",
+    ] {
+        assert!(compile(src).is_ok(), "expected `{src}` to compile");
+        let _ = testutil::run_val(src); // runs without error
     }
-    assert!(compile("[1].push();").is_ok());
     let errs = compile("Math.pow(1, 2, 3);").expect_err("too many args");
     let msg = &errs[0].message;
     assert!(msg.contains("`pow`"), "got: {msg}");
