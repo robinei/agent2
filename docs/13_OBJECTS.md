@@ -607,6 +607,14 @@ Value::Bound(Rc<BoundFn>)
 // BoundFn { this_val: Value, bound_args: ThinVec<Value>, callable: Value }
 ```
 
+- **`bind` is a `Method`-kind builtin** (like `.call`/`.apply`): receiver = the
+  callable being bound, so a non-callable receiver is a `TypeError`. It splits its
+  args into `this_val` (arg 1) and `bound_args` (args 2+) and **constructs** the
+  `Value::Bound` — it does *not* invoke (the eager siblings `.call`/`.apply` do).
+  Re-binding (`g.bind(…)` where the receiver is itself a `Bound`) **flattens**
+  into a fresh `BoundFn` over the innermost `callable`, concatenating
+  `bound_args` and keeping the *first* `this_val` (JS: re-binding `this` is a
+  no-op).
 - **Immutable** `Rc`, inline like `RcStr`/`RcRegExp` (not an arena entry):
   bound functions are transient, and the arena never reclaims. The `Rc` graph
   is acyclic **by construction** — `BoundFn` has no interior mutability and
@@ -689,7 +697,8 @@ Acceptance:
 - [ ] `typeof`/equality/hash/JSON-rejection covered.
 - [ ] `f.call(t, a)` and `f.apply(t, [a])` both run `f` with `this === t`;
       `.apply` with a non-array second arg is a `TypeError`.
-- [ ] `.call`/`.apply` on a non-callable receiver is a `TypeError`.
+- [ ] `bind`/`.call`/`.apply` on a non-callable receiver is a `TypeError`;
+      `bind` constructs a `Bound` (doesn't invoke), `.call`/`.apply` invoke.
 - [ ] Bound ∘ spread composes: a bound function called with a spread
       (`g(...xs)` where `g = f.bind(null, p)`) runs `f(p, ...xs)` — bound args
       precede the spread args.
