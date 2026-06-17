@@ -103,6 +103,7 @@ impl<'src> super::Compiler<'src> {
                 &[],
                 f.span.start,
                 false,
+                false,
             );
         }
     }
@@ -125,6 +126,7 @@ impl<'src> super::Compiler<'src> {
                 &[],
                 span,
                 false,
+                false,
             );
         }
     }
@@ -145,6 +147,7 @@ impl<'src> super::Compiler<'src> {
             &[],
             span,
             is_expression_body,
+            false,
         );
     }
 
@@ -172,6 +175,7 @@ impl<'src> super::Compiler<'src> {
                     &[],
                     span,
                     a.expression,
+                    false,
                 );
             }
             ast::Expression::FunctionExpression(f) => {
@@ -182,6 +186,7 @@ impl<'src> super::Compiler<'src> {
                         Some(&f.params),
                         &[],
                         span,
+                        false,
                         false,
                     );
                 }
@@ -225,6 +230,7 @@ impl<'src> super::Compiler<'src> {
         field_inits: &[(RcStr, Option<&ast::Expression>)],
         span: u32,
         is_expression_body: bool,
+        defer_fields_after_super: bool,
     ) {
         let (
             label,
@@ -407,17 +413,12 @@ impl<'src> super::Compiler<'src> {
         self.hoist_function_decls(body_stmts);
 
         // Instance-field initializers (class constructors only): `this.<name> =
-        // <init>`, in declaration order, prepended to the constructor body (after
-        // params are set up, before user statements). `ObjSet` leaves the value,
-        // so discard it.
-        for (name, init) in field_inits {
-            self.emit(Instr::LoadThis, span);
-            match init {
-                Some(e) => self.compile_expr(e),
-                None => self.emit(Instr::PushUndefined, span),
-            }
-            self.emit(Instr::ObjSet(name.clone(), SetMode::New), span);
-            self.emit(Instr::Pop(1), span);
+        // <init>`, in declaration order. A base class runs them as a prologue
+        // (after params are set up, before user statements). A derived class
+        // (Step 7b) runs them *after* `super(...)` returns, so they can observe
+        // values the parent constructor set — emitted in the body loop below.
+        if !defer_fields_after_super {
+            self.emit_field_inits(field_inits, span);
         }
 
         if is_expression_body && body_stmts.len() == 1 {
@@ -426,8 +427,19 @@ impl<'src> super::Compiler<'src> {
                 self.emit(Instr::Return(1), span);
             }
         } else {
+            let mut fields_emitted = false;
             for stmt in body_stmts {
                 self.compile_stmt(stmt);
+                if defer_fields_after_super && !fields_emitted && Self::is_super_call_stmt(stmt) {
+                    self.emit_field_inits(field_inits, span);
+                    fields_emitted = true;
+                }
+            }
+            // A derived constructor with no `super(...)` statement we could find
+            // (e.g. inside a branch): fall back to emitting the field inits at the
+            // end so they still run.
+            if defer_fields_after_super && !fields_emitted {
+                self.emit_field_inits(field_inits, span);
             }
             self.emit(Instr::PushUndefined, span);
             self.emit(Instr::Return(1), span);
@@ -441,6 +453,43 @@ impl<'src> super::Compiler<'src> {
         self.const_env = prev_const_env;
         self.barriers = prev_barriers;
         self.return_spill = prev_return_spill;
+    }
+
+    /// Emit a class constructor's instance-field initializers: `this.<name> =
+    /// <init>` for each, in declaration order. `ObjSet` leaves the value, so it
+    /// is discarded. A field with no initializer stores `undefined`.
+    fn emit_field_inits(&mut self, field_inits: &[(RcStr, Option<&ast::Expression>)], span: u32) {
+        for (name, init) in field_inits {
+            self.emit(Instr::LoadThis, span);
+            match init {
+                Some(e) => self.compile_expr(e),
+                None => self.emit(Instr::PushUndefined, span),
+            }
+            self.emit(Instr::ObjSet(name.clone(), SetMode::New), span);
+            self.emit(Instr::Pop(1), span);
+        }
+    }
+
+    /// Whether a statement is a top-level `super(...)` call (an expression
+    /// statement whose expression, after stripping parentheses, is a call with a
+    /// `super` callee). Used to place a derived class's field inits right after
+    /// the `super()` call (Step 7b).
+    fn is_super_call_stmt(stmt: &ast::Statement) -> bool {
+        let ast::Statement::ExpressionStatement(es) = stmt else {
+            return false;
+        };
+        let mut expr = &es.expression;
+        while let ast::Expression::ParenthesizedExpression(p) = expr {
+            expr = &p.expression;
+        }
+        let ast::Expression::CallExpression(call) = expr else {
+            return false;
+        };
+        let mut callee = &call.callee;
+        while let ast::Expression::ParenthesizedExpression(p) = callee {
+            callee = &p.expression;
+        }
+        matches!(callee, ast::Expression::Super(_))
     }
 
     /// Emit per-parameter prologue code. The argument value is already in the

@@ -840,14 +840,36 @@ instance* as `this`, so it needs explicit mechanism:
   the front (a base class keeps 7a's front-prepend).
 
 Acceptance (7b):
-- [ ] `class P { constructor(x){ this.x = x } get(){ return this.x } }`
+- [x] `class P { constructor(x){ this.x = x } get(){ return this.x } }`
       `class C extends P { constructor(x){ super(x) } }` → `new C(7).get() === 7`
       (inherited method, `this` bound to the instance; `super` threads `this`).
-- [ ] `super.m()` calls the parent's `m` even when `C` overrides `m`.
-- [ ] a derived field initializes *after* `super()` (observable when it reads a
+- [x] `super.m()` calls the parent's `m` even when `C` overrides `m`.
+- [x] a derived field initializes *after* `super()` (observable when it reads a
       value `super()` set).
-- [ ] `new C() instanceof P` and `new C() instanceof C` are both `true` (Step 8).
-- [ ] Gate: `cargo fmt && cargo clippy && cargo test` green.
+- [x] `new C() instanceof P` and `new C() instanceof C` are both `true` (Step 8).
+- [x] Gate: `cargo fmt && cargo clippy && cargo test` green.
+
+**Implementation notes / MVP divergences (7b):**
+- **`super` is a captured binding, not a separate mechanism.** A `super`
+  reference resolves to the `extends` identifier (analyzer registers the `super`
+  node's span as a reference to that name), so the parent constructor is threaded
+  in as an ordinary upval. `super(args)` → `[this, Parent, args…]` +
+  `CallDyn(has_this=true)` (the parent runs with the instance as `this`, *not*
+  the `New` path). `super.m(args)` → `[this, Parent.prototype.m, args…]` +
+  `CallDyn(has_this=true)` (resolved on the parent prototype, skipping a `C`
+  override). The `super` context is lexical: inherited by nested arrows, cleared
+  on entering a nested non-arrow function, re-set per nested class.
+- **`extends` requires a plain identifier.** An expression superclass
+  (`extends mix(Base)`) is rejected, mirroring `new`'s static-callee rule.
+- **A derived class must declare an explicit `constructor`.** No default
+  forwarding constructor is synthesized (the `super` binding needs a real
+  constructor scope to capture the parent).
+- **Static inheritance is out of scope.** Only `C.prototype`'s `[[Prototype]]`
+  is linked to `Parent.prototype` (via the Step-8 `setPrototypeOf` primitive);
+  `C`'s own `[[Prototype]]` is not set to `Parent`.
+- **`super` binds by the superclass identifier name**, so a local in the
+  constructor/method that shadows that name would be picked up instead — an
+  accepted edge-case divergence of the capture-by-name lowering.
 
 ## Step 8 — prototype reflection: `instanceof`, `Object.getPrototypeOf`/`setPrototypeOf`
 

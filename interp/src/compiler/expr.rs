@@ -141,6 +141,11 @@ impl<'src> super::Compiler<'src> {
                 }
             }
             ast::Expression::ClassExpression(c) => self.compile_class_expr(c, c.span.start),
+            ast::Expression::Super(s) => self.error(
+                s.span.start,
+                "`super` is only valid as `super(...)` or `super.method(...)` \
+                 inside a derived class",
+            ),
             other => self.error(other.span().start, "unsupported expression"),
         }
     }

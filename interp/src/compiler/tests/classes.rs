@@ -190,13 +190,136 @@ fn class_expression_binds_to_const() {
 
 // ── rejected sugar (alternative-naming diagnostics) ──────────────────
 
+// ── `extends` / `super` (Step 7b) ────────────────────────────────────
+
+/// A derived class inherits the parent's prototype methods, and `super(x)`
+/// threads the instance as `this` into the parent constructor.
 #[test]
-fn class_extends_is_rejected() {
-    let errs = compile("class B {} class C extends B {}").expect_err("extends rejected");
+fn class_extends_inherits_and_super_threads_this() {
+    assert_eq!(
+        testutil::run_val(
+            "class P { constructor(x) { this.x = x; } get() { return this.x; } }
+             class C extends P { constructor(x) { super(x); } }
+             return new C(7).get();",
+        ),
+        Value::PosInt(7)
+    );
+}
+
+/// `super.m()` calls the parent's `m` even when `C` overrides it.
+#[test]
+fn class_super_method_skips_override() {
+    assert_eq!(
+        testutil::run_ret(
+            "class P { constructor() {} label() { return \"P\"; } }
+             class C extends P {
+                 constructor() { super(); }
+                 label() { return \"C-\" + super.label(); }
+             }
+             return new C().label();",
+        ),
+        serde_json::json!("C-P")
+    );
+}
+
+/// A derived class's field initializes *after* `super()` returns, so it can
+/// observe a value the parent constructor set.
+#[test]
+fn class_derived_field_initializes_after_super() {
+    assert_eq!(
+        testutil::run_val(
+            "class P { constructor() { this.base = 40; } }
+             class C extends P {
+                 derived = this.base + 2;
+                 constructor() { super(); }
+             }
+             return new C().derived;",
+        ),
+        testutil::num(42.0)
+    );
+}
+
+/// `new C()` is an instance of both `C` and its parent `P` (proto chain link).
+#[test]
+fn class_derived_instanceof_both() {
+    assert_eq!(
+        testutil::run_val(
+            "class P { constructor() {} }
+             class C extends P { constructor() { super(); } }
+             const c = new C();
+             return (c instanceof C) && (c instanceof P);",
+        ),
+        Value::Bool(true)
+    );
+}
+
+/// A method inherited from a *grandparent* resolves through the chain.
+#[test]
+fn class_extends_grandparent_method() {
+    assert_eq!(
+        testutil::run_val(
+            "class A { constructor() {} hi() { return 1; } }
+             class B extends A { constructor() { super(); } }
+             class C extends B { constructor() { super(); } }
+             return new C().hi();",
+        ),
+        Value::PosInt(1)
+    );
+}
+
+/// `super(...args)` forwards spread args to the parent constructor.
+#[test]
+fn class_super_spread_args() {
+    assert_eq!(
+        testutil::run_val(
+            "class P { constructor(a, b) { this.sum = a + b; } }
+             class C extends P {
+                 constructor(args) { super(...args); }
+             }
+             return new C([3, 4]).sum;",
+        ),
+        testutil::num(7.0)
+    );
+}
+
+/// A derived class without an explicit constructor is rejected (the MVP does
+/// not synthesize a forwarding default constructor).
+#[test]
+fn class_derived_without_constructor_is_rejected() {
+    let errs = compile("class B { constructor() {} } class C extends B {}")
+        .expect_err("derived default ctor rejected");
+    assert!(
+        errs.iter()
+            .any(|e| e.message.contains("constructor") && e.message.contains("super")),
+        "expected a missing-constructor diagnostic, got: {errs:?}"
+    );
+}
+
+/// An expression superclass (`extends mixin(B)`) is rejected — `extends`
+/// requires a plain identifier in the MVP.
+#[test]
+fn class_extends_expression_is_rejected() {
+    let errs = compile("function mix(b) { return b; } class C extends mix(Object) {}")
+        .expect_err("expression superclass rejected");
     assert!(
         errs.iter().any(|e| e.message.contains("extends")),
         "expected an extends diagnostic, got: {errs:?}"
     );
+}
+
+/// A derived class behaves identically to its hand-written prototype-link form.
+#[test]
+fn class_extends_matches_handwritten_form() {
+    let class_src = "class P { constructor(n) { this.n = n; } val() { return this.n; } }
+                     class C extends P { constructor(n) { super(n * 2); } }
+                     return new C(10).val();";
+    let hand_src = "function P(n) { this.n = n; }
+                    P.prototype.val = function() { return this.n; };
+                    function C(n) { P.call(this, n * 2); }
+                    Object.setPrototypeOf(C.prototype, P.prototype);
+                    return new C(10).val();";
+    assert_eq!(testutil::run_val(class_src), testutil::num(20.0));
+    assert_eq!(testutil::run_val(hand_src), testutil::num(20.0));
 }
 
 #[test]

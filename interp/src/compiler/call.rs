@@ -66,8 +66,19 @@ impl<'src> super::Compiler<'src> {
         }
 
         match &call.callee {
+            // `super(args)` (Step 7b): invoke the parent constructor with the
+            // current instance as `this` — not the `new` path (no fresh object).
+            ast::Expression::Super(s) => {
+                self.compile_super_call(s.span.start, &argv, span);
+            }
             ast::Expression::StaticMemberExpression(m) => {
                 let method = m.property.name.as_str();
+                // `super.m(args)` (Step 7b): resolve `m` on the *parent prototype*
+                // (so an override on `C` is skipped) and call it with `this`.
+                if let ast::Expression::Super(s) = &m.object {
+                    self.compile_super_method_call(s.span.start, method, &argv, span);
+                    return;
+                }
                 // A leading identifier matching a reserved namespace is a static
                 // intrinsic; otherwise it is a method on the receiver value.
                 if let ast::Expression::Identifier(obj) = &m.object {
@@ -131,6 +142,28 @@ impl<'src> super::Compiler<'src> {
                     self.error(span, "spread arguments are not supported on tool calls");
                     return;
                 }
+            }
+        }
+
+        // `super(...args)` / `super.m(...args)` (Step 7b) with a spread: same
+        // `has_this` layout as the non-spread forms, but the args become an array
+        // for `CallSpread`. Receiver is always `this`.
+        if let ast::Expression::Super(s) = &call.callee {
+            self.emit(Instr::LoadThis, span);
+            self.emit_super_class_ref(s.span.start);
+            self.compile_call_args_array(&call.arguments, span);
+            self.emit(Instr::CallSpread(true), span);
+            return;
+        }
+        if let ast::Expression::StaticMemberExpression(m) = &call.callee {
+            if let ast::Expression::Super(s) = &m.object {
+                self.emit(Instr::LoadThis, span);
+                self.emit_super_class_ref(s.span.start);
+                self.emit(Instr::ObjGet(crate::vm::RcStr::from("prototype")), span);
+                self.emit(Instr::ObjGet(m.property.name.as_str().into()), span);
+                self.compile_call_args_array(&call.arguments, span);
+                self.emit(Instr::CallSpread(true), span);
+                return;
             }
         }
 
@@ -628,6 +661,59 @@ impl<'src> super::Compiler<'src> {
         }
         if let Some(end) = end {
             self.emit(Instr::Label(end), span);
+        }
+    }
+
+    /// `super(args)` in a derived constructor (Step 7b): dispatch the parent
+    /// constructor with `this` (the instance being built) as the receiver, so
+    /// its `this.x = …` writes onto the same instance. Arranged as the `has_this`
+    /// call layout `[this, Parent, args…]` + `CallDyn(has_this=true)` — *not* the
+    /// `New` path (no fresh instance is allocated). The parent value is the
+    /// captured superclass binding (resolved at this `super` node's span).
+    pub(super) fn compile_super_call(
+        &mut self,
+        super_span: u32,
+        argv: &[&ast::Expression],
+        span: u32,
+    ) {
+        self.emit(Instr::LoadThis, span); // receiver = the instance
+        self.emit_super_class_ref(super_span); // callee = parent constructor
+        self.compile_args(argv);
+        self.emit(Instr::CallDyn(argv.len() as u32, true), span);
+    }
+
+    /// `super.m(args)` (Step 7b): resolve `m` on the **parent prototype** (so a
+    /// `C` override is bypassed), then call it with `this` bound to the instance.
+    /// Layout `[this, Parent.prototype.m, args…]` + `CallDyn(has_this=true)`.
+    pub(super) fn compile_super_method_call(
+        &mut self,
+        super_span: u32,
+        method: &str,
+        argv: &[&ast::Expression],
+        span: u32,
+    ) {
+        self.emit(Instr::LoadThis, span); // receiver = the instance
+        self.emit_super_class_ref(super_span); // parent constructor
+        self.emit(Instr::ObjGet(crate::vm::RcStr::from("prototype")), span); // Parent.prototype
+        self.emit(Instr::ObjGet(method.into()), span); // Parent.prototype.m (chain walk)
+        self.compile_args(argv);
+        self.emit(Instr::CallDyn(argv.len() as u32, true), span);
+    }
+
+    /// Read the captured superclass (parent constructor) value at a `super` use
+    /// site. The analyzer registered this `super` node's span as a reference to
+    /// the `extends` identifier, so it resolves like any captured binding.
+    pub(super) fn emit_super_class_ref(&mut self, super_span: u32) {
+        if let Some(value) = self.const_ref(super_span) {
+            let push = self.const_value_push(&value);
+            self.emit(push, super_span);
+        } else if let Some(r) = self.ref_slot(super_span) {
+            self.emit_slot_read(&r, super_span);
+        } else {
+            self.error(
+                super_span,
+                "`super` is only valid inside a derived class constructor or method",
+            );
         }
     }
 

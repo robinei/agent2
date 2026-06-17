@@ -850,6 +850,7 @@ pub(crate) fn analyze(program: &ast::Program) -> Analysis {
         next_label: 0,
         diagnostics: Vec::new(),
         loop_depth: 0,
+        current_super: None,
     };
     let program = analyzer.analyze_program(program);
     Analysis {
@@ -869,6 +870,13 @@ struct Analyzer {
     /// `> 0` is a per-iteration binding: if also captured, it gets a fresh cell
     /// each iteration rather than one eager cell, so its slot kind is `Plain`.
     loop_depth: u32,
+    /// The superclass *identifier name* of the `extends` clause for the class
+    /// whose method/constructor body is currently being analyzed (`None`
+    /// outside a derived class). A `super` reference (Step 7b) resolves to this
+    /// name, so the existing capture machinery threads the parent constructor in
+    /// as an upval. Lexically scoped like `this`: inherited by nested arrows,
+    /// cleared on entering a nested non-arrow function, re-set per nested class.
+    current_super: Option<String>,
 }
 
 impl Analyzer {
@@ -1147,7 +1155,7 @@ impl Analyzer {
             }
             ast::Statement::FunctionDeclaration(f) => {
                 // Name already hoisted; build the function's scope.
-                let child = self.build_function_scope(f, true, scopes);
+                let child = self.build_function_scope(f, true, false, scopes);
                 scope.children.push(child);
             }
             ast::Statement::ClassDeclaration(c) => {
@@ -1165,7 +1173,7 @@ impl Analyzer {
                         next_slot,
                     );
                 }
-                self.build_class_scopes(c, scope, scopes);
+                self.build_class_scopes(c, scope, block_scopes, scopes);
             }
             ast::Statement::BlockStatement(block) => {
                 block_scopes.push(IndexMap::new());
@@ -1675,7 +1683,7 @@ impl Analyzer {
                 self.analyze_chain_element(&chain.expression, scope, block_scopes, scopes);
             }
             ast::Expression::FunctionExpression(f) => {
-                let child = self.build_function_scope(f, false, scopes);
+                let child = self.build_function_scope(f, false, false, scopes);
                 scope.children.push(child);
             }
             ast::Expression::ArrowFunctionExpression(a) => {
@@ -1685,7 +1693,7 @@ impl Analyzer {
             ast::Expression::ClassExpression(c) => {
                 // A class expression binds no name in the enclosing scope; just
                 // build its constructor/method scopes.
-                self.build_class_scopes(c, scope, scopes);
+                self.build_class_scopes(c, scope, block_scopes, scopes);
             }
             ast::Expression::NewExpression(n) => {
                 // Visit the callee (Step 4b: user functions can now appear in
@@ -1708,6 +1716,16 @@ impl Analyzer {
             ast::Expression::ThisExpression(t) => {
                 scope.free_refs.push((t.span.start, "<this>".to_string()));
                 scope.free_vars.insert("<this>".to_string());
+            }
+            ast::Expression::Super(s) => {
+                // `super` (as `super(...)` callee or `super.m` member object).
+                // Resolve to the enclosing derived class's superclass binding so
+                // the parent constructor is captured as an upval and read at the
+                // `super` use site (keyed by this node's span). Outside a derived
+                // class it is a no-op here; codegen reports the error.
+                if let Some(name) = self.current_super.clone() {
+                    self.analyze_ref(&name, s.span.start, scope, block_scopes);
+                }
             }
             _ => {}
         }
@@ -1911,10 +1929,16 @@ impl Analyzer {
     }
 
     /// Build a `FuncScope` for a function declaration or expression.
+    ///
+    /// `inherit_super`: a class method keeps the enclosing class's `super`
+    /// context (`true`); an ordinary nested function is a `super` boundary and
+    /// clears it for its body (`false`), matching JS (a plain function has no
+    /// `super`, an arrow inherits it lexically — see `build_arrow_scope`).
     fn build_function_scope(
         &mut self,
         func: &ast::Function,
         is_declaration: bool,
+        inherit_super: bool,
         scopes: &mut Vec<FuncScope>,
     ) -> usize {
         let label = self.new_label();
@@ -1933,7 +1957,12 @@ impl Analyzer {
             scope.uses_arguments = true;
         }
         let body = func.body.as_ref().map(|b| &b.statements[..]).unwrap_or(&[]);
+        let saved_super = self.current_super.clone();
+        if !inherit_super {
+            self.current_super = None;
+        }
         self.analyze_function_body(&mut scope, Some(&func.params), body, &[], scopes);
+        self.current_super = saved_super;
         self.push_scope(scope, scopes)
     }
 
@@ -1977,8 +2006,26 @@ impl Analyzer {
         &mut self,
         class: &ast::Class,
         scope: &mut FuncScope,
+        block_scopes: &mut BlockScopes,
         scopes: &mut Vec<FuncScope>,
     ) {
+        // `extends <ident>` (Step 7b): analyze the superclass reference in *this*
+        // (enclosing) scope — codegen reads it here to link `C.prototype`'s proto
+        // — and set the `super` context so the members capture the parent
+        // constructor. A non-identifier superclass is left for codegen to reject.
+        let super_name = match &class.super_class {
+            Some(sc) => {
+                self.analyze_expr(sc, scope, block_scopes, scopes);
+                match sc {
+                    ast::Expression::Identifier(id) => Some(id.name.as_str().to_string()),
+                    _ => None,
+                }
+            }
+            None => None,
+        };
+        let saved_super = self.current_super.take();
+        self.current_super = super_name;
+
         // Gather the explicit constructor (if any) and the instance-field
         // initializer expressions, in declaration order.
         let mut ctor: Option<&ast::Function> = None;
@@ -2001,15 +2048,18 @@ impl Analyzer {
         // The constructor (explicit, or synthetic with just the field inits).
         let ctor_scope = self.build_constructor_scope(class, ctor, &field_inits, scopes);
         scope.children.push(ctor_scope);
-        // Each non-constructor method is an ordinary (non-arrow) function scope.
+        // Each non-constructor method is an ordinary (non-arrow) function scope,
+        // but keeps the class's `super` context (`inherit_super = true`).
         for el in &class.body.body {
             if let ast::ClassElement::MethodDefinition(m) = el
                 && m.kind != ast::MethodDefinitionKind::Constructor
             {
-                let child = self.build_function_scope(&m.value, false, scopes);
+                let child = self.build_function_scope(&m.value, false, true, scopes);
                 scope.children.push(child);
             }
         }
+
+        self.current_super = saved_super;
     }
 
     /// Build the constructor `FuncScope` for a class. With an explicit

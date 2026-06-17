@@ -1,6 +1,7 @@
 use oxc_ast::ast;
 use oxc_span::GetSpan;
 
+use crate::builtin::Builtin;
 use crate::vm::{Instr, LocalIndex, RcStr, SetMode};
 
 /// One instance method to install on `C.prototype`.
@@ -47,14 +48,22 @@ impl<'src> super::Compiler<'src> {
     /// nothing is left on the stack.
     fn compile_class_value(&mut self, class: &ast::Class) -> bool {
         let span = class.span.start;
-        if class.super_class.is_some() {
-            self.error(
-                span,
-                "`class extends` / `super` are not supported yet (use composition, \
-                 or a plain class without `extends`)",
-            );
-            return false;
-        }
+        // `extends <ident>` (Step 7b): the superclass must be a plain identifier
+        // resolvable to a constructor value (the MVP rejects an expression
+        // superclass, matching the static-callee restriction on `new`).
+        let super_class: Option<&ast::Expression> = match &class.super_class {
+            Some(ast::Expression::Identifier(_)) => class.super_class.as_ref(),
+            Some(other) => {
+                self.error(
+                    other.span().start,
+                    "`extends` requires a class/constructor name (an expression \
+                     superclass is not supported)",
+                );
+                return false;
+            }
+            None => None,
+        };
+        let is_derived = super_class.is_some();
         if !class.decorators.is_empty() {
             self.error(span, "class decorators are not supported");
             return false;
@@ -115,10 +124,24 @@ impl<'src> super::Compiler<'src> {
             }
         }
 
+        // A derived class needs an explicit `constructor` that calls `super(...)`
+        // (the MVP does not synthesize a default forwarding constructor — `super`
+        // binding requires a real constructor scope to capture the parent).
+        if is_derived && ctor.is_none() {
+            self.error(
+                span,
+                "a `class` with `extends` must declare a `constructor` that calls \
+                 `super(...)` (a default constructor is not synthesized)",
+            );
+            return false;
+        }
+
         // ── the constructor becomes `C` ──────────────────────────────────────
         // The constructor scope is the explicit `constructor` method's scope, or
         // (for a default constructor) a synthetic scope the analyzer keyed by the
-        // class node's span. Field initializers are prepended to its body.
+        // class node's span. Field initializers are prepended to its body — or,
+        // for a derived class, emitted right after `super(...)` returns
+        // (`defer_fields_after_super`), so they observe parent-set values.
         let ctor_span = ctor.map_or(span, |f| f.span.start);
         let Some(ctor_scope) = self.scope_for_node(ctor_span) else {
             self.error(
@@ -131,10 +154,18 @@ impl<'src> super::Compiler<'src> {
         match ctor {
             Some(func) => {
                 let body = func.body.as_ref().map(|b| &b.statements[..]).unwrap_or(&[]);
-                self.emit_function_def(ctor_scope, body, Some(&func.params), &fields, span, false);
+                self.emit_function_def(
+                    ctor_scope,
+                    body,
+                    Some(&func.params),
+                    &fields,
+                    span,
+                    false,
+                    is_derived,
+                );
             }
             None => {
-                self.emit_function_def(ctor_scope, &[], None, &fields, span, false);
+                self.emit_function_def(ctor_scope, &[], None, &fields, span, false, false);
             }
         }
 
@@ -155,12 +186,33 @@ impl<'src> super::Compiler<'src> {
                     .as_ref()
                     .map(|b| &b.statements[..])
                     .unwrap_or(&[]);
-                self.emit_function_def(m_scope, body, Some(&m.func.params), &[], m.span, false);
+                self.emit_function_def(
+                    m_scope,
+                    body,
+                    Some(&m.func.params),
+                    &[],
+                    m.span,
+                    false,
+                    false,
+                );
                 // ObjSet leaves the value; discard it, keep the prototype.
                 self.emit(Instr::ObjSet(m.name.clone(), SetMode::New), m.span);
                 self.emit(Instr::Pop(1), m.span);
             }
             self.emit(Instr::Pop(1), span); // drop the prototype, leaving C
+        }
+
+        // ── `extends`: link `C.prototype`'s [[Prototype]] to `Parent.prototype`
+        // so instances inherit parent methods via the Step-2 chain walk. Reuses
+        // the Step-8 `Object.setPrototypeOf` primitive (which rejects cycles).
+        if let Some(sc) = super_class {
+            self.emit(Instr::Pick(0), span); // dup C
+            self.emit(Instr::ObjGet(RcStr::from("prototype")), span); // C.prototype
+            self.compile_expr(sc); // Parent
+            self.emit(Instr::ObjGet(RcStr::from("prototype")), span); // Parent.prototype
+            // setPrototypeOf(C.prototype, Parent.prototype) → returns C.prototype.
+            self.emit(Instr::CallBuiltin(Builtin::ObjSetProtoOf, 2), span);
+            self.emit(Instr::Pop(1), span); // drop the returned C.prototype, leaving C
         }
         true
     }
