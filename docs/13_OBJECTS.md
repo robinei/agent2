@@ -439,10 +439,15 @@ through a `ParenthesizedExpression`, or rely on oxc having stripped it.)
     calls outright ("`computed method calls (obj[expr](...)` are not supported");
     replace that arm. Computed method calls are real method calls and **must bind
     `this`** — `has_this = true`, the same as the static form.
-  - **The `has_this` fork** (the bit added in 3a, now exercised): `CallDyn`/
-    `CallSpread` pop the receiver from below the callee and pass it as `this_val`
-    to `dispatch_call`. All routing happens at the **one chokepoint** (see the
-    unified picture): a **user function/closure** gets `this_val` in its frame
+  - **The `has_this` fork** (the bit added in 3a, now exercised). Because the args
+    are pushed last, they are already the contiguous top-`N` region = the frame
+    (`fp = len - argc`, **no shift**); the callee sits at `fp-1` and the receiver
+    at `fp-2`, both *below* `fp` as caller-pushed dead space. So the receiver is
+    **read in place** (`this_val = stack[fp-2]`), not popped — the args never
+    move. On return, teardown truncates to the bottom of the call group (`fp-2`
+    for `has_this`, else `fp-1`) and pushes the result; `has_this` only changes
+    that count, never a shift. Routing then happens at the **one chokepoint** (see
+    the unified picture): a **user function/closure** gets `this_val` in its frame
     field (recv is not an `arguments` entry); a **builtin** gets it spliced as
     arg 0; a **`Bound`** defers to its own `this_val` (Step 5). A dispatch-time
     routing fork only — **no `EnterFrame` reconciliation, no slot move**; the
