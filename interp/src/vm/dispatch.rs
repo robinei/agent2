@@ -321,21 +321,29 @@ impl VM {
 
                 // ── control flow ─────────────────────────────────
                 Instr::Call(addr, nargs) => {
-                    self.call_function(*addr, *nargs, u32::MAX, Value::Undefined)?
+                    // Bare-address call: the callee is in the instruction, nothing
+                    // sits below the args (reclaim_below = 0).
+                    self.call_function(*addr, *nargs, u32::MAX, Value::Undefined, 0)?
                 }
 
                 Instr::CallDyn(nargs, has_this) => {
                     let nargs = *nargs;
                     let has_this = *has_this;
-                    let this_val = if has_this {
-                        let recv_idx = self.stack.len().saturating_sub(2 + nargs as usize);
-                        self.stack.remove(recv_idx)
+                    // Callee-below-args: stack is `[recv?, callee, args…]`. Read
+                    // the callee (and receiver) *in place* — no arg shift — and
+                    // leave their slots as `Undefined` placeholders that `Return`
+                    // reclaims via `reclaim_below`.
+                    let args_start = self.stack.len() - nargs as usize;
+                    let callable =
+                        std::mem::replace(&mut self.stack[args_start - 1], Value::Undefined);
+                    let (this_val, below) = if has_this {
+                        let recv =
+                            std::mem::replace(&mut self.stack[args_start - 2], Value::Undefined);
+                        (recv, 2)
                     } else {
-                        Value::Undefined
+                        (Value::Undefined, 1)
                     };
-                    let idx = self.stack.len() - 1 - nargs as usize;
-                    let callable = self.stack.remove(idx);
-                    self.dispatch_call(callable, this_val, nargs)?;
+                    self.dispatch_call(callable, this_val, nargs, below)?;
                 }
 
                 Instr::CallBuiltin(b, argc) => {
@@ -357,14 +365,20 @@ impl VM {
 
                 Instr::CallSpread(has_this) => {
                     let has_this = *has_this;
-                    // Callee sits below the args array, receiver (if has_this)
-                    // sits below the callee.
-                    let this_val = if has_this {
-                        self.stack.remove(self.stack.len() - 3)
+                    // `[recv?, callee, argsArray]`. Read callee/recv *in place*
+                    // (no shift) — placeholders stay under the spread args for
+                    // `Return` to reclaim via `reclaim_below`.
+                    let callee_idx = self.stack.len() - 2;
+                    let callable = std::mem::replace(&mut self.stack[callee_idx], Value::Undefined);
+                    let (this_val, below) = if has_this {
+                        let recv_idx = self.stack.len() - 3;
+                        (
+                            std::mem::replace(&mut self.stack[recv_idx], Value::Undefined),
+                            2,
+                        )
                     } else {
-                        Value::Undefined
+                        (Value::Undefined, 1)
                     };
-                    let callable = self.stack.remove(self.stack.len() - 2);
                     let arr_ptr = match self.pop()? {
                         Value::Array(p) => p,
                         _ => {
@@ -386,7 +400,7 @@ impl VM {
                     for val in elements {
                         self.stack.push(val);
                     }
-                    self.dispatch_call(callable, this_val, nargs)?;
+                    self.dispatch_call(callable, this_val, nargs, below)?;
                 }
 
                 Instr::ClosureNew(addr, captures) => {
@@ -408,10 +422,11 @@ impl VM {
                         .callstack
                         .pop()
                         .ok_or_else(|| self.fail(ErrorKind::BadReturn, "bad return"))?;
-                    // `fp` points at the frame base (arg 0 / local 0), which is
-                    // where the caller pushed the args — so the return value(s)
-                    // replace the whole frame, restoring the caller's stack.
-                    let keep_below = self.fp as usize;
+                    // `fp` points at the frame base (arg 0 / local 0). The
+                    // return value(s) replace the whole call group: the frame
+                    // *plus* the `reclaim_below` dead slots (callee/receiver) the
+                    // caller left just under `fp` (read in place, not shifted).
+                    let keep_below = (self.fp - frame.reclaim_below) as usize;
                     let n = *nrets;
                     if self.stack.len() < keep_below + n {
                         return Err(self.fail(ErrorKind::StackUnderflow, "stack underflow"));

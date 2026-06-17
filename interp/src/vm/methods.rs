@@ -32,6 +32,7 @@ impl VM {
                 arguments_cache: None,
                 pending_closure: u32::MAX,
                 this_val: Value::Undefined,
+                reclaim_below: 0,
                 completion: Completion::Normal,
             }],
             ip: 0,
@@ -584,6 +585,13 @@ impl VM {
             .ok_or_else(|| self.fail(ErrorKind::BadReturn, "suspend without a frame"))?;
         self.fp = frame.prev_fp;
         self.cur_local_count = self.callstack.last().map_or(0, |f| f.local_count);
+        // Reclaim the call-group slots the caller left just under `fp` (callee /
+        // receiver, read in place rather than shifted away). `split_off(fp)` took
+        // the frame's region; these placeholders are now the top of the stack.
+        // A suspending call completes by returning a promise to the caller, so —
+        // like `Return` — that promise must land at `fp - reclaim_below`.
+        self.stack
+            .truncate(self.stack.len() - frame.reclaim_below as usize);
         let (promise, first_suspension) = match frame.completion {
             Completion::Normal => (self.alloc_promise(), true),
             Completion::ResolvePromise(pid) => (pid, false),
@@ -697,6 +705,7 @@ impl VM {
             pending_closure: u32::MAX,
             arguments_cache: cont.arguments_cache,
             this_val: Value::Undefined,
+            reclaim_below: 0,
             completion: Completion::ResolvePromise(cont.promise),
         });
         self.fp = new_fp;
@@ -1228,8 +1237,11 @@ impl VM {
             .cloned();
         match method {
             Some(f) => {
-                let recv = self.stack.remove(base); // drop the receiver; args shift down
-                self.dispatch_call(f, recv, argc - 1)
+                // Read the receiver in place; its slot becomes an `Undefined`
+                // placeholder that `Return` reclaims (`reclaim_below = 1`). No
+                // arg shift.
+                let recv = std::mem::replace(&mut self.stack[base], Value::Undefined);
+                self.dispatch_call(f, recv, argc - 1, 1)
             }
             None => {
                 self.stack.truncate(base);
@@ -1239,19 +1251,35 @@ impl VM {
         }
     }
 
-    /// Shared dispatch for `CallDyn` and `CallSpread`: the args are already
-    /// on the stack in left-to-right order (arg 0 deepest), with the callable
-    /// already popped.  `this_val` is the receiver for user functions/closures
-    /// (set as the frame field); for builtins it is spliced as arg 0.
-    /// Handles `Builtin`, `Closure`, and non-callable.
+    /// Shared dispatch for `CallDyn`/`CallSpread`/reroute/bind/`new`. The args
+    /// are the top `nargs` stack values (arg 0 deepest). `this_val` is the
+    /// receiver (for a user function it becomes the frame field; for a builtin it
+    /// is spliced as arg 0). `below` is the number of dead call-group slots the
+    /// caller left *just under* the args (the callee value and/or receiver, read
+    /// in place rather than shifted out): the `Closure` path reclaims them via
+    /// the frame's `reclaim_below` on `Return`, leaving the args untouched; the
+    /// rarer `Builtin`/error paths compact them away first.
     pub(crate) fn dispatch_call(
         &mut self,
         callable: Value,
         this_val: Value,
         nargs: u32,
+        below: u32,
     ) -> Result<(), VMError> {
         match callable {
+            Value::Closure { addr, ptr } => {
+                // No shift: args stay on top, the `below` placeholders stay under
+                // `fp`, and `Return` truncates to `fp - below`.
+                self.call_function(addr, nargs, ptr, this_val, below)?
+            }
             Value::Builtin(b) => {
+                // Builtins read args positionally from the top and self-truncate,
+                // so the below-args placeholders must go first (rare: a builtin
+                // arriving as a runtime value).
+                if below > 0 {
+                    let args_start = self.stack.len() - nargs as usize;
+                    self.stack.drain(args_start - below as usize..args_start);
+                }
                 let nargs_with_recv = if matches!(this_val, Value::Undefined) {
                     nargs
                 } else {
@@ -1267,9 +1295,11 @@ impl VM {
                     Err(e) => return Err(e),
                 }
             }
-            Value::Closure { addr, ptr } => self.call_function(addr, nargs, ptr, this_val)?,
             _ => {
-                let keep = self.stack.len().saturating_sub(nargs as usize);
+                let keep = self
+                    .stack
+                    .len()
+                    .saturating_sub(nargs as usize + below as usize);
                 self.stack.truncate(keep);
                 let msg = format!("cannot call a {} as a function", callable.type_name());
                 return Err(self.fail(ErrorKind::TypeError, msg));
@@ -1284,6 +1314,7 @@ impl VM {
         nargs: u32,
         closure_ptr: ClosurePtr,
         this_val: Value,
+        reclaim_below: u32,
     ) -> Result<(), VMError> {
         let addr = self.validate_func_addr(addr)?;
         if nargs as usize > self.stack.len() {
@@ -1297,6 +1328,7 @@ impl VM {
             arguments_cache: None,
             pending_closure: closure_ptr,
             this_val,
+            reclaim_below,
             completion: Completion::Normal,
         });
         self.ip = addr;

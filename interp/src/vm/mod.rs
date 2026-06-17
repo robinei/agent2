@@ -374,6 +374,13 @@ pub struct CallFrame {
     local_count: u32,
     return_addr: CodeAddr,
     prev_fp: StackAddr,
+    /// Extra call-group slots sitting *below* `fp` that belong to this call but
+    /// are not args — the callee value and/or the receiver, left in place by the
+    /// caller (read, not shifted away). `Return` reclaims them by truncating to
+    /// `fp - reclaim_below` instead of `fp`. `0` for bare-address `Call` (no
+    /// value on the stack); `1` for a plain `CallDyn`/reroute (callee or
+    /// receiver); `2` for a method `CallDyn`/`CallSpread` (receiver + callee).
+    reclaim_below: u32,
     /// A closure's captured environment, stashed by `CallDyn`/`Call` and
     /// installed as the callee's upval locals by the prologue `EnterFrame`
     /// (after the arg region is normalized to `nparams`). Points into
