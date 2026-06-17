@@ -81,6 +81,30 @@ branches on `kind` yet. (Uncaught program throws already have their own
 `UncaughtException` kind, carrying the thrown value in `VMError::payload` —
 that split was structural, not cosmetic, and is done.)
 
+**Stdlib lang-items: move `Error`/`TypeError`/… into the prelude as classes
+(post-Phase-13).** Once Phase 13's `class` (Step 7) and `instanceof` (Step 8)
+land, the `new Error` compiler special-form (`compile_error_ctor` → bare
+`ObjNew{name, message}`) and the `{name, message}` shape built by
+`error_to_thrown` can be replaced by **prelude classes** —
+`class Error { constructor(message){ this.name="Error"; this.message=message } }`,
+`class TypeError extends Error {…}`, etc. `new Error(...)` then takes the normal
+`New`/`NewReturn` path, `e instanceof Error`/`TypeError` works via the proto
+chain, and `class AppError extends Error {}` falls out of Step 7b. This closes
+the **`instanceof Error`** gap (the one divergence Step 8 leaves) and subsumes
+the JS-named-error-kinds note above (the names become real subclasses).
+The link from library entity to VM-internal concept is a **lang-item**
+mechanism (cf. Rust `#[lang = "…"]`, Swift's underscored attributes, the JVM's
+well-known classes): a fixed table of slots (`Error`, `TypeError`, …) that the
+prelude fills — the compiler records each prelude class's prototype by
+recognizing its known name (the prelude is trusted code) or a lightweight
+`//@lang error` pragma, and `error_to_thrown` proto-links the object it
+materializes to `lang_items[Error].prototype` (a cached ptr, lazily allocated
+like any `F.prototype`) rather than special-casing the shape. Boundary:
+lang-items suit *library-definable* concepts (Error is just an object shape +
+proto); genuinely native types (`Map`/`Set`, arena-backed) can't move to the
+prelude — a lang-item could still *name* their prototype for `instanceof`, but
+the data structure stays native.
+
 **`Map`/`Set` (evidence-gated, unlike `this`/`class` which are architectural):
 start without them.** IndexMap-backed plain objects already cover ordered
 string-keyed lookup, and Set has no stable JSON form at the program's
@@ -98,14 +122,13 @@ diagnostics for rejected syntax.** LLMs reflexively write `new Map()` /
 of 6_LANGUAGE Part B). Keep rejecting them, but make the `new` diagnostic
 name the alternative per constructor: Map/Set → plain object or array,
 Date → ISO strings or a host time tool.
-Same treatment for `this`/`class`: suggest plain objects +
-functions, and note that everything durable (program results, tool
-arguments, artifacts) is JSON-shaped — methods and prototypes would not
-survive the log/restart boundary anyway, which is *why* they are
-excluded, not just implementation cost.
+(The `this`/`class` repair-hint applied *pre-Phase-13*: that decision is now
+reversed — see `13_OBJECTS.md`, which adds an in-program-only object system
+(`this`/methods/prototypes/`new`/`bind`/`instanceof`/`class`) that never crosses
+the JSON boundary, exactly as `Closure`/`RegExp` don't today.)
 
 Non-goals, recorded so they aren't relitigated: `ToPrimitive` on objects,
-UTF-16 string semantics, `class`/`new`/`this`, prototype chains, generators,
+UTF-16 string semantics, generators,
 a JS event loop / microtask queue (promises themselves exist as of 7_ASYNC
 Tier 1, but scheduling is the deterministic strand model, not an event
 loop), heap reclamation / GC (programs are short-lived;
