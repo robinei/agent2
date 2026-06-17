@@ -843,7 +843,7 @@ Acceptance (7b):
 - [ ] `new C() instanceof P` and `new C() instanceof C` are both `true` (Step 8).
 - [ ] Gate: `cargo fmt && cargo clippy && cargo test` green.
 
-## Step 8 — prototype reflection: `instanceof`, `Object.getPrototypeOf`/`setPrototypeOf`, `__proto__`
+## Step 8 — prototype reflection: `instanceof`, `Object.getPrototypeOf`/`setPrototypeOf`
 
 The proto chain (Step 2) and `F.prototype` (Step 4b) exist but are not yet
 *observable* from the language. These three features expose them. All reuse the
@@ -886,11 +886,13 @@ together.
   handling: reject** a `proto` whose own chain already reaches `obj` (matches JS's
   throw) — the `MAX_PROTO_DEPTH` cap already prevents a hang, but rejecting is the
   faithful choice; state it.
-- **`__proto__`** — recognize `obj.__proto__` in static member **read** and
-  **assignment** and route to the get/set-prototype logic above (not the property
-  map). **Divergences**: the object-literal `{ __proto__: x }` proto-setting form
-  and computed `obj["__proto__"]` (which JS treats as a data property) are **not**
-  modeled — `__proto__` is only the accessor on a static member. Document.
+- **`__proto__`** — **not modeled.** The `__proto__` accessor is legacy
+  (Annex B), not core spec, and `Object.get/setPrototypeOf` is its standard,
+  complete equivalent. Modeling it would mean special-casing `__proto__` in every
+  property read/write arm to divert it away from the property map (JS achieves the
+  divert via an accessor on `Object.prototype`, which we have neither of, nor
+  getters/setters). So `__proto__` stays an ordinary string-keyed data property:
+  `obj.__proto__` reads/writes the property map like any other key. Document.
 
 Acceptance (Step 8):
 - [ ] `function F(){}; new F() instanceof F` is `true`; `({}) instanceof F` is
@@ -904,8 +906,8 @@ Acceptance (Step 8):
       `Object.getPrototypeOf({})` is `null`.
 - [ ] `Object.setPrototypeOf(o, p); Object.getPrototypeOf(o) === p`, and an
       inherited read on `o` now resolves through `p`.
-- [ ] `o.__proto__` read and `o.__proto__ = p` write match
-      `get`/`setPrototypeOf`.
+- [ ] `o.__proto__` is a plain data property: `({}).__proto__` is `undefined`,
+      and `o.__proto__ = p` does **not** change `o`'s prototype.
 - [ ] a self-referential `setPrototypeOf` is rejected (and never hangs).
 - [ ] Gate: `cargo fmt && cargo clippy && cargo test` green.
 
@@ -964,9 +966,9 @@ one-off bolt-ons.
 - **Prototype reflection is partial** (Step 8). `Object.getPrototypeOf` returns
   `null` for a plain object (no `Object.prototype`); `getPrototypeOf` on a
   primitive is a `TypeError` (no wrapper coercion); a cyclic `setPrototypeOf` is
-  rejected (as JS). `__proto__` is recognized only as a static-member accessor —
-  the object-literal `{ __proto__: x }` form and computed `obj["__proto__"]`
-  (a data property in JS) are not modeled.
+  rejected (as JS). Prototype get/set is *only* via `Object.get/setPrototypeOf` —
+  the legacy (Annex B) `__proto__` accessor is not modeled, so `__proto__` is an
+  ordinary string-keyed data property.
 - **`fn.length` for builtins is approximate** (Step 6): derived from `min_args`
   rather than JS's fixed declared count.
 - **`ToPrimitive` on objects stays unperformed** (the existing divergence):

@@ -867,44 +867,20 @@ impl VM {
         Ok(Value::Undefined)
     }
 
-    /// `x instanceof F`: walk `x`'s prototype chain looking for `F.prototype`.
-    /// LHS need not be an Object — non-Object values (primitives) cannot be on
-    /// a prototype chain so return `false` immediately. RHS must be a `Closure`
-    /// or `Bound` (callables with a `.prototype`) — else `TypeError`. The walk
-    /// reuses the same `MAX_PROTO_DEPTH` cap as `resolve_proto_chain`, so a
-    /// cyclic chain terminates.
-    pub(crate) fn instanceof(&mut self, lhs: Value, rhs: Value) -> Result<bool, VMError> {
-        let (lhs_obj, proto_ptr) = match (lhs, rhs) {
-            (Value::Object(lhs_ptr), Value::Closure { ptr, .. }) => {
-                let proto = self.resolve_prototype(ptr)?;
-                (lhs_ptr, proto)
-            }
-            (Value::Object(lhs_ptr), Value::Bound(b)) => {
-                let inner = match &b.callable {
-                    Value::Closure { ptr, .. } => *ptr,
-                    _ => {
-                        return Err(self.fail(
-                            ErrorKind::TypeError,
-                            "right-hand side of `instanceof` is not callable",
-                        ));
-                    }
-                };
-                let proto = self.resolve_prototype(inner)?;
-                (lhs_ptr, proto)
-            }
-            (_, Value::Closure { .. } | Value::Bound(_)) => return Ok(false),
-            _ => {
-                return Err(self.fail(
-                    ErrorKind::TypeError,
-                    "right-hand side of `instanceof` is not callable",
-                ));
-            }
-        };
+    /// Walk a prototype chain from `start`, reporting whether `target` appears
+    /// on it. Reuses the same `MAX_PROTO_DEPTH` cap as `resolve_proto_chain`, so
+    /// a cyclic chain terminates (returns `false`). Shared by `instanceof` and
+    /// the cyclic-prototype check in `set_object_proto`.
+    pub(crate) fn proto_chain_contains(
+        &self,
+        start: ObjectPtr,
+        target: ObjectPtr,
+    ) -> Result<bool, VMError> {
         const MAX_PROTO_DEPTH: u32 = 100;
-        let mut cur = Some(lhs_obj);
+        let mut cur = Some(start);
         for _ in 0..MAX_PROTO_DEPTH {
             match cur {
-                Some(p) if p == proto_ptr => return Ok(true),
+                Some(p) if p == target => return Ok(true),
                 Some(p) => {
                     let obj = self.objects.get(p as usize).ok_or_else(|| {
                         self.fail_not_resumable(ErrorKind::TypeError, "bad object pointer")
@@ -917,10 +893,80 @@ impl VM {
         Ok(false)
     }
 
+    /// An `Object`'s `[[Prototype]]` as a value: `Value::Object(proto)` or
+    /// `Value::Null` when it has none. Shared by `Object.getPrototypeOf` and
+    /// `set_object_proto`'s previous-value capture.
+    pub(crate) fn object_proto_value(&self, obj_ptr: ObjectPtr) -> Result<Value, VMError> {
+        let obj = self
+            .objects
+            .get(obj_ptr as usize)
+            .ok_or_else(|| self.fail_not_resumable(ErrorKind::TypeError, "bad object pointer"))?;
+        Ok(match obj.proto {
+            Some(p) => Value::Object(p),
+            None => Value::Null,
+        })
+    }
+
+    /// Set an `Object`'s `[[Prototype]]` to `val` (an `Object` or `Null`).
+    /// Rejects a non-Object/non-Null `val` and a cycle (the new proto's chain
+    /// must not reach the receiver), matching JS. Used by `Object.setPrototypeOf`.
+    pub(crate) fn set_object_proto(
+        &mut self,
+        obj_ptr: ObjectPtr,
+        val: Value,
+    ) -> Result<(), VMError> {
+        let new_proto = match val {
+            Value::Object(p) => Some(p),
+            Value::Null => None,
+            _ => {
+                return Err(self.fail(ErrorKind::TypeError, "prototype must be an object or null"));
+            }
+        };
+        if let Some(proto_ptr) = new_proto
+            && self.proto_chain_contains(proto_ptr, obj_ptr)?
+        {
+            return Err(self.fail(ErrorKind::TypeError, "cyclic prototype chain"));
+        }
+        self.objects[obj_ptr as usize].proto = new_proto;
+        Ok(())
+    }
+
+    /// `x instanceof F`: walk `x`'s prototype chain looking for `F.prototype`.
+    /// LHS need not be an Object — non-Object values (primitives) cannot be on
+    /// a prototype chain so return `false` immediately. RHS must be a `Closure`
+    /// or `Bound` (callables with a `.prototype`) — else `TypeError`.
+    pub(crate) fn instanceof(&mut self, lhs: Value, rhs: Value) -> Result<bool, VMError> {
+        let (lhs_obj, proto_ptr) = match (lhs, rhs) {
+            (Value::Object(lhs_ptr), Value::Closure { ptr, .. }) => {
+                (lhs_ptr, self.resolve_prototype(ptr)?)
+            }
+            (Value::Object(lhs_ptr), Value::Bound(b)) => {
+                let inner = match &b.callable {
+                    Value::Closure { ptr, .. } => *ptr,
+                    _ => {
+                        return Err(self.fail(
+                            ErrorKind::TypeError,
+                            "right-hand side of `instanceof` is not callable",
+                        ));
+                    }
+                };
+                (lhs_ptr, self.resolve_prototype(inner)?)
+            }
+            (_, Value::Closure { .. } | Value::Bound(_)) => return Ok(false),
+            _ => {
+                return Err(self.fail(
+                    ErrorKind::TypeError,
+                    "right-hand side of `instanceof` is not callable",
+                ));
+            }
+        };
+        self.proto_chain_contains(lhs_obj, proto_ptr)
+    }
+
     /// Resolve a Closure's `.prototype`, lazily allocating an empty object on
     /// first access. Shared by `resolve_closure_prototype` (for `F.prototype`
     /// property reads) and `instanceof` (for walking the chain).
-    fn resolve_prototype(&mut self, ptr: ClosurePtr) -> Result<ObjectPtr, VMError> {
+    pub(crate) fn resolve_prototype(&mut self, ptr: ClosurePtr) -> Result<ObjectPtr, VMError> {
         if let Some(proto_ptr) = self.closures.get(ptr as usize).and_then(|c| c.prototype) {
             return Ok(proto_ptr);
         }

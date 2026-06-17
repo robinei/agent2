@@ -1494,35 +1494,21 @@ fn set_prototype_of_and_inherited_read() {
     );
 }
 
-/// `__proto__` read matches `getPrototypeOf`.
+/// `__proto__` is not a special accessor — it is an ordinary string-keyed
+/// property (no proto get/set diversion). Use `Object.get/setPrototypeOf`.
 #[test]
-fn proto_dunder_read() {
+fn proto_dunder_is_plain_property() {
+    // Read of an unset `__proto__` resolves like any missing property.
     assert_eq!(
-        testutil::run_val(
-            "const o = {}; const p = { y: 1 }; Object.setPrototypeOf(o, p); return o.__proto__ === p;"
-        ),
+        testutil::run_val("return ({}).__proto__ === undefined;"),
         Value::Bool(true)
     );
-    // Plain object has null __proto__.
-    assert_eq!(
-        testutil::run_val("return ({}).__proto__ === null;"),
-        Value::Bool(true)
-    );
-}
-
-/// `__proto__` write matches `setPrototypeOf`.
-#[test]
-fn proto_dunder_write() {
-    assert_eq!(
-        testutil::run_val("const o = {}; const p = { z: 99 }; o.__proto__ = p; return o.z;"),
-        Value::PosInt(99)
-    );
-    // Setting to null clears proto.
+    // Write stores an own data property; it does not change the prototype.
     assert_eq!(
         testutil::run_val(
-            "const o = {}; const p = { z: 1 }; o.__proto__ = p; o.__proto__ = null; return o.z;"
+            "const o = {}; const p = { z: 99 }; o.__proto__ = p; return o.z === undefined && o.__proto__ === p;"
         ),
-        Value::Undefined
+        Value::Bool(true)
     );
 }
 

@@ -216,10 +216,9 @@ The remaining intentional divergences from JS — deferred or accepted, NOT bugs
     link.
   • `Object.getPrototypeOf` returns `null` for a plain object (no
     `Object.prototype`) and rejects a primitive argument with `TypeError` (no
-    wrapper coercion).
-  • `__proto__` is recognized only as a static-member read/assignment accessor;
-    the object-literal `{ __proto__: x }` form and computed `obj["__proto__"]`
-    (a data property in JS) are not modeled.
+    wrapper coercion). Prototype get/set is *only* via `Object.get/setPrototypeOf`
+    — the legacy (Annex B) `__proto__` accessor is not modeled, so `__proto__` is
+    an ordinary string-keyed data property.
 
 */
 

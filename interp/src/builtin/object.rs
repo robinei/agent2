@@ -173,14 +173,7 @@ pub fn obj_get_proto_of(vm: &mut VM, args: Args) -> Result<Value, VMError> {
         Value::Object(p) => *p,
         _ => return Err(vm.fail(ErrorKind::TypeError, "type error")),
     };
-    let obj = vm
-        .objects
-        .get(obj_ptr as usize)
-        .ok_or_else(|| vm.fail(ErrorKind::ValueError, "value error"))?;
-    match obj.proto {
-        Some(p) => Ok(Value::Object(p)),
-        None => Ok(Value::Null),
-    }
+    vm.object_proto_value(obj_ptr)
 }
 
 /// `Object.setPrototypeOf(obj, proto)` → sets `obj`'s prototype and returns
@@ -191,34 +184,8 @@ pub fn obj_set_proto_of(vm: &mut VM, args: Args) -> Result<Value, VMError> {
         Value::Object(p) => *p,
         _ => return Err(vm.fail(ErrorKind::TypeError, "type error")),
     };
-    let new_proto = match args.get(vm, 1) {
-        Value::Object(p) => Some(*p),
-        Value::Null => None,
-        _ => {
-            return Err(vm.fail(ErrorKind::TypeError, "prototype must be an object or null"));
-        }
-    };
-    // Cycle check: walk `new_proto`'s chain to see if it reaches `obj_ptr`.
-    if let Some(proto_ptr) = new_proto {
-        const MAX_PROTO_DEPTH: u32 = 100;
-        let mut cur = Some(proto_ptr);
-        for _ in 0..MAX_PROTO_DEPTH {
-            match cur {
-                Some(p) if p == obj_ptr => {
-                    return Err(vm.fail(ErrorKind::TypeError, "cyclic prototype chain"));
-                }
-                Some(p) => {
-                    let o = vm
-                        .objects
-                        .get(p as usize)
-                        .ok_or_else(|| vm.fail(ErrorKind::ValueError, "value error"))?;
-                    cur = o.proto;
-                }
-                None => break,
-            }
-        }
-    }
-    vm.objects[obj_ptr as usize].proto = new_proto;
+    let proto = args.get(vm, 1).clone();
+    vm.set_object_proto(obj_ptr, proto)?;
     Ok(Value::Object(obj_ptr))
 }
 

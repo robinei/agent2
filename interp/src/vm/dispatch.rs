@@ -62,87 +62,7 @@ impl VM {
         if field_str != "prototype" {
             return Err(self.fail(ErrorKind::TypeError, "cannot read property on function"));
         }
-        if let Some(proto_ptr) = self.closures.get(ptr as usize).and_then(|c| c.prototype) {
-            return Ok(Value::Object(proto_ptr));
-        }
-        let new_map = IndexMap::new();
-        let proto_ptr = self.objects.len() as ObjectPtr;
-        self.objects.push(ObjData {
-            proto: None,
-            map: new_map,
-        });
-        self.closures[ptr as usize].prototype = Some(proto_ptr);
-        Ok(Value::Object(proto_ptr))
-    }
-
-    /// Resolve `"__proto__"` on an `Object` receiver: returns the object's
-    /// `[[Prototype]]` as `Value::Object(proto_ptr)` or `Value::Null` when
-    /// `proto` is `None`.
-    fn resolve_object_proto(&self, obj_ptr: ObjectPtr) -> Result<Value, VMError> {
-        let obj = match self.objects.get(obj_ptr as usize) {
-            Some(o) => o,
-            None => {
-                return Err(self.fail_not_resumable(ErrorKind::TypeError, "bad object pointer"));
-            }
-        };
-        match obj.proto {
-            Some(p) => Ok(Value::Object(p)),
-            None => Ok(Value::Null),
-        }
-    }
-
-    /// Set the `[[Prototype]]` of an `Object` receiver to the given value
-    /// (an `Object` or `Null`). Rejects a cycle (the new proto's chain must not
-    /// reach the receiver) and non-Object/non-Null values. Returns the old
-    /// proto value (or `Null`) for `SetMode::Old`, or the new value for
-    /// `SetMode::New`.
-    fn set_object_proto(
-        &mut self,
-        obj_ptr: ObjectPtr,
-        val: Value,
-        mode: SetMode,
-    ) -> Result<Value, VMError> {
-        let new_proto = match val {
-            Value::Object(p) => Some(p),
-            Value::Null => None,
-            _ => {
-                return Err(self.fail(ErrorKind::TypeError, "prototype must be an object or null"));
-            }
-        };
-        // Cycle check: walk new_proto's chain to see if it reaches obj_ptr.
-        if let Some(proto_ptr) = new_proto {
-            const MAX_PROTO_DEPTH: u32 = 100;
-            let mut cur = Some(proto_ptr);
-            for _ in 0..MAX_PROTO_DEPTH {
-                match cur {
-                    Some(p) if p == obj_ptr => {
-                        return Err(self.fail(ErrorKind::TypeError, "cyclic prototype chain"));
-                    }
-                    Some(p) => {
-                        let o = self.objects.get(p as usize).ok_or_else(|| {
-                            self.fail_not_resumable(ErrorKind::TypeError, "bad object pointer")
-                        })?;
-                        cur = o.proto;
-                    }
-                    None => break,
-                }
-            }
-        }
-        let obj = match self.objects.get_mut(obj_ptr as usize) {
-            Some(o) => o,
-            None => {
-                return Err(self.fail_not_resumable(ErrorKind::TypeError, "bad object pointer"));
-            }
-        };
-        let old_proto = match obj.proto {
-            Some(p) => Value::Object(p),
-            None => Value::Null,
-        };
-        obj.proto = new_proto;
-        match mode {
-            SetMode::Old => Ok(old_proto),
-            SetMode::New => Ok(val),
-        }
+        Ok(Value::Object(self.resolve_prototype(ptr)?))
     }
 
     /// Shared computed-property resolution for `IndexGet`/`ObjPeekDyn`:
@@ -1326,11 +1246,6 @@ impl VM {
                             self.stack.pop();
                             self.stack.push(val);
                         }
-                        Some(Value::Object(p)) if field_str == "__proto__" => {
-                            let val = self.resolve_object_proto(*p)?;
-                            self.stack.pop();
-                            self.stack.push(val);
-                        }
                         _ => match self.resolve_property_from_top(&field_str) {
                             Ok(val) => {
                                 self.stack.pop();
@@ -1353,10 +1268,6 @@ impl VM {
                     match self.stack.last() {
                         Some(Value::Closure { ptr, .. }) => {
                             let val = self.resolve_closure_prototype(*ptr, &field_str)?;
-                            self.stack.push(val);
-                        }
-                        Some(Value::Object(p)) if field_str == "__proto__" => {
-                            let val = self.resolve_object_proto(*p)?;
                             self.stack.push(val);
                         }
                         _ => {
@@ -1408,47 +1319,38 @@ impl VM {
                         }
                         Some(Value::Object(p)) => {
                             let obj_ptr = *p;
-                            if field.as_str() == "__proto__" {
-                                let result = self.set_object_proto(obj_ptr, val, mode)?;
-                                self.stack.pop();
-                                self.stack.push(result);
-                            } else {
-                                let obj = match self.objects.get_mut(obj_ptr as usize) {
-                                    Some(o) => o,
-                                    _ => {
-                                        return Err(self.fail_not_resumable(
-                                            ErrorKind::TypeError,
-                                            "bad object pointer",
-                                        ));
+                            let obj = match self.objects.get_mut(obj_ptr as usize) {
+                                Some(o) => o,
+                                _ => {
+                                    return Err(self.fail_not_resumable(
+                                        ErrorKind::TypeError,
+                                        "bad object pointer",
+                                    ));
+                                }
+                            };
+                            let result = match mode {
+                                SetMode::Old => {
+                                    let old =
+                                        obj.map.get(&field).cloned().unwrap_or(Value::Undefined);
+                                    if let Some(slot) = obj.map.get_mut(&field) {
+                                        *slot = val;
+                                    } else {
+                                        obj.map.insert(field, val);
                                     }
-                                };
-                                let result = match mode {
-                                    SetMode::Old => {
-                                        let old = obj
-                                            .map
-                                            .get(&field)
-                                            .cloned()
-                                            .unwrap_or(Value::Undefined);
-                                        if let Some(slot) = obj.map.get_mut(&field) {
-                                            *slot = val;
-                                        } else {
-                                            obj.map.insert(field, val);
-                                        }
-                                        old
+                                    old
+                                }
+                                SetMode::New => {
+                                    let result = val.clone();
+                                    if let Some(slot) = obj.map.get_mut(&field) {
+                                        *slot = val;
+                                    } else {
+                                        obj.map.insert(field, val);
                                     }
-                                    SetMode::New => {
-                                        let result = val.clone();
-                                        if let Some(slot) = obj.map.get_mut(&field) {
-                                            *slot = val;
-                                        } else {
-                                            obj.map.insert(field, val);
-                                        }
-                                        result
-                                    }
-                                };
-                                self.stack.pop();
-                                self.stack.push(result);
-                            }
+                                    result
+                                }
+                            };
+                            self.stack.pop();
+                            self.stack.push(result);
                             self.ip += 1;
                         }
                         _ => {
