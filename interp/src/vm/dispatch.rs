@@ -337,6 +337,10 @@ impl VM {
                     let callable =
                         std::mem::replace(&mut self.stack[args_start - 1], Value::Undefined);
                     let (this_val, below) = if has_this {
+                        // 3b method-call path (`recv.m(args)`, `recv[k](args)`):
+                        // both the receiver and the callee sit below `fp`, so
+                        // `reclaim_below = 2`. Exercised by the method-`this`
+                        // tests in `compiler/tests/objects_arrays.rs`.
                         let recv =
                             std::mem::replace(&mut self.stack[args_start - 2], Value::Undefined);
                         (recv, 2)

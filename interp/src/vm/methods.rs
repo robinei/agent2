@@ -1,9 +1,6 @@
 use super::*;
 
 use crate::diag::Diagnostic;
-use crate::vm::value::MapKey;
-use indexmap::IndexSet;
-use std::collections::HashMap;
 
 impl VM {
     pub fn new(code: Vec<Instr>) -> Self {
@@ -866,18 +863,6 @@ impl VM {
             }
         }
         Ok(Value::Undefined)
-    }
-
-    pub(crate) fn alloc_map(&mut self, map: IndexMap<MapKey, Value>) -> Value {
-        let addr = self.maps.len() as MapPtr;
-        self.maps.push(map);
-        Value::Map(addr)
-    }
-
-    pub(crate) fn alloc_set(&mut self, set: IndexSet<MapKey>) -> Value {
-        let addr = self.sets.len() as SetPtr;
-        self.sets.push(set);
-        Value::Set(addr)
     }
 
     pub(super) fn alloc_closure(&mut self, addr: CodeAddr, upvals: ThinVec<Value>) -> Value {
