@@ -751,6 +751,17 @@ not error. Extend `Instr::GetLength`'s polymorphic dispatch with a callable arm:
 keeps `.length` off the call path (it's a property, not a method; see the
 GetLength-vs-builtin rationale).
 
+**Implementation findings (close these before building):**
+- The "receiver-type-aware `(type, name) → Builtin`" lookup **doesn't exist yet** —
+  `Builtin::for_method` is name-only. Add a `(receiver_type, name) → Builtin`
+  resolver (or fold the type check into `GetMethodOrProp`).
+- `fn.length` for a `Closure` needs **per-`CodeAddr` declared-arity metadata**
+  (param count before the first default/rest), recorded where `GetLength` can
+  read it (extend the function/debug table). It is not currently stored.
+- The `Builtin` arm (`min_args − 1`) only **approximates** JS's fixed `.length`
+  (builtins have no "params before first default"); record it as a divergence
+  rather than claiming exactness.
+
 Acceptance:
 - [ ] `const f = [].push.bind(arr); f(3)` pushes to `arr`.
 - [ ] `obj.has` where `obj` has a data property `has` still reads the data
@@ -763,42 +774,123 @@ Acceptance:
 
 ## Step 7 — `class` sugar
 
-No new runtime concepts. **Direct codegen, not AST rewriting:** add a
-`compile_class` that walks the `ClassDeclaration`/`ClassExpression` node and
-*emits* the same instruction sequence the hand-written `function C(){…};
-C.prototype.m = function(){…}` form compiles to — by reusing the existing
-codegen helpers (`compile_function` for the constructor and method bodies, plus
-Step 4's prototype-assignment path). The two forms **converge at the bytecode
-level**; nothing materializes an intermediate ES5 AST.
+**Direct codegen, not AST rewriting:** `compile_class` walks the
+`ClassDeclaration`/`ClassExpression` node and *emits* the same instruction
+sequence the hand-written `function C(){…}; C.prototype.m = function(){…}` form
+compiles to — reusing the existing helpers (`compile_function` for the
+constructor and method bodies, plus the `F.prototype` read/assign path from Step
+4b). The two forms **converge at the bytecode level**; nothing materializes an
+intermediate ES5 AST. (`class` is currently `self.error(…)` at **`stmt.rs:137`**;
+replace that arm.) This matches the established idiom — spread → `ArrExtend`,
+optional chaining → branches, the `new` special-forms in `expr.rs` — and keeps
+the class node's real spans for diagnostics.
 
-This matches the established idiom — every sugar here is direct emission (spread
-→ `ArrExtend`, optional chaining → branches, the `new` special-forms
-`compile_map_ctor`/`compile_regexp_ctor`/… in `expr.rs`) — and avoids
-synthesizing arena-bound oxc nodes (lifetimes + fabricated spans), keeping the
-class node's real spans for diagnostics. (`class` is currently `self.error(…)`
-at `stmt.rs:128`; replace that arm.)
+It splits into **7a** (a plain class — constructor + methods + fields, no
+`extends`) and **7b** (`extends`/`super`), because `super` is the one part that
+needs real mechanism rather than direct transcription. **A `class` is only useful
+with `instanceof`** — land **Step 8** alongside it.
 
-- **Constructor + methods:** `compile_function` for the constructor body
-  (becomes `C`); each method → `ClosureNew` + an `ObjSet` onto `C.prototype`.
-- **Fields** (`x = 1`): emit `this.x = 1` into the *front* of the constructor's
-  instruction stream, in field order (no synthetic AST — just prepend the
-  store sequence).
-- **`extends` / `super`:** set `C.prototype`'s proto to the parent prototype;
-  `super(...)`/`super.m(...)` emit a *direct* parent-constructor / parent-proto
-  lookup (these have no clean ES5-AST twin, so direct codegen is the natural
-  form, not a fallback).
+### Step 7a — plain class (no `extends`)
+
+- **Constructor + methods.** `compile_function` for the constructor body (becomes
+  `C`, instantiated by `new` via Step 4b's `New`/`NewReturn`). Each method →
+  push its function value (the canonical `PushFn` from 4a for a non-capturing
+  method, or `ClosureNew` if it captures) + `ObjSet` onto `C.prototype` (read
+  `C.prototype` via 4b's callable-`ObjGet` arm, lazily allocating it).
+- **Fields** (`x = 1`): prepend `this.x = <init>` to the *front* of the
+  constructor body, in field order (`LoadThis` + `ObjSet`; no synthetic AST).
 - **`static` / getters / setters:** **reject in the MVP** with an
-  alternative-naming diagnostic (do not implement them this phase). This keeps
-  the surface small; revisit on evidence.
+  alternative-naming diagnostic. Keeps the surface small; revisit on evidence.
 
-Acceptance:
-- [ ] A `class` with a constructor and a method compiles to bytecode equivalent
-      to (and behaves identically to) its hand-written `function`+`prototype`
-      form — assert via a shared test body run both ways.
-- [ ] `extends` + `super(...)` + `super.m()` resolve to the parent.
-- [ ] Diagnostics carry the original class-node spans (not fabricated ones).
-- [ ] Rejected sugar (whatever the MVP omits) has an alternative-naming
-      diagnostic, not a parser panic.
+Acceptance (7a):
+- [ ] A `class` with a constructor + method compiles to bytecode behaving
+      identically to its hand-written `function`+`prototype` form (shared test
+      body run both ways).
+- [ ] Fields initialize on construction, in declaration order, before the
+      constructor body.
+- [ ] `new C() instanceof C` is `true` (with Step 8).
+- [ ] Rejected sugar (`static`, get/set) has an alternative-naming diagnostic,
+      not a parser panic; diagnostics carry the real class-node spans.
+- [ ] Gate: `cargo fmt && cargo clippy && cargo test` green.
+
+### Step 7b — `extends` / `super`
+
+`super` is **not** `new Parent()` — it invokes the parent with the *current
+instance* as `this`, so it needs explicit mechanism:
+
+- **`extends Parent`**: set `C.prototype`'s `[[Prototype]]` to `Parent.prototype`
+  (so instances inherit parent methods via the Step-2 chain walk) — i.e. the
+  Step-8 set-prototype logic applied to `C.prototype`. (Static inheritance —
+  `C`'s own `[[Prototype]] = Parent` — is **out of scope** unless `static` lands.)
+- **`super(args)`** in the derived constructor: dispatch the **parent
+  constructor** with `this_val = LoadThis` (the instance being built) and `args`
+  — *not* the `New` path (no fresh instance). The parent's `this.x = …` writes
+  onto the same instance.
+- **`super.m(args)`**: resolve `m` on the **parent prototype** (not the
+  instance's own chain, which would re-find an override) and dispatch with
+  `this_val = LoadThis` (`has_this`).
+- **Field-init ordering**: a derived class's fields initialize **after** `super()`
+  returns (JS) — prepend the field stores *after* the `super(...)` call, not at
+  the front (a base class keeps 7a's front-prepend).
+
+Acceptance (7b):
+- [ ] `class P { constructor(x){ this.x = x } get(){ return this.x } }`
+      `class C extends P { constructor(x){ super(x) } }` → `new C(7).get() === 7`
+      (inherited method, `this` bound to the instance; `super` threads `this`).
+- [ ] `super.m()` calls the parent's `m` even when `C` overrides `m`.
+- [ ] a derived field initializes *after* `super()` (observable when it reads a
+      value `super()` set).
+- [ ] `new C() instanceof P` and `new C() instanceof C` are both `true` (Step 8).
+- [ ] Gate: `cargo fmt && cargo clippy && cargo test` green.
+
+## Step 8 — prototype reflection: `instanceof`, `Object.getPrototypeOf`/`setPrototypeOf`, `__proto__`
+
+The proto chain (Step 2) and `F.prototype` (Step 4b) exist but are not yet
+*observable* from the language. These three features expose them. All reuse the
+existing `resolve_proto_chain` walk (with its `MAX_PROTO_DEPTH` cap, so a cyclic
+chain terminates rather than hanging). Depends on **2 + 4b**; independent of
+5/6/7 — but `class` (7) is half a model without `instanceof`, so land it
+together.
+
+- **`instanceof`** (`x instanceof F`). Replace the hard-error at
+  **`operators.rs:47`** with an `InstanceOf` instruction (binary `x, F -> bool`).
+  Runtime: `F` must be callable — a **`Closure`** (user function / class) or a
+  **`Bound`** (use its target's prototype); a non-callable RHS is a `TypeError`
+  ("right-hand side of `instanceof` is not callable"). Resolve `F.prototype`
+  (lazy-alloc, as 4b), then walk `x`'s prototype chain (`x` an `Object`, else
+  `false`): `true` iff that `ObjectPtr` appears. Classify `pe_*` pure (proto walk,
+  no user code) + `ResumeMode`. **Divergence: builtin "constructors" (`Array`,
+  `Object`, `Map`, …) are namespaces, not callable values with a `.prototype`, so
+  `x instanceof Array` is unsupported** (TypeError) — document.
+- **`Object.getPrototypeOf(obj)`** — namespace builtin. Returns `obj`'s
+  `[[Prototype]]` as `Value::Object(proto_ptr)`, or **`Value::Null`** when `proto`
+  is `None` (plain objects have no proto here — a divergence from JS's
+  `Object.prototype`). A non-`Object` arg is a `TypeError` (JS coerces primitives
+  to wrappers; unsupported).
+- **`Object.setPrototypeOf(obj, proto)`** — namespace builtin. `obj` an `Object`;
+  set `ObjData.proto = Some(ptr)` for an `Object` `proto`, `None` for `null`; a
+  non-`Object`/non-`null` `proto` is a `TypeError`. Returns `obj`. **Cycle
+  handling: reject** a `proto` whose own chain already reaches `obj` (matches JS's
+  throw) — the `MAX_PROTO_DEPTH` cap already prevents a hang, but rejecting is the
+  faithful choice; state it.
+- **`__proto__`** — recognize `obj.__proto__` in static member **read** and
+  **assignment** and route to the get/set-prototype logic above (not the property
+  map). **Divergences**: the object-literal `{ __proto__: x }` proto-setting form
+  and computed `obj["__proto__"]` (which JS treats as a data property) are **not**
+  modeled — `__proto__` is only the accessor on a static member. Document.
+
+Acceptance (Step 8):
+- [ ] `function F(){}; new F() instanceof F` is `true`; `({}) instanceof F` is
+      `false`; `5 instanceof F` is `false`.
+- [ ] `x instanceof <non-callable>` is a `TypeError`; `x instanceof Array` is the
+      documented unsupported `TypeError`.
+- [ ] `Object.getPrototypeOf(new F()) === F.prototype`;
+      `Object.getPrototypeOf({})` is `null`.
+- [ ] `Object.setPrototypeOf(o, p); Object.getPrototypeOf(o) === p`, and an
+      inherited read on `o` now resolves through `p`.
+- [ ] `o.__proto__` read and `o.__proto__ = p` write match
+      `get`/`setPrototypeOf`.
+- [ ] a self-referential `setPrototypeOf` is rejected (and never hangs).
 - [ ] Gate: `cargo fmt && cargo clippy && cargo test` green.
 
 ---
@@ -820,10 +912,13 @@ value model). 1b and 2 are independent and can land in either order, but both
 precede **3b** (3b sets the first non-undefined `this`, which is when 1b's capture
 wiring must already be correct): 3b depends on 1b + 2 + 3a. **4b** depends on
 4a + 3b. **5** depends on 3b + 4a (its `Bound` checklist and `.call`/`.apply`
-receiver test assume the unified `Closure`). 6 depends on 3b + 5. 7 depends on 4b
-(and 5 if methods-as-values appear in class bodies). The **minimum coherent
-system** is Steps 1–4; 5–7 are the deferred items folded into the same substrate
-so they never become one-off bolt-ons.
+receiver test assume the unified `Closure`). 6 depends on 3b + 5. **8**
+(prototype reflection) depends on 2 + 4b and is otherwise independent. **7a**
+(plain class) depends on 4b; **7b** (`extends`/`super`) depends on 7a + 8 (it
+reuses 8's set-prototype primitive). `class` is only *useful* with `instanceof`,
+so **8 should land with 7**. The **minimum coherent system** is Steps 1–4; 5–8
+are the deferred items folded into the same substrate so they never become
+one-off bolt-ons.
 
 ## Divergences from JS (record in the divergence list as they land)
 
@@ -845,6 +940,18 @@ so they never become one-off bolt-ons.
   and resolves user methods on `Object` receivers, but a computed key naming a
   *builtin* method (`arr["push"]()`) fails — builtins aren't stored properties,
   so only the static form (`arr.push()`, compiler-resolved) reaches them.
+- **`instanceof` is user-callables only** (Step 8). `x instanceof F` works for a
+  user function / class / `Bound`; builtin "constructors" (`Array`, `Object`,
+  `Map`, …) are namespaces with no callable `.prototype`, so `x instanceof Array`
+  is a `TypeError`.
+- **Prototype reflection is partial** (Step 8). `Object.getPrototypeOf` returns
+  `null` for a plain object (no `Object.prototype`); `getPrototypeOf` on a
+  primitive is a `TypeError` (no wrapper coercion); a cyclic `setPrototypeOf` is
+  rejected (as JS). `__proto__` is recognized only as a static-member accessor —
+  the object-literal `{ __proto__: x }` form and computed `obj["__proto__"]`
+  (a data property in JS) are not modeled.
+- **`fn.length` for builtins is approximate** (Step 6): derived from `min_args`
+  rather than JS's fixed declared count.
 - **`ToPrimitive` on objects stays unperformed** (the existing divergence):
   arithmetic/`==` against a plain or constructed object is still a `TypeError`,
   not a `toString`/`valueOf` coercion.
