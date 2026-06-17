@@ -276,6 +276,8 @@ builtins! {
     ObjFromEntries, BuiltinKind::Namespace("Object"), "fromEntries", 1, 1,      obj_from_entries;
     ObjAssign,      BuiltinKind::Namespace("Object"), "assign",      1, VARARG, obj_assign;
     ObjHasOwn,      BuiltinKind::Namespace("Object"), "hasOwn",      2, 2,      obj_has_own;
+    ObjGetProtoOf,  BuiltinKind::Namespace("Object"), "getPrototypeOf", 1, 1,   obj_get_proto_of;
+    ObjSetProtoOf,  BuiltinKind::Namespace("Object"), "setPrototypeOf", 2, 2,   obj_set_proto_of;
 
     // ── object methods ──
     ObjHasOwnProperty, BuiltinKind::Method, "hasOwnProperty", 2, 2, obj_has_own_property;

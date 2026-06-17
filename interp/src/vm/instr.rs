@@ -52,6 +52,19 @@ pub enum SetMode {
     Old,
 }
 
+/// Builtin-type tag for `instanceof` fast-path checks. Maps to the JS
+/// builtin constructors whose `instanceof` behaviour is a structural
+/// value-tag check rather than a proto-chain walk.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum TypeTag {
+    Array,
+    Object,
+    Map,
+    Set,
+    RegExp,
+    Function,
+}
+
 /// Instructions for a stack based language used for LLM composition of complex tool flows.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Instr {
@@ -355,6 +368,16 @@ pub enum Instr {
     GetLength, // str|arr -> num
     /// `.size` for Map or Set, or `size` property for objects
     GetSize, // map|set -> num
+
+    /// `x instanceof F` — walks `x`'s prototype chain looking for
+    /// `F.prototype`. LHS (value) then RHS (callable) on stack; pops both,
+    /// pushes bool. RHS must be a Closure or Bound; else TypeError.
+    /// Stack: value, callable -> bool
+    InstanceOf,
+    /// Builtin-type `instanceof` fast path (`x instanceof Array`, etc.).
+    /// Pops the LHS value and pushes whether it matches the given type tag.
+    /// Stack: value -> bool
+    TypeCheck(TypeTag),
 
     /// JS `String(x)` / ToString: pops any value, pushes its string form. Unlike
     /// StrFromJson (which emits JSON, and rejects non-JSON values), this matches

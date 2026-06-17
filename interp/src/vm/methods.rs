@@ -867,6 +867,73 @@ impl VM {
         Ok(Value::Undefined)
     }
 
+    /// `x instanceof F`: walk `x`'s prototype chain looking for `F.prototype`.
+    /// LHS need not be an Object — non-Object values (primitives) cannot be on
+    /// a prototype chain so return `false` immediately. RHS must be a `Closure`
+    /// or `Bound` (callables with a `.prototype`) — else `TypeError`. The walk
+    /// reuses the same `MAX_PROTO_DEPTH` cap as `resolve_proto_chain`, so a
+    /// cyclic chain terminates.
+    pub(crate) fn instanceof(&mut self, lhs: Value, rhs: Value) -> Result<bool, VMError> {
+        let (lhs_obj, proto_ptr) = match (lhs, rhs) {
+            (Value::Object(lhs_ptr), Value::Closure { ptr, .. }) => {
+                let proto = self.resolve_prototype(ptr)?;
+                (lhs_ptr, proto)
+            }
+            (Value::Object(lhs_ptr), Value::Bound(b)) => {
+                let inner = match &b.callable {
+                    Value::Closure { ptr, .. } => *ptr,
+                    _ => {
+                        return Err(self.fail(
+                            ErrorKind::TypeError,
+                            "right-hand side of `instanceof` is not callable",
+                        ));
+                    }
+                };
+                let proto = self.resolve_prototype(inner)?;
+                (lhs_ptr, proto)
+            }
+            (_, Value::Closure { .. } | Value::Bound(_)) => return Ok(false),
+            _ => {
+                return Err(self.fail(
+                    ErrorKind::TypeError,
+                    "right-hand side of `instanceof` is not callable",
+                ));
+            }
+        };
+        const MAX_PROTO_DEPTH: u32 = 100;
+        let mut cur = Some(lhs_obj);
+        for _ in 0..MAX_PROTO_DEPTH {
+            match cur {
+                Some(p) if p == proto_ptr => return Ok(true),
+                Some(p) => {
+                    let obj = self.objects.get(p as usize).ok_or_else(|| {
+                        self.fail_not_resumable(ErrorKind::TypeError, "bad object pointer")
+                    })?;
+                    cur = obj.proto;
+                }
+                None => return Ok(false),
+            }
+        }
+        Ok(false)
+    }
+
+    /// Resolve a Closure's `.prototype`, lazily allocating an empty object on
+    /// first access. Shared by `resolve_closure_prototype` (for `F.prototype`
+    /// property reads) and `instanceof` (for walking the chain).
+    fn resolve_prototype(&mut self, ptr: ClosurePtr) -> Result<ObjectPtr, VMError> {
+        if let Some(proto_ptr) = self.closures.get(ptr as usize).and_then(|c| c.prototype) {
+            return Ok(proto_ptr);
+        }
+        let new_map = IndexMap::new();
+        let proto_ptr = self.objects.len() as ObjectPtr;
+        self.objects.push(ObjData {
+            proto: None,
+            map: new_map,
+        });
+        self.closures[ptr as usize].prototype = Some(proto_ptr);
+        Ok(proto_ptr)
+    }
+
     pub(super) fn alloc_closure(&mut self, addr: CodeAddr, upvals: ThinVec<Value>) -> Value {
         let idx = self.closures.len() as ClosurePtr;
         self.closures.push(Closure {

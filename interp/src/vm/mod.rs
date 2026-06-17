@@ -209,6 +209,17 @@ The remaining intentional divergences from JS — deferred or accepted, NOT bugs
     throw/rejection rejects the call's promise, exactly as in JS. Circular
     awaits are detected and reported as a dedicated `Deadlock` error naming
     the await chain.
+  • `instanceof` covers builtin types (`Array`/`Object`/`Map`/`Set`/`RegExp`/
+    `Function`) via a structural value-tag check and user callables (`Closure`/
+    `Bound`) via a prototype-chain walk. `instanceof Error` is unsupported —
+    Error instances are plain `Object`s with no distinct tag or `Error.prototype`
+    link.
+  • `Object.getPrototypeOf` returns `null` for a plain object (no
+    `Object.prototype`) and rejects a primitive argument with `TypeError` (no
+    wrapper coercion).
+  • `__proto__` is recognized only as a static-member read/assignment accessor;
+    the object-literal `{ __proto__: x }` form and computed `obj["__proto__"]`
+    (a data property in JS) are not modeled.
 
 */
 

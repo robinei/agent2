@@ -75,6 +75,76 @@ impl VM {
         Ok(Value::Object(proto_ptr))
     }
 
+    /// Resolve `"__proto__"` on an `Object` receiver: returns the object's
+    /// `[[Prototype]]` as `Value::Object(proto_ptr)` or `Value::Null` when
+    /// `proto` is `None`.
+    fn resolve_object_proto(&self, obj_ptr: ObjectPtr) -> Result<Value, VMError> {
+        let obj = match self.objects.get(obj_ptr as usize) {
+            Some(o) => o,
+            None => {
+                return Err(self.fail_not_resumable(ErrorKind::TypeError, "bad object pointer"));
+            }
+        };
+        match obj.proto {
+            Some(p) => Ok(Value::Object(p)),
+            None => Ok(Value::Null),
+        }
+    }
+
+    /// Set the `[[Prototype]]` of an `Object` receiver to the given value
+    /// (an `Object` or `Null`). Rejects a cycle (the new proto's chain must not
+    /// reach the receiver) and non-Object/non-Null values. Returns the old
+    /// proto value (or `Null`) for `SetMode::Old`, or the new value for
+    /// `SetMode::New`.
+    fn set_object_proto(
+        &mut self,
+        obj_ptr: ObjectPtr,
+        val: Value,
+        mode: SetMode,
+    ) -> Result<Value, VMError> {
+        let new_proto = match val {
+            Value::Object(p) => Some(p),
+            Value::Null => None,
+            _ => {
+                return Err(self.fail(ErrorKind::TypeError, "prototype must be an object or null"));
+            }
+        };
+        // Cycle check: walk new_proto's chain to see if it reaches obj_ptr.
+        if let Some(proto_ptr) = new_proto {
+            const MAX_PROTO_DEPTH: u32 = 100;
+            let mut cur = Some(proto_ptr);
+            for _ in 0..MAX_PROTO_DEPTH {
+                match cur {
+                    Some(p) if p == obj_ptr => {
+                        return Err(self.fail(ErrorKind::TypeError, "cyclic prototype chain"));
+                    }
+                    Some(p) => {
+                        let o = self.objects.get(p as usize).ok_or_else(|| {
+                            self.fail_not_resumable(ErrorKind::TypeError, "bad object pointer")
+                        })?;
+                        cur = o.proto;
+                    }
+                    None => break,
+                }
+            }
+        }
+        let obj = match self.objects.get_mut(obj_ptr as usize) {
+            Some(o) => o,
+            None => {
+                return Err(self.fail_not_resumable(ErrorKind::TypeError, "bad object pointer"));
+            }
+        };
+        let old_proto = match obj.proto {
+            Some(p) => Value::Object(p),
+            None => Value::Null,
+        };
+        obj.proto = new_proto;
+        match mode {
+            SetMode::Old => Ok(old_proto),
+            SetMode::New => Ok(val),
+        }
+    }
+
     /// Shared computed-property resolution for `IndexGet`/`ObjPeekDyn`:
     /// inspects `container` (the object/array/string being indexed) and
     /// resolves `key` against it. String→char, Array→int-index,
@@ -955,6 +1025,45 @@ impl VM {
                     self.ip += 1;
                 }
 
+                // ── instanceof ────────────────────────────────
+                Instr::TypeCheck(tag) => {
+                    use crate::vm::instr::TypeTag;
+                    let tag = *tag;
+                    let val = self.pop()?;
+                    let result = match tag {
+                        TypeTag::Array => matches!(val, Value::Array(_)),
+                        TypeTag::Object => matches!(
+                            val,
+                            Value::Object(_)
+                                | Value::Array(_)
+                                | Value::Map(_)
+                                | Value::Set(_)
+                                | Value::RegExp(_)
+                                | Value::Closure { .. }
+                                | Value::Bound(_)
+                        ),
+                        TypeTag::Map => matches!(val, Value::Map(_)),
+                        TypeTag::Set => matches!(val, Value::Set(_)),
+                        TypeTag::RegExp => matches!(val, Value::RegExp(_)),
+                        TypeTag::Function => {
+                            matches!(
+                                val,
+                                Value::Closure { .. } | Value::Builtin(_) | Value::Bound(_)
+                            )
+                        }
+                    };
+                    self.stack.push(Value::Bool(result));
+                    self.ip += 1;
+                }
+
+                Instr::InstanceOf => {
+                    let rhs = self.pop()?;
+                    let lhs = self.pop()?;
+                    let result = self.instanceof(lhs, rhs)?;
+                    self.stack.push(Value::Bool(result));
+                    self.ip += 1;
+                }
+
                 // ── unary operators ─────────────────────────────
                 Instr::Neg => unary_num!(|n: f64| -n),
 
@@ -1217,6 +1326,11 @@ impl VM {
                             self.stack.pop();
                             self.stack.push(val);
                         }
+                        Some(Value::Object(p)) if field_str == "__proto__" => {
+                            let val = self.resolve_object_proto(*p)?;
+                            self.stack.pop();
+                            self.stack.push(val);
+                        }
                         _ => match self.resolve_property_from_top(&field_str) {
                             Ok(val) => {
                                 self.stack.pop();
@@ -1239,6 +1353,10 @@ impl VM {
                     match self.stack.last() {
                         Some(Value::Closure { ptr, .. }) => {
                             let val = self.resolve_closure_prototype(*ptr, &field_str)?;
+                            self.stack.push(val);
+                        }
+                        Some(Value::Object(p)) if field_str == "__proto__" => {
+                            let val = self.resolve_object_proto(*p)?;
                             self.stack.push(val);
                         }
                         _ => {
@@ -1290,38 +1408,47 @@ impl VM {
                         }
                         Some(Value::Object(p)) => {
                             let obj_ptr = *p;
-                            let obj = match self.objects.get_mut(obj_ptr as usize) {
-                                Some(o) => o,
-                                _ => {
-                                    return Err(self.fail_not_resumable(
-                                        ErrorKind::TypeError,
-                                        "bad object pointer",
-                                    ));
-                                }
-                            };
-                            let result = match mode {
-                                SetMode::Old => {
-                                    let old =
-                                        obj.map.get(&field).cloned().unwrap_or(Value::Undefined);
-                                    if let Some(slot) = obj.map.get_mut(&field) {
-                                        *slot = val;
-                                    } else {
-                                        obj.map.insert(field, val);
+                            if field.as_str() == "__proto__" {
+                                let result = self.set_object_proto(obj_ptr, val, mode)?;
+                                self.stack.pop();
+                                self.stack.push(result);
+                            } else {
+                                let obj = match self.objects.get_mut(obj_ptr as usize) {
+                                    Some(o) => o,
+                                    _ => {
+                                        return Err(self.fail_not_resumable(
+                                            ErrorKind::TypeError,
+                                            "bad object pointer",
+                                        ));
                                     }
-                                    old
-                                }
-                                SetMode::New => {
-                                    let result = val.clone();
-                                    if let Some(slot) = obj.map.get_mut(&field) {
-                                        *slot = val;
-                                    } else {
-                                        obj.map.insert(field, val);
+                                };
+                                let result = match mode {
+                                    SetMode::Old => {
+                                        let old = obj
+                                            .map
+                                            .get(&field)
+                                            .cloned()
+                                            .unwrap_or(Value::Undefined);
+                                        if let Some(slot) = obj.map.get_mut(&field) {
+                                            *slot = val;
+                                        } else {
+                                            obj.map.insert(field, val);
+                                        }
+                                        old
                                     }
-                                    result
-                                }
-                            };
-                            self.stack.pop();
-                            self.stack.push(result);
+                                    SetMode::New => {
+                                        let result = val.clone();
+                                        if let Some(slot) = obj.map.get_mut(&field) {
+                                            *slot = val;
+                                        } else {
+                                            obj.map.insert(field, val);
+                                        }
+                                        result
+                                    }
+                                };
+                                self.stack.pop();
+                                self.stack.push(result);
+                            }
                             self.ip += 1;
                         }
                         _ => {

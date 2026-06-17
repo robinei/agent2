@@ -1,5 +1,6 @@
 use oxc_ast::ast;
 
+use crate::vm::instr::TypeTag;
 use crate::vm::{Instr, Value};
 
 impl<'src> super::Compiler<'src> {
@@ -16,6 +17,11 @@ impl<'src> super::Compiler<'src> {
             self.compile_expr(&bin.right);
             self.emit(Instr::Dig(1), span);
             self.emit(Instr::ObjHas, span);
+            return;
+        }
+
+        if bin.operator == Op::Instanceof {
+            self.compile_instanceof(&bin.left, &bin.right, span);
             return;
         }
 
@@ -43,13 +49,49 @@ impl<'src> super::Compiler<'src> {
             Op::ShiftLeft => Instr::BitLhs,
             Op::ShiftRight => Instr::BitRhs,
             Op::ShiftRightZeroFill => Instr::BitURhs,
-            Op::Instanceof => {
-                self.error(span, "`instanceof` is not supported");
-                return;
-            }
             Op::In => unreachable!("`in` handled above"),
+            Op::Instanceof => unreachable!("`instanceof` handled above"),
         };
         self.emit(instr, span);
+    }
+
+    /// `x instanceof RHS`. The compiler picks one of two lowerings by the RHS:
+    /// - **Builtin type**: RHS is an *undeclared* identifier naming a known
+    ///   builtin constructor (`Array`, `Object`, `Map`, `Set`, `RegExp`,
+    ///   `Function`). Emit `TypeCheck(tag)` for a structural value-tag check.
+    ///   A declared local shadowing the same name takes the user-callable path.
+    /// - **User callable**: evaluate the RHS and emit `InstanceOf`, which walks
+    ///   the prototype chain at runtime.
+    pub(super) fn compile_instanceof(
+        &mut self,
+        lhs: &ast::Expression,
+        rhs: &ast::Expression,
+        span: u32,
+    ) {
+        self.compile_expr(lhs);
+        // Check for builtin-type fast path: RHS is an undeclared identifier
+        // naming a known builtin type.
+        if let ast::Expression::Identifier(id) = rhs {
+            let ref_span = id.span.start;
+            if self.ref_slot(ref_span).is_none() && !crate::is_host_const(id.name.as_str()) {
+                let tag = match id.name.as_str() {
+                    "Array" => Some(TypeTag::Array),
+                    "Object" => Some(TypeTag::Object),
+                    "Map" => Some(TypeTag::Map),
+                    "Set" => Some(TypeTag::Set),
+                    "RegExp" => Some(TypeTag::RegExp),
+                    "Function" => Some(TypeTag::Function),
+                    _ => None,
+                };
+                if let Some(tag) = tag {
+                    self.emit(Instr::TypeCheck(tag), span);
+                    return;
+                }
+            }
+        }
+        // User-callable path: evaluate RHS and emit InstanceOf.
+        self.compile_expr(rhs);
+        self.emit(Instr::InstanceOf, span);
     }
 
     pub(super) fn compile_unary(&mut self, un: &ast::UnaryExpression) {

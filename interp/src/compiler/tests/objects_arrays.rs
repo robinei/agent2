@@ -1371,3 +1371,193 @@ fn bound_function_to_string() {
         Value::String(RcStr::from("function () { [native code] }"))
     );
 }
+
+// ── Phase 13 Step 8: prototype reflection ──────────────────────────
+
+/// `instanceof` with user constructors walks the prototype chain.
+#[test]
+fn instanceof_user_constructor() {
+    // `new F() instanceof F` is true.
+    assert_eq!(
+        testutil::run_val("function F(){} return new F() instanceof F;"),
+        Value::Bool(true)
+    );
+    // `({}) instanceof F` is false.
+    assert_eq!(
+        testutil::run_val("function F(){} return ({}) instanceof F;"),
+        Value::Bool(false)
+    );
+    // `5 instanceof F` is false (non-object lhs).
+    assert_eq!(
+        testutil::run_val("function F(){} return 5 instanceof F;"),
+        Value::Bool(false)
+    );
+}
+
+/// `instanceof` with builtin type names uses structural tag check.
+#[test]
+fn instanceof_builtin_types() {
+    // `[] instanceof Array` is true.
+    assert_eq!(
+        testutil::run_val("return [] instanceof Array;"),
+        Value::Bool(true)
+    );
+    // `({}) instanceof Array` is false.
+    assert_eq!(
+        testutil::run_val("return ({}) instanceof Array;"),
+        Value::Bool(false)
+    );
+    // `[] instanceof Object` is true (all non-primitives are Object).
+    assert_eq!(
+        testutil::run_val("return [] instanceof Object;"),
+        Value::Bool(true)
+    );
+    // `(()=>{}) instanceof Object` is true.
+    assert_eq!(
+        testutil::run_val("return (()=>{}) instanceof Object;"),
+        Value::Bool(true)
+    );
+    // `5 instanceof Object` is false (primitives are not Object).
+    assert_eq!(
+        testutil::run_val("return 5 instanceof Object;"),
+        Value::Bool(false)
+    );
+    // `new Map() instanceof Map` is true.
+    assert_eq!(
+        testutil::run_val("return new Map() instanceof Map;"),
+        Value::Bool(true)
+    );
+    // `new Set() instanceof Set` is true.
+    assert_eq!(
+        testutil::run_val("return new Set() instanceof Set;"),
+        Value::Bool(true)
+    );
+    // `[] instanceof Function` is false.
+    assert_eq!(
+        testutil::run_val("return [] instanceof Function;"),
+        Value::Bool(false)
+    );
+    // `(()=>{}) instanceof Function` is true.
+    assert_eq!(
+        testutil::run_val("return (()=>{}) instanceof Function;"),
+        Value::Bool(true)
+    );
+}
+
+/// `x instanceof <non-callable value>` (declared local) is TypeError.
+#[test]
+fn instanceof_non_callable_is_type_error() {
+    let err = testutil::run_runtime_err("const x = 5; return 3 instanceof x;");
+    assert!(
+        err.message.contains("not callable"),
+        "expected 'not callable', got: {}",
+        err.message
+    );
+}
+
+/// `Object.getPrototypeOf(new F())` returns `F.prototype`.
+#[test]
+fn get_prototype_of_returns_proto() {
+    assert_eq!(
+        testutil::run_val(
+            "function F(){ this.x = 1 } const o = new F(); return Object.getPrototypeOf(o) === F.prototype;"
+        ),
+        Value::Bool(true)
+    );
+    // `Object.getPrototypeOf({})` returns `null` (no Object.prototype).
+    assert_eq!(
+        testutil::run_val("return Object.getPrototypeOf({}) === null;"),
+        Value::Bool(true)
+    );
+}
+
+/// `Object.setPrototypeOf(o, p)` sets proto and returns `o`.
+#[test]
+fn set_prototype_of_and_inherited_read() {
+    assert_eq!(
+        testutil::run_val(
+            "const o = {}; const p = { x: 42 }; Object.setPrototypeOf(o, p); return o.x;"
+        ),
+        Value::PosInt(42)
+    );
+    // setPrototypeOf returns the target.
+    assert_eq!(
+        testutil::run_val("const o = {}; const p = {}; return Object.setPrototypeOf(o, p) === o;"),
+        Value::Bool(true)
+    );
+    // getPrototypeOf after setPrototypeOf matches.
+    assert_eq!(
+        testutil::run_val(
+            "const o = {}; const p = {}; Object.setPrototypeOf(o, p); return Object.getPrototypeOf(o) === p;"
+        ),
+        Value::Bool(true)
+    );
+}
+
+/// `__proto__` read matches `getPrototypeOf`.
+#[test]
+fn proto_dunder_read() {
+    assert_eq!(
+        testutil::run_val(
+            "const o = {}; const p = { y: 1 }; Object.setPrototypeOf(o, p); return o.__proto__ === p;"
+        ),
+        Value::Bool(true)
+    );
+    // Plain object has null __proto__.
+    assert_eq!(
+        testutil::run_val("return ({}).__proto__ === null;"),
+        Value::Bool(true)
+    );
+}
+
+/// `__proto__` write matches `setPrototypeOf`.
+#[test]
+fn proto_dunder_write() {
+    assert_eq!(
+        testutil::run_val("const o = {}; const p = { z: 99 }; o.__proto__ = p; return o.z;"),
+        Value::PosInt(99)
+    );
+    // Setting to null clears proto.
+    assert_eq!(
+        testutil::run_val(
+            "const o = {}; const p = { z: 1 }; o.__proto__ = p; o.__proto__ = null; return o.z;"
+        ),
+        Value::Undefined
+    );
+}
+
+/// Reject cyclic `setPrototypeOf`.
+#[test]
+fn cyclic_set_prototype_of_is_rejected() {
+    let err = testutil::run_runtime_err(
+        "const o = {}; const p = {}; Object.setPrototypeOf(p, o); Object.setPrototypeOf(o, p);",
+    );
+    assert!(
+        err.message.contains("cyclic"),
+        "expected cyclic, got: {}",
+        err.message
+    );
+}
+
+/// Instances inherit methods from prototype chain via `instanceof`.
+#[test]
+fn instanceof_respects_prototype_chain() {
+    // After manually setting up a prototype chain, instanceof should walk it.
+    assert_eq!(
+        testutil::run_val(
+            "function F(){} function G(){} const f = new F(); Object.setPrototypeOf(f, G.prototype); return f instanceof G;"
+        ),
+        Value::Bool(true)
+    );
+}
+
+/// `Object.getPrototypeOf` on a non-Object is a TypeError.
+#[test]
+fn get_prototype_of_primitive_is_type_error() {
+    let err = testutil::run_runtime_err("return Object.getPrototypeOf(5);");
+    assert!(
+        err.message.contains("type error"),
+        "expected type error, got: {}",
+        err.message
+    );
+}

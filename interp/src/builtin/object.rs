@@ -165,6 +165,63 @@ pub fn obj_has_own_property(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     Ok(Value::Bool(obj.map.contains_key(key.as_str())))
 }
 
+/// `Object.getPrototypeOf(obj)` → the prototype of `obj`, or `null` if none.
+/// Only accepts `Value::Object`; non-Object args are a TypeError (no wrapper
+/// coercion).
+pub fn obj_get_proto_of(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let obj_ptr = match args.get(vm, 0) {
+        Value::Object(p) => *p,
+        _ => return Err(vm.fail(ErrorKind::TypeError, "type error")),
+    };
+    let obj = vm
+        .objects
+        .get(obj_ptr as usize)
+        .ok_or_else(|| vm.fail(ErrorKind::ValueError, "value error"))?;
+    match obj.proto {
+        Some(p) => Ok(Value::Object(p)),
+        None => Ok(Value::Null),
+    }
+}
+
+/// `Object.setPrototypeOf(obj, proto)` → sets `obj`'s prototype and returns
+/// `obj`. `proto` must be an `Object` or `null`. A cyclic set (where `proto`'s
+/// own chain already reaches `obj`) is rejected with a `TypeError`, matching JS.
+pub fn obj_set_proto_of(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let obj_ptr = match args.get(vm, 0) {
+        Value::Object(p) => *p,
+        _ => return Err(vm.fail(ErrorKind::TypeError, "type error")),
+    };
+    let new_proto = match args.get(vm, 1) {
+        Value::Object(p) => Some(*p),
+        Value::Null => None,
+        _ => {
+            return Err(vm.fail(ErrorKind::TypeError, "prototype must be an object or null"));
+        }
+    };
+    // Cycle check: walk `new_proto`'s chain to see if it reaches `obj_ptr`.
+    if let Some(proto_ptr) = new_proto {
+        const MAX_PROTO_DEPTH: u32 = 100;
+        let mut cur = Some(proto_ptr);
+        for _ in 0..MAX_PROTO_DEPTH {
+            match cur {
+                Some(p) if p == obj_ptr => {
+                    return Err(vm.fail(ErrorKind::TypeError, "cyclic prototype chain"));
+                }
+                Some(p) => {
+                    let o = vm
+                        .objects
+                        .get(p as usize)
+                        .ok_or_else(|| vm.fail(ErrorKind::ValueError, "value error"))?;
+                    cur = o.proto;
+                }
+                None => break,
+            }
+        }
+    }
+    vm.objects[obj_ptr as usize].proto = new_proto;
+    Ok(Value::Object(obj_ptr))
+}
+
 // ── tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

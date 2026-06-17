@@ -316,6 +316,10 @@ fn pe_produces_bool(i: &Instr) -> bool {
             | Instr::IsNum
             | Instr::IsStr
             | Instr::IsObj
+            | Instr::IsMap
+            | Instr::IsSet
+            | Instr::InstanceOf
+            | Instr::TypeCheck(_)
             | Instr::ObjHas
             | Instr::ObjDelete
     )
