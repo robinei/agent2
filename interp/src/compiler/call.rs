@@ -109,7 +109,12 @@ impl<'src> super::Compiler<'src> {
             ast::Expression::Identifier(id) => {
                 self.compile_user_call(id.name.as_str(), id.span.start, &argv, span)
             }
-            other => self.error(other.span().start, "unsupported call target"),
+            other => {
+                // General expression callee: evaluate it, push args, CallDyn.
+                self.compile_expr(other);
+                self.compile_args(&argv);
+                self.emit(Instr::CallDyn(argv.len() as u32, false), span);
+            }
         }
     }
 
@@ -132,7 +137,9 @@ impl<'src> super::Compiler<'src> {
         // Detect a method callee so we emit ObjPeek/ObjPeekDyn (keeping the
         // receiver) instead of ObjGet/IndexGet (consuming it), and thread
         // has_this=true to CallSpread.  Skip namespaces (Math.max) — those
-        // are builtins accessed via ObjGet.
+        // are builtins accessed via ObjGet.  For known method builtins, emit
+        // PushBuiltin instead of ObjPeek so the builtin value (not a property
+        // read) lands on the stack for dispatch_call's Builtin arm.
         let has_this = match &call.callee {
             ast::Expression::StaticMemberExpression(m) => {
                 if let ast::Expression::Identifier(obj) = &m.object {
@@ -161,7 +168,12 @@ impl<'src> super::Compiler<'src> {
             match &call.callee {
                 ast::Expression::StaticMemberExpression(m) => {
                     self.compile_expr(&m.object);
-                    self.emit(Instr::ObjPeek(m.property.name.as_str().into()), span);
+                    let method = m.property.name.as_str();
+                    if let Some(builtin) = Builtin::for_method(method) {
+                        self.emit(Instr::PushBuiltin(builtin), span);
+                    } else {
+                        self.emit(Instr::ObjPeek(method.into()), span);
+                    }
                 }
                 ast::Expression::ComputedMemberExpression(m) => {
                     self.compile_expr(&m.object);

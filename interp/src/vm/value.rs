@@ -1,8 +1,10 @@
 use std::hash::{Hash, Hasher};
+use std::rc::Rc;
 
 use crate::builtin::Builtin;
 pub use crate::rc_str::RcStr;
 
+pub(crate) use super::BoundFn;
 pub(crate) use super::RcRegExp;
 use super::instr;
 use super::instr::CodeAddr;
@@ -71,6 +73,13 @@ pub enum Value {
     /// The compiler's common path uses the static `Instr::CallBuiltin` instead;
     /// this variant exists for the rarer higher-order/callback use.
     Builtin(Builtin),
+    /// A bound function: `f.bind(thisArg, ...args)`. Immutable, refcounted
+    /// via `Rc<BoundFn>`. Carries a pre-welded `this` value and optional
+    /// pre-bound args. Callable via `dispatch_call`, which prepends
+    /// `bound_args` and recurses with `callable` + `this_val`. Identity
+    /// by pointer equality (`Rc::ptr_eq`); `typeof` returns `"function"`;
+    /// no JSON form.
+    Bound(Rc<BoundFn>),
     /// A promise: the future result of a tool call (`tools.f(...)` — the only
     /// source; there is no `new Promise`). Indexes the VM's `promises` heap.
     /// A transient value like `Fn`/`Closure`: no JSON form, "object" under
@@ -195,6 +204,10 @@ impl Hash for MapKey {
                 15u8.hash(state);
                 p.hash(state);
             }
+            Bound(b) => {
+                16u8.hash(state);
+                std::ptr::hash(Rc::as_ptr(b), state);
+            }
         }
     }
 }
@@ -220,6 +233,7 @@ impl Value {
             | Value::Object(_)
             | Value::Closure { .. }
             | Value::Builtin(_)
+            | Value::Bound(_)
             | Value::Promise(_)
             | Value::RegExp(_)
             | Value::Map(_)
@@ -248,6 +262,7 @@ impl Value {
             | Value::Object(_)
             | Value::Closure { .. }
             | Value::Builtin(_)
+            | Value::Bound(_)
             | Value::Promise(_)
             | Value::RegExp(_)
             | Value::Map(_)
@@ -331,6 +346,8 @@ impl Value {
             // Map and Set compare by reference identity.
             (Value::Map(p), Value::Map(q)) => p == q,
             (Value::Set(p), Value::Set(q)) => p == q,
+            // Bound functions compare by pointer identity: `f.bind(x) !== f.bind(x)`.
+            (Value::Bound(a), Value::Bound(b)) => Rc::ptr_eq(a, b),
             _ => false,
         }
     }
@@ -441,7 +458,7 @@ impl Value {
             Value::String(_) => "string",
             Value::Array(_) => "array",
             Value::Object(_) => "object",
-            Value::Closure { .. } | Value::Builtin(_) => "function",
+            Value::Closure { .. } | Value::Builtin(_) | Value::Bound(_) => "function",
             Value::Promise(_) => "promise",
             Value::RegExp(_) => "object",
             Value::Map(_) => "map",

@@ -34,6 +34,7 @@ use crate::vm::{ErrorKind, RcStr, VM, VMError, Value};
 mod array;
 mod console;
 mod edit;
+mod function;
 mod json;
 mod map;
 mod math;
@@ -47,6 +48,7 @@ mod string;
 use array::*;
 use console::*;
 use edit::*;
+use function::*;
 use json::*;
 use map::*;
 use math::*;
@@ -310,6 +312,11 @@ builtins! {
 
     // ── universal methods (any receiver) ──
     ToString, BuiltinKind::Method, "toString", 1, 1, value_to_string;
+
+    // ── Function methods (Phase 13 Step 5: bind, call, apply) ──
+    FunctionBind,  BuiltinKind::Method, "bind",  1, VARARG, function_bind;
+    FunctionCall,  BuiltinKind::Method, "call",  1, VARARG, function_call;
+    FunctionApply, BuiltinKind::Method, "apply", 1, VARARG, function_apply;
 
     // ── string methods that accept RegExp ──
     StrMatch,    BuiltinKind::Method, "match",    2, 2, str_match;

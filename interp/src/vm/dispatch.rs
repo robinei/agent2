@@ -379,17 +379,32 @@ impl VM {
                 Instr::CallBuiltin(b, argc) => {
                     let b = *b;
                     let argc = *argc;
-                    // Happy path: the builtin runs. If it lands on an Object
-                    // receiver (the `MethodOnObject` signal), the args are still
-                    // on the stack — re-route the call to the object's own
-                    // same-named property so user properties shadow builtin
-                    // method names (push, trim, …). `reroute` sets `ip`.
-                    match b.call(self, argc) {
-                        Ok(()) => self.ip += 1,
-                        Err(e) if e.kind == ErrorKind::MethodOnObject => {
-                            self.reroute_method_to_object(b, argc, Value::Undefined)?;
+                    // `.call` and `.apply` re-enter dispatch: the handler
+                    // signals readiness but does not itself call the target,
+                    // because the builtin epilogue would corrupt the frame.
+                    // The dispatch lane shifts/expands args and dispatches
+                    // directly — same hand-off as `reroute_method_to_object`.
+                    match b {
+                        crate::builtin::Builtin::FunctionCall => {
+                            self.reroute_call_builtin(argc)?;
                         }
-                        Err(e) => return Err(e),
+                        crate::builtin::Builtin::FunctionApply => {
+                            self.reroute_apply_builtin(argc)?;
+                        }
+                        _ => {
+                            // Happy path: the builtin runs. If it lands on an Object
+                            // receiver (the `MethodOnObject` signal), the args are still
+                            // on the stack — re-route the call to the object's own
+                            // same-named property so user properties shadow builtin
+                            // method names (push, trim, …). `reroute` sets `ip`.
+                            match b.call(self, argc) {
+                                Ok(()) => self.ip += 1,
+                                Err(e) if e.kind == ErrorKind::MethodOnObject => {
+                                    self.reroute_method_to_object(b, argc, Value::Undefined)?;
+                                }
+                                Err(e) => return Err(e),
+                            }
+                        }
                     }
                 }
 
@@ -883,7 +898,7 @@ impl VM {
                         Value::Bool(_) => "boolean",
                         Value::Float(_) | Value::PosInt(_) | Value::NegInt(_) => "number",
                         Value::String(_) => "string",
-                        Value::Closure { .. } | Value::Builtin(_) => "function",
+                        Value::Closure { .. } | Value::Builtin(_) | Value::Bound(_) => "function",
                         Value::Array(_)
                         | Value::Object(_)
                         | Value::Promise(_)

@@ -514,6 +514,23 @@ pub struct Closure {
     pub prototype: Option<ObjectPtr>,
 }
 
+/// A bound function value produced by `f.bind(thisArg, ...args)` — the only
+/// receiver-carrying value in the VM. Immutable, refcounted via `Rc` (not an
+/// arena entry): bound functions are transient, and the arena never reclaims.
+/// The `Rc` graph is acyclic by construction — `BoundFn` has no interior
+/// mutability and references heap aggregates only by arena index (a `u32`),
+/// never by a strong `Rc`. The `bound_args` vector is fixed at bind time, and
+/// any `Rc`-bearing element (`RcStr`/`RcRegExp`/another `Bound`) is itself
+/// immutable and pre-existing, so no element can close a cycle back to this
+/// `BoundFn`. (`ThinVec` keeps the common `f.bind(obj)` case — empty
+/// `bound_args` — to a single pointer, no heap alloc.)
+#[derive(Clone, Debug, PartialEq)]
+pub struct BoundFn {
+    pub this_val: Value,
+    pub bound_args: ThinVec<Value>,
+    pub callable: Value,
+}
+
 /// State of one entry in the VM's `promises` heap. A promise is born
 /// `Pending` (by `Instr::Invoke`) and transitions exactly once.
 #[derive(Debug, Clone, PartialEq)]

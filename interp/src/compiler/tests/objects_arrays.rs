@@ -1144,3 +1144,230 @@ fn new_constructor_does_not_serialize_proto() {
     ));
     assert_eq!(val, serde_json::json!({"x": 42}));
 }
+
+// ── Step 5: bind, call, apply ─────────────────────────────────────────
+
+#[test]
+fn bind_carries_this() {
+    // `const g = obj.greet.bind(obj); g() === obj.greet()` — carried `this`.
+    assert_eq!(
+        testutil::run_val(concat!(
+            "const obj = { x: 42, greet: function() { return this.x; } };",
+            "const g = obj.greet.bind(obj);",
+            "return g();"
+        )),
+        Value::PosInt(42)
+    );
+}
+
+#[test]
+fn bind_partial_application() {
+    // Pre-bound args precede call-site args.
+    assert_eq!(
+        testutil::run_val(concat!(
+            "const add = (a, b) => a + b;",
+            "return add.bind(null, 2)(3);"
+        )),
+        testutil::num(5.0)
+    );
+}
+
+#[test]
+fn bound_function_ignores_call_site_receiver() {
+    // A bound function uses its welded `this`, ignoring a later call-site
+    // receiver (e.g. `other.h = g; other.h()` still uses bound `this`).
+    assert_eq!(
+        testutil::run_val(concat!(
+            "const obj = { x: 1, greet: function() { return this.x; } };",
+            "const g = obj.greet.bind(obj);",
+            "const other = { x: 99, h: g };",
+            "return other.h();"
+        )),
+        Value::PosInt(1)
+    );
+}
+
+#[test]
+fn rebinding_composes_args_and_keeps_first_this() {
+    // `f.bind(a, x).bind(b, y)` → `this = a`, args `x, y, …`.
+    assert_eq!(
+        testutil::run_val(concat!(
+            "function f(a, b, c, d) { return [this.v, a, b, c, d]; }",
+            "return f.bind({v: 1}, 'x').bind({v: 9}, 'y')('a', 'b');"
+        )),
+        testutil::run_val("return [1, 'x', 'y', 'a', 'b'];")
+    );
+}
+
+#[test]
+fn bound_function_is_function_type() {
+    // `typeof` on a bound function returns `"function"`.
+    assert_eq!(
+        testutil::run_val("const f = (function(){}).bind(null); return typeof f;"),
+        Value::String(RcStr::from("function"))
+    );
+}
+
+#[test]
+fn bound_function_identity() {
+    // `f.bind(x) !== f.bind(x)` — each bind produces a distinct value.
+    assert_eq!(
+        testutil::run_val(concat!(
+            "function f() {}",
+            "return f.bind(null) !== f.bind(null);"
+        )),
+        Value::Bool(true)
+    );
+}
+
+#[test]
+fn bind_does_not_invoke() {
+    // `bind` returns a function without invoking; the original is not called.
+    assert_eq!(
+        testutil::run_val(concat!(
+            "let called = false;",
+            "function f() { called = true; return 1; }",
+            "const g = f.bind(null);",
+            "return called;"
+        )),
+        Value::Bool(false)
+    );
+}
+
+#[test]
+fn call_invokes_with_this() {
+    // `f.call(t, a, b)` runs `f` with `this === t`.
+    assert_eq!(
+        testutil::run_val(concat!(
+            "function f(a, b) { return this.x + a + b; }",
+            "return f.call({x: 10}, 1, 2);"
+        )),
+        testutil::num(13.0)
+    );
+}
+
+#[test]
+fn apply_invokes_with_this() {
+    // `f.apply(t, [a])` runs `f` with `this === t`.
+    assert_eq!(
+        testutil::run_val(concat!(
+            "function f(a, b) { return this.x + a + b; }",
+            "return f.apply({x: 10}, [1, 2]);"
+        )),
+        testutil::num(13.0)
+    );
+}
+
+#[test]
+fn apply_non_array_second_arg_is_type_error() {
+    // `.apply` with a non-array second argument is a `TypeError`.
+    let err = testutil::run_runtime_err("function f() {} return f.apply(null, 42);");
+    assert_eq!(err.kind, ErrorKind::TypeError);
+}
+
+#[test]
+fn apply_null_second_arg_is_empty_args() {
+    // `f.apply(null, null)` has no args — null second arg is treated as empty.
+    assert_eq!(
+        testutil::run_val(concat!(
+            "function f() { return this.x || 99; }",
+            "return f.apply({x: 7}, null);"
+        )),
+        Value::PosInt(7)
+    );
+}
+
+#[test]
+fn bind_on_non_callable_is_type_error() {
+    let err = testutil::run_runtime_err("return (42).bind(null);");
+    assert_eq!(err.kind, ErrorKind::TypeError);
+}
+
+#[test]
+fn call_on_non_callable_is_type_error() {
+    let err = testutil::run_runtime_err("return (42).call(null);");
+    assert_eq!(err.kind, ErrorKind::TypeError);
+}
+
+#[test]
+fn apply_on_non_callable_is_type_error() {
+    let err = testutil::run_runtime_err("return (42).apply(null, []);");
+    assert_eq!(err.kind, ErrorKind::TypeError);
+}
+
+#[test]
+fn call_with_spreaded_ref() {
+    // `f.call(t, ...xs)` compiles and runs correctly.
+    assert_eq!(
+        testutil::run_val(concat!(
+            "function f(a, b) { return this.x + a + b; }",
+            "const xs = [1, 2];",
+            "return f.call({x: 5}, ...xs);"
+        )),
+        testutil::num(8.0)
+    );
+}
+
+#[test]
+fn apply_same_as_spread_for_null_this() {
+    // `f.apply(null, xs)` yields same result as `f(...xs)`.
+    assert_eq!(
+        testutil::run_val(concat!(
+            "function sum(a, b) { return a + b; }",
+            "return sum.apply(null, [3, 4]);"
+        )),
+        testutil::num(7.0)
+    );
+}
+
+#[test]
+fn call_routes_through_dispatch_for_builtin() {
+    // `.call` on a builtin routes through dispatch_call and works.
+    assert_eq!(
+        testutil::run_val("return Math.max.call(null, 3, 7, 2);"),
+        testutil::num(7.0)
+    );
+}
+
+#[test]
+fn apply_routes_through_dispatch_for_builtin() {
+    // `.apply` on a builtin routes through dispatch_call and works.
+    assert_eq!(
+        testutil::run_val("return Math.max.apply(null, [3, 7, 2]);"),
+        testutil::num(7.0)
+    );
+}
+
+#[test]
+fn bound_call_composes_with_builtin() {
+    // A bound builtin call works.
+    assert_eq!(
+        testutil::run_val(concat!(
+            "const max3 = Math.max.bind(null, 3);",
+            "return max3(7, 2);"
+        )),
+        testutil::num(7.0)
+    );
+}
+
+#[test]
+fn bound_function_serialization_rejected() {
+    // A bound function has no JSON form (rejected like Closure).
+    let val = testutil::run_val("return (function(){}).bind(null);");
+    assert!(matches!(val, Value::Bound(_)));
+    let _prog = testutil::compile_ok("return (function(){}).bind(null);");
+    let vm = testutil::run_vm("return (function(){}).bind(null);");
+    let result = vm.stack_value_to_json(&val, 0);
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert_eq!(err.kind, ErrorKind::ValueError);
+}
+
+#[test]
+fn bound_function_to_string() {
+    // `String(f.bind(x))` should return a JS-like string representation.
+    assert_eq!(
+        testutil::run_val("return String((function(){}).bind(null));"),
+        Value::String(RcStr::from("function () { [native code] }"))
+    );
+}

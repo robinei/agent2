@@ -205,6 +205,7 @@ pub fn preview(vm: &VM, v: &Value, max: usize) -> String {
             .unwrap_or_else(|_| "<unrepresentable>".to_string()),
         Value::Closure { addr, ptr } => format!("fn@{addr}#{ptr}"),
         Value::Builtin(b) => format!("{b:?}"),
+        Value::Bound(_) => "bound function".to_string(),
         Value::Promise(p) => {
             let state = match vm.promises.get(*p as usize) {
                 Some(PromiseState::Pending { .. }) => "pending",
