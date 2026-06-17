@@ -751,26 +751,26 @@ not error. Extend `Instr::GetLength`'s polymorphic dispatch with a callable arm:
 keeps `.length` off the call path (it's a property, not a method; see the
 GetLength-vs-builtin rationale).
 
-**Implementation findings (close these before building):**
-- The "receiver-type-aware `(type, name) → Builtin`" lookup **doesn't exist yet** —
-  `Builtin::for_method` is name-only. Add a `(receiver_type, name) → Builtin`
-  resolver (or fold the type check into `GetMethodOrProp`).
-- `fn.length` for a `Closure` needs **per-`CodeAddr` declared-arity metadata**
-  (param count before the first default/rest), recorded where `GetLength` can
-  read it (extend the function/debug table). It is not currently stored.
+**Implementation findings (closed):**
+- ~~The "receiver-type-aware `(type, name) → Builtin`" lookup **doesn't exist yet**~~
+  — added `Builtin::method_for_receiver(recv, name)` in `builtin/mod.rs`, folding
+  the type check into a single receiver-type-keyed match.
+- ~~`fn.length` for a `Closure` needs **per-`CodeAddr` declared-arity metadata**~~
+  — `arity: u16` stored on the `Closure` heap struct, baked into `PushFn` and
+  `ClosureNew` instructions (fits in padding, `Instr` stays 16 bytes). The analyzer
+  computes it via `FuncScope::js_length()` (params before first default/rest).
 - The `Builtin` arm (`min_args − 1`) only **approximates** JS's fixed `.length`
-  (builtins have no "params before first default"); record it as a divergence
-  rather than claiming exactness.
+  (builtins have no "params before first default"); recorded as a divergence.
 
 Acceptance:
-- [ ] `const f = [].push.bind(arr); f(3)` pushes to `arr`.
-- [ ] `obj.has` where `obj` has a data property `has` still reads the data
+- [x] `const f = [].push.bind(arr); f(3)` pushes to `arr`.
+- [x] `obj.has` where `obj` has a data property `has` still reads the data
       (no regression).
-- [ ] `[].push` (bare) is a `"function"` value, not a read error.
-- [ ] `((a, b) => a + b).length === 2`; a default/rest param stops the count
+- [x] `[].push` (bare) is a `"function"` value, not a read error.
+- [x] `((a, b) => a + b).length === 2`; a default/rest param stops the count
       (`((a, b = 1) => 0).length === 1`); `f.bind(null, x).length` is
       `f.length - 1` (clamped at 0).
-- [ ] Gate: `cargo fmt && cargo clippy && cargo test` green.
+- [x] Gate: `cargo fmt && cargo clippy && cargo test` green.
 
 ## Step 7 — `class` sugar
 
@@ -968,9 +968,10 @@ one-off bolt-ons.
 
 ## Divergences from JS (record in the divergence list as they land)
 
-- **Identity of method/bound values.** `f.bind(x) !== f.bind(x)`; a bare method
-  read (`[].push`) mints a fresh value, so `arr.push !== arr.push`. JS shares
-  the prototype function. Accepted.
+- **Identity of method/bound values.** `f.bind(x) !== f.bind(x)` (each `bind`
+  mints a fresh `Rc<BoundFn>`); a bare method read (`[].push`) yields the same
+  `Value::Builtin` enum value, so `arr.push === arr.push` — JS-faithful (JS
+  shares the prototype function). The `bind` identity divergence is accepted.
 - **No `[[Set]]` traps / accessors.** Own-property assignment only; no
   getters/setters in the MVP.
 - **`F.prototype` is mutable but not reassignable.** `F.prototype.m = …` works
@@ -998,7 +999,9 @@ one-off bolt-ons.
   the legacy (Annex B) `__proto__` accessor is not modeled, so `__proto__` is an
   ordinary string-keyed data property.
 - **`fn.length` for builtins is approximate** (Step 6): derived from `min_args`
-  rather than JS's fixed declared count.
+  (`min_args − 1` for `Method`-kind, `min_args` for `Namespace`) rather than JS's
+  fixed declared count. `fn.length` for user `Closure`/`Bound` is exact (params
+  before first default/rest; `max(0, target − bound_args.len())`).
 - **`ToPrimitive` on objects stays unperformed** (the existing divergence):
   arithmetic/`==` against a plain or constructed object is still a `TypeError`,
   not a `toString`/`valueOf` coercion.

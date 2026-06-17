@@ -1,4 +1,5 @@
 use super::*;
+use crate::builtin::{Builtin, BuiltinKind};
 use smallvec::SmallVec;
 
 /// The missing-`await` hint, appended to property/index access errors when
@@ -120,6 +121,31 @@ impl VM {
 }
 
 impl VM {
+    /// JS `Function.prototype.length` for any callable value (Step 6):
+    /// `Closure` → the declared param count before the first default/rest
+    /// (stored on the `Closure` heap entry); `Builtin` → `min_args` minus 1
+    /// for `Method`-kind (the receiver isn't a declared param) or `min_args`
+    /// for `Namespace` (approximate — a documented divergence); `Bound` →
+    /// `max(0, target.length - bound_args.len())`. Non-callable → `None`.
+    fn callable_length(&self, val: &Value) -> Option<u16> {
+        match val {
+            Value::Closure { ptr, .. } => self.closures.get(*ptr as usize).map(|c| c.arity),
+            Value::Builtin(b) => {
+                let meta = b.meta();
+                let n = match meta.kind {
+                    BuiltinKind::Method => meta.min_args.saturating_sub(1),
+                    BuiltinKind::Namespace(_) => meta.min_args,
+                };
+                Some(n as u16)
+            }
+            Value::Bound(b) => {
+                let target = self.callable_length(&b.callable).unwrap_or(0);
+                Some(target.saturating_sub(b.bound_args.len() as u16))
+            }
+            _ => None,
+        }
+    }
+
     pub(crate) fn dispatch(&mut self, fuel: &mut u64) -> Result<StepResult, VMError> {
         // ── macros for repetitive instruction shapes ─────────────────
 
@@ -262,7 +288,7 @@ impl VM {
                     self.stack.push(Value::Object(*h));
                     self.ip += 1;
                 }
-                Instr::PushFn(addr, ptr) => {
+                Instr::PushFn(addr, ptr, _) => {
                     self.stack.push(Value::Closure {
                         addr: *addr,
                         ptr: *ptr,
@@ -511,7 +537,7 @@ impl VM {
                     self.ip += 1;
                 }
 
-                Instr::ClosureNew(addr, captures) => {
+                Instr::ClosureNew(addr, arity, captures) => {
                     let addr = self.validate_func_addr(*addr)?;
                     let mut upvals: SmallVec<[Value; 8]> = SmallVec::new();
                     for slot in captures.iter() {
@@ -520,7 +546,8 @@ impl VM {
                         }
                         upvals.push(self.stack[(self.fp + *slot as u32) as usize].clone());
                     }
-                    let closure = self.alloc_closure(addr, ThinVec::from(upvals.as_slice()));
+                    let closure =
+                        self.alloc_closure(addr, ThinVec::from(upvals.as_slice()), *arity);
                     self.stack.push(closure);
                     self.ip += 1;
                 }
@@ -1290,6 +1317,42 @@ impl VM {
                     self.ip += 1;
                 }
 
+                // Method-aware read (Step 6): Object → property read (same as
+                // ObjGet); structural/callable → Builtin or Undefined; null/
+                // undefined → TypeError (receiver popped first, pop-first
+                // normalization matching ObjGet).
+                Instr::GetMethodOrProp(field) => {
+                    // `field` is an `RcStr`; clone the refcount (not the bytes)
+                    // to release the borrow on `self` for the stack mutations.
+                    let field = field.clone();
+                    let recv = self.stack.last().cloned();
+                    let result = match recv {
+                        Some(Value::Object(p)) => {
+                            // Object: own→proto property read (an own data
+                            // property shadows any builtin name).
+                            self.stack.pop();
+                            self.resolve_proto_chain(p, &field)?
+                        }
+                        Some(Value::Null) | Some(Value::Undefined) | None => {
+                            let recv = self.pop()?;
+                            let msg = format!(
+                                "cannot read property on {}{}",
+                                recv.type_name(),
+                                await_hint(&recv)
+                            );
+                            return Err(self.fail(ErrorKind::TypeError, msg));
+                        }
+                        Some(ref r) => {
+                            self.stack.pop();
+                            Builtin::method_for_receiver(r, &field)
+                                .map(Value::Builtin)
+                                .unwrap_or(Value::Undefined)
+                        }
+                    };
+                    self.stack.push(result);
+                    self.ip += 1;
+                }
+
                 Instr::ObjSet(field, mode) => {
                     let field = field.clone();
                     let mode = *mode;
@@ -1638,7 +1701,9 @@ impl VM {
                     // `.length`: intrinsic byte/element count for strings and
                     // arrays; on an *object* a plain property read (JS — e.g. a
                     // RegExp match result stores its own `length`), `undefined`
-                    // when absent. Anything else (incl. map/set) is a
+                    // when absent. For a callable (Closure/Builtin/Bound), JS
+                    // `fn.length` — the declared param count before the first
+                    // default/rest (Step 6). Anything else (incl. map/set) is a
                     // `TypeError` — for-of lowering relies on that (it iterates
                     // only array/string, via `idx < ArrLength`).
                     let result = match val {
@@ -1657,6 +1722,29 @@ impl VM {
                             .get("length")
                             .cloned()
                             .unwrap_or(Value::Undefined),
+                        Value::Closure { ptr, .. } => {
+                            let arity = self
+                                .closures
+                                .get(ptr as usize)
+                                .map(|c| c.arity)
+                                .unwrap_or(0);
+                            Value::Float(arity as f64)
+                        }
+                        Value::Builtin(b) => {
+                            let meta = b.meta();
+                            let n = match meta.kind {
+                                crate::builtin::BuiltinKind::Method => {
+                                    meta.min_args.saturating_sub(1)
+                                }
+                                crate::builtin::BuiltinKind::Namespace(_) => meta.min_args,
+                            };
+                            Value::Float(n as f64)
+                        }
+                        Value::Bound(b) => {
+                            let target = self.callable_length(&b.callable).unwrap_or(0);
+                            let n = target.saturating_sub(b.bound_args.len() as u16);
+                            Value::Float(n as f64)
+                        }
                         _ => return Err(self.fail(ErrorKind::TypeError, "type error")),
                     };
                     self.stack.push(result);

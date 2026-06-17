@@ -880,7 +880,7 @@ impl<'src> super::Compiler<'src> {
     ) {
         // A constant function (Phase F): no slot — call its label statically.
         // Pad missing args to the declared arity (as the slotted path does).
-        if let Some(ConstValue::Fn { label, arity }) = self.const_ref(callee_span) {
+        if let Some(ConstValue::Fn { label, arity, .. }) = self.const_ref(callee_span) {
             self.compile_args(argv);
             let passed = argv.len() as u32;
             for _ in passed..arity {

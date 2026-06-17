@@ -27,10 +27,13 @@ pub(crate) enum ConstValue {
     /// A non-capturing, non-reassigned function: its value is a fixed code
     /// address (`Fn(label)`), so the binding is a compile-time constant — no
     /// slot, references emit `PushFn(label)`, calls are static `Call(label)`.
-    /// `arity` is the declared parameter count (for static-call arg padding).
+    /// `arity` is the declared parameter count (for static-call arg padding);
+    /// `js_length` is JS `Function.prototype.length` (params before the first
+    /// default/rest), baked into the `PushFn` for `fn.length` (Step 6).
     Fn {
         label: u32,
         arity: u32,
+        js_length: u16,
     },
 }
 
@@ -349,6 +352,21 @@ impl FuncScope {
             _ => self.params.len() as u32,
         }
     }
+
+    /// JS `Function.prototype.length`: the number of parameters **before the
+    /// first one with a default value or the rest parameter** — counting stops
+    /// at the first default/rest, and the rest param itself is never counted.
+    /// Stored per-`Closure` (Step 6) so `fn.length` reads it off the value.
+    pub(crate) fn js_length(&self) -> u16 {
+        let mut n = 0u16;
+        for p in &self.params {
+            if p.has_default || p.is_rest {
+                break;
+            }
+            n += 1;
+        }
+        n
+    }
 }
 
 /// Absolute frame slot for an own-local index under the `[params | upvals |
@@ -560,6 +578,7 @@ fn register_const_fns(scopes: &mut [FuncScope], const_fns: &HashSet<usize>) {
         let val = ConstValue::Fn {
             label: scopes[sf].label,
             arity: scopes[sf].declared_arity(),
+            js_length: scopes[sf].js_length(),
         };
         let slot = scopes[parent].names.get(&name).map(|i| i.slot);
         scopes[parent]
@@ -786,6 +805,7 @@ fn finalize_tables(
                         ConstValue::Fn {
                             label: s.label,
                             arity: s.declared_arity(),
+                            js_length: s.js_length(),
                         },
                     );
                 } else {

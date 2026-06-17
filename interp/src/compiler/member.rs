@@ -49,6 +49,12 @@ impl<'src> super::Compiler<'src> {
             self.emit(Instr::GetLength, span);
         } else if name == "size" {
             self.emit(Instr::GetSize, span);
+        } else if Builtin::for_method(name).is_some() {
+            // Method-builtin name: emit `GetMethodOrProp` so a structural
+            // receiver (array/string/map/set/regexp/closure) yields the builtin
+            // value, while an `Object` receiver still reads the property (own
+            // data shadows the builtin name). Non-builtin names stay `ObjGet`.
+            self.emit(Instr::GetMethodOrProp(name.into()), span);
         } else {
             self.emit(Instr::ObjGet(name.into()), span);
         }

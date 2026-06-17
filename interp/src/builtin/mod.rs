@@ -362,6 +362,105 @@ builtins! {
     MapSetEntries, BuiltinKind::Method, "entries", 1, 1, map_set_entries;
 }
 
+impl Builtin {
+    /// Receiver-type-aware method-builtin lookup (Step 6): given a receiver
+    /// value and a method name, return the `Builtin` if the name is a valid
+    /// method for that receiver *type*, or `None` otherwise. Used by
+    /// `GetMethodOrProp` for reading a method as a value (`[].push`, `"".trim`,
+    /// `f.bind`, …) — a `None` result yields `Undefined` at the read (the call
+    /// then errors "not a function", JS-faithful — the error is at the call,
+    /// not the read). `Object` receivers are **not** handled here: they go
+    /// through the property-read path in `GetMethodOrProp` directly (an own
+    /// data property shadows any builtin name).
+    ///
+    /// `toString` is universal (valid for every structural + callable type);
+    /// polymorphic builtins (`slice`/`includes`/`indexOf`/`lastIndexOf`/`at`/
+    /// `concat` for string+array, `has`/`delete`/`clear`/`keys`/`values`/
+    /// `entries` for map+set) are listed in each matching arm.
+    pub fn method_for_receiver(recv: &Value, name: &str) -> Option<Builtin> {
+        let builtin = Builtin::for_method(name)?;
+        match recv {
+            Value::Array(_) => match builtin {
+                Builtin::ArrayPush
+                | Builtin::ArrayPop
+                | Builtin::ArrayShift
+                | Builtin::ArrayUnshift
+                | Builtin::ArrayJoin
+                | Builtin::ArrayReverse
+                | Builtin::ArrayFlat
+                | Builtin::ArrayFill
+                | Builtin::ArraySplice
+                | Builtin::StrSlice
+                | Builtin::StrIncludes
+                | Builtin::StrIndexOf
+                | Builtin::StrLastIndexOf
+                | Builtin::StrAt
+                | Builtin::StrConcat
+                | Builtin::ToString => Some(builtin),
+                _ => None,
+            },
+            Value::String(_) => match builtin {
+                Builtin::StrSplit
+                | Builtin::StrIncludes
+                | Builtin::StrIndexOf
+                | Builtin::StrLastIndexOf
+                | Builtin::StrStartsWith
+                | Builtin::StrEndsWith
+                | Builtin::StrSlice
+                | Builtin::StrSubstring
+                | Builtin::StrTrim
+                | Builtin::StrToLowerCase
+                | Builtin::StrToUpperCase
+                | Builtin::StrPadStart
+                | Builtin::StrPadEnd
+                | Builtin::StrRepeat
+                | Builtin::StrTrimStart
+                | Builtin::StrTrimEnd
+                | Builtin::StrCharAt
+                | Builtin::StrAt
+                | Builtin::StrConcat
+                | Builtin::StrMatch
+                | Builtin::StrMatchAll
+                | Builtin::StrSearch
+                | Builtin::ToString => Some(builtin),
+                _ => None,
+            },
+            Value::Map(_) => match builtin {
+                Builtin::MapGet
+                | Builtin::MapSet
+                | Builtin::MapSetHas
+                | Builtin::MapSetDelete
+                | Builtin::MapSetClear
+                | Builtin::MapSetKeys
+                | Builtin::MapSetValues
+                | Builtin::MapSetEntries
+                | Builtin::ToString => Some(builtin),
+                _ => None,
+            },
+            Value::Set(_) => match builtin {
+                Builtin::SetAdd
+                | Builtin::MapSetHas
+                | Builtin::MapSetDelete
+                | Builtin::MapSetClear
+                | Builtin::MapSetKeys
+                | Builtin::MapSetValues
+                | Builtin::MapSetEntries
+                | Builtin::ToString => Some(builtin),
+                _ => None,
+            },
+            Value::RegExp(_) => match builtin {
+                Builtin::RegExpTest | Builtin::RegExpExec | Builtin::ToString => Some(builtin),
+                _ => None,
+            },
+            Value::Closure { .. } | Value::Builtin(_) | Value::Bound(_) => match builtin {
+                Builtin::FunctionBind | Builtin::ToString => Some(builtin),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+}
+
 // ── argument accessor ────────────────────────────────────────────────────────
 
 /// Zero-cost argument handle: a short-lived borrow token that reads arguments

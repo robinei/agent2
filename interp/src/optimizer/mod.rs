@@ -159,7 +159,7 @@ fn simplify_cfg(code: Vec<Instr>, spans: Vec<u32>, next_label: u32) -> (Vec<Inst
     let mut visited = vec![false; n];
     let mut work: Vec<usize> = vec![0];
     for instr in &code {
-        if let Instr::Call(l, _) | Instr::PushFn(l, _) | Instr::ClosureNew(l, _) = instr {
+        if let Instr::Call(l, _) | Instr::PushFn(l, _, _) | Instr::ClosureNew(l, _, _) = instr {
             if let Some(idx) = marker_idx(*l) {
                 work.push(idx);
             }
@@ -626,8 +626,10 @@ fn backpatch(code: Vec<Instr>, spans: Vec<u32>, next_label: u32) -> (Vec<Instr>,
             Instr::JNotNullish(l) => Instr::JNotNullish(label_offset[l as usize]),
             Instr::TryEnter(l) => Instr::TryEnter(label_offset[l as usize]),
             Instr::Call(l, n) => Instr::Call(label_offset[l as usize], n),
-            Instr::ClosureNew(l, caps) => Instr::ClosureNew(label_offset[l as usize], caps),
-            Instr::PushFn(l, ptr) => Instr::PushFn(label_offset[l as usize], ptr),
+            Instr::ClosureNew(l, arity, caps) => {
+                Instr::ClosureNew(label_offset[l as usize], arity, caps)
+            }
+            Instr::PushFn(l, ptr, arity) => Instr::PushFn(label_offset[l as usize], ptr, arity),
             other => other,
         };
         out_code.push(rewritten);

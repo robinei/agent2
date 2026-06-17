@@ -292,16 +292,19 @@ impl VM {
         // Allocate one canonical `Closure` per unique `PushFn` code address
         // for non-capturing functions, so that `f === f` holds (same ptr every
         // push). The ptr is baked into the instruction; no runtime addr→ptr map.
+        // The JS arity (for `fn.length`, Step 6) is also baked into the
+        // instruction and stored on the heap `Closure` here.
         {
             let mut canonical: std::collections::HashMap<CodeAddr, ClosurePtr> =
                 std::collections::HashMap::new();
             for instr in &mut vm.code {
-                if let Instr::PushFn(addr, ptr) = instr {
+                if let Instr::PushFn(addr, ptr, arity) = instr {
                     let cptr = *canonical.entry(*addr).or_insert_with(|| {
                         let idx = vm.closures.len() as ClosurePtr;
                         vm.closures.push(Closure {
                             upvals: ThinVec::new(),
                             prototype: None,
+                            arity: *arity,
                         });
                         idx
                     });
@@ -980,11 +983,17 @@ impl VM {
         Ok(proto_ptr)
     }
 
-    pub(super) fn alloc_closure(&mut self, addr: CodeAddr, upvals: ThinVec<Value>) -> Value {
+    pub(super) fn alloc_closure(
+        &mut self,
+        addr: CodeAddr,
+        upvals: ThinVec<Value>,
+        arity: u16,
+    ) -> Value {
         let idx = self.closures.len() as ClosurePtr;
         self.closures.push(Closure {
             upvals,
             prototype: None,
+            arity,
         });
         Value::Closure { addr, ptr: idx }
     }

@@ -521,14 +521,17 @@ pub enum ThrowOutcome {
 
 /// A heap-allocated closure value. `upvals` is the captured environment;
 /// `prototype` is lazily allocated on first `F.prototype` access (Stage 4b),
-/// `None` until then. The code address (`addr`) lives inline in
-/// `Value::Closure` so dispatch can jump directly without dereferencing
-/// this entry; this entry is read only by `EnterFrame` to install upvals
-/// (and only when the callee's static upval count > 0).
+/// `None` until then. `arity` is the JS `Function.prototype.length` (params
+/// before the first default/rest) for `fn.length` (Step 6). The code address
+/// (`addr`) lives inline in `Value::Closure` so dispatch can jump directly
+/// without dereferencing this entry; this entry is read only by `EnterFrame`
+/// to install upvals (and only when the callee's static upval count > 0) and
+/// by `GetLength` for `fn.length`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Closure {
     pub upvals: ThinVec<Value>,
     pub prototype: Option<ObjectPtr>,
+    pub arity: u16,
 }
 
 /// A bound function value produced by `f.bind(thisArg, ...args)` — the only
@@ -677,6 +680,7 @@ pub enum ErrorKind {
 /// | Builtin handlers (args truncated by `Builtin::call` epilogue on the error path) | TypeError/ValueError | PushValueThenContinue | args truncated before error propagates |
 /// | JSON depth / unsupported type (JSON.stringify, to_json) | ValueError | PushValueThenContinue | args popped by builtin before conversion |
 /// | ObjGet (non-object receiver) | TypeError | PushValueThenContinue | receiver popped in the error arm (pop-first normalized) |
+/// | GetMethodOrProp (null/undefined receiver) | TypeError | PushValueThenContinue | receiver popped in the error arm (pop-first normalized, same as ObjGet) |
 /// | ObjSet (non-object receiver) | TypeError | PushValueThenContinue | value popped, then receiver popped in the error arm (pop-first normalized) |
 /// | **ObjExtend** (non-object src) | TypeError | PushValueThenContinue | both src+obj popped first |
 /// | **ArrExtend** (non-array src) | TypeError | PushValueThenContinue | both src+arr popped first |

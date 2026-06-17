@@ -68,17 +68,17 @@ pub enum TypeTag {
 /// Instructions for a stack based language used for LLM composition of complex tool flows.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Instr {
-    PushUndefined,                // () -> undefined
-    PushNull,                     // () -> null
-    PushBool(bool),               // () -> bool
-    PushPosInt(u64),              // () -> num
-    PushNegInt(i64),              // () -> num
-    PushFloat(f64),               // () -> num
-    PushStr(RcStr),               // () -> str
-    PushArray(ArrayPtr),          // () -> arr
-    PushObject(ObjectPtr),        // () -> obj
-    PushFn(CodeAddr, ClosurePtr), // () -> fn
-    PushBuiltin(Builtin),         // () -> builtin
+    PushUndefined,                     // () -> undefined
+    PushNull,                          // () -> null
+    PushBool(bool),                    // () -> bool
+    PushPosInt(u64),                   // () -> num
+    PushNegInt(i64),                   // () -> num
+    PushFloat(f64),                    // () -> num
+    PushStr(RcStr),                    // () -> str
+    PushArray(ArrayPtr),               // () -> arr
+    PushObject(ObjectPtr),             // () -> obj
+    PushFn(CodeAddr, ClosurePtr, u16), // () -> fn (u16 = JS arity for fn.length)
+    PushBuiltin(Builtin),              // () -> builtin
 
     Pop(usize),
 
@@ -293,7 +293,7 @@ pub enum Instr {
     /// Plain slot yields its current value (a by-value snapshot — which the
     /// compiler only emits when the binding is provably never reassigned). The
     /// captures are listed in the order the target body expects its upvals.
-    ClosureNew(CodeAddr, ThinVec<LocalIndex>), // () -> fn
+    ClosureNew(CodeAddr, u16, ThinVec<LocalIndex>), // () -> fn (u16 = JS arity for fn.length)
 
     /// Pops a pattern string and a flags string, compiles a RegExp, pushes the
     /// result as Value::RegExp. Flags string may be empty (no flags). Invalid
@@ -324,6 +324,18 @@ pub enum Instr {
     /// `ObjGetDyn` minus the obj-pop: keep the receiver below the resolved
     /// property. obj, key -> obj, value
     ObjPeekDyn,
+    /// Method-aware property read (Step 6): reads `recv.name` as a value,
+    /// dispatching on the receiver type. For an `Object`, behaves exactly like
+    /// `ObjGet` (own→proto property read — so an own data property shadows any
+    /// builtin name). For an array/string/map/set/regexp/closure/builtin/bound
+    /// receiver, yields the plain `Value::Builtin` for a method name valid for
+    /// that type (`[].push` → the array-push builtin), or `Undefined` when the
+    /// name is not valid for the type (JS-faithful: the call errors, not the
+    /// read). `null`/`undefined` receivers are a `TypeError`. Only emitted when
+    /// `Builtin::for_method(name)` is `Some`, so `obj.has` (a data property
+    /// named `has`) is not regressed — the `Object` branch reads the property.
+    /// recv -> any
+    GetMethodOrProp(FieldName),
     /// Sets the field and leaves a value on the stack (assignment is an
     /// expression). In `New` mode leaves the assigned value; in `Old` mode
     /// reads and leaves the previous value. Statement-context callers follow

@@ -24,10 +24,10 @@ impl<'src> super::Compiler<'src> {
                 let Some(scope_id) = self.scope_for_node(f.span.start) else {
                     return;
                 };
-                let (label, captures) = {
+                let (label, captures, js_length) = {
                     let analysis = self.analysis.as_ref().expect("analysis present");
                     let child = &analysis.scopes[scope_id];
-                    (child.label, child.captures.clone())
+                    (child.label, child.captures.clone(), child.js_length())
                 };
                 // A constant function (Phase F) has no live slot — its binding
                 // store is dead (references/calls go through its `Fn` constant).
@@ -38,11 +38,12 @@ impl<'src> super::Compiler<'src> {
                     if let Some(slot) = self.binding_slot(id.span.start) {
                         let span = f.span.start;
                         if captures.is_empty() {
-                            self.emit(Instr::PushFn(label, u32::MAX), span);
+                            self.emit(Instr::PushFn(label, u32::MAX, js_length), span);
                         } else {
                             self.emit(
                                 Instr::ClosureNew(
                                     label,
+                                    js_length,
                                     captures.iter().map(|&c| c as LocalIndex).collect(),
                                 ),
                                 span,
@@ -199,16 +200,20 @@ impl<'src> super::Compiler<'src> {
     /// Push a function value: a bare `Fn` when it captures nothing, else a
     /// `MakeClosure` over its capture list.
     pub(super) fn emit_closure_value(&mut self, scope_id: usize, span: u32) {
-        let (label, captures) = {
+        let (label, captures, js_length) = {
             let analysis = self.analysis.as_ref().expect("analysis present");
             let child = &analysis.scopes[scope_id];
-            (child.label, child.captures.clone())
+            (child.label, child.captures.clone(), child.js_length())
         };
         if captures.is_empty() {
-            self.emit(Instr::PushFn(label, u32::MAX), span);
+            self.emit(Instr::PushFn(label, u32::MAX, js_length), span);
         } else {
             self.emit(
-                Instr::ClosureNew(label, captures.iter().map(|&c| c as LocalIndex).collect()),
+                Instr::ClosureNew(
+                    label,
+                    js_length,
+                    captures.iter().map(|&c| c as LocalIndex).collect(),
+                ),
                 span,
             );
         }
@@ -242,6 +247,7 @@ impl<'src> super::Compiler<'src> {
             uses_arguments,
             captures,
             this_slot,
+            js_length,
         ) = {
             let analysis = self.analysis.as_ref().expect("analysis present");
             let scope = &analysis.scopes[scope_id];
@@ -255,6 +261,7 @@ impl<'src> super::Compiler<'src> {
                 scope.uses_arguments,
                 scope.captures.clone(),
                 scope.this_slot,
+                scope.js_length(),
             )
         };
         let nparams = params_info.len() as u32;
@@ -405,7 +412,7 @@ impl<'src> super::Compiler<'src> {
         // (static self-recursion), so the self-slot is dead — skip the setup.
         if self_name.is_some() && !self.is_const_fn_scope(scope_id) {
             let self_slot = frame_abs(own_local_count, nparams, upval_count);
-            self.emit(Instr::PushFn(label, u32::MAX), span);
+            self.emit(Instr::PushFn(label, u32::MAX, js_length), span);
             self.emit(Instr::SetLocal(self_slot as LocalIndex), span);
         }
 

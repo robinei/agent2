@@ -765,7 +765,7 @@ fn call_dyn_indirect() {
     // [8] Return(1)
     assert_eq!(
         run(vec![
-            PushFn(5, u32::MAX),
+            PushFn(5, u32::MAX, 0),
             PushFloat(10.0),
             PushFloat(3.0),
             CallDyn(2, false),
@@ -815,7 +815,7 @@ fn call_spread_with_empty_array() {
 fn call_spread_with_fn() {
     // fn(a, b) = a - b, called as fn(...[10, 3])
     let code = vec![
-        PushFn(6, u32::MAX), // callable below args array (addr of fn body)
+        PushFn(6, u32::MAX, 0), // callable below args array (addr of fn body)
         PushFloat(10.0),
         PushFloat(3.0),
         ArrNew(2), // args array
@@ -857,7 +857,7 @@ fn arguments_builds_array_of_frame_args() {
     // [0] callable, [1..3] args, [4] CallDyn(3, false), [5] Return(1)
     // [6] Arguments (fn body), [7] Return(1)
     let mut vm = VM::new(vec![
-        PushFn(6, u32::MAX),
+        PushFn(6, u32::MAX, 0),
         PushFloat(10.0),
         PushFloat(20.0),
         PushFloat(30.0),
@@ -881,7 +881,7 @@ fn arguments_is_cached_within_a_frame() {
     // Two `Arguments` in the same frame yield the SAME heap pointer (the
     // per-frame cache), so `Eq` (reference equality for arrays) is true.
     let out = run(vec![
-        PushFn(4, u32::MAX),
+        PushFn(4, u32::MAX, 0),
         PushFloat(1.0),
         CallDyn(1, false),
         Return(1),
@@ -895,7 +895,7 @@ fn arguments_is_cached_within_a_frame() {
 
 #[test]
 fn call_dyn_bad_addr() {
-    let code = vec![PushFn(999, u32::MAX), CallDyn(0, false)];
+    let code = vec![PushFn(999, u32::MAX, 0), CallDyn(0, false)];
     assert!(matches!(run_err(code).kind, ErrorKind::BadCall));
 }
 
@@ -903,11 +903,11 @@ fn call_dyn_bad_addr() {
 fn fn_value_equality_and_json() {
     // Same address -> equal; different -> not.
     assert_eq!(
-        run(vec![PushFn(3, u32::MAX), PushFn(3, u32::MAX), Eq]),
+        run(vec![PushFn(3, u32::MAX, 0), PushFn(3, u32::MAX, 0), Eq]),
         vec![b(true)]
     );
     assert_eq!(
-        run(vec![PushFn(3, u32::MAX), PushFn(4, u32::MAX), Eq]),
+        run(vec![PushFn(3, u32::MAX, 0), PushFn(4, u32::MAX, 0), Eq]),
         vec![b(false)]
     );
 }
@@ -923,7 +923,7 @@ fn append_counter(code: &mut Vec<Instr>) -> u32 {
     code.push(PushFloat(0.0));
     code.push(SetLocal(0)); // count = 0 (writes through the cell)
     let mk = code.len();
-    code.push(ClosureNew(0, vec![0].into())); // patched: capture count
+    code.push(ClosureNew(0, 0, vec![0].into())); // patched: capture count
     code.push(Return(1));
     let inner = code.len() as u32;
     // 0 params, 1 upval → EnterFrame installs the captured cell at slot 0.
@@ -934,7 +934,7 @@ fn append_counter(code: &mut Vec<Instr>) -> u32 {
     code.push(SetLocal(0)); // count = count + 1 (through the shared cell)
     code.push(GetLocal(0));
     code.push(Return(1)); // return count
-    code[mk] = ClosureNew(inner, vec![0].into());
+    code[mk] = ClosureNew(inner, 0, vec![0].into());
     mc
 }
 
@@ -1015,7 +1015,7 @@ fn closure_captures_plain_slot_by_value() {
     code.push(PushFloat(5.0));
     code.push(SetLocal(0));
     let mk = code.len();
-    code.push(ClosureNew(0, vec![0].into())); // snapshot x = 5
+    code.push(ClosureNew(0, 0, vec![0].into())); // snapshot x = 5
     code.push(PushFloat(99.0));
     code.push(SetLocal(0)); // x = 99 AFTER capture (must not be seen)
     code.push(Return(1));
@@ -1024,7 +1024,7 @@ fn closure_captures_plain_slot_by_value() {
     code.push(GetLocal(0)); // return captured snapshot
     code.push(Return(1));
     code[call] = Call(maker, 0);
-    code[mk] = ClosureNew(inner, vec![0].into());
+    code[mk] = ClosureNew(inner, 0, vec![0].into());
     assert_eq!(run(code), vec![n(5.0)]);
 }
 
@@ -1054,9 +1054,9 @@ fn two_closures_share_one_cell() {
     code.push(PushFloat(0.0));
     code.push(SetLocal(0));
     let mk_get = code.len();
-    code.push(ClosureNew(0, vec![0].into()));
+    code.push(ClosureNew(0, 0, vec![0].into()));
     let mk_set = code.len();
-    code.push(ClosureNew(0, vec![0].into()));
+    code.push(ClosureNew(0, 0, vec![0].into()));
     code.push(ArrNew(2)); // [getter, setter]
     code.push(Return(1));
     let getter = code.len() as u32;
@@ -1070,8 +1070,8 @@ fn two_closures_share_one_cell() {
     code.push(SetLocal(1)); // x = arg (through the shared cell)
     code.push(Return(0));
     code[call] = Call(maker, 0);
-    code[mk_get] = ClosureNew(getter, vec![0].into());
-    code[mk_set] = ClosureNew(setter, vec![0].into());
+    code[mk_get] = ClosureNew(getter, 0, vec![0].into());
+    code[mk_set] = ClosureNew(setter, 0, vec![0].into());
     assert_eq!(run(code), vec![n(42.0)]);
 }
 
@@ -1091,21 +1091,21 @@ fn nested_capture_forwards_same_cell() {
     code.push(PushFloat(7.0));
     code.push(SetLocal(0));
     let mk_mid = code.len();
-    code.push(ClosureNew(0, vec![0].into()));
+    code.push(ClosureNew(0, 0, vec![0].into()));
     code.push(Return(1));
     let middle = code.len() as u32;
     // middle's slot 0 is x (installed upval); forward it to inner.
     code.push(EnterFrame(0, false, vec![].into()));
     let mk_in = code.len();
-    code.push(ClosureNew(0, vec![0].into()));
+    code.push(ClosureNew(0, 0, vec![0].into()));
     code.push(Return(1));
     let inner = code.len() as u32;
     code.push(EnterFrame(0, false, vec![].into()));
     code.push(GetLocal(0));
     code.push(Return(1));
     code[call] = Call(outer, 0);
-    code[mk_mid] = ClosureNew(middle, vec![0].into());
-    code[mk_in] = ClosureNew(inner, vec![0].into());
+    code[mk_mid] = ClosureNew(middle, 0, vec![0].into());
+    code[mk_in] = ClosureNew(inner, 0, vec![0].into());
     assert_eq!(run(code), vec![n(7.0)]);
 }
 
@@ -1116,7 +1116,7 @@ fn closure_identity_equality() {
         EnterFrame(0, false, vec![SlotKind::Boxed].into()),
         PushFloat(1.0),
         SetLocal(0),
-        ClosureNew(6, vec![0].into()),
+        ClosureNew(6, 0, vec![0].into()),
         Pick(0),
         Eq,
         Return(1), // addr 6: also a valid (never-called) closure target
@@ -1127,8 +1127,8 @@ fn closure_identity_equality() {
         EnterFrame(0, false, vec![SlotKind::Boxed].into()),
         PushFloat(1.0),
         SetLocal(0),
-        ClosureNew(7, vec![0].into()),
-        ClosureNew(7, vec![0].into()),
+        ClosureNew(7, 0, vec![0].into()),
+        ClosureNew(7, 0, vec![0].into()),
         Eq,
         Return(1),
         Return(1), // addr 7
@@ -1143,7 +1143,7 @@ fn make_closure_rejects_out_of_range_capture() {
         Call(2, 0),
         Return(0),
         EnterFrame(0, false, plain(1).into()),
-        ClosureNew(0, vec![5].into()), // only slot 0 exists
+        ClosureNew(0, 0, vec![5].into()), // only slot 0 exists
         Return(1),
     ];
     assert!(matches!(run_err(code).kind, ErrorKind::BadLocal));
@@ -1535,7 +1535,7 @@ fn typeof_tags() {
             Value::Float(f) => PushFloat(*f),
             Value::PosInt(u) => PushPosInt(*u),
             Value::NegInt(i) => PushNegInt(*i),
-            Value::Closure { addr, .. } => PushFn(*addr, u32::MAX),
+            Value::Closure { addr, .. } => PushFn(*addr, u32::MAX, 0),
             _ => panic!("unexpected stack value"),
         };
         let out = run(vec![instr, TypeOf, ps(tag), Eq]);
@@ -2125,7 +2125,7 @@ fn alloc_breakdown() {
     {
         // Program: push Fn(3), CallDyn(0, false), Return(0) | PushPosInt(42), Return(1)
         let mut vm = VM::new(vec![
-            PushFn(3, u32::MAX),
+            PushFn(3, u32::MAX, 0),
             CallDyn(0, false),
             Return(0),
             PushPosInt(42),
@@ -2145,9 +2145,9 @@ fn alloc_breakdown() {
     alloc_counter::reset();
     {
         let mut vm = VM::new(vec![
-            PushFn(5, u32::MAX),
+            PushFn(5, u32::MAX, 0),
             CallDyn(0, false),
-            PushFn(5, u32::MAX),
+            PushFn(5, u32::MAX, 0),
             CallDyn(0, false),
             Return(0),
             PushPosInt(42),

@@ -1547,3 +1547,129 @@ fn get_prototype_of_primitive_is_type_error() {
         err.message
     );
 }
+
+// ── Step 6: method values off a receiver (`[].push`, `obj.m` uncalled) ──────
+
+/// `[].push` (bare, uncalled) is a `"function"` value, not a read error.
+#[test]
+fn array_method_value_is_function() {
+    let val = testutil::run_val("return [].push;");
+    assert_eq!(val.type_name(), "function");
+}
+
+/// `const f = [].push.bind(arr); f(3)` pushes to `arr` — the method value
+/// carries no `this`, so the user binds it explicitly.
+#[test]
+fn bound_array_method_pushes_to_target() {
+    let result = testutil::run_val(
+        "const arr = [1, 2]; const f = [].push.bind(arr); f(3); return arr.length;",
+    );
+    assert_eq!(result, testutil::num(3.0));
+}
+
+/// `obj.has` where `obj` has a data property `has` still reads the data —
+/// `GetMethodOrProp` on an Object does a property read, not a builtin lookup.
+#[test]
+fn object_data_property_shadows_method_name_on_read() {
+    assert_eq!(
+        testutil::run_val("const o = { has: 42 }; return o.has;"),
+        Value::PosInt(42)
+    );
+    // And an object without the property reads `undefined` (no builtin fallback).
+    assert_eq!(
+        testutil::run_val("const o = { a: 1 }; return o.push;"),
+        Value::Undefined
+    );
+}
+
+/// A string method read as a value is a `"function"`.
+#[test]
+fn string_method_value_is_function() {
+    let val = testutil::run_val("return \"\".trim;");
+    assert_eq!(val.type_name(), "function");
+}
+
+/// A method name not valid for the receiver type yields `Undefined`
+/// (JS-faithful — the call errors, not the read).
+#[test]
+fn invalid_method_name_yields_undefined() {
+    assert_eq!(eval("[].trim"), Value::Undefined);
+    assert_eq!(eval("\"\".push"), Value::Undefined);
+}
+
+/// `typeof` a method value is `"function"`.
+#[test]
+fn typeof_method_value() {
+    assert_eq!(eval_str("typeof [].push"), "function");
+    assert_eq!(eval_str("typeof \"\".trim"), "function");
+}
+
+// ── Step 6: `fn.length` (arity) ─────────────────────────────────────────────
+
+/// `((a, b) => a + b).length === 2` — the declared param count.
+#[test]
+fn closure_length_is_param_count() {
+    assert_eq!(eval("((a, b) => a + b).length"), testutil::num(2.0));
+    assert_eq!(eval("(function() {}).length"), testutil::num(0.0));
+    assert_eq!(eval("(function(x) {}).length"), testutil::num(1.0));
+}
+
+/// A default param stops the count (JS `fn.length` semantics).
+#[test]
+fn default_param_stops_length_count() {
+    assert_eq!(eval("((a, b = 1) => 0).length"), testutil::num(1.0));
+    assert_eq!(
+        eval("(function(a, b, c = 1) {}).length"),
+        testutil::num(2.0)
+    );
+}
+
+/// A rest param stops the count and is itself not counted.
+#[test]
+fn rest_param_stops_length_count() {
+    assert_eq!(eval("((a, ...rest) => 0).length"), testutil::num(1.0));
+    assert_eq!(eval("((...rest) => 0).length"), testutil::num(0.0));
+}
+
+/// `f.bind(null, x).length` is `f.length - 1` (clamped at 0).
+#[test]
+fn bound_length_drops_by_bound_args() {
+    assert_eq!(
+        eval("((a, b, c) => 0).bind(null, 1).length"),
+        testutil::num(2.0)
+    );
+    assert_eq!(
+        eval("((a, b) => 0).bind(null, 1, 2).length"),
+        testutil::num(0.0)
+    );
+    // Clamped at 0: binding more args than the arity still gives 0.
+    assert_eq!(
+        eval("((a) => 0).bind(null, 1, 2, 3).length"),
+        testutil::num(0.0)
+    );
+}
+
+/// A builtin's `.length` is approximate: `min_args - 1` for Method-kind
+/// (the receiver isn't a declared param), `min_args` for Namespace.
+#[test]
+fn builtin_length_is_approximate() {
+    // `Math.max` is a Namespace builtin with min_args=0 → length 0.
+    assert_eq!(eval("Math.max.length"), testutil::num(0.0));
+    // `Math.pow` is a Namespace builtin with min_args=2 → length 2.
+    assert_eq!(eval("Math.pow.length"), testutil::num(2.0));
+}
+
+/// `[].push === [].push` — method-value reads yield the same `Builtin` enum
+/// value (identity by enum equality), which is JS-faithful (JS shares the
+/// prototype function). `f.bind(x) !== f.bind(x)` diverges (each `bind` mints
+/// a fresh `Rc<BoundFn>`).
+#[test]
+fn method_value_identity_vs_bound_identity() {
+    // Method-value reads: same Builtin enum value → identity holds (JS-faithful).
+    assert_eq!(eval("[].push === [].push"), Value::Bool(true));
+    // Bound values: fresh Rc each time → identity diverges (documented).
+    assert_eq!(
+        eval("((a) => 0).bind(null) === ((a) => 0).bind(null)"),
+        Value::Bool(false)
+    );
+}
