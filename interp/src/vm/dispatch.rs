@@ -474,27 +474,39 @@ impl VM {
                 }
 
                 Instr::NewReturn => {
-                    let ret_val = self.stack.last().cloned();
-                    match ret_val {
-                        Some(Value::Object(_)) => {
-                            // Constructor returned an object explicitly; keep it.
-                        }
-                        _ => {
-                            // Constructor returned a non-object; use the allocated
-                            // instance stored in the caller frame.
-                            let new_obj = self
-                                .callstack
-                                .last_mut()
-                                .and_then(|f| f.new_obj.take())
-                                .ok_or_else(|| {
-                                    self.fail_not_resumable(
-                                        ErrorKind::BadReturn,
-                                        "NewReturn: no new_obj on caller frame",
-                                    )
-                                })?;
-                            self.stack.pop();
-                            self.stack.push(Value::Object(new_obj));
-                        }
+                    // JS: `new` yields the constructor's return value iff it is an
+                    // *object* — arrays and functions included, i.e. anything
+                    // non-primitive; otherwise it yields the freshly-allocated
+                    // instance. (`Upval` is an internal cell marker, never a
+                    // user-visible return value.)
+                    let returned_object = matches!(
+                        self.stack.last(),
+                        Some(
+                            Value::Object(_)
+                                | Value::Array(_)
+                                | Value::Map(_)
+                                | Value::Set(_)
+                                | Value::RegExp(_)
+                                | Value::Closure { .. }
+                                | Value::Builtin(_)
+                                | Value::Promise(_)
+                        )
+                    );
+                    if !returned_object {
+                        // Non-object return: discard it and use the allocated
+                        // instance stored on the caller frame.
+                        let new_obj = self
+                            .callstack
+                            .last_mut()
+                            .and_then(|f| f.new_obj.take())
+                            .ok_or_else(|| {
+                                self.fail_not_resumable(
+                                    ErrorKind::BadReturn,
+                                    "NewReturn: no new_obj on caller frame",
+                                )
+                            })?;
+                        self.stack.pop();
+                        self.stack.push(Value::Object(new_obj));
                     }
                     if let Some(f) = self.callstack.last_mut() {
                         f.new_obj = None;

@@ -154,6 +154,13 @@ The remaining intentional divergences from JS — deferred or accepted, NOT bugs
     benefit; the runtime relaxes to match JS.
   • Number→string uses Rust's float formatting for the non-integer path, so very
     large/small magnitudes are not rendered in JS's exponential form (`1e21`).
+  • Method calls on a builtin-method *name* compile to a builtin call only when
+    the arg count fits the builtin's `[min_args, max_args]`; otherwise they fall
+    through to dynamic dispatch (so an object's own/proto property can shadow a
+    builtin name at a different arity). Consequence: a wrong-arity call of a
+    builtin method on a *structural* receiver (e.g. `[].push()` with no value)
+    surfaces as a property-read/not-a-function error via the dynamic path rather
+    than the builtin's own arity error. Both still error.
   • Exceptions: `throw`/`try`/`catch`/`finally` are supported with full JS
     completion-value semantics (6_LANGUAGE Part B + B2): `break`/
     `continue`/`return` crossing a `finally` boundary run the block on the

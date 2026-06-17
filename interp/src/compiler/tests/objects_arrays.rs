@@ -1027,6 +1027,20 @@ fn new_constructor_returning_primitive_yields_instance() {
 }
 
 #[test]
+fn new_constructor_returning_array_yields_the_array() {
+    // JS: a constructor returning *any* object — arrays (and functions)
+    // included, not just plain objects — yields it, not the fresh instance.
+    assert_eq!(
+        testutil::run_val(concat!(
+            "function F() { this.x = 1; return [9, 8]; }",
+            "const a = new F();",
+            "return a[0];" // 9 if the array was kept; the instance has no [0]
+        )),
+        Value::PosInt(9)
+    );
+}
+
+#[test]
 fn new_constructor_returning_undefined_yields_instance() {
     // Returning undefined (or no return) yields the instance.
     assert_eq!(
