@@ -517,12 +517,22 @@ addr inline, no heap entry) and `Value::Closure(ClosurePtr)` (heap entry
   `ClosureNew` (distinct `ptr` → distinct identity, also correct). Static
   `Call(addr)` is untouched (addr baked in the instruction); the canonical
   `Closure` is materialized only when a function is used as a *value*.
+- **Upval install: stash the `ptr`, gate on the callee's static count.** The
+  upval count is a compile-time property of the callee (`Scope.captures`), so
+  don't carry it in the `Value` (no room — `{addr,ptr}` is the full 8-byte
+  payload — and no need). Instead: `CallDyn` stashes the **`ptr`** (inline in the
+  `Value`, *free* — no deref) into the frame; `EnterFrame`, which knows its own
+  upval count statically, reads `closures[ptr].upvals` **only when count > 0**. So
+  a non-capturing call **never dereferences `closures[ptr]`** — not in dispatch,
+  not in the prologue. This also lets the frame's eager `pending_upvals`
+  (`SmallVec<[Value; 8]>`, ~128 bytes, `mod.rs:369`) shrink to a 4-byte `ptr` with
+  a lazy, gated read. (Closures are immutable arena entries, so the lazy read sees
+  the same upvals captured at `ClosureNew` time.)
 - **Match-arm migration** (the compiler flags each): collapse every `Fn | Closure`
   arm to a single `Closure` (`value.rs:218/247/440`); `strict_equal` becomes
   `Closure` `ptr`-equality (the canonical-per-addr scheme preserves today's
   `Fn(a)==Fn(b)` ⇔ same addr); `type_name` → `"function"`; the `dispatch_call`
-  `Fn`/`Closure` arms **merge into one**; `EnterFrame` reads upvals from
-  `closures[ptr]`.
+  `Fn`/`Closure` arms **merge into one**.
 
 Behavior-preserving — functions dispatch, compare, and print exactly as before;
 `prototype` is dormant. Isolated as its own green checkpoint.
@@ -534,6 +544,9 @@ Acceptance (4a):
 - [ ] `Value` still 16 bytes (size assertion); `Value::Fn` removed.
 - [ ] A non-capturing function pushed twice has the **same** `ptr` (identity);
       `dispatch_call` no longer derefs to fetch `addr` (it's inline).
+- [ ] A non-capturing call dereferences `closures[ptr]` **zero** times (upval read
+      gated on the callee's static count); the frame stashes a `ptr`, not the
+      upvals vector.
 - [ ] Gate: `cargo fmt && cargo clippy && cargo test` green.
 
 ### Step 4b — `new F(args)` + `F.prototype`
