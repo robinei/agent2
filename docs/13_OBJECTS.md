@@ -716,17 +716,22 @@ Acceptance:
 
 ## Sequencing
 
-**1a → 1b** is a hard order, but neither half moves a slot or changes a call
-convention — `this` is a frame field, so 1a is purely additive (add the field +
-`LoadThis`, every read `undefined`) and 1b adds only the reify-on-capture wiring.
-The novel/risky surface is concentrated in **1b** (reify-on-capture for arrows)
-and **3** (the user-fn-vs-builtin receiver fork), so keep each behind its
-acceptance gate. 1b and 2 are independent and can land in either order, but both
-precede 3 (3 sets the first non-undefined `this`, which is when 1b's capture
-wiring must already be correct). 3 depends on 1b+2. 4 depends on 3. 5 depends on
-3. 6 depends on 3+5. 7 depends on 4 (and 5 if methods-as-values appear in class
-bodies). The **minimum coherent system** is Steps 1–4; 5–7 are the deferred items
-folded into the same substrate so they never become one-off bolt-ons.
+Both **1a → 1b** and **3a → 3b** are hard orders that isolate a behavior-
+preserving mechanical change (1a: add the field + `LoadThis`, every read
+`undefined`; 3a: callee-below-args + `has_this` plumbed-`false`, suite green)
+from the semantics that follow (1b: reify-on-capture; 3b: bind `this`). The
+novel/risky surface is concentrated in **1b** (reify-on-capture for arrows) and
+**3b** (the user-fn-vs-builtin receiver fork + threading `this_val` through the
+chokepoint), so keep each behind its gate.
+
+**3a is independent** — a pure call-convention refactor that touches neither
+`this` nor the proto chain, so it can land *first*, even before 1/2, as a
+warm-up. 1b and 2 are independent and can land in either order, but both precede
+**3b** (3b sets the first non-undefined `this`, which is when 1b's capture wiring
+must already be correct): 3b depends on 1b + 2 + 3a. 4 depends on 3b. 5 depends
+on 3b. 6 depends on 3b + 5. 7 depends on 4 (and 5 if methods-as-values appear in
+class bodies). The **minimum coherent system** is Steps 1–4; 5–7 are the deferred
+items folded into the same substrate so they never become one-off bolt-ons.
 
 ## Divergences from JS (record in the divergence list as they land)
 
