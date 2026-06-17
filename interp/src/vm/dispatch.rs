@@ -379,32 +379,17 @@ impl VM {
                 Instr::CallBuiltin(b, argc) => {
                     let b = *b;
                     let argc = *argc;
-                    // `.call` and `.apply` re-enter dispatch: the handler
-                    // signals readiness but does not itself call the target,
-                    // because the builtin epilogue would corrupt the frame.
-                    // The dispatch lane shifts/expands args and dispatches
-                    // directly — same hand-off as `reroute_method_to_object`.
-                    match b {
-                        crate::builtin::Builtin::FunctionCall => {
-                            self.reroute_call_builtin(argc)?;
+                    // Happy path: the builtin runs. If it lands on an Object
+                    // receiver (the `MethodOnObject` signal), the args are still
+                    // on the stack — re-route the call to the object's own
+                    // same-named property so user properties shadow builtin
+                    // method names (push, trim, …). `reroute` sets `ip`.
+                    match b.call(self, argc) {
+                        Ok(()) => self.ip += 1,
+                        Err(e) if e.kind == ErrorKind::MethodOnObject => {
+                            self.reroute_method_to_object(b, argc, Value::Undefined)?;
                         }
-                        crate::builtin::Builtin::FunctionApply => {
-                            self.reroute_apply_builtin(argc)?;
-                        }
-                        _ => {
-                            // Happy path: the builtin runs. If it lands on an Object
-                            // receiver (the `MethodOnObject` signal), the args are still
-                            // on the stack — re-route the call to the object's own
-                            // same-named property so user properties shadow builtin
-                            // method names (push, trim, …). `reroute` sets `ip`.
-                            match b.call(self, argc) {
-                                Ok(()) => self.ip += 1,
-                                Err(e) if e.kind == ErrorKind::MethodOnObject => {
-                                    self.reroute_method_to_object(b, argc, Value::Undefined)?;
-                                }
-                                Err(e) => return Err(e),
-                            }
-                        }
+                        Err(e) => return Err(e),
                     }
                 }
 
@@ -424,8 +409,27 @@ impl VM {
                     } else {
                         (Value::Undefined, 1)
                     };
-                    let arr_ptr = match self.pop()? {
-                        Value::Array(p) => p,
+                    let nargs = match self.pop()? {
+                        Value::Array(arr_ptr) => {
+                            let ip = self.ip;
+                            let elements: ThinVec<Value> = self
+                                .arrays
+                                .get(arr_ptr as usize)
+                                .ok_or_else(|| {
+                                    VMError::fail_at(ip, ErrorKind::TypeError, "bad array pointer")
+                                })?
+                                .clone();
+                            let n = elements.len() as u32;
+                            for val in elements {
+                                self.stack.push(val);
+                            }
+                            n
+                        }
+                        // Nullish args → no args. Lets `f.apply(t, null)` /
+                        // `f.apply(t)` mean "call with no args" (JS-faithful for
+                        // `.apply`); also makes `f(...null)` lenient, consistent
+                        // with the VM's other nullish-spread divergences.
+                        Value::Null | Value::Undefined => 0,
                         _ => {
                             return Err(self.fail(
                                 ErrorKind::TypeError,
@@ -433,18 +437,6 @@ impl VM {
                             ));
                         }
                     };
-                    let ip = self.ip;
-                    let elements: ThinVec<Value> = self
-                        .arrays
-                        .get(arr_ptr as usize)
-                        .ok_or_else(|| {
-                            VMError::fail_at(ip, ErrorKind::TypeError, "bad array pointer")
-                        })?
-                        .clone();
-                    let nargs = elements.len() as u32;
-                    for val in elements {
-                        self.stack.push(val);
-                    }
                     self.dispatch_call(callable, this_val, nargs, below)?;
                 }
 

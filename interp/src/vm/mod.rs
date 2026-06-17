@@ -163,6 +163,13 @@ The remaining intentional divergences from JS — deferred or accepted, NOT bugs
     with its lenient, JS-faithful behavior (extra args ignored, missing optional
     args default — e.g. `'abc'.split()` is `['abc']`), and an `Object` receiver
     reroutes to the shadowing property.
+  • `f.call`/`f.apply` are recognized as invocation forwarders (lowered to the
+    `has_this` dispatch), so a plain object cannot shadow them with its own
+    `call`/`apply` method — the receiver is always treated as the function being
+    invoked. (`f.apply`'s args array may be nullish → no args, as in JS.)
+  • A spread call over a nullish value — `f(...null)` / `f(...undefined)` — passes
+    no args rather than throwing (JS: "not iterable"). Consistent with the VM's
+    other nullish-spread leniencies (object rest, `.apply(t, null)`).
   • Exceptions: `throw`/`try`/`catch`/`finally` are supported with full JS
     completion-value semantics (6_LANGUAGE Part B + B2): `break`/
     `continue`/`return` crossing a `finally` boundary run the block on the

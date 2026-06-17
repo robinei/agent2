@@ -313,10 +313,10 @@ builtins! {
     // ── universal methods (any receiver) ──
     ToString, BuiltinKind::Method, "toString", 1, 1, value_to_string;
 
-    // ── Function methods (Phase 13 Step 5: bind, call, apply) ──
+    // ── Function methods (Phase 13 Step 5) ──
+    // `bind` constructs a `Value::Bound`; `.call`/`.apply` are not builtins —
+    // the compiler lowers them to `has_this` dispatch (`compile_invoke_forward`).
     FunctionBind,  BuiltinKind::Method, "bind",  1, VARARG, function_bind;
-    FunctionCall,  BuiltinKind::Method, "call",  1, VARARG, function_call;
-    FunctionApply, BuiltinKind::Method, "apply", 1, VARARG, function_apply;
 
     // ── string methods that accept RegExp ──
     StrMatch,    BuiltinKind::Method, "match",    2, 2, str_match;

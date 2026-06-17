@@ -134,6 +134,33 @@ impl<'src> super::Compiler<'src> {
             }
         }
 
+        // `f.call(thisArg, ...args)` (and the degenerate `f.apply(...)`) with a
+        // spread among the args: forward to the `has_this` dispatch — thisArg is
+        // arg 0, the rest become the (spread) args array. See
+        // `compile_invoke_forward` for the non-spread case.
+        if let ast::Expression::StaticMemberExpression(m) = &call.callee {
+            if matches!(m.property.name.as_str(), "call" | "apply") {
+                self.compile_expr(&m.object); // [f]
+                let end = if call.optional {
+                    Some(self.begin_optional(span))
+                } else {
+                    None
+                };
+                match call.arguments.first().and_then(|a| a.as_expression()) {
+                    Some(t) => self.compile_expr(t),
+                    None => self.emit(Instr::PushUndefined, span),
+                }
+                self.emit(Instr::Dig(1), span); // [thisArg, f]
+                let rest = 1.min(call.arguments.len());
+                self.compile_call_args_array(&call.arguments[rest..], span);
+                self.emit(Instr::CallSpread(true), span);
+                if let Some(end) = end {
+                    self.emit(Instr::Label(end), span);
+                }
+                return;
+            }
+        }
+
         // Detect a method callee so we emit ObjPeek/ObjPeekDyn (keeping the
         // receiver) instead of ObjGet/IndexGet (consuming it), and thread
         // has_this=true to CallSpread.  Skip namespaces (Math.max) — those
@@ -201,11 +228,7 @@ impl<'src> super::Compiler<'src> {
     /// Compile call arguments into an array on the stack.  Supports spread
     /// elements: leading static args + `ArrNew`, then `ArrExtend` for each
     /// spread and `ArrPush` for each trailing static argument.
-    pub(super) fn compile_call_args_array(
-        &mut self,
-        args: &oxc_allocator::Vec<'_, ast::Argument>,
-        span: u32,
-    ) {
+    pub(super) fn compile_call_args_array(&mut self, args: &[ast::Argument<'_>], span: u32) {
         // Count leading non-spread arguments.
         let leading_count = args
             .iter()
@@ -523,6 +546,11 @@ impl<'src> super::Compiler<'src> {
                 return self.compile_hof(recv, argv, span, optional, "__findLastIndex", 1);
             }
             "sort" => return self.compile_sort(recv, argv, span, optional),
+            // `f.call`/`f.apply` are invocation forwarders, not builtins: lower
+            // them to the existing `has_this` dispatch (`dispatch_call(f, this =
+            // thisArg, args)`). See `compile_invoke_forward`.
+            "call" => return self.compile_invoke_forward(recv, argv, span, optional, false),
+            "apply" => return self.compile_invoke_forward(recv, argv, span, optional, true),
             // `replace`/`replaceAll` are prelude helpers so a *function*
             // replacer can be invoked from JS; they fall back to the
             // `__replaceStr`/`__replaceAllStr` builtins for string replacers.
@@ -548,6 +576,59 @@ impl<'src> super::Compiler<'src> {
         // followed by dynamic call (e.g. `state.add5(3)` where
         // add5 is a function stored in state).
         self.compile_dynamic_method_call(recv, method, argv, span, optional);
+    }
+
+    /// `f.call(thisArg, ...args)` / `f.apply(thisArg, argsArray)` — JS function
+    /// invocation forwarders. Rather than builtins that re-enter dispatch, these
+    /// lower to the existing `has_this` dispatch: arrange `[thisArg, f, args…]`
+    /// and emit `CallDyn`/`CallSpread(has_this=true)`, i.e.
+    /// `dispatch_call(f, this = thisArg, args)`. `dispatch_call` then handles
+    /// every callee kind (a `Closure` gets `thisArg` in its frame, a `Builtin`
+    /// gets it as arg 0, a `Bound` overrides it with its own `this`).
+    ///
+    /// Divergence: a plain object cannot shadow `call`/`apply` with its own
+    /// method — the receiver is always treated as the function being invoked.
+    fn compile_invoke_forward(
+        &mut self,
+        recv: &ast::Expression, // the function being invoked
+        argv: &[&ast::Expression],
+        span: u32,
+        optional: bool,
+        spread: bool,
+    ) {
+        self.compile_expr(recv); // [f]
+        let end = if optional {
+            Some(self.begin_optional(span))
+        } else {
+            None
+        };
+        // thisArg = argv[0] (or undefined), pushed then swapped *below* the
+        // callee to match the `has_this` layout `[thisArg, f, …]`.
+        match argv.first() {
+            Some(t) => self.compile_expr(t),
+            None => self.emit(Instr::PushUndefined, span),
+        }
+        self.emit(Instr::Dig(1), span); // [thisArg, f]
+        if spread {
+            // `.apply`: argv[1] is the args array (absent → empty). A nullish
+            // value yields no args; a non-array, non-nullish value is a runtime
+            // TypeError (both handled by `CallSpread`).
+            match argv.get(1) {
+                Some(arr) => self.compile_expr(arr),
+                None => self.emit(Instr::ArrNew(0), span),
+            }
+            self.emit(Instr::CallSpread(true), span);
+        } else {
+            // `.call`: argv[1..] are the call args.
+            let rest = argv.get(1..).unwrap_or(&[]);
+            for &a in rest {
+                self.compile_expr(a);
+            }
+            self.emit(Instr::CallDyn(rest.len() as u32, true), span);
+        }
+        if let Some(end) = end {
+            self.emit(Instr::Label(end), span);
+        }
     }
 
     /// Compile a method call where the method name is not a known builtin.

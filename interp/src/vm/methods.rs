@@ -1237,103 +1237,6 @@ impl VM {
         }
     }
 
-    /// Re-route a `.call` expression: stack has `[callable, thisArg, a, b…]`
-    /// (argc total). Shift the target args (`a, b…`) down, truncate the stack,
-    /// then re-enter `dispatch_call` with `this_val = thisArg`. The handler
-    /// path does not itself call `dispatch_call` — the builtin epilogue would
-    /// corrupt the frame before the callee runs — so this is invoked directly
-    /// from the `CallBuiltin` dispatch lane instead.
-    pub(crate) fn reroute_call_builtin(&mut self, argc: u32) -> Result<(), VMError> {
-        let n = argc as usize;
-        if self.stack.len() < n {
-            return Err(self.fail(ErrorKind::StackUnderflow, "stack underflow"));
-        }
-        let base = self.stack.len() - n;
-        let callable = self.stack[base].clone();
-        let this_arg = if n >= 2 {
-            self.stack[base + 1].clone()
-        } else {
-            Value::Undefined
-        };
-        match &callable {
-            Value::Closure { .. } | Value::Builtin(_) | Value::Bound(_) => {}
-            _ => {
-                self.stack.truncate(base);
-                return Err(self.fail(
-                    ErrorKind::TypeError,
-                    format!("cannot call a {} as a function", callable.type_name()),
-                ));
-            }
-        }
-        let nargs = if n >= 2 { (n - 2) as u32 } else { 0 };
-        // Shift args[2..] down to replace callable and thisArg
-        for i in 2..n {
-            let val = self.stack[base + i].clone();
-            self.stack[base + i - 2] = val;
-        }
-        self.stack.truncate(base + nargs as usize);
-        self.dispatch_call(callable, this_arg, nargs, 0)
-    }
-
-    /// Re-route an `.apply` expression: stack has `[callable, thisArg,
-    /// argsArray]`. Expand `argsArray` (reusing the same array-expansion
-    /// pattern as `CallSpread`), then re-enter `dispatch_call`.
-    pub(crate) fn reroute_apply_builtin(&mut self, argc: u32) -> Result<(), VMError> {
-        let n = argc as usize;
-        if self.stack.len() < n {
-            return Err(self.fail(ErrorKind::StackUnderflow, "stack underflow"));
-        }
-        let base = self.stack.len() - n;
-        let callable = self.stack[base].clone();
-        let this_arg = if n >= 2 {
-            self.stack[base + 1].clone()
-        } else {
-            Value::Undefined
-        };
-        match &callable {
-            Value::Closure { .. } | Value::Builtin(_) | Value::Bound(_) => {}
-            _ => {
-                self.stack.truncate(base);
-                return Err(self.fail(
-                    ErrorKind::TypeError,
-                    format!("cannot call a {} as a function", callable.type_name()),
-                ));
-            }
-        }
-        // Extract and expand the args array (or use empty)
-        let elements: ThinVec<Value> = if n >= 3 {
-            match &self.stack[base + 2] {
-                Value::Array(p) => {
-                    let arr = self
-                        .arrays
-                        .get(*p as usize)
-                        .ok_or_else(|| {
-                            VMError::fail_at(self.ip, ErrorKind::TypeError, "bad array pointer")
-                        })?
-                        .clone();
-                    arr
-                }
-                Value::Null | Value::Undefined => ThinVec::new(),
-                other => {
-                    let ty = other.type_name();
-                    self.stack.truncate(base);
-                    return Err(self.fail(
-                        ErrorKind::TypeError,
-                        format!("second argument to apply must be an array, not {ty}"),
-                    ));
-                }
-            }
-        } else {
-            ThinVec::new()
-        };
-        let nargs = elements.len() as u32;
-        self.stack.truncate(base);
-        for val in elements {
-            self.stack.push(val);
-        }
-        self.dispatch_call(callable, this_arg, nargs, 0)
-    }
-
     /// Shared dispatch for `CallDyn`/`CallSpread`/reroute/bind/`new`. The args
     /// are the top `nargs` stack values (arg 0 deepest). `this_val` is the
     /// receiver (for a user function it becomes the frame field; for a builtin it
@@ -1374,28 +1277,6 @@ impl VM {
                 )?;
             }
             Value::Builtin(b) => {
-                // `.call` and `.apply` re-enter dispatch whether they arrive
-                // via CallBuiltin or as a value (CallDyn/CallSpread).
-                use crate::builtin::Builtin as B;
-                if matches!(b, B::FunctionCall | B::FunctionApply) {
-                    if below > 0 {
-                        let args_start = self.stack.len() - nargs as usize;
-                        self.stack.drain(args_start - below as usize..args_start);
-                    }
-                    let nargs_with_recv = if matches!(this_val, Value::Undefined) {
-                        nargs
-                    } else {
-                        let insert_idx = self.stack.len() - nargs as usize;
-                        self.stack.insert(insert_idx, this_val.clone());
-                        nargs + 1
-                    };
-                    if matches!(b, B::FunctionCall) {
-                        self.reroute_call_builtin(nargs_with_recv)?
-                    } else {
-                        self.reroute_apply_builtin(nargs_with_recv)?
-                    }
-                    return Ok(());
-                }
                 // Builtins read args positionally from the top and self-truncate,
                 // so the below-args placeholders must go first (rare: a builtin
                 // arriving as a runtime value).
