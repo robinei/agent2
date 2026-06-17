@@ -274,38 +274,40 @@ impl<'src> super::Compiler<'src> {
     ) {
         let base = recv.is_some() as u32; // the receiver occupies one arity slot
         let argc = base + argv.len() as u32;
-        let meta = builtin.meta();
         // Compile-time arity lint — only for receiver-less builtins (namespace /
         // global, e.g. `Math.max`). A *method* call's receiver type isn't known
         // here: it may be an `Object` with a same-named own/proto property that
         // shadows the builtin (with its own arity), so method arity is left to
         // runtime — the handler runs for a matching receiver (leniently, as the
         // runtime already does for `split`/`indexOf`…) and an `Object` receiver
-        // reroutes. This is why a wrong-arity method call no longer hard-errors
-        // at compile time.
-        if recv.is_none() && (argc < meta.min_args || argc > meta.max_args) {
-            // Report the bounds without the implicit receiver, so the message
-            // matches how the call is written in source.
-            let lo = meta.min_args.saturating_sub(base);
-            let want = if meta.max_args == u32::MAX {
-                format!("at least {lo}")
-            } else {
-                let hi = meta.max_args - base;
-                if lo == hi {
-                    format!("{lo}")
+        // reroutes. So a method call never hard-errors on arity here, and its
+        // `meta()` is never consulted.
+        if recv.is_none() {
+            let meta = builtin.meta();
+            if argc < meta.min_args || argc > meta.max_args {
+                // Report the bounds without the implicit receiver, so the message
+                // matches how the call is written in source.
+                let lo = meta.min_args.saturating_sub(base);
+                let want = if meta.max_args == u32::MAX {
+                    format!("at least {lo}")
                 } else {
-                    format!("{lo} to {hi}")
-                }
-            };
-            self.error(
-                span,
-                format!(
-                    "`{}` expects {want} argument(s), got {}",
-                    meta.name,
-                    argv.len()
-                ),
-            );
-            return;
+                    let hi = meta.max_args - base;
+                    if lo == hi {
+                        format!("{lo}")
+                    } else {
+                        format!("{lo} to {hi}")
+                    }
+                };
+                self.error(
+                    span,
+                    format!(
+                        "`{}` expects {want} argument(s), got {}",
+                        meta.name,
+                        argv.len()
+                    ),
+                );
+                return;
+            }
         }
         // Optional method call: guard on the receiver before the args/call.
         // `JNotNullish` (via `begin_optional`) keeps the receiver on the
