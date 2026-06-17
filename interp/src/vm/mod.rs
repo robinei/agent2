@@ -397,6 +397,11 @@ pub struct CallFrame {
     /// local-slot space. Defaults to `Undefined`; set by method dispatch,
     /// `new`, `bind`, `.call`, and `.apply` (Phase 13 OO).
     pub(super) this_val: Value,
+    /// The allocated instance object for a `new` call (Phase 13 OO). Set by
+    /// `Instr::New` on the *caller* frame and consumed by `Instr::NewReturn`
+    /// for the post-return fixup (if the constructor returns a non-object the
+    /// instance is used instead). `None` for non-new calls.
+    pub(super) new_obj: Option<ObjectPtr>,
     /// How this frame completes (7_ASYNC Tier 2). Direct calls are `Normal`;
     /// a scheduler-resumed async frame is `ResolvePromise` — it has no
     /// caller below it on the stack.

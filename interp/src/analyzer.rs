@@ -1666,9 +1666,10 @@ impl Analyzer {
                 scope.children.push(child);
             }
             ast::Expression::NewExpression(n) => {
-                // Only the error-constructor form (`new Error(msg)`) compiles,
-                // but walk all `new` arguments so their references resolve.
-                // The callee is matched by name in codegen, never evaluated.
+                // Visit the callee (Step 4b: user functions can now appear in
+                // `new` expressions) and all arguments so their references
+                // resolve.
+                self.analyze_expr(&n.callee, scope, block_scopes, scopes);
                 for arg in &n.arguments {
                     match arg {
                         ast::Argument::SpreadElement(s) => {

@@ -511,8 +511,15 @@ impl<'src> super::Compiler<'src> {
             _ => {}
         }
         if let Some(builtin) = Builtin::for_method(method) {
-            self.compile_builtin_call(builtin, Some(recv), argv, span, optional);
-            return;
+            let meta = builtin.meta();
+            let argc = 1 + argv.len() as u32; // receiver + explicit args
+            if argc >= meta.min_args && argc <= meta.max_args {
+                self.compile_builtin_call(builtin, Some(recv), argv, span, optional);
+                return;
+            }
+            // Arity doesn't match the builtin — the receiver may be an Object
+            // with a same-named own/proto property that shadows the builtin.
+            // Fall through to the dynamic path so the VM can reroute at runtime.
         }
         // Not a known builtin method — treat as property access
         // followed by dynamic call (e.g. `state.add5(3)` where

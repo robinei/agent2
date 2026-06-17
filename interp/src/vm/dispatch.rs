@@ -49,6 +49,32 @@ impl VM {
         }
     }
 
+    /// Resolve `"prototype"` on a `Closure` receiver (for `F.prototype`).
+    /// Lazily allocates an empty object on first access. Other property names
+    /// on a Closure are a TypeError. Called directly from the `ObjGet`/`ObjPeek`
+    /// dispatch arms to avoid a `&self`/`&mut self` conflict with the `step()`
+    /// code borrow.
+    fn resolve_closure_prototype(
+        &mut self,
+        ptr: ClosurePtr,
+        field_str: &str,
+    ) -> Result<Value, VMError> {
+        if field_str != "prototype" {
+            return Err(self.fail(ErrorKind::TypeError, "cannot read property on function"));
+        }
+        if let Some(proto_ptr) = self.closures.get(ptr as usize).and_then(|c| c.prototype) {
+            return Ok(Value::Object(proto_ptr));
+        }
+        let new_map = IndexMap::new();
+        let proto_ptr = self.objects.len() as ObjectPtr;
+        self.objects.push(ObjData {
+            proto: None,
+            map: new_map,
+        });
+        self.closures[ptr as usize].prototype = Some(proto_ptr);
+        Ok(Value::Object(proto_ptr))
+    }
+
     /// Shared computed-property resolution for `IndexGet`/`ObjPeekDyn`:
     /// inspects `container` (the object/array/string being indexed) and
     /// resolves `key` against it. String→char, Array→int-index,
@@ -405,6 +431,75 @@ impl VM {
                         self.stack.push(val);
                     }
                     self.dispatch_call(callable, this_val, nargs, below)?;
+                }
+
+                Instr::New(nargs) => {
+                    let nargs = *nargs;
+                    let args_start = self.stack.len() - nargs as usize;
+                    let callable =
+                        std::mem::replace(&mut self.stack[args_start - 1], Value::Undefined);
+                    let (_addr, ptr) = match &callable {
+                        Value::Closure { addr, ptr } => (*addr, *ptr),
+                        _ => {
+                            let msg = format!(
+                                "cannot call a {} as a function with `new`",
+                                callable.type_name()
+                            );
+                            self.stack.truncate(args_start - 1);
+                            return Err(self.fail(ErrorKind::TypeError, msg));
+                        }
+                    };
+                    let proto_ptr = self
+                        .closures
+                        .get(ptr as usize)
+                        .and_then(|c| c.prototype)
+                        .unwrap_or_else(|| {
+                            let new_map = IndexMap::new();
+                            let proto_ptr = self.objects.len() as ObjectPtr;
+                            self.objects.push(ObjData {
+                                proto: None,
+                                map: new_map,
+                            });
+                            self.closures[ptr as usize].prototype = Some(proto_ptr);
+                            proto_ptr
+                        });
+                    let new_obj = self.objects.len() as ObjectPtr;
+                    self.objects.push(ObjData {
+                        proto: Some(proto_ptr),
+                        map: IndexMap::new(),
+                    });
+                    let new_obj_val = Value::Object(new_obj);
+                    self.callstack.last_mut().unwrap().new_obj = Some(new_obj);
+                    self.dispatch_call(callable, new_obj_val, nargs, 1)?;
+                }
+
+                Instr::NewReturn => {
+                    let ret_val = self.stack.last().cloned();
+                    match ret_val {
+                        Some(Value::Object(_)) => {
+                            // Constructor returned an object explicitly; keep it.
+                        }
+                        _ => {
+                            // Constructor returned a non-object; use the allocated
+                            // instance stored in the caller frame.
+                            let new_obj = self
+                                .callstack
+                                .last_mut()
+                                .and_then(|f| f.new_obj.take())
+                                .ok_or_else(|| {
+                                    self.fail_not_resumable(
+                                        ErrorKind::BadReturn,
+                                        "NewReturn: no new_obj on caller frame",
+                                    )
+                                })?;
+                            self.stack.pop();
+                            self.stack.push(Value::Object(new_obj));
+                        }
+                    }
+                    if let Some(f) = self.callstack.last_mut() {
+                        f.new_obj = None;
+                    }
+                    self.ip += 1;
                 }
 
                 Instr::ClosureNew(addr, captures) => {
@@ -1092,27 +1187,46 @@ impl VM {
                 }
 
                 Instr::ObjGet(field) => {
-                    let field_str = field.as_str();
-                    match self.resolve_property_from_top(field_str) {
-                        Ok(val) => {
+                    // Snapshot the field name as an owned `String` so the
+                    // `self.code` borrow from the `field` match binding is
+                    // released before the mutable `resolve_closure_prototype`
+                    // call on the `Closure` path.
+                    let field_str = field.as_str().to_owned();
+                    match self.stack.last() {
+                        Some(Value::Closure { ptr, .. }) => {
+                            let val = self.resolve_closure_prototype(*ptr, &field_str)?;
                             self.stack.pop();
                             self.stack.push(val);
-                            self.ip += 1;
                         }
-                        Err(e) => {
-                            self.stack.pop();
-                            return Err(e);
-                        }
+                        _ => match self.resolve_property_from_top(&field_str) {
+                            Ok(val) => {
+                                self.stack.pop();
+                                self.stack.push(val);
+                            }
+                            Err(e) => {
+                                self.stack.pop();
+                                return Err(e);
+                            }
+                        },
                     }
+                    self.ip += 1;
                 }
 
                 // ObjGet minus the pop: reads the property but keeps the
                 // receiver below it. Same resolution (own→proto chain) as
                 // ObjGet, shared helper. obj -> obj, any
                 Instr::ObjPeek(field) => {
-                    let field_str = field.as_str();
-                    let val = self.resolve_property_from_top(field_str)?;
-                    self.stack.push(val);
+                    let field_str = field.as_str().to_owned();
+                    match self.stack.last() {
+                        Some(Value::Closure { ptr, .. }) => {
+                            let val = self.resolve_closure_prototype(*ptr, &field_str)?;
+                            self.stack.push(val);
+                        }
+                        _ => {
+                            let val = self.resolve_property_from_top(&field_str)?;
+                            self.stack.push(val);
+                        }
+                    }
                     self.ip += 1;
                 }
 

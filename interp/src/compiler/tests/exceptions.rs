@@ -173,9 +173,12 @@ fn new_error_rejects_extra_args() {
 
 #[test]
 fn new_non_error_still_rejected() {
+    // `Foo` is undeclared — the callee fails to resolve via the new `new` path,
+    // producing an undeclared-variable error instead of the generic "`new` is
+    // not supported" (Step 4b now compiles `new F()` for declared user functions).
     let errs = compile_errs(r#"const x = new Foo();"#);
     assert!(
-        errs.iter().any(|e| e.contains("`new` is not supported")),
+        errs.iter().any(|e| e.contains("undeclared")),
         "got: {errs:?}"
     );
 }

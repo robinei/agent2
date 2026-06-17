@@ -1122,22 +1122,15 @@ mod tests {
 
     #[test]
     fn js_static_arity_is_strict_runtime_is_relaxed() {
-        // Static: 'a,b'.split(',', 2, 3) is still a compile error (surplus args).
-        let errs = testutil::compile_errs("'a,b'.split(',', 2, 3);");
-        let msg = errs.join("\n");
-        assert!(
-            msg.contains("split"),
-            "expected split arity error, got: {msg}"
-        );
+        // 'a,b'.split(',', 2, 3) still reaches a builtin — argc=4 > max=3 falls
+        // through to dynamic dispatch, errors at runtime.
+        let err = testutil::run_runtime_err("'a,b'.split(',', 2, 3);");
+        assert_eq!(err.kind, ErrorKind::TypeError);
 
-        // Static: 'abc'.split() is still a compile error (too few args).
-        // The static compiler requires recv + delim for split.
-        let errs = testutil::compile_errs("'abc'.split();");
-        let msg = errs.join("\n");
-        assert!(
-            msg.contains("split"),
-            "expected split arity error, got: {msg}"
-        );
+        // 'abc'.split() — acr=1 < min=2 falls through to dynamic dispatch,
+        // errors at runtime.
+        let err = testutil::run_runtime_err("'abc'.split();");
+        assert_eq!(err.kind, ErrorKind::TypeError);
 
         // Runtime: calling split with only a receiver via direct VM call.
         let out = run_instrs(vec![

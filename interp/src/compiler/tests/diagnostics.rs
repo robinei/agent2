@@ -4,6 +4,7 @@
 use crate::compiler::compile;
 use crate::testutil;
 use crate::testutil::eval;
+use crate::vm::ErrorKind;
 
 #[test]
 fn unsupported_statement_errors() {
@@ -42,13 +43,11 @@ fn diagnostics_for_unsupported() {
 
 #[test]
 fn builtin_arity_is_enforced_from_meta() {
+    // Namespace calls (no receiver) always check arity at compile time.
     for src in [
         "Math.pow(1);",
         "Math.pow(1, 2, 3);",
         "Math.abs();",
-        "\"x\".slice();",
-        "\"x\".slice(1, 2, 3);",
-        "[1].pop(2);",
         "Object.keys();",
         "Number.parseInt(1, 2, 3);",
     ] {
@@ -57,11 +56,20 @@ fn builtin_arity_is_enforced_from_meta() {
             "expected `{src}` to fail arity check"
         );
     }
+    // Receiver-based method calls that mismatch arity fall through to
+    // dynamic dispatch (the receiver may be an Object with a shadowing
+    // property). They no longer fail at compile time but error at runtime.
+    for src in ["\"x\".slice();", "\"x\".slice(1, 2, 3);", "[1].pop(2);"] {
+        assert!(
+            testutil::run_runtime_err(src).kind == ErrorKind::TypeError,
+            "expected `{src}` to fail at runtime"
+        );
+    }
     assert!(compile("[1].push();").is_ok());
-    let errs = compile("\"x\".slice(1, 2, 3);").expect_err("too many args");
+    let errs = compile("Math.pow(1, 2, 3);").expect_err("too many args");
     let msg = &errs[0].message;
-    assert!(msg.contains("`slice`"), "got: {msg}");
-    assert!(msg.contains("1 to 2"), "got: {msg}");
+    assert!(msg.contains("`pow`"), "got: {msg}");
+    assert!(msg.contains("2"), "got: {msg}");
     assert_eq!(eval("Math.max()"), testutil::num(f64::NEG_INFINITY));
     assert_eq!(eval("Math.max(1, 2, 3, 4, 5)"), testutil::num(5.0));
 }

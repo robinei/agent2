@@ -966,3 +966,167 @@ fn plain_call_this_is_undefined() {
         Value::Bool(true)
     );
 }
+
+// ── Step 4b: `new F(args)` + `F.prototype` ───────────────────────────────
+
+#[test]
+fn new_constructor_binds_this() {
+    // `new P(5)` should bind `this` to a fresh instance, and `this.x = x`
+    // writes an own property.
+    assert_eq!(
+        testutil::run_val(concat!(
+            "function P(x) { this.x = x; }",
+            "const p = new P(5);",
+            "return p.x;"
+        )),
+        Value::PosInt(5)
+    );
+}
+
+#[test]
+fn new_constructor_shared_prototype_method() {
+    // A method on `P.prototype` is inherited by instances and runs with `this`
+    // bound to the instance.
+    assert_eq!(
+        testutil::run_val(concat!(
+            "function P(x) { this.x = x; }",
+            "P.prototype.get = function() { return this.x; };",
+            "const p = new P(7);",
+            "return p.get();"
+        )),
+        Value::PosInt(7)
+    );
+}
+
+#[test]
+fn new_constructor_returning_object() {
+    // If a constructor returns an object, `new` yields that object instead of
+    // the fresh instance.
+    assert_eq!(
+        testutil::run_val(concat!(
+            "function P() { this.x = 1; return { y: 2 }; }",
+            "const p = new P();",
+            "return p.y;"
+        )),
+        Value::PosInt(2)
+    );
+}
+
+#[test]
+fn new_constructor_returning_primitive_yields_instance() {
+    // If a constructor returns a primitive, `new` ignores it and yields the
+    // fresh instance.
+    assert_eq!(
+        testutil::run_val(concat!(
+            "function P(x) { this.x = x; return 42; }",
+            "const p = new P(9);",
+            "return p.x;"
+        )),
+        Value::PosInt(9)
+    );
+}
+
+#[test]
+fn new_constructor_returning_undefined_yields_instance() {
+    // Returning undefined (or no return) yields the instance.
+    assert_eq!(
+        testutil::run_val(concat!(
+            "function P() { this.tag = 'ok'; }",
+            "const p = new P();",
+            "return p.tag;"
+        )),
+        Value::String(RcStr::from("ok"))
+    );
+}
+
+#[test]
+fn function_prototype_lazy_allocation() {
+    // `F.prototype` returns an object, lazily allocated on first access.
+    // Re-reading returns the same object (a write to it persists).
+    assert_eq!(
+        testutil::run_val(concat!(
+            "function F() {}",
+            "const p1 = F.prototype;",
+            "p1.tag = 'proto';",
+            "const p2 = F.prototype;",
+            "return p2.tag;"
+        )),
+        Value::String(RcStr::from("proto"))
+    );
+}
+
+#[test]
+fn distinct_closures_get_distinct_prototypes() {
+    // Two closures from the same code (but capturing different environments,
+    // hence distinct) get distinct prototype objects.
+    assert_eq!(
+        testutil::run_val(concat!(
+            "function makeF(x) { return function() { return x; }; }",
+            "const F1 = makeF(1);",
+            "const F2 = makeF(2);",
+            "return F1.prototype !== F2.prototype;"
+        )),
+        Value::Bool(true)
+    );
+}
+
+#[test]
+fn new_constructor_can_chain_prototype_methods() {
+    // `new P(...)` followed by a prototype-method call chains correctly:
+    // the method call reads `m` from the proto chain with `this = instance`.
+    assert_eq!(
+        testutil::run_val(concat!(
+            "function P(x) { this.x = x; }",
+            "P.prototype.double = function() { return this.x * 2; };",
+            "const p = new P(5);",
+            "return p.double();"
+        )),
+        testutil::num(10.0)
+    );
+}
+
+#[test]
+fn new_map_still_works_as_before() {
+    // `new Map()` still hits its dedicated compiler path, unaffected by the
+    // generic user-function `new` path.
+    let val = testutil::run_val("const m = new Map(); return m;");
+    match val {
+        Value::Map(_) => {}
+        _ => panic!("expected Map, got {val:?}"),
+    }
+}
+
+#[test]
+fn new_set_still_works_as_before() {
+    let val = testutil::run_val("const s = new Set(); return s;");
+    match val {
+        Value::Set(_) => {}
+        _ => panic!("expected Set, got {val:?}"),
+    }
+}
+
+#[test]
+fn new_keyword_compiles_for_user_functions() {
+    // The generic `new` path compiles — no hard error for user functions.
+    // A constructor with no args that sets no properties returns a working
+    // instance.
+    assert_eq!(
+        testutil::run_val(concat!(
+            "function Empty() {}",
+            "const e = new Empty();",
+            "return typeof e;"
+        )),
+        Value::String(RcStr::from("object"))
+    );
+}
+
+#[test]
+fn new_constructor_does_not_serialize_proto() {
+    // Instances serialize own enumerable data only (no proto link or methods).
+    let val = testutil::run_ret(concat!(
+        "function P(x) { this.x = x; }",
+        "const p = new P(42);",
+        "return p;"
+    ));
+    assert_eq!(val, serde_json::json!({"x": 42}));
+}

@@ -113,6 +113,20 @@ pub enum Instr {
     /// as `this`. Covers user functions, closures, and builtins uniformly.
     CallSpread(bool), // args_arr, callable -> result
 
+    /// `new F(args)`: the callable (a Closure) sits *below* its N args. Allocates
+    /// a fresh object `O` with `O.proto = F.prototype` (creating the prototype
+    /// lazily on first access), stores `O` on the *caller* frame's `new_obj`, and
+    /// dispatches the callee with `this_val = O`. The post-return fixup happens
+    /// in `NewReturn` which must be the next instruction.
+    /// Stack: callee, args… -> (next instr: NewReturn)
+    New(ArgCount),
+    /// Post-return fixup for `New`: peeks at the top-of-stack return value. If it
+    /// is an `Object`, keep it (the constructor returned an object explicitly).
+    /// Otherwise consume the return value and push the allocated instance object
+    /// stored in the caller frame's `new_obj`. Always clears `new_obj`.
+    /// Stack: return_val -> result
+    NewReturn,
+
     /// return from in-program function Call, returning the top N values (in
     /// push order, so the first-pushed return value stays first).
     Return(usize),

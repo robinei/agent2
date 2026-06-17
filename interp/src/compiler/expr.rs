@@ -137,7 +137,7 @@ impl<'src> super::Compiler<'src> {
                          and async functions (there is no executor pattern)",
                     )
                 } else {
-                    self.error(n.span.start, "`new` is not supported")
+                    self.compile_new_call(n);
                 }
             }
             other => self.error(other.span().start, "unsupported expression"),
@@ -274,6 +274,29 @@ impl<'src> super::Compiler<'src> {
             self.emit(Instr::PushUndefined, span);
         }
         self.emit(Instr::SetNew, span);
+    }
+
+    /// `new F(args)` for a user-defined function `F` (not a builtin ctor).
+    /// MVP requires a statically resolvable callee (an Identifier); in-practice
+    /// `new (expr)()` is rare and the dynamic form is a documented divergence.
+    /// Compiles to: push callee, push args, `New(nargs)`, `NewReturn`.
+    fn compile_new_call(&mut self, n: &ast::NewExpression) {
+        let span = n.span.start;
+        // Push the callee (a Closure value)
+        self.compile_expr(&n.callee);
+        let nargs = n.arguments.len() as u32;
+        // Push arguments left-to-right
+        for arg in &n.arguments {
+            match arg.as_expression() {
+                Some(e) => self.compile_expr(e),
+                None => {
+                    self.error(span, "spread arguments are not supported with `new`");
+                    return;
+                }
+            }
+        }
+        self.emit(Instr::New(nargs), span);
+        self.emit(Instr::NewReturn, span);
     }
 
     /// A bare identifier resolves only to the host-seeded `input` object or the

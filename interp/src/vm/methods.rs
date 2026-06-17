@@ -29,6 +29,7 @@ impl VM {
                 arguments_cache: None,
                 pending_closure: u32::MAX,
                 this_val: Value::Undefined,
+                new_obj: None,
                 reclaim_below: 0,
                 completion: Completion::Normal,
             }],
@@ -702,6 +703,7 @@ impl VM {
             pending_closure: u32::MAX,
             arguments_cache: cont.arguments_cache,
             this_val: Value::Undefined,
+            new_obj: None,
             reclaim_below: 0,
             completion: Completion::ResolvePromise(cont.promise),
         });
@@ -1215,11 +1217,10 @@ impl VM {
             // The signal is only ever raised for an Object receiver.
             _ => return Err(self.fail_not_resumable(ErrorKind::BadCall, "reroute: non-object")),
         };
-        let method = self
-            .objects
-            .get(recv_ptr as usize)
-            .and_then(|o| o.map.get(name))
-            .cloned();
+        let method = match self.resolve_proto_chain(recv_ptr, name)? {
+            Value::Undefined => None,
+            v => Some(v),
+        };
         match method {
             Some(f) => {
                 // Read the receiver in place; its slot becomes an `Undefined`
@@ -1313,6 +1314,7 @@ impl VM {
             arguments_cache: None,
             pending_closure: closure_ptr,
             this_val,
+            new_obj: None,
             reclaim_below,
             completion: Completion::Normal,
         });
