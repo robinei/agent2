@@ -852,16 +852,29 @@ chain terminates rather than hanging). Depends on **2 + 4b**; independent of
 5/6/7 — but `class` (7) is half a model without `instanceof`, so land it
 together.
 
-- **`instanceof`** (`x instanceof F`). Replace the hard-error at
-  **`operators.rs:47`** with an `InstanceOf` instruction (binary `x, F -> bool`).
-  Runtime: `F` must be callable — a **`Closure`** (user function / class) or a
-  **`Bound`** (use its target's prototype); a non-callable RHS is a `TypeError`
-  ("right-hand side of `instanceof` is not callable"). Resolve `F.prototype`
-  (lazy-alloc, as 4b), then walk `x`'s prototype chain (`x` an `Object`, else
-  `false`): `true` iff that `ObjectPtr` appears. Classify `pe_*` pure (proto walk,
-  no user code) + `ResumeMode`. **Divergence: builtin "constructors" (`Array`,
-  `Object`, `Map`, …) are namespaces, not callable values with a `.prototype`, so
-  `x instanceof Array` is unsupported** (TypeError) — document.
+- **`instanceof`** (`x instanceof RHS`). Replace the hard-error at
+  **`operators.rs:47`**. The compiler picks one of two lowerings by the RHS:
+  - **Builtin type** — RHS is an *undeclared* identifier naming a builtin type
+    (`Array`, `Object`, `Map`, `Set`, `RegExp`, `Function`). These are namespaces,
+    not callable values with a `.prototype` — but `instanceof` against them needs
+    no proto chain, just a **value-tag check** on the LHS (emit `TypeCheck(tag)`).
+    `Array`→`Value::Array`, `Map`→`Map`, `Set`→`Set`, `RegExp`→`RegExp`,
+    `Function`→any callable (`Closure`/`Builtin`/`Bound`), `Object`→any
+    non-primitive (object/array/map/set/regexp/function — matching JS, where
+    `[] instanceof Object` and `(()=>{}) instanceof Object` are `true`).
+    Primitives are always `false` (we have no boxed primitives, so
+    `5 instanceof Number` is `false`, which is JS-faithful for unboxed values). A
+    *declared* local shadowing the name takes the value path instead.
+  - **User callable** — RHS evaluates to a value: a `Closure` (user function /
+    class) or a `Bound` (use its target's prototype); else `TypeError`
+    ("right-hand side of `instanceof` is not callable"). Resolve `RHS.prototype`
+    (lazy-alloc, 4b) and walk `x`'s prototype chain (`x` an `Object`, else
+    `false`) via the capped `resolve_proto_chain`: `true` iff that `ObjectPtr`
+    appears. (`InstanceOf` instruction, `pe_*` pure, `ResumeMode`.)
+
+  Divergence: `instanceof Error` is unsupported — Error instances are plain
+  `Object`s here with no distinct tag or `Error.prototype` link, so they can't be
+  told from a `{name, message}` object.
 - **`Object.getPrototypeOf(obj)`** — namespace builtin. Returns `obj`'s
   `[[Prototype]]` as `Value::Object(proto_ptr)`, or **`Value::Null`** when `proto`
   is `None` (plain objects have no proto here — a divergence from JS's
@@ -882,8 +895,11 @@ together.
 Acceptance (Step 8):
 - [ ] `function F(){}; new F() instanceof F` is `true`; `({}) instanceof F` is
       `false`; `5 instanceof F` is `false`.
-- [ ] `x instanceof <non-callable>` is a `TypeError`; `x instanceof Array` is the
-      documented unsupported `TypeError`.
+- [ ] `[] instanceof Array` is `true`, `({}) instanceof Array` is `false`;
+      `[] instanceof Object` and `(()=>{}) instanceof Object` are `true`;
+      `5 instanceof Object` is `false`. `new Map() instanceof Map` is `true`.
+- [ ] `x instanceof <non-callable value>` (a declared local that isn't a
+      function) is a `TypeError`.
 - [ ] `Object.getPrototypeOf(new F()) === F.prototype`;
       `Object.getPrototypeOf({})` is `null`.
 - [ ] `Object.setPrototypeOf(o, p); Object.getPrototypeOf(o) === p`, and an
@@ -940,10 +956,11 @@ one-off bolt-ons.
   and resolves user methods on `Object` receivers, but a computed key naming a
   *builtin* method (`arr["push"]()`) fails — builtins aren't stored properties,
   so only the static form (`arr.push()`, compiler-resolved) reaches them.
-- **`instanceof` is user-callables only** (Step 8). `x instanceof F` works for a
-  user function / class / `Bound`; builtin "constructors" (`Array`, `Object`,
-  `Map`, …) are namespaces with no callable `.prototype`, so `x instanceof Array`
-  is a `TypeError`.
+- **`instanceof` covers builtin types and user callables** (Step 8).
+  `x instanceof Array`/`Object`/`Map`/`Set`/`RegExp`/`Function` is a value-tag
+  check; `x instanceof F` for a user function / class / `Bound` walks the proto
+  chain. Only **`instanceof Error` is unsupported** — Error instances are plain
+  `Object`s with no distinct tag or `Error.prototype` link.
 - **Prototype reflection is partial** (Step 8). `Object.getPrototypeOf` returns
   `null` for a plain object (no `Object.prototype`); `getPrototypeOf` on a
   primitive is a `TypeError` (no wrapper coercion); a cyclic `setPrototypeOf` is
