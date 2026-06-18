@@ -1,0 +1,15 @@
+[package]
+name = "conformance"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "conformance"
+path = "src/main.rs"
+
+[dependencies]
+interp = { path = "../interp" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yml = "0.0.12"
+walkdir = "2"
