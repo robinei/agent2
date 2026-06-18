@@ -1,7 +1,7 @@
 use crate::analyzer::{ConstValue, RefSlot};
 use crate::vm::{Instr, LocalIndex, Value};
 
-impl<'src> super::Compiler<'src> {
+impl super::Compiler {
     /// Absolute frame slot for a binding occurrence (keyed by its span). `None`
     /// only when the binding was rejected during analysis (e.g. shadowing
     /// `state`), in which case a diagnostic was already recorded.
@@ -66,7 +66,6 @@ impl<'src> super::Compiler<'src> {
     pub(super) fn const_value_push(&mut self, v: &ConstValue) -> Instr {
         match v {
             ConstValue::Null => Instr::PushNull,
-            ConstValue::Undefined => Instr::PushUndefined,
             ConstValue::Bool(b) => Instr::PushBool(*b),
             ConstValue::Str(s) => Instr::PushStr(self.intern_string(s)),
             ConstValue::Num(n) => match super::f64_to_value(*n) {
@@ -106,11 +105,11 @@ impl<'src> super::Compiler<'src> {
     /// would read an uninitialized (undefined) slot. Every consumer of a
     /// `RefSlot` read must go through here.
     pub(super) fn emit_slot_read(&mut self, r: &RefSlot, span: u32) {
-        if r.immutable {
-            if let Some(push) = self.const_env.get(&r.slot) {
-                self.emit(push.clone(), span);
-                return;
-            }
+        if r.immutable
+            && let Some(push) = self.const_env.get(&r.slot)
+        {
+            self.emit(push.clone(), span);
+            return;
         }
         self.emit(Instr::GetLocal(r.slot as LocalIndex), span);
     }

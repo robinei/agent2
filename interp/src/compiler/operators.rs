@@ -3,7 +3,7 @@ use oxc_ast::ast;
 use crate::vm::instr::TypeTag;
 use crate::vm::{Instr, Value};
 
-impl<'src> super::Compiler<'src> {
+impl super::Compiler {
     pub(super) fn compile_binary(&mut self, bin: &ast::BinaryExpression) {
         use ast::BinaryOperator as Op;
         let span = bin.span.start;

@@ -277,14 +277,11 @@ fn raise_is_not_catchable() {
     }
     // Resuming continues past the raise — the catch never runs.
     vm.resume_raise(Value::Null);
-    loop {
-        match vm.step(u64::MAX).unwrap() {
-            StepResult::Done { value, .. } => {
-                assert_eq!(value, Value::String("after".into()));
-                break;
-            }
-            other => panic!("unexpected effect: {other:?}"),
+    match vm.step(u64::MAX).unwrap() {
+        StepResult::Done { value, .. } => {
+            assert_eq!(value, Value::String("after".into()));
         }
+        other => panic!("unexpected effect: {other:?}"),
     }
 }
 

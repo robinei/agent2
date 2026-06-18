@@ -348,6 +348,7 @@ impl Session {
     /// Whether the conversation is over (root frame done / `Shutdown`).
     /// The attached TUI keeps rendering past this for post-mortem
     /// reading; `run()` exits on it.
+    #[allow(dead_code)]
     pub fn is_done(&self) -> bool {
         self.done
     }
@@ -355,6 +356,7 @@ impl Session {
     /// Whether the root frame has yielded its turn back to the user (a
     /// final answer is on the spine and the frame is idle, awaiting the
     /// next `UserTurn`). Distinct from `is_done`: the conversation lives.
+    #[allow(dead_code)]
     pub fn is_awaiting_user(&self) -> bool {
         self.awaiting_user
     }
@@ -788,10 +790,7 @@ fn synthesize_if_interrupted(tree: &mut Tree, leaf: EventId) -> io::Result<Event
     // Collect artifacts from the frame's spine segment.
     let mut artifacts = Vec::new();
     let mut current = leaf;
-    loop {
-        let Some(event) = tree.events.get(&current) else {
-            break;
-        };
+    while let Some(event) = tree.events.get(&current) {
         match &event.payload {
             EventPayload::Invoke { name, args, .. } => {
                 artifacts.push(format!(
@@ -821,7 +820,7 @@ fn synthesize_if_interrupted(tree: &mut Tree, leaf: EventId) -> io::Result<Event
         report.push_str("(none)\n");
     } else {
         for a in &artifacts {
-            report.push_str(&a);
+            report.push_str(a);
             report.push('\n');
         }
     }
@@ -922,7 +921,6 @@ mod tests {
             name: name.into(),
             description: String::new(),
             input_schema: json!({ "type": "array" }),
-            output_schema: json!({}),
             handler: Box::new(handler),
         }
     }

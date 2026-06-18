@@ -3,7 +3,7 @@ use oxc_span::GetSpan;
 
 use crate::vm::{Instr, RcStr, Value};
 
-impl<'src> super::Compiler<'src> {
+impl super::Compiler {
     /// Every expression leaves exactly one value on the stack (the
     /// stack-discipline invariant). Unsupported nodes record a diagnostic and
     /// emit nothing — the diagnostics abort the compile before a `Program` is

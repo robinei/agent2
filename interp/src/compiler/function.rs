@@ -7,7 +7,7 @@ use crate::analyzer::frame_abs;
 use crate::builtin::Builtin;
 use crate::vm::{Instr, LocalIndex, RcStr, SetMode, SlotKind};
 
-impl<'src> super::Compiler<'src> {
+impl super::Compiler {
     /// Hoist function declarations in the current scope's prologue: emit each
     /// declaration's binding value (`Fn`/closure) into its slot. Recurses
     /// through blocks/conditionals/loops (function declarations hoist to the
@@ -34,23 +34,23 @@ impl<'src> super::Compiler<'src> {
                 if self.is_const_fn_scope(scope_id) {
                     return;
                 }
-                if let Some(id) = &f.id {
-                    if let Some(slot) = self.binding_slot(id.span.start) {
-                        let span = f.span.start;
-                        if captures.is_empty() {
-                            self.emit(Instr::PushFn(label, u32::MAX, js_length), span);
-                        } else {
-                            self.emit(
-                                Instr::ClosureNew(
-                                    label,
-                                    js_length,
-                                    captures.iter().map(|&c| c as LocalIndex).collect(),
-                                ),
-                                span,
-                            );
-                        }
-                        self.emit(Instr::SetLocal(slot as LocalIndex), span);
+                if let Some(id) = &f.id
+                    && let Some(slot) = self.binding_slot(id.span.start)
+                {
+                    let span = f.span.start;
+                    if captures.is_empty() {
+                        self.emit(Instr::PushFn(label, u32::MAX, js_length), span);
+                    } else {
+                        self.emit(
+                            Instr::ClosureNew(
+                                label,
+                                js_length,
+                                captures.iter().map(|&c| c as LocalIndex).collect(),
+                            ),
+                            span,
+                        );
                     }
+                    self.emit(Instr::SetLocal(slot as LocalIndex), span);
                 }
             }
             ast::Statement::BlockStatement(b) => {
@@ -226,7 +226,7 @@ impl<'src> super::Compiler<'src> {
     /// or at the declaration site. `is_expression_body` (arrow `=> expr`)
     /// suppresses the trailing implicit `return undefined`. All slots/kinds come
     /// from analysis; there is no codegen-side scope state to set up.
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
     pub(super) fn emit_function_def(
         &mut self,
         scope_id: usize,
@@ -348,7 +348,7 @@ impl<'src> super::Compiler<'src> {
                 let item = &params.items[p_idx];
                 if matches!(&item.pattern, ast::BindingPattern::BindingIdentifier(_)) {
                     let needs_box = matches!(slot_kinds.get(p_idx).copied(), Some(SlotKind::Boxed));
-                    let default_expr = item.initializer.as_ref().map(|v| &**v);
+                    let default_expr = item.initializer.as_deref();
                     self.emit_param_setup(
                         slot,
                         needs_box,
@@ -379,7 +379,7 @@ impl<'src> super::Compiler<'src> {
             // `arguments.slice(nregular)` gives the surplus elements that become
             // the rest array.
             if has_rest {
-                let rest_slot = nregular as u32;
+                let rest_slot = nregular;
                 self.emit(Instr::Arguments, span);
                 self.emit(Instr::PushPosInt(nregular as u64), span);
                 self.emit(Instr::CallBuiltin(Builtin::StrSlice, 2), span);
@@ -505,7 +505,7 @@ impl<'src> super::Compiler<'src> {
     ///     default expression's value;
     ///   - if captured (`needs_box`): box the slot in place with `FreshCell`
     ///     (Plain value → fresh cell), so closures capture it by reference.
-    /// A plain param with no default needs no code at all.
+    ///     A plain param with no default needs no code at all.
     pub(super) fn emit_param_setup(
         &mut self,
         slot: u32,
@@ -514,18 +514,16 @@ impl<'src> super::Compiler<'src> {
         default_expr: Option<&ast::Expression>,
         span: u32,
     ) {
-        if has_default {
-            if let Some(default) = default_expr {
-                // if Local(slot) === undefined { slot = default }
-                let skip_default = self.new_label();
-                self.emit(Instr::GetLocal(slot as LocalIndex), span);
-                self.emit(Instr::PushUndefined, span);
-                self.emit(Instr::Eq, span);
-                self.emit(Instr::JFalse(skip_default), span);
-                self.compile_expr(default);
-                self.emit(Instr::SetLocal(slot as LocalIndex), span);
-                self.emit(Instr::Label(skip_default), span);
-            }
+        if has_default && let Some(default) = default_expr {
+            // if Local(slot) === undefined { slot = default }
+            let skip_default = self.new_label();
+            self.emit(Instr::GetLocal(slot as LocalIndex), span);
+            self.emit(Instr::PushUndefined, span);
+            self.emit(Instr::Eq, span);
+            self.emit(Instr::JFalse(skip_default), span);
+            self.compile_expr(default);
+            self.emit(Instr::SetLocal(slot as LocalIndex), span);
+            self.emit(Instr::Label(skip_default), span);
         }
         if needs_box {
             // Promote the plain arg value in the slot to a shared cell.

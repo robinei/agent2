@@ -7,11 +7,9 @@ use crate::vm::*;
 /// Run code in a fresh VM (no initial heap) to completion; return final stack.
 fn run(code: Vec<Instr>) -> Vec<Value> {
     let mut vm = VM::new(code);
-    loop {
-        match vm.step(u64::MAX).unwrap() {
-            StepResult::Done { .. } => return vm.stack.clone(),
-            other => panic!("unexpected effect: {other:?}"),
-        }
+    match vm.step(u64::MAX).unwrap() {
+        StepResult::Done { .. } => vm.stack.clone(),
+        other => panic!("unexpected effect: {other:?}"),
     }
 }
 
@@ -24,23 +22,19 @@ fn ps(val: &str) -> Instr {
 /// Run code to the first effect (Pending/Raise), returning the StepResult.
 fn run_effect(code: Vec<Instr>) -> StepResult {
     let mut vm = VM::new(code);
-    loop {
-        match vm.step(u64::MAX).unwrap() {
-            StepResult::Done { .. } => panic!("unexpected completion"),
-            effect => return effect,
-        }
+    match vm.step(u64::MAX).unwrap() {
+        StepResult::Done { .. } => panic!("unexpected completion"),
+        effect => effect,
     }
 }
 
 /// Run code that is expected to error; return the error.
 fn run_err(code: Vec<Instr>) -> VMError {
     let mut vm = VM::new(code);
-    loop {
-        match vm.step(u64::MAX) {
-            Err(e) => return e,
-            Ok(StepResult::Done { .. }) => panic!("unexpected completion"),
-            Ok(_) => panic!("unexpected effect"),
-        }
+    match vm.step(u64::MAX) {
+        Err(e) => e,
+        Ok(StepResult::Done { .. }) => panic!("unexpected completion"),
+        Ok(_) => panic!("unexpected effect"),
     }
 }
 
@@ -314,6 +308,7 @@ fn is_bool() {
 // ── unary operators ───────────────────────────────────────────
 
 #[test]
+#[allow(clippy::approx_constant)]
 fn not_bitnot() {
     assert_eq!(run(vec![PushBool(false), Not]), vec![b(true)]);
     assert_eq!(run(vec![PushNull, Not]), vec![b(true)]);
@@ -941,11 +936,9 @@ fn append_counter(code: &mut Vec<Instr>) -> u32 {
 /// Run to completion and return the finished VM (to inspect heap/cells).
 fn run_vm(code: Vec<Instr>) -> VM {
     let mut vm = VM::new(code);
-    loop {
-        match vm.step(u64::MAX).unwrap() {
-            StepResult::Done { .. } => return vm,
-            other => panic!("unexpected effect: {other:?}"),
-        }
+    match vm.step(u64::MAX).unwrap() {
+        StepResult::Done { .. } => vm,
+        other => panic!("unexpected effect: {other:?}"),
     }
 }
 
@@ -2041,11 +2034,9 @@ fn alloc_baseline_hot_loop() {
     // Reset after building `code` so the literals' construction isn't counted.
     let mut vm = VM::new(code);
     alloc_counter::reset();
-    loop {
-        match vm.step(u64::MAX).unwrap() {
-            StepResult::Done { .. } => break,
-            other => panic!("unexpected effect: {other:?}"),
-        }
+    match vm.step(u64::MAX).unwrap() {
+        StepResult::Done { .. } => {}
+        other => panic!("unexpected effect: {other:?}"),
     }
     let allocs = alloc_counter::count();
     eprintln!("BASELINE hot_loop_100_iter: {allocs} allocs");
@@ -2078,11 +2069,9 @@ fn alloc_breakdown() {
     let code = vec![ps("hello"), ps("x"), Add];
     let mut vm = VM::new(code);
     alloc_counter::reset();
-    loop {
-        match vm.step(u64::MAX).unwrap() {
-            StepResult::Done { .. } => break,
-            other => panic!("unexpected effect: {other:?}"),
-        }
+    match vm.step(u64::MAX).unwrap() {
+        StepResult::Done { .. } => {}
+        other => panic!("unexpected effect: {other:?}"),
     }
     let per_add = alloc_counter::count();
     eprintln!("  Add (str+str): {per_add}");
@@ -2091,11 +2080,9 @@ fn alloc_breakdown() {
     alloc_counter::reset();
     {
         let mut vm = VM::new(vec![PushFloat(-42.0), CallBuiltin(Builtin::MathAbs, 1)]);
-        loop {
-            match vm.step(u64::MAX).unwrap() {
-                StepResult::Done { .. } => break,
-                other => panic!("unexpected effect: {other:?}"),
-            }
+        match vm.step(u64::MAX).unwrap() {
+            StepResult::Done { .. } => {}
+            other => panic!("unexpected effect: {other:?}"),
         }
     }
     let per_math_abs = alloc_counter::count();
@@ -2131,11 +2118,9 @@ fn alloc_breakdown() {
             PushPosInt(42),
             Return(1),
         ]);
-        loop {
-            match vm.step(u64::MAX).unwrap() {
-                StepResult::Done { .. } => break,
-                other => panic!("unexpected effect: {other:?}"),
-            }
+        match vm.step(u64::MAX).unwrap() {
+            StepResult::Done { .. } => {}
+            other => panic!("unexpected effect: {other:?}"),
         }
     }
     let call_dyn_ret = alloc_counter::count();
@@ -2153,11 +2138,9 @@ fn alloc_breakdown() {
             PushPosInt(42),
             Return(1),
         ]);
-        loop {
-            match vm.step(u64::MAX).unwrap() {
-                StepResult::Done { .. } => break,
-                other => panic!("unexpected effect: {other:?}"),
-            }
+        match vm.step(u64::MAX).unwrap() {
+            StepResult::Done { .. } => {}
+            other => panic!("unexpected effect: {other:?}"),
         }
     }
     let call_dyn_x2 = alloc_counter::count();
@@ -2193,11 +2176,9 @@ fn string_empty_needle_index_of() {
         PushStr("".into()),
         CallBuiltin(Builtin::StrIndexOf, 2),
     ]);
-    loop {
-        match vm.step(u64::MAX).unwrap() {
-            StepResult::Done { .. } => break,
-            other => panic!("unexpected effect: {other:?}"),
-        }
+    match vm.step(u64::MAX).unwrap() {
+        StepResult::Done { .. } => {}
+        other => panic!("unexpected effect: {other:?}"),
     }
     assert_eq!(vm.stack.last(), Some(&Value::PosInt(0)));
 }
@@ -2281,14 +2262,14 @@ fn math_min_max_nan_propagates() {
         PushFloat(5.0),
         CallBuiltin(Builtin::MathMin, 2),
     ]);
-    assert!(out[0].as_f64().map_or(false, |n| n.is_nan()), "got {out:?}");
+    assert!(out[0].as_f64().is_some_and(|n| n.is_nan()), "got {out:?}");
     // JS: Math.max with NaN propagates NaN.
     let out = run(vec![
         PushFloat(f64::NAN),
         PushFloat(3.0),
         CallBuiltin(Builtin::MathMax, 2),
     ]);
-    assert!(out[0].as_f64().map_or(false, |n| n.is_nan()), "got {out:?}");
+    assert!(out[0].as_f64().is_some_and(|n| n.is_nan()), "got {out:?}");
 }
 
 // ── Invoke interleaved with Raise ───────────────────────────────
@@ -2833,11 +2814,9 @@ fn message_calldyn_non_callable_and_resume() {
         err.resume
     );
     vm.resume_with(&err, Value::PosInt(7)).unwrap();
-    let value = loop {
-        match vm.step(u64::MAX).unwrap() {
-            StepResult::Done { value, .. } => break value,
-            other => panic!("unexpected effect: {other:?}"),
-        }
+    let value = match vm.step(u64::MAX).unwrap() {
+        StepResult::Done { value, .. } => value,
+        other => panic!("unexpected effect: {other:?}"),
     };
     assert_eq!(value, Value::PosInt(7));
 }
@@ -3039,18 +3018,15 @@ fn obj_has_own_vs_proto() {
         proto: Some(0),
         map: IndexMap::new(),
     }); // 1: child
-    loop {
-        match vm.step(u64::MAX).unwrap() {
-            StepResult::Done { .. } => {
-                assert_eq!(
-                    vm.stack,
-                    vec![Value::Bool(true)],
-                    "a in child -> true via proto"
-                );
-                break;
-            }
-            other => panic!("unexpected effect: {other:?}"),
+    match vm.step(u64::MAX).unwrap() {
+        StepResult::Done { .. } => {
+            assert_eq!(
+                vm.stack,
+                vec![Value::Bool(true)],
+                "a in child -> true via proto"
+            );
         }
+        other => panic!("unexpected effect: {other:?}"),
     }
 }
 
@@ -3080,17 +3056,14 @@ fn obj_set_only_affects_own() {
         proto: Some(0),
         map: IndexMap::new(),
     }); // 1: child
-    loop {
-        match vm.step(u64::MAX).unwrap() {
-            StepResult::Done { .. } => {
-                assert_eq!(vm.stack.len(), 3);
-                assert_eq!(vm.stack[0], Value::PosInt(99), "ObjSet result");
-                assert_eq!(vm.stack[1], Value::PosInt(99), "child.a after set");
-                assert_eq!(vm.stack[2], Value::PosInt(1), "parent.a unchanged");
-                break;
-            }
-            other => panic!("unexpected effect: {other:?}"),
+    match vm.step(u64::MAX).unwrap() {
+        StepResult::Done { .. } => {
+            assert_eq!(vm.stack.len(), 3);
+            assert_eq!(vm.stack[0], Value::PosInt(99), "ObjSet result");
+            assert_eq!(vm.stack[1], Value::PosInt(99), "child.a after set");
+            assert_eq!(vm.stack[2], Value::PosInt(1), "parent.a unchanged");
         }
+        other => panic!("unexpected effect: {other:?}"),
     }
 }
 
@@ -3117,24 +3090,21 @@ fn obj_delete_only_affects_own() {
         proto: Some(0),
         map: IndexMap::new(),
     }); // 1: child
-    loop {
-        match vm.step(u64::MAX).unwrap() {
-            StepResult::Done { .. } => {
-                assert_eq!(vm.stack.len(), 2);
-                assert_eq!(
-                    vm.stack[0],
-                    Value::Bool(false),
-                    "delete non-own yields false"
-                );
-                assert_eq!(
-                    vm.stack[1],
-                    Value::Bool(true),
-                    "a in child walk-proto -> true"
-                );
-                break;
-            }
-            other => panic!("unexpected effect: {other:?}"),
+    match vm.step(u64::MAX).unwrap() {
+        StepResult::Done { .. } => {
+            assert_eq!(vm.stack.len(), 2);
+            assert_eq!(
+                vm.stack[0],
+                Value::Bool(false),
+                "delete non-own yields false"
+            );
+            assert_eq!(
+                vm.stack[1],
+                Value::Bool(true),
+                "a in child walk-proto -> true"
+            );
         }
+        other => panic!("unexpected effect: {other:?}"),
     }
 }
 
@@ -3169,13 +3139,10 @@ fn obj_extend_reads_proto() {
         proto: Some(1),
         map: child,
     }); // 2: child
-    loop {
-        match vm.step(u64::MAX).unwrap() {
-            StepResult::Done { .. } => {
-                assert_eq!(vm.stack, vec![Value::PosInt(2)], "own_only was copied");
-                break;
-            }
-            other => panic!("unexpected effect: {other:?}"),
+    match vm.step(u64::MAX).unwrap() {
+        StepResult::Done { .. } => {
+            assert_eq!(vm.stack, vec![Value::PosInt(2)], "own_only was copied");
         }
+        other => panic!("unexpected effect: {other:?}"),
     }
 }

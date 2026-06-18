@@ -51,7 +51,7 @@ pub fn number_is_nan(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 /// the longest numeric prefix, return NaN on failure, accept `Infinity`.
 pub fn number_parse_float(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let s = vm.str_from(args.get(vm, 0))?;
-    let n = js_parse_float(&s);
+    let n = js_parse_float(s);
     Ok(Value::Float(n))
 }
 
@@ -211,6 +211,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::approx_constant)]
     fn bare_parse_float() {
         assert_eq!(
             testutil::run_ret("return parseFloat('3.14');"),

@@ -48,11 +48,11 @@ pub fn disasm_window(vm: &VM, height: usize, scroll_top: Option<usize>) -> Vec<A
     let mut rows = Vec::with_capacity(end - start);
     let mut cur_fn = None;
     for ip in start as u32..end as u32 {
-        if let Some((idx, f)) = vm.function_at(ip) {
-            if cur_fn != Some(idx) {
-                rows.push(AsmRow::Header(format!("── {} ──", f.name)));
-                cur_fn = Some(idx);
-            }
+        if let Some((idx, f)) = vm.function_at(ip)
+            && cur_fn != Some(idx)
+        {
+            rows.push(AsmRow::Header(format!("── {} ──", f.name)));
+            cur_fn = Some(idx);
         }
         let debug = format!("{:?}", vm.code[ip as usize]);
         let (op, args) = match debug.split_once('(') {

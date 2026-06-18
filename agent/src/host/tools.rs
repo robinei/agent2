@@ -169,13 +169,6 @@ fn read_file_def() -> ToolDef {
             "minItems": 1,
             "maxItems": 1
         }),
-        output_schema: json!({
-            "type": "object",
-            "properties": {
-                "content": { "type": "string" },
-                "version": { "type": "string" }
-            }
-        }),
         handler: Box::new(|args| {
             let path = args
                 .get(0)
@@ -211,12 +204,6 @@ fn create_file_def() -> ToolDef {
             ],
             "minItems": 2,
             "maxItems": 2
-        }),
-        output_schema: json!({
-            "type": "object",
-            "properties": {
-                "version": { "type": "string" }
-            }
         }),
         handler: Box::new(|args| {
             let path = args
@@ -267,13 +254,6 @@ fn replace_file_def() -> ToolDef {
             ],
             "minItems": 3,
             "maxItems": 3
-        }),
-        output_schema: json!({
-            "type": "object",
-            "properties": {
-                "version": { "type": "string" },
-                "diff": { "type": "string" }
-            }
         }),
         handler: Box::new(|args| {
             let path = args
@@ -342,15 +322,6 @@ fn bash_def() -> ToolDef {
             ],
             "minItems": 1,
             "maxItems": 1
-        }),
-        output_schema: json!({
-            "type": "object",
-            "properties": {
-                "status": { "type": ["integer", "null"] },
-                "stdout": { "type": "string" },
-                "stderr": { "type": "string" },
-                "truncated": { "type": "boolean" }
-            }
         }),
         handler: Box::new(|args| {
             // Accept the command as a string, or as an argv array joined

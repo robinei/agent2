@@ -2,7 +2,7 @@ use oxc_ast::ast;
 
 use crate::vm::{Instr, LocalIndex};
 
-impl<'src> super::Compiler<'src> {
+impl super::Compiler {
     pub(super) fn compile_if(&mut self, s: &ast::IfStatement) {
         let span = s.span.start;
         self.compile_expr(&s.test);
@@ -77,12 +77,11 @@ impl<'src> super::Compiler<'src> {
             Some(ast::ForStatementInit::VariableDeclaration(decl)) => {
                 self.compile_var_decl(decl);
                 for d in &decl.declarations {
-                    if let ast::BindingPattern::BindingIdentifier(id) = &d.id {
-                        if let Some(slot) = self.binding_slot(id.span.start) {
-                            if self.slot_needs_fresh(slot) {
-                                head_fresh.push(slot);
-                            }
-                        }
+                    if let ast::BindingPattern::BindingIdentifier(id) = &d.id
+                        && let Some(slot) = self.binding_slot(id.span.start)
+                        && self.slot_needs_fresh(slot)
+                    {
+                        head_fresh.push(slot);
                     }
                 }
             }

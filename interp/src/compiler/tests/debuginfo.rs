@@ -74,12 +74,11 @@ fn frames_reports_names_and_locals_mid_call() {
             let top = &frames[1];
             if let Some(acc_slot) =
                 (0..top.locals.len()).find(|&i| top.local_name(i) == Some("acc"))
+                && top.locals[acc_slot] == Value::Float(42.0)
             {
-                if top.locals[acc_slot] == Value::Float(42.0) {
-                    assert_eq!(top.local_name(0), Some("n"));
-                    assert_eq!(top.locals[0], Value::PosInt(41));
-                    seen = true;
-                }
+                assert_eq!(top.local_name(0), Some("n"));
+                assert_eq!(top.locals[0], Value::PosInt(41));
+                seen = true;
             }
         }
     }

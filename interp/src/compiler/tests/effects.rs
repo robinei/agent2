@@ -25,14 +25,11 @@ fn awaited_tools_call_yields_pending_effect() {
     };
     // Host resolves the call; the re-executed await returns its value.
     vm.resolve_promise(id, Value::PosInt(13)).unwrap();
-    loop {
-        match vm.step(u64::MAX).unwrap() {
-            StepResult::Done { value, .. } => {
-                assert_eq!(value, Value::PosInt(13));
-                break;
-            }
-            other => panic!("unexpected effect: {other:?}"),
+    match vm.step(u64::MAX).unwrap() {
+        StepResult::Done { value, .. } => {
+            assert_eq!(value, Value::PosInt(13));
         }
+        other => panic!("unexpected effect: {other:?}"),
     }
 }
 
@@ -90,14 +87,11 @@ fn raise_yields_effect_and_resumes_as_expression() {
     }
     // Resume via resume_raise (ip already advanced by step()).
     vm.resume_raise(Value::PosInt(42));
-    loop {
-        match vm.step(u64::MAX).unwrap() {
-            StepResult::Done { value, .. } => {
-                assert_eq!(value, Value::PosInt(42));
-                break;
-            }
-            other => panic!("unexpected effect: {other:?}"),
+    match vm.step(u64::MAX).unwrap() {
+        StepResult::Done { value, .. } => {
+            assert_eq!(value, Value::PosInt(42));
         }
+        other => panic!("unexpected effect: {other:?}"),
     }
 }
 

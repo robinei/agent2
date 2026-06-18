@@ -3,7 +3,7 @@ use oxc_span::GetSpan;
 
 use crate::vm::{Instr, RcStr, SetMode};
 
-impl<'src> super::Compiler<'src> {
+impl super::Compiler {
     pub(super) fn compile_array(&mut self, arr: &ast::ArrayExpression) {
         let span = arr.span.start;
         // Fast path: no spread elements (byte-for-byte unchanged from before)

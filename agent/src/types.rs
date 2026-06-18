@@ -183,7 +183,4 @@ impl EventId {
     }
 }
 
-pub(crate) fn get_config_path() -> PathBuf {
-    let path = std::env::home_dir().expect("unable to get home dir!");
-    path.join(".agent2")
-}
+

@@ -31,7 +31,7 @@ pub fn json_stringify(vm: &mut VM, args: Args) -> Result<Value, VMError> {
             Value::PosInt(n) => " ".repeat((*n).min(10) as usize),
             Value::NegInt(_) => String::new(),
             Value::Float(n) => {
-                let n = n.trunc().max(0.0).min(10.0) as usize;
+                let n = n.trunc().clamp(0.0, 10.0) as usize;
                 " ".repeat(n)
             }
             Value::String(s) => s.chars().take(10).collect(),

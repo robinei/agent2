@@ -158,8 +158,8 @@ pub enum Instr {
     ///     Undefined for Plain, a fresh cell + Upval for Boxed, so the final
     ///     layout is [params | upvals | locals]. The self-reference slot
     ///     (named/recursive functions) is the last kind.
-    /// This is the sole frame-setup instruction: there is no separate per-arg
-    /// copy or local-allocation step.
+    ///     This is the sole frame-setup instruction: there is no separate per-arg
+    ///     copy or local-allocation step.
     EnterFrame(LocalCount, bool, ThinVec<SlotKind>),
 
     /// Push the `arguments` array for the current frame: a fresh heap array of

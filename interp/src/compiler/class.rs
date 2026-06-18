@@ -11,7 +11,7 @@ struct Method<'a> {
     span: u32,
 }
 
-impl<'src> super::Compiler<'src> {
+impl super::Compiler {
     /// `class C { … }` declaration (Step 7a — plain class, no `extends`). Direct
     /// codegen: emit the same bytecode the hand-written `function C(){…};
     /// C.prototype.m = …` form compiles to, then store `C` into its binding slot.

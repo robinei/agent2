@@ -177,14 +177,12 @@ impl VM {
     /// (the `new Error(...)` shape) formats as `uncaught {name}: {message}`;
     /// anything else falls back to a preview of the value.
     pub(super) fn uncaught_message(&self, value: &Value) -> String {
-        if let Value::Object(p) = value {
-            if let Some(obj) = self.objects.get(*p as usize) {
-                if let (Some(Value::String(name)), Some(Value::String(msg))) =
-                    (obj.map.get("name"), obj.map.get("message"))
-                {
-                    return format!("uncaught {}: {}", name.as_str(), msg.as_str());
-                }
-            }
+        if let Value::Object(p) = value
+            && let Some(obj) = self.objects.get(*p as usize)
+            && let (Some(Value::String(name)), Some(Value::String(msg))) =
+                (obj.map.get("name"), obj.map.get("message"))
+        {
+            return format!("uncaught {}: {}", name.as_str(), msg.as_str());
         }
         format!("uncaught exception: {}", self.preview(value))
     }
@@ -415,13 +413,13 @@ impl VM {
         let mut out = String::new();
         let mut cur_fn = usize::MAX;
         for ip in start..end {
-            if let Some((idx, f)) = self.function_at(ip) {
-                if idx != cur_fn {
-                    out.push_str("── ");
-                    out.push_str(&f.name);
-                    out.push_str(" ──\n");
-                    cur_fn = idx;
-                }
+            if let Some((idx, f)) = self.function_at(ip)
+                && idx != cur_fn
+            {
+                out.push_str("── ");
+                out.push_str(&f.name);
+                out.push_str(" ──\n");
+                cur_fn = idx;
             }
             out.push_str(&self.disasm_line(ip));
             out.push('\n');
@@ -675,11 +673,11 @@ impl VM {
             // A rejection arriving at a frame with no handler around its
             // await needs no frame materialization: the rejection
             // propagates straight to this call's own promise.
-            if let ResumePayload::Rejected(errval) = &payload {
-                if cont.saved_handlers.is_empty() {
-                    self.settle_and_wake(cont.promise, PromiseState::Rejected(errval.clone()))?;
-                    continue;
-                }
+            if let ResumePayload::Rejected(errval) = &payload
+                && cont.saved_handlers.is_empty()
+            {
+                self.settle_and_wake(cont.promise, PromiseState::Rejected(errval.clone()))?;
+                continue;
             }
             self.resume_continuation(cont, payload);
             return Ok(());
@@ -1022,7 +1020,7 @@ impl VM {
                 if let Some(arr) = self.arrays.get(*p as usize) {
                     for (i, v) in arr.iter().enumerate() {
                         if i > 0 {
-                            buf.push_str(",");
+                            buf.push(',');
                         }
                         match v {
                             Value::Null | Value::Undefined => {}
@@ -1321,7 +1319,6 @@ impl VM {
         &mut self,
         b: crate::builtin::Builtin,
         argc: u32,
-        _this_val: Value,
     ) -> Result<(), VMError> {
         // Invariant: the signalling handler raised `MethodOnObject` at its
         // receiver check, before touching the stack — so all `argc` args
@@ -1416,7 +1413,7 @@ impl VM {
                 match b.call(self, nargs_with_recv) {
                     Ok(()) => self.ip += 1,
                     Err(e) if e.kind == ErrorKind::MethodOnObject => {
-                        self.reroute_method_to_object(b, nargs, this_val)?;
+                        self.reroute_method_to_object(b, nargs)?;
                     }
                     Err(e) => return Err(e),
                 }

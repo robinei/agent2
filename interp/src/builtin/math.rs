@@ -27,7 +27,7 @@ pub fn math_floor(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 
 /// JS `Math.round`: rounds half toward +∞ (not away-from-zero like Rust).
 pub fn math_round(vm: &mut VM, args: Args) -> Result<Value, VMError> {
-    math_unary(vm, args, |n| js_round(n))
+    math_unary(vm, args, js_round)
 }
 
 /// JS `Math.sign`: returns the input unchanged when n == 0.0 or -0.0, else

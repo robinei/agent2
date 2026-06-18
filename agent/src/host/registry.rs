@@ -17,8 +17,6 @@ pub struct ToolDef {
     pub description: String,
     /// JSON schema of the positional argument array.
     pub input_schema: serde_json::Value,
-    /// JSON schema of the result value.
-    pub output_schema: serde_json::Value,
     pub handler: Box<ToolHandler>,
 }
 

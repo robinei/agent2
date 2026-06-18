@@ -495,11 +495,11 @@ pub(crate) fn float_is_int(n: f64) -> bool {
 /// None for non-numeric values. This is the single coercion point that keeps
 /// `Int` from multiplying the arithmetic match arms: ops just `as_f64` their
 /// operands and always produce `Number`.
-
+///
 /// Coerce a numeric value to i64 for integer-only ops (mod, bitwise, shifts,
 /// indices). `NegInt` is taken directly; a `PosInt` must fit in i64; a
 /// `Number` must be integer-valued. Returns None otherwise.
-
+///
 /// JS `ToNumber` applied to a string, as used when a loose `==` compares a
 /// number to a string. Trims whitespace, treats the empty string as 0, and
 /// otherwise parses as f64 — yielding NaN (which is never equal to anything)

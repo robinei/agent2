@@ -279,14 +279,12 @@ mod tests {
             name: "fetch_page".into(),
             description: "Fetch a URL and return its body text.".into(),
             input_schema: json!({ "type": "array", "items": [{ "type": "string" }] }),
-            output_schema: json!({ "type": "string" }),
             handler: Box::new(|_| Ok(json!(null))),
         });
         registry.register(ToolDef {
             name: "send_email".into(),
             description: "Send an email.".into(),
             input_schema: json!({ "type": "array" }),
-            output_schema: json!({}),
             handler: Box::new(|_| Ok(json!(null))),
         });
         registry

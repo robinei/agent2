@@ -62,6 +62,7 @@ pub fn scripted_program(call_id: &str, source: &str) -> Message {
 
 /// A scripted assistant turn calling `resume` with `value` — the
 /// restart offered while a program is suspended on a condition.
+#[allow(dead_code)]
 pub fn scripted_resume(call_id: &str, value: serde_json::Value) -> Message {
     Message::Assistant {
         text: String::new(),

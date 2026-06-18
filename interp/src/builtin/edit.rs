@@ -353,10 +353,10 @@ fn balanced_pairs(text: &str, open_ch: char, close_ch: char) -> Vec<(usize, usiz
         let ch = b as char;
         if ch == open_ch {
             stack.push(i);
-        } else if ch == close_ch {
-            if let Some(start) = stack.pop() {
-                pairs.push((start, i + 1)); // exclusive end
-            }
+        } else if ch == close_ch
+            && let Some(start) = stack.pop()
+        {
+            pairs.push((start, i + 1)); // exclusive end
         }
         i += 1;
     }

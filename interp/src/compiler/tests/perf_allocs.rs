@@ -11,11 +11,9 @@ use crate::vm::{StepResult, VM, Value};
 fn run_counted(prog: Program) -> (VM, usize) {
     alloc_counter::reset();
     let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
-    loop {
-        match vm.step(u64::MAX).unwrap() {
-            StepResult::Done { .. } => break,
-            other => panic!("unexpected effect: {other:?}"),
-        }
+    match vm.step(u64::MAX).unwrap() {
+        StepResult::Done { .. } => {}
+        other => panic!("unexpected effect: {other:?}"),
     }
     let count = alloc_counter::count();
     (vm, count)

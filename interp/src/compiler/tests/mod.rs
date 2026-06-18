@@ -19,11 +19,9 @@ pub mod perf_allocs;
 /// finished VM so the heap/stack can be inspected.
 pub(super) fn run_program(prog: Program) -> VM {
     let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
-    loop {
-        match vm.step(u64::MAX).unwrap() {
-            StepResult::Done { .. } => return vm,
-            other => panic!("unexpected effect: {other:?}"),
-        }
+    match vm.step(u64::MAX).unwrap() {
+        StepResult::Done { .. } => vm,
+        other => panic!("unexpected effect: {other:?}"),
     }
 }
 // ── Legacy helpers (kept for input-subject tests only) ────────────────

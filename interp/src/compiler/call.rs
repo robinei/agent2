@@ -5,7 +5,7 @@ use crate::analyzer::ConstValue;
 use crate::builtin::Builtin;
 use crate::vm::Instr;
 
-impl<'src> super::Compiler<'src> {
+impl super::Compiler {
     /// Calls are recognized structurally (the VM has no method objects): a
     /// `namespace.method(...)` static intrinsic, a `recv.method(...)` array/
     /// string method, or a global function like `String(x)`. Each lowers to a
@@ -41,18 +41,16 @@ impl<'src> super::Compiler<'src> {
             // `Math.max(a, b)`. Emit the static `CallBuiltin` and skip the
             // guard/`CallDyn`. (First-class builtin refs are the only constant
             // callables today; named function refs join them in Phase 3.)
-            if let ast::Expression::StaticMemberExpression(m) = &call.callee {
-                if let ast::Expression::Identifier(obj) = &m.object {
-                    if Builtin::for_namespace(obj.name.as_str(), m.property.name.as_str()).is_some()
-                    {
-                        return self.compile_namespace_call(
-                            obj.name.as_str(),
-                            m.property.name.as_str(),
-                            &argv,
-                            span,
-                        );
-                    }
-                }
+            if let ast::Expression::StaticMemberExpression(m) = &call.callee
+                && let ast::Expression::Identifier(obj) = &m.object
+                && Builtin::for_namespace(obj.name.as_str(), m.property.name.as_str()).is_some()
+            {
+                return self.compile_namespace_call(
+                    obj.name.as_str(),
+                    m.property.name.as_str(),
+                    &argv,
+                    span,
+                );
             }
             // Otherwise the callee is a genuine runtime value: evaluate it,
             // short-circuit to undefined when nullish (args skipped), else
@@ -136,13 +134,12 @@ impl<'src> super::Compiler<'src> {
         // valid structurally as an `Invoke` receiver (compiling it as an
         // expression would give a misleading undeclared-variable error), and
         // `Invoke` has a static arg count. Reject with a targeted error.
-        if let ast::Expression::StaticMemberExpression(m) = &call.callee {
-            if let ast::Expression::Identifier(obj) = &m.object {
-                if obj.name.as_str() == "tools" {
-                    self.error(span, "spread arguments are not supported on tool calls");
-                    return;
-                }
-            }
+        if let ast::Expression::StaticMemberExpression(m) = &call.callee
+            && let ast::Expression::Identifier(obj) = &m.object
+            && obj.name.as_str() == "tools"
+        {
+            self.error(span, "spread arguments are not supported on tool calls");
+            return;
         }
 
         // `super(...args)` / `super.m(...args)` (Step 7b) with a spread: same
@@ -155,43 +152,43 @@ impl<'src> super::Compiler<'src> {
             self.emit(Instr::CallSpread(true), span);
             return;
         }
-        if let ast::Expression::StaticMemberExpression(m) = &call.callee {
-            if let ast::Expression::Super(s) = &m.object {
-                self.emit(Instr::LoadThis, span);
-                self.emit_super_class_ref(s.span.start);
-                self.emit(Instr::ObjGet(crate::vm::RcStr::from("prototype")), span);
-                self.emit(Instr::ObjGet(m.property.name.as_str().into()), span);
-                self.compile_call_args_array(&call.arguments, span);
-                self.emit(Instr::CallSpread(true), span);
-                return;
-            }
+        if let ast::Expression::StaticMemberExpression(m) = &call.callee
+            && let ast::Expression::Super(s) = &m.object
+        {
+            self.emit(Instr::LoadThis, span);
+            self.emit_super_class_ref(s.span.start);
+            self.emit(Instr::ObjGet(crate::vm::RcStr::from("prototype")), span);
+            self.emit(Instr::ObjGet(m.property.name.as_str().into()), span);
+            self.compile_call_args_array(&call.arguments, span);
+            self.emit(Instr::CallSpread(true), span);
+            return;
         }
 
         // `f.call(thisArg, ...args)` (and the degenerate `f.apply(...)`) with a
         // spread among the args: forward to the `has_this` dispatch — thisArg is
         // arg 0, the rest become the (spread) args array. See
         // `compile_invoke_forward` for the non-spread case.
-        if let ast::Expression::StaticMemberExpression(m) = &call.callee {
-            if matches!(m.property.name.as_str(), "call" | "apply") {
-                self.compile_expr(&m.object); // [f]
-                let end = if call.optional {
-                    Some(self.begin_optional(span))
-                } else {
-                    None
-                };
-                match call.arguments.first().and_then(|a| a.as_expression()) {
-                    Some(t) => self.compile_expr(t),
-                    None => self.emit(Instr::PushUndefined, span),
-                }
-                self.emit(Instr::Dig(1), span); // [thisArg, f]
-                let rest = 1.min(call.arguments.len());
-                self.compile_call_args_array(&call.arguments[rest..], span);
-                self.emit(Instr::CallSpread(true), span);
-                if let Some(end) = end {
-                    self.emit(Instr::Label(end), span);
-                }
-                return;
+        if let ast::Expression::StaticMemberExpression(m) = &call.callee
+            && matches!(m.property.name.as_str(), "call" | "apply")
+        {
+            self.compile_expr(&m.object); // [f]
+            let end = if call.optional {
+                Some(self.begin_optional(span))
+            } else {
+                None
+            };
+            match call.arguments.first().and_then(|a| a.as_expression()) {
+                Some(t) => self.compile_expr(t),
+                None => self.emit(Instr::PushUndefined, span),
             }
+            self.emit(Instr::Dig(1), span); // [thisArg, f]
+            let rest = 1.min(call.arguments.len());
+            self.compile_call_args_array(&call.arguments[rest..], span);
+            self.emit(Instr::CallSpread(true), span);
+            if let Some(end) = end {
+                self.emit(Instr::Label(end), span);
+            }
+            return;
         }
 
         // Detect a method callee so we emit ObjPeek/ObjPeekDyn (keeping the
@@ -538,7 +535,7 @@ impl<'src> super::Compiler<'src> {
                 };
                 if argv.len() >= 2 {
                     // Payload: compile the expression, emit Raise with argc=1.
-                    self.compile_expr(&argv[1]);
+                    self.compile_expr(argv[1]);
                     self.emit(Instr::Raise(name, 1), span);
                 } else {
                     self.emit(Instr::Raise(name, 0), span);

@@ -4,7 +4,7 @@ use oxc_span::GetSpan;
 use crate::builtin::Builtin;
 use crate::vm::{Instr, LocalIndex, RcStr};
 
-impl<'src> super::Compiler<'src> {
+impl super::Compiler {
     /// Apply a destructuring/parameter default to the value on top of the stack:
     /// if it is `undefined`, replace it with the default expression's value;
     /// otherwise leave it. (JS applies defaults only for `undefined`, not
@@ -30,12 +30,10 @@ impl<'src> super::Compiler<'src> {
         computed: bool,
         span: u32,
     ) {
-        if computed {
-            if let Some(expr) = key.as_expression() {
-                self.compile_expr(expr);
-                self.emit(Instr::IndexGet, span);
-                return;
-            }
+        if computed && let Some(expr) = key.as_expression() {
+            self.compile_expr(expr);
+            self.emit(Instr::IndexGet, span);
+            return;
         }
         let name = match key {
             ast::PropertyKey::StaticIdentifier(id) => id.name.as_str().to_string(),
@@ -63,12 +61,10 @@ impl<'src> super::Compiler<'src> {
         computed: bool,
         span: u32,
     ) {
-        if computed {
-            if let Some(expr) = key.as_expression() {
-                self.compile_expr(expr);
-                self.emit(Instr::ToStr, span);
-                return;
-            }
+        if computed && let Some(expr) = key.as_expression() {
+            self.compile_expr(expr);
+            self.emit(Instr::ToStr, span);
+            return;
         }
         let name = match key {
             ast::PropertyKey::StaticIdentifier(id) => id.name.as_str().to_string(),
@@ -169,10 +165,10 @@ impl<'src> super::Compiler<'src> {
     pub(super) fn emit_pattern_fresh_cells(&mut self, pat: &ast::BindingPattern, span: u32) {
         match pat {
             ast::BindingPattern::BindingIdentifier(id) => {
-                if let Some(slot) = self.binding_slot(id.span.start) {
-                    if self.slot_needs_fresh(slot) {
-                        self.emit(Instr::FreshCell(slot as LocalIndex), span);
-                    }
+                if let Some(slot) = self.binding_slot(id.span.start)
+                    && self.slot_needs_fresh(slot)
+                {
+                    self.emit(Instr::FreshCell(slot as LocalIndex), span);
                 }
             }
             ast::BindingPattern::AssignmentPattern(ap) => {

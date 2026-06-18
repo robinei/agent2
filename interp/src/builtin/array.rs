@@ -172,15 +172,15 @@ pub fn flatten_into(
     out: &mut ThinVec<Value>,
 ) -> Result<(), VMError> {
     for v in src {
-        if depth > 0 {
-            if let Value::Array(p) = v {
-                let nested = vm
-                    .arrays
-                    .get(*p as usize)
-                    .ok_or_else(|| vm.fail(ErrorKind::TypeError, "bad array pointer"))?;
-                flatten_into(vm, nested, depth - 1, out)?;
-                continue;
-            }
+        if depth > 0
+            && let Value::Array(p) = v
+        {
+            let nested = vm
+                .arrays
+                .get(*p as usize)
+                .ok_or_else(|| vm.fail(ErrorKind::TypeError, "bad array pointer"))?;
+            flatten_into(vm, nested, depth - 1, out)?;
+            continue;
         }
         out.push(v.clone());
     }

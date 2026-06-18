@@ -3,7 +3,7 @@ use oxc_ast::ast;
 use crate::builtin::Builtin;
 use crate::vm::Instr;
 
-impl<'src> super::Compiler<'src> {
+impl super::Compiler {
     /// `obj.foo` (and `state.foo`, since `state` lowers to `Ptr(0)`). `.length`
     /// lowers to `ArrLength` (str/arr intrinsic; on an object, the `length`
     /// property) and `.size` to `MapSetSize` (map/set intrinsic; on an object,

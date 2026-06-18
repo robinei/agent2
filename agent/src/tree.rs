@@ -910,6 +910,7 @@ mod tests {
                 .read(true)
                 .write(true)
                 .create(true)
+                .truncate(false)
                 .open(&path)?;
             let mut tree = Tree::open(file)?;
             let (caller, child) = build_branched_tree(&mut tree)?;
@@ -961,6 +962,7 @@ mod tests {
                 .read(true)
                 .write(true)
                 .create(true)
+                .truncate(false)
                 .open(&path)?;
             let mut tree = Tree::open(file)?;
             let mut spine = tree.start_frame(None, "root", json!(null))?;
@@ -1001,6 +1003,7 @@ mod tests {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(&path)?;
         let mut tree = Tree::open(file)?;
         assert!(tree.list_leaves().is_empty());

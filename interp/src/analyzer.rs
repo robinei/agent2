@@ -20,7 +20,6 @@ use crate::vm::SlotKind;
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum ConstValue {
     Null,
-    Undefined,
     Bool(bool),
     Num(f64),
     Str(String),
@@ -396,7 +395,7 @@ pub(crate) fn frame_abs(own: u32, nparams: u32, upval_count: u32) -> u32 {
 /// `resolve_captures`; **demote** any that still ended up with a real capture;
 /// repeat until stable. Monotone (demote-only) ⇒ converges. The final iteration
 /// leaves `scopes` with the correct captures/upvals for `finalize_tables`.
-fn resolve_const_functions(scopes: &mut Vec<FuncScope>) -> HashSet<usize> {
+fn resolve_const_functions(scopes: &mut [FuncScope]) -> HashSet<usize> {
     // `resolve_captures` mutates `free_vars` (propagation) and the derived
     // capture fields; snapshot the inputs so each iteration starts clean.
     let direct_free: Vec<IndexSet<String>> = scopes.iter().map(|s| s.free_vars.clone()).collect();
@@ -417,10 +416,10 @@ fn resolve_const_functions(scopes: &mut Vec<FuncScope>) -> HashSet<usize> {
         let Some(name) = const_fn_binding_name(s) else {
             continue;
         };
-        if let Some(info) = scopes[s.parent].names.get(name) {
-            if !scopes[s.parent].reassigned.contains(&info.slot) {
-                const_fns.insert(id);
-            }
+        if let Some(info) = scopes[s.parent].names.get(name)
+            && !scopes[s.parent].reassigned.contains(&info.slot)
+        {
+            const_fns.insert(id);
         }
     }
 
@@ -741,6 +740,7 @@ fn resolve_captures(scopes: &mut [FuncScope]) {
 /// Convert the per-scope, span-keyed records (own-slot relative) into the
 /// absolute-slot tables codegen consults. Runs after `resolve_captures` has
 /// fixed every `upval_count`.
+#[allow(clippy::type_complexity)]
 fn finalize_tables(
     scopes: &[FuncScope],
     const_fns: &HashSet<usize>,
@@ -1056,31 +1056,31 @@ impl Analyzer {
                 self.analyze_hoist_stmt(&s.body, scope, block_scopes, next_slot)
             }
             ast::Statement::ForStatement(s) => {
-                if let Some(ast::ForStatementInit::VariableDeclaration(decl)) = &s.init {
-                    if decl.kind == ast::VariableDeclarationKind::Var {
-                        for d in &decl.declarations {
-                            self.hoist_var_pattern(&d.id, scope, block_scopes, next_slot);
-                        }
+                if let Some(ast::ForStatementInit::VariableDeclaration(decl)) = &s.init
+                    && decl.kind == ast::VariableDeclarationKind::Var
+                {
+                    for d in &decl.declarations {
+                        self.hoist_var_pattern(&d.id, scope, block_scopes, next_slot);
                     }
                 }
                 self.analyze_hoist_stmt(&s.body, scope, block_scopes, next_slot);
             }
             ast::Statement::ForOfStatement(s) => {
-                if let ast::ForStatementLeft::VariableDeclaration(decl) = &s.left {
-                    if decl.kind == ast::VariableDeclarationKind::Var {
-                        for d in &decl.declarations {
-                            self.hoist_var_pattern(&d.id, scope, block_scopes, next_slot);
-                        }
+                if let ast::ForStatementLeft::VariableDeclaration(decl) = &s.left
+                    && decl.kind == ast::VariableDeclarationKind::Var
+                {
+                    for d in &decl.declarations {
+                        self.hoist_var_pattern(&d.id, scope, block_scopes, next_slot);
                     }
                 }
                 self.analyze_hoist_stmt(&s.body, scope, block_scopes, next_slot);
             }
             ast::Statement::ForInStatement(s) => {
-                if let ast::ForStatementLeft::VariableDeclaration(decl) = &s.left {
-                    if decl.kind == ast::VariableDeclarationKind::Var {
-                        for d in &decl.declarations {
-                            self.hoist_var_pattern(&d.id, scope, block_scopes, next_slot);
-                        }
+                if let ast::ForStatementLeft::VariableDeclaration(decl) = &s.left
+                    && decl.kind == ast::VariableDeclarationKind::Var
+                {
+                    for d in &decl.declarations {
+                        self.hoist_var_pattern(&d.id, scope, block_scopes, next_slot);
                     }
                 }
                 self.analyze_hoist_stmt(&s.body, scope, block_scopes, next_slot);
@@ -1366,20 +1366,13 @@ impl Analyzer {
             // binding — it occupies no slot and is never captured; references
             // resolve to the value. The literal initializer has no refs/effects,
             // so it is not analyzed. (host-seeded consts may not be shadowed.)
-            if is_const {
-                if let ast::BindingPattern::BindingIdentifier(id) = &d.id {
-                    if !crate::is_host_const(&id.name) {
-                        if let Some(value) = d.init.as_ref().and_then(literal_const_value) {
-                            self.analyze_register_const(
-                                id.name.as_str(),
-                                value,
-                                scope,
-                                block_scopes,
-                            );
-                            continue;
-                        }
-                    }
-                }
+            if is_const
+                && let ast::BindingPattern::BindingIdentifier(id) = &d.id
+                && !crate::is_host_const(&id.name)
+                && let Some(value) = d.init.as_ref().and_then(literal_const_value)
+            {
+                self.analyze_register_const(id.name.as_str(), value, scope, block_scopes);
+                continue;
             }
             // `var` names were hoisted; `let`/`const` register here.
             self.analyze_declare_pattern(
@@ -1399,18 +1392,16 @@ impl Analyzer {
                 // (Phase F), like a declaration. `var` is excluded — its hoisted-
                 // `undefined` value means a pre-assignment reference isn't the
                 // function. Reassignment is checked later (in the fixpoint).
-                if !is_var {
-                    if let ast::BindingPattern::BindingIdentifier(id) = &d.id {
-                        let fn_span = match init {
-                            ast::Expression::ArrowFunctionExpression(a) => Some(a.span.start),
-                            ast::Expression::FunctionExpression(f) => Some(f.span.start),
-                            _ => None,
-                        };
-                        if let Some(fn_span) = fn_span {
-                            if let Some(s) = scopes.iter_mut().find(|s| s.node_span == fn_span) {
-                                s.binding_name = Some(id.name.to_string());
-                            }
-                        }
+                if !is_var && let ast::BindingPattern::BindingIdentifier(id) = &d.id {
+                    let fn_span = match init {
+                        ast::Expression::ArrowFunctionExpression(a) => Some(a.span.start),
+                        ast::Expression::FunctionExpression(f) => Some(f.span.start),
+                        _ => None,
+                    };
+                    if let Some(fn_span) = fn_span
+                        && let Some(s) = scopes.iter_mut().find(|s| s.node_span == fn_span)
+                    {
+                        s.binding_name = Some(id.name.to_string());
                     }
                 }
             }
@@ -1436,6 +1427,7 @@ impl Analyzer {
 
     /// Register `let`/`const` binding names (skipped for already-hoisted `var`s)
     /// and analyze any pattern default expressions for free variables.
+    #[allow(clippy::too_many_arguments)]
     fn analyze_declare_pattern(
         &mut self,
         pat: &ast::BindingPattern,
@@ -1498,10 +1490,10 @@ impl Analyzer {
             }
             ast::BindingPattern::ObjectPattern(obj) => {
                 for prop in &obj.properties {
-                    if prop.computed {
-                        if let Some(expr) = prop.key.as_expression() {
-                            self.analyze_expr(expr, scope, block_scopes, scopes);
-                        }
+                    if prop.computed
+                        && let Some(expr) = prop.key.as_expression()
+                    {
+                        self.analyze_expr(expr, scope, block_scopes, scopes);
                     }
                     self.analyze_declare_pattern(
                         &prop.value,
@@ -1531,6 +1523,7 @@ impl Analyzer {
     /// Register a binding name, recording its span→slot mapping. `var` names
     /// live in the function scope (`block_scopes[0]`) and reuse an existing
     /// slot; `let`/`const` get a fresh slot in the innermost block.
+    #[allow(clippy::too_many_arguments)]
     fn analyze_register_name(
         &mut self,
         name: &str,
@@ -1670,10 +1663,10 @@ impl Analyzer {
                 for prop in &obj.properties {
                     match prop {
                         ast::ObjectPropertyKind::ObjectProperty(p) => {
-                            if p.computed {
-                                if let Some(e) = p.key.as_expression() {
-                                    self.analyze_expr(e, scope, block_scopes, scopes);
-                                }
+                            if p.computed
+                                && let Some(e) = p.key.as_expression()
+                            {
+                                self.analyze_expr(e, scope, block_scopes, scopes);
                             }
                             self.analyze_expr(&p.value, scope, block_scopes, scopes);
                         }
@@ -1836,10 +1829,10 @@ impl Analyzer {
                             }
                         }
                         ast::AssignmentTargetProperty::AssignmentTargetPropertyProperty(p) => {
-                            if p.computed {
-                                if let Some(e) = p.name.as_expression() {
-                                    self.analyze_expr(e, scope, block_scopes, scopes);
-                                }
+                            if p.computed
+                                && let Some(e) = p.name.as_expression()
+                            {
+                                self.analyze_expr(e, scope, block_scopes, scopes);
                             }
                             self.analyze_assign_maybe_default(
                                 &p.binding,
@@ -2196,21 +2189,21 @@ impl Analyzer {
                     );
                 }
             }
-            if let Some(rest) = &params.rest {
-                if !matches!(
+            if let Some(rest) = &params.rest
+                && !matches!(
                     &rest.rest.argument,
                     ast::BindingPattern::BindingIdentifier(_)
-                ) {
-                    self.analyze_declare_pattern(
-                        &rest.rest.argument,
-                        false,
-                        false,
-                        scope,
-                        &mut block_scopes,
-                        &mut next_slot,
-                        scopes,
-                    );
-                }
+                )
+            {
+                self.analyze_declare_pattern(
+                    &rest.rest.argument,
+                    false,
+                    false,
+                    scope,
+                    &mut block_scopes,
+                    &mut next_slot,
+                    scopes,
+                );
             }
             // Param default expressions (`function f(a, b = a)`) — params are now
             // in scope, so a default may reference an earlier one.

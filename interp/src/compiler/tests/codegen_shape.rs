@@ -634,7 +634,10 @@ fn optional_call_reclaims_static_builtin() {
 fn captured_loop_var_allocates_plain_not_boxed() {
     let prog = compile("let fns = []; for (let i = 0; i < 3; i++) { fns.push(() => i); }")
         .expect("compiles");
-    let has_boxed = prog.code.iter().any(|i| matches!(i, Instr::EnterFrame(_, _, kinds) if kinds.iter().any(|k| *k == SlotKind::Boxed)));
+    let has_boxed = prog
+        .code
+        .iter()
+        .any(|i| matches!(i, Instr::EnterFrame(_, _, kinds) if kinds.contains(&SlotKind::Boxed)));
     assert!(
         !has_boxed,
         "captured loop var should be Plain-allocated: {:?}",

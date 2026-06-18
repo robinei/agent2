@@ -325,12 +325,12 @@ fn push_replacement(out: &mut String, repl: &str, text: &str, m: &regress::Match
                         .saturating_mul(10)
                         .saturating_add((c2 as u32 - '0' as u32) as usize);
                 }
-                if n > 0 && n <= m.captures.len() {
-                    if let Some(cap) = m.captures.get(n - 1) {
-                        if let Some(range) = cap {
-                            out.push_str(&text[range.clone()]);
-                        }
-                    }
+                if n > 0
+                    && n <= m.captures.len()
+                    && let Some(cap) = m.captures.get(n - 1)
+                    && let Some(range) = cap
+                {
+                    out.push_str(&text[range.clone()]);
                 }
             }
             '<' => {

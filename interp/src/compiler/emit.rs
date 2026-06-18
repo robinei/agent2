@@ -3,10 +3,9 @@ use std::collections::{HashMap, HashSet};
 use crate::diag::Diagnostic;
 use crate::vm::{Instr, RcStr};
 
-impl<'src> super::Compiler<'src> {
-    pub(super) fn new(source: &'src str) -> Self {
+impl super::Compiler {
+    pub(super) fn new() -> Self {
         super::Compiler {
-            source,
             code: Vec::new(),
             spans: Vec::new(),
             next_label: 0,

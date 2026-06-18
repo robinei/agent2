@@ -4,7 +4,7 @@ use oxc_span::GetSpan;
 use crate::builtin::Builtin;
 use crate::vm::{Instr, LocalIndex, RcStr, SetMode};
 
-impl<'src> super::Compiler<'src> {
+impl super::Compiler {
     /// Assignment is an expression: when `value_needed` is true, it leaves the
     /// assigned value on the stack. In void context (`value_needed == false`),
     /// the value is either consumed by `SetLocal` (for locals) or popped after

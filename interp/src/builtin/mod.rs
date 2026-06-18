@@ -622,12 +622,9 @@ mod tests {
         // Stack has operands consumed.
         vm.resume_with(&err, Value::PosInt(99)).unwrap();
         loop {
-            match vm.step(u64::MAX).unwrap() {
-                StepResult::Done { value, .. } => {
-                    assert_eq!(value, Value::PosInt(99));
-                    break;
-                }
-                _ => {}
+            if let StepResult::Done { value, .. } = vm.step(u64::MAX).unwrap() {
+                assert_eq!(value, Value::PosInt(99));
+                break;
             }
         }
     }

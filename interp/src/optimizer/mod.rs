@@ -93,13 +93,13 @@ fn invert_branches(code: Vec<Instr>, spans: Vec<u32>) -> (Vec<Instr>, Vec<u32>) 
                 (Instr::JTrue(l), Instr::Jump(m)) => Some((*l, Instr::JFalse(*m))),
                 _ => None,
             };
-            if let Some((l, inv)) = inverted {
-                if label_is_next(&code, i + 2, l) {
-                    out_code.push(inv);
-                    out_spans.push(spans[i]);
-                    i += 2; // consume the conditional and the now-folded Jump
-                    continue;
-                }
+            if let Some((l, inv)) = inverted
+                && label_is_next(&code, i + 2, l)
+            {
+                out_code.push(inv);
+                out_spans.push(spans[i]);
+                i += 2; // consume the conditional and the now-folded Jump
+                continue;
             }
         }
         out_code.push(code[i].clone());
@@ -159,10 +159,10 @@ fn simplify_cfg(code: Vec<Instr>, spans: Vec<u32>, next_label: u32) -> (Vec<Inst
     let mut visited = vec![false; n];
     let mut work: Vec<usize> = vec![0];
     for instr in &code {
-        if let Instr::Call(l, _) | Instr::PushFn(l, _, _) | Instr::ClosureNew(l, _, _) = instr {
-            if let Some(idx) = marker_idx(*l) {
-                work.push(idx);
-            }
+        if let Instr::Call(l, _) | Instr::PushFn(l, _, _) | Instr::ClosureNew(l, _, _) = instr
+            && let Some(idx) = marker_idx(*l)
+        {
+            work.push(idx);
         }
     }
     while let Some(i) = work.pop() {

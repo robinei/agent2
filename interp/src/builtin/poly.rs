@@ -21,14 +21,13 @@ use crate::vm::{ErrorKind, VM, VMError, Value};
 /// `(255).toString(16)` is an arity error, not a silent base-10 result.)
 pub fn value_to_string(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let recv = args.get(vm, 0);
-    if let Value::Object(p) = recv {
-        if vm
+    if let Value::Object(p) = recv
+        && vm
             .objects
             .get(*p as usize)
             .is_some_and(|o| o.map.contains_key("toString"))
-        {
-            return Err(vm.fail(ErrorKind::MethodOnObject, ""));
-        }
+    {
+        return Err(vm.fail(ErrorKind::MethodOnObject, ""));
     }
     let s = vm.to_js_string(recv, 0);
     Ok(Value::String(s))

@@ -76,7 +76,7 @@ pub fn compile(source: &str) -> Result<Program, Vec<Diagnostic>> {
         })
         .parse();
 
-    let mut compiler = Compiler::new(&full_source);
+    let mut compiler = Compiler::new();
 
     // Convert oxc's own syntax errors into our Diagnostic shape.
     for err in &ret.errors {
@@ -243,8 +243,7 @@ enum LValue<'r, 'a> {
 }
 
 /// Codegen state for one compilation unit.
-struct Compiler<'src> {
-    source: &'src str,
+struct Compiler {
     /// Instructions with `Label` markers; addresses in `Jump`/`JFalse`/`Call`/
     /// `MakeClosure`/`Push(Fn)` are label ids until the backpatch pass.
     code: Vec<Instr>,
@@ -294,7 +293,7 @@ struct Compiler<'src> {
 
 // ── impl blocks live in the sub-modules above ────────────────────────
 //
-// Each sub-file contains `impl<'src> Compiler<'src> { … }` with the
+// Each sub-file contains `impl Compiler { … }` with the
 // methods listed below.  They're organised by concern:
 //
 //  emit.rs        — new, new_label, emit, intern_string, error

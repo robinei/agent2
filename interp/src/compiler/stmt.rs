@@ -3,7 +3,7 @@ use oxc_span::GetSpan;
 
 use crate::vm::{Instr, LocalIndex};
 
-impl<'src> super::Compiler<'src> {
+impl super::Compiler {
     /// The whole program is the root frame's body. Scope/capture analysis ran
     /// already (in `self.analysis`), so the prologue `EnterFrame` slot kinds and all
     /// binding/reference/function resolutions are precomputed and looked up by
@@ -160,12 +160,11 @@ impl<'src> super::Compiler<'src> {
             // `const NAME = <non-capturing fn-expr>` is a constant function
             // (Phase F): emit only the body — no value push, no store — since
             // references resolve to its `Fn` constant.
-            if let ast::BindingPattern::BindingIdentifier(_) = &d.id {
-                if let Some(init) = &d.init {
-                    if self.emit_const_fn_expr_body(init) {
-                        continue;
-                    }
-                }
+            if let ast::BindingPattern::BindingIdentifier(_) = &d.id
+                && let Some(init) = &d.init
+                && self.emit_const_fn_expr_body(init)
+            {
+                continue;
             }
             match &d.id {
                 ast::BindingPattern::BindingIdentifier(id) => {
@@ -210,16 +209,17 @@ impl<'src> super::Compiler<'src> {
                                 self.emit(Instr::SetLocal(slot as LocalIndex), d.span.start);
                             }
                         }
-                        (None, Some(slot)) if !is_var => {
+                        (None, Some(slot))
+                            if !is_var
                             // `let x;` re-initializes to `undefined` each time the
                             // declaration executes (e.g. per loop iteration).
                             // Outside a loop `EnterFrame` already zeroed the slot,
                             // so skip the redundant Push+SetLocal.
-                            if !self.loops.is_empty() {
-                                self.fresh_cell_if_needed(slot, d.span.start);
-                                self.emit(Instr::PushUndefined, d.span.start);
-                                self.emit(Instr::SetLocal(slot as LocalIndex), d.span.start);
-                            }
+                            && !self.loops.is_empty() =>
+                        {
+                            self.fresh_cell_if_needed(slot, d.span.start);
+                            self.emit(Instr::PushUndefined, d.span.start);
+                            self.emit(Instr::SetLocal(slot as LocalIndex), d.span.start);
                         }
                         _ => {}
                     }

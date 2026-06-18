@@ -43,7 +43,7 @@ impl VM {
                 let msg = format!(
                     "cannot read property on {}{}",
                     recv.map(|v| v.type_name()).unwrap_or("unknown"),
-                    recv.map(|v| await_hint(v)).unwrap_or("")
+                    recv.map(await_hint).unwrap_or("")
                 );
                 Err(self.fail(ErrorKind::TypeError, msg))
             }
@@ -403,7 +403,7 @@ impl VM {
                     match b.call(self, argc) {
                         Ok(()) => self.ip += 1,
                         Err(e) if e.kind == ErrorKind::MethodOnObject => {
-                            self.reroute_method_to_object(b, argc, Value::Undefined)?;
+                            self.reroute_method_to_object(b, argc)?;
                         }
                         Err(e) => return Err(e),
                     }
@@ -704,13 +704,13 @@ impl VM {
                         .last()
                         .map_or(u32::MAX, |f| f.pending_closure);
                     let mut k: u32 = 0;
-                    if ptr != u32::MAX {
-                        if let Some(closure) = self.closures.get(ptr as usize) {
-                            for uv in &closure.upvals {
-                                self.stack.push(uv.clone());
-                            }
-                            k = closure.upvals.len() as u32;
+                    if ptr != u32::MAX
+                        && let Some(closure) = self.closures.get(ptr as usize)
+                    {
+                        for uv in &closure.upvals {
+                            self.stack.push(uv.clone());
                         }
+                        k = closure.upvals.len() as u32;
                     }
                     // 4. Allocate the declared (non-param) own locals + self-ref
                     // slot (Boxed → fresh cell + Upval).

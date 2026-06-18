@@ -241,8 +241,8 @@ pub(super) fn render_source_str(
             .insert(0, Span::styled(format!("{n:>4} "), num_style));
     }
     let height = area.height.saturating_sub(2) as usize;
-    let default_top = lines.len().saturating_sub(height).max(0);
-    let top = scroll.unwrap_or(default_top).min(default_top.max(0));
+    let default_top = lines.len().saturating_sub(height);
+    let top = scroll.unwrap_or(default_top).min(default_top);
     let end = (top + height).min(lines.len());
     let para = Paragraph::new(lines[top..end].to_vec())
         .block(Block::default().borders(Borders::ALL).title(" source [1] "));
@@ -273,7 +273,7 @@ pub(super) fn render_source(
         .unwrap_or(1)
         .saturating_sub(height / 2 + 1)
         .min(lines.len().saturating_sub(height));
-    let top = scroll.unwrap_or(default_top).min(default_top.max(0));
+    let top = scroll.unwrap_or(default_top).min(default_top);
     let end = (top + height).min(lines.len());
     let para = Paragraph::new(lines[top..end].to_vec())
         .block(Block::default().borders(Borders::ALL).title(" source [1] "));

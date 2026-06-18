@@ -62,19 +62,6 @@ pub fn outline_def() -> ToolDef {
             "minItems": 1,
             "maxItems": 1
         }),
-        output_schema: json!({
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "name": { "type": "string" },
-                    "kind": { "type": "string" },
-                    "start_line": { "type": "integer" },
-                    "end_line": { "type": "integer" },
-                    "signature": { "type": "string" }
-                }
-            }
-        }),
         handler: Box::new(|args| {
             let path = args
                 .get(0)
@@ -118,14 +105,14 @@ fn collect_definitions(node: Node, source: &str, lang: &str) -> Vec<OutlineEntry
 
 fn collect_definitions_impl(node: Node, source: &str, lang: &str, entries: &mut Vec<OutlineEntry>) {
     let is_def = is_definition_node(node.kind(), lang);
-    let mut def_children: Vec<Node> = Vec::with_capacity(node.named_child_count() as usize);
+    let mut def_children: Vec<Node> = Vec::with_capacity(node.named_child_count());
     for i in 0..node.child_count() {
-        if let Some(child) = node.child(i) {
-            if child.is_named() {
-                def_children.push(child);
-                if !is_definition_node(child.kind(), lang) {
-                    collect_definitions_impl(child, source, lang, entries);
-                }
+        if let Some(child) = node.child(i)
+            && child.is_named()
+        {
+            def_children.push(child);
+            if !is_definition_node(child.kind(), lang) {
+                collect_definitions_impl(child, source, lang, entries);
             }
         }
     }
@@ -139,8 +126,8 @@ fn collect_definitions_impl(node: Node, source: &str, lang: &str, entries: &mut 
             entries.push(OutlineEntry {
                 name,
                 kind: node.kind().to_string(),
-                start_line: (start.row + 1) as usize,
-                end_line: (end.row + 1) as usize,
+                start_line: (start.row + 1),
+                end_line: (end.row + 1),
                 signature: sig,
             });
         }
@@ -157,8 +144,8 @@ fn collect_definitions_impl(node: Node, source: &str, lang: &str, entries: &mut 
                 entries.push(OutlineEntry {
                     name,
                     kind: child.kind().to_string(),
-                    start_line: (start.row + 1) as usize,
-                    end_line: (end.row + 1) as usize,
+                    start_line: (start.row + 1),
+                    end_line: (end.row + 1),
                     signature: sig,
                 });
             }
@@ -288,23 +275,7 @@ pub fn parse_errors_def() -> ToolDef {
             "minItems": 1,
             "maxItems": 3
         }),
-        output_schema: json!({
-            "type": "object",
-            "properties": {
-                "ok": { "type": "boolean" },
-                "errors": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "line": { "type": "integer" },
-                            "col": { "type": "integer" },
-                            "message": { "type": "string" }
-                        }
-                    }
-                }
-            }
-        }),
+
         handler: Box::new(|args| {
             let first = args.get(0);
             if first.is_none() || first == Some(&Value::Null) {
@@ -393,8 +364,8 @@ fn collect_errors(node: Node, source: &str, errors: &mut Vec<ParseError>) {
             }
         };
         errors.push(ParseError {
-            line: (pos.row + 1) as usize,
-            col: (pos.column + 1) as usize,
+            line: (pos.row + 1),
+            col: (pos.column + 1),
             message: msg,
         });
         return; // Don't recurse into error nodes — their children are also errors.
@@ -412,7 +383,6 @@ fn collect_errors(node: Node, source: &str, errors: &mut Vec<ParseError>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
 
     fn call_handler(def: &ToolDef, args: Value) -> Result<Value, String> {
         (def.handler)(args)
