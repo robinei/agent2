@@ -409,16 +409,53 @@ Acceptance (2a, Part 1):
 
 **Part 2 — constructor objects + identifier rebinding.**
 
-- **Constructor objects.** Promote the namespace/constructor fictions
-  (`Array`, `Map`, `Set`, `RegExp`, `Object`, `Number`, `Boolean`,
-  `String`, plus `Math`/`JSON` as plain frozen namespaces) from
-  compiler-only `for_namespace` lookups (`compiler/member.rs:28`,
-  `compiler/call.rs:407`) to **real frozen `Object` values**: each
-  constructor's static methods (`Array.isArray`, `Object.keys`, `JSON.parse`,
-  `Math.max`, …) become own properties holding `Value::Builtin`, and a
-  constructor's `.prototype` points at the type's frozen prototype from
-  Part 1. `Math`/`JSON` carry their constants (`Math.PI`) as own data
-  properties, retiring `namespace_constant` (`compiler/member.rs:16`).
+**Constructors are *functions*, namespaces are *objects* — do not conflate
+them.** This is the JS object model and test262 enforces it hard (whole
+`built-ins/Map/`, `built-ins/Array/` subtrees gate on it):
+
+| | what it is | `typeof` | callable / `new` | examples |
+|---|---|---|---|---|
+| **Constructor** | callable function value, proto-chains to `Function.prototype` | `"function"` | yes | `Object`, `Array`, `Function`, `Map`, `Set`, `RegExp`, `Number`, `Boolean`, `String`, `Error` |
+| **Namespace** | non-callable frozen plain object | `"object"` | no | `Math`, `JSON`, `Reflect` |
+
+Representing a constructor as a frozen `Value::Object` is **wrong** and fails
+basic, feature-independent tests (`typeof Map === "function"`, `new Map()`,
+`Map instanceof Function`, `Array(3)`, `Object.getPrototypeOf(Map) ===
+Function.prototype`) — a *wrong-model* failure that pollutes the baseline, not
+an honest "unimplemented" one. So:
+
+- **Constructors → callable values.** Promote them to **callable** builtins:
+  add a **`BuiltinKind::Constructor { type_tag }`** (today's kinds are only
+  `Method`/`Namespace`, `builtin/mod.rs:67`). `typeof` already yields
+  `"function"` for `Value::Builtin` (`dispatch.rs` `TypeOf` arm), so the type
+  tag is free; their proto chain reaches `Function.prototype` (2b) so
+  `instanceof Function`/`getPrototypeOf` hold. Static methods
+  (`Array.isArray`, `Object.keys`) and `.prototype`/`.name`/`.length` are
+  **virtual rungs** off the constructor (resolved from the Step-1 registry),
+  *not* materialized into a map — see the enumerability note below.
+- **`New` must accept native constructors.** Today `New` only routes
+  `Value::Closure` (`dispatch.rs:465`, else "cannot call … with `new`"). A
+  `new Map()`/`new Set()`/`new RegExp()` must dispatch to the type's native
+  constructor (folding in today's `MapNew`/`SetNew`/`RegExpNew`/array paths).
+  This **retires** the ledger's "`new Map()` rejected" divergence. Mark which
+  constructors *require* `new` (`Map`/`Set` throw without it) vs. are callable
+  as plain functions (`Array`/`Object`/`Number`/`String`/`Boolean`).
+- **Namespaces → frozen plain objects** (the doc was already right here).
+  `Math`/`JSON` (and later `Reflect`) stay **non-callable** frozen
+  `Value::Object`s carrying their statics/constants (`Math.max`, `Math.PI`,
+  `JSON.parse`) as own properties, retiring `namespace_constant`
+  (`compiler/member.rs:16`). `typeof Math === "object"`; `Math()` / `new Math`
+  throw, as in JS.
+- **Enumerability falls out of "methods are virtual."** Builtin prototype
+  methods and constructor statics must be **non-enumerable** —
+  `Object.keys(Array.prototype) === []`, `for-in` shows no `push`. Keeping
+  them as virtual rungs (registry-resolved) with the prototype's own `map`
+  **empty** gives this for free; materializing methods into the map would
+  wrongly make them enumerable. So "methods are virtual" is a correctness
+  requirement, not just an optimization. (Descriptor-accurate
+  `writable`/`configurable` on these — what `propertyHelper.js`'s
+  `verifyProperty` checks — is the Step-4 tier and an *expected* baseline-red
+  bucket, not a Step-2 failure.)
 - **The bare identifier rebinds, not just the `.member` path.** Today
   `Array`/`Object`/`Math`/… are *not* values — they exist only as the head of
   a `for_namespace` member/call lowering, so `let f = Array` has nothing to
@@ -439,16 +476,26 @@ Acceptance (2a, Part 1):
   `for_namespace`. No new dispatch on the hot path.
 
 Acceptance (2a, Part 2):
-- [ ] `Math`/`JSON`/`Array`/`Object`/… are real frozen objects with their
-      static methods and constants as own properties; `for_namespace` and
-      `namespace_constant` are gone (or reduced to the reflective lookup).
+- [ ] **Constructors are callable functions:** `typeof Array === "function"`,
+      `typeof Map === "function"`; `new Map()` / `new Set()` / `new RegExp()`
+      construct (not "cannot call … with `new`"); `Array(3)` / `Number("5")`
+      call as plain functions; `Map()` without `new` throws. The "`new Map()`
+      rejected" ledger divergence is retired.
+- [ ] **Namespaces are non-callable objects:** `typeof Math === "object"`,
+      `Math()` / `new Math` throw; `Math.PI`, `JSON.parse` resolve as own
+      properties. `for_namespace`/`namespace_constant` are gone (or reduced to
+      the reflective lookup).
+- [ ] **Enumerability:** `Object.keys(Array.prototype) === []` and
+      `for-in` over `[]` shows no method names (methods are virtual rungs; the
+      prototype's own map is empty).
 - [ ] The **bare identifier** resolves: `let f = Array; f === globalThis.Array`,
       `const k = Object.keys; k({a:1})` work via the global binding, not a
       member fiction.
 - [ ] `CallBuiltin` / namespace-call fast paths unchanged (codegen-shape);
       no proto-walk added to any method call. Alloc tests reflect only the
       one-time (or lazy) prototype/constructor allocation, asserted exactly.
-- [ ] Constructors have no JSON form (`stack_value_to_json` rejects; test).
+- [ ] Constructors/namespaces have no JSON form (`stack_value_to_json`
+      rejects; test).
 - [ ] Gate: `cargo fmt && cargo clippy --workspace --all-targets && cargo test`.
 
 ### Step 2b — reflection wired to the real objects
@@ -465,6 +512,11 @@ ordinary lookups rather than special cases:
 - **`.constructor`** on any value reads through its type prototype to the
   real constructor object (`[].constructor === Array`,
   `(5).constructor === Number`).
+- **Constructors chain to `Function.prototype`.** Each constructor value's
+  `[[Prototype]]` is `Function.prototype`, so `Map instanceof Function`,
+  `Object.getPrototypeOf(Array) === Function.prototype`, and the shared
+  `Function.prototype` methods (`.call`/`.bind`/`.apply` read as values) hold —
+  the constructor is a *function* in the proto graph, not a one-off object.
 - **`Object.getPrototypeOf`** returns the real prototype for primitives and
   builtins (today it returns `null` for non-Object — `builtin/object.rs:171`);
   **`Object.create(proto)`**, `Object.getOwnPropertyNames`, and the
@@ -483,6 +535,8 @@ Acceptance (2b):
       Phase 13 still holds (one walk, no `TypeTag` special-case left).
 - [ ] `[].constructor === Array`, `"".constructor === String`,
       `(5).constructor === Number`.
+- [ ] `Map instanceof Function` is `true`;
+      `Object.getPrototypeOf(Array) === Function.prototype`.
 - [ ] `Object.getPrototypeOf([])` / `("")` returns the real prototype, not
       `null`; `Object.create(proto)` links it.
 - [ ] A primitive method call (`(5).toFixed`, `"x".at`) resolves via the
@@ -872,12 +926,16 @@ rather than silently tolerated:
   no "params before first default" — recorded in 13_OBJECTS Step 6.
 - **Class field init scope** sees constructor params (direct-prepend
   lowering) where JS uses a separate scope — 13_OBJECTS Step 7a.
-- **`static` / computed / private (`#x`) class members**, **`new Map()`/
-  `new Set()`/`new Date()`** — rejected with alternative-naming diagnostics
-  under the instrumental goal; under the terminal goal these are
-  *schedulable* (corpus-gated), no longer architectural exclusions. Note
-  `new Map()` still collides with a `4_FUTURE` decision — flip that
-  deliberately, with a ledger entry, if/when the corpus warrants.
+- **`static` / computed / private (`#x`) class members** — rejected with
+  alternative-naming diagnostics under the instrumental goal; under the
+  terminal goal these are *schedulable* (corpus-gated), no longer
+  architectural exclusions.
+- **`new Map()`/`new Set()`/`new RegExp()` — resolved in Step 2a Part 2**, not
+  pinned: once constructors are callable function values and `New` accepts
+  native constructors, `new Map()` constructs normally (this is the
+  representation fix that makes `typeof Map === "function"` etc. hold). This
+  flips the old `4_FUTURE` "no `new Map()`" decision deliberately. `new Date()`
+  remains schedulable separately (no `Date` type yet).
 - **`Object.isFrozen(Array.prototype)` is `true`** here vs `false` in JS
   (real-JS builtin prototypes are mutable) — Step 2d. Not a new divergence:
   it is the same deferred "builtin prototypes are frozen, not yet

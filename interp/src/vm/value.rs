@@ -377,9 +377,12 @@ impl Value {
             return l_nullish && r_nullish;
         }
         match (self, other) {
-            // Boolean → number, then re-run the comparison.
+            // Boolean → number, then re-run the comparison. Each arm coerces
+            // the *boolean* side (the one that matched `Bool`) and keeps the
+            // other operand unchanged — coercing the wrong side leaves a `Bool`
+            // in place and re-runs forever (the `1 == false` overflow).
             (Bool(b), _) => Value::Float(if *b { 1.0 } else { 0.0 }).loose_equal(other),
-            (_, Bool(b)) => Value::Float(if *b { 1.0 } else { 0.0 }).loose_equal(other),
+            (_, Bool(b)) => self.loose_equal(&Value::Float(if *b { 1.0 } else { 0.0 })),
             // Number vs string (either order): coerce the string with ToNumber.
             (l, String(s)) if l.is_number() => l.num_loose_eq_str(s),
             (String(s), r) if r.is_number() => r.num_loose_eq_str(s),

@@ -12,14 +12,6 @@ use crate::harness::Harness;
 const STEP_FUEL: u64 = 200_000;
 const WORKER_STACK: usize = 16 * 1024 * 1024;
 
-/// Patterns in test sources that trigger known compiler stack overflow bugs.
-fn contains_crash_patterns(source: &str) -> bool {
-    source.contains("== false")
-        || source.contains("!= false")
-        || source.contains("== true")
-        || source.contains("!= true")
-}
-
 /// Features that the VM structurally cannot support.
 const SKIP_FEATURES: &[&str] = &[
     "module",
@@ -34,7 +26,31 @@ const SKIP_FEATURES: &[&str] = &[
     "regexp-unicode-property-escapes",
 ];
 
-const SKIP_FLAGS: &[&str] = &["module", "async"];
+// `raw`: must run with NO harness prepended (sta.js/assert.js included) — we
+// always prepend, so running them would be wrong; skip honestly instead.
+const SKIP_FLAGS: &[&str] = &["module", "async", "raw"];
+
+/// Collapse a per-test `detail` string to a **coarse, stable** histogram key.
+/// `detail` carries specifics (full parse diagnostics, raised condition names)
+/// that are unique per test — bucketing on it directly explodes the histogram
+/// into thousands of one-off entries and destroys the "by cause" signal. The
+/// runtime/error-kind details are already coarse (a bounded `ErrorKind` set)
+/// and pass through.
+fn coarse_cause(detail: &str) -> String {
+    if detail.starts_with("parse:") {
+        "parse error".to_string()
+    } else if detail.starts_with("harness:") {
+        "harness load error".to_string()
+    } else if detail.starts_with("vm-init:") {
+        "vm-init error".to_string()
+    } else if detail.starts_with("unexpected raise:") {
+        "unexpected raise".to_string()
+    } else {
+        // Already coarse: "runtime: TypeError", "out of fuel",
+        // "expected error, got success", "panic (…)", "unexpected pending".
+        detail.to_string()
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TestOutcome {
@@ -154,9 +170,6 @@ pub fn run_tests(
                 }
             }
         }
-        if skip_reason.is_none() && contains_crash_patterns(test_body) {
-            skip_reason = Some("skip: known compiler crash pattern".to_string());
-        }
         if skip_reason.is_none()
             && let Some(exp) = expectations
             && let Some(expected) = exp.entries.get(&rel_str)
@@ -187,7 +200,10 @@ pub fn run_tests(
             Ok(s) => s,
             Err(e) => {
                 stats.fail += 1;
-                *stats.by_cause.entry(format!("harness: {e}")).or_insert(0) += 1;
+                *stats
+                    .by_cause
+                    .entry(coarse_cause(&format!("harness: {e}")))
+                    .or_insert(0) += 1;
                 stats.results.push(TestResult {
                     path: rel_str,
                     outcome: TestOutcome::Fail,
@@ -224,7 +240,7 @@ pub fn run_tests(
                     TestOutcome::Pass => stats.pass += 1,
                     TestOutcome::Fail => {
                         stats.fail += 1;
-                        *stats.by_cause.entry(r.detail.clone()).or_insert(0) += 1;
+                        *stats.by_cause.entry(coarse_cause(&r.detail)).or_insert(0) += 1;
                         if let Some(f) = r.features.first() {
                             *stats.by_feature.entry(f.clone()).or_insert(0) += 1;
                         }
@@ -236,7 +252,7 @@ pub fn run_tests(
             Err(_) => {
                 stats.fail += 1;
                 let detail = "panic (stack overflow or internal error)".to_string();
-                *stats.by_cause.entry(detail.clone()).or_insert(0) += 1;
+                *stats.by_cause.entry(coarse_cause(&detail)).or_insert(0) += 1;
                 stats.results.push(TestResult {
                     path: work_path,
                     outcome: TestOutcome::Fail,

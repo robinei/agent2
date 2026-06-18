@@ -556,6 +556,61 @@ fn loose_eq_boolean_coercion() {
         run(vec![PushBool(true), PushFloat(2.0), LooseEq]),
         vec![b(false)]
     );
+    // Reversed operand order: the non-boolean is on the left, the boolean on
+    // the right. This is the arm that previously infinite-recursed: the Bool
+    // side was never actually coerced, so `1 == false` overflowed the stack.
+    assert_eq!(
+        run(vec![PushFloat(1.0), PushBool(true), LooseEq]),
+        vec![b(true)]
+    );
+    assert_eq!(
+        run(vec![PushFloat(0.0), PushBool(false), LooseEq]),
+        vec![b(true)]
+    );
+    assert_eq!(
+        run(vec![PushPosInt(1), PushBool(false), LooseEq]),
+        vec![b(false)]
+    );
+    assert_eq!(
+        run(vec![PushNegInt(-1), PushBool(true), LooseEq]),
+        vec![b(false)]
+    );
+    // Bool vs Bool either order terminates and gives the strict result.
+    assert_eq!(
+        run(vec![PushBool(true), PushBool(true), LooseEq]),
+        vec![b(true)]
+    );
+    assert_eq!(
+        run(vec![PushBool(true), PushBool(false), LooseEq]),
+        vec![b(false)]
+    );
+    assert_eq!(
+        run(vec![PushBool(false), PushBool(true), LooseNeq]),
+        vec![b(true)]
+    );
+}
+
+#[test]
+fn loose_eq_bool_const_fold_no_overflow() {
+    // Regression: `compile` const-folds `==`/`!=` against a boolean literal by
+    // running the op through a real throwaway VM. The `(_, Bool)` coercion arm
+    // used to infinite-recurse there, aborting the process with SIGABRT (an
+    // uncatchable stack overflow, not a panic). These end-to-end assertions
+    // guard the compile path — if the fix regresses, `compile_ok` aborts before
+    // any assertion runs, failing the test binary itself.
+    use crate::testutil::eval;
+    assert_eq!(eval("1 == false"), Value::Bool(false));
+    assert_eq!(eval("1 == true"), Value::Bool(true));
+    assert_eq!(eval("0 == false"), Value::Bool(true));
+    assert_eq!(eval("1 != false"), Value::Bool(true));
+    assert_eq!(eval("true != false"), Value::Bool(true));
+    assert_eq!(eval("true == true"), Value::Bool(true));
+    // `var x = 1; x == false` — the original repro: the optimizer forward-
+    // propagates the `1` into the comparison, then const-folds the `LooseEq`.
+    assert_eq!(
+        crate::testutil::run_val("var x = 1; return x == false;"),
+        Value::Bool(false)
+    );
 }
 
 #[test]
