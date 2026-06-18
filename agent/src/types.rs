@@ -182,5 +182,3 @@ impl EventId {
         val.get()
     }
 }
-
-
