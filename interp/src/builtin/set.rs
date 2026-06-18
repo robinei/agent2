@@ -2,6 +2,16 @@ use crate::builtin::Args;
 use crate::vm::{ErrorKind, MapKey, VM, VMError, Value};
 use thin_vec::ThinVec;
 
+/// `Set()` without `new` — throws (JS: `TypeError: Constructor Set requires
+/// 'new'`). The `new Set(…)` path is handled by `Instr::New`'s
+/// builtin-constructor arm (`VM::construct_builtin`).
+pub fn set_ctor(vm: &mut VM, _args: Args) -> Result<Value, VMError> {
+    Err(vm.fail(
+        ErrorKind::TypeError,
+        "cannot call `Set` as a function, use `new Set()`",
+    ))
+}
+
 pub fn set_is_set(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     Ok(Value::Bool(matches!(args.get(vm, 0), Value::Set(_))))
 }
@@ -65,16 +75,12 @@ pub fn set_values(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 
 #[cfg(test)]
 mod tests {
-    use crate::{
-        Value,
-        testutil::{self, run_instrs},
-        vm::Instr,
-    };
+    use crate::{Value, testutil};
 
     #[test]
     fn set_new_empty() {
-        let out = run_instrs(vec![Instr::PushUndefined, Instr::SetNew]);
-        assert!(matches!(&out[0], Value::Set(_)));
+        let v = testutil::eval("new Set()");
+        assert!(matches!(v, Value::Set(_)));
     }
 
     #[test]

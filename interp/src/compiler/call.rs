@@ -460,6 +460,14 @@ impl super::Compiler {
     /// Global function calls recognized structurally.
     pub(super) fn compile_global_call(&mut self, name: &str, argv: &[&ast::Expression], span: u32) {
         match name {
+            // Step 2a Part 2: constructor names called as plain functions.
+            // `String(x)`/`Number(x)`/`Boolean(x)` keep their dedicated
+            // fast-path instructions (`ToStr`/`ToNum`/`ToBool`) — more
+            // efficient than routing through `CallBuiltin` and behaviorally
+            // identical. `Array(...)`/`Object(...)` route through the
+            // constructor builtin (folding the native construction). `Map()`
+            // /`Set()` without `new` throw at runtime (the handler raises
+            // `TypeError`), matching JS.
             "String" => {
                 if !self.arity(argv, 1, span, "String") {
                     return;
@@ -480,6 +488,28 @@ impl super::Compiler {
                 }
                 self.compile_args(argv);
                 self.emit(Instr::ToBool, span);
+            }
+            "Array" | "Object" | "Map" | "Set" | "RegExp" => {
+                if let Some(b) = Builtin::for_constructor(name) {
+                    self.compile_builtin_call(b, None, argv, span, false);
+                } else {
+                    self.error(span, format!("unsupported `{name}`"));
+                }
+            }
+            // Step 2a Part 2: `Math()` / `JSON()` — the namespace is a
+            // non-callable object. Push it and dispatch via `CallDyn`, which
+            // raises a `TypeError` at runtime ("cannot call a object as a
+            // function"), matching JS. A compile-time error would be less
+            // faithful — JS throws at runtime.
+            "Math" => {
+                self.emit(Instr::PushGlobal(crate::vm::GlobalId::Math), span);
+                self.compile_args(argv);
+                self.emit(Instr::CallDyn(argv.len() as u32, false), span);
+            }
+            "JSON" => {
+                self.emit(Instr::PushGlobal(crate::vm::GlobalId::JSON), span);
+                self.compile_args(argv);
+                self.emit(Instr::CallDyn(argv.len() as u32, false), span);
             }
             "parseInt" => {
                 // Delegate to Number.parseInt

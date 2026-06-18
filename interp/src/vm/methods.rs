@@ -1,5 +1,6 @@
 use super::*;
 
+use crate::compiler::{ConstVal, namespace_constants, namespace_static_names};
 use crate::diag::Diagnostic;
 
 impl VM {
@@ -41,6 +42,7 @@ impl VM {
             console_lines: Vec::new(),
             debug: crate::debuginfo::DebugTable::default(),
             prototypes: Vec::new(),
+            namespaces: Vec::new(),
         }
     }
 
@@ -839,6 +841,38 @@ impl VM {
         Value::Array(addr)
     }
 
+    /// Compile and allocate a `Value::RegExp` from a pattern + flags string.
+    /// Shared by the `RegExp` constructor handler (`regexp_ctor`) and
+    /// `construct_builtin` (the `new RegExp(…)` path). Validates flags and
+    /// compiles via `regress`; an invalid pattern or flags → `ValueError`.
+    pub(crate) fn alloc_regexp(&mut self, pattern: RcStr, flags: RcStr) -> Result<Value, VMError> {
+        let flags_str = flags.as_str();
+        for c in flags_str.chars() {
+            if !matches!(c, 'g' | 'i' | 'm' | 's' | 'u' | 'y' | 'd' | 'v') {
+                return Err(self.fail(
+                    ErrorKind::ValueError,
+                    format!("invalid regular expression flags: {flags_str}"),
+                ));
+            }
+        }
+        let compiled = match regress::Regex::with_flags(pattern.as_str(), flags_str) {
+            Ok(re) => re,
+            Err(e) => {
+                return Err(self.fail(
+                    ErrorKind::ValueError,
+                    format!("invalid regular expression: {e}"),
+                ));
+            }
+        };
+        let rx_data = RegExpData {
+            pattern,
+            flags,
+            compiled,
+            last_index: std::cell::Cell::new(0),
+        };
+        Ok(Value::RegExp(RcRegExp::new(rx_data)))
+    }
+
     pub(crate) fn alloc_object(&mut self, obj: IndexMap<FieldName, Value>) -> Value {
         let addr = self.objects.len() as ObjectPtr;
         self.objects.push(ObjData {
@@ -1048,6 +1082,236 @@ impl VM {
     /// `None` if it has not been lazily materialized yet. Does *not* allocate.
     pub fn prototype_ptr(&self, tag: crate::vm::instr::TypeTag) -> Option<ObjectPtr> {
         self.prototypes.get(tag as usize).copied().flatten()
+    }
+
+    // ── Step 2a Part 2: namespace objects + native constructors ──────────
+
+    /// Get the `ObjectPtr` of a global namespace object (`Math`, `JSON`),
+    /// allocating it lazily on first access. The object is a frozen
+    /// `ObjData` with `kind: BuiltinNamespace` (no JSON form) carrying its
+    /// statics/constants as own properties — materialized, since a namespace
+    /// is a plain object not a constructor (methods like `Math.max` are
+    /// `Value::Builtin` entries). The side table (`self.namespaces`, indexed
+    /// by `GlobalId as usize`) caches the ptr so repeated calls return the
+    /// same object — identity matters for `Math === Math`.
+    pub fn namespace_for(&mut self, g: crate::vm::instr::GlobalId) -> Result<ObjectPtr, VMError> {
+        let idx = g as usize;
+        if let Some(Some(p)) = self.namespaces.get(idx) {
+            return Ok(*p);
+        }
+        // Compute the prototype first (may allocate into `objects`) so the
+        // borrow checker is happy and the ptr is stable for the push below.
+        let proto = Some(self.prototype_for(crate::vm::instr::TypeTag::Object)?);
+        let ptr = self.objects.len() as ObjectPtr;
+        self.objects.push(ObjData {
+            proto,
+            map: IndexMap::new(),
+            integrity: IntegrityLevel::Frozen,
+            kind: ObjKind::BuiltinNamespace,
+        });
+        // Populate own properties from the registry: every `BuiltinKind::Namespace(ns)`
+        // row whose `ns` matches this global becomes a `Value::Builtin` entry.
+        let ns_name = match g {
+            crate::vm::instr::GlobalId::Math => "Math",
+            crate::vm::instr::GlobalId::JSON => "JSON",
+        };
+        let mut map = std::mem::take(&mut self.objects[ptr as usize].map);
+        // Compile-time constants (Math.PI, Math.E) folded into the map.
+        for &(ns, member, val) in namespace_constants() {
+            if ns == ns_name {
+                let key = RcStr::from(member);
+                let v = match val {
+                    ConstVal::Float(f) => Value::Float(f),
+                    ConstVal::PosInt(n) => Value::PosInt(n),
+                };
+                map.insert(key, v);
+            }
+        }
+        // Static functions: every namespaced builtin row for this namespace.
+        // We iterate the registry by scanning all `Builtin` variants — the
+        // `builtins!` macro gives us no direct iteration, so we use
+        // `Builtin::for_namespace` per known static name. The static name
+        // list is derived from the registry by a one-time scan: we look up
+        // every member name we know about. Since the registry is closed, we
+        // can collect the names by walking the well-known set.
+        for &member in namespace_static_names(ns_name) {
+            if let Some(b) = crate::builtin::Builtin::for_namespace(ns_name, member) {
+                map.insert(RcStr::from(member), Value::Builtin(b));
+            }
+        }
+        self.objects[ptr as usize].map = map;
+        // Grow the side table to fit this index (lazy: starts empty).
+        if idx >= self.namespaces.len() {
+            self.namespaces.resize(2, None); // GlobalId::COUNT == 2
+        }
+        self.namespaces[idx] = Some(ptr);
+        Ok(ptr)
+    }
+
+    /// Read-only peek at a namespace's `ObjectPtr` if already allocated, or
+    /// `None` if it has not been lazily materialized yet. Does *not* allocate.
+    pub fn namespace_ptr(&self, g: crate::vm::instr::GlobalId) -> Option<ObjectPtr> {
+        self.namespaces.get(g as usize).copied().flatten()
+    }
+
+    /// Construct a value via a native constructor's `new` path. Step 2a
+    /// Part 2: `new Map()`/`new Set()`/`new RegExp()`/`new Array()`/etc.
+    /// dispatches here. The args sit on the stack (arg 0 deepest),
+    /// `nargs` of them; this consumes them and pushes the constructed value.
+    /// A constructor that requires `new` (`Map`/`Set`) is never called
+    /// through the plain-call path here — that's the `Builtin::call` arm.
+    pub fn construct_builtin(
+        &mut self,
+        b: crate::builtin::Builtin,
+        nargs: u32,
+    ) -> Result<(), VMError> {
+        // Dispatch on the constructor's `type_tag`. Each arm folds the
+        // existing native-construction logic; the args are on the stack in
+        // the standard call convention (arg 0 deepest).
+        let tag = b
+            .constructor_type_tag()
+            .expect("construct_builtin called on a non-constructor builtin");
+        use crate::vm::instr::TypeTag;
+        match tag {
+            TypeTag::Array => {
+                // `new Array(...)` — same as `Array(...)`. Reuse the handler:
+                // collect args, call `array_ctor`. The handler reads via
+                // `Args` against the stack top, so set up `Args` and call.
+                let n = nargs as usize;
+                if self.stack.len() < n {
+                    return Err(self.fail(ErrorKind::StackUnderflow, "stack underflow"));
+                }
+                let base = self.stack.len() - n;
+                let args = crate::builtin::Args { base, argc: n };
+                let result = crate::builtin::array_ctor(self, args)?;
+                self.stack.truncate(base);
+                self.stack.push(result);
+            }
+            TypeTag::Object => {
+                // `new Object(x)` — same as `Object(x)`.
+                let n = nargs as usize;
+                if self.stack.len() < n {
+                    return Err(self.fail(ErrorKind::StackUnderflow, "stack underflow"));
+                }
+                let base = self.stack.len() - n;
+                let args = crate::builtin::Args { base, argc: n };
+                let result = crate::builtin::object_ctor(self, args)?;
+                self.stack.truncate(base);
+                self.stack.push(result);
+            }
+            TypeTag::Map => {
+                // `new Map([entries])`.
+                let arg = if nargs == 0 {
+                    Value::Undefined
+                } else {
+                    // One arg expected; extras ignored (JS-faithful leniency).
+                    let base = self.stack.len() - nargs as usize;
+                    self.stack[base].clone()
+                };
+                let base = self.stack.len() - nargs as usize;
+                self.stack.truncate(base);
+                let mut map: IndexMap<MapKey, Value> = IndexMap::new();
+                if let Value::Array(p) = arg {
+                    let entries = self
+                        .arrays
+                        .get(p as usize)
+                        .ok_or_else(|| self.fail(ErrorKind::ValueError, "value error"))?;
+                    for entry in entries.iter() {
+                        let pair_ptr = match entry {
+                            Value::Array(p) => *p,
+                            _ => {
+                                return Err(self.fail(ErrorKind::TypeError, "type error"));
+                            }
+                        };
+                        let pair = self
+                            .arrays
+                            .get(pair_ptr as usize)
+                            .ok_or_else(|| self.fail(ErrorKind::ValueError, "value error"))?;
+                        if pair.len() < 2 {
+                            continue;
+                        }
+                        map.insert(MapKey(pair[0].clone()), pair[1].clone());
+                    }
+                } else if !matches!(arg, Value::Undefined) {
+                    return Err(self.fail(
+                        ErrorKind::TypeError,
+                        "Map argument must be an iterable of [key, value] pairs",
+                    ));
+                }
+                let addr = self.maps.len() as MapPtr;
+                self.maps.push(map);
+                self.stack.push(Value::Map(addr));
+            }
+            TypeTag::Set => {
+                // `new Set([iterable])`.
+                let arg = if nargs == 0 {
+                    Value::Undefined
+                } else {
+                    let base = self.stack.len() - nargs as usize;
+                    self.stack[base].clone()
+                };
+                let base = self.stack.len() - nargs as usize;
+                self.stack.truncate(base);
+                let mut set: IndexSet<MapKey> = IndexSet::new();
+                if let Value::Array(p) = arg {
+                    let arr = self
+                        .arrays
+                        .get(p as usize)
+                        .ok_or_else(|| self.fail(ErrorKind::ValueError, "value error"))?;
+                    for v in arr.iter() {
+                        set.insert(MapKey(v.clone()));
+                    }
+                } else if !matches!(arg, Value::Undefined) {
+                    return Err(self.fail(ErrorKind::TypeError, "Set argument must be an iterable"));
+                }
+                let addr = self.sets.len() as SetPtr;
+                self.sets.push(set);
+                self.stack.push(Value::Set(addr));
+            }
+            TypeTag::RegExp => {
+                // `new RegExp(pattern[, flags])` — same as `RegExp(...)`.
+                let n = nargs as usize;
+                if self.stack.len() < n {
+                    return Err(self.fail(ErrorKind::StackUnderflow, "stack underflow"));
+                }
+                let base = self.stack.len() - n;
+                let args = crate::builtin::Args { base, argc: n };
+                let result = crate::builtin::regexp_ctor(self, args)?;
+                self.stack.truncate(base);
+                self.stack.push(result);
+            }
+            // `new Number(x)` / `new String(x)` / `new Boolean(x)` — JS boxes;
+            // here we return the primitive (documented divergence, no boxed
+            // primitives — Step 2b keeps method compat without boxing).
+            TypeTag::Number | TypeTag::String | TypeTag::Boolean => {
+                let n = nargs as usize;
+                if self.stack.len() < n {
+                    return Err(self.fail(ErrorKind::StackUnderflow, "stack underflow"));
+                }
+                let base = self.stack.len() - n;
+                let args = crate::builtin::Args { base, argc: n };
+                let handler = match tag {
+                    TypeTag::Number => crate::builtin::number_ctor,
+                    TypeTag::String => crate::builtin::string_ctor,
+                    TypeTag::Boolean => crate::builtin::boolean_ctor,
+                    _ => unreachable!(),
+                };
+                let result = handler(self, args)?;
+                self.stack.truncate(base);
+                self.stack.push(result);
+            }
+            // `Function` is a constructor in JS but has no `Builtin` row here
+            // (no `new Function(body)` support); unreachable from the
+            // registry. `TypeTag::Function` keys the prototype side table only.
+            TypeTag::Function => {
+                return Err(self.fail(
+                    ErrorKind::TypeError,
+                    "`new Function` is not supported (use function expressions)",
+                ));
+            }
+        }
+        self.ip += 1;
+        Ok(())
     }
 
     pub(super) fn alloc_closure(
@@ -1263,14 +1527,18 @@ impl VM {
                     .objects
                     .get(*p as usize)
                     .ok_or_else(|| self.fail(ErrorKind::ValueError, "value error"))?;
-                // JSON boundary (guardrail 2): builtin prototypes (and
-                // later namespaces) are reflective artifacts with no JSON
-                // form, unlike a user `Object.freeze`'d plain object whose
-                // data still serializes (Step 2d). `kind` distinguishes them.
-                if obj.kind == ObjKind::BuiltinPrototype {
+                // JSON boundary (guardrail 2): builtin prototypes and
+                // namespaces (Step 2a Part 2: `Math`, `JSON`) are reflective
+                // artifacts with no JSON form, unlike a user
+                // `Object.freeze`'d plain object whose data still serializes
+                // (Step 2d). `kind` distinguishes them.
+                if matches!(
+                    obj.kind,
+                    ObjKind::BuiltinPrototype | ObjKind::BuiltinNamespace
+                ) {
                     return Err(self.fail(
                         ErrorKind::ValueError,
-                        "cannot serialize a builtin prototype to JSON",
+                        "cannot serialize a builtin prototype/namespace to JSON",
                     ));
                 }
                 let mut map = serde_json::Map::new();

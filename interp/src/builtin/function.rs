@@ -5,6 +5,22 @@ use thin_vec::ThinVec;
 use crate::builtin::Args;
 use crate::vm::{BoundFn, ErrorKind, VM, VMError, Value};
 
+// ── Boolean constructor ─────────────────────────────────────────────────────
+
+/// `Boolean(x)` / `new Boolean(x)` — the constructor as a plain call.
+/// `Boolean()` → `false`; with one arg, ToBoolean. The `new` path would
+/// box (`new Boolean(false)` → a Boolean wrapper object whose `typeof` is
+/// `"object"`); here it is a documented divergence — we have no boxed
+/// primitives, so `new Boolean(false)` returns the primitive `false`
+/// (Step 2b keeps method compat without boxing).
+pub fn boolean_ctor(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    if args.argc == 0 {
+        return Ok(Value::Bool(false));
+    }
+    let v = args.get(vm, 0).clone();
+    Ok(Value::Bool(v.is_truthy()))
+}
+
 // ── Function.prototype.bind ────────────────────────────────
 
 /// `f.bind(thisArg, ...args)` — constructs a `Value::Bound` without invoking.

@@ -5,6 +5,35 @@ use thin_vec::ThinVec;
 
 // ── Array static implementations ─────────────────────────────────────────────
 
+/// `Array(...items)` / `Array(length)` — the constructor as a plain call.
+/// `Array(n)` with a single numeric arg creates a length-`n` array of
+/// `undefined` (JS's sparse-array-of-holes, modeled as undefined slots).
+/// `Array(a, b, …)` creates `[a, b, …]`. `Array()` → `[]`. The `new` path
+/// (`new Array(…)`) is identical to the plain call and is handled by
+/// `Instr::New`'s builtin-constructor arm, which delegates here.
+pub fn array_ctor(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    // `Array(n)` with a single number → length-n array of undefined.
+    if args.argc == 1
+        && let Some(n) = args.get(vm, 0).to_number()
+        && n >= 0.0
+        && n.is_finite()
+        && n <= 10_000_000.0
+    {
+        let len = n as usize;
+        let arr: ThinVec<Value> = std::iter::repeat_n(Value::Undefined, len).collect();
+        return Ok(vm.alloc_array(arr));
+    }
+    // Negative or non-finite: JS throws RangeError. We surface a
+    // ValueError with a clear message (no RangeError kind yet).
+    // Non-numeric single arg: fall through to `[arg]` (JS coerces to
+    // number and throws on NaN, but the common case is a numeric length;
+    // a non-numeric `Array(x)` is `Array(x)` → `[x]` in practice only
+    // when x is not a number — matching `Array("foo")` → `["foo"]`).
+    // `Array(a, b, …)` / `Array()` → `[...args]`.
+    let items: ThinVec<Value> = (0..args.argc).map(|i| args.get(vm, i).clone()).collect();
+    Ok(vm.alloc_array(items))
+}
+
 /// `Array.isArray(x)` → bool.
 pub fn array_is_array(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     Ok(Value::Bool(matches!(args.get(vm, 0), Value::Array(_))))

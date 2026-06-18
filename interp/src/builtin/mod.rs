@@ -28,7 +28,7 @@
 //! result — assignment-style "leave a value" semantics, so every builtin call
 //! is a well-formed expression.
 
-use crate::vm::instr::{ArrayPtr, MapPtr, SetPtr};
+use crate::vm::instr::{ArrayPtr, MapPtr, SetPtr, TypeTag};
 use crate::vm::{ErrorKind, RcStr, VM, VMError, Value};
 
 mod array;
@@ -59,14 +59,33 @@ use regexp::*;
 use set::*;
 use string::*;
 
+// Re-export the constructor handlers so `VM::construct_builtin` can reach
+// them by bare name. The `builtins!` macro references them unqualified via
+// the glob imports above; this `pub(crate) use` makes them reachable as
+// `crate::builtin::array_ctor` etc. too.
+pub(crate) use array::array_ctor;
+pub(crate) use function::boolean_ctor;
+pub(crate) use map::map_ctor;
+pub(crate) use number::number_ctor;
+pub(crate) use object::object_ctor;
+pub(crate) use regexp::regexp_ctor;
+pub(crate) use set::set_ctor;
+pub(crate) use string::string_ctor;
+
 // ── declarative builtin registry ─────────────────────────────────────────────
 
-/// The kind of a builtin: either a method on a receiver value (string or array),
-/// or a static function under a namespace (`Math.abs`, `JSON.parse`, …).
+/// The kind of a builtin: a method on a receiver value, a static function
+/// under a namespace (`Math.abs`, `JSON.parse`, …), or a constructor
+/// (`Array`, `Map`, … — Step 2a Part 2). Constructors are callable
+/// `Value::Builtin`s whose `type_tag` keys the prototype side table and
+/// derives the owning-namespace name (`TypeTag::name`), so their static
+/// methods (`Array.isArray`) and `.prototype` resolve as virtual rungs off
+/// the constructor value.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum BuiltinKind {
     Method,
     Namespace(&'static str),
+    Constructor { type_tag: TypeTag },
 }
 
 /// Sentinel for variadic builtins: no upper bound on argument count.
@@ -162,7 +181,7 @@ macro_rules! builtins {
                 // methods; compile-time arity is strict (compiler lint).
                 let min_runtime = match self.meta().kind {
                     BuiltinKind::Method => 1,
-                    BuiltinKind::Namespace(_) => 0,
+                    BuiltinKind::Namespace(_) | BuiltinKind::Constructor { .. } => 0,
                 };
                 if argc < min_runtime {
                     vm.stack.truncate(base);
@@ -229,6 +248,30 @@ macro_rules! builtins {
                     }
                 )*
                 None
+            }
+
+            /// Look up a constructor builtin by its JS name (`Array`, `Map`, …).
+            /// Step 2a Part 2: constructors are callable `Value::Builtin`s, so
+            /// the bare identifier `Array` and `new Map(…)` resolve through this.
+            pub fn for_constructor(name: &str) -> Option<Builtin> {
+                $(
+                    if let BuiltinKind::Constructor { type_tag } = $kind {
+                        if type_tag.name() == name {
+                            return Some(Builtin::$variant);
+                        }
+                    }
+                )*
+                None
+            }
+
+            /// The `TypeTag` of a constructor builtin, or `None` for non-constructors.
+            /// Used by `Instr::New` and the virtual-rung property reads
+            /// (`.prototype`, static methods) to key the prototype side table.
+            pub fn constructor_type_tag(self) -> Option<TypeTag> {
+                match self.meta().kind {
+                    BuiltinKind::Constructor { type_tag } => Some(type_tag),
+                    _ => None,
+                }
             }
 
             /// Receiver-type-aware method-builtin lookup: given a receiver
@@ -415,6 +458,20 @@ builtins! {
     MapSetKeys,    BuiltinKind::Method, "keys",    1, 1, map_set_keys,    false, false, true, true, false, false;
     MapSetValues,  BuiltinKind::Method, "values",  1, 1, map_set_values,  false, false, true, true, false, false;
     MapSetEntries, BuiltinKind::Method, "entries", 1, 1, map_set_entries, false, false, true, true, false, false;
+
+    // ── Constructors (Step 2a Part 2) ──
+    // Callable `Value::Builtin`s keyed by `BuiltinKind::Constructor { type_tag }`.
+    // The handler is the plain-call behavior (`Array(3)`, `Number("5")`, …);
+    // `Instr::New` dispatches the `new` path directly (via `construct_builtin`).
+    // `Map`/`Set` require `new` — their handler throws.
+    ArrayCtor,   BuiltinKind::Constructor { type_tag: TypeTag::Array },   "Array",   0, VARARG, array_ctor,   false, false, false, false, false, false;
+    ObjectCtor,  BuiltinKind::Constructor { type_tag: TypeTag::Object },  "Object",  0, 1,      object_ctor,  false, false, false, false, false, false;
+    MapCtor,     BuiltinKind::Constructor { type_tag: TypeTag::Map },     "Map",     0, 1,      map_ctor,     false, false, false, false, false, false;
+    SetCtor,     BuiltinKind::Constructor { type_tag: TypeTag::Set },     "Set",     0, 1,      set_ctor,     false, false, false, false, false, false;
+    RegExpCtor,  BuiltinKind::Constructor { type_tag: TypeTag::RegExp },  "RegExp",  1, 2,      regexp_ctor,  false, false, false, false, false, false;
+    NumberCtor,  BuiltinKind::Constructor { type_tag: TypeTag::Number },  "Number",  1, 1,      number_ctor,  false, false, false, false, false, false;
+    StringCtor,  BuiltinKind::Constructor { type_tag: TypeTag::String },  "String",  1, 1,      string_ctor,  false, false, false, false, false, false;
+    BooleanCtor, BuiltinKind::Constructor { type_tag: TypeTag::Boolean }, "Boolean", 1, 1,      boolean_ctor, false, false, false, false, false, false;
 }
 
 // ── argument accessor ────────────────────────────────────────────────────────
@@ -426,11 +483,11 @@ builtins! {
 /// semantics. Handlers apply JS-level defaults for optional args (e.g. `join`
 /// separator → `","`, `slice` end → length) themselves.
 #[derive(Clone, Copy)]
-struct Args {
+pub(crate) struct Args {
     /// Index of arg 0 in `vm.stack` (the deepest).
-    base: usize,
+    pub(crate) base: usize,
     /// Number of arguments present.
-    argc: usize,
+    pub(crate) argc: usize,
 }
 
 impl Args {

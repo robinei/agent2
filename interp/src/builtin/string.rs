@@ -4,6 +4,20 @@ use crate::builtin::Args;
 use crate::builtin::regexp::{build_exec_result, try_reg_exp};
 use crate::vm::{ErrorKind, RcStr, VM, VMError, Value};
 
+// ── String static implementations ────────────────────────────────────────────
+
+/// `String(x)` / `new String(x)` — the constructor as a plain call.
+/// `String()` → `""`; with one arg, ToString. The `new` path would box
+/// (`new String("hi")` → a String wrapper object); here it is a documented
+/// divergence — we have no boxed primitives, so `new String("hi")` returns
+/// the primitive `"hi"` (Step 2b keeps method compat without boxing).
+pub fn string_ctor(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    if args.argc == 0 {
+        return Ok(Value::String(RcStr::from("")));
+    }
+    Ok(Value::String(vm.to_js_string(args.get(vm, 0), 0)))
+}
+
 // ── string method implementations ────────────────────────────────────────────
 
 /// `s.split(delim[, limit])` → array of substrings. Delimiter may be a

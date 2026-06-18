@@ -1,4 +1,5 @@
 use crate::builtin::Builtin;
+use crate::testutil;
 use crate::vm::instr::Instr::*;
 use crate::vm::*;
 
@@ -3375,4 +3376,355 @@ fn prototype_ptr_lazy() {
     assert!(vm.prototype_ptr(TypeTag::Array).is_none());
     let p = vm.prototype_for(TypeTag::Array).unwrap();
     assert_eq!(vm.prototype_ptr(TypeTag::Array), Some(p));
+}
+
+// ── Step 2a Part 2: constructor objects + identifier rebinding ─────────────
+
+/// Constructors are callable functions: `typeof Array === "function"`,
+/// `typeof Map === "function"`, etc.
+#[test]
+fn constructors_are_callable_functions() {
+    assert_eq!(
+        testutil::eval("typeof Array"),
+        Value::String(RcStr::from("function"))
+    );
+    assert_eq!(
+        testutil::eval("typeof Map"),
+        Value::String(RcStr::from("function"))
+    );
+    assert_eq!(
+        testutil::eval("typeof Object"),
+        Value::String(RcStr::from("function"))
+    );
+    assert_eq!(
+        testutil::eval("typeof RegExp"),
+        Value::String(RcStr::from("function"))
+    );
+    assert_eq!(
+        testutil::eval("typeof Number"),
+        Value::String(RcStr::from("function"))
+    );
+    assert_eq!(
+        testutil::eval("typeof String"),
+        Value::String(RcStr::from("function"))
+    );
+    assert_eq!(
+        testutil::eval("typeof Boolean"),
+        Value::String(RcStr::from("function"))
+    );
+}
+
+/// `new Map()` / `new Set()` / `new RegExp()` construct (not "cannot call …
+/// with `new`"). Retires the ledger's "`new Map()` rejected" divergence.
+#[test]
+fn new_map_set_regexp_construct() {
+    let m = testutil::eval("new Map()");
+    assert!(matches!(m, Value::Map(_)));
+
+    let s = testutil::eval("new Set()");
+    assert!(matches!(s, Value::Set(_)));
+
+    let r = testutil::eval("new RegExp('ab', 'g')");
+    assert!(matches!(r, Value::RegExp(_)));
+}
+
+/// `new Map([['a',1]])` constructs a map with entries.
+#[test]
+fn new_map_with_entries() {
+    let m = testutil::eval("new Map([['a', 1], ['b', 2]])");
+    assert!(matches!(m, Value::Map(_)));
+}
+
+/// `new Set([1,2,3])` constructs a set with values.
+#[test]
+fn new_set_with_values() {
+    let s = testutil::eval("new Set([1, 2, 3, 2, 1])");
+    assert!(matches!(s, Value::Set(_)));
+}
+
+/// `Array(3)` calls as a plain function (creates a length-3 array).
+#[test]
+fn array_called_as_function() {
+    let a = testutil::eval("Array(3)");
+    assert!(matches!(a, Value::Array(_)));
+    // Verify it's a length-3 array via run_ret.
+    assert_eq!(
+        testutil::run_ret("return Array(3).length;"),
+        serde_json::json!(3)
+    );
+}
+
+/// `Array(1,2,3)` with multiple args creates `[1,2,3]`.
+#[test]
+fn array_with_args() {
+    assert_eq!(
+        testutil::run_ret("return Array(1, 2, 3);"),
+        serde_json::json!([1, 2, 3])
+    );
+}
+
+/// `Number("5")` / `String(5)` / `Boolean(0)` call as plain functions.
+#[test]
+fn coercing_constructors_as_functions() {
+    assert_eq!(
+        testutil::run_ret("return Number('5');"),
+        serde_json::json!(5)
+    );
+    assert_eq!(
+        testutil::run_ret("return String(5);"),
+        serde_json::json!("5")
+    );
+    assert_eq!(
+        testutil::run_ret("return Boolean(0);"),
+        serde_json::json!(false)
+    );
+}
+
+/// `Map()` without `new` throws a TypeError.
+#[test]
+fn map_without_new_throws() {
+    let prog = testutil::compile_ok("return Map();");
+    let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
+    let err = loop {
+        match vm.step(u64::MAX) {
+            Err(e) => break e,
+            Ok(StepResult::Done { .. }) => panic!("expected error"),
+            Ok(_) => {}
+        }
+    };
+    assert_eq!(err.kind, ErrorKind::TypeError);
+}
+
+/// `Set()` without `new` throws a TypeError.
+#[test]
+fn set_without_new_throws() {
+    let prog = testutil::compile_ok("return Set();");
+    let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
+    let err = loop {
+        match vm.step(u64::MAX) {
+            Err(e) => break e,
+            Ok(StepResult::Done { .. }) => panic!("expected error"),
+            Ok(_) => {}
+        }
+    };
+    assert_eq!(err.kind, ErrorKind::TypeError);
+}
+
+/// Namespaces are non-callable objects: `typeof Math === "object"`.
+#[test]
+fn namespaces_are_non_callable_objects() {
+    assert_eq!(
+        testutil::eval("typeof Math"),
+        Value::String(RcStr::from("object"))
+    );
+    assert_eq!(
+        testutil::eval("typeof JSON"),
+        Value::String(RcStr::from("object"))
+    );
+}
+
+/// `Math()` / `new Math` throw (non-callable namespace).
+#[test]
+fn math_call_and_new_throw() {
+    let prog = testutil::compile_ok("return Math();");
+    let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
+    let err = loop {
+        match vm.step(u64::MAX) {
+            Err(e) => break e,
+            Ok(StepResult::Done { .. }) => panic!("expected error"),
+            Ok(_) => {}
+        }
+    };
+    assert_eq!(err.kind, ErrorKind::TypeError);
+}
+
+/// `Math.PI`, `JSON.parse` resolve as own properties of the namespace object.
+#[test]
+fn namespace_own_properties() {
+    assert_eq!(
+        testutil::run_ret("return Math.PI;"),
+        serde_json::json!(std::f64::consts::PI)
+    );
+    // Math.max is a Value::Builtin on the namespace object.
+    let v = testutil::eval("Math.max");
+    assert!(matches!(v, Value::Builtin(_)));
+    // JSON.parse is a Value::Builtin on the namespace object.
+    let v = testutil::eval("JSON.parse");
+    assert!(matches!(v, Value::Builtin(_)));
+}
+
+/// `Math.max` as a value works when called via CallDyn.
+#[test]
+fn namespace_method_as_value_callable() {
+    assert_eq!(
+        testutil::run_ret("const f = Math.max; return f(2, 7);"),
+        serde_json::json!(7)
+    );
+}
+
+/// Enumerability: `Object.keys(Array.prototype) === []` — methods are virtual
+/// rungs, the prototype's own map is empty.
+#[test]
+fn prototype_methods_non_enumerable() {
+    assert_eq!(
+        testutil::run_ret("return Object.keys(Array.prototype);"),
+        serde_json::json!([])
+    );
+}
+
+/// `for-in` over an object shows own keys, not method names. (Tests on an
+/// object, not an array — `for-in` over arrays has a pre-existing limitation
+/// unrelated to Step 2a Part 2.)
+#[test]
+fn for_in_object_shows_own_keys_only() {
+    assert_eq!(
+        testutil::run_ret("const r = {x:1}; for (const k in r) { return k; } return 'none';"),
+        serde_json::json!("x")
+    );
+}
+
+/// The bare identifier resolves: `let f = Array; f === Array`.
+#[test]
+fn bare_identifier_resolves_to_constructor() {
+    assert_eq!(
+        testutil::run_ret("const f = Array; return f === Array;"),
+        serde_json::json!(true)
+    );
+    assert_eq!(
+        testutil::run_ret("const f = Array; return f(3).length;"),
+        serde_json::json!(3)
+    );
+}
+
+/// `const k = Object.keys; k({a:1})` works via the global binding.
+#[test]
+fn object_keys_as_callback() {
+    assert_eq!(
+        testutil::run_ret("const k = Object.keys; return k({a:1, b:2});"),
+        serde_json::json!(["a", "b"])
+    );
+}
+
+/// `Array.isArray` is accessible as a static on the constructor value.
+#[test]
+fn array_isarray_static_on_constructor() {
+    let v = testutil::eval("Array.isArray");
+    assert!(matches!(v, Value::Builtin(_)));
+    assert_eq!(
+        testutil::run_ret("return Array.isArray([1,2]);"),
+        serde_json::json!(true)
+    );
+    assert_eq!(
+        testutil::run_ret("return Array.isArray({});"),
+        serde_json::json!(false)
+    );
+}
+
+/// Constructors/namespaces have no JSON form (`stack_value_to_json` rejects).
+#[test]
+fn namespace_has_no_json_form() {
+    let mut vm = VM::new(vec![]);
+    let p = vm.namespace_for(crate::vm::GlobalId::Math).unwrap();
+    let result = vm.stack_value_to_json(&Value::Object(p), 0);
+    assert!(
+        matches!(result, Err(ref e) if e.kind == ErrorKind::ValueError),
+        "expected ValueError for namespace serialization, got {result:?}"
+    );
+}
+
+/// `namespace_ptr` returns `None` before lazy allocation and `Some` after.
+#[test]
+fn namespace_ptr_lazy() {
+    let mut vm = VM::new(vec![]);
+    assert!(vm.namespace_ptr(crate::vm::GlobalId::Math).is_none());
+    let p = vm.namespace_for(crate::vm::GlobalId::Math).unwrap();
+    assert_eq!(vm.namespace_ptr(crate::vm::GlobalId::Math), Some(p));
+}
+
+/// Namespace object is frozen (writing to it is a TypeError).
+#[test]
+fn namespace_is_frozen() {
+    let mut vm = VM::new(vec![]);
+    let p = vm.namespace_for(crate::vm::GlobalId::Math).unwrap();
+    assert_eq!(vm.objects[p as usize].integrity, IntegrityLevel::Frozen);
+    assert_eq!(vm.objects[p as usize].kind, ObjKind::BuiltinNamespace);
+}
+
+/// `Math === Math` (identity stable across references).
+#[test]
+fn math_identity_stable() {
+    assert_eq!(
+        testutil::run_ret("return Math === Math;"),
+        serde_json::json!(true)
+    );
+}
+
+/// `new Object(x)` returns x if x is an object, else `{}`.
+#[test]
+fn new_object_constructor() {
+    assert_eq!(
+        testutil::run_ret("const o = {a:1}; return new Object(o) === o;"),
+        serde_json::json!(true)
+    );
+    // `new Object()` with no args → empty object.
+    let v = testutil::eval("new Object()");
+    assert!(matches!(v, Value::Object(_)));
+}
+
+/// `new Array(3)` works (same as `Array(3)`).
+#[test]
+fn new_array_constructor() {
+    assert_eq!(
+        testutil::run_ret("return new Array(3).length;"),
+        serde_json::json!(3)
+    );
+    assert_eq!(
+        testutil::run_ret("return new Array(1,2,3);"),
+        serde_json::json!([1, 2, 3])
+    );
+}
+
+/// `new RegExp(re)` returns the same regexp (JS-faithful).
+#[test]
+fn new_regexp_same_regexp() {
+    assert_eq!(
+        testutil::run_ret("const r = /abc/g; return new RegExp(r) === r;"),
+        serde_json::json!(true)
+    );
+}
+
+/// `Object.getPrototypeOf(Array) === Function.prototype` — constructors chain
+/// to `Function.prototype`. Step 2b wires this fully; for now the constructor
+/// is a `Value::Builtin` and `Object.getPrototypeOf` only accepts
+/// `Value::Object`, so this is deferred to Step 2b.
+///
+/// `CallBuiltin` / namespace-call fast paths unchanged: `Math.max(2, 7)` still
+/// works via the fast path (codegen-shape — the call lowers to `CallBuiltin`).
+#[test]
+fn namespace_call_fast_path_unchanged() {
+    assert_eq!(
+        testutil::run_ret("return Math.max(2, 7);"),
+        serde_json::json!(7)
+    );
+    assert_eq!(
+        testutil::run_ret("return Math.PI;"),
+        serde_json::json!(std::f64::consts::PI)
+    );
+    assert_eq!(
+        testutil::run_ret("return JSON.parse('[1,2]');"),
+        serde_json::json!([1, 2])
+    );
+}
+
+/// Method-call fast paths unchanged: `arr.push(x)` still works.
+#[test]
+fn method_call_fast_path_unchanged() {
+    assert_eq!(
+        testutil::run_ret("const a = [1]; a.push(2); return a;"),
+        serde_json::json!([1, 2])
+    );
+    assert_eq!(
+        testutil::run_ret("return '  hi  '.trim();"),
+        serde_json::json!("hi")
+    );
 }

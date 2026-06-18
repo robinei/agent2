@@ -332,8 +332,10 @@ struct Compiler {
 //  function.rs    — hoist_function_decls, emit_function_def, …
 // All method bodies were moved to the sub-module files listed above.
 
-/// Represents a compile-time constant value (used for namespace member reads).
-enum ConstVal {
+/// Represents a compile-time constant value (used for namespace member reads
+/// and namespace-object materialization in Step 2a Part 2).
+#[derive(Copy, Clone)]
+pub(crate) enum ConstVal {
     Float(f64),
     PosInt(u64),
 }
@@ -386,6 +388,35 @@ fn namespace_constant(ns: &str, member: &str) -> Option<ConstVal> {
         ("Number", "MAX_SAFE_INTEGER") => Some(ConstVal::PosInt(9007199254740991)),
         ("Number", "EPSILON") => Some(ConstVal::Float(f64::EPSILON)),
         _ => None,
+    }
+}
+
+/// All compile-time constants carried by a namespace object (Step 2a Part 2).
+/// Used by `VM::namespace_for` to materialize `Math.PI`, `Math.E`, etc. as
+/// own properties on the frozen namespace object. The `Number` constants
+/// (`MAX_SAFE_INTEGER`, `EPSILON`) live on the `Number` constructor value's
+/// virtual rungs (resolved via `for_namespace`), not on a namespace object,
+/// so they are not materialized here — only `Math`/`JSON` namespace constants.
+pub(crate) fn namespace_constants() -> &'static [(&'static str, &'static str, ConstVal)] {
+    &[
+        ("Math", "PI", ConstVal::Float(std::f64::consts::PI)),
+        ("Math", "E", ConstVal::Float(std::f64::consts::E)),
+    ]
+}
+
+/// The static-method names of a namespace, for `VM::namespace_for` to
+/// materialize as `Value::Builtin` own properties on the namespace object.
+/// This is the closed set of names the `builtins!` registry declares for
+/// each namespace; it is kept in sync with the registry by inspection.
+pub(crate) fn namespace_static_names(ns: &str) -> &'static [&'static str] {
+    match ns {
+        "Math" => &[
+            "abs", "sqrt", "ceil", "floor", "round", "sign", "min", "max", "pow", "trunc", "cbrt",
+            "exp", "log", "log2", "log10", "sin", "cos", "tan", "asin", "acos", "atan", "atan2",
+            "hypot",
+        ],
+        "JSON" => &["parse", "stringify"],
+        _ => &[],
     }
 }
 

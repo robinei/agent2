@@ -2,6 +2,26 @@ use crate::builtin::Args;
 use crate::vm::{RcStr, VM, VMError, Value};
 use indexmap::IndexMap;
 
+/// `RegExp(pattern[, flags])` — the constructor as a plain call. Same as
+/// `new RegExp(pattern, flags)`: compiles the pattern with the given flags.
+/// `RegExp(re)` (a RegExp arg) returns `re` itself (JS: returns the same
+/// object). The `new` path folds the same logic via `VM::construct_builtin`.
+pub fn regexp_ctor(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    // `RegExp(re)` → return the regexp itself (JS-faithful).
+    if args.argc == 1
+        && let Value::RegExp(_) = args.get(vm, 0)
+    {
+        return Ok(args.get(vm, 0).clone());
+    }
+    let pattern = vm.string_from(args.get(vm, 0))?;
+    let flags = if args.argc >= 2 {
+        vm.string_from(args.get(vm, 1))?
+    } else {
+        RcStr::from("")
+    };
+    vm.alloc_regexp(pattern, flags)
+}
+
 /// Build the result object for `exec()` / non-global `match()`:
 /// `{ "0": full, "1": cap1, ..., "index": start, "input": input }`, plus a
 /// `groups` object when the pattern has named captures (`(?<name>…)`) —

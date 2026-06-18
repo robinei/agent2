@@ -3,6 +3,22 @@ use crate::vm::{VM, VMError, Value};
 
 // ── Number static implementations ────────────────────────────────────────────
 
+/// `Number(x)` / `new Number(x)` — the constructor as a plain call.
+/// `Number()` with no argument yields `0` (JS). With one arg, ToNumber.
+/// The `new` path would box (`new Number(5)` → a `Number` object); here it
+/// is a documented divergence — we have no boxed primitives, so `new Number(5)`
+/// returns the primitive `5` (Step 2b keeps method compat without boxing).
+pub fn number_ctor(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    if args.argc == 0 {
+        return Ok(Value::Float(0.0));
+    }
+    let n = args
+        .get(vm, 0)
+        .to_number()
+        .ok_or_else(|| vm.fail(crate::vm::ErrorKind::TypeError, "type error"))?;
+    Ok(Value::int_from_f64(n))
+}
+
 /// `Number.isInteger(x)` → bool.
 pub fn number_is_integer(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let v = args.get(vm, 0);

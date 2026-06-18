@@ -5,6 +5,32 @@ use thin_vec::ThinVec;
 
 // ── object static implementations ────────────────────────────────────────────
 
+/// `Object(x)` / `new Object(x)` — the constructor. Returns `x` if it is
+/// already an object (Object/Array/Map/Set/RegExp/Closure/Builtin/Bound/
+/// Promise), else coerces to a plain object. With no argument (or
+/// `undefined`/`null`), returns `{}`. Boxed primitives (`new Number(5)`) are
+/// deferred (Step 2b gives method compat without boxing); `Object(5)` in JS
+/// boxes too, but here it returns `{}` since we have no wrapper — a known
+/// divergence pinned in the ledger.
+pub fn object_ctor(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let arg = args.get(vm, 0);
+    match arg {
+        Value::Object(_)
+        | Value::Array(_)
+        | Value::Map(_)
+        | Value::Set(_)
+        | Value::RegExp(_)
+        | Value::Closure { .. }
+        | Value::Builtin(_)
+        | Value::Bound(_)
+        | Value::Promise(_) => Ok(arg.clone()),
+        Value::Undefined | Value::Null => Ok(vm.alloc_object(IndexMap::new())),
+        // Primitives: JS boxes (`Object(5)` → `new Number(5)`); we return
+        // `{}` (no wrapper type — Step 2b keeps method compat without boxing).
+        _ => Ok(vm.alloc_object(IndexMap::new())),
+    }
+}
+
 /// `Object.keys(obj)` → array of strings.
 pub fn obj_keys(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let obj_ptr = match args.get(vm, 0) {

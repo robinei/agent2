@@ -1,6 +1,7 @@
 use oxc_ast::ast;
 use oxc_span::GetSpan;
 
+use crate::builtin::Builtin;
 use crate::vm::{Instr, RcStr, Value};
 
 impl super::Compiler {
@@ -95,9 +96,13 @@ impl super::Compiler {
                 let pattern = self.intern_string(r.regex.pattern.text.as_str());
                 let flags_str = super::regexp_flags_to_str(r.regex.flags);
                 let flags = self.intern_string(&flags_str);
+                // Route through the `RegExp` constructor builtin — the same
+                // path as `new RegExp(pattern, flags)` and `RegExp(...)`. One
+                // canonical construction path (the `regexp_ctor` handler →
+                // `alloc_regexp`), no dedicated instruction.
                 self.emit(Instr::PushStr(pattern), span);
                 self.emit(Instr::PushStr(flags), span);
-                self.emit(Instr::RegExpNew, span);
+                self.emit(Instr::CallBuiltin(Builtin::RegExpCtor, 2), span);
             }
             ast::Expression::ThisExpression(t) => {
                 // A `this` inside an arrow resolves to the nearest non-arrow's
@@ -116,14 +121,15 @@ impl super::Compiler {
                     if super::is_error_ctor(id.name.as_str()) {
                         return self.compile_error_ctor(id.name.as_str(), n);
                     }
-                    if id.name == "RegExp" {
-                        return self.compile_regexp_ctor(n);
-                    }
-                    if id.name == "Map" {
-                        return self.compile_map_ctor(n);
-                    }
-                    if id.name == "Set" {
-                        return self.compile_set_ctor(n);
+                    // Step 2a Part 2: native constructors (`new Map()`,
+                    // `new Set()`, `new RegExp()`, `new Array()`, …) route
+                    // through the generic `new` path: `compile_expr(callee)`
+                    // emits `PushBuiltin(constructor)`, then `New` +
+                    // `NewReturn` — `Instr::New`'s builtin-constructor arm
+                    // folds the type's native construction. The dedicated
+                    // `compile_*_ctor` helpers are retired by this.
+                    if Builtin::for_constructor(id.name.as_str()).is_some() {
+                        return self.compile_new_call(n);
                     }
                 }
                 // Targeted message for the misuse LLMs actually type: there is
@@ -190,102 +196,17 @@ impl super::Compiler {
         );
     }
 
-    /// `new RegExp(pattern[, flags])` — compile pattern and flags, emit
-    /// `RegExpNew`. Pattern coerces to string; flags default to `""`.
-    pub(super) fn compile_regexp_ctor(&mut self, n: &ast::NewExpression) {
-        let span = n.span.start;
-        if n.arguments.len() > 2 {
-            self.error(span, "`new RegExp` takes at most two arguments");
-            return;
-        }
-        // First argument: pattern (required, coerced to string).
-        match n.arguments.first() {
-            None => {
-                let empty = self.intern_string("");
-                self.emit(Instr::PushStr(empty), span);
-            }
-            Some(arg) => match arg.as_expression() {
-                Some(expr) => {
-                    self.compile_expr(expr);
-                    self.emit(Instr::ToStr, span);
-                }
-                None => {
-                    self.error(span, "spread arguments are not supported in `new RegExp`");
-                    return;
-                }
-            },
-        }
-        // Second argument: flags (optional, coerced to string, default "").
-        if n.arguments.len() >= 2 {
-            match n.arguments[1].as_expression() {
-                Some(expr) => {
-                    self.compile_expr(expr);
-                    self.emit(Instr::ToStr, span);
-                }
-                None => {
-                    self.error(span, "spread arguments are not supported in `new RegExp`");
-                    return;
-                }
-            }
-        } else {
-            let empty = self.intern_string("");
-            self.emit(Instr::PushStr(empty), span);
-        }
-        self.emit(Instr::RegExpNew, span);
-    }
-
-    /// `new Map([entries])`: if an argument is given it must be an array of
-    /// [key, value] pairs. No argument → empty Map.
-    pub(super) fn compile_map_ctor(&mut self, n: &ast::NewExpression) {
-        let span = n.span.start;
-        if n.arguments.len() > 1 {
-            self.error(span, "`new Map` takes at most one (iterable) argument");
-            return;
-        }
-        if let Some(arg) = n.arguments.first() {
-            match arg.as_expression() {
-                Some(expr) => {
-                    self.compile_expr(expr);
-                }
-                None => {
-                    self.error(span, "spread arguments are not supported in `new Map`");
-                    return;
-                }
-            }
-        } else {
-            self.emit(Instr::PushUndefined, span);
-        }
-        self.emit(Instr::MapNew, span);
-    }
-
-    /// `new Set([iterable])`: if an argument is given it must be an array of
-    /// values. No argument → empty Set.
-    pub(super) fn compile_set_ctor(&mut self, n: &ast::NewExpression) {
-        let span = n.span.start;
-        if n.arguments.len() > 1 {
-            self.error(span, "`new Set` takes at most one (iterable) argument");
-            return;
-        }
-        if let Some(arg) = n.arguments.first() {
-            match arg.as_expression() {
-                Some(expr) => {
-                    self.compile_expr(expr);
-                }
-                None => {
-                    self.error(span, "spread arguments are not supported in `new Set`");
-                    return;
-                }
-            }
-        } else {
-            self.emit(Instr::PushUndefined, span);
-        }
-        self.emit(Instr::SetNew, span);
-    }
-
     /// `new F(args)` for a user-defined function `F` (not a builtin ctor).
     /// MVP requires a statically resolvable callee (an Identifier); in-practice
     /// `new (expr)()` is rare and the dynamic form is a documented divergence.
     /// Compiles to: push callee, push args, `New(nargs)`, `NewReturn`.
+    /// Step 2a Part 2: native constructors (`new Map()`, `new RegExp()`, …)
+    /// also flow through here — `compile_expr(callee)` emits
+    /// `PushBuiltin(constructor)`, and `Instr::New`'s builtin-constructor arm
+    /// Step 2a Part 2: native constructors (`new Map()`, `new RegExp()`, …)
+    /// also flow through here — `compile_expr(callee)` emits
+    /// `PushBuiltin(constructor)`, and `Instr::New`'s builtin-constructor arm
+    /// dispatches the native construction (`VM::construct_builtin`).
     fn compile_new_call(&mut self, n: &ast::NewExpression) {
         let span = n.span.start;
         // Push the callee (a Closure value)
@@ -339,6 +260,21 @@ impl super::Compiler {
             "undefined" => self.emit(Instr::PushUndefined, span),
             "NaN" => self.emit(Instr::PushFloat(f64::NAN), span),
             "Infinity" => self.emit(Instr::PushFloat(f64::INFINITY), span),
+            // Step 2a Part 2: bare constructor identifiers resolve to the real
+            // `Value::Builtin` (callable, `typeof === "function"`). The
+            // compiler's fast path (`Array(…)`, `new Array(…)`, `Array.isArray`)
+            // still lowers to `CallBuiltin`/`New` directly; this is the
+            // value/reflective path (`let f = Array`, `f === globalThis.Array`).
+            _ if Builtin::for_constructor(name).is_some() => {
+                let b = Builtin::for_constructor(name).unwrap();
+                self.emit(Instr::PushBuiltin(b), span);
+            }
+            // Step 2a Part 2: bare namespace identifiers (`Math`, `JSON`)
+            // resolve to the real frozen `Value::Object` (non-callable, `typeof
+            // === "object"`). The fast path (`Math.max(…)`) still lowers to
+            // `CallBuiltin`; this is the value path (`let m = Math`).
+            "Math" => self.emit(Instr::PushGlobal(crate::vm::GlobalId::Math), span),
+            "JSON" => self.emit(Instr::PushGlobal(crate::vm::GlobalId::JSON), span),
             _ => {
                 self.error(span, format!("undeclared variable `{name}`"));
             }

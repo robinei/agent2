@@ -78,6 +78,36 @@ pub enum TypeTag {
 impl TypeTag {
     /// Number of variants — sizes the prototype side table.
     pub const COUNT: usize = 9;
+
+    /// The JS constructor name for this type (`Array`, `Object`, …). The
+    /// `BuiltinKind::Constructor { type_tag }` rows use this to derive their
+    /// owning-namespace name, so a constructor's static methods
+    /// (`Array.isArray`, `Object.keys`) resolve via `for_namespace(name, …)`
+    /// — the same registry lookup the compiler's fast path uses.
+    pub fn name(&self) -> &'static str {
+        match self {
+            TypeTag::Array => "Array",
+            TypeTag::Object => "Object",
+            TypeTag::Map => "Map",
+            TypeTag::Set => "Set",
+            TypeTag::RegExp => "RegExp",
+            TypeTag::Function => "Function",
+            TypeTag::String => "String",
+            TypeTag::Number => "Number",
+            TypeTag::Boolean => "Boolean",
+        }
+    }
+}
+
+/// A global builtin value identifier for `Instr::PushGlobal` (Step 2a Part 2).
+/// Covers the non-callable namespace objects (`Math`, `JSON`) — frozen plain
+/// `Value::Object`s the VM lazily allocates from a side table. Constructor
+/// values (`Array`, `Map`, …) are `Value::Builtin` and pushed via the existing
+/// `Instr::PushBuiltin`; they don't need an entry here.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum GlobalId {
+    Math,
+    JSON,
 }
 
 /// Instructions for a stack based language used for LLM composition of complex tool flows.
@@ -94,6 +124,12 @@ pub enum Instr {
     PushObject(ObjectPtr),             // () -> obj
     PushFn(CodeAddr, ClosurePtr, u16), // () -> fn (u16 = JS arity for fn.length)
     PushBuiltin(Builtin),              // () -> builtin
+    /// Push a global namespace object (`Math`, `JSON`) — a frozen, non-callable
+    /// `Value::Object` lazily allocated by the VM. The reflective/value path for
+    /// the bare identifier (`let m = Math`) and indirect member reads
+    /// (`globalThis.Math.PI`); the compiler's fast path (`Math.max(…)`) still
+    /// lowers to `CallBuiltin` directly. () -> object
+    PushGlobal(GlobalId),
 
     Pop(usize),
 
@@ -309,20 +345,6 @@ pub enum Instr {
     /// compiler only emits when the binding is provably never reassigned). The
     /// captures are listed in the order the target body expects its upvals.
     ClosureNew(CodeAddr, u16, ThinVec<LocalIndex>), // () -> fn (u16 = JS arity for fn.length)
-
-    /// Pops a pattern string and a flags string, compiles a RegExp, pushes the
-    /// result as Value::RegExp. Flags string may be empty (no flags). Invalid
-    /// pattern or unknown flags → SyntaxError.
-    RegExpNew, // str, str -> regexp
-
-    /// Pops an iterable array (or undefined for empty), builds a Set with
-    /// SameValueZero deduplication, pushes the result as Value::Set.
-    SetNew, // arr? -> set
-
-    /// Pops an iterable array of [key, value] pairs (or undefined for empty),
-    /// builds a Map with SameValueZero key equality, pushes the result as
-    /// Value::Map.
-    MapNew, // entries? -> map
 
     /// pops N values where N is the number of field names, then pushes an
     /// object with each field set to its corresponding value. Left-to-right:

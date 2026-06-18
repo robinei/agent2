@@ -6,8 +6,8 @@ pub mod value;
 // Re-exports so external paths (`crate::vm::Value` etc.) are unchanged.
 pub use crate::rc_str::RcStr;
 pub use instr::{
-    ArrayPtr, CellIndex, ClosurePtr, CodeAddr, FieldName, Instr, LocalIndex, MapPtr, ObjectPtr,
-    PromisePtr, SetMode, SetPtr, SlotKind, StackAddr, TypeTag, UpdateMode,
+    ArrayPtr, CellIndex, ClosurePtr, CodeAddr, FieldName, GlobalId, Instr, LocalIndex, MapPtr,
+    ObjectPtr, PromisePtr, SetMode, SetPtr, SlotKind, StackAddr, TypeTag, UpdateMode,
 };
 pub use value::Value;
 pub(crate) use value::{MapKey, float_is_int, js_number_to_string};
@@ -231,8 +231,9 @@ const MAX_JSON_DEPTH: usize = 128;
 /// immutable; `last_index` is the one mutable bit — the `/g` iteration
 /// cursor (a byte offset), held in a `Cell` so a shared handle can advance
 /// it without the borrow overhead/panic risk of a `RefCell`. Each *literal
-/// evaluation* allocates a fresh instance (`Instr::RegExpNew`), so the
-/// cursor never leaks across unrelated uses — matching JS object identity.
+/// evaluation* allocates a fresh instance (via the `RegExp` constructor
+/// builtin), so the cursor never leaks across unrelated uses — matching JS
+/// object identity.
 #[derive(Debug)]
 pub struct RegExpData {
     pub pattern: RcStr,
@@ -291,8 +292,9 @@ pub enum IntegrityLevel {
 /// reflective artifacts this phase introduces (which have **no JSON form**
 /// per the invariant boundary) from ordinary user objects (which
 /// serialize as data). `BuiltinNamespace` (Step 2a Part 2: `Math`, `JSON`)
-/// joins here when those land; for Part 1 only `Ordinary` and
-/// `BuiltinPrototype` are constructed.
+/// is a frozen non-callable plain object carrying its statics/constants as
+/// own properties; `BuiltinPrototype` is the frozen per-type prototype with
+/// an empty map (methods are virtual rungs).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
 pub enum ObjKind {
     /// A plain user object — serializes to JSON.
@@ -300,6 +302,11 @@ pub enum ObjKind {
     Ordinary,
     /// A frozen builtin prototype (`Array.prototype`, …) — no JSON form.
     BuiltinPrototype,
+    /// A frozen builtin namespace (`Math`, `JSON`) — no JSON form. Carries
+    /// its statics/constants as own properties (materialized, since the
+    /// namespace is a plain object not a constructor — methods on it like
+    /// `Math.max` are `Value::Builtin` entries).
+    BuiltinNamespace,
 }
 
 /// An object stored in the `objects` heap. The `map` is the own-property
@@ -413,6 +420,13 @@ pub struct VM {
     /// materialized — Step 2a Part 2's enumerability requirement). All
     /// prototypes chain to `Object.prototype` (which chains to `null`).
     pub prototypes: Vec<Option<ObjectPtr>>,
+    /// Per-namespace frozen object side table (Step 2a Part 2), indexed by
+    /// `GlobalId as usize`. `None` until first reflective touch (lazy), so
+    /// the bare identifier `Math` and the fast path `Math.max(…)` pay
+    /// nothing unless the namespace object is actually read as a value. The
+    /// object is a frozen `ObjData` with `kind: BuiltinNamespace` (no JSON
+    /// form) carrying its statics/constants as own properties.
+    pub namespaces: Vec<Option<ObjectPtr>>,
 }
 
 /// A read-only view of one live call frame, for the debugger

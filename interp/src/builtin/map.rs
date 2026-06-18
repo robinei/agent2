@@ -2,6 +2,16 @@ use crate::builtin::Args;
 use crate::vm::{ErrorKind, MapKey, VM, VMError, Value};
 use thin_vec::ThinVec;
 
+/// `Map()` without `new` — throws (JS: `TypeError: Constructor Map requires
+/// 'new'`). The `new Map(…)` path is handled by `Instr::New`'s
+/// builtin-constructor arm (`VM::construct_builtin`).
+pub fn map_ctor(vm: &mut VM, _args: Args) -> Result<Value, VMError> {
+    Err(vm.fail(
+        ErrorKind::TypeError,
+        "cannot call `Map` as a function, use `new Map()`",
+    ))
+}
+
 pub fn map_is_map(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     Ok(Value::Bool(matches!(args.get(vm, 0), Value::Map(_))))
 }
@@ -174,16 +184,12 @@ pub fn map_set_entries(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 
 #[cfg(test)]
 mod tests {
-    use crate::{
-        Value,
-        testutil::{self, run_instrs},
-        vm::Instr,
-    };
+    use crate::{Value, testutil};
 
     #[test]
     fn map_new_empty() {
-        let out = run_instrs(vec![Instr::PushUndefined, Instr::MapNew]);
-        assert!(matches!(&out[0], Value::Map(_)));
+        let v = testutil::eval("new Map()");
+        assert!(matches!(v, Value::Map(_)));
     }
 
     #[test]

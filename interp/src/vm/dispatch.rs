@@ -50,6 +50,42 @@ impl VM {
         }
     }
 
+    /// Resolve a named property on a `Value::Builtin` constructor (Step 2a
+    /// Part 2). The virtual rungs are:
+    /// - `prototype` → the type's frozen prototype object (from the side
+    ///   table, lazily allocated);
+    /// - `name` → the constructor's display name (`meta().name`);
+    /// - static methods (`Array.isArray`, `Object.keys`, …) → resolved via
+    ///   `Builtin::for_namespace(type_tag.name(), field)`.
+    ///
+    /// Non-constructor builtins (method/namespace kinds) have no virtual
+    /// rungs here — `Math.max` as a value is a `Value::Builtin` read off
+    /// the namespace object, not a property of a constructor.
+    fn resolve_builtin_property(&mut self, b: Builtin, field_str: &str) -> Result<Value, VMError> {
+        // Only constructors have virtual rungs. A method/namespace builtin
+        // read as a value has no properties (it is a leaf function value);
+        // JS returns `undefined` for arbitrary prop reads on functions, but
+        // the reflective rungs (`prototype`/`name`/`length`) are the ones
+        // that matter and `length` is handled by `GetLength`.
+        let Some(tag) = b.constructor_type_tag() else {
+            // Non-constructor builtin: no virtual rungs. `undefined` for
+            // any property read (matches JS function-value behavior for
+            // unknown properties).
+            return Ok(Value::Undefined);
+        };
+        match field_str {
+            "prototype" => Ok(Value::Object(self.prototype_for(tag)?)),
+            "name" => Ok(Value::String(RcStr::from(b.meta().name))),
+            // Static methods on the constructor (`Array.isArray`,
+            // `Object.keys`, …) — resolved from the same registry the
+            // compiler's fast path uses, keyed by the type's name.
+            _ => match Builtin::for_namespace(tag.name(), field_str) {
+                Some(b) => Ok(Value::Builtin(b)),
+                None => Ok(Value::Undefined),
+            },
+        }
+    }
+
     /// Resolve `"prototype"` on a `Closure` receiver (for `F.prototype`).
     /// Lazily allocates an empty object on first access. Other property names
     /// on a Closure are a TypeError. Called directly from the `ObjGet`/`ObjPeek`
@@ -134,7 +170,7 @@ impl VM {
                 let meta = b.meta();
                 let n = match meta.kind {
                     BuiltinKind::Method => meta.min_args.saturating_sub(1),
-                    BuiltinKind::Namespace(_) => meta.min_args,
+                    BuiltinKind::Namespace(_) | BuiltinKind::Constructor { .. } => meta.min_args,
                 };
                 Some(n as u16)
             }
@@ -299,6 +335,11 @@ impl VM {
                     self.stack.push(Value::Builtin(*b));
                     self.ip += 1;
                 }
+                Instr::PushGlobal(g) => {
+                    let obj = self.namespace_for(*g)?;
+                    self.stack.push(Value::Object(obj));
+                    self.ip += 1;
+                }
 
                 Instr::Pop(n) => {
                     // Only expression temporaries may be popped, never locals
@@ -461,6 +502,28 @@ impl VM {
                     let args_start = self.stack.len() - nargs as usize;
                     let callable =
                         std::mem::replace(&mut self.stack[args_start - 1], Value::Undefined);
+                    // Native constructor (Step 2a Part 2): `new Map()`,
+                    // `new Set()`, `new RegExp()`, `new Array()`, … — fold
+                    // the type's native construction directly. The builtin's
+                    // `type_tag` keys the prototype side table (so the
+                    // constructed value's `[[Prototype]]` is correct); no
+                    // user-code frame is pushed, so the `NewReturn` that
+                    // follows this `New` in the code stream would wrongly
+                    // try to use the caller frame's `new_obj` (which we
+                    // never set). Skip it: `construct_builtin` consumes the
+                    // args and pushes the result, and we advance ip past
+                    // `NewReturn` in one step.
+                    if let Value::Builtin(b) = &callable
+                        && b.constructor_type_tag().is_some()
+                    {
+                        // Drop the callee placeholder slot.
+                        self.stack.remove(args_start - 1);
+                        self.construct_builtin(*b, nargs)?;
+                        // `construct_builtin` advanced ip past `New`;
+                        // skip the trailing `NewReturn` too.
+                        self.ip += 1;
+                        continue;
+                    }
                     let (_addr, ptr) = match &callable {
                         Value::Closure { addr, ptr } => (*addr, *ptr),
                         _ => {
@@ -1165,91 +1228,6 @@ impl VM {
                 }
 
                 // ── object operations ───────────────────────────
-                Instr::RegExpNew => {
-                    // Stack: [..., pattern_str, flags_str] (flags on top).
-                    let flags_val = self.pop()?;
-                    let pattern_val = self.pop()?;
-                    let pattern = self.str_from(&pattern_val)?;
-                    let flags_str = self.str_from(&flags_val)?;
-                    // Validate flags: only g, i, m, s, u, y, d, v are valid.
-                    for c in flags_str.chars() {
-                        if !matches!(c, 'g' | 'i' | 'm' | 's' | 'u' | 'y' | 'd' | 'v') {
-                            return Err(self.fail(
-                                ErrorKind::ValueError,
-                                format!("invalid regular expression flags: {flags_str}"),
-                            ));
-                        }
-                    }
-                    let compiled = match regress::Regex::with_flags(pattern, flags_str) {
-                        Ok(re) => re,
-                        Err(e) => {
-                            return Err(self.fail(
-                                ErrorKind::ValueError,
-                                format!("invalid regular expression: {e}"),
-                            ));
-                        }
-                    };
-                    let rx_data = RegExpData {
-                        pattern: self.string_from(&pattern_val)?,
-                        flags: self.string_from(&flags_val)?,
-                        compiled,
-                        last_index: std::cell::Cell::new(0),
-                    };
-                    self.stack.push(Value::RegExp(RcRegExp::new(rx_data)));
-                    self.ip += 1;
-                }
-
-                Instr::SetNew => {
-                    let arg = self.pop()?;
-                    let mut set: IndexSet<MapKey> = IndexSet::new();
-                    if let Value::Array(p) = arg {
-                        let arr = self
-                            .arrays
-                            .get(p as usize)
-                            .ok_or_else(|| self.fail(ErrorKind::ValueError, "value error"))?;
-                        for v in arr.iter() {
-                            set.insert(MapKey(v.clone()));
-                        }
-                    } else if !matches!(arg, Value::Undefined) {
-                        return Err(self.fail(ErrorKind::TypeError, "type error"));
-                    }
-                    let addr = self.sets.len() as SetPtr;
-                    self.sets.push(set);
-                    self.stack.push(Value::Set(addr));
-                    self.ip += 1;
-                }
-
-                Instr::MapNew => {
-                    let arg = self.pop()?;
-                    let mut map: IndexMap<MapKey, Value> = IndexMap::new();
-                    if let Value::Array(p) = arg {
-                        let entries = self
-                            .arrays
-                            .get(p as usize)
-                            .ok_or_else(|| self.fail(ErrorKind::ValueError, "value error"))?;
-                        for entry in entries.iter() {
-                            let pair_ptr = match entry {
-                                Value::Array(p) => *p,
-                                _ => return Err(self.fail(ErrorKind::TypeError, "type error")),
-                            };
-                            let pair = self
-                                .arrays
-                                .get(pair_ptr as usize)
-                                .ok_or_else(|| self.fail(ErrorKind::ValueError, "value error"))?;
-                            if pair.len() < 2 {
-                                continue;
-                            }
-                            map.insert(MapKey(pair[0].clone()), pair[1].clone());
-                        }
-                    } else if !matches!(arg, Value::Undefined) {
-                        return Err(self.fail(ErrorKind::TypeError, "type error"));
-                    }
-                    let addr = self.maps.len() as MapPtr;
-                    self.maps.push(map);
-                    self.stack.push(Value::Map(addr));
-                    self.ip += 1;
-                }
-
                 Instr::ObjNew(fields) => {
                     let n = fields.len();
                     if n > self.stack.len() {
@@ -1281,6 +1259,11 @@ impl VM {
                             self.stack.pop();
                             self.stack.push(val);
                         }
+                        Some(Value::Builtin(b)) => {
+                            let val = self.resolve_builtin_property(*b, &field_str)?;
+                            self.stack.pop();
+                            self.stack.push(val);
+                        }
                         _ => match self.resolve_property_from_top(&field_str) {
                             Ok(val) => {
                                 self.stack.pop();
@@ -1303,6 +1286,10 @@ impl VM {
                     match self.stack.last() {
                         Some(Value::Closure { ptr, .. }) => {
                             let val = self.resolve_closure_prototype(*ptr, &field_str)?;
+                            self.stack.push(val);
+                        }
+                        Some(Value::Builtin(b)) => {
+                            let val = self.resolve_builtin_property(*b, &field_str)?;
                             self.stack.push(val);
                         }
                         _ => {
@@ -1340,6 +1327,14 @@ impl VM {
                             // property shadows any builtin name).
                             self.stack.pop();
                             self.resolve_proto_chain(p, &field)?
+                        }
+                        Some(Value::Builtin(b)) => {
+                            // A builtin value read as a property: constructor
+                            // virtual rungs (`prototype`, `name`, statics) for
+                            // constructors; `undefined` for method/namespace
+                            // builtins (leaf function values).
+                            self.stack.pop();
+                            self.resolve_builtin_property(b, &field)?
                         }
                         Some(Value::Null) | Some(Value::Undefined) | None => {
                             let recv = self.pop()?;
@@ -1807,7 +1802,8 @@ impl VM {
                                 crate::builtin::BuiltinKind::Method => {
                                     meta.min_args.saturating_sub(1)
                                 }
-                                crate::builtin::BuiltinKind::Namespace(_) => meta.min_args,
+                                crate::builtin::BuiltinKind::Namespace(_)
+                                | crate::builtin::BuiltinKind::Constructor { .. } => meta.min_args,
                             };
                             Value::Float(n as f64)
                         }
