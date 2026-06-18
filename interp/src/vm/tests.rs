@@ -3572,15 +3572,36 @@ fn prototype_methods_non_enumerable() {
     );
 }
 
-/// `for-in` over an object shows own keys, not method names. (Tests on an
-/// object, not an array — `for-in` over arrays has a pre-existing limitation
-/// unrelated to Step 2a Part 2.)
+/// `for-in` over `[]` — the test the Part-2 box names. The "no method names"
+/// guarantee holds (array prototypes are virtual, the proto map is empty),
+/// but `for-in` over an array currently throws a `TypeError` because
+/// `for-in` lowers to `ObjKeys(container)`, which only accepts `Value::Object`
+/// — a pre-existing limitation pinned in the ledger (Step 2a Part 3 item F).
+/// The test documents this: no method names leak (the throw is before any
+/// enumeration), and the limitation is explicitly pinned, not papered over.
 #[test]
-fn for_in_object_shows_own_keys_only() {
-    assert_eq!(
-        testutil::run_ret("const r = {x:1}; for (const k in r) { return k; } return 'none';"),
-        serde_json::json!("x")
-    );
+fn for_in_array_throws_no_method_names_leak() {
+    let prog =
+        testutil::compile_ok("const r = []; for (const k in r) { return k; } return 'none';");
+    let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
+    let err = loop {
+        match vm.step(u64::MAX) {
+            Err(e) => break e,
+            Ok(StepResult::Done { value, .. }) => {
+                // If it completes (future fix), it must show no method names.
+                assert_eq!(
+                    value,
+                    Value::String(RcStr::from("none")),
+                    "for-in over [] must not enumerate method names"
+                );
+                return;
+            }
+            Ok(_) => {}
+        }
+    };
+    // Current behavior: TypeError (ObjKeys rejects non-Object). Pinned in
+    // the ledger — not a Step 2a regression.
+    assert_eq!(err.kind, ErrorKind::TypeError);
 }
 
 /// The bare identifier resolves: `let f = Array; f === Array`.

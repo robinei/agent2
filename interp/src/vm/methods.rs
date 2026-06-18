@@ -1,6 +1,6 @@
 use super::*;
 
-use crate::compiler::{ConstVal, namespace_constants, namespace_static_names};
+use crate::compiler::{ConstVal, namespace_constants};
 use crate::diag::Diagnostic;
 
 impl VM {
@@ -1127,15 +1127,12 @@ impl VM {
                 map.insert(key, v);
             }
         }
-        // Static functions: every namespaced builtin row for this namespace.
-        // We iterate the registry by scanning all `Builtin` variants — the
-        // `builtins!` macro gives us no direct iteration, so we use
-        // `Builtin::for_namespace` per known static name. The static name
-        // list is derived from the registry by a one-time scan: we look up
-        // every member name we know about. Since the registry is closed, we
-        // can collect the names by walking the well-known set.
-        for &member in namespace_static_names(ns_name) {
-            if let Some(b) = crate::builtin::Builtin::for_namespace(ns_name, member) {
+        // Static functions: projected from the `builtins!` registry — the
+        // same rows the compiler's fast path uses. No hand-maintained name
+        // list (Step 2a Part 3 item B): a namespace method added to the
+        // registry appears here with no second edit.
+        for (ns, member, b) in crate::builtin::Builtin::namespace_statics() {
+            if ns == ns_name {
                 map.insert(RcStr::from(member), Value::Builtin(b));
             }
         }
@@ -1154,163 +1151,137 @@ impl VM {
         self.namespaces.get(g as usize).copied().flatten()
     }
 
+    /// Construct a `Value::Map` from an optional iterable of `[key, value]`
+    /// pairs. The **one** native Map construction body (Step 2a Part 3 item C):
+    /// `new Map(entries)` and any other entry point share this. `arg` is
+    /// `Value::Undefined` for the no-arg case (`new Map()`).
+    pub(crate) fn map_construct(&mut self, arg: Value) -> Result<Value, VMError> {
+        let mut map: IndexMap<MapKey, Value> = IndexMap::new();
+        if let Value::Array(p) = arg {
+            let entries = self
+                .arrays
+                .get(p as usize)
+                .ok_or_else(|| self.fail(ErrorKind::ValueError, "value error"))?;
+            for entry in entries.iter() {
+                let pair_ptr = match entry {
+                    Value::Array(p) => *p,
+                    _ => {
+                        return Err(self.fail(ErrorKind::TypeError, "type error"));
+                    }
+                };
+                let pair = self
+                    .arrays
+                    .get(pair_ptr as usize)
+                    .ok_or_else(|| self.fail(ErrorKind::ValueError, "value error"))?;
+                if pair.len() < 2 {
+                    continue;
+                }
+                map.insert(MapKey(pair[0].clone()), pair[1].clone());
+            }
+        } else if !matches!(arg, Value::Undefined) {
+            return Err(self.fail(
+                ErrorKind::TypeError,
+                "Map argument must be an iterable of [key, value] pairs",
+            ));
+        }
+        let addr = self.maps.len() as MapPtr;
+        self.maps.push(map);
+        Ok(Value::Map(addr))
+    }
+
+    /// Construct a `Value::Set` from an optional iterable of values. The
+    /// **one** native Set construction body (Step 2a Part 3 item C):
+    /// `new Set(iterable)` and any other entry point share this. `arg` is
+    /// `Value::Undefined` for the no-arg case (`new Set()`).
+    pub(crate) fn set_construct(&mut self, arg: Value) -> Result<Value, VMError> {
+        let mut set: IndexSet<MapKey> = IndexSet::new();
+        if let Value::Array(p) = arg {
+            let arr = self
+                .arrays
+                .get(p as usize)
+                .ok_or_else(|| self.fail(ErrorKind::ValueError, "value error"))?;
+            for v in arr.iter() {
+                set.insert(MapKey(v.clone()));
+            }
+        } else if !matches!(arg, Value::Undefined) {
+            return Err(self.fail(ErrorKind::TypeError, "Set argument must be an iterable"));
+        }
+        let addr = self.sets.len() as SetPtr;
+        self.sets.push(set);
+        Ok(Value::Set(addr))
+    }
+
     /// Construct a value via a native constructor's `new` path. Step 2a
     /// Part 2: `new Map()`/`new Set()`/`new RegExp()`/`new Array()`/etc.
-    /// dispatches here. The args sit on the stack (arg 0 deepest),
-    /// `nargs` of them; this consumes them and pushes the constructed value.
-    /// A constructor that requires `new` (`Map`/`Set`) is never called
-    /// through the plain-call path here — that's the `Builtin::call` arm.
+    /// dispatches here. A **pure value-producer** (Step 2a Part 3 item D):
+    /// consumes the `nargs` args **and** the callee placeholder slot just
+    /// below them from the stack, pushes the constructed result, but does
+    /// **not** advance `self.ip` — the caller (`Instr::New`) owns the ip
+    /// step past both `New` and the dead `NewReturn`. No `Vec::remove`
+    /// mid-stack (item E): the stack is `[...caller, callee, args…]`, we
+    /// truncate to `base` (below the callee) and push, giving
+    /// `[...caller, result]` in one O(1) truncate + push.
     pub fn construct_builtin(
         &mut self,
         b: crate::builtin::Builtin,
         nargs: u32,
     ) -> Result<(), VMError> {
-        // Dispatch on the constructor's `type_tag`. Each arm folds the
-        // existing native-construction logic; the args are on the stack in
-        // the standard call convention (arg 0 deepest).
         let tag = b
             .constructor_type_tag()
             .expect("construct_builtin called on a non-constructor builtin");
-        use crate::vm::instr::TypeTag;
-        match tag {
-            TypeTag::Array => {
-                // `new Array(...)` — same as `Array(...)`. Reuse the handler:
-                // collect args, call `array_ctor`. The handler reads via
-                // `Args` against the stack top, so set up `Args` and call.
-                let n = nargs as usize;
-                if self.stack.len() < n {
-                    return Err(self.fail(ErrorKind::StackUnderflow, "stack underflow"));
-                }
-                let base = self.stack.len() - n;
-                let args = crate::builtin::Args { base, argc: n };
-                let result = crate::builtin::array_ctor(self, args)?;
-                self.stack.truncate(base);
-                self.stack.push(result);
-            }
-            TypeTag::Object => {
-                // `new Object(x)` — same as `Object(x)`.
-                let n = nargs as usize;
-                if self.stack.len() < n {
-                    return Err(self.fail(ErrorKind::StackUnderflow, "stack underflow"));
-                }
-                let base = self.stack.len() - n;
-                let args = crate::builtin::Args { base, argc: n };
-                let result = crate::builtin::object_ctor(self, args)?;
-                self.stack.truncate(base);
-                self.stack.push(result);
-            }
-            TypeTag::Map => {
-                // `new Map([entries])`.
-                let arg = if nargs == 0 {
+        let n = nargs as usize;
+        // Stack: [...caller, callee_placeholder, arg0, ..., argN-1].
+        // `base` is just below the callee; args start at `base + 1`.
+        if self.stack.len() < n + 1 {
+            return Err(self.fail(ErrorKind::StackUnderflow, "stack underflow"));
+        }
+        let base = self.stack.len() - n - 1;
+        let args = crate::builtin::Args {
+            base: base + 1,
+            argc: n,
+        };
+        let result = match tag {
+            // Types whose `*_ctor` handler **is** the construction body
+            // (callable as both `T(...)` and `new T(...)`): delegate to the
+            // handler directly.
+            crate::vm::instr::TypeTag::Array => crate::builtin::array_ctor(self, args)?,
+            crate::vm::instr::TypeTag::Object => crate::builtin::object_ctor(self, args)?,
+            crate::vm::instr::TypeTag::RegExp => crate::builtin::regexp_ctor(self, args)?,
+            crate::vm::instr::TypeTag::Number => crate::builtin::number_ctor(self, args)?,
+            crate::vm::instr::TypeTag::String => crate::builtin::string_ctor(self, args)?,
+            crate::vm::instr::TypeTag::Boolean => crate::builtin::boolean_ctor(self, args)?,
+            // Map/Set require `new` — their `*_ctor` handlers throw, so the
+            // construction body lives in `map_construct`/`set_construct`
+            // (one body per type, shared by all entry points).
+            crate::vm::instr::TypeTag::Map => {
+                let arg = if n == 0 {
                     Value::Undefined
                 } else {
-                    // One arg expected; extras ignored (JS-faithful leniency).
-                    let base = self.stack.len() - nargs as usize;
-                    self.stack[base].clone()
+                    args.get(self, 0).clone()
                 };
-                let base = self.stack.len() - nargs as usize;
-                self.stack.truncate(base);
-                let mut map: IndexMap<MapKey, Value> = IndexMap::new();
-                if let Value::Array(p) = arg {
-                    let entries = self
-                        .arrays
-                        .get(p as usize)
-                        .ok_or_else(|| self.fail(ErrorKind::ValueError, "value error"))?;
-                    for entry in entries.iter() {
-                        let pair_ptr = match entry {
-                            Value::Array(p) => *p,
-                            _ => {
-                                return Err(self.fail(ErrorKind::TypeError, "type error"));
-                            }
-                        };
-                        let pair = self
-                            .arrays
-                            .get(pair_ptr as usize)
-                            .ok_or_else(|| self.fail(ErrorKind::ValueError, "value error"))?;
-                        if pair.len() < 2 {
-                            continue;
-                        }
-                        map.insert(MapKey(pair[0].clone()), pair[1].clone());
-                    }
-                } else if !matches!(arg, Value::Undefined) {
-                    return Err(self.fail(
-                        ErrorKind::TypeError,
-                        "Map argument must be an iterable of [key, value] pairs",
-                    ));
-                }
-                let addr = self.maps.len() as MapPtr;
-                self.maps.push(map);
-                self.stack.push(Value::Map(addr));
+                self.map_construct(arg)?
             }
-            TypeTag::Set => {
-                // `new Set([iterable])`.
-                let arg = if nargs == 0 {
+            crate::vm::instr::TypeTag::Set => {
+                let arg = if n == 0 {
                     Value::Undefined
                 } else {
-                    let base = self.stack.len() - nargs as usize;
-                    self.stack[base].clone()
+                    args.get(self, 0).clone()
                 };
-                let base = self.stack.len() - nargs as usize;
-                self.stack.truncate(base);
-                let mut set: IndexSet<MapKey> = IndexSet::new();
-                if let Value::Array(p) = arg {
-                    let arr = self
-                        .arrays
-                        .get(p as usize)
-                        .ok_or_else(|| self.fail(ErrorKind::ValueError, "value error"))?;
-                    for v in arr.iter() {
-                        set.insert(MapKey(v.clone()));
-                    }
-                } else if !matches!(arg, Value::Undefined) {
-                    return Err(self.fail(ErrorKind::TypeError, "Set argument must be an iterable"));
-                }
-                let addr = self.sets.len() as SetPtr;
-                self.sets.push(set);
-                self.stack.push(Value::Set(addr));
-            }
-            TypeTag::RegExp => {
-                // `new RegExp(pattern[, flags])` — same as `RegExp(...)`.
-                let n = nargs as usize;
-                if self.stack.len() < n {
-                    return Err(self.fail(ErrorKind::StackUnderflow, "stack underflow"));
-                }
-                let base = self.stack.len() - n;
-                let args = crate::builtin::Args { base, argc: n };
-                let result = crate::builtin::regexp_ctor(self, args)?;
-                self.stack.truncate(base);
-                self.stack.push(result);
-            }
-            // `new Number(x)` / `new String(x)` / `new Boolean(x)` — JS boxes;
-            // here we return the primitive (documented divergence, no boxed
-            // primitives — Step 2b keeps method compat without boxing).
-            TypeTag::Number | TypeTag::String | TypeTag::Boolean => {
-                let n = nargs as usize;
-                if self.stack.len() < n {
-                    return Err(self.fail(ErrorKind::StackUnderflow, "stack underflow"));
-                }
-                let base = self.stack.len() - n;
-                let args = crate::builtin::Args { base, argc: n };
-                let handler = match tag {
-                    TypeTag::Number => crate::builtin::number_ctor,
-                    TypeTag::String => crate::builtin::string_ctor,
-                    TypeTag::Boolean => crate::builtin::boolean_ctor,
-                    _ => unreachable!(),
-                };
-                let result = handler(self, args)?;
-                self.stack.truncate(base);
-                self.stack.push(result);
+                self.set_construct(arg)?
             }
             // `Function` is a constructor in JS but has no `Builtin` row here
             // (no `new Function(body)` support); unreachable from the
             // registry. `TypeTag::Function` keys the prototype side table only.
-            TypeTag::Function => {
+            crate::vm::instr::TypeTag::Function => {
+                self.stack.truncate(base);
                 return Err(self.fail(
                     ErrorKind::TypeError,
                     "`new Function` is not supported (use function expressions)",
                 ));
             }
-        }
-        self.ip += 1;
+        };
+        self.stack.truncate(base);
+        self.stack.push(result);
         Ok(())
     }
 

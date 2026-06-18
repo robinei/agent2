@@ -397,27 +397,13 @@ fn namespace_constant(ns: &str, member: &str) -> Option<ConstVal> {
 /// (`MAX_SAFE_INTEGER`, `EPSILON`) live on the `Number` constructor value's
 /// virtual rungs (resolved via `for_namespace`), not on a namespace object,
 /// so they are not materialized here — only `Math`/`JSON` namespace constants.
+/// Static *functions* (`Math.max`, `JSON.parse`, …) are projected from the
+/// `builtins!` registry via `Builtin::namespace_statics()` — not listed here.
 pub(crate) fn namespace_constants() -> &'static [(&'static str, &'static str, ConstVal)] {
     &[
         ("Math", "PI", ConstVal::Float(std::f64::consts::PI)),
         ("Math", "E", ConstVal::Float(std::f64::consts::E)),
     ]
-}
-
-/// The static-method names of a namespace, for `VM::namespace_for` to
-/// materialize as `Value::Builtin` own properties on the namespace object.
-/// This is the closed set of names the `builtins!` registry declares for
-/// each namespace; it is kept in sync with the registry by inspection.
-pub(crate) fn namespace_static_names(ns: &str) -> &'static [&'static str] {
-    match ns {
-        "Math" => &[
-            "abs", "sqrt", "ceil", "floor", "round", "sign", "min", "max", "pow", "trunc", "cbrt",
-            "exp", "log", "log2", "log10", "sin", "cos", "tan", "asin", "acos", "atan", "atan2",
-            "hypot",
-        ],
-        "JSON" => &["parse", "stringify"],
-        _ => &[],
-    }
 }
 
 /// Canonicalize a non-negative numeric literal: an integer in `u64` range

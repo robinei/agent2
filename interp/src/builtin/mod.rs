@@ -250,6 +250,27 @@ macro_rules! builtins {
                 None
             }
 
+            /// Enumerate every `Namespace`-kind row as `(namespace, member,
+            /// Builtin)`. The single source of truth for populating the real
+            /// `Math`/`JSON`/… namespace objects (Step 2a Part 3): a new
+            /// namespace method added to the `builtins!` table appears on the
+            /// real object with no second edit, so the value path
+            /// (`Math.max` read as a value) and the call path
+            /// (`Math.max(…)` via `CallBuiltin`) cannot disagree.
+            pub fn namespace_statics() -> impl Iterator<Item = (&'static str, &'static str, Builtin)> {
+                [
+                    $(
+                        (if let BuiltinKind::Namespace(ns_val) = $kind {
+                            Some((ns_val, $name, Builtin::$variant))
+                        } else {
+                            None
+                        }),
+                    )*
+                ]
+                .into_iter()
+                .flatten()
+            }
+
             /// Look up a constructor builtin by its JS name (`Array`, `Map`, …).
             /// Step 2a Part 2: constructors are callable `Value::Builtin`s, so
             /// the bare identifier `Array` and `new Map(…)` resolve through this.
@@ -492,7 +513,7 @@ pub(crate) struct Args {
 
 impl Args {
     /// Arg `i`, or `&Value::Undefined` if absent. Zero-cost — no clone.
-    fn get<'a>(&self, vm: &'a VM, i: usize) -> &'a Value {
+    pub(crate) fn get<'a>(&self, vm: &'a VM, i: usize) -> &'a Value {
         if i < self.argc {
             &vm.stack[self.base + i]
         } else {

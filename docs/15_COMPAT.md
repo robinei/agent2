@@ -214,6 +214,12 @@ the canonical pair or smeared a new copy beside them.
 - **Finish a step before starting the next.** Each `Acceptance` box is a
   gate; do not begin step N+1 with step N's box unchecked. Steps are
   ordered by dependency.
+- **Runner-infrastructure changes and any wholesale `expectations.json`
+  rebaseline land in their own commit**, never folded into a feature
+  commit — a feature's corpus delta must be a readable diff (only the cells
+  it actually flipped). (Added after 2a Part 1 bundled a runner
+  panic-hardening fix that doubled the expectations file inside the feature
+  diff; see Step 0's baseline note and 2a Part 3 item G.)
 - Every new instruction needs a doc comment with its stack effect, a
   `step()` arm, an optimizer purity classification (walk each `pe_*`
   table), and a Phase-3 resume classification (`ResumeMode`).
@@ -294,6 +300,15 @@ prototypes) is recorded as **`known-divergence` with a ledger reference**, not
 `skip` and not a silent red. So the ledger and the suite agree from day one,
 and any later run that flips a cell (a regression, or an auto-resolved
 divergence) surfaces as a diff against the file.
+
+**Baseline-honesty note (added retroactively, 2a Part 3).** The baseline first
+committed here (24,843 entries) was a **truncated** sweep: the runner aborted on
+the first panicking test, so most of the suite never ran. 2a Part 1 added a panic
+hook + `catch_unwind` so the sweep completes, and the expectations file roughly
+doubled (→53,658) — that is the first *honest* full-suite map. Read the
+2a-Part-1 expectations as the real baseline, not this one. (This is exactly why
+the Ground rules now require runner/​rebaseline changes to land in their own
+commit: here the correction was buried in a feature diff.)
 
 **Keep the hand-written/differential corpus as a complement, not the primary.**
 test262 does not cover *our dialect's* own surface — `raise`, the condition
@@ -488,14 +503,137 @@ Acceptance (2a, Part 2):
 - [ ] **Enumerability:** `Object.keys(Array.prototype) === []` and
       `for-in` over `[]` shows no method names (methods are virtual rungs; the
       prototype's own map is empty).
-- [ ] The **bare identifier** resolves: `let f = Array; f === globalThis.Array`,
-      `const k = Object.keys; k({a:1})` work via the global binding, not a
-      member fiction.
+- [ ] The **bare identifier** resolves: `let f = Array; f === Array`,
+      `const k = Object.keys; k({a:1})` work — the name resolves to the real
+      constructor `Value`, not a member fiction. (**Amended** from the original
+      `f === globalThis.Array`: `globalThis` is *not* built here — see Part 3,
+      item A, and the ledger entry — because a faithful one needs identifier
+      resolution to read *through* a mutable global record, which this part does
+      not do. The bare-identifier resolution is the substantive win; `globalThis`
+      is deferred, not faked.)
 - [ ] `CallBuiltin` / namespace-call fast paths unchanged (codegen-shape);
       no proto-walk added to any method call. Alloc tests reflect only the
       one-time (or lazy) prototype/constructor allocation, asserted exactly.
 - [ ] Constructors/namespaces have no JSON form (`stack_value_to_json`
       rejects; test).
+- [ ] Gate: `cargo fmt && cargo clippy --workspace --all-targets && cargo test`.
+
+### Step 2a — Part 3: cleanup before 2b builds on top
+
+Parts 1–2 landed the representation and the JS object model and the gate is
+green, but a review surfaced a handful of loose ends. Two are
+**correctness-of-record** (an acceptance box claimed something the code does not
+do, and a "baseline" that was not honest); the rest are **local code smells that
+violate this phase's own rules** — "single source of truth" (Step 1) and "fewer
+helpers, one canonical path" (the convergence target). None block, but Step 2b
+wires reflection *through* these objects, so it should start from honest ground
+rather than inherit the debt. Finish this part before 2b, same as the other
+gates.
+
+**A — `globalThis`: defer it honestly, do not fake it frozen.** The Part 2 box
+claimed `f === globalThis.Array`; `globalThis` does not exist, and the test
+substitutes `f === Array`. The box is amended above to claim only what is true
+(the bare identifier resolves to the real constructor `Value`). The design
+question — *should the global object be frozen?* — is settled **no**: a frozen
+`globalThis` diverges from JS hard (`globalThis.foo = 1`, top-level `var`, and
+reassigning `Array` all throw against it), and its *only* motivation would be to
+paper over the fact that bare-name resolution here is **compile-time**
+(`compile_identifier` → `PushBuiltin`), so a *mutable* global object would create
+two sources of truth (`globalThis.Array = 5` would not be seen by a later bare
+`Array`). The faithful fix is not freezing — it is making identifier resolution
+read *through* a real **mutable global environment record**, so `Array` and
+`globalThis.Array` share one slot. That is a name-resolution change to the
+compiler, corpus-gated, and nothing in the suite needs writable globals yet. So:
+do **not** build a `globalThis` object in Part 3; record it as a deferred,
+schedulable item in the ledger with the through-the-record design noted, and stop
+overclaiming in the box.
+
+**B — `namespace_for` reintroduces a hand-maintained list (the Step-1 sin).**
+`VM::namespace_for` populates `Math`/`JSON` own properties by iterating
+`namespace_static_names(ns)` (`compiler/mod.rs:411`) — a hardcoded `match ns =>
+&["abs","sqrt",…]` "kept in sync with the registry by inspection." This is
+exactly the second-source-of-truth Step 1 *deleted* when it generated
+`method_for_receiver` from the `builtins!` macro: a new namespace method (or a
+typo in the list) silently fails to appear on the real `Math` object while the
+compiler's `Math.max(…)` fast path still works, so the value path and the call
+path disagree. **Fix:** extend the `builtins!` macro to enumerate the
+`Namespace`-kind rows (the same way it already generates `for_namespace`), and
+have `namespace_for` project the object's own properties from that enumeration.
+Delete `namespace_static_names`. This is the headline of Part 3 — it is the one
+item that is an actual regression of a finished step's guarantee, not just a
+local tidy.
+
+**C — one construction path per type, uniformly.** `construct_builtin` delegates
+to the `*_ctor` handler for Array/Object/RegExp/Number/String/Boolean, but
+**inlines** the full entry-iteration logic for `Map`/`Set` (lifted verbatim from
+the retired `MapNew`/`SetNew`). The commit message claims "one canonical
+construction path per type"; for Map/Set the path is a second body that shares
+nothing with the `*_ctor` row except the throw. **Fix:** extract
+`map_construct`/`set_construct` helpers (or fold the iteration into the existing
+handlers behind a `requires_new` flag) so every type has exactly one native
+construction body.
+
+**D — `construct_builtin` must not own control flow.** It currently does
+`self.ip += 1` internally, and the `New` dispatch arm then does another
+`self.ip += 1; continue` — ip advancement split across two functions, with the
+"skip the trailing `NewReturn`" reasoning spread between them. **Fix:** make
+`construct_builtin` a pure value-producer (consume `nargs`, push the result,
+leave `ip` alone); the `New` arm owns the single `self.ip += 2` that steps past
+both `New` and the dead `NewReturn`, with the comment in one place.
+
+**E — drop the O(n) mid-stack `remove` in the `New` arm.**
+`self.stack.remove(args_start - 1)` (`dispatch.rs:520`) shifts the entire stack
+above the callee slot on *every* native `new`. The args are already contiguous
+above the placeholder; restructure so the native-constructor path consumes the
+slot in place (the same shape `construct_builtin` already uses — compute `base`,
+truncate, push) instead of opening a hole and memmoving over it.
+
+**F — test the `for-in` case the box actually names.** Part 2 verified "no method
+names in `for-in`" on a *plain object* because array `for-in` had a pre-existing
+limitation; the box says `for-in` over `[]`. Now that array prototypes are
+virtual (empty proto map), `for-in` over `[]` should show no method names for the
+right reason. **Fix:** add the array `for-in` test the box specifies; if it still
+fails for an unrelated reason (array `for-in` not enumerating indices), pin that
+limitation explicitly in the ledger rather than satisfying the box with a
+different test.
+
+**G — the truncated baseline + a process rule.** The Step-0 baseline committed
+24,843 expectation entries; it was a *partial* sweep — the runner aborted on the
+first panicking test. Part 1's panic hook + `catch_unwind` made the sweep
+complete, and the file roughly doubled (→53,658) as a **side effect buried inside
+the feature commit's 50k-line diff**, so neither the rebaseline nor the feature's
+true corpus delta is reviewable there. **Fix (record-keeping, no code):** add a
+note to Step 0 that the honest baseline dates from 2a Part 1, and adopt the
+ground rule below so this does not recur.
+
+Add to **Ground rules**: *runner-infrastructure changes and any wholesale
+`expectations.json` rebaseline land in their own commit, never folded into a
+feature commit — a feature's corpus delta must be a readable diff (only the cells
+it actually flipped).*
+
+Acceptance (2a, Part 3):
+- [ ] `namespace_static_names` is **gone**; `Math`/`JSON` own properties are
+      projected from the `builtins!` registry (macro enumerates `Namespace`-kind
+      rows). A namespace method added to the registry appears on the real object
+      with no second edit (codegen-shape / inspection); value path and call path
+      cannot disagree.
+- [ ] `Map`/`Set` native construction has **one body** shared between
+      `new Map()` and any other entry point — no inlined copy in
+      `construct_builtin` (inspection).
+- [ ] `construct_builtin` does not mutate `self.ip`; the `New` arm owns the
+      `New`+`NewReturn` skip in one place (inspection).
+- [ ] The native-`new` path no longer calls `Vec::remove` mid-stack
+      (inspection); alloc/stack-shape tests unchanged.
+- [ ] `for-in` over `[]` shows no method names (the test the box names), or the
+      array-`for-in` limitation is pinned in the ledger.
+- [ ] The Part-2 `globalThis` box is amended (done); a ledger entry records
+      `globalThis` as deferred with the through-a-mutable-global-record design.
+      No frozen global object is built.
+- [ ] Step 0 notes that the honest baseline dates from 2a Part 1; the Ground
+      rules carry the "runner/​rebaseline in its own commit" rule.
+- [ ] No behavior change beyond the namespace-projection fix; suite + corpus
+      green; `expectations.json` unchanged (or only cells the projection fix
+      legitimately flips, in their own commit).
 - [ ] Gate: `cargo fmt && cargo clippy --workspace --all-targets && cargo test`.
 
 ### Step 2b — reflection wired to the real objects
@@ -963,6 +1101,19 @@ rather than silently tolerated:
   arguably *more* faithful). `Array` is the first to get a real (side-table)
   bag if the corpus warrants. Primitive prop writes (`"x".foo = 1`) do not
   persist (no-op / `TypeError` — pin one).
+- **`globalThis` is unimplemented** — Step 2a Part 2 / Part 3. Bare constructor
+  and namespace identifiers (`Array`, `Math`, …) resolve to the real `Value`s,
+  but there is no `globalThis` object, so `globalThis.Array` does not exist. It
+  is **deferred, not faked frozen**: a faithful `globalThis` requires identifier
+  resolution to read *through* a mutable global environment record (so `Array`
+  and `globalThis.Array` share one slot), not a frozen mirror object — freezing
+  would only paper over the compile-time name resolution and diverge from JS
+  (`globalThis.foo = 1`, top-level `var`, global reassignment all throw against a
+  frozen global). Schedulable when the corpus needs writable globals.
+- **Array `for-in`** — Step 2a Part 3 / item F. If `for-in` over an array does
+  not enumerate indices (pre-existing limitation), pin it here; the
+  "no method names in `for-in`" guarantee holds regardless (array prototypes are
+  virtual, the proto map is empty). Resolve when the corpus hits array `for-in`.
 
 ## Out of scope (permanent — the guardrails, restated)
 

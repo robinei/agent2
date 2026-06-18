@@ -508,20 +508,21 @@ impl VM {
                     // `type_tag` keys the prototype side table (so the
                     // constructed value's `[[Prototype]]` is correct); no
                     // user-code frame is pushed, so the `NewReturn` that
-                    // follows this `New` in the code stream would wrongly
-                    // try to use the caller frame's `new_obj` (which we
-                    // never set). Skip it: `construct_builtin` consumes the
-                    // args and pushes the result, and we advance ip past
-                    // `NewReturn` in one step.
+                    // follows this `New` in the code stream is dead.
+                    //
+                    // `construct_builtin` is a pure value-producer (Step 2a
+                    // Part 3 item D): it consumes the callee placeholder +
+                    // args and pushes the result, but does not touch `ip`.
+                    // No `Vec::remove` mid-stack (item E): it truncates to
+                    // below the callee and pushes, giving `[...caller,
+                    // result]` in one O(1) truncate + push. We own the
+                    // single `ip += 2` that steps past both `New` and the
+                    // dead `NewReturn`.
                     if let Value::Builtin(b) = &callable
                         && b.constructor_type_tag().is_some()
                     {
-                        // Drop the callee placeholder slot.
-                        self.stack.remove(args_start - 1);
                         self.construct_builtin(*b, nargs)?;
-                        // `construct_builtin` advanced ip past `New`;
-                        // skip the trailing `NewReturn` too.
-                        self.ip += 1;
+                        self.ip += 2;
                         continue;
                     }
                     let (_addr, ptr) = match &callable {
