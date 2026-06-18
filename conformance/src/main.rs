@@ -148,13 +148,14 @@ fn main() {
     if args.update {
         // Merge: if a filter was active, keep entries outside the filter scope.
         if let Some(filter) = &args.filter
-            && let Ok(existing) = Expectations::load(&args.expectations_path) {
-                for (path, expected) in existing.entries {
-                    if !path.contains(filter.as_str()) {
-                        new_expectations.entries.entry(path).or_insert(expected);
-                    }
+            && let Ok(existing) = Expectations::load(&args.expectations_path)
+        {
+            for (path, expected) in existing.entries {
+                if !path.contains(filter.as_str()) {
+                    new_expectations.entries.entry(path).or_insert(expected);
                 }
             }
+        }
         if let Err(e) = new_expectations.save(&args.expectations_path) {
             eprintln!("error: failed to save expectations: {e}");
             process::exit(1);
