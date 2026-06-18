@@ -82,11 +82,16 @@ pub(crate) fn resolve_const_functions(scopes: &mut [FuncScope]) -> HashSet<usize
         }
         // The external binding: a declaration's own name, or a function
         // expression's `const NAME = …` binding. Either must be non-reassigned.
+        // A binding that shares a param slot (annex B block-level function
+        // declaration with the same name as a parameter) is excluded: the slot
+        // is a live param slot that cannot be reclaimed, and the name may refer
+        // to the param value rather than the function (annex B "skip" semantics).
         let Some(name) = const_fn_binding_name(s) else {
             continue;
         };
         if let Some(info) = scopes[s.parent].names.get(name)
             && !scopes[s.parent].reassigned.contains(&info.slot)
+            && info.slot >= scopes[s.parent].params.len() as u32
         {
             const_fns.insert(id);
         }

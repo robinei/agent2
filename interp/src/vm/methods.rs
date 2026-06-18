@@ -40,6 +40,7 @@ impl VM {
             source: Arc::from(""),
             console_lines: Vec::new(),
             debug: crate::debuginfo::DebugTable::default(),
+            prototypes: Vec::new(),
         }
     }
 
@@ -261,6 +262,7 @@ impl VM {
             let diag = Diagnostic {
                 span,
                 message: e.message.clone(),
+                kind: crate::diag::DiagKind::Semantic,
             };
             diag.render(&self.source)
         } else {
@@ -317,20 +319,24 @@ impl VM {
         vm.objects.push(ObjData {
             proto: None,
             map: IndexMap::new(),
+            ..Default::default()
         }); // objects[0] = input
         vm.objects.push(ObjData {
             proto: None,
             map: IndexMap::new(),
+            ..Default::default()
         }); // objects[1] = attachments
         let input_entries = vm.seed_const_object(input)?;
         let attachment_entries = vm.seed_const_object(attachments)?;
         vm.objects[0] = ObjData {
             proto: None,
             map: input_entries,
+            ..Default::default()
         };
         vm.objects[1] = ObjData {
             proto: None,
             map: attachment_entries,
+            ..Default::default()
         };
         Ok(vm)
     }
@@ -838,6 +844,7 @@ impl VM {
         self.objects.push(ObjData {
             proto: None,
             map: obj,
+            ..Default::default()
         });
         Value::Object(addr)
     }
@@ -909,8 +916,9 @@ impl VM {
     }
 
     /// Set an `Object`'s `[[Prototype]]` to `val` (an `Object` or `Null`).
-    /// Rejects a non-Object/non-Null `val` and a cycle (the new proto's chain
-    /// must not reach the receiver), matching JS. Used by `Object.setPrototypeOf`.
+    /// Rejects a non-Object/non-Null `val`, a non-extensible (Sealed/Frozen)
+    /// receiver, and a cycle (the new proto's chain must not reach the
+    /// receiver), matching JS. Used by `Object.setPrototypeOf`.
     pub(crate) fn set_object_proto(
         &mut self,
         obj_ptr: ObjectPtr,
@@ -923,6 +931,18 @@ impl VM {
                 return Err(self.fail(ErrorKind::TypeError, "prototype must be an object or null"));
             }
         };
+        // Integrity gate (Step 2a): a non-extensible object's prototype is
+        // locked — JS `Object.setPrototypeOf` throws on Sealed/Frozen.
+        let integrity = self
+            .objects
+            .get(obj_ptr as usize)
+            .map_or(IntegrityLevel::Extensible, |o| o.integrity);
+        if matches!(integrity, IntegrityLevel::Sealed | IntegrityLevel::Frozen) {
+            return Err(self.fail(
+                ErrorKind::TypeError,
+                "cannot set prototype of a non-extensible object",
+            ));
+        }
         if let Some(proto_ptr) = new_proto
             && self.proto_chain_contains(proto_ptr, obj_ptr)?
         {
@@ -976,9 +996,58 @@ impl VM {
         self.objects.push(ObjData {
             proto: None,
             map: new_map,
+            ..Default::default()
         });
         self.closures[ptr as usize].prototype = Some(proto_ptr);
         Ok(proto_ptr)
+    }
+
+    // ── Step 2a: per-type builtin prototypes ──────────────────────────
+
+    /// Get the `ObjectPtr` of a builtin type's frozen prototype, allocating
+    /// it lazily on first access. The prototype is a frozen `ObjData` with
+    /// `kind: BuiltinPrototype` (no JSON form) and an empty `map` — methods
+    /// are *virtual rungs* resolved from the `builtins!` registry, not
+    /// materialized, so `Object.keys(Array.prototype)` is `[]` and `for-in`
+    /// shows no method names (Step 2a Part 2 enumerability). All prototypes
+    /// chain to `Object.prototype` (`proto: Some(..)`); `Object.prototype`
+    /// itself chains to `null` (`proto: None`), matching JS. The side table
+    /// (`self.prototypes`, indexed by `TypeTag as usize`) caches the ptr so
+    /// repeated calls return the same object — identity matters for
+    /// `Object.getPrototypeOf([]) === Array.prototype`.
+    pub fn prototype_for(&mut self, tag: crate::vm::instr::TypeTag) -> Result<ObjectPtr, VMError> {
+        let idx = tag as usize;
+        if let Some(Some(p)) = self.prototypes.get(idx) {
+            return Ok(*p);
+        }
+        // Object.prototype is the root: proto = None. Every other prototype
+        // chains to it, so allocate it first (recursively, but the recursion
+        // bottoms out immediately at the Object arm).
+        let proto = if matches!(tag, crate::vm::instr::TypeTag::Object) {
+            None
+        } else {
+            Some(self.prototype_for(crate::vm::instr::TypeTag::Object)?)
+        };
+        let ptr = self.objects.len() as ObjectPtr;
+        self.objects.push(ObjData {
+            proto,
+            map: IndexMap::new(),
+            integrity: IntegrityLevel::Frozen,
+            kind: ObjKind::BuiltinPrototype,
+        });
+        // Grow the side table to fit this index (lazy: starts empty).
+        if idx >= self.prototypes.len() {
+            self.prototypes
+                .resize(crate::vm::instr::TypeTag::COUNT, None);
+        }
+        self.prototypes[idx] = Some(ptr);
+        Ok(ptr)
+    }
+
+    /// Read-only peek at a prototype's `ObjectPtr` if already allocated, or
+    /// `None` if it has not been lazily materialized yet. Does *not* allocate.
+    pub fn prototype_ptr(&self, tag: crate::vm::instr::TypeTag) -> Option<ObjectPtr> {
+        self.prototypes.get(tag as usize).copied().flatten()
     }
 
     pub(super) fn alloc_closure(
@@ -1194,6 +1263,16 @@ impl VM {
                     .objects
                     .get(*p as usize)
                     .ok_or_else(|| self.fail(ErrorKind::ValueError, "value error"))?;
+                // JSON boundary (guardrail 2): builtin prototypes (and
+                // later namespaces) are reflective artifacts with no JSON
+                // form, unlike a user `Object.freeze`'d plain object whose
+                // data still serializes (Step 2d). `kind` distinguishes them.
+                if obj.kind == ObjKind::BuiltinPrototype {
+                    return Err(self.fail(
+                        ErrorKind::ValueError,
+                        "cannot serialize a builtin prototype to JSON",
+                    ));
+                }
                 let mut map = serde_json::Map::new();
                 for (k, v) in obj.map.iter() {
                     // JS: properties whose value is `undefined` are omitted.

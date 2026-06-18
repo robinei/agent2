@@ -482,6 +482,7 @@ impl VM {
                             self.objects.push(ObjData {
                                 proto: None,
                                 map: new_map,
+                                ..Default::default()
                             });
                             self.closures[ptr as usize].prototype = Some(proto_ptr);
                             proto_ptr
@@ -490,6 +491,7 @@ impl VM {
                     self.objects.push(ObjData {
                         proto: Some(proto_ptr),
                         map: IndexMap::new(),
+                        ..Default::default()
                     });
                     let new_obj_val = Value::Object(new_obj);
                     self.callstack.last_mut().unwrap().new_obj = Some(new_obj);
@@ -998,6 +1000,12 @@ impl VM {
                                 Value::Closure { .. } | Value::Builtin(_) | Value::Bound(_)
                             )
                         }
+                        // Primitive wrapper types: a primitive is never
+                        // `instanceof` its wrapper in JS (`"x" instanceof
+                        // String` is `false`), and this dialect has no boxed
+                        // primitives. These tags key the prototype side table
+                        // only; the compiler never emits them via `TypeCheck`.
+                        TypeTag::String | TypeTag::Number | TypeTag::Boolean => false,
                     };
                     self.stack.push(Value::Bool(result));
                     self.ip += 1;
@@ -1382,6 +1390,37 @@ impl VM {
                         }
                         Some(Value::Object(p)) => {
                             let obj_ptr = *p;
+                            // Integrity gate (Step 2a): a Frozen object rejects
+                            // all writes; a Sealed object rejects new keys.
+                            // The value is already popped; on a violation pop
+                            // the receiver too (pop-first invariant, matching
+                            // the non-object error arm below).
+                            let (is_new, integrity) = {
+                                let obj = match self.objects.get(obj_ptr as usize) {
+                                    Some(o) => o,
+                                    _ => {
+                                        return Err(self.fail_not_resumable(
+                                            ErrorKind::TypeError,
+                                            "bad object pointer",
+                                        ));
+                                    }
+                                };
+                                (!obj.map.contains_key(&field), obj.integrity)
+                            };
+                            if integrity == IntegrityLevel::Frozen {
+                                self.stack.pop();
+                                return Err(self.fail(
+                                    ErrorKind::TypeError,
+                                    "cannot set a property of a frozen object",
+                                ));
+                            }
+                            if integrity == IntegrityLevel::Sealed && is_new {
+                                self.stack.pop();
+                                return Err(self.fail(
+                                    ErrorKind::TypeError,
+                                    "cannot add a property to a sealed object",
+                                ));
+                            }
                             let obj = match self.objects.get_mut(obj_ptr as usize) {
                                 Some(o) => o,
                                 _ => {
@@ -1532,6 +1571,25 @@ impl VM {
                             Value::Object(p) => *p,
                             _ => unreachable!(),
                         };
+                        // Integrity gate (Step 2a): Frozen rejects all
+                        // writes; Sealed rejects new keys. All operands
+                        // (val+key+container) are already popped.
+                        let (is_new, integrity) = match self.objects.get(p as usize) {
+                            Some(o) => (!o.map.contains_key(field.as_str()), o.integrity),
+                            None => (true, IntegrityLevel::Extensible),
+                        };
+                        if integrity == IntegrityLevel::Frozen {
+                            return Err(self.fail(
+                                ErrorKind::TypeError,
+                                "cannot set a property of a frozen object",
+                            ));
+                        }
+                        if integrity == IntegrityLevel::Sealed && is_new {
+                            return Err(self.fail(
+                                ErrorKind::TypeError,
+                                "cannot add a property to a sealed object",
+                            ));
+                        }
                         let ip = self.ip;
                         let obj = self.objects.get_mut(p as usize).ok_or_else(|| {
                             VMError::fail_at(ip, ErrorKind::TypeError, "bad object pointer")
@@ -1568,6 +1626,19 @@ impl VM {
                             Value::Object(p) => p,
                             _ => return Err(self.fail(ErrorKind::TypeError, "type error")),
                         };
+                    // Integrity gate (Step 2a): Frozen and Sealed both
+                    // forbid delete. Both operands (field + object) are
+                    // already popped, so this is pop-first normalized.
+                    let integrity = self
+                        .objects
+                        .get(obj_ptr as usize)
+                        .map_or(IntegrityLevel::Extensible, |o| o.integrity);
+                    if matches!(integrity, IntegrityLevel::Frozen | IntegrityLevel::Sealed) {
+                        return Err(self.fail(
+                            ErrorKind::TypeError,
+                            "cannot delete a property of a frozen or sealed object",
+                        ));
+                    }
                     // shift_remove keeps the remaining keys in insertion order.
                     let ip = self.ip;
                     let existed = self

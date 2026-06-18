@@ -1,11 +1,26 @@
 //! Compile/run-time diagnostics shared by the analyzer and codegen.
 
+/// Which pass produced a [`Diagnostic`]. Lets the conformance runner bucket
+/// failures honestly (oxc parse errors vs. our own semantic rejections),
+/// instead of folding every compile error into one "parse error" bucket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiagKind {
+    /// An error from the `oxc_parser` pass (syntax): "Unexpected token",
+    /// "Cannot assign to this expression", etc.
+    Parse,
+    /// An error from our analyzer or codegen (semantics): "undeclared
+    /// variable", "X is not supported", "assignment to constant", etc.
+    Semantic,
+}
+
 /// A compile- or run-time diagnostic anchored at a source byte offset.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Diagnostic {
     /// Source byte offset the diagnostic points at.
     pub span: u32,
     pub message: String,
+    /// Which pass produced this diagnostic.
+    pub kind: DiagKind,
 }
 
 /// 1-based `(line, col)` of a byte offset in `source`, with the offset of the

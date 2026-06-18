@@ -7,7 +7,7 @@ pub mod value;
 pub use crate::rc_str::RcStr;
 pub use instr::{
     ArrayPtr, CellIndex, ClosurePtr, CodeAddr, FieldName, Instr, LocalIndex, MapPtr, ObjectPtr,
-    PromisePtr, SetMode, SetPtr, SlotKind, StackAddr, UpdateMode,
+    PromisePtr, SetMode, SetPtr, SlotKind, StackAddr, TypeTag, UpdateMode,
 };
 pub use value::Value;
 pub(crate) use value::{MapKey, float_is_int, js_number_to_string};
@@ -267,17 +267,57 @@ impl RcRegExp {
     }
 }
 
+/// Whole-object integrity level (Step 2a). The same field dogfooded by
+/// the builtin prototypes (constructed `Frozen`) is what the user-facing
+/// `Object.freeze`/`seal`/`preventExtensions` write in Step 2d — one
+/// mechanism, so the internal guarantee and the public surface are
+/// provably the same code. A three-state enum (not a bool) because `seal`
+/// sits between `preventExtensions` and `freeze`: `Sealed` forbids add +
+/// delete but allows modifying existing keys, `Frozen` forbids all three.
+/// Coarse / whole-object only — descriptor-accurate per-property
+/// `writable`/`configurable` is the Step-4 tier.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub enum IntegrityLevel {
+    /// Default: add / modify / delete all permitted.
+    #[default]
+    Extensible,
+    /// `Object.seal`: no add, no delete; modify-existing permitted.
+    Sealed,
+    /// `Object.freeze` / builtin prototypes: no add, no delete, no modify.
+    Frozen,
+}
+
+/// What kind of `Object` an `ObjData` is (Step 2a). Distinguishes the
+/// reflective artifacts this phase introduces (which have **no JSON form**
+/// per the invariant boundary) from ordinary user objects (which
+/// serialize as data). `BuiltinNamespace` (Step 2a Part 2: `Math`, `JSON`)
+/// joins here when those land; for Part 1 only `Ordinary` and
+/// `BuiltinPrototype` are constructed.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub enum ObjKind {
+    /// A plain user object — serializes to JSON.
+    #[default]
+    Ordinary,
+    /// A frozen builtin prototype (`Array.prototype`, …) — no JSON form.
+    BuiltinPrototype,
+}
+
 /// An object stored in the `objects` heap. The `map` is the own-property
 /// insertion-ordered store; `proto` is the optional prototype link (only
 /// `Object` receivers carry a proto — primitives, arrays, maps, and sets
 /// keep their structural builtin dispatch). `proto: None` is the common
 /// case (plain object literals, `new F()` before `.prototype` is given a
 /// proto, and all objects created by the existing VM code); only `proto:
-/// Some(_)` triggers the chain walk in `ObjGet`/`ObjHas`.
-#[derive(Debug)]
+/// Some(_)` triggers the chain walk in `ObjGet`/`ObjHas`. `integrity` is
+/// the whole-object freeze/seal level (Step 2a); `kind` marks the
+/// non-serializable reflective artifacts. Both default so `..Default::default()`
+/// keeps existing construction sites untouched.
+#[derive(Debug, Default)]
 pub struct ObjData {
     pub proto: Option<ObjectPtr>,
     pub map: IndexMap<FieldName, Value>,
+    pub integrity: IntegrityLevel,
+    pub kind: ObjKind,
 }
 
 pub struct VM {
@@ -363,6 +403,16 @@ pub struct VM {
     /// entries) for `VM::new` programs; the introspection accessors
     /// degrade gracefully.
     pub debug: crate::debuginfo::DebugTable,
+    /// Per-type frozen builtin prototype side table (Step 2a), indexed by
+    /// `TypeTag as usize`. `None` until first reflective touch (lazy), so
+    /// startup and the hot path pay nothing — `Vec::new()` at construction
+    /// is zero-alloc and the table grows only when a prototype is actually
+    /// consulted. The prototype itself is a frozen `ObjData` with
+    /// `kind: BuiltinPrototype` (no JSON form) and an empty `map` (methods
+    /// are virtual rungs resolved from the `builtins!` registry, not
+    /// materialized — Step 2a Part 2's enumerability requirement). All
+    /// prototypes chain to `Object.prototype` (which chains to `null`).
+    pub prototypes: Vec<Option<ObjectPtr>>,
 }
 
 /// A read-only view of one live call frame, for the debugger

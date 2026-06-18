@@ -2441,6 +2441,7 @@ fn stack_value_to_json_depth_limit() {
             )]
             .into_iter()
             .collect(),
+            ..Default::default()
         });
         innermost = Value::Object(obj);
     }
@@ -2926,6 +2927,7 @@ fn cyclic_value_serialization_errors() {
         map: [(RcStr::from("me"), Value::Object(0))]
             .into_iter()
             .collect(),
+        ..Default::default()
     });
     let result = vm.stack_value_to_json(&Value::Object(0), 0);
     assert!(
@@ -2942,7 +2944,11 @@ fn proto_chain_own_hit() {
     let mut vm = VM::new(vec![]);
     let mut map = IndexMap::new();
     map.insert(RcStr::from("x"), Value::PosInt(42));
-    vm.objects.push(ObjData { proto: None, map });
+    vm.objects.push(ObjData {
+        proto: None,
+        map,
+        ..Default::default()
+    });
     let val = vm.resolve_proto_chain(0, "x").unwrap();
     assert_eq!(val, Value::PosInt(42));
 }
@@ -2958,6 +2964,7 @@ fn proto_chain_proto_hit() {
     vm.objects.push(ObjData {
         proto: None,
         map: parent,
+        ..Default::default()
     });
     // Child: has no "x", but proto links to parent
     let mut child = IndexMap::new();
@@ -2965,6 +2972,7 @@ fn proto_chain_proto_hit() {
     vm.objects.push(ObjData {
         proto: Some(parent_ptr),
         map: child,
+        ..Default::default()
     });
     let val = vm.resolve_proto_chain(1, "x").unwrap();
     assert_eq!(val, Value::PosInt(99));
@@ -2977,6 +2985,7 @@ fn proto_chain_miss() {
     vm.objects.push(ObjData {
         proto: None,
         map: IndexMap::new(),
+        ..Default::default()
     });
     let val = vm.resolve_proto_chain(0, "nope").unwrap();
     assert_eq!(val, Value::Undefined);
@@ -2990,6 +2999,7 @@ fn proto_chain_none_short_circuit() {
     vm.objects.push(ObjData {
         proto: None,
         map: IndexMap::new(),
+        ..Default::default()
     });
     let val = vm.resolve_proto_chain(0, "missing").unwrap();
     assert_eq!(val, Value::Undefined);
@@ -3005,6 +3015,7 @@ fn proto_chain_own_shadows_proto() {
     vm.objects.push(ObjData {
         proto: None,
         map: parent,
+        ..Default::default()
     });
     // Child: x = 2, proto = parent
     let mut child = IndexMap::new();
@@ -3012,6 +3023,7 @@ fn proto_chain_own_shadows_proto() {
     vm.objects.push(ObjData {
         proto: Some(0),
         map: child,
+        ..Default::default()
     });
     let val = vm.resolve_proto_chain(1, "x").unwrap();
     assert_eq!(val, Value::PosInt(2), "own must shadow proto");
@@ -3027,6 +3039,7 @@ fn proto_chain_self_referential_no_hang() {
     vm.objects.push(ObjData {
         proto: Some(0), // points to itself
         map,
+        ..Default::default()
     });
     let val = vm.resolve_proto_chain(0, "nope").unwrap();
     assert_eq!(val, Value::Undefined);
@@ -3042,11 +3055,13 @@ fn obj_has_walks_proto_chain() {
     vm.objects.push(ObjData {
         proto: None,
         map: parent,
+        ..Default::default()
     });
     // Child: no "a", proto = parent
     vm.objects.push(ObjData {
         proto: Some(0),
         map: IndexMap::new(),
+        ..Default::default()
     });
     let val = vm.resolve_proto_chain(1, "a").unwrap();
     assert_eq!(val, Value::PosInt(1), "proto-chain hit via resolve");
@@ -3068,10 +3083,12 @@ fn obj_has_own_vs_proto() {
     vm.objects.push(ObjData {
         proto: None,
         map: parent,
+        ..Default::default()
     }); // 0: parent
     vm.objects.push(ObjData {
         proto: Some(0),
         map: IndexMap::new(),
+        ..Default::default()
     }); // 1: child
     match vm.step(u64::MAX).unwrap() {
         StepResult::Done { .. } => {
@@ -3106,10 +3123,12 @@ fn obj_set_only_affects_own() {
     vm.objects.push(ObjData {
         proto: None,
         map: parent,
+        ..Default::default()
     }); // 0: parent
     vm.objects.push(ObjData {
         proto: Some(0),
         map: IndexMap::new(),
+        ..Default::default()
     }); // 1: child
     match vm.step(u64::MAX).unwrap() {
         StepResult::Done { .. } => {
@@ -3140,10 +3159,12 @@ fn obj_delete_only_affects_own() {
     vm.objects.push(ObjData {
         proto: None,
         map: parent,
+        ..Default::default()
     }); // 0: parent
     vm.objects.push(ObjData {
         proto: Some(0),
         map: IndexMap::new(),
+        ..Default::default()
     }); // 1: child
     match vm.step(u64::MAX).unwrap() {
         StepResult::Done { .. } => {
@@ -3179,6 +3200,7 @@ fn obj_extend_reads_proto() {
     vm.objects.push(ObjData {
         proto: None,
         map: IndexMap::new(),
+        ..Default::default()
     }); // 0
     // Parent
     let mut parent = IndexMap::new();
@@ -3186,6 +3208,7 @@ fn obj_extend_reads_proto() {
     vm.objects.push(ObjData {
         proto: None,
         map: parent,
+        ..Default::default()
     }); // 1: parent
     // Child: own "own_only", proto = parent
     let mut child = IndexMap::new();
@@ -3193,6 +3216,7 @@ fn obj_extend_reads_proto() {
     vm.objects.push(ObjData {
         proto: Some(1),
         map: child,
+        ..Default::default()
     }); // 2: child
     match vm.step(u64::MAX).unwrap() {
         StepResult::Done { .. } => {
@@ -3200,4 +3224,155 @@ fn obj_extend_reads_proto() {
         }
         other => panic!("unexpected effect: {other:?}"),
     }
+}
+
+// ── Step 2a Part 1: frozen builtin prototypes + integrity field ───────────
+
+/// `Value` stays 16 bytes — the load-bearing size invariant. Per-type
+/// prototypes live in a static side table, never a per-value field.
+#[test]
+fn value_size_still_16_bytes() {
+    assert_eq!(std::mem::size_of::<Value>(), 16);
+}
+
+/// Every builtin type tag gets a frozen prototype from the side table, and
+/// the ptr is cached (repeat calls return the same object — identity matters
+/// for `Object.getPrototypeOf([]) === Array.prototype`).
+#[test]
+fn prototype_for_each_type_tag() {
+    let mut vm = VM::new(vec![]);
+    for tag in [
+        TypeTag::Array,
+        TypeTag::Object,
+        TypeTag::Map,
+        TypeTag::Set,
+        TypeTag::RegExp,
+        TypeTag::Function,
+        TypeTag::String,
+        TypeTag::Number,
+        TypeTag::Boolean,
+    ] {
+        let p1 = vm.prototype_for(tag).unwrap();
+        let p2 = vm.prototype_for(tag).unwrap();
+        assert_eq!(p1, p2, "prototype_for({tag:?}) not cached");
+        let obj = &vm.objects[p1 as usize];
+        assert_eq!(obj.integrity, IntegrityLevel::Frozen, "{tag:?} not frozen");
+        assert_eq!(obj.kind, ObjKind::BuiltinPrototype, "{tag:?} wrong kind");
+        assert!(
+            obj.map.is_empty(),
+            "{tag:?} map not empty (methods are virtual)"
+        );
+    }
+}
+
+/// All prototypes chain to `Object.prototype`; `Object.prototype` itself
+/// chains to `null` (`proto: None`).
+#[test]
+fn prototype_chain_to_object_prototype() {
+    let mut vm = VM::new(vec![]);
+    let object_proto = vm.prototype_for(TypeTag::Object).unwrap();
+    assert_eq!(
+        vm.objects[object_proto as usize].proto, None,
+        "Object.prototype should chain to null"
+    );
+    for tag in [
+        TypeTag::Array,
+        TypeTag::Map,
+        TypeTag::Set,
+        TypeTag::RegExp,
+        TypeTag::Function,
+        TypeTag::String,
+        TypeTag::Number,
+        TypeTag::Boolean,
+    ] {
+        let p = vm.prototype_for(tag).unwrap();
+        assert_eq!(
+            vm.objects[p as usize].proto,
+            Some(object_proto),
+            "{tag:?}.prototype should chain to Object.prototype"
+        );
+    }
+}
+
+/// Writing to a frozen prototype via `ObjSet` is a `TypeError`.
+#[test]
+fn objset_on_frozen_prototype_is_typeerror() {
+    let mut vm = VM::new(vec![]);
+    let proto = vm.prototype_for(TypeTag::Array).unwrap();
+    vm.stack.push(Value::Object(proto));
+    vm.stack.push(Value::PosInt(1));
+    vm.code = vec![Instr::ObjSet(RcStr::from("x"), SetMode::New)];
+    vm.ip = 0;
+    let err = vm.step(u64::MAX).unwrap_err();
+    assert_eq!(err.kind, ErrorKind::TypeError);
+    // The prototype's map is still empty — the write was rejected.
+    assert!(vm.objects[proto as usize].map.is_empty());
+}
+
+/// Deleting from a frozen prototype via `ObjDelete` is a `TypeError`.
+#[test]
+fn objdelete_on_frozen_prototype_is_typeerror() {
+    let mut vm = VM::new(vec![]);
+    let proto = vm.prototype_for(TypeTag::Object).unwrap();
+    vm.stack.push(Value::Object(proto));
+    vm.stack.push(Value::String(RcStr::from("x")));
+    vm.code = vec![Instr::ObjDelete];
+    vm.ip = 0;
+    let err = vm.step(u64::MAX).unwrap_err();
+    assert_eq!(err.kind, ErrorKind::TypeError);
+}
+
+/// `Object.setPrototypeOf` on a frozen prototype is a `TypeError`.
+#[test]
+fn set_proto_on_frozen_prototype_is_typeerror() {
+    let mut vm = VM::new(vec![]);
+    let proto = vm.prototype_for(TypeTag::Array).unwrap();
+    let err = vm.set_object_proto(proto, Value::Null).unwrap_err();
+    assert_eq!(err.kind, ErrorKind::TypeError);
+}
+
+/// A builtin prototype has no JSON form — `stack_value_to_json` rejects it,
+/// per the invariant boundary. (A user `Object.freeze`'d plain object still
+/// serializes — Step 2d — so the rejection is keyed on `kind`, not
+/// `integrity`.)
+#[test]
+fn prototype_has_no_json_form() {
+    let mut vm = VM::new(vec![]);
+    let proto = vm.prototype_for(TypeTag::Array).unwrap();
+    let result = vm.stack_value_to_json(&Value::Object(proto), 0);
+    assert!(
+        matches!(result, Err(ref e) if e.kind == ErrorKind::ValueError),
+        "expected ValueError for prototype serialization, got {result:?}"
+    );
+}
+
+/// An ordinary (user) object — even one manually marked `Frozen` — still
+/// serializes to JSON. This pins the distinction: the JSON rejection is
+/// `kind == BuiltinPrototype`, not `integrity == Frozen`.
+#[test]
+fn frozen_ordinary_object_serializes() {
+    let mut vm = VM::new(vec![]);
+    let mut map = IndexMap::new();
+    map.insert(RcStr::from("x"), Value::PosInt(1));
+    let ptr = vm.objects.len() as ObjectPtr;
+    vm.objects.push(ObjData {
+        proto: None,
+        map,
+        integrity: IntegrityLevel::Frozen,
+        kind: ObjKind::Ordinary,
+    });
+    let result = vm.stack_value_to_json(&Value::Object(ptr), 0);
+    assert!(
+        result.is_ok(),
+        "a frozen ordinary object should serialize, got {result:?}"
+    );
+}
+
+/// `prototype_ptr` returns `None` before lazy allocation and `Some` after.
+#[test]
+fn prototype_ptr_lazy() {
+    let mut vm = VM::new(vec![]);
+    assert!(vm.prototype_ptr(TypeTag::Array).is_none());
+    let p = vm.prototype_for(TypeTag::Array).unwrap();
+    assert_eq!(vm.prototype_ptr(TypeTag::Array), Some(p));
 }

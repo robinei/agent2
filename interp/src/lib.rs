@@ -16,9 +16,9 @@ pub mod vm;
 #[cfg(test)]
 pub(crate) mod testutil;
 
-pub use compiler::{Program, compile};
+pub use compiler::{Program, compile, compile_for_test262};
 pub use debuginfo::{DebugTable, FnDebug};
-pub use diag::Diagnostic;
+pub use diag::{DiagKind, Diagnostic};
 pub use rc_str::RcStr;
 pub use vm::{
     ErrorKind, FrameView, Instr, InvokeCall, PromisePtr, PromiseState, ResumeMode, StepResult, VM,

@@ -1248,7 +1248,12 @@ fn raise_location(vm: &VM, condition: &str) -> String {
     let message = format!("condition `{condition}` raised");
     let ip = (vm.ip as usize).saturating_sub(1);
     match vm.spans.get(ip) {
-        Some(&span) if !vm.source.is_empty() => Diagnostic { span, message }.render(&vm.source),
+        Some(&span) if !vm.source.is_empty() => Diagnostic {
+            kind: interp::DiagKind::Semantic,
+            span,
+            message,
+        }
+        .render(&vm.source),
         _ => message,
     }
 }

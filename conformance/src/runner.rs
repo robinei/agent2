@@ -1,9 +1,10 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Instant;
 
-use interp::{StepResult, VM, compile};
+use interp::{StepResult, VM, compile_for_test262};
 
 use crate::expectations::{Expectations, ExpectedResult};
 use crate::frontmatter::{Negative, parse_frontmatter};
@@ -11,6 +12,67 @@ use crate::harness::Harness;
 
 const STEP_FUEL: u64 = 200_000;
 const WORKER_STACK: usize = 16 * 1024 * 1024;
+
+thread_local! {
+    /// The path of the test currently executing on this thread, so the panic
+    /// hook can attribute a crash to a specific test file.
+    static CURRENT_TEST: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+static HOOK_INSTALLED: AtomicBool = AtomicBool::new(false);
+
+/// Install a panic hook that prefixes the crashing test's path. Without it, a
+/// worker-thread panic prints only `thread '<unnamed>' panicked at …` with no
+/// indication of which test was running. Idempotent across `run_tests` calls.
+fn install_panic_hook() {
+    if HOOK_INSTALLED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    std::panic::set_hook(Box::new(move |info| {
+        let test = CURRENT_TEST.with(|c| c.borrow().clone());
+        let thread = std::thread::current();
+        let name = thread.name().unwrap_or("<unnamed>");
+        let id = thread.id();
+        let loc = info.location();
+        let payload = info.payload();
+        let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
+            (*s).to_string()
+        } else if let Some(s) = payload.downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "Box<dyn Any>".to_string()
+        };
+        if let Some(test) = test {
+            eprintln!("── test panicked: {test} ──");
+        }
+        if let Some(loc) = loc {
+            eprintln!(
+                "thread '{name}' ({id:?}) panicked at {}:{}:{}:",
+                loc.file(),
+                loc.line(),
+                loc.column()
+            );
+        } else {
+            eprintln!("thread '{name}' ({id:?}) panicked:");
+        }
+        eprintln!("{msg}");
+        eprintln!("note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace");
+    }));
+}
+
+/// Pull a printable message out of a panic payload (which is either a
+/// `&'static str` or a `String` for the standard `panic!`/`assert!`/`unwrap`
+/// macros, or a `Box<dyn Any + Send>` otherwise).
+fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".to_string()
+    }
+}
 
 /// Features that the VM structurally cannot support.
 const SKIP_FEATURES: &[&str] = &[
@@ -39,12 +101,16 @@ const SKIP_FLAGS: &[&str] = &["module", "async", "raw"];
 fn coarse_cause(detail: &str) -> String {
     if detail.starts_with("parse:") {
         "parse error".to_string()
+    } else if detail.starts_with("semantic:") {
+        "semantic error".to_string()
     } else if detail.starts_with("harness:") {
         "harness load error".to_string()
     } else if detail.starts_with("vm-init:") {
         "vm-init error".to_string()
     } else if detail.starts_with("unexpected raise:") {
         "unexpected raise".to_string()
+    } else if detail.starts_with("panic:") {
+        "panic".to_string()
     } else {
         // Already coarse: "runtime: TypeError", "out of fuel",
         // "expected error, got success", "panic (…)", "unexpected pending".
@@ -84,6 +150,9 @@ struct WorkItem {
     full_source: String,
     negative: Option<Negative>,
     features: Vec<String>,
+    /// Parse in strict mode (test262 `onlyStrict`); non-strict script
+    /// otherwise (`noStrict` and unflagged tests).
+    strict: bool,
 }
 
 pub fn run_tests(
@@ -96,6 +165,7 @@ pub fn run_tests(
     let mut harness = Harness::new(local_harness.to_path_buf(), test262_harness.to_path_buf());
     let mut stats = RunStats::default();
     let started = Instant::now();
+    install_panic_hook();
 
     // Collect test paths.
     let mut test_paths: Vec<PathBuf> = Vec::new();
@@ -215,11 +285,13 @@ pub fn run_tests(
         };
 
         // Run in a worker thread with a large stack to survive compiler recursion.
+        let strict = fm.flags.iter().any(|f| f == "onlyStrict");
         let work = WorkItem {
             path: rel_str,
             full_source,
             negative: fm.negative,
             features: fm.features,
+            strict,
         };
         let work_path = work.path.clone();
         let work_features = work.features.clone();
@@ -249,9 +321,9 @@ pub fn run_tests(
                 }
                 stats.results.push(r);
             }
-            Err(_) => {
+            Err(payload) => {
                 stats.fail += 1;
-                let detail = "panic (stack overflow or internal error)".to_string();
+                let detail = format!("panic: {}", panic_message(&payload));
                 *stats.by_cause.entry(coarse_cause(&detail)).or_insert(0) += 1;
                 stats.results.push(TestResult {
                     path: work_path,
@@ -278,13 +350,27 @@ pub fn run_tests(
 /// are created and destroyed within this thread. Only String/TestResult cross
 /// the thread boundary.
 fn run_work_item(item: WorkItem) -> TestResult {
-    let program = match compile(&item.full_source) {
+    CURRENT_TEST.with(|c| *c.borrow_mut() = Some(item.path.clone()));
+    let program = match compile_for_test262(&item.full_source, item.strict) {
         Ok(p) => p,
         Err(diags) => {
-            let msg = diags
-                .first()
+            let first = diags.first();
+            let msg = first
                 .map(|d| d.render(&item.full_source))
                 .unwrap_or_else(|| "compile error".to_string());
+            // Bucket by phase: oxc parse error vs. our own semantic rejection
+            // (undeclared global, unsupported feature, assignment to constant,
+            // …). The distinction is what makes the failure histogram useful.
+            let phase = match first.map(|d| d.kind) {
+                Some(interp::DiagKind::Parse) => "parse",
+                Some(interp::DiagKind::Semantic) => "semantic",
+                None => "compile",
+            };
+            if std::env::var_os("PROBE_PARSE").is_some() {
+                let phase_uc = phase.to_uppercase();
+                let first_line = msg.split('\n').next().unwrap_or("");
+                eprintln!("{phase_uc} {} :: {first_line}", item.path);
+            }
             if let Some(neg) = &item.negative
                 && neg.phase.as_deref() == Some("parse")
             {
@@ -298,7 +384,7 @@ fn run_work_item(item: WorkItem) -> TestResult {
             return TestResult {
                 path: item.path,
                 outcome: TestOutcome::Fail,
-                detail: format!("parse: {msg}"),
+                detail: format!("{phase}: {msg}"),
                 features: item.features,
             };
         }

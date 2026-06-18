@@ -89,7 +89,11 @@ pub fn obj_from_entries(vm: &mut VM, args: Args) -> Result<Value, VMError> {
         map.insert(key, pair[1].clone());
     }
     let addr = vm.objects.len() as u32;
-    vm.objects.push(ObjData { proto: None, map });
+    vm.objects.push(ObjData {
+        proto: None,
+        map,
+        ..Default::default()
+    });
     Ok(Value::Object(addr))
 }
 

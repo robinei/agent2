@@ -49,14 +49,35 @@ pub struct Program {
 /// Compile JS source into a `Program`. Collects every diagnostic (oxc syntax
 /// errors plus our own semantic errors) and returns them all if any exist,
 /// rather than producing a partial program.
+///
+/// Parses as a strict module: top-level `await` is permitted (the primary
+/// pattern — the program is the main task, 7_ASYNC) and top-level `return`
+/// is permitted via `allow_return_outside_function` (8_HARNESS Step 0). This
+/// is the dialect's own surface. For test262 conformance (mostly non-strict
+/// scripts), use [`compile_for_test262`].
 pub fn compile(source: &str) -> Result<Program, Vec<Diagnostic>> {
+    compile_with(source, SourceType::mjs())
+}
+
+/// Compile for a test262 test, selecting strict vs. non-strict script mode.
+///
+/// `strict = false` (the default for `noStrict` and unflagged tests) parses
+/// as a non-strict script — annex B block-level function declarations, `with`,
+/// octal literals, duplicate params, etc. are legal. `strict = true` (for
+/// `onlyStrict` tests) parses as a strict module, matching test262's strict-
+/// mode run. `module`-flagged tests are skipped by the runner before reaching
+/// here, so top-level `await`/`import` from module mode is irrelevant.
+pub fn compile_for_test262(source: &str, strict: bool) -> Result<Program, Vec<Diagnostic>> {
+    let source_type = if strict {
+        SourceType::mjs()
+    } else {
+        SourceType::script()
+    };
+    compile_with(source, source_type)
+}
+
+fn compile_with(source: &str, source_type: SourceType) -> Result<Program, Vec<Diagnostic>> {
     let allocator = Allocator::default();
-    // Module mode, so top-level `await` parses (the primary pattern: the
-    // program is the main task — 7_ASYNC). Top-level `return` (8_HARNESS
-    // Step 0) is preserved via `allow_return_outside_function`. Other
-    // module-vs-script differences (e.g. `with`) are already rejected
-    // explicitly by the compiler.
-    let source_type = SourceType::mjs();
 
     // Append only the higher-order-method helpers (`__map`, …) the program
     // actually uses. They are real JS compiled in the same unit (appended, so
@@ -86,7 +107,7 @@ pub fn compile(source: &str) -> Result<Program, Vec<Diagnostic>> {
             .and_then(|labels| labels.first())
             .map(|l| l.offset() as u32)
             .unwrap_or(0);
-        compiler.error(span, err.message.to_string());
+        compiler.parse_error(span, err.message.to_string());
     }
 
     // Pass 1: scope/capture analysis. It resolves every binding/reference to a

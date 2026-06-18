@@ -85,11 +85,12 @@ impl Analyzer {
         id
     }
 
-    /// Record a diagnostic.
+    /// Record a semantic diagnostic from the analyzer.
     pub(super) fn error(&mut self, span: u32, message: impl Into<String>) {
         self.diagnostics.push(Diagnostic {
             span,
             message: message.into(),
+            kind: super::diag::DiagKind::Semantic,
         });
     }
 

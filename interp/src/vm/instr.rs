@@ -52,10 +52,17 @@ pub enum SetMode {
     Old,
 }
 
-/// Builtin-type tag for `instanceof` fast-path checks. Maps to the JS
-/// builtin constructors whose `instanceof` behaviour is a structural
-/// value-tag check rather than a proto-chain walk.
-#[derive(Copy, Clone, Debug, PartialEq)]
+/// Builtin-type tag for `instanceof` fast-path checks and the per-type
+/// prototype side table (Step 2a). Maps to the JS builtin constructors.
+/// The first six variants (`Array` … `Function`) are emitted by
+/// `Instr::TypeCheck` for the structural `instanceof` fast path; the
+/// remaining three (`String`/`Number`/`Boolean`) cover the primitive
+/// wrapper types — they key prototype side-table entries but are never
+/// emitted by `TypeCheck` (a primitive is never `instanceof` its wrapper
+/// type in JS, so the arm returns `false`). Step 2b folds the structural
+/// fast path into the proto-chain walk; the enum stays as the side-table
+/// key.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum TypeTag {
     Array,
     Object,
@@ -63,6 +70,14 @@ pub enum TypeTag {
     Set,
     RegExp,
     Function,
+    String,
+    Number,
+    Boolean,
+}
+
+impl TypeTag {
+    /// Number of variants — sizes the prototype side table.
+    pub const COUNT: usize = 9;
 }
 
 /// Instructions for a stack based language used for LLM composition of complex tool flows.

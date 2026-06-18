@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::diag::Diagnostic;
+use crate::diag::{DiagKind, Diagnostic};
 use crate::vm::{Instr, RcStr};
 
 impl super::Compiler {
@@ -46,11 +46,22 @@ impl super::Compiler {
         rc
     }
 
-    /// Record a diagnostic; aborts the compile before a `Program` is produced.
+    /// Record a semantic diagnostic; aborts the compile before a `Program` is
+    /// produced.
     pub(super) fn error(&mut self, span: u32, message: impl Into<String>) {
         self.diagnostics.push(Diagnostic {
             span,
             message: message.into(),
+            kind: DiagKind::Semantic,
+        });
+    }
+
+    /// Record a parse diagnostic (from `oxc_parser`).
+    pub(super) fn parse_error(&mut self, span: u32, message: impl Into<String>) {
+        self.diagnostics.push(Diagnostic {
+            span,
+            message: message.into(),
+            kind: DiagKind::Parse,
         });
     }
 }
