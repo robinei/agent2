@@ -3,6 +3,29 @@ use super::*;
 use crate::compiler::{ConstVal, namespace_constants};
 use crate::diag::Diagnostic;
 
+/// Whether a value is an *object* for `instanceof` purposes (Step 2b). JS
+/// `instanceof` spec: "If Type(relObj) is not Object, return false." The
+/// "object" types are the heap/structural types (Object/Array/Map/Set/
+/// RegExp/Closure/Builtin/Bound/Promise); primitives (String/Number/Bool/
+/// Null/Undefined) and the internal `Upval` marker are not. This gates the
+/// proto-chain walk in `instanceof` — `value_proto` returns a prototype for
+/// primitives too (the wrapper type's, for `Object.getPrototypeOf`), so the
+/// walk must be gated on this check, not on `value_proto` returning `Some`.
+fn is_object_for_instanceof(val: &Value) -> bool {
+    matches!(
+        val,
+        Value::Object(_)
+            | Value::Array(_)
+            | Value::Map(_)
+            | Value::Set(_)
+            | Value::RegExp(_)
+            | Value::Closure { .. }
+            | Value::Builtin(_)
+            | Value::Bound(_)
+            | Value::Promise(_)
+    )
+}
+
 impl VM {
     pub fn new(code: Vec<Instr>) -> Self {
         VM {
@@ -330,13 +353,20 @@ impl VM {
         }); // objects[1] = attachments
         let input_entries = vm.seed_const_object(input)?;
         let attachment_entries = vm.seed_const_object(attachments)?;
+        // Step 2b: chain the host-seeded objects to `Object.prototype`,
+        // matching JS (`Object.getPrototypeOf(input) === Object.prototype`
+        // for a parsed JSON object). The prototype is allocated after
+        // seeding (so it lands at a stable index beyond the nested values),
+        // and the fixed `Object(0)`/`Object(1)` references are untouched —
+        // only the `proto` field is set.
+        let object_proto = vm.prototype_for(crate::vm::instr::TypeTag::Object)?;
         vm.objects[0] = ObjData {
-            proto: None,
+            proto: Some(object_proto),
             map: input_entries,
             ..Default::default()
         };
         vm.objects[1] = ObjData {
-            proto: None,
+            proto: Some(object_proto),
             map: attachment_entries,
             ..Default::default()
         };
@@ -874,9 +904,20 @@ impl VM {
     }
 
     pub(crate) fn alloc_object(&mut self, obj: IndexMap<FieldName, Value>) -> Value {
+        // Step 2b: plain objects chain to `Object.prototype` (matching JS —
+        // `Object.getPrototypeOf({}) === Object.prototype`, `{} instanceof
+        // Object` is true). The prototype is lazily allocated; the cost is
+        // one `prototype_for` call (a side-table lookup + one push on first
+        // allocation, a pure lookup after). Objects that should NOT chain
+        // (builtin prototypes/namespaces, `Object.create(null)` instances)
+        // push `ObjData` directly rather than calling here.
+        let proto = self.prototype_for(crate::vm::instr::TypeTag::Object).ok();
+        // Compute `addr` AFTER `prototype_for` — it may push to `self.objects`
+        // (lazily allocating `Object.prototype`), which would make an
+        // earlier `addr` stale.
         let addr = self.objects.len() as ObjectPtr;
         self.objects.push(ObjData {
-            proto: None,
+            proto,
             map: obj,
             ..Default::default()
         });
@@ -887,6 +928,12 @@ impl VM {
     /// immediately; `proto: None` returns `Undefined` with one branch and
     /// never enters the loop. A depth cap guards against malformed cycles.
     /// Stack effect: none (pure property resolution).
+    ///
+    /// Step 2b: when the walk reaches a builtin prototype (`kind ==
+    /// BuiltinPrototype`), the `constructor` virtual rung is resolved —
+    /// `[].constructor === Array`, `(5).constructor === Number` — without
+    /// materializing it into the (empty) map, so enumerability
+    /// (`Object.keys(Array.prototype) === []`) holds.
     pub(crate) fn resolve_proto_chain(
         &self,
         obj_ptr: ObjectPtr,
@@ -900,6 +947,13 @@ impl VM {
             })?;
             if let Some(v) = obj.map.get(field) {
                 return Ok(v.clone());
+            }
+            // Virtual rung: `constructor` on a builtin prototype.
+            if obj.kind == ObjKind::BuiltinPrototype
+                && field == "constructor"
+                && let Some(v) = self.prototype_constructor(cur)
+            {
+                return Ok(v);
             }
             match obj.proto {
                 Some(parent) => cur = parent,
@@ -933,20 +987,6 @@ impl VM {
             }
         }
         Ok(false)
-    }
-
-    /// An `Object`'s `[[Prototype]]` as a value: `Value::Object(proto)` or
-    /// `Value::Null` when it has none. Shared by `Object.getPrototypeOf` and
-    /// `set_object_proto`'s previous-value capture.
-    pub(crate) fn object_proto_value(&self, obj_ptr: ObjectPtr) -> Result<Value, VMError> {
-        let obj = self
-            .objects
-            .get(obj_ptr as usize)
-            .ok_or_else(|| self.fail_not_resumable(ErrorKind::TypeError, "bad object pointer"))?;
-        Ok(match obj.proto {
-            Some(p) => Value::Object(p),
-            None => Value::Null,
-        })
     }
 
     /// Set an `Object`'s `[[Prototype]]` to `val` (an `Object` or `Null`).
@@ -987,27 +1027,47 @@ impl VM {
     }
 
     /// `x instanceof F`: walk `x`'s prototype chain looking for `F.prototype`.
-    /// LHS need not be an Object — non-Object values (primitives) cannot be on
-    /// a prototype chain so return `false` immediately. RHS must be a `Closure`
-    /// or `Bound` (callables with a `.prototype`) — else `TypeError`.
+    /// Step 2b folds the structural `TypeTag` fast path and the user-class
+    /// walk into one path: the RHS is evaluated to a real constructor value
+    /// (`Value::Closure`/`Value::Bound`/`Value::Builtin`-constructor), its
+    /// `.prototype` is resolved (the type's frozen prototype for builtins,
+    /// the lazily-allocated `F.prototype` for user closures), and `x`'s
+    /// `[[Prototype]]` chain is walked via [`Self::value_proto`] — so
+    /// `[] instanceof Array`, `m instanceof Map`, `f instanceof Function`,
+    /// `x instanceof Object`, and `new F() instanceof F` all take the same
+    /// walk with no `TypeTag` special-case.
+    ///
+    /// Primitives (`String`/`Number`/`Bool`/`Null`/`Undefined`) have no
+    /// `[[Prototype]]` chain for `instanceof` purposes (JS: a primitive is
+    /// never `instanceof` anything), so they return `false` immediately.
+    /// RHS must be callable with a `.prototype` — else `TypeError`. A
+    /// method/namespace `Value::Builtin` has no `.prototype`, so it yields
+    /// `false` (matching JS where `x instanceof Math.max` is false).
     pub(crate) fn instanceof(&mut self, lhs: Value, rhs: Value) -> Result<bool, VMError> {
-        let (lhs_obj, proto_ptr) = match (lhs, rhs) {
-            (Value::Object(lhs_ptr), Value::Closure { ptr, .. }) => {
-                (lhs_ptr, self.resolve_prototype(ptr)?)
-            }
-            (Value::Object(lhs_ptr), Value::Bound(b)) => {
-                let inner = match &b.callable {
-                    Value::Closure { ptr, .. } => *ptr,
-                    _ => {
-                        return Err(self.fail(
-                            ErrorKind::TypeError,
-                            "right-hand side of `instanceof` is not callable",
-                        ));
-                    }
-                };
-                (lhs_ptr, self.resolve_prototype(inner)?)
-            }
-            (_, Value::Closure { .. } | Value::Bound(_)) => return Ok(false),
+        // Resolve the RHS's `.prototype` (the target we walk `lhs`'s chain
+        // looking for). A non-callable RHS is a TypeError; a callable without
+        // a `.prototype` (method/namespace builtin) yields `false`.
+        let target_proto = match rhs {
+            Value::Closure { ptr, .. } => self.resolve_prototype(ptr)?,
+            Value::Bound(b) => match &b.callable {
+                Value::Closure { ptr, .. } => self.resolve_prototype(*ptr)?,
+                // A Bound wrapping a builtin constructor: use the
+                // constructor's type prototype.
+                Value::Builtin(b) => match b.constructor_type_tag() {
+                    Some(tag) => self.prototype_for(tag)?,
+                    None => return Ok(false),
+                },
+                _ => {
+                    return Err(self.fail(
+                        ErrorKind::TypeError,
+                        "right-hand side of `instanceof` is not callable",
+                    ));
+                }
+            },
+            Value::Builtin(b) => match b.constructor_type_tag() {
+                Some(tag) => self.prototype_for(tag)?,
+                None => return Ok(false),
+            },
             _ => {
                 return Err(self.fail(
                     ErrorKind::TypeError,
@@ -1015,12 +1075,92 @@ impl VM {
                 ));
             }
         };
-        self.proto_chain_contains(lhs_obj, proto_ptr)
+        // Primitives never participate in `instanceof` (JS: `"x" instanceof
+        // String` is false, `5 instanceof Object` is false — the spec's first
+        // step is "If Type(relObj) is not Object, return false"). Only
+        // objects and structural heap types (Array/Map/Set/RegExp/Closure/
+        // Builtin/Bound/Promise) have a `[[Prototype]]` chain to walk.
+        // `value_proto` returns a prototype for primitives too (the wrapper
+        // type's prototype, for `Object.getPrototypeOf`), so gate the walk
+        // on the LHS being an object type, not on `value_proto` returning
+        // `Some`.
+        if !is_object_for_instanceof(&lhs) {
+            return Ok(false);
+        }
+        let start = match self.value_proto(&lhs)? {
+            Some(p) => p,
+            None => return Ok(false),
+        };
+        // Walk from `lhs`'s `[[Prototype]]` looking for `target_proto`.
+        // `proto_chain_contains(start, target)` checks `start` itself and
+        // walks up — exactly `instanceof`'s semantics.
+        self.proto_chain_contains(start, target_proto)
+    }
+
+    /// The `[[Prototype]]` of any value as an `ObjectPtr` (Step 2b). For an
+    /// `Object`, it is `obj.proto` (the explicit field — `Some(Object.prototype)`
+    /// for plain objects, `Some(F.prototype)` for `new F()`, `None` for
+    /// `Object.create(null)`). For structural heap types (Array/Map/Set/
+    /// RegExp) and callables (Closure/Builtin/Bound), it is the type's
+    /// frozen builtin prototype (lazily allocated). For primitives
+    /// (String/Number/Bool), it is the wrapper type's prototype — matching
+    /// JS `Object.getPrototypeOf` which returns the wrapper prototype for
+    /// primitives. `Null`/`Undefined`/`Upval` have no `[[Prototype]]`
+    /// (`None`); `Object.getPrototypeOf` throws for null/undefined.
+    ///
+    /// This is the one place the `[[Prototype]]` mapping is defined, shared
+    /// by `instanceof`, `Object.getPrototypeOf`, and the `get_property`
+    /// proto-chain walk — the seed of the convergence target's `get_property`
+    /// /`set_property` pair.
+    pub(crate) fn value_proto(&mut self, val: &Value) -> Result<Option<ObjectPtr>, VMError> {
+        Ok(match val {
+            Value::Object(p) => self
+                .objects
+                .get(*p as usize)
+                .map(|o| o.proto)
+                .unwrap_or(None),
+            Value::Array(_) => Some(self.prototype_for(crate::vm::instr::TypeTag::Array)?),
+            Value::Map(_) => Some(self.prototype_for(crate::vm::instr::TypeTag::Map)?),
+            Value::Set(_) => Some(self.prototype_for(crate::vm::instr::TypeTag::Set)?),
+            Value::RegExp(_) => Some(self.prototype_for(crate::vm::instr::TypeTag::RegExp)?),
+            Value::Closure { .. } | Value::Bound(_) | Value::Builtin(_) => {
+                Some(self.prototype_for(crate::vm::instr::TypeTag::Function)?)
+            }
+            Value::String(_) => Some(self.prototype_for(crate::vm::instr::TypeTag::String)?),
+            Value::Float(_) | Value::PosInt(_) | Value::NegInt(_) => {
+                Some(self.prototype_for(crate::vm::instr::TypeTag::Number)?)
+            }
+            Value::Bool(_) => Some(self.prototype_for(crate::vm::instr::TypeTag::Boolean)?),
+            // Promises chain to Object.prototype (no Promise.prototype in
+            // this dialect — promises are transient tool-call values).
+            Value::Promise(_) => Some(self.prototype_for(crate::vm::instr::TypeTag::Object)?),
+            Value::Null | Value::Undefined | Value::Upval(_) => None,
+        })
+    }
+
+    /// Resolve the `constructor` virtual rung on a builtin prototype
+    /// (Step 2b). If `proto_ptr` is one of the lazily-allocated builtin
+    /// prototypes (`Array.prototype`, `Object.prototype`, …), return the
+    /// corresponding constructor `Value::Builtin` (`ArrayCtor`, …); else
+    /// `None`. This is what makes `[].constructor === Array`,
+    /// `(5).constructor === Number`, etc. hold: a property read walks the
+    /// chain, hits the type's frozen prototype, and resolves `constructor`
+    /// to the constructor value without materializing it into the map (so
+    /// `Object.keys(Array.prototype) === []` still holds — enumerability).
+    pub(crate) fn prototype_constructor(&self, proto_ptr: ObjectPtr) -> Option<Value> {
+        // Reverse-map a prototype ptr to its type tag by consulting the side
+        // table through `prototype_ptr` (which keys by `tag as usize`), so the
+        // index↔tag correspondence lives in one place (`TypeTag::ALL`) and
+        // cannot drift if the enum is reordered.
+        let tag = crate::vm::instr::TypeTag::ALL
+            .into_iter()
+            .find(|&tag| self.prototype_ptr(tag) == Some(proto_ptr))?;
+        crate::builtin::Builtin::for_type_tag(tag).map(Value::Builtin)
     }
 
     /// Resolve a Closure's `.prototype`, lazily allocating an empty object on
-    /// first access. Shared by `resolve_closure_prototype` (for `F.prototype`
-    /// property reads) and `instanceof` (for walking the chain).
+    /// first access. Shared by `get_property` (for `F.prototype` property
+    /// reads) and `instanceof` (for walking the chain).
     pub(crate) fn resolve_prototype(&mut self, ptr: ClosurePtr) -> Result<ObjectPtr, VMError> {
         if let Some(proto_ptr) = self.closures.get(ptr as usize).and_then(|c| c.prototype) {
             return Ok(proto_ptr);

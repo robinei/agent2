@@ -1455,7 +1455,9 @@ fn instanceof_non_callable_is_type_error() {
     );
 }
 
-/// `Object.getPrototypeOf(new F())` returns `F.prototype`.
+/// `Object.getPrototypeOf(new F())` returns `F.prototype`. Step 2b: plain
+/// objects chain to `Object.prototype`, so `Object.getPrototypeOf({})` is
+/// `Object.prototype` (not `null` as before).
 #[test]
 fn get_prototype_of_returns_proto() {
     assert_eq!(
@@ -1464,9 +1466,14 @@ fn get_prototype_of_returns_proto() {
         ),
         Value::Bool(true)
     );
-    // `Object.getPrototypeOf({})` returns `null` (no Object.prototype).
+    // Step 2b: `Object.getPrototypeOf({})` returns `Object.prototype`.
     assert_eq!(
-        testutil::run_val("return Object.getPrototypeOf({}) === null;"),
+        testutil::run_val("const op = Object.getPrototypeOf({}); return op === Object.prototype;"),
+        Value::Bool(true)
+    );
+    // `Object.create(null)` produces an object with no prototype.
+    assert_eq!(
+        testutil::run_val("return Object.getPrototypeOf(Object.create(null)) === null;"),
         Value::Bool(true)
     );
 }
@@ -1537,15 +1544,24 @@ fn instanceof_respects_prototype_chain() {
     );
 }
 
-/// `Object.getPrototypeOf` on a non-Object is a TypeError.
+/// Step 2b: `Object.getPrototypeOf` on a primitive returns the wrapper
+/// type's prototype (`Object.getPrototypeOf(5) === Number.prototype`),
+/// matching JS. `null`/`undefined` are a TypeError (no wrapper coercion).
 #[test]
-fn get_prototype_of_primitive_is_type_error() {
-    let err = testutil::run_runtime_err("return Object.getPrototypeOf(5);");
-    assert!(
-        err.message.contains("type error"),
-        "expected type error, got: {}",
-        err.message
+fn get_prototype_of_primitive_returns_wrapper_proto() {
+    // `Object.getPrototypeOf(5) === Number.prototype`.
+    assert_eq!(
+        testutil::run_val("return Object.getPrototypeOf(5) === Number.prototype;"),
+        Value::Bool(true)
     );
+    // `Object.getPrototypeOf("") === String.prototype`.
+    assert_eq!(
+        testutil::run_val("return Object.getPrototypeOf(\"\") === String.prototype;"),
+        Value::Bool(true)
+    );
+    // `Object.getPrototypeOf(null)` throws.
+    let err = testutil::run_runtime_err("return Object.getPrototypeOf(null);");
+    assert_eq!(err.kind, crate::vm::ErrorKind::TypeError);
 }
 
 // ── Step 6: method values off a receiver (`[].push`, `obj.m` uncalled) ──────

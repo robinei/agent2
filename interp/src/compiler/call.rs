@@ -489,7 +489,7 @@ impl super::Compiler {
                 self.compile_args(argv);
                 self.emit(Instr::ToBool, span);
             }
-            "Array" | "Object" | "Map" | "Set" | "RegExp" => {
+            "Array" | "Object" | "Map" | "Set" | "RegExp" | "Function" => {
                 if let Some(b) = Builtin::for_constructor(name) {
                     self.compile_builtin_call(b, None, argv, span, false);
                 } else {

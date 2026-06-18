@@ -1,5 +1,5 @@
 use crate::builtin::Args;
-use crate::vm::{VM, VMError, Value};
+use crate::vm::{ErrorKind, VM, VMError, Value};
 
 // ── Number static implementations ────────────────────────────────────────────
 
@@ -17,6 +17,47 @@ pub fn number_ctor(vm: &mut VM, args: Args) -> Result<Value, VMError> {
         .to_number()
         .ok_or_else(|| vm.fail(crate::vm::ErrorKind::TypeError, "type error"))?;
     Ok(Value::int_from_f64(n))
+}
+
+/// `Number.prototype.toFixed(digits)` — formats a number to a fixed number
+/// of decimal places (Step 2b). The receiver is an unboxed number value
+/// (arg 0), passed as a primitive — no boxing allocation. `digits` defaults
+/// to 0 when absent (JS). JS allows 0..=100; we accept the same range.
+/// `NaN` → `"NaN"`, `±Infinity` → `"Infinity"`/`"-Infinity"` (matching JS).
+pub fn number_to_fixed(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let n = args.get(vm, 0).as_f64().ok_or_else(|| {
+        vm.fail(
+            ErrorKind::TypeError,
+            "Number.prototype.toFixed called on non-number receiver",
+        )
+    })?;
+    let digits = match args.get(vm, 1) {
+        Value::Undefined => 0u32,
+        v => {
+            let d = v.to_number().ok_or_else(|| {
+                vm.fail(
+                    ErrorKind::TypeError,
+                    "toFixed: digits argument must be a number",
+                )
+            })?;
+            if !d.is_finite() || !(0.0..=100.0).contains(&d) {
+                return Err(vm.fail(
+                    crate::vm::ErrorKind::ValueError,
+                    "toFixed: digits argument must be in [0, 100]",
+                ));
+            }
+            d as u32
+        }
+    };
+    let s = if n.is_nan() {
+        "NaN".to_string()
+    } else if n.is_infinite() {
+        if n > 0.0 { "Infinity" } else { "-Infinity" }.to_string()
+    } else {
+        let digits = digits as usize;
+        format!("{n:.digits$}")
+    };
+    Ok(Value::String(crate::vm::RcStr::from(s)))
 }
 
 /// `Number.isInteger(x)` → bool.

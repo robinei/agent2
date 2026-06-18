@@ -2645,9 +2645,12 @@ fn try_exit_after_clean_body_pops_handler() {
 
 #[test]
 fn objget_non_object_pops_receiver_and_resumes() {
-    // Pop-first normalization: ObjGet on a non-object consumes the receiver,
-    // so the error is PushValueThenContinue and resume_with works unchanged.
-    let mut vm = VM::new(vec![PushPosInt(1), ObjGet("foo".into())]);
+    // Pop-first normalization: ObjGet on null consumes the receiver, so the
+    // error is PushValueThenContinue and resume_with works unchanged.
+    // Step 2b: primitive receivers (number/string/bool) now resolve via
+    // their type prototype and return `undefined` on a miss — only
+    // null/undefined throw.
+    let mut vm = VM::new(vec![PushNull, ObjGet("foo".into())]);
     let err = vm.step(u64::MAX).unwrap_err();
     assert!(matches!(err.kind, ErrorKind::TypeError));
     assert!(matches!(err.resume, ResumeMode::PushValueThenContinue));
@@ -2816,13 +2819,18 @@ fn message_indexget_includes_container_type() {
 
 #[test]
 fn message_objget_non_object_includes_type() {
-    // ObjGet peeks stack.last() — if it's not an object, message names the type.
-    let err = run_err(vec![PushPosInt(42), ObjGet("key".into())]);
+    // ObjGet on null/undefined — message names the type. Step 2b: non-
+    // null/undefined primitives now resolve via their type prototype
+    // (`(42).key` → `undefined`, matching JS), so only null/undefined throw.
+    let err = run_err(vec![PushNull, ObjGet("key".into())]);
     assert!(
-        err.message.contains("number"),
+        err.message.contains("null"),
         "should mention type: {}",
         err.message
     );
+    // A primitive property read (number) now returns undefined, not an error.
+    let out = run(vec![PushPosInt(42), ObjGet("key".into())]);
+    assert_eq!(out, vec![Value::Undefined]);
 }
 
 #[test]
@@ -3747,5 +3755,313 @@ fn method_call_fast_path_unchanged() {
     assert_eq!(
         testutil::run_ret("return '  hi  '.trim();"),
         serde_json::json!("hi")
+    );
+}
+
+// ── Step 2b: reflection wired to the real objects ───────────────────────────
+
+/// `instanceof` for builtins — the proto-chain walk (Step 2b). The
+/// structural `TypeTag` fast path is folded into one walk: `[] instanceof
+/// Array`, `new Map() instanceof Map`, `(()=>0) instanceof Function`,
+/// `{} instanceof Object` all walk `[[Prototype]]` chains. Cross-type
+/// negatives are `false`. Primitives are never `instanceof` anything.
+#[test]
+fn instanceof_builtins_via_proto_chain() {
+    // Positive cases — the chain reaches the type's frozen prototype.
+    assert_eq!(
+        testutil::run_val("return [] instanceof Array;"),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        testutil::run_val("return new Map() instanceof Map;"),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        testutil::run_val("return (()=>0) instanceof Function;"),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        testutil::run_val("return {} instanceof Object;"),
+        Value::Bool(true)
+    );
+    // `x instanceof Object` walks to `Object.prototype` via the type proto.
+    assert_eq!(
+        testutil::run_val("return [] instanceof Object;"),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        testutil::run_val("return new Map() instanceof Object;"),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        testutil::run_val("return (()=>0) instanceof Object;"),
+        Value::Bool(true)
+    );
+    // Cross-type negatives.
+    assert_eq!(
+        testutil::run_val("return [] instanceof Map;"),
+        Value::Bool(false)
+    );
+    assert_eq!(
+        testutil::run_val("return new Map() instanceof Array;"),
+        Value::Bool(false)
+    );
+    assert_eq!(
+        testutil::run_val("return [] instanceof Function;"),
+        Value::Bool(false)
+    );
+    assert_eq!(
+        testutil::run_val("return (()=>0) instanceof Array;"),
+        Value::Bool(false)
+    );
+    // Primitives are never `instanceof` anything (JS: "If Type(relObj) is
+    // not Object, return false").
+    assert_eq!(
+        testutil::run_val("return 5 instanceof Number;"),
+        Value::Bool(false)
+    );
+    assert_eq!(
+        testutil::run_val("return 5 instanceof Object;"),
+        Value::Bool(false)
+    );
+    assert_eq!(
+        testutil::run_val("return \"x\" instanceof String;"),
+        Value::Bool(false)
+    );
+    assert_eq!(
+        testutil::run_val("return true instanceof Boolean;"),
+        Value::Bool(false)
+    );
+}
+
+/// `instanceof` with a `Value::Builtin` constructor RHS — the `.prototype`
+/// is the type's frozen prototype, resolved via `prototype_for`.
+#[test]
+fn instanceof_builtin_constructor_rhs() {
+    // `Map instanceof Function` — the constructor value's [[Prototype]] is
+    // `Function.prototype`, and `FunctionCtor.prototype` is
+    // `Function.prototype`, so the walk finds it.
+    assert_eq!(
+        testutil::run_val("return Map instanceof Function;"),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        testutil::run_val("return Array instanceof Function;"),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        testutil::run_val("return Object instanceof Function;"),
+        Value::Bool(true)
+    );
+    // Constructors are instances of Object too (Function.prototype chains
+    // to Object.prototype).
+    assert_eq!(
+        testutil::run_val("return Map instanceof Object;"),
+        Value::Bool(true)
+    );
+}
+
+/// The user-class `instanceof` from Phase 13 still holds — one walk, no
+/// `TypeTag` special-case left.
+#[test]
+fn instanceof_user_class_still_holds() {
+    assert_eq!(
+        testutil::run_val("function F(){} return new F() instanceof F;"),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        testutil::run_val("function F(){} function G(){} return new F() instanceof G;"),
+        Value::Bool(false)
+    );
+    // `instanceof` respects a manually-set prototype chain.
+    assert_eq!(
+        testutil::run_val(
+            "function F(){} function G(){} const f = new F(); Object.setPrototypeOf(f, G.prototype); return f instanceof G;"
+        ),
+        Value::Bool(true)
+    );
+}
+
+/// `.constructor` on any value reads through its type prototype to the
+/// real constructor object.
+#[test]
+fn constructor_virtual_rung() {
+    assert_eq!(
+        testutil::run_val("return [].constructor === Array;"),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        testutil::run_val("return \"\".constructor === String;"),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        testutil::run_val("return (5).constructor === Number;"),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        testutil::run_val("return (true).constructor === Boolean;"),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        testutil::run_val("return ({}).constructor === Object;"),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        testutil::run_val("return new Map().constructor === Map;"),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        testutil::run_val("return /x/.constructor === RegExp;"),
+        Value::Bool(true)
+    );
+    // `constructor` is a virtual rung: it does NOT appear in
+    // `Object.keys(Array.prototype)` (enumerability).
+    assert_eq!(
+        testutil::run_ret("return Object.keys(Array.prototype);"),
+        serde_json::json!([])
+    );
+}
+
+/// Constructors chain to `Function.prototype`: `Object.getPrototypeOf(Array)
+/// === Function.prototype`.
+#[test]
+fn constructors_chain_to_function_prototype() {
+    assert_eq!(
+        testutil::run_val("return Object.getPrototypeOf(Array) === Function.prototype;"),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        testutil::run_val("return Object.getPrototypeOf(Map) === Function.prototype;"),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        testutil::run_val("return Object.getPrototypeOf(Object) === Function.prototype;"),
+        Value::Bool(true)
+    );
+    // `Function.prototype` chains to `Object.prototype`.
+    assert_eq!(
+        testutil::run_val("return Object.getPrototypeOf(Function.prototype) === Object.prototype;"),
+        Value::Bool(true)
+    );
+}
+
+/// `Object.getPrototypeOf` returns the real prototype for primitives and
+/// builtins; `Object.create(proto)` links it.
+#[test]
+fn get_prototype_of_primitives_and_builtins() {
+    // Primitives → wrapper type prototype.
+    assert_eq!(
+        testutil::run_val("return Object.getPrototypeOf([]) === Array.prototype;"),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        testutil::run_val("return Object.getPrototypeOf(\"\") === String.prototype;"),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        testutil::run_val("return Object.getPrototypeOf(5) === Number.prototype;"),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        testutil::run_val("return Object.getPrototypeOf(true) === Boolean.prototype;"),
+        Value::Bool(true)
+    );
+    // `Object.create(proto)` links the prototype.
+    assert_eq!(
+        testutil::run_val("const p = {x: 42}; const o = Object.create(p); return o.x;"),
+        Value::PosInt(42)
+    );
+    assert_eq!(
+        testutil::run_val(
+            "const p = {}; const o = Object.create(p); return Object.getPrototypeOf(o) === p;"
+        ),
+        Value::Bool(true)
+    );
+    // `Object.create(null)` → no prototype.
+    assert_eq!(
+        testutil::run_val("return Object.getPrototypeOf(Object.create(null)) === null;"),
+        Value::Bool(true)
+    );
+    // `Object.create` with a non-Object/non-null proto → TypeError.
+    let err = testutil::run_runtime_err("return Object.create(5);");
+    assert_eq!(err.kind, ErrorKind::TypeError);
+}
+
+/// A primitive method call (`(5).toFixed`, `"x".at`) resolves via the type
+/// prototype with no boxing allocation — the receiver stays an unboxed
+/// number/string value handed to the builtin as arg 0.
+#[test]
+fn primitive_method_call_no_boxing() {
+    // `(5).toFixed(2)` → "5.00" — the receiver is an unboxed `PosInt(5)`.
+    assert_eq!(
+        testutil::run_ret("return (5).toFixed(2);"),
+        serde_json::json!("5.00")
+    );
+    // `(5).toFixed()` with no args → "5" (digits defaults to 0).
+    assert_eq!(
+        testutil::run_ret("return (5).toFixed();"),
+        serde_json::json!("5")
+    );
+    // `(3.14159).toFixed(2)` → "3.14".
+    assert_eq!(
+        testutil::run_ret("return (3.14159).toFixed(2);"),
+        serde_json::json!("3.14")
+    );
+    // `"x".at(0)` → "x" — already works via `method_for_receiver`.
+    assert_eq!(
+        testutil::run_ret("return \"x\".at(0);"),
+        serde_json::json!("x")
+    );
+    // `(255).toString(16)` — `toString` is a universal method (number=true).
+    assert_eq!(
+        testutil::run_ret("return (255).toString(16);"),
+        serde_json::json!("ff")
+    );
+}
+
+/// `Function` as a value: `typeof Function === "function"`, but neither
+/// `new Function(...)` nor `Function(...)` is supported (both throw — a
+/// documented divergence; function expressions are the alternative).
+#[test]
+fn function_constructor_value() {
+    assert_eq!(
+        testutil::eval("typeof Function"),
+        Value::String(RcStr::from("function"))
+    );
+    // `Function.prototype` is the frozen Function prototype object.
+    let v = testutil::eval("Function.prototype");
+    assert!(matches!(v, Value::Object(_)));
+    // `new Function(...)` throws.
+    let err = testutil::run_runtime_err("return new Function('return 42');");
+    assert_eq!(err.kind, ErrorKind::TypeError);
+    // `Function(...)` as a plain call throws.
+    let err = testutil::run_runtime_err("return Function('return 42');");
+    assert_eq!(err.kind, ErrorKind::TypeError);
+}
+
+/// No-boxing alloc test: `(5).toFixed(2)` resolves via `Number.prototype`
+/// without wrapping the primitive in an object. The only allocations
+/// should be the result string — no intermediate `Value::Object` for the
+/// receiver. (Tested by counting objects: a boxing implementation would
+/// allocate one object per call.)
+#[test]
+fn primitive_method_no_boxing_alloc() {
+    let mut vm = VM::for_program(
+        testutil::compile_ok("return (5).toFixed(2);"),
+        serde_json::Value::Null,
+    )
+    .unwrap();
+    let objects_before = vm.objects.len();
+    match vm.step(u64::MAX).unwrap() {
+        StepResult::Done { .. } => {}
+        other => panic!("unexpected: {other:?}"),
+    }
+    // The only new objects should be the lazily-allocated prototypes
+    // (Number.prototype, Object.prototype — at most 2, allocated once and
+    // cached). No per-call boxing allocation.
+    let new_objects = vm.objects.len() - objects_before;
+    assert!(
+        new_objects <= 2,
+        "primitive method call allocated {new_objects} objects (expected ≤2 for prototypes, no boxing)"
     );
 }

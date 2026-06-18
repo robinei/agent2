@@ -1925,7 +1925,7 @@ fetched: 41
         assert_eq!(
             last_tool_text(&state),
             r#"## what happened
-2:10: cannot read property on null
+2:10: cannot read property 'x' on null
 return v.x;
          ^
 

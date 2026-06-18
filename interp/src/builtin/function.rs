@@ -21,6 +21,23 @@ pub fn boolean_ctor(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     Ok(Value::Bool(v.is_truthy()))
 }
 
+// ── Function constructor (Step 2b) ──────────────────────────────────────────
+
+/// `Function(...)` / `new Function(...)` — the constructor. Neither form is
+/// supported: there is no `new Function(body)` (function expressions are the
+/// alternative), and `Function()` as a plain call is meaningless without it.
+/// The constructor *value* exists for reflection: `typeof Function ===
+/// "function"`, `Map instanceof Function`, `Object.getPrototypeOf(Array) ===
+/// Function.prototype`. Both `new Function(...)` (via `construct_builtin`'s
+/// `TypeTag::Function` arm) and `Function(...)` (here) throw — a documented
+/// divergence pinned in the ledger.
+pub fn function_ctor(vm: &mut VM, _args: Args) -> Result<Value, VMError> {
+    Err(vm.fail(
+        ErrorKind::TypeError,
+        "`Function` constructor is not supported (use function expressions)",
+    ))
+}
+
 // ── Function.prototype.bind ────────────────────────────────
 
 /// `f.bind(thisArg, ...args)` — constructs a `Value::Bound` without invoking.

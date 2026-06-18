@@ -52,16 +52,14 @@ pub enum SetMode {
     Old,
 }
 
-/// Builtin-type tag for `instanceof` fast-path checks and the per-type
-/// prototype side table (Step 2a). Maps to the JS builtin constructors.
-/// The first six variants (`Array` … `Function`) are emitted by
-/// `Instr::TypeCheck` for the structural `instanceof` fast path; the
-/// remaining three (`String`/`Number`/`Boolean`) cover the primitive
-/// wrapper types — they key prototype side-table entries but are never
-/// emitted by `TypeCheck` (a primitive is never `instanceof` its wrapper
-/// type in JS, so the arm returns `false`). Step 2b folds the structural
-/// fast path into the proto-chain walk; the enum stays as the side-table
-/// key.
+/// Builtin-type tag for the per-type prototype side table (Step 2a) and
+/// constructor identity (Step 2a Part 2). Maps to the JS builtin
+/// constructors. The `TypeTag`-keyed prototype side table
+/// (`VM::prototypes`, `VM::prototype_for`) is the substrate `instanceof`,
+/// `Object.getPrototypeOf`, `.constructor`, and primitive method resolution
+/// all walk (Step 2b). Step 2b folded the former structural `instanceof`
+/// fast path (`Instr::TypeCheck`) into the proto-chain walk; the enum stays
+/// as the side-table key and constructor-identity tag.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum TypeTag {
     Array,
@@ -76,8 +74,24 @@ pub enum TypeTag {
 }
 
 impl TypeTag {
+    /// Every variant, in discriminant order. The single source of truth for
+    /// "what type tags exist" — iterate this instead of hand-listing variants
+    /// or mapping side-table indices back to tags by literal number (which
+    /// silently breaks if the enum is reordered). `COUNT` is derived from it.
+    pub const ALL: [TypeTag; 9] = [
+        TypeTag::Array,
+        TypeTag::Object,
+        TypeTag::Map,
+        TypeTag::Set,
+        TypeTag::RegExp,
+        TypeTag::Function,
+        TypeTag::String,
+        TypeTag::Number,
+        TypeTag::Boolean,
+    ];
+
     /// Number of variants — sizes the prototype side table.
-    pub const COUNT: usize = 9;
+    pub const COUNT: usize = Self::ALL.len();
 
     /// The JS constructor name for this type (`Array`, `Object`, …). The
     /// `BuiltinKind::Constructor { type_tag }` rows use this to derive their
@@ -420,13 +434,14 @@ pub enum Instr {
 
     /// `x instanceof F` — walks `x`'s prototype chain looking for
     /// `F.prototype`. LHS (value) then RHS (callable) on stack; pops both,
-    /// pushes bool. RHS must be a Closure or Bound; else TypeError.
+    /// pushes bool. RHS must be a Closure, Bound, or constructor Builtin;
+    /// else TypeError. Step 2b: the structural `TypeTag` fast path
+    /// (`Instr::TypeCheck`) is folded into this walk — the RHS is always
+    /// evaluated to a real constructor value, so `[] instanceof Array`
+    /// resolves `Array` to `Value::Builtin(ArrayCtor)` and walks the
+    /// chain here, with no special-case instruction.
     /// Stack: value, callable -> bool
     InstanceOf,
-    /// Builtin-type `instanceof` fast path (`x instanceof Array`, etc.).
-    /// Pops the LHS value and pushes whether it matches the given type tag.
-    /// Stack: value -> bool
-    TypeCheck(TypeTag),
 
     /// JS `String(x)` / ToString: pops any value, pushes its string form. Unlike
     /// StrFromJson (which emits JSON, and rejects non-JSON values), this matches

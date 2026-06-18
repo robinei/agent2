@@ -1,6 +1,5 @@
 use oxc_ast::ast;
 
-use crate::vm::instr::TypeTag;
 use crate::vm::{Instr, Value};
 
 impl super::Compiler {
@@ -55,13 +54,16 @@ impl super::Compiler {
         self.emit(instr, span);
     }
 
-    /// `x instanceof RHS`. The compiler picks one of two lowerings by the RHS:
-    /// - **Builtin type**: RHS is an *undeclared* identifier naming a known
-    ///   builtin constructor (`Array`, `Object`, `Map`, `Set`, `RegExp`,
-    ///   `Function`). Emit `TypeCheck(tag)` for a structural value-tag check.
-    ///   A declared local shadowing the same name takes the user-callable path.
-    /// - **User callable**: evaluate the RHS and emit `InstanceOf`, which walks
-    ///   the prototype chain at runtime.
+    /// `x instanceof RHS`. Step 2b: the structural `TypeTag` fast path is
+    /// folded into the proto-chain walk — the RHS is always evaluated to a
+    /// real constructor value and `Instr::InstanceOf` walks the
+    /// `[[Prototype]]` chain at runtime. So `[] instanceof Array` evaluates
+    /// `Array` to `Value::Builtin(ArrayCtor)` (via `compile_identifier`) and
+    /// the walk finds `Array.prototype` on `[].[[Prototype]]` — one path
+    /// for builtin and user constructors alike, no `TypeCheck` special-case.
+    /// A declared local shadowing a builtin name takes the same path: the
+    /// local value is the RHS, and `InstanceOf` walks against its
+    /// `.prototype` (or TypeErrors if it's not callable).
     pub(super) fn compile_instanceof(
         &mut self,
         lhs: &ast::Expression,
@@ -69,27 +71,6 @@ impl super::Compiler {
         span: u32,
     ) {
         self.compile_expr(lhs);
-        // Check for builtin-type fast path: RHS is an undeclared identifier
-        // naming a known builtin type.
-        if let ast::Expression::Identifier(id) = rhs {
-            let ref_span = id.span.start;
-            if self.ref_slot(ref_span).is_none() && !crate::is_host_const(id.name.as_str()) {
-                let tag = match id.name.as_str() {
-                    "Array" => Some(TypeTag::Array),
-                    "Object" => Some(TypeTag::Object),
-                    "Map" => Some(TypeTag::Map),
-                    "Set" => Some(TypeTag::Set),
-                    "RegExp" => Some(TypeTag::RegExp),
-                    "Function" => Some(TypeTag::Function),
-                    _ => None,
-                };
-                if let Some(tag) = tag {
-                    self.emit(Instr::TypeCheck(tag), span);
-                    return;
-                }
-            }
-        }
-        // User-callable path: evaluate RHS and emit InstanceOf.
         self.compile_expr(rhs);
         self.emit(Instr::InstanceOf, span);
     }

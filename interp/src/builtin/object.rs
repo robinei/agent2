@@ -114,13 +114,9 @@ pub fn obj_from_entries(vm: &mut VM, args: Args) -> Result<Value, VMError> {
         let key = vm.to_js_string(&pair[0], 0);
         map.insert(key, pair[1].clone());
     }
-    let addr = vm.objects.len() as u32;
-    vm.objects.push(ObjData {
-        proto: None,
-        map,
-        ..Default::default()
-    });
-    Ok(Value::Object(addr))
+    // Step 2b: use `alloc_object` so the result chains to `Object.prototype`
+    // (matching JS — `Object.fromEntries([])` is a plain object).
+    Ok(vm.alloc_object(map))
 }
 
 /// `Object.assign(target, ...sources)` → copies properties from sources to target,
@@ -195,15 +191,61 @@ pub fn obj_has_own_property(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     Ok(Value::Bool(obj.map.contains_key(key.as_str())))
 }
 
-/// `Object.getPrototypeOf(obj)` → the prototype of `obj`, or `null` if none.
-/// Only accepts `Value::Object`; non-Object args are a TypeError (no wrapper
-/// coercion).
-pub fn obj_get_proto_of(vm: &mut VM, args: Args) -> Result<Value, VMError> {
-    let obj_ptr = match args.get(vm, 0) {
-        Value::Object(p) => *p,
-        _ => return Err(vm.fail(ErrorKind::TypeError, "type error")),
+/// `Object.create(proto [, properties])` — creates a new object with
+/// `proto` as its `[[Prototype]]` (Step 2b). `proto` must be an `Object` or
+/// `null`. The optional second argument (property descriptors) is not
+/// supported (descriptor tier is Step 4) — passing it is a `TypeError` so
+/// the divergence is loud, not silent. The new object is extensible with
+/// an empty own-property map, exactly like JS.
+pub fn obj_create(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let proto = args.get(vm, 0);
+    let proto_ptr = match proto {
+        Value::Object(p) => Some(*p),
+        Value::Null => None,
+        _ => {
+            return Err(vm.fail(
+                ErrorKind::TypeError,
+                "Object.create: prototype must be an object or null",
+            ));
+        }
     };
-    vm.object_proto_value(obj_ptr)
+    // The optional second arg (property descriptors) is not supported.
+    if !matches!(args.get(vm, 1), Value::Undefined) {
+        return Err(vm.fail(
+            ErrorKind::TypeError,
+            "Object.create: property descriptors are not supported (Step 4 tier)",
+        ));
+    }
+    let ptr = vm.objects.len() as u32;
+    vm.objects.push(ObjData {
+        proto: proto_ptr,
+        map: IndexMap::new(),
+        ..Default::default()
+    });
+    Ok(Value::Object(ptr))
+}
+
+/// `Object.getPrototypeOf(x)` → the `[[Prototype]]` of `x` as a value, or
+/// `null` if `x` has no prototype (`Object.create(null)`). Step 2b: accepts
+/// any value — primitives return their wrapper type's prototype
+/// (`Object.getPrototypeOf(5) === Number.prototype`), structural types
+/// return their type prototype (`Object.getPrototypeOf([]) ===
+/// Array.prototype`), constructors return `Function.prototype`
+/// (`Object.getPrototypeOf(Array) === Function.prototype`). `null`/
+/// `undefined` are a `TypeError` (no wrapper coercion — JS throws too).
+pub fn obj_get_proto_of(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let val = args.get(vm, 0).clone();
+    match vm.value_proto(&val)? {
+        Some(p) => Ok(Value::Object(p)),
+        None => match &val {
+            Value::Null | Value::Undefined => Err(vm.fail(
+                ErrorKind::TypeError,
+                "Object.getPrototypeOf: cannot convert primitive to object (null/undefined)",
+            )),
+            // Upval is an internal marker that should never reach here.
+            _ => Ok(Value::Null),
+        },
+    }
 }
 
 /// `Object.setPrototypeOf(obj, proto)` → sets `obj`'s prototype and returns

@@ -30,76 +30,119 @@ fn regexp_prop(r: &RcRegExp, field: &str) -> Value {
 }
 
 impl VM {
-    /// Shared property resolution for `ObjGet`/`ObjPeek`: inspects the
-    /// top-of-stack as the receiver and returns the resolved property value.
-    /// Used by both instructions so the only difference is whether the
-    /// receiver is popped (ObjGet) or kept (ObjPeek).
-    fn resolve_property_from_top(&self, field_str: &str) -> Result<Value, VMError> {
-        match self.stack.last() {
-            Some(Value::RegExp(r)) => Ok(regexp_prop(r, field_str)),
-            Some(Value::Object(p)) => self.resolve_proto_chain(*p, field_str),
-            _ => {
-                let recv = self.stack.last();
-                let msg = format!(
-                    "cannot read property on {}{}",
-                    recv.map(|v| v.type_name()).unwrap_or("unknown"),
-                    recv.map(await_hint).unwrap_or("")
-                );
-                Err(self.fail(ErrorKind::TypeError, msg))
-            }
-        }
-    }
-
-    /// Resolve a named property on a `Value::Builtin` constructor (Step 2a
-    /// Part 2). The virtual rungs are:
-    /// - `prototype` → the type's frozen prototype object (from the side
-    ///   table, lazily allocated);
-    /// - `name` → the constructor's display name (`meta().name`);
-    /// - static methods (`Array.isArray`, `Object.keys`, …) → resolved via
-    ///   `Builtin::for_namespace(type_tag.name(), field)`.
+    /// Unified named-property read for any receiver value (Step 2b) — the
+    /// seed of the convergence target's `get_property`. For an `Object`,
+    /// walks own map → proto chain (the existing `resolve_proto_chain`,
+    /// now with the `constructor` virtual rung on builtin prototypes). For
+    /// every other value with a `[[Prototype]]` (Array/Map/Set/RegExp/
+    /// Closure/Builtin/Bound/String/Number/Bool/Promise), starts at the
+    /// type's builtin prototype and walks from there — so `[].constructor`,
+    /// `(5).constructor`, `"".constructor` resolve as ordinary lookups
+    /// rather than special cases. The per-type virtual rungs (Closure
+    /// `.prototype`, Builtin constructor `.prototype`/`.name`/statics,
+    /// RegExp `source`/`flags`/`lastIndex`) are handled here too, folding
+    /// the former `resolve_closure_prototype`/`resolve_builtin_property`/
+    /// `regexp_prop`-as-top-level-resolver into one body.
     ///
-    /// Non-constructor builtins (method/namespace kinds) have no virtual
-    /// rungs here — `Math.max` as a value is a `Value::Builtin` read off
-    /// the namespace object, not a property of a constructor.
-    fn resolve_builtin_property(&mut self, b: Builtin, field_str: &str) -> Result<Value, VMError> {
-        // Only constructors have virtual rungs. A method/namespace builtin
-        // read as a value has no properties (it is a leaf function value);
-        // JS returns `undefined` for arbitrary prop reads on functions, but
-        // the reflective rungs (`prototype`/`name`/`length`) are the ones
-        // that matter and `length` is handled by `GetLength`.
-        let Some(tag) = b.constructor_type_tag() else {
-            // Non-constructor builtin: no virtual rungs. `undefined` for
-            // any property read (matches JS function-value behavior for
-            // unknown properties).
-            return Ok(Value::Undefined);
-        };
-        match field_str {
-            "prototype" => Ok(Value::Object(self.prototype_for(tag)?)),
-            "name" => Ok(Value::String(RcStr::from(b.meta().name))),
-            // Static methods on the constructor (`Array.isArray`,
-            // `Object.keys`, …) — resolved from the same registry the
-            // compiler's fast path uses, keyed by the type's name.
-            _ => match Builtin::for_namespace(tag.name(), field_str) {
-                Some(b) => Ok(Value::Builtin(b)),
-                None => Ok(Value::Undefined),
-            },
+    /// `null`/`undefined` receivers are a `TypeError` (matching JS). A miss
+    /// returns `Undefined`. This is `&mut self` because the type prototype
+    /// may be lazily allocated on first reflective touch.
+    fn get_property(&mut self, receiver: &Value, field: &str) -> Result<Value, VMError> {
+        match receiver {
+            Value::Null | Value::Undefined => Err(self.fail(
+                ErrorKind::TypeError,
+                format!(
+                    "cannot read property '{field}' on {}{}",
+                    receiver.type_name(),
+                    await_hint(receiver)
+                ),
+            )),
+            Value::Object(p) => self.resolve_proto_chain(*p, field),
+            Value::RegExp(r) => {
+                let v = regexp_prop(r, field);
+                if !matches!(v, Value::Undefined) {
+                    return Ok(v);
+                }
+                self.get_property_from_type(crate::vm::instr::TypeTag::RegExp, field)
+            }
+            Value::Closure { ptr, .. } => {
+                if field == "prototype" {
+                    return Ok(Value::Object(self.resolve_prototype(*ptr)?));
+                }
+                self.get_property_from_type(crate::vm::instr::TypeTag::Function, field)
+            }
+            Value::Bound(_) => {
+                self.get_property_from_type(crate::vm::instr::TypeTag::Function, field)
+            }
+            Value::Builtin(b) => {
+                if let Some(tag) = b.constructor_type_tag() {
+                    match field {
+                        "prototype" => {
+                            return Ok(Value::Object(self.prototype_for(tag)?));
+                        }
+                        "name" => return Ok(Value::String(RcStr::from(b.meta().name))),
+                        _ => {
+                            if let Some(static_b) =
+                                crate::builtin::Builtin::for_namespace(tag.name(), field)
+                            {
+                                return Ok(Value::Builtin(static_b));
+                            }
+                        }
+                    }
+                    // Constructor's other properties: walk to
+                    // Function.prototype.
+                    self.get_property_from_type(crate::vm::instr::TypeTag::Function, field)
+                } else {
+                    // Method/namespace builtin: a function value whose
+                    // [[Prototype]] is Function.prototype.
+                    self.get_property_from_type(crate::vm::instr::TypeTag::Function, field)
+                }
+            }
+            Value::Array(_) => self.get_property_from_type(crate::vm::instr::TypeTag::Array, field),
+            Value::Map(_) => self.get_property_from_type(crate::vm::instr::TypeTag::Map, field),
+            Value::Set(_) => self.get_property_from_type(crate::vm::instr::TypeTag::Set, field),
+            Value::String(_) => {
+                self.get_property_from_type(crate::vm::instr::TypeTag::String, field)
+            }
+            Value::Float(_) | Value::PosInt(_) | Value::NegInt(_) => {
+                self.get_property_from_type(crate::vm::instr::TypeTag::Number, field)
+            }
+            Value::Bool(_) => {
+                self.get_property_from_type(crate::vm::instr::TypeTag::Boolean, field)
+            }
+            Value::Promise(_) => {
+                // Promises are transient tool-call values. Property access
+                // on one is the classic missing-`await` mistake
+                // (`tools.f().field` instead of `(await tools.f()).field`),
+                // so raise a TypeError with the hint rather than silently
+                // walking `Object.prototype` and returning `undefined`.
+                // (This is a deliberate diagnostic, pinned in the divergence
+                // list — not a compat gap; `Object.getPrototypeOf(p)` still
+                // returns `Object.prototype` via `value_proto`.)
+                Err(self.fail(
+                    ErrorKind::TypeError,
+                    format!(
+                        "cannot read property '{field}' on promise{}",
+                        await_hint(receiver)
+                    ),
+                ))
+            }
+            Value::Upval(_) => Err(self.fail(ErrorKind::ValueError, "value error")),
         }
     }
 
-    /// Resolve `"prototype"` on a `Closure` receiver (for `F.prototype`).
-    /// Lazily allocates an empty object on first access. Other property names
-    /// on a Closure are a TypeError. Called directly from the `ObjGet`/`ObjPeek`
-    /// dispatch arms to avoid a `&self`/`&mut self` conflict with the `step()`
-    /// code borrow.
-    fn resolve_closure_prototype(
+    /// Walk the builtin prototype chain for `tag`, starting at `tag`'s frozen
+    /// prototype (lazily allocated). Used by [`get_property`] for non-Object
+    /// receivers — the `[[Prototype]]` of an array is `Array.prototype`, of
+    /// a number is `Number.prototype`, etc. — so property reads on
+    /// primitives and structural types walk the same chain as objects.
+    fn get_property_from_type(
         &mut self,
-        ptr: ClosurePtr,
-        field_str: &str,
+        tag: crate::vm::instr::TypeTag,
+        field: &str,
     ) -> Result<Value, VMError> {
-        if field_str != "prototype" {
-            return Err(self.fail(ErrorKind::TypeError, "cannot read property on function"));
-        }
-        Ok(Value::Object(self.resolve_prototype(ptr)?))
+        let proto = self.prototype_for(tag)?;
+        self.resolve_proto_chain(proto, field)
     }
 
     /// Shared computed-property resolution for `IndexGet`/`ObjPeekDyn`:
@@ -1039,42 +1082,13 @@ impl VM {
                 }
 
                 // ── instanceof ────────────────────────────────
-                Instr::TypeCheck(tag) => {
-                    use crate::vm::instr::TypeTag;
-                    let tag = *tag;
-                    let val = self.pop()?;
-                    let result = match tag {
-                        TypeTag::Array => matches!(val, Value::Array(_)),
-                        TypeTag::Object => matches!(
-                            val,
-                            Value::Object(_)
-                                | Value::Array(_)
-                                | Value::Map(_)
-                                | Value::Set(_)
-                                | Value::RegExp(_)
-                                | Value::Closure { .. }
-                                | Value::Bound(_)
-                        ),
-                        TypeTag::Map => matches!(val, Value::Map(_)),
-                        TypeTag::Set => matches!(val, Value::Set(_)),
-                        TypeTag::RegExp => matches!(val, Value::RegExp(_)),
-                        TypeTag::Function => {
-                            matches!(
-                                val,
-                                Value::Closure { .. } | Value::Builtin(_) | Value::Bound(_)
-                            )
-                        }
-                        // Primitive wrapper types: a primitive is never
-                        // `instanceof` its wrapper in JS (`"x" instanceof
-                        // String` is `false`), and this dialect has no boxed
-                        // primitives. These tags key the prototype side table
-                        // only; the compiler never emits them via `TypeCheck`.
-                        TypeTag::String | TypeTag::Number | TypeTag::Boolean => false,
-                    };
-                    self.stack.push(Value::Bool(result));
-                    self.ip += 1;
-                }
-
+                // Step 2b: the structural `TypeTag` fast path
+                // (`Instr::TypeCheck`) is folded into this walk — the
+                // compiler evaluates the RHS to a real constructor value
+                // and `instanceof` walks the `[[Prototype]]` chain via
+                // `value_proto` for all receiver types (Object/Array/Map/
+                // Set/RegExp/Closure/Builtin/Bound), with no special-case
+                // instruction.
                 Instr::InstanceOf => {
                     let rhs = self.pop()?;
                     let lhs = self.pop()?;
@@ -1251,31 +1265,27 @@ impl VM {
                 Instr::ObjGet(field) => {
                     // Snapshot the field name as an owned `String` so the
                     // `self.code` borrow from the `field` match binding is
-                    // released before the mutable `resolve_closure_prototype`
-                    // call on the `Closure` path.
+                    // released before the mutable `get_property` call.
                     let field_str = field.as_str().to_owned();
-                    match self.stack.last() {
-                        Some(Value::Closure { ptr, .. }) => {
-                            let val = self.resolve_closure_prototype(*ptr, &field_str)?;
-                            self.stack.pop();
-                            self.stack.push(val);
+                    // Step 2b: `get_property` handles all receiver types
+                    // (Object/Array/Map/Set/RegExp/Closure/Builtin/Bound/
+                    // String/Number/Bool/Promise), walking the proto chain
+                    // with virtual rungs — folding the former
+                    // `resolve_closure_prototype`/`resolve_builtin_property`/
+                    // `resolve_property_from_top` into one body. Clone the
+                    // receiver (a refcount bump for strings/regexps, trivial
+                    // for others) so the `&mut self` call is borrow-clean.
+                    let recv = match self.stack.last() {
+                        Some(r) => r.clone(),
+                        None => {
+                            return Err(self.fail(ErrorKind::StackUnderflow, "stack underflow"));
                         }
-                        Some(Value::Builtin(b)) => {
-                            let val = self.resolve_builtin_property(*b, &field_str)?;
-                            self.stack.pop();
-                            self.stack.push(val);
-                        }
-                        _ => match self.resolve_property_from_top(&field_str) {
-                            Ok(val) => {
-                                self.stack.pop();
-                                self.stack.push(val);
-                            }
-                            Err(e) => {
-                                self.stack.pop();
-                                return Err(e);
-                            }
-                        },
-                    }
+                    };
+                    let result = self.get_property(&recv, &field_str);
+                    // Pop the receiver (pop-first invariant: the operand is
+                    // consumed whether the read succeeded or errored).
+                    self.stack.pop();
+                    self.stack.push(result?);
                     self.ip += 1;
                 }
 
@@ -1284,20 +1294,17 @@ impl VM {
                 // ObjGet, shared helper. obj -> obj, any
                 Instr::ObjPeek(field) => {
                     let field_str = field.as_str().to_owned();
-                    match self.stack.last() {
-                        Some(Value::Closure { ptr, .. }) => {
-                            let val = self.resolve_closure_prototype(*ptr, &field_str)?;
-                            self.stack.push(val);
+                    // Step 2b: use `get_property` (same as ObjGet) so all
+                    // receiver types resolve uniformly. The receiver stays
+                    // on the stack (peek, not pop).
+                    let recv = match self.stack.last() {
+                        Some(r) => r.clone(),
+                        None => {
+                            return Err(self.fail(ErrorKind::StackUnderflow, "stack underflow"));
                         }
-                        Some(Value::Builtin(b)) => {
-                            let val = self.resolve_builtin_property(*b, &field_str)?;
-                            self.stack.push(val);
-                        }
-                        _ => {
-                            let val = self.resolve_property_from_top(&field_str)?;
-                            self.stack.push(val);
-                        }
-                    }
+                    };
+                    let val = self.get_property(&recv, &field_str)?;
+                    self.stack.push(val);
                     self.ip += 1;
                 }
 
@@ -1316,7 +1323,11 @@ impl VM {
                 // Method-aware read (Step 6): Object → property read (same as
                 // ObjGet); structural/callable → Builtin or Undefined; null/
                 // undefined → TypeError (receiver popped first, pop-first
-                // normalization matching ObjGet).
+                // normalization matching ObjGet). Step 2b: number/boolean
+                // primitive receivers now resolve via `method_for_receiver`
+                // (the `number`/`boolean` columns), so `(5).toFixed` finds
+                // `NumberToFixed` with the receiver staying an unboxed
+                // primitive (no boxing allocation).
                 Instr::GetMethodOrProp(field) => {
                     // `field` is an `RcStr`; clone the refcount (not the bytes)
                     // to release the borrow on `self` for the stack mutations.
@@ -1325,9 +1336,11 @@ impl VM {
                     let result = match recv {
                         Some(Value::Object(p)) => {
                             // Object: own→proto property read (an own data
-                            // property shadows any builtin name).
+                            // property shadows any builtin name). Step 2b:
+                            // use `get_property` so virtual rungs
+                            // (`constructor`) resolve too.
                             self.stack.pop();
-                            self.resolve_proto_chain(p, &field)?
+                            self.get_property(&Value::Object(p), &field)?
                         }
                         Some(Value::Builtin(b)) => {
                             // A builtin value read as a property: constructor
@@ -1335,7 +1348,7 @@ impl VM {
                             // constructors; `undefined` for method/namespace
                             // builtins (leaf function values).
                             self.stack.pop();
-                            self.resolve_builtin_property(b, &field)?
+                            self.get_property(&Value::Builtin(b), &field)?
                         }
                         Some(Value::Null) | Some(Value::Undefined) | None => {
                             let recv = self.pop()?;
@@ -1348,6 +1361,13 @@ impl VM {
                         }
                         Some(ref r) => {
                             self.stack.pop();
+                            // Structural receiver (array/string/map/set/
+                            // regexp/closure/bound/number/boolean): resolve
+                            // the method via `method_for_receiver`, which
+                            // checks the type's method columns. For a
+                            // primitive (number/boolean), the receiver stays
+                            // unboxed — the builtin handler receives it as
+                            // arg 0 (no boxing allocation).
                             Builtin::method_for_receiver(r, &field)
                                 .map(Value::Builtin)
                                 .unwrap_or(Value::Undefined)

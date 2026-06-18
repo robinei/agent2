@@ -231,7 +231,10 @@ fn caught_error_message_carries_rendered_diagnostic() {
     let msg = msg.as_str().unwrap();
     // The rendered diagnostic includes the message, line:col, and the
     // offending source line.
-    assert!(msg.contains("cannot read property on null"), "got: {msg}");
+    assert!(
+        msg.contains("cannot read property 'foo' on null"),
+        "got: {msg}"
+    );
     assert!(msg.contains("1:"), "got: {msg}");
     assert!(msg.contains("null.foo"), "got: {msg}");
 }

@@ -1057,6 +1057,10 @@ rather than silently tolerated:
   Revisited by the `ToPrimitive` tier.
 - **No boxed primitives** — Step 2b deliberately keeps this (method compat
   without wrappers); full wrapper identity is a separate low-priority tier.
+  `(5).toFixed(2)` resolves `toFixed` via `Number.prototype` for method
+  lookup only, the receiver staying an unboxed number — no `Value` allocation.
+  `[].constructor === Array`, `(5).constructor === Number` hold via the
+  `constructor` virtual rung on builtin prototypes.
 - **`Number` formatting** diverges on exponential form (`1e21`) and the
   `PosInt`/`NegInt`/`Float` split has accepted edge cases beyond the f64
   mantissa — value.rs:478. Audit when the corpus hits number-stringify.
@@ -1068,12 +1072,17 @@ rather than silently tolerated:
   alternative-naming diagnostics under the instrumental goal; under the
   terminal goal these are *schedulable* (corpus-gated), no longer
   architectural exclusions.
-- **`new Map()`/`new Set()`/`new RegExp()` — resolved in Step 2a Part 2**, not
-  pinned: once constructors are callable function values and `New` accepts
-  native constructors, `new Map()` constructs normally (this is the
+- **`new Map()`/`new Set()`/`new RegExp()` — resolved in Step 2a Part 2**,
+  not pinned: once constructors are callable function values and `New`
+  accepts native constructors, `new Map()` constructs normally (this is the
   representation fix that makes `typeof Map === "function"` etc. hold). This
-  flips the old `4_FUTURE` "no `new Map()`" decision deliberately. `new Date()`
-  remains schedulable separately (no `Date` type yet).
+  flips the old `4_FUTURE` "no `new Map()`" decision deliberately. `new
+  Function(body)` is unsupported — `Function` is a constructor *value*
+  (Step 2b: `Map instanceof Function`,
+  `Object.getPrototypeOf(Array) === Function.prototype`) but both `new
+  Function(...)` and `Function(...)` throw (function expressions are the
+  alternative). `new Date()` remains schedulable separately (no `Date` type
+  yet).
 - **`Object.isFrozen(Array.prototype)` is `true`** here vs `false` in JS
   (real-JS builtin prototypes are mutable) — Step 2d. Not a new divergence:
   it is the same deferred "builtin prototypes are frozen, not yet

@@ -320,7 +320,6 @@ fn pe_produces_bool(i: &Instr) -> bool {
             | Instr::IsMap
             | Instr::IsSet
             | Instr::InstanceOf
-            | Instr::TypeCheck(_)
             | Instr::ObjHas
             | Instr::ObjDelete
     )

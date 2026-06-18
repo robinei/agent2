@@ -209,16 +209,28 @@ The remaining intentional divergences from JS — deferred or accepted, NOT bugs
     throw/rejection rejects the call's promise, exactly as in JS. Circular
     awaits are detected and reported as a dedicated `Deadlock` error naming
     the await chain.
-  • `instanceof` covers builtin types (`Array`/`Object`/`Map`/`Set`/`RegExp`/
-    `Function`) via a structural value-tag check and user callables (`Closure`/
-    `Bound`) via a prototype-chain walk. `instanceof Error` is unsupported —
-    Error instances are plain `Object`s with no distinct tag or `Error.prototype`
-    link.
-  • `Object.getPrototypeOf` returns `null` for a plain object (no
-    `Object.prototype`) and rejects a primitive argument with `TypeError` (no
-    wrapper coercion). Prototype get/set is *only* via `Object.get/setPrototypeOf`
-    — the legacy (Annex B) `__proto__` accessor is not modeled, so `__proto__` is
-    an ordinary string-keyed data property.
+  • `instanceof` walks the `[[Prototype]]` chain for all RHS types (Step
+    2b): `[] instanceof Array`, `m instanceof Map`, `f instanceof Function`,
+    `x instanceof Object`, and `new F() instanceof F` all take one walk
+    (no structural `TypeTag` fast path). Primitives are never `instanceof`
+    anything (JS: "If Type(relObj) is not Object, return false").
+    `instanceof Error` is unsupported — Error instances are plain `Object`s
+    with no distinct tag or `Error.prototype` link.
+  • `Function` is a constructor *value* for reflection (`typeof Function ===
+    "function"`, `Map instanceof Function`,
+    `Object.getPrototypeOf(Array) === Function.prototype`), but neither `new
+    Function(body)` nor `Function(body)` is supported — both throw (a
+    documented divergence; function expressions are the alternative).
+  • `Object.getPrototypeOf` returns the real `[[Prototype]]` for any value
+    (Step 2b): primitives return their wrapper type's prototype
+    (`Object.getPrototypeOf(5) === Number.prototype`), structural types
+    return their type prototype (`Object.getPrototypeOf([]) ===
+    Array.prototype`), constructors return `Function.prototype`. Plain
+    objects chain to `Object.prototype` (`Object.getPrototypeOf({}) ===
+    Object.prototype`). `null`/`undefined` are a `TypeError` (no wrapper
+    coercion). Prototype get/set is *only* via `Object.get/setPrototypeOf`
+    — the legacy (Annex B) `__proto__` accessor is not modeled, so
+    `__proto__` is an ordinary string-keyed data property.
 
 */
 
