@@ -590,19 +590,19 @@ fn missing_method_on_object_is_type_error() {
     );
 }
 
-/// `hasOwnProperty` is the one method builtin that *accepts* an Object receiver,
-/// so it stays on the builtin fast path: it succeeds without consulting the
-/// object's own properties. An own `hasOwnProperty` therefore does **not**
-/// shadow the builtin — a deliberate divergence from JS and from the other
-/// method builtins' shadowing (see `obj_has_own_property`).
+/// Step 2c: `hasOwnProperty` shadows uniformly with every other method
+/// builtin — an own property of that name wins (the former deliberate
+/// divergence is retired; the unified `CallBuiltin` Object-receiver path
+/// now consults `resolve_method_for_object_receiver` for *every* method
+/// name, not a whitelist).
 #[test]
-fn has_own_property_is_not_shadowed() {
-    // Own `hasOwnProperty` does NOT win: the builtin runs (`'a'` is present).
+fn has_own_property_is_shadowed_like_every_other_method() {
+    // Own `hasOwnProperty` wins: the user function runs.
     assert_eq!(
         testutil::run_val(
             "const o = { a: 1, hasOwnProperty: () => 999 }; return o.hasOwnProperty('a');"
         ),
-        Value::Bool(true)
+        Value::PosInt(999)
     );
     // And the builtin behaves normally on a plain object.
     assert_eq!(

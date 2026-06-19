@@ -625,7 +625,7 @@ impl super::Compiler {
             // decides by receiver *type* (unknown here): a matching receiver runs
             // the builtin (its own lenient/error behavior — the proper builtin
             // arity error for a structural receiver, not a property-read error);
-            // an `Object` receiver reroutes (`MethodOnObject`) to a same-named
+            // an `Object` receiver resolves to a same-named
             // own/proto property, which carries its own arity. So a prototype
             // method sharing a builtin's name but not its arity still works
             // without diverting structural-receiver calls to the dynamic path.

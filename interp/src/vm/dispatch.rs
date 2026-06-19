@@ -63,16 +63,16 @@ impl VM {
                 if !matches!(v, Value::Undefined) {
                     return Ok(v);
                 }
-                self.get_property_from_type(crate::vm::instr::TypeTag::RegExp, field)
+                self.get_property_from_type(crate::vm::instr::TypeTag::RegExp, field, receiver)
             }
             Value::Closure { ptr, .. } => {
                 if field == "prototype" {
                     return Ok(Value::Object(self.resolve_prototype(*ptr)?));
                 }
-                self.get_property_from_type(crate::vm::instr::TypeTag::Function, field)
+                self.get_property_from_type(crate::vm::instr::TypeTag::Function, field, receiver)
             }
             Value::Bound(_) => {
-                self.get_property_from_type(crate::vm::instr::TypeTag::Function, field)
+                self.get_property_from_type(crate::vm::instr::TypeTag::Function, field, receiver)
             }
             Value::Builtin(b) => {
                 if let Some(tag) = b.constructor_type_tag() {
@@ -91,24 +91,38 @@ impl VM {
                     }
                     // Constructor's other properties: walk to
                     // Function.prototype.
-                    self.get_property_from_type(crate::vm::instr::TypeTag::Function, field)
+                    self.get_property_from_type(
+                        crate::vm::instr::TypeTag::Function,
+                        field,
+                        receiver,
+                    )
                 } else {
                     // Method/namespace builtin: a function value whose
                     // [[Prototype]] is Function.prototype.
-                    self.get_property_from_type(crate::vm::instr::TypeTag::Function, field)
+                    self.get_property_from_type(
+                        crate::vm::instr::TypeTag::Function,
+                        field,
+                        receiver,
+                    )
                 }
             }
-            Value::Array(_) => self.get_property_from_type(crate::vm::instr::TypeTag::Array, field),
-            Value::Map(_) => self.get_property_from_type(crate::vm::instr::TypeTag::Map, field),
-            Value::Set(_) => self.get_property_from_type(crate::vm::instr::TypeTag::Set, field),
+            Value::Array(_) => {
+                self.get_property_from_type(crate::vm::instr::TypeTag::Array, field, receiver)
+            }
+            Value::Map(_) => {
+                self.get_property_from_type(crate::vm::instr::TypeTag::Map, field, receiver)
+            }
+            Value::Set(_) => {
+                self.get_property_from_type(crate::vm::instr::TypeTag::Set, field, receiver)
+            }
             Value::String(_) => {
-                self.get_property_from_type(crate::vm::instr::TypeTag::String, field)
+                self.get_property_from_type(crate::vm::instr::TypeTag::String, field, receiver)
             }
             Value::Float(_) | Value::PosInt(_) | Value::NegInt(_) => {
-                self.get_property_from_type(crate::vm::instr::TypeTag::Number, field)
+                self.get_property_from_type(crate::vm::instr::TypeTag::Number, field, receiver)
             }
             Value::Bool(_) => {
-                self.get_property_from_type(crate::vm::instr::TypeTag::Boolean, field)
+                self.get_property_from_type(crate::vm::instr::TypeTag::Boolean, field, receiver)
             }
             Value::Promise(_) => {
                 // Promises are transient tool-call values. Property access
@@ -136,13 +150,32 @@ impl VM {
     /// receivers — the `[[Prototype]]` of an array is `Array.prototype`, of
     /// a number is `Number.prototype`, etc. — so property reads on
     /// primitives and structural types walk the same chain as objects.
+    ///
+    /// Step 2c: when the proto-chain walk returns `Undefined`, consult
+    /// `Builtin::method_for_receiver` as a fallback — the builtin prototype's
+    /// own map is empty (methods are virtual, for non-enumerability), so
+    /// method-value reads (`[].push`, `"x".at`) and reflective lookups
+    /// resolve through this gate, folding the former standalone
+    /// `method_for_receiver` call in `GetMethodOrProp` into the unified
+    /// `get_property` ladder.
     fn get_property_from_type(
         &mut self,
         tag: crate::vm::instr::TypeTag,
         field: &str,
+        receiver: &Value,
     ) -> Result<Value, VMError> {
         let proto = self.prototype_for(tag)?;
-        self.resolve_proto_chain(proto, field)
+        let val = self.resolve_proto_chain(proto, field)?;
+        if !matches!(val, Value::Undefined) {
+            return Ok(val);
+        }
+        // Fallback: builtin prototype map is empty (methods are virtual
+        // rungs for non-enumerability), so consult the builtins! registry
+        // directly. This is the unified method-resolution gate — the former
+        // standalone `method_for_receiver` call in `GetMethodOrProp`.
+        Ok(Builtin::method_for_receiver(receiver, field)
+            .map(Value::Builtin)
+            .unwrap_or(Value::Undefined))
     }
 
     /// Shared computed-property resolution for `IndexGet`/`ObjPeekDyn`:
@@ -196,6 +229,63 @@ impl VM {
                 Err(self.fail(ErrorKind::TypeError, msg))
             }
         }
+    }
+
+    /// Resolve a method name on an `Object` receiver via the unified
+    /// own-properties → proto-chain walk. When a `CallBuiltin` instruction
+    /// lands on an `Object` receiver, this helper checks whether the object
+    /// (or its proto chain) has a shadowing property of the same name —
+    /// if so, that property is dispatched instead of the builtin (Step 2c:
+    /// uniform shadowing for every method name, including `hasOwnProperty`).
+    /// The former `MethodOnObject` error-signal + `reroute_method_to_object`
+    /// pair are retired; this is the fast-path shadow check that keeps
+    /// `CallBuiltin` the common case while sharing one resolution body
+    /// (`resolve_proto_chain`) with `get_property`.
+    pub(crate) fn resolve_method_for_object_receiver(
+        &mut self,
+        recv: &Value,
+        name: &str,
+    ) -> Result<Option<Value>, VMError> {
+        let obj_ptr = match recv {
+            Value::Object(p) => *p,
+            _ => return Ok(None),
+        };
+        let val = self.resolve_proto_chain(obj_ptr, name)?;
+        Ok(if matches!(val, Value::Undefined) {
+            None
+        } else {
+            Some(val)
+        })
+    }
+
+    /// Dispatch a `CallBuiltin`-shaped call that an `Object` receiver may
+    /// shadow. The top `argc` stack values are the builtin's args (arg 0 =
+    /// receiver, deepest). If the receiver is an `Object` whose own/proto
+    /// chain carries a property of the builtin's name, that property shadows
+    /// the builtin and is dispatched with the Object as `this` (Step 2c:
+    /// uniform shadowing, replacing the retired `MethodOnObject` reroute);
+    /// otherwise the builtin runs normally. The Object check is the *only*
+    /// thing on the fast path — the cheap `matches!` gates the receiver clone
+    /// and the proto walk, so a structural receiver (`arr.push`, `"x".at`)
+    /// pays one branch and nothing else. On the builtin path `ip` is advanced
+    /// here; the shadow path defers `ip` to `dispatch_call`. Shared by the
+    /// `Instr::CallBuiltin` arm and `dispatch_call`'s `Builtin` arm.
+    pub(crate) fn call_builtin_or_shadow(&mut self, b: Builtin, argc: u32) -> Result<(), VMError> {
+        if argc > 0 {
+            let base = self.stack.len() - argc as usize;
+            if matches!(self.stack[base], Value::Object(_)) {
+                let recv = self.stack[base].clone();
+                if let Some(callable) =
+                    self.resolve_method_for_object_receiver(&recv, b.meta().name)?
+                {
+                    let recv = std::mem::replace(&mut self.stack[base], Value::Undefined);
+                    return self.dispatch_call(callable, recv, argc - 1, 1);
+                }
+            }
+        }
+        b.call(self, argc)?;
+        self.ip += 1;
+        Ok(())
     }
 }
 
@@ -477,20 +567,7 @@ impl VM {
                 }
 
                 Instr::CallBuiltin(b, argc) => {
-                    let b = *b;
-                    let argc = *argc;
-                    // Happy path: the builtin runs. If it lands on an Object
-                    // receiver (the `MethodOnObject` signal), the args are still
-                    // on the stack — re-route the call to the object's own
-                    // same-named property so user properties shadow builtin
-                    // method names (push, trim, …). `reroute` sets `ip`.
-                    match b.call(self, argc) {
-                        Ok(()) => self.ip += 1,
-                        Err(e) if e.kind == ErrorKind::MethodOnObject => {
-                            self.reroute_method_to_object(b, argc)?;
-                        }
-                        Err(e) => return Err(e),
-                    }
+                    self.call_builtin_or_shadow(*b, *argc)?;
                 }
 
                 Instr::CallSpread(has_this) => {
@@ -1320,59 +1397,26 @@ impl VM {
                     self.ip += 1;
                 }
 
-                // Method-aware read (Step 6): Object → property read (same as
-                // ObjGet); structural/callable → Builtin or Undefined; null/
-                // undefined → TypeError (receiver popped first, pop-first
-                // normalization matching ObjGet). Step 2b: number/boolean
-                // primitive receivers now resolve via `method_for_receiver`
-                // (the `number`/`boolean` columns), so `(5).toFixed` finds
-                // `NumberToFixed` with the receiver staying an unboxed
-                // primitive (no boxing allocation).
+                // Method/value read (Step 6): resolve a named property on the
+                // receiver, yielding a method (Builtin) for structural types
+                // or a data value for objects. Step 2c: unified — every arm
+                // funnels through `get_property`, which walks own properties
+                // (Object) or the type's prototype chain, and falls back to
+                // `method_for_receiver` when the builtin prototype map is
+                // empty (methods are virtual rungs for non-enumerability).
+                // The former per-arm `method_for_receiver`/`resolve_property_from_top`
+                // duplication is collapsed into the one ladder.
                 Instr::GetMethodOrProp(field) => {
-                    // `field` is an `RcStr`; clone the refcount (not the bytes)
-                    // to release the borrow on `self` for the stack mutations.
+                    // Clone the field refcount to release the `self.code` borrow.
                     let field = field.clone();
-                    let recv = self.stack.last().cloned();
-                    let result = match recv {
-                        Some(Value::Object(p)) => {
-                            // Object: own→proto property read (an own data
-                            // property shadows any builtin name). Step 2b:
-                            // use `get_property` so virtual rungs
-                            // (`constructor`) resolve too.
-                            self.stack.pop();
-                            self.get_property(&Value::Object(p), &field)?
-                        }
-                        Some(Value::Builtin(b)) => {
-                            // A builtin value read as a property: constructor
-                            // virtual rungs (`prototype`, `name`, statics) for
-                            // constructors; `undefined` for method/namespace
-                            // builtins (leaf function values).
-                            self.stack.pop();
-                            self.get_property(&Value::Builtin(b), &field)?
-                        }
-                        Some(Value::Null) | Some(Value::Undefined) | None => {
-                            let recv = self.pop()?;
-                            let msg = format!(
-                                "cannot read property on {}{}",
-                                recv.type_name(),
-                                await_hint(&recv)
-                            );
-                            return Err(self.fail(ErrorKind::TypeError, msg));
-                        }
-                        Some(ref r) => {
-                            self.stack.pop();
-                            // Structural receiver (array/string/map/set/
-                            // regexp/closure/bound/number/boolean): resolve
-                            // the method via `method_for_receiver`, which
-                            // checks the type's method columns. For a
-                            // primitive (number/boolean), the receiver stays
-                            // unboxed — the builtin handler receives it as
-                            // arg 0 (no boxing allocation).
-                            Builtin::method_for_receiver(r, &field)
-                                .map(Value::Builtin)
-                                .unwrap_or(Value::Undefined)
+                    let recv = match self.stack.last() {
+                        Some(r) => r.clone(),
+                        None => {
+                            return Err(self.fail(ErrorKind::StackUnderflow, "stack underflow"));
                         }
                     };
+                    let result = self.get_property(&recv, &field)?;
+                    self.stack.pop();
                     self.stack.push(result);
                     self.ip += 1;
                 }

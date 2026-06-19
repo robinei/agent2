@@ -11,10 +11,11 @@ use crate::vm::{ErrorKind, VM, VMError, Value};
 // ── polymorphic handlers (dispatch on receiver: string vs array) ─────────────
 
 /// `x.toString([radix])` for any receiver — the general ToString method.
-/// Delegates to the same `to_js_string` coercion used by `String(x)` and
+/// Descendents to the same `to_js_string` coercion used by `String(x)` and
 /// template interpolation (one renderer behind both). An object's own
-/// `toString` shadows the default (consistent with method dispatch —
-/// re-routes via the `MethodOnObject` signal); a plain object otherwise
+/// `toString` shadows the default (the `CallBuiltin`/`dispatch_call` sites
+/// intercept Object receivers before calling this handler); a plain object
+/// otherwise
 /// yields `"[object Object]"`. Nullish receivers never reach here:
 /// `null.toString()` errors at the member access.
 ///
@@ -24,14 +25,6 @@ use crate::vm::{ErrorKind, VM, VMError, Value};
 /// radix.
 pub fn value_to_string(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let recv = args.get(vm, 0);
-    if let Value::Object(p) = recv
-        && vm
-            .objects
-            .get(*p as usize)
-            .is_some_and(|o| o.map.contains_key("toString"))
-    {
-        return Err(vm.fail(ErrorKind::MethodOnObject, ""));
-    }
     // Number with radix: JS `Number.prototype.toString(radix)`.
     if recv.is_number() && args.argc >= 2 {
         let radix = args.get(vm, 1);

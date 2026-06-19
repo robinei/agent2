@@ -716,19 +716,6 @@ pub enum ErrorKind {
     /// Tier 2). Only reachable via circular awaits among async calls — the
     /// message names the await chain. Never resumable.
     Deadlock,
-    /// Not a real error: an internal control-flow signal. A method builtin
-    /// (`push`, `trim`, …) was called with an `Object` receiver, which those
-    /// builtins never accept. Raised at the receiver check (see
-    /// `VM::method_receiver_error`) instead of a `TypeError`; the `call()`
-    /// epilogue forwards it with the arguments left on the stack, and the call
-    /// sites (`Instr::CallBuiltin` and `dispatch_call`) intercept it to re-route
-    /// the call to the object's own same-named property
-    /// (`VM::reroute_method_to_object`). Named for what is known when it is
-    /// raised — the receiver is an object — not for shadowing, which is only
-    /// confirmed later if that property exists (otherwise the reroute itself
-    /// raises a real `TypeError`). Must never surface to the program or a `try`
-    /// handler — both interceptors handle it exhaustively.
-    MethodOnObject,
 }
 
 /// Whether the host can resume from this error by feeding a value (see

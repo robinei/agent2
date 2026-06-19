@@ -211,25 +211,12 @@ macro_rules! builtins {
                 };
                 // Epilogue: drop the args and push the result on success; on
                 // error, drop the args and tag the message.
-                //
-                // Exception: a method builtin whose receiver (arg 0) is an
-                // `Object` raises the `MethodOnObject` signal at its receiver
-                // check (`VM::method_receiver_error`). Forward it verbatim with
-                // the args left on the stack so the call site
-                // (`reroute_method_to_object`) can dispatch the object's own
-                // property. We key off the error *kind* — the signal is raised
-                // exactly where the object receiver is detected, never inferred
-                // from some other error. (`hasOwnProperty` is the one method
-                // builtin that accepts an Object receiver; it just succeeds, so
-                // an own `hasOwnProperty` does not shadow it — a deliberate
-                // divergence, see `obj_has_own_property`.)
                 match result {
                     Ok(val) => {
                         vm.stack.truncate(args.base);
                         vm.stack.push(val);
                         Ok(())
                     }
-                    Err(e) if e.kind == ErrorKind::MethodOnObject => Err(e),
                     Err(mut e) => {
                         vm.stack.truncate(args.base);
                         e.message = format!("in `{}`: {}", meta.name, e.message);
@@ -585,9 +572,11 @@ impl Args {
     // ── method-receiver extraction ──────────────────────────────────────────
     //
     // Each method builtin validates its receiver (arg 0) through one of these.
-    // A non-matching receiver routes through `VM::method_receiver_error`, which
-    // raises the `MethodOnObject` re-route signal for an `Object` and a real
-    // `TypeError` for anything else — so the signal is produced *at* the
+    // A non-matching receiver routes through `VM::method_receiver_error`,
+    // which raises a `TypeError`. Object receivers are intercepted before
+    // the builtin handler is called (at the `CallBuiltin`/`dispatch_call`
+    // sites) to resolve the method via the unified own-properties →
+    // proto-chain walk — so the signal is produced *at* the
     // receiver check, never inferred downstream.
 
     /// Receiver as an array pointer (else the method-receiver error).
