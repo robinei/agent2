@@ -1474,11 +1474,16 @@ impl VM {
                                     "cannot set a property of a frozen object",
                                 ));
                             }
-                            if integrity == IntegrityLevel::Sealed && is_new {
+                            if is_new
+                                && matches!(
+                                    integrity,
+                                    IntegrityLevel::NonExtensible | IntegrityLevel::Sealed
+                                )
+                            {
                                 self.stack.pop();
                                 return Err(self.fail(
                                     ErrorKind::TypeError,
-                                    "cannot add a property to a sealed object",
+                                    "cannot add a property to a non-extensible object",
                                 ));
                             }
                             let obj = match self.objects.get_mut(obj_ptr as usize) {
@@ -1644,10 +1649,15 @@ impl VM {
                                 "cannot set a property of a frozen object",
                             ));
                         }
-                        if integrity == IntegrityLevel::Sealed && is_new {
+                        if is_new
+                            && matches!(
+                                integrity,
+                                IntegrityLevel::NonExtensible | IntegrityLevel::Sealed
+                            )
+                        {
                             return Err(self.fail(
                                 ErrorKind::TypeError,
-                                "cannot add a property to a sealed object",
+                                "cannot add a property to a non-extensible object",
                             ));
                         }
                         let ip = self.ip;
@@ -1725,6 +1735,19 @@ impl VM {
                             ));
                         }
                     };
+                    // Integrity gate (Step 2d): NonExtensible/Sealed/Frozen
+                    // objects reject new properties, and ObjExtend always
+                    // adds (never overwrites in place).
+                    let integrity = self
+                        .objects
+                        .get(obj_ptr as usize)
+                        .map_or(IntegrityLevel::Extensible, |o| o.integrity);
+                    if integrity != IntegrityLevel::Extensible {
+                        return Err(self.fail(
+                            ErrorKind::TypeError,
+                            "cannot extend a non-extensible object",
+                        ));
+                    }
                     // null/undefined src is a no-op (JS semantics).
                     // Non-object, non-null/undefined src is TypeError
                     // (divergence: JS would copy index keys from arrays/strings).

@@ -1,5 +1,5 @@
 use crate::builtin::Args;
-use crate::vm::{ErrorKind, ObjData, RcStr, VM, VMError, Value};
+use crate::vm::{ErrorKind, IntegrityLevel, ObjData, RcStr, VM, VMError, Value};
 use indexmap::IndexMap;
 use thin_vec::ThinVec;
 
@@ -257,6 +257,138 @@ pub fn obj_set_proto_of(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     Ok(Value::Object(obj_ptr))
 }
 
+// ── Step 2d: Object.freeze / seal / preventExtensions ───────────────────────
+
+/// `Object.freeze(obj)` — freezes the object (no add, delete, or modify) and
+/// returns it. Shallow — only the object itself, not nested children.
+/// MVP: receiver must be `Value::Object`; non-Object (array/map/set) is
+/// deferred (documented divergence).
+pub fn obj_freeze(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let obj_ptr = match args.get(vm, 0) {
+        Value::Object(p) => *p,
+        _ => {
+            return Err(vm.fail(
+                ErrorKind::TypeError,
+                "Object.freeze: receiver must be an Object (arrays/maps/sets deferred)",
+            ));
+        }
+    };
+    let ip = vm.ip;
+    let obj = vm
+        .objects
+        .get_mut(obj_ptr as usize)
+        .ok_or_else(|| VMError::fail_at(ip, ErrorKind::TypeError, "bad object pointer"))?;
+    obj.integrity = IntegrityLevel::Frozen;
+    Ok(Value::Object(obj_ptr))
+}
+
+/// `Object.isFrozen(obj)` → bool. Returns whether the object is frozen.
+/// MVP: non-Object receivers return `false` (deferred).
+pub fn obj_is_frozen(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    match args.get(vm, 0) {
+        Value::Object(p) => {
+            let obj = vm
+                .objects
+                .get(*p as usize)
+                .ok_or_else(|| vm.fail(ErrorKind::TypeError, "bad object pointer"))?;
+            Ok(Value::Bool(obj.integrity == IntegrityLevel::Frozen))
+        }
+        _ => Ok(Value::Bool(false)),
+    }
+}
+
+/// `Object.seal(obj)` — seals the object (no add, no delete; modify allowed)
+/// and returns it. Shallow.
+/// MVP: receiver must be `Value::Object`; non-Object is deferred.
+pub fn obj_seal(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let obj_ptr = match args.get(vm, 0) {
+        Value::Object(p) => *p,
+        _ => {
+            return Err(vm.fail(
+                ErrorKind::TypeError,
+                "Object.seal: receiver must be an Object (arrays/maps/sets deferred)",
+            ));
+        }
+    };
+    let ip = vm.ip;
+    let obj = vm
+        .objects
+        .get_mut(obj_ptr as usize)
+        .ok_or_else(|| VMError::fail_at(ip, ErrorKind::TypeError, "bad object pointer"))?;
+    // seal is a strict upgrade: from Extensible or NonExtensible → Sealed.
+    // Never downgrade (a Frozen object stays Frozen).
+    if matches!(
+        obj.integrity,
+        IntegrityLevel::Extensible | IntegrityLevel::NonExtensible
+    ) {
+        obj.integrity = IntegrityLevel::Sealed;
+    }
+    Ok(Value::Object(obj_ptr))
+}
+
+/// `Object.isSealed(obj)` → bool. Returns whether the object is sealed.
+/// An object is sealed if it is at least Sealed (or Frozen).
+/// MVP: non-Object receivers return `false`.
+pub fn obj_is_sealed(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    match args.get(vm, 0) {
+        Value::Object(p) => {
+            let obj = vm
+                .objects
+                .get(*p as usize)
+                .ok_or_else(|| vm.fail(ErrorKind::TypeError, "bad object pointer"))?;
+            Ok(Value::Bool(matches!(
+                obj.integrity,
+                IntegrityLevel::Sealed | IntegrityLevel::Frozen
+            )))
+        }
+        _ => Ok(Value::Bool(false)),
+    }
+}
+
+/// `Object.preventExtensions(obj)` — prevents new properties from being
+/// added (modify + delete still allowed) and returns the object.
+/// If already NonExtensible/Sealed/Frozen, a no-op (but the level doesn't
+/// downgrade). Shallow.
+/// MVP: receiver must be `Value::Object`; non-Object is deferred.
+pub fn obj_prevent_extensions(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let obj_ptr = match args.get(vm, 0) {
+        Value::Object(p) => *p,
+        _ => {
+            return Err(vm.fail(
+                ErrorKind::TypeError,
+                "Object.preventExtensions: receiver must be an Object (arrays/maps/sets deferred)",
+            ));
+        }
+    };
+    let ip = vm.ip;
+    let obj = vm
+        .objects
+        .get_mut(obj_ptr as usize)
+        .ok_or_else(|| VMError::fail_at(ip, ErrorKind::TypeError, "bad object pointer"))?;
+    // Only upgrade; never downgrade (e.g. a sealed object stays sealed).
+    if obj.integrity == IntegrityLevel::Extensible {
+        obj.integrity = IntegrityLevel::NonExtensible;
+    }
+    Ok(Value::Object(obj_ptr))
+}
+
+/// `Object.isExtensible(obj)` → bool. Returns whether the object can have
+/// new properties added. Extensible only — NonExtensible/Sealed/Frozen all
+/// return false.
+/// MVP: non-Object receivers return `false`.
+pub fn obj_is_extensible(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    match args.get(vm, 0) {
+        Value::Object(p) => {
+            let obj = vm
+                .objects
+                .get(*p as usize)
+                .ok_or_else(|| vm.fail(ErrorKind::TypeError, "bad object pointer"))?;
+            Ok(Value::Bool(obj.integrity == IntegrityLevel::Extensible))
+        }
+        _ => Ok(Value::Bool(false)),
+    }
+}
+
 // ── tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -264,8 +396,8 @@ mod tests {
     use crate::{
         Value,
         builtin::Builtin,
-        testutil::{self, run_instrs},
-        vm::Instr,
+        testutil::{self, run_instrs, run_runtime_err},
+        vm::{ErrorKind, Instr},
     };
 
     // ── Object.keys / Object.values ────────────────────────────────────
@@ -369,6 +501,192 @@ mod tests {
         assert_eq!(
             testutil::run_ret("return ({a: 1}).hasOwnProperty('b');"),
             serde_json::json!(false)
+        );
+    }
+
+    // ── Step 2d: Object.freeze / seal / preventExtensions ──────────────
+
+    #[test]
+    fn freeze_blocks_writes() {
+        let err = run_runtime_err("const o = {a:1}; Object.freeze(o); o.a = 2; return o;");
+        assert_eq!(err.kind, ErrorKind::TypeError);
+    }
+
+    #[test]
+    fn freeze_returns_object() {
+        assert_eq!(
+            testutil::run_ret("const o = {}; return Object.freeze(o) === o;"),
+            serde_json::json!(true)
+        );
+    }
+
+    #[test]
+    fn is_frozen_after_freeze() {
+        assert_eq!(
+            testutil::run_ret(
+                "const o = {}; return [Object.isFrozen(o), Object.freeze(o), Object.isFrozen(o)];"
+            ),
+            serde_json::json!([false, {}, true])
+        );
+    }
+
+    #[test]
+    fn freeze_blocks_delete() {
+        let err = run_runtime_err("const o = {a:1}; Object.freeze(o); delete o.a;");
+        assert_eq!(err.kind, ErrorKind::TypeError);
+    }
+
+    #[test]
+    fn freeze_blocks_new_keys() {
+        let err = run_runtime_err("const o = {}; Object.freeze(o); o.x = 1;");
+        assert_eq!(err.kind, ErrorKind::TypeError);
+    }
+
+    #[test]
+    fn seal_blocks_add_and_delete_but_allows_modify() {
+        assert_eq!(
+            testutil::run_ret("const o = {a:1}; Object.seal(o); o.a = 2; return o.a;"),
+            serde_json::json!(2)
+        );
+        let err = run_runtime_err("const o = {a:1}; Object.seal(o); o.x = 1;");
+        assert_eq!(err.kind, ErrorKind::TypeError);
+        let err = run_runtime_err("const o = {a:1}; Object.seal(o); delete o.a;");
+        assert_eq!(err.kind, ErrorKind::TypeError);
+    }
+
+    #[test]
+    fn is_sealed_after_seal() {
+        assert_eq!(
+            testutil::run_ret(
+                "const o = {}; return [Object.isSealed(o), Object.seal(o), Object.isSealed(o)];"
+            ),
+            serde_json::json!([false, {}, true])
+        );
+    }
+
+    #[test]
+    fn prevent_extensions_blocks_new_keys_but_allows_modify_and_delete() {
+        assert_eq!(
+            testutil::run_ret("const o = {a:1}; Object.preventExtensions(o); o.a = 2; return o.a;"),
+            serde_json::json!(2)
+        );
+        let err = run_runtime_err("const o = {a:1}; Object.preventExtensions(o); o.x = 1;");
+        assert_eq!(err.kind, ErrorKind::TypeError);
+        assert_eq!(
+            testutil::run_ret(
+                "const o = {a:1}; Object.preventExtensions(o); delete o.a; return o.a === undefined;"
+            ),
+            serde_json::json!(true)
+        );
+    }
+
+    #[test]
+    fn is_extensible_tracks_prevent_extensions() {
+        assert_eq!(
+            testutil::run_ret(
+                "const o = {}; const before = Object.isExtensible(o); Object.preventExtensions(o); return [before, Object.isExtensible(o)];"
+            ),
+            serde_json::json!([true, false])
+        );
+    }
+
+    #[test]
+    fn freeze_is_shallow() {
+        // freeze is shallow: a nested object stays mutable.
+        assert_eq!(
+            testutil::run_ret("const o = {a: {b: 1}}; Object.freeze(o); o.a.b = 2; return o.a.b;"),
+            serde_json::json!(2)
+        );
+    }
+
+    #[test]
+    fn frozen_object_serializes_as_plain_data() {
+        // A frozen ordinary object still serializes to JSON — the level is
+        // dropped, per the invariant boundary. (Builtin prototypes are
+        // rejected by `kind`, not by `integrity`.)
+        assert_eq!(
+            testutil::run_ret("const o = {a:1}; Object.freeze(o); return o;"),
+            serde_json::json!({ "a": 1 })
+        );
+    }
+
+    #[test]
+    fn freeze_seal_prevent_extensions_progression() {
+        // Each step is strictly stronger; `seal` subsumes `preventExtensions`.
+        assert_eq!(
+            testutil::run_ret(
+                "const o = {}; Object.preventExtensions(o); Object.seal(o); return [Object.isExtensible(o), Object.isSealed(o), Object.isFrozen(o)];"
+            ),
+            serde_json::json!([false, true, false])
+        );
+        assert_eq!(
+            testutil::run_ret(
+                "const o = {}; Object.seal(o); Object.freeze(o); return Object.isFrozen(o);"
+            ),
+            serde_json::json!(true)
+        );
+    }
+
+    #[test]
+    fn seal_after_freeze_is_noop() {
+        assert_eq!(
+            testutil::run_ret(
+                "const o = {}; Object.freeze(o); Object.seal(o); return Object.isFrozen(o);"
+            ),
+            serde_json::json!(true)
+        );
+    }
+
+    #[test]
+    fn prevent_extensions_after_seal_is_noop() {
+        // preventExtensions on a sealed object does not downgrade.
+        assert_eq!(
+            testutil::run_ret(
+                "const o = {}; Object.seal(o); Object.preventExtensions(o); return Object.isSealed(o);"
+            ),
+            serde_json::json!(true)
+        );
+    }
+
+    #[test]
+    fn freeze_on_non_object_is_deferred() {
+        let err = run_runtime_err("Object.freeze([]);");
+        assert_eq!(err.kind, ErrorKind::TypeError);
+        let err = run_runtime_err("Object.freeze(new Map());");
+        assert_eq!(err.kind, ErrorKind::TypeError);
+        let err = run_runtime_err("Object.freeze(new Set());");
+        assert_eq!(err.kind, ErrorKind::TypeError);
+    }
+
+    #[test]
+    fn is_frozen_on_non_object_is_false() {
+        assert_eq!(
+            testutil::run_ret("return Object.isFrozen([]);"),
+            serde_json::json!(false)
+        );
+        assert_eq!(
+            testutil::run_ret("return Object.isFrozen(5);"),
+            serde_json::json!(false)
+        );
+    }
+
+    #[test]
+    fn is_extensible_on_non_object_is_false() {
+        assert_eq!(
+            testutil::run_ret("return Object.isExtensible([]);"),
+            serde_json::json!(false)
+        );
+    }
+
+    #[test]
+    fn freeze_on_object_prototype_is_noop() {
+        // Builtin prototypes are already Frozen (Step 2a); freeze on a
+        // Frozen `BuiltinPrototype` object is a no-op. The integrity field
+        // is the *same* one — user freeze writes the same `ObjData.integrity`
+        // that the 2a builtin-prototype freeze used.
+        assert_eq!(
+            testutil::run_ret("return Object.freeze(Object.prototype) === Object.prototype;"),
+            serde_json::json!(true)
         );
     }
 }

@@ -1004,7 +1004,10 @@ impl VM {
             .objects
             .get(obj_ptr as usize)
             .map_or(IntegrityLevel::Extensible, |o| o.integrity);
-        if matches!(integrity, IntegrityLevel::Sealed | IntegrityLevel::Frozen) {
+        if matches!(
+            integrity,
+            IntegrityLevel::NonExtensible | IntegrityLevel::Sealed | IntegrityLevel::Frozen
+        ) {
             return Err(self.fail(
                 ErrorKind::TypeError,
                 "cannot set prototype of a non-extensible object",

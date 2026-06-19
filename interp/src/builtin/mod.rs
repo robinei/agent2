@@ -70,6 +70,12 @@ pub(crate) use map::map_ctor;
 pub(crate) use number::number_ctor;
 pub(crate) use number::number_to_fixed;
 pub(crate) use object::obj_create;
+pub(crate) use object::obj_freeze;
+pub(crate) use object::obj_is_extensible;
+pub(crate) use object::obj_is_frozen;
+pub(crate) use object::obj_is_sealed;
+pub(crate) use object::obj_prevent_extensions;
+pub(crate) use object::obj_seal;
 pub(crate) use object::object_ctor;
 pub(crate) use regexp::regexp_ctor;
 pub(crate) use set::set_ctor;
@@ -437,6 +443,12 @@ builtins! {
     ObjGetProtoOf,  BuiltinKind::Namespace("Object"), "getPrototypeOf", 1, 1,   obj_get_proto_of, false, false, false, false, false, false, false, false;
     ObjSetProtoOf,  BuiltinKind::Namespace("Object"), "setPrototypeOf", 2, 2,   obj_set_proto_of, false, false, false, false, false, false, false, false;
     ObjCreate,      BuiltinKind::Namespace("Object"), "create",          1, 2,   obj_create,       false, false, false, false, false, false, false, false;
+    ObjFreeze,            BuiltinKind::Namespace("Object"), "freeze",            1, 1, obj_freeze,             false, false, false, false, false, false, false, false;
+    ObjIsFrozen,          BuiltinKind::Namespace("Object"), "isFrozen",          1, 1, obj_is_frozen,          false, false, false, false, false, false, false, false;
+    ObjSeal,              BuiltinKind::Namespace("Object"), "seal",              1, 1, obj_seal,               false, false, false, false, false, false, false, false;
+    ObjIsSealed,          BuiltinKind::Namespace("Object"), "isSealed",          1, 1, obj_is_sealed,          false, false, false, false, false, false, false, false;
+    ObjPreventExtensions, BuiltinKind::Namespace("Object"), "preventExtensions", 1, 1, obj_prevent_extensions, false, false, false, false, false, false, false, false;
+    ObjIsExtensible,      BuiltinKind::Namespace("Object"), "isExtensible",      1, 1, obj_is_extensible,      false, false, false, false, false, false, false, false;
 
     // ── object methods ──
     ObjHasOwnProperty, BuiltinKind::Method, "hasOwnProperty", 2, 2, obj_has_own_property, false, false, false, false, false, false, false, false;

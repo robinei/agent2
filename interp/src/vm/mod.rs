@@ -289,11 +289,17 @@ impl RcRegExp {
 /// delete but allows modifying existing keys, `Frozen` forbids all three.
 /// Coarse / whole-object only — descriptor-accurate per-property
 /// `writable`/`configurable` is the Step-4 tier.
+///
+/// The progression: `Extensible` → `NonExtensible` (cannot add) → `Sealed`
+/// (cannot add or delete) → `Frozen` (cannot add, delete, or modify). Each
+/// step is a strictly stronger restriction.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
 pub enum IntegrityLevel {
     /// Default: add / modify / delete all permitted.
     #[default]
     Extensible,
+    /// `Object.preventExtensions`: no new keys; modify + delete permitted.
+    NonExtensible,
     /// `Object.seal`: no add, no delete; modify-existing permitted.
     Sealed,
     /// `Object.freeze` / builtin prototypes: no add, no delete, no modify.

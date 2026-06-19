@@ -914,7 +914,7 @@ first looks like — the code makes it a near-simplification:
   same.
 - **Mechanism:** make the `PushFn` arm allocate a fresh closure entry (it
   already carries `addr`/`arity`/`prototype`) instead of pushing the baked
-  ptr, and delete the canonical-patching loop — or, cleaner, **fold `PushFn`
+  ptr, and delete the canonical-patching loop — or, cleaner (DO THIS), **fold `PushFn`
   into `ClosureNew(addr, arity, [])`** and drop the instruction entirely, one
   fewer special case (on-theme with this phase). `strict_equal` already
   compares `addr && ptr` (`value.rs:328`), so distinct entries ⇒ distinct
