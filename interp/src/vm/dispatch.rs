@@ -77,10 +77,9 @@ impl VM {
                 }
                 let idx = idx as usize;
                 let (length, kind, buf_ptr, byte_off) = {
-                    let view =
-                        self.typed_arrays.get(ptr as usize).ok_or_else(|| {
-                            self.fail_not_resumable(ErrorKind::TypeError, "bad typed array pointer")
-                        })?;
+                    let view = self.typed_arrays.get(ptr as usize).ok_or_else(|| {
+                        self.fail_not_resumable(ErrorKind::TypeError, "bad typed array pointer")
+                    })?;
                     if idx >= view.length() as usize {
                         return Ok(Value::Undefined);
                     }
@@ -413,14 +412,11 @@ impl VM {
                     let udx = idx as usize;
                     let (length, kind, buf_ptr, byte_off, old_val) = {
                         let view = self.typed_arrays.get(ptr as usize).ok_or_else(|| {
-                            self.fail_not_resumable(
-                                ErrorKind::TypeError,
-                                "bad typed array pointer",
-                            )
+                            self.fail_not_resumable(ErrorKind::TypeError, "bad typed array pointer")
                         })?;
                         if udx < view.length() as usize {
-                            let boff = view.byte_offset as usize
-                                + udx * view.kind.element_size() as usize;
+                            let boff =
+                                view.byte_offset as usize + udx * view.kind.element_size() as usize;
                             let old = if matches!(mode, SetMode::Old) {
                                 let buf =
                                     self.buffers.get(view.buffer as usize).ok_or_else(|| {
@@ -433,13 +429,7 @@ impl VM {
                             } else {
                                 Value::Undefined
                             };
-                            (
-                                view.length() as usize,
-                                view.kind,
-                                view.buffer,
-                                boff,
-                                old,
-                            )
+                            (view.length() as usize, view.kind, view.buffer, boff, old)
                         } else {
                             // OOB: silent no-op.
                             return Ok(match mode {
@@ -452,10 +442,9 @@ impl VM {
                     let f = val.to_number().unwrap_or(0.0);
                     let elem_size = kind.element_size() as usize;
                     let ip = self.ip;
-                    let buf =
-                        self.buffers
-                            .get_mut(buf_ptr as usize)
-                            .ok_or_else(|| VMError::fail_at(ip, ErrorKind::TypeError, "bad buffer pointer"))?;
+                    let buf = self.buffers.get_mut(buf_ptr as usize).ok_or_else(|| {
+                        VMError::fail_at(ip, ErrorKind::TypeError, "bad buffer pointer")
+                    })?;
                     crate::builtin::ta_encode_bytes(
                         kind,
                         f,

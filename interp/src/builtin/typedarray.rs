@@ -1,4 +1,6 @@
-use crate::vm::instr::{BufferPtr, DataViewEntry, DataViewPtr, TypedArrayKind, TypedArrayPtr, TypedArrayView};
+use crate::vm::instr::{
+    BufferPtr, DataViewEntry, DataViewPtr, TypedArrayKind, TypedArrayPtr, TypedArrayView,
+};
 use crate::vm::{ErrorKind, VM, VMError, Value};
 
 use super::Args;
@@ -14,9 +16,7 @@ pub(crate) fn ta_decode_bytes(kind: TypedArrayKind, bytes: &[u8]) -> Value {
         TypedArrayKind::Int16 => {
             Value::int_from_f64(i16::from_ne_bytes([bytes[0], bytes[1]]) as f64)
         }
-        TypedArrayKind::Uint16 => {
-            Value::PosInt(u16::from_ne_bytes([bytes[0], bytes[1]]) as u64)
-        }
+        TypedArrayKind::Uint16 => Value::PosInt(u16::from_ne_bytes([bytes[0], bytes[1]]) as u64),
         TypedArrayKind::Int32 => {
             let v = i32::from_ne_bytes(bytes[..4].try_into().unwrap());
             Value::int_from_f64(v as f64)
@@ -28,9 +28,7 @@ pub(crate) fn ta_decode_bytes(kind: TypedArrayKind, bytes: &[u8]) -> Value {
         TypedArrayKind::Float32 => {
             Value::Float(f32::from_ne_bytes(bytes[..4].try_into().unwrap()) as f64)
         }
-        TypedArrayKind::Float64 => {
-            Value::Float(f64::from_ne_bytes(bytes[..8].try_into().unwrap()))
-        }
+        TypedArrayKind::Float64 => Value::Float(f64::from_ne_bytes(bytes[..8].try_into().unwrap())),
         TypedArrayKind::BigInt64 | TypedArrayKind::BigUint64 => {
             // BigInt not yet supported — return 0 as a fallback.
             Value::PosInt(0)
@@ -119,7 +117,10 @@ pub(crate) fn arraybuffer_ctor(vm: &mut VM, args: Args) -> Result<Value, VMError
         None => {
             return Err(vm.fail(
                 ErrorKind::TypeError,
-                format!("ArrayBuffer length must be a number, got {}", raw.type_name()),
+                format!(
+                    "ArrayBuffer length must be a number, got {}",
+                    raw.type_name()
+                ),
             ));
         }
     };
@@ -131,7 +132,10 @@ pub(crate) fn arraybuffer_ctor(vm: &mut VM, args: Args) -> Result<Value, VMError
 /// `ArrayBuffer.isView(x)` — returns true if x is a TypedArray or DataView.
 pub(crate) fn arraybuffer_is_view(_vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let val = args.get(_vm, 0);
-    Ok(Value::Bool(matches!(val, Value::TypedArray(_) | Value::DataView(_))))
+    Ok(Value::Bool(matches!(
+        val,
+        Value::TypedArray(_) | Value::DataView(_)
+    )))
 }
 
 /// `ArrayBuffer.prototype.slice(begin[, end])` — copy a byte range into a new buffer.
@@ -193,10 +197,7 @@ fn typed_array_ctor_impl(vm: &mut VM, args: Args, kind: TypedArrayKind) -> Resul
 
         &Value::PosInt(n) => {
             if n > u32::MAX as u64 {
-                return Err(vm.fail(
-                    ErrorKind::ValueError,
-                    "typed array length out of range",
-                ));
+                return Err(vm.fail(ErrorKind::ValueError, "typed array length out of range"));
             }
             alloc_typed_array(vm, n as usize, kind)
         }
@@ -222,7 +223,11 @@ fn typed_array_ctor_impl(vm: &mut VM, args: Args, kind: TypedArrayKind) -> Resul
 
         &Value::Array(arr_ptr) => {
             let arr_ptr = arr_ptr;
-            let len = vm.arrays.get(arr_ptr as usize).map(|a| a.len()).unwrap_or(0);
+            let len = vm
+                .arrays
+                .get(arr_ptr as usize)
+                .map(|a| a.len())
+                .unwrap_or(0);
             let elem_size = kind.element_size() as usize;
             let mut buf = vec![0u8; len * elem_size];
             for i in 0..len {
@@ -249,7 +254,12 @@ fn typed_array_ctor_impl(vm: &mut VM, args: Args, kind: TypedArrayKind) -> Resul
         &Value::TypedArray(src_ptr) => {
             let (src_len, src_kind, src_buf_ptr, src_byte_offset) =
                 match vm.typed_arrays.get(src_ptr as usize) {
-                    Some(v) => (v.length() as usize, v.kind, v.buffer, v.byte_offset as usize),
+                    Some(v) => (
+                        v.length() as usize,
+                        v.kind,
+                        v.buffer,
+                        v.byte_offset as usize,
+                    ),
                     None => {
                         return Err(
                             vm.fail_not_resumable(ErrorKind::TypeError, "bad typed array pointer")
@@ -340,22 +350,28 @@ macro_rules! ta_ctor {
     };
 }
 
-ta_ctor!(int8array_ctor,         TypedArrayKind::Int8);
-ta_ctor!(uint8array_ctor,        TypedArrayKind::Uint8);
-ta_ctor!(uint8clamped_ctor,      TypedArrayKind::Uint8Clamped);
-ta_ctor!(int16array_ctor,        TypedArrayKind::Int16);
-ta_ctor!(uint16array_ctor,       TypedArrayKind::Uint16);
-ta_ctor!(int32array_ctor,        TypedArrayKind::Int32);
-ta_ctor!(uint32array_ctor,       TypedArrayKind::Uint32);
-ta_ctor!(float32array_ctor,      TypedArrayKind::Float32);
-ta_ctor!(float64array_ctor,      TypedArrayKind::Float64);
+ta_ctor!(int8array_ctor, TypedArrayKind::Int8);
+ta_ctor!(uint8array_ctor, TypedArrayKind::Uint8);
+ta_ctor!(uint8clamped_ctor, TypedArrayKind::Uint8Clamped);
+ta_ctor!(int16array_ctor, TypedArrayKind::Int16);
+ta_ctor!(uint16array_ctor, TypedArrayKind::Uint16);
+ta_ctor!(int32array_ctor, TypedArrayKind::Int32);
+ta_ctor!(uint32array_ctor, TypedArrayKind::Uint32);
+ta_ctor!(float32array_ctor, TypedArrayKind::Float32);
+ta_ctor!(float64array_ctor, TypedArrayKind::Float64);
 
 pub(crate) fn bigint64array_ctor(vm: &mut VM, _args: Args) -> Result<Value, VMError> {
-    Err(vm.fail(ErrorKind::TypeError, "BigInt64Array: BigInt not yet supported"))
+    Err(vm.fail(
+        ErrorKind::TypeError,
+        "BigInt64Array: BigInt not yet supported",
+    ))
 }
 
 pub(crate) fn biguint64array_ctor(vm: &mut VM, _args: Args) -> Result<Value, VMError> {
-    Err(vm.fail(ErrorKind::TypeError, "BigUint64Array: BigInt not yet supported"))
+    Err(vm.fail(
+        ErrorKind::TypeError,
+        "BigUint64Array: BigInt not yet supported",
+    ))
 }
 
 // ── Step 5: DataView ──────────────────────────────────────────────────────────
@@ -380,7 +396,7 @@ pub(crate) fn dataview_ctor(vm: &mut VM, args: Args) -> Result<Value, VMError> {
         Value::Undefined => 0usize,
         v => {
             let f = v.to_number().unwrap_or(0.0);
-            if f < 0.0 || f.is_nan() {
+            if f < 0.0 || f.is_nan() || !f.is_finite() {
                 0usize
             } else {
                 f as usize
@@ -394,11 +410,11 @@ pub(crate) fn dataview_ctor(vm: &mut VM, args: Args) -> Result<Value, VMError> {
         Value::Undefined => buf_len - byte_offset,
         v => {
             let f = v.to_number().unwrap_or(0.0);
-            if f < 0.0 || f.is_nan() {
+            if f < 0.0 || f.is_nan() || !f.is_finite() {
                 return Err(vm.fail(ErrorKind::ValueError, "DataView: invalid byteLength"));
             }
             let bl = f as usize;
-            if byte_offset + bl > buf_len {
+            if byte_offset.saturating_add(bl) > buf_len {
                 return Err(vm.fail(ErrorKind::ValueError, "DataView: byteLength out of bounds"));
             }
             bl
@@ -436,11 +452,15 @@ fn dv_byte_index(
     access_size: usize,
 ) -> Result<usize, VMError> {
     let f = offset_val.to_number().unwrap_or(0.0);
-    if f < 0.0 || f.is_nan() {
-        return Err(vm.fail(ErrorKind::ValueError, "DataView offset must be non-negative"));
+    if f < 0.0 || f.is_nan() || !f.is_finite() {
+        return Err(vm.fail(
+            ErrorKind::ValueError,
+            "DataView offset must be non-negative",
+        ));
     }
     let off = f as usize;
-    if off + access_size > view_len {
+    // Use saturating_add to avoid overflow on huge offsets.
+    if off.saturating_add(access_size) > view_len {
         return Err(vm.fail(ErrorKind::ValueError, "DataView access out of bounds"));
     }
     let _ = buf_ptr;
@@ -489,36 +509,144 @@ macro_rules! dv_set {
     };
 }
 
-dv_get!(dv_get_int8,   1, |b: [u8;1]| b[0] as i8,  |b: [u8;1]| b[0] as i8,  |v: i8|  Value::int_from_f64(v as f64));
-dv_get!(dv_get_uint8,  1, |b: [u8;1]| b[0],         |b: [u8;1]| b[0],         |v: u8|  Value::PosInt(v as u64));
-dv_get!(dv_get_int16,  2, |b: [u8;2]| i16::from_le_bytes(b), |b: [u8;2]| i16::from_be_bytes(b), |v: i16| Value::int_from_f64(v as f64));
-dv_get!(dv_get_uint16, 2, |b: [u8;2]| u16::from_le_bytes(b), |b: [u8;2]| u16::from_be_bytes(b), |v: u16| Value::PosInt(v as u64));
-dv_get!(dv_get_int32,  4, |b: [u8;4]| i32::from_le_bytes(b), |b: [u8;4]| i32::from_be_bytes(b), |v: i32| Value::int_from_f64(v as f64));
-dv_get!(dv_get_uint32, 4, |b: [u8;4]| u32::from_le_bytes(b), |b: [u8;4]| u32::from_be_bytes(b), |v: u32| Value::PosInt(v as u64));
-dv_get!(dv_get_float32, 4, |b: [u8;4]| f32::from_le_bytes(b), |b: [u8;4]| f32::from_be_bytes(b), |v: f32| Value::Float(v as f64));
-dv_get!(dv_get_float64, 8, |b: [u8;8]| f64::from_le_bytes(b), |b: [u8;8]| f64::from_be_bytes(b), |v: f64| Value::Float(v));
+dv_get!(
+    dv_get_int8,
+    1,
+    |b: [u8; 1]| b[0] as i8,
+    |b: [u8; 1]| b[0] as i8,
+    |v: i8| Value::int_from_f64(v as f64)
+);
+dv_get!(
+    dv_get_uint8,
+    1,
+    |b: [u8; 1]| b[0],
+    |b: [u8; 1]| b[0],
+    |v: u8| Value::PosInt(v as u64)
+);
+dv_get!(
+    dv_get_int16,
+    2,
+    |b: [u8; 2]| i16::from_le_bytes(b),
+    |b: [u8; 2]| i16::from_be_bytes(b),
+    |v: i16| Value::int_from_f64(v as f64)
+);
+dv_get!(
+    dv_get_uint16,
+    2,
+    |b: [u8; 2]| u16::from_le_bytes(b),
+    |b: [u8; 2]| u16::from_be_bytes(b),
+    |v: u16| Value::PosInt(v as u64)
+);
+dv_get!(
+    dv_get_int32,
+    4,
+    |b: [u8; 4]| i32::from_le_bytes(b),
+    |b: [u8; 4]| i32::from_be_bytes(b),
+    |v: i32| Value::int_from_f64(v as f64)
+);
+dv_get!(
+    dv_get_uint32,
+    4,
+    |b: [u8; 4]| u32::from_le_bytes(b),
+    |b: [u8; 4]| u32::from_be_bytes(b),
+    |v: u32| Value::PosInt(v as u64)
+);
+dv_get!(
+    dv_get_float32,
+    4,
+    |b: [u8; 4]| f32::from_le_bytes(b),
+    |b: [u8; 4]| f32::from_be_bytes(b),
+    |v: f32| Value::Float(v as f64)
+);
+dv_get!(
+    dv_get_float64,
+    8,
+    |b: [u8; 8]| f64::from_le_bytes(b),
+    |b: [u8; 8]| f64::from_be_bytes(b),
+    |v: f64| Value::Float(v)
+);
 
 pub(crate) fn dv_get_bigint64(_vm: &mut VM, _args: Args) -> Result<Value, VMError> {
-    Err(_vm.fail(ErrorKind::TypeError, "DataView.getBigInt64: BigInt not yet supported"))
+    Err(_vm.fail(
+        ErrorKind::TypeError,
+        "DataView.getBigInt64: BigInt not yet supported",
+    ))
 }
 pub(crate) fn dv_get_biguint64(_vm: &mut VM, _args: Args) -> Result<Value, VMError> {
-    Err(_vm.fail(ErrorKind::TypeError, "DataView.getBigUint64: BigInt not yet supported"))
+    Err(_vm.fail(
+        ErrorKind::TypeError,
+        "DataView.getBigUint64: BigInt not yet supported",
+    ))
 }
 
-dv_set!(dv_set_int8,   1, |f: f64| to_uint32(f) as u8 as i8, |v: i8| v.to_le_bytes(), |v: i8| v.to_be_bytes());
-dv_set!(dv_set_uint8,  1, |f: f64| to_uint32(f) as u8,        |v: u8| v.to_le_bytes(), |v: u8| v.to_be_bytes());
-dv_set!(dv_set_int16,  2, |f: f64| to_uint32(f) as u16 as i16, |v: i16| v.to_le_bytes(), |v: i16| v.to_be_bytes());
-dv_set!(dv_set_uint16, 2, |f: f64| to_uint32(f) as u16,         |v: u16| v.to_le_bytes(), |v: u16| v.to_be_bytes());
-dv_set!(dv_set_int32,  4, |f: f64| to_uint32(f) as i32,         |v: i32| v.to_le_bytes(), |v: i32| v.to_be_bytes());
-dv_set!(dv_set_uint32, 4, |f: f64| to_uint32(f),                |v: u32| v.to_le_bytes(), |v: u32| v.to_be_bytes());
-dv_set!(dv_set_float32, 4, |f: f64| f as f32, |v: f32| v.to_le_bytes(), |v: f32| v.to_be_bytes());
-dv_set!(dv_set_float64, 8, |f: f64| f,         |v: f64| v.to_le_bytes(), |v: f64| v.to_be_bytes());
+dv_set!(
+    dv_set_int8,
+    1,
+    |f: f64| to_uint32(f) as u8 as i8,
+    |v: i8| v.to_le_bytes(),
+    |v: i8| v.to_be_bytes()
+);
+dv_set!(
+    dv_set_uint8,
+    1,
+    |f: f64| to_uint32(f) as u8,
+    |v: u8| v.to_le_bytes(),
+    |v: u8| v.to_be_bytes()
+);
+dv_set!(
+    dv_set_int16,
+    2,
+    |f: f64| to_uint32(f) as u16 as i16,
+    |v: i16| v.to_le_bytes(),
+    |v: i16| v.to_be_bytes()
+);
+dv_set!(
+    dv_set_uint16,
+    2,
+    |f: f64| to_uint32(f) as u16,
+    |v: u16| v.to_le_bytes(),
+    |v: u16| v.to_be_bytes()
+);
+dv_set!(
+    dv_set_int32,
+    4,
+    |f: f64| to_uint32(f) as i32,
+    |v: i32| v.to_le_bytes(),
+    |v: i32| v.to_be_bytes()
+);
+dv_set!(
+    dv_set_uint32,
+    4,
+    |f: f64| to_uint32(f),
+    |v: u32| v.to_le_bytes(),
+    |v: u32| v.to_be_bytes()
+);
+dv_set!(
+    dv_set_float32,
+    4,
+    |f: f64| f as f32,
+    |v: f32| v.to_le_bytes(),
+    |v: f32| v.to_be_bytes()
+);
+dv_set!(
+    dv_set_float64,
+    8,
+    |f: f64| f,
+    |v: f64| v.to_le_bytes(),
+    |v: f64| v.to_be_bytes()
+);
 
 pub(crate) fn dv_set_bigint64(_vm: &mut VM, _args: Args) -> Result<Value, VMError> {
-    Err(_vm.fail(ErrorKind::TypeError, "DataView.setBigInt64: BigInt not yet supported"))
+    Err(_vm.fail(
+        ErrorKind::TypeError,
+        "DataView.setBigInt64: BigInt not yet supported",
+    ))
 }
 pub(crate) fn dv_set_biguint64(_vm: &mut VM, _args: Args) -> Result<Value, VMError> {
-    Err(_vm.fail(ErrorKind::TypeError, "DataView.setBigUint64: BigInt not yet supported"))
+    Err(_vm.fail(
+        ErrorKind::TypeError,
+        "DataView.setBigUint64: BigInt not yet supported",
+    ))
 }
 
 // ── Step 4: Typed array prototype methods ─────────────────────────────────────
@@ -534,7 +662,11 @@ fn ta_clamp_index(val: &Value, len: usize) -> usize {
             } else {
                 let i = f as i64;
                 let len_i = len as i64;
-                if i < 0 { (i + len_i).max(0) as usize } else { i.min(len_i) as usize }
+                if i < 0 {
+                    (i + len_i).max(0) as usize
+                } else {
+                    i.min(len_i) as usize
+                }
             }
         }
     }
@@ -623,7 +755,11 @@ pub(crate) fn ta_set(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let (length, elem_size, kind, buf_ptr, byte_offset) = ta_view!(vm, ta_ptr);
     let offset = {
         let f = args.get(vm, 2).to_number().unwrap_or(0.0);
-        if f.is_nan() || f < 0.0 { 0usize } else { f as usize }
+        if f.is_nan() || f < 0.0 {
+            0usize
+        } else {
+            f as usize
+        }
     };
     match args.get(vm, 1) {
         &Value::TypedArray(src_ptr) => {
@@ -649,7 +785,11 @@ pub(crate) fn ta_set(vm: &mut VM, args: Args) -> Result<Value, VMError> {
             }
         }
         &Value::Array(arr_ptr) => {
-            let src_len = vm.arrays.get(arr_ptr as usize).map(|a| a.len()).unwrap_or(0);
+            let src_len = vm
+                .arrays
+                .get(arr_ptr as usize)
+                .map(|a| a.len())
+                .unwrap_or(0);
             let vals: Vec<f64> = (0..src_len)
                 .map(|i| {
                     vm.arrays
@@ -755,7 +895,11 @@ pub(crate) fn ta_index_of(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let needle = args.get(vm, 1).clone();
     let from = {
         let f = args.get(vm, 2).to_number().unwrap_or(0.0);
-        if f.is_nan() { 0usize } else { f.max(0.0) as usize }
+        if f.is_nan() {
+            0usize
+        } else {
+            f.max(0.0) as usize
+        }
     };
     let (length, elem_size, kind, buf_ptr, byte_offset) = ta_view!(vm, ta_ptr);
     for i in from.min(length)..length {
@@ -842,6 +986,93 @@ pub(crate) fn ta_fill(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     Ok(Value::TypedArray(ta_ptr))
 }
 
+/// `ta.sort()` — sort elements in-place numerically (ascending, NaN last).
+/// The sort-with-comparefn path is handled by the `__sort` prelude HOF; this
+/// builtin is only reached when there is no comparefn argument.
+pub(crate) fn ta_sort(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let ta_ptr = match args.get(vm, 0) {
+        Value::TypedArray(p) => *p,
+        recv => return Err(vm.method_receiver_error(recv)),
+    };
+    let (length, elem_size, kind, buf_ptr, byte_offset) = ta_view!(vm, ta_ptr);
+
+    // Decode all f64 values.
+    let mut vals: Vec<f64> = (0..length)
+        .map(|i| {
+            let off = byte_offset + i * elem_size;
+            match ta_decode_bytes(kind, &vm.buffers[buf_ptr as usize][off..]) {
+                v => v.to_number().unwrap_or(f64::NAN),
+            }
+        })
+        .collect();
+
+    // Numeric ascending; NaN sorts to end.
+    vals.sort_by(|&a, &b| match (a.is_nan(), b.is_nan()) {
+        (true, true) => std::cmp::Ordering::Equal,
+        (true, false) => std::cmp::Ordering::Greater,
+        (false, true) => std::cmp::Ordering::Less,
+        (false, false) => a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal),
+    });
+
+    let buf = &mut vm.buffers[buf_ptr as usize];
+    for (i, &f) in vals.iter().enumerate() {
+        let off = byte_offset + i * elem_size;
+        let mut elem_buf = [0u8; 8];
+        ta_encode_bytes(kind, f, &mut elem_buf);
+        buf[off..off + elem_size].copy_from_slice(&elem_buf[..elem_size]);
+    }
+
+    Ok(Value::TypedArray(ta_ptr))
+}
+
+/// `ta.keys()` — returns Array of indices [0, 1, ..., length-1].
+pub(crate) fn ta_keys(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let ta_ptr = match args.get(vm, 0) {
+        Value::TypedArray(p) => *p,
+        recv => return Err(vm.method_receiver_error(recv)),
+    };
+    let length = vm
+        .typed_arrays
+        .get(ta_ptr as usize)
+        .map(|v| v.length() as usize)
+        .unwrap_or(0);
+    let arr: thin_vec::ThinVec<Value> = (0..length).map(|i| Value::PosInt(i as u64)).collect();
+    Ok(vm.alloc_array(arr))
+}
+
+/// `ta.values()` — returns Array of decoded element values.
+pub(crate) fn ta_values(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let ta_ptr = match args.get(vm, 0) {
+        Value::TypedArray(p) => *p,
+        recv => return Err(vm.method_receiver_error(recv)),
+    };
+    let (length, elem_size, kind, buf_ptr, byte_offset) = ta_view!(vm, ta_ptr);
+    let arr: thin_vec::ThinVec<Value> = (0..length)
+        .map(|i| {
+            let off = byte_offset + i * elem_size;
+            ta_decode_bytes(kind, &vm.buffers[buf_ptr as usize][off..])
+        })
+        .collect();
+    Ok(vm.alloc_array(arr))
+}
+
+/// `ta.entries()` — returns Array of [index, value] pairs.
+pub(crate) fn ta_entries(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let ta_ptr = match args.get(vm, 0) {
+        Value::TypedArray(p) => *p,
+        recv => return Err(vm.method_receiver_error(recv)),
+    };
+    let (length, elem_size, kind, buf_ptr, byte_offset) = ta_view!(vm, ta_ptr);
+    let mut outer: thin_vec::ThinVec<Value> = thin_vec::ThinVec::new();
+    for i in 0..length {
+        let off = byte_offset + i * elem_size;
+        let val = ta_decode_bytes(kind, &vm.buffers[buf_ptr as usize][off..]);
+        let pair: thin_vec::ThinVec<Value> = [Value::PosInt(i as u64), val].into_iter().collect();
+        outer.push(vm.alloc_array(pair));
+    }
+    Ok(vm.alloc_array(outer))
+}
+
 /// `ta.reverse()` — reverse elements in-place, returns receiver.
 pub(crate) fn ta_reverse(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let ta_ptr = match args.get(vm, 0) {
@@ -853,7 +1084,10 @@ pub(crate) fn ta_reverse(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     for i in 0..length / 2 {
         let j = length - 1 - i;
         for k in 0..elem_size {
-            buf.swap(byte_offset + i * elem_size + k, byte_offset + j * elem_size + k);
+            buf.swap(
+                byte_offset + i * elem_size + k,
+                byte_offset + j * elem_size + k,
+            );
         }
     }
     Ok(Value::TypedArray(ta_ptr))
@@ -914,8 +1148,7 @@ mod tests {
     #[test]
     fn arraybuffer_json_rejection() {
         let prog = testutil::compile_ok("return new ArrayBuffer(4);");
-        let mut vm =
-            crate::vm::VM::for_program(prog, serde_json::Value::Null).unwrap();
+        let mut vm = crate::vm::VM::for_program(prog, serde_json::Value::Null).unwrap();
         use crate::vm::StepResult;
         let result = loop {
             match vm.step(u64::MAX).unwrap() {
@@ -971,17 +1204,13 @@ mod tests {
 
     #[test]
     fn typed_array_oob_is_undefined() {
-        let v = testutil::run_ret(
-            "const ta = new Uint8Array(4); return ta[4] === undefined;",
-        );
+        let v = testutil::run_ret("const ta = new Uint8Array(4); return ta[4] === undefined;");
         assert_eq!(v, serde_json::json!(true));
     }
 
     #[test]
     fn typed_array_negative_index_is_undefined() {
-        let v = testutil::run_ret(
-            "const ta = new Uint8Array(4); return ta[-1] === undefined;",
-        );
+        let v = testutil::run_ret("const ta = new Uint8Array(4); return ta[-1] === undefined;");
         assert_eq!(v, serde_json::json!(true));
     }
 
@@ -1011,9 +1240,7 @@ mod tests {
 
     #[test]
     fn uint8_nan_write_is_zero() {
-        let v = testutil::run_ret(
-            "const ta = new Uint8Array(1); ta[0] = NaN; return ta[0];",
-        );
+        let v = testutil::run_ret("const ta = new Uint8Array(1); ta[0] = NaN; return ta[0];");
         assert_eq!(v, serde_json::json!(0));
     }
 
@@ -1058,122 +1285,146 @@ mod tests {
 
     #[test]
     fn ta_subarray_shares_buffer() {
-        let v = testutil::run_ret(r#"
+        let v = testutil::run_ret(
+            r#"
             const ta = new Uint8Array([10, 20, 30, 40, 50]);
             const sub = ta.subarray(1, 4);
             return [sub[0], sub[1], sub[2], sub.length, sub.byteOffset];
-        "#);
+        "#,
+        );
         assert_eq!(v, serde_json::json!([20, 30, 40, 3, 1]));
     }
 
     #[test]
     fn ta_subarray_mutation_reflects() {
-        let v = testutil::run_ret(r#"
+        let v = testutil::run_ret(
+            r#"
             const ta = new Uint8Array([1, 2, 3, 4]);
             const sub = ta.subarray(1, 3);
             sub[0] = 99;
             return ta[1];
-        "#);
+        "#,
+        );
         assert_eq!(v, serde_json::json!(99));
     }
 
     #[test]
     fn ta_slice_copies() {
-        let v = testutil::run_ret(r#"
+        let v = testutil::run_ret(
+            r#"
             const ta = new Int32Array([10, 20, 30, 40]);
             const s = ta.slice(1, 3);
             s[0] = 999;
             return [ta[1], s[0], s.length];
-        "#);
+        "#,
+        );
         // slice makes a copy — mutating s does not affect ta
         assert_eq!(v, serde_json::json!([20, 999, 2]));
     }
 
     #[test]
     fn ta_set_from_array() {
-        let v = testutil::run_ret(r#"
+        let v = testutil::run_ret(
+            r#"
             const ta = new Uint8Array(5);
             ta.set([1, 2, 3], 1);
             return [ta[0], ta[1], ta[2], ta[3], ta[4]];
-        "#);
+        "#,
+        );
         assert_eq!(v, serde_json::json!([0, 1, 2, 3, 0]));
     }
 
     #[test]
     fn ta_set_from_typed_array() {
-        let v = testutil::run_ret(r#"
+        let v = testutil::run_ret(
+            r#"
             const src = new Float64Array([1.5, 2.5]);
             const dst = new Float64Array(4);
             dst.set(src, 2);
             return [dst[0], dst[1], dst[2], dst[3]];
-        "#);
+        "#,
+        );
         assert_eq!(v, serde_json::json!([0, 0, 1.5, 2.5]));
     }
 
     #[test]
     fn ta_copywithin() {
-        let v = testutil::run_ret(r#"
+        let v = testutil::run_ret(
+            r#"
             const ta = new Uint8Array([1, 2, 3, 4, 5]);
             ta.copyWithin(0, 3);
             return [ta[0], ta[1], ta[2], ta[3], ta[4]];
-        "#);
+        "#,
+        );
         // copyWithin(0, 3) → copy elements 3,4 to positions 0,1
         assert_eq!(v, serde_json::json!([4, 5, 3, 4, 5]));
     }
 
     #[test]
     fn ta_fill_basic() {
-        let v = testutil::run_ret(r#"
+        let v = testutil::run_ret(
+            r#"
             const ta = new Uint8Array(5);
             ta.fill(7, 1, 4);
             return [ta[0], ta[1], ta[2], ta[3], ta[4]];
-        "#);
+        "#,
+        );
         assert_eq!(v, serde_json::json!([0, 7, 7, 7, 0]));
     }
 
     #[test]
     fn ta_reverse_basic() {
-        let v = testutil::run_ret(r#"
+        let v = testutil::run_ret(
+            r#"
             const ta = new Uint8Array([1, 2, 3, 4]);
             ta.reverse();
             return [ta[0], ta[1], ta[2], ta[3]];
-        "#);
+        "#,
+        );
         assert_eq!(v, serde_json::json!([4, 3, 2, 1]));
     }
 
     #[test]
     fn ta_join_basic() {
-        let v = testutil::run_ret(r#"
+        let v = testutil::run_ret(
+            r#"
             const ta = new Uint8Array([1, 2, 3]);
             return ta.join("-");
-        "#);
+        "#,
+        );
         assert_eq!(v, serde_json::json!("1-2-3"));
     }
 
     #[test]
     fn ta_at_negative() {
-        let v = testutil::run_ret(r#"
+        let v = testutil::run_ret(
+            r#"
             const ta = new Uint8Array([10, 20, 30]);
             return ta.at(-1);
-        "#);
+        "#,
+        );
         assert_eq!(v, serde_json::json!(30));
     }
 
     #[test]
     fn ta_includes_basic() {
-        let v = testutil::run_ret(r#"
+        let v = testutil::run_ret(
+            r#"
             const ta = new Uint8Array([1, 2, 3]);
             return [ta.includes(2), ta.includes(5)];
-        "#);
+        "#,
+        );
         assert_eq!(v, serde_json::json!([true, false]));
     }
 
     #[test]
     fn ta_index_of_basic() {
-        let v = testutil::run_ret(r#"
+        let v = testutil::run_ret(
+            r#"
             const ta = new Uint8Array([10, 20, 30, 20]);
             return [ta.indexOf(20), ta.lastIndexOf(20)];
-        "#);
+        "#,
+        );
         assert_eq!(v, serde_json::json!([1, 3]));
     }
 
@@ -1181,51 +1432,60 @@ mod tests {
 
     #[test]
     fn dataview_get_set_int32_le() {
-        let v = testutil::run_ret(r#"
+        let v = testutil::run_ret(
+            r#"
             const buf = new ArrayBuffer(8);
             const dv = new DataView(buf);
             dv.setInt32(0, 0x12345678, true);
             return dv.getInt32(0, true);
-        "#);
+        "#,
+        );
         assert_eq!(v, serde_json::json!(0x12345678));
     }
 
     #[test]
     fn dataview_get_set_int32_be() {
-        let v = testutil::run_ret(r#"
+        let v = testutil::run_ret(
+            r#"
             const buf = new ArrayBuffer(4);
             const dv = new DataView(buf);
             dv.setInt32(0, -1, false);
             return dv.getInt32(0, false);
-        "#);
+        "#,
+        );
         assert_eq!(v, serde_json::json!(-1));
     }
 
     #[test]
     fn dataview_get_set_float64() {
-        let v = testutil::run_ret(r#"
+        let v = testutil::run_ret(
+            r#"
             const buf = new ArrayBuffer(8);
             const dv = new DataView(buf);
             dv.setFloat64(0, 3.14, true);
             return dv.getFloat64(0, true);
-        "#);
+        "#,
+        );
         // 3.14 round-trips through f64
         assert!((v.as_f64().unwrap() - 3.14).abs() < 1e-10);
     }
 
     #[test]
     fn dataview_byte_offset_and_length() {
-        let v = testutil::run_ret(r#"
+        let v = testutil::run_ret(
+            r#"
             const buf = new ArrayBuffer(16);
             const dv = new DataView(buf, 4, 8);
             return [dv.byteOffset, dv.byteLength];
-        "#);
+        "#,
+        );
         assert_eq!(v, serde_json::json!([4, 8]));
     }
 
     #[test]
     fn dataview_uint8_across_bytes() {
-        let v = testutil::run_ret(r#"
+        let v = testutil::run_ret(
+            r#"
             const buf = new ArrayBuffer(4);
             const dv = new DataView(buf);
             dv.setUint8(0, 10);
@@ -1233,29 +1493,115 @@ mod tests {
             dv.setUint8(2, 30);
             dv.setUint8(3, 40);
             return [dv.getUint8(0), dv.getUint8(1), dv.getUint8(2), dv.getUint8(3)];
-        "#);
+        "#,
+        );
         assert_eq!(v, serde_json::json!([10, 20, 30, 40]));
     }
 
     #[test]
     fn dataview_endian_matters_for_int16() {
-        let v = testutil::run_ret(r#"
+        let v = testutil::run_ret(
+            r#"
             const buf = new ArrayBuffer(2);
             const dv = new DataView(buf);
             dv.setInt16(0, 0x0102, false); // big-endian: [0x01, 0x02]
             return [dv.getUint8(0), dv.getUint8(1)];
-        "#);
+        "#,
+        );
         assert_eq!(v, serde_json::json!([1, 2]));
     }
 
+    // ── Step 6: HOFs + iteration helpers ──────────────────────────────────
+
     #[test]
     fn ta_map_via_prelude() {
-        let v = testutil::run_ret(r#"
+        let v = testutil::run_ret(
+            r#"
             const ta = new Float64Array([1, 2, 3]);
             return ta.map(x => x * 2);
-        "#);
+        "#,
+        );
         // map on a TypedArray — prelude HOF iterates via .length and [i]
         // Returns a plain Array (prelude HOF creates an Array result)
         assert_eq!(v, serde_json::json!([2, 4, 6]));
+    }
+
+    #[test]
+    fn ta_filter_via_prelude() {
+        let v = testutil::run_ret(
+            r#"
+            const ta = new Float64Array([1, 2, 3, 4, 5]);
+            return ta.filter(x => x % 2 === 0);
+        "#,
+        );
+        assert_eq!(v, serde_json::json!([2, 4]));
+    }
+
+    #[test]
+    fn ta_reduce_via_prelude() {
+        let v = testutil::run_ret(
+            r#"
+            const ta = new Float64Array([1, 2, 3, 4]);
+            return ta.reduce((acc, x) => acc + x, 0);
+        "#,
+        );
+        assert_eq!(v, serde_json::json!(10));
+    }
+
+    #[test]
+    fn ta_sort_default_numeric() {
+        let v = testutil::run_ret(
+            r#"
+            const ta = new Float64Array([3, 1, 2]);
+            ta.sort();
+            return [ta[0], ta[1], ta[2]];
+        "#,
+        );
+        assert_eq!(v, serde_json::json!([1, 2, 3]));
+    }
+
+    #[test]
+    fn ta_sort_with_comparefn() {
+        let v = testutil::run_ret(
+            r#"
+            const ta = new Float64Array([30, 10, 20]);
+            ta.sort((a, b) => a - b);
+            return [ta[0], ta[1], ta[2]];
+        "#,
+        );
+        assert_eq!(v, serde_json::json!([10, 20, 30]));
+    }
+
+    #[test]
+    fn ta_keys_basic() {
+        let v = testutil::run_ret(
+            r#"
+            const ta = new Uint8Array([10, 20, 30]);
+            return ta.keys();
+        "#,
+        );
+        assert_eq!(v, serde_json::json!([0, 1, 2]));
+    }
+
+    #[test]
+    fn ta_values_basic() {
+        let v = testutil::run_ret(
+            r#"
+            const ta = new Uint8Array([10, 20, 30]);
+            return ta.values();
+        "#,
+        );
+        assert_eq!(v, serde_json::json!([10, 20, 30]));
+    }
+
+    #[test]
+    fn ta_entries_basic() {
+        let v = testutil::run_ret(
+            r#"
+            const ta = new Uint8Array([10, 20]);
+            return ta.entries();
+        "#,
+        );
+        assert_eq!(v, serde_json::json!([[0, 10], [1, 20]]));
     }
 }

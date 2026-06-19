@@ -85,20 +85,20 @@ pub(crate) use string::string_ctor;
 // Typed array constructors + codec helpers used by dispatch.rs.
 pub(crate) use typedarray::arraybuffer_ctor;
 pub(crate) use typedarray::arraybuffer_slice;
-pub(crate) use typedarray::dataview_ctor;
 pub(crate) use typedarray::bigint64array_ctor;
 pub(crate) use typedarray::biguint64array_ctor;
+pub(crate) use typedarray::dataview_ctor;
 pub(crate) use typedarray::float32array_ctor;
 pub(crate) use typedarray::float64array_ctor;
+pub(crate) use typedarray::int8array_ctor;
 pub(crate) use typedarray::int16array_ctor;
 pub(crate) use typedarray::int32array_ctor;
-pub(crate) use typedarray::int8array_ctor;
 pub(crate) use typedarray::ta_decode_bytes;
 pub(crate) use typedarray::ta_encode_bytes;
-pub(crate) use typedarray::uint16array_ctor;
-pub(crate) use typedarray::uint32array_ctor;
 pub(crate) use typedarray::uint8array_ctor;
 pub(crate) use typedarray::uint8clamped_ctor;
+pub(crate) use typedarray::uint16array_ctor;
+pub(crate) use typedarray::uint32array_ctor;
 
 // ── declarative builtin registry ─────────────────────────────────────────────
 
@@ -638,6 +638,10 @@ builtins! {
     TaJoin,        BuiltinKind::Method, "join",        1, 2,      ta_join,        false, false, false, false, false, false, false, false, true, false;
     TaFill,        BuiltinKind::Method, "fill",        2, VARARG, ta_fill,        false, false, false, false, false, false, false, false, true, false;
     TaReverse,     BuiltinKind::Method, "reverse",     1, 1,      ta_reverse,     false, false, false, false, false, false, false, false, true, false;
+    TaSort,        BuiltinKind::Method, "sort",        1, 2,      ta_sort,        false, false, false, false, false, false, false, false, true, false;
+    TaKeys,        BuiltinKind::Method, "keys",        1, 1,      ta_keys,        false, false, false, false, false, false, false, false, true, false;
+    TaValues,      BuiltinKind::Method, "values",      1, 1,      ta_values,      false, false, false, false, false, false, false, false, true, false;
+    TaEntries,     BuiltinKind::Method, "entries",     1, 1,      ta_entries,     false, false, false, false, false, false, false, false, true, false;
 }
 
 // ── argument accessor ────────────────────────────────────────────────────────

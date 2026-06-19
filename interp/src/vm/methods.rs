@@ -1476,28 +1476,16 @@ impl VM {
                     "`new Function` is not supported (use function expressions)",
                 ));
             }
-            crate::vm::instr::TypeTag::ArrayBuffer => {
-                crate::builtin::arraybuffer_ctor(self, args)?
-            }
+            crate::vm::instr::TypeTag::ArrayBuffer => crate::builtin::arraybuffer_ctor(self, args)?,
             crate::vm::instr::TypeTag::Int8Array => crate::builtin::int8array_ctor(self, args)?,
-            crate::vm::instr::TypeTag::Uint8Array => {
-                crate::builtin::uint8array_ctor(self, args)?
-            }
+            crate::vm::instr::TypeTag::Uint8Array => crate::builtin::uint8array_ctor(self, args)?,
             crate::vm::instr::TypeTag::Uint8ClampedArray => {
                 crate::builtin::uint8clamped_ctor(self, args)?
             }
-            crate::vm::instr::TypeTag::Int16Array => {
-                crate::builtin::int16array_ctor(self, args)?
-            }
-            crate::vm::instr::TypeTag::Uint16Array => {
-                crate::builtin::uint16array_ctor(self, args)?
-            }
-            crate::vm::instr::TypeTag::Int32Array => {
-                crate::builtin::int32array_ctor(self, args)?
-            }
-            crate::vm::instr::TypeTag::Uint32Array => {
-                crate::builtin::uint32array_ctor(self, args)?
-            }
+            crate::vm::instr::TypeTag::Int16Array => crate::builtin::int16array_ctor(self, args)?,
+            crate::vm::instr::TypeTag::Uint16Array => crate::builtin::uint16array_ctor(self, args)?,
+            crate::vm::instr::TypeTag::Int32Array => crate::builtin::int32array_ctor(self, args)?,
+            crate::vm::instr::TypeTag::Uint32Array => crate::builtin::uint32array_ctor(self, args)?,
             crate::vm::instr::TypeTag::Float32Array => {
                 crate::builtin::float32array_ctor(self, args)?
             }
