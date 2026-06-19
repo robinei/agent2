@@ -97,6 +97,7 @@ pub fn slice_poly(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     match args.get(vm, 0) {
         Value::String(_) => str_slice(vm, args),
         Value::Array(_) => array_slice_builtin(vm, args),
+        Value::ArrayBuffer(_) => crate::builtin::arraybuffer_slice(vm, args),
         recv => Err(vm.method_receiver_error(recv)),
     }
 }

@@ -66,9 +66,38 @@ impl VM {
             _ => {}
         }
 
-        // Integer-key fast path: arrays and strings (first, so
+        // Integer-key fast path: arrays, strings, and typed arrays (first, so
         // `arr[0]` never enters the named/ladder path).
         if let Some(idx) = key.as_i64() {
+            // TypedArray: integer-indexed exotic — negative/OOB → Undefined (no error).
+            if let Value::TypedArray(p) = receiver {
+                let ptr = *p;
+                if idx < 0 {
+                    return Ok(Value::Undefined);
+                }
+                let idx = idx as usize;
+                let (length, kind, buf_ptr, byte_off) = {
+                    let view =
+                        self.typed_arrays.get(ptr as usize).ok_or_else(|| {
+                            self.fail_not_resumable(ErrorKind::TypeError, "bad typed array pointer")
+                        })?;
+                    if idx >= view.length() as usize {
+                        return Ok(Value::Undefined);
+                    }
+                    (
+                        view.length() as usize,
+                        view.kind,
+                        view.buffer,
+                        view.byte_offset as usize + idx * view.kind.element_size() as usize,
+                    )
+                };
+                let _ = length;
+                let buf = self.buffers.get(buf_ptr as usize).ok_or_else(|| {
+                    self.fail_not_resumable(ErrorKind::TypeError, "bad buffer pointer")
+                })?;
+                return Ok(crate::builtin::ta_decode_bytes(kind, &buf[byte_off..]));
+            }
+
             if idx < 0 {
                 return Err(self.fail(ErrorKind::ValueError, "value error"));
             }
@@ -277,11 +306,17 @@ impl VM {
             }
 
             // ── TypedArray: length/byteLength/byteOffset/buffer/BYTES_PER_ELEMENT rungs ─
-            Value::TypedArray(_) => {
+            Value::TypedArray(p) => {
+                let ptr = *p;
                 if let Some(val) = self.typed_array_virtual(field, receiver) {
                     return val;
                 }
-                self.type_proto_lookup(crate::vm::instr::TypeTag::Float64Array, field, receiver)
+                let tag = self
+                    .typed_arrays
+                    .get(ptr as usize)
+                    .map(|v| v.kind.type_tag())
+                    .unwrap_or(crate::vm::instr::TypeTag::Float64Array);
+                self.type_proto_lookup(tag, field, receiver)
             }
 
             // ── DataView: byteLength/byteOffset/buffer rungs → DataView proto ─
@@ -369,8 +404,75 @@ impl VM {
         val: Value,
         mode: SetMode,
     ) -> Result<Value, VMError> {
-        // Integer-key fast path for arrays.
+        // Integer-key fast path for arrays and typed arrays.
         if let Some(idx) = key.as_i64() {
+            // TypedArray: integer-indexed exotic — negative/OOB are silent no-ops.
+            if let Value::TypedArray(p) = receiver {
+                let ptr = *p;
+                if idx >= 0 {
+                    let udx = idx as usize;
+                    let (length, kind, buf_ptr, byte_off, old_val) = {
+                        let view = self.typed_arrays.get(ptr as usize).ok_or_else(|| {
+                            self.fail_not_resumable(
+                                ErrorKind::TypeError,
+                                "bad typed array pointer",
+                            )
+                        })?;
+                        if udx < view.length() as usize {
+                            let boff = view.byte_offset as usize
+                                + udx * view.kind.element_size() as usize;
+                            let old = if matches!(mode, SetMode::Old) {
+                                let buf =
+                                    self.buffers.get(view.buffer as usize).ok_or_else(|| {
+                                        self.fail_not_resumable(
+                                            ErrorKind::TypeError,
+                                            "bad buffer pointer",
+                                        )
+                                    })?;
+                                crate::builtin::ta_decode_bytes(view.kind, &buf[boff..])
+                            } else {
+                                Value::Undefined
+                            };
+                            (
+                                view.length() as usize,
+                                view.kind,
+                                view.buffer,
+                                boff,
+                                old,
+                            )
+                        } else {
+                            // OOB: silent no-op.
+                            return Ok(match mode {
+                                SetMode::New => val,
+                                SetMode::Old => Value::Undefined,
+                            });
+                        }
+                    };
+                    let _ = length;
+                    let f = val.to_number().unwrap_or(0.0);
+                    let elem_size = kind.element_size() as usize;
+                    let ip = self.ip;
+                    let buf =
+                        self.buffers
+                            .get_mut(buf_ptr as usize)
+                            .ok_or_else(|| VMError::fail_at(ip, ErrorKind::TypeError, "bad buffer pointer"))?;
+                    crate::builtin::ta_encode_bytes(
+                        kind,
+                        f,
+                        &mut buf[byte_off..byte_off + elem_size],
+                    );
+                    return Ok(match mode {
+                        SetMode::New => val,
+                        SetMode::Old => old_val,
+                    });
+                }
+                // Negative index: silent no-op.
+                return Ok(match mode {
+                    SetMode::New => val,
+                    SetMode::Old => Value::Undefined,
+                });
+            }
+
             if idx < 0 {
                 return Err(self.fail(ErrorKind::ValueError, "value error"));
             }

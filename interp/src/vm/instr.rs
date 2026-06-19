@@ -71,6 +71,23 @@ impl TypedArrayKind {
     pub fn bytes_per_element(self) -> u32 {
         self.element_size()
     }
+
+    /// The `TypeTag` that identifies this kind's constructor and prototype.
+    pub fn type_tag(self) -> TypeTag {
+        match self {
+            TypedArrayKind::Int8 => TypeTag::Int8Array,
+            TypedArrayKind::Uint8 => TypeTag::Uint8Array,
+            TypedArrayKind::Uint8Clamped => TypeTag::Uint8ClampedArray,
+            TypedArrayKind::Int16 => TypeTag::Int16Array,
+            TypedArrayKind::Uint16 => TypeTag::Uint16Array,
+            TypedArrayKind::Int32 => TypeTag::Int32Array,
+            TypedArrayKind::Uint32 => TypeTag::Uint32Array,
+            TypedArrayKind::Float32 => TypeTag::Float32Array,
+            TypedArrayKind::Float64 => TypeTag::Float64Array,
+            TypedArrayKind::BigInt64 => TypeTag::BigInt64Array,
+            TypedArrayKind::BigUint64 => TypeTag::BigUint64Array,
+        }
+    }
 }
 
 /// A typed array view over an ArrayBuffer.

@@ -44,6 +44,7 @@ mod poly;
 mod regexp;
 mod set;
 mod string;
+mod typedarray;
 
 use array::*;
 use console::*;
@@ -58,6 +59,7 @@ use poly::*;
 use regexp::*;
 use set::*;
 use string::*;
+use typedarray::*;
 
 // Re-export the constructor handlers so `VM::construct_builtin` can reach
 // them by bare name. The `builtins!` macro references them unqualified via
@@ -80,6 +82,21 @@ pub(crate) use object::object_ctor;
 pub(crate) use regexp::regexp_ctor;
 pub(crate) use set::set_ctor;
 pub(crate) use string::string_ctor;
+// Typed array constructors + codec helpers used by dispatch.rs.
+pub(crate) use typedarray::arraybuffer_ctor;
+pub(crate) use typedarray::bigint64array_ctor;
+pub(crate) use typedarray::biguint64array_ctor;
+pub(crate) use typedarray::float32array_ctor;
+pub(crate) use typedarray::float64array_ctor;
+pub(crate) use typedarray::int16array_ctor;
+pub(crate) use typedarray::int32array_ctor;
+pub(crate) use typedarray::int8array_ctor;
+pub(crate) use typedarray::ta_decode_bytes;
+pub(crate) use typedarray::ta_encode_bytes;
+pub(crate) use typedarray::uint16array_ctor;
+pub(crate) use typedarray::uint32array_ctor;
+pub(crate) use typedarray::uint8array_ctor;
+pub(crate) use typedarray::uint8clamped_ctor;
 
 // ── declarative builtin registry ─────────────────────────────────────────────
 
@@ -373,6 +390,10 @@ macro_rules! builtins {
                         $(method_check!($dataview, $name, $variant, name);)*
                         None
                     }
+                    Value::ArrayBuffer(_) => {
+                        $(method_check!($dataview, $name, $variant, name);)*
+                        None
+                    }
                     _ => None,
                 }
             }
@@ -558,6 +579,24 @@ builtins! {
     StringCtor,  BuiltinKind::Constructor { type_tag: TypeTag::String },  "String",  1, 1,      string_ctor,  false, false, false, false, false, false, false, false, false, false;
     BooleanCtor, BuiltinKind::Constructor { type_tag: TypeTag::Boolean }, "Boolean", 1, 1,      boolean_ctor, false, false, false, false, false, false, false, false, false, false;
     FunctionCtor,BuiltinKind::Constructor { type_tag: TypeTag::Function },"Function",0, VARARG, function_ctor, false, false, false, false, false, false, false, false, false, false;
+
+    // ── ArrayBuffer ──
+    ArrayBufferCtor,    BuiltinKind::Constructor { type_tag: TypeTag::ArrayBuffer },        "ArrayBuffer",        1, 1,      arraybuffer_ctor,      false, false, false, false, false, false, false, false, false, false;
+    ArrayBufferIsView,  BuiltinKind::Namespace("ArrayBuffer"), "isView",                    1, 1,      arraybuffer_is_view,   false, false, false, false, false, false, false, false, false, false;
+    ArrayBufferSlice,   BuiltinKind::Method, "slice",                                       2, 3,      arraybuffer_slice,     false, false, false, false, false, false, false, false, false, true;
+
+    // ── Typed array constructors ──
+    Int8ArrayCtor,         BuiltinKind::Constructor { type_tag: TypeTag::Int8Array },         "Int8Array",         0, VARARG, int8array_ctor,        false, false, false, false, false, false, false, false, false, false;
+    Uint8ArrayCtor,        BuiltinKind::Constructor { type_tag: TypeTag::Uint8Array },        "Uint8Array",        0, VARARG, uint8array_ctor,       false, false, false, false, false, false, false, false, false, false;
+    Uint8ClampedArrayCtor, BuiltinKind::Constructor { type_tag: TypeTag::Uint8ClampedArray }, "Uint8ClampedArray", 0, VARARG, uint8clamped_ctor,     false, false, false, false, false, false, false, false, false, false;
+    Int16ArrayCtor,        BuiltinKind::Constructor { type_tag: TypeTag::Int16Array },        "Int16Array",        0, VARARG, int16array_ctor,       false, false, false, false, false, false, false, false, false, false;
+    Uint16ArrayCtor,       BuiltinKind::Constructor { type_tag: TypeTag::Uint16Array },       "Uint16Array",       0, VARARG, uint16array_ctor,      false, false, false, false, false, false, false, false, false, false;
+    Int32ArrayCtor,        BuiltinKind::Constructor { type_tag: TypeTag::Int32Array },        "Int32Array",        0, VARARG, int32array_ctor,       false, false, false, false, false, false, false, false, false, false;
+    Uint32ArrayCtor,       BuiltinKind::Constructor { type_tag: TypeTag::Uint32Array },       "Uint32Array",       0, VARARG, uint32array_ctor,      false, false, false, false, false, false, false, false, false, false;
+    Float32ArrayCtor,      BuiltinKind::Constructor { type_tag: TypeTag::Float32Array },      "Float32Array",      0, VARARG, float32array_ctor,     false, false, false, false, false, false, false, false, false, false;
+    Float64ArrayCtor,      BuiltinKind::Constructor { type_tag: TypeTag::Float64Array },      "Float64Array",      0, VARARG, float64array_ctor,     false, false, false, false, false, false, false, false, false, false;
+    BigInt64ArrayCtor,     BuiltinKind::Constructor { type_tag: TypeTag::BigInt64Array },     "BigInt64Array",     0, VARARG, bigint64array_ctor,    false, false, false, false, false, false, false, false, false, false;
+    BigUint64ArrayCtor,    BuiltinKind::Constructor { type_tag: TypeTag::BigUint64Array },    "BigUint64Array",    0, VARARG, biguint64array_ctor,   false, false, false, false, false, false, false, false, false, false;
 }
 
 // ── argument accessor ────────────────────────────────────────────────────────

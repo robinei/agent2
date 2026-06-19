@@ -23,6 +23,9 @@ fn is_object_for_instanceof(val: &Value) -> bool {
             | Value::Builtin(_)
             | Value::Bound(_)
             | Value::Promise(_)
+            | Value::TypedArray(_)
+            | Value::DataView(_)
+            | Value::ArrayBuffer(_)
     )
 }
 
@@ -1143,8 +1146,13 @@ impl VM {
             Value::ArrayBuffer(_) => {
                 Some(self.prototype_for(crate::vm::instr::TypeTag::ArrayBuffer)?)
             }
-            Value::TypedArray(_) => {
-                Some(self.prototype_for(crate::vm::instr::TypeTag::Float64Array)?)
+            Value::TypedArray(p) => {
+                let tag = self
+                    .typed_arrays
+                    .get(*p as usize)
+                    .map(|v| v.kind.type_tag())
+                    .unwrap_or(crate::vm::instr::TypeTag::Float64Array);
+                Some(self.prototype_for(tag)?)
             }
             Value::DataView(_) => Some(self.prototype_for(crate::vm::instr::TypeTag::DataView)?),
             Value::Null | Value::Undefined | Value::Upval(_) => None,
@@ -1468,23 +1476,45 @@ impl VM {
                     "`new Function` is not supported (use function expressions)",
                 ));
             }
-            crate::vm::instr::TypeTag::ArrayBuffer
-            | crate::vm::instr::TypeTag::Int8Array
-            | crate::vm::instr::TypeTag::Uint8Array
-            | crate::vm::instr::TypeTag::Uint8ClampedArray
-            | crate::vm::instr::TypeTag::Int16Array
-            | crate::vm::instr::TypeTag::Uint16Array
-            | crate::vm::instr::TypeTag::Int32Array
-            | crate::vm::instr::TypeTag::Uint32Array
-            | crate::vm::instr::TypeTag::Float32Array
-            | crate::vm::instr::TypeTag::Float64Array
-            | crate::vm::instr::TypeTag::BigInt64Array
-            | crate::vm::instr::TypeTag::BigUint64Array
-            | crate::vm::instr::TypeTag::DataView => {
+            crate::vm::instr::TypeTag::ArrayBuffer => {
+                crate::builtin::arraybuffer_ctor(self, args)?
+            }
+            crate::vm::instr::TypeTag::Int8Array => crate::builtin::int8array_ctor(self, args)?,
+            crate::vm::instr::TypeTag::Uint8Array => {
+                crate::builtin::uint8array_ctor(self, args)?
+            }
+            crate::vm::instr::TypeTag::Uint8ClampedArray => {
+                crate::builtin::uint8clamped_ctor(self, args)?
+            }
+            crate::vm::instr::TypeTag::Int16Array => {
+                crate::builtin::int16array_ctor(self, args)?
+            }
+            crate::vm::instr::TypeTag::Uint16Array => {
+                crate::builtin::uint16array_ctor(self, args)?
+            }
+            crate::vm::instr::TypeTag::Int32Array => {
+                crate::builtin::int32array_ctor(self, args)?
+            }
+            crate::vm::instr::TypeTag::Uint32Array => {
+                crate::builtin::uint32array_ctor(self, args)?
+            }
+            crate::vm::instr::TypeTag::Float32Array => {
+                crate::builtin::float32array_ctor(self, args)?
+            }
+            crate::vm::instr::TypeTag::Float64Array => {
+                crate::builtin::float64array_ctor(self, args)?
+            }
+            crate::vm::instr::TypeTag::BigInt64Array => {
+                crate::builtin::bigint64array_ctor(self, args)?
+            }
+            crate::vm::instr::TypeTag::BigUint64Array => {
+                crate::builtin::biguint64array_ctor(self, args)?
+            }
+            crate::vm::instr::TypeTag::DataView => {
                 self.stack.truncate(base);
                 return Err(self.fail(
                     ErrorKind::TypeError,
-                    "typed arrays / DataView not yet implemented",
+                    "DataView not yet implemented",
                 ));
             }
         };
