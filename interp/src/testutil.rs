@@ -166,13 +166,11 @@ mod tests {
 
     #[test]
     fn compile_errs_renders_diagnostics() {
-        let errs = compile_errs("let x = y;"); // undeclared `y`
+        // Undeclared identifiers now compile via PushName; use a genuine
+        // unsupported expression (labeled statement) for this coverage.
+        let errs = compile_errs("outer: while (true) break outer;");
         assert!(!errs.is_empty(), "expected at least one diagnostic");
-        assert!(
-            errs[0].contains("undeclared") || errs[0].contains("y"),
-            "got: {}",
-            errs[0]
-        );
+        assert!(errs[0].contains("labeled"), "got: {}", errs[0]);
     }
 
     #[test]

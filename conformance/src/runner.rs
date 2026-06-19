@@ -473,10 +473,20 @@ fn run_work_item(item: WorkItem) -> TestResult {
                     }
                 }
             }
+            // Include the first line of the error message for ReferenceError
+            // so that name-level resolution failures from PushName show the
+            // unresolved name in the histogram (e.g. "Symbol is not defined").
+            let detail = match error_name.as_str() {
+                "ReferenceError" => {
+                    let first = e.message.split('\n').next().unwrap_or("");
+                    format!("runtime: ReferenceError ({first})")
+                }
+                _ => format!("runtime: {error_name}"),
+            };
             TestResult {
                 path: item.path,
                 outcome: TestOutcome::Fail,
-                detail: format!("runtime: {error_name}"),
+                detail,
                 features: item.features,
             }
         }

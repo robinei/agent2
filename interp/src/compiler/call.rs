@@ -571,10 +571,51 @@ impl super::Compiler {
                     self.emit(Instr::Raise(name, 0), span);
                 }
             }
-            _ => self.error(
-                span,
-                format!("call to undeclared function `{name}` (user functions are Phase 3)"),
-            ),
+            name if super::is_error_ctor(name) => {
+                // `TypeError("msg")` / `Error("msg")` → create error object
+                // (same logic as `compile_error_ctor` for `new`).
+                if argv.len() > 1 {
+                    self.error(
+                        span,
+                        format!("`{name}` takes at most one (message) argument"),
+                    );
+                    return;
+                }
+                let name_str = self.intern_string(name);
+                self.emit(Instr::PushStr(name_str), span);
+                match argv.first() {
+                    None => {
+                        let empty = self.intern_string("");
+                        self.emit(Instr::PushStr(empty), span);
+                    }
+                    Some(msg) => {
+                        self.compile_expr(msg);
+                        self.emit(Instr::ToStr, span);
+                    }
+                }
+                self.emit(
+                    Instr::ObjNew(
+                        vec![
+                            crate::vm::RcStr::from("name"),
+                            crate::vm::RcStr::from("message"),
+                        ]
+                        .into(),
+                    ),
+                    span,
+                );
+            }
+            _ => {
+                // Unknown global — compile as a dynamic call resolved at runtime.
+                // `PushName` resolves the name via the builtin registry / hardcoded
+                // globals: a name that maps to a value is then invoked by `CallDyn`
+                // (raising `TypeError` if it isn't callable), while a genuinely
+                // undeclared name raises `ReferenceError` at `PushName` itself —
+                // before `CallDyn` runs — exactly as JS does for `undeclared()`.
+                let name_str = self.intern_string(name);
+                self.emit(Instr::PushName(name_str), span);
+                self.compile_args(argv);
+                self.emit(Instr::CallDyn(argv.len() as u32, false), span);
+            }
         }
     }
 

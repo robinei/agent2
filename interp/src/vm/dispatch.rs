@@ -812,6 +812,12 @@ impl VM {
                     self.stack.push(Value::Object(obj));
                     self.ip += 1;
                 }
+                Instr::PushName(name) => {
+                    let name = name.clone();
+                    let val = self.resolve_name(&name)?;
+                    self.stack.push(val);
+                    self.ip += 1;
+                }
 
                 Instr::Pop(n) => {
                     // Only expression temporaries may be popped, never locals

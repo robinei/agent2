@@ -732,6 +732,10 @@ pub enum ErrorKind {
     /// Tier 2). Only reachable via circular awaits among async calls — the
     /// message names the await chain. Never resumable.
     Deadlock,
+    /// A bare-name resolution failure from [`Instr::PushName`] — the name
+    /// is not in the builtin registry, not a hardcoded global, and not an
+    /// error constructor. Maps to JS's `ReferenceError`.
+    ReferenceError,
 }
 
 /// Whether the host can resume from this error by feeding a value (see

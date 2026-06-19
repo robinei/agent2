@@ -55,10 +55,11 @@ fn catch_destructures_thrown_value() {
 
 #[test]
 fn catch_binding_is_block_scoped() {
-    let errs = compile_errs(r#"try { throw 1; } catch (e) {} return e;"#);
-    assert!(
-        errs.iter().any(|e| e.contains("undeclared variable `e`")),
-        "got: {errs:?}"
+    // `e` outside the catch block resolves via `PushName` and fails at
+    // runtime with a `ReferenceError` — matching JS semantics.
+    assert_eq!(
+        run_err_kind(r#"try { throw 1; } catch (e) {} return e;"#),
+        ErrorKind::ReferenceError
     );
 }
 
@@ -173,13 +174,15 @@ fn new_error_rejects_extra_args() {
 
 #[test]
 fn new_non_error_still_rejected() {
-    // `Foo` is undeclared — the callee fails to resolve via the new `new` path,
-    // producing an undeclared-variable error instead of the generic "`new` is
-    // not supported" (Step 4b now compiles `new F()` for declared user functions).
-    let errs = compile_errs(r#"const x = new Foo();"#);
+    // `new Foo()` now compiles (the undeclared identifier `Foo` resolves to
+    // `PushName` at runtime). The runtime `PushName` raises `ReferenceError`.
     assert!(
-        errs.iter().any(|e| e.contains("undeclared")),
-        "got: {errs:?}"
+        compile_ok("const x = new Foo();").code.len() > 0,
+        "expected to compile"
+    );
+    assert_eq!(
+        run_err_kind("const x = new Foo();"),
+        ErrorKind::ReferenceError
     );
 }
 

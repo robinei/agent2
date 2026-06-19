@@ -276,7 +276,8 @@ impl super::Compiler {
             "Math" => self.emit(Instr::PushGlobal(crate::vm::GlobalId::Math), span),
             "JSON" => self.emit(Instr::PushGlobal(crate::vm::GlobalId::JSON), span),
             _ => {
-                self.error(span, format!("undeclared variable `{name}`"));
+                let name_str = self.intern_string(name);
+                self.emit(Instr::PushName(name_str), span);
             }
         }
     }

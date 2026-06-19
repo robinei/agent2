@@ -174,6 +174,14 @@ pub enum Instr {
     /// lowers to `CallBuiltin` directly. () -> object
     PushGlobal(GlobalId),
 
+    /// Push a globally-scoped name resolved at runtime — the reflective fallback
+    /// for bare identifiers the compiler does not statically recognize
+    /// (`TypeError`, `Symbol`, `Date`, …). The string is already interned and
+    /// cheap to compare. The VM checks the builtin registry, error-constructor
+    /// set, and hardcoded globals; everything else resolves to a `ReferenceError`.
+    /// () -> any
+    PushName(RcStr),
+
     Pop(usize),
 
     /// Generalized stack reach (Forth-like), counting from the top (0 = top).

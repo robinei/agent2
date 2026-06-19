@@ -254,6 +254,7 @@ fn pe_is_pure_push(i: &Instr) -> bool {
             | Instr::PushObject(_)
             | Instr::PushBuiltin(_)
             | Instr::PushGlobal(_)
+            | Instr::PushName(_)
             | Instr::PushStr(_)
             | Instr::GetLocal(_)
             | Instr::LoadThis

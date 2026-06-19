@@ -99,7 +99,9 @@ impl VM {
             // TypeError / ValueError: most sites pop operands first (macros,
             // take_args, check_arity!). Default to PushValueThenContinue;
             // specific sites that error before popping override below.
-            ErrorKind::TypeError | ErrorKind::ValueError => ResumeMode::PushValueThenContinue,
+            ErrorKind::TypeError | ErrorKind::ValueError | ErrorKind::ReferenceError => {
+                ResumeMode::PushValueThenContinue
+            }
             // An escaped program-level throw: the operand was consumed, but
             // a `throw` has no result slot a substituted value could fill.
             ErrorKind::UncaughtException => ResumeMode::NotResumable,
@@ -1296,6 +1298,36 @@ impl VM {
     /// `None` if it has not been lazily materialized yet. Does *not* allocate.
     pub fn namespace_ptr(&self, g: crate::vm::instr::GlobalId) -> Option<ObjectPtr> {
         self.namespaces.get(g as usize).copied().flatten()
+    }
+
+    /// Resolve a bare name to a value at runtime — the fallback when the
+    /// compiler does not statically recognize an identifier. Used by
+    /// [`Instr::PushName`]. Names in the builtin registry resolve directly;
+    /// error-constructor names (`TypeError`, …) resolve to the `Function`
+    /// constructor as a callable placeholder (the compiler's `new` path
+    /// handles them separately via `compile_error_ctor`); hardcoded globals
+    /// (`undefined`, `NaN`, `Infinity`) resolve to their literal values;
+    /// everything else raises a `ReferenceError` whose message includes the
+    /// name — preserving the name-level signal in the failure histogram.
+    pub fn resolve_name(&mut self, name: &str) -> Result<Value, VMError> {
+        if let Some(b) = crate::builtin::Builtin::for_constructor(name) {
+            return Ok(Value::Builtin(b));
+        }
+        match name {
+            "undefined" => Ok(Value::Undefined),
+            "NaN" => Ok(Value::Float(f64::NAN)),
+            "Infinity" => Ok(Value::Float(f64::INFINITY)),
+            // error constructors: used by test262 for typeof checks,
+            // instanceof, and error-type comparison.  The compiler's `new`
+            // path handles construction; here we provide a callable identity
+            // so `typeof TypeError` returns "function".
+            "Error" | "TypeError" | "ReferenceError" | "SyntaxError" | "RangeError"
+            | "EvalError" => Ok(Value::Builtin(crate::builtin::Builtin::FunctionCtor)),
+            _ => Err(self.fail(
+                crate::vm::ErrorKind::ReferenceError,
+                format!("{name} is not defined"),
+            )),
+        }
     }
 
     /// Construct a `Value::Map` from an optional iterable of `[key, value]`

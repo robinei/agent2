@@ -21,22 +21,25 @@ fn syntax_error_is_reported() {
 
 #[test]
 fn diagnostics_for_unsupported() {
+    // Undeclared bare identifiers now compile — they resolve to `PushName` at
+    // runtime and the VM handles resolution. Assignment to undeclared names
+    // ("x = 1;") and update expressions ("i++;") still fail at compile time
+    // because the lvalue path checks for a declared slot.
     for src in [
-        "x;",
         "x = 1;",
         "i++;",
-        "tools;",
-        "tools.send;",
         "raise(x);",
         "raise();",
         "raise(\"name\", 1, 2);", // at most one payload
         "Math.random();",
         "Math.pow(1);",
-        "f(...args);",
-        "new Foo();",
         "class C extends B {}",
     ] {
         assert!(compile(src).is_err(), "expected `{src}` to fail to compile");
+    }
+    // These now compile and fail at runtime instead of at compile time.
+    for src in ["x;", "tools;", "tools.send;", "f(...args);", "new Foo();"] {
+        assert!(compile(src).is_ok(), "expected `{src}` to compile");
     }
 }
 
