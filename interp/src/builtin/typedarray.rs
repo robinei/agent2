@@ -358,6 +358,344 @@ pub(crate) fn biguint64array_ctor(vm: &mut VM, _args: Args) -> Result<Value, VME
     Err(vm.fail(ErrorKind::TypeError, "BigUint64Array: BigInt not yet supported"))
 }
 
+// ── Step 4: Typed array prototype methods ─────────────────────────────────────
+
+/// Clamp an index argument into [0, len] range, supporting negative offsets.
+fn ta_clamp_index(val: &Value, len: usize) -> usize {
+    match val {
+        Value::Undefined => 0,
+        _ => {
+            let f = val.to_number().unwrap_or(0.0);
+            if f.is_nan() {
+                0
+            } else {
+                let i = f as i64;
+                let len_i = len as i64;
+                if i < 0 { (i + len_i).max(0) as usize } else { i.min(len_i) as usize }
+            }
+        }
+    }
+}
+
+/// Helper: get (length, elem_size, kind, buf_ptr, byte_offset) from a TypedArray.
+macro_rules! ta_view {
+    ($vm:expr, $ta_ptr:expr) => {{
+        let view = $vm
+            .typed_arrays
+            .get($ta_ptr as usize)
+            .ok_or_else(|| $vm.fail(ErrorKind::TypeError, "bad typed array pointer"))?;
+        let elem_size = view.kind.element_size() as usize;
+        (
+            view.length() as usize,
+            elem_size,
+            view.kind,
+            view.buffer,
+            view.byte_offset as usize,
+        )
+    }};
+}
+
+/// `ta.subarray(begin[, end])` — new view over the same buffer.
+pub(crate) fn ta_subarray(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let ta_ptr = match args.get(vm, 0) {
+        Value::TypedArray(p) => *p,
+        recv => return Err(vm.method_receiver_error(recv)),
+    };
+    let (length, elem_size, kind, buf_ptr, byte_offset) = ta_view!(vm, ta_ptr);
+    let begin = ta_clamp_index(args.get(vm, 1), length);
+    let end = if args.argc >= 3 {
+        ta_clamp_index(args.get(vm, 2), length)
+    } else {
+        length
+    };
+    let end = end.max(begin);
+    let new_byte_offset = byte_offset + begin * elem_size;
+    let new_byte_length = (end - begin) * elem_size;
+    let new_ptr = vm.typed_arrays.len() as TypedArrayPtr;
+    vm.typed_arrays.push(TypedArrayView {
+        buffer: buf_ptr,
+        byte_offset: new_byte_offset as u32,
+        byte_length: new_byte_length as u32,
+        kind,
+    });
+    Ok(Value::TypedArray(new_ptr))
+}
+
+/// `ta.slice(begin[, end])` — new TypedArray with a copy of the element range.
+pub(crate) fn ta_slice_ta(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let ta_ptr = match args.get(vm, 0) {
+        Value::TypedArray(p) => *p,
+        recv => return Err(vm.method_receiver_error(recv)),
+    };
+    let (length, elem_size, kind, buf_ptr, byte_offset) = ta_view!(vm, ta_ptr);
+    let begin = ta_clamp_index(args.get(vm, 1), length);
+    let end = if args.argc >= 3 {
+        ta_clamp_index(args.get(vm, 2), length)
+    } else {
+        length
+    };
+    let end = end.max(begin);
+    let src_start = byte_offset + begin * elem_size;
+    let src_end = byte_offset + end * elem_size;
+    let new_bytes = vm.buffers[buf_ptr as usize][src_start..src_end].to_vec();
+    let new_byte_length = new_bytes.len() as u32;
+    let new_buf_ptr = vm.buffers.len() as BufferPtr;
+    vm.buffers.push(new_bytes);
+    let new_ta_ptr = vm.typed_arrays.len() as TypedArrayPtr;
+    vm.typed_arrays.push(TypedArrayView {
+        buffer: new_buf_ptr,
+        byte_offset: 0,
+        byte_length: new_byte_length,
+        kind,
+    });
+    Ok(Value::TypedArray(new_ta_ptr))
+}
+
+/// `ta.set(source[, offset])` — copy elements from source into this typed array.
+pub(crate) fn ta_set(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let ta_ptr = match args.get(vm, 0) {
+        Value::TypedArray(p) => *p,
+        recv => return Err(vm.method_receiver_error(recv)),
+    };
+    let (length, elem_size, kind, buf_ptr, byte_offset) = ta_view!(vm, ta_ptr);
+    let offset = {
+        let f = args.get(vm, 2).to_number().unwrap_or(0.0);
+        if f.is_nan() || f < 0.0 { 0usize } else { f as usize }
+    };
+    match args.get(vm, 1) {
+        &Value::TypedArray(src_ptr) => {
+            let (src_len, src_elem_size, src_kind, src_buf_ptr, src_byte_offset) =
+                ta_view!(vm, src_ptr);
+            // Read source elements as f64 values first to avoid aliasing issues
+            let vals: Vec<f64> = (0..src_len)
+                .map(|i| {
+                    let off = src_byte_offset + i * src_elem_size;
+                    let buf = &vm.buffers[src_buf_ptr as usize];
+                    let v = ta_decode_bytes(src_kind, &buf[off..]);
+                    v.to_number().unwrap_or(0.0)
+                })
+                .collect();
+            for (i, f) in vals.iter().enumerate() {
+                let dst_i = offset + i;
+                if dst_i >= length {
+                    break;
+                }
+                let dst_off = byte_offset + dst_i * elem_size;
+                let buf = &mut vm.buffers[buf_ptr as usize];
+                ta_encode_bytes(kind, *f, &mut buf[dst_off..dst_off + elem_size]);
+            }
+        }
+        &Value::Array(arr_ptr) => {
+            let src_len = vm.arrays.get(arr_ptr as usize).map(|a| a.len()).unwrap_or(0);
+            let vals: Vec<f64> = (0..src_len)
+                .map(|i| {
+                    vm.arrays
+                        .get(arr_ptr as usize)
+                        .and_then(|a| a.get(i))
+                        .and_then(|v| v.to_number())
+                        .unwrap_or(0.0)
+                })
+                .collect();
+            for (i, f) in vals.iter().enumerate() {
+                let dst_i = offset + i;
+                if dst_i >= length {
+                    break;
+                }
+                let dst_off = byte_offset + dst_i * elem_size;
+                let buf = &mut vm.buffers[buf_ptr as usize];
+                ta_encode_bytes(kind, *f, &mut buf[dst_off..dst_off + elem_size]);
+            }
+        }
+        other => {
+            return Err(vm.fail(
+                ErrorKind::TypeError,
+                format!(
+                    "TypedArray.set: source must be TypedArray or Array, got {}",
+                    other.type_name()
+                ),
+            ));
+        }
+    }
+    Ok(Value::Undefined)
+}
+
+/// `ta.copyWithin(target, start[, end])` — in-place copy within the buffer.
+pub(crate) fn ta_copywithin(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let ta_ptr = match args.get(vm, 0) {
+        Value::TypedArray(p) => *p,
+        recv => return Err(vm.method_receiver_error(recv)),
+    };
+    let (length, elem_size, _kind, buf_ptr, byte_offset) = ta_view!(vm, ta_ptr);
+    let target = ta_clamp_index(args.get(vm, 1), length);
+    let start = ta_clamp_index(args.get(vm, 2), length);
+    let end = if args.argc >= 4 {
+        ta_clamp_index(args.get(vm, 3), length)
+    } else {
+        length
+    };
+    let count = end.saturating_sub(start).min(length.saturating_sub(target));
+    if count > 0 {
+        let src_byte = byte_offset + start * elem_size;
+        let dst_byte = byte_offset + target * elem_size;
+        let count_bytes = count * elem_size;
+        let buf = &mut vm.buffers[buf_ptr as usize];
+        buf.copy_within(src_byte..src_byte + count_bytes, dst_byte);
+    }
+    Ok(Value::TypedArray(ta_ptr))
+}
+
+/// `ta.at(index)` — element at index, supporting negative indices.
+pub(crate) fn ta_at(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let ta_ptr = match args.get(vm, 0) {
+        Value::TypedArray(p) => *p,
+        recv => return Err(vm.method_receiver_error(recv)),
+    };
+    let idx = args.get(vm, 1).to_number().unwrap_or(0.0) as i64;
+    let (length, elem_size, kind, buf_ptr, byte_offset) = ta_view!(vm, ta_ptr);
+    let len = length as i64;
+    let i = if idx < 0 { idx + len } else { idx };
+    if i < 0 || i as usize >= length {
+        return Ok(Value::Undefined);
+    }
+    let off = byte_offset + i as usize * elem_size;
+    Ok(ta_decode_bytes(kind, &vm.buffers[buf_ptr as usize][off..]))
+}
+
+/// `ta.includes(needle[, fromIndex])` — SameValueZero search.
+pub(crate) fn ta_includes(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let ta_ptr = match args.get(vm, 0) {
+        Value::TypedArray(p) => *p,
+        recv => return Err(vm.method_receiver_error(recv)),
+    };
+    let needle = args.get(vm, 1).clone();
+    let from = {
+        let f = args.get(vm, 2).to_number().unwrap_or(0.0);
+        if f.is_nan() { 0usize } else { f as usize }
+    };
+    let (length, elem_size, kind, buf_ptr, byte_offset) = ta_view!(vm, ta_ptr);
+    for i in from.min(length)..length {
+        let off = byte_offset + i * elem_size;
+        let v = ta_decode_bytes(kind, &vm.buffers[buf_ptr as usize][off..]);
+        if crate::vm::value::same_value_zero(&v, &needle) {
+            return Ok(Value::Bool(true));
+        }
+    }
+    Ok(Value::Bool(false))
+}
+
+/// `ta.indexOf(needle[, fromIndex])` — strict equality search, returns index.
+pub(crate) fn ta_index_of(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let ta_ptr = match args.get(vm, 0) {
+        Value::TypedArray(p) => *p,
+        recv => return Err(vm.method_receiver_error(recv)),
+    };
+    let needle = args.get(vm, 1).clone();
+    let from = {
+        let f = args.get(vm, 2).to_number().unwrap_or(0.0);
+        if f.is_nan() { 0usize } else { f.max(0.0) as usize }
+    };
+    let (length, elem_size, kind, buf_ptr, byte_offset) = ta_view!(vm, ta_ptr);
+    for i in from.min(length)..length {
+        let off = byte_offset + i * elem_size;
+        let v = ta_decode_bytes(kind, &vm.buffers[buf_ptr as usize][off..]);
+        if v.strict_equal(&needle) {
+            return Ok(Value::int_from_f64(i as f64));
+        }
+    }
+    Ok(Value::NegInt(-1))
+}
+
+/// `ta.lastIndexOf(needle[, fromIndex])` — strict equality reverse search.
+pub(crate) fn ta_last_index_of(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let ta_ptr = match args.get(vm, 0) {
+        Value::TypedArray(p) => *p,
+        recv => return Err(vm.method_receiver_error(recv)),
+    };
+    let needle = args.get(vm, 1).clone();
+    let (length, elem_size, kind, buf_ptr, byte_offset) = ta_view!(vm, ta_ptr);
+    let end = match args.get(vm, 2) {
+        Value::Undefined => length,
+        v => {
+            let f = v.to_number().unwrap_or(length as f64);
+            (f as i64 + 1).max(0).min(length as i64) as usize
+        }
+    };
+    for i in (0..end).rev() {
+        let off = byte_offset + i * elem_size;
+        let v = ta_decode_bytes(kind, &vm.buffers[buf_ptr as usize][off..]);
+        if v.strict_equal(&needle) {
+            return Ok(Value::int_from_f64(i as f64));
+        }
+    }
+    Ok(Value::NegInt(-1))
+}
+
+/// `ta.join([sep])` — join elements with separator string.
+pub(crate) fn ta_join(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let ta_ptr = match args.get(vm, 0) {
+        Value::TypedArray(p) => *p,
+        recv => return Err(vm.method_receiver_error(recv)),
+    };
+    let sep = match args.get(vm, 1) {
+        Value::Undefined => ",".to_string(),
+        v => vm.to_js_string(v, 0).as_str().to_owned(),
+    };
+    let (length, elem_size, kind, buf_ptr, byte_offset) = ta_view!(vm, ta_ptr);
+    let mut joined = String::new();
+    for i in 0..length {
+        if i > 0 {
+            joined.push_str(&sep);
+        }
+        let off = byte_offset + i * elem_size;
+        let v = ta_decode_bytes(kind, &vm.buffers[buf_ptr as usize][off..]);
+        joined.push_str(vm.to_js_string(&v, 0).as_str());
+    }
+    Ok(Value::String(crate::vm::RcStr::from(joined)))
+}
+
+/// `ta.fill(value[, start[, end]])` — fill in-place, returns receiver.
+pub(crate) fn ta_fill(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let ta_ptr = match args.get(vm, 0) {
+        Value::TypedArray(p) => *p,
+        recv => return Err(vm.method_receiver_error(recv)),
+    };
+    let f = args.get(vm, 1).to_number().unwrap_or(0.0);
+    let (length, elem_size, kind, buf_ptr, byte_offset) = ta_view!(vm, ta_ptr);
+    let start = ta_clamp_index(args.get(vm, 2), length);
+    let end = if args.argc >= 4 {
+        ta_clamp_index(args.get(vm, 3), length)
+    } else {
+        length
+    };
+    let end = end.max(start);
+    // Encode the value once, then copy repeatedly.
+    let mut elem_buf = vec![0u8; elem_size];
+    ta_encode_bytes(kind, f, &mut elem_buf);
+    let buf = &mut vm.buffers[buf_ptr as usize];
+    for i in start..end {
+        let off = byte_offset + i * elem_size;
+        buf[off..off + elem_size].copy_from_slice(&elem_buf);
+    }
+    Ok(Value::TypedArray(ta_ptr))
+}
+
+/// `ta.reverse()` — reverse elements in-place, returns receiver.
+pub(crate) fn ta_reverse(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let ta_ptr = match args.get(vm, 0) {
+        Value::TypedArray(p) => *p,
+        recv => return Err(vm.method_receiver_error(recv)),
+    };
+    let (length, elem_size, _kind, buf_ptr, byte_offset) = ta_view!(vm, ta_ptr);
+    let buf = &mut vm.buffers[buf_ptr as usize];
+    for i in 0..length / 2 {
+        let j = length - 1 - i;
+        for k in 0..elem_size {
+            buf.swap(byte_offset + i * elem_size + k, byte_offset + j * elem_size + k);
+        }
+    }
+    Ok(Value::TypedArray(ta_ptr))
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -551,5 +889,139 @@ mod tests {
             "const ta = new Uint8ClampedArray(3); ta[0] = 0.5; ta[1] = 1.5; ta[2] = 2.5; return [ta[0], ta[1], ta[2]];",
         );
         assert_eq!(v, serde_json::json!([0, 2, 2]));
+    }
+
+    // ── Step 4: prototype methods ──────────────────────────────────────────
+
+    #[test]
+    fn ta_subarray_shares_buffer() {
+        let v = testutil::run_ret(r#"
+            const ta = new Uint8Array([10, 20, 30, 40, 50]);
+            const sub = ta.subarray(1, 4);
+            return [sub[0], sub[1], sub[2], sub.length, sub.byteOffset];
+        "#);
+        assert_eq!(v, serde_json::json!([20, 30, 40, 3, 1]));
+    }
+
+    #[test]
+    fn ta_subarray_mutation_reflects() {
+        let v = testutil::run_ret(r#"
+            const ta = new Uint8Array([1, 2, 3, 4]);
+            const sub = ta.subarray(1, 3);
+            sub[0] = 99;
+            return ta[1];
+        "#);
+        assert_eq!(v, serde_json::json!(99));
+    }
+
+    #[test]
+    fn ta_slice_copies() {
+        let v = testutil::run_ret(r#"
+            const ta = new Int32Array([10, 20, 30, 40]);
+            const s = ta.slice(1, 3);
+            s[0] = 999;
+            return [ta[1], s[0], s.length];
+        "#);
+        // slice makes a copy — mutating s does not affect ta
+        assert_eq!(v, serde_json::json!([20, 999, 2]));
+    }
+
+    #[test]
+    fn ta_set_from_array() {
+        let v = testutil::run_ret(r#"
+            const ta = new Uint8Array(5);
+            ta.set([1, 2, 3], 1);
+            return [ta[0], ta[1], ta[2], ta[3], ta[4]];
+        "#);
+        assert_eq!(v, serde_json::json!([0, 1, 2, 3, 0]));
+    }
+
+    #[test]
+    fn ta_set_from_typed_array() {
+        let v = testutil::run_ret(r#"
+            const src = new Float64Array([1.5, 2.5]);
+            const dst = new Float64Array(4);
+            dst.set(src, 2);
+            return [dst[0], dst[1], dst[2], dst[3]];
+        "#);
+        assert_eq!(v, serde_json::json!([0, 0, 1.5, 2.5]));
+    }
+
+    #[test]
+    fn ta_copywithin() {
+        let v = testutil::run_ret(r#"
+            const ta = new Uint8Array([1, 2, 3, 4, 5]);
+            ta.copyWithin(0, 3);
+            return [ta[0], ta[1], ta[2], ta[3], ta[4]];
+        "#);
+        // copyWithin(0, 3) → copy elements 3,4 to positions 0,1
+        assert_eq!(v, serde_json::json!([4, 5, 3, 4, 5]));
+    }
+
+    #[test]
+    fn ta_fill_basic() {
+        let v = testutil::run_ret(r#"
+            const ta = new Uint8Array(5);
+            ta.fill(7, 1, 4);
+            return [ta[0], ta[1], ta[2], ta[3], ta[4]];
+        "#);
+        assert_eq!(v, serde_json::json!([0, 7, 7, 7, 0]));
+    }
+
+    #[test]
+    fn ta_reverse_basic() {
+        let v = testutil::run_ret(r#"
+            const ta = new Uint8Array([1, 2, 3, 4]);
+            ta.reverse();
+            return [ta[0], ta[1], ta[2], ta[3]];
+        "#);
+        assert_eq!(v, serde_json::json!([4, 3, 2, 1]));
+    }
+
+    #[test]
+    fn ta_join_basic() {
+        let v = testutil::run_ret(r#"
+            const ta = new Uint8Array([1, 2, 3]);
+            return ta.join("-");
+        "#);
+        assert_eq!(v, serde_json::json!("1-2-3"));
+    }
+
+    #[test]
+    fn ta_at_negative() {
+        let v = testutil::run_ret(r#"
+            const ta = new Uint8Array([10, 20, 30]);
+            return ta.at(-1);
+        "#);
+        assert_eq!(v, serde_json::json!(30));
+    }
+
+    #[test]
+    fn ta_includes_basic() {
+        let v = testutil::run_ret(r#"
+            const ta = new Uint8Array([1, 2, 3]);
+            return [ta.includes(2), ta.includes(5)];
+        "#);
+        assert_eq!(v, serde_json::json!([true, false]));
+    }
+
+    #[test]
+    fn ta_index_of_basic() {
+        let v = testutil::run_ret(r#"
+            const ta = new Uint8Array([10, 20, 30, 20]);
+            return [ta.indexOf(20), ta.lastIndexOf(20)];
+        "#);
+        assert_eq!(v, serde_json::json!([1, 3]));
+    }
+
+    #[test]
+    fn ta_map_via_prelude() {
+        let v = testutil::run_ret(r#"
+            const ta = new Float64Array([1, 2, 3]);
+            return ta.map(x => x * 2);
+        "#);
+        // map on a TypedArray — prelude HOF iterates via .length and [i]
+        // Returns a plain Array (prelude HOF creates an Array result)
+        assert_eq!(v, serde_json::json!([2, 4, 6]));
     }
 }

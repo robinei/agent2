@@ -84,6 +84,7 @@ pub(crate) use set::set_ctor;
 pub(crate) use string::string_ctor;
 // Typed array constructors + codec helpers used by dispatch.rs.
 pub(crate) use typedarray::arraybuffer_ctor;
+pub(crate) use typedarray::arraybuffer_slice;
 pub(crate) use typedarray::bigint64array_ctor;
 pub(crate) use typedarray::biguint64array_ctor;
 pub(crate) use typedarray::float32array_ctor;
@@ -597,6 +598,22 @@ builtins! {
     Float64ArrayCtor,      BuiltinKind::Constructor { type_tag: TypeTag::Float64Array },      "Float64Array",      0, VARARG, float64array_ctor,     false, false, false, false, false, false, false, false, false, false;
     BigInt64ArrayCtor,     BuiltinKind::Constructor { type_tag: TypeTag::BigInt64Array },     "BigInt64Array",     0, VARARG, bigint64array_ctor,    false, false, false, false, false, false, false, false, false, false;
     BigUint64ArrayCtor,    BuiltinKind::Constructor { type_tag: TypeTag::BigUint64Array },    "BigUint64Array",    0, VARARG, biguint64array_ctor,   false, false, false, false, false, false, false, false, false, false;
+
+    // ── Typed array prototype methods (Step 4) ──
+    // All have typedarray: true (column 8). The static path compiles
+    // to the first-matched builtin; call_builtin_or_shadow re-dispatches
+    // to the receiver-specific handler at runtime.
+    TaSubarray,    BuiltinKind::Method, "subarray",    2, 3,      ta_subarray,    false, false, false, false, false, false, false, false, true, false;
+    TaSet,         BuiltinKind::Method, "set",         2, 3,      ta_set,         false, false, false, false, false, false, false, false, true, false;
+    TaCopyWithin,  BuiltinKind::Method, "copyWithin",  2, 4,      ta_copywithin,  false, false, false, false, false, false, false, false, true, false;
+    TaSlice,       BuiltinKind::Method, "slice",       2, 3,      ta_slice_ta,    false, false, false, false, false, false, false, false, true, false;
+    TaAt,          BuiltinKind::Method, "at",          2, 2,      ta_at,          false, false, false, false, false, false, false, false, true, false;
+    TaIncludes,    BuiltinKind::Method, "includes",    2, 3,      ta_includes,    false, false, false, false, false, false, false, false, true, false;
+    TaIndexOf,     BuiltinKind::Method, "indexOf",     2, 3,      ta_index_of,    false, false, false, false, false, false, false, false, true, false;
+    TaLastIndexOf, BuiltinKind::Method, "lastIndexOf", 2, 3,      ta_last_index_of, false, false, false, false, false, false, false, false, true, false;
+    TaJoin,        BuiltinKind::Method, "join",        1, 2,      ta_join,        false, false, false, false, false, false, false, false, true, false;
+    TaFill,        BuiltinKind::Method, "fill",        2, VARARG, ta_fill,        false, false, false, false, false, false, false, false, true, false;
+    TaReverse,     BuiltinKind::Method, "reverse",     1, 1,      ta_reverse,     false, false, false, false, false, false, false, false, true, false;
 }
 
 // ── argument accessor ────────────────────────────────────────────────────────

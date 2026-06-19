@@ -782,7 +782,7 @@ impl VM {
     /// here; the shadow path defers `ip` to `dispatch_call`. Shared by the
     /// `Instr::CallBuiltin` arm and `dispatch_call`'s `Builtin` arm.
     pub(crate) fn call_builtin_or_shadow(&mut self, b: Builtin, argc: u32) -> Result<(), VMError> {
-        if argc > 0 {
+        let b = if argc > 0 {
             let base = self.stack.len() - argc as usize;
             if matches!(self.stack[base], Value::Object(_)) {
                 let recv = self.stack[base].clone();
@@ -792,8 +792,18 @@ impl VM {
                     let recv = std::mem::replace(&mut self.stack[base], Value::Undefined);
                     return self.dispatch_call(callable, recv, argc - 1, 1);
                 }
+                b
+            } else {
+                // For non-Object receivers, re-resolve to the type-specific handler
+                // if the statically-compiled builtin doesn't match the actual
+                // receiver type. Handles cases like `ta.set(src)` compiled as
+                // MapSet but receiver is TypedArray.
+                crate::builtin::Builtin::method_for_receiver(&self.stack[base], b.meta().name)
+                    .unwrap_or(b)
             }
-        }
+        } else {
+            b
+        };
         b.call(self, argc)?;
         self.ip += 1;
         Ok(())
