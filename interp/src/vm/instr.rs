@@ -15,6 +15,12 @@ pub type PromisePtr = u32;
 pub type MapPtr = u32;
 /// Index into the VM's `sets` heap.
 pub type SetPtr = u32;
+/// Index into the VM's `buffers` heap (ArrayBuffer backing stores).
+pub type BufferPtr = u32;
+/// Index into the VM's `typed_arrays` heap.
+pub type TypedArrayPtr = u32;
+/// Index into the VM's `data_views` heap.
+pub type DataViewPtr = u32;
 pub type LocalIndex = u16;
 pub type LocalCount = u16;
 pub type ArgCount = u32;
@@ -34,6 +40,60 @@ pub type FieldName = RcStr;
 pub enum SlotKind {
     Plain,
     Boxed,
+}
+
+/// Element kind for a typed array view.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum TypedArrayKind {
+    Int8,
+    Uint8,
+    Uint8Clamped,
+    Int16,
+    Uint16,
+    Int32,
+    Uint32,
+    Float32,
+    Float64,
+    BigInt64,
+    BigUint64,
+}
+
+impl TypedArrayKind {
+    pub fn element_size(self) -> u32 {
+        match self {
+            TypedArrayKind::Int8 | TypedArrayKind::Uint8 | TypedArrayKind::Uint8Clamped => 1,
+            TypedArrayKind::Int16 | TypedArrayKind::Uint16 => 2,
+            TypedArrayKind::Int32 | TypedArrayKind::Uint32 | TypedArrayKind::Float32 => 4,
+            TypedArrayKind::Float64 | TypedArrayKind::BigInt64 | TypedArrayKind::BigUint64 => 8,
+        }
+    }
+
+    pub fn bytes_per_element(self) -> u32 {
+        self.element_size()
+    }
+}
+
+/// A typed array view over an ArrayBuffer.
+#[derive(Clone, Debug)]
+pub struct TypedArrayView {
+    pub buffer: BufferPtr,
+    pub byte_offset: u32,
+    pub byte_length: u32,
+    pub kind: TypedArrayKind,
+}
+
+impl TypedArrayView {
+    pub fn length(&self) -> u32 {
+        self.byte_length / self.kind.element_size()
+    }
+}
+
+/// A DataView entry wrapping an ArrayBuffer.
+#[derive(Clone, Debug)]
+pub struct DataViewEntry {
+    pub buffer: BufferPtr,
+    pub byte_offset: u32,
+    pub byte_length: u32,
 }
 
 /// Whether an `IncLocal` is prefix (`++x`) or postfix (`x++`), controlling
@@ -71,6 +131,19 @@ pub enum TypeTag {
     String,
     Number,
     Boolean,
+    ArrayBuffer,
+    Int8Array,
+    Uint8Array,
+    Uint8ClampedArray,
+    Int16Array,
+    Uint16Array,
+    Int32Array,
+    Uint32Array,
+    Float32Array,
+    Float64Array,
+    BigInt64Array,
+    BigUint64Array,
+    DataView,
 }
 
 impl TypeTag {
@@ -78,7 +151,7 @@ impl TypeTag {
     /// "what type tags exist" — iterate this instead of hand-listing variants
     /// or mapping side-table indices back to tags by literal number (which
     /// silently breaks if the enum is reordered). `COUNT` is derived from it.
-    pub const ALL: [TypeTag; 9] = [
+    pub const ALL: [TypeTag; 22] = [
         TypeTag::Array,
         TypeTag::Object,
         TypeTag::Map,
@@ -88,6 +161,19 @@ impl TypeTag {
         TypeTag::String,
         TypeTag::Number,
         TypeTag::Boolean,
+        TypeTag::ArrayBuffer,
+        TypeTag::Int8Array,
+        TypeTag::Uint8Array,
+        TypeTag::Uint8ClampedArray,
+        TypeTag::Int16Array,
+        TypeTag::Uint16Array,
+        TypeTag::Int32Array,
+        TypeTag::Uint32Array,
+        TypeTag::Float32Array,
+        TypeTag::Float64Array,
+        TypeTag::BigInt64Array,
+        TypeTag::BigUint64Array,
+        TypeTag::DataView,
     ];
 
     /// Number of variants — sizes the prototype side table.
@@ -109,6 +195,19 @@ impl TypeTag {
             TypeTag::String => "String",
             TypeTag::Number => "Number",
             TypeTag::Boolean => "Boolean",
+            TypeTag::ArrayBuffer => "ArrayBuffer",
+            TypeTag::Int8Array => "Int8Array",
+            TypeTag::Uint8Array => "Uint8Array",
+            TypeTag::Uint8ClampedArray => "Uint8ClampedArray",
+            TypeTag::Int16Array => "Int16Array",
+            TypeTag::Uint16Array => "Uint16Array",
+            TypeTag::Int32Array => "Int32Array",
+            TypeTag::Uint32Array => "Uint32Array",
+            TypeTag::Float32Array => "Float32Array",
+            TypeTag::Float64Array => "Float64Array",
+            TypeTag::BigInt64Array => "BigInt64Array",
+            TypeTag::BigUint64Array => "BigUint64Array",
+            TypeTag::DataView => "DataView",
         }
     }
 }

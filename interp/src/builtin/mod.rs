@@ -139,7 +139,9 @@ macro_rules! builtins {
             $regexp:tt,
             $function:tt,
             $number:tt,
-            $boolean:tt;
+            $boolean:tt,
+            $typedarray:tt,
+            $dataview:tt;
         )*
     ) => {
         /// A builtin's identity. Used both as the static call target
@@ -363,6 +365,14 @@ macro_rules! builtins {
                         $(method_check!($boolean, $name, $variant, name);)*
                         None
                     }
+                    Value::TypedArray(_) => {
+                        $(method_check!($typedarray, $name, $variant, name);)*
+                        None
+                    }
+                    Value::DataView(_) => {
+                        $(method_check!($dataview, $name, $variant, name);)*
+                        None
+                    }
                     _ => None,
                 }
             }
@@ -372,163 +382,163 @@ macro_rules! builtins {
 
 builtins! {
     // ── Array static ──
-    ArrayIsArray, BuiltinKind::Namespace("Array"), "isArray", 1, 1, array_is_array, false, false, false, false, false, false, false, false;
-    ArrayFrom,    BuiltinKind::Namespace("Array"), "from",    1, 2, array_from,    false, false, false, false, false, false, false, false;
+    ArrayIsArray, BuiltinKind::Namespace("Array"), "isArray", 1, 1, array_is_array, false, false, false, false, false, false, false, false, false, false;
+    ArrayFrom,    BuiltinKind::Namespace("Array"), "from",    1, 2, array_from,    false, false, false, false, false, false, false, false, false, false;
 
     // ── array methods ──
-    ArrayPush,    BuiltinKind::Method, "push",        1, VARARG, array_push,    true,  false, false, false, false, false, false, false;
-    ArrayPop,     BuiltinKind::Method, "pop",         1, 1,      array_pop,     true,  false, false, false, false, false, false, false;
-    ArrayShift,   BuiltinKind::Method, "shift",       1, 1,      array_shift,   true,  false, false, false, false, false, false, false;
-    ArrayUnshift, BuiltinKind::Method, "unshift",     1, VARARG, array_unshift, true,  false, false, false, false, false, false, false;
-    ArrayJoin,    BuiltinKind::Method, "join",        1, 2,      array_join,    true,  false, false, false, false, false, false, false;
-    ArrayReverse, BuiltinKind::Method, "reverse",     1, 1,      array_reverse, true,  false, false, false, false, false, false, false;
-    ArrayFlat,    BuiltinKind::Method, "flat",        1, 2,      array_flat,    true,  false, false, false, false, false, false, false;
-    ArrayFill,    BuiltinKind::Method, "fill",        2, VARARG, array_fill,    true,  false, false, false, false, false, false, false;
-    ArraySplice,  BuiltinKind::Method, "splice",      1, VARARG, array_splice,  true,  false, false, false, false, false, false, false;
+    ArrayPush,    BuiltinKind::Method, "push",        1, VARARG, array_push,    true,  false, false, false, false, false, false, false, false, false;
+    ArrayPop,     BuiltinKind::Method, "pop",         1, 1,      array_pop,     true,  false, false, false, false, false, false, false, false, false;
+    ArrayShift,   BuiltinKind::Method, "shift",       1, 1,      array_shift,   true,  false, false, false, false, false, false, false, false, false;
+    ArrayUnshift, BuiltinKind::Method, "unshift",     1, VARARG, array_unshift, true,  false, false, false, false, false, false, false, false, false;
+    ArrayJoin,    BuiltinKind::Method, "join",        1, 2,      array_join,    true,  false, false, false, false, false, false, false, false, false;
+    ArrayReverse, BuiltinKind::Method, "reverse",     1, 1,      array_reverse, true,  false, false, false, false, false, false, false, false, false;
+    ArrayFlat,    BuiltinKind::Method, "flat",        1, 2,      array_flat,    true,  false, false, false, false, false, false, false, false, false;
+    ArrayFill,    BuiltinKind::Method, "fill",        2, VARARG, array_fill,    true,  false, false, false, false, false, false, false, false, false;
+    ArraySplice,  BuiltinKind::Method, "splice",      1, VARARG, array_splice,  true,  false, false, false, false, false, false, false, false, false;
 
     // ── console ──
-    ConsoleLog,  BuiltinKind::Namespace("console"), "log",  0, VARARG, console_log,  false, false, false, false, false, false, false, false;
-    ConsoleWarn, BuiltinKind::Namespace("console"), "warn", 0, VARARG, console_warn, false, false, false, false, false, false, false, false;
-    ConsoleError,BuiltinKind::Namespace("console"), "error",0, VARARG, console_error,false, false, false, false, false, false, false, false;
-    ConsoleInfo, BuiltinKind::Namespace("console"), "info", 0, VARARG, console_info, false, false, false, false, false, false, false, false;
-    ConsoleAssert,BuiltinKind::Namespace("console"), "assert", 1, VARARG, console_assert, false, false, false, false, false, false, false, false;
+    ConsoleLog,  BuiltinKind::Namespace("console"), "log",  0, VARARG, console_log,  false, false, false, false, false, false, false, false, false, false;
+    ConsoleWarn, BuiltinKind::Namespace("console"), "warn", 0, VARARG, console_warn, false, false, false, false, false, false, false, false, false, false;
+    ConsoleError,BuiltinKind::Namespace("console"), "error",0, VARARG, console_error,false, false, false, false, false, false, false, false, false, false;
+    ConsoleInfo, BuiltinKind::Namespace("console"), "info", 0, VARARG, console_info, false, false, false, false, false, false, false, false, false, false;
+    ConsoleAssert,BuiltinKind::Namespace("console"), "assert", 1, VARARG, console_assert, false, false, false, false, false, false, false, false, false, false;
 
     // ── JSON static ──
-    JSONParse,     BuiltinKind::Namespace("JSON"), "parse",     1, 1, json_parse,     false, false, false, false, false, false, false, false;
-    JSONStringify, BuiltinKind::Namespace("JSON"), "stringify", 1, 3, json_stringify, false, false, false, false, false, false, false, false;
+    JSONParse,     BuiltinKind::Namespace("JSON"), "parse",     1, 1, json_parse,     false, false, false, false, false, false, false, false, false, false;
+    JSONStringify, BuiltinKind::Namespace("JSON"), "stringify", 1, 3, json_stringify, false, false, false, false, false, false, false, false, false, false;
 
     // ── Math ──
-    MathAbs,   BuiltinKind::Namespace("Math"), "abs",   1, 1,      math_abs,   false, false, false, false, false, false, false, false;
-    MathSqrt,  BuiltinKind::Namespace("Math"), "sqrt",  1, 1,      math_sqrt,  false, false, false, false, false, false, false, false;
-    MathCeil,  BuiltinKind::Namespace("Math"), "ceil",  1, 1,      math_ceil,  false, false, false, false, false, false, false, false;
-    MathFloor, BuiltinKind::Namespace("Math"), "floor", 1, 1,      math_floor, false, false, false, false, false, false, false, false;
-    MathRound, BuiltinKind::Namespace("Math"), "round", 1, 1,      math_round, false, false, false, false, false, false, false, false;
-    MathSign,  BuiltinKind::Namespace("Math"), "sign",  1, 1,      math_sign,  false, false, false, false, false, false, false, false;
-    MathMin,   BuiltinKind::Namespace("Math"), "min",   0, VARARG, math_min,   false, false, false, false, false, false, false, false;
-    MathMax,   BuiltinKind::Namespace("Math"), "max",   0, VARARG, math_max,   false, false, false, false, false, false, false, false;
-    MathPow,   BuiltinKind::Namespace("Math"), "pow",   2, 2,      math_pow,   false, false, false, false, false, false, false, false;
-    MathTrunc, BuiltinKind::Namespace("Math"), "trunc", 1, 1,      math_trunc, false, false, false, false, false, false, false, false;
-    MathCbrt,  BuiltinKind::Namespace("Math"), "cbrt",  1, 1,      math_cbrt,  false, false, false, false, false, false, false, false;
-    MathExp,   BuiltinKind::Namespace("Math"), "exp",   1, 1,      math_exp,   false, false, false, false, false, false, false, false;
-    MathLog,   BuiltinKind::Namespace("Math"), "log",   1, 1,      math_log,   false, false, false, false, false, false, false, false;
-    MathLog2,  BuiltinKind::Namespace("Math"), "log2",  1, 1,      math_log2,  false, false, false, false, false, false, false, false;
-    MathLog10, BuiltinKind::Namespace("Math"), "log10", 1, 1,      math_log10, false, false, false, false, false, false, false, false;
-    MathSin,   BuiltinKind::Namespace("Math"), "sin",   1, 1,      math_sin,   false, false, false, false, false, false, false, false;
-    MathCos,   BuiltinKind::Namespace("Math"), "cos",   1, 1,      math_cos,   false, false, false, false, false, false, false, false;
-    MathTan,   BuiltinKind::Namespace("Math"), "tan",   1, 1,      math_tan,   false, false, false, false, false, false, false, false;
-    MathAsin,  BuiltinKind::Namespace("Math"), "asin",  1, 1,      math_asin,  false, false, false, false, false, false, false, false;
-    MathAcos,  BuiltinKind::Namespace("Math"), "acos",  1, 1,      math_acos,  false, false, false, false, false, false, false, false;
-    MathAtan,  BuiltinKind::Namespace("Math"), "atan",  1, 1,      math_atan,  false, false, false, false, false, false, false, false;
-    MathAtan2, BuiltinKind::Namespace("Math"), "atan2", 2, 2,      math_atan2, false, false, false, false, false, false, false, false;
-    MathHypot, BuiltinKind::Namespace("Math"), "hypot", 0, VARARG, math_hypot, false, false, false, false, false, false, false, false;
+    MathAbs,   BuiltinKind::Namespace("Math"), "abs",   1, 1,      math_abs,   false, false, false, false, false, false, false, false, false, false;
+    MathSqrt,  BuiltinKind::Namespace("Math"), "sqrt",  1, 1,      math_sqrt,  false, false, false, false, false, false, false, false, false, false;
+    MathCeil,  BuiltinKind::Namespace("Math"), "ceil",  1, 1,      math_ceil,  false, false, false, false, false, false, false, false, false, false;
+    MathFloor, BuiltinKind::Namespace("Math"), "floor", 1, 1,      math_floor, false, false, false, false, false, false, false, false, false, false;
+    MathRound, BuiltinKind::Namespace("Math"), "round", 1, 1,      math_round, false, false, false, false, false, false, false, false, false, false;
+    MathSign,  BuiltinKind::Namespace("Math"), "sign",  1, 1,      math_sign,  false, false, false, false, false, false, false, false, false, false;
+    MathMin,   BuiltinKind::Namespace("Math"), "min",   0, VARARG, math_min,   false, false, false, false, false, false, false, false, false, false;
+    MathMax,   BuiltinKind::Namespace("Math"), "max",   0, VARARG, math_max,   false, false, false, false, false, false, false, false, false, false;
+    MathPow,   BuiltinKind::Namespace("Math"), "pow",   2, 2,      math_pow,   false, false, false, false, false, false, false, false, false, false;
+    MathTrunc, BuiltinKind::Namespace("Math"), "trunc", 1, 1,      math_trunc, false, false, false, false, false, false, false, false, false, false;
+    MathCbrt,  BuiltinKind::Namespace("Math"), "cbrt",  1, 1,      math_cbrt,  false, false, false, false, false, false, false, false, false, false;
+    MathExp,   BuiltinKind::Namespace("Math"), "exp",   1, 1,      math_exp,   false, false, false, false, false, false, false, false, false, false;
+    MathLog,   BuiltinKind::Namespace("Math"), "log",   1, 1,      math_log,   false, false, false, false, false, false, false, false, false, false;
+    MathLog2,  BuiltinKind::Namespace("Math"), "log2",  1, 1,      math_log2,  false, false, false, false, false, false, false, false, false, false;
+    MathLog10, BuiltinKind::Namespace("Math"), "log10", 1, 1,      math_log10, false, false, false, false, false, false, false, false, false, false;
+    MathSin,   BuiltinKind::Namespace("Math"), "sin",   1, 1,      math_sin,   false, false, false, false, false, false, false, false, false, false;
+    MathCos,   BuiltinKind::Namespace("Math"), "cos",   1, 1,      math_cos,   false, false, false, false, false, false, false, false, false, false;
+    MathTan,   BuiltinKind::Namespace("Math"), "tan",   1, 1,      math_tan,   false, false, false, false, false, false, false, false, false, false;
+    MathAsin,  BuiltinKind::Namespace("Math"), "asin",  1, 1,      math_asin,  false, false, false, false, false, false, false, false, false, false;
+    MathAcos,  BuiltinKind::Namespace("Math"), "acos",  1, 1,      math_acos,  false, false, false, false, false, false, false, false, false, false;
+    MathAtan,  BuiltinKind::Namespace("Math"), "atan",  1, 1,      math_atan,  false, false, false, false, false, false, false, false, false, false;
+    MathAtan2, BuiltinKind::Namespace("Math"), "atan2", 2, 2,      math_atan2, false, false, false, false, false, false, false, false, false, false;
+    MathHypot, BuiltinKind::Namespace("Math"), "hypot", 0, VARARG, math_hypot, false, false, false, false, false, false, false, false, false, false;
 
     // ── Number static ──
-    NumberIsInteger,  BuiltinKind::Namespace("Number"), "isInteger",  1, 1, number_is_integer,  false, false, false, false, false, false, false, false;
-    NumberIsFinite,   BuiltinKind::Namespace("Number"), "isFinite",   1, 1, number_is_finite,   false, false, false, false, false, false, false, false;
-    NumberIsNaN,      BuiltinKind::Namespace("Number"), "isNaN",      1, 1, number_is_nan,      false, false, false, false, false, false, false, false;
-    NumberParseInt,   BuiltinKind::Namespace("Number"), "parseInt",   1, 2, number_parse_int,   false, false, false, false, false, false, false, false;
-    NumberParseFloat, BuiltinKind::Namespace("Number"), "parseFloat", 1, 1, number_parse_float, false, false, false, false, false, false, false, false;
+    NumberIsInteger,  BuiltinKind::Namespace("Number"), "isInteger",  1, 1, number_is_integer,  false, false, false, false, false, false, false, false, false, false;
+    NumberIsFinite,   BuiltinKind::Namespace("Number"), "isFinite",   1, 1, number_is_finite,   false, false, false, false, false, false, false, false, false, false;
+    NumberIsNaN,      BuiltinKind::Namespace("Number"), "isNaN",      1, 1, number_is_nan,      false, false, false, false, false, false, false, false, false, false;
+    NumberParseInt,   BuiltinKind::Namespace("Number"), "parseInt",   1, 2, number_parse_int,   false, false, false, false, false, false, false, false, false, false;
+    NumberParseFloat, BuiltinKind::Namespace("Number"), "parseFloat", 1, 1, number_parse_float, false, false, false, false, false, false, false, false, false, false;
 
     // ── Number.prototype methods (Step 2b — primitive method resolution
     //     without boxing; the receiver stays an unboxed number value) ──
-    NumberToFixed, BuiltinKind::Method, "toFixed", 1, 2, number_to_fixed, false, false, false, false, false, false, true, false;
+    NumberToFixed, BuiltinKind::Method, "toFixed", 1, 2, number_to_fixed, false, false, false, false, false, false, true, false, false, false;
 
     // ── Object static ──
-    ObjKeys,        BuiltinKind::Namespace("Object"), "keys",        1, 1,      obj_keys,         false, false, false, false, false, false, false, false;
-    ObjValues,      BuiltinKind::Namespace("Object"), "values",      1, 1,      obj_values,       false, false, false, false, false, false, false, false;
-    ObjEntries,     BuiltinKind::Namespace("Object"), "entries",     1, 1,      obj_entries,      false, false, false, false, false, false, false, false;
-    ObjFromEntries, BuiltinKind::Namespace("Object"), "fromEntries", 1, 1,      obj_from_entries, false, false, false, false, false, false, false, false;
-    ObjAssign,      BuiltinKind::Namespace("Object"), "assign",      1, VARARG, obj_assign,       false, false, false, false, false, false, false, false;
-    ObjHasOwn,      BuiltinKind::Namespace("Object"), "hasOwn",      2, 2,      obj_has_own,      false, false, false, false, false, false, false, false;
-    ObjGetProtoOf,  BuiltinKind::Namespace("Object"), "getPrototypeOf", 1, 1,   obj_get_proto_of, false, false, false, false, false, false, false, false;
-    ObjSetProtoOf,  BuiltinKind::Namespace("Object"), "setPrototypeOf", 2, 2,   obj_set_proto_of, false, false, false, false, false, false, false, false;
-    ObjCreate,      BuiltinKind::Namespace("Object"), "create",          1, 2,   obj_create,       false, false, false, false, false, false, false, false;
-    ObjFreeze,            BuiltinKind::Namespace("Object"), "freeze",            1, 1, obj_freeze,             false, false, false, false, false, false, false, false;
-    ObjIsFrozen,          BuiltinKind::Namespace("Object"), "isFrozen",          1, 1, obj_is_frozen,          false, false, false, false, false, false, false, false;
-    ObjSeal,              BuiltinKind::Namespace("Object"), "seal",              1, 1, obj_seal,               false, false, false, false, false, false, false, false;
-    ObjIsSealed,          BuiltinKind::Namespace("Object"), "isSealed",          1, 1, obj_is_sealed,          false, false, false, false, false, false, false, false;
-    ObjPreventExtensions, BuiltinKind::Namespace("Object"), "preventExtensions", 1, 1, obj_prevent_extensions, false, false, false, false, false, false, false, false;
-    ObjIsExtensible,      BuiltinKind::Namespace("Object"), "isExtensible",      1, 1, obj_is_extensible,      false, false, false, false, false, false, false, false;
+    ObjKeys,        BuiltinKind::Namespace("Object"), "keys",        1, 1,      obj_keys,         false, false, false, false, false, false, false, false, false, false;
+    ObjValues,      BuiltinKind::Namespace("Object"), "values",      1, 1,      obj_values,       false, false, false, false, false, false, false, false, false, false;
+    ObjEntries,     BuiltinKind::Namespace("Object"), "entries",     1, 1,      obj_entries,      false, false, false, false, false, false, false, false, false, false;
+    ObjFromEntries, BuiltinKind::Namespace("Object"), "fromEntries", 1, 1,      obj_from_entries, false, false, false, false, false, false, false, false, false, false;
+    ObjAssign,      BuiltinKind::Namespace("Object"), "assign",      1, VARARG, obj_assign,       false, false, false, false, false, false, false, false, false, false;
+    ObjHasOwn,      BuiltinKind::Namespace("Object"), "hasOwn",      2, 2,      obj_has_own,      false, false, false, false, false, false, false, false, false, false;
+    ObjGetProtoOf,  BuiltinKind::Namespace("Object"), "getPrototypeOf", 1, 1,   obj_get_proto_of, false, false, false, false, false, false, false, false, false, false;
+    ObjSetProtoOf,  BuiltinKind::Namespace("Object"), "setPrototypeOf", 2, 2,   obj_set_proto_of, false, false, false, false, false, false, false, false, false, false;
+    ObjCreate,      BuiltinKind::Namespace("Object"), "create",          1, 2,   obj_create,       false, false, false, false, false, false, false, false, false, false;
+    ObjFreeze,            BuiltinKind::Namespace("Object"), "freeze",            1, 1, obj_freeze,             false, false, false, false, false, false, false, false, false, false;
+    ObjIsFrozen,          BuiltinKind::Namespace("Object"), "isFrozen",          1, 1, obj_is_frozen,          false, false, false, false, false, false, false, false, false, false;
+    ObjSeal,              BuiltinKind::Namespace("Object"), "seal",              1, 1, obj_seal,               false, false, false, false, false, false, false, false, false, false;
+    ObjIsSealed,          BuiltinKind::Namespace("Object"), "isSealed",          1, 1, obj_is_sealed,          false, false, false, false, false, false, false, false, false, false;
+    ObjPreventExtensions, BuiltinKind::Namespace("Object"), "preventExtensions", 1, 1, obj_prevent_extensions, false, false, false, false, false, false, false, false, false, false;
+    ObjIsExtensible,      BuiltinKind::Namespace("Object"), "isExtensible",      1, 1, obj_is_extensible,      false, false, false, false, false, false, false, false, false, false;
 
     // ── object methods ──
-    ObjHasOwnProperty, BuiltinKind::Method, "hasOwnProperty", 2, 2, obj_has_own_property, false, false, false, false, false, false, false, false;
+    ObjHasOwnProperty, BuiltinKind::Method, "hasOwnProperty", 2, 2, obj_has_own_property, false, false, false, false, false, false, false, false, false, false;
 
     // ── string methods ──
-    StrSplit,       BuiltinKind::Method, "split",       2, 3, str_split,       false, true,  false, false, false, false, false, false;
-    StrIncludes,    BuiltinKind::Method, "includes",    2, 3, includes_poly,   true,  true,  false, false, false, false, false, false;
-    StrIndexOf,     BuiltinKind::Method, "indexOf",     2, 3, index_of_poly,  true,  true,  false, false, false, false, false, false;
-    StrLastIndexOf, BuiltinKind::Method, "lastIndexOf", 2, 3, last_index_of_poly, true, true, false, false, false, false, false, false;
-    StrStartsWith,  BuiltinKind::Method, "startsWith",  2, 2, str_starts_with, false, true,  false, false, false, false, false, false;
-    StrEndsWith,    BuiltinKind::Method, "endsWith",    2, 2, str_ends_with,   false, true,  false, false, false, false, false, false;
-    StrSlice,       BuiltinKind::Method, "slice",       2, 3, slice_poly,      true,  true,  false, false, false, false, false, false;
-    StrSubstring,   BuiltinKind::Method, "substring",   2, 3, str_substring,   false, true,  false, false, false, false, false, false;
-    StrTrim,        BuiltinKind::Method, "trim",        1, 1, str_trim,        false, true,  false, false, false, false, false, false;
-    StrReplace,      BuiltinKind::Method, "__replaceStr",    3, 3, str_replace,        false, true, false, false, false, false, false, false;
-    StrReplaceAll,   BuiltinKind::Method, "__replaceAllStr", 3, 3, str_replace_all,    false, true, false, false, false, false, false, false;
-    StrToLowerCase,  BuiltinKind::Method, "toLowerCase",  1, 1, str_to_lower_case,  false, true, false, false, false, false, false, false;
-    StrToUpperCase,  BuiltinKind::Method, "toUpperCase",  1, 1, str_to_upper_case,  false, true, false, false, false, false, false, false;
-    StrPadStart,     BuiltinKind::Method, "padStart",     2, 3, str_pad_start,     false, true, false, false, false, false, false, false;
-    StrPadEnd,       BuiltinKind::Method, "padEnd",       2, 3, str_pad_end,       false, true, false, false, false, false, false, false;
-    StrRepeat,       BuiltinKind::Method, "repeat",       2, 2, str_repeat,        false, true, false, false, false, false, false, false;
-    StrTrimStart,    BuiltinKind::Method, "trimStart",    1, 1, str_trim_start,    false, true, false, false, false, false, false, false;
-    StrTrimEnd,      BuiltinKind::Method, "trimEnd",      1, 1, str_trim_end,      false, true, false, false, false, false, false, false;
-    StrCharAt,       BuiltinKind::Method, "charAt",       2, 2, str_char_at,       false, true, false, false, false, false, false, false;
-    StrAt,           BuiltinKind::Method, "at",           2, 2, at_poly,           true,  true, false, false, false, false, false, false;
-    StrConcat,       BuiltinKind::Method, "concat",       1, VARARG, concat_poly,  true,  true, false, false, false, false, false, false;
+    StrSplit,       BuiltinKind::Method, "split",       2, 3, str_split,       false, true,  false, false, false, false, false, false, false, false;
+    StrIncludes,    BuiltinKind::Method, "includes",    2, 3, includes_poly,   true,  true,  false, false, false, false, false, false, false, false;
+    StrIndexOf,     BuiltinKind::Method, "indexOf",     2, 3, index_of_poly,  true,  true,  false, false, false, false, false, false, false, false;
+    StrLastIndexOf, BuiltinKind::Method, "lastIndexOf", 2, 3, last_index_of_poly, true, true, false, false, false, false, false, false, false, false;
+    StrStartsWith,  BuiltinKind::Method, "startsWith",  2, 2, str_starts_with, false, true,  false, false, false, false, false, false, false, false;
+    StrEndsWith,    BuiltinKind::Method, "endsWith",    2, 2, str_ends_with,   false, true,  false, false, false, false, false, false, false, false;
+    StrSlice,       BuiltinKind::Method, "slice",       2, 3, slice_poly,      true,  true,  false, false, false, false, false, false, false, false;
+    StrSubstring,   BuiltinKind::Method, "substring",   2, 3, str_substring,   false, true,  false, false, false, false, false, false, false, false;
+    StrTrim,        BuiltinKind::Method, "trim",        1, 1, str_trim,        false, true,  false, false, false, false, false, false, false, false;
+    StrReplace,      BuiltinKind::Method, "__replaceStr",    3, 3, str_replace,        false, true, false, false, false, false, false, false, false, false;
+    StrReplaceAll,   BuiltinKind::Method, "__replaceAllStr", 3, 3, str_replace_all,    false, true, false, false, false, false, false, false, false, false;
+    StrToLowerCase,  BuiltinKind::Method, "toLowerCase",  1, 1, str_to_lower_case,  false, true, false, false, false, false, false, false, false, false;
+    StrToUpperCase,  BuiltinKind::Method, "toUpperCase",  1, 1, str_to_upper_case,  false, true, false, false, false, false, false, false, false, false;
+    StrPadStart,     BuiltinKind::Method, "padStart",     2, 3, str_pad_start,     false, true, false, false, false, false, false, false, false, false;
+    StrPadEnd,       BuiltinKind::Method, "padEnd",       2, 3, str_pad_end,       false, true, false, false, false, false, false, false, false, false;
+    StrRepeat,       BuiltinKind::Method, "repeat",       2, 2, str_repeat,        false, true, false, false, false, false, false, false, false, false;
+    StrTrimStart,    BuiltinKind::Method, "trimStart",    1, 1, str_trim_start,    false, true, false, false, false, false, false, false, false, false;
+    StrTrimEnd,      BuiltinKind::Method, "trimEnd",      1, 1, str_trim_end,      false, true, false, false, false, false, false, false, false, false;
+    StrCharAt,       BuiltinKind::Method, "charAt",       2, 2, str_char_at,       false, true, false, false, false, false, false, false, false, false;
+    StrAt,           BuiltinKind::Method, "at",           2, 2, at_poly,           true,  true, false, false, false, false, false, false, false, false;
+    StrConcat,       BuiltinKind::Method, "concat",       1, VARARG, concat_poly,  true,  true, false, false, false, false, false, false, false, false;
 
     // ── RegExp methods ──
-    RegExpTest,     BuiltinKind::Method, "test",     2, 2, regexp_test, false, false, false, false, true, false, false, false;
-    RegExpExec,     BuiltinKind::Method, "exec",     2, 2, regexp_exec, false, false, false, false, true, false, false, false;
+    RegExpTest,     BuiltinKind::Method, "test",     2, 2, regexp_test, false, false, false, false, true, false, false, false, false, false;
+    RegExpExec,     BuiltinKind::Method, "exec",     2, 2, regexp_exec, false, false, false, false, true, false, false, false, false, false;
 
     // ── universal methods ──
     // `toString`: 1 arg (receiver) for most types; 2 (receiver + radix) for
     // numbers (Step 2b: `(255).toString(16)` → "ff"). Extra args are ignored
     // at runtime for non-number receivers.
-    ToString, BuiltinKind::Method, "toString", 1, 2, value_to_string, true, true, true, true, true, true, true, true;
+    ToString, BuiltinKind::Method, "toString", 1, 2, value_to_string, true, true, true, true, true, true, true, true, false, false;
 
     // ── Function methods ──
-    FunctionBind,  BuiltinKind::Method, "bind",  1, VARARG, function_bind, false, false, false, false, false, true, false, false;
+    FunctionBind,  BuiltinKind::Method, "bind",  1, VARARG, function_bind, false, false, false, false, false, true, false, false, false, false;
 
     // ── string methods that accept RegExp ──
-    StrMatch,    BuiltinKind::Method, "match",    2, 2, str_match,     false, true, false, false, false, false, false, false;
-    StrMatchAll, BuiltinKind::Method, "matchAll", 2, 2, str_match_all, false, true, false, false, false, false, false, false;
-    StrSearch,   BuiltinKind::Method, "search",   2, 2, str_search,    false, true, false, false, false, false, false, false;
+    StrMatch,    BuiltinKind::Method, "match",    2, 2, str_match,     false, true, false, false, false, false, false, false, false, false;
+    StrMatchAll, BuiltinKind::Method, "matchAll", 2, 2, str_match_all, false, true, false, false, false, false, false, false, false, false;
+    StrSearch,   BuiltinKind::Method, "search",   2, 2, str_search,    false, true, false, false, false, false, false, false, false, false;
 
     // ── String static ──
-    StrFromCharCode,  BuiltinKind::Namespace("String"), "fromCharCode",  0, VARARG, str_from_char_code,  false, false, false, false, false, false, false, false;
-    StrFromCodePoint, BuiltinKind::Namespace("String"), "fromCodePoint", 0, VARARG, str_from_code_point, false, false, false, false, false, false, false, false;
+    StrFromCharCode,  BuiltinKind::Namespace("String"), "fromCharCode",  0, VARARG, str_from_char_code,  false, false, false, false, false, false, false, false, false, false;
+    StrFromCodePoint, BuiltinKind::Namespace("String"), "fromCodePoint", 0, VARARG, str_from_code_point, false, false, false, false, false, false, false, false, false, false;
 
     // ── Edit static ──
-    EditReplaceOnce,       BuiltinKind::Namespace("Edit"), "replaceOnce",    3, 3, edit_replace_once,       false, false, false, false, false, false, false, false;
-    EditReplaceCount,      BuiltinKind::Namespace("Edit"), "replaceCount",   3, 3, edit_replace_count,      false, false, false, false, false, false, false, false;
-    EditCount,             BuiltinKind::Namespace("Edit"), "count",          2, 2, edit_count,             false, false, false, false, false, false, false, false;
-    EditExtractBlock,      BuiltinKind::Namespace("Edit"), "extractBlock",   2, 2, edit_extract_block,      false, false, false, false, false, false, false, false;
-    EditExtractByIndent,   BuiltinKind::Namespace("Edit"), "extractByIndent",    2, 2, edit_extract_by_indent,   false, false, false, false, false, false, false, false;
-    EditExtractEnclosing,  BuiltinKind::Namespace("Edit"), "extractEnclosing",   4, 4, edit_extract_enclosing,  false, false, false, false, false, false, false, false;
-    EditReplaceLines,      BuiltinKind::Namespace("Edit"), "replaceLines",   4, 4, edit_replace_lines,      false, false, false, false, false, false, false, false;
-    EditInsertAt,          BuiltinKind::Namespace("Edit"), "insertAt",       3, 3, edit_insert_at,          false, false, false, false, false, false, false, false;
-    EditApplyEdits,        BuiltinKind::Namespace("Edit"), "applyEdits",     2, 2, edit_apply_edits,        false, false, false, false, false, false, false, false;
+    EditReplaceOnce,       BuiltinKind::Namespace("Edit"), "replaceOnce",    3, 3, edit_replace_once,       false, false, false, false, false, false, false, false, false, false;
+    EditReplaceCount,      BuiltinKind::Namespace("Edit"), "replaceCount",   3, 3, edit_replace_count,      false, false, false, false, false, false, false, false, false, false;
+    EditCount,             BuiltinKind::Namespace("Edit"), "count",          2, 2, edit_count,             false, false, false, false, false, false, false, false, false, false;
+    EditExtractBlock,      BuiltinKind::Namespace("Edit"), "extractBlock",   2, 2, edit_extract_block,      false, false, false, false, false, false, false, false, false, false;
+    EditExtractByIndent,   BuiltinKind::Namespace("Edit"), "extractByIndent",    2, 2, edit_extract_by_indent,   false, false, false, false, false, false, false, false, false, false;
+    EditExtractEnclosing,  BuiltinKind::Namespace("Edit"), "extractEnclosing",   4, 4, edit_extract_enclosing,  false, false, false, false, false, false, false, false, false, false;
+    EditReplaceLines,      BuiltinKind::Namespace("Edit"), "replaceLines",   4, 4, edit_replace_lines,      false, false, false, false, false, false, false, false, false, false;
+    EditInsertAt,          BuiltinKind::Namespace("Edit"), "insertAt",       3, 3, edit_insert_at,          false, false, false, false, false, false, false, false, false, false;
+    EditApplyEdits,        BuiltinKind::Namespace("Edit"), "applyEdits",     2, 2, edit_apply_edits,        false, false, false, false, false, false, false, false, false, false;
 
     // ── Map static ──
-    MapIsMap, BuiltinKind::Namespace("Map"), "isMap", 1, 1, map_is_map, false, false, false, false, false, false, false, false;
+    MapIsMap, BuiltinKind::Namespace("Map"), "isMap", 1, 1, map_is_map, false, false, false, false, false, false, false, false, false, false;
 
     // ── Map methods ──
-    MapGet,    BuiltinKind::Method, "get",    2, 2, map_get, false, false, true, false, false, false, false, false;
-    MapSet,    BuiltinKind::Method, "set",    3, 3, map_set, false, false, true, false, false, false, false, false;
+    MapGet,    BuiltinKind::Method, "get",    2, 2, map_get, false, false, true, false, false, false, false, false, false, false;
+    MapSet,    BuiltinKind::Method, "set",    3, 3, map_set, false, false, true, false, false, false, false, false, false, false;
 
     // ── Set static ──
-    SetIsSet, BuiltinKind::Namespace("Set"), "isSet", 1, 1, set_is_set, false, false, false, false, false, false, false, false;
+    SetIsSet, BuiltinKind::Namespace("Set"), "isSet", 1, 1, set_is_set, false, false, false, false, false, false, false, false, false, false;
 
     // ── Set methods ──
-    SetAdd,    BuiltinKind::Method, "add",    2, 2, set_add, false, false, false, true, false, false, false, false;
+    SetAdd,    BuiltinKind::Method, "add",    2, 2, set_add, false, false, false, true, false, false, false, false, false, false;
 
     // ── Map/Set shared methods ──
-    MapSetHas,     BuiltinKind::Method, "has",     2, 2, map_set_has,     false, false, true, true, false, false, false, false;
-    MapSetDelete,  BuiltinKind::Method, "delete",  2, 2, map_set_delete,  false, false, true, true, false, false, false, false;
-    MapSetClear,   BuiltinKind::Method, "clear",   1, 1, map_set_clear,   false, false, true, true, false, false, false, false;
-    MapSetKeys,    BuiltinKind::Method, "keys",    1, 1, map_set_keys,    false, false, true, true, false, false, false, false;
-    MapSetValues,  BuiltinKind::Method, "values",  1, 1, map_set_values,  false, false, true, true, false, false, false, false;
-    MapSetEntries, BuiltinKind::Method, "entries", 1, 1, map_set_entries, false, false, true, true, false, false, false, false;
+    MapSetHas,     BuiltinKind::Method, "has",     2, 2, map_set_has,     false, false, true, true, false, false, false, false, false, false;
+    MapSetDelete,  BuiltinKind::Method, "delete",  2, 2, map_set_delete,  false, false, true, true, false, false, false, false, false, false;
+    MapSetClear,   BuiltinKind::Method, "clear",   1, 1, map_set_clear,   false, false, true, true, false, false, false, false, false, false;
+    MapSetKeys,    BuiltinKind::Method, "keys",    1, 1, map_set_keys,    false, false, true, true, false, false, false, false, false, false;
+    MapSetValues,  BuiltinKind::Method, "values",  1, 1, map_set_values,  false, false, true, true, false, false, false, false, false, false;
+    MapSetEntries, BuiltinKind::Method, "entries", 1, 1, map_set_entries, false, false, true, true, false, false, false, false, false, false;
 
     // ── Constructors (Step 2a Part 2) ──
     // Callable `Value::Builtin`s keyed by `BuiltinKind::Constructor { type_tag }`.
@@ -539,15 +549,15 @@ builtins! {
     // `Object.getPrototypeOf(Array) === Function.prototype`) but neither
     // `new Function(body)` nor `Function(body)` is supported — both throw
     // (a documented divergence; function expressions are the alternative).
-    ArrayCtor,   BuiltinKind::Constructor { type_tag: TypeTag::Array },   "Array",   0, VARARG, array_ctor,   false, false, false, false, false, false, false, false;
-    ObjectCtor,  BuiltinKind::Constructor { type_tag: TypeTag::Object },  "Object",  0, 1,      object_ctor,  false, false, false, false, false, false, false, false;
-    MapCtor,     BuiltinKind::Constructor { type_tag: TypeTag::Map },     "Map",     0, 1,      map_ctor,     false, false, false, false, false, false, false, false;
-    SetCtor,     BuiltinKind::Constructor { type_tag: TypeTag::Set },     "Set",     0, 1,      set_ctor,     false, false, false, false, false, false, false, false;
-    RegExpCtor,  BuiltinKind::Constructor { type_tag: TypeTag::RegExp },  "RegExp",  1, 2,      regexp_ctor,  false, false, false, false, false, false, false, false;
-    NumberCtor,  BuiltinKind::Constructor { type_tag: TypeTag::Number },  "Number",  1, 1,      number_ctor,  false, false, false, false, false, false, false, false;
-    StringCtor,  BuiltinKind::Constructor { type_tag: TypeTag::String },  "String",  1, 1,      string_ctor,  false, false, false, false, false, false, false, false;
-    BooleanCtor, BuiltinKind::Constructor { type_tag: TypeTag::Boolean }, "Boolean", 1, 1,      boolean_ctor, false, false, false, false, false, false, false, false;
-    FunctionCtor,BuiltinKind::Constructor { type_tag: TypeTag::Function },"Function",0, VARARG, function_ctor, false, false, false, false, false, false, false, false;
+    ArrayCtor,   BuiltinKind::Constructor { type_tag: TypeTag::Array },   "Array",   0, VARARG, array_ctor,   false, false, false, false, false, false, false, false, false, false;
+    ObjectCtor,  BuiltinKind::Constructor { type_tag: TypeTag::Object },  "Object",  0, 1,      object_ctor,  false, false, false, false, false, false, false, false, false, false;
+    MapCtor,     BuiltinKind::Constructor { type_tag: TypeTag::Map },     "Map",     0, 1,      map_ctor,     false, false, false, false, false, false, false, false, false, false;
+    SetCtor,     BuiltinKind::Constructor { type_tag: TypeTag::Set },     "Set",     0, 1,      set_ctor,     false, false, false, false, false, false, false, false, false, false;
+    RegExpCtor,  BuiltinKind::Constructor { type_tag: TypeTag::RegExp },  "RegExp",  1, 2,      regexp_ctor,  false, false, false, false, false, false, false, false, false, false;
+    NumberCtor,  BuiltinKind::Constructor { type_tag: TypeTag::Number },  "Number",  1, 1,      number_ctor,  false, false, false, false, false, false, false, false, false, false;
+    StringCtor,  BuiltinKind::Constructor { type_tag: TypeTag::String },  "String",  1, 1,      string_ctor,  false, false, false, false, false, false, false, false, false, false;
+    BooleanCtor, BuiltinKind::Constructor { type_tag: TypeTag::Boolean }, "Boolean", 1, 1,      boolean_ctor, false, false, false, false, false, false, false, false, false, false;
+    FunctionCtor,BuiltinKind::Constructor { type_tag: TypeTag::Function },"Function",0, VARARG, function_ctor, false, false, false, false, false, false, false, false, false, false;
 }
 
 // ── argument accessor ────────────────────────────────────────────────────────

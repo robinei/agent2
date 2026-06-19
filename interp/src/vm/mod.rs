@@ -6,9 +6,9 @@ pub mod value;
 // Re-exports so external paths (`crate::vm::Value` etc.) are unchanged.
 pub use crate::rc_str::RcStr;
 pub use instr::{
-    ArrayPtr, CellIndex, ClosurePtr, CodeAddr, FieldName, GlobalId, Instr, LocalIndex, MapPtr,
-    ObjectPtr, PromisePtr, SetMode, SetPtr, SlotKind, StackAddr, TypePrototype, TypeTag,
-    UpdateMode,
+    ArrayPtr, BufferPtr, CellIndex, ClosurePtr, CodeAddr, DataViewEntry, DataViewPtr, FieldName,
+    GlobalId, Instr, LocalIndex, MapPtr, ObjectPtr, PromisePtr, SetMode, SetPtr, SlotKind,
+    StackAddr, TypePrototype, TypeTag, TypedArrayKind, TypedArrayPtr, TypedArrayView, UpdateMode,
 };
 pub use value::Value;
 pub(crate) use value::{MapKey, float_is_int, js_number_to_string};
@@ -357,6 +357,15 @@ pub struct VM {
     /// Set heap, indexed by `Value::Set(SetPtr)`. Each entry is an
     /// insertion-ordered set with SameValueZero equality.
     pub sets: Vec<IndexSet<MapKey>>,
+    /// ArrayBuffer heap, indexed by `Value::ArrayBuffer(BufferPtr)`. Each entry
+    /// is the owned byte buffer for typed arrays and DataViews to view into.
+    pub buffers: Vec<Vec<u8>>,
+    /// TypedArray heap, indexed by `Value::TypedArray(TypedArrayPtr)`. Each
+    /// entry is a view over an ArrayBuffer at a specific offset and length.
+    pub typed_arrays: Vec<TypedArrayView>,
+    /// DataView heap, indexed by `Value::DataView(DataViewPtr)`. Each entry
+    /// wraps an ArrayBuffer for byte-level get/set access.
+    pub data_views: Vec<DataViewEntry>,
     /// Side table of captured bindings (cells). A `Boxed` local lives here so
     /// it has identity and outlives its frame; `Value::Upval` indexes it.
     /// Grows monotonically (no reclamation), like `heap`.

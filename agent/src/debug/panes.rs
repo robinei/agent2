@@ -220,6 +220,25 @@ pub fn preview(vm: &VM, v: &Value, max: usize) -> String {
             .stack_value_to_json(v, 0)
             .map(|j| j.to_string())
             .unwrap_or_else(|_| "<unrepresentable>".to_string()),
+        Value::ArrayBuffer(p) => {
+            let len = vm.buffers.get(*p as usize).map(|b| b.len()).unwrap_or(0);
+            format!("ArrayBuffer({len})")
+        }
+        Value::TypedArray(p) => {
+            let info = vm.typed_arrays.get(*p as usize);
+            match info {
+                Some(ta) => format!("{:?}({})", ta.kind, ta.length()),
+                None => "TypedArray(?)".to_string(),
+            }
+        }
+        Value::DataView(p) => {
+            let len = vm
+                .data_views
+                .get(*p as usize)
+                .map(|dv| dv.byte_length)
+                .unwrap_or(0);
+            format!("DataView({len})")
+        }
     };
     truncate(s, max)
 }

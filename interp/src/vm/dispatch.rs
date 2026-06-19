@@ -261,6 +261,36 @@ impl VM {
             Value::Bool(_) => {
                 self.type_proto_lookup(crate::vm::instr::TypeTag::Boolean, field, receiver)
             }
+
+            // ── ArrayBuffer: byteLength rung → ArrayBuffer proto ──
+            Value::ArrayBuffer(_) => {
+                if field == "byteLength" {
+                    let len = match receiver {
+                        Value::ArrayBuffer(p) => {
+                            self.buffers.get(*p as usize).map(|b| b.len()).unwrap_or(0)
+                        }
+                        _ => unreachable!(),
+                    };
+                    return Ok(Value::Float(len as f64));
+                }
+                self.type_proto_lookup(crate::vm::instr::TypeTag::ArrayBuffer, field, receiver)
+            }
+
+            // ── TypedArray: length/byteLength/byteOffset/buffer/BYTES_PER_ELEMENT rungs ─
+            Value::TypedArray(_) => {
+                if let Some(val) = self.typed_array_virtual(field, receiver) {
+                    return val;
+                }
+                self.type_proto_lookup(crate::vm::instr::TypeTag::Float64Array, field, receiver)
+            }
+
+            // ── DataView: byteLength/byteOffset/buffer rungs → DataView proto ─
+            Value::DataView(_) => {
+                if let Some(val) = self.data_view_virtual(field, receiver) {
+                    return val;
+                }
+                self.type_proto_lookup(crate::vm::instr::TypeTag::DataView, field, receiver)
+            }
         }
     }
 
@@ -280,6 +310,42 @@ impl VM {
         Ok(Builtin::method_for_receiver(receiver, field)
             .map(Value::Builtin)
             .unwrap_or(Value::Undefined))
+    }
+
+    /// Resolve typed-array virtual properties (length, byteLength,
+    /// byteOffset, buffer, BYTES_PER_ELEMENT). Returns `Some(Value)` for a
+    /// matched rung, `None` to fall through to the proto chain.
+    fn typed_array_virtual(&self, field: &str, receiver: &Value) -> Option<Result<Value, VMError>> {
+        let ptr = match receiver {
+            Value::TypedArray(p) => *p,
+            _ => return None,
+        };
+        let view = self.typed_arrays.get(ptr as usize)?;
+        match field {
+            "length" => Some(Ok(Value::Float(view.length() as f64))),
+            "byteLength" => Some(Ok(Value::Float(view.byte_length as f64))),
+            "byteOffset" => Some(Ok(Value::Float(view.byte_offset as f64))),
+            "buffer" => Some(Ok(Value::ArrayBuffer(view.buffer))),
+            "BYTES_PER_ELEMENT" => Some(Ok(Value::Float(view.kind.element_size() as f64))),
+            _ => None,
+        }
+    }
+
+    /// Resolve DataView virtual properties (byteLength, byteOffset,
+    /// buffer). Returns `Some(Value)` for a matched rung, `None` to fall
+    /// through to the proto chain.
+    fn data_view_virtual(&self, field: &str, receiver: &Value) -> Option<Result<Value, VMError>> {
+        let ptr = match receiver {
+            Value::DataView(p) => *p,
+            _ => return None,
+        };
+        let dv = self.data_views.get(ptr as usize)?;
+        match field {
+            "byteLength" => Some(Ok(Value::Float(dv.byte_length as f64))),
+            "byteOffset" => Some(Ok(Value::Float(dv.byte_offset as f64))),
+            "buffer" => Some(Ok(Value::ArrayBuffer(dv.buffer))),
+            _ => None,
+        }
     }
 
     // ── set_property: the canonical write ladder ────────────────────
@@ -501,6 +567,18 @@ impl VM {
             Value::Promise(_) => Err(self.fail(
                 ErrorKind::TypeError,
                 "cannot set a property on a promise (non-extensible)",
+            )),
+            Value::ArrayBuffer(_) => Err(self.fail(
+                ErrorKind::TypeError,
+                "cannot set a named property on an ArrayBuffer (non-extensible)",
+            )),
+            Value::TypedArray(_) => Err(self.fail(
+                ErrorKind::TypeError,
+                "cannot set a named property on a TypedArray (non-extensible)",
+            )),
+            Value::DataView(_) => Err(self.fail(
+                ErrorKind::TypeError,
+                "cannot set a named property on a DataView (non-extensible)",
             )),
             Value::String(_)
             | Value::Float(_)
@@ -1044,6 +1122,9 @@ impl VM {
                                 | Value::Closure { .. }
                                 | Value::Builtin(_)
                                 | Value::Promise(_)
+                                | Value::ArrayBuffer(_)
+                                | Value::TypedArray(_)
+                                | Value::DataView(_)
                         )
                     );
                     if !returned_object {
@@ -1444,7 +1525,10 @@ impl VM {
                         | Value::Promise(_)
                         | Value::RegExp(_)
                         | Value::Map(_)
-                        | Value::Set(_) => "object",
+                        | Value::Set(_)
+                        | Value::ArrayBuffer(_)
+                        | Value::TypedArray(_)
+                        | Value::DataView(_) => "object",
                         Value::Upval(_) => {
                             return Err(self.fail(ErrorKind::ValueError, "value error"));
                         }
@@ -1992,6 +2076,13 @@ impl VM {
                                 .ok_or_else(|| self.fail(ErrorKind::ValueError, "value error"))?
                                 .len() as f64,
                         ),
+                        Value::TypedArray(p) => {
+                            let view = self
+                                .typed_arrays
+                                .get(p as usize)
+                                .ok_or_else(|| self.fail(ErrorKind::ValueError, "value error"))?;
+                            Value::Float(view.length() as f64)
+                        }
                         Value::Object(p) => self
                             .objects
                             .get(p as usize)

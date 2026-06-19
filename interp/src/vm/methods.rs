@@ -35,6 +35,9 @@ impl VM {
             closures: Vec::new(),
             maps: Vec::new(),
             sets: Vec::new(),
+            buffers: Vec::new(),
+            typed_arrays: Vec::new(),
+            data_views: Vec::new(),
             cells: Vec::new(),
             promises: Vec::new(),
             outbox: Vec::new(),
@@ -1137,6 +1140,13 @@ impl VM {
             // Promises chain to Object.prototype (no Promise.prototype in
             // this dialect — promises are transient tool-call values).
             Value::Promise(_) => Some(self.prototype_for(crate::vm::instr::TypeTag::Object)?),
+            Value::ArrayBuffer(_) => {
+                Some(self.prototype_for(crate::vm::instr::TypeTag::ArrayBuffer)?)
+            }
+            Value::TypedArray(_) => {
+                Some(self.prototype_for(crate::vm::instr::TypeTag::Float64Array)?)
+            }
+            Value::DataView(_) => Some(self.prototype_for(crate::vm::instr::TypeTag::DataView)?),
             Value::Null | Value::Undefined | Value::Upval(_) => None,
         })
     }
@@ -1458,6 +1468,25 @@ impl VM {
                     "`new Function` is not supported (use function expressions)",
                 ));
             }
+            crate::vm::instr::TypeTag::ArrayBuffer
+            | crate::vm::instr::TypeTag::Int8Array
+            | crate::vm::instr::TypeTag::Uint8Array
+            | crate::vm::instr::TypeTag::Uint8ClampedArray
+            | crate::vm::instr::TypeTag::Int16Array
+            | crate::vm::instr::TypeTag::Uint16Array
+            | crate::vm::instr::TypeTag::Int32Array
+            | crate::vm::instr::TypeTag::Uint32Array
+            | crate::vm::instr::TypeTag::Float32Array
+            | crate::vm::instr::TypeTag::Float64Array
+            | crate::vm::instr::TypeTag::BigInt64Array
+            | crate::vm::instr::TypeTag::BigUint64Array
+            | crate::vm::instr::TypeTag::DataView => {
+                self.stack.truncate(base);
+                return Err(self.fail(
+                    ErrorKind::TypeError,
+                    "typed arrays / DataView not yet implemented",
+                ));
+            }
         };
         self.stack.truncate(base);
         self.stack.push(result);
@@ -1500,6 +1529,9 @@ impl VM {
                 buf.push_str("function () { [native code] }");
             }
             Value::Upval(_) => {}
+            Value::ArrayBuffer(_) => buf.push_str("[object ArrayBuffer]"),
+            Value::TypedArray(_) => buf.push_str("[object TypedArray]"),
+            Value::DataView(_) => buf.push_str("[object DataView]"),
             Value::Array(p) => {
                 if let Some(arr) = self.arrays.get(*p as usize) {
                     for (i, v) in arr.iter().enumerate() {
@@ -1622,7 +1654,13 @@ impl VM {
             // A function/closure has no JSON representation, and an Upval marker
             // is an internal indirection that should never reach here: fail
             // loudly rather than silently dropping it.
-            Value::Closure { .. } | Value::Builtin(_) | Value::Bound(_) | Value::Upval(_) => {
+            Value::Closure { .. }
+            | Value::Builtin(_)
+            | Value::Bound(_)
+            | Value::Upval(_)
+            | Value::ArrayBuffer(_)
+            | Value::TypedArray(_)
+            | Value::DataView(_) => {
                 return Err(self.fail(
                     ErrorKind::ValueError,
                     format!("cannot serialize a {} to JSON", val.type_name()),

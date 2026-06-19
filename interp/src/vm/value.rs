@@ -8,7 +8,7 @@ pub(crate) use super::BoundFn;
 pub(crate) use super::RcRegExp;
 use super::instr;
 use super::instr::CodeAddr;
-use super::instr::{MapPtr, SetPtr};
+use super::instr::{BufferPtr, DataViewPtr, MapPtr, SetPtr, TypedArrayPtr};
 
 /// Not `Copy`: the `String` variant owns an `RcStr` whose clone must bump a
 /// refcount and whose drop must release one. Every other variant is a trivial
@@ -96,6 +96,16 @@ pub enum Value {
     /// A Set: an insertion-ordered collection of unique values with
     /// SameValueZero equality. Indexes the VM's `sets` heap.
     Set(SetPtr),
+    /// An ArrayBuffer: a fixed-length byte buffer that typed arrays and
+    /// DataViews view into. Indexes the VM's `buffers` heap.
+    ArrayBuffer(BufferPtr),
+    /// A typed array view over an ArrayBuffer. Indexes the VM's `typed_arrays`
+    /// heap. The element kind (Int8, Float64, …) determines byte packing and
+    /// bounds.
+    TypedArray(TypedArrayPtr),
+    /// A DataView: a flexible byte-level view over an ArrayBuffer with
+    /// explicit endianness per access. Indexes the VM's `data_views` heap.
+    DataView(DataViewPtr),
 }
 
 // Value size is load-bearing: it determines max call size and stack density,
@@ -208,6 +218,18 @@ impl Hash for MapKey {
                 16u8.hash(state);
                 std::ptr::hash(Rc::as_ptr(b), state);
             }
+            ArrayBuffer(p) => {
+                17u8.hash(state);
+                p.hash(state);
+            }
+            TypedArray(p) => {
+                18u8.hash(state);
+                p.hash(state);
+            }
+            DataView(p) => {
+                19u8.hash(state);
+                p.hash(state);
+            }
         }
     }
 }
@@ -237,7 +259,10 @@ impl Value {
             | Value::Promise(_)
             | Value::RegExp(_)
             | Value::Map(_)
-            | Value::Set(_) => true,
+            | Value::Set(_)
+            | Value::ArrayBuffer(_)
+            | Value::TypedArray(_)
+            | Value::DataView(_) => true,
             // Internal indirection; never a legitimate operand.
             Value::Upval(_) => false,
         }
@@ -267,6 +292,9 @@ impl Value {
             | Value::RegExp(_)
             | Value::Map(_)
             | Value::Set(_)
+            | Value::ArrayBuffer(_)
+            | Value::TypedArray(_)
+            | Value::DataView(_)
             | Value::Upval(_) => None,
         }
     }
@@ -348,6 +376,9 @@ impl Value {
             (Value::Set(p), Value::Set(q)) => p == q,
             // Bound functions compare by pointer identity: `f.bind(x) !== f.bind(x)`.
             (Value::Bound(a), Value::Bound(b)) => Rc::ptr_eq(a, b),
+            (Value::ArrayBuffer(p), Value::ArrayBuffer(q)) => p == q,
+            (Value::TypedArray(p), Value::TypedArray(q)) => p == q,
+            (Value::DataView(p), Value::DataView(q)) => p == q,
             _ => false,
         }
     }
@@ -466,6 +497,8 @@ impl Value {
             Value::RegExp(_) => "object",
             Value::Map(_) => "map",
             Value::Set(_) => "set",
+            Value::ArrayBuffer(_) => "arraybuffer",
+            Value::TypedArray(_) | Value::DataView(_) => "object",
             Value::Upval(_) => "upval",
         }
     }
