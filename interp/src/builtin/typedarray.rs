@@ -971,7 +971,14 @@ pub(crate) fn ta_last_index_of(vm: &mut VM, args: Args) -> Result<Value, VMError
         Value::Undefined => length,
         v => {
             let f = v.to_number().unwrap_or(length as f64);
-            (f as i64 + 1).max(0).min(length as i64) as usize
+            if f == f64::INFINITY {
+                length
+            } else if f == f64::NEG_INFINITY {
+                0
+            } else {
+                // NaN as i64 == 0 in Rust (saturating cast since 1.45)
+                (f as i64 + 1).max(0).min(length as i64) as usize
+            }
         }
     };
     for i in (0..end).rev() {

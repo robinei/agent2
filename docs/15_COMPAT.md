@@ -1133,6 +1133,31 @@ rather than silently tolerated:
   not enumerate indices (pre-existing limitation), pin it here; the
   "no method names in `for-in`" guarantee holds regardless (array prototypes are
   virtual, the proto map is empty). Resolve when the corpus hits array `for-in`.
+- **BigInt typed arrays** — Phase 16. `BigInt64Array` / `BigUint64Array`
+  constructors exist in the registry and are constructable, but element
+  `.get`/`.set` error with `"BigInt not yet supported"`. `DataView`'s
+  `getBigInt64`/`setBigInt64`/`getBigUint64`/`setBigUint64` likewise.
+  Scheduled behind full `BigInt` support (15_COMPAT future tier).
+- **No buffer detach** — Phase 16. `ArrayBuffer.prototype.transfer` and the
+  `detached` flag do not exist; views are always live. Tests that call
+  `.transfer()` or pass a transferred buffer to a view constructor will fail.
+  Scheduled behind `SharedArrayBuffer`/`Atomics` / resizable-buffer (4_FUTURE).
+- **No `Symbol.species`** — Phase 16. `TypedArray.prototype.subarray` and
+  `TypedArray.prototype.slice` always return a new view of the same kind;
+  species override via `[Symbol.species]` is not consulted. Scheduled behind
+  `Symbol` (15_COMPAT future tier).
+- **`keys`/`values`/`entries` return plain arrays, not iterators** — Phase 16.
+  The three typed-array iteration methods are implemented as prelude functions
+  that return plain arrays. The JS spec requires iterator objects with
+  `[Symbol.iterator]` / `next()`. They do not work with `for…of` or spread.
+  Scheduled behind the iterator protocol (15_COMPAT future tier).
+- **No `%TypedArray%` intrinsic** — Phase 16. The spec's `%TypedArray%`
+  abstract supertype (shared `prototype`, `from`, `of`, `@@iterator`,
+  `Symbol.toStringTag`) is not exposed. Per-type constructors exist and share
+  method implementations, but `%TypedArray%.prototype` is not accessible via
+  any global name. Tests using `TypedArray.prototype` or `testTypedArray.js`'s
+  `TypedArray` global alias will fail unless the harness feature-detects and
+  skips them.
 
 ## Step 3a — resolve undeclared names at runtime (largest failure bucket)
 
