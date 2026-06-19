@@ -236,7 +236,9 @@ pub fn str_replace(vm: &mut VM, args: Args) -> Result<Value, VMError> {
             let mut last = 0;
             for m in rx.compiled.find_iter(text) {
                 out.push_str(&text[last..m.range.start]);
-                push_replacement(&mut out, replacement.as_str(), text, &m);
+                if !push_replacement(&mut out, replacement.as_str(), text, &m) {
+                    return Err(vm.fail(ErrorKind::ValueError, TOO_LARGE));
+                }
                 last = m.range.end;
             }
             out.push_str(&text[last..]);
@@ -245,7 +247,9 @@ pub fn str_replace(vm: &mut VM, args: Args) -> Result<Value, VMError> {
             if let Some(m) = rx.compiled.find(text) {
                 let mut out = String::with_capacity(s.len());
                 out.push_str(&text[..m.range.start]);
-                push_replacement(&mut out, replacement.as_str(), text, &m);
+                if !push_replacement(&mut out, replacement.as_str(), text, &m) {
+                    return Err(vm.fail(ErrorKind::ValueError, TOO_LARGE));
+                }
                 out.push_str(&text[m.range.end..]);
                 return Ok(Value::String(RcStr::from(out)));
             }
@@ -282,7 +286,9 @@ pub fn str_replace_all(vm: &mut VM, args: Args) -> Result<Value, VMError> {
         let mut last = 0;
         for m in rx.compiled.find_iter(text) {
             out.push_str(&text[last..m.range.start]);
-            push_replacement(&mut out, replacement.as_str(), text, &m);
+            if !push_replacement(&mut out, replacement.as_str(), text, &m) {
+                return Err(vm.fail(ErrorKind::ValueError, TOO_LARGE));
+            }
             last = m.range.end;
         }
         out.push_str(&text[last..]);
@@ -294,11 +300,30 @@ pub fn str_replace_all(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     )))
 }
 
+/// Upper bound on a built string's byte length. JS engines cap string length
+/// (V8 ≈2^30) and throw `RangeError`; this dialect has no `RangeError` kind, so
+/// the string builders raise a loud `ValueError` instead of attempting a
+/// multi-gigabyte allocation that would OOM the whole process. test262's
+/// `staging/sm/String/replace-math.js` builds a 2^36-char (~64 GiB) string by
+/// expanding a 2^20-char `$1` capture 2^16 times in one `replace`, which is
+/// what motivated this guard. 256 MiB is far above any realistic agent string.
+pub(crate) const MAX_STRING_LEN: usize = 256 * 1024 * 1024;
+
+/// Diagnostic raised when a string builder would exceed [`MAX_STRING_LEN`].
+const TOO_LARGE: &str = "result string too large (max 256MiB)";
+
 /// Append the JS replacement pattern to `out`, substituting `$n`, `$<name>`,
-/// `$&`, ``$` ``, `$'`, and `$$` from the match's captures.
-fn push_replacement(out: &mut String, repl: &str, text: &str, m: &regress::Match) {
+/// `$&`, ``$` ``, `$'`, and `$$` from the match's captures. Returns `false` if
+/// the result would exceed [`MAX_STRING_LEN`] (checked before each token, so a
+/// single overshoot is bounded by one `text` length); the caller turns that
+/// into a `ValueError` rather than building an unbounded string.
+#[must_use]
+fn push_replacement(out: &mut String, repl: &str, text: &str, m: &regress::Match) -> bool {
     let mut chars = repl.chars().peekable();
     while let Some(c) = chars.next() {
+        if out.len() > MAX_STRING_LEN {
+            return false;
+        }
         if c != '$' {
             out.push(c);
             continue;
@@ -374,6 +399,7 @@ fn push_replacement(out: &mut String, repl: &str, text: &str, m: &regress::Match
             }
         }
     }
+    true
 }
 
 /// `s.match(pattern)` — pattern may be a string or RegExp.
