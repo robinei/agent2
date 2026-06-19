@@ -1510,13 +1510,7 @@ impl VM {
             crate::vm::instr::TypeTag::BigUint64Array => {
                 crate::builtin::biguint64array_ctor(self, args)?
             }
-            crate::vm::instr::TypeTag::DataView => {
-                self.stack.truncate(base);
-                return Err(self.fail(
-                    ErrorKind::TypeError,
-                    "DataView not yet implemented",
-                ));
-            }
+            crate::vm::instr::TypeTag::DataView => crate::builtin::dataview_ctor(self, args)?,
         };
         self.stack.truncate(base);
         self.stack.push(result);

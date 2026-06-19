@@ -1,4 +1,4 @@
-use crate::vm::instr::{BufferPtr, TypedArrayKind, TypedArrayPtr, TypedArrayView};
+use crate::vm::instr::{BufferPtr, DataViewEntry, DataViewPtr, TypedArrayKind, TypedArrayPtr, TypedArrayView};
 use crate::vm::{ErrorKind, VM, VMError, Value};
 
 use super::Args;
@@ -356,6 +356,169 @@ pub(crate) fn bigint64array_ctor(vm: &mut VM, _args: Args) -> Result<Value, VMEr
 
 pub(crate) fn biguint64array_ctor(vm: &mut VM, _args: Args) -> Result<Value, VMError> {
     Err(vm.fail(ErrorKind::TypeError, "BigUint64Array: BigInt not yet supported"))
+}
+
+// ── Step 5: DataView ──────────────────────────────────────────────────────────
+
+/// `new DataView(buffer[, byteOffset[, byteLength]])` constructor.
+pub(crate) fn dataview_ctor(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let buf_ptr = match args.get(vm, 0) {
+        Value::ArrayBuffer(p) => *p,
+        recv => {
+            return Err(vm.fail(
+                ErrorKind::TypeError,
+                format!("DataView requires an ArrayBuffer, got {}", recv.type_name()),
+            ));
+        }
+    };
+    let buf_len = vm
+        .buffers
+        .get(buf_ptr as usize)
+        .ok_or_else(|| vm.fail(ErrorKind::TypeError, "bad ArrayBuffer pointer"))?
+        .len();
+    let byte_offset = match args.get(vm, 1) {
+        Value::Undefined => 0usize,
+        v => {
+            let f = v.to_number().unwrap_or(0.0);
+            if f < 0.0 || f.is_nan() {
+                0usize
+            } else {
+                f as usize
+            }
+        }
+    };
+    if byte_offset > buf_len {
+        return Err(vm.fail(ErrorKind::ValueError, "DataView: byteOffset out of bounds"));
+    }
+    let byte_length = match args.get(vm, 2) {
+        Value::Undefined => buf_len - byte_offset,
+        v => {
+            let f = v.to_number().unwrap_or(0.0);
+            if f < 0.0 || f.is_nan() {
+                return Err(vm.fail(ErrorKind::ValueError, "DataView: invalid byteLength"));
+            }
+            let bl = f as usize;
+            if byte_offset + bl > buf_len {
+                return Err(vm.fail(ErrorKind::ValueError, "DataView: byteLength out of bounds"));
+            }
+            bl
+        }
+    };
+    let ptr = vm.data_views.len() as DataViewPtr;
+    vm.data_views.push(DataViewEntry {
+        buffer: buf_ptr,
+        byte_offset: byte_offset as u32,
+        byte_length: byte_length as u32,
+    });
+    Ok(Value::DataView(ptr))
+}
+
+/// Extract `(buf_ptr, byte_offset, byte_length)` from a DataView receiver.
+fn dv_receiver(vm: &VM, args: &Args) -> Result<(BufferPtr, usize, usize), VMError> {
+    let ptr = match args.get(vm, 0) {
+        Value::DataView(p) => *p,
+        recv => return Err(vm.method_receiver_error(recv)),
+    };
+    let dv = vm
+        .data_views
+        .get(ptr as usize)
+        .ok_or_else(|| vm.fail(ErrorKind::TypeError, "bad DataView pointer"))?;
+    Ok((dv.buffer, dv.byte_offset as usize, dv.byte_length as usize))
+}
+
+/// Validate a DataView byte offset + access size, returning the absolute byte index.
+fn dv_byte_index(
+    vm: &VM,
+    buf_ptr: BufferPtr,
+    view_off: usize,
+    view_len: usize,
+    offset_val: &Value,
+    access_size: usize,
+) -> Result<usize, VMError> {
+    let f = offset_val.to_number().unwrap_or(0.0);
+    if f < 0.0 || f.is_nan() {
+        return Err(vm.fail(ErrorKind::ValueError, "DataView offset must be non-negative"));
+    }
+    let off = f as usize;
+    if off + access_size > view_len {
+        return Err(vm.fail(ErrorKind::ValueError, "DataView access out of bounds"));
+    }
+    let _ = buf_ptr;
+    Ok(view_off + off)
+}
+
+/// Parse `littleEndian` boolean from optional arg (default `false` = big-endian).
+fn dv_little_endian(args: &Args, vm: &VM, idx: usize) -> bool {
+    args.get(vm, idx).is_truthy()
+}
+
+macro_rules! dv_get {
+    ($name:ident, $size:expr, $from_le:expr, $from_be:expr, $to_val:expr) => {
+        pub(crate) fn $name(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+            let (buf_ptr, view_off, view_len) = dv_receiver(vm, &args)?;
+            let abs = dv_byte_index(vm, buf_ptr, view_off, view_len, args.get(vm, 1), $size)?;
+            let buf = vm
+                .buffers
+                .get(buf_ptr as usize)
+                .ok_or_else(|| vm.fail(ErrorKind::TypeError, "bad buffer pointer"))?;
+            let bytes: [u8; $size] = buf[abs..abs + $size].try_into().unwrap();
+            let le = dv_little_endian(&args, vm, 2);
+            let raw = if le { $from_le(bytes) } else { $from_be(bytes) };
+            Ok($to_val(raw))
+        }
+    };
+}
+
+macro_rules! dv_set {
+    ($name:ident, $size:expr, $from_f:expr, $to_le:expr, $to_be:expr) => {
+        pub(crate) fn $name(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+            let (buf_ptr, view_off, view_len) = dv_receiver(vm, &args)?;
+            let abs = dv_byte_index(vm, buf_ptr, view_off, view_len, args.get(vm, 1), $size)?;
+            let raw_f = args.get(vm, 2).to_number().unwrap_or(0.0);
+            let val = $from_f(raw_f);
+            let le = dv_little_endian(&args, vm, 3);
+            let bytes = if le { $to_le(val) } else { $to_be(val) };
+            let ip = vm.ip;
+            let buf = vm
+                .buffers
+                .get_mut(buf_ptr as usize)
+                .ok_or_else(|| VMError::fail_at(ip, ErrorKind::TypeError, "bad buffer pointer"))?;
+            buf[abs..abs + $size].copy_from_slice(&bytes);
+            Ok(Value::Undefined)
+        }
+    };
+}
+
+dv_get!(dv_get_int8,   1, |b: [u8;1]| b[0] as i8,  |b: [u8;1]| b[0] as i8,  |v: i8|  Value::int_from_f64(v as f64));
+dv_get!(dv_get_uint8,  1, |b: [u8;1]| b[0],         |b: [u8;1]| b[0],         |v: u8|  Value::PosInt(v as u64));
+dv_get!(dv_get_int16,  2, |b: [u8;2]| i16::from_le_bytes(b), |b: [u8;2]| i16::from_be_bytes(b), |v: i16| Value::int_from_f64(v as f64));
+dv_get!(dv_get_uint16, 2, |b: [u8;2]| u16::from_le_bytes(b), |b: [u8;2]| u16::from_be_bytes(b), |v: u16| Value::PosInt(v as u64));
+dv_get!(dv_get_int32,  4, |b: [u8;4]| i32::from_le_bytes(b), |b: [u8;4]| i32::from_be_bytes(b), |v: i32| Value::int_from_f64(v as f64));
+dv_get!(dv_get_uint32, 4, |b: [u8;4]| u32::from_le_bytes(b), |b: [u8;4]| u32::from_be_bytes(b), |v: u32| Value::PosInt(v as u64));
+dv_get!(dv_get_float32, 4, |b: [u8;4]| f32::from_le_bytes(b), |b: [u8;4]| f32::from_be_bytes(b), |v: f32| Value::Float(v as f64));
+dv_get!(dv_get_float64, 8, |b: [u8;8]| f64::from_le_bytes(b), |b: [u8;8]| f64::from_be_bytes(b), |v: f64| Value::Float(v));
+
+pub(crate) fn dv_get_bigint64(_vm: &mut VM, _args: Args) -> Result<Value, VMError> {
+    Err(_vm.fail(ErrorKind::TypeError, "DataView.getBigInt64: BigInt not yet supported"))
+}
+pub(crate) fn dv_get_biguint64(_vm: &mut VM, _args: Args) -> Result<Value, VMError> {
+    Err(_vm.fail(ErrorKind::TypeError, "DataView.getBigUint64: BigInt not yet supported"))
+}
+
+dv_set!(dv_set_int8,   1, |f: f64| to_uint32(f) as u8 as i8, |v: i8| v.to_le_bytes(), |v: i8| v.to_be_bytes());
+dv_set!(dv_set_uint8,  1, |f: f64| to_uint32(f) as u8,        |v: u8| v.to_le_bytes(), |v: u8| v.to_be_bytes());
+dv_set!(dv_set_int16,  2, |f: f64| to_uint32(f) as u16 as i16, |v: i16| v.to_le_bytes(), |v: i16| v.to_be_bytes());
+dv_set!(dv_set_uint16, 2, |f: f64| to_uint32(f) as u16,         |v: u16| v.to_le_bytes(), |v: u16| v.to_be_bytes());
+dv_set!(dv_set_int32,  4, |f: f64| to_uint32(f) as i32,         |v: i32| v.to_le_bytes(), |v: i32| v.to_be_bytes());
+dv_set!(dv_set_uint32, 4, |f: f64| to_uint32(f),                |v: u32| v.to_le_bytes(), |v: u32| v.to_be_bytes());
+dv_set!(dv_set_float32, 4, |f: f64| f as f32, |v: f32| v.to_le_bytes(), |v: f32| v.to_be_bytes());
+dv_set!(dv_set_float64, 8, |f: f64| f,         |v: f64| v.to_le_bytes(), |v: f64| v.to_be_bytes());
+
+pub(crate) fn dv_set_bigint64(_vm: &mut VM, _args: Args) -> Result<Value, VMError> {
+    Err(_vm.fail(ErrorKind::TypeError, "DataView.setBigInt64: BigInt not yet supported"))
+}
+pub(crate) fn dv_set_biguint64(_vm: &mut VM, _args: Args) -> Result<Value, VMError> {
+    Err(_vm.fail(ErrorKind::TypeError, "DataView.setBigUint64: BigInt not yet supported"))
 }
 
 // ── Step 4: Typed array prototype methods ─────────────────────────────────────
@@ -1012,6 +1175,77 @@ mod tests {
             return [ta.indexOf(20), ta.lastIndexOf(20)];
         "#);
         assert_eq!(v, serde_json::json!([1, 3]));
+    }
+
+    // ── Step 5: DataView ──────────────────────────────────────────────────
+
+    #[test]
+    fn dataview_get_set_int32_le() {
+        let v = testutil::run_ret(r#"
+            const buf = new ArrayBuffer(8);
+            const dv = new DataView(buf);
+            dv.setInt32(0, 0x12345678, true);
+            return dv.getInt32(0, true);
+        "#);
+        assert_eq!(v, serde_json::json!(0x12345678));
+    }
+
+    #[test]
+    fn dataview_get_set_int32_be() {
+        let v = testutil::run_ret(r#"
+            const buf = new ArrayBuffer(4);
+            const dv = new DataView(buf);
+            dv.setInt32(0, -1, false);
+            return dv.getInt32(0, false);
+        "#);
+        assert_eq!(v, serde_json::json!(-1));
+    }
+
+    #[test]
+    fn dataview_get_set_float64() {
+        let v = testutil::run_ret(r#"
+            const buf = new ArrayBuffer(8);
+            const dv = new DataView(buf);
+            dv.setFloat64(0, 3.14, true);
+            return dv.getFloat64(0, true);
+        "#);
+        // 3.14 round-trips through f64
+        assert!((v.as_f64().unwrap() - 3.14).abs() < 1e-10);
+    }
+
+    #[test]
+    fn dataview_byte_offset_and_length() {
+        let v = testutil::run_ret(r#"
+            const buf = new ArrayBuffer(16);
+            const dv = new DataView(buf, 4, 8);
+            return [dv.byteOffset, dv.byteLength];
+        "#);
+        assert_eq!(v, serde_json::json!([4, 8]));
+    }
+
+    #[test]
+    fn dataview_uint8_across_bytes() {
+        let v = testutil::run_ret(r#"
+            const buf = new ArrayBuffer(4);
+            const dv = new DataView(buf);
+            dv.setUint8(0, 10);
+            dv.setUint8(1, 20);
+            dv.setUint8(2, 30);
+            dv.setUint8(3, 40);
+            return [dv.getUint8(0), dv.getUint8(1), dv.getUint8(2), dv.getUint8(3)];
+        "#);
+        assert_eq!(v, serde_json::json!([10, 20, 30, 40]));
+    }
+
+    #[test]
+    fn dataview_endian_matters_for_int16() {
+        let v = testutil::run_ret(r#"
+            const buf = new ArrayBuffer(2);
+            const dv = new DataView(buf);
+            dv.setInt16(0, 0x0102, false); // big-endian: [0x01, 0x02]
+            return [dv.getUint8(0), dv.getUint8(1)];
+        "#);
+        assert_eq!(v, serde_json::json!([1, 2]));
     }
 
     #[test]

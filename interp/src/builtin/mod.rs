@@ -85,6 +85,7 @@ pub(crate) use string::string_ctor;
 // Typed array constructors + codec helpers used by dispatch.rs.
 pub(crate) use typedarray::arraybuffer_ctor;
 pub(crate) use typedarray::arraybuffer_slice;
+pub(crate) use typedarray::dataview_ctor;
 pub(crate) use typedarray::bigint64array_ctor;
 pub(crate) use typedarray::biguint64array_ctor;
 pub(crate) use typedarray::float32array_ctor;
@@ -598,6 +599,29 @@ builtins! {
     Float64ArrayCtor,      BuiltinKind::Constructor { type_tag: TypeTag::Float64Array },      "Float64Array",      0, VARARG, float64array_ctor,     false, false, false, false, false, false, false, false, false, false;
     BigInt64ArrayCtor,     BuiltinKind::Constructor { type_tag: TypeTag::BigInt64Array },     "BigInt64Array",     0, VARARG, bigint64array_ctor,    false, false, false, false, false, false, false, false, false, false;
     BigUint64ArrayCtor,    BuiltinKind::Constructor { type_tag: TypeTag::BigUint64Array },    "BigUint64Array",    0, VARARG, biguint64array_ctor,   false, false, false, false, false, false, false, false, false, false;
+
+    // ── DataView (Step 5) ──
+    DataViewCtor,      BuiltinKind::Constructor { type_tag: TypeTag::DataView }, "DataView", 1, 3, dataview_ctor, false, false, false, false, false, false, false, false, false, false;
+    DvGetInt8,         BuiltinKind::Method, "getInt8",     2, 2, dv_get_int8,    false, false, false, false, false, false, false, false, false, true;
+    DvGetUint8,        BuiltinKind::Method, "getUint8",    2, 2, dv_get_uint8,   false, false, false, false, false, false, false, false, false, true;
+    DvGetInt16,        BuiltinKind::Method, "getInt16",    2, 3, dv_get_int16,   false, false, false, false, false, false, false, false, false, true;
+    DvGetUint16,       BuiltinKind::Method, "getUint16",   2, 3, dv_get_uint16,  false, false, false, false, false, false, false, false, false, true;
+    DvGetInt32,        BuiltinKind::Method, "getInt32",    2, 3, dv_get_int32,   false, false, false, false, false, false, false, false, false, true;
+    DvGetUint32,       BuiltinKind::Method, "getUint32",   2, 3, dv_get_uint32,  false, false, false, false, false, false, false, false, false, true;
+    DvGetFloat32,      BuiltinKind::Method, "getFloat32",  2, 3, dv_get_float32, false, false, false, false, false, false, false, false, false, true;
+    DvGetFloat64,      BuiltinKind::Method, "getFloat64",  2, 3, dv_get_float64, false, false, false, false, false, false, false, false, false, true;
+    DvGetBigInt64,     BuiltinKind::Method, "getBigInt64", 2, 3, dv_get_bigint64,  false, false, false, false, false, false, false, false, false, true;
+    DvGetBigUint64,    BuiltinKind::Method, "getBigUint64",2, 3, dv_get_biguint64, false, false, false, false, false, false, false, false, false, true;
+    DvSetInt8,         BuiltinKind::Method, "setInt8",     3, 3, dv_set_int8,    false, false, false, false, false, false, false, false, false, true;
+    DvSetUint8,        BuiltinKind::Method, "setUint8",    3, 3, dv_set_uint8,   false, false, false, false, false, false, false, false, false, true;
+    DvSetInt16,        BuiltinKind::Method, "setInt16",    3, 4, dv_set_int16,   false, false, false, false, false, false, false, false, false, true;
+    DvSetUint16,       BuiltinKind::Method, "setUint16",   3, 4, dv_set_uint16,  false, false, false, false, false, false, false, false, false, true;
+    DvSetInt32,        BuiltinKind::Method, "setInt32",    3, 4, dv_set_int32,   false, false, false, false, false, false, false, false, false, true;
+    DvSetUint32,       BuiltinKind::Method, "setUint32",   3, 4, dv_set_uint32,  false, false, false, false, false, false, false, false, false, true;
+    DvSetFloat32,      BuiltinKind::Method, "setFloat32",  3, 4, dv_set_float32, false, false, false, false, false, false, false, false, false, true;
+    DvSetFloat64,      BuiltinKind::Method, "setFloat64",  3, 4, dv_set_float64, false, false, false, false, false, false, false, false, false, true;
+    DvSetBigInt64,     BuiltinKind::Method, "setBigInt64", 3, 4, dv_set_bigint64,  false, false, false, false, false, false, false, false, false, true;
+    DvSetBigUint64,    BuiltinKind::Method, "setBigUint64",3, 4, dv_set_biguint64, false, false, false, false, false, false, false, false, false, true;
 
     // ── Typed array prototype methods (Step 4) ──
     // All have typedarray: true (column 8). The static path compiles
