@@ -227,6 +227,25 @@ impl TypeTag {
             TypeTag::DataView => "DataView",
         }
     }
+
+    /// Returns the `TypedArrayKind` for typed-array type tags, or `None` for
+    /// non-typed-array tags. Used to serve `BYTES_PER_ELEMENT` on constructors.
+    pub fn typed_array_kind(self) -> Option<TypedArrayKind> {
+        match self {
+            TypeTag::Int8Array => Some(TypedArrayKind::Int8),
+            TypeTag::Uint8Array => Some(TypedArrayKind::Uint8),
+            TypeTag::Uint8ClampedArray => Some(TypedArrayKind::Uint8Clamped),
+            TypeTag::Int16Array => Some(TypedArrayKind::Int16),
+            TypeTag::Uint16Array => Some(TypedArrayKind::Uint16),
+            TypeTag::Int32Array => Some(TypedArrayKind::Int32),
+            TypeTag::Uint32Array => Some(TypedArrayKind::Uint32),
+            TypeTag::Float32Array => Some(TypedArrayKind::Float32),
+            TypeTag::Float64Array => Some(TypedArrayKind::Float64),
+            TypeTag::BigInt64Array => Some(TypedArrayKind::BigInt64),
+            TypeTag::BigUint64Array => Some(TypedArrayKind::BigUint64),
+            _ => None,
+        }
+    }
 }
 
 /// A single entry in the per-type builtin prototype side table
@@ -297,6 +316,11 @@ pub enum Instr {
     /// set, and hardcoded globals; everything else resolves to a `ReferenceError`.
     /// () -> any
     PushName(RcStr),
+    /// Like `PushName` but returns `Undefined` instead of throwing for unknown
+    /// names. Used exclusively for `typeof <undeclared-identifier>` where JS
+    /// specifies that the result must be `"undefined"` (no ReferenceError).
+    /// () -> any
+    PushNameSoft(RcStr),
 
     Pop(usize),
 

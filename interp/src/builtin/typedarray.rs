@@ -187,9 +187,7 @@ fn clamp_index(val: &Value, total: u32) -> u32 {
 /// - `new T(n)` — allocate `n` zero-initialised elements
 /// - `new T([...])` — copy from an ordinary `Array`
 /// - `new T(otherTA)` — copy from another `TypedArray`
-///
-/// The `new T(buffer[, byteOffset[, length]])` overload (shared backing store)
-/// is deferred to Step 7a.
+/// - `new T(buffer[, byteOffset[, length]])` — view over an `ArrayBuffer`
 fn typed_array_ctor_impl(vm: &mut VM, args: Args, kind: TypedArrayKind) -> Result<Value, VMError> {
     let first = args.get(vm, 0);
     match first {
@@ -297,21 +295,70 @@ fn typed_array_ctor_impl(vm: &mut VM, args: Args, kind: TypedArrayKind) -> Resul
         }
 
         &Value::ArrayBuffer(buf_ptr) => {
-            let byte_len = vm
+            let buf_len = vm
                 .buffers
                 .get(buf_ptr as usize)
                 .map(|b| b.len())
                 .unwrap_or(0);
             let elem_size = kind.element_size() as usize;
-            let byte_length = byte_len as u32;
+
+            // Parse byteOffset (arg 1), default 0.
+            let byte_offset = match args.get(vm, 1) {
+                Value::Undefined => 0usize,
+                v => {
+                    let f = v.to_number().unwrap_or(0.0);
+                    if f < 0.0 || f.is_nan() || !f.is_finite() || f as usize > buf_len {
+                        return Err(
+                            vm.fail(ErrorKind::ValueError, "typed array: invalid byteOffset")
+                        );
+                    }
+                    let off = f as usize;
+                    if off % elem_size != 0 {
+                        return Err(vm.fail(
+                            ErrorKind::ValueError,
+                            "typed array: byteOffset must be a multiple of element size",
+                        ));
+                    }
+                    off
+                }
+            };
+
+            // Parse length (arg 2) or derive from buffer.
+            let byte_length = match args.get(vm, 2) {
+                Value::Undefined => {
+                    let remaining = buf_len.saturating_sub(byte_offset);
+                    if remaining % elem_size != 0 {
+                        return Err(vm.fail(
+                            ErrorKind::ValueError,
+                            "typed array: buffer length - byteOffset must be a multiple of element size",
+                        ));
+                    }
+                    remaining
+                }
+                v => {
+                    let f = v.to_number().unwrap_or(0.0);
+                    if f < 0.0 || f.is_nan() || !f.is_finite() {
+                        return Err(vm.fail(ErrorKind::ValueError, "typed array: invalid length"));
+                    }
+                    let n = f as usize;
+                    let bl = n * elem_size;
+                    if byte_offset.saturating_add(bl) > buf_len {
+                        return Err(vm.fail(
+                            ErrorKind::ValueError,
+                            "typed array: byte range out of bounds",
+                        ));
+                    }
+                    bl
+                }
+            };
+
             let ta_ptr = vm.typed_arrays.len() as TypedArrayPtr;
             vm.typed_arrays.push(TypedArrayView {
                 buffer: buf_ptr,
-                byte_offset: 0,
-                byte_length,
+                byte_offset: byte_offset as u32,
+                byte_length: byte_length as u32,
                 kind,
             });
-            let _ = elem_size;
             Ok(Value::TypedArray(ta_ptr))
         }
 
@@ -1603,5 +1650,117 @@ mod tests {
         "#,
         );
         assert_eq!(v, serde_json::json!([[0, 10], [1, 20]]));
+    }
+
+    #[test]
+    fn bytes_per_element_static() {
+        let v = testutil::run_ret(
+            r#"
+            return [
+                Int8Array.BYTES_PER_ELEMENT,
+                Uint8Array.BYTES_PER_ELEMENT,
+                Int16Array.BYTES_PER_ELEMENT,
+                Int32Array.BYTES_PER_ELEMENT,
+                Float64Array.BYTES_PER_ELEMENT,
+            ];
+        "#,
+        );
+        assert_eq!(v, serde_json::json!([1, 1, 2, 4, 8]));
+    }
+
+    // ── Step 7a: ArrayBuffer constructor overload ──────────────────────────
+
+    #[test]
+    fn ta_from_arraybuffer_basic() {
+        let v = testutil::run_ret(
+            r#"
+            const buf = new ArrayBuffer(16);
+            const ta = new Float64Array(buf);
+            return [ta.length, ta.byteLength, ta.byteOffset];
+        "#,
+        );
+        assert_eq!(v, serde_json::json!([2, 16, 0]));
+    }
+
+    #[test]
+    fn ta_from_arraybuffer_with_byteoffset() {
+        let v = testutil::run_ret(
+            r#"
+            const buf = new ArrayBuffer(16);
+            const ta = new Uint8Array(buf, 4);
+            return [ta.length, ta.byteOffset];
+        "#,
+        );
+        assert_eq!(v, serde_json::json!([12, 4]));
+    }
+
+    #[test]
+    fn ta_from_arraybuffer_with_length() {
+        let v = testutil::run_ret(
+            r#"
+            const buf = new ArrayBuffer(16);
+            const ta = new Int32Array(buf, 4, 2);
+            return [ta.length, ta.byteLength, ta.byteOffset];
+        "#,
+        );
+        assert_eq!(v, serde_json::json!([2, 8, 4]));
+    }
+
+    #[test]
+    fn ta_from_arraybuffer_shared_mutation() {
+        let v = testutil::run_ret(
+            r#"
+            const buf = new ArrayBuffer(4);
+            const a = new Uint8Array(buf);
+            const b = new Uint8Array(buf);
+            a[0] = 42;
+            return b[0];
+        "#,
+        );
+        assert_eq!(v, serde_json::json!(42));
+    }
+
+    #[test]
+    fn ta_constructor_property() {
+        let v = testutil::run_ret(
+            r#"
+            const ta = new Float64Array(4);
+            return [
+                ta.constructor === Float64Array,
+                Object.getPrototypeOf(ta) === Float64Array.prototype,
+            ];
+        "#,
+        );
+        assert_eq!(v, serde_json::json!([true, true]));
+    }
+
+    // ── Step 7b: instanceof ────────────────────────────────────────────────
+
+    #[test]
+    fn ta_instanceof_float64array() {
+        let v = testutil::run_ret(
+            r#"
+            const ta = new Float64Array(4);
+            return ta instanceof Float64Array;
+        "#,
+        );
+        assert_eq!(v, serde_json::json!(true));
+    }
+
+    #[test]
+    fn ta_instanceof_uint8array() {
+        let v = testutil::run_ret(
+            r#"
+            const ta = new Uint8Array(4);
+            return [ta instanceof Uint8Array, ta instanceof Float64Array];
+        "#,
+        );
+        assert_eq!(v, serde_json::json!([true, false]));
+    }
+
+    #[test]
+    fn ta_instanceof_int32array() {
+        let v = testutil::run_ret(r#"return new Int32Array(1) instanceof Int32Array;"#);
+        assert_eq!(v, serde_json::json!(true));
     }
 }

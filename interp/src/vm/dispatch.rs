@@ -224,6 +224,12 @@ impl VM {
                             };
                             return Ok(Value::Float(n as f64));
                         }
+                        // Static BYTES_PER_ELEMENT on TypedArray constructors.
+                        "BYTES_PER_ELEMENT" => {
+                            if let Some(kind) = tag.typed_array_kind() {
+                                return Ok(Value::Float(kind.element_size() as f64));
+                            }
+                        }
                         _ => {
                             if let Some(static_b) =
                                 crate::builtin::Builtin::for_namespace(tag.name(), field)
@@ -994,6 +1000,12 @@ impl VM {
                 Instr::PushName(name) => {
                     let name = name.clone();
                     let val = self.resolve_name(&name)?;
+                    self.stack.push(val);
+                    self.ip += 1;
+                }
+                Instr::PushNameSoft(name) => {
+                    let name = name.clone();
+                    let val = self.resolve_name(&name).unwrap_or(Value::Undefined);
                     self.stack.push(val);
                     self.ip += 1;
                 }

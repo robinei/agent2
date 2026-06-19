@@ -107,6 +107,36 @@ impl super::Compiler {
                 self.emit(Instr::BitNot, span);
             }
             Op::Typeof => {
+                // For `typeof <identifier>`, JS requires the lookup to not throw
+                // even for undeclared names (`typeof undeclaredVar === "undefined"`).
+                // When the identifier would compile to `PushName` (runtime-resolved,
+                // potentially undeclared), use `PushNameSoft` instead to suppress the
+                // ReferenceError. All other expressions (member access, etc.) can throw.
+                if let ast::Expression::Identifier(id) = &un.argument {
+                    let name = id.name.as_str();
+                    // Only apply soft-push for names that would go through PushName
+                    // (not const-folded, not a slot variable, not a known builtin/global).
+                    let is_static = self.const_ref(id.span.start).is_some()
+                        || self.ref_slot(id.span.start).is_some()
+                        || name == "arguments"
+                        || matches!(
+                            name,
+                            "input"
+                                | "attachments"
+                                | "undefined"
+                                | "NaN"
+                                | "Infinity"
+                                | "Math"
+                                | "JSON"
+                        )
+                        || crate::builtin::Builtin::for_constructor(name).is_some();
+                    if !is_static {
+                        let name_str = self.intern_string(name);
+                        self.emit(Instr::PushNameSoft(name_str), span);
+                        self.emit(Instr::TypeOf, span);
+                        return;
+                    }
+                }
                 self.compile_expr(&un.argument);
                 self.emit(Instr::TypeOf, span);
             }
