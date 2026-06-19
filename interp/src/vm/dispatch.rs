@@ -12,75 +12,190 @@ fn await_hint(v: &Value) -> &'static str {
     }
 }
 
-/// Look up a named property on a RegExp value. Returns the JS-standard
-/// properties that would be on `RegExp.prototype`.
-fn regexp_prop(r: &RcRegExp, field: &str) -> Value {
-    match field {
-        "source" => Value::String(r.pattern.clone()),
-        "flags" => Value::String(r.flags.clone()),
-        "global" => Value::Bool(r.flags.contains('g')),
-        "ignoreCase" => Value::Bool(r.flags.contains('i')),
-        "multiline" => Value::Bool(r.flags.contains('m')),
-        "dotAll" => Value::Bool(r.flags.contains('s')),
-        "unicode" => Value::Bool(r.flags.contains('u')),
-        "sticky" => Value::Bool(r.flags.contains('y')),
-        "lastIndex" => Value::PosInt(r.last_index.get() as u64),
-        _ => Value::Undefined,
-    }
-}
-
 impl VM {
-    /// Unified named-property read for any receiver value (Step 2b) — the
-    /// seed of the convergence target's `get_property`. For an `Object`,
-    /// walks own map → proto chain (the existing `resolve_proto_chain`,
-    /// now with the `constructor` virtual rung on builtin prototypes). For
-    /// every other value with a `[[Prototype]]` (Array/Map/Set/RegExp/
-    /// Closure/Builtin/Bound/String/Number/Bool/Promise), starts at the
-    /// type's builtin prototype and walks from there — so `[].constructor`,
-    /// `(5).constructor`, `"".constructor` resolve as ordinary lookups
-    /// rather than special cases. The per-type virtual rungs (Closure
-    /// `.prototype`, Builtin constructor `.prototype`/`.name`/statics,
-    /// RegExp `source`/`flags`/`lastIndex`) are handled here too, folding
-    /// the former `resolve_closure_prototype`/`resolve_builtin_property`/
-    /// `regexp_prop`-as-top-level-resolver into one body.
+    // ── Step 2e: the canonical property read/write pair ────────────
+    //
+    /// The one property *read* ladder for every receiver type. Resolves in
+    /// order:
     ///
-    /// `null`/`undefined` receivers are a `TypeError` (matching JS). A miss
-    /// returns `Undefined`. This is `&mut self` because the type prototype
-    /// may be lazily allocated on first reflective touch.
-    fn get_property(&mut self, receiver: &Value, field: &str) -> Result<Value, VMError> {
+    ///   1. Primary representation (Array int-index, Object own-map,
+    ///      Map.get, String char-at, RegExp virtual props, Closure
+    ///      virtual props, Builtin constructor virtual props)
+    ///   2. User own-property bag (Object's map; Closure's inline `props`).
+    ///      Array/Map/Set/Promise/RegExp are non-extensible for now (a user
+    ///      write is a `TypeError`, pinned), so they carry no bag; a
+    ///      side-table is the corpus-gated seam if that changes.
+    ///   3. Type prototype chain (2a), with `method_for_receiver`
+    ///      fallback (builtin prototypes have empty maps — methods are
+    ///      virtual)
+    ///   4. `Undefined`
+    ///
+    /// `key` is a `Value`: `String(field)` for named reads, an int for
+    /// array/string indexing, or any value ToString'd for Object lookup.
+    /// `null`/`undefined` receivers are a `TypeError`. This subsumes and
+    /// **deletes**: the former `regexp_prop`, `resolve_computed_property`,
+    /// `get_property_from_type`, and the inline resolve copies in
+    /// `IndexGet`/`IndexSet`/`ObjHas`.
+    pub(crate) fn get_property(&mut self, receiver: &Value, key: &Value) -> Result<Value, VMError> {
+        // ── rung 0: primary representation ────────────────────────
         match receiver {
-            Value::Null | Value::Undefined => Err(self.fail(
-                ErrorKind::TypeError,
-                format!(
-                    "cannot read property '{field}' on {}{}",
-                    receiver.type_name(),
-                    await_hint(receiver)
-                ),
-            )),
+            Value::Null | Value::Undefined => {
+                let name = self.to_js_string(key, 0);
+                return Err(self.fail(
+                    ErrorKind::TypeError,
+                    format!(
+                        "cannot read property '{}' on {}{}",
+                        name.as_str(),
+                        receiver.type_name(),
+                        await_hint(receiver)
+                    ),
+                ));
+            }
+            Value::Upval(_) => return Err(self.fail(ErrorKind::ValueError, "value error")),
+            Value::Promise(_) => {
+                let name = self.to_js_string(key, 0);
+                return Err(self.fail(
+                    ErrorKind::TypeError,
+                    format!(
+                        "cannot read property '{}' on promise{}",
+                        name.as_str(),
+                        await_hint(receiver)
+                    ),
+                ));
+            }
+            _ => {}
+        }
+
+        // Integer-key fast path: arrays and strings (first, so
+        // `arr[0]` never enters the named/ladder path).
+        if let Some(idx) = key.as_i64() {
+            if idx < 0 {
+                return Err(self.fail(ErrorKind::ValueError, "value error"));
+            }
+            let idx = idx as usize;
+            match receiver {
+                Value::Array(p) => {
+                    let arr = self.arrays.get(*p as usize).ok_or_else(|| {
+                        self.fail_not_resumable(ErrorKind::TypeError, "bad array pointer")
+                    })?;
+                    return Ok(arr.get(idx).cloned().unwrap_or(Value::Undefined));
+                }
+                Value::String(s) => {
+                    let s = s.as_str();
+                    if idx >= s.len() {
+                        return Ok(Value::Undefined);
+                    }
+                    if !s.is_char_boundary(idx) {
+                        return Err(self.fail(ErrorKind::ValueError, "value error"));
+                    }
+                    let ch = s[idx..].chars().next().unwrap();
+                    return Ok(Value::String(RcStr::from(ch.to_string())));
+                }
+                // Integer key on a non-array, non-string, non-Object:
+                // TypeError (cannot index into <type>). Object falls
+                // through to the named path (ToString the key).
+                Value::Object(_) => {} // falls through
+                _ => {
+                    return Err(self.fail(
+                        ErrorKind::TypeError,
+                        format!(
+                            "cannot index into {} with {}",
+                            receiver.type_name(),
+                            self.preview(key)
+                        ),
+                    ));
+                }
+            }
+        }
+
+        // Named-key path: coerce the key to a string.
+        let field = self.to_js_string(key, 0);
+        self.named_get_property(receiver, field.as_str())
+    }
+
+    /// The named half of [`get_property`] — virtual rungs, own-property
+    /// bags, and proto-chain walk for a `&str` field. Called after the
+    /// integer-key fast path above (which lives in `get_property` so
+    /// array-index reads inline to exactly today's code).
+    fn named_get_property(&mut self, receiver: &Value, field: &str) -> Result<Value, VMError> {
+        match receiver {
+            Value::Null | Value::Undefined | Value::Promise(_) | Value::Upval(_) => {
+                unreachable!("handled before named_get_property")
+            }
+
+            // ── Object: own map → proto chain (the model) ────────
             Value::Object(p) => self.resolve_proto_chain(*p, field),
+
+            // ── RegExp: virtual rungs (folded from `regexp_prop`) ─
             Value::RegExp(r) => {
-                let v = regexp_prop(r, field);
+                let v = match field {
+                    "source" => Value::String(r.pattern.clone()),
+                    "flags" => Value::String(r.flags.clone()),
+                    "global" => Value::Bool(r.flags.contains('g')),
+                    "ignoreCase" => Value::Bool(r.flags.contains('i')),
+                    "multiline" => Value::Bool(r.flags.contains('m')),
+                    "dotAll" => Value::Bool(r.flags.contains('s')),
+                    "unicode" => Value::Bool(r.flags.contains('u')),
+                    "sticky" => Value::Bool(r.flags.contains('y')),
+                    "lastIndex" => Value::PosInt(r.last_index.get() as u64),
+                    _ => Value::Undefined,
+                };
                 if !matches!(v, Value::Undefined) {
                     return Ok(v);
                 }
-                self.get_property_from_type(crate::vm::instr::TypeTag::RegExp, field, receiver)
+                self.type_proto_lookup(crate::vm::instr::TypeTag::RegExp, field, receiver)
             }
+
+            // ── Closure: virtual rungs → inline bag → Function proto ─
             Value::Closure { ptr, .. } => {
-                if field == "prototype" {
-                    return Ok(Value::Object(self.resolve_prototype(*ptr)?));
+                match field {
+                    "prototype" => {
+                        return Ok(Value::Object(self.resolve_prototype(*ptr)?));
+                    }
+                    "name" | "length" => {
+                        let c = self.closures.get(*ptr as usize).ok_or_else(|| {
+                            self.fail_not_resumable(ErrorKind::TypeError, "bad closure pointer")
+                        })?;
+                        if field == "name" {
+                            return Ok(Value::String(RcStr::from("")));
+                        }
+                        return Ok(Value::Float(c.arity as f64));
+                    }
+                    _ => {}
                 }
-                self.get_property_from_type(crate::vm::instr::TypeTag::Function, field, receiver)
+                // Inline own-property bag (Step 2e).
+                let c = self.closures.get(*ptr as usize).ok_or_else(|| {
+                    self.fail_not_resumable(ErrorKind::TypeError, "bad closure pointer")
+                })?;
+                if let Some(ref bag) = c.props
+                    && let Some(v) = bag.get(field)
+                {
+                    return Ok(v.clone());
+                }
+                self.type_proto_lookup(crate::vm::instr::TypeTag::Function, field, receiver)
             }
-            Value::Bound(_) => {
-                self.get_property_from_type(crate::vm::instr::TypeTag::Function, field, receiver)
-            }
+
+            // ── Builtin: virtual rungs (constructor) or Function proto ─
             Value::Builtin(b) => {
                 if let Some(tag) = b.constructor_type_tag() {
                     match field {
                         "prototype" => {
                             return Ok(Value::Object(self.prototype_for(tag)?));
                         }
-                        "name" => return Ok(Value::String(RcStr::from(b.meta().name))),
+                        "name" => {
+                            return Ok(Value::String(RcStr::from(b.meta().name)));
+                        }
+                        "length" => {
+                            let meta = b.meta();
+                            let n = match meta.kind {
+                                crate::builtin::BuiltinKind::Method => {
+                                    meta.min_args.saturating_sub(1)
+                                }
+                                crate::builtin::BuiltinKind::Namespace(_)
+                                | crate::builtin::BuiltinKind::Constructor { .. } => meta.min_args,
+                            };
+                            return Ok(Value::Float(n as f64));
+                        }
                         _ => {
                             if let Some(static_b) =
                                 crate::builtin::Builtin::for_namespace(tag.name(), field)
@@ -89,76 +204,69 @@ impl VM {
                             }
                         }
                     }
-                    // Constructor's other properties: walk to
-                    // Function.prototype.
-                    self.get_property_from_type(
-                        crate::vm::instr::TypeTag::Function,
-                        field,
-                        receiver,
-                    )
-                } else {
-                    // Method/namespace builtin: a function value whose
-                    // [[Prototype]] is Function.prototype.
-                    self.get_property_from_type(
-                        crate::vm::instr::TypeTag::Function,
-                        field,
-                        receiver,
-                    )
                 }
+                self.type_proto_lookup(crate::vm::instr::TypeTag::Function, field, receiver)
             }
+
+            // ── Array: `length` virtual rung → Array proto ───────
             Value::Array(_) => {
-                self.get_property_from_type(crate::vm::instr::TypeTag::Array, field, receiver)
+                if field == "length" {
+                    let len = match receiver {
+                        Value::Array(p) => {
+                            self.arrays.get(*p as usize).map(|a| a.len()).unwrap_or(0)
+                        }
+                        _ => unreachable!(),
+                    };
+                    return Ok(Value::Float(len as f64));
+                }
+                self.type_proto_lookup(crate::vm::instr::TypeTag::Array, field, receiver)
             }
+
+            // ── Map: `size` virtual rung → Map proto ────────────
             Value::Map(_) => {
-                self.get_property_from_type(crate::vm::instr::TypeTag::Map, field, receiver)
+                if field == "size" {
+                    let sz = match receiver {
+                        Value::Map(p) => self.maps.get(*p as usize).map(|m| m.len()).unwrap_or(0),
+                        _ => unreachable!(),
+                    };
+                    return Ok(Value::Float(sz as f64));
+                }
+                self.type_proto_lookup(crate::vm::instr::TypeTag::Map, field, receiver)
             }
+
+            // ── Set: `size` virtual rung → Set proto ────────────
             Value::Set(_) => {
-                self.get_property_from_type(crate::vm::instr::TypeTag::Set, field, receiver)
+                if field == "size" {
+                    let sz = match receiver {
+                        Value::Set(p) => self.sets.get(*p as usize).map(|s| s.len()).unwrap_or(0),
+                        _ => unreachable!(),
+                    };
+                    return Ok(Value::Float(sz as f64));
+                }
+                self.type_proto_lookup(crate::vm::instr::TypeTag::Set, field, receiver)
             }
+
+            // ── Bound: Function proto (non-extensible) ───────────
+            Value::Bound(_) => {
+                self.type_proto_lookup(crate::vm::instr::TypeTag::Function, field, receiver)
+            }
+
+            // ── String/Number/Boolean: type proto (no bags) ─────
             Value::String(_) => {
-                self.get_property_from_type(crate::vm::instr::TypeTag::String, field, receiver)
+                self.type_proto_lookup(crate::vm::instr::TypeTag::String, field, receiver)
             }
             Value::Float(_) | Value::PosInt(_) | Value::NegInt(_) => {
-                self.get_property_from_type(crate::vm::instr::TypeTag::Number, field, receiver)
+                self.type_proto_lookup(crate::vm::instr::TypeTag::Number, field, receiver)
             }
             Value::Bool(_) => {
-                self.get_property_from_type(crate::vm::instr::TypeTag::Boolean, field, receiver)
+                self.type_proto_lookup(crate::vm::instr::TypeTag::Boolean, field, receiver)
             }
-            Value::Promise(_) => {
-                // Promises are transient tool-call values. Property access
-                // on one is the classic missing-`await` mistake
-                // (`tools.f().field` instead of `(await tools.f()).field`),
-                // so raise a TypeError with the hint rather than silently
-                // walking `Object.prototype` and returning `undefined`.
-                // (This is a deliberate diagnostic, pinned in the divergence
-                // list — not a compat gap; `Object.getPrototypeOf(p)` still
-                // returns `Object.prototype` via `value_proto`.)
-                Err(self.fail(
-                    ErrorKind::TypeError,
-                    format!(
-                        "cannot read property '{field}' on promise{}",
-                        await_hint(receiver)
-                    ),
-                ))
-            }
-            Value::Upval(_) => Err(self.fail(ErrorKind::ValueError, "value error")),
         }
     }
 
-    /// Walk the builtin prototype chain for `tag`, starting at `tag`'s frozen
-    /// prototype (lazily allocated). Used by [`get_property`] for non-Object
-    /// receivers — the `[[Prototype]]` of an array is `Array.prototype`, of
-    /// a number is `Number.prototype`, etc. — so property reads on
-    /// primitives and structural types walk the same chain as objects.
-    ///
-    /// Step 2c: when the proto-chain walk returns `Undefined`, consult
-    /// `Builtin::method_for_receiver` as a fallback — the builtin prototype's
-    /// own map is empty (methods are virtual, for non-enumerability), so
-    /// method-value reads (`[].push`, `"x".at`) and reflective lookups
-    /// resolve through this gate, folding the former standalone
-    /// `method_for_receiver` call in `GetMethodOrProp` into the unified
-    /// `get_property` ladder.
-    fn get_property_from_type(
+    /// Walk the builtin prototype chain for `tag`, then fall back to
+    /// `method_for_receiver` (the unified method-resolution gate).
+    fn type_proto_lookup(
         &mut self,
         tag: crate::vm::instr::TypeTag,
         field: &str,
@@ -169,65 +277,242 @@ impl VM {
         if !matches!(val, Value::Undefined) {
             return Ok(val);
         }
-        // Fallback: builtin prototype map is empty (methods are virtual
-        // rungs for non-enumerability), so consult the builtins! registry
-        // directly. This is the unified method-resolution gate — the former
-        // standalone `method_for_receiver` call in `GetMethodOrProp`.
         Ok(Builtin::method_for_receiver(receiver, field)
             .map(Value::Builtin)
             .unwrap_or(Value::Undefined))
     }
 
-    /// Shared computed-property resolution for `IndexGet`/`ObjPeekDyn`:
-    /// inspects `container` (the object/array/string being indexed) and
-    /// resolves `key` against it. String→char, Array→int-index,
-    /// Object→string-key.
-    fn resolve_computed_property(&self, container: &Value, key: &Value) -> Result<Value, VMError> {
-        match container {
-            Value::String(s) => {
-                let s = s.as_str();
-                let idx = key
-                    .as_i64()
-                    .ok_or_else(|| self.fail(ErrorKind::TypeError, "type error"))?;
-                if idx < 0 {
-                    return Err(self.fail(ErrorKind::ValueError, "value error"));
-                }
-                let idx = idx as usize;
-                if idx >= s.len() {
-                    Ok(Value::Undefined)
-                } else if !s.is_char_boundary(idx) {
-                    Err(self.fail(ErrorKind::ValueError, "value error"))
-                } else {
-                    let ch = s[idx..].chars().next().unwrap();
-                    Ok(Value::String(RcStr::from(ch.to_string())))
-                }
+    // ── set_property: the canonical write ladder ────────────────────
+    //
+    /// The one property *write* ladder. Resolves the destination through
+    /// the matching rungs and performs the write:
+    ///
+    ///   1. Primary representation in-place (Array int-index, Object
+    ///      own-map, RegExp `lastIndex` cell)
+    ///   2. Integrity gate (Step 2d: extensible/seal/frozen)
+    ///   3. User own-prop bag (Object's map; Closure inline bag;
+    ///      side-table bags)
+    ///   4. Reject (primitives, non-extensible natives)
+    ///
+    /// `mode` controls the return value: `New` leaves the assigned value,
+    /// `Old` reads and leaves the previous value.
+    pub(crate) fn set_property(
+        &mut self,
+        receiver: &Value,
+        key: &Value,
+        val: Value,
+        mode: SetMode,
+    ) -> Result<Value, VMError> {
+        // Integer-key fast path for arrays.
+        if let Some(idx) = key.as_i64() {
+            if idx < 0 {
+                return Err(self.fail(ErrorKind::ValueError, "value error"));
             }
-            Value::Array(p) => {
-                let arr = self
-                    .arrays
-                    .get(*p as usize)
-                    .ok_or_else(|| self.fail(ErrorKind::ValueError, "value error"))?;
-                let idx = key
-                    .as_i64()
-                    .ok_or_else(|| self.fail(ErrorKind::TypeError, "type error"))?;
-                if idx < 0 {
-                    return Err(self.fail(ErrorKind::ValueError, "value error"));
+            let idx = idx as usize;
+            if let Value::Array(p) = receiver {
+                let ip = self.ip;
+                let arr = match self.arrays.get_mut(*p as usize) {
+                    Some(a) => a,
+                    _ => {
+                        return Err(VMError::fail_at(
+                            ip,
+                            ErrorKind::TypeError,
+                            "bad array pointer",
+                        ));
+                    }
+                };
+                if idx >= arr.len() {
+                    let len = arr.len();
+                    return Err(self.fail(
+                        ErrorKind::ValueError,
+                        format!("cannot write array index {idx}: out of bounds (length {len})"),
+                    ));
                 }
-                Ok(arr.get(idx as usize).cloned().unwrap_or(Value::Undefined))
+                let old = std::mem::replace(&mut arr[idx], val);
+                return Ok(match mode {
+                    SetMode::New => arr[idx].clone(),
+                    SetMode::Old => old,
+                });
             }
+        }
+
+        let field = self.to_js_string(key, 0);
+        self.named_set_property(receiver, field.as_str(), val, mode)
+    }
+
+    /// Named half of [`set_property`].
+    fn named_set_property(
+        &mut self,
+        receiver: &Value,
+        field: &str,
+        val: Value,
+        mode: SetMode,
+    ) -> Result<Value, VMError> {
+        match receiver {
+            // ── Object: own map, with integrity gate ─────────────
             Value::Object(p) => {
-                let field = self.to_js_string(key, 0);
-                self.resolve_proto_chain(*p, field.as_str())
+                let obj_ptr = *p;
+                let (is_new, integrity) = {
+                    let obj = match self.objects.get(obj_ptr as usize) {
+                        Some(o) => o,
+                        _ => {
+                            return Err(
+                                self.fail_not_resumable(ErrorKind::TypeError, "bad object pointer")
+                            );
+                        }
+                    };
+                    (!obj.map.contains_key(field), obj.integrity)
+                };
+                if integrity == IntegrityLevel::Frozen {
+                    return Err(self.fail(
+                        ErrorKind::TypeError,
+                        "cannot set a property of a frozen object",
+                    ));
+                }
+                if is_new
+                    && matches!(
+                        integrity,
+                        IntegrityLevel::NonExtensible | IntegrityLevel::Sealed
+                    )
+                {
+                    return Err(self.fail(
+                        ErrorKind::TypeError,
+                        "cannot add a property to a non-extensible object",
+                    ));
+                }
+                let ip = self.ip;
+                let obj = match self.objects.get_mut(obj_ptr as usize) {
+                    Some(o) => o,
+                    _ => {
+                        return Err(VMError::fail_at(
+                            ip,
+                            ErrorKind::TypeError,
+                            "bad object pointer",
+                        ));
+                    }
+                };
+                let result = match mode {
+                    SetMode::Old => {
+                        let old = obj.map.get(field).cloned().unwrap_or(Value::Undefined);
+                        if let Some(slot) = obj.map.get_mut(field) {
+                            *slot = val;
+                        } else {
+                            obj.map.insert(RcStr::from(field), val);
+                        }
+                        old
+                    }
+                    SetMode::New => {
+                        let result = val.clone();
+                        if let Some(slot) = obj.map.get_mut(field) {
+                            *slot = val;
+                        } else {
+                            obj.map.insert(RcStr::from(field), val);
+                        }
+                        result
+                    }
+                };
+                Ok(result)
             }
-            _ => {
-                let msg = format!(
-                    "cannot index into {} with {}{}",
-                    container.type_name(),
-                    self.preview(key),
-                    await_hint(container)
-                );
-                Err(self.fail(ErrorKind::TypeError, msg))
+
+            // ── RegExp: lastIndex is writable ────────────────────
+            Value::RegExp(r) => {
+                if field == "lastIndex" {
+                    let n = val.to_number().unwrap_or(0.0);
+                    let n = if n.is_finite() && n >= 0.0 {
+                        n as usize
+                    } else {
+                        0
+                    };
+                    let old = Value::PosInt(r.last_index.get() as u64);
+                    r.last_index.set(n);
+                    return Ok(match mode {
+                        SetMode::New => val,
+                        SetMode::Old => old,
+                    });
+                }
+                // Other RegExp properties are read-only; silently accept.
+                Ok(match mode {
+                    SetMode::New => val,
+                    SetMode::Old => val,
+                })
             }
+
+            // ── Closure: inline bag (extensible) ────────────────
+            Value::Closure { ptr, .. } => {
+                let ip = self.ip;
+                let c = match self.closures.get_mut(*ptr as usize) {
+                    Some(c) => c,
+                    _ => {
+                        return Err(VMError::fail_at(
+                            ip,
+                            ErrorKind::TypeError,
+                            "bad closure pointer",
+                        ));
+                    }
+                };
+                let bag = c.props.get_or_insert_with(|| Box::new(IndexMap::new()));
+                let result = match mode {
+                    SetMode::Old => {
+                        let old = bag.get(field).cloned().unwrap_or(Value::Undefined);
+                        if let Some(slot) = bag.get_mut(field) {
+                            *slot = val;
+                        } else {
+                            bag.insert(RcStr::from(field), val);
+                        }
+                        old
+                    }
+                    SetMode::New => {
+                        let result = val.clone();
+                        if let Some(slot) = bag.get_mut(field) {
+                            *slot = val;
+                        } else {
+                            bag.insert(RcStr::from(field), val);
+                        }
+                        result
+                    }
+                };
+                Ok(result)
+            }
+
+            // ── Builtin/Bound/Array/Map/Set/Promise/primitives: ──
+            //     non-extensible (TypeError) for now. Side-table
+            //     bags for Array/Map/Set/RegExp are deferred
+            //     (corpus-gated).
+            Value::Builtin(_) => Err(self.fail(
+                ErrorKind::TypeError,
+                "cannot set a property of a builtin function",
+            )),
+            Value::Bound(_) => Err(self.fail(
+                ErrorKind::TypeError,
+                "cannot set a property of a bound function",
+            )),
+            Value::Array(_) => Err(self.fail(
+                ErrorKind::TypeError,
+                "cannot set a named property on an array (non-extensible)",
+            )),
+            Value::Map(_) => Err(self.fail(
+                ErrorKind::TypeError,
+                "cannot set a named property on a Map (non-extensible)",
+            )),
+            Value::Set(_) => Err(self.fail(
+                ErrorKind::TypeError,
+                "cannot set a named property on a Set (non-extensible)",
+            )),
+            Value::Promise(_) => Err(self.fail(
+                ErrorKind::TypeError,
+                "cannot set a property on a promise (non-extensible)",
+            )),
+            Value::String(_)
+            | Value::Float(_)
+            | Value::PosInt(_)
+            | Value::NegInt(_)
+            | Value::Bool(_)
+            | Value::Null
+            | Value::Undefined
+            | Value::Upval(_) => Err(self.fail(
+                ErrorKind::TypeError,
+                format!("cannot set property on {}", receiver.type_name()),
+            )),
         }
     }
 
@@ -256,6 +541,52 @@ impl VM {
         } else {
             Some(val)
         })
+    }
+
+    /// Snapshot of a receiver's own enumerable string-keyed properties as
+    /// (key, value) pairs in insertion order — the one source the reflection
+    /// builtins (`Object.keys`/`values`/`entries`) read. An `Object` reads its
+    /// `map`; a function reads its `Closure.props` bag (Step 2e), whose virtual
+    /// rungs (`name`/`length`/`prototype`) are *not* stored there and so are
+    /// correctly excluded from enumeration. A function with no user props yields
+    /// an empty list. Returns `None` for any other receiver — the builtins turn
+    /// that into the same `TypeError` they already raise for non-objects.
+    /// (Collections/primitives are non-extensible, so they have no user bag.)
+    pub(crate) fn own_enumerable_props(&self, value: &Value) -> Option<Vec<(RcStr, Value)>> {
+        match value {
+            Value::Object(p) => self
+                .objects
+                .get(*p as usize)
+                .map(|o| o.map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
+            Value::Closure { ptr, .. } => Some(
+                self.closures
+                    .get(*ptr as usize)
+                    .and_then(|c| c.props.as_deref())
+                    .map(|bag| bag.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+                    .unwrap_or_default(),
+            ),
+            _ => None,
+        }
+    }
+
+    /// Whether a receiver has its own property `key` — the unified backing for
+    /// `Object.hasOwn` and `obj.hasOwnProperty`. Mirrors `own_enumerable_props`'s
+    /// receiver handling (Object `map` or function `props` bag); `None` for a
+    /// receiver the reflection builtins reject.
+    pub(crate) fn own_prop_contains(&self, value: &Value, key: &str) -> Option<bool> {
+        match value {
+            Value::Object(p) => self
+                .objects
+                .get(*p as usize)
+                .map(|o| o.map.contains_key(key)),
+            Value::Closure { ptr, .. } => Some(
+                self.closures
+                    .get(*ptr as usize)
+                    .and_then(|c| c.props.as_deref())
+                    .is_some_and(|bag| bag.contains_key(key)),
+            ),
+            _ => None,
+        }
     }
 
     /// Dispatch a `CallBuiltin`-shaped call that an `Object` receiver may
@@ -458,6 +789,14 @@ impl VM {
                     self.ip += 1;
                 }
                 Instr::PushFn(addr, ptr, _) => {
+                    // Const-fn canonical push (Step 2e): a const-fn declaration
+                    // is single-identity (one function object), so every
+                    // value-reference resolves to the *same* pre-allocated
+                    // canonical closure (`ptr` baked at load by
+                    // `for_program_with`). This keeps `F === F`, a shared
+                    // `.prototype`, and `new F() instanceof F` correct. Genuine
+                    // per-evaluation function values (expressions, non-const
+                    // decls) use `ClosureNew` instead, which allocates fresh.
                     self.stack.push(Value::Closure {
                         addr: *addr,
                         ptr: *ptr,
@@ -1340,27 +1679,15 @@ impl VM {
                 }
 
                 Instr::ObjGet(field) => {
-                    // Snapshot the field name as an owned `String` so the
-                    // `self.code` borrow from the `field` match binding is
-                    // released before the mutable `get_property` call.
-                    let field_str = field.as_str().to_owned();
-                    // Step 2b: `get_property` handles all receiver types
-                    // (Object/Array/Map/Set/RegExp/Closure/Builtin/Bound/
-                    // String/Number/Bool/Promise), walking the proto chain
-                    // with virtual rungs — folding the former
-                    // `resolve_closure_prototype`/`resolve_builtin_property`/
-                    // `resolve_property_from_top` into one body. Clone the
-                    // receiver (a refcount bump for strings/regexps, trivial
-                    // for others) so the `&mut self` call is borrow-clean.
+                    // Stack-shape adapter: receiver (peeked) → pop, push val.
+                    let key = Value::String(field.clone());
                     let recv = match self.stack.last() {
                         Some(r) => r.clone(),
                         None => {
                             return Err(self.fail(ErrorKind::StackUnderflow, "stack underflow"));
                         }
                     };
-                    let result = self.get_property(&recv, &field_str);
-                    // Pop the receiver (pop-first invariant: the operand is
-                    // consumed whether the read succeeded or errored).
+                    let result = self.get_property(&recv, &key);
                     self.stack.pop();
                     self.stack.push(result?);
                     self.ip += 1;
@@ -1370,364 +1697,161 @@ impl VM {
                 // receiver below it. Same resolution (own→proto chain) as
                 // ObjGet, shared helper. obj -> obj, any
                 Instr::ObjPeek(field) => {
-                    let field_str = field.as_str().to_owned();
-                    // Step 2b: use `get_property` (same as ObjGet) so all
-                    // receiver types resolve uniformly. The receiver stays
-                    // on the stack (peek, not pop).
+                    let key = Value::String(field.clone());
                     let recv = match self.stack.last() {
                         Some(r) => r.clone(),
                         None => {
                             return Err(self.fail(ErrorKind::StackUnderflow, "stack underflow"));
                         }
                     };
-                    let val = self.get_property(&recv, &field_str)?;
+                    let val = self.get_property(&recv, &key)?;
                     self.stack.push(val);
                     self.ip += 1;
                 }
 
                 // ObjGetDyn minus the obj-pop: `Pick(0); IndexGet` fused.
-                // Resolves the property via the same type dispatch as IndexGet
-                // (Array→int, Object→key, String→char) but keeps the container
-                // below the result. obj, key -> obj, value
+                // obj, key -> obj, value
                 Instr::ObjPeekDyn => {
                     let key = self.pop()?;
                     let container = self.stack.last().cloned().unwrap_or(Value::Undefined);
-                    let val = self.resolve_computed_property(&container, &key)?;
+                    let val = self.get_property(&container, &key)?;
                     self.stack.push(val);
                     self.ip += 1;
                 }
 
                 // Method/value read (Step 6): resolve a named property on the
-                // receiver, yielding a method (Builtin) for structural types
-                // or a data value for objects. Step 2c: unified — every arm
-                // funnels through `get_property`, which walks own properties
-                // (Object) or the type's prototype chain, and falls back to
-                // `method_for_receiver` when the builtin prototype map is
-                // empty (methods are virtual rungs for non-enumerability).
-                // The former per-arm `method_for_receiver`/`resolve_property_from_top`
-                // duplication is collapsed into the one ladder.
+                // receiver. Step 2e: now a thin adapter over `get_property`.
                 Instr::GetMethodOrProp(field) => {
-                    // Clone the field refcount to release the `self.code` borrow.
-                    let field = field.clone();
+                    let key = Value::String(field.clone());
                     let recv = match self.stack.last() {
                         Some(r) => r.clone(),
                         None => {
                             return Err(self.fail(ErrorKind::StackUnderflow, "stack underflow"));
                         }
                     };
-                    let result = self.get_property(&recv, &field)?;
+                    let result = self.get_property(&recv, &key)?;
                     self.stack.pop();
                     self.stack.push(result);
                     self.ip += 1;
                 }
 
                 Instr::ObjSet(field, mode) => {
-                    let field = field.clone();
+                    // Stack-shape adapter for named set. obj, val -> result.
+                    let key = Value::String(field.clone());
                     let mode = *mode;
                     let val = self.pop()?;
-                    // Peek the receiver to check type.
-                    match self.stack.last() {
-                        Some(Value::RegExp(r)) => {
-                            // `lastIndex` is writable (the `/g` cursor); every
-                            // other RegExp property is read-only and the write
-                            // is accepted silently.
-                            if field.as_str() == "lastIndex" {
-                                let n = val.to_number().unwrap_or(0.0);
-                                let n = if n.is_finite() && n >= 0.0 {
-                                    n as usize
-                                } else {
-                                    0
-                                };
-                                r.last_index.set(n);
-                            }
-                            let result = match mode {
-                                SetMode::Old => val,
-                                SetMode::New => val,
-                            };
-                            self.stack.pop();
-                            self.stack.push(result);
-                            self.ip += 1;
+                    let recv = match self.stack.last() {
+                        Some(r) => r.clone(),
+                        None => {
+                            return Err(self.fail(ErrorKind::StackUnderflow, "stack underflow"));
                         }
-                        Some(Value::Object(p)) => {
-                            let obj_ptr = *p;
-                            // Integrity gate (Step 2a): a Frozen object rejects
-                            // all writes; a Sealed object rejects new keys.
-                            // The value is already popped; on a violation pop
-                            // the receiver too (pop-first invariant, matching
-                            // the non-object error arm below).
-                            let (is_new, integrity) = {
-                                let obj = match self.objects.get(obj_ptr as usize) {
-                                    Some(o) => o,
-                                    _ => {
-                                        return Err(self.fail_not_resumable(
-                                            ErrorKind::TypeError,
-                                            "bad object pointer",
-                                        ));
-                                    }
-                                };
-                                (!obj.map.contains_key(&field), obj.integrity)
-                            };
-                            if integrity == IntegrityLevel::Frozen {
-                                self.stack.pop();
-                                return Err(self.fail(
-                                    ErrorKind::TypeError,
-                                    "cannot set a property of a frozen object",
-                                ));
-                            }
-                            if is_new
-                                && matches!(
-                                    integrity,
-                                    IntegrityLevel::NonExtensible | IntegrityLevel::Sealed
-                                )
-                            {
-                                self.stack.pop();
-                                return Err(self.fail(
-                                    ErrorKind::TypeError,
-                                    "cannot add a property to a non-extensible object",
-                                ));
-                            }
-                            let obj = match self.objects.get_mut(obj_ptr as usize) {
-                                Some(o) => o,
-                                _ => {
-                                    return Err(self.fail_not_resumable(
-                                        ErrorKind::TypeError,
-                                        "bad object pointer",
-                                    ));
-                                }
-                            };
-                            let result = match mode {
-                                SetMode::Old => {
-                                    let old =
-                                        obj.map.get(&field).cloned().unwrap_or(Value::Undefined);
-                                    if let Some(slot) = obj.map.get_mut(&field) {
-                                        *slot = val;
-                                    } else {
-                                        obj.map.insert(field, val);
-                                    }
-                                    old
-                                }
-                                SetMode::New => {
-                                    let result = val.clone();
-                                    if let Some(slot) = obj.map.get_mut(&field) {
-                                        *slot = val;
-                                    } else {
-                                        obj.map.insert(field, val);
-                                    }
-                                    result
-                                }
-                            };
-                            self.stack.pop();
-                            self.stack.push(result);
-                            self.ip += 1;
-                        }
-                        _ => {
-                            let recv = self.pop()?;
-                            let msg = format!(
-                                "cannot set property on {}{}",
-                                recv.type_name(),
-                                await_hint(&recv)
-                            );
-                            return Err(self.fail(ErrorKind::TypeError, msg));
-                        }
-                    }
+                    };
+                    let result = self.set_property(&recv, &key, val, mode);
+                    // Pop-first: consume the receiver regardless of outcome.
+                    self.stack.pop();
+                    self.stack.push(result?);
+                    self.ip += 1;
                 }
 
-                // Runtime-polymorphic computed read. Dispatch on the container
-                // type: array (int index), object (ToString key), or string
-                // (byte-offset char). A char result needs a fresh allocation, so
-                // it is computed under the heap borrow and allocated after.
+                // Runtime-polymorphic computed read.
                 Instr::IndexGet => {
                     let key = self.pop()?;
                     let container = self.pop()?;
-                    let val = self.resolve_computed_property(&container, &key)?;
+                    let val = self.get_property(&container, &key)?;
                     self.stack.push(val);
                     self.ip += 1;
                 }
 
-                // Runtime-polymorphic computed write. Arrays index by int (OOB or
-                // negative is an error — no hole-growing); objects key by the
-                // ToString'd key; strings are immutable (TypeError).
+                // Runtime-polymorphic computed write.
                 Instr::IndexSet(mode) => {
                     let mode = *mode;
                     let val = self.pop()?;
                     let key = self.pop()?;
                     let container = self.pop()?;
-                    let is_array = match &container {
-                        Value::Array(_) => true,
-                        Value::Object(_) => false,
-                        // Strings are immutable; closures aren't indexable.
-                        _ => {
-                            let msg = format!(
-                                "cannot index-set on {}{}",
-                                container.type_name(),
-                                await_hint(&container)
-                            );
-                            return Err(self.fail(ErrorKind::TypeError, msg));
-                        }
-                    };
-                    let old = if matches!(mode, SetMode::Old) {
-                        // Read the previous value before the write (for postfix
-                        // `++`/`--` on computed targets).
-                        if is_array {
-                            let idx = key
-                                .as_i64()
-                                .ok_or_else(|| self.fail(ErrorKind::TypeError, "type error"))?;
-                            if idx < 0 {
-                                return Err(self.fail(ErrorKind::ValueError, "value error"));
-                            }
-                            match &container {
-                                Value::Array(p) => self
-                                    .arrays
-                                    .get(*p as usize)
-                                    .and_then(|a| a.get(idx as usize).cloned())
-                                    .unwrap_or(Value::Undefined),
-                                _ => unreachable!(),
-                            }
-                        } else {
-                            let field = self.to_js_string(&key, 0);
-                            match &container {
-                                Value::Object(p) => self
-                                    .objects
-                                    .get(*p as usize)
-                                    .and_then(|o| o.map.get(field.as_str()).cloned())
-                                    .unwrap_or(Value::Undefined),
-                                _ => unreachable!(),
-                            }
-                        }
-                    } else {
-                        Value::Undefined // placeholder, unused
-                    };
-                    // The value left on the stack: the assigned value (`New`) or
-                    // the previous one (`Old`). Computed before the store, which
-                    // moves `val`; the clone is a refcount bump for strings.
-                    let result = match mode {
-                        SetMode::New => val.clone(),
-                        SetMode::Old => old,
-                    };
-                    if is_array {
-                        let idx = key
-                            .as_i64()
-                            .ok_or_else(|| self.fail(ErrorKind::TypeError, "type error"))?;
-                        if idx < 0 {
-                            return Err(self.fail(ErrorKind::ValueError, "value error"));
-                        }
-                        let idx = idx as usize;
-                        let p = match &container {
-                            Value::Array(p) => *p,
-                            _ => unreachable!(),
-                        };
-                        let ip = self.ip;
-                        let arr = self.arrays.get_mut(p as usize).ok_or_else(|| {
-                            VMError::fail_at(ip, ErrorKind::TypeError, "bad array pointer")
-                        })?;
-                        if idx >= arr.len() {
-                            let len = arr.len();
-                            return Err(self.fail(
-                                ErrorKind::ValueError,
-                                format!(
-                                    "cannot write array index {idx}: out of bounds (length {len})"
-                                ),
-                            ));
-                        }
-                        arr[idx] = val;
-                    } else {
-                        let field = self.to_js_string(&key, 0);
-                        let p = match &container {
-                            Value::Object(p) => *p,
-                            _ => unreachable!(),
-                        };
-                        // Integrity gate (Step 2a): Frozen rejects all
-                        // writes; Sealed rejects new keys. All operands
-                        // (val+key+container) are already popped.
-                        let (is_new, integrity) = match self.objects.get(p as usize) {
-                            Some(o) => (!o.map.contains_key(field.as_str()), o.integrity),
-                            None => (true, IntegrityLevel::Extensible),
-                        };
-                        if integrity == IntegrityLevel::Frozen {
-                            return Err(self.fail(
-                                ErrorKind::TypeError,
-                                "cannot set a property of a frozen object",
-                            ));
-                        }
-                        if is_new
-                            && matches!(
-                                integrity,
-                                IntegrityLevel::NonExtensible | IntegrityLevel::Sealed
-                            )
-                        {
-                            return Err(self.fail(
-                                ErrorKind::TypeError,
-                                "cannot add a property to a non-extensible object",
-                            ));
-                        }
-                        let ip = self.ip;
-                        let obj = self.objects.get_mut(p as usize).ok_or_else(|| {
-                            VMError::fail_at(ip, ErrorKind::TypeError, "bad object pointer")
-                        })?;
-                        obj.map.insert(field, val);
-                    }
+                    let result = self.set_property(&container, &key, val, mode)?;
                     self.stack.push(result);
                     self.ip += 1;
                 }
 
                 Instr::ObjHas => {
+                    // `key in obj` — obj, str -> bool.
                     let field = self.pop_string()?;
-                    let obj_ptr =
-                        match self.stack.pop().ok_or_else(|| {
-                            self.fail(ErrorKind::StackUnderflow, "stack underflow")
-                        })? {
-                            Value::Object(p) => p,
-                            _ => return Err(self.fail(ErrorKind::TypeError, "type error")),
-                        };
-                    let has = !matches!(
-                        self.resolve_proto_chain(obj_ptr, field.as_str())?,
-                        Value::Undefined
-                    );
-                    self.stack.push(Value::Bool(has));
+                    let recv = self
+                        .stack
+                        .pop()
+                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
+                    let key = Value::String(field);
+                    // has_property: read that asks presence, not value.
+                    let val = self.get_property(&recv, &key)?;
+                    self.stack
+                        .push(Value::Bool(!matches!(val, Value::Undefined)));
                     self.ip += 1;
                 }
 
                 Instr::ObjDelete => {
+                    // `delete obj[key]` — obj, str -> bool.
                     let field = self.pop_string()?;
-                    let obj_ptr =
-                        match self.stack.pop().ok_or_else(|| {
-                            self.fail(ErrorKind::StackUnderflow, "stack underflow")
-                        })? {
-                            Value::Object(p) => p,
-                            _ => return Err(self.fail(ErrorKind::TypeError, "type error")),
-                        };
-                    // Integrity gate (Step 2a): Frozen and Sealed both
-                    // forbid delete. Both operands (field + object) are
-                    // already popped, so this is pop-first normalized.
-                    let integrity = self
-                        .objects
-                        .get(obj_ptr as usize)
-                        .map_or(IntegrityLevel::Extensible, |o| o.integrity);
-                    if matches!(integrity, IntegrityLevel::Frozen | IntegrityLevel::Sealed) {
-                        return Err(self.fail(
-                            ErrorKind::TypeError,
-                            "cannot delete a property of a frozen or sealed object",
-                        ));
-                    }
-                    // shift_remove keeps the remaining keys in insertion order.
-                    let ip = self.ip;
-                    let existed = self
-                        .objects
-                        .get_mut(obj_ptr as usize)
-                        .ok_or_else(|| {
-                            VMError::fail_at(ip, ErrorKind::TypeError, "bad object pointer")
-                        })?
-                        .map
-                        .shift_remove(field.as_str())
-                        .is_some();
+                    let recv = self
+                        .stack
+                        .pop()
+                        .ok_or_else(|| self.fail(ErrorKind::StackUnderflow, "stack underflow"))?;
+                    let existed = match &recv {
+                        Value::Object(p) => {
+                            let obj_ptr = *p;
+                            let integrity = self
+                                .objects
+                                .get(obj_ptr as usize)
+                                .map_or(IntegrityLevel::Extensible, |o| o.integrity);
+                            if matches!(integrity, IntegrityLevel::Frozen | IntegrityLevel::Sealed)
+                            {
+                                return Err(self.fail(
+                                    ErrorKind::TypeError,
+                                    "cannot delete a property of a frozen or sealed object",
+                                ));
+                            }
+                            let ip = self.ip;
+                            self.objects
+                                .get_mut(obj_ptr as usize)
+                                .ok_or_else(|| {
+                                    VMError::fail_at(ip, ErrorKind::TypeError, "bad object pointer")
+                                })?
+                                .map
+                                .shift_remove(field.as_str())
+                                .is_some()
+                        }
+                        Value::Closure { ptr, .. } => {
+                            let ip = self.ip;
+                            let c = match self.closures.get_mut(*ptr as usize) {
+                                Some(c) => c,
+                                _ => {
+                                    return Err(VMError::fail_at(
+                                        ip,
+                                        ErrorKind::TypeError,
+                                        "bad closure pointer",
+                                    ));
+                                }
+                            };
+                            if let Some(ref mut bag) = c.props {
+                                bag.shift_remove(field.as_str()).is_some()
+                            } else {
+                                false
+                            }
+                        }
+                        // Non-extensible types: delete returns false (JS).
+                        _ => false,
+                    };
                     self.stack.push(Value::Bool(existed));
                     self.ip += 1;
                 }
 
                 Instr::ObjExtend => {
+                    // `Object.assign`-style: copy own props of src into obj.
+                    // obj, src -> obj. Only Object receivers; null/undefined
+                    // src is a no-op.
                     let src = self.pop()?;
-                    let obj_ptr = match self.pop()? {
-                        Value::Object(p) => p,
+                    let recv = self.pop()?;
+                    let obj_ptr = match &recv {
+                        Value::Object(p) => *p,
                         _ => {
                             return Err(self.fail(
                                 ErrorKind::TypeError,
@@ -1735,9 +1859,6 @@ impl VM {
                             ));
                         }
                     };
-                    // Integrity gate (Step 2d): NonExtensible/Sealed/Frozen
-                    // objects reject new properties, and ObjExtend always
-                    // adds (never overwrites in place).
                     let integrity = self
                         .objects
                         .get(obj_ptr as usize)
@@ -1748,14 +1869,11 @@ impl VM {
                             "cannot extend a non-extensible object",
                         ));
                     }
-                    // null/undefined src is a no-op (JS semantics).
-                    // Non-object, non-null/undefined src is TypeError
-                    // (divergence: JS would copy index keys from arrays/strings).
                     let ip = self.ip;
                     match src {
                         Value::Null | Value::Undefined => {}
                         Value::Object(src_ptr) => {
-                            let entries: SmallVec<[(FieldName, Value); 8]> = self
+                            let entries: SmallVec<[(RcStr, Value); 8]> = self
                                 .objects
                                 .get(src_ptr as usize)
                                 .ok_or_else(|| {
@@ -1777,7 +1895,7 @@ impl VM {
                             ));
                         }
                     }
-                    self.stack.push(Value::Object(obj_ptr));
+                    self.stack.push(recv);
                     self.ip += 1;
                 }
 

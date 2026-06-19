@@ -38,18 +38,14 @@ impl super::Compiler {
                     && let Some(slot) = self.binding_slot(id.span.start)
                 {
                     let span = f.span.start;
-                    if captures.is_empty() {
-                        self.emit(Instr::PushFn(label, u32::MAX, js_length), span);
-                    } else {
-                        self.emit(
-                            Instr::ClosureNew(
-                                label,
-                                js_length,
-                                captures.iter().map(|&c| c as LocalIndex).collect(),
-                            ),
-                            span,
-                        );
-                    }
+                    self.emit(
+                        Instr::ClosureNew(
+                            label,
+                            js_length,
+                            captures.iter().map(|&c| c as LocalIndex).collect(),
+                        ),
+                        span,
+                    );
                     self.emit(Instr::SetLocal(slot as LocalIndex), span);
                 }
             }
@@ -197,26 +193,25 @@ impl super::Compiler {
         true
     }
 
-    /// Push a function value: a bare `Fn` when it captures nothing, else a
-    /// `MakeClosure` over its capture list.
+    /// Push a function value via `ClosureNew` — one instruction for both
+    /// capturing and non-capturing functions (an empty capture list is the
+    /// non-capturing case). Step 2e: each evaluation allocates a fresh
+    /// closure at runtime, giving JS per-instance identity (`PushFn`, the
+    /// former zero-alloc canonical-closure special case, is folded away).
     pub(super) fn emit_closure_value(&mut self, scope_id: usize, span: u32) {
         let (label, captures, js_length) = {
             let analysis = self.analysis.as_ref().expect("analysis present");
             let child = &analysis.scopes[scope_id];
             (child.label, child.captures.clone(), child.js_length())
         };
-        if captures.is_empty() {
-            self.emit(Instr::PushFn(label, u32::MAX, js_length), span);
-        } else {
-            self.emit(
-                Instr::ClosureNew(
-                    label,
-                    js_length,
-                    captures.iter().map(|&c| c as LocalIndex).collect(),
-                ),
-                span,
-            );
-        }
+        self.emit(
+            Instr::ClosureNew(
+                label,
+                js_length,
+                captures.iter().map(|&c| c as LocalIndex).collect(),
+            ),
+            span,
+        );
     }
 
     /// Emit a function body: jump-over guard, entry label, prologue
@@ -412,7 +407,10 @@ impl super::Compiler {
         // (static self-recursion), so the self-slot is dead — skip the setup.
         if self_name.is_some() && !self.is_const_fn_scope(scope_id) {
             let self_slot = frame_abs(own_local_count, nparams, upval_count);
-            self.emit(Instr::PushFn(label, u32::MAX, js_length), span);
+            self.emit(
+                Instr::ClosureNew(label, js_length, thin_vec::ThinVec::new()),
+                span,
+            );
             self.emit(Instr::SetLocal(self_slot as LocalIndex), span);
         }
 

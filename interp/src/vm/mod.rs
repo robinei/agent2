@@ -609,11 +609,18 @@ pub enum ThrowOutcome {
 /// without dereferencing this entry; this entry is read only by `EnterFrame`
 /// to install upvals (and only when the callee's static upval count > 0) and
 /// by `GetLength` for `fn.length`.
+///
+/// Step 2e: `props` is the inline own-property bag — `Option<Box<…>>` so a
+/// function without user props (the common case) pays one `is_none()` branch
+/// on a named-access miss only, never an allocation. `name`/`length`/
+/// `prototype` are virtual rungs resolved by `get_property`; they materialize
+/// into the bag only on reassign (`f.name = "x"`).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Closure {
     pub upvals: ThinVec<Value>,
     pub prototype: Option<ObjectPtr>,
     pub arity: u16,
+    pub props: Option<Box<IndexMap<RcStr, Value>>>,
 }
 
 /// A bound function value produced by `f.bind(thisArg, ...args)` — the only

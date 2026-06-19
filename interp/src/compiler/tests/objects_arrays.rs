@@ -611,6 +611,54 @@ fn has_own_property_is_shadowed_like_every_other_method() {
     );
 }
 
+/// Step 2e: a function is an extensible object — user props live in its
+/// inline `Closure.props` bag, and the reflection builtins enumerate that bag.
+/// `Object.keys`/`values`/`entries` and `hasOwnProperty`/`Object.hasOwn` all
+/// route through one own-prop accessor, so they see a function's user props
+/// while excluding the virtual `name`/`length`/`prototype` rungs (which are
+/// not stored in the bag).
+#[test]
+fn function_own_props_are_reflectable() {
+    // Object.keys over a function returns its user props, in insertion order.
+    assert_eq!(
+        testutil::run_val("function f(){} f.b = 1; f.a = 2; return Object.keys(f).join(',');"),
+        Value::String("b,a".into())
+    );
+    // Virtual rungs are non-enumerable: no user props ⇒ empty.
+    assert_eq!(
+        testutil::run_val("function f(){} return Object.keys(f).length;"),
+        testutil::num(0.0)
+    );
+    // Object.values / entries see the same bag.
+    assert_eq!(
+        testutil::run_val("function f(){} f.x = 7; f.z = 9; return Object.values(f).join(',');"),
+        Value::String("7,9".into())
+    );
+    assert_eq!(
+        testutil::run_val("function f(){} f.x = 7; return Object.entries(f).length;"),
+        testutil::num(1.0)
+    );
+    // hasOwnProperty / Object.hasOwn over a function: user prop is own…
+    assert_eq!(
+        testutil::run_val("function f(){} f.x = 1; return f.hasOwnProperty('x');"),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        testutil::run_val("function f(){} f.x = 1; return Object.hasOwn(f, 'x');"),
+        Value::Bool(true)
+    );
+    // …a missing prop is not…
+    assert_eq!(
+        testutil::run_val("function f(){} return f.hasOwnProperty('x');"),
+        Value::Bool(false)
+    );
+    // …and a virtual rung is not an *own* (enumerable) property.
+    assert_eq!(
+        testutil::run_val("function f(){} return f.hasOwnProperty('prototype');"),
+        Value::Bool(false)
+    );
+}
+
 /// Shadowing is uniform across every receiver type that routes through a
 /// `*_receiver` getter: map (`map_receiver`), set (`set_receiver`), regexp
 /// (`regexp_receiver`), and the polymorphic string/array methods. An own
@@ -878,11 +926,21 @@ fn computed_method_call_binds_this() {
 }
 
 #[test]
-fn computed_method_builtin_name_gives_undefined() {
-    // arr['push'](x) — builtins are not stored properties, so the read yields undefined
-    // and the call fails with "not a function".
-    let err = testutil::run_runtime_err("const arr = [1,2]; return arr['push'](3);");
-    assert_eq!(err.kind, ErrorKind::TypeError);
+fn computed_method_builtin_name_resolves_via_ladder() {
+    // arr['push'](x) — Step 2e: a computed read funnels through the one
+    // `get_property` ladder, which resolves a builtin method name on the type
+    // prototype just like a dotted `arr.push`. So `arr['push']` is the push
+    // method and `arr['push'](3)` mutates the array and returns the new length
+    // (3), matching JS — the former "computed reads don't resolve builtins"
+    // divergence is retired.
+    assert_eq!(
+        testutil::run_val("const arr = [1,2]; return arr['push'](3);"),
+        Value::PosInt(3)
+    );
+    assert_eq!(
+        testutil::run_val("const arr = [1,2]; arr['push'](3); return arr.length;"),
+        testutil::num(3.0)
+    );
 }
 
 #[test]

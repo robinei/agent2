@@ -307,11 +307,15 @@ impl VM {
         attachments: serde_json::Value,
     ) -> Result<Self, VMError> {
         let mut vm = VM::new(program.code);
-        // Allocate one canonical `Closure` per unique `PushFn` code address
-        // for non-capturing functions, so that `f === f` holds (same ptr every
-        // push). The ptr is baked into the instruction; no runtime addr→ptr map.
-        // The JS arity (for `fn.length`, Step 6) is also baked into the
-        // instruction and stored on the heap `Closure` here.
+        // Allocate one canonical `Closure` per unique `PushFn` code address.
+        // `PushFn` is emitted only for **const-fns** (Step 2e), which are
+        // single-identity: a `function F(){}` declaration is one function
+        // object, so every value-reference must resolve to the same `ptr`
+        // (baked into the instruction here; no runtime addr→ptr map). This is
+        // what keeps `F === F`, a shared `.prototype`, and `new F() instanceof
+        // F` correct. Genuine per-evaluation function values (expressions,
+        // non-const declarations, capturing closures) use `ClosureNew`, which
+        // allocates a fresh entry each time for JS per-instance identity.
         {
             let mut canonical: std::collections::HashMap<CodeAddr, ClosurePtr> =
                 std::collections::HashMap::new();
@@ -323,6 +327,7 @@ impl VM {
                             upvals: ThinVec::new(),
                             prototype: None,
                             arity: *arity,
+                            props: None,
                         });
                         idx
                     });
@@ -1432,6 +1437,7 @@ impl VM {
             upvals,
             prototype: None,
             arity,
+            props: None,
         });
         Value::Closure { addr, ptr: idx }
     }

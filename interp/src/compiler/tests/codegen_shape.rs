@@ -323,12 +323,18 @@ fn const_only_closure_demotes_to_fn() {
 
 #[test]
 fn const_only_closure_in_loop_demotes_to_fn() {
-    // The `map` callback references only a literal const → no per-iteration
-    // closure allocation (bare `Fn`, not `MakeClosure`).
+    // The `map` callback references only a literal const, so it captures
+    // nothing: it demotes from a capturing closure to an **empty-capture**
+    // `ClosureNew` (Step 2e: an anonymous non-const function value allocates a
+    // fresh closure per evaluation — option (b) — but with no captures, so no
+    // per-iteration capture cost). The point of the test is the empty capture
+    // list (vs. a closure capturing the loop var), not the instruction.
     let prog = compile("const f = 2; input.r = [1, 2, 3].map(x => x * f);").expect("ok");
     assert!(
-        !prog.code.iter().any(|i| matches!(i, Instr::ClosureNew(..))),
-        "callback over a const should not allocate a closure: {:?}",
+        prog.code
+            .iter()
+            .any(|i| matches!(i, Instr::ClosureNew(_, _, caps) if caps.is_empty())),
+        "callback over a const should be an empty-capture ClosureNew: {:?}",
         prog.code
     );
     let vm = run_program(prog);
@@ -433,6 +439,9 @@ fn self_recursion_is_static_with_no_slot() {
 fn function_passed_as_value_is_fn_constant() {
     let prog =
         compile("function dbl(x){ return x * 2; } input.r = [1, 2, 3].map(dbl);").expect("ok");
+    // A const-fn (never reassigned, single identity) is emitted as `PushFn`,
+    // which resolves to its one canonical closure (Step 2e keeps `PushFn` for
+    // const-fns; only per-evaluation function values use `ClosureNew`).
     assert!(prog.code.iter().any(|i| matches!(i, Instr::PushFn(..))));
     assert!(!prog.code.iter().any(|i| matches!(i, Instr::ClosureNew(..))));
     let vm = run_program(prog);

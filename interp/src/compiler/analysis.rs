@@ -74,11 +74,15 @@ impl super::Compiler {
                 Value::Float(f) => Instr::PushFloat(f),
                 _ => unreachable!("f64_to_value yields an int or float"),
             },
-            // A constant function (Phase F): its value is its code address,
-            // with the canonical closure ptr patched during `for_program_with`.
+            // A constant function (Phase F): a const-fn is single-identity, so
+            // it is pushed via `PushFn`, which resolves to the one canonical
+            // closure for this address (allocated by `for_program_with`). Every
+            // value-reference to the const-fn is the same object — required for
+            // `F === F`, a shared `.prototype`, and `new F() instanceof F`.
+            // (Genuine per-evaluation function values use `ClosureNew`.)
             ConstValue::Fn {
                 label, js_length, ..
-            } => Instr::PushFn(*label, 0, *js_length),
+            } => Instr::PushFn(*label, u32::MAX, *js_length),
         }
     }
 

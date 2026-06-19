@@ -2,6 +2,7 @@ use crate::builtin::Builtin;
 use crate::testutil;
 use crate::vm::instr::Instr::*;
 use crate::vm::*;
+use thin_vec::ThinVec;
 
 // ── harness ──────────────────────────────────────────────────
 
@@ -952,13 +953,17 @@ fn call_dyn_bad_addr() {
 
 #[test]
 fn fn_value_equality_and_json() {
-    // Same address -> equal; different -> not.
+    // Step 2e: function identity follows JS — each evaluation of a function
+    // literal produces a distinct closure object, so two `ClosureNew`s over
+    // the same body address are `!==` (formerly `===` under the canonical
+    // zero-alloc scheme). The body address (2) is a no-op `Return` here; the
+    // closures are only compared, never called.
     assert_eq!(
-        run(vec![PushFn(3, u32::MAX, 0), PushFn(3, u32::MAX, 0), Eq]),
-        vec![b(true)]
-    );
-    assert_eq!(
-        run(vec![PushFn(3, u32::MAX, 0), PushFn(4, u32::MAX, 0), Eq]),
+        run(vec![
+            ClosureNew(2, 0, ThinVec::new()),
+            ClosureNew(2, 0, ThinVec::new()),
+            Eq,
+        ]),
         vec![b(false)]
     );
 }
@@ -1585,6 +1590,7 @@ fn typeof_tags() {
             Value::PosInt(u) => PushPosInt(*u),
             Value::NegInt(i) => PushNegInt(*i),
             Value::Closure { addr, .. } => PushFn(*addr, u32::MAX, 0),
+            Value::Builtin(b) => PushBuiltin(*b),
             _ => panic!("unexpected stack value"),
         };
         let out = run(vec![instr, TypeOf, ps(tag), Eq]);
@@ -2017,10 +2023,14 @@ fn negative_integers_are_negint_and_roundtrip() {
 }
 
 #[test]
-fn posint_too_large_for_index_errors() {
-    // A PosInt beyond i64::MAX can't be an array index -> error, no panic.
+fn posint_too_large_for_index_is_undefined() {
+    // A PosInt beyond i64::MAX can't be a valid array index. Step 2e: the
+    // unified read ladder treats an out-of-range index as a missing property
+    // and yields `undefined` (matching JS, where `arr[hugeIndex]` is
+    // `undefined`, not a throw), instead of the former TypeError divergence.
+    // The load-bearing guarantee — no panic on an oversized index — still holds.
     let code = vec![PushFloat(1.0), ArrNew(1), PushPosInt(u64::MAX), IndexGet];
-    assert!(matches!(run_err(code).kind, ErrorKind::TypeError));
+    assert_eq!(run(code), vec![undef()]);
 }
 
 #[test]

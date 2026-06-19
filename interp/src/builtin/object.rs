@@ -31,55 +31,37 @@ pub fn object_ctor(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     }
 }
 
-/// `Object.keys(obj)` → array of strings.
+/// `Object.keys(obj)` → array of own enumerable string keys. Step 2e: reads
+/// the unified own-prop snapshot, so it also enumerates a **function's** user
+/// props (excluding the virtual `name`/`length`/`prototype` rungs), not just
+/// plain objects.
 pub fn obj_keys(vm: &mut VM, args: Args) -> Result<Value, VMError> {
-    let obj_ptr = match args.get(vm, 0) {
-        Value::Object(p) => *p,
-        _ => return Err(vm.fail(ErrorKind::TypeError, "type error")),
-    };
-    let keys: Vec<RcStr> = {
-        let obj = vm
-            .objects
-            .get(obj_ptr as usize)
-            .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?;
-        obj.map.keys().cloned().collect()
-    };
-    let arr: ThinVec<Value> = keys.into_iter().map(Value::String).collect();
+    let recv = args.get(vm, 0).clone();
+    let props = vm
+        .own_enumerable_props(&recv)
+        .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?;
+    let arr: ThinVec<Value> = props.into_iter().map(|(k, _)| Value::String(k)).collect();
     Ok(vm.alloc_array(arr))
 }
 
-/// `Object.values(obj)` → array of values.
+/// `Object.values(obj)` → array of own enumerable values (Object map or a
+/// function's `props` bag — see [`obj_keys`]).
 pub fn obj_values(vm: &mut VM, args: Args) -> Result<Value, VMError> {
-    let obj_ptr = match args.get(vm, 0) {
-        Value::Object(p) => *p,
-        _ => return Err(vm.fail(ErrorKind::TypeError, "type error")),
-    };
-    let vals: ThinVec<Value> = {
-        let obj = vm
-            .objects
-            .get(obj_ptr as usize)
-            .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?;
-        obj.map.values().cloned().collect()
-    };
+    let recv = args.get(vm, 0).clone();
+    let props = vm
+        .own_enumerable_props(&recv)
+        .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?;
+    let vals: ThinVec<Value> = props.into_iter().map(|(_, v)| v).collect();
     Ok(vm.alloc_array(vals))
 }
 
-/// `Object.entries(obj)` → array of [key, value] pairs.
+/// `Object.entries(obj)` → array of [key, value] pairs (Object map or a
+/// function's `props` bag — see [`obj_keys`]).
 pub fn obj_entries(vm: &mut VM, args: Args) -> Result<Value, VMError> {
-    let obj_ptr = match args.get(vm, 0) {
-        Value::Object(p) => *p,
-        _ => return Err(vm.fail(ErrorKind::TypeError, "type error")),
-    };
-    let pairs: Vec<(RcStr, Value)> = {
-        let obj = vm
-            .objects
-            .get(obj_ptr as usize)
-            .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?;
-        obj.map
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect()
-    };
+    let recv = args.get(vm, 0).clone();
+    let pairs = vm
+        .own_enumerable_props(&recv)
+        .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?;
     let mut result: ThinVec<Value> = ThinVec::with_capacity(pairs.len());
     for (k, v) in pairs {
         let pair: ThinVec<Value> = vec![Value::String(k), v].into();
@@ -155,16 +137,12 @@ pub fn obj_assign(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 /// property `key`. Since there is no prototype chain in this dialect,
 /// this is equivalent to `key in obj`.
 pub fn obj_has_own(vm: &mut VM, args: Args) -> Result<Value, VMError> {
-    let obj_ptr = match args.get(vm, 0) {
-        Value::Object(p) => *p,
-        _ => return Err(vm.fail(ErrorKind::TypeError, "type error")),
-    };
+    let recv = args.get(vm, 0).clone();
     let key = vm.to_js_string(args.get(vm, 1), 0);
-    let obj = vm
-        .objects
-        .get(obj_ptr as usize)
-        .ok_or_else(|| vm.fail(ErrorKind::ValueError, "value error"))?;
-    Ok(Value::Bool(obj.map.contains_key(key.as_str())))
+    let has = vm
+        .own_prop_contains(&recv, key.as_str())
+        .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?;
+    Ok(Value::Bool(has))
 }
 
 /// `obj.hasOwnProperty(key)` → bool. Instance version of `Object.hasOwn`.
@@ -175,16 +153,12 @@ pub fn obj_has_own(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 /// Object-receiver path consults `resolve_method_for_object_receiver` for
 /// every method name, not a whitelist.
 pub fn obj_has_own_property(vm: &mut VM, args: Args) -> Result<Value, VMError> {
-    let obj_ptr = match args.get(vm, 0) {
-        Value::Object(p) => *p,
-        _ => return Err(vm.fail(ErrorKind::TypeError, "type error")),
-    };
+    let recv = args.get(vm, 0).clone();
     let key = vm.to_js_string(args.get(vm, 1), 0);
-    let obj = vm
-        .objects
-        .get(obj_ptr as usize)
-        .ok_or_else(|| vm.fail(ErrorKind::ValueError, "value error"))?;
-    Ok(Value::Bool(obj.map.contains_key(key.as_str())))
+    let has = vm
+        .own_prop_contains(&recv, key.as_str())
+        .ok_or_else(|| vm.fail(ErrorKind::TypeError, "type error"))?;
+    Ok(Value::Bool(has))
 }
 
 /// `Object.create(proto [, properties])` — creates a new object with

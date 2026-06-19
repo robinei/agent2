@@ -136,7 +136,7 @@ pub enum Instr {
     PushStr(RcStr),                    // () -> str
     PushArray(ArrayPtr),               // () -> arr
     PushObject(ObjectPtr),             // () -> obj
-    PushFn(CodeAddr, ClosurePtr, u16), // () -> fn (u16 = JS arity for fn.length)
+    PushFn(CodeAddr, ClosurePtr, u16), // () -> fn ; const-fn canonical push (u16 = JS arity for fn.length)
     PushBuiltin(Builtin),              // () -> builtin
     /// Push a global namespace object (`Math`, `JSON`) — a frozen, non-callable
     /// `Value::Object` lazily allocated by the VM. The reflective/value path for

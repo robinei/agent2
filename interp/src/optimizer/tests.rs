@@ -1,6 +1,7 @@
 use super::*;
 use crate::builtin::Builtin;
 use crate::vm::RcStr;
+use thin_vec::ThinVec;
 
 fn s0(n: usize) -> Vec<u32> {
     vec![0u32; n]
@@ -243,7 +244,7 @@ fn cfg_collapses_chain_of_empty_blocks() {
 #[test]
 fn cfg_keeps_call_referenced_block() {
     let code = vec![
-        Instr::PushFn(0, u32::MAX, 0),
+        Instr::ClosureNew(0, 0, ThinVec::new()),
         Instr::Pop(1),
         Instr::Return(0),
         Instr::Label(0),
