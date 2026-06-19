@@ -7,7 +7,8 @@ pub mod value;
 pub use crate::rc_str::RcStr;
 pub use instr::{
     ArrayPtr, CellIndex, ClosurePtr, CodeAddr, FieldName, GlobalId, Instr, LocalIndex, MapPtr,
-    ObjectPtr, PromisePtr, SetMode, SetPtr, SlotKind, StackAddr, TypeTag, UpdateMode,
+    ObjectPtr, PromisePtr, SetMode, SetPtr, SlotKind, StackAddr, TypePrototype, TypeTag,
+    UpdateMode,
 };
 pub use value::Value;
 pub(crate) use value::{MapKey, float_is_int, js_number_to_string};
@@ -428,16 +429,18 @@ pub struct VM {
     /// entries) for `VM::new` programs; the introspection accessors
     /// degrade gracefully.
     pub debug: crate::debuginfo::DebugTable,
-    /// Per-type frozen builtin prototype side table (Step 2a), indexed by
-    /// `TypeTag as usize`. `None` until first reflective touch (lazy), so
-    /// startup and the hot path pay nothing — `Vec::new()` at construction
-    /// is zero-alloc and the table grows only when a prototype is actually
-    /// consulted. The prototype itself is a frozen `ObjData` with
-    /// `kind: BuiltinPrototype` (no JSON form) and an empty `map` (methods
-    /// are virtual rungs resolved from the `builtins!` registry, not
-    /// materialized — Step 2a Part 2's enumerability requirement). All
-    /// prototypes chain to `Object.prototype` (which chains to `null`).
-    pub prototypes: Vec<Option<ObjectPtr>>,
+    /// Per-type frozen builtin prototype side table (Step 2a, 3), indexed by
+    /// `TypeTag as usize`. Each entry holds the lazily-allocated prototype
+    /// object and the `overridden` mutability-seam flag (Step 3). `None`
+    /// prototype ptr until first reflective touch (lazy), so startup and the
+    /// hot path pay nothing — `Vec::new()` at construction is zero-alloc and
+    /// the table grows only when a prototype is actually consulted. The
+    /// prototype itself is a frozen `ObjData` with `kind: BuiltinPrototype`
+    /// (no JSON form) and an empty `map` (methods are virtual rungs resolved
+    /// from the `builtins!` registry, not materialized — Step 2a Part 2's
+    /// enumerability requirement). All prototypes chain to `Object.prototype`
+    /// (which chains to `null`).
+    pub prototypes: Vec<TypePrototype>,
     /// Per-namespace frozen object side table (Step 2a Part 2), indexed by
     /// `GlobalId as usize`. `None` until first reflective touch (lazy), so
     /// the bare identifier `Math` and the fast path `Math.max(…)` pay

@@ -113,6 +113,35 @@ impl TypeTag {
     }
 }
 
+/// A single entry in the per-type builtin prototype side table
+/// (`VM::prototypes`, indexed by `TypeTag as usize`). Holds the lazily-allocated
+/// frozen prototype object ptr and the mutability seam flag (Step 3).
+///
+/// ## The `overridden` seam — forward-compatible mutability
+///
+/// `overridden` defaults to `false`. While `false`, the compiler's `CallBuiltin` is
+/// permanently valid — no guard branch is emitted and no runtime check runs. The
+/// frozen prototype guarantee makes the compiled method selection an inline cache
+/// that never invalidates.
+///
+/// **Thaw path (specified, not yet implemented):** when a builtin prototype is
+/// eventually mutated (descriptor write, `delete`, `setPrototypeOf`),
+/// set its `overridden` flag to `true`. The `CallBuiltin` instruction gains a V8-style
+/// guard: `if overridden[type] { proto-walk } else { CallBuiltin }` — a single
+/// predictable branch, taken only for types the program *actually* patches.
+/// Prototypes remain frozen (write → `TypeError`) until the corpus shows a real
+/// need, so today `overridden` is read nowhere on the hot path. This struct is the
+/// cheap seam that keeps a later thaw a localized change rather than a redesign.
+#[derive(Clone, Debug, Default)]
+pub struct TypePrototype {
+    /// The lazily-allocated frozen prototype object, or `None` if never
+    /// reflectively touched.
+    pub ptr: Option<ObjectPtr>,
+    /// Forward-compatibility flag for monkeypatchable builtins (Step 3).
+    /// `false` means the frozen `CallBuiltin` IC is permanently valid.
+    pub overridden: bool,
+}
+
 /// A global builtin value identifier for `Instr::PushGlobal` (Step 2a Part 2).
 /// Covers the non-callable namespace objects (`Math`, `JSON`) — frozen plain
 /// `Value::Object`s the VM lazily allocates from a side table. Constructor

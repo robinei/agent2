@@ -1190,10 +1190,16 @@ impl VM {
     /// (`self.prototypes`, indexed by `TypeTag as usize`) caches the ptr so
     /// repeated calls return the same object — identity matters for
     /// `Object.getPrototypeOf([]) === Array.prototype`.
+    ///
+    /// The `TypePrototype::overridden` flag (Step 3) is initialized to
+    /// `false` (the `TypePrototype::default`) — no guard branch is emitted
+    /// on the hot path while prototypes are frozen.
     pub fn prototype_for(&mut self, tag: crate::vm::instr::TypeTag) -> Result<ObjectPtr, VMError> {
         let idx = tag as usize;
-        if let Some(Some(p)) = self.prototypes.get(idx) {
-            return Ok(*p);
+        if let Some(entry) = self.prototypes.get(idx)
+            && let Some(p) = entry.ptr
+        {
+            return Ok(p);
         }
         // Object.prototype is the root: proto = None. Every other prototype
         // chains to it, so allocate it first (recursively, but the recursion
@@ -1213,16 +1219,16 @@ impl VM {
         // Grow the side table to fit this index (lazy: starts empty).
         if idx >= self.prototypes.len() {
             self.prototypes
-                .resize(crate::vm::instr::TypeTag::COUNT, None);
+                .resize(crate::vm::instr::TypeTag::COUNT, Default::default());
         }
-        self.prototypes[idx] = Some(ptr);
+        self.prototypes[idx].ptr = Some(ptr);
         Ok(ptr)
     }
 
     /// Read-only peek at a prototype's `ObjectPtr` if already allocated, or
     /// `None` if it has not been lazily materialized yet. Does *not* allocate.
     pub fn prototype_ptr(&self, tag: crate::vm::instr::TypeTag) -> Option<ObjectPtr> {
-        self.prototypes.get(tag as usize).copied().flatten()
+        self.prototypes.get(tag as usize).and_then(|tp| tp.ptr)
     }
 
     // ── Step 2a Part 2: namespace objects + native constructors ──────────

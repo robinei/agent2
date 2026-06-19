@@ -1000,12 +1000,12 @@ later thaw is a localized change, not a redesign.
   mutable phase is a known, small diff rather than a fork in the road.
 
 Acceptance:
-- [ ] The `overridden` flag exists, defaults `false`, and is read nowhere
+- [x] The `overridden` flag exists, defaults `false`, and is read nowhere
       on the hot path (no guard branch emitted while frozen).
-- [ ] A doc comment at the table + a ledger entry specify the thaw path
+- [x] A doc comment at the table + a ledger entry specify the thaw path
       (set flag on mutation → guarded dispatch) so it is forward-compatible.
-- [ ] No behavior change; prototypes remain frozen; suite + corpus green.
-- [ ] Gate: `cargo fmt && cargo clippy --workspace --all-targets && cargo test`.
+- [x] No behavior change; prototypes remain frozen; suite + corpus green.
+- [x] Gate: `cargo fmt && cargo clippy --workspace --all-targets && cargo test`.
 
 ## Step 4+ — corpus-gated compat tiers (sketch, not yet specified)
 
@@ -1089,6 +1089,16 @@ rather than silently tolerated:
   monkeypatchable" fact that already makes a write to `Array.prototype`
   throw, now observable through `isFrozen` too. **Auto-resolves when Step 3
   thaws** (extensible builtin prototypes → `isFrozen` reports `false`).
+- **Builtin prototypes are frozen with an `overridden` mutability seam** —
+  Step 3. The per-type side table (`VM::prototypes`, indexed by `TypeTag`)
+  carries an `overridden: bool` flag, default `false`. While `false`, the
+  compiler's `CallBuiltin` is permanently valid — no guard branch emitted, no
+  runtime check. The thaw path is specified but not implemented: when a builtin
+  prototype is mutated (descriptor write / `delete` / `setPrototypeOf`), set its
+  `overridden` flag to `true`, and `CallBuiltin` gains a V8-style guard
+  (`if overridden[type] { proto-walk } else { CallBuiltin }`) — a single
+  predictable branch, taken only for types the program actually patches. This
+  keeps the eventual mutable phase a localized change rather than a redesign.
 - **`freeze`/`seal` are coarse (whole-object integrity level, no
   descriptors)** — Step 2d. A freeze violation is a `TypeError` (JS strict
   mode) rather than a sloppy-mode silent no-op; `isFrozen`/`isSealed` report
