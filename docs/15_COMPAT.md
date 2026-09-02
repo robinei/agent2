@@ -1007,6 +1007,331 @@ Acceptance:
 - [x] No behavior change; prototypes remain frozen; suite + corpus green.
 - [x] Gate: `cargo fmt && cargo clippy --workspace --all-targets && cargo test`.
 
+## Step 4 — property descriptors + getters/setters
+
+The gateway compat tier. `propertyHelper.js` in the test262 harness gates
+a large bucket of tests on `Object.defineProperty`; adding a real descriptor
+model turns those from expected-failures into honest attempts. Split into two
+independently committable parts: data descriptors first (4a), then the harder
+accessor tier (4b), with a corpus rebaseline between.
+
+### Step 4a — data descriptor model
+
+**What changes.** Today `ObjData.map` is `IndexMap<FieldName, Value>` — every
+own property is implicitly `{writable: true, enumerable: true,
+configurable: true}`. Step 4a makes those attributes explicit and settable,
+without getter/setter invocation.
+
+**Where the attributes live is settled by [Step 4-storage](#step-4-storage--shapes-array-based-objects--inline-caches-sketch-not-yet-specified),
+not here.** An earlier draft of this step stored them per-property, in a
+`Property { Plain | DataDesc | Accessor }` enum replacing the `Value` in
+`ObjData.map`. That design is **discarded**: it taxes every ordinary object to
+serve the rare descriptor, and the shape model makes the tax vanish rather than
+shrink. The rest of 4a is representation-independent — the semantics below hold
+whichever way the attributes are stored, so this step is specified in terms of
+"the property's attributes" and takes the representation from 4-storage.
+
+Whatever the representation, the change propagates through the same sites:
+`own_enumerable_props` (yields only properties whose `enumerable` is true),
+`own_prop_contains`, `set_property`'s object arm, `delete_property`, and the
+JSON serializer (data properties serialize; an accessor is a no-JSON form —
+add rejection + test). Closure own-prop attribute tracking is deferred — pin in
+the ledger.
+
+**Enforcement at three existing write sites:**
+
+- **`set_property` (named write to an existing own property):** if the property
+  is non-writable, raise `TypeError` (not a sloppy no-op — see divergence
+  note). A new property (no existing entry) checks the receiver's
+  `IntegrityLevel`; if `Extensible`, creates an ordinary data property.
+- **`delete_property` (`ObjDelete`):** if the property is non-configurable, or
+  is any property on a `Sealed`/`Frozen` object, raise `TypeError`. Ordinary
+  properties on an `Extensible` or `NonExtensible` object are configurable and
+  can be deleted.
+- **`for-in` and `Object.keys`/`values`/`entries`:** already delegate to
+  `own_enumerable_props`, which now skips non-enumerable properties. No
+  instruction changes.
+
+**`Object.defineProperty(obj, prop, descriptor)`.** The primary new API,
+following `ValidateAndApplyPropertyDescriptor`:
+
+- **New property:** each absent field in the descriptor defaults to `false`
+  (not `true` — a define with no attrs is `{value: undefined, writable: false,
+  enumerable: false, configurable: false}`). Absent `value` defaults to
+  `undefined`. Check `IntegrityLevel`; a non-extensible object cannot gain new
+  properties.
+- **Existing property:** apply only the fields present in the descriptor.
+  Restrictions: if current property has `configurable: false`, cannot change
+  `configurable` or `enumerable`, cannot change kind (data ↔ accessor), cannot
+  make `writable` go from `false` back to `true`. If `writable: false`, cannot
+  change `value`. Violations are `TypeError`.
+- In 4a, a descriptor with `get` or `set` raises
+  `TypeError("accessor descriptors are not yet supported (Step 4b)")`.
+- `Object.defineProperty` returns the object (for chaining).
+
+**`Object.freeze` / `seal` refinement.** `Object.freeze(o)` already sets
+`IntegrityLevel::Frozen`. It now also marks every current own property
+non-writable and non-configurable (the spec says freeze sets `writable` and
+`configurable` to `false` on all own data properties). `isFrozen(o)` returns
+`true` iff `o.integrity == Frozen` **and** every own property has
+`writable: false, configurable: false` (or is an accessor with `configurable:
+false`). The `IntegrityLevel` field remains the fast "no new keys" gate;
+per-property attrs carry the accurate description.
+
+**Reflection builtins** (new, on the `Object` constructor):
+
+- `Object.getOwnPropertyDescriptor(obj, key)` → a plain object
+  `{value, writable, enumerable, configurable}` for data props; `undefined` if
+  the key is absent. (Accessor form added in 4b.)
+- `Object.getOwnPropertyNames(obj)` → array of all own string-keyed property
+  names, including non-enumerable ones (unlike `Object.keys`).
+- `Object.getOwnPropertyDescriptors(obj)` → object mapping each own key to its
+  full descriptor.
+- `Object.defineProperties(obj, props)` → iterates the own enumerable
+  properties of `props` and calls `defineProperty` for each.
+- `Object.create(proto, descriptors)` — the second argument now works (was a
+  `TypeError` in Step 2b with a "Step 4 tier" note). Internally calls
+  `defineProperties` after linking the proto.
+
+**`in` operator and `hasOwnProperty`** are unaffected: an accessor is still a
+defined property and `in` / `hasOwnProperty` report `true` for it.
+
+Acceptance (4a):
+
+- [ ] Attribute storage follows the representation chosen in 4-storage;
+      ordinary `obj.x = v` produces a plain data property and allocates no
+      per-property descriptor record (inspection).
+- [ ] `Object.defineProperty(o, 'x', {writable: false})` → subsequent
+      `o.x = 1` throws `TypeError`; `Object.getOwnPropertyDescriptor` returns
+      `writable: false`.
+- [ ] `Object.defineProperty(o, 'x', {enumerable: false})` → `x` absent from
+      `Object.keys(o)`, `Object.values(o)`, `Object.entries(o)`, and `for-in`.
+- [ ] `Object.defineProperty(o, 'x', {configurable: false})` → `delete o.x`
+      throws `TypeError`; redefining the property to change kind or attrs
+      throws `TypeError`.
+- [ ] `Object.getOwnPropertyNames(o)` includes non-enumerable own keys;
+      `Object.getOwnPropertyDescriptors` returns the full descriptor map.
+- [ ] `Object.defineProperties` and `Object.create(proto, descs)` work.
+- [ ] `Object.freeze(o)` marks all own data props `writable: false,
+      configurable: false`; `Object.isFrozen` derives from per-property attrs.
+- [ ] No accessor property is constructible in 4a; a descriptor with
+      `get`/`set` throws `TypeError` (4b placeholder).
+- [ ] An accessor property has no JSON form (`stack_value_to_json` rejects; test).
+- [ ] Closure own-prop attrs (`Closure.props`) are not changed; deferred +
+      pinned in the divergence ledger.
+- [ ] Corpus rebaseline (own commit): `propertyHelper.js`-dependent tests that
+      only use data descriptors pass; count the net flip.
+- [ ] All existing tests green; `Value` still 16 bytes.
+- [ ] Gate: `cargo fmt && cargo clippy --workspace --all-targets && cargo test`.
+
+### Step 4b — accessor descriptors + getter/setter invocation
+
+**This is the one step with real mechanism cost.** An accessor property
+read invokes the getter — user code — which requires pushing a call frame and
+returning to the dispatch loop; it cannot run inside `get_property` (the
+"no host callback mid-instruction" guardrail). This step makes accessor
+properties constructible and wires the dispatch adapters to handle them.
+Nothing here depends on the storage representation — this half of Step 4 is
+unaffected by the 4-storage decision.
+
+**`Object.defineProperty` with `{get, set}`.** Defining an accessor now works.
+`get`/`set` are `Value::Closure`/`Value::Builtin`; `Value::Undefined` signals
+"no getter" / "no setter". A descriptor may not mix `{value, writable}` with
+`{get, set}` — `TypeError`.
+
+**Return type of `get_property` → `PropertySlot`.** The day-one seam called
+out in the convergence-target note:
+
+```rust
+pub enum PropertySlot {
+    /// A resolved data value (common case).
+    Data(Value),
+    /// An accessor getter: the adapter instruction must call `getter` with
+    /// `receiver` as `this`, zero args.
+    AccessorGet { getter: Value, receiver: Value },
+}
+```
+
+`get_property` now returns `Result<PropertySlot, VMError>`. While no accessor
+exists (today, and in 4a), only `Data` is ever returned — the discriminant
+check is predictable and the `Data` arm is the same as the current function
+body. Callers that just need a `Value` (e.g., deep-chain builtins on the cold
+path) can call a thin wrapper that asserts/errors on the accessor arm until
+those sites are audited.
+
+**Adapter instruction changes** (`ObjGet` / `IndexGet` / `ObjPeek` /
+`ObjPeekDyn` / `GetMethodOrProp`). Each was `Data`-only: pop operands, call
+`get_property`, push value, `ip += 1`. Now:
+
+```
+Data(v)  →  stack.push(v);  ip += 1     (unchanged)
+
+AccessorGet { getter, receiver }
+         →  call_function(getter, receiver, nargs=0, below=<consumed_slots>)
+            // NOT ip += 1 — call_function saves return_addr = ip + 1,
+            // so when the getter fires Return, ip resumes past this instruction
+            // and the getter's return value lands on the stack (exactly as if
+            // Data(v) had been pushed).
+```
+
+`call_function` already stores `return_addr: self.ip + 1` in the new frame.
+`Return` restores `self.ip = frame.return_addr` and pushes the return values.
+From the caller's perspective the instruction "returned" a value — the stack
+shape is identical to the `Data` arm. The `below` count per adapter:
+
+- `ObjGet(field)`: pops receiver before calling `get_property` → `below = 0`
+  (no placeholder slot below the empty args region)
+- `ObjPeek(field)`: does **not** pop receiver (it stays on stack for the
+  callee's `this`) → `below = 1`; verify carefully
+- `IndexGet`: pops both receiver and key → `below = 0` (no uncleaned slots)
+- `GetMethodOrProp(field)`: similar to `ObjPeek` — receiver stays for the
+  subsequent method call; trace the exact `below` needed
+
+Each adapter must be traced individually; the principle is one adapter = one
+`dispatch_call`/`call_function` call with the correct `below`.
+
+**Setter invocation** (`ObjSet` / `IndexSet`). `set_property` for an accessor
+property needs to call the setter and then push the result of the assignment
+(the assigned value — JS assignment evaluates to the RHS, *not* what the setter
+returns). A new `Completion` variant handles the discarding:
+
+```rust
+pub(super) enum Completion {
+    Normal,
+    ResolvePromise(PromisePtr),
+    /// Setter call: when Return fires, discard the setter's return value and
+    /// push `result_val` instead (the assigned value for the ObjSet result).
+    SetterReturn(Value),
+}
+```
+
+`set_property` for the accessor arm returns a `SetterAction`:
+
+```rust
+pub enum SetterAction {
+    /// Write completed (data property); push this as the result.
+    Done(Value),
+    /// Setter call needed: call `setter(arg)` with `this = receiver`;
+    /// after Return, push `result_val` (the assigned value).
+    Setter { setter: Value, receiver: Value, arg: Value, result_val: Value },
+}
+```
+
+`ObjSet`'s setter arm:
+1. Pushes `arg` (the value to assign) onto the stack as the setter's argument
+2. Calls `call_function(setter, receiver, nargs=1, below=1, completion=SetterReturn(result_val))`
+   — `below=1` so `Return` reclaims the arg slot before pushing `result_val`
+3. Does **not** advance `ip` — `Return` handles the step
+
+`Return` with `Completion::SetterReturn(result_val)`: after normal stack cleanup
+(reclaim args/below), do not push the setter's return value; instead push
+`result_val`. Continue execution at `return_addr`. Stack shape and `ip` are
+identical to the `Done` path.
+
+**Optimizer impact.** `ObjGet`, `IndexGet`, `ObjPeek`, `ObjPeekDyn`, and
+`GetMethodOrProp` can now invoke user code — they are **no longer pure reads**.
+Audit every `pe_*` function; none of these instructions may appear in any table
+that assumes "heap-read with no side effects." Currently `pe_is_pure_push` and
+`pe_fold_arity` are the main allow-lists — check each. (Today these instructions
+are already excluded from `pe_is_pure_push` since they touch the heap; verify
+that they are not implicitly assumed pure anywhere else.)
+
+`ObjSet`/`IndexSet` are already impure (heap writes); no change needed there.
+
+**ResumeMode.** The adapter instructions do not directly raise new resumable
+errors. A getter/setter that raises a `PushValueThenContinue` error surfaces
+from within the getter/setter's call frame and is handled by the existing
+try-catch machinery — no change to the adapters' own error classification.
+
+Acceptance (4b):
+
+- [ ] `Object.defineProperty(o, 'x', {get() { return 42; }})` → `o.x === 42`.
+- [ ] `Object.defineProperty(o, 'x', {set(v) { this._x = v; }})` → `o.x = 5`
+      invokes the setter; `this._x === 5`.
+- [ ] `(o.x = 5) === 5` even if the setter returns a different value
+      (`Completion::SetterReturn` discards setter's return).
+- [ ] Accessor inherited from a prototype is invoked on the correct `this`:
+      `o.x` where `x` is an accessor on `Object.getPrototypeOf(o)` passes `o`
+      as `this`.
+- [ ] `get_property` returns `PropertySlot`; all five adapters handle both arms
+      (inspection — no adapter calls `get_property` and blindly pops a `Value`).
+- [ ] `ObjGet`/`IndexGet`/`ObjPeek`/`ObjPeekDyn`/`GetMethodOrProp` do not appear
+      in any `pe_*` pure-push or constant-fold allowlist (inspection).
+- [ ] `Completion::SetterReturn` exists; `Return` dispatches on it.
+- [ ] Mixed chain: own data prop shadows accessor on proto; accessor on obj
+      is found before data prop on proto.
+- [ ] `Object.getOwnPropertyDescriptor` on an accessor property returns
+      `{get, set, enumerable, configurable}` (no `value`/`writable`).
+- [ ] Defining an accessor with both `{value, get}` or `{writable, set}` throws
+      `TypeError`.
+- [ ] Corpus rebaseline (own commit): `propertyHelper.js` green for accessor
+      tests; net pass count from the full descriptor bucket.
+- [ ] Gate: `cargo fmt && cargo clippy --workspace --all-targets && cargo test`.
+
+### Step 4-storage — shapes: array-based objects + inline caches (sketch, not yet specified)
+
+**Status:** the direction chosen for descriptor storage, recorded 2026-09-02;
+sketch only, not yet a specified step. It replaces the discarded per-property
+`Property` enum described in 4a, and should be built **before** 4a's semantics
+are implemented on top of it.
+
+The insight: the problem 4a solves (per-property attributes) and the problem the
+VM's property lookup has (hash a string per access, per proto hop) have **one**
+solution. Solving them separately means paying twice and carrying both.
+
+```
+Object = { shape: ShapeId, slots: Vec<Value> }
+Shape  = { parent, key, slot, attrs, transitions: HashMap<FieldName, ShapeId> }
+```
+
+Objects hold no keys and no hash index. Shapes are interned VM-side and shared
+by every object of the same structure; slot order is insertion order, so
+enumeration order is preserved for free.
+
+**Why it is a net removal** — the same test the rest of this phase uses:
+
+- Attributes live in the *shape*, shared, so no per-property descriptor record
+  is needed at all. Plain data objects keep bare 16-byte `Value` slots no
+  matter how many descriptors exist elsewhere; a million objects of one shape
+  pay for their attributes once. This is the direct answer to the cost
+  objection that discarded 4a's enum — the tax does not shrink, it vanishes.
+- `IntegrityLevel` (2a/2d) folds in: frozen/sealed become shape transitions,
+  not a separate `ObjData` field.
+- The 2e rare-props side table is unnecessary — a rare prop is just another
+  shape.
+- Per-object key storage and per-access string hashing disappear.
+
+**Inline caching becomes sound and trivial:** cache `(shape_id, slot)` per call
+site; the guard is one `u32` compare. Crucially it covers **prototype hits** —
+the receiver's shape proves "no own `x` shadows this," which a per-object index
+cache cannot establish.
+
+*Rejected lighter variant, for the record:* caching a `FieldIndex` into today's
+`IndexMap` and re-validating by comparing the key at that index (interned
+`RcStr`, so a pointer compare). It is correct by construction — the guard can
+only false-miss, never false-hit — and needs no invalidation, but it caches
+own-property *position* only, leaves the user-class method path uncached, and
+stacks a fourth mechanism beside the map, the descriptor records, and the 2e
+side table instead of replacing any of them.
+
+**Honest costs:**
+
+- `delete` typically forces a dictionary-mode fallback (rare here — most
+  objects are JSON-shaped data).
+- Shape explosion if `JSON.parse` sees highly heterogeneous keys; a non-issue
+  when tool results share a schema.
+- Touches every site that iterates `ObjData.map` — `Object.keys`, JSON
+  serialize, `for-in`, spread — plus the 2a prototype/constructor wiring. This
+  is the largest structural change in the VM to date, which is why it is a
+  sketch and not a step.
+
+**Sequencing.** This replaces 4a's *storage* model rather than layering on it.
+4b's *invocation* design survives unchanged either way — the `PropertySlot`
+seam, `Completion::SetterReturn`, and the adapter `below` counts are about
+control flow, not storage.
+
+---
+
 ## Step 4+ — corpus-gated compat tiers (sketch, not yet specified)
 
 From here, the **conformance corpus sequences the work** — build the
@@ -1014,19 +1339,6 @@ substrate above, then let measured failures choose the order. Each tier is
 its own numbered sub-plan when it is picked up; sketched here only so the
 shape of the iceberg is on record.
 
-- **Property descriptors + getters/setters.** `Object.defineProperty`,
-  enumerable/writable/configurable, accessor properties. The gateway tier
-  (much else depends on a real property model). **Design note:** an accessor
-  makes property *read/write* a call site — it can run user code, suspend,
-  throw, and consume fuel. The structural seam for this is **already in place**
-  from Step 2e: `get_property`/`set_property` return a *slot* (`Data` |
-  `Accessor`), and the instruction — which owns frame-pushing — invokes the
-  accessor on the StepResult path. So this tier *populates* the `Accessor`
-  arm (and adds the descriptor model behind it) rather than re-signaturing the
-  canonical pair. What it still must revisit: the `pe_*` purity classification
-  and `ResumeMode` of the adapter instructions, now that their resolved slot
-  can be a call. This remains the one tier with a real mechanism cost beyond
-  "add a table entry," but the cost is bounded by the day-one seam.
 - **Iterator protocol + `Symbol.iterator` + generators.** `for…of` over
   user iterables, spread of arbitrary iterables, `[...map.keys()]`. Needs
   `Symbol` (at least well-known symbols) first.
@@ -1129,6 +1441,23 @@ rather than silently tolerated:
   would only paper over the compile-time name resolution and diverge from JS
   (`globalThis.foo = 1`, top-level `var`, global reassignment all throw against a
   frozen global). Schedulable when the corpus needs writable globals.
+- **Non-writable / non-configurable violations always throw `TypeError`** —
+  Step 4a/4b. JS strict mode throws; sloppy mode silently no-ops. The VM has
+  no sloppy mode and already throws `TypeError` for integrity violations (Step
+  2d). The sloppy-mode silent-no-op is a pinned divergence — corpus-gated if
+  any test262 test runs in sloppy mode and expects the no-op.
+- **Closure own-prop attributes deferred** — Step 4a. `Closure.props` (the
+  inline bag from Step 2e) stores `IndexMap<FieldName, Value>` — values only,
+  no descriptor attrs. `Object.defineProperty` on a function's own property
+  (e.g. setting `fn.name` non-configurable) is not supported; it throws
+  `TypeError("defineProperty on function own-props is not yet supported")`.
+  Resolve when the corpus shows a test that needs it (rare outside framework
+  metaclass plumbing).
+- **`Object.defineProperty` on exotic own-props deferred** — Step 4a. Array
+  `length`, typed-array integer-indexed properties, and other spec-exotic
+  defined-property cases are not wired to `Object.defineProperty`. Calling
+  `Object.defineProperty([], 'length', {value: 3})` raises `TypeError`
+  (array/typed-array non-`Object`). Resolve when the corpus shows it.
 - **Array `for-in`** — Step 2a Part 3 / item F. If `for-in` over an array does
   not enumerate indices (pre-existing limitation), pin it here; the
   "no method names in `for-in`" guarantee holds regardless (array prototypes are
@@ -1151,6 +1480,13 @@ rather than silently tolerated:
   that return plain arrays. The JS spec requires iterator objects with
   `[Symbol.iterator]` / `next()`. They do not work with `for…of` or spread.
   Scheduled behind the iterator protocol (15_COMPAT future tier).
+- **Higher-order methods return plain arrays, not typed arrays** — Phase 16.
+  `map` / `filter` (and other prelude-lowered HOFs) on a typed array produce
+  an ordinary `Array`, whereas the JS spec returns a new typed array of the
+  same kind (via the `%TypedArray%` species constructor). Observable: e.g.
+  `f64.map(g) instanceof Float64Array` is `false` and the result has no
+  `BYTES_PER_ELEMENT`/`buffer`. Same root cause as the missing `%TypedArray%`
+  intrinsic and `Symbol.species`; resolve alongside them.
 - **No `%TypedArray%` intrinsic** — Phase 16. The spec's `%TypedArray%`
   abstract supertype (shared `prototype`, `from`, `of`, `@@iterator`,
   `Symbol.toStringTag`) is not exposed. Per-type constructors exist and share
