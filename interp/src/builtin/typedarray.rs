@@ -91,7 +91,7 @@ fn to_uint8_clamp(f: f64) -> u8 {
     } else {
         // Exactly 0.5: round to even.
         let v = floor as u8;
-        if v % 2 == 0 { v } else { v + 1 }
+        if v.is_multiple_of(2) { v } else { v + 1 }
     }
 }
 
@@ -220,7 +220,6 @@ fn typed_array_ctor_impl(vm: &mut VM, args: Args, kind: TypedArrayKind) -> Resul
         }
 
         &Value::Array(arr_ptr) => {
-            let arr_ptr = arr_ptr;
             let len = vm
                 .arrays
                 .get(arr_ptr as usize)
@@ -313,7 +312,7 @@ fn typed_array_ctor_impl(vm: &mut VM, args: Args, kind: TypedArrayKind) -> Resul
                         );
                     }
                     let off = f as usize;
-                    if off % elem_size != 0 {
+                    if !off.is_multiple_of(elem_size) {
                         return Err(vm.fail(
                             ErrorKind::ValueError,
                             "typed array: byteOffset must be a multiple of element size",
@@ -327,7 +326,7 @@ fn typed_array_ctor_impl(vm: &mut VM, args: Args, kind: TypedArrayKind) -> Resul
             let byte_length = match args.get(vm, 2) {
                 Value::Undefined => {
                     let remaining = buf_len.saturating_sub(byte_offset);
-                    if remaining % elem_size != 0 {
+                    if !remaining.is_multiple_of(elem_size) {
                         return Err(vm.fail(
                             ErrorKind::ValueError,
                             "typed array: buffer length - byteOffset must be a multiple of element size",
@@ -719,6 +718,23 @@ fn ta_clamp_index(val: &Value, len: usize) -> usize {
     }
 }
 
+/// Resolve a forward-search `fromIndex` argument (as used by `indexOf` /
+/// `includes`) into a start index in `[0, len]`. A negative `fromIndex`
+/// counts from the end (`len + fromIndex`, floored at 0); `NaN` → 0.
+fn ta_from_index(val: &Value, len: usize) -> usize {
+    let f = val.to_number().unwrap_or(0.0);
+    if f.is_nan() {
+        return 0;
+    }
+    let i = f as i64;
+    let len_i = len as i64;
+    if i < 0 {
+        (len_i + i).max(0) as usize
+    } else {
+        i.min(len_i) as usize
+    }
+}
+
 /// Helper: get (length, elem_size, kind, buf_ptr, byte_offset) from a TypedArray.
 macro_rules! ta_view {
     ($vm:expr, $ta_ptr:expr) => {{
@@ -800,36 +816,35 @@ pub(crate) fn ta_set(vm: &mut VM, args: Args) -> Result<Value, VMError> {
         recv => return Err(vm.method_receiver_error(recv)),
     };
     let (length, elem_size, kind, buf_ptr, byte_offset) = ta_view!(vm, ta_ptr);
+    // ToInteger(offset); JS throws RangeError for a negative offset.
     let offset = {
         let f = args.get(vm, 2).to_number().unwrap_or(0.0);
-        if f.is_nan() || f < 0.0 {
+        if f.is_nan() {
             0usize
+        } else if f < 0.0 {
+            return Err(vm.fail(
+                ErrorKind::ValueError,
+                "TypedArray.set: offset is out of bounds (negative)",
+            ));
         } else {
             f as usize
         }
     };
-    match args.get(vm, 1) {
+    // Gather the source values up front, then bounds-check against the
+    // destination. JS throws RangeError if `offset + src.length > length`
+    // *before* writing anything (the copy is all-or-nothing).
+    let vals: Vec<f64> = match args.get(vm, 1) {
         &Value::TypedArray(src_ptr) => {
             let (src_len, src_elem_size, src_kind, src_buf_ptr, src_byte_offset) =
                 ta_view!(vm, src_ptr);
-            // Read source elements as f64 values first to avoid aliasing issues
-            let vals: Vec<f64> = (0..src_len)
+            (0..src_len)
                 .map(|i| {
                     let off = src_byte_offset + i * src_elem_size;
                     let buf = &vm.buffers[src_buf_ptr as usize];
                     let v = ta_decode_bytes(src_kind, &buf[off..]);
                     v.to_number().unwrap_or(0.0)
                 })
-                .collect();
-            for (i, f) in vals.iter().enumerate() {
-                let dst_i = offset + i;
-                if dst_i >= length {
-                    break;
-                }
-                let dst_off = byte_offset + dst_i * elem_size;
-                let buf = &mut vm.buffers[buf_ptr as usize];
-                ta_encode_bytes(kind, *f, &mut buf[dst_off..dst_off + elem_size]);
-            }
+                .collect()
         }
         &Value::Array(arr_ptr) => {
             let src_len = vm
@@ -837,7 +852,7 @@ pub(crate) fn ta_set(vm: &mut VM, args: Args) -> Result<Value, VMError> {
                 .get(arr_ptr as usize)
                 .map(|a| a.len())
                 .unwrap_or(0);
-            let vals: Vec<f64> = (0..src_len)
+            (0..src_len)
                 .map(|i| {
                     vm.arrays
                         .get(arr_ptr as usize)
@@ -845,16 +860,7 @@ pub(crate) fn ta_set(vm: &mut VM, args: Args) -> Result<Value, VMError> {
                         .and_then(|v| v.to_number())
                         .unwrap_or(0.0)
                 })
-                .collect();
-            for (i, f) in vals.iter().enumerate() {
-                let dst_i = offset + i;
-                if dst_i >= length {
-                    break;
-                }
-                let dst_off = byte_offset + dst_i * elem_size;
-                let buf = &mut vm.buffers[buf_ptr as usize];
-                ta_encode_bytes(kind, *f, &mut buf[dst_off..dst_off + elem_size]);
-            }
+                .collect()
         }
         other => {
             return Err(vm.fail(
@@ -865,6 +871,17 @@ pub(crate) fn ta_set(vm: &mut VM, args: Args) -> Result<Value, VMError> {
                 ),
             ));
         }
+    };
+    if offset.saturating_add(vals.len()) > length {
+        return Err(vm.fail(
+            ErrorKind::ValueError,
+            "TypedArray.set: source is too large to fit at the given offset",
+        ));
+    }
+    for (i, f) in vals.iter().enumerate() {
+        let dst_off = byte_offset + (offset + i) * elem_size;
+        let buf = &mut vm.buffers[buf_ptr as usize];
+        ta_encode_bytes(kind, *f, &mut buf[dst_off..dst_off + elem_size]);
     }
     Ok(Value::Undefined)
 }
@@ -918,12 +935,9 @@ pub(crate) fn ta_includes(vm: &mut VM, args: Args) -> Result<Value, VMError> {
         recv => return Err(vm.method_receiver_error(recv)),
     };
     let needle = args.get(vm, 1).clone();
-    let from = {
-        let f = args.get(vm, 2).to_number().unwrap_or(0.0);
-        if f.is_nan() { 0usize } else { f as usize }
-    };
     let (length, elem_size, kind, buf_ptr, byte_offset) = ta_view!(vm, ta_ptr);
-    for i in from.min(length)..length {
+    let from = ta_from_index(args.get(vm, 2), length);
+    for i in from..length {
         let off = byte_offset + i * elem_size;
         let v = ta_decode_bytes(kind, &vm.buffers[buf_ptr as usize][off..]);
         if crate::vm::value::same_value_zero(&v, &needle) {
@@ -940,16 +954,9 @@ pub(crate) fn ta_index_of(vm: &mut VM, args: Args) -> Result<Value, VMError> {
         recv => return Err(vm.method_receiver_error(recv)),
     };
     let needle = args.get(vm, 1).clone();
-    let from = {
-        let f = args.get(vm, 2).to_number().unwrap_or(0.0);
-        if f.is_nan() {
-            0usize
-        } else {
-            f.max(0.0) as usize
-        }
-    };
     let (length, elem_size, kind, buf_ptr, byte_offset) = ta_view!(vm, ta_ptr);
-    for i in from.min(length)..length {
+    let from = ta_from_index(args.get(vm, 2), length);
+    for i in from..length {
         let off = byte_offset + i * elem_size;
         let v = ta_decode_bytes(kind, &vm.buffers[buf_ptr as usize][off..]);
         if v.strict_equal(&needle) {
@@ -967,17 +974,26 @@ pub(crate) fn ta_last_index_of(vm: &mut VM, args: Args) -> Result<Value, VMError
     };
     let needle = args.get(vm, 1).clone();
     let (length, elem_size, kind, buf_ptr, byte_offset) = ta_view!(vm, ta_ptr);
+    // `end` is the exclusive upper bound of the reverse scan. With no
+    // `fromIndex`, search the whole array; otherwise `fromIndex` is the
+    // (inclusive) start, counting from the end when negative.
     let end = match args.get(vm, 2) {
         Value::Undefined => length,
         v => {
-            let f = v.to_number().unwrap_or(length as f64);
+            let f = v.to_number().unwrap_or(0.0);
             if f == f64::INFINITY {
                 length
             } else if f == f64::NEG_INFINITY {
                 0
             } else {
-                // NaN as i64 == 0 in Rust (saturating cast since 1.45)
-                (f as i64 + 1).max(0).min(length as i64) as usize
+                // NaN as i64 == 0 in Rust (saturating cast since 1.45).
+                let i = f as i64;
+                let start = if i < 0 {
+                    i + length as i64
+                } else {
+                    i.min(length as i64 - 1)
+                };
+                if start < 0 { 0 } else { start as usize + 1 }
             }
         }
     };
@@ -1054,9 +1070,8 @@ pub(crate) fn ta_sort(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let mut vals: Vec<f64> = (0..length)
         .map(|i| {
             let off = byte_offset + i * elem_size;
-            match ta_decode_bytes(kind, &vm.buffers[buf_ptr as usize][off..]) {
-                v => v.to_number().unwrap_or(f64::NAN),
-            }
+            let v = ta_decode_bytes(kind, &vm.buffers[buf_ptr as usize][off..]);
+            v.to_number().unwrap_or(f64::NAN)
         })
         .collect();
 
@@ -1199,19 +1214,40 @@ mod tests {
         assert_eq!(v, serde_json::json!([20, 30, 2]));
     }
 
-    #[test]
-    fn arraybuffer_json_rejection() {
-        let prog = testutil::compile_ok("return new ArrayBuffer(4);");
+    /// Run `src` to completion and return `(vm, final_value)` so a test can
+    /// poke at the value through VM-level helpers (e.g. JSON serialization).
+    fn run_to_value(src: &str) -> (crate::vm::VM, Value) {
+        let prog = testutil::compile_ok(src);
         let mut vm = crate::vm::VM::for_program(prog, serde_json::Value::Null).unwrap();
         use crate::vm::StepResult;
-        let result = loop {
-            match vm.step(u64::MAX).unwrap() {
-                StepResult::Done { value, .. } => break value,
-                _ => {}
+        let value = loop {
+            if let StepResult::Done { value, .. } = vm.step(u64::MAX).unwrap() {
+                break value;
             }
         };
-        // stack_value_to_json should reject ArrayBuffer → Null sentinel
-        assert!(matches!(result, Value::ArrayBuffer(_)));
+        (vm, value)
+    }
+
+    #[test]
+    fn arraybuffer_json_rejection() {
+        let (vm, value) = run_to_value("return new ArrayBuffer(4);");
+        assert!(matches!(value, Value::ArrayBuffer(_)));
+        // stack_value_to_json must refuse to serialize an ArrayBuffer.
+        assert!(vm.stack_value_to_json(&value, 0).is_err());
+    }
+
+    #[test]
+    fn typed_array_json_rejection() {
+        let (vm, value) = run_to_value("return new Uint8Array(4);");
+        assert!(matches!(value, Value::TypedArray(_)));
+        assert!(vm.stack_value_to_json(&value, 0).is_err());
+    }
+
+    #[test]
+    fn dataview_json_rejection() {
+        let (vm, value) = run_to_value("return new DataView(new ArrayBuffer(4));");
+        assert!(matches!(value, Value::DataView(_)));
+        assert!(vm.stack_value_to_json(&value, 0).is_err());
     }
 
     // ── Step 3: Typed arrays ───────────────────────────────────────────────
@@ -1482,6 +1518,45 @@ mod tests {
         assert_eq!(v, serde_json::json!([1, 3]));
     }
 
+    #[test]
+    fn ta_index_of_negative_from() {
+        // negative fromIndex counts from the end: indexOf(20, -2) starts at idx 2,
+        // so the first 20 (idx 1) is skipped and the second (idx 3) is found.
+        let v = testutil::run_ret(
+            r#"
+            const ta = new Uint8Array([10, 20, 30, 20]);
+            return [ta.indexOf(20, -2), ta.includes(20, -1), ta.lastIndexOf(20, -2)];
+        "#,
+        );
+        // includes(20, -1) only scans idx 3 (==20) → true; lastIndexOf(20, -2)
+        // scans idx 2 down → finds idx 1.
+        assert_eq!(v, serde_json::json!([3, true, 1]));
+    }
+
+    #[test]
+    fn ta_set_offset_overflow_throws() {
+        let kind = testutil::run_err_kind(
+            r#"
+            const ta = new Uint8Array(3);
+            ta.set([1, 2, 3], 1);
+            return 0;
+        "#,
+        );
+        assert_eq!(kind, crate::vm::ErrorKind::ValueError);
+    }
+
+    #[test]
+    fn ta_set_negative_offset_throws() {
+        let kind = testutil::run_err_kind(
+            r#"
+            const ta = new Uint8Array(3);
+            ta.set([1], -1);
+            return 0;
+        "#,
+        );
+        assert_eq!(kind, crate::vm::ErrorKind::ValueError);
+    }
+
     // ── Step 5: DataView ──────────────────────────────────────────────────
 
     #[test]
@@ -1516,12 +1591,12 @@ mod tests {
             r#"
             const buf = new ArrayBuffer(8);
             const dv = new DataView(buf);
-            dv.setFloat64(0, 3.14, true);
+            dv.setFloat64(0, 1.234, true);
             return dv.getFloat64(0, true);
         "#,
         );
-        // 3.14 round-trips through f64
-        assert!((v.as_f64().unwrap() - 3.14).abs() < 1e-10);
+        // A decimal with no exact binary form round-trips through f64.
+        assert!((v.as_f64().unwrap() - 1.234).abs() < 1e-10);
     }
 
     #[test]
