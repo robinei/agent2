@@ -1148,17 +1148,17 @@ answer to the dead VM.
 
 ### Step A0 — DESIGN.md amendment
 
-- [ ] DESIGN.md gains "Exchanges": the vocabulary (agent / branch / spine /
+- [x] DESIGN.md gains "Exchanges": the vocabulary (agent / branch / spine /
       context / frame), rules A–C, the four-event exchange, the user as an
       author who borrows the branch's context (no user branch — forking
       is why), and that branch ids are root event ids (concurrency leaves
       the log unchanged). Roadmap range `0_…`–`17_…`.
-- [ ] The dependency-spine paragraph adds to link 3: after a resume no
+- [x] The dependency-spine paragraph adds to link 3: after a resume no
       completed work is invisible (reconciliation), and reuse-by-id covers
       in-flight exchanges (a pending ask is re-awaited, not repeated).
-- [ ] The condition table's "user interrupt / steering" row is marked as
+- [x] The condition table's "user interrupt / steering" row is marked as
       built here, and gains the annotated-source report.
-- [ ] Gate: `cargo fmt && cargo clippy --workspace --all-targets &&
+- [x] Gate: `cargo fmt && cargo clippy --workspace --all-targets &&
       cargo test` green.
 
 ### Step A1 — Rename: `frame` → `agent` everywhere but the VM (`agent/src/**`)

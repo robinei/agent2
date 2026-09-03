@@ -3,7 +3,7 @@
 A code-mode agent system: the LLM writes JS programs that orchestrate tool
 calls; the programs run on a bespoke VM; and a Lisp-style condition system
 makes the LLM (and above it, the user) the interactive restart handler. The
-numbered plan files (`0_…` – `15_…`) are the roadmap; this file is the
+numbered plan files (`0_…` – `17_…`) are the roadmap; this file is the
 rationale they all serve. Where a plan file and this file disagree, surface
 it — that's a design change, not a detail.
 
@@ -30,7 +30,7 @@ authority picks a restart. Every interaction is one instance of that shape:
 | `Invoke` (tool call) | the call(s) | deliver result(s) | host, automatically |
 | `raise(name, payload)` | condition report | resume(value) / rewrite | LLM |
 | trapped runtime error | rendered diagnostic + artifact menu | resume(value) / rewrite | LLM |
-| user interrupt / steering | condition report + user's message | resume / rewrite | user → LLM |
+| user interrupt / steering (17_BRANCHES) | condition report + user's message + the **annotated source** (every call site labelled with its artifact id and state) | answer / resume / rewrite | user → LLM |
 | `OutOfFuel` / memory budget | report | top up / abort | host policy |
 | crash / version mismatch | interruption + artifact menu | rewrite with artifacts | LLM |
 
@@ -81,7 +81,13 @@ intact:
    is exactly why determinism is unnecessary:** reuse is keyed by an explicit
    id, not by a rerun retracing the original control flow position-for-
    position — so a nondeterministic rerun, or an LLM-rewritten program, still
-   reuses the right completed work →
+   reuses the right completed work. Two consequences the log must earn
+   (17_BRANCHES): **after a resume, no completed work is invisible** — every
+   half-finished exchange in the log is reconciled on open, so a call that
+   landed is an artifact and a call that was merely issued says so; and
+   **reuse by id covers in-flight exchanges too** — `tools.tool_result(id)` on
+   a still-pending ask returns a promise that resolves when its result lands,
+   so a re-entered or rewritten program **re-awaits** rather than re-asks →
 4. so programs need **no durable `state`** — they are functions
    `(input, tools, artifacts) → returned JSON + effects` →
 5. so the **condition report's artifact menu** is the complete restart
@@ -103,6 +109,98 @@ Parallel spine for concurrency: it lives in the **program layer**
 (promises + outbox, 7_ASYNC), so the conversation tree never needs a
 concurrency mechanism — subagents are tools, transcripts are branches,
 the tree just allows multiple active leaves.
+
+## Exchanges
+
+A conversation is a tree, and every message in it is an event on a path
+through that tree. The vocabulary (`17_BRANCHES.md`), fixed here because
+five earlier plan files used one word — "frame" — for four things:
+
+- **Agent** — a clean-room context with a charter: the thing you spawn,
+  ask, and list. Identified by its `Agent` event id (`AgentId`).
+- **Branch** — an addressable conversation: one path from a root to a
+  leaf. An agent has one branch until someone forks it; then it has two,
+  both live, both its own. Identified by its **root event**
+  (`BranchId = EventId`) — the `Agent` for an agent's first branch, a
+  `Fork` for a divergent one.
+- **Spine** — the code's handle for a branch's path: leaf id plus the
+  reconstructed chain of contexts. Internal.
+- **Context** — the reconstructed conversation of one agent along a
+  spine: charter, system prompt, posts, turns, open questions. What is
+  rendered into an LLM request.
+- **Frame** — reserved for the **VM call stack** (`CallFrame`,
+  `VM::frames()`, the debugger's stack pane) and nothing else.
+
+**Branch ids are root event ids, so concurrency leaves the log
+unchanged.** Nothing session-local is minted and nothing about "which
+branches are live right now" is written down: live-ness is session state,
+identity is in the log. Reopening a log re-derives the set of branches
+from the events it already holds.
+
+### Three rules
+
+**A. The branch is the address.** A post is logged on the branch it is
+delivered into; a record is logged on the branch whose state it changes.
+There is no routing table — the tree *is* the routing.
+
+**B. A post is logged on arrival and delivered at the recipient's next
+safe point — and every fuel-slice boundary is a safe point.** Nothing
+anyone says is rejected, queued invisibly, or lost to a crash: it is
+visible immediately, and it reaches the LLM at the next slice (a running
+program suspends into a condition whose report is the message), beside a
+pending report (suspended), or when the current generation lands
+(thinking). This is the load-bearing suspension property spent on
+responsiveness, and it is why upward questions cannot deadlock: a parent
+awaiting its child is one slice from being told.
+
+**C. Waiting is a property of the awaiting program, never of the
+message.** A value someone's program awaits arrives as a `Result` and
+resolves the promise — machine-bound, never entering a context. A message
+nobody's program awaits arrives as a `Post` — mind-bound, delivered into
+the context because otherwise no one would see it. This is "the one
+exception" above restated as a mechanism: **data crosses into a mind
+exactly when no program is waiting to receive it.**
+
+### The four-event exchange
+
+One question and its answer are four events, two on each side, each side
+reconstructible from its own path:
+
+| | asker's branch | answerer's branch |
+|---|---|---|
+| the question | `Send { to, text, input, expects_reply, site }` | `Post { from, origin: Sent(send) }` |
+| the answer | `Result { call: send, outcome }` | `Answer { question: post, value }` |
+
+The four form a closed loop of ids — `Post.origin → Send`,
+`Result.call → Send`, `Answer.question → Post` — so from any one the
+other three are one lookup away. That loop is what reconciliation walks
+after a crash, how a renderer resolves a body, and how an answer finds
+the branch that asked. **A body is stored once**: the `Send` holds the
+question and the `Post` names it; the `Answer` holds the value and the
+`Result` names it. What a delivery-side event contributes is *position* —
+that this message landed here, in this branch, at this point.
+
+Everything else is the same table with a column blanked: a host tool call
+is the left column only (`Invoke` … `Result`); a `tell` blanks the
+`Answer`; and the user blanks both program columns.
+
+### The user is an author, not an agent
+
+The user has no branch. They speak *inside* branches: an utterance in
+branch X is a `Post { from: User }` on X, X's reply is X's own answer,
+and the user reads it there — **borrowing the context of whichever branch
+they are in**, which is exactly the experience of holding a different
+pseudo-identity in each conversation.
+
+**Forking is why this must be so.** The user's post sits in the shared
+prefix of two forks, and each fork answers it in its own branch. A single
+global user branch could not represent "you-in-fork-A" and
+"you-in-fork-B" as different participants, and it would owe two results
+for one call. So the user is a blanked column in the exchange table: no
+program to `Send` with, no context to `Post` into. The same reading makes
+the user the outermost restart handler literal rather than metaphorical —
+they take a branch's turn directly, supplying a value, a rewrite, or an
+answer without spending an LLM turn.
 
 ## The one exception: the answer crosses into context
 

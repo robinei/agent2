@@ -177,7 +177,7 @@ fn new_non_error_still_rejected() {
     // `new Foo()` now compiles (the undeclared identifier `Foo` resolves to
     // `PushName` at runtime). The runtime `PushName` raises `ReferenceError`.
     assert!(
-        compile_ok("const x = new Foo();").code.len() > 0,
+        !compile_ok("const x = new Foo();").code.is_empty(),
         "expected to compile"
     );
     assert_eq!(

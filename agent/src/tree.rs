@@ -451,10 +451,7 @@ impl Tree {
             if let EventPayload::Label(label) = &event.payload {
                 return Some(label.clone());
             }
-            match event.parent_id {
-                Some(parent) => current = parent,
-                None => return None,
-            };
+            current = event.parent_id?;
         }
     }
 }
