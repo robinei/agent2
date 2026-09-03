@@ -10,7 +10,7 @@
 
 use std::io::BufRead;
 
-use crate::host::llm::{LlmChunk, LlmClient};
+use crate::host::llm::{Cancel, LlmChunk, LlmClient};
 use crate::machine::{LlmRequest, LlmTurn, Rendered};
 use crate::types::ToolCall;
 
@@ -56,6 +56,7 @@ impl LlmClient for DeepSeekClient {
     fn complete(
         &self,
         request: &LlmRequest,
+        cancel: &Cancel,
         chunk: &mut dyn FnMut(LlmChunk),
     ) -> Result<LlmTurn, String> {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
@@ -75,7 +76,7 @@ impl LlmClient for DeepSeekClient {
             return Err(format!("deepseek http {status}: {text}"));
         }
         let reader = std::io::BufReader::new(response.body_mut().as_reader());
-        parse_sse(reader, chunk)
+        parse_sse(reader, cancel, chunk)
     }
 }
 
@@ -163,12 +164,22 @@ struct PartialCall {
 
 /// Parse a chat-completions SSE stream into the final assistant
 /// message, forwarding deltas to `chunk` as they arrive.
-fn parse_sse(reader: impl BufRead, chunk: &mut dyn FnMut(LlmChunk)) -> Result<LlmTurn, String> {
+fn parse_sse(
+    reader: impl BufRead,
+    cancel: &Cancel,
+    chunk: &mut dyn FnMut(LlmChunk),
+) -> Result<LlmTurn, String> {
     let mut text = String::new();
     let mut thinking = String::new();
     let mut calls: Vec<PartialCall> = Vec::new();
 
     for line in reader.lines() {
+        // The one place a cancellation lands: between SSE lines, so an
+        // interrupted generation stops streaming within a chunk rather
+        // than at the end of a completion that may run for minutes.
+        if cancel.is_cancelled() {
+            return Err("cancelled".into());
+        }
         let line = line.map_err(|e| format!("stream read failed: {e}"))?;
         let Some(data) = line.strip_prefix("data:") else {
             continue; // empty keep-alive lines, comments
@@ -338,7 +349,7 @@ mod tests {
             r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
         ]);
         let mut chunks = Vec::new();
-        let message = parse_sse(stream.as_bytes(), &mut |c| {
+        let message = parse_sse(stream.as_bytes(), &Cancel::new(), &mut |c| {
             chunks.push(match c {
                 LlmChunk::Text(t) => format!("T:{t}"),
                 LlmChunk::Thinking(t) => format!("R:{t}"),
@@ -365,7 +376,7 @@ mod tests {
             r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"return 6*7;\"}"}}]}}]}"#,
             r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
         ]);
-        let message = parse_sse(stream.as_bytes(), &mut |_| {}).unwrap();
+        let message = parse_sse(stream.as_bytes(), &Cancel::new(), &mut |_| {}).unwrap();
 
         let LlmTurn { tool_calls, .. } = message;
         assert_eq!(tool_calls.len(), 1);
@@ -377,7 +388,7 @@ mod tests {
     #[test]
     fn parse_sse_surfaces_stream_errors() {
         let stream = "data: {\"error\":{\"message\":\"rate limited\"}}\n\n";
-        let err = parse_sse(stream.as_bytes(), &mut |_| {}).unwrap_err();
+        let err = parse_sse(stream.as_bytes(), &Cancel::new(), &mut |_| {}).unwrap_err();
         assert!(err.contains("rate limited"), "{err}");
     }
 }

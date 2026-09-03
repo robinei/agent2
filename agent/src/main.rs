@@ -18,13 +18,16 @@ const USAGE: &str = "usage: agent <command>
                                     the TUI picks it automatically when the
                                     key is set — --headless stays scripted
                                     unless --real is given
-    --turn <text>                   queue a first user turn (headless)
+    --turn <text>                   queue a first user turn on the
+                                    conversation branch (headless)
     --list-leaves                   print the log's leaf set and exit
-    --resume <id>                   open anchored at leaf <id> (else the
-                                    lowest incomplete leaf)
+    --list-branches                 print the log's branch set and exit
+    --resume <id>                   open the branch leaf <id> sits on (else
+                                    the lowest leaf that owes work)
     --fork <id>                     fork a divergent branch from event <id>
+                                    and print its id
     --name <text>                   name the branch (with --fork), else rename
-                                    the active leaf";
+                                    the conversation branch";
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -45,6 +48,7 @@ fn main() {
             let mut turn: Option<String> = None;
             let mut log_path: Option<String> = None;
             let mut list_leaves = false;
+            let mut list_branches = false;
             let mut resume: Option<u64> = None;
             let mut fork: Option<u64> = None;
             let mut name: Option<String> = None;
@@ -73,6 +77,7 @@ fn main() {
                     "--real" => real = true,
                     "--turn" => turn = Some(next_val(&mut rest, "--turn")),
                     "--list-leaves" => list_leaves = true,
+                    "--list-branches" => list_branches = true,
                     "--resume" => {
                         resume = Some(parse_id(next_val(&mut rest, "--resume"), "--resume"))
                     }
@@ -87,6 +92,7 @@ fn main() {
             let use_real = real || (!headless && std::env::var("DEEPSEEK_API_KEY").is_ok());
             let nav = SessionNav {
                 list_leaves,
+                list_branches,
                 resume,
                 fork,
                 name,
@@ -178,6 +184,7 @@ fn build_brain(
 /// Fork/rename/resume navigation (M4), shared by the CLI front-ends.
 struct SessionNav {
     list_leaves: bool,
+    list_branches: bool,
     resume: Option<u64>,
     fork: Option<u64>,
     name: Option<String>,
@@ -201,22 +208,28 @@ fn build_session(
     session.map_err(|e| e.to_string())
 }
 
-/// Queue the M4 navigation commands (fork/rename) ahead of an optional
+/// Queue the navigation commands (fork/rename) ahead of an optional
 /// first user turn — all FIFO on the one inbox, so order is preserved.
+///
+/// A fork **adds** a branch and moves nothing, so a `--turn` beside a
+/// `--fork` still lands on the conversation branch; the fork's id is
+/// printed (`BranchOpened`) for the next invocation to address.
 fn queue_nav(session: &host::Session, nav: &SessionNav) {
     let h = session.handle();
+    let branch = session.conversation_branch();
     if let Some(from) = nav.fork {
         h.send(host::SessionCommand::Fork {
             from: EventId::new(from),
             name: nav.name.clone(),
         });
-    } else if let Some(text) = nav.name.clone() {
-        h.send(host::SessionCommand::Rename(text));
+    } else if let Some(name) = nav.name.clone() {
+        h.send(host::SessionCommand::Rename { branch, name });
     }
     if let Some(text) = nav.turn.clone() {
         h.send(host::SessionCommand::UserTurn {
-            branch: session.root(),
+            branch,
             text,
+            expects_reply: true,
         });
     }
 }
@@ -229,7 +242,9 @@ fn run_session_tui(
     resume: Option<u64>,
 ) -> Result<(), String> {
     let (tx, rx) = std::sync::mpsc::channel();
-    let session = build_session(log_path, real, resume, tx)?;
+    let mut session = build_session(log_path, real, resume, tx)?;
+    // The TUI *is* a client, so it is presence.
+    session.set_attached(true);
     debug::run_attached(session, rx)
 }
 
@@ -250,18 +265,28 @@ fn run_session_headless(
         }
     });
 
-    let driven = nav.list_leaves || nav.fork.is_some() || nav.name.is_some() || nav.turn.is_some();
-    let session = if nav.list_leaves {
-        // Open, ask for the leaf set, exit — no LLM contact.
+    let listing = nav.list_leaves || nav.list_branches;
+    let driven = listing || nav.fork.is_some() || nav.name.is_some() || nav.turn.is_some();
+    let session = if listing {
+        // Open, ask for the projection, exit — no LLM contact.
         let session = build_session(log_path, real, nav.resume, tx)?;
-        session.handle().send(host::SessionCommand::ListLeaves);
+        if nav.list_leaves {
+            session.handle().send(host::SessionCommand::ListLeaves);
+        }
+        if nav.list_branches {
+            session.handle().send(host::SessionCommand::ListBranches);
+        }
         session.handle().send(host::SessionCommand::Shutdown);
         session.run()
     } else if real || driven || nav.resume.is_some() {
-        let session = build_session(log_path, real, nav.resume, tx)?;
+        let mut session = build_session(log_path, real, nav.resume, tx)?;
         if real && !driven {
             return Err("a real headless session needs --turn <text>".into());
         }
+        // Presence is per-request and honest about its limit: a headless
+        // run with a queued turn has someone waiting on the other end; one
+        // without does not, and its agents are told so.
+        session.set_attached(nav.turn.is_some());
         queue_nav(&session, &nav);
         session.run()
     } else {
@@ -278,35 +303,61 @@ fn print_session_event(event: &SessionEvent) {
         // message instead of interleaving partial text.
         SessionEvent::Chunk { .. } => {}
         SessionEvent::ProgramStatus {
-            agent,
+            branch,
             program,
             status,
+            ..
         } => {
             println!(
-                "[agent {} · #{}] program status: {status:?}",
-                agent.as_u64(),
+                "[branch {} · #{}] program status: {status:?}",
+                branch.as_u64(),
                 program.as_u64(),
             );
         }
-        SessionEvent::Error { agent, message } => match agent {
-            Some(f) => eprintln!("!! [agent {}] {message}", f.as_u64()),
+        SessionEvent::Error { branch, message } => match branch {
+            Some(b) => eprintln!("!! [branch {}] {message}", b.as_u64()),
             None => eprintln!("!! {message}"),
         },
+        SessionEvent::BranchOpened { branch } => {
+            println!("branch #{} is live", branch.as_u64());
+        }
+        SessionEvent::Branches(branches) => {
+            println!("branches ({}):", branches.len());
+            for b in branches {
+                let name = b
+                    .name
+                    .as_deref()
+                    .map(|n| format!(" «{n}»"))
+                    .unwrap_or_default();
+                let asking = b
+                    .asking_user
+                    .map(|q| format!(" · asking you #{}", q.as_u64()))
+                    .unwrap_or_default();
+                println!(
+                    "  #{}{name} [agent {} · leaf #{} · {} · {} open{asking}]",
+                    b.branch.as_u64(),
+                    b.agent.as_u64(),
+                    b.leaf.as_u64(),
+                    b.status,
+                    b.open,
+                );
+            }
+        }
         SessionEvent::Answered {
-            agent,
+            branch,
             question,
             value,
+            ..
         } => {
             println!(
-                "[agent {}] answered #{}: {value}",
-                agent.as_u64(),
+                "[branch {}] answered #{}: {value}",
+                branch.as_u64(),
                 question.as_u64()
             );
         }
         SessionEvent::Leaves(leaves) => {
             println!("leaves ({}):", leaves.len());
             for leaf in leaves {
-                let mark = if leaf.active { "*" } else { " " };
                 let state = match leaf.open {
                     0 => "idle".to_owned(),
                     n => format!("{n} open"),
@@ -317,15 +368,15 @@ fn print_session_event(event: &SessionEvent) {
                     .map(|n| format!(" «{n}»"))
                     .unwrap_or_default();
                 println!(
-                    "  {mark} #{} [agent {} · {state}]{name}  {}",
+                    "  #{} [agent {} · {state}]{name}  {}",
                     leaf.leaf.as_u64(),
                     leaf.agent.as_u64(),
                     leaf.summary,
                 );
             }
         }
-        SessionEvent::Event { agent, event } => {
-            let head = format!("[agent {} · #{}]", agent.as_u64(), event.id.as_u64());
+        SessionEvent::Event { branch, event, .. } => {
+            let head = format!("[branch {} · #{}]", branch.as_u64(), event.id.as_u64());
             match &event.payload {
                 EventPayload::Agent { name, charter, .. } => {
                     let name = name

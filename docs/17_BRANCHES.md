@@ -841,11 +841,14 @@ know the shape to use it well:
 > that is stuck asks *you*: `await tools.ask({ text })` with no
 > `to` reaches whoever asked it; you will see it as a condition — answer
 > with `answer(...)`, then `resume()`. The person driving the session may
-> speak to you, or to any worker directly, at any time. Your system
-> prompt says whether anyone is attached right now: if no one is, prefer
-> proceeding on a stated assumption (`tools.tell` it) over waiting on a
-> question that may sit for hours. Nothing re-prompts you when you stop
-> talking — if there is more to do, keep doing it in the program.
+> speak to you, or to any worker directly, at any time. **Each request's
+> last line says whether anyone is attached right now**: if no one is,
+> prefer proceeding on a stated assumption (`tools.tell` it) over waiting
+> on a question that may sit for hours. Waiting is free either way — a
+> parked ask burns no fuel and is re-attachable by id — so the choice is
+> yours to make against what that line says. Nothing re-prompts you when
+> you stop talking — if there is more to do, keep doing it in the
+> program.
 
 ## Answers
 
@@ -1252,7 +1255,8 @@ The load-bearing step of Part A: after it, no renderer touches the `VM`.
       handback, carrying every input its report needs.
       `ProgramStatus` becomes derivable from a reopened log
       (`program_status_survives_reopen`); a run that raises, resumes,
-      traps, resumes and returns logs four outcomes
+      traps, resumes and returns logs **three** outcomes — one per
+      handback, and the arithmetic in the original box was off by one
       (`one_outcome_per_handback_not_per_run`).
 - [x] `Message::Tool` **deleted, not ported**: tool-role messages are
       rendered by `report.rs` from the run's outcome and the events
@@ -1483,7 +1487,10 @@ events per step.
       report re-renders byte-identically — which is the responsiveness
       table's own wording ("appended beside the pending report; the next
       request shows both"). `Interrupt` (C1) is the override that makes a
-      post land now.)*
+      post land now. **Confirmed in C1**, and it is what
+      `Runner::interrupt` does for a suspended branch: it cancels the
+      request in flight and re-renders — not a second prompt for the same
+      cause, but the same one, carrying what has arrived since.)*
 - [x] Upward round trip, scripted: parent awaits child; child program
       `tools.ask({ text })` posts to the running parent; parent's LLM
       `answer`s + `resume`s in one turn; child gets its `Result`, answers;
@@ -1559,11 +1566,14 @@ events per step.
 
 ### Step C1 — `BranchId`; addressed commands; fork adds; interrupt; restart (`host/mod.rs`, `protocol.rs`, `tree.rs`, `main.rs`)
 
-- [ ] `BranchId = EventId` in `protocol.rs`; `Tree::branch_of(leaf)` walks
+- [x] `BranchId = EventId` in `protocol.rs`; `Tree::branch_of(leaf)` walks
       up to the nearest `Agent` or `Fork`;
-      `states`/`paused`/`starved`/`waits` and every `LoopMsg` keyed by
+      `states`/`paused`/`starved` and every `LoopMsg` keyed by
       `BranchId`; `SessionEvent` variants carry `branch` alongside `agent`.
-- [ ] `Fork { from, name }` logs `Fork { name }` as the new branch's root
+      *(The box also listed `waits`. It was deleted in B1, not re-keyed —
+      every call is settled through its logged `Call` id — so there is
+      nothing there to key.)*
+- [x] `Fork { from, name }` logs `Fork { name }` as the new branch's root
       (empty name allowed) and returns its id via
       `SessionEvent::BranchOpened`; `Resume(leaf)` returns
       `branch_of(leaf)`. Commands: `UserTurn { branch, text, expects_reply }`, `Reply {
@@ -1573,41 +1583,73 @@ events per step.
       busy rejections: deleted. `Branches(Vec<BranchInfo { branch, agent,
       leaf, name, parent_branch, status, open, asking_user: Option<EventId>, thinking
       }>)`; `ListLeaves` remains the log projection.
-- [ ] Two forks of one agent both grow under concurrent `UserTurn`s; the
+      *(`Session::conversation_branch()` replaces `root` for the CLI and
+      the UI's initial selection: the root agent's first branch, read off
+      `Tree::branches()` — a fact about the log, not a cursor. And
+      `LeafInfo.active` went with the cursor it named. The only rejection
+      left is "there is no such branch in this log".)*
+- [x] Two forks of one agent both grow under concurrent `UserTurn`s; the
       original leaf is untouched; `agents()` from the parent lists both
       (`two_forks_of_one_agent_run_concurrently`).
-- [ ] A fork is born idle: creating one issues no request; its first
+- [x] A fork is born idle: creating one issues no request; its first
       `UserTurn` does (`fork_is_born_idle`). `Fork` renders as a harness
       line, or — when the fork point's last `Turn` has an unanswered tool
       call — as that call's tool result naming the original branch and
       the artifacts so far; golden renders for both
       (`fork_line_renders`, `mid_program_fork_answers_the_dangling_call`).
-- [ ] `Interrupt` on an awaiting-LLM branch cancels the worker's stream
+- [x] `Interrupt` on an awaiting-LLM branch cancels the worker's stream
       (the `LlmClient` trait gains a cancellation token; the scripted
       client honours it), logs nothing for the cancelled turn, and the
       pending post starts a fresh turn (`interrupt_cancels_generation`);
       on a running branch it pauses at the next slice and the post lands
-      (`interrupt_pauses_program`).
-- [ ] `Restart { branch, call }` with `resume`, `run_program`, or `answer`
+      (`interrupt_pauses_program`). *(Cancellation is enforced by a
+      per-branch **epoch**, not by the client: a `LlmDone` whose epoch is
+      stale is dropped whatever the client returned, so "from the API's
+      view it did not happen" holds even against a client that ignores
+      its token. And when there is no post to land, the **harness authors
+      one** — see the unawaited-`Result` box below; one mechanism, both
+      wakes.)*
+- [x] `Restart { branch, call }` with `resume`, `run_program`, or `answer`
       on a suspended or idle branch: any in-flight LLM turn cancelled, a
       `Turn { author: User }` with that one call logged (synthetic
       `call_id`), applied exactly as if the LLM had made it, the next
       report answering that `call_id` like any other
       (`user_resumes_and_user_rewrites`, `user_answers_on_the_original_after_forking`).
       The TUI renders user-authored turns distinctly.
-- [ ] `awaiting_user` → `quiet()`; `run()` returns on quiet
+- [x] `awaiting_user` → `quiet()`; `run()` returns on quiet
       (`run_returns_when_every_branch_is_quiet`); two hot programs
       interleave and a third branch's turn is served
-      (`hot_programs_do_not_starve_other_branches`).
-- [ ] Presence: `Session` tracks whether a client is attached (the TUI is;
+      (`hot_programs_do_not_starve_other_branches`). *(Quiet is "no
+      **worker** in flight and no branch thinking", counted rather than
+      derived from phases: a worker that has produced its answer but has
+      not yet been drained is still work in flight, and no phase shows
+      that. B's `run_routed` helper now calls `run()`, and its `QUIET`
+      const is deleted — as intended.)*
+- [x] Presence: `Session` tracks whether a client is attached (the TUI is;
       `--headless` without `--turn` is not) and `render_request` emits it
       as a **trailing ephemeral line after the newest message** — never in
       the system prompt, never logged. Attaching mid-run changes only the
       next request's tail; the prefix before it is byte-identical across
-      the flip (`presence_flip_does_not_disturb_the_prefix`).
-- [ ] `agent session --list-branches`; `--turn` addressed to the
+      the flip (`presence_flip_does_not_disturb_the_prefix`). The
+      Orchestrating paragraph's presence sentence is restored to point at
+      that line.
+- [x] **Rule C's other half: an unawaited `Result` is surfaced as a
+      harness post.** A `Result` that lands with no program awaiting it —
+      the run was rewritten away, or the branch holds no VM — is logged as
+      an artifact *and* delivered as `Post { from: Harness, expects_reply:
+      false }`, which wakes the branch through the existing trigger rule
+      and owes no answer
+      (`unawaited_result_wakes_the_branch_as_a_harness_post`). This is
+      what the Open Questions section already decides ("default to
+      waking"), and it is a **legal** wake because the rule is *never wake
+      a branch without a cause event you can name in the log* — not
+      "never wake". The cause is logged, visible, auditable, and renders
+      identically forever. Without it, an orchestrator whose program ended
+      while its workers ran would get their answers logged and nothing
+      else.
+- [x] `agent session --list-branches`; `--turn` addressed to the
       conversation branch; `--fork` prints the new id.
-- [ ] Gate: `cargo fmt && cargo clippy --workspace --all-targets &&
+- [x] Gate: `cargo fmt && cargo clippy --workspace --all-targets &&
       cargo test` green.
 
 ### Step C2 — Reconciliation on open (`host/mod.rs`, `tree.rs`)

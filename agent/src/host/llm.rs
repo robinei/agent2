@@ -3,9 +3,37 @@
 //! trait, so the session loop never knows the difference.
 
 use std::collections::VecDeque;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::machine::{LlmRequest, LlmTurn};
+
+/// A cancellation token, one per in-flight completion.
+///
+/// `Interrupt` is the one override on rule B: a generation the user no
+/// longer wants is cancelled, and **from the API's view it did not
+/// happen** — nothing is logged for it. Correctness does not rest on the
+/// client noticing: the session drops a cancelled generation's response
+/// by epoch whatever the client returns. The token is what stops the
+/// wasted work, and it is why the trait carries one rather than the
+/// session racing a thread it cannot reach.
+#[derive(Clone, Default)]
+pub struct Cancel(Arc<AtomicBool>);
+
+impl Cancel {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Ask the in-flight completion to stop. Idempotent.
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+}
 
 /// A streamed piece of the assistant turn, forwarded to UIs live.
 pub enum LlmChunk {
@@ -28,6 +56,7 @@ pub trait LlmClient: Send + Sync {
     fn complete(
         &self,
         request: &LlmRequest,
+        cancel: &Cancel,
         chunk: &mut dyn FnMut(LlmChunk),
     ) -> Result<LlmTurn, String>;
 }
@@ -142,8 +171,12 @@ impl LlmClient for RoutedLlm {
     fn complete(
         &self,
         request: &LlmRequest,
+        cancel: &Cancel,
         chunk: &mut dyn FnMut(LlmChunk),
     ) -> Result<LlmTurn, String> {
+        if cancel.is_cancelled() {
+            return Err("cancelled".into());
+        }
         for (charter, queue) in &self.rules {
             if !request.system.ends_with(charter.as_str()) {
                 continue;
@@ -171,8 +204,12 @@ impl LlmClient for ScriptedLlm {
     fn complete(
         &self,
         _request: &LlmRequest,
+        cancel: &Cancel,
         chunk: &mut dyn FnMut(LlmChunk),
     ) -> Result<LlmTurn, String> {
+        if cancel.is_cancelled() {
+            return Err("cancelled".into());
+        }
         let message = self
             .responses
             .lock()
@@ -186,5 +223,74 @@ impl LlmClient for ScriptedLlm {
             chunk(LlmChunk::Text(message.text.clone()));
         }
         Ok(message)
+    }
+}
+
+/// A scripted client whose first `hold` completions **block until they
+/// are cancelled** — the one thing a test needs that no pure script can
+/// give it: a generation that is genuinely still in flight when
+/// `Interrupt` arrives. Later completions are served from `inner`.
+///
+/// It also counts the cancellations it observed, so a test can assert
+/// the token reached the worker rather than only that the session
+/// dropped the answer.
+#[cfg(test)]
+pub struct HoldingLlm {
+    held: Mutex<usize>,
+    observed: std::sync::atomic::AtomicUsize,
+    inner: ScriptedLlm,
+}
+
+#[cfg(test)]
+impl HoldingLlm {
+    pub fn new(hold: usize, responses: impl IntoIterator<Item = LlmTurn>) -> Self {
+        HoldingLlm {
+            held: Mutex::new(hold),
+            observed: std::sync::atomic::AtomicUsize::new(0),
+            inner: ScriptedLlm::new(responses),
+        }
+    }
+
+    /// How many completions saw their token cancelled.
+    pub fn cancelled(&self) -> usize {
+        self.observed.load(Ordering::SeqCst)
+    }
+}
+
+/// A shared client is the normal case (several branches think at once),
+/// so a test that keeps a handle on one hands the session an `Arc`.
+impl<T: LlmClient + ?Sized> LlmClient for Arc<T> {
+    fn complete(
+        &self,
+        request: &LlmRequest,
+        cancel: &Cancel,
+        chunk: &mut dyn FnMut(LlmChunk),
+    ) -> Result<LlmTurn, String> {
+        (**self).complete(request, cancel, chunk)
+    }
+}
+
+#[cfg(test)]
+impl LlmClient for HoldingLlm {
+    fn complete(
+        &self,
+        request: &LlmRequest,
+        cancel: &Cancel,
+        chunk: &mut dyn FnMut(LlmChunk),
+    ) -> Result<LlmTurn, String> {
+        let hold = {
+            let mut left = self.held.lock().unwrap();
+            let hold = *left > 0;
+            *left = left.saturating_sub(1);
+            hold
+        };
+        if hold {
+            while !cancel.is_cancelled() {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            self.observed.fetch_add(1, Ordering::SeqCst);
+            return Err("cancelled".into());
+        }
+        self.inner.complete(request, cancel, chunk)
     }
 }

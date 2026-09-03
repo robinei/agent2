@@ -159,7 +159,7 @@ impl AttachedApp {
     /// auto-pop — the selected agent starting a `run_program` pops the
     /// source + console column (decision 6).
     pub fn apply(&mut self, event: &SessionEvent) {
-        if let SessionEvent::Event { agent, event } = event
+        if let SessionEvent::Event { agent, event, .. } = event
             && Some(*agent) == self.selected
             && matches!(
                 &event.payload,
@@ -550,7 +550,7 @@ pub fn run_attached(mut session: Session, events_rx: Receiver<SessionEvent>) -> 
         });
     }
 
-    let mut app = AttachedApp::new(session.root());
+    let mut app = AttachedApp::new(session.conversation_branch());
     let mut terminal = ratatui::init();
     ratatui::crossterm::execute!(
         std::io::stdout(),
@@ -582,6 +582,7 @@ pub fn run_attached(mut session: Session, events_rx: Receiver<SessionEvent>) -> 
                             handle.send(SessionCommand::UserTurn {
                                 branch: selected,
                                 text,
+                                expects_reply: true,
                             });
                             app.reset_scrolls();
                         }
@@ -1004,9 +1005,11 @@ fn build_navigator_lines(agents: &[AgentView]) -> Vec<(AgentView, String)> {
 
 fn render_navigator(frame: &mut Frame, app: &AttachedApp, session: &Session, area: Rect) {
     // Agents from the log projection so the navigator survives resume
-    // (decision 8), with live status overlayed from `session.agents()`.
+    // (decision 8), with live status overlayed from the live branches.
+    // Part D replaces this with the branch tree; until then it shows an
+    // agent's *first* branch, whose id is the `Agent` event's own.
     let live: std::collections::HashMap<AgentId, &'static str> =
-        session.agents().into_iter().collect();
+        session.branches().into_iter().collect();
     let agent_views = session.tree().agent_list();
     let tree_lines = build_navigator_lines(&agent_views);
     let lines: Vec<Line> = tree_lines
@@ -1232,7 +1235,7 @@ mod tests {
     fn m0_run_program_auto_pops_and_sticks() {
         let (tx, rx) = channel();
         let session = run_demo(Tree::new(None), tx).unwrap();
-        let mut app = AttachedApp::new(session.root());
+        let mut app = AttachedApp::new(session.conversation_branch());
 
         let mut popped_while_program_visible = false;
         for event in rx.try_iter() {
@@ -1250,7 +1253,7 @@ mod tests {
         assert!(panes.right.contains(&Pane::Source));
         assert!(panes.right.contains(&Pane::Console));
         // The post-mortem VM is still borrowable for those panes.
-        let state = session.state(session.root()).unwrap();
+        let state = session.state(session.conversation_branch()).unwrap();
         assert!(!state.vm_is_live());
         assert!(state.vm().is_some(), "final program state kept");
 
@@ -1373,22 +1376,23 @@ mod tests {
         )
         .unwrap();
         session.handle().send(SessionCommand::UserTurn {
-            branch: session.root(),
+            branch: session.conversation_branch(),
             text: "delegate".into(),
+            expects_reply: true,
         });
 
-        // Pump until both agents are live with running programs.
+        // Pump until both branches are live with running programs.
         for _ in 0..200 {
-            let agents = session.agents();
-            if agents.len() == 2 && agents.iter().all(|(_, s)| *s == "running") {
+            let branches = session.branches();
+            if branches.len() == 2 && branches.iter().all(|(_, s)| *s == "running") {
                 break;
             }
             assert!(session.pump_one(), "session ended early");
         }
-        let agents = session.agents();
+        let agents = session.branches();
         assert_eq!(agents.len(), 2, "{agents:?}");
 
-        // Selecting each agent yields its own VM: different programs.
+        // Selecting each branch yields its own VM: different programs.
         let sources: Vec<String> = agents
             .iter()
             .map(|(id, _)| session.state(*id).unwrap().vm().unwrap().source.to_string())
@@ -1396,9 +1400,10 @@ mod tests {
         assert!(sources[0].contains("tools.agent"), "{sources:?}");
         assert!(sources[1].contains("tools.slow"), "{sources:?}");
 
-        // And the whole thing still settles cleanly: the root yields its
-        // final answer back to the user (the top conversation never ends).
+        // And the whole thing still settles cleanly: nothing *ends* —
+        // agents never close — so what it reaches is **quiet**, with the
+        // root's final answer on its branch.
         while session.pump_one() {}
-        assert!(session.is_awaiting_user());
+        assert!(session.quiet());
     }
 }

@@ -33,7 +33,8 @@ pub use tools::*;
 
 use std::collections::{HashMap, HashSet};
 use std::io;
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Instant;
@@ -42,7 +43,7 @@ use crate::machine::{
     LlmRequest, LlmTurn, OutCall, Runner, SpawnRequest, StepInput, StepOutput, ToolResult,
 };
 use crate::types::{
-    Address, Author, Call, Cause, EventId, EventPayload, Message, Origin, Outcome, Spine, Tree,
+    Address, Author, Call, Cause, EventId, EventPayload, Message, Origin, Outcome, ToolCall, Tree,
 };
 
 /// Instructions per VM slice on the loop thread (9_TUI decision 3).
@@ -111,25 +112,33 @@ pub type UiInput = ratatui::crossterm::event::Event;
 
 /// The unified inbox message. Every producer — UI, LLM worker, tool
 /// worker, the loop itself — sends this one enum.
+/// Every producer — UI, LLM worker, tool worker, the loop itself — sends
+/// this one enum, and every variant names a **branch**: the branch is the
+/// address, so nothing in flight has to be re-attributed on arrival.
 pub(crate) enum LoopMsg {
     Command(SessionCommand),
     LlmChunk {
-        agent: AgentId,
+        branch: BranchId,
         thinking: bool,
         text: String,
     },
     LlmDone {
-        agent: AgentId,
+        branch: BranchId,
+        /// Which generation this answers. `Interrupt` bumps the branch's
+        /// epoch, so a cancelled turn's response arrives stale and is
+        /// dropped — nothing is logged for it, which is what "from the
+        /// API's view it did not happen" means in the loop.
+        epoch: u64,
         result: Result<LlmTurn, String>,
     },
     ToolDone {
-        agent: AgentId,
+        branch: BranchId,
         call: EventId,
         result: Result<serde_json::Value, String>,
     },
     /// Fuel-slice continuation, re-enqueued between slices.
     Continue {
-        agent: AgentId,
+        branch: BranchId,
     },
     /// Terminal input for the embedding TUI; opaque to the loop.
     Ui(UiInput),
@@ -156,8 +165,11 @@ impl SessionHandle {
 
 pub struct Session {
     tree: Tree,
-    states: HashMap<AgentId, Runner>,
-    root: AgentId,
+    /// **Live state keyed by `BranchId`, not `AgentId`** — the one line
+    /// that makes any number of leaves grow at once. Two forks of one
+    /// agent are two runners here; nothing is minted, because a branch
+    /// id is its root event.
+    states: HashMap<BranchId, Runner>,
     registry: ToolRegistry,
     /// Shared client: `complete(&self)` lets several contexts think at
     /// once. Concurrency is bounded by `llm_permits`, not by the client.
@@ -169,16 +181,26 @@ pub struct Session {
     events: Sender<SessionEvent>,
     /// High-water mark of event ids already surfaced as `SessionEvent`s.
     emitted: u64,
-    /// Agents whose VM the debugger paused: their `Continue` messages
+    /// Branches whose VM the debugger paused: their `Continue` messages
     /// are parked in `starved` instead of ticking.
-    paused: HashSet<AgentId>,
-    starved: HashSet<AgentId>,
+    paused: HashSet<BranchId>,
+    starved: HashSet<BranchId>,
     done: bool,
-    /// The root agent yielded its turn back to the user (it produced a
-    /// final answer but, being the top conversation, did not complete).
-    /// `run()` stops here; interactive front-ends keep going and clear it
-    /// on the next `UserTurn`.
-    awaiting_user: bool,
+    /// Per-branch generation counter for LLM turns. `Interrupt` bumps it;
+    /// a `LlmDone` that does not match is a cancelled turn and is
+    /// dropped. Correctness lives here rather than in the client honouring
+    /// its token — the token only stops the wasted work.
+    llm_epoch: HashMap<BranchId, u64>,
+    /// The cancellation token of each in-flight generation.
+    cancels: HashMap<BranchId, Cancel>,
+    /// Worker threads that have not yet sent their result. Read **before**
+    /// draining the inbox and decremented **after** the send, so zero
+    /// means every send already landed — which is what makes `quiet()`
+    /// race-free without a second channel.
+    in_flight: Arc<AtomicUsize>,
+    /// Whether a client is attached. A per-request fact, pushed into each
+    /// runner's trailing line and stored nowhere else.
+    attached: bool,
 }
 
 impl Session {
@@ -232,8 +254,8 @@ impl Session {
         Self::assemble(tree, state, registry, llm, events, emitted)
     }
 
-    /// Shared construction for `new`/`open_at`: card the state, derive
-    /// the root agent, wire the inbox, and surface any logged events.
+    /// Shared construction for `new`/`open_at`: card the state, key it by
+    /// its **branch**, wire the inbox, and surface any logged events.
     fn assemble(
         tree: Tree,
         mut state: Runner,
@@ -243,13 +265,12 @@ impl Session {
         emitted: u64,
     ) -> io::Result<Self> {
         state.set_dialect_card(dialect_card(&registry));
-        let root = agent_root_of(&tree, state.spine.leaf_id);
+        let branch = state.branch_id();
 
         let (tx, rx) = channel();
         let mut session = Session {
             tree,
-            states: HashMap::from([(root, state)]),
-            root,
+            states: HashMap::from([(branch, state)]),
             registry,
             llm: Arc::from(llm),
             llm_permits: Arc::new(Semaphore::new(llm_concurrency())),
@@ -260,9 +281,12 @@ impl Session {
             paused: HashSet::new(),
             starved: HashSet::new(),
             done: false,
-            awaiting_user: false,
+            llm_epoch: HashMap::new(),
+            cancels: HashMap::new(),
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            attached: false,
         };
-        session.emit_new(root);
+        session.emit_new();
         // Opening is a step of its own: the root `Agent`, or a repair
         // appended by reconciliation, is durable before the loop runs.
         session.tree.sync()?;
@@ -279,17 +303,26 @@ impl Session {
         &self.tree
     }
 
-    pub fn root(&self) -> AgentId {
-        self.root
+    /// The **conversation branch**: the first branch of the log's root
+    /// agent. Not a cursor — the loop holds none — but the address a CLI
+    /// `--turn` and a UI's initial selection need, and a fact about the
+    /// log rather than about this session.
+    pub fn conversation_branch(&self) -> BranchId {
+        self.tree
+            .branches()
+            .first()
+            .map(|(root, _)| *root)
+            .or_else(|| self.states.keys().min_by_key(|id| id.as_u64()).copied())
+            .expect("a session always has one branch")
     }
 
-    pub fn state(&self, agent: AgentId) -> Option<&Runner> {
-        self.states.get(&agent)
+    pub fn state(&self, branch: BranchId) -> Option<&Runner> {
+        self.states.get(&branch)
     }
 
-    /// Active contexts, for agent lists (id, machine status).
-    pub fn agents(&self) -> Vec<(AgentId, &'static str)> {
-        let mut out: Vec<(AgentId, &'static str)> = self
+    /// Live branches, lowest id first (id, machine status).
+    pub fn branches(&self) -> Vec<(BranchId, &'static str)> {
+        let mut out: Vec<(BranchId, &'static str)> = self
             .states
             .iter()
             .map(|(id, s)| (*id, s.status()))
@@ -298,26 +331,62 @@ impl Session {
         out
     }
 
-    /// Run until the root agent yields the turn back to the user or
-    /// `Shutdown`. The root never *completes* (the top conversation
-    /// never ends); `run()` is the one-shot convenience that stops at the
-    /// yield. Interactive front-ends drive `pump_until` instead and keep
-    /// going across turns.
+    /// Whether a client is attached. Presence is a per-request fact: this
+    /// changes the next render's trailing line on every branch and not one
+    /// byte of any cached prefix.
+    pub fn set_attached(&mut self, attached: bool) {
+        self.attached = attached;
+        for state in self.states.values_mut() {
+            state.set_attached(attached);
+        }
+    }
+
+    /// Run until the session goes **quiet** or `Shutdown`. Nothing ends —
+    /// agents never close — so "quiet" is the only stopping condition
+    /// there is: no worker in flight and no branch thinking.
     pub fn run(mut self) -> Self {
         while self.pump_one() {}
         self
     }
 
-    /// Block for one inbox message and handle it; `false` once the
-    /// session is over (`Shutdown`) or the root has yielded its turn.
+    /// **Quiet: no branch has work in flight.** Not "no branch has
+    /// anything left to do" — a branch parked on a question to the human
+    /// is quiet, because nothing will move it until someone speaks, and
+    /// blocking there is how `run()` used to hang.
+    ///
+    /// It is deliberately *not* derived from phases alone: a worker
+    /// thread that has produced its answer but not yet been drained is
+    /// still work in flight, which `in_flight` counts and no phase shows.
+    pub fn quiet(&self) -> bool {
+        self.in_flight.load(Ordering::SeqCst) == 0
+            && !self.states.values().any(|s| s.status() == "awaiting llm")
+    }
+
+    /// Handle one inbox message; `false` once the session is over
+    /// (`Shutdown`) or quiet.
     pub fn pump_one(&mut self) -> bool {
-        if self.done || self.awaiting_user {
+        if self.done {
+            return false;
+        }
+        // Sampled **before** the drain, and decremented **after** each
+        // worker's send: zero here means every send already landed, so an
+        // empty inbox now is genuinely empty.
+        let quiet = self.quiet();
+        match self.rx.try_recv() {
+            Ok(msg) => {
+                self.on_msg(msg);
+                return !self.done;
+            }
+            Err(TryRecvError::Disconnected) => return false,
+            Err(TryRecvError::Empty) => {}
+        }
+        if quiet {
             return false;
         }
         match self.rx.recv() {
             Ok(msg) => {
                 self.on_msg(msg);
-                !(self.done || self.awaiting_user)
+                !self.done
             }
             Err(_) => false,
         }
@@ -346,43 +415,34 @@ impl Session {
         }
     }
 
-    /// Whether the conversation is over (root agent done / `Shutdown`).
-    /// The attached TUI keeps rendering past this for post-mortem
-    /// reading; `run()` exits on it.
+    /// Whether the session is over (`Shutdown` / an IO failure). The
+    /// attached TUI keeps rendering past this for post-mortem reading.
     #[allow(dead_code)]
     pub fn is_done(&self) -> bool {
         self.done
     }
 
-    /// Whether the root agent has yielded its turn back to the user (a
-    /// final answer is on the spine and the agent is idle, awaiting the
-    /// next `UserTurn`). Distinct from `is_done`: the conversation lives.
-    #[allow(dead_code)]
-    pub fn is_awaiting_user(&self) -> bool {
-        self.awaiting_user
-    }
-
     // ── debugger controls (privileged: same thread as the loop) ──────
 
-    /// Pause/resume an agent's VM. Pausing parks its fuel-slice
+    /// Pause/resume a branch's VM. Pausing parks its fuel-slice
     /// continuations; resuming re-enqueues a parked one.
-    pub fn set_paused(&mut self, agent: AgentId, paused: bool) {
+    pub fn set_paused(&mut self, branch: BranchId, paused: bool) {
         if paused {
-            self.paused.insert(agent);
-        } else if self.paused.remove(&agent) && self.starved.remove(&agent) {
-            let _ = self.tx.send(LoopMsg::Continue { agent });
+            self.paused.insert(branch);
+        } else if self.paused.remove(&branch) && self.starved.remove(&branch) {
+            let _ = self.tx.send(LoopMsg::Continue { branch });
         }
     }
 
-    pub fn is_paused(&self, agent: AgentId) -> bool {
-        self.paused.contains(&agent)
+    pub fn is_paused(&self, branch: BranchId) -> bool {
+        self.paused.contains(&branch)
     }
 
     /// Run one slice of at most `fuel` instructions on a (paused)
-    /// agent — the debugger's step keys.
-    pub fn step_paused(&mut self, agent: AgentId, fuel: u64) {
+    /// branch — the debugger's step keys.
+    pub fn step_paused(&mut self, branch: BranchId, fuel: u64) {
         let _ = self
-            .step_agent(agent, StepInput::Tick { fuel })
+            .step_branch(branch, StepInput::Tick { fuel })
             .and_then(|()| self.tree.sync());
     }
 
@@ -393,7 +453,7 @@ impl Session {
         let stepped = self.dispatch(msg).and_then(|()| self.tree.sync());
         if let Err(e) = stepped {
             self.emit(SessionEvent::Error {
-                agent: None,
+                branch: None,
                 message: format!("session io error: {e}"),
             });
             self.done = true;
@@ -406,28 +466,25 @@ impl Session {
                 self.done = true;
                 Ok(())
             }
-            LoopMsg::Command(SessionCommand::UserTurn { branch, text }) => {
-                let root = branch;
-                let Some(state) = self.states.get(&root) else {
-                    self.emit(SessionEvent::Error {
-                        agent: Some(branch),
-                        message: format!("no live branch {}", branch.as_u64()),
-                    });
-                    return Ok(());
-                };
-                // **Nothing you say is ever rejected.** A post is logged
-                // on arrival in every phase and delivered at the
-                // recipient's next safe point — for a running program,
-                // its next fuel slice (rule B).
-                let _ = state;
-                self.awaiting_user = false; // the user took their turn
+            // **Nothing you say is ever rejected.** A post is logged on
+            // arrival in every phase and delivered at the recipient's
+            // next safe point — for a running program, its next fuel
+            // slice (rule B). There is no busy rejection left to make.
+            LoopMsg::Command(SessionCommand::UserTurn {
+                branch,
+                text,
+                expects_reply,
+            }) => {
+                if !self.open_branch(branch) {
+                    return self.unaddressable(branch);
+                }
                 self.deliver_post(
-                    root,
+                    branch,
                     Author::User,
                     Origin::Direct {
                         text,
                         input: serde_json::Value::Null,
-                        expects_reply: true,
+                        expects_reply,
                     },
                 )
                 .map(|_| ())
@@ -437,112 +494,169 @@ impl Session {
                 call,
                 value,
             }) => self.cmd_reply(branch, call, value),
+            LoopMsg::Command(SessionCommand::Restart { branch, call }) => {
+                self.cmd_restart(branch, call)
+            }
+            LoopMsg::Command(SessionCommand::Interrupt { branch }) => self.cmd_interrupt(branch),
+            LoopMsg::Command(SessionCommand::Spawn {
+                parent,
+                name,
+                charter,
+                text,
+            }) => self.cmd_spawn(parent, name, charter, text),
             LoopMsg::Command(SessionCommand::ListLeaves) => {
                 let leaves = self.leaf_infos();
                 self.emit(SessionEvent::Leaves(leaves));
                 Ok(())
             }
-            LoopMsg::Command(SessionCommand::Rename(name)) => self.cmd_rename(name),
+            LoopMsg::Command(SessionCommand::ListBranches) => {
+                self.emit_branches();
+                Ok(())
+            }
+            LoopMsg::Command(SessionCommand::Rename { branch, name }) => {
+                self.cmd_rename(branch, name)
+            }
             LoopMsg::Command(SessionCommand::Fork { from, name }) => self.cmd_fork(from, name),
             LoopMsg::Command(SessionCommand::Resume(leaf)) => self.cmd_resume(leaf),
             LoopMsg::LlmChunk {
-                agent,
+                branch,
                 thinking,
                 text,
             } => {
+                let agent = self.agent_of(branch);
                 self.emit(SessionEvent::Chunk {
                     agent,
+                    branch,
                     thinking,
                     text,
                 });
                 Ok(())
             }
-            LoopMsg::LlmDone { agent, result } => match result {
-                Ok(message) => self.step_agent(agent, StepInput::LlmResponse(message)),
-                Err(message) => {
-                    self.emit(SessionEvent::Error {
-                        agent: Some(agent),
-                        message: message.clone(),
-                    });
-                    // A dead branch fails every call waiting on it.
-                    let owed = self.owed_by(agent);
-                    if owed.is_empty() {
-                        self.done = true;
-                    }
-                    for (asker, send) in owed {
-                        let _ = self.tx.send(LoopMsg::ToolDone {
-                            agent: asker,
-                            call: send,
-                            result: Err(format!("subagent failed: {message}")),
-                        });
-                    }
-                    Ok(())
-                }
-            },
-            LoopMsg::ToolDone {
-                agent,
-                call,
+            LoopMsg::LlmDone {
+                branch,
+                epoch,
                 result,
-            } => self.step_agent(
-                agent,
-                StepInput::ToolResults(vec![ToolResult { call, result }]),
-            ),
-            LoopMsg::Continue { agent } => {
-                if self.paused.contains(&agent) {
-                    // Park the slice; `set_paused(false)` re-enqueues it.
-                    self.starved.insert(agent);
+            } => {
+                // A cancelled generation: `Interrupt` bumped the epoch,
+                // so this turn never happened as far as the log is
+                // concerned. Dropping it here is what makes that true
+                // whatever the client did with its token.
+                if self.llm_epoch.get(&branch).copied() != Some(epoch) {
                     return Ok(());
                 }
-                self.step_agent(agent, StepInput::Tick { fuel: FUEL_SLICE })
+                self.cancels.remove(&branch);
+                match result {
+                    Ok(message) => self.step_branch(branch, StepInput::LlmResponse(message)),
+                    Err(message) => {
+                        self.emit(SessionEvent::Error {
+                            branch: Some(branch),
+                            message: message.clone(),
+                        });
+                        // The branch is not thinking any more, whatever
+                        // it believes: leaving it `AwaitingLlm` with
+                        // nothing in flight is a state nothing can ever
+                        // move it out of.
+                        if let Some(state) = self.states.get_mut(&branch) {
+                            state.abandon_request();
+                        }
+                        // A dead branch fails every call waiting on it.
+                        for (asker, send) in self.owed_by(branch) {
+                            let _ = self.tx.send(LoopMsg::ToolDone {
+                                branch: asker,
+                                call: send,
+                                result: Err(format!("subagent failed: {message}")),
+                            });
+                        }
+                        Ok(())
+                    }
+                }
+            }
+            LoopMsg::ToolDone {
+                branch,
+                call,
+                result,
+            } => self.step_branch(
+                branch,
+                StepInput::ToolResults(vec![ToolResult { call, result }]),
+            ),
+            LoopMsg::Continue { branch } => {
+                if self.paused.contains(&branch) {
+                    // Park the slice; `set_paused(false)` re-enqueues it.
+                    self.starved.insert(branch);
+                    return Ok(());
+                }
+                self.step_branch(branch, StepInput::Tick { fuel: FUEL_SLICE })
             }
             // Handled by `pump_until`; harmless if one reaches `run()`.
             LoopMsg::Ui(_) => Ok(()),
         }
     }
 
-    /// The active root agent's id if it is idle; otherwise emit a
-    /// rejection and return `None`. Fork/label/resume re-anchor the root
-    /// and must not tear down a running VM (like `UserTurn`).
-    fn idle_root(&mut self) -> Option<AgentId> {
-        let root = self.root;
-        match self.states.get(&root) {
-            Some(state) if state.is_idle() => Some(root),
-            Some(state) => {
-                let status = state.status();
-                self.emit(SessionEvent::Error {
-                    agent: Some(root),
-                    message: format!("agent is busy ({status})"),
-                });
-                None
-            }
-            None => None,
-        }
-    }
-
-    /// Name the active branch. A `Rename` is a **record**, not a message,
-    /// so it changes the navigator and wakes nothing.
-    fn cmd_rename(&mut self, name: String) -> io::Result<()> {
-        let Some(root) = self.idle_root() else {
-            return Ok(());
-        };
-        let state = self.states.get_mut(&root).expect("idle_root checked");
-        self.tree
-            .append(&mut state.spine, EventPayload::Rename { name })?;
-        self.emit_new(root);
-        let leaves = self.leaf_infos();
-        self.emit(SessionEvent::Leaves(leaves));
+    /// Say so when a command names something that is not a branch. This
+    /// is the *only* rejection left: not "that branch is busy" — no
+    /// branch is ever too busy to be spoken to — but "there is no such
+    /// branch in this log".
+    fn unaddressable(&mut self, branch: BranchId) -> io::Result<()> {
+        self.emit(SessionEvent::Error {
+            branch: Some(branch),
+            message: format!("#{} is not a branch in this log", branch.as_u64()),
+        });
         Ok(())
     }
 
-    fn cmd_fork(&mut self, from: EventId, name: Option<String>) -> io::Result<()> {
-        if self.idle_root().is_none() {
-            return Ok(());
+    /// Make `branch` live, re-hydrating it from the log if this session
+    /// has no runner for it. `false` when it is not a branch at all.
+    ///
+    /// **`dormant` means "no runner yet", never "lost"**: a branch is a
+    /// path in the log, so re-hydrating it is `spine_at` and nothing
+    /// else. The re-opened runner starts `shown` at its leaf, so it waits
+    /// to be spoken to rather than self-prompting (C2 lowers that mark
+    /// where reconciliation owes a prompt).
+    fn open_branch(&mut self, branch: BranchId) -> bool {
+        if self.states.contains_key(&branch) {
+            return true;
         }
+        let Some((_, leaf)) = self
+            .tree
+            .branches()
+            .into_iter()
+            .find(|(root, _)| *root == branch)
+        else {
+            return false;
+        };
+        let mut state = Runner::with_spine(&self.tree, self.tree.spine_at(leaf));
+        state.set_dialect_card(dialect_card(&self.registry));
+        state.set_attached(self.attached);
+        self.states.insert(branch, state);
+        self.emit(SessionEvent::BranchOpened { branch });
+        true
+    }
+
+    /// Name a branch. A `Rename` is a **record**, not a message, so it
+    /// changes the navigator and wakes nothing — and it is accepted in
+    /// every phase, because nothing about it touches a running program.
+    fn cmd_rename(&mut self, branch: BranchId, name: String) -> io::Result<()> {
+        if !self.open_branch(branch) {
+            return self.unaddressable(branch);
+        }
+        let state = self.states.get_mut(&branch).expect("open_branch inserted");
+        self.tree
+            .append(&mut state.spine, EventPayload::Rename { name })?;
+        self.emit_new();
+        self.emit_branches();
+        Ok(())
+    }
+
+    /// **Fork adds a branch; it never moves you.** Every other branch is
+    /// untouched, the new one is born idle (its `shown` starts at its own
+    /// root, so inherited history is never a cause), and the only thing
+    /// it returns is the new id.
+    fn cmd_fork(&mut self, from: EventId, name: Option<String>) -> io::Result<()> {
         let mut spine = match self.tree.fork(from) {
             Ok(spine) => spine,
             Err(e) => {
                 self.emit(SessionEvent::Error {
-                    agent: None,
+                    branch: None,
                     message: format!("fork failed: {e}"),
                 });
                 return Ok(());
@@ -550,49 +664,153 @@ impl Session {
         };
         // A `Fork` roots the divergent branch: history and artifacts
         // cross it, obligations do not.
-        self.tree.append(&mut spine, EventPayload::Fork { name })?;
-        self.reanchor_root(spine);
-        let leaves = self.leaf_infos();
-        self.emit(SessionEvent::Leaves(leaves));
+        let fork = self.tree.append(&mut spine, EventPayload::Fork { name })?;
+        let mut state = Runner::with_spine(&self.tree, spine);
+        state.set_dialect_card(dialect_card(&self.registry));
+        state.set_attached(self.attached);
+        self.states.insert(fork, state);
+        self.emit_new();
+        self.emit(SessionEvent::BranchOpened { branch: fork });
+        self.emit_branches();
         Ok(())
     }
 
+    /// Open the branch `leaf` sits on. It moves no cursor — there is
+    /// none — it makes a dormant branch live and says which one it is.
     fn cmd_resume(&mut self, leaf: EventId) -> io::Result<()> {
-        if self.idle_root().is_none() {
-            return Ok(());
-        }
-        if !self.tree.events.contains_key(&leaf) {
+        let Some(branch) = self.tree.branch_of(leaf) else {
             self.emit(SessionEvent::Error {
-                agent: None,
+                branch: None,
                 message: format!("cannot resume {leaf:?}: not in the log"),
             });
             return Ok(());
+        };
+        // `open_branch` announces one it had to re-hydrate; a branch
+        // that was already live is announced here, so a `Resume` always
+        // answers with the id — and never twice.
+        let already = self.states.contains_key(&branch);
+        if !self.open_branch(branch) {
+            return self.unaddressable(branch);
         }
-        let spine = self.tree.spine_at(leaf);
-        self.reanchor_root(spine);
-        let leaves = self.leaf_infos();
-        self.emit(SessionEvent::Leaves(leaves));
+        if already {
+            self.emit(SessionEvent::BranchOpened { branch });
+        }
+        self.emit_branches();
         Ok(())
     }
 
-    /// Make `spine` the active root: card a fresh `Runner`, key it by
-    /// its agent's `Agent` (replacing any prior in-memory state for
-    /// that agent — the superseded branch stays in the tree, re-listable
-    /// via `ListLeaves`), and point `root` at it. Any freshly logged
-    /// events (a fork's `Label`) are surfaced.
-    fn reanchor_root(&mut self, spine: Spine) {
-        let mut state = Runner::with_spine(&self.tree, spine);
-        state.set_dialect_card(dialect_card(&self.registry));
-        let root = agent_root_of(&self.tree, state.spine.leaf_id);
-        self.states.insert(root, state);
-        self.root = root;
-        self.emit_new(root);
+    /// **The user takes a branch's turn** — `Restart`, DESIGN.md's
+    /// outermost handler made literal. Any in-flight generation is
+    /// cancelled, a `Turn { author: User }` carrying that one call is
+    /// logged, and it is applied exactly as if the LLM had made it: the
+    /// next report answers its `call_id` like any other, and the branch's
+    /// later history shows it resumed with 5, which is true.
+    fn cmd_restart(&mut self, branch: BranchId, call: UserCall) -> io::Result<()> {
+        if !self.open_branch(branch) {
+            return self.unaddressable(branch);
+        }
+        self.cancel_generation(branch);
+        // Unique for the life of the log, like every other id here.
+        let id = format!("user-{}", self.tree.id_counter + 1);
+        let turn = LlmTurn {
+            text: String::new(),
+            thinking: None,
+            tool_calls: vec![match call {
+                UserCall::RunProgram { source } => ToolCall {
+                    id,
+                    name: crate::machine::TOOL_RUN_PROGRAM.into(),
+                    arguments: serde_json::json!({ "source": source }),
+                },
+                UserCall::Resume { value } => ToolCall {
+                    id,
+                    name: crate::machine::TOOL_RESUME.into(),
+                    arguments: match value {
+                        Some(v) => serde_json::json!({ "value": v }),
+                        None => serde_json::json!({}),
+                    },
+                },
+                UserCall::Answer { question, value } => ToolCall {
+                    id,
+                    name: crate::machine::TOOL_ANSWER.into(),
+                    arguments: serde_json::json!({
+                        "question": question.as_u64(),
+                        "value": value,
+                    }),
+                },
+            }],
+        };
+        let state = self.states.get_mut(&branch).expect("open_branch inserted");
+        let outputs = state.take_turn(&mut self.tree, turn)?;
+        self.after_step(branch, outputs)
     }
 
-    /// The tree's leaves as serializable `LeafInfo`s, lowest id first,
-    /// the current active root leaf flagged.
+    /// **`Interrupt`** — cancel an in-flight generation, or make a
+    /// running program hand back at its next fuel slice. The one override
+    /// on rule B's "next safe point"; what the branch does about it is
+    /// `Runner::interrupt`.
+    fn cmd_interrupt(&mut self, branch: BranchId) -> io::Result<()> {
+        self.cancel_generation(branch);
+        let Some(state) = self.states.get_mut(&branch) else {
+            return Ok(());
+        };
+        let outputs = state.interrupt(&mut self.tree)?;
+        self.after_step(branch, outputs)
+    }
+
+    /// Abandon any generation in flight on `branch`: bump the epoch so
+    /// its response is dropped on arrival, and cancel the worker's token
+    /// so it stops streaming. Logs nothing — from the API's view that
+    /// turn did not happen.
+    fn cancel_generation(&mut self, branch: BranchId) {
+        *self.llm_epoch.entry(branch).or_default() += 1;
+        if let Some(cancel) = self.cancels.remove(&branch) {
+            cancel.cancel();
+        }
+    }
+
+    /// The user's own spawn: create an agent under `parent` and, if they
+    /// said something, ask it. The user has no program, so there is no
+    /// `Send` — just a `Post { from: User }` on the new branch, whose
+    /// answer they read inline, exactly as anywhere else.
+    fn cmd_spawn(
+        &mut self,
+        parent: BranchId,
+        name: Option<String>,
+        charter: String,
+        text: Option<String>,
+    ) -> io::Result<()> {
+        if !self.open_branch(parent) {
+            return self.unaddressable(parent);
+        }
+        let at = self.states[&parent].spine.leaf_id;
+        let tools = self.allowlist(self.agent_of(parent));
+        let card = match &tools {
+            Some(allowed) => dialect_card(&self.registry.narrowed(allowed)),
+            None => dialect_card(&self.registry),
+        };
+        let mut child = Runner::new_agent(&mut self.tree, at, name, charter, tools, None, &card)?;
+        child.set_attached(self.attached);
+        let branch = child.branch_id();
+        self.states.insert(branch, child);
+        self.emit_new();
+        self.emit(SessionEvent::BranchOpened { branch });
+        if let Some(text) = text {
+            self.deliver_post(
+                branch,
+                Author::User,
+                Origin::Direct {
+                    text,
+                    input: serde_json::Value::Null,
+                    expects_reply: true,
+                },
+            )?;
+        }
+        self.emit_branches();
+        Ok(())
+    }
+
+    /// The tree's leaves as serializable `LeafInfo`s, lowest id first.
     fn leaf_infos(&self) -> Vec<LeafInfo> {
-        let active = self.states.get(&self.root).map(|s| s.spine.leaf_id);
         let mut leaves = self.tree.list_leaves();
         leaves.sort_by_key(|(id, _)| id.as_u64());
         leaves
@@ -602,42 +820,106 @@ impl Session {
                 agent: agent_root_of(&self.tree, leaf),
                 name,
                 open: self.tree.spine_at(leaf).context().open.len(),
-                active: Some(leaf) == active,
                 summary: leaf_summary(&self.tree, leaf),
             })
             .collect()
     }
 
-    fn step_agent(&mut self, agent: AgentId, input: StepInput) -> io::Result<()> {
-        let Some(state) = self.states.get_mut(&agent) else {
+    /// Every branch in the log as a navigator row: identity and shape
+    /// from the log, `status`/`thinking` from live session state.
+    fn branch_infos(&self) -> Vec<BranchInfo> {
+        self.tree
+            .branches()
+            .into_iter()
+            .map(|(branch, leaf)| BranchInfo {
+                branch,
+                agent: agent_root_of(&self.tree, leaf),
+                leaf,
+                name: self.tree.branch_name(leaf),
+                parent_branch: self
+                    .tree
+                    .events
+                    .get(&branch)
+                    .and_then(|e| e.parent_id)
+                    .and_then(|p| self.tree.branch_of(p)),
+                status: self.branch_status(branch).to_owned(),
+                open: self.tree.spine_at(leaf).context().open.len(),
+                asking_user: self.asking_user(leaf),
+                thinking: self.branch_status(branch) == "thinking",
+            })
+            .collect()
+    }
+
+    fn emit_branches(&mut self) {
+        let branches = self.branch_infos();
+        self.emit(SessionEvent::Branches(branches));
+    }
+
+    /// The `Send { to: user }` this branch is still waiting on, if any —
+    /// what makes the inbox a *view*: every live branch with a pending
+    /// ask to the human, highlighted where it sits.
+    fn asking_user(&self, leaf: EventId) -> Option<EventId> {
+        let path = self.tree.path_events(leaf);
+        path.iter()
+            .rev()
+            .find(|e| {
+                matches!(
+                    &e.payload,
+                    EventPayload::Call(Call::Send {
+                        to: Address::User,
+                        expects_reply: true,
+                        ..
+                    })
+                ) && !path.iter().any(
+                    |r| matches!(&r.payload, EventPayload::Result { call, .. } if *call == e.id),
+                )
+            })
+            .map(|e| e.id)
+    }
+
+    fn step_branch(&mut self, branch: BranchId, input: StepInput) -> io::Result<()> {
+        let Some(state) = self.states.get_mut(&branch) else {
             return Ok(());
         };
         let outputs = state.step(&mut self.tree, input)?;
-        let transitions = state.take_status_transitions();
-        self.emit_new(agent);
+        self.after_step(branch, outputs)
+    }
+
+    /// Surface what a step logged and act on what it asked for. Every
+    /// door into a `Runner` — `step`, `deliver`, `take_turn`,
+    /// `interrupt` — comes back through here.
+    fn after_step(&mut self, branch: BranchId, outputs: Vec<StepOutput>) -> io::Result<()> {
+        let transitions = self
+            .states
+            .get_mut(&branch)
+            .map(|s| s.take_status_transitions())
+            .unwrap_or_default();
+        self.emit_new();
+        let agent = self.agent_of(branch);
         for (program, status) in transitions {
             self.emit(SessionEvent::ProgramStatus {
                 agent,
+                branch,
                 program,
                 status,
             });
         }
-        self.process(agent, outputs)
+        self.process(branch, outputs)
     }
 
-    fn process(&mut self, agent: AgentId, outputs: Vec<StepOutput>) -> io::Result<()> {
+    fn process(&mut self, branch: BranchId, outputs: Vec<StepOutput>) -> io::Result<()> {
         for output in outputs {
             match output {
-                StepOutput::LlmRequest(request) => self.spawn_llm(agent, request),
-                StepOutput::ToolCalls(calls) => self.spawn_tools(agent, calls),
+                StepOutput::LlmRequest(request) => self.spawn_llm(branch, request),
+                StepOutput::ToolCalls(calls) => self.spawn_tools(branch, calls),
                 StepOutput::Spawns(spawns) => {
                     for spawn in spawns {
-                        self.create_agent(agent, spawn)?;
+                        self.create_agent(branch, spawn)?;
                     }
                 }
                 StepOutput::Sends(sends) => {
                     for send in sends {
-                        self.deliver_send(agent, send)?;
+                        self.deliver_send(branch, send)?;
                     }
                 }
                 // A branch answered and went idle. **The branch is the
@@ -645,10 +927,10 @@ impl Session {
                 // asked, which is a fact on the post itself — not by any
                 // flag on the branch.
                 StepOutput::Answered { question, value } => {
-                    self.route_answer(agent, question, value)?
+                    self.route_answer(branch, question, value)?
                 }
                 StepOutput::Working => {
-                    let _ = self.tx.send(LoopMsg::Continue { agent });
+                    let _ = self.tx.send(LoopMsg::Continue { branch });
                 }
             }
         }
@@ -657,10 +939,17 @@ impl Session {
 
     /// One worker thread per in-flight completion (blocking reads live
     /// there; chunks and the final message come back through the inbox).
-    fn spawn_llm(&self, agent: AgentId, request: LlmRequest) {
+    fn spawn_llm(&mut self, branch: BranchId, request: LlmRequest) {
+        let epoch = self.llm_epoch.entry(branch).or_default();
+        *epoch += 1;
+        let epoch = *epoch;
+        let cancel = Cancel::new();
+        self.cancels.insert(branch, cancel.clone());
         let llm = Arc::clone(&self.llm);
         let permits = Arc::clone(&self.llm_permits);
         let tx = self.tx.clone();
+        let in_flight = Arc::clone(&self.in_flight);
+        in_flight.fetch_add(1, Ordering::SeqCst);
         thread::spawn(move || {
             // Block off-loop until a completion slot is free; the permit
             // is held only for this `complete()` call and released on drop.
@@ -671,20 +960,28 @@ impl Session {
                     LlmChunk::Thinking(t) => (true, t),
                 };
                 let _ = tx.send(LoopMsg::LlmChunk {
-                    agent,
+                    branch,
                     thinking,
                     text,
                 });
             };
-            let result = llm.complete(&request, &mut on_chunk);
-            let _ = tx.send(LoopMsg::LlmDone { agent, result });
+            let result = llm.complete(&request, &cancel, &mut on_chunk);
+            let _ = tx.send(LoopMsg::LlmDone {
+                branch,
+                epoch,
+                result,
+            });
+            // After the send, never before: `quiet()` reads this counter
+            // and then drains, so zero must mean "already in the inbox".
+            in_flight.fetch_sub(1, Ordering::SeqCst);
         });
     }
 
     /// Spawn-per-call fan-out; completions arrive at the inbox in
     /// whatever order the tools finish — that arrival order is the
     /// logged resolution order.
-    fn spawn_tools(&self, agent: AgentId, calls: Vec<OutCall>) {
+    fn spawn_tools(&self, branch: BranchId, calls: Vec<OutCall>) {
+        let agent = self.agent_of(branch);
         for call in calls {
             // `agents` is the one tool the registry cannot serve: its
             // answer is a projection over the tree **plus live session
@@ -692,7 +989,7 @@ impl Session {
             // see. Answered inline, on the loop thread — it reads memory.
             if call.name == crate::machine::TOOL_AGENTS {
                 let _ = self.tx.send(LoopMsg::ToolDone {
-                    agent,
+                    branch,
                     call: call.call,
                     result: self.serve_agents(agent, &call.args),
                 });
@@ -700,7 +997,7 @@ impl Session {
             }
             if let Err(refused) = self.check_allowlist(agent, &call.name) {
                 let _ = self.tx.send(LoopMsg::ToolDone {
-                    agent,
+                    branch,
                     call: call.call,
                     result: Err(refused),
                 });
@@ -710,18 +1007,21 @@ impl Session {
                 Some(def) => {
                     let def = Arc::clone(def);
                     let tx = self.tx.clone();
+                    let in_flight = Arc::clone(&self.in_flight);
+                    in_flight.fetch_add(1, Ordering::SeqCst);
                     thread::spawn(move || {
                         let result = guard_size((def.handler)(call.args));
                         let _ = tx.send(LoopMsg::ToolDone {
-                            agent,
+                            branch,
                             call: call.call,
                             result,
                         });
+                        in_flight.fetch_sub(1, Ordering::SeqCst);
                     });
                 }
                 None => {
                     let _ = self.tx.send(LoopMsg::ToolDone {
-                        agent,
+                        branch,
                         call: call.call,
                         result: Err(format!("unknown tool `{}`", call.name)),
                     });
@@ -764,8 +1064,9 @@ impl Session {
     /// conversation that created it. Nothing is asked here: a spawned
     /// agent is idle with nothing open, so the driving rule leaves it
     /// silent until someone speaks to it.
-    fn create_agent(&mut self, parent: AgentId, spawn: SpawnRequest) -> io::Result<()> {
+    fn create_agent(&mut self, parent: BranchId, spawn: SpawnRequest) -> io::Result<()> {
         let SpawnRequest { call, budget } = spawn;
+        let parent_agent = self.agent_of(parent);
         // `name`/`charter`/`tools` live on the logged `Spawn`; the host
         // reads them there rather than being handed a copy.
         let Some(EventPayload::Call(Call::Spawn {
@@ -781,7 +1082,7 @@ impl Session {
         // `tools` **narrows**: a child can never widen past its parent's
         // allowlist, so an intersection is the only honest reading of
         // "default: yours".
-        let tools = match (self.allowlist(parent), tools.clone()) {
+        let tools = match (self.allowlist(parent_agent), tools.clone()) {
             (None, child) => child,
             (Some(parent_tools), None) => Some(parent_tools),
             (Some(parent_tools), Some(child)) => Some(
@@ -795,12 +1096,15 @@ impl Session {
             Some(allowed) => dialect_card(&self.registry.narrowed(allowed)),
             None => dialect_card(&self.registry),
         };
-        let child = Runner::new_agent(&mut self.tree, call, name, charter, tools, budget, &card)?;
+        let mut child =
+            Runner::new_agent(&mut self.tree, call, name, charter, tools, budget, &card)?;
+        child.set_attached(self.attached);
         let child_id = child.agent_id();
-        self.states.insert(child_id, child);
-        self.emit_new(child_id);
+        self.states.insert(child.branch_id(), child);
+        self.emit_new();
+        self.emit(SessionEvent::BranchOpened { branch: child_id });
         let _ = self.tx.send(LoopMsg::ToolDone {
-            agent: parent,
+            branch: parent,
             call,
             result: Ok(serde_json::json!({ "agent": child_id.as_u64() })),
         });
@@ -817,7 +1121,7 @@ impl Session {
     /// - to the human: **no `Post` anywhere** — they have no branch to
     ///   post into. An `ask` stays pending until `Reply` settles it; a
     ///   `tell` is a receipt with no post to name.
-    fn deliver_send(&mut self, sender: AgentId, send: EventId) -> io::Result<()> {
+    fn deliver_send(&mut self, sender: BranchId, send: EventId) -> io::Result<()> {
         let Some(EventPayload::Call(Call::Send {
             to, expects_reply, ..
         })) = self.tree.events.get(&send).map(|e| &e.payload)
@@ -829,7 +1133,7 @@ impl Session {
             Address::User => {
                 if !expects_reply {
                     let _ = self.tx.send(LoopMsg::ToolDone {
-                        agent: sender,
+                        branch: sender,
                         call: send,
                         result: Ok(serde_json::json!({ "post": serde_json::Value::Null })),
                     });
@@ -838,23 +1142,24 @@ impl Session {
             }
             Address::Branch(branch) => branch,
         };
-        if !self.states.contains_key(&branch) {
+        // A dormant branch is not a dead one: it is a path in the log
+        // with no runner yet, so being spoken to is exactly what makes
+        // it live again.
+        if !self.open_branch(branch) {
             let _ = self.tx.send(LoopMsg::ToolDone {
-                agent: sender,
+                branch: sender,
                 call: send,
-                result: Err(format!(
-                    "branch #{} is not live in this session",
-                    branch.as_u64()
-                )),
+                result: Err(format!("#{} is not a branch in this log", branch.as_u64())),
             });
             return Ok(());
         }
-        let post = self.deliver_post(branch, Author::Agent(sender), Origin::Sent(send))?;
+        let from = Author::Agent(self.agent_of(sender));
+        let post = self.deliver_post(branch, from, Origin::Sent(send))?;
         // A tell resolves as soon as its post lands: what a tell spares
         // is the answer, not the attention.
         if !expects_reply {
             let _ = self.tx.send(LoopMsg::ToolDone {
-                agent: sender,
+                branch: sender,
                 call: send,
                 result: Ok(serde_json::json!({ "post": post.map(|p| p.as_u64()) })),
             });
@@ -866,7 +1171,7 @@ impl Session {
     /// Returns the `Post`'s id — a `tell`'s receipt names it.
     fn deliver_post(
         &mut self,
-        branch: AgentId,
+        branch: BranchId,
         from: Author,
         origin: Origin,
     ) -> io::Result<Option<EventId>> {
@@ -874,16 +1179,7 @@ impl Session {
             return Ok(None);
         };
         let (post, outputs) = state.deliver(&mut self.tree, from, origin)?;
-        let transitions = state.take_status_transitions();
-        self.emit_new(branch);
-        for (program, status) in transitions {
-            self.emit(SessionEvent::ProgramStatus {
-                agent: branch,
-                program,
-                status,
-            });
-        }
-        self.process(branch, outputs)?;
+        self.after_step(branch, outputs)?;
         Ok(Some(post))
     }
 
@@ -892,10 +1188,13 @@ impl Session {
     /// the `Result` lands on the branch that asked.
     fn cmd_reply(
         &mut self,
-        branch: AgentId,
+        branch: BranchId,
         call: EventId,
         value: serde_json::Value,
     ) -> io::Result<()> {
+        if !self.open_branch(branch) {
+            return self.unaddressable(branch);
+        }
         let pending = matches!(
             self.tree.events.get(&call).map(|e| &e.payload),
             Some(EventPayload::Call(Call::Send {
@@ -906,7 +1205,7 @@ impl Session {
         );
         if !pending {
             self.emit(SessionEvent::Error {
-                agent: Some(branch),
+                branch: Some(branch),
                 message: format!("#{} is not a question to you", call.as_u64()),
             });
             return Ok(());
@@ -921,15 +1220,27 @@ impl Session {
                 outcome: Outcome::Delivered(value),
             },
         )?;
-        self.emit_new(branch);
-        Ok(())
+        self.emit_new();
+        // The human's reply is what the parked program was waiting on.
+        let outputs = self
+            .states
+            .get_mut(&branch)
+            .map(|s| {
+                if matches!(s.status(), "running") {
+                    vec![StepOutput::Working]
+                } else {
+                    Vec::new()
+                }
+            })
+            .unwrap_or_default();
+        self.process(branch, outputs)
     }
 
     /// The exchanges `branch` still owes: `(asker, send)` for every open
     /// post on it that names a `Send`. Read from the log — no wait table:
     /// the four events form a closed loop of ids, so the asker and the
     /// call to settle are both one lookup from the post.
-    fn owed_by(&self, branch: AgentId) -> Vec<(AgentId, EventId)> {
+    fn owed_by(&self, branch: BranchId) -> Vec<(BranchId, EventId)> {
         let Some(state) = self.states.get(&branch) else {
             return Vec::new();
         };
@@ -948,7 +1259,7 @@ impl Session {
     /// `Answer.question → Post`, `Post.origin → Send`, and the `Send`'s
     /// position **is** the asker's branch. Nothing session-local is
     /// consulted, so it survives a reopen as-is.
-    fn asking_branch(&self, post: EventId) -> Option<(AgentId, EventId)> {
+    fn asking_branch(&self, post: EventId) -> Option<(BranchId, EventId)> {
         let Some(EventPayload::Message(Message::Post {
             origin: Origin::Sent(send),
             ..
@@ -957,7 +1268,9 @@ impl Session {
             return None;
         };
         let send = *send;
-        let asker = self.tree.enclosing_agent(send)?;
+        // The `Send`'s **position** is the asker's branch — not its
+        // agent, which a fork would make ambiguous.
+        let asker = self.tree.branch_of(send)?;
         Some((asker, send))
     }
 
@@ -967,20 +1280,21 @@ impl Session {
     /// asker was the human, who reads the answer inline where it sits.
     fn route_answer(
         &mut self,
-        branch: AgentId,
+        branch: BranchId,
         question: Option<EventId>,
         value: serde_json::Value,
     ) -> io::Result<()> {
         let Some(question) = question else {
-            // Nothing was owed: the branch is simply idle now.
-            self.awaiting_user = true;
+            // Nothing was owed: the branch is simply idle now. Agents
+            // never close, so that is the whole of it — there is no
+            // session-level "awaiting user" left to set.
             return Ok(());
         };
         match self.asking_branch(question) {
             // An agent asked: its `Send` settles on its own branch.
             Some((asker, send)) => {
                 let _ = self.tx.send(LoopMsg::ToolDone {
-                    agent: asker,
+                    branch: asker,
                     call: send,
                     result: guard_size(Ok(value)),
                 });
@@ -988,9 +1302,10 @@ impl Session {
             // The user asked. They have no branch and no program, so
             // there is nothing to settle — the answer is read inline.
             None => {
-                self.awaiting_user = true;
+                let agent = self.agent_of(branch);
                 self.emit(SessionEvent::Answered {
-                    agent: branch,
+                    agent,
+                    branch,
                     question,
                     value,
                 });
@@ -1095,24 +1410,30 @@ impl Session {
 
     /// Surface every newly logged event as a `SessionEvent`, attributed
     /// to the agent just stepped (a `Agent` is its own agent).
-    fn emit_new(&mut self, agent: AgentId) {
+    /// Surface every newly logged event, attributed to the **branch** it
+    /// landed on and the agent that branch belongs to — both read from
+    /// the log by id, so nothing depends on which branch was stepped.
+    fn emit_new(&mut self) {
         while self.emitted < self.tree.id_counter {
             self.emitted += 1;
             let id = EventId::new(self.emitted);
             let Some(event) = self.tree.events.get(&id) else {
                 continue;
             };
-            let owner = if matches!(event.payload, EventPayload::Agent { .. }) {
-                id
-            } else {
-                agent
-            };
+            let branch = self.tree.branch_of(id).unwrap_or(id);
+            let agent = self.tree.enclosing_agent(id).unwrap_or(id);
             let event = event.clone();
             let _ = self.events.send(SessionEvent::Event {
-                agent: owner,
+                agent,
+                branch,
                 event,
             });
         }
+    }
+
+    /// The agent a branch is a conversation with. Two forks share it.
+    fn agent_of(&self, branch: BranchId) -> AgentId {
+        self.tree.enclosing_agent(branch).unwrap_or(branch)
     }
 
     fn emit(&mut self, event: SessionEvent) {
@@ -1309,29 +1630,30 @@ mod tests {
         )
         .unwrap();
         session.handle().send(SessionCommand::UserTurn {
-            branch: session.root(),
+            branch: session.conversation_branch(),
             text: user_turn.into(),
+            expects_reply: true,
         });
         let session = session.run();
         let events = rx.try_iter().collect();
         (session, events)
     }
 
-    /// Build a session, send one user turn, and drive the loop until it
-    /// goes momentarily quiet.
+    /// Build a session, send one user turn, and run it to **quiet**.
     ///
-    /// Not `run()`: that stops the moment **any** branch answers and owes
-    /// nothing, which from B1 on includes a worker going idle while the
-    /// orchestrator is still running. It also keeps going where `run()`
-    /// would block forever — a branch still waiting on the human, which
-    /// is a legitimate end state for several of these tests.
+    /// B drove these through `pump_until` on a wall-clock deadline
+    /// because `run()` stopped the moment any branch answered owing
+    /// nothing — which from B1 on includes a worker going idle while the
+    /// orchestrator is still working — and blocked forever on a branch
+    /// waiting for the human. `quiet()` is both of those fixed, so the
+    /// deadline is gone and this is `run()` with a user turn in front.
     fn run_routed(
         registry: ToolRegistry,
         rules: impl IntoIterator<Item = (&'static str, Vec<LlmTurn>)>,
         user_turn: &str,
     ) -> (Session, Vec<SessionEvent>) {
         let (tx, rx) = channel();
-        let mut session = Session::new(
+        let session = Session::new(
             Tree::new(None),
             "test agent",
             registry,
@@ -1340,18 +1662,14 @@ mod tests {
         )
         .unwrap();
         session.handle().send(SessionCommand::UserTurn {
-            branch: session.root(),
+            branch: session.conversation_branch(),
             text: user_turn.into(),
+            expects_reply: true,
         });
-        session.pump_until(Instant::now() + QUIET, &mut Vec::new());
+        let session = session.run();
         let events = rx.try_iter().collect();
         (session, events)
     }
-
-    /// How long `run_routed` waits for the inbox to fall quiet. Long
-    /// enough for a few LLM worker threads to hand back, short enough not
-    /// to slow the suite.
-    const QUIET: Duration = Duration::from_millis(300);
 
     /// The value a branch's program returned — the `Return` on its path.
     fn returned(tree: &Tree, leaf: EventId) -> serde_json::Value {
@@ -1406,7 +1724,11 @@ mod tests {
     }
 
     fn root_leaf(session: &Session) -> EventId {
-        session.state(session.root()).unwrap().spine.leaf_id
+        session
+            .state(session.conversation_branch())
+            .unwrap()
+            .spine
+            .leaf_id
     }
 
     /// The reports the LLM read on the root branch. They are **derived,
@@ -1506,10 +1828,11 @@ mod tests {
         fn complete(
             &self,
             request: &LlmRequest,
+            cancel: &Cancel,
             chunk: &mut dyn FnMut(LlmChunk),
         ) -> Result<LlmTurn, String> {
             self.seen.lock().unwrap().push(request.system.clone());
-            self.inner.complete(request, chunk)
+            self.inner.complete(request, cancel, chunk)
         }
     }
 
@@ -1532,8 +1855,9 @@ mod tests {
         )
         .unwrap();
         session.handle().send(SessionCommand::UserTurn {
-            branch: session.root(),
+            branch: session.conversation_branch(),
             text: "go".into(),
+            expects_reply: true,
         });
         session.run();
 
@@ -1956,7 +2280,7 @@ mod tests {
         // Child events were attributed to the child agent.
         assert!(events.iter().any(|e| matches!(
             e,
-            SessionEvent::Event { agent, event } if *agent == child_start.id && event.id == child_start.id
+            SessionEvent::Event { agent, event, .. } if *agent == child_start.id && event.id == child_start.id
         )));
     }
 
@@ -1988,13 +2312,14 @@ mod tests {
             (session, rx)
         };
         session.handle().send(SessionCommand::UserTurn {
-            branch: session.root(),
+            branch: session.conversation_branch(),
             text: "delegate this".into(),
+            expects_reply: true,
         });
         while session.pump_one() {}
 
         // The child answered, and the parent joined its result.
-        let root = session.root();
+        let root = session.conversation_branch();
         let child = session
             .tree()
             .agent_list()
@@ -2015,8 +2340,8 @@ mod tests {
         session.handle().send(SessionCommand::UserTurn {
             branch: child.id,
             text: "one more thing".into(),
+            expects_reply: true,
         });
-        session.awaiting_user = false;
         while session.pump_one() {}
 
         let child_kinds = kinds(
@@ -2059,7 +2384,7 @@ mod tests {
             .unwrap();
 
         let (session, rx) = open(tree, vec![]);
-        let branch = session.root();
+        let branch = session.conversation_branch();
         let h = session.handle();
         // A call that is not a question to the user is refused…
         h.send(SessionCommand::Reply {
@@ -2260,6 +2585,7 @@ mod tests {
         fn complete(
             &self,
             request: &LlmRequest,
+            cancel: &Cancel,
             chunk: &mut dyn FnMut(LlmChunk),
         ) -> Result<LlmTurn, String> {
             {
@@ -2269,7 +2595,7 @@ mod tests {
                 *p = (*p).max(*n);
             }
             thread::sleep(Duration::from_millis(50));
-            let result = self.inner.complete(request, chunk);
+            let result = self.inner.complete(request, cancel, chunk);
             *self.inflight.lock().unwrap() -= 1;
             result
         }
@@ -2307,8 +2633,9 @@ mod tests {
         )
         .unwrap();
         session.handle().send(SessionCommand::UserTurn {
-            branch: session.root(),
+            branch: session.conversation_branch(),
             text: "delegate two".into(),
+            expects_reply: true,
         });
         session.run();
 
@@ -2368,8 +2695,9 @@ mod tests {
         .unwrap();
         let handle = session.handle();
         handle.send(SessionCommand::UserTurn {
-            branch: session.root(),
+            branch: session.conversation_branch(),
             text: "spin forever".into(),
+            expects_reply: true,
         });
 
         // The program never finishes; the loop keeps taking fuel-slice
@@ -2407,17 +2735,19 @@ mod tests {
         .unwrap();
         let handle = session.handle();
         handle.send(SessionCommand::UserTurn {
-            branch: session.root(),
+            branch: session.conversation_branch(),
             text: "go".into(),
+            expects_reply: true,
         });
         for _ in 0..10 {
             assert!(session.pump_one(), "the hot program keeps ticking");
         }
         handle.send(SessionCommand::UserTurn {
-            branch: session.root(),
+            branch: session.conversation_branch(),
             text: "are you done yet?".into(),
+            expects_reply: true,
         });
-        session.pump_until(Instant::now() + QUIET, &mut Vec::new());
+        while session.pump_one() {}
         // No rejection: the post landed, and the hot program suspended
         // into a condition whose report *is* the message.
         assert!(
@@ -2503,6 +2833,11 @@ mod tests {
         session
     }
 
+    /// How long a test that deliberately blocks a worker waits for the
+    /// inbox to fall quiet. `run()` cannot be used there: the session is
+    /// genuinely not quiet, and that is the point.
+    const SETTLE: Duration = Duration::from_millis(200);
+
     fn last_leaves(events: &[SessionEvent]) -> Vec<LeafInfo> {
         events
             .iter()
@@ -2512,6 +2847,28 @@ mod tests {
                 _ => None,
             })
             .expect("a Leaves event")
+    }
+
+    fn last_branches(events: &[SessionEvent]) -> Vec<BranchInfo> {
+        events
+            .iter()
+            .rev()
+            .find_map(|e| match e {
+                SessionEvent::Branches(b) => Some(b.clone()),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
+    /// Branch ids announced live in this session, in order.
+    fn opened(events: &[SessionEvent]) -> Vec<EventId> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                SessionEvent::BranchOpened { branch } => Some(*branch),
+                _ => None,
+            })
+            .collect()
     }
 
     fn errors(events: &[SessionEvent]) -> Vec<String> {
@@ -2524,8 +2881,11 @@ mod tests {
             .collect()
     }
 
+    /// `ListLeaves` is a **log projection**, and nothing in it is active
+    /// any more: a session holds no cursor, so there is no leaf for one
+    /// to be on.
     #[test]
-    fn list_leaves_reports_the_active_root() {
+    fn list_leaves_projects_the_log() {
         let (session, rx) = open(tree_with_open_root(), vec![]);
         session.handle().send(SessionCommand::ListLeaves);
         session.handle().send(SessionCommand::Shutdown);
@@ -2535,29 +2895,33 @@ mod tests {
         assert_eq!(leaves.len(), 1);
         assert_eq!(leaves[0].leaf, EventId::new(3));
         assert_eq!(leaves[0].agent, EventId::new(1));
-        assert!(leaves[0].active && leaves[0].open == 1);
+        assert_eq!(leaves[0].open, 1);
         assert_eq!(leaves[0].summary, "Turn: a1");
     }
 
     #[test]
-    fn rename_logs_on_the_active_branch_and_surfaces() {
+    fn rename_names_the_branch_it_addresses_and_surfaces() {
         let (session, rx) = open(tree_with_open_root(), vec![]);
         let h = session.handle();
-        h.send(SessionCommand::Rename("my-branch".into()));
+        let branch = session.conversation_branch();
+        h.send(SessionCommand::Rename {
+            branch,
+            name: "my-branch".into(),
+        });
         h.send(SessionCommand::Shutdown);
         let session = drain(session);
 
-        // A Rename event was logged on the root spine.
+        // A Rename event was logged on that branch's spine.
         assert!(
             session.tree().events.values().any(
                 |e| matches!(&e.payload, EventPayload::Rename { name } if name == "my-branch")
             )
         );
-        // …and the refreshed leaf list carries it as the branch's name.
-        let leaves = last_leaves(&rx.try_iter().collect::<Vec<_>>());
-        assert_eq!(leaves.len(), 1);
-        assert!(leaves[0].active);
-        assert_eq!(leaves[0].name.as_deref(), Some("my-branch"));
+        // …and the refreshed branch list carries it as the branch's name.
+        let branches = last_branches(&rx.try_iter().collect::<Vec<_>>());
+        assert_eq!(branches.len(), 1);
+        assert_eq!(branches[0].branch, branch);
+        assert_eq!(branches[0].name.as_deref(), Some("my-branch"));
     }
 
     /// A `Rename` is a record, not a `Message`: it must not start an LLM
@@ -2567,7 +2931,10 @@ mod tests {
     fn rename_does_not_wake() {
         let (session, rx) = open(tree_with_open_root(), vec![]);
         let h = session.handle();
-        h.send(SessionCommand::Rename("quiet".into()));
+        h.send(SessionCommand::Rename {
+            branch: session.conversation_branch(),
+            name: "quiet".into(),
+        });
         h.send(SessionCommand::Shutdown);
         let session = drain(session);
 
@@ -2578,20 +2945,28 @@ mod tests {
         assert_eq!(kinds, ["Agent", "Post", "Turn", "Rename"], "{kinds:?}");
     }
 
+    /// **Fork adds a branch; it never moves you.** The user turn that
+    /// follows is addressed at the *fork* — because the session holds no
+    /// cursor for a fork to have stolen — and the original leaf is
+    /// untouched.
     #[test]
     fn fork_then_user_turn_diverges_in_the_same_agent() {
         let (session, rx) = open(tree_with_open_root(), vec![scripted_text("forked done")]);
         let h = session.handle();
         // Fork off the user message (#2), dropping the original a1 reply.
+        // The `Fork` is the next event logged, so its id — the new
+        // branch's id — is #4.
         h.send(SessionCommand::Fork {
             from: EventId::new(2),
             name: Some("retry".into()),
         });
+        let fork = EventId::new(4);
         h.send(SessionCommand::UserTurn {
-            branch: session.root(),
+            branch: fork,
             text: "forked follow-up".into(),
+            expects_reply: true,
         });
-        let session = drain(session); // forked agent yields the turn back
+        let session = drain(session);
         let tree = session.tree();
 
         // Two leaves, both under the root agent (Agent #1).
@@ -2602,44 +2977,51 @@ mod tests {
         }
         // The original assistant leaf (#3) survived untouched.
         assert!(leaves.iter().any(|(id, _)| *id == EventId::new(3)));
-        // The forked branch diverged off #2 (never saw "a1"). It is the
-        // root conversation, so it yields rather than completing — no
-        // the spine stays open — nothing seals a branch.
+        // The forked branch diverged off #2 (never saw "a1") and is a
+        // branch of its own, rooted at the `Fork`.
         let forked_leaf = leaves
             .iter()
             .map(|(id, _)| *id)
             .find(|id| *id != EventId::new(3))
             .unwrap();
+        assert_eq!(tree.branch_of(forked_leaf), Some(fork));
         let forked = tree.spine_at(forked_leaf);
-        assert!(session.is_awaiting_user());
+        assert!(session.quiet());
         // The system prompt is on the branch root now, not a message.
         let msgs: Vec<&str> = forked.context().messages.iter().map(|m| m.text()).collect();
         assert_eq!(msgs, ["q", "forked follow-up", "forked done"]);
+        // The fork's id was announced, and both branches are live.
+        let events: Vec<SessionEvent> = rx.try_iter().collect();
+        assert_eq!(opened(&events), [fork]);
         // The fork's name sits on the new branch, not the original.
-        let leaves = last_leaves(&rx.try_iter().collect::<Vec<_>>());
+        let branches = last_branches(&events);
+        assert_eq!(branches.len(), 2);
         assert_eq!(
-            leaves
+            branches
                 .iter()
-                .find(|l| l.name.is_some())
-                .and_then(|l| l.name.clone()),
+                .find(|b| b.branch == fork)
+                .and_then(|b| b.name.clone()),
             Some("retry".into())
         );
         assert_eq!(
-            leaves.iter().filter(|l| l.name.is_some()).count(),
+            branches.iter().filter(|b| b.name.is_some()).count(),
             1,
-            "renaming the fork left the original unnamed"
+            "naming the fork left the original unnamed"
         );
     }
 
-    /// Nothing seals a branch any more, so the only resume that can be
-    /// rejected is one naming an id the log does not hold. An
-    /// already-answered branch is a perfectly good place to resume.
+    /// `Resume` **opens** the branch a leaf sits on and says which one it
+    /// is. It moves no cursor — there is none — so the only thing it can
+    /// reject is an id the log does not hold.
     #[test]
-    fn resume_switches_root_and_rejects_only_the_unknown() {
-        // Open root (#3) plus a sibling branch, forked off #2, that has
-        // answered — under the old rules that spine was sealed.
+    fn resume_opens_a_branch_and_rejects_only_the_unknown() {
+        // Open root (#3) plus a real second branch, forked off #2, that
+        // has answered — under the old rules that spine was sealed.
         let mut tree = tree_with_open_root();
         let mut branch = tree.fork(EventId::new(2)).unwrap();
+        let fork = tree
+            .append(&mut branch, EventPayload::Fork { name: None })
+            .unwrap();
         tree.append(&mut branch, user("other")).unwrap();
         let answered_leaf = tree
             .append(
@@ -2663,44 +3045,74 @@ mod tests {
         let errs = errors(&events);
         assert_eq!(errs.len(), 1, "{errs:?}");
         assert!(errs[0].contains("not in the log"));
-        // The last accepted resume left the active root on that branch.
+        // Each accepted resume announced the branch that leaf sits on —
+        // the root's own for #3, the fork's for the answered leaf.
+        assert_eq!(opened(&events), [EventId::new(1), fork]);
+        // …and the fork is live now, with its own leaf. The original
+        // branch was never moved.
         assert_eq!(
-            session.state(session.root()).unwrap().spine.leaf_id,
-            answered_leaf
+            session.state(fork).unwrap().spine.leaf_id,
+            answered_leaf,
+            "the re-hydrated fork sits at its own leaf"
+        );
+        assert_eq!(
+            session
+                .state(session.conversation_branch())
+                .unwrap()
+                .spine
+                .leaf_id,
+            EventId::new(3),
         );
     }
 
+    /// **Nothing you say is ever rejected, and nothing you do to the
+    /// tree is either.** The busy rejections are gone: a rename is a
+    /// record, a fork adds a branch, and a resume opens one — none of
+    /// them touches a running VM, so none of them has anything to
+    /// bounce off.
     #[test]
-    fn mutating_commands_are_rejected_while_the_agent_is_busy() {
+    fn navigation_commands_are_accepted_while_a_branch_is_busy() {
         let (mut session, rx) = open(
             tree_with_open_root(),
             vec![scripted_program("c1", "while (true) {}")],
         );
         let h = session.handle();
+        let branch = session.conversation_branch();
         h.send(SessionCommand::UserTurn {
-            branch: session.root(),
+            branch,
             text: "spin".into(),
+            expects_reply: true,
         });
         for _ in 0..6 {
             session.pump_one();
         }
-        // The agent is now Running; every mutating command bounces.
-        h.send(SessionCommand::Rename("late".into()));
+        assert_eq!(session.state(branch).unwrap().status(), "running");
+        h.send(SessionCommand::Rename {
+            branch,
+            name: "late".into(),
+        });
         h.send(SessionCommand::Fork {
             from: EventId::new(2),
             name: None,
         });
         h.send(SessionCommand::Resume(EventId::new(2)));
-        for _ in 0..6 {
+        for _ in 0..8 {
             session.pump_one();
         }
-        let busy = rx
-            .try_iter()
-            .filter(
-                |e| matches!(e, SessionEvent::Error { message, .. } if message.contains("busy")),
-            )
-            .count();
-        assert_eq!(busy, 3, "rename/fork/resume each rejected while busy");
+        let events: Vec<SessionEvent> = rx.try_iter().collect();
+        assert!(errors(&events).is_empty(), "{:?}", errors(&events));
+        // The rename landed, the fork is a live branch of its own, and
+        // the busy branch is still running its program.
+        let branches = last_branches(&events);
+        assert_eq!(branches.len(), 2, "{branches:?}");
+        assert_eq!(
+            branches
+                .iter()
+                .find(|b| b.branch == branch)
+                .map(|b| b.name.clone()),
+            Some(Some("late".into()))
+        );
+        assert_eq!(session.state(branch).unwrap().status(), "running");
         h.send(SessionCommand::Shutdown);
         while session.pump_one() {}
     }
@@ -2723,7 +3135,11 @@ mod tests {
         .unwrap();
         // `new` would auto-pick #3; `open_at` honours the chosen leaf.
         assert_eq!(
-            session.state(session.root()).unwrap().spine.leaf_id,
+            session
+                .state(session.conversation_branch())
+                .unwrap()
+                .spine
+                .leaf_id,
             other_leaf
         );
 
@@ -2825,8 +3241,9 @@ mod tests {
         // Now send a user turn; the LLM sees the interrupted report and
         // responds with a run_program rewrite.
         session.handle().send(SessionCommand::UserTurn {
-            branch: session.root(),
+            branch: session.conversation_branch(),
             text: "continue".into(),
+            expects_reply: true,
         });
         let session = session.run();
 
@@ -2843,7 +3260,7 @@ mod tests {
             kinds.last() == Some(&"Answer"),
             "the branch answered and went idle: {kinds:?}"
         );
-        assert!(session.is_awaiting_user());
+        assert!(session.quiet());
 
         let _events: Vec<SessionEvent> = rx.try_iter().collect();
     }
@@ -2875,8 +3292,8 @@ mod tests {
             tx,
         )
         .expect("an answered log opens idle, not an error");
-        assert_eq!(session.root(), EventId::new(1));
-        let state = session.state(session.root()).unwrap();
+        assert_eq!(session.conversation_branch(), EventId::new(1));
+        let state = session.state(session.conversation_branch()).unwrap();
         assert!(state.is_idle());
         assert!(state.open().is_empty(), "nothing is owed");
     }
@@ -2924,7 +3341,7 @@ mod tests {
             .expect("the Send");
         assert_eq!(
             tree.enclosing_agent(send),
-            Some(session.root()),
+            Some(session.conversation_branch()),
             "the Send sits on the asking branch"
         );
 
@@ -2942,7 +3359,7 @@ mod tests {
         let EventPayload::Message(Message::Post { from, .. }) = &tree.events[&post].payload else {
             unreachable!()
         };
-        assert_eq!(*from, Author::Agent(session.root()));
+        assert_eq!(*from, Author::Agent(session.conversation_branch()));
         assert_eq!(tree.enclosing_agent(post), Some(worker));
 
         // Post → Answer: the reply, on the answerer's branch.
@@ -2972,7 +3389,10 @@ mod tests {
             })
             .expect("the Result naming that Send");
         assert_eq!(result.1, Outcome::Delivered(value.clone()));
-        assert_eq!(tree.enclosing_agent(result.0), Some(session.root()));
+        assert_eq!(
+            tree.enclosing_agent(result.0),
+            Some(session.conversation_branch())
+        );
 
         // …and the program got the answer, whole.
         assert_eq!(returned(tree, root_leaf(&session)), value);
@@ -3097,7 +3517,10 @@ mod tests {
             ["alpha", "beta", "gamma"]
         );
         for row in &rows {
-            assert_eq!(row["parent"].as_u64(), Some(session.root().as_u64()));
+            assert_eq!(
+                row["parent"].as_u64(),
+                Some(session.conversation_branch().as_u64())
+            );
             assert_eq!(row["open"].as_u64(), Some(0), "nobody asked them anything");
             assert!(row["last_answer"].is_null());
             assert_eq!(
@@ -3445,7 +3868,7 @@ mod tests {
             .expect("the upward ask");
         assert_eq!(
             upward,
-            Address::Branch(session.root()),
+            Address::Branch(session.conversation_branch()),
             "a subagent's asker is its parent's branch"
         );
         // It reached the parent: logged on arrival even mid-program, and
@@ -3456,7 +3879,7 @@ mod tests {
             parent_path.iter().any(|e| matches!(
                 &e.payload,
                 EventPayload::Message(Message::Post { from: Author::Agent(a), .. })
-                if tree.enclosing_agent(*a) != Some(session.root())
+                if tree.enclosing_agent(*a) != Some(session.conversation_branch())
             )),
             "the worker's question is on the parent's branch: {:?}",
             kinds(tree, root_leaf(&session))
@@ -3523,10 +3946,11 @@ mod tests {
         )
         .unwrap();
         session.handle().send(SessionCommand::UserTurn {
-            branch: session.root(),
+            branch: session.conversation_branch(),
             text: "ask the worker".into(),
+            expects_reply: true,
         });
-        session.pump_until(Instant::now() + QUIET, &mut Vec::new());
+        while session.pump_one() {}
         drop(rx);
 
         let refused = returned(session.tree(), root_leaf(&session));
@@ -3808,5 +4232,696 @@ mod tests {
                 leaf.as_u64()
             );
         }
+    }
+
+    // ── C1: branches are the address ─────────────────────────────────
+
+    /// **Any number of leaves growing at once**, and the one line that
+    /// makes it so: live state keyed by `BranchId`, not `AgentId`. Two
+    /// forks of one agent take concurrent user turns, both grow, and the
+    /// leaf they forked from is untouched.
+    #[test]
+    fn two_forks_of_one_agent_run_concurrently() {
+        let (session, rx) = open(
+            tree_with_open_root(),
+            vec![scripted_text("A answers"), scripted_text("B answers")],
+        );
+        let h = session.handle();
+        // Two forks off the same point (#2). Their ids are the next two
+        // events logged: #4 and #5.
+        h.send(SessionCommand::Fork {
+            from: EventId::new(2),
+            name: Some("A".into()),
+        });
+        h.send(SessionCommand::Fork {
+            from: EventId::new(2),
+            name: Some("B".into()),
+        });
+        let (a, b) = (EventId::new(4), EventId::new(5));
+        h.send(SessionCommand::UserTurn {
+            branch: a,
+            text: "to A".into(),
+            expects_reply: true,
+        });
+        h.send(SessionCommand::UserTurn {
+            branch: b,
+            text: "to B".into(),
+            expects_reply: true,
+        });
+        let session = drain(session);
+        let tree = session.tree();
+
+        // Three branches on one agent, three runners, three leaves.
+        assert_eq!(
+            tree.branches_of_agent(EventId::new(1)),
+            [EventId::new(1), a, b]
+        );
+        assert_eq!(
+            session
+                .branches()
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>(),
+            [EventId::new(1), a, b]
+        );
+        // Each fork grew its own transcript from the shared prefix, and
+        // the original's leaf (#3) never moved.
+        let leaf_of = |branch| session.state(branch).unwrap().spine.leaf_id;
+        assert_eq!(leaf_of(EventId::new(1)), EventId::new(3));
+        let texts = |branch| -> Vec<String> {
+            tree.spine_at(leaf_of(branch))
+                .context()
+                .messages
+                .iter()
+                .map(|m| m.text().to_owned())
+                .collect()
+        };
+        assert_eq!(texts(a), ["q", "to A", "A answers"]);
+        assert_eq!(texts(b), ["q", "to B", "B answers"]);
+
+        let events: Vec<SessionEvent> = rx.try_iter().collect();
+        assert_eq!(opened(&events), [a, b]);
+        // …and the parent's own `agents()` view lists all three rows.
+        let rows = last_branches(&events);
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        assert!(rows.iter().all(|r| r.agent == EventId::new(1)));
+    }
+
+    /// **Forks are born idle.** Creating one issues no request at all —
+    /// the scripted client has exactly one turn, and the fork must not
+    /// eat it. Its first `UserTurn` is what wakes it.
+    #[test]
+    fn fork_is_born_idle() {
+        let (session, rx) = open(tree_with_open_root(), vec![scripted_text("only turn")]);
+        let h = session.handle();
+        h.send(SessionCommand::Fork {
+            from: EventId::new(2),
+            name: None,
+        });
+        h.send(SessionCommand::Shutdown);
+        let mut session = drain(session);
+        let fork = EventId::new(4);
+
+        // Nothing but the `Fork` was logged, and the fork is idle.
+        assert_eq!(session.tree().id_counter, 4);
+        assert_eq!(session.state(fork).unwrap().status(), "idle");
+        assert!(errors(&rx.try_iter().collect::<Vec<_>>()).is_empty());
+
+        // Speaking to it is what starts a turn.
+        session.done = false;
+        session.handle().send(SessionCommand::UserTurn {
+            branch: fork,
+            text: "now say something".into(),
+            expects_reply: true,
+        });
+        let session = drain(session);
+        let kinds = kinds(session.tree(), session.state(fork).unwrap().spine.leaf_id);
+        assert_eq!(
+            kinds,
+            ["Agent", "Post", "Fork", "Post", "Turn", "Answer"],
+            "the fork diverged at #2, before the original's reply: {kinds:?}"
+        );
+    }
+
+    /// **`Fork` renders.** At an ordinary fork point it is a harness line
+    /// naming the branch the pre-fork questions stayed with — the only
+    /// honest lever there is, since there is no API-level "do not address
+    /// that" and hiding history would defeat forking.
+    #[test]
+    fn fork_line_renders() {
+        let (session, _rx) = open(tree_with_open_root(), vec![]);
+        session.handle().send(SessionCommand::Fork {
+            from: EventId::new(3),
+            name: None,
+        });
+        session.handle().send(SessionCommand::Shutdown);
+        let session = drain(session);
+
+        let state = session.state(EventId::new(4)).unwrap();
+        let rendered = state.render_messages_for_test(session.tree());
+        assert_eq!(
+            rendered.last(),
+            Some(&crate::machine::Rendered::User(
+                "[harness] fork of branch #1 at #3 — questions before this line are being \
+                 handled there; do not redo its work unless asked."
+                    .to_owned()
+            )),
+            "{rendered:?}"
+        );
+    }
+
+    /// A fork taken **mid-program** renders as that call's tool result:
+    /// the run stayed on the original, and the dangling `run_program`
+    /// call still has to be answered or the next request is a 400.
+    #[test]
+    fn mid_program_fork_answers_the_dangling_call() {
+        let (mut session, _rx) = open(
+            tree_with_open_root(),
+            vec![scripted_program(
+                "c1",
+                "tools.read_file('a'); while (true) {}",
+            )],
+        );
+        let h = session.handle();
+        let branch = session.conversation_branch();
+        h.send(SessionCommand::UserTurn {
+            branch,
+            text: "go".into(),
+            expects_reply: true,
+        });
+        for _ in 0..8 {
+            session.pump_one();
+        }
+        // Fork at the running leaf: the "ask a running agent something
+        // without pausing it" gesture.
+        let at = session.state(branch).unwrap().spine.leaf_id;
+        h.send(SessionCommand::Fork {
+            from: at,
+            name: Some("sidebar".into()),
+        });
+        for _ in 0..4 {
+            session.pump_one();
+        }
+        let fork = session
+            .branches()
+            .into_iter()
+            .map(|(id, _)| id)
+            .find(|id| *id != branch)
+            .expect("the fork is live");
+
+        let state = session.state(fork).unwrap();
+        let rendered = state.render_messages_for_test(session.tree());
+        let last = rendered.last().expect("something rendered");
+        let crate::machine::Rendered::Tool { call_id, text } = last else {
+            panic!("a mid-program fork answers the dangling call: {rendered:?}");
+        };
+        assert_eq!(call_id, "c1", "it answers the call that is running");
+        assert!(text.contains("is running on branch #1, not here"), "{text}");
+        assert!(text.contains("artifacts so far"), "{text}");
+        // Every assistant tool call in the rendered request is answered:
+        // the adjacency rule the API enforces.
+        let calls: usize = rendered
+            .iter()
+            .filter_map(|r| match r {
+                crate::machine::Rendered::Assistant { tool_calls, .. } => Some(tool_calls.len()),
+                _ => None,
+            })
+            .sum();
+        let tools = rendered
+            .iter()
+            .filter(|r| matches!(r, crate::machine::Rendered::Tool { .. }))
+            .count();
+        assert_eq!(calls, tools, "{rendered:?}");
+    }
+
+    /// **`Interrupt` cancels an in-flight generation**, and nothing is
+    /// logged for it: from the API's view that turn did not happen. The
+    /// post that arrived while it was thinking then starts a fresh turn.
+    #[test]
+    fn interrupt_cancels_generation() {
+        let llm = Arc::new(HoldingLlm::new(1, vec![scripted_text("second thoughts")]));
+        let (tx, rx) = channel();
+        let mut session = Session::new(
+            Tree::new(None),
+            "test agent",
+            ToolRegistry::new(),
+            Box::new(Arc::clone(&llm)),
+            tx,
+        )
+        .unwrap();
+        let h = session.handle();
+        let branch = session.conversation_branch();
+        h.send(SessionCommand::UserTurn {
+            branch,
+            text: "think hard".into(),
+            expects_reply: true,
+        });
+        session.pump_one(); // the request goes out and the worker holds
+        assert_eq!(session.state(branch).unwrap().status(), "awaiting llm");
+
+        // Speak again while it thinks: logged on arrival, unseen.
+        h.send(SessionCommand::UserTurn {
+            branch,
+            text: "actually, stop".into(),
+            expects_reply: true,
+        });
+        h.send(SessionCommand::Interrupt { branch });
+        let session = drain(session);
+
+        // The worker saw its token; the cancelled turn logged nothing.
+        assert_eq!(llm.cancelled(), 1);
+        let kinds = kinds(session.tree(), root_leaf(&session));
+        assert_eq!(
+            kinds,
+            ["Agent", "Post", "Post", "Turn", "Answer"],
+            "one turn, and it is the one that answered the second post: {kinds:?}"
+        );
+        // …and the turn that did happen answered the *oldest* open post,
+        // because both were unseen when its request was rendered.
+        let events: Vec<SessionEvent> = rx.try_iter().collect();
+        assert!(events.iter().any(|e| matches!(
+            e,
+            SessionEvent::Answered { value, .. } if value == &json!("second thoughts")
+        )));
+    }
+
+    /// **`Interrupt` on a running branch pauses it at its next fuel
+    /// slice, and a post lands.** With nothing else to say, the harness
+    /// authors that post itself — a wake with a cause event you can name
+    /// in the log, never a bare re-prompt.
+    #[test]
+    fn interrupt_pauses_program() {
+        let (mut session, _rx) = open(
+            tree_with_open_root(),
+            vec![
+                scripted_program("c1", "while (true) {}"),
+                scripted_text("stopped"),
+            ],
+        );
+        let h = session.handle();
+        let branch = session.conversation_branch();
+        h.send(SessionCommand::UserTurn {
+            branch,
+            text: "spin".into(),
+            expects_reply: true,
+        });
+        for _ in 0..8 {
+            session.pump_one();
+        }
+        assert_eq!(session.state(branch).unwrap().status(), "running");
+
+        h.send(SessionCommand::Interrupt { branch });
+        for _ in 0..12 {
+            session.pump_one();
+        }
+        let tree = session.tree();
+        let leaf = session.state(branch).unwrap().spine.leaf_id;
+        // The harness's own post is on the branch, owing nothing…
+        let notice = tree
+            .path_events(leaf)
+            .into_iter()
+            .find(|e| {
+                matches!(&e.payload,
+                    EventPayload::Message(Message::Post { from: Author::Harness, origin })
+                    if origin.direct().is_some_and(|(t, _, r)| t.contains("interrupted") && !r))
+            })
+            .expect("the interrupt is a logged harness post");
+        // …and it is what the program suspended on, at its next slice.
+        assert!(tree.path_events(leaf).iter().any(|e| matches!(
+            &e.payload,
+            EventPayload::Condition { cause: Cause::Posted { ids }, .. } if ids.contains(&notice.id)
+        )));
+        assert!(
+            !session.state(branch).unwrap().open().contains(&notice.id),
+            "a harness notice owes no answer"
+        );
+    }
+
+    /// **The user takes a branch's turn.** `Restart` logs a `Turn {
+    /// author: User }` carrying one call, applied exactly as the LLM's
+    /// would be — so the report that follows answers its `call_id` like
+    /// any other, and the branch's later history shows it resumed with 5.
+    #[test]
+    fn user_resumes_and_user_rewrites() {
+        let (mut session, _rx) = open(
+            tree_with_open_root(),
+            vec![scripted_program("c1", "return raise('need', {}) + 1;")],
+        );
+        let h = session.handle();
+        let branch = session.conversation_branch();
+        h.send(SessionCommand::UserTurn {
+            branch,
+            text: "go".into(),
+            expects_reply: true,
+        });
+        for _ in 0..12 {
+            session.pump_one();
+        }
+        assert_eq!(session.state(branch).unwrap().status(), "suspended");
+
+        // The user supplies the value the raise asked for — no LLM turn.
+        h.send(SessionCommand::Restart {
+            branch,
+            call: UserCall::Resume {
+                value: Some(json!(4)),
+            },
+        });
+        for _ in 0..12 {
+            session.pump_one();
+        }
+        let leaf = session.state(branch).unwrap().spine.leaf_id;
+        assert_eq!(returned(session.tree(), leaf), json!(5));
+
+        // Every user-authored turn is logged as one, and the report that
+        // followed it answers *its* synthetic call id.
+        let user_turns: Vec<&crate::types::Event> = session
+            .tree()
+            .path_events(leaf)
+            .into_iter()
+            .filter(|e| {
+                matches!(
+                    &e.payload,
+                    EventPayload::Message(Message::Turn {
+                        author: Author::User,
+                        ..
+                    })
+                )
+            })
+            .collect();
+        assert_eq!(user_turns.len(), 1, "one user-authored turn");
+        let paired = derived_with_ids(session.tree(), leaf);
+        let EventPayload::Message(Message::Turn { tool_calls, .. }) = &user_turns[0].payload else {
+            unreachable!()
+        };
+        let id = tool_calls[0].id.clone();
+        assert!(id.starts_with("user-"), "{id}");
+        assert!(
+            paired
+                .iter()
+                .any(|(call, text)| *call == id && text.contains("program completed")),
+            "the completion report answers the user's own call id: {paired:?}"
+        );
+
+        // And a user *rewrite* is the same door: a fresh program runs.
+        h.send(SessionCommand::Restart {
+            branch,
+            call: UserCall::RunProgram {
+                source: "return 'rewritten';".into(),
+            },
+        });
+        for _ in 0..12 {
+            session.pump_one();
+        }
+        let leaf = session.state(branch).unwrap().spine.leaf_id;
+        assert_eq!(returned(session.tree(), leaf), json!("rewritten"));
+    }
+
+    /// A fork's bare turn "answers" a pre-fork question for the reader,
+    /// not for the log. To make it **the** answer, the user takes the
+    /// original branch's turn with `answer(#post, value)` — which is what
+    /// makes exploring in a fork and then committing one gesture.
+    #[test]
+    fn user_answers_on_the_original_after_forking() {
+        let (session, rx) = open(tree_with_open_root(), vec![scripted_text("explored")]);
+        let h = session.handle();
+        let branch = session.conversation_branch();
+        let question = EventId::new(2); // the user's "q", open on #1
+        h.send(SessionCommand::Fork {
+            from: EventId::new(3),
+            name: Some("explore".into()),
+        });
+        let fork = EventId::new(4);
+        h.send(SessionCommand::UserTurn {
+            branch: fork,
+            text: "what would you say?".into(),
+            expects_reply: true,
+        });
+        h.send(SessionCommand::Restart {
+            branch,
+            call: UserCall::Answer {
+                question,
+                value: json!("explored, and this is the answer"),
+            },
+        });
+        let session = drain(session);
+
+        // The `Answer` is on the **original** branch, which is the one
+        // that owed it — and the fork logged none for that post.
+        let on = |b: EventId| -> Vec<&'static str> {
+            kinds(session.tree(), session.state(b).unwrap().spine.leaf_id)
+        };
+        let answers_to = |b: EventId| -> Vec<EventId> {
+            session
+                .tree()
+                .path_events(session.state(b).unwrap().spine.leaf_id)
+                .into_iter()
+                .filter_map(|e| match &e.payload {
+                    EventPayload::Answer { question, .. } => Some(*question),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert!(answers_to(branch).contains(&question), "{:?}", on(branch));
+        // The fork answered its *own* post and never the inherited one:
+        // a fork inherits history, not obligations.
+        assert!(
+            !answers_to(fork).contains(&question),
+            "{:?} / {:?}",
+            answers_to(fork),
+            on(fork)
+        );
+        assert!(session.state(branch).unwrap().open().is_empty());
+        let events: Vec<SessionEvent> = rx.try_iter().collect();
+        assert!(events.iter().any(|e| matches!(
+            e,
+            SessionEvent::Answered { branch: b, question: q, .. } if *b == branch && *q == question
+        )));
+    }
+
+    /// **Quiet, not "awaiting user".** `run()` returns when no branch has
+    /// work in flight — which is *not* "no branch has anything left to
+    /// do": a branch parked on a question to the human is quiet, because
+    /// nothing will move it until someone speaks.
+    #[test]
+    fn run_returns_when_every_branch_is_quiet() {
+        let registry = ToolRegistry::new();
+        let (session, _) = run_routed(
+            registry,
+            [
+                (
+                    "test agent",
+                    vec![scripted_program(
+                        "c1",
+                        r#"const w = await tools.spawn({ name: "w", charter: "worker" });
+                           await tools.tell({ to: w.agent, text: "fyi" });
+                           return await tools.ask({ text: "which file?" });"#,
+                    )],
+                ),
+                ("worker", vec![scripted_text("noted")]),
+            ],
+            "delegate",
+        );
+        // The root's program is parked on a question to the human and the
+        // worker is idle: nothing is in flight, so `run()` returned
+        // rather than blocking — which is the whole assertion.
+        let root = session.conversation_branch();
+        assert!(session.quiet());
+        assert_eq!(session.state(root).unwrap().status(), "running");
+        let asking = session
+            .branch_infos()
+            .into_iter()
+            .filter(|b| b.asking_user.is_some())
+            .count();
+        assert_eq!(asking, 1, "the inbox is a view: one branch asking you");
+    }
+
+    /// Two hot programs interleave on the loop thread and a third
+    /// branch's turn is still served — fuel slices round-robin across
+    /// branches, and `llm_permits` is the only throttle.
+    #[test]
+    fn hot_programs_do_not_starve_other_branches() {
+        let (tx, _rx) = channel();
+        let mut session = Session::new(
+            Tree::new(None),
+            "test agent",
+            ToolRegistry::new(),
+            Box::new(RoutedLlm::new([
+                (
+                    "test agent",
+                    vec![scripted_program("c1", "while (true) {}")],
+                ),
+                ("hot", vec![scripted_program("c2", "while (true) {}")]),
+                ("cool", vec![scripted_text("served")]),
+            ])),
+            tx,
+        )
+        .unwrap();
+        let h = session.handle();
+        let root = session.conversation_branch();
+        h.send(SessionCommand::UserTurn {
+            branch: root,
+            text: "spin".into(),
+            expects_reply: true,
+        });
+        h.send(SessionCommand::Spawn {
+            parent: root,
+            name: Some("hot".into()),
+            charter: "hot".into(),
+            text: Some("spin too".into()),
+        });
+        for _ in 0..40 {
+            session.pump_one();
+        }
+        let running = session
+            .branches()
+            .into_iter()
+            .filter(|(_, s)| *s == "running")
+            .count();
+        assert_eq!(running, 2, "both hot programs interleave");
+
+        // A third branch, spoken to while both spin, still gets served.
+        h.send(SessionCommand::Spawn {
+            parent: root,
+            name: Some("cool".into()),
+            charter: "cool".into(),
+            text: Some("answer me".into()),
+        });
+        let cool = 'found: {
+            for _ in 0..400 {
+                session.pump_one();
+                if let Some(b) = session
+                    .branches()
+                    .into_iter()
+                    .find(|(id, _)| session.tree().branch_name(*id).as_deref() == Some("cool"))
+                    .map(|(id, _)| id)
+                    && kinds(session.tree(), session.state(b).unwrap().spine.leaf_id)
+                        .contains(&"Answer")
+                {
+                    break 'found b;
+                }
+            }
+            panic!("the third branch was starved");
+        };
+        assert_eq!(session.state(cool).unwrap().status(), "idle");
+        assert_eq!(running, 2, "and the hot programs were never stopped");
+    }
+
+    /// **Presence is per-request, never branch state.** Attaching or
+    /// detaching changes the next request's trailing line and not one
+    /// byte of the prefix before it — which is the whole reason it lives
+    /// in the tail rather than in the system prompt.
+    #[test]
+    fn presence_flip_does_not_disturb_the_prefix() {
+        let (mut session, _rx) = open(tree_with_open_root(), vec![]);
+        let branch = session.conversation_branch();
+        let render = |session: &mut Session, attached: bool| -> LlmRequest {
+            session.set_attached(attached);
+            let tree = &session.tree;
+            session
+                .states
+                .get_mut(&branch)
+                .unwrap()
+                .render_request_for_test(tree)
+        };
+        let away = render(&mut session, false);
+        let here = render(&mut session, true);
+
+        assert_eq!(away.system, here.system, "the snapshot never moves");
+        assert_eq!(away.messages, here.messages, "no rendered message varies");
+        assert_eq!(away.tools.len(), here.tools.len());
+        assert_ne!(away.tail, here.tail, "only the trailing line flips");
+        assert!(
+            away.tail
+                .as_deref()
+                .is_some_and(|t| t.contains("No one is attached"))
+        );
+        assert!(
+            here.tail
+                .as_deref()
+                .is_some_and(|t| t.contains("Someone is attached"))
+        );
+        // Presence goes **last**, after any other per-request fact.
+        assert!(here.tail.as_deref().is_some_and(
+            |t| t.lines().last() == Some("Someone is attached to this session right now.")
+        ));
+    }
+
+    /// **Rule C's other half.** A `Result` that lands with no program
+    /// awaiting it is logged as an artifact *and* surfaced as a harness
+    /// post — a tell, so the branch notices without owing an answer.
+    ///
+    /// The post is what makes waking legal: the rule is not "never wake a
+    /// branch" but "never wake one without a cause event you can name in
+    /// the log", and this cause is logged, visible, and renders
+    /// identically forever.
+    #[test]
+    fn unawaited_result_wakes_the_branch_as_a_harness_post() {
+        let mut registry = ToolRegistry::new();
+        let (gate_tx, gate_rx) = channel::<()>();
+        let gate = Mutex::new(gate_rx);
+        registry.register(tool("slow", move |_| {
+            let _ = gate.lock().unwrap().recv();
+            Ok(json!("late answer"))
+        }));
+        let (tx, _rx) = channel();
+        let mut session = Session::new(
+            Tree::new(None),
+            "test agent",
+            registry,
+            Box::new(ScriptedLlm::new(vec![
+                scripted_program("c1", "return await tools.slow();"),
+                // The rewrite's completion report prompts this…
+                scripted_text("moved on"),
+                // …and the harness post prompts this.
+                scripted_text("noted the late answer"),
+            ])),
+            tx,
+        )
+        .unwrap();
+        let h = session.handle();
+        let branch = session.conversation_branch();
+        h.send(SessionCommand::UserTurn {
+            branch,
+            text: "go".into(),
+            expects_reply: true,
+        });
+        // Bounded, not `run()`: the tool's worker is deliberately blocked,
+        // so the session is *not* quiet and never will be until the gate
+        // opens — which is the state this test is about.
+        let settle = |s: &mut Session| s.pump_until(Instant::now() + SETTLE, &mut Vec::new());
+        settle(&mut session);
+        assert_eq!(session.state(branch).unwrap().status(), "running");
+
+        // Paste a rewrite: the run that awaited the call is gone, but the
+        // call itself is still in flight — the physics happened.
+        h.send(SessionCommand::Restart {
+            branch,
+            call: UserCall::RunProgram {
+                source: "return 'moved on';".into(),
+            },
+        });
+        settle(&mut session);
+        assert_eq!(session.state(branch).unwrap().status(), "idle");
+
+        let _ = gate_tx.send(()); // now let the worker finish
+        let session = drain(session);
+
+        let leaf = session.state(branch).unwrap().spine.leaf_id;
+        let path = session.tree().path_events(leaf);
+        // The value is an artifact…
+        let call = path
+            .iter()
+            .find(|e| matches!(&e.payload, EventPayload::Call(Call::Invoke { name, .. }) if name == "slow"))
+            .expect("the call is logged at dispatch")
+            .id;
+        assert!(path.iter().any(|e| matches!(
+            &e.payload,
+            EventPayload::Result { call: c, outcome: Outcome::Delivered(v) }
+            if *c == call && v == &json!("late answer")
+        )));
+        // …*and* a harness tell, naming the id the whole value is behind.
+        let notice = path
+            .iter()
+            .find(|e| {
+                matches!(&e.payload,
+                    EventPayload::Message(Message::Post { from: Author::Harness, origin })
+                    if origin.direct().is_some_and(|(t, _, r)| t.contains("no program awaiting it") && !r))
+            })
+            .expect("an unawaited result is surfaced as a harness post");
+        let EventPayload::Message(Message::Post { origin, .. }) = &notice.payload else {
+            unreachable!()
+        };
+        let (text, _, _) = origin.direct().unwrap();
+        assert!(
+            text.contains(&format!("tools.tool_result({})", call.as_u64())),
+            "{text}"
+        );
+        // The branch woke on it and owes nothing.
+        assert!(
+            kinds(session.tree(), leaf).ends_with(&["Post", "Turn"]),
+            "{:?}",
+            kinds(session.tree(), leaf)
+        );
+        assert!(session.state(branch).unwrap().open().is_empty());
     }
 }

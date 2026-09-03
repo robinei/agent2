@@ -103,6 +103,7 @@ impl ChatState {
                 agent,
                 thinking,
                 text,
+                ..
             } => {
                 if *thinking {
                     return; // thinking stays live-only and unrendered for now
@@ -112,8 +113,8 @@ impl ChatState {
                     None => self.streaming.push((*agent, text.clone())),
                 }
             }
-            SessionEvent::Error { agent, message } => {
-                if let Some(f) = agent.or(self.main_agent) {
+            SessionEvent::Error { branch, message } => {
+                if let Some(f) = branch.or(self.main_agent) {
                     self.entries.push(Entry::Line {
                         agent: f,
                         kind: ChatKind::Error,
@@ -125,7 +126,7 @@ impl ChatState {
             // The answer to a user's question is already this branch's
             // `Turn` in the transcript — the event only says it landed.
             SessionEvent::Answered { .. } => {}
-            SessionEvent::Event { agent, event } => {
+            SessionEvent::Event { agent, event, .. } => {
                 self.apply_payload(*agent, event.id, &event.payload);
             }
             // Live program-block status titles the matching header.
@@ -134,8 +135,11 @@ impl ChatState {
             } => {
                 self.program_status.insert(*program, *status);
             }
-            // Leaf-list data is for the fork/leaf UI, not the chat pane.
-            SessionEvent::Leaves(_) => {}
+            // Leaf/branch lists are for the navigator, not the chat pane;
+            // a branch opening is the navigator's news too.
+            SessionEvent::Leaves(_)
+            | SessionEvent::Branches(_)
+            | SessionEvent::BranchOpened { .. } => {}
         }
     }
 
@@ -187,14 +191,31 @@ impl ChatState {
                 });
             }
             EventPayload::Message(Message::Turn {
-                text, tool_calls, ..
+                author,
+                text,
+                tool_calls,
+                ..
             }) => {
                 self.streaming.retain(|(f, _)| *f != agent);
-                if !text.is_empty() {
+                // A `Turn { author: User }` is the user taking this
+                // branch's turn (`Restart`). It renders as an assistant
+                // message to the API — the *branch* acted — but the
+                // person driving needs to see whose hand it was.
+                let by_user = matches!(author, crate::types::Author::User);
+                if !text.is_empty() || by_user {
+                    let calls: Vec<&str> = tool_calls.iter().map(|c| c.name.as_str()).collect();
                     self.entries.push(Entry::Line {
                         agent,
-                        kind: ChatKind::Assistant,
-                        text: text.clone(),
+                        kind: if by_user {
+                            ChatKind::Marker
+                        } else {
+                            ChatKind::Assistant
+                        },
+                        text: if by_user {
+                            format!("you took this branch's turn: {}", calls.join(", "))
+                        } else {
+                            text.clone()
+                        },
                         program: None,
                     });
                 }
@@ -409,6 +430,7 @@ mod tests {
     fn ev(id: u64, payload: EventPayload) -> SessionEvent {
         SessionEvent::Event {
             agent: EventId::new(1),
+            branch: EventId::new(1),
             event: Event {
                 id: EventId::new(id),
                 parent_id: None,
@@ -479,6 +501,7 @@ mod tests {
             }),
         ));
         chat.apply(&SessionEvent::Chunk {
+            branch: EventId::new(1),
             agent: EventId::new(1),
             thinking: false,
             text: "thinki".into(),
@@ -573,6 +596,7 @@ mod tests {
         );
         // …and tracks ProgramStatus to completed.
         chat.apply(&SessionEvent::ProgramStatus {
+            branch: EventId::new(1),
             agent: EventId::new(1),
             program: EventId::new(2),
             status: ProgramStatus::Completed,
@@ -623,6 +647,7 @@ mod tests {
         // Subagent agent #4 with its own system prompt.
         let child = EventId::new(4);
         let child_event = |id: u64, payload| SessionEvent::Event {
+            branch: EventId::new(2),
             agent: child,
             event: Event {
                 id: EventId::new(id),

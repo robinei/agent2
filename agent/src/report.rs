@@ -933,6 +933,75 @@ fn annotated_source(h: &Handback<'_>) -> String {
     clip(out.trim_end(), ANNOTATED_SOURCE_MAX_BYTES)
 }
 
+/// **What a `Fork` renders as** — the honest lever, and the only one.
+///
+/// Retry and sidebar are not modes: fork *before* a question and say "try
+/// again with X", or fork *at the running leaf* and ask "what are you
+/// doing?". The same gesture, and this line is what tells the model which
+/// it is.
+///
+/// Two shapes, chosen by whether the fork point left a tool call
+/// unanswered on this path:
+///
+/// - an **ordinary** fork point: a harness line naming the branch the
+///   pre-fork questions stayed with.
+/// - a **mid-program** fork point: that call's tool result, naming the
+///   original branch and the artifacts so far — which also keeps the
+///   API's adjacency rule satisfied instead of leaving a dangling call.
+///
+/// Every input is an event id, so it renders identically forever.
+pub fn render_fork(
+    tree: &Tree,
+    leaf: EventId,
+    fork: EventId,
+    dangling: &[ToolCall],
+) -> Vec<crate::machine::Rendered> {
+    let at = tree.events.get(&fork).and_then(|e| e.parent_id);
+    let origin = at.and_then(|at| tree.branch_of(at));
+    let branch = origin
+        .map(|b| format!("#{}", b.as_u64()))
+        .unwrap_or_else(|| "the original".to_owned());
+    if dangling.is_empty() {
+        let point = at
+            .map(|at| format!(" at #{}", at.as_u64()))
+            .unwrap_or_default();
+        return vec![crate::machine::Rendered::User(format!(
+            "[harness] fork of branch {branch}{point} — questions before this line are \
+             being handled there; do not redo its work unless asked."
+        ))];
+    }
+    // The fork point's last turn is still running on the original. Its
+    // artifacts crossed the fork (history and artifacts do); the run
+    // itself did not (the VM is never copied).
+    let path = tree.path_events(leaf);
+    let fork_at = path.iter().position(|e| e.id == fork).unwrap_or(0);
+    let turn_at = path[..fork_at]
+        .iter()
+        .rposition(|e| matches!(e.payload, EventPayload::Message(Message::Turn { .. })));
+    let program = turn_at
+        .map(|i| format!("#{}", path[i].id.as_u64()))
+        .unwrap_or_else(|| "the program".to_owned());
+    let start = path[..fork_at]
+        .iter()
+        .rposition(|e| matches!(e.payload, EventPayload::Agent { .. }))
+        .unwrap_or(0);
+    let segment: Vec<&Event> = path[start..fork_at].to_vec();
+    let artifacts = crate::machine::menu_rows(&segment, 0);
+    let head = format!(
+        "program {program} is running on branch {branch}, not here. This fork inherited \
+         its history and its artifacts; the run itself stayed there, so nothing you do \
+         here disturbs it.\n\n{}",
+        render_menu("artifacts so far", &artifacts)
+    );
+    dangling
+        .iter()
+        .map(|call| crate::machine::Rendered::Tool {
+            call_id: call.id.clone(),
+            text: head.clone(),
+        })
+        .collect()
+}
+
 /// Whether this run inlined a file body longer than a snippet into
 /// `source` — the nudge condition, read off the logged call args.
 fn inlined_large_body(h: &Handback<'_>) -> bool {

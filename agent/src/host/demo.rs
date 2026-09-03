@@ -56,8 +56,9 @@ pub fn run_demo(tree: Tree, events: Sender<SessionEvent>) -> io::Result<Session>
         events,
     )?;
     session.handle().send(SessionCommand::UserTurn {
-        branch: session.root(),
+        branch: session.conversation_branch(),
         text: "Demonstrate a tool fan-out and report what came back.".into(),
+        expects_reply: true,
     });
     Ok(session.run())
 }

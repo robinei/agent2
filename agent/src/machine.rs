@@ -156,6 +156,21 @@ pub fn answer_spec() -> ToolSpec {
 /// "and N more" — a bounded line, like every other rendered bound.
 const OPEN_NOTE_MAX_IDS: usize = 8;
 
+/// The trailing presence line, the two ways round. It is deliberately
+/// about the *client*, not the person: attached means a client is
+/// connected, and claiming to know a human is reading would be a lie the
+/// model would act on.
+const PRESENT: &str = "Someone is attached to this session right now.";
+const ABSENT: &str = "No one is attached to this session right now; a question to the user \
+                      may sit unanswered for a long time.";
+
+/// What the harness says when the user interrupts a running program and
+/// has nothing else to add. It is a `tell` — the branch owes no answer —
+/// and it exists so the wake has a cause event in the log.
+const INTERRUPT_NOTICE: &str = "The user interrupted your program. It is paused at its last fuel slice; nothing was \
+     lost. Carry on with resume(), change course with run_program(source), or stop with a \
+     plain reply.";
+
 /// Iteration cap for one `Tick`: each extra round requires a synchronous
 /// artifact fetch (`tools.tool_result`) to have unblocked the program,
 /// but a pathological program could chain those forever.
@@ -383,6 +398,11 @@ pub struct Runner {
     /// branch is a conversation with. Resolved once at construction; the
     /// leaf moves, the agent does not.
     agent: EventId,
+    /// This branch's root event, and its id: the `Agent` for an agent's
+    /// first branch, a `Fork` for a divergent one. Live state is keyed by
+    /// it, so two forks of one agent are two runners — which is the whole
+    /// of "any number of leaves growing at once".
+    branch: EventId,
     phase: Phase,
     generation: u64,
     pending: HashMap<EventId, PendingCall>,
@@ -409,6 +429,14 @@ pub struct Runner {
     /// logged only once the first call's outcome has landed, so outcomes
     /// stay in call order and the positional pairing holds.
     deferred_refusals: Vec<String>,
+    /// Whether a client is attached to the session right now.
+    ///
+    /// Presence is a **per-request fact**, never branch state that
+    /// anything else reads: it goes in the trailing ephemeral line and
+    /// nowhere else, so attaching or detaching changes the next render
+    /// and not one byte of the cached prefix. A branch that ran alone
+    /// overnight is simply told, on its next request, that you are back.
+    attached: bool,
     /// Event-id high-water mark at this branch's **last request render**
     /// — the whole of the session state the trigger rule needs, and what
     /// replaces any pending queue.
@@ -505,10 +533,12 @@ impl Runner {
     /// Resume an existing spine: a re-opened log, a fork, a re-anchor.
     pub fn with_spine(tree: &Tree, spine: Spine) -> Self {
         let agent = tree.enclosing_agent(spine.leaf_id).unwrap_or(spine.leaf_id);
+        let branch = tree.branch_of(spine.leaf_id).unwrap_or(spine.leaf_id);
         let leaf = spine.leaf_id;
         Runner {
             spine,
             agent,
+            branch,
             phase: Phase::Idle,
             generation: 0,
             pending: HashMap::new(),
@@ -517,6 +547,7 @@ impl Runner {
             status_transitions: Vec::new(),
             answer_budget: DEFAULT_ANSWER_BUDGET,
             deferred_refusals: Vec::new(),
+            attached: false,
             // A branch handed to a fresh `Runner` has said nothing to
             // *this* session's LLM and is owed no prompt for its
             // history: a fork born at its `Fork` root speaks only when
@@ -537,6 +568,20 @@ impl Runner {
     /// This branch's agent — the innermost `Agent` root on its path.
     pub fn agent_id(&self) -> EventId {
         self.agent
+    }
+
+    /// This branch's id: its root event. Two forks of one agent share
+    /// `agent_id` and differ here, which is why live state is keyed by
+    /// this and not by the agent.
+    pub fn branch_id(&self) -> EventId {
+        self.branch
+    }
+
+    /// Tell this branch whether anyone is attached. It changes the next
+    /// request's trailing line and nothing else — no logged event, no
+    /// prefix byte, no wake.
+    pub fn set_attached(&mut self, attached: bool) {
+        self.attached = attached;
     }
 
     /// Drain the program-status transitions logged during the just-run
@@ -851,6 +896,70 @@ impl Runner {
         Ok((post, Vec::new()))
     }
 
+    /// The request this branch was waiting on **failed**. Nothing is
+    /// logged — that turn did not happen, the same as a cancellation —
+    /// and the branch drops back to idle so it can be spoken to again.
+    ///
+    /// It is deliberately not re-prompted: a failed request is not a new
+    /// cause event, and retrying a failing client in a loop is exactly
+    /// the causeless wake this design forbids. What it *must* not do is
+    /// leave the branch claiming to be thinking with nothing in flight —
+    /// that state can never progress, and `quiet()` would never fire.
+    pub fn abandon_request(&mut self) {
+        if matches!(self.phase, Phase::AwaitingLlm) {
+            self.phase = Phase::Idle;
+        }
+    }
+
+    /// **`Interrupt`** — the one override on rule B's "next safe point".
+    ///
+    /// The cancellation of an in-flight generation is the *session's*
+    /// half (nothing is logged: from the API's view that turn did not
+    /// happen); this is what the branch does once it is cancelled.
+    ///
+    /// Note what it never does: wake a branch that has nothing to hear.
+    /// An idle branch is left idle, and an interrupted generation
+    /// re-enters the trigger rule rather than bypassing it — a post that
+    /// arrived during the generation is the cause, and if there is none
+    /// there is no request.
+    pub fn interrupt(&mut self, tree: &mut Tree) -> io::Result<Vec<StepOutput>> {
+        match &self.phase {
+            // Nothing is in flight and nothing is owed.
+            Phase::Idle => Ok(Vec::new()),
+            // The cancelled turn is gone. Back to idle, where the trigger
+            // rule decides afresh: the post that arrived mid-generation
+            // now starts a fresh turn.
+            Phase::AwaitingLlm => {
+                self.phase = Phase::Idle;
+                Ok(self.prompt_if_needed(tree))
+            }
+            // A suspended branch has its condition report out and is
+            // awaiting the restart choice, so B3 has an arriving post
+            // ride the *next* request rather than double-prompting. This
+            // is the override that makes it land now — and it is not a
+            // second prompt for the same cause: the request it replaces
+            // never reached the model.
+            Phase::Suspended(..) => Ok(vec![self.render_request(tree)]),
+            // Rule B delivers to a running program at its next fuel
+            // slice, so an interrupt's job is to **be a cause** for one.
+            // If nothing is unseen, the harness says so itself — in a
+            // post, which is a wake with an event you can name in the
+            // log, and never a bare "you stopped, is there more?".
+            Phase::Running(_) => {
+                if !self.unseen_posts(tree).is_empty() {
+                    return Ok(vec![StepOutput::Working]);
+                }
+                let origin = Origin::Direct {
+                    text: INTERRUPT_NOTICE.to_owned(),
+                    input: serde_json::Value::Null,
+                    expects_reply: false,
+                };
+                let (_, out) = self.deliver(tree, Author::Harness, origin)?;
+                Ok(out)
+            }
+        }
+    }
+
     // ── input handlers ──────────────────────────────────────────────
 
     fn on_llm_response(&mut self, tree: &mut Tree, turn: LlmTurn) -> io::Result<Vec<StepOutput>> {
@@ -858,11 +967,40 @@ impl Runner {
             matches!(self.phase, Phase::AwaitingLlm | Phase::Suspended(..)),
             "LlmResponse with no request in flight"
         );
+        let author = Author::Agent(self.agent_id());
+        self.apply_turn(tree, turn, author)
+    }
+
+    /// **The user takes this branch's turn** — the handler hierarchy's
+    /// outermost layer made literal. The `Turn` is logged with
+    /// `author: User` and applied by exactly the path an LLM turn takes,
+    /// so the report that follows answers its `call_id` like any other
+    /// and the branch's later history shows it resumed with 5, which is
+    /// true.
+    ///
+    /// It works on an **idle** branch as well as a suspended one: an
+    /// ineligible restart is refused here the same way, by the same one
+    /// check, so the user gets the same self-sufficient correction the
+    /// model would.
+    pub fn take_turn(&mut self, tree: &mut Tree, turn: LlmTurn) -> io::Result<Vec<StepOutput>> {
+        self.apply_turn(tree, turn, Author::User)
+    }
+
+    /// Log one turn on this branch and serve its calls. `author` is the
+    /// only difference between the LLM's turn and the user's: it renders
+    /// as an assistant message either way, because the **branch** acted.
+    fn apply_turn(
+        &mut self,
+        tree: &mut Tree,
+        turn: LlmTurn,
+        author: Author,
+    ) -> io::Result<Vec<StepOutput>> {
         let tool_calls = turn.tool_calls.clone();
-        // The branch's own LLM acted: stamp the author here, where the
-        // agent id is known, rather than asking a client to invent it.
+        // The author is stamped here, where the agent id is known, rather
+        // than asked of a client that speaks *for* a branch and does not
+        // decide who acted.
         let message = Message::Turn {
-            author: Author::Agent(self.agent_id()),
+            author,
             text: turn.text,
             thinking: turn.thinking,
             tool_calls: turn.tool_calls,
@@ -1096,6 +1234,11 @@ impl Runner {
     ) -> io::Result<Vec<StepOutput>> {
         let mut delivered = false;
         let mut sends = Vec::new();
+        // Calls that settled with **nothing awaiting them**: the run that
+        // issued them has been rewritten away, or the branch holds no VM
+        // at all (it re-entered after a crash). Rule C decides what
+        // happens to them — see below.
+        let mut unawaited: Vec<(EventId, EventId)> = Vec::new();
         for tr in batch {
             let Some(p) = self.pending.remove(&tr.call) else {
                 continue; // unknown or duplicate — nothing to log
@@ -1106,7 +1249,7 @@ impl Runner {
                 Ok(v) => Outcome::Delivered(v.clone()),
                 Err(msg) => Outcome::Failed(msg.clone()),
             };
-            tree.append(
+            let result = tree.append(
                 &mut self.spine,
                 EventPayload::Result {
                     call: tr.call,
@@ -1114,11 +1257,12 @@ impl Runner {
                 },
             )?;
 
-            // Deliver only into the run that issued the call.
-            if p.generation != self.generation {
-                continue;
-            }
-            if !matches!(self.phase, Phase::Running(_) | Phase::Suspended(..)) {
+            // Deliver only into the run that issued the call. Anything
+            // else is an artifact **and** a notice (rule C, below).
+            if p.generation != self.generation
+                || !matches!(self.phase, Phase::Running(_) | Phase::Suspended(..))
+            {
+                unawaited.push((tr.call, result));
                 continue;
             }
             // `tools.agent` is the one call that is two: the spawn just
@@ -1183,12 +1327,61 @@ impl Runner {
         if !sends.is_empty() {
             out.push(StepOutput::Sends(sends));
         }
+        // **Rule C**, the other half: waiting is a property of the
+        // awaiting program, never of the message. A value someone's
+        // program awaits resolves its promise and never enters a context;
+        // one **nobody** awaits is logged as an artifact *and* surfaced
+        // as a harness post — a tell, so the branch notices without
+        // owing anyone an answer.
+        //
+        // The post is what makes this a legal wake. The rule the design
+        // holds is not "never wake a branch" but "never wake one without
+        // a cause event you can name in the log": this cause is logged,
+        // visible, auditable, and renders identically forever, so the
+        // model can see *why* it woke. Without it an orchestrator whose
+        // program ended while its workers ran would have their answers
+        // logged and nothing else.
+        for (call, result) in unawaited {
+            let origin = Origin::Direct {
+                text: self.settled_notice(tree, call, result),
+                input: serde_json::Value::Null,
+                expects_reply: false,
+            };
+            let (_, delivered) = self.deliver(tree, Author::Harness, origin)?;
+            out.extend(delivered);
+        }
         // A suspended run stays suspended (results land for later); a
         // running one can make progress now.
         if delivered && matches!(self.phase, Phase::Running(_)) {
             out.push(StepOutput::Working);
         }
         Ok(out)
+    }
+
+    /// The body of the harness post that surfaces an unawaited `Result`.
+    ///
+    /// Built from the two logged events and nothing else, so it renders
+    /// identically forever — and it names the call id, because reuse is
+    /// by id and the whole value is a `tool_result` away.
+    fn settled_notice(&self, tree: &Tree, call: EventId, result: EventId) -> String {
+        let label = match tree.events.get(&call).map(|e| &e.payload) {
+            Some(EventPayload::Call(c)) => call_label(c),
+            _ => format!("#{}", call.as_u64()),
+        };
+        let outcome = match tree.events.get(&result).map(|e| &e.payload) {
+            Some(EventPayload::Result { outcome, .. }) => match outcome {
+                Outcome::Delivered(v) => crate::report::preview(v),
+                Outcome::Failed(msg) => format!("failed: {msg}"),
+            },
+            _ => String::new(),
+        };
+        format!(
+            "A call you issued has settled with no program awaiting it: [#{}] {label} → \
+             {outcome}. Fetch the whole value with tools.tool_result({}). Nothing is owed \
+             in reply.",
+            call.as_u64(),
+            call.as_u64(),
+        )
     }
 
     /// The VM a landing `Result` settles into — live while running or
@@ -1929,31 +2122,41 @@ impl Runner {
     /// re-emitted at the new end, so the prefix it followed stays intact —
     /// which is why a right-now fact may live here and nowhere else.
     ///
-    /// So far: which questions are open, when more than one is. A single
-    /// open post needs no note (a bare reply answers it, which is the
-    /// default anyway); several do, because the binding rule silently
-    /// picks the oldest and the model cannot see which that is.
+    /// Two facts so far, presence **last** — every request's last line
+    /// says whether anyone is attached:
+    ///
+    /// - which questions are open, when more than one is. A single open
+    ///   post needs no note (a bare reply answers it, which is the
+    ///   default anyway); several do, because the binding rule silently
+    ///   picks the oldest and the model cannot see which that is.
+    /// - **presence**: whether a client is attached right now. It is
+    ///   honest about its limit — attached means a client is connected,
+    ///   not that a human is reading — and it is what lets an agent that
+    ///   needs input choose between waiting (free) and proceeding on a
+    ///   stated assumption.
     fn request_tail(&self) -> Option<String> {
+        let mut lines: Vec<String> = Vec::new();
         let open = self.open();
-        if open.len() < 2 {
-            return None;
+        if open.len() >= 2 {
+            let shown = open.len().min(OPEN_NOTE_MAX_IDS);
+            let ids: Vec<String> = open[..shown]
+                .iter()
+                .map(|id| format!("#{}", id.as_u64()))
+                .collect();
+            let more = match open.len() - shown {
+                0 => String::new(),
+                n => format!(", and {n} more"),
+            };
+            lines.push(format!(
+                "{} questions are open on this branch: {}{more}. A reply with no tool call \
+                 answers the oldest ({}); answer(question, value) picks one.",
+                open.len(),
+                ids.join(", "),
+                ids[0],
+            ));
         }
-        let shown = open.len().min(OPEN_NOTE_MAX_IDS);
-        let ids: Vec<String> = open[..shown]
-            .iter()
-            .map(|id| format!("#{}", id.as_u64()))
-            .collect();
-        let more = match open.len() - shown {
-            0 => String::new(),
-            n => format!(", and {n} more"),
-        };
-        Some(format!(
-            "{} questions are open on this branch: {}{more}. A reply with no tool call \
-             answers the oldest ({}); answer(question, value) picks one.",
-            open.len(),
-            ids.join(", "),
-            ids[0],
-        ))
+        lines.push(if self.attached { PRESENT } else { ABSENT }.to_owned());
+        Some(lines.join("\n"))
     }
 
     /// The rendered message list for a request: the branch's posts and
@@ -1966,9 +2169,31 @@ impl Runner {
     fn render_messages(&self, tree: &Tree) -> Vec<Rendered> {
         let leaf = self.spine.leaf_id;
         let mut out = Vec::new();
+        // Tool calls of the most recent `Turn` that no outcome on this
+        // path answers. On an ordinary branch this is always empty by
+        // the time anything else renders; on a **fork taken mid-program**
+        // it is the original's running call, and the `Fork` is what
+        // answers it (below).
+        let mut dangling: Vec<ToolCall> = Vec::new();
         for event in self.agent_segment(tree) {
-            let EventPayload::Message(msg) = &event.payload else {
-                continue;
+            let msg = match &event.payload {
+                EventPayload::Message(msg) => msg,
+                // **`Fork` renders.** Once prompted, a fork's LLM sees
+                // the pre-fork question in its history with no answer on
+                // this path, and the card compels it to answer open
+                // questions. There is no API-level "do not address that"
+                // and hiding history would defeat forking, so the lever
+                // is rendering — the only honest one.
+                EventPayload::Fork { .. } => {
+                    out.extend(crate::report::render_fork(
+                        tree,
+                        leaf,
+                        event.id,
+                        &std::mem::take(&mut dangling),
+                    ));
+                    continue;
+                }
+                _ => continue,
             };
             match msg {
                 Message::Post { from, .. } => {
@@ -1992,21 +2217,38 @@ impl Runner {
                         tool_calls: tool_calls.clone(),
                     });
                     let outcomes = crate::report::outcomes_of_turn(tree, leaf, event.id);
-                    for (call, outcome) in tool_calls.iter().zip(outcomes) {
+                    for (call, outcome) in tool_calls.iter().zip(&outcomes) {
                         out.push(Rendered::Tool {
                             call_id: call.id.clone(),
                             text: crate::report::derive_report(
                                 tree,
                                 leaf,
-                                outcome,
+                                *outcome,
                                 self.answer_budget,
                             ),
                         });
                     }
+                    dangling = tool_calls[outcomes.len().min(tool_calls.len())..].to_vec();
                 }
             }
         }
         out
+    }
+
+    /// The rendered message list, for tests that assert on what an LLM
+    /// would actually see (the fork lines, the adjacency rule).
+    #[cfg(test)]
+    pub fn render_messages_for_test(&self, tree: &Tree) -> Vec<Rendered> {
+        self.render_messages(tree)
+    }
+
+    /// One request, for tests that compare two renders (presence).
+    #[cfg(test)]
+    pub fn render_request_for_test(&mut self, tree: &Tree) -> LlmRequest {
+        match self.render_request(tree) {
+            StepOutput::LlmRequest(r) => r,
+            _ => unreachable!("render_request returns a request"),
+        }
     }
 
     /// Log the refusals deferred behind a VM-driving call, now that its
@@ -4374,10 +4616,9 @@ got X
     fn many_open_posts_are_noted_in_the_request_tail() {
         let (mut tree, mut state) = setup();
         let out = user_post(&mut state, &mut tree, "first");
-        assert!(
-            expect_request(&out).tail.is_none(),
-            "one open post needs no note — a bare reply answers it"
-        );
+        // One open post needs no note — a bare reply answers it — so the
+        // tail is the presence line alone.
+        assert_eq!(expect_request(&out).tail.as_deref(), Some(ABSENT));
 
         let (second, _) = state
             .deliver(&mut tree, Author::User, direct("second", true))

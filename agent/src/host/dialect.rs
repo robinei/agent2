@@ -174,9 +174,13 @@ inform a worker without needing an answer, `tools.tell` it. A worker \
 that is stuck asks *you*: `await tools.ask({ text })` with no `to` \
 reaches whoever asked it; you will see it as a condition — answer with \
 `answer(...)`, then `resume()`. The person driving the session may speak \
-to you, or to any worker directly, at any time. A question to the human \
-may sit unanswered for a long time, so prefer proceeding on a stated \
-assumption (`tools.tell` it) over waiting on one. Nothing re-prompts you \
+to you, or to any worker directly, at any time. **Each request's last \
+line says whether anyone is attached right now**: if no one is, a \
+question to the human may sit unanswered for a long time, so prefer \
+proceeding on a stated assumption (`tools.tell` it) over waiting on one. \
+Waiting is free either way — a parked ask burns no fuel and is \
+re-attachable by id — so the choice is yours to make against what that \
+line says. Nothing re-prompts you \
 when you stop talking — if there is more to do, keep doing it in the \
 program.
 - Before repeating a call shown in the menu, read the call — if it \
@@ -434,6 +438,8 @@ mod tests {
             "Workers outlive your programs",
             "reaches whoever asked it",
             "Nothing re-prompts you",
+            // C1: presence, in the trailing line and never the prompt.
+            "last line says whether anyone is attached right now",
             "re-attaches and",
         ] {
             assert!(card.contains(needle), "card missing: {needle}");
