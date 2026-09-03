@@ -38,7 +38,9 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Instant;
 
-use crate::machine::{LlmRequest, OutCall, Runner, SpawnAgent, StepInput, StepOutput, ToolResult};
+use crate::machine::{
+    LlmRequest, LlmTurn, OutCall, Runner, SpawnAgent, StepInput, StepOutput, ToolResult,
+};
 use crate::types::{Call, EventId, EventPayload, Message, Outcome, Spine, Tree};
 
 /// Instructions per VM slice on the loop thread (9_TUI decision 3).
@@ -116,7 +118,7 @@ pub(crate) enum LoopMsg {
     },
     LlmDone {
         agent: AgentId,
-        result: Result<Message, String>,
+        result: Result<LlmTurn, String>,
     },
     ToolDone {
         agent: AgentId,
@@ -188,15 +190,14 @@ impl Session {
     /// leaf instead.
     pub fn new(
         mut tree: Tree,
-        prompt: &str,
-        input: serde_json::Value,
+        charter: &str,
         registry: ToolRegistry,
         llm: Box<dyn LlmClient>,
         events: Sender<SessionEvent>,
     ) -> io::Result<Self> {
         if tree.events.is_empty() {
             let emitted = tree.id_counter;
-            let state = Runner::new_root(&mut tree, prompt, input)?;
+            let state = Runner::new_root(&mut tree, charter, &dialect_card(&registry))?;
             Self::assemble(tree, state, registry, llm, events, emitted)
         } else {
             let leaf = pick_resume_leaf(&tree)?;
@@ -227,7 +228,7 @@ impl Session {
         }
         let leaf = synthesize_if_interrupted(&mut tree, leaf)?;
         let emitted = 0; // replay all existing events into the chat pane
-        let state = Runner::with_spine(tree.spine_at(leaf));
+        let state = Runner::with_spine(&tree, tree.spine_at(leaf));
         Self::assemble(tree, state, registry, llm, events, emitted)
     }
 
@@ -428,8 +429,8 @@ impl Session {
                 self.emit(SessionEvent::Leaves(leaves));
                 Ok(())
             }
-            LoopMsg::Command(SessionCommand::Label(text)) => self.cmd_label(text),
-            LoopMsg::Command(SessionCommand::Fork { from, label }) => self.cmd_fork(from, label),
+            LoopMsg::Command(SessionCommand::Rename(name)) => self.cmd_rename(name),
+            LoopMsg::Command(SessionCommand::Fork { from, name }) => self.cmd_fork(from, name),
             LoopMsg::Command(SessionCommand::Resume(leaf)) => self.cmd_resume(leaf),
             LoopMsg::LlmChunk {
                 agent,
@@ -504,7 +505,9 @@ impl Session {
         }
     }
 
-    fn cmd_label(&mut self, text: String) -> io::Result<()> {
+    /// Name the active branch. A `Rename` is a **record**, not a message,
+    /// so it changes the navigator and wakes nothing.
+    fn cmd_rename(&mut self, name: String) -> io::Result<()> {
         let Some(root) = self.idle_root() else {
             return Ok(());
         };
@@ -512,19 +515,19 @@ impl Session {
         if state.spine.is_complete() {
             self.emit(SessionEvent::Error {
                 agent: Some(root),
-                message: "spine is complete; cannot label past a FrameResult".into(),
+                message: "spine is complete; cannot rename past a FrameResult".into(),
             });
             return Ok(());
         }
         self.tree
-            .append(&mut state.spine, EventPayload::Label(text))?;
+            .append(&mut state.spine, EventPayload::Rename { name })?;
         self.emit_new(root);
         let leaves = self.leaf_infos();
         self.emit(SessionEvent::Leaves(leaves));
         Ok(())
     }
 
-    fn cmd_fork(&mut self, from: EventId, label: Option<String>) -> io::Result<()> {
+    fn cmd_fork(&mut self, from: EventId, name: Option<String>) -> io::Result<()> {
         if self.idle_root().is_none() {
             return Ok(());
         }
@@ -538,8 +541,9 @@ impl Session {
                 return Ok(());
             }
         };
-        if let Some(text) = label {
-            self.tree.append(&mut spine, EventPayload::Label(text))?;
+        if let Some(name) = name {
+            self.tree
+                .append(&mut spine, EventPayload::Rename { name })?;
         }
         self.reanchor_root(spine);
         let leaves = self.leaf_infos();
@@ -580,7 +584,7 @@ impl Session {
     /// via `ListLeaves`), and point `root` at it. Any freshly logged
     /// events (a fork's `Label`) are surfaced.
     fn reanchor_root(&mut self, spine: Spine) {
-        let mut state = Runner::with_spine(spine);
+        let mut state = Runner::with_spine(&self.tree, spine);
         state.set_dialect_card(dialect_card(&self.registry));
         let root = agent_root_of(&self.tree, state.spine.leaf_id);
         self.states.insert(root, state);
@@ -596,10 +600,10 @@ impl Session {
         leaves.sort_by_key(|(id, _)| id.as_u64());
         leaves
             .into_iter()
-            .map(|(leaf, label)| LeafInfo {
+            .map(|(leaf, name)| LeafInfo {
                 leaf,
                 agent: agent_root_of(&self.tree, leaf),
-                label,
+                name,
                 complete: self.tree.spine_at(leaf).is_complete(),
                 active: Some(leaf) == active,
                 summary: leaf_summary(&self.tree, leaf),
@@ -724,9 +728,17 @@ impl Session {
             budget,
         } = spawn;
         let call_site = self.states[&parent].spine.leaf_id;
-        let mut child = Runner::new_child(&mut self.tree, call_site, prompt, input, budget)?;
-        child.set_dialect_card(dialect_card(&self.registry));
-        let child_id = child.spine.leaf_id; // the Agent it was rooted at
+        let card = dialect_card(&self.registry);
+        let mut child = Runner::new_child(
+            &mut self.tree,
+            call_site,
+            parent,
+            prompt,
+            input,
+            budget,
+            &card,
+        )?;
+        let child_id = child.agent_id();
         self.emit_new(child_id);
         self.parents.insert(child_id, (parent, invoke_id));
         let outputs = child.kickoff(&mut self.tree)?;
@@ -768,7 +780,7 @@ impl Session {
 fn synthesize_if_interrupted(tree: &mut Tree, leaf: EventId) -> io::Result<EventId> {
     let spine = tree.spine_at(leaf);
     let msgs = &spine.context().messages;
-    let Some(Message::Assistant { tool_calls, .. }) = msgs.last() else {
+    let Some(Message::Turn { tool_calls, .. }) = msgs.last() else {
         return Ok(leaf);
     };
     let Some(call) = tool_calls.first() else {
@@ -863,20 +875,21 @@ fn leaf_summary(tree: &Tree, leaf: EventId) -> String {
         return String::new();
     };
     let s = match &event.payload {
-        EventPayload::Agent { prompt, .. } => format!("Agent: {prompt}"),
+        EventPayload::Agent { charter, .. } => format!("Agent: {charter}"),
         EventPayload::FrameResult { result } => format!("FrameResult: {result}"),
-        EventPayload::Message(Message::User { text }) => format!("User: {text}"),
-        EventPayload::Message(Message::Assistant {
+        EventPayload::Message(Message::Post { from, origin }) => {
+            format!("Post: {}", crate::report::render_post(*from, origin))
+        }
+        EventPayload::Message(Message::Turn {
             text, tool_calls, ..
         }) => {
             if tool_calls.is_empty() {
-                format!("Assistant: {text}")
+                format!("Turn: {text}")
             } else {
                 let names: Vec<&str> = tool_calls.iter().map(|c| c.name.as_str()).collect();
-                format!("Assistant: ⚙ {}", names.join(", "))
+                format!("Turn: ⚙ {}", names.join(", "))
             }
         }
-        EventPayload::Message(Message::System { .. }) => "System".into(),
         EventPayload::Message(Message::Tool { name, .. }) => format!("Tool: {name}"),
         EventPayload::Call(Call::Invoke { name, .. }) => format!("Invoke: {name}"),
         EventPayload::Call(Call::Send { expects_reply, .. }) => {
@@ -890,7 +903,7 @@ fn leaf_summary(tree: &Tree, leaf: EventId) -> String {
             Outcome::Failed(msg) => format!("Result of #{}: failed: {msg}", call.as_u64()),
         },
         EventPayload::ProgramResult { value } => format!("ProgramResult: {value}"),
-        EventPayload::Label(label) => format!("Label: {label}"),
+        EventPayload::Rename { name } => format!("Rename: {name}"),
         EventPayload::Console { lines } => format!("Console: {} lines", lines.len()),
     };
     crate::report::clip(&s, crate::report::PREVIEW_MAX_BYTES)
@@ -919,7 +932,7 @@ mod tests {
     use serde_json::json;
     use std::time::Duration;
 
-    use crate::types::ToolCall;
+    use crate::types::{Author, Origin, ToolCall};
 
     fn tool(
         name: &str,
@@ -937,14 +950,13 @@ mod tests {
     /// completion, and return it with the buffered `SessionEvent`s.
     fn run_session(
         registry: ToolRegistry,
-        script: Vec<Message>,
+        script: Vec<LlmTurn>,
         user_turn: &str,
     ) -> (Session, Vec<SessionEvent>) {
         let (tx, rx) = channel();
         let session = Session::new(
             Tree::new(None),
             "test agent",
-            json!(null),
             registry,
             Box::new(ScriptedLlm::new(script)),
             tx,
@@ -967,15 +979,14 @@ mod tests {
             out.push(match &event.payload {
                 EventPayload::Agent { .. } => "Agent",
                 EventPayload::FrameResult { .. } => "FrameResult",
-                EventPayload::Message(Message::User { .. }) => "User",
-                EventPayload::Message(Message::Assistant { .. }) => "Assistant",
-                EventPayload::Message(Message::System { .. }) => "System",
+                EventPayload::Message(Message::Post { .. }) => "Post",
+                EventPayload::Message(Message::Turn { .. }) => "Turn",
                 EventPayload::Message(Message::Tool { .. }) => "Tool",
                 EventPayload::Call(_) => "Call",
                 EventPayload::Result { .. } => "Result",
                 EventPayload::ProgramResult { .. } => "ProgramResult",
                 EventPayload::Console { .. } => "Console",
-                EventPayload::Label(_) => "Label",
+                EventPayload::Rename { .. } => "Rename",
             });
             if matches!(event.payload, EventPayload::Agent { .. }) {
                 break;
@@ -1019,9 +1030,8 @@ mod tests {
             kinds(session.tree(), root_leaf(&session)),
             [
                 "Agent",
-                "System",
-                "User",
-                "Assistant",
+                "Post",
+                "Turn",
                 // Calls are logged at dispatch, their results at landing.
                 "Call",
                 "Call",
@@ -1030,7 +1040,7 @@ mod tests {
                 "ProgramResult",
                 "Tool",
                 "Console",
-                "Assistant",
+                "Turn",
                 // The root yields its final answer to the user; the top
                 // conversation never ends, so no `FrameResult` is logged.
             ]
@@ -1082,10 +1092,8 @@ mod tests {
             &self,
             request: &LlmRequest,
             chunk: &mut dyn FnMut(LlmChunk),
-        ) -> Result<Message, String> {
-            if let Some(Message::System { text }) = request.messages.first() {
-                self.seen.lock().unwrap().push(text.clone());
-            }
+        ) -> Result<LlmTurn, String> {
+            self.seen.lock().unwrap().push(request.system.clone());
             self.inner.complete(request, chunk)
         }
     }
@@ -1103,7 +1111,6 @@ mod tests {
         let session = Session::new(
             Tree::new(None),
             "agent prompt here",
-            json!(null),
             registry,
             Box::new(llm),
             tx,
@@ -1219,7 +1226,7 @@ mod tests {
     fn attachments_suppress_the_inline_nudge() {
         let mut registry = ToolRegistry::new();
         registry.register(tool("create_file", |_| Ok(json!({ "version": "v1" }))));
-        let prog = Message::Assistant {
+        let prog = LlmTurn {
             text: String::new(),
             thinking: None,
             tool_calls: vec![ToolCall {
@@ -1325,7 +1332,7 @@ mod tests {
         assert!(!spine.contains(&"Call"), "{spine:?}");
         // Root yields its final answer (no `FrameResult`); the top
         // conversation never ends.
-        assert_eq!(spine.last(), Some(&"Assistant"));
+        assert_eq!(spine.last(), Some(&"Turn"));
 
         // The completion report must answer the *resume* call ("c2"), not
         // the original run_program ("c1") — otherwise the next chat
@@ -1354,7 +1361,7 @@ mod tests {
             .values()
             .find(|e| {
                 matches!(&e.payload,
-                    EventPayload::Message(Message::Assistant { tool_calls, .. })
+                    EventPayload::Message(Message::Turn { tool_calls, .. })
                         if tool_calls.first().is_some_and(|c| c.name == crate::machine::TOOL_RUN_PROGRAM))
             })
             .map(|e| e.id)
@@ -1415,20 +1422,35 @@ mod tests {
 
     /// Step 2 (decision 4): the first event after an agent's `Agent`
     /// is the stored `Message::System` — the assembled card + prompt.
+    /// The system prompt is a snapshot on the branch **root**, not a
+    /// message on the spine: `Agent.system` carries the assembled card +
+    /// charter, and every request rebuilds its system message from it.
     #[test]
-    fn agent_root_is_followed_by_the_stored_system_prompt() {
+    fn the_agent_root_carries_the_system_prompt_snapshot() {
         let mut registry = ToolRegistry::new();
         registry.register(tool("fetch_page", |_| Ok(json!(null))));
         let (session, _) = run_session(registry, vec![scripted_text("done")], "go");
         let tree = session.tree();
-        // Agent is #1; the system prompt is the next event, #2.
-        let system = &tree.events[&EventId::new(2)];
-        assert_eq!(system.parent_id, Some(EventId::new(1)));
-        let EventPayload::Message(Message::System { text }) = &system.payload else {
-            panic!("the event after Agent must be the system prompt");
+        let EventPayload::Agent {
+            charter, system, ..
+        } = &tree.events[&EventId::new(1)].payload
+        else {
+            panic!("#1 must be the root Agent");
         };
-        assert!(text.contains("- tools.fetch_page"), "card present: {text}");
-        assert!(text.contains("test agent"), "agent prompt follows the card");
+        assert_eq!(charter, "test agent");
+        assert!(
+            system.contains("- tools.fetch_page"),
+            "card present: {system}"
+        );
+        assert!(
+            system.contains("test agent"),
+            "the charter follows the card"
+        );
+        // Nothing on the spine is a system message any more.
+        assert!(
+            !kinds(tree, root_leaf(&session)).contains(&"System"),
+            "the system prompt is not a spine message"
+        );
     }
 
     /// M2: a trapped runtime error reports, and the rewrite restart reuses
@@ -1438,32 +1460,32 @@ mod tests {
     fn trapped_error_rewrite_reuses_artifact_through_the_session() {
         let mut registry = ToolRegistry::new();
         registry.register(tool("fetch", |_| Ok(json!("DATA"))));
-        // Event ids are deterministic: Agent 1, System 2, User 3,
-        // Assistant 4, the fetch Invoke 5 — so the rewrite names
-        // `tool_result(5)` (the stored system prompt is id 2, decision 4).
+        // Event ids are deterministic: Agent 1, Post 2, Turn 3, the fetch
+        // `Call` 4 — so the rewrite names `tool_result(4)`, which is the
+        // call id the menu shows and which resolves to its `Result`.
         let script = vec![
             scripted_program(
                 "c1",
                 r#"await tools.fetch("expensive"); const v = null; return v.x;"#,
             ),
-            scripted_program("c2", "return await tools.tool_result(5);"),
+            scripted_program("c2", "return await tools.tool_result(4);"),
             scripted_text("done"),
         ];
         let (session, _) = run_session(registry, script, "fetch then trip");
 
-        // The fetch really is artifact #5 (guards the hardcoded id above).
+        // The fetch call really is #4 (guards the hardcoded id above).
         let fetch_invoke = session
             .tree()
             .events
             .values()
             .find(|e| matches!(&e.payload, EventPayload::Call(Call::Invoke { name, .. }) if name == "fetch"))
             .expect("the fetch Invoke");
-        assert_eq!(fetch_invoke.id.as_u64(), 5);
+        assert_eq!(fetch_invoke.id.as_u64(), 4);
 
         // The condition report rendered the trapped error and the menu.
         let reports = tool_texts(&session);
         assert!(
-            reports[0].contains("[#5]") && reports[0].contains("fetch"),
+            reports[0].contains("[#4]") && reports[0].contains("fetch"),
             "{}",
             reports[0]
         );
@@ -1505,7 +1527,7 @@ mod tests {
             .events
             .values()
             .find(|e| {
-                matches!(&e.payload, EventPayload::Agent { prompt, .. } if prompt == "child task")
+                matches!(&e.payload, EventPayload::Agent { charter, .. } if charter == "child task")
             })
             .expect("child Agent");
         let child_leaf = tree
@@ -1516,7 +1538,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             kinds(tree, child_leaf),
-            ["Agent", "System", "Assistant", "FrameResult"]
+            ["Agent", "Post", "Turn", "FrameResult"]
         );
 
         // The join: the child's result is the caller's logged artifact
@@ -1562,7 +1584,7 @@ mod tests {
             .events
             .values()
             .filter_map(|e| match &e.payload {
-                EventPayload::Agent { prompt, .. } => Some(prompt.clone()),
+                EventPayload::Agent { charter, .. } => Some(charter.clone()),
                 _ => None,
             })
             .collect();
@@ -1573,10 +1595,7 @@ mod tests {
             if leaf == root_leaf(&session) {
                 continue;
             }
-            assert_eq!(
-                kinds(tree, leaf),
-                ["Agent", "System", "Assistant", "FrameResult"]
-            );
+            assert_eq!(kinds(tree, leaf), ["Agent", "Post", "Turn", "FrameResult"]);
         }
 
         // The caller logged both agent calls as artifacts on its spine…
@@ -1620,7 +1639,7 @@ mod tests {
             &self,
             request: &LlmRequest,
             chunk: &mut dyn FnMut(LlmChunk),
-        ) -> Result<Message, String> {
+        ) -> Result<LlmTurn, String> {
             {
                 let mut n = self.inflight.lock().unwrap();
                 *n += 1;
@@ -1660,7 +1679,6 @@ mod tests {
         let session = Session::new(
             Tree::new(None),
             "test agent",
-            json!(null),
             ToolRegistry::new(),
             Box::new(llm),
             tx,
@@ -1717,7 +1735,6 @@ mod tests {
         let mut session = Session::new(
             Tree::new(None),
             "test agent",
-            json!(null),
             ToolRegistry::new(),
             Box::new(ScriptedLlm::new([scripted_program(
                 "c1",
@@ -1750,7 +1767,6 @@ mod tests {
         let mut session = Session::new(
             Tree::new(None),
             "test agent",
-            json!(null),
             ToolRegistry::new(),
             Box::new(ScriptedLlm::new([scripted_program(
                 "c1",
@@ -1779,11 +1795,19 @@ mod tests {
     // --- M4: fork / label / resume / list-leaves ---
 
     fn user(text: &str) -> EventPayload {
-        EventPayload::Message(Message::User { text: text.into() })
+        EventPayload::Message(Message::Post {
+            from: Author::User,
+            origin: Origin::Direct {
+                text: text.into(),
+                input: json!(null),
+                expects_reply: true,
+            },
+        })
     }
 
     fn assistant(text: &str) -> EventPayload {
-        EventPayload::Message(Message::Assistant {
+        EventPayload::Message(Message::Turn {
+            author: Author::Agent(EventId::new(1)),
             text: text.into(),
             thinking: None,
             tool_calls: Vec::new(),
@@ -1794,18 +1818,17 @@ mod tests {
     /// Assistant(3 "a1"). Leaf = #3 — open, so resumable and forkable.
     fn tree_with_open_root() -> Tree {
         let mut tree = Tree::new(None);
-        let mut spine = tree.start_agent(None, "root", json!(null)).unwrap();
+        let mut spine = tree.start_agent(None, None, "root", "").unwrap();
         tree.append(&mut spine, user("q")).unwrap();
         tree.append(&mut spine, assistant("a1")).unwrap();
         tree
     }
 
-    fn open(tree: Tree, script: Vec<Message>) -> (Session, Receiver<SessionEvent>) {
+    fn open(tree: Tree, script: Vec<LlmTurn>) -> (Session, Receiver<SessionEvent>) {
         let (tx, rx) = channel();
         let session = Session::new(
             tree,
             "ignored on resume",
-            json!(null),
             ToolRegistry::new(),
             Box::new(ScriptedLlm::new(script)),
             tx,
@@ -1852,30 +1875,46 @@ mod tests {
         assert_eq!(leaves[0].leaf, EventId::new(3));
         assert_eq!(leaves[0].agent, EventId::new(1));
         assert!(leaves[0].active && !leaves[0].complete);
-        assert_eq!(leaves[0].summary, "Assistant: a1");
+        assert_eq!(leaves[0].summary, "Turn: a1");
     }
 
     #[test]
-    fn label_logs_on_the_active_leaf_and_surfaces() {
+    fn rename_logs_on_the_active_branch_and_surfaces() {
         let (session, rx) = open(tree_with_open_root(), vec![]);
         let h = session.handle();
-        h.send(SessionCommand::Label("my-branch".into()));
+        h.send(SessionCommand::Rename("my-branch".into()));
         h.send(SessionCommand::Shutdown);
         let session = drain(session);
 
-        // A Label event was logged on the root spine.
+        // A Rename event was logged on the root spine.
         assert!(
-            session
-                .tree()
-                .events
-                .values()
-                .any(|e| matches!(&e.payload, EventPayload::Label(l) if l == "my-branch"))
+            session.tree().events.values().any(
+                |e| matches!(&e.payload, EventPayload::Rename { name } if name == "my-branch")
+            )
         );
-        // …and the refreshed leaf list carries it as the active leaf's label.
+        // …and the refreshed leaf list carries it as the branch's name.
         let leaves = last_leaves(&rx.try_iter().collect::<Vec<_>>());
         assert_eq!(leaves.len(), 1);
         assert!(leaves[0].active);
-        assert_eq!(leaves[0].label.as_deref(), Some("my-branch"));
+        assert_eq!(leaves[0].name.as_deref(), Some("my-branch"));
+    }
+
+    /// A `Rename` is a record, not a `Message`: it must not start an LLM
+    /// turn. The scripted client has no responses at all, so any request
+    /// would fail the run.
+    #[test]
+    fn rename_does_not_wake() {
+        let (session, rx) = open(tree_with_open_root(), vec![]);
+        let h = session.handle();
+        h.send(SessionCommand::Rename("quiet".into()));
+        h.send(SessionCommand::Shutdown);
+        let session = drain(session);
+
+        let events: Vec<SessionEvent> = rx.try_iter().collect();
+        assert!(errors(&events).is_empty(), "{:?}", errors(&events));
+        // Nothing but the rename was appended, and no turn was taken.
+        let kinds = kinds(session.tree(), root_leaf(&session));
+        assert_eq!(kinds, ["Agent", "Post", "Turn", "Rename"], "{kinds:?}");
     }
 
     #[test]
@@ -1885,7 +1924,7 @@ mod tests {
         // Fork off the user message (#2), dropping the original a1 reply.
         h.send(SessionCommand::Fork {
             from: EventId::new(2),
-            label: Some("retry".into()),
+            name: Some("retry".into()),
         });
         h.send(SessionCommand::UserTurn("forked follow-up".into()));
         let session = drain(session); // forked agent yields the turn back
@@ -1910,23 +1949,22 @@ mod tests {
         let forked = tree.spine_at(forked_leaf);
         assert!(!forked.is_complete());
         assert!(session.is_awaiting_user());
-        // Chat messages, minus the materialized system prompt (decision 4;
-        // this legacy tree had none, so it's inserted on the first turn).
-        let msgs: Vec<&str> = forked
-            .context()
-            .messages
-            .iter()
-            .filter(|m| !matches!(m, Message::System { .. }))
-            .map(|m| m.text())
-            .collect();
+        // The system prompt is on the branch root now, not a message.
+        let msgs: Vec<&str> = forked.context().messages.iter().map(|m| m.text()).collect();
         assert_eq!(msgs, ["q", "forked follow-up", "forked done"]);
-        // The fork's label sits on the new branch, not the original.
+        // The fork's name sits on the new branch, not the original.
+        let leaves = last_leaves(&rx.try_iter().collect::<Vec<_>>());
         assert_eq!(
-            last_leaves(&rx.try_iter().collect::<Vec<_>>())
+            leaves
                 .iter()
-                .find(|l| l.label.is_some())
-                .and_then(|l| l.label.clone()),
+                .find(|l| l.name.is_some())
+                .and_then(|l| l.name.clone()),
             Some("retry".into())
+        );
+        assert_eq!(
+            leaves.iter().filter(|l| l.name.is_some()).count(),
+            1,
+            "renaming the fork left the original unnamed"
         );
     }
 
@@ -1975,10 +2013,10 @@ mod tests {
             session.pump_one();
         }
         // The agent is now Running; every mutating command bounces.
-        h.send(SessionCommand::Label("late".into()));
+        h.send(SessionCommand::Rename("late".into()));
         h.send(SessionCommand::Fork {
             from: EventId::new(2),
-            label: None,
+            name: None,
         });
         h.send(SessionCommand::Resume(EventId::new(2)));
         for _ in 0..6 {
@@ -1990,7 +2028,7 @@ mod tests {
                 |e| matches!(e, SessionEvent::Error { message, .. } if message.contains("busy")),
             )
             .count();
-        assert_eq!(busy, 3, "label/fork/resume each rejected while busy");
+        assert_eq!(busy, 3, "rename/fork/resume each rejected while busy");
         h.send(SessionCommand::Shutdown);
         while session.pump_one() {}
     }
@@ -2038,18 +2076,24 @@ mod tests {
         // Agent 1, User 2, Assistant 3 (run_program, no result).
         let mut tree = Tree::new(None);
         let mut spine = tree
-            .start_agent(None, "you are an agent", json!(null))
+            .start_agent(None, None, "you are an agent", "")
             .unwrap();
         tree.append(
             &mut spine,
-            EventPayload::Message(Message::User {
-                text: "do something".into(),
+            EventPayload::Message(Message::Post {
+                from: Author::User,
+                origin: Origin::Direct {
+                    text: "do something".into(),
+                    input: json!(null),
+                    expects_reply: true,
+                },
             }),
         )
         .unwrap();
         tree.append(
             &mut spine,
-            EventPayload::Message(Message::Assistant {
+            EventPayload::Message(Message::Turn {
+                author: Author::Agent(EventId::new(1)),
                 text: String::new(),
                 thinking: None,
                 tool_calls: vec![ToolCall {
@@ -2067,7 +2111,6 @@ mod tests {
         let session = Session::new(
             tree,
             "ignored",
-            json!(null),
             ToolRegistry::new(),
             Box::new(ScriptedLlm::new(vec![
                 scripted_program("c2", "return 999;"),
@@ -2111,7 +2154,7 @@ mod tests {
         );
         let kinds = kinds(session.tree(), root_leaf(&session));
         assert!(
-            kinds.last() == Some(&"Assistant"),
+            kinds.last() == Some(&"Turn"),
             "agent yielded its final answer: {kinds:?}"
         );
         assert!(session.is_awaiting_user());
@@ -2123,7 +2166,7 @@ mod tests {
     fn all_complete_log_opens_idle_for_fork() {
         // A fully completed single-agent log: previously `new` errored.
         let mut tree = Tree::new(None);
-        let mut spine = tree.start_agent(None, "root", json!(null)).unwrap();
+        let mut spine = tree.start_agent(None, None, "root", "").unwrap();
         tree.append(&mut spine, assistant("done")).unwrap();
         tree.append(&mut spine, EventPayload::FrameResult { result: json!(1) })
             .unwrap();
@@ -2132,7 +2175,6 @@ mod tests {
         let session = Session::new(
             tree,
             "ignored",
-            json!(null),
             ToolRegistry::new(),
             Box::new(ScriptedLlm::new(vec![])),
             tx,

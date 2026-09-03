@@ -23,7 +23,7 @@ const USAGE: &str = "usage: agent <command>
     --resume <id>                   open anchored at leaf <id> (else the
                                     lowest incomplete leaf)
     --fork <id>                     fork a divergent branch from event <id>
-    --label <text>                  name the branch (with --fork) / label
+    --name <text>                   name the branch (with --fork), else rename
                                     the active leaf";
 
 fn main() {
@@ -47,7 +47,7 @@ fn main() {
             let mut list_leaves = false;
             let mut resume: Option<u64> = None;
             let mut fork: Option<u64> = None;
-            let mut label: Option<String> = None;
+            let mut name: Option<String> = None;
             let mut rest = args[2..].iter();
             let next_val = |rest: &mut std::slice::Iter<String>, flag: &str| -> String {
                 match rest.next() {
@@ -77,7 +77,7 @@ fn main() {
                         resume = Some(parse_id(next_val(&mut rest, "--resume"), "--resume"))
                     }
                     "--fork" => fork = Some(parse_id(next_val(&mut rest, "--fork"), "--fork")),
-                    "--label" => label = Some(next_val(&mut rest, "--label")),
+                    "--name" => name = Some(next_val(&mut rest, "--name")),
                     other => log_path = Some(other.to_string()),
                 }
             }
@@ -89,7 +89,7 @@ fn main() {
                 list_leaves,
                 resume,
                 fork,
-                label,
+                name,
                 turn,
             };
             let result = if headless {
@@ -175,12 +175,12 @@ fn build_brain(
     }
 }
 
-/// Fork/label/resume navigation (M4), shared by the CLI front-ends.
+/// Fork/rename/resume navigation (M4), shared by the CLI front-ends.
 struct SessionNav {
     list_leaves: bool,
     resume: Option<u64>,
     fork: Option<u64>,
-    label: Option<String>,
+    name: Option<String>,
     turn: Option<String>,
 }
 
@@ -196,22 +196,22 @@ fn build_session(
     let (registry, llm, prompt) = build_brain(real)?;
     let session = match resume {
         Some(id) => host::Session::open_at(tree, EventId::new(id), registry, llm, tx),
-        None => host::Session::new(tree, prompt, serde_json::Value::Null, registry, llm, tx),
+        None => host::Session::new(tree, prompt, registry, llm, tx),
     };
     session.map_err(|e| e.to_string())
 }
 
-/// Queue the M4 navigation commands (fork/label) ahead of an optional
+/// Queue the M4 navigation commands (fork/rename) ahead of an optional
 /// first user turn — all FIFO on the one inbox, so order is preserved.
 fn queue_nav(session: &host::Session, nav: &SessionNav) {
     let h = session.handle();
     if let Some(from) = nav.fork {
         h.send(host::SessionCommand::Fork {
             from: EventId::new(from),
-            label: nav.label.clone(),
+            name: nav.name.clone(),
         });
-    } else if let Some(text) = nav.label.clone() {
-        h.send(host::SessionCommand::Label(text));
+    } else if let Some(text) = nav.name.clone() {
+        h.send(host::SessionCommand::Rename(text));
     }
     if let Some(text) = nav.turn.clone() {
         h.send(host::SessionCommand::UserTurn(text));
@@ -233,7 +233,7 @@ fn run_session_tui(
 /// The headless session: print every `SessionEvent` from the channel —
 /// the CLI is just another consumer of the serializable UI boundary.
 /// With no navigation flags, scripted runs the M0 demo; otherwise the
-/// session is driven by the queued `--list-leaves`/`--fork`/`--label`/
+/// session is driven by the queued `--list-leaves`/`--fork`/`--name`/
 /// `--turn` commands.
 fn run_session_headless(
     log_path: Option<String>,
@@ -247,7 +247,7 @@ fn run_session_headless(
         }
     });
 
-    let driven = nav.list_leaves || nav.fork.is_some() || nav.label.is_some() || nav.turn.is_some();
+    let driven = nav.list_leaves || nav.fork.is_some() || nav.name.is_some() || nav.turn.is_some();
     let session = if nav.list_leaves {
         // Open, ask for the leaf set, exit — no LLM contact.
         let session = build_session(log_path, real, nav.resume, tx)?;
@@ -294,13 +294,13 @@ fn print_session_event(event: &SessionEvent) {
             for leaf in leaves {
                 let mark = if leaf.active { "*" } else { " " };
                 let state = if leaf.complete { "done" } else { "open" };
-                let label = leaf
-                    .label
+                let name = leaf
+                    .name
                     .as_deref()
-                    .map(|l| format!(" «{l}»"))
+                    .map(|n| format!(" «{n}»"))
                     .unwrap_or_default();
                 println!(
-                    "  {mark} #{} [agent {} · {state}]{label}  {}",
+                    "  {mark} #{} [agent {} · {state}]{name}  {}",
                     leaf.leaf.as_u64(),
                     leaf.agent.as_u64(),
                     leaf.summary,
@@ -310,26 +310,27 @@ fn print_session_event(event: &SessionEvent) {
         SessionEvent::Event { agent, event } => {
             let head = format!("[agent {} · #{}]", agent.as_u64(), event.id.as_u64());
             match &event.payload {
-                EventPayload::Agent { prompt, input } => {
-                    println!("{head} agent start: {prompt} (input: {input})");
+                EventPayload::Agent { name, charter, .. } => {
+                    let name = name
+                        .as_deref()
+                        .map(|n| format!(" «{n}»"))
+                        .unwrap_or_default();
+                    println!("{head} agent{name}: {charter}");
                 }
                 EventPayload::FrameResult { result } => {
                     println!("{head} agent result: {result}");
                 }
-                EventPayload::Message(Message::User { text }) => {
-                    println!("{head} user: {text}");
+                EventPayload::Message(Message::Post { from, origin }) => {
+                    println!("{head} post: {}", report::render_post(*from, origin));
                 }
-                EventPayload::Message(Message::Assistant {
+                EventPayload::Message(Message::Turn {
                     text, tool_calls, ..
                 }) => {
                     let calls: Vec<String> = tool_calls
                         .iter()
                         .map(|c| format!("⚙ {}({})", c.name, c.arguments))
                         .collect();
-                    println!("{head} assistant: {}{}", text, calls.join(" "));
-                }
-                EventPayload::Message(Message::System { text }) => {
-                    println!("{head} system: {text}");
+                    println!("{head} turn: {}{}", text, calls.join(" "));
                 }
                 EventPayload::Message(Message::Tool { name, text, .. }) => {
                     println!("{head} tool result ({name}):");
@@ -351,7 +352,7 @@ fn print_session_event(event: &SessionEvent) {
                 EventPayload::ProgramResult { value } => {
                     println!("{head} program result: {value}");
                 }
-                EventPayload::Label(label) => println!("{head} label: {label}"),
+                EventPayload::Rename { name } => println!("{head} rename: {name}"),
                 EventPayload::Console { lines } => {
                     println!("{head} console: {} lines", lines.len());
                 }

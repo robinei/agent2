@@ -163,7 +163,7 @@ impl AttachedApp {
             && Some(*agent) == self.selected
             && matches!(
                 &event.payload,
-                EventPayload::Message(Message::Assistant { tool_calls, .. })
+                EventPayload::Message(Message::Turn { tool_calls, .. })
                     if tool_calls.iter().any(|c| c.name == TOOL_RUN_PROGRAM)
             )
         {
@@ -1353,7 +1353,6 @@ mod tests {
         let mut session = Session::new(
             Tree::new(None),
             "parent",
-            json!(null),
             registry,
             Box::new(ScriptedLlm::new(script)),
             tx,

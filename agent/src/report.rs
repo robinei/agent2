@@ -8,6 +8,8 @@
 //! mitigation locked in the plan: bounded reports, menu pruned to
 //! recent entries, full data always fetchable by id).
 
+use crate::types::{Author, Origin};
+
 /// Max bytes of the "what happened" section (diagnostic + payload).
 pub const WHAT_MAX_BYTES: usize = 2048;
 /// Max bytes of a rendered condition payload (within the what section).
@@ -274,6 +276,75 @@ fn render_menu(title: &str, artifacts: &[Artifact]) -> String {
         out.push_str(&format!("\n[#{}] {} → {}", a.id, a.label, tail));
     }
     out
+}
+
+// ── rendered messages ───────────────────────────────────────────────
+
+/// Max bytes of a post's rendered `input` preview.
+pub const INPUT_PREVIEW_MAX_BYTES: usize = 512;
+/// Object keys / array entries named in an `input` preview.
+pub const INPUT_PREVIEW_MAX_KEYS: usize = 12;
+
+/// Render a `Post` into the text an LLM sees: the body, author-labelled
+/// when it did not come from the person driving the session, plus a
+/// **bounded preview** of any machine-bound `input`.
+///
+/// The preview is the whole point: the full value reaches the *program*
+/// as the `input` const, so rendering it in full would dump a caller's
+/// data into the callee's context — exactly what by-reference travel
+/// exists to prevent.
+pub fn render_post(from: Author, origin: &Origin) -> String {
+    let Some((text, input, _)) = origin.direct() else {
+        // An unresolved reference should never reach a renderer: a
+        // `Context` materialises bodies. Say so rather than render a lie.
+        return "(message body unavailable)".to_owned();
+    };
+    let mut out = String::new();
+    match from {
+        Author::User => {}
+        Author::Harness => out.push_str("[harness] "),
+        Author::Agent(id) => out.push_str(&format!("[agent {}] ", id.as_u64())),
+    }
+    out.push_str(text);
+    if !input.is_null() {
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        out.push_str("input: ");
+        out.push_str(&input_preview(input));
+    }
+    out
+}
+
+/// A bounded, *shape-first* preview of machine-bound data: what kind it
+/// is, which keys it has, how big it is — never the value itself.
+pub fn input_preview(v: &serde_json::Value) -> String {
+    let bytes = v.to_string().len();
+    match v {
+        serde_json::Value::Object(map) => {
+            let mut keys: Vec<&str> = map.keys().map(String::as_str).collect();
+            let omitted = keys.len().saturating_sub(INPUT_PREVIEW_MAX_KEYS);
+            keys.truncate(INPUT_PREVIEW_MAX_KEYS);
+            let mut shape = format!("object, {} keys: {}", map.len(), keys.join(", "));
+            if omitted > 0 {
+                shape.push_str(&format!(", … ({omitted} more)"));
+            }
+            format!("{{{shape}}} ({bytes} bytes) — bound whole as `input`")
+        }
+        serde_json::Value::Array(items) => format!(
+            "[array, {} items] ({bytes} bytes) — bound whole as `input`",
+            items.len()
+        ),
+        serde_json::Value::String(text) => format!(
+            "{} ({bytes} bytes) — bound whole as `input`",
+            clip(
+                &serde_json::Value::String(text.clone()).to_string(),
+                INPUT_PREVIEW_MAX_BYTES
+            )
+        ),
+        // Scalars are smaller than any description of them.
+        other => other.to_string(),
+    }
 }
 
 // ── helpers ─────────────────────────────────────────────────────────

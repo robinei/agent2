@@ -51,7 +51,6 @@ pub fn run_demo(tree: Tree, events: Sender<SessionEvent>) -> io::Result<Session>
     let session = Session::new(
         tree,
         DEMO_PROMPT,
-        json!(null),
         demo_registry(),
         Box::new(demo_script()),
         events,

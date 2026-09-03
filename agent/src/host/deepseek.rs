@@ -11,7 +11,7 @@
 use std::io::BufRead;
 
 use crate::host::llm::{LlmChunk, LlmClient};
-use crate::machine::LlmRequest;
+use crate::machine::{LlmRequest, LlmTurn};
 use crate::types::{Message, ToolCall};
 
 const DEFAULT_MODEL: &str = "deepseek-v4-pro";
@@ -57,7 +57,7 @@ impl LlmClient for DeepSeekClient {
         &self,
         request: &LlmRequest,
         chunk: &mut dyn FnMut(LlmChunk),
-    ) -> Result<Message, String> {
+    ) -> Result<LlmTurn, String> {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         let body = request_body(request, &self.model);
         let mut response = self
@@ -83,7 +83,13 @@ impl LlmClient for DeepSeekClient {
 /// Assistant `thinking` is never sent back: DeepSeek requires
 /// `reasoning_content` to be excluded from the next-turn context.
 fn request_body(request: &LlmRequest, model: &str) -> serde_json::Value {
-    let messages: Vec<serde_json::Value> = request.messages.iter().map(message_json).collect();
+    // The system prompt is rebuilt from `Agent.system` at the front of
+    // every request — it is prefix, and prefix is immutable.
+    let mut messages = vec![serde_json::json!({
+        "role": "system",
+        "content": request.system,
+    })];
+    messages.extend(request.messages.iter().map(message_json));
     let tools: Vec<serde_json::Value> = request
         .tools
         .iter()
@@ -106,16 +112,20 @@ fn request_body(request: &LlmRequest, model: &str) -> serde_json::Value {
     })
 }
 
+/// Each rendered kind maps to exactly one API role **by its variant**,
+/// never by a flag.
 fn message_json(message: &Message) -> serde_json::Value {
     match message {
-        Message::System { text } => serde_json::json!({ "role": "system", "content": text }),
-        Message::User { text } => serde_json::json!({ "role": "user", "content": text }),
+        Message::Post { from, origin } => serde_json::json!({
+            "role": "user",
+            "content": crate::report::render_post(*from, origin),
+        }),
         Message::Tool { call_id, text, .. } => serde_json::json!({
             "role": "tool",
             "tool_call_id": call_id,
             "content": text,
         }),
-        Message::Assistant {
+        Message::Turn {
             text, tool_calls, ..
         } => {
             let mut obj = serde_json::json!({ "role": "assistant", "content": text });
@@ -149,7 +159,7 @@ struct PartialCall {
 
 /// Parse a chat-completions SSE stream into the final assistant
 /// message, forwarding deltas to `chunk` as they arrive.
-fn parse_sse(reader: impl BufRead, chunk: &mut dyn FnMut(LlmChunk)) -> Result<Message, String> {
+fn parse_sse(reader: impl BufRead, chunk: &mut dyn FnMut(LlmChunk)) -> Result<LlmTurn, String> {
     let mut text = String::new();
     let mut thinking = String::new();
     let mut calls: Vec<PartialCall> = Vec::new();
@@ -220,7 +230,7 @@ fn parse_sse(reader: impl BufRead, chunk: &mut dyn FnMut(LlmChunk)) -> Result<Me
         })
         .collect::<Result<Vec<_>, String>>()?;
 
-    Ok(Message::Assistant {
+    Ok(LlmTurn {
         text,
         thinking: (!thinking.is_empty()).then_some(thinking),
         tool_calls,
@@ -231,17 +241,24 @@ fn parse_sse(reader: impl BufRead, chunk: &mut dyn FnMut(LlmChunk)) -> Result<Me
 mod tests {
     use super::*;
     use crate::machine::{resume_spec, run_program_spec};
+    use crate::types::{Author, EventId, Origin};
     use serde_json::json;
 
     #[test]
     fn request_body_maps_messages_and_tools() {
         let request = LlmRequest {
+            system: "card".into(),
             messages: vec![
-                Message::System {
-                    text: "card".into(),
+                Message::Post {
+                    from: Author::User,
+                    origin: Origin::Direct {
+                        text: "go".into(),
+                        input: json!(null),
+                        expects_reply: true,
+                    },
                 },
-                Message::User { text: "go".into() },
-                Message::Assistant {
+                Message::Turn {
+                    author: Author::Agent(EventId::new(1)),
                     text: String::new(),
                     thinking: Some("hidden".into()),
                     tool_calls: vec![ToolCall {
@@ -311,14 +328,11 @@ mod tests {
         })
         .unwrap();
 
-        let Message::Assistant {
+        let LlmTurn {
             text,
             thinking,
             tool_calls,
-        } = message
-        else {
-            panic!("not an assistant message");
-        };
+        } = message;
         assert_eq!(text, "the answer is 42");
         assert_eq!(thinking.as_deref(), Some("let me think"));
         assert!(tool_calls.is_empty());
@@ -335,9 +349,7 @@ mod tests {
         ]);
         let message = parse_sse(stream.as_bytes(), &mut |_| {}).unwrap();
 
-        let Message::Assistant { tool_calls, .. } = message else {
-            panic!("not an assistant message");
-        };
+        let LlmTurn { tool_calls, .. } = message;
         assert_eq!(tool_calls.len(), 1);
         assert_eq!(tool_calls[0].id, "call_1");
         assert_eq!(tool_calls[0].name, "run_program");

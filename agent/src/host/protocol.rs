@@ -34,14 +34,12 @@ pub enum SessionCommand {
     UserTurn(String),
     /// Request the current leaf set (replied to with `SessionEvent::Leaves`).
     ListLeaves,
-    /// Label the active root spine's leaf for fork/leaf UX (idle only).
-    Label(String),
+    /// Name the active branch from here on (idle only). A record, not a
+    /// message: renaming never wakes the branch.
+    Rename(String),
     /// Fork from any event into a divergent branch and make it the active
-    /// root (idle only). The optional label names the new branch.
-    Fork {
-        from: EventId,
-        label: Option<String>,
-    },
+    /// root (idle only). The optional name names the new branch.
+    Fork { from: EventId, name: Option<String> },
     /// Re-anchor the active root at an existing leaf (idle only; rejected
     /// if that leaf's spine is already complete).
     Resume(EventId),
@@ -87,8 +85,9 @@ pub struct LeafInfo {
     pub leaf: EventId,
     /// The innermost `Agent` above the leaf (which agent it belongs to).
     pub agent: AgentId,
-    /// Nearest `Label` on the spine, if any.
-    pub label: Option<String>,
+    /// The branch's name: the last `Rename` at or after its root, else
+    /// the root's own name. One concept, one field.
+    pub name: Option<String>,
     /// Whether the leaf's spine has recorded its `FrameResult`.
     pub complete: bool,
     /// Whether this is the session's current active root leaf.
@@ -100,7 +99,7 @@ pub struct LeafInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Event, EventPayload, Message};
+    use crate::types::{Author, Event, EventPayload, Message, Origin};
     use jiff::Timestamp;
 
     fn roundtrip_cmd(cmd: SessionCommand) {
@@ -118,10 +117,10 @@ mod tests {
         let id = EventId::new(7);
         roundtrip_cmd(SessionCommand::UserTurn("hi".into()));
         roundtrip_cmd(SessionCommand::ListLeaves);
-        roundtrip_cmd(SessionCommand::Label("branch A".into()));
+        roundtrip_cmd(SessionCommand::Rename("branch A".into()));
         roundtrip_cmd(SessionCommand::Fork {
             from: id,
-            label: Some("retry".into()),
+            name: Some("retry".into()),
         });
         roundtrip_cmd(SessionCommand::Resume(id));
         roundtrip_cmd(SessionCommand::Shutdown);
@@ -134,7 +133,7 @@ mod tests {
         roundtrip_evt(SessionEvent::Leaves(vec![LeafInfo {
             leaf: id,
             agent: EventId::new(1),
-            label: Some("branch A".into()),
+            name: Some("branch A".into()),
             complete: false,
             active: true,
             summary: "Assistant: hello".into(),
@@ -145,7 +144,14 @@ mod tests {
                 id,
                 parent_id: Some(EventId::new(1)),
                 timestamp: Timestamp::UNIX_EPOCH,
-                payload: EventPayload::Message(Message::User { text: "x".into() }),
+                payload: EventPayload::Message(Message::Post {
+                    from: Author::User,
+                    origin: Origin::Direct {
+                        text: "x".into(),
+                        input: serde_json::Value::Null,
+                        expects_reply: true,
+                    },
+                }),
             },
         });
     }

@@ -1208,7 +1208,7 @@ Before the message reshape, because `Post.origin` names a `Send`.
 `Message::Tool` stays for now and is deleted in A4, so this step is a
 reshape of the two kinds that survive.
 
-- [ ] `Message` reshaped: `Post { from, origin }` where `origin` is
+- [x] `Message` reshaped: `Post { from, origin }` where `origin` is
       `Sent(id)` or `Direct{text, input, expects_reply}`, and `Turn {
       author, text, thinking, tool_calls }`; `Author` enum added; doc
       comments give each parent rule, branch, and render role. No body is
@@ -1221,25 +1221,25 @@ reshape of the two kinds that survive.
       two borrows are disjoint, so no restructuring is needed. Resolved
       bodies are cloned into the in-memory `Context`; only the *log* is
       free of copies.
-- [ ] `Agent { name, charter, tools, system }`; `ensure_system` deleted;
+- [x] `Agent { name, charter, tools, system }`; `ensure_system` deleted;
       the system message is rebuilt by `render_request` from
       `Agent.system` (the stored-prompt test becomes "the request's first
       message equals `Agent.system`").
-- [ ] `EventPayload::Label`, `SessionCommand::Label`, `cmd_label` and
+- [x] `EventPayload::Label`, `SessionCommand::Label`, `cmd_label` and
       `LeafInfo.label` deleted; `Rename { name }` added; `tree::tests`'
       label cases become branch-name cases, plus: a branch's name is the
       last `Rename` at or after its root, a rename on the original leaves
       a fork's name alone, and a `Rename` triggers no prompt
       (`rename_folds_from_the_branch_root`, `rename_does_not_wake`).
-- [ ] `replay_event`: `Message`s → `messages`; `Context.prompt/input` →
+- [x] `replay_event`: `Message`s → `messages`; `Context.prompt/input` →
       `Context.charter/system`; `input` renders as a bounded preview while
       the whole value reaches the program
       (`large_input_previews_in_context_and_binds_whole`).
-- [ ] `deepseek.rs` request builder maps the new shapes; fixture tests
+- [x] `deepseek.rs` request builder maps the new shapes; fixture tests
       updated, still pure.
-- [ ] Every existing test passes with assertions re-expressed and **not
+- [x] Every existing test passes with assertions re-expressed and **not
       weakened**.
-- [ ] Gate: `cargo fmt && cargo clippy --workspace --all-targets &&
+- [x] Gate: `cargo fmt && cargo clippy --workspace --all-targets &&
       cargo test` green.
 
 ### Step A4 — Outcomes and derived reports (`types.rs`, `machine.rs`, `report.rs`)

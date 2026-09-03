@@ -113,8 +113,9 @@ pub enum StepInput {
     /// A user message. Valid while idle; arriving mid-program it becomes
     /// a host-injected condition — deferred to M2 (panics until then).
     UserTurn(String),
-    /// The assistant's turn (logged verbatim; tool calls dispatched).
-    LlmResponse(Message),
+    /// The assistant's turn (logged with its author; tool calls
+    /// dispatched).
+    LlmResponse(LlmTurn),
     /// Completed host tool calls, in resolution order.
     ToolResults(Vec<ToolResult>),
     /// A child agent's `FrameResult` arriving at its call site.
@@ -152,8 +153,25 @@ pub enum StepOutput {
     Working,
 }
 
+/// One completed assistant turn, as an LLM client produced it.
+///
+/// A client speaks *for* a branch; it does not decide **who acted**. So
+/// the `author` is not here: the harness stamps it when it logs the
+/// `Message::Turn`, which is also what lets the user take a branch's turn
+/// through the very same path (`Restart`).
+#[derive(Clone, Debug, Default)]
+pub struct LlmTurn {
+    pub text: String,
+    pub thinking: Option<String>,
+    pub tool_calls: Vec<ToolCall>,
+}
+
 #[derive(Debug)]
 pub struct LlmRequest {
+    /// The branch's system prompt, rebuilt verbatim from `Agent.system`.
+    /// It is a *snapshot*, so a later card edit or a new registry tool
+    /// never alters an existing conversation's cached prefix.
+    pub system: String,
     pub messages: Vec<Message>,
     pub tools: Vec<ToolSpec>,
 }
@@ -226,6 +244,10 @@ struct PendingCall {
 
 pub struct Runner {
     pub spine: Spine,
+    /// The innermost `Agent` root above this branch's leaf — who the
+    /// branch is a conversation with. Resolved once at construction; the
+    /// leaf moves, the agent does not.
+    agent: EventId,
     /// The session's top agent: the user-facing conversation. It never
     /// completes — a final no-tool-call turn *yields* to the user
     /// instead of logging a `FrameResult`. Child (subagent) contexts are
@@ -265,28 +287,49 @@ enum SuspendCause {
 }
 
 impl Runner {
-    /// Root agent of a tree.
-    pub fn new_root(
-        tree: &mut Tree,
-        prompt: impl Into<String>,
-        input: serde_json::Value,
-    ) -> io::Result<Self> {
-        let spine = tree.start_agent(None, prompt, input)?;
-        Ok(Self::with_spine(spine))
+    /// Root agent of a tree. `charter` is what the agent is for; the
+    /// system prompt is assembled from it and the card and snapshotted on
+    /// the `Agent` event.
+    pub fn new_root(tree: &mut Tree, charter: impl Into<String>, card: &str) -> io::Result<Self> {
+        let charter = charter.into();
+        let system = assemble_system(card, &charter);
+        let spine = tree.start_agent(None, None, charter, system)?;
+        let mut state = Self::with_spine(tree, spine);
+        state.dialect_card = card.to_owned();
+        Ok(state)
     }
 
     /// Child agent branching at `call_site` on the caller's spine (the
-    /// host maps each `SpawnAgent` to one of these).
+    /// host maps each `SpawnAgent` to one of these). The first question is
+    /// a `Post` — the child's charter is what it is *for*, and the
+    /// question is what it was *asked*, which for `tools.agent`'s one-shot
+    /// sugar happen to be the same string.
     pub fn new_child(
         tree: &mut Tree,
         call_site: EventId,
-        prompt: impl Into<String>,
+        caller: EventId,
+        charter: impl Into<String>,
         input: serde_json::Value,
         budget: Option<usize>,
+        card: &str,
     ) -> io::Result<Self> {
-        let spine = tree.start_agent(Some(call_site), prompt, input)?;
-        let mut state = Self::with_spine(spine);
-        state.is_root = false; // a subagent agent completes and returns
+        let charter = charter.into();
+        let system = assemble_system(card, &charter);
+        let mut spine = tree.start_agent(Some(call_site), None, charter.clone(), system)?;
+        tree.append(
+            &mut spine,
+            EventPayload::Message(Message::Post {
+                from: Author::Agent(caller),
+                origin: Origin::Direct {
+                    text: charter,
+                    input,
+                    expects_reply: true,
+                },
+            }),
+        )?;
+        let mut state = Self::with_spine(tree, spine);
+        state.dialect_card = card.to_owned();
+        state.is_root = false; // a subagent completes and returns
         state.answer_budget = budget.unwrap_or(DEFAULT_ANSWER_BUDGET);
         Ok(state)
     }
@@ -294,9 +337,11 @@ impl Runner {
     /// Resume an existing spine (re-opened log). This is the session's
     /// top agent — `is_root` — whether freshly rooted (`new_root`) or
     /// re-anchored on resume (`open_at`); `new_child` clears the flag.
-    pub fn with_spine(spine: Spine) -> Self {
+    pub fn with_spine(tree: &Tree, spine: Spine) -> Self {
+        let agent = tree.enclosing_agent(spine.leaf_id).unwrap_or(spine.leaf_id);
         Runner {
             spine,
+            agent,
             is_root: true,
             phase: Phase::Idle,
             invoke_counter: 0,
@@ -311,9 +356,16 @@ impl Runner {
     }
 
     /// The dialect card rendered as the root of the system message
-    /// (the host generates it from the tool registry).
+    /// (the host generates it from the tool registry). It seeds the
+    /// snapshot on a *new* agent's root; an existing branch's system
+    /// prompt is the snapshot and never re-derived.
     pub fn set_dialect_card(&mut self, card: String) {
         self.dialect_card = card;
+    }
+
+    /// This branch's agent — the innermost `Agent` root on its path.
+    pub fn agent_id(&self) -> EventId {
+        self.agent
     }
 
     /// Drain the program-status transitions logged during the just-run
@@ -325,44 +377,6 @@ impl Runner {
     /// Record a program-block status transition for the host to surface.
     fn note_status(&mut self, program: EventId, status: ProgramStatus) {
         self.status_transitions.push((program, status));
-    }
-
-    /// Materialize this agent's system prompt once (decision 4): the
-    /// assembled dialect card + prompt + input, logged as the spine's
-    /// first `Message::System`. Idempotent — a spine that already carries
-    /// a leading `System` (a re-opened log) is left untouched, so the
-    /// stored prompt replays verbatim even as the registry's card evolves.
-    fn ensure_system(&mut self, tree: &mut Tree) -> io::Result<()> {
-        if matches!(
-            self.spine.context().messages.first(),
-            Some(Message::System { .. })
-        ) {
-            return Ok(());
-        }
-        let text = self.assemble_system();
-        tree.append(
-            &mut self.spine,
-            EventPayload::Message(Message::System { text }),
-        )?;
-        Ok(())
-    }
-
-    /// Assemble the system prompt string: the dialect card, the agent
-    /// prompt, then the agent input as a fenced JSON block.
-    fn assemble_system(&self) -> String {
-        let agent = self.spine.context();
-        let mut system = String::new();
-        if !self.dialect_card.is_empty() {
-            system.push_str(&self.dialect_card);
-            system.push_str("\n\n");
-        }
-        system.push_str(&agent.prompt);
-        if !agent.input.is_null() {
-            system.push_str("\n\nInput:\n```json\n");
-            system.push_str(&agent.input.to_string());
-            system.push_str("\n```");
-        }
-        system
     }
 
     /// Whether the agent can accept a `UserTurn` right now.
@@ -400,8 +414,8 @@ impl Runner {
     /// Start the conversation without a user turn — how child contexts
     /// begin (their input arrived in `Agent`).
     pub fn kickoff(&mut self, tree: &mut Tree) -> io::Result<Vec<StepOutput>> {
+        let _ = tree;
         assert!(matches!(self.phase, Phase::Idle), "kickoff on a busy agent");
-        self.ensure_system(tree)?;
         self.phase = Phase::AwaitingLlm;
         Ok(vec![self.render_request()])
     }
@@ -439,27 +453,34 @@ impl Runner {
             Phase::AwaitingLlm => panic!("user turn while an LLM request is in flight"),
             Phase::Done => panic!("user turn on a completed agent"),
         }
-        self.ensure_system(tree)?;
         tree.append(
             &mut self.spine,
-            EventPayload::Message(Message::User { text }),
+            EventPayload::Message(Message::Post {
+                from: Author::User,
+                origin: Origin::Direct {
+                    text,
+                    input: serde_json::Value::Null,
+                    expects_reply: true,
+                },
+            }),
         )?;
         self.phase = Phase::AwaitingLlm;
         Ok(vec![self.render_request()])
     }
 
-    fn on_llm_response(
-        &mut self,
-        tree: &mut Tree,
-        message: Message,
-    ) -> io::Result<Vec<StepOutput>> {
+    fn on_llm_response(&mut self, tree: &mut Tree, turn: LlmTurn) -> io::Result<Vec<StepOutput>> {
         assert!(
             matches!(self.phase, Phase::AwaitingLlm | Phase::Suspended(..)),
             "LlmResponse with no request in flight"
         );
-        let tool_calls = match &message {
-            Message::Assistant { tool_calls, .. } => tool_calls.clone(),
-            other => panic!("LlmResponse must be an Assistant message, got {other:?}"),
+        let tool_calls = turn.tool_calls.clone();
+        // The branch's own LLM acted: stamp the author here, where the
+        // agent id is known, rather than asking a client to invent it.
+        let message = Message::Turn {
+            author: Author::Agent(self.agent_id()),
+            text: turn.text,
+            thinking: turn.thinking,
+            tool_calls: turn.tool_calls,
         };
         let assistant_id = tree.append(&mut self.spine, EventPayload::Message(message))?;
 
@@ -673,7 +694,9 @@ impl Runner {
     ) -> Result<Run, String> {
         let program = compile(source).map_err(|diags| render_diags(source, &diags))?;
         let had_attachments = attachments.as_object().is_some_and(|m| !m.is_empty());
-        let vm = VM::for_program_with(program, self.spine.context().input.clone(), attachments)
+        // The whole `input` reaches the program even though the context
+        // saw only a bounded preview of it.
+        let vm = VM::for_program_with(program, self.spine.context().input().clone(), attachments)
             .map_err(|e| format!("program setup failed: {}", e.message))?;
         Ok(Run {
             program_id,
@@ -1054,7 +1077,7 @@ impl Runner {
         }
         self.generation += 1;
         let text = match self.spine.context().messages.last() {
-            Some(Message::Assistant { text, .. }) => text.clone(),
+            Some(Message::Turn { text, .. }) => text.clone(),
             _ => String::new(),
         };
         if self.is_root {
@@ -1073,14 +1096,21 @@ impl Runner {
         if text.len() > self.answer_budget && self.answer_retries < ANSWER_RETRY_LIMIT {
             self.answer_retries += 1;
             let nudge = format!(
-                "[harness] Your answer is {} bytes; the budget is {}. Tighten it to a \
-                 digest, or write a large product with create_file and report its path.",
+                "Your answer is {} bytes; the budget is {}. Tighten it to a digest, or \
+                 write a large product with create_file and report its path.",
                 text.len(),
                 self.answer_budget
             );
             tree.append(
                 &mut self.spine,
-                EventPayload::Message(Message::User { text: nudge }),
+                EventPayload::Message(Message::Post {
+                    from: Author::Harness,
+                    origin: Origin::Direct {
+                        text: nudge,
+                        input: serde_json::Value::Null,
+                        expects_reply: false,
+                    },
+                }),
             )?;
             self.phase = Phase::AwaitingLlm;
             return Ok(vec![self.render_request()]);
@@ -1105,10 +1135,12 @@ impl Runner {
     // ── rendering ───────────────────────────────────────────────────
 
     fn render_request(&self) -> StepOutput {
-        // The system prompt is the spine's first message (materialized
-        // once by `ensure_system`, decision 4); send the agent's messages
-        // verbatim — no synthesized prepend.
-        let messages = self.spine.context().messages.clone();
+        // The system prompt is rebuilt from the `Agent`'s snapshot, not
+        // re-derived from the registry: the prefix is immutable, so a
+        // later card edit must not alter an existing conversation.
+        let context = self.spine.context();
+        let system = context.system.clone();
+        let messages = context.messages.clone();
 
         let tools = match &self.phase {
             Phase::Suspended(_, Suspension::Trapped(e))
@@ -1119,7 +1151,11 @@ impl Runner {
             Phase::Suspended(..) => vec![resume_spec(), run_program_spec()],
             _ => vec![run_program_spec()],
         };
-        StepOutput::LlmRequest(LlmRequest { messages, tools })
+        StepOutput::LlmRequest(LlmRequest {
+            system,
+            messages,
+            tools,
+        })
     }
 
     fn log_tool_error(&mut self, tree: &mut Tree, call: &ToolCall, msg: &str) -> io::Result<()> {
@@ -1185,6 +1221,20 @@ impl Runner {
 }
 
 // ── helpers ─────────────────────────────────────────────────────────
+
+/// Assemble an agent's system prompt: the dialect card, then the charter.
+/// The result is snapshotted on the `Agent` event and never re-derived —
+/// `input` is *not* part of it, because machine-bound data belongs on the
+/// post that carries it, previewed rather than dumped into context.
+fn assemble_system(card: &str, charter: &str) -> String {
+    let mut system = String::new();
+    if !card.is_empty() {
+        system.push_str(card);
+        system.push_str("\n\n");
+    }
+    system.push_str(charter);
+    system
+}
 
 /// Extract + validate the optional `attachments` map from a `run_program`
 /// call: an object of name → content string (this run's authored bodies).
@@ -1361,12 +1411,12 @@ mod tests {
 
     fn setup() -> (Tree, Runner) {
         let mut tree = Tree::new(None);
-        let state = Runner::new_root(&mut tree, "you are a test agent", json!(null)).unwrap();
+        let state = Runner::new_root(&mut tree, "you are a test agent", "").unwrap();
         (tree, state)
     }
 
-    fn llm_program(call_id: &str, source: &str) -> Message {
-        Message::Assistant {
+    fn llm_program(call_id: &str, source: &str) -> LlmTurn {
+        LlmTurn {
             text: String::new(),
             thinking: None,
             tool_calls: vec![ToolCall {
@@ -1377,8 +1427,8 @@ mod tests {
         }
     }
 
-    fn llm_resume(call_id: &str, value: serde_json::Value) -> Message {
-        Message::Assistant {
+    fn llm_resume(call_id: &str, value: serde_json::Value) -> LlmTurn {
+        LlmTurn {
             text: String::new(),
             thinking: None,
             tool_calls: vec![ToolCall {
@@ -1389,8 +1439,8 @@ mod tests {
         }
     }
 
-    fn llm_text(text: &str) -> Message {
-        Message::Assistant {
+    fn llm_text(text: &str) -> LlmTurn {
+        LlmTurn {
             text: text.into(),
             thinking: None,
             tool_calls: Vec::new(),
@@ -1439,15 +1489,14 @@ mod tests {
             .map(|e| match &e.payload {
                 EventPayload::Agent { .. } => "Agent",
                 EventPayload::FrameResult { .. } => "FrameResult",
-                EventPayload::Message(Message::User { .. }) => "User",
-                EventPayload::Message(Message::Assistant { .. }) => "Assistant",
-                EventPayload::Message(Message::System { .. }) => "System",
+                EventPayload::Message(Message::Post { .. }) => "Post",
+                EventPayload::Message(Message::Turn { .. }) => "Turn",
                 EventPayload::Message(Message::Tool { .. }) => "Tool",
                 EventPayload::Call(_) => "Call",
                 EventPayload::Result { .. } => "Result",
                 EventPayload::ProgramResult { .. } => "ProgramResult",
                 EventPayload::Console { .. } => "Console",
-                EventPayload::Label(_) => "Label",
+                EventPayload::Rename { .. } => "Rename",
             })
             .collect()
     }
@@ -1474,6 +1523,91 @@ mod tests {
                 _ => None,
             })
             .expect("a ToolCalls output")
+    }
+
+    // ── rendered messages (A3) ──────────────────────────────────────
+
+    /// Machine-bound data travels by reference: the *context* sees a
+    /// bounded shape preview, while the whole value reaches the
+    /// *program* as the `input` const. A caller passing a large `input`
+    /// must never dump it into the callee's context.
+    #[test]
+    fn large_input_previews_in_context_and_binds_whole() {
+        let mut tree = Tree::new(None);
+        let root = Runner::new_root(&mut tree, "root", "").unwrap();
+        let big = "z".repeat(9_000);
+        let mut child = Runner::new_child(
+            &mut tree,
+            root.spine.leaf_id,
+            root.agent_id(),
+            "summarize it",
+            json!({ "body": big.clone(), "path": "PLAN.md" }),
+            None,
+            "",
+        )
+        .unwrap();
+
+        // What the LLM sees: shape, keys, size — not the bytes.
+        let out = child.kickoff(&mut tree).unwrap();
+        let req = expect_request(&out);
+        let rendered = match &req.messages[0] {
+            Message::Post { from, origin } => crate::report::render_post(*from, origin),
+            other => panic!("expected a Post, got {other:?}"),
+        };
+        assert!(!rendered.contains(&big), "the body must not enter context");
+        assert!(rendered.contains("summarize it"), "{rendered}");
+        assert!(
+            rendered.contains("object, 2 keys: body, path"),
+            "{rendered}"
+        );
+        assert!(rendered.len() < 500, "the preview is bounded: {rendered}");
+
+        // What the program sees: the whole value.
+        let out = child
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(llm_program("c1", "return input.body.length;")),
+            )
+            .unwrap();
+        drain(&mut child, &mut tree, out);
+        assert!(
+            last_tool_text(&child).contains("returned: 9000"),
+            "{}",
+            last_tool_text(&child)
+        );
+    }
+
+    /// A post's author is rendered, not guessed: a harness notice reads
+    /// as one, and the user's own words carry no label.
+    #[test]
+    fn post_rendering_labels_its_author() {
+        let plain = crate::report::render_post(
+            Author::User,
+            &Origin::Direct {
+                text: "hello".into(),
+                input: json!(null),
+                expects_reply: true,
+            },
+        );
+        assert_eq!(plain, "hello");
+        let harness = crate::report::render_post(
+            Author::Harness,
+            &Origin::Direct {
+                text: "your answer is too long".into(),
+                input: json!(null),
+                expects_reply: false,
+            },
+        );
+        assert_eq!(harness, "[harness] your answer is too long");
+        let agent = crate::report::render_post(
+            Author::Agent(EventId::new(7)),
+            &Origin::Direct {
+                text: "which file?".into(),
+                input: json!(null),
+                expects_reply: true,
+            },
+        );
+        assert_eq!(agent, "[agent 7] which file?");
     }
 
     // ── typed calls (A2) ────────────────────────────────────────────
@@ -1631,10 +1765,9 @@ mod tests {
             .step(&mut tree, StepInput::UserTurn("compute 6*7".into()))
             .unwrap();
         let req = expect_request(&out);
-        assert!(
-            matches!(&req.messages[0], Message::System { text } if text.contains("test agent"))
-        );
-        assert!(matches!(&req.messages[1], Message::User { text } if text == "compute 6*7"));
+        assert!(req.system.contains("test agent"));
+        assert!(matches!(&req.messages[0], Message::Post { origin, .. }
+                     if origin.direct().unwrap().0 == "compute 6*7"));
         assert_eq!(tool_names(req), [TOOL_RUN_PROGRAM]);
         // The full definition rides along: schema'd parameters, not a name.
         assert!(req.tools[0].parameters["properties"]["source"].is_object());
@@ -1642,64 +1775,77 @@ mod tests {
     }
 
     #[test]
-    fn dialect_card_roots_the_system_message() {
-        let (mut tree, mut state) = setup();
-        state.set_dialect_card("THE DIALECT CARD".into());
+    fn dialect_card_roots_the_system_prompt() {
+        let mut tree = Tree::new(None);
+        let mut state =
+            Runner::new_root(&mut tree, "you are a test agent", "THE DIALECT CARD").unwrap();
         let out = state
             .step(&mut tree, StepInput::UserTurn("go".into()))
             .unwrap();
         let req = expect_request(&out);
-        let Message::System { text } = &req.messages[0] else {
-            panic!("first message must be the system message");
-        };
-        assert!(text.starts_with("THE DIALECT CARD\n\n"), "{text}");
-        // The stored prompt is the spine's first event after Agent.
-        assert_eq!(payload_kinds(&state, &tree).first(), Some(&"Agent"));
-        assert_eq!(payload_kinds(&state, &tree).get(1), Some(&"System"));
         assert!(
-            text.contains("you are a test agent"),
-            "agent prompt follows the card: {text}"
+            req.system.starts_with("THE DIALECT CARD\n\n"),
+            "{}",
+            req.system
         );
+        assert!(
+            req.system.contains("you are a test agent"),
+            "the charter follows the card: {}",
+            req.system
+        );
+        // The system prompt is the snapshot on the branch root — not a
+        // message on the spine.
+        assert_eq!(payload_kinds(&state, &tree), ["Agent", "Post"]);
     }
 
-    /// Step 2 (decision 4): the system prompt is materialized once and
-    /// replays verbatim. Re-opening the spine with a *different* card does
-    /// not re-derive it — `render_request` sends the stored `System` as-is.
+    /// The prefix is immutable: a request's system message **equals**
+    /// `Agent.system`, the snapshot taken when the agent was created. A
+    /// later card edit cannot alter an existing conversation.
     #[test]
-    fn reopened_spine_replays_the_stored_system_prompt() {
+    fn the_request_system_equals_the_agent_snapshot() {
         let mut tree = Tree::new(None);
-        let mut state = Runner::new_root(&mut tree, "agent", json!({ "n": 1 })).unwrap();
-        state.set_dialect_card("CARD A".into());
-        state.kickoff(&mut tree).unwrap(); // logs the System (#2) with CARD A
-        let stored = match &tree.events[&EventId::new(2)].payload {
-            EventPayload::Message(Message::System { text }) => text.clone(),
-            other => panic!("expected a System at #2, got {other:?}"),
+        let state = Runner::new_root(&mut tree, "agent", "CARD A").unwrap();
+        let EventPayload::Agent { system: stored, .. } = &tree.events[&EventId::new(1)].payload
+        else {
+            panic!("#1 must be the root Agent");
         };
+        let stored = stored.clone();
         assert!(stored.starts_with("CARD A"));
+        let root = state.spine.leaf_id;
 
-        // Re-anchor a fresh state on the logged spine, card the registry
-        // differently, take a new turn — the request's system message is
-        // the stored CARD A prompt, not a CARD B re-derivation.
-        let mut reopened = Runner::with_spine(tree.spine_at(EventId::new(2)));
+        // Re-anchor a fresh runner on the logged spine, card the registry
+        // differently, take a new turn — the request's system prompt is
+        // the stored CARD A snapshot, not a CARD B re-derivation.
+        let mut reopened = Runner::with_spine(&tree, tree.spine_at(root));
         reopened.set_dialect_card("CARD B — evolved".into());
         let out = reopened
             .step(&mut tree, StepInput::UserTurn("more".into()))
             .unwrap();
         let req = expect_request(&out);
-        let Message::System { text } = &req.messages[0] else {
-            panic!("first message must be the stored system prompt");
-        };
-        assert_eq!(text, &stored, "stored prompt replays verbatim");
+        assert_eq!(req.system, stored, "the snapshot replays verbatim");
         assert!(
-            !text.contains("CARD B"),
+            !req.system.contains("CARD B"),
             "the evolved card must not leak in"
         );
     }
 
+    /// The whole `input` reaches the program as the `input` const — it
+    /// travels on the post that carried it, and a child's first `Post` is
+    /// where a caller's data lands.
     #[test]
     fn input_binding_reaches_the_program() {
         let mut tree = Tree::new(None);
-        let mut state = Runner::new_root(&mut tree, "agent", json!({ "n": 7 })).unwrap();
+        let root = Runner::new_root(&mut tree, "root", "").unwrap();
+        let mut state = Runner::new_child(
+            &mut tree,
+            root.spine.leaf_id,
+            root.agent_id(),
+            "agent",
+            json!({ "n": 7 }),
+            None,
+            "",
+        )
+        .unwrap();
         state.kickoff(&mut tree).unwrap();
         let out = state
             .step(
@@ -1718,7 +1864,7 @@ mod tests {
         // A run_program carrying authored content in `attachments`; the
         // program reads it as the `attachments` const, never embedding it
         // in `source`.
-        let msg = Message::Assistant {
+        let msg = LlmTurn {
             text: String::new(),
             thinking: None,
             tool_calls: vec![ToolCall {
@@ -1744,7 +1890,7 @@ mod tests {
     fn malformed_attachments_is_a_repair_loop() {
         let (mut tree, mut state) = setup();
         state.kickoff(&mut tree).unwrap();
-        let msg = Message::Assistant {
+        let msg = LlmTurn {
             text: String::new(),
             thinking: None,
             tool_calls: vec![ToolCall {
@@ -1807,13 +1953,12 @@ mod tests {
             payload_kinds(&state, &tree),
             [
                 "Agent",
-                "System",
-                "User",
-                "Assistant",
+                "Post",
+                "Turn",
                 "ProgramResult",
                 "Tool",
                 "Console",
-                "Assistant",
+                "Turn",
             ]
         );
 
@@ -1821,7 +1966,7 @@ mod tests {
         state
             .step(&mut tree, StepInput::UserTurn("more".into()))
             .unwrap();
-        assert!(matches!(payload_kinds(&state, &tree).last(), Some(&"User")));
+        assert!(matches!(payload_kinds(&state, &tree).last(), Some(&"Post")));
     }
 
     #[test]
@@ -1908,10 +2053,7 @@ mod tests {
         assert_eq!(tool_names(req), [TOOL_RUN_PROGRAM]);
         assert!(last_tool_text(&state).contains("compile error"));
         // No execution events were logged.
-        assert_eq!(
-            payload_kinds(&state, &tree),
-            ["Agent", "System", "Assistant", "Tool"]
-        );
+        assert_eq!(payload_kinds(&state, &tree), ["Agent", "Turn", "Tool"]);
     }
 
     #[test]
@@ -2065,9 +2207,11 @@ mod tests {
         let mut child = Runner::new_child(
             &mut tree,
             state.spine.leaf_id,
+            state.agent_id(),
             &spawn.prompt,
             spawn.input.clone(),
             spawn.budget,
+            "",
         )
         .unwrap();
         assert_eq!(tree.list_leaves().len(), 2, "caller + in-flight child");
@@ -2156,7 +2300,7 @@ console (last 1 of 1 lines):
 fetched: 41
 
 ## artifacts — fetch with tools.tool_result(id)
-[#4] fetch(["a"]) → 41
+[#3] fetch(["a"]) → 41
 
 ## restarts
 - resume(value): continue past the raise; `value` becomes the result of the raise(...) expression
@@ -2224,8 +2368,8 @@ console (last 1 of 1 lines):
 got X
 
 ## new artifacts — fetch with tools.tool_result(id)
-[#4] fetch(["x"]) → "X"
-[#6] program result → ["X",2]"#
+[#3] fetch(["x"]) → "X"
+[#5] program result → ["X",2]"#
         );
     }
 
@@ -2307,8 +2451,16 @@ got X
     fn over_budget_subagent_answer_reprompts_then_truncates() {
         let (mut tree, root) = setup();
         let call_site = root.spine.leaf_id;
-        let mut child =
-            Runner::new_child(&mut tree, call_site, "summarize", json!({}), Some(50)).unwrap();
+        let mut child = Runner::new_child(
+            &mut tree,
+            call_site,
+            root.agent_id(),
+            "summarize",
+            json!({}),
+            Some(50),
+            "",
+        )
+        .unwrap();
         child.kickoff(&mut tree).unwrap();
         let long = "y".repeat(500);
         // First over-budget final answer → one re-prompt, not completion.
@@ -2337,7 +2489,7 @@ got X
                 .context()
                 .messages
                 .iter()
-                .any(|m| matches!(m, Message::Assistant { text, .. } if text.len() == 500)),
+                .any(|m| matches!(m, Message::Turn { text, .. } if text.len() == 500)),
             "full prose retained on spine"
         );
     }

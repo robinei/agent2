@@ -138,10 +138,16 @@ impl ChatState {
 
     fn apply_payload(&mut self, agent: AgentId, id: EventId, payload: &EventPayload) {
         match payload {
-            EventPayload::Agent { .. } => {
-                // The agent's prompt renders via its `System` block; the
-                // contexts pane carries its identity. Just track the main one.
+            EventPayload::Agent { system, .. } => {
+                // The system prompt is a snapshot on the root, not a
+                // message: render it as this agent's leading block.
                 self.main_agent.get_or_insert(agent);
+                self.entries.push(Entry::Line {
+                    agent,
+                    kind: ChatKind::System,
+                    text: system.clone(),
+                    program: Some(id),
+                });
             }
             EventPayload::FrameResult { result } => {
                 if Some(agent) != self.main_agent {
@@ -153,23 +159,15 @@ impl ChatState {
                     });
                 }
             }
-            EventPayload::Message(Message::System { text }) => {
-                self.entries.push(Entry::Line {
-                    agent,
-                    kind: ChatKind::System,
-                    text: text.clone(),
-                    program: Some(id),
-                });
-            }
-            EventPayload::Message(Message::User { text }) => {
+            EventPayload::Message(Message::Post { from, origin }) => {
                 self.entries.push(Entry::Line {
                     agent,
                     kind: ChatKind::User,
-                    text: text.clone(),
+                    text: crate::report::render_post(*from, origin),
                     program: None,
                 });
             }
-            EventPayload::Message(Message::Assistant {
+            EventPayload::Message(Message::Turn {
                 text, tool_calls, ..
             }) => {
                 self.streaming.retain(|(f, _)| *f != agent);
@@ -251,7 +249,9 @@ impl ChatState {
             }
             // Execution/marker events are debug-pane data, never transcript.
             EventPayload::ProgramResult { .. } | EventPayload::Console { .. } => {}
-            EventPayload::Label(_) => {}
+            // A rename is a record: it changes the navigator, never the
+            // transcript, and never wakes the branch.
+            EventPayload::Rename { .. } => {}
         }
     }
 
@@ -383,7 +383,7 @@ fn short(v: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Event, ToolCall};
+    use crate::types::{Author, Event, Origin, ToolCall};
     use jiff::Timestamp;
 
     fn ev(id: u64, payload: EventPayload) -> SessionEvent {
@@ -401,7 +401,8 @@ mod tests {
     fn run_program(id: u64) -> SessionEvent {
         ev(
             id,
-            EventPayload::Message(Message::Assistant {
+            EventPayload::Message(Message::Turn {
+                author: Author::Agent(EventId::new(1)),
                 text: String::new(),
                 thinking: None,
                 tool_calls: vec![ToolCall {
@@ -440,13 +441,22 @@ mod tests {
         chat.apply(&ev(
             1,
             EventPayload::Agent {
-                prompt: "be helpful".into(),
-                input: serde_json::Value::Null,
+                name: None,
+                charter: "be helpful".into(),
+                tools: None,
+                system: String::new(),
             },
         ));
         chat.apply(&ev(
             2,
-            EventPayload::Message(Message::User { text: "hi".into() }),
+            EventPayload::Message(Message::Post {
+                from: Author::User,
+                origin: Origin::Direct {
+                    text: "hi".into(),
+                    input: serde_json::Value::Null,
+                    expects_reply: true,
+                },
+            }),
         ));
         chat.apply(&SessionEvent::Chunk {
             agent: EventId::new(1),
@@ -472,7 +482,7 @@ mod tests {
             && t == "run_program: running"
             && *p == RowDetail::Program(EventId::new(3))));
 
-        // ProgramResult/Label never reach the transcript.
+        // ProgramResult/Rename never reach the transcript.
         let before = chat.rows(None).len();
         chat.apply(&ev(
             5,
@@ -480,7 +490,12 @@ mod tests {
                 value: serde_json::json!("done"),
             },
         ));
-        chat.apply(&ev(6, EventPayload::Label("note".into())));
+        chat.apply(&ev(
+            6,
+            EventPayload::Rename {
+                name: "note".into(),
+            },
+        ));
         assert_eq!(chat.rows(None).len(), before);
     }
 
@@ -493,8 +508,10 @@ mod tests {
         chat.apply(&ev(
             1,
             EventPayload::Agent {
-                prompt: "p".into(),
-                input: serde_json::Value::Null,
+                name: None,
+                charter: "p".into(),
+                tools: None,
+                system: String::new(),
             },
         ));
         chat.apply(&run_program(2));
@@ -563,9 +580,9 @@ mod tests {
         );
     }
 
-    /// The stored `System` renders as the leading `system` row of its
-    /// agent, and selecting another agent shows that agent's slice (its
-    /// own system block), not the root's.
+    /// `Agent.system` — the snapshot on the branch root — renders as the
+    /// leading `system` row of its agent, and selecting another agent
+    /// shows that agent's slice (its own system block), not the root's.
     #[test]
     fn system_block_is_leading_and_per_agent() {
         let mut chat = ChatState::new();
@@ -573,20 +590,21 @@ mod tests {
         chat.apply(&ev(
             1,
             EventPayload::Agent {
-                prompt: "root".into(),
-                input: serde_json::Value::Null,
+                name: None,
+                charter: "root".into(),
+                tools: None,
+                system: "ROOT SYSTEM PROMPT".into(),
             },
         ));
         chat.apply(&ev(
-            2,
-            EventPayload::Message(Message::System {
-                text: "ROOT SYSTEM PROMPT".into(),
-            }),
-        ));
-        chat.apply(&ev(
             3,
-            EventPayload::Message(Message::User {
-                text: "root q".into(),
+            EventPayload::Message(Message::Post {
+                from: Author::User,
+                origin: Origin::Direct {
+                    text: "root q".into(),
+                    input: serde_json::Value::Null,
+                    expects_reply: true,
+                },
             }),
         ));
         // Subagent agent #4 with its own system prompt.
@@ -603,15 +621,11 @@ mod tests {
         chat.apply(&child_event(
             4,
             EventPayload::Agent {
-                prompt: "child".into(),
-                input: serde_json::Value::Null,
+                name: None,
+                charter: "child".into(),
+                tools: None,
+                system: "CHILD SYSTEM PROMPT".into(),
             },
-        ));
-        chat.apply(&child_event(
-            5,
-            EventPayload::Message(Message::System {
-                text: "CHILD SYSTEM PROMPT".into(),
-            }),
         ));
 
         // Root's slice: leading system row, then the user message.

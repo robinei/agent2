@@ -5,8 +5,7 @@
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
-use crate::machine::LlmRequest;
-use crate::types::Message;
+use crate::machine::{LlmRequest, LlmTurn};
 
 /// A streamed piece of the assistant turn, forwarded to UIs live.
 pub enum LlmChunk {
@@ -16,7 +15,9 @@ pub enum LlmChunk {
 
 /// One blocking completion per call; runs on a worker thread owned by
 /// the session loop. Chunks go through `chunk` as they arrive; the
-/// returned `Message` is the complete assistant turn.
+/// returned `LlmTurn` is the complete assistant turn. A client speaks for
+/// a branch and never stamps *who acted* — the harness does that when it
+/// logs the turn.
 ///
 /// `complete` takes `&self` so the session loop can share one client
 /// (`Arc<dyn LlmClient>`) and run several completions concurrently —
@@ -28,7 +29,7 @@ pub trait LlmClient: Send + Sync {
         &self,
         request: &LlmRequest,
         chunk: &mut dyn FnMut(LlmChunk),
-    ) -> Result<Message, String>;
+    ) -> Result<LlmTurn, String>;
 }
 
 /// Scripted client: pops canned assistant turns in order. Each turn's
@@ -36,11 +37,11 @@ pub trait LlmClient: Send + Sync {
 /// exercised end-to-end without a network. The queue is behind a `Mutex`
 /// so the shared `&self` client stays `Sync` under concurrent pops.
 pub struct ScriptedLlm {
-    responses: Mutex<VecDeque<Message>>,
+    responses: Mutex<VecDeque<LlmTurn>>,
 }
 
 impl ScriptedLlm {
-    pub fn new(responses: impl IntoIterator<Item = Message>) -> Self {
+    pub fn new(responses: impl IntoIterator<Item = LlmTurn>) -> Self {
         ScriptedLlm {
             responses: Mutex::new(responses.into_iter().collect()),
         }
@@ -48,8 +49,8 @@ impl ScriptedLlm {
 }
 
 /// A scripted assistant turn calling `run_program` with `source`.
-pub fn scripted_program(call_id: &str, source: &str) -> Message {
-    Message::Assistant {
+pub fn scripted_program(call_id: &str, source: &str) -> LlmTurn {
+    LlmTurn {
         text: String::new(),
         thinking: None,
         tool_calls: vec![crate::types::ToolCall {
@@ -63,8 +64,8 @@ pub fn scripted_program(call_id: &str, source: &str) -> Message {
 /// A scripted assistant turn calling `resume` with `value` — the
 /// restart offered while a program is suspended on a condition.
 #[allow(dead_code)]
-pub fn scripted_resume(call_id: &str, value: serde_json::Value) -> Message {
-    Message::Assistant {
+pub fn scripted_resume(call_id: &str, value: serde_json::Value) -> LlmTurn {
+    LlmTurn {
         text: String::new(),
         thinking: None,
         tool_calls: vec![crate::types::ToolCall {
@@ -76,8 +77,8 @@ pub fn scripted_resume(call_id: &str, value: serde_json::Value) -> Message {
 }
 
 /// A scripted plain-text assistant turn (completes the agent).
-pub fn scripted_text(text: &str) -> Message {
-    Message::Assistant {
+pub fn scripted_text(text: &str) -> LlmTurn {
+    LlmTurn {
         text: text.into(),
         thinking: None,
         tool_calls: Vec::new(),
@@ -89,20 +90,18 @@ impl LlmClient for ScriptedLlm {
         &self,
         _request: &LlmRequest,
         chunk: &mut dyn FnMut(LlmChunk),
-    ) -> Result<Message, String> {
+    ) -> Result<LlmTurn, String> {
         let message = self
             .responses
             .lock()
             .unwrap()
             .pop_front()
             .ok_or("scripted LLM ran out of responses")?;
-        if let Message::Assistant { text, thinking, .. } = &message {
-            if let Some(t) = thinking {
-                chunk(LlmChunk::Thinking(t.clone()));
-            }
-            if !text.is_empty() {
-                chunk(LlmChunk::Text(text.clone()));
-            }
+        if let Some(t) = &message.thinking {
+            chunk(LlmChunk::Thinking(t.clone()));
+        }
+        if !message.text.is_empty() {
+            chunk(LlmChunk::Text(message.text.clone()));
         }
         Ok(message)
     }

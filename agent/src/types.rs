@@ -38,15 +38,35 @@ pub enum EventPayload {
     /// summaries, condition reports).
     Message(Message),
 
-    /// Execution event; the branch root of an agent. Parent: the
+    /// Structural event; roots an agent's first branch. Parent: the
     /// call-site event on the caller's spine (`None` for the tree
     /// root). Starts a new spine: the caller's spine continues past the
-    /// call site independently. Renders to chat: no — the child agent's
-    /// LLM request is rendered *from* `prompt`/`input`, and the child
-    /// never sees ancestor transcripts (clean-room, decision 3).
+    /// call site independently. Renders to chat: no — but `context()`
+    /// **resets** here, which is clean-room isolation (decision 3) in the
+    /// type rather than in an `is_some()`.
+    ///
+    /// `system` is the deliberate exception to "nothing regenerable is
+    /// stored": the system prompt is assembled from the registry — state
+    /// outside the log — and sits at the very front of the prompt, where
+    /// churn is most expensive. Snapshotting it is what keeps a later card
+    /// edit or a new registry tool from altering an existing
+    /// conversation's cached prefix.
     Agent {
-        prompt: String,
-        input: serde_json::Value,
+        /// The branch's name at birth; `None` shows a derived label until
+        /// someone names it. A branch's name is the last [`Rename`] at or
+        /// after its root, else this.
+        ///
+        /// [`Rename`]: EventPayload::Rename
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        /// What this agent is for — the role its system prompt states.
+        charter: String,
+        /// The agent's tool allowlist, enforced by the registry from the
+        /// agent's own root; `None` inherits the spawner's.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tools: Option<Vec<String>>,
+        /// The assembled system prompt, snapshotted at creation.
+        system: String,
     },
 
     /// Execution event; the terminal event of an agent's spine. Parent:
@@ -81,9 +101,16 @@ pub enum EventPayload {
     /// result (the completion report quotes it).
     ProgramResult { value: serde_json::Value },
 
-    /// Marker naming a branch for fork/leaf UX. Parent: the owning
-    /// agent's spine. Renders to chat: no.
-    Label(String),
+    /// This branch is called this from here on. Parent: the owning
+    /// branch's spine. Renders to chat: **no** — a `Rename` is a record,
+    /// so renaming a branch never wakes it (the driving rule counts only
+    /// `Message`s).
+    ///
+    /// A branch's name is the last `Rename` **at or after its root**, else
+    /// its root's name. That is per-*path*, so renaming an original leaves
+    /// its forks alone — which is what you want when a fork was named for
+    /// how it differs.
+    Rename { name: String },
 
     /// Execution event; the full, unclipped console output of one program
     /// run, logged at its terminal (success/suspend/abandon). Parent: the
@@ -94,21 +121,35 @@ pub enum EventPayload {
     Console { lines: Vec<String> },
 }
 
+/// The rendered kinds — one per API role, chosen by the **variant**,
+/// never by a flag.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum Message {
-    User {
-        text: String,
-    },
-    Assistant {
+    /// A message delivered *here* (user role). Parent: the previous event
+    /// on the receiving branch's spine.
+    ///
+    /// **A `Post` is a delivery marker, not a copy.** The new fact it
+    /// records is that this message landed here, at this position in this
+    /// branch's transcript; where its body lives is `origin`.
+    Post { from: Author, origin: Origin },
+
+    /// This context's own output (assistant role). Parent: the previous
+    /// event on the branch's spine. `author` is the LLM, or the user
+    /// taking a turn on this branch — it renders as an assistant message
+    /// either way, because the *branch* acted.
+    Turn {
+        author: Author,
         text: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         thinking: Option<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         tool_calls: Vec<ToolCall>,
     },
-    System {
-        text: String,
-    },
+
+    /// A tool-role message answering one of a `Turn`'s tool calls.
+    ///
+    /// Deleted in A4: these are *rendered* from the run's outcome and the
+    /// events around it, never stored.
     Tool {
         name: String,
         call_id: String,
@@ -116,13 +157,62 @@ pub enum Message {
     },
 }
 
+/// Who authored a message. The user is an author, not an agent: they have
+/// no branch of their own and speak *inside* branches.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Author {
+    User,
+    Agent(EventId),
+    Harness,
+}
+
+/// Where a delivered message's body lives.
+///
+/// A body is stored **once**: the `Send` holds the question and the `Post`
+/// names it. The card's own pattern hands the same plan to every worker,
+/// so copying would write twenty bodies for a ten-way fan-out.
+///
+/// The in-memory `Context` is the other side of that trade: `replay_event`
+/// resolves `Sent` through the `Tree` and stores the resolved body inline,
+/// so only the *log* is free of copies.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub enum Origin {
+    /// The `Send` that dispatched this delivery; the body is read there.
+    /// This is also what routes an answer back to the sender's branch.
+    Sent(EventId),
+    /// The body inline — for the user and harness posts that have no send
+    /// side.
+    Direct {
+        text: String,
+        #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+        input: serde_json::Value,
+        expects_reply: bool,
+    },
+}
+
+impl Origin {
+    /// The inline body, when this origin carries one. A `Sent` origin
+    /// resolves through the `Tree` instead (`Tree::resolve_origin`).
+    pub fn direct(&self) -> Option<(&str, &serde_json::Value, bool)> {
+        match self {
+            Origin::Direct {
+                text,
+                input,
+                expects_reply,
+            } => Some((text, input, *expects_reply)),
+            Origin::Sent(_) => None,
+        }
+    }
+}
+
 impl Message {
+    /// The message's own text. A `Post` whose body is still by-reference
+    /// (`Origin::Sent`) has none — resolve it through the `Tree` first,
+    /// which is what `replay_event` does when building a `Context`.
     pub fn text(&self) -> &str {
         match self {
-            Message::User { text }
-            | Message::Assistant { text, .. }
-            | Message::System { text }
-            | Message::Tool { text, .. } => text,
+            Message::Turn { text, .. } | Message::Tool { text, .. } => text,
+            Message::Post { origin, .. } => origin.direct().map(|(t, _, _)| t).unwrap_or(""),
         }
     }
 }
@@ -223,15 +313,43 @@ impl Outcome {
 }
 
 /// One agent's reconstructed conversation along a spine — its slice of
-/// the `Agent`-ancestor chain: the prompt and input it was rooted with,
-/// the chat messages logged on its segment of the path, and the result
-/// if the agent has completed.
+/// the `Agent`-ancestor chain: what it is for, the system prompt it was
+/// rooted with, the rendered messages on its segment of the path, and the
+/// result if the agent has completed.
+///
+/// Bodies here are **resolved**: a `Post` that names its `Send` in the log
+/// carries the body inline once it reaches a `Context`.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Context {
-    pub prompt: String,
-    pub input: serde_json::Value,
+    /// What this agent is for (`Agent.charter`).
+    pub charter: String,
+    /// The system prompt snapshotted at the agent's root (`Agent.system`),
+    /// rebuilt into every request verbatim.
+    pub system: String,
     pub messages: Vec<Message>,
     pub result: Option<serde_json::Value>,
+}
+
+impl Context {
+    /// The `input` const a program binds: the machine-bound data of the
+    /// **oldest open post**, whole. The context sees only a bounded
+    /// preview of the same value, so a caller passing a large `input`
+    /// never dumps it into the callee's context.
+    ///
+    /// "Open" is refined in A6 to "unanswered, at or after this branch's
+    /// root"; here it is the oldest post that expects a reply.
+    pub fn input(&self) -> &serde_json::Value {
+        self.messages
+            .iter()
+            .find_map(|m| match m {
+                Message::Post { origin, .. } => match origin.direct() {
+                    Some((_, input, true)) => Some(input),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .unwrap_or(&serde_json::Value::Null)
+    }
 }
 
 /// A handle on one active leaf of the tree: the cursor appends go
