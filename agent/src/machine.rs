@@ -5510,4 +5510,60 @@ reading
 - run_program(source)"#
         );
     }
+
+    /// The live pane and the report it stands in for must never disagree
+    /// (17_BRANCHES Part D): both derive the annotated source the same
+    /// way — from the log, never a VM — so `report::annotate_program`
+    /// (over `Tree::programs_for`, what a running branch's chat pane
+    /// calls) and the settled-run annotation the report above pins
+    /// produce byte-identical lines for the same calls.
+    #[test]
+    fn live_annotation_agrees_with_the_report_it_stands_in_for() {
+        let (mut tree, mut state) = setup();
+        user_post(&mut state, &mut tree, "read a and b");
+        let src = "const a = tools.read(\"a\");\nconsole.log(\"reading\");\nconst b = tools.read(\"b\");\nreturn [await a, await b];";
+        let out = state
+            .step(&mut tree, StepInput::LlmResponse(llm_program("c1", src)))
+            .unwrap();
+        let settled = drain(&mut state, &mut tree, out);
+        let calls: Vec<EventId> = expect_tool_calls(&settled).iter().map(|c| c.call).collect();
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::ToolResults(vec![ToolResult {
+                    call: calls[0],
+                    result: Ok(json!("A")),
+                }]),
+            )
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+
+        // Still running — no outcome yet, so there is no `Handback` and
+        // no report; only `programs_for`'s live projection exists.
+        let programs = tree.programs_for(state.branch_id(), state.spine.leaf_id);
+        let pv = programs.last().expect("the program is running");
+        let live = crate::report::annotate_program(pv);
+        assert!(live.contains(r#"const a = tools.read("a");  // → #4 done"#));
+        assert!(live.contains(r#"const b = tools.read("b");  // → #5 issued; may have happened"#));
+
+        // Now let the post arrive and the run suspend — the same two
+        // calls settle the same way in the report `golden_post_condition_report`
+        // pins, byte-for-byte with what the live pane already showed.
+        state
+            .deliver(
+                &mut tree,
+                Author::User,
+                direct("b is gone; use a twice", true),
+            )
+            .unwrap();
+        let out = state
+            .step(&mut tree, StepInput::Tick { fuel: FUEL })
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+        let report = last_report(&state, &tree);
+        assert!(report.contains(r#"const a = tools.read("a");  // → #4 done"#));
+        assert!(
+            report.contains(r#"const b = tools.read("b");  // → #5 issued; may have happened"#)
+        );
+    }
 }

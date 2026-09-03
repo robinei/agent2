@@ -15,6 +15,12 @@ pub struct InvokeView {
     pub name: String,
     pub args: serde_json::Value,
     pub outcome: Option<Outcome>,
+    /// The call's dispatch site (a byte offset into the program source)
+    /// and whether it is a `Send` — what `report::annotate_calls` needs
+    /// to annotate a running program's source live, from this same
+    /// log-derived projection rather than the VM (17_BRANCHES Part D).
+    pub site: u32,
+    pub is_send: bool,
 }
 
 /// One program execution, projected from the log: everything its panes
@@ -626,6 +632,8 @@ impl Tree {
                             name,
                             args,
                             outcome: None,
+                            site: call.site(),
+                            is_send: matches!(call, Call::Send { .. }),
                         });
                     }
                 }

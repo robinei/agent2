@@ -21,7 +21,7 @@
 //! to recent entries, full data always fetchable by id).
 
 use crate::types::{
-    Author, Call, Cause, Event, EventId, EventPayload, Message, Origin, ToolCall, Tree,
+    Author, Call, Cause, Event, EventId, EventPayload, Message, Origin, Outcome, ToolCall, Tree,
 };
 
 /// Max bytes of the "what happened" section (diagnostic + payload).
@@ -929,45 +929,54 @@ fn menu_since(h: &Handback<'_>, since: u64) -> Vec<Artifact> {
     crate::machine::menu_rows(&segment, since)
 }
 
+/// One call's dispatch site and whether it is a `Send` (re-awaitable by
+/// id when pending, unlike a host call) — the per-call input
+/// [`annotate_calls`] needs, independent of whether it came from a
+/// finished handback's path or a still-running program.
+pub struct CallSite {
+    pub site: u32,
+    pub id: EventId,
+    pub is_send: bool,
+}
+
 /// The program source with **every call site annotated by its
-/// artifact** — the section that makes "change course" a copy-edit
-/// rather than a reconstruction.
+/// settlement** — the pure core a finished handback's report
+/// ([`annotated_source`], below) and a running program's live pane
+/// (17_BRANCHES Part D) both call, so the two can never disagree: both
+/// derive from the log — a handback's own path, or `Tree::programs_for`
+/// walked to the branch's current leaf — never from a live VM.
 ///
 /// `site` on every `Call` is what makes this possible: a byte offset
-/// logged at dispatch, so the annotation is derived from the log with no
-/// live VM. Pending *sends* are re-awaitable by id and say so; pending
-/// host calls are not, and say that instead.
-fn annotated_source(h: &Handback<'_>) -> String {
+/// logged at dispatch, so the annotation is derived from the log alone.
+/// Pending *sends* are re-awaitable by id and say so; pending host calls
+/// are not, and say that instead.
+pub fn annotate_calls<'a>(
+    source: &str,
+    calls: &[CallSite],
+    settled: impl Fn(EventId) -> Option<&'a Outcome>,
+) -> String {
     // Line starts, so a byte offset becomes a line index.
     let line_of = |offset: u32| -> usize {
-        h.source
+        source
             .bytes()
             .take(offset as usize)
             .filter(|b| *b == b'\n')
             .count()
     };
-    let mut notes: Vec<Vec<String>> = vec![Vec::new(); h.source.lines().count().max(1)];
-    let segment: Vec<&Event> = h.path[..=h.outcome_at].to_vec();
-    for event in &h.path[h.turn_at + 1..=h.outcome_at] {
-        let EventPayload::Call(call) = &event.payload else {
-            continue;
+    let mut notes: Vec<Vec<String>> = vec![Vec::new(); source.lines().count().max(1)];
+    for call in calls {
+        let id = call.id.as_u64();
+        let note = match settled(call.id) {
+            Some(Outcome::Delivered(_)) => format!("#{id} done"),
+            Some(Outcome::Failed(_)) => format!("#{id} failed"),
+            None if call.is_send => format!("#{id} pending — await tools.tool_result({id})"),
+            None => format!("#{id} issued; may have happened"),
         };
-        let id = event.id.as_u64();
-        let note = match crate::machine::settlement_of(&segment, event.id) {
-            Some(crate::types::Outcome::Delivered(_)) => format!("#{id} done"),
-            Some(crate::types::Outcome::Failed(_)) => format!("#{id} failed"),
-            None => match call {
-                Call::Send { .. } => {
-                    format!("#{id} pending — await tools.tool_result({id})")
-                }
-                _ => format!("#{id} issued; may have happened"),
-            },
-        };
-        let line = line_of(call.site()).min(notes.len().saturating_sub(1));
+        let line = line_of(call.site).min(notes.len().saturating_sub(1));
         notes[line].push(note);
     }
     let mut out = String::new();
-    for (n, line) in h.source.lines().enumerate() {
+    for (n, line) in source.lines().enumerate() {
         out.push_str(line);
         let on_this_line = notes.get(n).map(Vec::as_slice).unwrap_or_default();
         if !on_this_line.is_empty() {
@@ -981,6 +990,52 @@ fn annotated_source(h: &Handback<'_>) -> String {
         out.push('\n');
     }
     clip(out.trim_end(), ANNOTATED_SOURCE_MAX_BYTES)
+}
+
+/// A program's annotated source **live**: the same derivation as a
+/// finished handback's report, over whatever `Tree::programs_for`
+/// currently reconstructs for it — never a VM, so a running branch's
+/// chat pane and the model's own report can never disagree
+/// (17_BRANCHES Part D: "a pane that shows something the model also
+/// sees must derive it the same way the model's copy is derived").
+pub fn annotate_program(pv: &crate::tree::ProgramView) -> String {
+    let calls: Vec<CallSite> = pv
+        .invokes
+        .iter()
+        .map(|iv| CallSite {
+            site: iv.site,
+            id: iv.id,
+            is_send: iv.is_send,
+        })
+        .collect();
+    annotate_calls(&pv.source, &calls, |id| {
+        pv.invokes
+            .iter()
+            .find(|iv| iv.id == id)
+            .and_then(|iv| iv.outcome.as_ref())
+    })
+}
+
+/// A finished handback's annotated source: every call between its
+/// driving `Turn` and its `outcome`, settled from that same segment.
+fn annotated_source(h: &Handback<'_>) -> String {
+    let segment: Vec<&Event> = h.path[..=h.outcome_at].to_vec();
+    let calls: Vec<CallSite> = h.path[h.turn_at + 1..=h.outcome_at]
+        .iter()
+        .filter_map(|event| {
+            let EventPayload::Call(call) = &event.payload else {
+                return None;
+            };
+            Some(CallSite {
+                site: call.site(),
+                id: event.id,
+                is_send: matches!(call, Call::Send { .. }),
+            })
+        })
+        .collect();
+    annotate_calls(&h.source, &calls, |id| {
+        crate::machine::settlement_of(&segment, id)
+    })
 }
 
 /// **What a `Fork` renders as** — the honest lever, and the only one.

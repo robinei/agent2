@@ -46,7 +46,7 @@ pub enum ProgramStatus {
 /// turn takes, so nothing downstream is special-cased. It carries values
 /// where `machine::Restart` carries only the kind, because the user is
 /// supplying the value.
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub enum UserCall {
     /// Paste a rewrite: replace the program.
     RunProgram { source: String },
@@ -64,7 +64,7 @@ pub enum UserCall {
     },
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub enum SessionCommand {
     /// A user message **for one branch**. The user has no branch of
     /// their own — they speak *inside* branches — so every utterance

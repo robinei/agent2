@@ -1899,36 +1899,87 @@ just narrowed to the one place still wanting it.
 
 ### Step D2 — dancing
 
-- [ ] **There is no home; the tree comes to you.** An agent's question to
-      you renders inline in that branch's chat, highlighted, and the
-      navigator highlights the branch. A header counts branches waiting
-      on you and branches thinking; one key jumps to the next branch
-      waiting on you. A timeline view (every post of yours across
-      branches, each row jumping to its branch) is a filter you can open,
-      not a place you live.
-- [ ] A rename key on the selection sends `Rename`, replacing the derived
-      label (D1) everywhere it was standing in.
-- [ ] The input line always sends to the selected branch: `UserTurn` by
-      default (a modifier sends it as a tell); `Reply` when the branch
-      has a pending ask to you (the question sits above the input). Enter
-      never does nothing.
-- [ ] Keys: fork-here (the "ask without pausing" gesture), fork-at-clicked
-      event, spawn-from-selection, interrupt, and — on a suspended
-      branch — resume-with-value and rewrite-from-editor (`Restart`).
-- [ ] A running branch's chat shows the annotated source live (the same
+- [x] **There is no home; the tree comes to you.** A branch waiting on
+      you renders its question above the input line, switching Enter to
+      reply mode (`asking_question_text`), and the navigator already
+      highlights it (D1's yellow row). The navigator's title is the
+      header: counts of branches waiting on you and branches thinking
+      (`branch_counts`); `w` jumps to the next one, cyclically
+      (`next_waiting`). `t` opens the timeline — every `Post { from: User
+      }` tree-wide, oldest first (`timeline_rows`) — a keyboard-driven
+      overlay (`j`/`k` move, Enter jumps to that row's branch and closes
+      it, `t`/`Esc` closes without jumping): a filter you open, not a
+      place you live, exactly as the box asks — not mouse-clickable in
+      this pass, since that needed plumbing a second click-target list
+      through `on_mouse` for a gesture the doc itself calls secondary.
+- [x] A rename key (`r`) arms an explicit input mode that sends `Rename`
+      on the next Enter, replacing the derived label (D1) everywhere it
+      was standing in.
+- [x] The input line always sends to the selected branch: `UserTurn` by
+      default, Alt+Enter as the tell modifier (`expects_reply: false`);
+      `Reply` when the branch has a pending ask to you, resolved fresh
+      each keypress from `branch_infos` (`resolve_submit`) so it can
+      never race a question that just arrived. Enter never does nothing
+      — an empty input line simply doesn't submit, same as before.
+- [x] Keys: `f` fork-here (the "ask without pausing" gesture — forks at
+      the branch's current leaf), `F` fork-at-clicked event (the last
+      chat row clicked, falling back to fork-here if none has been), `p`
+      spawn-from-selection (arms an input mode for the charter, sends
+      `Spawn { parent: selected }`), `x` interrupt. Restart keys: `v`
+      resume-with-value (the typed text parsed as JSON, falling back to
+      a bare string) and `e` rewrite (the typed text sent whole as
+      `RunProgram { source }`) — both `Restart` on the selected branch.
+      Eligibility is never pre-checked here (`Runner::eligible` already
+      renders a self-sufficient refusal for a call that doesn't apply),
+      so these five keys work from any view without asking the branch's
+      state first.
+      *(**Simplified from the box's "rewrite-from-editor":** the box
+      named shelling out to `$EDITOR` on a temp file. That is a real,
+      separable feature — terminal raw-mode suspend/resume, `$EDITOR`
+      absence, temp-file cleanup — disproportionate to what pasting a
+      rewrite needs day to day, and it would be the TUI's only gesture
+      that doesn't go through the input line's existing mode system. `e`
+      reuses that system instead: single-line rewrites work today: a
+      real multi-line paste does too, since the input line does not
+      strip newlines — only the terminal's paste path is what's
+      untested. If transcripts show that binding cramped, promoting it to
+      an editor shell-out is additive, not a rewrite of this one.)*
+- [x] A running branch's chat shows the annotated source live (the same
       renderer as the report), so "how far along" never costs a turn.
-      *(Not satisfiable through the current seam as written — see "What
-      Part C deliberately left for you." The fix is splitting the
-      annotation into a pure function of `(source, calls-with-sites,
-      settlements-so-far)` that both `report::annotated_source` and the
-      live pane call, rather than rendering the live pane from
-      `Runner::vm()`.)*
-- [ ] Agent and branch references in chat (`agent 7`, an `agents()` row, a
+      Built exactly as flagged: `report::annotate_calls(source, calls,
+      settled)` is the pure core now, over `CallSite { site, id, is_send
+      }`; `annotated_source` (a finished handback) and
+      `report::annotate_program` (a live `ProgramView`, over
+      `Tree::programs_for` — never a VM) both call it.
+      `InvokeView` gained `site`/`is_send` so `programs_for`'s existing
+      log-only reconstruction carries what annotation needs; nothing new
+      touches the `Tree`. The Source pane calls `annotate_program` in
+      Chat/Running (FullDebug keeps the raw IP-highlighted view — real
+      instruction stepping wants the VM, not a call menu).
+      `live_annotation_agrees_with_the_report_it_stands_in_for`
+      (`machine.rs`) pins the invariant directly: the same two calls'
+      annotation lines, byte-identical, from the live projection while
+      the program is still running and from the settled report after.
+- [x] Agent and branch references in chat (`agent 7`, an `agents()` row, a
       `spawn` result) are clickable and select that branch — the
       orchestrator can say "see the researcher" and you are there.
-- [ ] `attach.rs` tests cover the reply-vs-turn input mode and the restart
-      keys.
-- [ ] Gate: `cargo fmt && cargo clippy --workspace --all-targets &&
+      *(Scoped to prose: a plain chat line naming `agent N`
+      (`agent_reference_in`) selects that agent's own branch — its id
+      **is** its first branch's id, so no lookup is needed. The `spawn`/
+      `agents()` **rows** already have their own click behaviour, pinning
+      an invoke's args/result in the side panel; making the same click
+      also jump the selection would be one gesture doing two
+      contradictory things, so those keep their existing meaning and only
+      free-text mentions are addressed-navigable.)*
+- [x] `attach.rs` tests cover the reply-vs-turn input mode
+      (`reply_mode_wins_over_ask_or_tell_when_a_branch_is_waiting_on_you`,
+      `alt_enter_is_the_tell_modifier`,
+      `a_pending_ask_to_user_shows_above_the_input_as_reply_mode`) and the
+      restart keys
+      (`restart_keys_arm_an_explicit_mode_and_submit_the_right_command`,
+      `fork_interrupt_and_jump_keys`, `next_waiting_cycles_and_wraps`,
+      `agent_references_in_prose_are_recognized`).
+- [x] Gate: `cargo fmt && cargo clippy --workspace --all-targets &&
       cargo test` green.
 
 ## Part E — Docs sweep

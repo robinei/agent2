@@ -24,7 +24,9 @@ use std::thread;
 use std::time::Instant;
 
 use ratatui::Frame;
-use ratatui::crossterm::event::{Event as CtEvent, KeyCode, MouseButton, MouseEventKind};
+use ratatui::crossterm::event::{
+    Event as CtEvent, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind,
+};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
@@ -33,11 +35,11 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use super::app::PaneInfo;
 use super::chat::{ChatKind, ChatState, RowDetail};
 use super::ui;
-use crate::host::{BranchId, BranchInfo, Session, SessionCommand, SessionEvent};
+use crate::host::{BranchId, BranchInfo, Session, SessionCommand, SessionEvent, UserCall};
 use crate::machine::TOOL_RUN_PROGRAM;
 use crate::report::derived_branch_label;
 use crate::tree::ProgramView;
-use crate::types::{Cause, EventId, EventPayload, Message, Outcome};
+use crate::types::{Call, Cause, EventId, EventPayload, Message, Outcome};
 
 /// Cap for one step-line key, so a hot loop on one source line cannot
 /// wedge the UI (mirrors the standalone runner).
@@ -84,10 +86,49 @@ pub struct PaneSet {
 #[derive(Debug, PartialEq)]
 pub enum KeyAction {
     None,
-    Submit(String),
+    /// The input line's default behaviour: `UserTurn` (`expects_reply`)
+    /// or `Reply` — the caller resolves which by whether the selected
+    /// branch has a pending ask (17_BRANCHES: "Reply when the branch has
+    /// a pending ask to you").
+    Submit {
+        text: String,
+        expects_reply: bool,
+    },
+    /// One of the explicit input modes' submissions (rename, resume with
+    /// a value, paste a rewrite, spawn's charter).
+    SubmitMode(ExplicitMode, String),
     TogglePause,
     StepInstr,
     StepLine,
+    /// Fork the selected branch at its current leaf — "ask without
+    /// pausing it," no separate gesture from forking mid-program.
+    Fork,
+    /// Fork the selected branch at a specific logged event — the last
+    /// chat row clicked.
+    ForkAt(EventId),
+    /// Cancel the selected branch's in-flight generation, or pause its
+    /// program at the next slice.
+    Interrupt,
+    /// Select the next branch (cyclically) with a pending ask-to-user.
+    JumpToWaiting,
+    /// Jump to the timeline's currently highlighted branch and close it.
+    JumpTimeline,
+}
+
+/// An explicit input-line sub-mode (D2's restart/rename/spawn keys):
+/// what the next Enter submits, instead of the default ask/tell/reply.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ExplicitMode {
+    /// `r` — `Rename { branch, name }`.
+    Rename,
+    /// `v` — `Restart { branch, call: UserCall::Resume { value } }`; the
+    /// text is parsed as JSON, falling back to a bare string.
+    ResumeWithValue,
+    /// `e` — `Restart { branch, call: UserCall::RunProgram { source } }`,
+    /// pasting a full rewrite.
+    Rewrite,
+    /// `p` — `Spawn { parent: branch, charter, name: None, text: None }`.
+    SpawnCharter,
 }
 
 /// A subitem selected within a program block.
@@ -126,6 +167,18 @@ pub struct AttachedApp {
     pub promises_scroll: Option<usize>,
     pub pane_rects: Vec<(Pane, PaneInfo)>,
     last_chat_lines: usize,
+    /// The event id of the last chat row clicked — what `F` (fork at
+    /// this point) forks from; `f` (fork-here) ignores it and uses the
+    /// branch's current leaf instead.
+    pub last_clicked_event: Option<EventId>,
+    /// What the next Enter submits, when it isn't the default ask/tell/
+    /// reply — set by the rename/resume/rewrite/spawn keys, cleared on
+    /// submit or `Esc`.
+    pub explicit_mode: Option<ExplicitMode>,
+    /// The timeline: every post of yours across branches, a filter you
+    /// open rather than a place you live (17_BRANCHES Part D).
+    pub timeline: bool,
+    pub timeline_cursor: usize,
 }
 
 impl AttachedApp {
@@ -153,6 +206,10 @@ impl AttachedApp {
             promises_scroll: None,
             pane_rects: Vec::new(),
             last_chat_lines: 0,
+            last_clicked_event: None,
+            explicit_mode: None,
+            timeline: false,
+            timeline_cursor: 0,
         }
     }
 
@@ -260,7 +317,13 @@ impl AttachedApp {
                 let Some(body) = body else { return };
                 let line = info.scroll_top + body;
                 let rows = self.chat.rows(self.selected);
-                if let Some((kind, _text, detail)) = rows.get(line) {
+                if let Some((kind, text, detail, id)) = rows.get(line) {
+                    // "Fork at this point" (D2, `F`) forks from whatever
+                    // row was last clicked — a real logged event, never
+                    // the streaming sentinel.
+                    if id.as_u64() != u64::MAX {
+                        self.last_clicked_event = Some(*id);
+                    }
                     if *kind == ChatKind::System {
                         if let Some(branch) = self.selected
                             && !self.collapsed.remove(&branch)
@@ -270,7 +333,19 @@ impl AttachedApp {
                         return;
                     }
                     match detail {
-                        RowDetail::None => {}
+                        // A plain prose line mentioning "agent N" is
+                        // clickable — the orchestrator can say "see the
+                        // researcher" and clicking it is being there
+                        // (17_BRANCHES Part D). Scoped to prose rather
+                        // than the tool-call rows, which already have
+                        // their own click behaviour (inspect the call).
+                        RowDetail::None => {
+                            if let Some(n) = agent_reference_in(text)
+                                && n != 0
+                            {
+                                self.select_branch(EventId::new(n));
+                            }
+                        }
                         RowDetail::Program(pid) => {
                             self.selected_program = Some(*pid);
                             self.selected_subitem = None;
@@ -310,6 +385,7 @@ impl AttachedApp {
     fn select_branch(&mut self, branch: BranchId) {
         self.selected = Some(branch);
         self.selected_program = None;
+        self.last_clicked_event = None;
         self.reset_program_scrolls();
     }
 
@@ -369,25 +445,58 @@ impl AttachedApp {
         }
     }
 
-    pub fn on_key(&mut self, code: KeyCode, branches: &[BranchId]) -> KeyAction {
+    pub fn on_key(&mut self, key: KeyEvent, branches: &[BranchId]) -> KeyAction {
+        // The timeline is a filter you open, not a place you live: while
+        // it's open it owns every key, and closes on its own terms.
+        if self.timeline {
+            return self.on_timeline_key(key.code);
+        }
         // Context switching works everywhere.
-        if code == KeyCode::Tab {
+        if key.code == KeyCode::Tab {
             self.cycle_branch(branches);
             return KeyAction::None;
         }
         match self.view {
-            View::FullDebug => self.on_debug_key(code, branches),
+            View::FullDebug => self.on_debug_key(key.code, branches),
             View::Chat | View::Running => match self.focus {
-                Focus::Input => self.on_input_key(code),
-                Focus::Debug => self.on_debug_key(code, branches),
+                Focus::Input => self.on_input_key(key),
+                Focus::Debug => self.on_debug_key(key.code, branches),
             },
         }
     }
 
-    fn on_input_key(&mut self, code: KeyCode) -> KeyAction {
+    fn on_timeline_key(&mut self, code: KeyCode) -> KeyAction {
         match code {
+            KeyCode::Char('t') | KeyCode::Esc | KeyCode::Char('q') => {
+                self.timeline = false;
+                KeyAction::None
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.timeline_cursor = self.timeline_cursor.saturating_sub(1);
+                KeyAction::None
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.timeline_cursor += 1;
+                KeyAction::None
+            }
+            KeyCode::Enter => KeyAction::JumpTimeline,
+            _ => KeyAction::None,
+        }
+    }
+
+    fn on_input_key(&mut self, key: KeyEvent) -> KeyAction {
+        match key.code {
             KeyCode::Enter if !self.input.is_empty() => {
-                KeyAction::Submit(std::mem::take(&mut self.input))
+                let text = std::mem::take(&mut self.input);
+                match self.explicit_mode.take() {
+                    Some(mode) => KeyAction::SubmitMode(mode, text),
+                    None => KeyAction::Submit {
+                        text,
+                        // The tell modifier (17_BRANCHES: "the TUI
+                        // exposes it as a modifier on send").
+                        expects_reply: !key.modifiers.contains(KeyModifiers::ALT),
+                    },
+                }
             }
             KeyCode::Backspace => {
                 self.input.pop();
@@ -395,6 +504,7 @@ impl AttachedApp {
             }
             KeyCode::Esc => {
                 if self.input.is_empty() {
+                    self.explicit_mode = None;
                     self.focus = Focus::Debug;
                 } else {
                     self.input.clear();
@@ -407,6 +517,14 @@ impl AttachedApp {
             }
             _ => KeyAction::None,
         }
+    }
+
+    /// Arm an explicit input mode: focus the input line, ready for the
+    /// next Enter to submit as `mode` instead of the default ask/tell.
+    fn arm(&mut self, mode: ExplicitMode) -> KeyAction {
+        self.explicit_mode = Some(mode);
+        self.focus = Focus::Input;
+        KeyAction::None
     }
 
     fn on_debug_key(&mut self, code: KeyCode, branches: &[BranchId]) -> KeyAction {
@@ -443,6 +561,29 @@ impl AttachedApp {
             KeyCode::Char(' ') => KeyAction::TogglePause,
             KeyCode::Char('s') => KeyAction::StepInstr,
             KeyCode::Char('n') => KeyAction::StepLine,
+            // The dancing gestures (D2) — everywhere but FullDebug, which
+            // keeps its own single-purpose letters (space/s/n/1-9) for
+            // real instruction stepping.
+            KeyCode::Char('f') if self.view != View::FullDebug => KeyAction::Fork,
+            KeyCode::Char('F') if self.view != View::FullDebug => match self.last_clicked_event {
+                Some(id) => KeyAction::ForkAt(id),
+                None => KeyAction::Fork,
+            },
+            KeyCode::Char('x') if self.view != View::FullDebug => KeyAction::Interrupt,
+            KeyCode::Char('w') if self.view != View::FullDebug => KeyAction::JumpToWaiting,
+            KeyCode::Char('t') if self.view != View::FullDebug => {
+                self.timeline = true;
+                self.timeline_cursor = 0;
+                KeyAction::None
+            }
+            KeyCode::Char('r') if self.view != View::FullDebug => self.arm(ExplicitMode::Rename),
+            KeyCode::Char('v') if self.view != View::FullDebug => {
+                self.arm(ExplicitMode::ResumeWithValue)
+            }
+            KeyCode::Char('e') if self.view != View::FullDebug => self.arm(ExplicitMode::Rewrite),
+            KeyCode::Char('p') if self.view != View::FullDebug => {
+                self.arm(ExplicitMode::SpawnCharter)
+            }
             KeyCode::Char(c @ '1'..='9') => {
                 let idx = (c as u8 - b'1') as usize;
                 if self.view == View::FullDebug {
@@ -479,6 +620,131 @@ impl AttachedApp {
         };
         self.select_branch(branches[next]);
     }
+}
+
+/// The first `agent N` mention in `text` (case-insensitive on "agent"),
+/// as the id it names — what makes chat prose referencing a branch
+/// clickable (17_BRANCHES Part D: "the orchestrator can say 'see the
+/// researcher' and you are there"). An agent's own id is also its first
+/// branch's id, so this needs no lookup — the reference *is* the
+/// address.
+fn agent_reference_in(text: &str) -> Option<u64> {
+    let lower = text.to_ascii_lowercase();
+    let mut search = lower.as_str();
+    while let Some(at) = search.find("agent") {
+        let rest = &search[at + "agent".len()..];
+        let digits_start = rest.find(|c: char| !c.is_whitespace() && c != '#');
+        if let Some(ds) = digits_start {
+            let digits: String = rest[ds..]
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            if !digits.is_empty() {
+                return digits.parse().ok();
+            }
+        }
+        search = &search[at + "agent".len()..];
+    }
+    None
+}
+
+/// The input line's default Enter, resolved against live status: a
+/// `Reply` when `branch` has a pending ask-to-user, else a `UserTurn`
+/// carrying the ask/tell modifier (17_BRANCHES: "Reply when the branch
+/// has a pending ask to you"). Pure — takes the navigator's own
+/// `branch_infos` snapshot rather than a session, so it is directly
+/// testable.
+fn resolve_submit(
+    infos: &[BranchInfo],
+    branch: BranchId,
+    text: String,
+    expects_reply: bool,
+) -> SessionCommand {
+    let asking = infos
+        .iter()
+        .find(|b| b.branch == branch)
+        .and_then(|b| b.asking_user);
+    match asking {
+        Some(call) => SessionCommand::Reply {
+            branch,
+            call,
+            value: serde_json::Value::String(text),
+        },
+        None => SessionCommand::UserTurn {
+            branch,
+            text,
+            expects_reply,
+        },
+    }
+}
+
+/// One explicit input mode's submission, resolved into the command it
+/// stands for (17_BRANCHES Part D's rename/restart/spawn keys). Pure —
+/// no session needed, so it is directly testable.
+fn resolve_submit_mode(mode: ExplicitMode, branch: BranchId, text: String) -> SessionCommand {
+    match mode {
+        ExplicitMode::Rename => SessionCommand::Rename { branch, name: text },
+        ExplicitMode::ResumeWithValue => SessionCommand::Restart {
+            branch,
+            call: UserCall::Resume {
+                value: Some(serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text))),
+            },
+        },
+        ExplicitMode::Rewrite => SessionCommand::Restart {
+            branch,
+            call: UserCall::RunProgram { source: text },
+        },
+        ExplicitMode::SpawnCharter => SessionCommand::Spawn {
+            parent: branch,
+            name: None,
+            charter: text,
+            text: None,
+        },
+    }
+}
+
+/// The next branch waiting on you, cyclically after `current` — what `w`
+/// jumps to. `ordered` is the navigator's own row order, so repeated
+/// presses walk the tree the same way the eye does.
+fn next_waiting(ordered: &[BranchInfo], current: BranchId) -> Option<BranchId> {
+    let start = ordered
+        .iter()
+        .position(|b| b.branch == current)
+        .unwrap_or(0);
+    let n = ordered.len();
+    (1..=n)
+        .map(|offset| &ordered[(start + offset) % n])
+        .find(|b| b.asking_user.is_some())
+        .map(|b| b.branch)
+}
+
+/// Every post of yours across the whole tree, oldest first — the
+/// timeline (17_BRANCHES Part D): "a filter you can open, not a place
+/// you live." One row per `Post { from: User }`, whichever branch it
+/// landed on.
+fn timeline_rows(session: &Session) -> Vec<(EventId, BranchId, String)> {
+    let tree = session.tree();
+    let mut rows: Vec<(EventId, BranchId, String)> = tree
+        .events
+        .values()
+        .filter_map(|e| {
+            let EventPayload::Message(Message::Post {
+                from: crate::types::Author::User,
+                origin,
+            }) = &e.payload
+            else {
+                return None;
+            };
+            let branch = tree.branch_of(e.id)?;
+            Some((
+                e.id,
+                branch,
+                crate::report::render_post(crate::types::Author::User, origin),
+            ))
+        })
+        .collect();
+    rows.sort_by_key(|(id, ..)| id.as_u64());
+    rows
 }
 
 /// The current spine leaf for `branch` — from the live state if
@@ -572,28 +838,33 @@ pub fn run_attached(mut session: Session, events_rx: Receiver<SessionEvent>) -> 
         // the navigator's row order, and what Tab/1–9/clicks index into.
         // From `branch_infos` (identity + shape from the log,
         // status/thinking from live session state) so it survives resume
-        // (decision 8), not just the live `states`.
-        let branches: Vec<BranchId> = ordered_branches(session.branch_infos())
-            .iter()
-            .map(|b| b.branch)
-            .collect();
+        // (decision 8), not just the live `states`. Kept around this tick
+        // for the input line's ask-vs-reply decision and the `w` jump.
+        let infos = session.branch_infos();
+        let ordered = ordered_branches(infos.clone());
+        let branches: Vec<BranchId> = ordered.iter().map(|b| b.branch).collect();
         for input in inputs {
             match input {
                 CtEvent::Key(key) if key.is_press() => {
-                    let action = app.on_key(key.code, &branches);
+                    let action = app.on_key(key, &branches);
                     let Some(selected) = app.selected else {
                         continue;
                     };
                     match action {
                         KeyAction::None => {}
-                        KeyAction::Submit(text) => {
-                            // The input line always sends to the selected
-                            // branch: the user speaks *inside* branches.
-                            handle.send(SessionCommand::UserTurn {
-                                branch: selected,
-                                text,
-                                expects_reply: true,
-                            });
+                        // The input line always sends to the selected
+                        // branch: the user speaks *inside* branches.
+                        // Reply, not UserTurn, when this branch is
+                        // waiting on an answer from you.
+                        KeyAction::Submit {
+                            text,
+                            expects_reply,
+                        } => {
+                            handle.send(resolve_submit(&infos, selected, text, expects_reply));
+                            app.reset_scrolls();
+                        }
+                        KeyAction::SubmitMode(mode, text) => {
+                            handle.send(resolve_submit_mode(mode, selected, text));
                             app.reset_scrolls();
                         }
                         KeyAction::TogglePause => {
@@ -609,6 +880,39 @@ pub fn run_attached(mut session: Session, events_rx: Receiver<SessionEvent>) -> 
                         KeyAction::StepLine => {
                             step_line(&mut session, selected);
                             app.reset_scrolls();
+                        }
+                        // "Ask a running agent something without pausing
+                        // it" is fork-at-current-leaf; no separate
+                        // gesture (17_BRANCHES).
+                        KeyAction::Fork => {
+                            if let Some(at) = find_leaf(&session, selected) {
+                                handle.send(SessionCommand::Fork {
+                                    from: at,
+                                    name: None,
+                                });
+                            }
+                        }
+                        KeyAction::ForkAt(at) => {
+                            handle.send(SessionCommand::Fork {
+                                from: at,
+                                name: None,
+                            });
+                        }
+                        KeyAction::Interrupt => {
+                            handle.send(SessionCommand::Interrupt { branch: selected });
+                        }
+                        KeyAction::JumpToWaiting => {
+                            if let Some(next) = next_waiting(&ordered, selected) {
+                                app.select_branch(next);
+                            }
+                        }
+                        KeyAction::JumpTimeline => {
+                            let rows = timeline_rows(&session);
+                            if !rows.is_empty() {
+                                let idx = app.timeline_cursor.min(rows.len() - 1);
+                                app.select_branch(rows[idx].1);
+                            }
+                            app.timeline = false;
                         }
                     }
                 }
@@ -665,6 +969,16 @@ fn render(frame: &mut Frame, app: &mut AttachedApp, session: &Session) {
     let [main, footer] =
         Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(frame.area());
 
+    if app.timeline {
+        render_timeline(frame, app, session, main);
+        frame.render_widget(
+            Paragraph::new(" j/k move · enter jump to branch · t/esc close ")
+                .style(Style::default().add_modifier(Modifier::REVERSED)),
+            footer,
+        );
+        return;
+    }
+
     let panes = app.pane_set();
     let (left, right) = if panes.right.is_empty() {
         (main, None)
@@ -675,7 +989,12 @@ fn render(frame: &mut Frame, app: &mut AttachedApp, session: &Session) {
     };
 
     if panes.chat {
-        let (top, chat_area) = render_chat(frame, app, left, app.chat_scroll);
+        // The question sits above the input, and the input line switches
+        // to reply mode, exactly when this branch is waiting on you
+        // (17_BRANCHES Part D).
+        let asking_text = app.selected.and_then(|b| asking_question_text(session, b));
+        let (top, chat_area) =
+            render_chat(frame, app, left, app.chat_scroll, asking_text.as_deref());
         app.pane_rects.push((
             Pane::Chat,
             PaneInfo {
@@ -744,7 +1063,26 @@ fn render(frame: &mut Frame, app: &mut AttachedApp, session: &Session) {
                     ));
                 }
                 Pane::Source => {
-                    let top = if let Some(vm) = vm {
+                    // Outside FullDebug, "how far along" is the question
+                    // — the same annotated source the model's own report
+                    // renders (`report::annotate_program`, over
+                    // `programs_for`, never the VM: 17_BRANCHES Part D —
+                    // a pane the model also sees must derive it the same
+                    // way the model's copy is derived), so it agrees with
+                    // the report even while the program is still running.
+                    // FullDebug keeps the raw IP/line-highlighted view —
+                    // real instruction stepping wants the VM, not a call
+                    // menu.
+                    let top = if app.view != View::FullDebug
+                        && let Some(ref pv) = pv
+                    {
+                        ui::render_source_str(
+                            frame,
+                            &crate::report::annotate_program(pv),
+                            *slot,
+                            app.source_scroll,
+                        )
+                    } else if let Some(vm) = vm {
                         ui::render_source(frame, vm, *slot, app.source_scroll)
                     } else if let Some(ref pv) = pv {
                         ui::render_source_str(frame, &pv.source, *slot, app.source_scroll)
@@ -811,11 +1149,17 @@ fn render(frame: &mut Frame, app: &mut AttachedApp, session: &Session) {
         (View::FullDebug, _) => {
             " d/esc chat · tab/1-9 agent · space run/pause · s step · n step line · q quit "
         }
-        (_, Focus::Input) => " type to chat · enter send · tab agent · esc debug keys ",
-        (View::Running, Focus::Debug) => {
-            " esc/i type · c collapse · d debugger · 1-4 panes · space/s/n vm · tab agent · q quit "
+        (_, Focus::Input) => {
+            " type to chat · enter send (alt+enter tell) · tab agent · esc debug keys "
         }
-        (_, Focus::Debug) => " esc/i type · d debugger · space/s/n vm · tab agent · q quit ",
+        (View::Running, Focus::Debug) => {
+            " esc/i type · c collapse · d debugger · 1-4 panes · f/F fork · p spawn · x interrupt \
+             · v resume · e rewrite · r rename · w waiting · t timeline · tab agent · q quit "
+        }
+        (_, Focus::Debug) => {
+            " esc/i type · d debugger · f/F fork · p spawn · x interrupt · v resume · e rewrite \
+             · r rename · w waiting · t timeline · tab agent · q quit "
+        }
     };
     frame.render_widget(
         Paragraph::new(help).style(Style::default().add_modifier(Modifier::REVERSED)),
@@ -885,21 +1229,40 @@ fn chat_style(kind: ChatKind, even: bool) -> Style {
     }
 }
 
+/// The text of `branch`'s pending ask-to-user, if it has one — what
+/// renders above the input line and switches it to reply mode.
+fn asking_question_text(session: &Session, branch: BranchId) -> Option<String> {
+    let call = session
+        .branch_infos()
+        .into_iter()
+        .find(|info| info.branch == branch)?
+        .asking_user?;
+    match session.tree().events.get(&call).map(|e| &e.payload) {
+        Some(EventPayload::Call(Call::Send { text, .. })) => Some(text.clone()),
+        _ => None,
+    }
+}
+
 fn render_chat(
     frame: &mut Frame,
     app: &AttachedApp,
     area: Rect,
     scroll: Option<usize>,
+    asking: Option<&str>,
 ) -> (usize, Rect) {
-    let [transcript_area, input_area] =
-        Layout::vertical([Constraint::Min(1), Constraint::Length(3)]).areas(area);
+    let [transcript_area, question_area, input_area] = Layout::vertical([
+        Constraint::Min(1),
+        Constraint::Length(if asking.is_some() { 3 } else { 0 }),
+        Constraint::Length(3),
+    ])
+    .areas(area);
 
     let rows = app.chat.rows(app.selected);
     let mut lines: Vec<Line> = Vec::with_capacity(rows.len());
     let mut parity: HashMap<ChatKind, bool> = HashMap::new();
     let mut in_program: Option<EventId> = None;
     let mut prev_kind: Option<ChatKind> = None;
-    for (kind, text, detail) in &rows {
+    for (kind, text, detail, _id) in &rows {
         let even = match detail {
             RowDetail::Program(pid) | RowDetail::Attachment(pid, _) | RowDetail::Invoke(pid, _) => {
                 if in_program != Some(*pid) {
@@ -951,16 +1314,30 @@ fn render_chat(
         transcript_area,
     );
 
-    let (border, cursor) = match app.focus {
-        Focus::Input => (Style::default().fg(Color::Cyan), "▏"),
-        Focus::Debug => (Style::default().fg(Color::DarkGray), ""),
+    if let Some(question) = asking {
+        frame.render_widget(
+            Paragraph::new(question)
+                .style(Style::default().fg(Color::Yellow))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(Color::Yellow))
+                        .title(" waiting on your answer "),
+                ),
+            question_area,
+        );
+    }
+    let (border, cursor, title) = match (app.focus, asking) {
+        (Focus::Input, Some(_)) => (Style::default().fg(Color::Yellow), "▏", " reply "),
+        (Focus::Input, None) => (Style::default().fg(Color::Cyan), "▏", " message "),
+        (Focus::Debug, _) => (Style::default().fg(Color::DarkGray), "", " message "),
     };
     frame.render_widget(
         Paragraph::new(format!("❯ {}{}", app.input, cursor)).block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(border)
-                .title(" message "),
+                .title(title),
         ),
         input_area,
     );
@@ -1038,11 +1415,61 @@ fn navigator_rows(infos: Vec<BranchInfo>) -> Vec<(BranchInfo, String, bool)> {
     result
 }
 
+/// (branches asking you, branches thinking) — the header's two counts.
+fn branch_counts(infos: &[BranchInfo]) -> (usize, usize) {
+    let waiting = infos.iter().filter(|b| b.asking_user.is_some()).count();
+    let thinking = infos.iter().filter(|b| b.thinking).count();
+    (waiting, thinking)
+}
+
+/// Every post of yours across the whole tree, each row jumping to its
+/// branch on Enter — "a filter you can open, not a place you live"
+/// (17_BRANCHES Part D).
+fn render_timeline(frame: &mut Frame, app: &AttachedApp, session: &Session, area: Rect) {
+    let rows = timeline_rows(session);
+    let cursor = app.timeline_cursor.min(rows.len().saturating_sub(1));
+    let lines: Vec<Line> = if rows.is_empty() {
+        vec![Line::from("(no posts of yours yet)").style(Style::default().fg(Color::DarkGray))]
+    } else {
+        rows.iter()
+            .enumerate()
+            .map(|(i, (_, branch, text))| {
+                let name = session
+                    .tree()
+                    .branch_name(*branch)
+                    .or_else(|| {
+                        find_leaf(session, *branch)
+                            .and_then(|leaf| derived_branch_label(session.tree(), *branch, leaf))
+                    })
+                    .unwrap_or_else(|| format!("branch #{}", branch.as_u64()));
+                let first_line = text.lines().next().unwrap_or("");
+                let text = format!("{}: {}", name, first_line);
+                let style = if i == cursor {
+                    Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED)
+                } else {
+                    Style::default()
+                };
+                Line::from(text).style(style)
+            })
+            .collect()
+    };
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" timeline — every post of yours "),
+        ),
+        area,
+    );
+}
+
 fn render_navigator(frame: &mut Frame, app: &AttachedApp, session: &Session, area: Rect) {
     // `branch_infos` is the navigator projection: identity and shape from
     // the log (so it survives resume, decision 8), status/thinking from
     // live session state.
-    let rows = navigator_rows(session.branch_infos());
+    let infos = session.branch_infos();
+    let (waiting, thinking) = branch_counts(&infos);
+    let rows = navigator_rows(infos);
     let lines: Vec<Line> = rows
         .iter()
         .map(|(info, prefix, is_fork)| {
@@ -1091,8 +1518,12 @@ fn render_navigator(frame: &mut Frame, app: &AttachedApp, session: &Session, are
             Line::from(text).style(style)
         })
         .collect();
+    // "There is no home; the tree comes to you" (17_BRANCHES Part D): the
+    // header counts what needs you, right where the tree already is.
+    let title =
+        format!(" agents · {waiting} waiting on you · {thinking} thinking · w jump · t timeline ");
     frame.render_widget(
-        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" agents ")),
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title)),
         area,
     );
 }
@@ -1276,6 +1707,252 @@ mod tests {
         EventId::new(n)
     }
 
+    /// A minimal `BranchInfo` for the branch-keyed helpers, with no
+    /// pending ask.
+    fn info(branch: BranchId) -> BranchInfo {
+        BranchInfo {
+            branch,
+            agent: branch,
+            leaf: branch,
+            name: None,
+            parent_branch: None,
+            status: "idle".into(),
+            open: 0,
+            asking_user: None,
+            thinking: false,
+        }
+    }
+
+    /// The input line's default behaviour (D2): a plain Enter asks, an
+    /// Alt+Enter tells — both `UserTurn` — unless the branch has a
+    /// pending ask-to-user, in which case either one replies.
+    #[test]
+    fn reply_mode_wins_over_ask_or_tell_when_a_branch_is_waiting_on_you() {
+        let b = fid(1);
+        let idle = [info(b)];
+        assert_eq!(
+            resolve_submit(&idle, b, "hi".into(), true),
+            SessionCommand::UserTurn {
+                branch: b,
+                text: "hi".into(),
+                expects_reply: true,
+            }
+        );
+        assert_eq!(
+            resolve_submit(&idle, b, "fyi".into(), false),
+            SessionCommand::UserTurn {
+                branch: b,
+                text: "fyi".into(),
+                expects_reply: false,
+            }
+        );
+        let mut asking = info(b);
+        asking.asking_user = Some(fid(7));
+        assert_eq!(
+            resolve_submit(&[asking], b, "42".into(), true),
+            SessionCommand::Reply {
+                branch: b,
+                call: fid(7),
+                value: json!("42"),
+            }
+        );
+    }
+
+    /// Alt+Enter is the tell modifier; a plain Enter asks.
+    #[test]
+    fn alt_enter_is_the_tell_modifier() {
+        let mut app = AttachedApp::new(fid(1));
+        for c in "fyi".chars() {
+            app.on_input_key(KeyEvent::from(KeyCode::Char(c)));
+        }
+        assert_eq!(
+            app.on_input_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)),
+            KeyAction::Submit {
+                text: "fyi".into(),
+                expects_reply: false,
+            }
+        );
+        for c in "hi".chars() {
+            app.on_input_key(KeyEvent::from(KeyCode::Char(c)));
+        }
+        assert_eq!(
+            app.on_input_key(KeyEvent::from(KeyCode::Enter)),
+            KeyAction::Submit {
+                text: "hi".into(),
+                expects_reply: true,
+            }
+        );
+    }
+
+    /// The restart keys arm an explicit mode; typing and Enter submit it
+    /// as the right command, and `Esc` on an empty line disarms it
+    /// without submitting anything.
+    #[test]
+    fn restart_keys_arm_an_explicit_mode_and_submit_the_right_command() {
+        let mut app = AttachedApp::new(fid(1));
+        app.focus = Focus::Debug;
+        assert_eq!(app.on_debug_key(KeyCode::Char('r'), &[]), KeyAction::None);
+        assert_eq!(app.explicit_mode, Some(ExplicitMode::Rename));
+        assert_eq!(app.focus, Focus::Input);
+        for c in "researcher".chars() {
+            app.on_input_key(KeyEvent::from(KeyCode::Char(c)));
+        }
+        assert_eq!(
+            app.on_input_key(KeyEvent::from(KeyCode::Enter)),
+            KeyAction::SubmitMode(ExplicitMode::Rename, "researcher".into())
+        );
+        assert_eq!(app.explicit_mode, None, "cleared on submit");
+
+        app.focus = Focus::Debug;
+        app.on_debug_key(KeyCode::Char('v'), &[]);
+        assert_eq!(app.explicit_mode, Some(ExplicitMode::ResumeWithValue));
+        app.on_input_key(KeyEvent::from(KeyCode::Esc)); // Esc on empty input: disarm
+        assert_eq!(app.explicit_mode, None);
+        assert_eq!(app.focus, Focus::Debug);
+
+        let branch = fid(1);
+        assert_eq!(
+            resolve_submit_mode(ExplicitMode::Rename, branch, "researcher".into()),
+            SessionCommand::Rename {
+                branch,
+                name: "researcher".into(),
+            }
+        );
+        assert_eq!(
+            resolve_submit_mode(ExplicitMode::ResumeWithValue, branch, "5".into()),
+            SessionCommand::Restart {
+                branch,
+                call: UserCall::Resume {
+                    value: Some(json!(5))
+                },
+            }
+        );
+        assert_eq!(
+            resolve_submit_mode(ExplicitMode::ResumeWithValue, branch, "not json".into()),
+            SessionCommand::Restart {
+                branch,
+                call: UserCall::Resume {
+                    value: Some(json!("not json")),
+                },
+            },
+            "a non-JSON value falls back to a bare string"
+        );
+        assert_eq!(
+            resolve_submit_mode(ExplicitMode::Rewrite, branch, "return 1;".into()),
+            SessionCommand::Restart {
+                branch,
+                call: UserCall::RunProgram {
+                    source: "return 1;".into(),
+                },
+            }
+        );
+        assert_eq!(
+            resolve_submit_mode(ExplicitMode::SpawnCharter, branch, "read files".into()),
+            SessionCommand::Spawn {
+                parent: branch,
+                name: None,
+                charter: "read files".into(),
+                text: None,
+            }
+        );
+    }
+
+    /// `f`/`F`/`x`/`w` map to the right `KeyAction`, and `F` without a
+    /// prior click falls back to fork-here.
+    #[test]
+    fn fork_interrupt_and_jump_keys() {
+        let mut app = AttachedApp::new(fid(1));
+        app.focus = Focus::Debug;
+        assert_eq!(app.on_debug_key(KeyCode::Char('f'), &[]), KeyAction::Fork);
+        assert_eq!(app.on_debug_key(KeyCode::Char('F'), &[]), KeyAction::Fork);
+        app.last_clicked_event = Some(fid(42));
+        assert_eq!(
+            app.on_debug_key(KeyCode::Char('F'), &[]),
+            KeyAction::ForkAt(fid(42))
+        );
+        assert_eq!(
+            app.on_debug_key(KeyCode::Char('x'), &[]),
+            KeyAction::Interrupt
+        );
+        assert_eq!(
+            app.on_debug_key(KeyCode::Char('w'), &[]),
+            KeyAction::JumpToWaiting
+        );
+    }
+
+    /// A branch waiting on you renders its question above the input line
+    /// and switches Enter to reply mode (17_BRANCHES Part D).
+    #[test]
+    fn a_pending_ask_to_user_shows_above_the_input_as_reply_mode() {
+        let mut tree = Tree::new(None);
+        let mut spine = tree.start_agent(None, None, "root", None, "sys").unwrap();
+        let send = tree
+            .append(
+                &mut spine,
+                EventPayload::Call(crate::types::Call::Send {
+                    to: crate::types::Address::User,
+                    text: "which file?".into(),
+                    input: json!(null),
+                    expects_reply: true,
+                    site: 0,
+                }),
+            )
+            .unwrap();
+        let (tx, _rx) = channel();
+        let session = Session::open_at(
+            tree,
+            spine.leaf_id,
+            ToolRegistry::new(),
+            Box::new(ScriptedLlm::new([])),
+            tx,
+        )
+        .unwrap();
+
+        let branch = session.conversation_branch();
+        assert_eq!(
+            asking_question_text(&session, branch),
+            Some("which file?".into())
+        );
+
+        // And the resolved command is a Reply naming that Send, not a
+        // fresh UserTurn — the input line's default behaviour.
+        let infos = session.branch_infos();
+        assert_eq!(
+            resolve_submit(&infos, branch, "PLAN.md".into(), true),
+            SessionCommand::Reply {
+                branch,
+                call: send,
+                value: json!("PLAN.md"),
+            }
+        );
+    }
+
+    /// A chat reference like "see agent 7" or "Agent #12 is stuck" names
+    /// the branch it points at; unrelated text names none.
+    #[test]
+    fn agent_references_in_prose_are_recognized() {
+        assert_eq!(agent_reference_in("ask agent 7 about it"), Some(7));
+        assert_eq!(agent_reference_in("Agent #12 is stuck"), Some(12));
+        assert_eq!(agent_reference_in("no reference here"), None);
+        assert_eq!(agent_reference_in("agent alone, no number"), None);
+    }
+
+    /// `next_waiting` cycles from the current branch, wraps around, and
+    /// skips branches that owe you nothing.
+    #[test]
+    fn next_waiting_cycles_and_wraps() {
+        let mut a = info(fid(1));
+        let mut b = info(fid(2));
+        let c = info(fid(3));
+        a.asking_user = Some(fid(10));
+        b.asking_user = Some(fid(11));
+        let rows = vec![a, b, c];
+        assert_eq!(next_waiting(&rows, fid(1)), Some(fid(2)));
+        // From the last asker, wrap around past the non-asker back to the first.
+        assert_eq!(next_waiting(&rows, fid(2)), Some(fid(1)));
+        assert_eq!(next_waiting(&rows, fid(3)), Some(fid(1)));
+    }
+
     /// Drive the layout with the real M0 scripted demo's events.
     #[test]
     fn m0_run_program_auto_pops_and_sticks() {
@@ -1304,9 +1981,9 @@ mod tests {
         assert!(state.vm().is_some(), "final program state kept");
 
         // The collapse key restores full-width chat.
-        app.on_key(KeyCode::Esc, &[]); // input → debug focus
+        app.on_key(KeyCode::Esc.into(), &[]); // input → debug focus
         assert_eq!(app.focus, Focus::Debug);
-        app.on_key(KeyCode::Char('c'), &[]);
+        app.on_key(KeyCode::Char('c').into(), &[]);
         assert_eq!(app.view, View::Chat);
         assert_eq!(
             app.pane_set(),
@@ -1323,7 +2000,10 @@ mod tests {
         let mut app = AttachedApp::new(fid(1));
         app.view = View::Running;
         app.focus = Focus::Debug;
-        assert_eq!(app.on_key(KeyCode::Char('d'), &[fid(1)]), KeyAction::None);
+        assert_eq!(
+            app.on_key(KeyCode::Char('d').into(), &[fid(1)]),
+            KeyAction::None
+        );
         assert_eq!(app.view, View::FullDebug);
         let panes = app.pane_set();
         assert!(!panes.chat, "chat hidden in full debugger mode");
@@ -1338,7 +2018,10 @@ mod tests {
                 Pane::Promises
             ]
         );
-        assert_eq!(app.on_key(KeyCode::Char('d'), &[fid(1)]), KeyAction::None);
+        assert_eq!(
+            app.on_key(KeyCode::Char('d').into(), &[fid(1)]),
+            KeyAction::None
+        );
         assert_eq!(app.view, View::Running, "returns to the previous view");
     }
 
@@ -1348,9 +2031,9 @@ mod tests {
         app.view = View::Running;
         app.focus = Focus::Debug;
         assert!(app.pane_set().right.contains(&Pane::Source));
-        app.on_key(KeyCode::Char('1'), &[]);
+        app.on_key(KeyCode::Char('1').into(), &[]);
         assert!(!app.pane_set().right.contains(&Pane::Source));
-        app.on_key(KeyCode::Char('3'), &[]);
+        app.on_key(KeyCode::Char('3').into(), &[]);
         assert!(app.pane_set().right.contains(&Pane::Stack));
     }
 
@@ -1359,14 +2042,17 @@ mod tests {
         let mut app = AttachedApp::new(fid(1));
         app.view = View::Running; // digits must still type, not toggle
         for c in "d1 sq".chars() {
-            assert_eq!(app.on_key(KeyCode::Char(c), &[]), KeyAction::None);
+            assert_eq!(app.on_key(KeyCode::Char(c).into(), &[]), KeyAction::None);
         }
         assert_eq!(app.input, "d1 sq");
         assert_eq!(app.view, View::Running, "no debug keys fired while typing");
         assert!(!app.quit);
         assert_eq!(
-            app.on_key(KeyCode::Enter, &[]),
-            KeyAction::Submit("d1 sq".into())
+            app.on_key(KeyCode::Enter.into(), &[]),
+            KeyAction::Submit {
+                text: "d1 sq".into(),
+                expects_reply: true,
+            }
         );
         assert!(app.input.is_empty());
     }
@@ -1375,17 +2061,17 @@ mod tests {
     fn tab_cycles_agents_and_digits_select_in_full_debug() {
         let agents = [fid(1), fid(5)];
         let mut app = AttachedApp::new(fid(1));
-        app.on_key(KeyCode::Tab, &agents);
+        app.on_key(KeyCode::Tab.into(), &agents);
         assert_eq!(app.selected, Some(fid(5)));
-        app.on_key(KeyCode::Tab, &agents);
+        app.on_key(KeyCode::Tab.into(), &agents);
         assert_eq!(app.selected, Some(fid(1)));
 
         app.focus = Focus::Debug;
-        app.on_key(KeyCode::Char('d'), &agents);
+        app.on_key(KeyCode::Char('d').into(), &agents);
         assert_eq!(app.view, View::FullDebug);
-        app.on_key(KeyCode::Char('2'), &agents);
+        app.on_key(KeyCode::Char('2').into(), &agents);
         assert_eq!(app.selected, Some(fid(5)));
-        app.on_key(KeyCode::Char('1'), &agents);
+        app.on_key(KeyCode::Char('1').into(), &agents);
         assert_eq!(app.selected, Some(fid(1)));
     }
 

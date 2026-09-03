@@ -360,12 +360,15 @@ impl ChatState {
     }
 
     /// Transcript rows for `branch` (or the main branch when `None`): one
-    /// `(kind, line, detail)` per visual line — this branch's own events
-    /// plus, for a fork, the shared prefix it inherited. `detail` carries
-    /// click-hit metadata: which program, attachment, or invoke a row
-    /// targets. Multi-line items split; the system prompt collapses to a
-    /// single header row.
-    pub fn rows(&self, branch: Option<BranchId>) -> Vec<(ChatKind, String, RowDetail)> {
+    /// `(kind, line, detail, id)` per visual line — this branch's own
+    /// events plus, for a fork, the shared prefix it inherited. `detail`
+    /// carries click-hit metadata: which program, attachment, or invoke a
+    /// row targets. `id` is the row's own underlying event — what a
+    /// "fork at this point" gesture forks from (D2); a still-streaming
+    /// row carries no logged id yet, so it gets a sentinel no branch root
+    /// can ever equal. Multi-line items split; the system prompt
+    /// collapses to a single header row.
+    pub fn rows(&self, branch: Option<BranchId>) -> Vec<(ChatKind, String, RowDetail, EventId)> {
         let Some(target) = branch.or(self.main_branch) else {
             return Vec::new();
         };
@@ -393,12 +396,14 @@ impl ChatState {
                         ChatKind::ToolCall,
                         format!("run_program: {status}"),
                         RowDetail::Program(*program),
+                        *program,
                     ));
                     for name in attachments {
                         out.push((
                             ChatKind::Attachment,
                             format!("⬡ attachment: {name}"),
                             RowDetail::Attachment(*program, name.clone()),
+                            *program,
                         ));
                     }
                 }
@@ -410,7 +415,7 @@ impl ChatState {
                     program,
                 } if visible(*branch, *id) => {
                     if *kind == ChatKind::System {
-                        out.push((ChatKind::System, "system".into(), RowDetail::None));
+                        out.push((ChatKind::System, "system".into(), RowDetail::None, *id));
                         continue;
                     }
                     let detail = if *kind == ChatKind::ToolCall {
@@ -425,7 +430,7 @@ impl ChatState {
                     } else {
                         RowDetail::None
                     };
-                    push_wrapped(&mut out, *kind, text, detail);
+                    push_wrapped(&mut out, *kind, text, detail, *id);
                 }
                 _ => {}
             }
@@ -435,7 +440,12 @@ impl ChatState {
                 continue;
             }
             for line in buf.lines() {
-                out.push((ChatKind::Streaming, line.to_owned(), RowDetail::None));
+                out.push((
+                    ChatKind::Streaming,
+                    line.to_owned(),
+                    RowDetail::None,
+                    EventId::new(u64::MAX),
+                ));
             }
         }
         out
@@ -445,10 +455,11 @@ impl ChatState {
 /// Push an item's visual lines, labelling user/assistant prose and
 /// indenting continuation lines under the label.
 fn push_wrapped(
-    out: &mut Vec<(ChatKind, String, RowDetail)>,
+    out: &mut Vec<(ChatKind, String, RowDetail, EventId)>,
     kind: ChatKind,
     text: &str,
     detail: RowDetail,
+    id: EventId,
 ) {
     let label = match kind {
         ChatKind::User => "you ❯ ",
@@ -463,10 +474,10 @@ fn push_wrapped(
         } else {
             " ".repeat(label.chars().count())
         };
-        out.push((kind, format!("{head}{line}"), detail.clone()));
+        out.push((kind, format!("{head}{line}"), detail.clone(), id));
     }
     if !any {
-        out.push((kind, label.to_owned(), detail));
+        out.push((kind, label.to_owned(), detail, id));
     }
 }
 
@@ -588,19 +599,19 @@ mod tests {
         let rows = chat.rows(None);
         assert!(
             rows.iter()
-                .any(|(k, t, _)| *k == ChatKind::User && t.contains("hi"))
+                .any(|(k, t, _, _)| *k == ChatKind::User && t.contains("hi"))
         );
         assert!(
             rows.iter()
-                .any(|(k, t, _)| *k == ChatKind::Streaming && t.contains("thinki"))
+                .any(|(k, t, _, _)| *k == ChatKind::Streaming && t.contains("thinki"))
         );
 
         // The logged assistant message replaces the stream.
         chat.apply(&run_program(3));
         let rows = chat.rows(None);
-        assert!(!rows.iter().any(|(k, _, _)| *k == ChatKind::Streaming));
+        assert!(!rows.iter().any(|(k, _, _, _)| *k == ChatKind::Streaming));
         // A run_program renders as a status-titled block header.
-        assert!(rows.iter().any(|(k, t, p)| *k == ChatKind::ToolCall
+        assert!(rows.iter().any(|(k, t, p, _)| *k == ChatKind::ToolCall
             && t == "run_program: running"
             && *p == RowDetail::Program(EventId::new(3))));
 
@@ -645,33 +656,33 @@ mod tests {
         chat.apply(&settled(6, 4, serde_json::json!(true)));
 
         let rows = chat.rows(None);
-        let glyphs: Vec<&(ChatKind, String, RowDetail)> = rows
+        let glyphs: Vec<&(ChatKind, String, RowDetail, EventId)> = rows
             .iter()
-            .filter(|(k, t, _)| *k == ChatKind::ToolCall && t.starts_with('⚙'))
+            .filter(|(k, t, _, _)| *k == ChatKind::ToolCall && t.starts_with('⚙'))
             .collect();
         assert_eq!(glyphs.len(), 2, "two inner-call lines");
         // Each ⚙ line carries the program id + invoke index for hit-testing.
         assert!(
             glyphs
                 .iter()
-                .all(|(_, _, p)| matches!(p, RowDetail::Invoke(_, _)))
+                .all(|(_, _, p, _)| matches!(p, RowDetail::Invoke(_, _)))
         );
         assert!(
             glyphs
                 .iter()
-                .any(|(_, _, p)| *p == RowDetail::Invoke(EventId::new(2), 0))
+                .any(|(_, _, p, _)| *p == RowDetail::Invoke(EventId::new(2), 0))
         );
         assert!(
             glyphs
                 .iter()
-                .any(|(_, _, p)| *p == RowDetail::Invoke(EventId::new(2), 1))
+                .any(|(_, _, p, _)| *p == RowDetail::Invoke(EventId::new(2), 1))
         );
 
         // Header starts at running…
         assert!(
             chat.rows(None)
                 .iter()
-                .any(|(_, t, _)| t == "run_program: running")
+                .any(|(_, t, _, _)| t == "run_program: running")
         );
         // …and tracks ProgramStatus to completed.
         chat.apply(&SessionEvent::ProgramStatus {
@@ -683,7 +694,7 @@ mod tests {
         assert!(
             chat.rows(None)
                 .iter()
-                .any(|(_, t, _)| t == "run_program: completed")
+                .any(|(_, t, _, _)| t == "run_program: completed")
         );
 
         // The report body is never in the transcript — and now it is
@@ -692,7 +703,7 @@ mod tests {
             !chat
                 .rows(None)
                 .iter()
-                .any(|(_, t, _)| t.contains("program completed"))
+                .any(|(_, t, _, _)| t.contains("program completed"))
         );
     }
 
@@ -735,16 +746,16 @@ mod tests {
         assert!(
             root_rows
                 .iter()
-                .any(|(k, t, _)| *k == ChatKind::User && t.contains("root q"))
+                .any(|(k, t, _, _)| *k == ChatKind::User && t.contains("root q"))
         );
         // The child's content is not in the root's slice.
-        assert!(!root_rows.iter().any(|(_, t, _)| t.contains("CHILD")));
+        assert!(!root_rows.iter().any(|(_, t, _, _)| t.contains("CHILD")));
 
         // The child's slice leads with its own system header.
         let child_rows = chat.rows(Some(child));
         assert_eq!(child_rows[0].0, ChatKind::System);
         assert_eq!(child_rows[0].2, RowDetail::None);
-        assert!(!child_rows.iter().any(|(_, t, _)| t.contains("root q")));
+        assert!(!child_rows.iter().any(|(_, t, _, _)| t.contains("root q")));
     }
 
     /// A fork's own rows include the shared prefix up to (and including)
@@ -806,22 +817,22 @@ mod tests {
         assert!(
             fork_rows
                 .iter()
-                .any(|(_, t, _)| t.contains("shared question"))
+                .any(|(_, t, _, _)| t.contains("shared question"))
         );
         assert!(
             fork_rows
                 .iter()
-                .any(|(_, t, _)| t.contains("shared answer"))
+                .any(|(_, t, _, _)| t.contains("shared answer"))
         );
         assert!(
             fork_rows
                 .iter()
-                .any(|(_, t, _)| t.contains("fork continues"))
+                .any(|(_, t, _, _)| t.contains("fork continues"))
         );
         assert!(
             !fork_rows
                 .iter()
-                .any(|(_, t, _)| t.contains("original continues")),
+                .any(|(_, t, _, _)| t.contains("original continues")),
             "a fork owes nothing of what the original does afterward"
         );
 
@@ -829,12 +840,12 @@ mod tests {
         assert!(
             original_rows
                 .iter()
-                .any(|(_, t, _)| t.contains("original continues"))
+                .any(|(_, t, _, _)| t.contains("original continues"))
         );
         assert!(
             !original_rows
                 .iter()
-                .any(|(_, t, _)| t.contains("fork continues")),
+                .any(|(_, t, _, _)| t.contains("fork continues")),
             "the original does not see the fork's own history"
         );
     }
