@@ -36,7 +36,7 @@ use super::ui;
 use crate::host::{AgentId, Session, SessionCommand, SessionEvent};
 use crate::machine::TOOL_RUN_PROGRAM;
 use crate::tree::{AgentView, ProgramView};
-use crate::types::{EventId, EventPayload, Message};
+use crate::types::{EventId, EventPayload, Message, Outcome};
 
 /// Cap for one step-line key, so a hot loop on one source line cannot
 /// wedge the UI (mirrors the standalone runner).
@@ -1146,10 +1146,16 @@ fn render_subitem(
                     lines.push(Line::from(l.to_owned()));
                 }
                 lines.push(Line::from(""));
-                lines.push(Line::from("result:").style(Style::default().fg(Color::DarkGray)));
-                let result_str = serde_json::to_string_pretty(&invoke.result)
-                    .unwrap_or_else(|_| format!("{:?}", invoke.result));
-                for l in result_str.lines() {
+                let (head, body) = match &invoke.outcome {
+                    Some(Outcome::Delivered(v)) => (
+                        "result:",
+                        serde_json::to_string_pretty(v).unwrap_or_else(|_| format!("{v:?}")),
+                    ),
+                    Some(Outcome::Failed(msg)) => ("failed:", msg.clone()),
+                    None => ("result:", "(pending — no result recorded)".to_owned()),
+                };
+                lines.push(Line::from(head).style(Style::default().fg(Color::DarkGray)));
+                for l in body.lines() {
                     lines.push(Line::from(l.to_owned()));
                 }
                 format!(" ⚙ {} ", invoke.name)

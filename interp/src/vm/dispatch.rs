@@ -2303,10 +2303,14 @@ impl VM {
                     }
                     let args = self.stack.split_off(self.stack.len() - n);
                     let id = self.alloc_promise();
+                    // `ip` still points at this `Invoke`, so `spans[ip]` is
+                    // the call site the harness annotates its report with.
+                    let site = self.spans.get(self.ip as usize).copied().unwrap_or(0);
                     self.outbox.push(InvokeCall {
                         promise: id,
                         name,
                         args,
+                        site,
                     });
                     self.stack.push(Value::Promise(id));
                     self.ip += 1;

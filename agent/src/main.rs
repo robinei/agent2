@@ -337,9 +337,17 @@ fn print_session_event(event: &SessionEvent) {
                         println!("    {line}");
                     }
                 }
-                EventPayload::Invoke { name, args, result } => {
-                    println!("{head} invoke: {name}({args}) → {result}");
+                EventPayload::Call(call) => {
+                    println!("{head} call: {}", describe_call(call));
                 }
+                EventPayload::Result { call, outcome } => match outcome {
+                    Outcome::Delivered(v) => {
+                        println!("{head} result of #{}: {v}", call.as_u64())
+                    }
+                    Outcome::Failed(msg) => {
+                        println!("{head} result of #{}: failed: {msg}", call.as_u64())
+                    }
+                },
                 EventPayload::ProgramResult { value } => {
                     println!("{head} program result: {value}");
                 }
@@ -349,5 +357,31 @@ fn print_session_event(event: &SessionEvent) {
                 }
             }
         }
+    }
+}
+
+/// One-line rendering of a logged call for the headless printer.
+fn describe_call(call: &Call) -> String {
+    match call {
+        Call::Send {
+            to,
+            text,
+            expects_reply,
+            ..
+        } => {
+            let verb = if *expects_reply { "ask" } else { "tell" };
+            let to = match to {
+                Address::User => "user".to_owned(),
+                Address::Branch(id) => format!("#{}", id.as_u64()),
+            };
+            format!("{verb} {to}: {text}")
+        }
+        Call::Spawn { name, charter, .. } => {
+            format!(
+                "spawn {}: {charter}",
+                name.as_deref().unwrap_or("<unnamed>")
+            )
+        }
+        Call::Invoke { name, args, .. } => format!("invoke {name}({args})"),
     }
 }

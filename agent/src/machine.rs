@@ -16,7 +16,8 @@ use interp::{
 
 use crate::host::ProgramStatus;
 use crate::report::{
-    Artifact, CompletionReport, ConditionReport, PAYLOAD_MAX_BYTES, ResumeKind, clip, preview,
+    Artifact, ArtifactState, CompletionReport, ConditionReport, PAYLOAD_MAX_BYTES, ResumeKind,
+    clip, preview,
 };
 use crate::types::*;
 
@@ -213,8 +214,10 @@ enum Phase {
 }
 
 struct PendingCall {
-    name: String,
-    args: serde_json::Value,
+    /// The `Call` event logged at dispatch — what this call's `Result`
+    /// will name. The name and args live there, not here: the log is the
+    /// record, and the session state only has to route the settlement.
+    call: EventId,
     promise: PromisePtr,
     /// Which run issued it: results from an abandoned run are still
     /// logged as artifacts (the physics happened) but not delivered.
@@ -605,17 +608,17 @@ impl Runner {
             let Some(p) = self.pending.remove(&tr.invoke_id) else {
                 continue; // unknown or duplicate — nothing to log
             };
-            // Resolution order is arrival order: log now, result included.
-            let logged = match &tr.result {
-                Ok(v) => v.clone(),
-                Err(msg) => serde_json::json!({ "error": msg }),
+            // Resolution order is arrival order: the `Result` lands now,
+            // naming the `Call` logged at dispatch.
+            let outcome = match &tr.result {
+                Ok(v) => Outcome::Delivered(v.clone()),
+                Err(msg) => Outcome::Failed(msg.clone()),
             };
             tree.append(
                 &mut self.spine,
-                EventPayload::Invoke {
-                    name: p.name,
-                    args: p.args,
-                    result: logged,
+                EventPayload::Result {
+                    call: p.call,
+                    outcome,
                 },
             )?;
 
@@ -697,7 +700,7 @@ impl Runner {
                     return Ok(out);
                 }
                 Ok(StepResult::Pending { calls }) => {
-                    let progressed = self.dispatch_calls(tree, calls, &mut out);
+                    let progressed = self.dispatch_calls(tree, calls, &mut out)?;
                     if !progressed {
                         return Ok(out); // blocked on the host now
                     }
@@ -717,16 +720,22 @@ impl Runner {
         Ok(out)
     }
 
-    /// Classify one `Pending` batch: artifact fetches are answered from
-    /// the log immediately (returns true if any were — the program can
-    /// run again), `tools.agent` becomes `SpawnAgents`, everything else
-    /// becomes `ToolCalls`.
+    /// Classify one `Pending` batch. **This is the one place a `tools.*`
+    /// name becomes a `Call` variant** (17_BRANCHES A2): everything
+    /// downstream — the artifact menu, reconciliation, re-attach, routing
+    /// an answer home — matches on the variant, never on the string again.
+    ///
+    /// Artifact fetches are answered from the log immediately and log
+    /// nothing (returns true if any were — the program can run again);
+    /// `tools.agent` becomes `SpawnAgents`; everything else becomes
+    /// `ToolCalls`. Every call that leaves here is logged as a `Call`
+    /// event *at dispatch*, settled later by exactly one `Result`.
     fn dispatch_calls(
         &mut self,
-        tree: &Tree,
+        tree: &mut Tree,
         calls: Vec<InvokeCall>,
         out: &mut Vec<StepOutput>,
-    ) -> bool {
+    ) -> io::Result<bool> {
         let mut tool_calls = Vec::new();
         let mut spawns = Vec::new();
         let mut progressed = false;
@@ -734,7 +743,7 @@ impl Runner {
         for call in calls {
             match call.name.as_str() {
                 "tool_result" => {
-                    let fetched = self.fetch_artifact(tree, &call);
+                    let fetched = self.fetch_artifact(&*tree, &call);
                     let vm = self.running_vm();
                     match fetched {
                         Ok(json) => {
@@ -768,11 +777,15 @@ impl Runner {
                                 .get("budget")
                                 .and_then(|b| b.as_u64())
                                 .map(|b| b as usize);
-                            let id = self.register_pending(
-                                "agent",
-                                serde_json::json!([arg]),
+                            let id = self.issue_call(
+                                tree,
+                                Call::Invoke {
+                                    name: "agent".into(),
+                                    args: serde_json::json!([arg]),
+                                    site: call.site,
+                                },
                                 call.promise,
-                            );
+                            )?;
                             spawns.push(SpawnAgent {
                                 invoke_id: id,
                                 prompt,
@@ -797,7 +810,15 @@ impl Runner {
                             call.args.iter().map(|v| value_json(vm, v)).collect(),
                         )
                     };
-                    let id = self.register_pending(&call.name, args.clone(), call.promise);
+                    let id = self.issue_call(
+                        tree,
+                        Call::Invoke {
+                            name: call.name.clone(),
+                            args: args.clone(),
+                            site: call.site,
+                        },
+                        call.promise,
+                    )?;
                     tool_calls.push(OutCall {
                         invoke_id: id,
                         name: call.name,
@@ -812,7 +833,7 @@ impl Runner {
         if !spawns.is_empty() {
             out.push(StepOutput::SpawnAgents(spawns));
         }
-        progressed
+        Ok(progressed)
     }
 
     fn running_vm(&mut self) -> &mut VM {
@@ -822,44 +843,44 @@ impl Runner {
         }
     }
 
-    fn register_pending(
-        &mut self,
-        name: &str,
-        args: serde_json::Value,
-        promise: PromisePtr,
-    ) -> u64 {
+    /// Log a `Call` at dispatch and remember how to settle it. Returns the
+    /// session-local invoke id the host echoes back with the result.
+    fn issue_call(&mut self, tree: &mut Tree, call: Call, promise: PromisePtr) -> io::Result<u64> {
+        let logged = tree.append(&mut self.spine, EventPayload::Call(call))?;
         self.invoke_counter += 1;
         self.pending.insert(
             self.invoke_counter,
             PendingCall {
-                name: name.to_owned(),
-                args,
+                call: logged,
                 promise,
                 generation: self.generation,
             },
         );
-        self.invoke_counter
+        Ok(self.invoke_counter)
     }
 
-    /// Serve `tools.tool_result(id)` from the log. Artifact ids are
-    /// scoped to this agent's spine segment (decision 3: never ancestor
-    /// artifacts).
+    /// Serve `tools.tool_result(id)` from the log. Accepts a `Result` id
+    /// or the id of the **call** it settles — the menu names calls, so a
+    /// program reuses exactly the ids it was shown. Ids are scoped to this
+    /// agent's spine segment (decision 3: never ancestor artifacts).
     fn fetch_artifact(&self, tree: &Tree, call: &InvokeCall) -> Result<serde_json::Value, String> {
         let id = match call.args.first() {
             Some(Value::PosInt(n)) => *n,
             _ => return Err("tool_result needs a numeric artifact id".into()),
         };
-        for event in self.agent_segment(tree) {
-            if event.id.as_u64() != id {
-                continue;
-            }
-            return match &event.payload {
-                EventPayload::Invoke { result, .. } => Ok(result.clone()),
-                EventPayload::ProgramResult { value } => Ok(value.clone()),
-                _ => Err(format!("event #{id} is not an artifact")),
-            };
+        let segment = self.agent_segment(tree);
+        let Some(event) = segment.iter().find(|e| e.id.as_u64() == id) else {
+            return Err(format!("no artifact #{id} in this agent"));
+        };
+        match &event.payload {
+            EventPayload::Result { outcome, .. } => outcome_json(outcome),
+            EventPayload::Call(_) => match settlement_of(&segment, event.id) {
+                Some(outcome) => outcome_json(outcome),
+                None => Err(format!("call #{id} has no result yet")),
+            },
+            EventPayload::ProgramResult { value } => Ok(value.clone()),
+            _ => Err(format!("event #{id} is not an artifact")),
         }
-        Err(format!("no artifact #{id} in this agent"))
     }
 
     fn finish_program(
@@ -896,7 +917,15 @@ impl Runner {
                     .map(|v| value_json_of(&run.vm, v))
                     .collect(),
             );
-            let id = self.register_pending(&call.name, args.clone(), call.promise);
+            let id = self.issue_call(
+                tree,
+                Call::Invoke {
+                    name: call.name.clone(),
+                    args: args.clone(),
+                    site: call.site,
+                },
+                call.promise,
+            )?;
             fire_and_forget.push(OutCall {
                 invoke_id: id,
                 name: call.name.clone(),
@@ -1127,18 +1156,11 @@ impl Runner {
 
     /// Artifact-menu entries for every artifact on this agent so far.
     fn agent_artifacts(&self, tree: &Tree) -> Vec<Artifact> {
-        self.agent_segment(tree)
-            .into_iter()
-            .filter_map(artifact_entry)
-            .collect()
+        menu_rows(&self.agent_segment(tree), 0)
     }
 
     fn new_artifacts(&self, tree: &Tree, since: u64) -> Vec<Artifact> {
-        self.agent_segment(tree)
-            .into_iter()
-            .filter(|e| e.id.as_u64() > since)
-            .filter_map(artifact_entry)
-            .collect()
+        menu_rows(&self.agent_segment(tree), since)
     }
 
     /// Whether any `create_file`/`replace_file` logged by this run inlined
@@ -1149,7 +1171,7 @@ impl Runner {
             .into_iter()
             .filter(|e| e.id.as_u64() > since)
             .any(|e| match &e.payload {
-                EventPayload::Invoke { name, args, .. }
+                EventPayload::Call(Call::Invoke { name, args, .. })
                     if name == "create_file" || name == "replace_file" =>
                 {
                     args.as_array()
@@ -1224,20 +1246,92 @@ fn render_diags(source: &str, diags: &[Diagnostic]) -> String {
     format!("compile error:\n{}", rendered.join("\n"))
 }
 
-/// One artifact-menu entry from a logged execution event.
-fn artifact_entry(event: &Event) -> Option<Artifact> {
-    match &event.payload {
-        EventPayload::Invoke { name, args, result } => Some(Artifact {
-            id: event.id.as_u64(),
-            label: format!("{}({})", name, preview(args)),
-            result: result.clone(),
-        }),
-        EventPayload::ProgramResult { value } => Some(Artifact {
-            id: event.id.as_u64(),
-            label: "program result".into(),
-            result: value.clone(),
-        }),
+/// The `Result` settling `call`, if one landed on this path.
+fn settlement_of<'e>(segment: &[&'e Event], call: EventId) -> Option<&'e Outcome> {
+    segment.iter().find_map(|e| match &e.payload {
+        EventPayload::Result { call: c, outcome } if *c == call => Some(outcome),
         _ => None,
+    })
+}
+
+/// The artifact menu as a **projection over the events on this path**
+/// (17_BRANCHES): every call that landed here, plus every call still
+/// pending, plus prior program results. Nothing maintains a store — the
+/// log is the cache and the event id is the key.
+///
+/// Rows are named by the **call** id, which is what a program reuses:
+/// `tools.tool_result` resolves a call id through to its `Result`.
+fn menu_rows(segment: &[&Event], since: u64) -> Vec<Artifact> {
+    segment
+        .iter()
+        .filter(|e| e.id.as_u64() > since)
+        .filter_map(|event| {
+            let id = event.id.as_u64();
+            match &event.payload {
+                // A row's label comes from the call *variant*; its value
+                // (or its absence) from the `Result`.
+                EventPayload::Call(call) => Some(Artifact {
+                    id,
+                    label: call_label(call),
+                    state: match settlement_of(segment, event.id) {
+                        Some(Outcome::Delivered(v)) => ArtifactState::Delivered(v.clone()),
+                        Some(Outcome::Failed(msg)) => ArtifactState::Failed(msg.clone()),
+                        // Only one pending kind can be re-attached: a
+                        // `Send`'s answer is still coming, while an
+                        // `Invoke`'s worker died with the process.
+                        None => match call {
+                            Call::Send { .. } => ArtifactState::PendingSend,
+                            Call::Spawn { .. } | Call::Invoke { .. } => {
+                                ArtifactState::PendingInvoke
+                            }
+                        },
+                    },
+                }),
+                EventPayload::ProgramResult { value } => Some(Artifact {
+                    id,
+                    label: "program result".into(),
+                    state: ArtifactState::Delivered(value.clone()),
+                }),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// A menu row's label, read from the call variant — never by re-parsing a
+/// tool name. `ask` versus `tell` is `expects_reply`, the one place the
+/// difference is visible.
+fn call_label(call: &Call) -> String {
+    match call {
+        Call::Send {
+            to,
+            text,
+            expects_reply,
+            ..
+        } => format!(
+            "{}({}, {})",
+            if *expects_reply { "ask" } else { "tell" },
+            address_label(to),
+            preview(&serde_json::Value::String(text.clone()))
+        ),
+        Call::Spawn { name, .. } => format!("spawn({})", name.as_deref().unwrap_or("<unnamed>")),
+        Call::Invoke { name, args, .. } => format!("{}({})", name, preview(args)),
+    }
+}
+
+fn address_label(to: &Address) -> String {
+    match to {
+        Address::User => "user".into(),
+        Address::Branch(id) => format!("#{}", id.as_u64()),
+    }
+}
+
+/// A settled call's value for the program: a delivered value resolves,
+/// a failure rejects with its reason.
+fn outcome_json(outcome: &Outcome) -> Result<serde_json::Value, String> {
+    match outcome {
+        Outcome::Delivered(v) => Ok(v.clone()),
+        Outcome::Failed(msg) => Err(msg.clone()),
     }
 }
 
@@ -1349,7 +1443,8 @@ mod tests {
                 EventPayload::Message(Message::Assistant { .. }) => "Assistant",
                 EventPayload::Message(Message::System { .. }) => "System",
                 EventPayload::Message(Message::Tool { .. }) => "Tool",
-                EventPayload::Invoke { .. } => "Invoke",
+                EventPayload::Call(_) => "Call",
+                EventPayload::Result { .. } => "Result",
                 EventPayload::ProgramResult { .. } => "ProgramResult",
                 EventPayload::Console { .. } => "Console",
                 EventPayload::Label(_) => "Label",
@@ -1379,6 +1474,152 @@ mod tests {
                 _ => None,
             })
             .expect("a ToolCalls output")
+    }
+
+    // ── typed calls (A2) ────────────────────────────────────────────
+
+    /// A menu row's label comes from the `Call` **variant**, never from
+    /// re-parsing a tool name: `ask` vs `tell` is `expects_reply`, and
+    /// `spawn` shows the child's name.
+    #[test]
+    fn menu_labels_come_from_the_call_variant() {
+        let send = |expects_reply| Call::Send {
+            to: Address::Branch(EventId::new(3)),
+            text: "which file?".into(),
+            input: json!(null),
+            expects_reply,
+            site: 0,
+        };
+        assert_eq!(call_label(&send(true)), r#"ask(#3, "which file?")"#);
+        assert_eq!(call_label(&send(false)), r#"tell(#3, "which file?")"#);
+        assert_eq!(
+            call_label(&Call::Send {
+                to: Address::User,
+                text: "ok?".into(),
+                input: json!(null),
+                expects_reply: true,
+                site: 0,
+            }),
+            r#"ask(user, "ok?")"#
+        );
+        assert_eq!(
+            call_label(&Call::Spawn {
+                name: Some("researcher".into()),
+                charter: "read things".into(),
+                tools: None,
+                site: 0,
+            }),
+            "spawn(researcher)"
+        );
+        assert_eq!(
+            call_label(&Call::Invoke {
+                name: "fetch".into(),
+                args: json!(["x"]),
+                site: 0,
+            }),
+            r#"fetch(["x"])"#
+        );
+    }
+
+    /// `tools.tool_result` accepts either id the log offers: the `Result`
+    /// itself, or the **call** it settles — which is what the menu names.
+    #[test]
+    fn tool_result_accepts_a_call_id_or_its_result_id() {
+        let (mut tree, mut state) = setup();
+        state.kickoff(&mut tree).unwrap();
+        let src = r#"await tools.fetch("a"); raise("stop", null);"#;
+        let out = state
+            .step(&mut tree, StepInput::LlmResponse(llm_program("c1", src)))
+            .unwrap();
+        let settled = drain(&mut state, &mut tree, out);
+        let id = expect_tool_calls(&settled)[0].invoke_id;
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::ToolResults(vec![ToolResult {
+                    invoke_id: id,
+                    result: Ok(json!("DATA")),
+                }]),
+            )
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+
+        let segment = state.agent_segment(&tree);
+        let call = segment
+            .iter()
+            .find(|e| matches!(e.payload, EventPayload::Call(_)))
+            .unwrap()
+            .id;
+        let result = segment
+            .iter()
+            .find(|e| matches!(e.payload, EventPayload::Result { .. }))
+            .unwrap()
+            .id;
+        assert_ne!(call, result, "the two halves are separate events");
+
+        // Two successive rewrites on the same branch, each a fresh VM:
+        // one reuses by the call id the menu showed, one by the `Result`
+        // id. Neither re-issues the call.
+        for (n, fetch_by) in [call, result].into_iter().enumerate() {
+            let rewrite = format!("return await tools.tool_result({});", fetch_by.as_u64());
+            let out = state
+                .step(
+                    &mut tree,
+                    StepInput::LlmResponse(llm_program(&format!("c{}", n + 2), &rewrite)),
+                )
+                .unwrap();
+            let settled = drain(&mut state, &mut tree, out);
+            assert!(
+                !settled
+                    .iter()
+                    .any(|o| matches!(o, StepOutput::ToolCalls(_))),
+                "served from the log, no call re-issued"
+            );
+            assert!(
+                last_tool_text(&state).contains(r#"returned: "DATA""#),
+                "fetching #{} failed: {}",
+                fetch_by.as_u64(),
+                last_tool_text(&state)
+            );
+        }
+    }
+
+    /// A call that definitively failed is a `Failed` outcome on its
+    /// `Result` — distinguishable in the log from one that was merely
+    /// issued (no `Result` at all).
+    #[test]
+    fn a_failed_call_settles_with_its_reason() {
+        let (mut tree, mut state) = setup();
+        state.kickoff(&mut tree).unwrap();
+        let src = r#"try { return await tools.fetch("a"); } catch (e) { return "caught: " + e; }"#;
+        let out = state
+            .step(&mut tree, StepInput::LlmResponse(llm_program("c1", src)))
+            .unwrap();
+        let settled = drain(&mut state, &mut tree, out);
+        let id = expect_tool_calls(&settled)[0].invoke_id;
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::ToolResults(vec![ToolResult {
+                    invoke_id: id,
+                    result: Err("host is down".into()),
+                }]),
+            )
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+
+        let outcome = state
+            .agent_segment(&tree)
+            .iter()
+            .find_map(|e| match &e.payload {
+                EventPayload::Result { outcome, .. } => Some(outcome.clone()),
+                _ => None,
+            })
+            .expect("a Result");
+        assert!(matches!(&outcome, Outcome::Failed(m) if m == "host is down"));
+        // And the menu says so rather than previewing a value.
+        let report = last_tool_text(&state);
+        assert!(report.contains("failed: host is down"), "{report}");
     }
 
     // ── the scripted round-trip ─────────────────────────────────────
@@ -1625,18 +1866,29 @@ mod tests {
         drain(&mut state, &mut tree, out);
 
         assert!(last_tool_text(&state).contains(r#"returned: ["X","Y"]"#));
-        let invokes: Vec<serde_json::Value> = state
+        // Calls are logged at dispatch, in the program's issue order…
+        let issued: Vec<serde_json::Value> = state
             .agent_segment(&tree)
             .iter()
             .filter_map(|e| match &e.payload {
-                EventPayload::Invoke { result, .. } => Some(result.clone()),
+                EventPayload::Call(Call::Invoke { args, .. }) => Some(args.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(issued, vec![json!(["x"]), json!(["y"])], "issue order");
+        // …and their `Result`s in resolution order, which is arrival order.
+        let settled: Vec<serde_json::Value> = state
+            .agent_segment(&tree)
+            .iter()
+            .filter_map(|e| match &e.payload {
+                EventPayload::Result { outcome, .. } => outcome.value().cloned(),
                 _ => None,
             })
             .collect();
         assert_eq!(
-            invokes,
+            settled,
             vec![json!("Y"), json!("X")],
-            "logged in resolution order"
+            "results logged in resolution order"
         );
     }
 
@@ -1759,12 +2011,13 @@ mod tests {
             .unwrap();
         drain(&mut state, &mut tree, out); // suspended on the raise
 
-        // Find the logged Invoke artifact id from the report's menu.
+        // Find the logged call's id from the report's menu — the menu
+        // names calls, and `tool_result` resolves one to its `Result`.
         let artifact_id = state
             .agent_segment(&tree)
             .iter()
             .find_map(|e| match &e.payload {
-                EventPayload::Invoke { .. } => Some(e.id.as_u64()),
+                EventPayload::Call(_) => Some(e.id.as_u64()),
                 _ => None,
             })
             .unwrap();
@@ -1835,7 +2088,7 @@ mod tests {
         drain(&mut state, &mut tree, out);
         assert!(last_tool_text(&state).contains(r#"returned: "child says hi""#));
         assert!(
-            payload_kinds(&state, &tree).contains(&"Invoke"),
+            payload_kinds(&state, &tree).contains(&"Call"),
             "agent call logged as an artifact"
         );
     }
@@ -1972,7 +2225,7 @@ got X
 
 ## new artifacts — fetch with tools.tool_result(id)
 [#4] fetch(["x"]) → "X"
-[#5] program result → ["X",2]"#
+[#6] program result → ["X",2]"#
         );
     }
 

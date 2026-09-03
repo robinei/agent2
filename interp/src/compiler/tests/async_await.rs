@@ -719,6 +719,43 @@ fn chaining_cycle_is_type_error() {
     );
 }
 
+// ── call sites ─────────────────────────────────────────────────────
+
+/// Every `InvokeCall` carries `site` — the source byte offset of its
+/// `Invoke` instruction — so the harness can annotate a program's source
+/// per call site from the log alone, with no live VM (17_BRANCHES A2).
+/// Asserted through a *nested* call (inside an arrow inside `map`) to pin
+/// that the site is the call's own instruction, not the top-level one.
+#[test]
+fn invoke_call_carries_its_source_site() {
+    let src = r#"const outer = tools.first("x");
+const inner = ["a"].map(u => tools.second(u));
+return [await outer, await Promise.all(inner)];
+"#;
+    let prog = compile_ok(src);
+    let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
+    let calls = expect_pending(&mut vm);
+    assert_eq!(calls.len(), 2);
+
+    // Each site points at its own `tools.<name>(` in the source.
+    for call in &calls {
+        let at = &src[call.site as usize..];
+        assert!(
+            at.starts_with(&format!("tools.{}(", call.name)),
+            "site for `{}` landed at {:?}",
+            call.name,
+            &at[..at.len().min(30)]
+        );
+    }
+    // The nested call's site is on line 2, the top-level one's on line 1 —
+    // distinct positions, not one shared program-level offset.
+    let first = calls.iter().find(|c| c.name == "first").unwrap().site;
+    let second = calls.iter().find(|c| c.name == "second").unwrap().site;
+    assert_ne!(first, second);
+    assert_eq!(crate::diag::line_col(src, first).0, 1);
+    assert_eq!(crate::diag::line_col(src, second).0, 2);
+}
+
 // ── helpers ────────────────────────────────────────────────────────
 
 fn expect_pending(vm: &mut VM) -> Vec<InvokeCall> {

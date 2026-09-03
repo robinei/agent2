@@ -55,16 +55,25 @@ pub enum EventPayload {
     /// spine (as the `tools.agent` call's `Tool` message).
     FrameResult { result: serde_json::Value },
 
-    /// Execution event; one per tool call a program makes, logged in
-    /// resolution order (decision 7). Parent: the owning agent's spine,
+    /// Execution event; one per call a program issues, logged at
+    /// **dispatch** (17_BRANCHES A2). Parent: the owning agent's spine,
     /// between the program's `run_program` tool-call message and its
     /// `Tool` result. Renders to chat: no — queried for replay, the
-    /// artifact menu, and UI. Addressable via `tools.tool_result(id)`.
-    Invoke {
-        name: String,
-        args: serde_json::Value,
-        result: serde_json::Value,
-    },
+    /// artifact menu, and UI. Addressable via `tools.tool_result(id)`,
+    /// which resolves a call id through to its `Result`.
+    ///
+    /// Logging at issue rather than at resolution is what distinguishes a
+    /// call that **definitively did not work** (a `Failed` `Result`) from
+    /// one that was **in flight when the process died** (no `Result` at
+    /// all) — a `send_email` issued a millisecond before `kill -9` used to
+    /// be invisible in the log.
+    Call(Call),
+
+    /// Execution event; a call settled — the artifact. Parent: the owning
+    /// agent's spine, in **resolution order** (decision 7). `call` names
+    /// the `Call` event this settles; every call gets exactly one
+    /// `Result`. Renders to chat: no.
+    Result { call: EventId, outcome: Outcome },
 
     /// Execution event; a program's top-level `return` value, logged
     /// after each successful run. Parent: the owning agent's spine.
@@ -123,6 +132,94 @@ pub struct ToolCall {
     pub id: String,
     pub name: String,
     pub arguments: serde_json::Value,
+}
+
+/// What a program's branch waits on. Three **typed** kinds, not one
+/// `Invoke` with a magic `name`: from a program's view they are all
+/// `tools.*` calls ("subagents are tools", 8_HARNESS dec. 2, holds at the
+/// API), but `dispatch_calls` interprets the name exactly once, at
+/// dispatch, and everything downstream — the artifact menu,
+/// reconciliation, re-attach, routing an answer home — matches on the
+/// variant instead of re-parsing a string.
+///
+/// Every variant carries `site`, the source byte offset of its `Invoke`
+/// instruction, so a report can annotate the program source per call site
+/// from the log alone (`InvokeCall::site`).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub enum Call {
+    /// This branch's program messaged an agent or the user — the mirror of
+    /// `Post`. `tools.ask` and `tools.tell` both log one, differing only in
+    /// `expects_reply`; the body lives here and the `Post` names it, so it
+    /// is never copied.
+    Send {
+        to: Address,
+        text: String,
+        #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+        input: serde_json::Value,
+        expects_reply: bool,
+        site: u32,
+    },
+    /// This branch's program created an agent. Settled with the agent
+    /// handle; the `Agent` event it roots is a child of this `Spawn`.
+    Spawn {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        charter: String,
+        /// The child's tool allowlist; `None` inherits the caller's.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tools: Option<Vec<String>>,
+        site: u32,
+    },
+    /// This branch's program called a host tool.
+    Invoke {
+        name: String,
+        args: serde_json::Value,
+        site: u32,
+    },
+}
+
+impl Call {
+    pub fn site(&self) -> u32 {
+        match self {
+            Call::Send { site, .. } | Call::Spawn { site, .. } | Call::Invoke { site, .. } => *site,
+        }
+    }
+}
+
+/// Where a `Send` is addressed. `tools.ask` with `to` omitted resolves to
+/// the author of the question being answered *before* the call is logged,
+/// so nothing unresolved ever reaches the log.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Address {
+    /// The human driving the session. They have no branch — they speak
+    /// inside branches — so a question to them is pending until their
+    /// reply produces this `Send`'s `Result`.
+    User,
+    /// A branch, named by its root event id (an agent's `Agent`, or a
+    /// `Fork`).
+    Branch(EventId),
+}
+
+/// How a call settled. `Failed` is load-bearing, not a convenience: it is
+/// what separates a call that **definitively did not work** from one that
+/// was merely **issued** (no `Result` at all), which reconciliation must
+/// read as "may have happened".
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub enum Outcome {
+    /// An answer, a delivery receipt, an agent handle, or a tool result.
+    Delivered(serde_json::Value),
+    /// It definitively did not happen; the message is the reason.
+    Failed(String),
+}
+
+impl Outcome {
+    /// The delivered value, or `None` for a failure.
+    pub fn value(&self) -> Option<&serde_json::Value> {
+        match self {
+            Outcome::Delivered(v) => Some(v),
+            Outcome::Failed(_) => None,
+        }
+    }
 }
 
 /// One agent's reconstructed conversation along a spine — its slice of

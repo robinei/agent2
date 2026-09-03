@@ -23,13 +23,30 @@ pub const MENU_MAX_ENTRIES: usize = 20;
 /// Per-entry preview bytes in the artifact menu.
 pub const PREVIEW_MAX_BYTES: usize = 256;
 
-/// One artifact-menu entry: an `Invoke` or `ProgramResult` event,
-/// fetchable in full via `tools.tool_result(id)`.
+/// One artifact-menu entry: a `Call` (settled or still pending) or a
+/// `ProgramResult`, named by its event id and fetchable via
+/// `tools.tool_result(id)`.
 pub struct Artifact {
     pub id: u64,
-    /// `name(args-preview)` for tool calls, `program result` otherwise.
+    /// Read from the call variant: `ask(to, "…")` / `tell(to, "…")`,
+    /// `spawn(name)`, `name(args-preview)`, or `program result`.
     pub label: String,
-    pub result: serde_json::Value,
+    pub state: ArtifactState,
+}
+
+/// What the menu says about a row, and whether it can be fetched.
+pub enum ArtifactState {
+    /// A `Result` landed with a value.
+    Delivered(serde_json::Value),
+    /// A `Result` landed saying it definitively did not happen.
+    Failed(String),
+    /// A `Send` with no `Result`: the answer is still coming, and the row
+    /// is **re-attachable** — awaiting it by id is the correct move, never
+    /// re-asking.
+    PendingSend,
+    /// An `Invoke`/`Spawn` with no `Result`: issued, and whether it
+    /// happened is not knowable from the log. Not re-attachable.
+    PendingInvoke,
 }
 
 /// What `resume(value)` means for this suspension — the restart section
@@ -246,12 +263,15 @@ fn render_menu(title: &str, artifacts: &[Artifact]) -> String {
         ));
     }
     for a in &artifacts[start..] {
-        out.push_str(&format!(
-            "\n[#{}] {} → {}",
-            a.id,
-            a.label,
-            preview(&a.result)
-        ));
+        let tail = match &a.state {
+            ArtifactState::Delivered(v) => preview(v),
+            ArtifactState::Failed(msg) => format!("failed: {}", clip(msg, PREVIEW_MAX_BYTES)),
+            ArtifactState::PendingSend => {
+                format!("pending — await tools.tool_result(#{})", a.id)
+            }
+            ArtifactState::PendingInvoke => "issued; no result recorded; may have happened".into(),
+        };
+        out.push_str(&format!("\n[#{}] {} → {}", a.id, a.label, tail));
     }
     out
 }
@@ -309,7 +329,15 @@ mod tests {
         Artifact {
             id,
             label: label.into(),
-            result,
+            state: ArtifactState::Delivered(result),
+        }
+    }
+
+    fn pending(id: u64, label: &str, state: ArtifactState) -> Artifact {
+        Artifact {
+            id,
+            label: label.into(),
+            state,
         }
     }
 
@@ -347,6 +375,41 @@ mod tests {
         assert!(rendered.contains("(5 older artifacts omitted; their ids stay fetchable)"));
         assert!(!rendered.contains("[#5]"), "old entries gone");
         assert!(rendered.contains("[#6]") && rendered.contains("[#25]"));
+    }
+
+    /// The two pending kinds render differently because only one can be
+    /// re-attached: a `Send`'s answer is still coming and is awaited by
+    /// id, while an `Invoke`'s worker died with the process.
+    #[test]
+    fn pending_rows_say_which_can_be_reattached() {
+        let rendered = render_menu(
+            "artifacts",
+            &[
+                pending(11, "ask(#3, \"which file?\")", ArtifactState::PendingSend),
+                pending(12, "send_email([\"…\"])", ArtifactState::PendingInvoke),
+                pending(
+                    13,
+                    "fetch([\"x\"])",
+                    ArtifactState::Failed("host is down".into()),
+                ),
+            ],
+        );
+        assert!(
+            rendered.contains(
+                "[#11] ask(#3, \"which file?\") → pending — await tools.tool_result(#11)"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "[#12] send_email([\"…\"]) → issued; no result recorded; may have happened"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("[#13] fetch([\"x\"]) → failed: host is down"),
+            "{rendered}"
+        );
     }
 
     #[test]

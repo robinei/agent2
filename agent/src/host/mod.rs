@@ -39,7 +39,7 @@ use std::thread;
 use std::time::Instant;
 
 use crate::machine::{LlmRequest, OutCall, Runner, SpawnAgent, StepInput, StepOutput, ToolResult};
-use crate::types::{EventId, EventPayload, Message, Spine, Tree};
+use crate::types::{Call, EventId, EventPayload, Message, Outcome, Spine, Tree};
 
 /// Instructions per VM slice on the loop thread (9_TUI decision 3).
 pub const FUEL_SLICE: u64 = 100_000;
@@ -790,7 +790,7 @@ fn synthesize_if_interrupted(tree: &mut Tree, leaf: EventId) -> io::Result<Event
     let mut current = leaf;
     while let Some(event) = tree.events.get(&current) {
         match &event.payload {
-            EventPayload::Invoke { name, args, .. } => {
+            EventPayload::Call(Call::Invoke { name, args, .. }) => {
                 artifacts.push(format!(
                     "[#{}] {}({})",
                     event.id.as_u64(),
@@ -878,7 +878,17 @@ fn leaf_summary(tree: &Tree, leaf: EventId) -> String {
         }
         EventPayload::Message(Message::System { .. }) => "System".into(),
         EventPayload::Message(Message::Tool { name, .. }) => format!("Tool: {name}"),
-        EventPayload::Invoke { name, .. } => format!("Invoke: {name}"),
+        EventPayload::Call(Call::Invoke { name, .. }) => format!("Invoke: {name}"),
+        EventPayload::Call(Call::Send { expects_reply, .. }) => {
+            format!("Send: {}", if *expects_reply { "ask" } else { "tell" })
+        }
+        EventPayload::Call(Call::Spawn { name, .. }) => {
+            format!("Spawn: {}", name.as_deref().unwrap_or("<unnamed>"))
+        }
+        EventPayload::Result { call, outcome } => match outcome {
+            Outcome::Delivered(v) => format!("Result of #{}: {v}", call.as_u64()),
+            Outcome::Failed(msg) => format!("Result of #{}: failed: {msg}", call.as_u64()),
+        },
         EventPayload::ProgramResult { value } => format!("ProgramResult: {value}"),
         EventPayload::Label(label) => format!("Label: {label}"),
         EventPayload::Console { lines } => format!("Console: {} lines", lines.len()),
@@ -961,7 +971,8 @@ mod tests {
                 EventPayload::Message(Message::Assistant { .. }) => "Assistant",
                 EventPayload::Message(Message::System { .. }) => "System",
                 EventPayload::Message(Message::Tool { .. }) => "Tool",
-                EventPayload::Invoke { .. } => "Invoke",
+                EventPayload::Call(_) => "Call",
+                EventPayload::Result { .. } => "Result",
                 EventPayload::ProgramResult { .. } => "ProgramResult",
                 EventPayload::Console { .. } => "Console",
                 EventPayload::Label(_) => "Label",
@@ -1011,8 +1022,11 @@ mod tests {
                 "System",
                 "User",
                 "Assistant",
-                "Invoke",
-                "Invoke",
+                // Calls are logged at dispatch, their results at landing.
+                "Call",
+                "Call",
+                "Result",
+                "Result",
                 "ProgramResult",
                 "Tool",
                 "Console",
@@ -1022,17 +1036,17 @@ mod tests {
             ]
         );
         // Both fan-out results landed (order is completion order).
-        let invokes: Vec<serde_json::Value> = session
+        let results: Vec<serde_json::Value> = session
             .tree()
             .events
             .values()
             .filter_map(|e| match &e.payload {
-                EventPayload::Invoke { result, .. } => Some(result.clone()),
+                EventPayload::Result { outcome, .. } => outcome.value().cloned(),
                 _ => None,
             })
             .collect();
-        assert_eq!(invokes.len(), 2);
-        assert!(invokes.contains(&json!("alpha")) && invokes.contains(&json!("beta")));
+        assert_eq!(results.len(), 2);
+        assert!(results.contains(&json!("alpha")) && results.contains(&json!("beta")));
         let report = &tool_texts(&session)[0];
         assert!(report.contains("fanned out"), "{report}");
 
@@ -1125,17 +1139,21 @@ mod tests {
         ];
         let (session, _) = run_session(registry, script, "race them");
 
-        let mut invokes: Vec<(u64, serde_json::Value)> = session
+        // Calls are logged at *dispatch* (issue order); their `Result`s
+        // land in completion order, which is what the inbox decides.
+        let mut results: Vec<(u64, serde_json::Value)> = session
             .tree()
             .events
             .values()
             .filter_map(|e| match &e.payload {
-                EventPayload::Invoke { result, .. } => Some((e.id.as_u64(), result.clone())),
+                EventPayload::Result { outcome, .. } => {
+                    Some((e.id.as_u64(), outcome.value().cloned()?))
+                }
                 _ => None,
             })
             .collect();
-        invokes.sort_by_key(|(id, _)| *id);
-        let order: Vec<&serde_json::Value> = invokes.iter().map(|(_, v)| v).collect();
+        results.sort_by_key(|(id, _)| *id);
+        let order: Vec<&serde_json::Value> = results.iter().map(|(_, v)| v).collect();
         assert_eq!(
             order,
             [&json!("fast"), &json!("slow")],
@@ -1236,16 +1254,29 @@ mod tests {
         ];
         let (session, _) = run_session(registry, script, "fetch something huge");
 
-        let invoke = session
+        // The call is logged at dispatch either way; the guard shows up as
+        // a `Failed` outcome on its `Result` — definitively did not work,
+        // as distinct from a call with no `Result` at all.
+        assert!(
+            session
+                .tree()
+                .events
+                .values()
+                .any(|e| matches!(&e.payload, EventPayload::Call(Call::Invoke { name, .. }) if name == "big")),
+            "the call is still logged"
+        );
+        let outcome = session
             .tree()
             .events
             .values()
             .find_map(|e| match &e.payload {
-                EventPayload::Invoke { result, .. } => Some(result.clone()),
+                EventPayload::Result { outcome, .. } => Some(outcome.clone()),
                 _ => None,
             })
-            .expect("the call is still logged");
-        let error = invoke["error"].as_str().unwrap();
+            .expect("the call settled");
+        let Outcome::Failed(error) = &outcome else {
+            panic!("expected a Failed outcome, got {outcome:?}");
+        };
         assert!(error.contains("result too large"), "{error}");
         let program_result = session
             .tree()
@@ -1291,7 +1322,7 @@ mod tests {
         // A raise consumes no tools, so the spine carries no Invoke; the
         // arc is program → condition → resume → completion → text.
         let spine = kinds(session.tree(), root_leaf(&session));
-        assert!(!spine.contains(&"Invoke"), "{spine:?}");
+        assert!(!spine.contains(&"Call"), "{spine:?}");
         // Root yields its final answer (no `FrameResult`); the top
         // conversation never ends.
         assert_eq!(spine.last(), Some(&"Assistant"));
@@ -1425,7 +1456,7 @@ mod tests {
             .tree()
             .events
             .values()
-            .find(|e| matches!(&e.payload, EventPayload::Invoke { name, .. } if name == "fetch"))
+            .find(|e| matches!(&e.payload, EventPayload::Call(Call::Invoke { name, .. }) if name == "fetch"))
             .expect("the fetch Invoke");
         assert_eq!(fetch_invoke.id.as_u64(), 5);
 
@@ -1443,7 +1474,7 @@ mod tests {
             .tree()
             .events
             .values()
-            .filter(|e| matches!(&e.payload, EventPayload::Invoke { name, .. } if name == "fetch"))
+            .filter(|e| matches!(&e.payload, EventPayload::Call(Call::Invoke { name, .. }) if name == "fetch"))
             .count();
         assert_eq!(
             fetch_invokes, 1,
@@ -1490,7 +1521,7 @@ mod tests {
 
         // The join: the child's result is the caller's logged artifact
         // and reaches the caller's program.
-        assert!(kinds(tree, root_leaf(&session)).contains(&"Invoke"));
+        assert!(kinds(tree, root_leaf(&session)).contains(&"Call"));
         assert!(tool_texts(&session)[0].contains(r#"returned: "child says 42""#));
 
         // Child events were attributed to the child agent.
@@ -1551,7 +1582,7 @@ mod tests {
         // The caller logged both agent calls as artifacts on its spine…
         let invokes = kinds(tree, root_leaf(&session))
             .iter()
-            .filter(|k| **k == "Invoke")
+            .filter(|k| **k == "Call")
             .count();
         assert_eq!(invokes, 2, "both agent calls join as artifacts");
 

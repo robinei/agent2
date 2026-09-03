@@ -1182,9 +1182,9 @@ by eye.
 
 Before the message reshape, because `Post.origin` names a `Send`.
 
-- [ ] `InvokeCall` gains `site: Span` (the call instruction's
+- [x] `InvokeCall` gains `site: Span` (the call instruction's
       `spans[ip]`); one interp test asserts it for a nested call.
-- [ ] `Send { to, text, input, expects_reply, site }`, `Spawn { name,
+- [x] `Send { to, text, input, expects_reply, site }`, `Spawn { name,
       charter, tools, site }`, `Invoke { name, args, site }` logged at
       dispatch —
       `dispatch_calls` is the one place a `tools.*` name becomes a
@@ -1192,15 +1192,15 @@ Before the message reshape, because `Post.origin` names a `Send`.
       today). `tools.tool_result` accepts a `Result` id, or a call id that
       resolves to its `Result` if one exists. No harness code outside
       `dispatch_calls` matches on the strings `"ask"`/`"tell"`.
-- [ ] Menu rows read their label from the call variant (`ask(to, "…")` /
+- [x] Menu rows read their label from the call variant (`ask(to, "…")` /
       `tell(to, "…")` by `expects_reply`, `spawn(name)`, `name(args)`),
       value from the `Result`; a `Result`-less `Send` renders *pending —
       await tools.tool_result(#N)*,
       a `Result`-less `Invoke` *issued; no result recorded; may have
       happened*. Golden reports updated.
-- [ ] `fanout_logs_in_completion_order` asserts on `Result` order;
+- [x] `fanout_logs_in_completion_order` asserts on `Result` order;
       `oversized_result_is_guarded_before_the_log` on the `Result`.
-- [ ] Gate: `cargo fmt && cargo clippy --workspace --all-targets &&
+- [x] Gate: `cargo fmt && cargo clippy --workspace --all-targets &&
       cargo test` green.
 
 ### Step A3 — Rendered messages: `Message::{Post, Turn}`, `Agent`, `Rename` (`types.rs`, `tree.rs`, `machine.rs`, `deepseek.rs`)

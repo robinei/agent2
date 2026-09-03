@@ -16,12 +16,15 @@ pub struct AgentView {
     pub complete: bool,
 }
 
-/// One inner tool call a program made.
+/// One inner call a program made, with its settlement if one landed.
+/// `outcome` is `None` while the call is still in flight — the same
+/// distinction the artifact menu draws.
 #[derive(Debug, Clone, PartialEq)]
 pub struct InvokeView {
+    pub id: EventId,
     pub name: String,
     pub args: serde_json::Value,
-    pub result: serde_json::Value,
+    pub outcome: Option<Outcome>,
 }
 
 /// One program execution, projected from the log: everything its panes
@@ -242,7 +245,8 @@ impl Tree {
             }
             // Execution/marker events carry no agent-visible state; they
             // are queried from `events` by id (artifacts, replay, UI).
-            EventPayload::Invoke { .. }
+            EventPayload::Call(_)
+            | EventPayload::Result { .. }
             | EventPayload::ProgramResult { .. }
             | EventPayload::Console { .. }
             | EventPayload::Label(_) => {}
@@ -385,13 +389,32 @@ impl Tree {
                         // `resume` continues the open program — no new entry.
                     }
                 }
-                EventPayload::Invoke { name, args, result } => {
+                EventPayload::Call(call) => {
                     if let Some(p) = programs.last_mut() {
+                        let (name, args) = match call {
+                            Call::Invoke { name, args, .. } => (name.clone(), args.clone()),
+                            Call::Send { to, text, .. } => (
+                                "send".to_owned(),
+                                serde_json::json!({ "to": to, "text": text }),
+                            ),
+                            Call::Spawn { name, charter, .. } => (
+                                "spawn".to_owned(),
+                                serde_json::json!({ "name": name, "charter": charter }),
+                            ),
+                        };
                         p.invokes.push(InvokeView {
-                            name: name.clone(),
-                            args: args.clone(),
-                            result: result.clone(),
+                            id: ev.id,
+                            name,
+                            args,
+                            outcome: None,
                         });
+                    }
+                }
+                EventPayload::Result { call, outcome } => {
+                    if let Some(p) = programs.last_mut()
+                        && let Some(iv) = p.invokes.iter_mut().find(|iv| iv.id == *call)
+                    {
+                        iv.outcome = Some(outcome.clone());
                     }
                 }
                 EventPayload::ProgramResult { value } => {
@@ -529,12 +552,19 @@ mod tests {
                 &mut spine,
                 run_program_call("c1", "console.log('hi'); return 42;"),
             )?;
-            tree.append(
+            let bash = tree.append(
                 &mut spine,
-                EventPayload::Invoke {
+                EventPayload::Call(Call::Invoke {
                     name: "bash".into(),
                     args: json!(["ls"]),
-                    result: json!("file.txt"),
+                    site: 0,
+                }),
+            )?;
+            tree.append(
+                &mut spine,
+                EventPayload::Result {
+                    call: bash,
+                    outcome: Outcome::Delivered(json!("file.txt")),
                 },
             )?;
             tree.append(&mut spine, EventPayload::ProgramResult { value: json!(42) })?;
@@ -694,15 +724,22 @@ mod tests {
     // --- Execution events ---
 
     #[test]
-    fn test_invoke_and_program_result_are_artifacts_not_messages() -> io::Result<()> {
+    fn test_calls_and_program_result_are_artifacts_not_messages() -> io::Result<()> {
         let mut tree = Tree::new(None);
         let mut spine = tree.start_agent(None, "root", json!(null))?;
-        let invoke_id = tree.append(
+        let call_id = tree.append(
             &mut spine,
-            EventPayload::Invoke {
+            EventPayload::Call(Call::Invoke {
                 name: "fetch".into(),
                 args: json!({"url": "http://x"}),
-                result: json!("body"),
+                site: 0,
+            }),
+        )?;
+        let settled_id = tree.append(
+            &mut spine,
+            EventPayload::Result {
+                call: call_id,
+                outcome: Outcome::Delivered(json!("body")),
             },
         )?;
         let result_id = tree.append(
@@ -712,13 +749,17 @@ mod tests {
             },
         )?;
 
-        // Spine leaf advanced past both, but the agent's chat transcript
-        // is untouched — they're id-addressable artifacts.
+        // Spine leaf advanced past all three, but the agent's chat
+        // transcript is untouched — they're id-addressable artifacts.
         assert_eq!(spine.leaf_id, result_id);
         assert!(spine.context().messages.is_empty());
         assert!(matches!(
-            tree.events[&invoke_id].payload,
-            EventPayload::Invoke { .. }
+            tree.events[&call_id].payload,
+            EventPayload::Call(Call::Invoke { .. })
+        ));
+        assert!(matches!(
+            tree.events[&settled_id].payload,
+            EventPayload::Result { .. }
         ));
         assert!(matches!(
             tree.events[&result_id].payload,

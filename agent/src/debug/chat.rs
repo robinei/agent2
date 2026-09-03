@@ -18,7 +18,7 @@
 use std::collections::HashMap;
 
 use crate::host::{AgentId, ProgramStatus, SessionEvent};
-use crate::types::{EventId, EventPayload, Message};
+use crate::types::{Call, EventId, EventPayload, Message, Outcome};
 
 /// What a transcript row is, for styling by the renderer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -80,7 +80,10 @@ pub struct ChatState {
     streaming: Vec<(AgentId, String)>,
     /// The first agent seen — the default transcript when none is selected.
     main_agent: Option<AgentId>,
-    /// The open `run_program` block per agent: its inner `Invoke`s and a
+    /// Transcript row index of each logged `Call`, so its `Result` can
+    /// complete the row in place rather than pushing a second line.
+    call_rows: HashMap<EventId, usize>,
+    /// The open `run_program` block per agent: its inner calls and a
     /// folding `resume` attach here.
     current_program: HashMap<AgentId, EventId>,
     /// Live status per program block, titling its header.
@@ -213,14 +216,37 @@ impl ChatState {
             // The report body lives in the right console/result pane, not
             // the transcript (decision 2).
             EventPayload::Message(Message::Tool { .. }) => {}
-            EventPayload::Invoke { name, result, .. } => {
+            // A call is logged at dispatch, so its row appears the moment
+            // it is issued; the `Result` completes the same row in place.
+            EventPayload::Call(call) => {
                 if let Some(&program) = self.current_program.get(&agent) {
+                    let name = match call {
+                        Call::Invoke { name, .. } => name.clone(),
+                        Call::Send { expects_reply, .. } => {
+                            if *expects_reply { "ask" } else { "tell" }.to_owned()
+                        }
+                        Call::Spawn { .. } => "spawn".to_owned(),
+                    };
+                    self.call_rows.insert(id, self.entries.len());
                     self.entries.push(Entry::Line {
                         agent,
                         kind: ChatKind::ToolCall,
-                        text: format!("⚙ {name} → {}", short(result)),
+                        text: format!("⚙ {name} → …"),
                         program: Some(program),
                     });
+                }
+            }
+            EventPayload::Result { call, outcome } => {
+                if let Some(&row) = self.call_rows.get(call)
+                    && let Some(Entry::Line { text, .. }) = self.entries.get_mut(row)
+                {
+                    let head = text.rsplit_once(" → ").map(|(h, _)| h.to_owned());
+                    if let Some(head) = head {
+                        *text = match outcome {
+                            Outcome::Delivered(v) => format!("{head} → {}", short(v)),
+                            Outcome::Failed(msg) => format!("{head} → failed: {msg}"),
+                        };
+                    }
                 }
             }
             // Execution/marker events are debug-pane data, never transcript.
@@ -387,13 +413,23 @@ mod tests {
         )
     }
 
-    fn invoke(id: u64, name: &str, result: serde_json::Value) -> SessionEvent {
+    fn invoke(id: u64, name: &str) -> SessionEvent {
         ev(
             id,
-            EventPayload::Invoke {
+            EventPayload::Call(Call::Invoke {
                 name: name.into(),
                 args: serde_json::json!([]),
-                result,
+                site: 0,
+            }),
+        )
+    }
+
+    fn settled(id: u64, call: u64, result: serde_json::Value) -> SessionEvent {
+        ev(
+            id,
+            EventPayload::Result {
+                call: EventId::new(call),
+                outcome: Outcome::Delivered(result),
             },
         )
     }
@@ -462,8 +498,12 @@ mod tests {
             },
         ));
         chat.apply(&run_program(2));
-        chat.apply(&invoke(3, "fetch", serde_json::json!("A")));
-        chat.apply(&invoke(4, "store", serde_json::json!(true)));
+        chat.apply(&invoke(3, "fetch"));
+        chat.apply(&invoke(4, "store"));
+        // The `Result`s complete the rows already pushed at dispatch —
+        // two calls stay two lines, not four.
+        chat.apply(&settled(5, 3, serde_json::json!("A")));
+        chat.apply(&settled(6, 4, serde_json::json!(true)));
 
         let rows = chat.rows(None);
         let glyphs: Vec<&(ChatKind, String, RowDetail)> = rows

@@ -718,6 +718,12 @@ pub struct InvokeCall {
     pub name: String,
     /// Arguments in call order (`args[0]` is the first argument).
     pub args: Vec<Value>,
+    /// Source byte offset of the `Invoke` instruction that issued this
+    /// call — `spans[ip]` at the call site. The harness logs it on the
+    /// call event so a report can annotate the program source per call
+    /// site without a live VM (17_BRANCHES). `0` for hand-assembled
+    /// programs, which carry no spans.
+    pub site: u32,
 }
 
 #[derive(Debug, PartialEq)]
