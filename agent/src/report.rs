@@ -95,20 +95,28 @@ pub enum ResumeKind {
     No,
 }
 
-/// The **restarts** section: what is eligible for this suspension, one
-/// line each, with a reminder of what it does.
+/// The **restarts** section: what is eligible for *this suspension*.
 ///
-/// The tool list is constant (cache discipline), so which restarts are
-/// valid is a report-level fact rather than a schema one — and recency
-/// beats a rule stated far back in the context, which is why the lines
-/// are here and the *rules* are in the card.
+/// It carries only what is a fact about this handback. The `resume`
+/// wording genuinely differs by suspension kind — what `value` means for
+/// a raise, for a failed operation, or for a program merely parked —
+/// so it belongs in a message that renders identically forever.
 ///
-/// Every input is read from the log at this handback's own position, so
-/// a historical report keeps rendering the same list forever.
+/// Two things that used to be here are not:
+///
+/// - **the open-post list.** Whether a question is still owed is a fact
+///   about the branch *now*, not about this handback, and a rendered
+///   message keeps saying it forever: `answer(#4, value)` stays correct
+///   for the moment it describes while becoming a standing invitation to
+///   make an ineligible call. Obligations ride the trailing ephemeral
+///   line, which is always exactly one and always current.
+/// - **the explanation of `run_program`.** That is a *rule*, constant in
+///   every report ever rendered, and the cache-discipline split puts
+///   rules in the card where they are cached for the branch's life. The
+///   name stays, because which restarts are eligible is still a
+///   report-level fact; the forty words do not.
 pub struct Restarts {
     pub resume: ResumeKind,
-    /// Posts open on this branch **at this outcome**, oldest first.
-    pub open: Vec<EventId>,
 }
 
 impl Restarts {
@@ -131,25 +139,7 @@ impl Restarts {
                 out.push_str("(this condition is not resumable — resume is not offered)\n")
             }
         }
-        for (n, post) in self.open.iter().enumerate() {
-            if n >= MENU_MAX_ENTRIES {
-                out.push_str(&format!(
-                    "- ({} more open questions; every id stays answerable)\n",
-                    self.open.len() - n
-                ));
-                break;
-            }
-            out.push_str(&format!(
-                "- answer(#{}, value): answer that question with a JSON value; the \
-                 program is left exactly as it is\n",
-                post.as_u64()
-            ));
-        }
-        out.push_str(
-            "- run_program(source): replace the program — new source runs in a \
-             fresh VM; results in the artifact menu stay fetchable via \
-             tools.tool_result(id), so reuse them instead of repeating calls",
-        );
+        out.push_str("- run_program(source)");
         out
     }
 }
@@ -178,8 +168,10 @@ pub struct ConditionReport {
     pub console: Vec<String>,
     /// The `Console` event the tail comes from, named when it clips.
     pub console_id: Option<u64>,
-    /// Every artifact on the agent so far, oldest first (the renderer
-    /// prunes to the most recent).
+    /// The artifacts this handback added, oldest first — the same bound
+    /// the completion report uses, so the reports on a branch partition
+    /// its artifacts instead of each one re-listing its predecessor's.
+    /// The trailing line says how many exist in total and their id range.
     pub artifacts: Vec<Artifact>,
     pub restarts: Restarts,
 }
@@ -197,7 +189,7 @@ impl ConditionReport {
         out.push('\n');
         out.push_str(&render_console(&self.console, self.console_id));
         out.push_str("\n\n");
-        out.push_str(&render_menu("artifacts", &self.artifacts));
+        out.push_str(&render_menu("new artifacts", &self.artifacts));
         out.push_str("\n\n");
         out.push_str(&self.restarts.render());
         out
@@ -516,7 +508,7 @@ pub fn clip_answer(s: &str, max: usize, id: Option<u64>) -> String {
 
 /// Bump when the rendered format changes. The report memo is a cache of
 /// *one* renderer's output, so a change drops it wholesale.
-pub const REPORT_FORMAT_VERSION: u32 = 1;
+pub const REPORT_FORMAT_VERSION: u32 = 2;
 
 /// Cap a program's console for the log: a diagnostic stream, not data.
 /// Keeps the **tail** (the latest output before the stop) and replaces
@@ -546,8 +538,6 @@ pub fn cap_console(lines: &[String], event_hint: &str) -> Vec<String> {
 /// One program run's slice of a branch's path: the turn that drove it,
 /// the outcome it produced, and the events in between.
 struct Handback<'t> {
-    /// The `Turn` whose tool call this report answers.
-    turn: &'t Event,
     /// The source the turn asked to run (empty for a non-`run_program`).
     source: String,
     /// Whether the turn passed a non-empty `attachments` map.
@@ -566,10 +556,11 @@ struct Handback<'t> {
     /// must render identically **forever**, so a historical one cannot
     /// grow new rows as the branch continues past it.
     outcome_at: usize,
-    /// Posts open on this branch **at this outcome** — the same bound,
-    /// for the same reason: a historical report cannot offer to answer a
-    /// question that arrived after it.
-    open: Vec<EventId>,
+    /// The previous outcome's id on this path, or 0 at the agent root.
+    /// The menu's **lower** bound: every artifact then appears in
+    /// exactly one report, with no gaps and no repetition, instead of
+    /// every condition report re-listing its predecessor's rows.
+    previous_outcome: u64,
     /// The log, for resolving a `Post` whose body lives in its `Send`.
     /// Nothing here reads *live* state: only events, by id.
     tree: &'t Tree,
@@ -628,6 +619,14 @@ pub fn outcomes_of_turn(tree: &Tree, leaf: EventId, turn: EventId) -> Vec<EventI
 fn handback<'t>(tree: &'t Tree, leaf: EventId, outcome: EventId) -> Option<Handback<'t>> {
     let path = tree.path_events(leaf);
     let at = path.iter().position(|e| e.id == outcome)?;
+    // Where this report's menu starts: the outcome before it, so the
+    // reports on a branch partition its artifacts rather than each one
+    // re-rendering the last one's rows.
+    let previous_outcome = path[..at]
+        .iter()
+        .rposition(|e| is_outcome(&e.payload))
+        .map(|i| path[i].id.as_u64())
+        .unwrap_or(0);
     // The turn this outcome belongs to: the nearest `Turn` above it.
     let turn_at = path[..at]
         .iter()
@@ -651,10 +650,8 @@ fn handback<'t>(tree: &'t Tree, leaf: EventId, outcome: EventId) -> Option<Handb
             _ => None,
         })
         .unwrap_or_default();
-    let open = open_at(tree, &path[..=at]);
     Some(Handback {
         tree,
-        turn,
         source,
         had_attachments,
         outcome: path[at],
@@ -663,7 +660,7 @@ fn handback<'t>(tree: &'t Tree, leaf: EventId, outcome: EventId) -> Option<Handb
         path: path.clone(),
         turn_at,
         outcome_at: at,
-        open,
+        previous_outcome,
     })
 }
 
@@ -690,7 +687,7 @@ fn render_handback(h: &Handback<'_>, budget: usize) -> String {
             budget,
             console: h.console.clone(),
             console_id: h.console_id,
-            new_artifacts: menu_since(h, h.turn.id.as_u64()),
+            new_artifacts: menu_since(h, h.previous_outcome),
             advise_attachments: !h.had_attachments && inlined_large_body(h),
             failed_calls: h.path[h.turn_at + 1..=h.outcome_at]
                 .iter()
@@ -724,10 +721,9 @@ fn render_handback(h: &Handback<'_>, budget: usize) -> String {
                 },
                 console: h.console.clone(),
                 console_id: h.console_id,
-                artifacts: menu_since(h, 0),
+                artifacts: menu_since(h, h.previous_outcome),
                 restarts: Restarts {
                     resume: resume_kind(cause),
-                    open: h.open.clone(),
                 },
             }
             .render(),
@@ -871,37 +867,6 @@ fn resume_kind(cause: &Cause) -> ResumeKind {
         Cause::Posted { .. } => ResumeKind::Continue,
         _ => ResumeKind::No,
     }
-}
-
-/// Posts open at a point on the path, oldest first — `replay_event`'s
-/// `open` rule applied to a **prefix**.
-///
-/// The prefix is the point: a rendered report must render identically
-/// forever, so a historical one cannot list a question that arrived
-/// after it. A branch root resets the list (an `Agent` starts a
-/// clean-room context; a `Fork` inherits history but not obligations),
-/// which is what makes a fork's report offer no `answer` for a pre-fork
-/// post — the same rule `eligible` enforces at the call.
-fn open_at(tree: &Tree, path: &[&Event]) -> Vec<EventId> {
-    let mut open: Vec<EventId> = Vec::new();
-    for event in path {
-        match &event.payload {
-            EventPayload::Agent { .. } | EventPayload::Fork { .. } => open.clear(),
-            EventPayload::Message(post @ Message::Post { .. }) => {
-                // Resolved first: a `Post` whose body lives in its `Send`
-                // carries `expects_reply` there, not inline.
-                if matches!(tree.resolve(post),
-                            Message::Post { origin, .. }
-                            if matches!(origin.direct(), Some((_, _, true))))
-                {
-                    open.push(event.id);
-                }
-            }
-            EventPayload::Answer { question, .. } => open.retain(|id| id != question),
-            _ => {}
-        }
-    }
-    open
 }
 
 /// The artifact menu for this handback: every call **up to this
@@ -1284,6 +1249,88 @@ mod tests {
         assert!(text.contains("not resumable"), "{text}");
     }
 
+    /// **Every artifact appears in exactly one report**: each menu is
+    /// bounded below by the previous outcome, so the reports on a branch
+    /// partition its artifacts with no gaps and no repetition. Before
+    /// this, every condition report re-listed its predecessor's rows, and
+    /// a branch with N conditions carried N near-identical menus in a
+    /// prefix it can never shed.
+    #[test]
+    fn reports_partition_the_artifacts_they_list() {
+        let mut tree = Tree::new(None);
+        let mut spine = tree.start_agent(None, None, "agent", None, "").unwrap();
+        let mut ids = Vec::new();
+        let mut outcomes = Vec::new();
+        // Two handbacks, each with its own call and result.
+        for run in 0..2 {
+            tree.append(
+                &mut spine,
+                EventPayload::Message(Message::Turn {
+                    author: Author::Agent(EventId::new(1)),
+                    text: String::new(),
+                    thinking: None,
+                    tool_calls: vec![crate::types::ToolCall {
+                        id: format!("c{run}"),
+                        name: "run_program".into(),
+                        arguments: json!({ "source": "return 1;" }),
+                    }],
+                }),
+            )
+            .unwrap();
+            let call = tree
+                .append(
+                    &mut spine,
+                    EventPayload::Call(Call::Invoke {
+                        name: "read".into(),
+                        args: json!([run]),
+                        site: 0,
+                    }),
+                )
+                .unwrap();
+            ids.push(call.as_u64());
+            tree.append(
+                &mut spine,
+                EventPayload::Result {
+                    call,
+                    outcome: crate::types::Outcome::Delivered(json!(run)),
+                },
+            )
+            .unwrap();
+            outcomes.push(
+                tree.append(&mut spine, EventPayload::Return { value: json!(run) })
+                    .unwrap(),
+            );
+        }
+        let leaf = spine.leaf_id;
+        let rows = |o: EventId| -> Vec<u64> {
+            let h = handback(&tree, leaf, o).expect("a handback");
+            menu_since(&h, h.previous_outcome)
+                .into_iter()
+                .map(|a| a.id)
+                .collect()
+        };
+        let first = rows(outcomes[0]);
+        let second = rows(outcomes[1]);
+        // No repetition…
+        assert!(
+            first.iter().all(|id| !second.contains(id)),
+            "{first:?} / {second:?}"
+        );
+        // …and no gaps: every artifact — each call, and each run's own
+        // `Return` — is listed by exactly one report.
+        let every: Vec<u64> = ids
+            .iter()
+            .copied()
+            .chain(outcomes.iter().map(|o| o.as_u64()))
+            .collect();
+        for id in &every {
+            assert!(
+                first.contains(id) ^ second.contains(id),
+                "#{id} listed once: {first:?} / {second:?}"
+            );
+        }
+    }
+
     #[test]
     fn clip_bounds_and_marks() {
         let big = "x".repeat(5000);
@@ -1374,7 +1421,6 @@ mod tests {
             artifacts: Vec::new(),
             restarts: Restarts {
                 resume: ResumeKind::Raise,
-                open: Vec::new(),
             },
         };
         let rendered = report.render();
@@ -1433,7 +1479,6 @@ mod tests {
             artifacts: vec![artifact(7, "fetch([\"big\"])", json!("b".repeat(9000)))],
             restarts: Restarts {
                 resume: ResumeKind::Operation,
-                open: Vec::new(),
             },
         };
         let rendered = report.render();
@@ -1550,7 +1595,6 @@ mod tests {
             artifacts: Vec::new(),
             restarts: Restarts {
                 resume: ResumeKind::No,
-                open: Vec::new(),
             },
         };
         let rendered = report.render();

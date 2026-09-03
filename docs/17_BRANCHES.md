@@ -1438,6 +1438,11 @@ events per step.
       existing ones are byte-identical (their branches have nothing open)
       and `golden_condition_report_with_an_open_question` pins the new
       `answer(#N, value)` line.
+      *(C3 takes the open-post lines back out, and the `run_program`
+      reminder with them: an open post is a **now**-fact and a rendered
+      message says it forever, and the reminder was a rule the same
+      cache-discipline split puts in the card. What is left is what
+      genuinely varies per handback — the `resume` wording.)*
 - [x] `llm.rs` gains `scripted_answer(call_id, question, value)` beside
       `scripted_program`/`scripted_resume`/`scripted_text`.
 - [x] Two open posts: a bare turn binds to the older, `answer` to the
@@ -1447,7 +1452,9 @@ events per step.
 - [x] Requests with >1 open post carry a bounded one-line note listing
       them by id. *(It rides a new `LlmRequest.tail` — the trailing
       ephemeral line after the newest message, which is the only place a
-      right-now fact may go. C1's presence line lands in the same field.)*
+      right-now fact may go. C1's presence line lands in the same field;
+      C3 drops the `>1` threshold, because a single open post is exactly
+      the one that gets stranded.)*
 - [x] Gate: `cargo fmt && cargo clippy --workspace --all-targets &&
       cargo test` green.
 
@@ -1464,7 +1471,12 @@ events per step.
       `fork_is_born_idle`). *(A `Runner` opened on an existing branch
       starts `shown` at its leaf, so a re-opened branch waits to be
       spoken to and a fork is born idle by the same line; lowering it
-      where reconciliation owes a prompt is C2's.)*
+      where reconciliation owes a prompt is C2's. And C3 adds the clause
+      this was missing: an **open** post is a cause whether or not it has
+      been shown. A bare turn answers the oldest and no more, so a branch
+      shown several questions answered one and stranded the rest past the
+      mark — each stranded agent-authored one a `Send` that never
+      settles.)*
 - [x] Request rendering places each derived tool message immediately after
       the `Turn` whose call it answers, regardless of log position; a user post logged mid-run
       renders after the report, and the report's *what happened* names
@@ -1722,6 +1734,79 @@ events per step.
       *(Left unchecked: it needs the network and is yours to run.)*
 - [x] Gate: `cargo fmt && cargo clippy --workspace --all-targets &&
       cargo test` green.
+
+### Step C3 — Obligations wake, and ride the tail (`machine.rs`, `report.rs`, `dialect.rs`)
+
+Found by C2, which made the disagreement observable: the in-session
+trigger rule and the recovery table said different things about the same
+state. A branch shown three questions answered one and went idle owing
+two — while row one of the reconciliation table said an open post means
+the branch becomes live. Reopening the log healed a state the running
+session could not leave.
+
+The rule that settles it: **`shown` and `open` answer different
+questions** — *what have I rendered?* and *what do I still owe?* — and
+reading the render mark as the obligation is what stranded them.
+
+- [x] **An open post is a cause.** `needs_prompt` wakes an idle branch
+      while anything is open, shown or not. It terminates by
+      construction: a bare turn discharges exactly one open post, so the
+      count strictly decreases, and "woke with nothing to discharge" is
+      precisely `open.is_empty()`. A fan-in of *n* asks is answered to
+      the last one and the branch then owes nothing
+      (`a_fan_in_of_asks_is_answered_to_the_last_one`); a **tell** wakes
+      once and never again, because it was never open
+      (`a_tell_wakes_once_and_owes_nothing`); a fork is still born idle,
+      because `replay_event` clears `open` at its root.
+      *(This is not a re-prompt. The `Post` is a cause event — logged,
+      visible, auditable, rendering identically forever — which is the
+      whole of what "never wake a branch without a cause event you can
+      name in the log" asks. What remains forbidden is the wake whose
+      only cause is the absence of one.)*
+- [x] **Obligations ride the trailing ephemeral line, not a rendered
+      message.** Every open post is listed, one included — the old
+      `>= 2` threshold rested on "a bare reply answers it, which is the
+      default anyway", which is exactly the assumption the stranded case
+      breaks. The line states the batching rule where the model will act
+      on it, and **presence still goes last**
+      (`many_open_posts_are_noted_in_the_request_tail`).
+- [x] **The condition report stops listing open posts.** Whether a
+      question is still owed is a fact about the branch *now*, not about
+      that handback, and a rendered message keeps saying it forever:
+      `answer(#4, value)` stays correct for the moment it describes while
+      becoming a standing invitation to make an ineligible call, one
+      refusal turn at a time. `Restarts` keeps only the `resume` wording,
+      which genuinely differs by suspension kind.
+      `golden_condition_report_with_an_open_question` pins the same fact
+      in the tail instead of in the report. `Handback.open` and `open_at`
+      are deleted with it.
+- [x] **Every artifact appears in exactly one report.** The condition
+      report listed the whole menu (`menu_since(h, 0)`) while the
+      completion report listed only its own run's, so a branch with N
+      conditions carried N near-identical menus in a prefix it can never
+      shed — at the boundary this project crosses most. Both are now
+      bounded below by the **previous outcome**, so the reports on a
+      branch partition its artifacts with no gaps and no repetition
+      (`reports_partition_the_artifacts_they_list`), and the tail carries
+      the pointer back: how many rows exist and the ids they span
+      (`the_tail_points_at_every_artifact_a_report_no_longer_lists`).
+- [x] **The `run_program` reminder moves to the card.** It was forty
+      constant words in every condition report ever rendered — a *rule*,
+      and the cache-discipline split puts rules in the card where they
+      are cached for the branch's life. The restart's **name** stays,
+      because which restarts are eligible is still a report-level fact.
+- [x] `REPORT_FORMAT_VERSION` bumped to 2; the report memo drops
+      wholesale, which is what that counter is for. Golden reports
+      updated — the change is deliberate, not incidental.
+- [x] Gate: `cargo fmt && cargo clippy --workspace --all-targets &&
+      cargo test` green.
+
+**What this leaves open, deliberately.** Whether an agent may *decline*
+to answer a question it has been shown. C3 says no by construction — an
+open post is owed until an `Answer` names it — and that is the reading
+the recovery table already had. If declining is ever wanted it needs its
+own **event**, for exactly the reason `Failed` is one: an absence cannot
+be told apart from a crash, an interruption, or a model that lost track.
 
 ---
 

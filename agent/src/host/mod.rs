@@ -5589,10 +5589,16 @@ mod tests {
         let (session, _rx) = open_routed(
             tree,
             [
-                // A bare turn binds the **oldest** open post, which is
-                // the user's — so the child's question stays open and
-                // the parent stays free to answer it deliberately.
-                ("root", vec![scripted_text("noted")]),
+                // The parent parks on a question of its own, so both its
+                // obligations stay open and it is not re-prompted for
+                // them while the child works.
+                (
+                    "root",
+                    vec![scripted_program(
+                        "p1",
+                        r#"return await tools.ask({ to: "user", text: "anything else?" });"#,
+                    )],
+                ),
                 // The child re-attaches to the call it already made,
                 // instead of asking a second time.
                 (

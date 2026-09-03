@@ -649,8 +649,30 @@ impl Runner {
         }
         // Any unseen `Post` is a cause — including one that arrived
         // during a generation, which the turn that just landed could not
-        // have answered (its binding was fixed at `shown`).
+        // have answered (its binding was fixed at `shown`), and including
+        // a tell, which owes no answer but must still be seen.
         if !self.unseen_posts(tree).is_empty() {
+            return true;
+        }
+        // **Any post still open is a cause**, shown or not.
+        //
+        // `shown` and `open` answer different questions — *what have I
+        // rendered?* and *what do I still owe?* — and they diverge in
+        // exactly one place: a bare turn answers the **oldest** open post
+        // and no more, so a branch shown three questions answers one and
+        // has two left, both already past the mark. Reading the render
+        // mark as the obligation stranded them, and an agent-authored
+        // post stranded that way is a `Send` that never settles — a
+        // program parked forever, which is the deadlock rule B claims to
+        // have ruled out.
+        //
+        // It terminates by construction: each bare turn discharges
+        // exactly one open post, so the count strictly decreases, and
+        // "woke with nothing to discharge" is precisely
+        // `open.is_empty()`. And it is a **legal** wake — the `Post` is a
+        // cause event, logged, visible, and rendering identically
+        // forever, which is the whole of what the rule asks.
+        if !self.open().is_empty() {
             return true;
         }
         // The crash-recovery clause: a run whose report was never sent
@@ -2221,7 +2243,7 @@ impl Runner {
             system,
             messages,
             tools: tool_specs(),
-            tail: self.request_tail(),
+            tail: self.request_tail(tree),
         })
     }
 
@@ -2242,10 +2264,10 @@ impl Runner {
     ///   not that a human is reading — and it is what lets an agent that
     ///   needs input choose between waiting (free) and proceeding on a
     ///   stated assumption.
-    fn request_tail(&self) -> Option<String> {
+    fn request_tail(&self, tree: &Tree) -> Option<String> {
         let mut lines: Vec<String> = Vec::new();
         let open = self.open();
-        if open.len() >= 2 {
+        if !open.is_empty() {
             let shown = open.len().min(OPEN_NOTE_MAX_IDS);
             let ids: Vec<String> = open[..shown]
                 .iter()
@@ -2255,16 +2277,51 @@ impl Runner {
                 0 => String::new(),
                 n => format!(", and {n} more"),
             };
+            let count = match open.len() {
+                1 => "1 question is".to_owned(),
+                n => format!("{n} questions are"),
+            };
             lines.push(format!(
-                "{} questions are open on this branch: {}{more}. A reply with no tool call \
-                 answers the oldest ({}); answer(question, value) picks one.",
-                open.len(),
+                "{count} open on this branch: {}{more}. A reply with no tool call answers \
+                 the oldest ({}); answer(question, value) picks one, and **several answer \
+                 calls may ride one turn**, optionally followed by one run_program or \
+                 resume.",
                 ids.join(", "),
                 ids[0],
             ));
         }
+        if let Some((count, first, last)) = self.artifact_span(tree) {
+            lines.push(format!(
+                "{count} artifacts on this branch, #{first}–#{last}. A report lists only \
+                 what is new since the last one; every id above stays fetchable with \
+                 tools.tool_result(id)."
+            ));
+        }
         lines.push(if self.attached { PRESENT } else { ABSENT }.to_owned());
         Some(lines.join("\n"))
+    }
+
+    /// How many **menu rows** this branch's path holds, and the id range
+    /// they span — the pointer that lets each report list only what is
+    /// *new* without putting an older id out of reach. Rows are keyed by
+    /// the call id, which is what a program reuses, so a `Result` is not
+    /// one of its own.
+    ///
+    /// Counted, never rendered: a menu row costs a preview, and this line
+    /// is re-emitted on every request.
+    fn artifact_span(&self, tree: &Tree) -> Option<(usize, u64, u64)> {
+        let ids: Vec<u64> = self
+            .agent_segment(tree)
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.payload,
+                    EventPayload::Call(_) | EventPayload::Return { .. }
+                )
+            })
+            .map(|e| e.id.as_u64())
+            .collect();
+        Some((ids.len(), *ids.first()?, *ids.last()?))
     }
 
     /// The rendered message list for a request: the branch's posts and
@@ -3877,12 +3934,12 @@ in <root>
 console (last 1 of 1 lines):
 fetched: 41
 
-## artifacts — fetch with tools.tool_result(id)
+## new artifacts — fetch with tools.tool_result(id)
 [#3] fetch(["a"]) → 41
 
 ## restarts
 - resume(value): continue past the raise; `value` becomes the result of the raise(...) expression
-- run_program(source): replace the program — new source runs in a fresh VM; results in the artifact menu stay fetchable via tools.tool_result(id), so reuse them instead of repeating calls"#
+- run_program(source)"#
         );
     }
 
@@ -3908,20 +3965,22 @@ return v.x;
 in <root>
 console: (no output)
 
-## artifacts — fetch with tools.tool_result(id)
+## new artifacts — fetch with tools.tool_result(id)
 (none)
 
 ## restarts
 - resume(value): continue as if the failed operation had produced `value`
-- run_program(source): replace the program — new source runs in a fresh VM; results in the artifact menu stay fetchable via tools.tool_result(id), so reuse them instead of repeating calls"#
+- run_program(source)"#
         );
     }
 
-    /// The **restarts** section lists what is eligible *for this
-    /// suspension* — so a branch that also owes an answer is told so,
-    /// with a one-line reminder of what each restart does. The rules
-    /// themselves stay in the card; recency beats a rule stated far back
-    /// in the context.
+    /// **An open question is not a fact about this handback.** The
+    /// report says what is eligible for *this suspension* and nothing
+    /// else; what the branch still owes rides the trailing ephemeral
+    /// line, where it is always exactly one list and always current.
+    ///
+    /// This used to pin an `answer(#2, value)` line in the report. It
+    /// pins the same fact, in the place a now-fact may live.
     #[test]
     fn golden_condition_report_with_an_open_question() {
         let (mut tree, mut state) = setup();
@@ -3932,7 +3991,7 @@ console: (no output)
                 StepInput::LlmResponse(llm_program("c1", "raise(\"need_path\", null);")),
             )
             .unwrap();
-        drain(&mut state, &mut tree, out);
+        let settled = drain(&mut state, &mut tree, out);
         assert_eq!(
             last_report(&state, &tree),
             r#"## what happened
@@ -3945,13 +4004,27 @@ payload: null
 in <root>
 console: (no output)
 
-## artifacts — fetch with tools.tool_result(id)
+## new artifacts — fetch with tools.tool_result(id)
 (none)
 
 ## restarts
 - resume(value): continue past the raise; `value` becomes the result of the raise(...) expression
-- answer(#2, value): answer that question with a JSON value; the program is left exactly as it is
-- run_program(source): replace the program — new source runs in a fresh VM; results in the artifact menu stay fetchable via tools.tool_result(id), so reuse them instead of repeating calls"#
+- run_program(source)"#
+        );
+        // The obligation is in the trailing line instead, named by id and
+        // with the batching rule stated where the model will act on it.
+        let tail = expect_request(&settled)
+            .tail
+            .clone()
+            .expect("the tail always carries at least presence");
+        assert!(
+            tail.contains("1 question is open on this branch: #2"),
+            "{tail}"
+        );
+        assert!(tail.contains("answer(question, value) picks one"), "{tail}");
+        assert!(
+            tail.contains("several answer calls may ride one turn"),
+            "{tail}"
         );
     }
 
@@ -4770,9 +4843,16 @@ got X
     fn many_open_posts_are_noted_in_the_request_tail() {
         let (mut tree, mut state) = setup();
         let out = user_post(&mut state, &mut tree, "first");
-        // One open post needs no note — a bare reply answers it — so the
-        // tail is the presence line alone.
-        assert_eq!(expect_request(&out).tail.as_deref(), Some(ABSENT));
+        // **Every** open post is listed, one included: the old threshold
+        // rested on "a bare reply answers it, which is the default
+        // anyway", and a branch left owing a question it was shown is
+        // exactly the case that assumption misses.
+        let one = expect_request(&out).tail.clone().expect("a tail");
+        assert!(
+            one.starts_with("1 question is open on this branch: #2."),
+            "{one}"
+        );
+        assert!(one.ends_with(ABSENT), "presence goes last: {one}");
 
         let (second, _) = state
             .deliver(&mut tree, Author::User, direct("second", true))
@@ -4801,7 +4881,118 @@ got X
             tail.contains(&format!("answers the oldest (#{})", first.as_u64())),
             "it says which one a bare reply takes: {tail}"
         );
-        assert!(tail.len() < 300, "bounded: {}", tail.len());
+        // The obligations *line* is the bounded one; the tail as a whole
+        // also carries the artifact span and presence, each its own line.
+        let note = tail.lines().next().expect("the obligations line");
+        assert!(note.len() < 300, "bounded: {}", note.len());
+        // Presence goes **last**, after every other per-request fact.
+        assert!(tail.ends_with(ABSENT), "{tail}");
+        // Nothing has been called yet, so there is no artifact line.
+        assert!(!tail.contains("artifacts on this branch"), "{tail}");
+    }
+
+    /// **A fan-in of n asks gets n answers.** A bare turn binds the
+    /// oldest open post and no more, so a branch shown several questions
+    /// used to answer one and strand the rest past the `shown` mark —
+    /// each stranded one an asker's `Send` that never settles and a
+    /// program parked forever. An open post is a cause, so the branch
+    /// keeps being woken until it owes nothing, and it terminates
+    /// because every bare turn discharges exactly one.
+    #[test]
+    fn a_fan_in_of_asks_is_answered_to_the_last_one() {
+        let (mut tree, mut state) = setup();
+        let mut posts = Vec::new();
+        let mut out = Vec::new();
+        for n in 0..4 {
+            let (post, o) = state
+                .deliver(&mut tree, Author::User, direct(&format!("q{n}"), true))
+                .unwrap();
+            posts.push(post);
+            out.extend(o);
+        }
+        assert_eq!(state.open(), posts, "four questions owed");
+
+        let mut answered = Vec::new();
+        let mut turns = 0;
+        while out.iter().any(|o| matches!(o, StepOutput::LlmRequest(_))) {
+            turns += 1;
+            assert!(turns <= posts.len(), "one turn per question, at most");
+            out = state
+                .step(&mut tree, StepInput::LlmResponse(llm_text("ok")))
+                .unwrap();
+            answered.extend(out.iter().filter_map(|o| match o {
+                StepOutput::Answered { question, .. } => *question,
+                _ => None,
+            }));
+        }
+        // Every one answered, oldest first, and the branch owes nothing.
+        assert_eq!(answered, posts);
+        assert!(state.open().is_empty());
+        assert!(state.is_idle());
+        // …and it stops there: nothing wakes a branch that owes nothing.
+        assert!(!state.needs_prompt(&tree));
+    }
+
+    /// A **tell** wakes the branch and owes nothing, so it must not join
+    /// the queue the rule above drains — otherwise a chatty notifier
+    /// would keep a branch talking forever.
+    #[test]
+    fn a_tell_wakes_once_and_owes_nothing() {
+        let (mut tree, mut state) = setup();
+        let (_, out) = state
+            .deliver(&mut tree, Author::Harness, direct("fyi", false))
+            .unwrap();
+        assert!(
+            out.iter().any(|o| matches!(o, StepOutput::LlmRequest(_))),
+            "an unseen tell is still a cause"
+        );
+        let out = state
+            .step(&mut tree, StepInput::LlmResponse(llm_text("noted")))
+            .unwrap();
+        assert!(state.open().is_empty());
+        assert!(!state.needs_prompt(&tree), "and it does not wake again");
+        assert!(!out.iter().any(|o| matches!(o, StepOutput::LlmRequest(_))));
+    }
+
+    /// Because a report now lists only what is **new**, the trailing line
+    /// carries the pointer back: how many artifacts the branch holds and
+    /// the ids they span, so an older one is never out of reach.
+    #[test]
+    fn the_tail_points_at_every_artifact_a_report_no_longer_lists() {
+        let (mut tree, mut state) = setup();
+        user_post(&mut state, &mut tree, "go");
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(llm_program("c1", "return await tools.read(\"a\");")),
+            )
+            .unwrap();
+        // Serve the call, then let the program finish and re-render.
+        let served = drain(&mut state, &mut tree, out);
+        let calls = expect_tool_calls(&served);
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::ToolResults(vec![ToolResult {
+                    call: calls[0].call,
+                    result: Ok(json!("A")),
+                }]),
+            )
+            .unwrap();
+        let settled = drain(&mut state, &mut tree, out);
+        let tail = expect_request(&settled).tail.clone().expect("a tail");
+        let line = tail
+            .lines()
+            .find(|l| l.contains("artifacts on this branch"))
+            .unwrap_or_else(|| panic!("{tail}"));
+        // Two **rows**: the call and the run's `Return`. A `Result` is
+        // not a row of its own — the menu is keyed by the call id, which
+        // is what a program reuses.
+        assert!(line.starts_with("2 artifacts on this branch, #"), "{line}");
+        assert!(
+            line.contains("A report lists only what is new since the last one"),
+            "{line}"
+        );
     }
 
     // ── B3: rule B — posts on arrival ───────────────────────────────
@@ -5310,15 +5501,13 @@ return [await a, await b];
 console (last 1 of 1 lines):
 reading
 
-## artifacts — fetch with tools.tool_result(id)
+## new artifacts — fetch with tools.tool_result(id)
 [#4] read(["a"]) → "A"
 [#5] read(["b"]) → issued; no result recorded; may have happened
 
 ## restarts
 - resume(): continue the program from where it stopped — nothing here asked for a value
-- answer(#2, value): answer that question with a JSON value; the program is left exactly as it is
-- answer(#7, value): answer that question with a JSON value; the program is left exactly as it is
-- run_program(source): replace the program — new source runs in a fresh VM; results in the artifact menu stay fetchable via tools.tool_result(id), so reuse them instead of repeating calls"#
+- run_program(source)"#
         );
     }
 }

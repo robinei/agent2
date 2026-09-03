@@ -192,11 +192,15 @@ const CARD_TAIL: &str = "\
 Three restarts are always offered; which one is *valid* depends on where \
 you are, and the report you are reading says which. The rules never \
 change:
-- run_program(source) — always valid.
+- run_program(source) — always valid. It replaces any program you are \
+running with a fresh VM; every artifact already listed stays fetchable by \
+id, so reuse results instead of repeating the calls that made them.
 - resume(value) — valid only when your last message is a condition \
 report for a program that is still suspended.
 - answer(question, value) — valid only for a post that is open on **this** \
-branch. A post someone else was asked is not yours to answer.
+branch. A post someone else was asked is not yours to answer. **Several \
+answer calls may ride one turn**, optionally followed by one run_program \
+or resume; each request's trailing line lists what is still open.
 An ineligible call is not silently dropped: it is answered with a \
 refusal that states what is true and what is valid now, so it costs you \
 one turn and nothing else. Read the report's restart list rather than \
@@ -426,6 +430,8 @@ mod tests {
             // B1: orchestration and eligibility.
             "## eligibility",
             "run_program(source) — always valid",
+            // C3: obligations are a now-fact, and answers batch.
+            "answer calls may ride one turn",
             "still suspended",
             "open on **this** branch",
             "answered with a refusal that states what is true",
