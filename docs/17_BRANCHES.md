@@ -1441,18 +1441,24 @@ events per step.
 
 ### Step B3 — Rule B: posts on arrival, `Condition::Posted`, the annotated report (`machine.rs`, `report.rs`)
 
-- [ ] `on_user_turn`'s panics deleted. A post is appended in **every**
+- [x] `on_user_turn`'s panics deleted *(in B1, when agent-authored posts
+      started flowing through the same door)*; the host's busy-rejection
+      of a `UserTurn` is deleted here. A post is appended in **every**
       phase; `Runner.shown: u64` (event-id high-water mark at the last
       request render) replaces any queue. The trigger rule is one
-      function, `Runner::needs_prompt(&self, spine) -> bool` — no VM held
+      function, `Runner::needs_prompt(&self, tree) -> bool` — no VM held
       and an unseen `Post`, or a `Turn` whose calls have outcomes — and every request is
-      rendered through it (`prompt_iff_unseen_post_and_no_vm`).
-- [ ] Request rendering places each derived tool message immediately after
+      rendered through it (`prompt_iff_unseen_post_and_no_vm`,
+      `fork_is_born_idle`). *(A `Runner` opened on an existing branch
+      starts `shown` at its leaf, so a re-opened branch waits to be
+      spoken to and a fork is born idle by the same line; lowering it
+      where reconciliation owes a prompt is C2's.)*
+- [x] Request rendering places each derived tool message immediately after
       the `Turn` whose call it answers, regardless of log position; a user post logged mid-run
       renders after the report, and the report's *what happened* names
       its arrival (`mid_run_post_renders_after_the_report`; the
       `deepseek.rs` request-body fixture covers the adjacency).
-- [ ] `Running` + unseen post at `Tick` → `Condition::Posted`: report
+- [x] `Running` + unseen post at `Tick` → `Condition::Posted`: report
       whose *what happened* is the message(s), author-labelled and marked
       *asks you* / *tells you*; *where* is
       the **annotated source** (every call site → `#id done` / `#id
@@ -1460,22 +1466,40 @@ events per step.
       happened`) plus console tail; restarts `answer` / `resume` /
       `run_program`. `resume()` re-enters the same VM; outstanding results
       still land (`post_to_running_program_resumes_cleanly`).
-- [ ] `AwaitingLlm` + post: the post is already logged; on `LlmDone`, a
+      *(A **parked** program has no next slice of its own — it is
+      awaiting a call and burning no fuel — so `deliver` asks for one.
+      That is what makes "at the next slice" a guarantee rather than a
+      hope, and it is why an upward question cannot deadlock.)*
+- [x] `AwaitingLlm` + post: the post is already logged; on `LlmDone`, a
       text answer → idle → the post starts the next turn; a `run_program`
       → first slice suspends with the post
-      (`post_during_generation_lands_after_it`).
-- [ ] Suspended-on-a-condition + post → appended beside the report, re-request with the
+      (`post_during_generation_lands_after_it`,
+      `post_during_generation_suspends_the_program_it_started`).
+- [x] Suspended-on-a-condition + post → appended beside the report, re-request with the
       same menu (`post_while_suspended_is_shown_beside_the_report`).
-- [ ] Upward round trip, scripted: parent awaits child; child program
+      *(No **immediate** re-request: a suspended branch has its condition
+      report out and is awaiting the restart choice, so a second request
+      would double-prompt. The next request shows both, and the pending
+      report re-renders byte-identically — which is the responsiveness
+      table's own wording ("appended beside the pending report; the next
+      request shows both"). `Interrupt` (C1) is the override that makes a
+      post land now.)*
+- [x] Upward round trip, scripted: parent awaits child; child program
       `tools.ask({ text })` posts to the running parent; parent's LLM
       `answer`s + `resume`s in one turn; child gets its `Result`, answers;
       parent's ask resolves (`upward_clarification_does_not_deadlock`).
-- [ ] Rewrite-with-reuse: a user post mid-fan-out; the scripted rewrite
+- [x] Rewrite-with-reuse: a user post mid-fan-out; the scripted rewrite
       reuses two done results by id and `await`s one pending by id; no
       call is re-issued (`post_rewrite_reuses_done_and_pending_by_id`).
-- [ ] Golden render for the post-condition report, annotated source
-      included; every section bounded by named consts.
-- [ ] Gate: `cargo fmt && cargo clippy --workspace --all-targets &&
+      *(Re-attach is by "this session still has it in flight", not by
+      call variant: the **menu's** wording is derived from the log, which
+      cannot tell a live worker from one that died with the process, so
+      it stays cautious for an `Invoke`. The session knows better.)*
+- [x] Golden render for the post-condition report, annotated source
+      included; every section bounded by named consts
+      (`golden_post_condition_report`; `POST_MAX_BYTES`,
+      `ANNOTATED_SOURCE_MAX_BYTES`, `ANNOTATIONS_PER_LINE`).
+- [x] Gate: `cargo fmt && cargo clippy --workspace --all-targets &&
       cargo test` green.
 
 ### Step B4 — Budget as a rendering rule (`machine.rs`, `report.rs`, `dialect.rs`)

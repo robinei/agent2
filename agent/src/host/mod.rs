@@ -415,15 +415,11 @@ impl Session {
                     });
                     return Ok(());
                 };
-                if !state.is_idle() {
-                    // Steering a busy agent is M2's host-injected
-                    // condition; until then the command is rejected.
-                    self.emit(SessionEvent::Error {
-                        agent: Some(root),
-                        message: format!("agent is busy ({})", state.status()),
-                    });
-                    return Ok(());
-                }
+                // **Nothing you say is ever rejected.** A post is logged
+                // on arrival in every phase and delivered at the
+                // recipient's next safe point — for a running program,
+                // its next fuel slice (rule B).
+                let _ = state;
                 self.awaiting_user = false; // the user took their turn
                 self.deliver_post(
                     root,
@@ -2391,17 +2387,21 @@ mod tests {
         }
     }
 
+    /// **Rule B.** A post to a running program is logged on arrival and
+    /// the run suspends into `Condition::Posted` at its next fuel slice —
+    /// never rejected, never queued invisibly, never lost to a crash.
+    /// (Re-pointed from the M2-era test that asserted the rejection.)
     #[test]
-    fn user_turn_while_busy_is_rejected_not_panicked() {
+    fn user_turn_while_busy_suspends_the_program() {
         let (tx, rx) = channel();
         let mut session = Session::new(
             Tree::new(None),
             "test agent",
             ToolRegistry::new(),
-            Box::new(ScriptedLlm::new([scripted_program(
-                "c1",
-                "while (true) {}",
-            )])),
+            Box::new(ScriptedLlm::new([
+                scripted_program("c1", "while (true) {}"),
+                scripted_text("stopping, then"),
+            ])),
             tx,
         )
         .unwrap();
@@ -2411,19 +2411,44 @@ mod tests {
             text: "go".into(),
         });
         for _ in 0..10 {
-            assert!(session.pump_one());
+            assert!(session.pump_one(), "the hot program keeps ticking");
         }
         handle.send(SessionCommand::UserTurn {
             branch: session.root(),
             text: "are you done yet?".into(),
         });
-        for _ in 0..5 {
-            assert!(session.pump_one());
-        }
-        let saw_rejection = rx
-            .try_iter()
-            .any(|e| matches!(&e, SessionEvent::Error { message, .. } if message.contains("busy")));
-        assert!(saw_rejection);
+        session.pump_until(Instant::now() + QUIET, &mut Vec::new());
+        // No rejection: the post landed, and the hot program suspended
+        // into a condition whose report *is* the message.
+        assert!(
+            !rx.try_iter().any(
+                |e| matches!(&e, SessionEvent::Error { message, .. } if message.contains("busy"))
+            ),
+            "nothing you say is rejected"
+        );
+        let tree = session.tree();
+        let post = tree
+            .events
+            .values()
+            .find(|e| {
+                matches!(&e.payload,
+                EventPayload::Message(Message::Post { origin, .. })
+                if origin.direct().is_some_and(|(t, _, _)| t == "are you done yet?"))
+            })
+            .expect("the post is logged on arrival")
+            .id;
+        let posted = tree
+            .events
+            .values()
+            .find_map(|e| match &e.payload {
+                EventPayload::Condition {
+                    cause: Cause::Posted { ids },
+                    ..
+                } => Some(ids.clone()),
+                _ => None,
+            })
+            .expect("the run suspended into Condition::Posted");
+        assert_eq!(posted, [post], "the condition names the message");
         handle.send(SessionCommand::Shutdown);
         while session.pump_one() {}
     }
@@ -3423,12 +3448,28 @@ mod tests {
             Address::Branch(session.root()),
             "a subagent's asker is its parent's branch"
         );
-        // It reached the parent: logged on arrival, even mid-program.
-        assert_eq!(
-            kinds(tree, root_leaf(&session)).last(),
-            Some(&"Post"),
-            "logged on the running parent's branch: {:?}",
+        // It reached the parent: logged on arrival even mid-program, and
+        // heard there as a condition (rule B, `upward_clarification_
+        // does_not_deadlock` walks the whole round trip).
+        let parent_path = tree.path_events(root_leaf(&session));
+        assert!(
+            parent_path.iter().any(|e| matches!(
+                &e.payload,
+                EventPayload::Message(Message::Post { from: Author::Agent(a), .. })
+                if tree.enclosing_agent(*a) != Some(session.root())
+            )),
+            "the worker's question is on the parent's branch: {:?}",
             kinds(tree, root_leaf(&session))
+        );
+        assert!(
+            parent_path.iter().any(|e| matches!(
+                &e.payload,
+                EventPayload::Condition {
+                    cause: Cause::Posted { .. },
+                    ..
+                }
+            )),
+            "and the running parent suspended on it"
         );
     }
 
@@ -3641,5 +3682,131 @@ mod tests {
             ["Agent", "Post", "Turn", "Answer", "Turn"]
         );
         assert!(tree.spine_at(worker_leaf).context().open.is_empty());
+    }
+
+    // ── B3: the upward round trip ───────────────────────────────────
+
+    /// **Upward questions cannot deadlock.** A parent awaiting its child
+    /// is one fuel slice from being told: the post suspends the parent's
+    /// program into a condition, its LLM answers and resumes in one turn,
+    /// the child's `Result` lands, the child answers, and the parent's ask
+    /// resolves.
+    ///
+    /// A real runtime deadlocks here because the waiter is on a stack.
+    /// Here the waiter is a `StepResult`, which is the whole point of
+    /// rule B being written against fuel slices.
+    #[test]
+    fn upward_clarification_does_not_deadlock() {
+        // Ids are deterministic: Agent 1, Post 2, Turn 3, Spawn 4,
+        // Agent 5, Result 6, Send 7 (parent→child), Post 8 (on the
+        // child), Turn 9, Send 10 (child→parent), Post 11 (on the
+        // parent) — so the parent answers #11 and the child answers #8.
+        let child_question = 8;
+        let upward_question = 11;
+        let (session, _) = run_routed(
+            ToolRegistry::new(),
+            [
+                (
+                    "needs a path",
+                    vec![
+                        // The child asks upward with no `to`: whoever
+                        // asked it. It is parked, costing no fuel.
+                        scripted_program(
+                            "w1",
+                            r#"const path = await tools.ask({ text: "which file?" });
+                               return "read " + path;"#,
+                        ),
+                        scripted_text("done, read PLAN.md"),
+                    ],
+                ),
+                (
+                    "test agent",
+                    vec![
+                        scripted_program(
+                            "c1",
+                            r#"const w = await tools.spawn(
+                                 { name: "w", charter: "needs a path" });
+                               return await tools.ask({ to: w.agent, text: "read the plan" });"#,
+                        ),
+                        // The post-condition report's first move: answer
+                        // and carry on, in one turn.
+                        LlmTurn {
+                            text: String::new(),
+                            thinking: None,
+                            tool_calls: vec![
+                                ToolCall {
+                                    id: "a1".into(),
+                                    name: crate::machine::TOOL_ANSWER.into(),
+                                    arguments: json!({
+                                        "question": upward_question,
+                                        "value": "PLAN.md",
+                                    }),
+                                },
+                                ToolCall {
+                                    id: "r1".into(),
+                                    name: crate::machine::TOOL_RESUME.into(),
+                                    arguments: json!({}),
+                                },
+                            ],
+                        },
+                        scripted_text("the worker read it"),
+                    ],
+                ),
+            ],
+            "have the worker read the plan",
+        );
+        let tree = session.tree();
+        let child = agent_by_charter(tree, "needs a path");
+        let child_leaf = session.state(child).unwrap().spine.leaf_id;
+
+        // The hardcoded ids really are those two posts.
+        for id in [child_question, upward_question] {
+            assert!(
+                matches!(
+                    &tree.events[&EventId::new(id)].payload,
+                    EventPayload::Message(Message::Post {
+                        origin: Origin::Sent(_),
+                        ..
+                    })
+                ),
+                "#{id} must be a delivered question"
+            );
+        }
+        // The parent heard the upward question as a *condition*, not as a
+        // deadlock.
+        assert!(
+            tree.events.values().any(|e| matches!(
+                &e.payload,
+                EventPayload::Condition { cause: Cause::Posted { ids }, .. }
+                if ids.contains(&EventId::new(upward_question))
+            )),
+            "the running parent suspended on the child's question"
+        );
+        // Both sides of both exchanges settled, and the parent's program
+        // got the child's answer.
+        // The child's *program* returned into its own context; what
+        // crossed to the parent is the child's answer — its final turn,
+        // which is the exchange's other half.
+        assert_eq!(returned(tree, child_leaf), json!("read PLAN.md"));
+        assert_eq!(
+            returned(tree, root_leaf(&session)),
+            json!("done, read PLAN.md"),
+            "the child's answer reached the parent's program"
+        );
+        assert_eq!(
+            kinds(tree, child_leaf),
+            [
+                "Agent", "Post", "Turn", "Call", "Result", "Return", "Console", "Turn", "Answer"
+            ],
+            "the child asked, was answered, finished, and answered in turn"
+        );
+        // Nothing is left owed anywhere.
+        for (_, leaf) in tree.branches() {
+            assert!(
+                tree.spine_at(leaf).context().open.is_empty(),
+                "branch at #{} still owes an answer",
+                leaf.as_u64()
+            );
+        }
     }
 }

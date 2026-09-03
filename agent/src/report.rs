@@ -44,6 +44,12 @@ pub const CONSOLE_MAX_BYTES: usize = 256 * 1024;
 pub const CONSOLE_LINE_MAX_BYTES: usize = 200;
 /// Artifact-menu entries shown (most recent kept; older ids stay valid).
 pub const MENU_MAX_ENTRIES: usize = 20;
+/// Max bytes of one arriving post quoted in a post-condition report.
+pub const POST_MAX_BYTES: usize = 1024;
+/// Max bytes of the annotated program source in a post-condition report.
+pub const ANNOTATED_SOURCE_MAX_BYTES: usize = 4096;
+/// Calls named on one annotated source line before it says "and N more".
+pub const ANNOTATIONS_PER_LINE: usize = 6;
 /// Per-entry preview bytes in the artifact menu.
 pub const PREVIEW_MAX_BYTES: usize = 256;
 
@@ -148,13 +154,26 @@ impl Restarts {
     }
 }
 
+/// The **where** section: where the program stopped.
+///
+/// A raise or a trap stopped at a point, so the honest answer is the
+/// call-stack chain. A *post* stopped it nowhere in particular — the VM
+/// is parked between slices — so the honest answer is the whole program
+/// with its progress marked, which is also what turns a rewrite into a
+/// copy-edit rather than a reconstruction.
+pub enum Whence {
+    /// Call-stack function names, outermost first.
+    Stack(Vec<String>),
+    /// The program source, every call site annotated by its artifact.
+    AnnotatedSource(String),
+}
+
 /// The `run_program` tool result for a raise/trapped error.
 pub struct ConditionReport {
     /// Rendered diagnostic: condition name + payload, or the trapped
     /// error with source line and caret.
     pub what: String,
-    /// Call-stack function names, outermost first.
-    pub stack: Vec<String>,
+    pub whence: Whence,
     /// Full console log (the renderer tails it).
     pub console: Vec<String>,
     /// Every artifact on the agent so far, oldest first (the renderer
@@ -169,7 +188,10 @@ impl ConditionReport {
         out.push_str("## what happened\n");
         out.push_str(&clip(&self.what, WHAT_MAX_BYTES));
         out.push_str("\n\n## where\n");
-        out.push_str(&render_stack(&self.stack));
+        match &self.whence {
+            Whence::Stack(stack) => out.push_str(&render_stack(stack)),
+            Whence::AnnotatedSource(source) => out.push_str(source),
+        }
         out.push('\n');
         out.push_str(&render_console(&self.console));
         out.push_str("\n\n");
@@ -514,6 +536,9 @@ struct Handback<'t> {
     /// for the same reason: a historical report cannot offer to answer a
     /// question that arrived after it.
     open: Vec<EventId>,
+    /// The log, for resolving a `Post` whose body lives in its `Send`.
+    /// Nothing here reads *live* state: only events, by id.
+    tree: &'t Tree,
 }
 
 /// The `run_program` source and attachment flag carried by a tool call.
@@ -590,6 +615,7 @@ fn handback<'t>(tree: &'t Tree, leaf: EventId, outcome: EventId) -> Option<Handb
         .unwrap_or_default();
     let open = open_at(tree, &path[..=at]);
     Some(Handback {
+        tree,
         turn,
         source,
         had_attachments,
@@ -636,8 +662,14 @@ fn render_handback(h: &Handback<'_>, budget: usize) -> String {
             // is valid now, so the model recovers on its next turn.
             Cause::Refused { reason } => format!("refused: {reason}"),
             _ => ConditionReport {
-                what: what_happened(cause, *site, &h.source),
-                stack: stack.clone(),
+                what: what_happened(h, cause, *site),
+                // A post stopped the program nowhere in particular: the
+                // useful "where" is the whole program with its progress
+                // marked, which is what a rewrite copy-edits.
+                whence: match cause {
+                    Cause::Posted { .. } => Whence::AnnotatedSource(annotated_source(h)),
+                    _ => Whence::Stack(stack.clone()),
+                },
                 console: h.console.clone(),
                 artifacts: menu_since(h, 0),
                 restarts: Restarts {
@@ -654,7 +686,8 @@ fn render_handback(h: &Handback<'_>, budget: usize) -> String {
 /// The "what happened" diagnostic, rebuilt from the logged cause, the
 /// logged site, and the source in the turn's tool-call args — the three
 /// inputs that used to live only in the VM.
-fn what_happened(cause: &Cause, site: u32, source: &str) -> String {
+fn what_happened(h: &Handback<'_>, cause: &Cause, site: u32) -> String {
+    let source = &h.source;
     match cause {
         Cause::Raised { name, payload } => {
             let mut what = diagnostic(source, site, &format!("condition `{name}` raised"));
@@ -667,12 +700,38 @@ fn what_happened(cause: &Cause, site: u32, source: &str) -> String {
             what
         }
         Cause::Trapped { message, .. } => diagnostic(source, site, message),
+        // The product surface of this phase: the report a running branch
+        // gets when someone speaks to it. What happened **is** the
+        // message — author-labelled, and marked with what it owes you.
         Cause::Posted { ids } => {
-            let names: Vec<String> = ids.iter().map(|id| format!("#{}", id.as_u64())).collect();
-            format!(
-                "message(s) arrived while the program was running: {}",
-                names.join(", ")
-            )
+            let mut what = String::from(
+                "Someone spoke to you while your program was running. It is paused at \
+                 its last fuel slice; nothing was lost.\n",
+            );
+            for id in ids {
+                let Some(EventPayload::Message(post)) = h.tree.events.get(id).map(|e| &e.payload)
+                else {
+                    continue;
+                };
+                let Message::Post { from, origin } = h.tree.resolve(post) else {
+                    continue;
+                };
+                // *asks you* versus *tells you*: what it owes, which is
+                // the difference between `ask` and `tell` and the only
+                // thing the model has to decide about differently.
+                let owed = match origin.direct() {
+                    Some((_, _, true)) => "asks you",
+                    _ => "tells you",
+                };
+                what.push_str(&format!(
+                    "\n[#{}] {} — {}\n{}\n",
+                    id.as_u64(),
+                    author_label(from),
+                    owed,
+                    clip(&render_post(from, &origin), POST_MAX_BYTES),
+                ));
+            }
+            what.trim_end().to_owned()
         }
         Cause::Interrupted => {
             "This program was interrupted before completing — the process died and the VM \
@@ -681,6 +740,17 @@ fn what_happened(cause: &Cause, site: u32, source: &str) -> String {
                 .to_owned()
         }
         Cause::CompileFailed { message } | Cause::Refused { reason: message } => message.clone(),
+    }
+}
+
+/// Who a post is from, for the report's author label. A post from the
+/// person driving the session is unlabelled in the transcript, but a
+/// report *about* an arrival has to name them.
+fn author_label(from: Author) -> String {
+    match from {
+        Author::User => "the user".into(),
+        Author::Harness => "the harness".into(),
+        Author::Agent(id) => format!("agent {}", id.as_u64()),
     }
 }
 
@@ -758,6 +828,60 @@ fn menu_since(h: &Handback<'_>, since: u64) -> Vec<Artifact> {
         .unwrap_or(0);
     let segment: Vec<&Event> = h.path[start..=h.outcome_at].to_vec();
     crate::machine::menu_rows(&segment, since)
+}
+
+/// The program source with **every call site annotated by its
+/// artifact** — the section that makes "change course" a copy-edit
+/// rather than a reconstruction.
+///
+/// `site` on every `Call` is what makes this possible: a byte offset
+/// logged at dispatch, so the annotation is derived from the log with no
+/// live VM. Pending *sends* are re-awaitable by id and say so; pending
+/// host calls are not, and say that instead.
+fn annotated_source(h: &Handback<'_>) -> String {
+    // Line starts, so a byte offset becomes a line index.
+    let line_of = |offset: u32| -> usize {
+        h.source
+            .bytes()
+            .take(offset as usize)
+            .filter(|b| *b == b'\n')
+            .count()
+    };
+    let mut notes: Vec<Vec<String>> = vec![Vec::new(); h.source.lines().count().max(1)];
+    let segment: Vec<&Event> = h.path[..=h.outcome_at].to_vec();
+    for event in &h.path[h.turn_at + 1..=h.outcome_at] {
+        let EventPayload::Call(call) = &event.payload else {
+            continue;
+        };
+        let id = event.id.as_u64();
+        let note = match crate::machine::settlement_of(&segment, event.id) {
+            Some(crate::types::Outcome::Delivered(_)) => format!("#{id} done"),
+            Some(crate::types::Outcome::Failed(_)) => format!("#{id} failed"),
+            None => match call {
+                Call::Send { .. } => {
+                    format!("#{id} pending — await tools.tool_result({id})")
+                }
+                _ => format!("#{id} issued; may have happened"),
+            },
+        };
+        let line = line_of(call.site()).min(notes.len().saturating_sub(1));
+        notes[line].push(note);
+    }
+    let mut out = String::new();
+    for (n, line) in h.source.lines().enumerate() {
+        out.push_str(line);
+        let on_this_line = notes.get(n).map(Vec::as_slice).unwrap_or_default();
+        if !on_this_line.is_empty() {
+            let shown = on_this_line.len().min(ANNOTATIONS_PER_LINE);
+            out.push_str("  // → ");
+            out.push_str(&on_this_line[..shown].join(", "));
+            if on_this_line.len() > shown {
+                out.push_str(&format!(", and {} more", on_this_line.len() - shown));
+            }
+        }
+        out.push('\n');
+    }
+    clip(out.trim_end(), ANNOTATED_SOURCE_MAX_BYTES)
 }
 
 /// Whether this run inlined a file body longer than a snippet into
@@ -1024,7 +1148,7 @@ mod tests {
     fn what_section_is_bounded() {
         let report = ConditionReport {
             what: "w".repeat(10_000),
-            stack: vec!["<root>".into()],
+            whence: Whence::Stack(vec!["<root>".into()]),
             console: Vec::new(),
             artifacts: Vec::new(),
             restarts: Restarts {
@@ -1078,7 +1202,7 @@ mod tests {
     fn artifact_previews_are_bounded() {
         let report = ConditionReport {
             what: "boom".into(),
-            stack: vec!["<root>".into()],
+            whence: Whence::Stack(vec!["<root>".into()]),
             console: Vec::new(),
             artifacts: vec![artifact(7, "fetch([\"big\"])", json!("b".repeat(9000)))],
             restarts: Restarts {
@@ -1190,7 +1314,7 @@ mod tests {
     fn not_resumable_drops_resume_and_says_so() {
         let report = ConditionReport {
             what: "stack overflow".into(),
-            stack: Vec::new(),
+            whence: Whence::Stack(Vec::new()),
             console: Vec::new(),
             artifacts: Vec::new(),
             restarts: Restarts {
