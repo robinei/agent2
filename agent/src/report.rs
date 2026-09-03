@@ -54,7 +54,7 @@ pub struct ConditionReport {
     pub stack: Vec<String>,
     /// Full console log (the renderer tails it).
     pub console: Vec<String>,
-    /// Every artifact on the frame so far, oldest first (the renderer
+    /// Every artifact on the agent so far, oldest first (the renderer
     /// prunes to the most recent).
     pub artifacts: Vec<Artifact>,
     pub resume: ResumeKind,
@@ -96,11 +96,11 @@ impl ConditionReport {
 
 /// The `run_program` tool result for a successful run.
 pub struct CompletionReport {
-    /// The program's top-level return value — the frame's *answer* into
+    /// The program's top-level return value — the agent's *answer* into
     /// context, rendered up to [`Self::budget`] with the full value kept
     /// as a fetchable `ProgramResult` artifact.
     pub value: serde_json::Value,
-    /// Byte budget for the returned-value section (the frame's answer
+    /// Byte budget for the returned-value section (the agent's answer
     /// budget). Replaces the fixed `VALUE_MAX_BYTES` clip.
     pub budget: usize,
     /// Full console log (the renderer tails it).
@@ -206,12 +206,12 @@ fn looks_like_build(label: &str) -> bool {
 
 fn render_stack(stack: &[String]) -> String {
     if stack.is_empty() {
-        return "in (no live frames)".into();
+        return "in (no live contexts)".into();
     }
     if stack.len() > STACK_MAX_FRAMES {
         let omitted = stack.len() - STACK_MAX_FRAMES;
         format!(
-            "in … ({omitted} outer frames omitted) → {}",
+            "in … ({omitted} outer contexts omitted) → {}",
             stack[omitted..].join(" → ")
         )
     } else {
@@ -277,7 +277,7 @@ pub fn clip(s: &str, max: usize) -> String {
     format!("{}… [truncated; {} bytes total]", &s[..end], s.len())
 }
 
-/// Clip a frame's *answer* (the returned value) to its budget. Unlike
+/// Clip an agent's *answer* (the returned value) to its budget. Unlike
 /// [`clip`], an over-budget answer's marker names the fetch id so the full
 /// value stays reachable (`tools.tool_result(#id)`) — the answer is the
 /// one value the model may genuinely need in full (12_ANSWERS).
@@ -353,8 +353,8 @@ mod tests {
     fn stack_keeps_innermost_frames() {
         let stack: Vec<String> = (0..12).map(|i| format!("f{i}")).collect();
         let rendered = render_stack(&stack);
-        assert!(rendered.contains("(4 outer frames omitted)"));
-        assert!(!rendered.contains("f3 →"), "outer frames gone");
+        assert!(rendered.contains("(4 outer contexts omitted)"));
+        assert!(!rendered.contains("f3 →"), "outer contexts gone");
         assert!(rendered.ends_with("f11"), "innermost kept: {rendered}");
     }
 

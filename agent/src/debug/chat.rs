@@ -11,19 +11,19 @@
 //! `ProgramStatus`) with the program's inner `Invoke`s listed beneath as
 //! `⚙` lines; a `resume` folds into the same block. The completion/
 //! condition report body is *not* inlined — it lives in the right
-//! console/result pane. The transcript is **per-frame** (decision 6):
-//! `rows(frame)` renders just that frame's slice, including its own
+//! console/result pane. The transcript is **per-agent** (decision 6):
+//! `rows(agent)` renders just that agent's slice, including its own
 //! clean-room `System` prompt.
 
 use std::collections::HashMap;
 
-use crate::host::{FrameId, ProgramStatus, SessionEvent};
+use crate::host::{AgentId, ProgramStatus, SessionEvent};
 use crate::types::{EventId, EventPayload, Message};
 
 /// What a transcript row is, for styling by the renderer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ChatKind {
-    /// The frame's stored system prompt (a collapsible header).
+    /// The agent's stored system prompt (a collapsible header).
     System,
     User,
     Assistant,
@@ -33,7 +33,7 @@ pub enum ChatKind {
     ToolCall,
     /// An attachment line within a program block.
     Attachment,
-    /// Frame lifecycle markers.
+    /// Context lifecycle markers.
     Marker,
     Error,
 }
@@ -55,7 +55,7 @@ pub enum RowDetail {
 /// program's `ProgramStatus`; every other entry is a fixed line.
 enum Entry {
     Line {
-        frame: FrameId,
+        agent: AgentId,
         kind: ChatKind,
         text: String,
         /// The program this row belongs to (for click hit-testing): the
@@ -65,7 +65,7 @@ enum Entry {
     },
     /// A `run_program` block header, keyed by the program's event id.
     Header {
-        frame: FrameId,
+        agent: AgentId,
         program: EventId,
         /// Attachment names in definition order.
         attachments: Vec<String>,
@@ -75,14 +75,14 @@ enum Entry {
 #[derive(Default)]
 pub struct ChatState {
     entries: Vec<Entry>,
-    /// Accumulating streamed text per frame, shown until the logged
+    /// Accumulating streamed text per agent, shown until the logged
     /// assistant message replaces it.
-    streaming: Vec<(FrameId, String)>,
-    /// The first frame seen — the default transcript when none is selected.
-    main_frame: Option<FrameId>,
-    /// The open `run_program` block per frame: its inner `Invoke`s and a
+    streaming: Vec<(AgentId, String)>,
+    /// The first agent seen — the default transcript when none is selected.
+    main_agent: Option<AgentId>,
+    /// The open `run_program` block per agent: its inner `Invoke`s and a
     /// folding `resume` attach here.
-    current_program: HashMap<FrameId, EventId>,
+    current_program: HashMap<AgentId, EventId>,
     /// Live status per program block, titling its header.
     program_status: HashMap<EventId, ProgramStatus>,
     /// Attachment content per program: program_id → (name → content).
@@ -97,30 +97,30 @@ impl ChatState {
     pub fn apply(&mut self, event: &SessionEvent) {
         match event {
             SessionEvent::Chunk {
-                frame,
+                agent,
                 thinking,
                 text,
             } => {
                 if *thinking {
                     return; // thinking stays live-only and unrendered for now
                 }
-                match self.streaming.iter_mut().find(|(f, _)| f == frame) {
+                match self.streaming.iter_mut().find(|(f, _)| f == agent) {
                     Some((_, buf)) => buf.push_str(text),
-                    None => self.streaming.push((*frame, text.clone())),
+                    None => self.streaming.push((*agent, text.clone())),
                 }
             }
-            SessionEvent::Error { frame, message } => {
-                if let Some(f) = frame.or(self.main_frame) {
+            SessionEvent::Error { agent, message } => {
+                if let Some(f) = agent.or(self.main_agent) {
                     self.entries.push(Entry::Line {
-                        frame: f,
+                        agent: f,
                         kind: ChatKind::Error,
                         text: format!("error: {message}"),
                         program: None,
                     });
                 }
             }
-            SessionEvent::Event { frame, event } => {
-                self.apply_payload(*frame, event.id, &event.payload);
+            SessionEvent::Event { agent, event } => {
+                self.apply_payload(*agent, event.id, &event.payload);
             }
             // Live program-block status titles the matching header.
             SessionEvent::ProgramStatus {
@@ -133,17 +133,17 @@ impl ChatState {
         }
     }
 
-    fn apply_payload(&mut self, frame: FrameId, id: EventId, payload: &EventPayload) {
+    fn apply_payload(&mut self, agent: AgentId, id: EventId, payload: &EventPayload) {
         match payload {
-            EventPayload::FrameStart { .. } => {
-                // The frame's prompt renders via its `System` block; the
-                // frames pane carries its identity. Just track the main one.
-                self.main_frame.get_or_insert(frame);
+            EventPayload::Agent { .. } => {
+                // The agent's prompt renders via its `System` block; the
+                // contexts pane carries its identity. Just track the main one.
+                self.main_agent.get_or_insert(agent);
             }
             EventPayload::FrameResult { result } => {
-                if Some(frame) != self.main_frame {
+                if Some(agent) != self.main_agent {
                     self.entries.push(Entry::Line {
-                        frame,
+                        agent,
                         kind: ChatKind::Marker,
                         text: format!("subagent finished: {result}"),
                         program: None,
@@ -152,7 +152,7 @@ impl ChatState {
             }
             EventPayload::Message(Message::System { text }) => {
                 self.entries.push(Entry::Line {
-                    frame,
+                    agent,
                     kind: ChatKind::System,
                     text: text.clone(),
                     program: Some(id),
@@ -160,7 +160,7 @@ impl ChatState {
             }
             EventPayload::Message(Message::User { text }) => {
                 self.entries.push(Entry::Line {
-                    frame,
+                    agent,
                     kind: ChatKind::User,
                     text: text.clone(),
                     program: None,
@@ -169,10 +169,10 @@ impl ChatState {
             EventPayload::Message(Message::Assistant {
                 text, tool_calls, ..
             }) => {
-                self.streaming.retain(|(f, _)| *f != frame);
+                self.streaming.retain(|(f, _)| *f != agent);
                 if !text.is_empty() {
                     self.entries.push(Entry::Line {
-                        frame,
+                        agent,
                         kind: ChatKind::Assistant,
                         text: text.clone(),
                         program: None,
@@ -200,11 +200,11 @@ impl ChatState {
                         })
                         .unwrap_or_default();
                     self.entries.push(Entry::Header {
-                        frame,
+                        agent,
                         program: id,
                         attachments: attachment_names,
                     });
-                    self.current_program.insert(frame, id);
+                    self.current_program.insert(agent, id);
                     if !attachments.is_empty() {
                         self.attachment_content.insert(id, attachments);
                     }
@@ -214,9 +214,9 @@ impl ChatState {
             // the transcript (decision 2).
             EventPayload::Message(Message::Tool { .. }) => {}
             EventPayload::Invoke { name, result, .. } => {
-                if let Some(&program) = self.current_program.get(&frame) {
+                if let Some(&program) = self.current_program.get(&agent) {
                     self.entries.push(Entry::Line {
-                        frame,
+                        agent,
                         kind: ChatKind::ToolCall,
                         text: format!("⚙ {name} → {}", short(result)),
                         program: Some(program),
@@ -229,13 +229,13 @@ impl ChatState {
         }
     }
 
-    /// Transcript rows for `frame` (or the main frame when `None`): one
+    /// Transcript rows for `agent` (or the main agent when `None`): one
     /// `(kind, line, detail)` per visual line. `detail` carries click-hit
     /// metadata: which program, attachment, or invoke a row targets.
     /// Multi-line items split; the system prompt collapses to a single
     /// header row.
-    pub fn rows(&self, frame: Option<FrameId>) -> Vec<(ChatKind, String, RowDetail)> {
-        let Some(target) = frame.or(self.main_frame) else {
+    pub fn rows(&self, agent: Option<AgentId>) -> Vec<(ChatKind, String, RowDetail)> {
+        let Some(target) = agent.or(self.main_agent) else {
             return Vec::new();
         };
         let mut out = Vec::new();
@@ -243,10 +243,10 @@ impl ChatState {
         for entry in &self.entries {
             match entry {
                 Entry::Header {
-                    frame,
+                    agent,
                     program,
                     attachments,
-                } if *frame == target => {
+                } if *agent == target => {
                     let status = self
                         .program_status
                         .get(program)
@@ -266,11 +266,11 @@ impl ChatState {
                     }
                 }
                 Entry::Line {
-                    frame,
+                    agent,
                     kind,
                     text,
                     program,
-                } if *frame == target => {
+                } if *agent == target => {
                     if *kind == ChatKind::System {
                         out.push((ChatKind::System, "system".into(), RowDetail::None));
                         continue;
@@ -362,7 +362,7 @@ mod tests {
 
     fn ev(id: u64, payload: EventPayload) -> SessionEvent {
         SessionEvent::Event {
-            frame: EventId::new(1),
+            agent: EventId::new(1),
             event: Event {
                 id: EventId::new(id),
                 parent_id: None,
@@ -403,7 +403,7 @@ mod tests {
         let mut chat = ChatState::new();
         chat.apply(&ev(
             1,
-            EventPayload::FrameStart {
+            EventPayload::Agent {
                 prompt: "be helpful".into(),
                 input: serde_json::Value::Null,
             },
@@ -413,7 +413,7 @@ mod tests {
             EventPayload::Message(Message::User { text: "hi".into() }),
         ));
         chat.apply(&SessionEvent::Chunk {
-            frame: EventId::new(1),
+            agent: EventId::new(1),
             thinking: false,
             text: "thinki".into(),
         });
@@ -456,7 +456,7 @@ mod tests {
         let mut chat = ChatState::new();
         chat.apply(&ev(
             1,
-            EventPayload::FrameStart {
+            EventPayload::Agent {
                 prompt: "p".into(),
                 input: serde_json::Value::Null,
             },
@@ -496,7 +496,7 @@ mod tests {
         );
         // …and tracks ProgramStatus to completed.
         chat.apply(&SessionEvent::ProgramStatus {
-            frame: EventId::new(1),
+            agent: EventId::new(1),
             program: EventId::new(2),
             status: ProgramStatus::Completed,
         });
@@ -524,15 +524,15 @@ mod tests {
     }
 
     /// The stored `System` renders as the leading `system` row of its
-    /// frame, and selecting another frame shows that frame's slice (its
+    /// agent, and selecting another agent shows that agent's slice (its
     /// own system block), not the root's.
     #[test]
-    fn system_block_is_leading_and_per_frame() {
+    fn system_block_is_leading_and_per_agent() {
         let mut chat = ChatState::new();
-        // Root frame #1.
+        // Root agent #1.
         chat.apply(&ev(
             1,
-            EventPayload::FrameStart {
+            EventPayload::Agent {
                 prompt: "root".into(),
                 input: serde_json::Value::Null,
             },
@@ -549,10 +549,10 @@ mod tests {
                 text: "root q".into(),
             }),
         ));
-        // Subagent frame #4 with its own system prompt.
+        // Subagent agent #4 with its own system prompt.
         let child = EventId::new(4);
         let child_event = |id: u64, payload| SessionEvent::Event {
-            frame: child,
+            agent: child,
             event: Event {
                 id: EventId::new(id),
                 parent_id: None,
@@ -562,7 +562,7 @@ mod tests {
         };
         chat.apply(&child_event(
             4,
-            EventPayload::FrameStart {
+            EventPayload::Agent {
                 prompt: "child".into(),
                 input: serde_json::Value::Null,
             },

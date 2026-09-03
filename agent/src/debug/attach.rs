@@ -2,18 +2,18 @@
 //! harness session — this *is* the harness TUI (decision 6). The chat
 //! pane consumes `SessionEvent`s only (`chat.rs`); user input goes
 //! through `SessionCommand`; the debug panes borrow the selected
-//! frame's VM and the tree directly because rendering happens on the
+//! agent's VM and the tree directly because rendering happens on the
 //! loop thread (decision 4): crossterm input arrives as inbox messages
 //! via a cloned `SessionHandle`, and we render after draining.
 //!
 //! Layout state machine (pure UI state — nothing in the host changes):
 //! - **Chat** (default): full-width chat.
-//! - **Running**: auto-popped when the *selected* frame starts a
+//! - **Running**: auto-popped when the *selected* agent starts a
 //!   `run_program` — source + console as a right column, sticky after
 //!   completion for post-mortem reading; `c` collapses back, `1`–`4`
 //!   override the auto-pop set.
 //! - **FullDebug** (`d`): the standalone layout — console/result left,
-//!   full debug pane stack right, chat hidden; `1`–`9` switch frames.
+//!   full debug pane stack right, chat hidden; `1`–`9` switch agents.
 //!
 //! Keys are focus-modal so chat typing stays free: printable keys go
 //! to the input line; `Esc` swaps to debug-control focus (and back).
@@ -33,9 +33,9 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use super::app::PaneInfo;
 use super::chat::{ChatKind, ChatState, RowDetail};
 use super::ui;
-use crate::host::{FrameId, Session, SessionCommand, SessionEvent};
+use crate::host::{AgentId, Session, SessionCommand, SessionEvent};
 use crate::machine::TOOL_RUN_PROGRAM;
-use crate::tree::{FrameView, ProgramView};
+use crate::tree::{AgentView, ProgramView};
 use crate::types::{EventId, EventPayload, Message};
 
 /// Cap for one step-line key, so a hot loop on one source line cannot
@@ -60,7 +60,7 @@ pub enum Focus {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Pane {
     Chat,
-    FrameList,
+    Navigator,
     Source,
     Disasm,
     Stack,
@@ -101,16 +101,16 @@ pub struct AttachedApp {
     pub view: View,
     prev_view: View,
     pub focus: Focus,
-    pub selected: Option<FrameId>,
+    pub selected: Option<AgentId>,
     /// Which program the right-hand panes show (decision 1). `None` ⇒ the
-    /// selected frame's most-recent program (the default); a click on an
+    /// selected agent's most-recent program (the default); a click on an
     /// older chat block pins a specific one by its `run_program` event id.
     pub selected_program: Option<EventId>,
     /// A subitem within the selected program: an attachment or invoke to
     /// show in the right panel instead of the program console.
     pub selected_subitem: Option<Subitem>,
-    /// Frames whose `System` block is folded to its header (decision 7).
-    collapsed: HashSet<FrameId>,
+    /// Agents whose `System` block is folded to its header (decision 7).
+    collapsed: HashSet<AgentId>,
     pub input: String,
     pub quit: bool,
     pub show_source: bool,
@@ -128,7 +128,7 @@ pub struct AttachedApp {
 }
 
 impl AttachedApp {
-    pub fn new(root: FrameId) -> Self {
+    pub fn new(root: AgentId) -> Self {
         AttachedApp {
             chat: ChatState::new(),
             view: View::Chat,
@@ -156,18 +156,18 @@ impl AttachedApp {
     }
 
     /// Feed one `SessionEvent`: updates the transcript and drives the
-    /// auto-pop — the selected frame starting a `run_program` pops the
+    /// auto-pop — the selected agent starting a `run_program` pops the
     /// source + console column (decision 6).
     pub fn apply(&mut self, event: &SessionEvent) {
-        if let SessionEvent::Event { frame, event } = event
-            && Some(*frame) == self.selected
+        if let SessionEvent::Event { agent, event } = event
+            && Some(*agent) == self.selected
             && matches!(
                 &event.payload,
                 EventPayload::Message(Message::Assistant { tool_calls, .. })
                     if tool_calls.iter().any(|c| c.name == TOOL_RUN_PROGRAM)
             )
         {
-            // Follow the live program: a fresh run on the selected frame
+            // Follow the live program: a fresh run on the selected agent
             // drops any pinned older program.
             self.selected_program = None;
             if self.view == View::Chat {
@@ -200,9 +200,9 @@ impl AttachedApp {
         }
     }
 
-    pub fn on_mouse(&mut self, column: u16, row: u16, kind: MouseEventKind, frames: &[FrameId]) {
+    pub fn on_mouse(&mut self, column: u16, row: u16, kind: MouseEventKind, agents: &[AgentId]) {
         if matches!(kind, MouseEventKind::Down(MouseButton::Left)) {
-            self.on_click(column, row, frames);
+            self.on_click(column, row, agents);
             return;
         }
         let delta: i64 = match kind {
@@ -221,7 +221,7 @@ impl AttachedApp {
             Pane::Disasm => self.disasm_scroll = Some(new),
             Pane::Stack => self.stack_scroll = Some(new),
             Pane::Promises => self.promises_scroll = Some(new),
-            Pane::FrameList => {}
+            Pane::Navigator => {}
         }
     }
 
@@ -238,21 +238,21 @@ impl AttachedApp {
             .copied()
     }
 
-    /// Left-click hit-testing (decision 7): a frames-pane row retargets
-    /// the frame; a chat-block row pins the program; a `system` header
-    /// toggles its frame's fold.
-    fn on_click(&mut self, column: u16, row: u16, frames: &[FrameId]) {
+    /// Left-click hit-testing (decision 7): a navigator row retargets
+    /// the agent; a chat-block row pins the program; a `system` header
+    /// toggles its agent's fold.
+    fn on_click(&mut self, column: u16, row: u16, agents: &[AgentId]) {
         let Some((pane, info)) = self.pane_at(column, row) else {
             return;
         };
         // Row within the bordered pane body (the top border is row 0).
         let body = (row as usize).checked_sub(info.area.y as usize + 1);
         match pane {
-            Pane::FrameList => {
+            Pane::Navigator => {
                 if let Some(idx) = body
-                    && let Some(&fid) = frames.get(idx)
+                    && let Some(&fid) = agents.get(idx)
                 {
-                    self.select_frame(fid);
+                    self.select_agent(fid);
                 }
             }
             Pane::Chat => {
@@ -261,10 +261,10 @@ impl AttachedApp {
                 let rows = self.chat.rows(self.selected);
                 if let Some((kind, _text, detail)) = rows.get(line) {
                     if *kind == ChatKind::System {
-                        if let Some(frame) = self.selected
-                            && !self.collapsed.remove(&frame)
+                        if let Some(agent) = self.selected
+                            && !self.collapsed.remove(&agent)
                         {
-                            self.collapsed.insert(frame);
+                            self.collapsed.insert(agent);
                         }
                         return;
                     }
@@ -304,10 +304,10 @@ impl AttachedApp {
         }
     }
 
-    /// Point both selection axes at `frame`: it becomes the chat focus and
+    /// Point both selection axes at `agent`: it becomes the chat focus and
     /// the panes fall back to its most-recent program (decision 1).
-    fn select_frame(&mut self, frame: FrameId) {
-        self.selected = Some(frame);
+    fn select_agent(&mut self, agent: AgentId) {
+        self.selected = Some(agent);
         self.selected_program = None;
         self.reset_program_scrolls();
     }
@@ -325,16 +325,16 @@ impl AttachedApp {
     /// The layout state machine's output: view state in, pane set out.
     pub fn pane_set(&self) -> PaneSet {
         match self.view {
-            // The frames pane is persistent top-right in every view
+            // The navigator is persistent top-right in every view
             // (decision 7); Step 5 fills the rest of the column from
             // `selected_program`.
             View::Chat => PaneSet {
                 chat: true,
                 console_left: false,
-                right: vec![Pane::FrameList],
+                right: vec![Pane::Navigator],
             },
             View::Running => {
-                let mut right = vec![Pane::FrameList];
+                let mut right = vec![Pane::Navigator];
                 if self.show_source {
                     right.push(Pane::Source);
                 }
@@ -358,7 +358,7 @@ impl AttachedApp {
                 chat: false,
                 console_left: true,
                 right: vec![
-                    Pane::FrameList,
+                    Pane::Navigator,
                     Pane::Source,
                     Pane::Disasm,
                     Pane::Stack,
@@ -368,17 +368,17 @@ impl AttachedApp {
         }
     }
 
-    pub fn on_key(&mut self, code: KeyCode, frames: &[FrameId]) -> KeyAction {
-        // Frame switching works everywhere.
+    pub fn on_key(&mut self, code: KeyCode, agents: &[AgentId]) -> KeyAction {
+        // Context switching works everywhere.
         if code == KeyCode::Tab {
-            self.cycle_frame(frames);
+            self.cycle_agent(agents);
             return KeyAction::None;
         }
         match self.view {
-            View::FullDebug => self.on_debug_key(code, frames),
+            View::FullDebug => self.on_debug_key(code, agents),
             View::Chat | View::Running => match self.focus {
                 Focus::Input => self.on_input_key(code),
-                Focus::Debug => self.on_debug_key(code, frames),
+                Focus::Debug => self.on_debug_key(code, agents),
             },
         }
     }
@@ -408,7 +408,7 @@ impl AttachedApp {
         }
     }
 
-    fn on_debug_key(&mut self, code: KeyCode, frames: &[FrameId]) -> KeyAction {
+    fn on_debug_key(&mut self, code: KeyCode, agents: &[AgentId]) -> KeyAction {
         match code {
             KeyCode::Char('q') => {
                 self.quit = true;
@@ -445,9 +445,9 @@ impl AttachedApp {
             KeyCode::Char(c @ '1'..='9') => {
                 let idx = (c as u8 - b'1') as usize;
                 if self.view == View::FullDebug {
-                    // 1–9 switch which frame the panes borrow.
-                    if let Some(id) = frames.get(idx) {
-                        self.select_frame(*id);
+                    // 1–9 switch which agent the panes borrow.
+                    if let Some(id) = agents.get(idx) {
+                        self.select_agent(*id);
                     }
                 } else if self.view == View::Running {
                     // 1–4 override the auto-pop set.
@@ -465,45 +465,45 @@ impl AttachedApp {
         }
     }
 
-    fn cycle_frame(&mut self, frames: &[FrameId]) {
-        if frames.is_empty() {
+    fn cycle_agent(&mut self, agents: &[AgentId]) {
+        if agents.is_empty() {
             return;
         }
         let next = match self
             .selected
-            .and_then(|s| frames.iter().position(|f| *f == s))
+            .and_then(|s| agents.iter().position(|f| *f == s))
         {
-            Some(i) => (i + 1) % frames.len(),
+            Some(i) => (i + 1) % agents.len(),
             None => 0,
         };
-        self.select_frame(frames[next]);
+        self.select_agent(agents[next]);
     }
 }
 
-/// The current spine leaf for `frame` — from the live state if available
-/// (resume-friendly session), or the first leaf in the frame's subtree
+/// The current spine leaf for `agent` — from the live state if available
+/// (resume-friendly session), or the first leaf in the agent's subtree
 /// from the tree projection (log-only, decision 8).
-fn find_leaf(session: &Session, frame: FrameId) -> Option<EventId> {
-    if let Some(state) = session.state(frame) {
+fn find_leaf(session: &Session, agent: AgentId) -> Option<EventId> {
+    if let Some(state) = session.state(agent) {
         return Some(state.spine.leaf_id);
     }
     session.tree().list_leaves().iter().find_map(|(id, _)| {
         session
             .tree()
-            .enclosing_frame(*id)
-            .filter(|ef| *ef == frame)?;
+            .enclosing_agent(*id)
+            .filter(|ef| *ef == agent)?;
         Some(*id)
     })
 }
 
 /// If `program` is the current (or most-recently-completed) program in
-/// `frame`, returns the VM for rich introspection — otherwise `None` (it
+/// `agent`, returns the VM for rich introspection — otherwise `None` (it
 /// is an older program rendered from the log projection, Step 5).
-fn vm_for_program(session: &Session, frame: FrameId, program: EventId) -> Option<&interp::VM> {
-    let state = session.state(frame)?;
+fn vm_for_program(session: &Session, agent: AgentId, program: EventId) -> Option<&interp::VM> {
+    let state = session.state(agent)?;
     let vm = state.vm()?;
     let leaf = state.spine.leaf_id;
-    let programs = session.tree().programs_for(frame, leaf);
+    let programs = session.tree().programs_for(agent, leaf);
     if programs.last().map(|p| p.id) == Some(program) {
         Some(vm)
     } else {
@@ -519,18 +519,18 @@ fn resolve_program<'a>(
     app: &AttachedApp,
     session: &'a Session,
 ) -> (Option<&'a interp::VM>, Option<ProgramView>) {
-    let Some(frame) = app.selected else {
+    let Some(agent) = app.selected else {
         return (None, None);
     };
-    let Some(leaf) = find_leaf(session, frame) else {
+    let Some(leaf) = find_leaf(session, agent) else {
         return (None, None);
     };
-    let programs = session.tree().programs_for(frame, leaf);
+    let programs = session.tree().programs_for(agent, leaf);
     let effective = app
         .selected_program
         .or_else(|| programs.last().map(|p| p.id));
     let pv = effective.and_then(|id| programs.into_iter().find(|p| p.id == id));
-    let vm = effective.and_then(|prog_id| vm_for_program(session, frame, prog_id));
+    let vm = effective.and_then(|prog_id| vm_for_program(session, agent, prog_id));
     (vm, pv)
 }
 
@@ -564,13 +564,13 @@ pub fn run_attached(mut session: Session, events_rx: Receiver<SessionEvent>) -> 
             app.apply(&event);
         }
         app.auto_reset_chat_scroll();
-        // All frames root-first, from the log projection so the navigator
+        // All agents root-first, from the log projection so the navigator
         // survives resume (decision 8), not just the live `states`.
-        let frames: Vec<FrameId> = session.tree().frame_list().iter().map(|fv| fv.id).collect();
+        let agents: Vec<AgentId> = session.tree().agent_list().iter().map(|fv| fv.id).collect();
         for input in inputs {
             match input {
                 CtEvent::Key(key) if key.is_press() => {
-                    let action = app.on_key(key.code, &frames);
+                    let action = app.on_key(key.code, &agents);
                     let Some(selected) = app.selected else {
                         continue;
                     };
@@ -596,7 +596,7 @@ pub fn run_attached(mut session: Session, events_rx: Receiver<SessionEvent>) -> 
                         }
                     }
                 }
-                CtEvent::Mouse(mouse) => app.on_mouse(mouse.column, mouse.row, mouse.kind, &frames),
+                CtEvent::Mouse(mouse) => app.on_mouse(mouse.column, mouse.row, mouse.kind, &agents),
                 _ => {}
             }
         }
@@ -616,20 +616,20 @@ pub fn run_attached(mut session: Session, events_rx: Receiver<SessionEvent>) -> 
     result
 }
 
-/// Step the selected frame's VM until its source line changes (or the
+/// Step the selected agent's VM until its source line changes (or the
 /// program yields/finishes, or the cap is hit).
-fn step_line(session: &mut Session, frame: FrameId) {
-    session.set_paused(frame, true);
+fn step_line(session: &mut Session, agent: AgentId) {
+    session.set_paused(agent, true);
     let line_of = |session: &Session| {
         session
-            .state(frame)
+            .state(agent)
             .and_then(|s| s.vm())
             .and_then(super::panes::current_line)
     };
     let start = line_of(session);
     for _ in 0..LINE_STEP_CAP {
-        session.step_paused(frame, 1);
-        let state = session.state(frame);
+        session.step_paused(agent, 1);
+        let state = session.state(agent);
         if !state.map(|s| s.status() == "running").unwrap_or(false) {
             return; // blocked on the host, suspended, or finished
         }
@@ -682,22 +682,22 @@ fn render(frame: &mut Frame, app: &mut AttachedApp, session: &Session) {
         // and force source + console (plan Step 5).
         let mut right_panes = panes.right.clone();
         if vm.is_none() && pv.is_some() {
-            right_panes.retain(|p| matches!(p, Pane::FrameList | Pane::Source | Pane::Console));
+            right_panes.retain(|p| matches!(p, Pane::Navigator | Pane::Source | Pane::Console));
             if !right_panes.contains(&Pane::Source) {
                 right_panes.insert(1, Pane::Source);
             }
         }
         let slots = Layout::vertical(right_panes.iter().map(|p| match p {
-            Pane::FrameList => Constraint::Length(session.tree().frame_list().len() as u16 + 2),
+            Pane::Navigator => Constraint::Length(session.tree().agent_list().len() as u16 + 2),
             _ => Constraint::Fill(1),
         }))
         .split(right);
         for (pane, slot) in right_panes.iter().zip(slots.iter()) {
             match pane {
-                Pane::FrameList => {
-                    render_frame_list(frame, app, session, *slot);
+                Pane::Navigator => {
+                    render_navigator(frame, app, session, *slot);
                     app.pane_rects.push((
-                        Pane::FrameList,
+                        Pane::Navigator,
                         PaneInfo {
                             area: *slot,
                             scroll_top: 0,
@@ -791,13 +791,13 @@ fn render(frame: &mut Frame, app: &mut AttachedApp, session: &Session) {
 
     let help = match (app.view, app.focus) {
         (View::FullDebug, _) => {
-            " d/esc chat · tab/1-9 frame · space run/pause · s step · n step line · q quit "
+            " d/esc chat · tab/1-9 agent · space run/pause · s step · n step line · q quit "
         }
-        (_, Focus::Input) => " type to chat · enter send · tab frame · esc debug keys ",
+        (_, Focus::Input) => " type to chat · enter send · tab agent · esc debug keys ",
         (View::Running, Focus::Debug) => {
-            " esc/i type · c collapse · d debugger · 1-4 panes · space/s/n vm · tab frame · q quit "
+            " esc/i type · c collapse · d debugger · 1-4 panes · space/s/n vm · tab agent · q quit "
         }
-        (_, Focus::Debug) => " esc/i type · d debugger · space/s/n vm · tab frame · q quit ",
+        (_, Focus::Debug) => " esc/i type · d debugger · space/s/n vm · tab agent · q quit ",
     };
     frame.render_widget(
         Paragraph::new(help).style(Style::default().add_modifier(Modifier::REVERSED)),
@@ -949,22 +949,22 @@ fn render_chat(
     (top, area)
 }
 
-fn build_frame_tree_lines(frames: &[FrameView]) -> Vec<(FrameView, String)> {
-    let mut children: std::collections::HashMap<Option<FrameId>, Vec<&FrameView>> =
+fn build_navigator_lines(agents: &[AgentView]) -> Vec<(AgentView, String)> {
+    let mut children: std::collections::HashMap<Option<AgentId>, Vec<&AgentView>> =
         std::collections::HashMap::new();
-    for fv in frames {
+    for fv in agents {
         children.entry(fv.parent).or_default().push(fv);
     }
     for list in children.values_mut() {
         list.sort_by_key(|fv| fv.id.as_u64());
     }
 
-    let mut result = Vec::with_capacity(frames.len());
+    let mut result = Vec::with_capacity(agents.len());
     fn dfs(
-        parent: Option<FrameId>,
-        children: &std::collections::HashMap<Option<FrameId>, Vec<&FrameView>>,
+        parent: Option<AgentId>,
+        children: &std::collections::HashMap<Option<AgentId>, Vec<&AgentView>>,
         ancestors_last: &mut Vec<bool>,
-        result: &mut Vec<(FrameView, String)>,
+        result: &mut Vec<(AgentView, String)>,
     ) {
         let Some(kids) = children.get(&parent) else {
             return;
@@ -997,13 +997,13 @@ fn build_frame_tree_lines(frames: &[FrameView]) -> Vec<(FrameView, String)> {
     result
 }
 
-fn render_frame_list(frame: &mut Frame, app: &AttachedApp, session: &Session, area: Rect) {
-    // Frames from the log projection so the navigator survives resume
-    // (decision 8), with live status overlayed from `session.frames()`.
-    let live: std::collections::HashMap<FrameId, &'static str> =
-        session.frames().into_iter().collect();
-    let frame_views = session.tree().frame_list();
-    let tree_lines = build_frame_tree_lines(&frame_views);
+fn render_navigator(frame: &mut Frame, app: &AttachedApp, session: &Session, area: Rect) {
+    // Agents from the log projection so the navigator survives resume
+    // (decision 8), with live status overlayed from `session.agents()`.
+    let live: std::collections::HashMap<AgentId, &'static str> =
+        session.agents().into_iter().collect();
+    let agent_views = session.tree().agent_list();
+    let tree_lines = build_navigator_lines(&agent_views);
     let lines: Vec<Line> = tree_lines
         .iter()
         .map(|(fv, prefix)| {
@@ -1013,7 +1013,7 @@ fn render_frame_list(frame: &mut Frame, app: &AttachedApp, session: &Session, ar
             let paused = live_status.is_some() && session.is_paused(fv.id);
             let busy = matches!(live_status, Some("running" | "awaiting llm"));
             let text = format!(
-                "{} {}frame #{} · {}{}",
+                "{} {}agent #{} · {}{}",
                 if selected { "▶" } else { " " },
                 prefix,
                 fv.id.as_u64(),
@@ -1043,12 +1043,12 @@ fn render_frame_list(frame: &mut Frame, app: &AttachedApp, session: &Session, ar
         })
         .collect();
     frame.render_widget(
-        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" frames ")),
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" agents ")),
         area,
     );
 }
 
-/// Console + status for the selected frame's VM (live or post-mortem).
+/// Console + status for the selected agent's VM (live or post-mortem).
 fn render_attached_console(
     frame: &mut Frame,
     app: &AttachedApp,
@@ -1182,7 +1182,7 @@ fn render_placeholder(frame: &mut Frame, pane: Pane, area: Rect) {
         Pane::Disasm => " disassembly [2] ",
         Pane::Stack => " stack [3] ",
         Pane::Promises => " promises [4] ",
-        Pane::FrameList => " frames ",
+        Pane::Navigator => " agents ",
         Pane::Console => " console ",
     };
     frame.render_widget(
@@ -1203,7 +1203,7 @@ mod tests {
     use serde_json::json;
     use std::sync::mpsc::channel;
 
-    fn fid(n: u64) -> FrameId {
+    fn fid(n: u64) -> AgentId {
         EventId::new(n)
     }
 
@@ -1222,7 +1222,7 @@ mod tests {
             }
         }
         assert!(popped_while_program_visible);
-        // Sticky: the program completed and the frame finished, but the
+        // Sticky: the program completed and the agent finished, but the
         // panes remain for post-mortem reading.
         assert_eq!(app.view, View::Running);
         let panes = app.pane_set();
@@ -1244,7 +1244,7 @@ mod tests {
             PaneSet {
                 chat: true,
                 console_left: false,
-                right: vec![Pane::FrameList]
+                right: vec![Pane::Navigator]
             }
         );
     }
@@ -1262,7 +1262,7 @@ mod tests {
         assert_eq!(
             panes.right,
             vec![
-                Pane::FrameList,
+                Pane::Navigator,
                 Pane::Source,
                 Pane::Disasm,
                 Pane::Stack,
@@ -1303,27 +1303,27 @@ mod tests {
     }
 
     #[test]
-    fn tab_cycles_frames_and_digits_select_in_full_debug() {
-        let frames = [fid(1), fid(5)];
+    fn tab_cycles_agents_and_digits_select_in_full_debug() {
+        let agents = [fid(1), fid(5)];
         let mut app = AttachedApp::new(fid(1));
-        app.on_key(KeyCode::Tab, &frames);
+        app.on_key(KeyCode::Tab, &agents);
         assert_eq!(app.selected, Some(fid(5)));
-        app.on_key(KeyCode::Tab, &frames);
+        app.on_key(KeyCode::Tab, &agents);
         assert_eq!(app.selected, Some(fid(1)));
 
         app.focus = Focus::Debug;
-        app.on_key(KeyCode::Char('d'), &frames);
+        app.on_key(KeyCode::Char('d'), &agents);
         assert_eq!(app.view, View::FullDebug);
-        app.on_key(KeyCode::Char('2'), &frames);
+        app.on_key(KeyCode::Char('2'), &agents);
         assert_eq!(app.selected, Some(fid(5)));
-        app.on_key(KeyCode::Char('1'), &frames);
+        app.on_key(KeyCode::Char('1'), &agents);
         assert_eq!(app.selected, Some(fid(1)));
     }
 
-    /// Two live frames (caller + in-flight subagent): both appear in
-    /// the frame list, and switching retargets the VM the panes borrow.
+    /// Two live agents (caller + in-flight subagent): both appear in
+    /// the agent list, and switching retargets the VM the panes borrow.
     #[test]
-    fn concurrent_frames_list_and_retarget() {
+    fn concurrent_agents_list_and_retarget() {
         let mut registry = ToolRegistry::new();
         registry.register(ToolDef {
             name: "slow".into(),
@@ -1357,19 +1357,19 @@ mod tests {
             .handle()
             .send(SessionCommand::UserTurn("delegate".into()));
 
-        // Pump until both frames are live with running programs.
+        // Pump until both agents are live with running programs.
         for _ in 0..200 {
-            let frames = session.frames();
-            if frames.len() == 2 && frames.iter().all(|(_, s)| *s == "running") {
+            let agents = session.agents();
+            if agents.len() == 2 && agents.iter().all(|(_, s)| *s == "running") {
                 break;
             }
             assert!(session.pump_one(), "session ended early");
         }
-        let frames = session.frames();
-        assert_eq!(frames.len(), 2, "{frames:?}");
+        let agents = session.agents();
+        assert_eq!(agents.len(), 2, "{agents:?}");
 
-        // Selecting each frame yields its own VM: different programs.
-        let sources: Vec<String> = frames
+        // Selecting each agent yields its own VM: different programs.
+        let sources: Vec<String> = agents
             .iter()
             .map(|(id, _)| session.state(*id).unwrap().vm().unwrap().source.to_string())
             .collect();

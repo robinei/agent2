@@ -1,6 +1,6 @@
-//! Sans-io frame step machine (8_HARNESS Step 3).
+//! Sans-io branch step machine (8_HARNESS Step 3).
 //!
-//! One `AgentState` drives one frame: a deterministic, IO-free core the
+//! One `Runner` drives one branch: a deterministic, IO-free core the
 //! host feeds with `StepInput`s and drains of `StepOutput`s. The host
 //! owns the LLM API, tool execution, subagent loops, and scheduling;
 //! the core never blocks. VM compute is host-fueled: the machine runs
@@ -90,9 +90,9 @@ pub fn resume_spec() -> ToolSpec {
 /// but a pathological program could chain those forever.
 const MAX_PUMP_ROUNDS: usize = 100;
 
-/// Default budget for a frame's *answer* — the one value that deliberately
+/// Default budget for an agent's *answer* — the one value that deliberately
 /// crosses into a mind's context: a program's `return` (into its own
-/// frame) and a subagent's final turn (into its caller). Sized to a
+/// agent) and a subagent's final turn (into its caller). Sized to a
 /// typical source file so an ordinary read or summary lands in one shot
 /// (DESIGN.md "The one exception"; 12_ANSWERS). The full value is always a
 /// fetchable artifact; only the context copy is truncated past this. A
@@ -116,7 +116,7 @@ pub enum StepInput {
     LlmResponse(Message),
     /// Completed host tool calls, in resolution order.
     ToolResults(Vec<ToolResult>),
-    /// A child frame's `FrameResult` arriving at its call site.
+    /// A child agent's `FrameResult` arriving at its call site.
     SubagentResult {
         invoke_id: u64,
         result: serde_json::Value,
@@ -138,14 +138,14 @@ pub enum StepOutput {
     /// Execute these tools (any order/concurrency); feed back as
     /// `ToolResults` in completion order.
     ToolCalls(Vec<OutCall>),
-    /// Spawn child frames; feed each result back as `SubagentResult`.
-    SpawnFrames(Vec<SpawnFrame>),
-    /// The frame completed; its `FrameResult` is logged.
-    FrameDone(serde_json::Value),
-    /// The root frame produced a final answer but does *not* complete:
+    /// Spawn child contexts; feed each result back as `SubagentResult`.
+    SpawnAgents(Vec<SpawnAgent>),
+    /// The agent completed; its `FrameResult` is logged.
+    AgentDone(serde_json::Value),
+    /// The root agent produced a final answer but does *not* complete:
     /// the top conversation never ends, it yields the turn back to the
     /// user. No `FrameResult` is logged (the spine stays appendable); the
-    /// frame goes idle awaiting the next `UserTurn`.
+    /// agent goes idle awaiting the next `UserTurn`.
     Yielded,
     /// The VM wants another `Tick`.
     Working,
@@ -166,7 +166,7 @@ pub struct OutCall {
 }
 
 #[derive(Debug)]
-pub struct SpawnFrame {
+pub struct SpawnAgent {
     pub invoke_id: u64,
     pub prompt: String,
     pub input: serde_json::Value,
@@ -221,11 +221,11 @@ struct PendingCall {
     generation: u64,
 }
 
-pub struct AgentState {
+pub struct Runner {
     pub spine: Spine,
-    /// The session's top frame: the user-facing conversation. It never
+    /// The session's top agent: the user-facing conversation. It never
     /// completes — a final no-tool-call turn *yields* to the user
-    /// instead of logging a `FrameResult`. Child (subagent) frames are
+    /// instead of logging a `FrameResult`. Child (subagent) contexts are
     /// not root: they complete and return to their caller.
     is_root: bool,
     phase: Phase,
@@ -233,7 +233,7 @@ pub struct AgentState {
     generation: u64,
     pending: HashMap<u64, PendingCall>,
     /// The dialect card (8_HARNESS Step 6), prepended to every system
-    /// message ahead of the frame prompt (host-fed, registry-generated).
+    /// message ahead of the agent prompt (host-fed, registry-generated).
     dialect_card: String,
     /// The most recently finished/abandoned run's VM, kept so the
     /// debugger's sticky panes can show final state post-mortem
@@ -245,7 +245,7 @@ pub struct AgentState {
     /// one step — a rewrite abandoning the old run as a new one starts —
     /// both surface, and so the sans-io output set is untouched.
     status_transitions: Vec<(EventId, ProgramStatus)>,
-    /// Byte budget for this frame's *answer* into context (decisions 2, 6):
+    /// Byte budget for this agent's *answer* into context (decisions 2, 6):
     /// program `return`s and (for a subagent) the final turn. Seeded from
     /// the spawning `agent({ budget })` or `DEFAULT_ANSWER_BUDGET`.
     answer_budget: usize,
@@ -261,19 +261,19 @@ enum SuspendCause {
     Trapped(VMError),
 }
 
-impl AgentState {
-    /// Root frame of a tree.
+impl Runner {
+    /// Root agent of a tree.
     pub fn new_root(
         tree: &mut Tree,
         prompt: impl Into<String>,
         input: serde_json::Value,
     ) -> io::Result<Self> {
-        let spine = tree.start_frame(None, prompt, input)?;
+        let spine = tree.start_agent(None, prompt, input)?;
         Ok(Self::with_spine(spine))
     }
 
-    /// Child frame branching at `call_site` on the caller's spine (the
-    /// host maps each `SpawnFrame` to one of these).
+    /// Child agent branching at `call_site` on the caller's spine (the
+    /// host maps each `SpawnAgent` to one of these).
     pub fn new_child(
         tree: &mut Tree,
         call_site: EventId,
@@ -281,18 +281,18 @@ impl AgentState {
         input: serde_json::Value,
         budget: Option<usize>,
     ) -> io::Result<Self> {
-        let spine = tree.start_frame(Some(call_site), prompt, input)?;
+        let spine = tree.start_agent(Some(call_site), prompt, input)?;
         let mut state = Self::with_spine(spine);
-        state.is_root = false; // a subagent frame completes and returns
+        state.is_root = false; // a subagent agent completes and returns
         state.answer_budget = budget.unwrap_or(DEFAULT_ANSWER_BUDGET);
         Ok(state)
     }
 
     /// Resume an existing spine (re-opened log). This is the session's
-    /// top frame — `is_root` — whether freshly rooted (`new_root`) or
+    /// top agent — `is_root` — whether freshly rooted (`new_root`) or
     /// re-anchored on resume (`open_at`); `new_child` clears the flag.
     pub fn with_spine(spine: Spine) -> Self {
-        AgentState {
+        Runner {
             spine,
             is_root: true,
             phase: Phase::Idle,
@@ -324,14 +324,14 @@ impl AgentState {
         self.status_transitions.push((program, status));
     }
 
-    /// Materialize this frame's system prompt once (decision 4): the
+    /// Materialize this agent's system prompt once (decision 4): the
     /// assembled dialect card + prompt + input, logged as the spine's
     /// first `Message::System`. Idempotent — a spine that already carries
     /// a leading `System` (a re-opened log) is left untouched, so the
     /// stored prompt replays verbatim even as the registry's card evolves.
     fn ensure_system(&mut self, tree: &mut Tree) -> io::Result<()> {
         if matches!(
-            self.spine.frame().messages.first(),
+            self.spine.context().messages.first(),
             Some(Message::System { .. })
         ) {
             return Ok(());
@@ -344,30 +344,30 @@ impl AgentState {
         Ok(())
     }
 
-    /// Assemble the system prompt string: the dialect card, the frame
-    /// prompt, then the frame input as a fenced JSON block.
+    /// Assemble the system prompt string: the dialect card, the agent
+    /// prompt, then the agent input as a fenced JSON block.
     fn assemble_system(&self) -> String {
-        let frame = self.spine.frame();
+        let agent = self.spine.context();
         let mut system = String::new();
         if !self.dialect_card.is_empty() {
             system.push_str(&self.dialect_card);
             system.push_str("\n\n");
         }
-        system.push_str(&frame.prompt);
-        if !frame.input.is_null() {
+        system.push_str(&agent.prompt);
+        if !agent.input.is_null() {
             system.push_str("\n\nInput:\n```json\n");
-            system.push_str(&frame.input.to_string());
+            system.push_str(&agent.input.to_string());
             system.push_str("\n```");
         }
         system
     }
 
-    /// Whether the frame can accept a `UserTurn` right now.
+    /// Whether the agent can accept a `UserTurn` right now.
     pub fn is_idle(&self) -> bool {
         matches!(self.phase, Phase::Idle)
     }
 
-    /// One-word phase description for frame lists / status lines.
+    /// One-word phase description for agent lists / status lines.
     pub fn status(&self) -> &'static str {
         match self.phase {
             Phase::Idle => "idle",
@@ -394,10 +394,10 @@ impl AgentState {
         matches!(self.phase, Phase::Running(_) | Phase::Suspended(..))
     }
 
-    /// Start the conversation without a user turn — how child frames
-    /// begin (their input arrived in `FrameStart`).
+    /// Start the conversation without a user turn — how child contexts
+    /// begin (their input arrived in `Agent`).
     pub fn kickoff(&mut self, tree: &mut Tree) -> io::Result<Vec<StepOutput>> {
-        assert!(matches!(self.phase, Phase::Idle), "kickoff on a busy frame");
+        assert!(matches!(self.phase, Phase::Idle), "kickoff on a busy agent");
         self.ensure_system(tree)?;
         self.phase = Phase::AwaitingLlm;
         Ok(vec![self.render_request()])
@@ -434,7 +434,7 @@ impl AgentState {
                 panic!("mid-program user turns are not implemented yet (M2)");
             }
             Phase::AwaitingLlm => panic!("user turn while an LLM request is in flight"),
-            Phase::Done => panic!("user turn on a completed frame"),
+            Phase::Done => panic!("user turn on a completed agent"),
         }
         self.ensure_system(tree)?;
         tree.append(
@@ -461,8 +461,8 @@ impl AgentState {
         let assistant_id = tree.append(&mut self.spine, EventPayload::Message(message))?;
 
         let Some(call) = tool_calls.first().cloned() else {
-            // No tool call: the assistant's text completes the frame.
-            return self.finish_frame(tree);
+            // No tool call: the assistant's text completes the agent.
+            return self.finish_agent(tree);
         };
         for extra in &tool_calls[1..] {
             self.log_tool_error(tree, extra, "one tool call per turn; this call was ignored")?;
@@ -597,7 +597,7 @@ impl AgentState {
     ) -> io::Result<Vec<StepOutput>> {
         if matches!(self.phase, Phase::Done) {
             // The spine is complete (nothing may follow FrameResult);
-            // results of stragglers the frame outlived are dropped.
+            // results of stragglers the agent outlived are dropped.
             return Ok(Vec::new());
         }
         let mut delivered = false;
@@ -659,7 +659,7 @@ impl AgentState {
 
     // ── program driving ─────────────────────────────────────────────
 
-    /// Compile + bind the host consts (`input` from the frame, `attachments`
+    /// Compile + bind the host consts (`input` from the agent, `attachments`
     /// from this run). `Err` is the rendered repair-loop report.
     fn start_program(
         &mut self,
@@ -670,7 +670,7 @@ impl AgentState {
     ) -> Result<Run, String> {
         let program = compile(source).map_err(|diags| render_diags(source, &diags))?;
         let had_attachments = attachments.as_object().is_some_and(|m| !m.is_empty());
-        let vm = VM::for_program_with(program, self.spine.frame().input.clone(), attachments)
+        let vm = VM::for_program_with(program, self.spine.context().input.clone(), attachments)
             .map_err(|e| format!("program setup failed: {}", e.message))?;
         Ok(Run {
             program_id,
@@ -719,7 +719,7 @@ impl AgentState {
 
     /// Classify one `Pending` batch: artifact fetches are answered from
     /// the log immediately (returns true if any were — the program can
-    /// run again), `tools.agent` becomes `SpawnFrames`, everything else
+    /// run again), `tools.agent` becomes `SpawnAgents`, everything else
     /// becomes `ToolCalls`.
     fn dispatch_calls(
         &mut self,
@@ -773,7 +773,7 @@ impl AgentState {
                                 serde_json::json!([arg]),
                                 call.promise,
                             );
-                            spawns.push(SpawnFrame {
+                            spawns.push(SpawnAgent {
                                 invoke_id: id,
                                 prompt,
                                 input,
@@ -810,7 +810,7 @@ impl AgentState {
             out.push(StepOutput::ToolCalls(tool_calls));
         }
         if !spawns.is_empty() {
-            out.push(StepOutput::SpawnFrames(spawns));
+            out.push(StepOutput::SpawnAgents(spawns));
         }
         progressed
     }
@@ -842,14 +842,14 @@ impl AgentState {
     }
 
     /// Serve `tools.tool_result(id)` from the log. Artifact ids are
-    /// scoped to this frame's spine segment (decision 3: never ancestor
+    /// scoped to this agent's spine segment (decision 3: never ancestor
     /// artifacts).
     fn fetch_artifact(&self, tree: &Tree, call: &InvokeCall) -> Result<serde_json::Value, String> {
         let id = match call.args.first() {
             Some(Value::PosInt(n)) => *n,
             _ => return Err("tool_result needs a numeric artifact id".into()),
         };
-        for event in self.frame_segment(tree) {
+        for event in self.agent_segment(tree) {
             if event.id.as_u64() != id {
                 continue;
             }
@@ -859,7 +859,7 @@ impl AgentState {
                 _ => Err(format!("event #{id} is not an artifact")),
             };
         }
-        Err(format!("no artifact #{id} in this frame"))
+        Err(format!("no artifact #{id} in this agent"))
     }
 
     fn finish_program(
@@ -877,7 +877,7 @@ impl AgentState {
             .stack_value_to_json(&value, 0)
             .unwrap_or_else(|_| serde_json::Value::String(format!("{value:?}")));
 
-        // The return is the program's *answer* into this frame's context —
+        // The return is the program's *answer* into this agent's context —
         // the one value that deliberately crosses into a mind (DESIGN.md
         // "The one exception"). It is budgeted, not rejected: the full
         // value is logged as a fetchable `ProgramResult` below, and only
@@ -993,7 +993,7 @@ impl AgentState {
                 .map(|f| f.name().to_owned())
                 .collect(),
             console: run.vm.console_lines.clone(),
-            artifacts: self.frame_artifacts(tree),
+            artifacts: self.agent_artifacts(tree),
             resume,
         }
         .render();
@@ -1016,15 +1016,15 @@ impl AgentState {
         Ok(out)
     }
 
-    fn finish_frame(&mut self, tree: &mut Tree) -> io::Result<Vec<StepOutput>> {
+    fn finish_agent(&mut self, tree: &mut Tree) -> io::Result<Vec<StepOutput>> {
         // Abandon any suspended program: a no-tool-call turn completes
-        // the frame, its text is the result.
+        // the agent, its text is the result.
         if let Phase::Suspended(run, _) = std::mem::replace(&mut self.phase, Phase::Idle) {
             self.note_status(run.program_id, ProgramStatus::Failed);
             self.last_vm = Some(run.vm);
         }
         self.generation += 1;
-        let text = match self.spine.frame().messages.last() {
+        let text = match self.spine.context().messages.last() {
             Some(Message::Assistant { text, .. }) => text.clone(),
             _ => String::new(),
         };
@@ -1070,16 +1070,16 @@ impl AgentState {
             },
         )?;
         self.phase = Phase::Done;
-        Ok(vec![StepOutput::FrameDone(result)])
+        Ok(vec![StepOutput::AgentDone(result)])
     }
 
     // ── rendering ───────────────────────────────────────────────────
 
     fn render_request(&self) -> StepOutput {
         // The system prompt is the spine's first message (materialized
-        // once by `ensure_system`, decision 4); send the frame's messages
+        // once by `ensure_system`, decision 4); send the agent's messages
         // verbatim — no synthesized prepend.
-        let messages = self.spine.frame().messages.clone();
+        let messages = self.spine.context().messages.clone();
 
         let tools = match &self.phase {
             Phase::Suspended(_, Suspension::Trapped(e))
@@ -1105,15 +1105,15 @@ impl AgentState {
         Ok(())
     }
 
-    /// Events of this frame's spine segment (its `FrameStart` down to
+    /// Events of this agent's spine segment (its `Agent` down to
     /// the leaf), in log order.
-    fn frame_segment<'t>(&self, tree: &'t Tree) -> Vec<&'t Event> {
+    fn agent_segment<'t>(&self, tree: &'t Tree) -> Vec<&'t Event> {
         let mut events = Vec::new();
         let mut current = self.spine.leaf_id;
         while let Some(event) = tree.events.get(&current) {
-            let is_frame_start = matches!(event.payload, EventPayload::FrameStart { .. });
+            let is_agent_root = matches!(event.payload, EventPayload::Agent { .. });
             events.push(event);
-            if is_frame_start {
+            if is_agent_root {
                 break;
             }
             match event.parent_id {
@@ -1125,16 +1125,16 @@ impl AgentState {
         events
     }
 
-    /// Artifact-menu entries for every artifact on this frame so far.
-    fn frame_artifacts(&self, tree: &Tree) -> Vec<Artifact> {
-        self.frame_segment(tree)
+    /// Artifact-menu entries for every artifact on this agent so far.
+    fn agent_artifacts(&self, tree: &Tree) -> Vec<Artifact> {
+        self.agent_segment(tree)
             .into_iter()
             .filter_map(artifact_entry)
             .collect()
     }
 
     fn new_artifacts(&self, tree: &Tree, since: u64) -> Vec<Artifact> {
-        self.frame_segment(tree)
+        self.agent_segment(tree)
             .into_iter()
             .filter(|e| e.id.as_u64() > since)
             .filter_map(artifact_entry)
@@ -1145,7 +1145,7 @@ impl AgentState {
     /// a content body past [`INLINE_BODY_ADVICE_BYTES`]. Content is the last
     /// positional arg; the full (unclipped) args live on the `Invoke` event.
     fn run_inlined_large_body(&self, tree: &Tree, since: u64) -> bool {
-        self.frame_segment(tree)
+        self.agent_segment(tree)
             .into_iter()
             .filter(|e| e.id.as_u64() > since)
             .any(|e| match &e.payload {
@@ -1265,9 +1265,9 @@ mod tests {
 
     const FUEL: u64 = 100_000;
 
-    fn setup() -> (Tree, AgentState) {
+    fn setup() -> (Tree, Runner) {
         let mut tree = Tree::new(None);
-        let state = AgentState::new_root(&mut tree, "you are a test agent", json!(null)).unwrap();
+        let state = Runner::new_root(&mut tree, "you are a test agent", json!(null)).unwrap();
         (tree, state)
     }
 
@@ -1305,7 +1305,7 @@ mod tests {
 
     /// Drive `Tick`s until the machine stops asking for them; collects
     /// every non-`Working` output.
-    fn drain(state: &mut AgentState, tree: &mut Tree, outputs: Vec<StepOutput>) -> Vec<StepOutput> {
+    fn drain(state: &mut Runner, tree: &mut Tree, outputs: Vec<StepOutput>) -> Vec<StepOutput> {
         let mut result = Vec::new();
         let mut queue = outputs;
         for _ in 0..1000 {
@@ -1324,10 +1324,10 @@ mod tests {
         panic!("machine never settled");
     }
 
-    fn last_tool_text(state: &AgentState) -> String {
+    fn last_tool_text(state: &Runner) -> String {
         state
             .spine
-            .frame()
+            .context()
             .messages
             .iter()
             .rev()
@@ -1338,12 +1338,12 @@ mod tests {
             .expect("a tool message")
     }
 
-    fn payload_kinds(state: &AgentState, tree: &Tree) -> Vec<&'static str> {
+    fn payload_kinds(state: &Runner, tree: &Tree) -> Vec<&'static str> {
         state
-            .frame_segment(tree)
+            .agent_segment(tree)
             .iter()
             .map(|e| match &e.payload {
-                EventPayload::FrameStart { .. } => "FrameStart",
+                EventPayload::Agent { .. } => "Agent",
                 EventPayload::FrameResult { .. } => "FrameResult",
                 EventPayload::Message(Message::User { .. }) => "User",
                 EventPayload::Message(Message::Assistant { .. }) => "Assistant",
@@ -1412,12 +1412,12 @@ mod tests {
             panic!("first message must be the system message");
         };
         assert!(text.starts_with("THE DIALECT CARD\n\n"), "{text}");
-        // The stored prompt is the spine's first event after FrameStart.
-        assert_eq!(payload_kinds(&state, &tree).first(), Some(&"FrameStart"));
+        // The stored prompt is the spine's first event after Agent.
+        assert_eq!(payload_kinds(&state, &tree).first(), Some(&"Agent"));
         assert_eq!(payload_kinds(&state, &tree).get(1), Some(&"System"));
         assert!(
             text.contains("you are a test agent"),
-            "frame prompt follows the card: {text}"
+            "agent prompt follows the card: {text}"
         );
     }
 
@@ -1427,7 +1427,7 @@ mod tests {
     #[test]
     fn reopened_spine_replays_the_stored_system_prompt() {
         let mut tree = Tree::new(None);
-        let mut state = AgentState::new_root(&mut tree, "agent", json!({ "n": 1 })).unwrap();
+        let mut state = Runner::new_root(&mut tree, "agent", json!({ "n": 1 })).unwrap();
         state.set_dialect_card("CARD A".into());
         state.kickoff(&mut tree).unwrap(); // logs the System (#2) with CARD A
         let stored = match &tree.events[&EventId::new(2)].payload {
@@ -1439,7 +1439,7 @@ mod tests {
         // Re-anchor a fresh state on the logged spine, card the registry
         // differently, take a new turn — the request's system message is
         // the stored CARD A prompt, not a CARD B re-derivation.
-        let mut reopened = AgentState::with_spine(tree.spine_at(EventId::new(2)));
+        let mut reopened = Runner::with_spine(tree.spine_at(EventId::new(2)));
         reopened.set_dialect_card("CARD B — evolved".into());
         let out = reopened
             .step(&mut tree, StepInput::UserTurn("more".into()))
@@ -1458,7 +1458,7 @@ mod tests {
     #[test]
     fn input_binding_reaches_the_program() {
         let mut tree = Tree::new(None);
-        let mut state = AgentState::new_root(&mut tree, "agent", json!({ "n": 7 })).unwrap();
+        let mut state = Runner::new_root(&mut tree, "agent", json!({ "n": 7 })).unwrap();
         state.kickoff(&mut tree).unwrap();
         let out = state
             .step(
@@ -1550,9 +1550,9 @@ mod tests {
         let req = expect_request(&settled);
         assert!(matches!(req.messages.last(), Some(Message::Tool { .. })));
 
-        // Final text turn on the *root* frame yields to the user — the
+        // Final text turn on the *root* agent yields to the user — the
         // top conversation never ends, so no `FrameResult` is logged and
-        // the frame stays idle, ready for the next turn.
+        // the agent stays idle, ready for the next turn.
         let out = state
             .step(
                 &mut tree,
@@ -1565,7 +1565,7 @@ mod tests {
         assert_eq!(
             payload_kinds(&state, &tree),
             [
-                "FrameStart",
+                "Agent",
                 "System",
                 "User",
                 "Assistant",
@@ -1626,7 +1626,7 @@ mod tests {
 
         assert!(last_tool_text(&state).contains(r#"returned: ["X","Y"]"#));
         let invokes: Vec<serde_json::Value> = state
-            .frame_segment(&tree)
+            .agent_segment(&tree)
             .iter()
             .filter_map(|e| match &e.payload {
                 EventPayload::Invoke { result, .. } => Some(result.clone()),
@@ -1658,7 +1658,7 @@ mod tests {
         // No execution events were logged.
         assert_eq!(
             payload_kinds(&state, &tree),
-            ["FrameStart", "System", "Assistant", "Tool"]
+            ["Agent", "System", "Assistant", "Tool"]
         );
     }
 
@@ -1761,7 +1761,7 @@ mod tests {
 
         // Find the logged Invoke artifact id from the report's menu.
         let artifact_id = state
-            .frame_segment(&tree)
+            .agent_segment(&tree)
             .iter()
             .find_map(|e| match &e.payload {
                 EventPayload::Invoke { .. } => Some(e.id.as_u64()),
@@ -1790,7 +1790,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_call_spawns_child_frame() {
+    fn agent_call_spawns_child_agent() {
         let (mut tree, mut state) = setup();
         state.kickoff(&mut tree).unwrap();
         let src = r#"return await tools.agent({ prompt: "summarize", input: { n: 1 } });"#;
@@ -1801,15 +1801,15 @@ mod tests {
         let spawn = settled
             .iter()
             .find_map(|o| match o {
-                StepOutput::SpawnFrames(s) => Some(&s[0]),
+                StepOutput::SpawnAgents(s) => Some(&s[0]),
                 _ => None,
             })
-            .expect("a SpawnFrames output");
+            .expect("a SpawnAgents output");
         assert_eq!(spawn.prompt, "summarize");
         assert_eq!(spawn.input, json!({ "n": 1 }));
 
-        // Host side: run the child frame to completion on its own branch.
-        let mut child = AgentState::new_child(
+        // Host side: run the child agent to completion on its own branch.
+        let mut child = Runner::new_child(
             &mut tree,
             state.spine.leaf_id,
             &spawn.prompt,
@@ -1823,8 +1823,8 @@ mod tests {
             .step(&mut tree, StepInput::LlmResponse(llm_text("child says hi")))
             .unwrap();
         let result = match &out[..] {
-            [StepOutput::FrameDone(v)] => v.clone(),
-            other => panic!("expected FrameDone, got {other:?}"),
+            [StepOutput::AgentDone(v)] => v.clone(),
+            other => panic!("expected AgentDone, got {other:?}"),
         };
 
         // Join: the child's result resolves the caller's agent call.
@@ -1990,9 +1990,9 @@ got X
         let _ = state.step(&mut tree, StepInput::UserTurn("are you done?".into()));
     }
 
-    fn program_result_value(state: &AgentState, tree: &Tree) -> serde_json::Value {
+    fn program_result_value(state: &Runner, tree: &Tree) -> serde_json::Value {
         state
-            .frame_segment(tree)
+            .agent_segment(tree)
             .iter()
             .find_map(|e| match &e.payload {
                 EventPayload::ProgramResult { value } => Some(value.clone()),
@@ -2055,7 +2055,7 @@ got X
         let (mut tree, root) = setup();
         let call_site = root.spine.leaf_id;
         let mut child =
-            AgentState::new_child(&mut tree, call_site, "summarize", json!({}), Some(50)).unwrap();
+            Runner::new_child(&mut tree, call_site, "summarize", json!({}), Some(50)).unwrap();
         child.kickoff(&mut tree).unwrap();
         let long = "y".repeat(500);
         // First over-budget final answer → one re-prompt, not completion.
@@ -2071,8 +2071,8 @@ got X
             .step(&mut tree, StepInput::LlmResponse(llm_text(&long)))
             .unwrap();
         let result = match &out[..] {
-            [StepOutput::FrameDone(v)] => v.clone(),
-            other => panic!("expected FrameDone, got {other:?}"),
+            [StepOutput::AgentDone(v)] => v.clone(),
+            other => panic!("expected AgentDone, got {other:?}"),
         };
         let delivered = result.as_str().unwrap();
         assert!(delivered.contains("answer truncated"), "note: {delivered}");
@@ -2081,7 +2081,7 @@ got X
         assert!(
             child
                 .spine
-                .frame()
+                .context()
                 .messages
                 .iter()
                 .any(|m| matches!(m, Message::Assistant { text, .. } if text.len() == 500)),

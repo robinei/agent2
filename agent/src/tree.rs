@@ -5,14 +5,14 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 
 use jiff::Timestamp;
 
-/// One frame for the navigator pane, projected from the log (decision 8).
+/// One agent for the navigator pane, projected from the log (decision 8).
 #[derive(Debug, Clone, PartialEq)]
-pub struct FrameView {
+pub struct AgentView {
     pub id: EventId,
-    /// The enclosing frame of this frame's call site (`None` for root).
+    /// The enclosing agent of this agent's call site (`None` for root).
     pub parent: Option<EventId>,
     pub prompt: String,
-    /// A `FrameResult` was logged on this frame's spine.
+    /// A `FrameResult` was logged on this agent's spine.
     pub complete: bool,
 }
 
@@ -93,28 +93,25 @@ impl Tree {
         })
     }
 
-    /// Start a new frame: append a `FrameStart` rooting a new spine.
+    /// Start a new agent: append a `Agent` rooting a new spine.
     /// `parent_id` is the call-site event on the caller's spine (`None`
-    /// only for the tree's root frame). The caller's own spine handle is
+    /// only for the tree's root agent). The caller's own spine handle is
     /// untouched — its leaf does not advance past the call site.
-    pub fn start_frame(
+    pub fn start_agent(
         &mut self,
         parent_id: Option<EventId>,
         prompt: impl Into<String>,
         input: serde_json::Value,
     ) -> io::Result<Spine> {
         match parent_id {
-            None => assert!(
-                self.events.is_empty(),
-                "root FrameStart on a non-empty tree"
-            ),
+            None => assert!(self.events.is_empty(), "root Agent on a non-empty tree"),
             Some(parent) => assert!(
                 self.events.contains_key(&parent),
-                "FrameStart parent {parent:?} not in tree"
+                "Agent parent {parent:?} not in tree"
             ),
         }
 
-        let payload = EventPayload::FrameStart {
+        let payload = EventPayload::Agent {
             prompt: prompt.into(),
             input,
         };
@@ -125,7 +122,7 @@ impl Tree {
     /// Fork from any event: reconstruct the spine at `from` and return
     /// an appendable handle. The first `append` on the returned spine
     /// creates a *sibling* of `from`'s existing spine child — a
-    /// divergent branch within the same frame (user-driven retry /
+    /// divergent branch within the same agent (user-driven retry /
     /// exploration, decision 4). Errors if `from` is unknown or its
     /// spine is already complete (a `FrameResult` is on the path, so
     /// nothing may follow it).
@@ -147,19 +144,19 @@ impl Tree {
     }
 
     /// Append an event to a spine. The spine's leaf advances; the
-    /// innermost frame absorbs chat messages. `FrameStart` must go
-    /// through `start_frame`; nothing may follow a `FrameResult`.
+    /// innermost agent absorbs chat messages. `Agent` must go
+    /// through `start_agent`; nothing may follow a `FrameResult`.
     pub fn append(&mut self, spine: &mut Spine, payload: EventPayload) -> io::Result<EventId> {
         assert!(
-            !matches!(payload, EventPayload::FrameStart { .. }),
-            "FrameStart must go through start_frame"
+            !matches!(payload, EventPayload::Agent { .. }),
+            "Agent must go through start_agent"
         );
         assert!(
             !spine.is_complete(),
             "append after FrameResult on a completed spine"
         );
 
-        Self::replay_event(&mut spine.frames, &payload);
+        Self::replay_event(&mut spine.contexts, &payload);
         let id = self.log_event(Some(spine.leaf_id), payload)?;
         spine.leaf_id = id;
         Ok(id)
@@ -192,8 +189,8 @@ impl Tree {
     }
 
     /// Reconstruct a spine handle for a leaf: trace to the root via
-    /// `parent_id`, then replay forward. The frame chain is the
-    /// `FrameStart` ancestors of the leaf, innermost last.
+    /// `parent_id`, then replay forward. The agent chain is the
+    /// `Agent` ancestors of the leaf, innermost last.
     pub fn spine_at(&self, leaf_id: EventId) -> Spine {
         let mut path: Vec<EventId> = Vec::new();
         let mut current = leaf_id;
@@ -213,17 +210,17 @@ impl Tree {
         }
         path.reverse();
 
-        let mut frames: Vec<Frame> = Vec::new();
+        let mut contexts: Vec<Context> = Vec::new();
         for id in &path {
-            Self::replay_event(&mut frames, &self.events[id].payload);
+            Self::replay_event(&mut contexts, &self.events[id].payload);
         }
-        Spine { leaf_id, frames }
+        Spine { leaf_id, contexts }
     }
 
-    fn replay_event(frames: &mut Vec<Frame>, payload: &EventPayload) {
+    fn replay_event(contexts: &mut Vec<Context>, payload: &EventPayload) {
         match payload {
-            EventPayload::FrameStart { prompt, input } => {
-                frames.push(Frame {
+            EventPayload::Agent { prompt, input } => {
+                contexts.push(Context {
                     prompt: prompt.clone(),
                     input: input.clone(),
                     messages: Vec::new(),
@@ -231,19 +228,19 @@ impl Tree {
                 });
             }
             EventPayload::Message(msg) => {
-                frames
+                contexts
                     .last_mut()
-                    .expect("Message event with no enclosing frame")
+                    .expect("Message event with no enclosing agent")
                     .messages
                     .push(msg.clone());
             }
             EventPayload::FrameResult { result } => {
-                frames
+                contexts
                     .last_mut()
-                    .expect("FrameResult event with no enclosing frame")
+                    .expect("FrameResult event with no enclosing agent")
                     .result = Some(result.clone());
             }
-            // Execution/marker events carry no frame-visible state; they
+            // Execution/marker events carry no agent-visible state; they
             // are queried from `events` by id (artifacts, replay, UI).
             EventPayload::Invoke { .. }
             | EventPayload::ProgramResult { .. }
@@ -273,13 +270,13 @@ impl Tree {
         path
     }
 
-    /// The innermost `FrameStart` at or above `event` — which frame an
+    /// The innermost `Agent` at or above `event` — which agent an
     /// event belongs to.
-    pub fn enclosing_frame(&self, event: EventId) -> Option<EventId> {
+    pub fn enclosing_agent(&self, event: EventId) -> Option<EventId> {
         let mut current = Some(event);
         while let Some(cur) = current {
             let ev = self.events.get(&cur)?;
-            if matches!(ev.payload, EventPayload::FrameStart { .. }) {
+            if matches!(ev.payload, EventPayload::Agent { .. }) {
                 return Some(cur);
             }
             current = ev.parent_id;
@@ -287,26 +284,26 @@ impl Tree {
         None
     }
 
-    /// Every frame in the log, in DFS tree order (root-first, children
-    /// grouped under their parent and sorted by id): the frame-navigator
+    /// Every agent in the log, in DFS tree order (root-first, children
+    /// grouped under their parent and sorted by id): the agent-navigator
     /// projection (decision 8). `complete` is whether a `FrameResult`
-    /// was logged on the frame's spine.
-    pub fn frame_list(&self) -> Vec<FrameView> {
+    /// was logged on the agent's spine.
+    pub fn agent_list(&self) -> Vec<AgentView> {
         let mut completed: HashSet<EventId> = HashSet::new();
         for event in self.events.values() {
             if let EventPayload::FrameResult { .. } = event.payload
-                && let Some(frame) = event.parent_id.and_then(|p| self.enclosing_frame(p))
+                && let Some(agent) = event.parent_id.and_then(|p| self.enclosing_agent(p))
             {
-                completed.insert(frame);
+                completed.insert(agent);
             }
         }
-        let frames: Vec<FrameView> = self
+        let contexts: Vec<AgentView> = self
             .events
             .values()
             .filter_map(|event| match &event.payload {
-                EventPayload::FrameStart { prompt, .. } => Some(FrameView {
+                EventPayload::Agent { prompt, .. } => Some(AgentView {
                     id: event.id,
-                    parent: event.parent_id.and_then(|p| self.enclosing_frame(p)),
+                    parent: event.parent_id.and_then(|p| self.enclosing_agent(p)),
                     prompt: prompt.clone(),
                     complete: completed.contains(&event.id),
                 }),
@@ -314,16 +311,16 @@ impl Tree {
             })
             .collect();
 
-        let mut children: HashMap<Option<EventId>, Vec<&FrameView>> = HashMap::new();
-        for fv in &frames {
+        let mut children: HashMap<Option<EventId>, Vec<&AgentView>> = HashMap::new();
+        for fv in &contexts {
             children.entry(fv.parent).or_default().push(fv);
         }
         for list in children.values_mut() {
             list.sort_by_key(|fv| fv.id.as_u64());
         }
 
-        let mut ordered = Vec::with_capacity(frames.len());
-        let mut stack: Vec<&FrameView> =
+        let mut ordered = Vec::with_capacity(contexts.len());
+        let mut stack: Vec<&AgentView> =
             children.get(&None).into_iter().flatten().copied().collect();
         stack.reverse();
         while let Some(fv) = stack.pop() {
@@ -337,20 +334,20 @@ impl Tree {
         ordered
     }
 
-    /// `frame`'s programs along `leaf`'s path, in order — the program-list
+    /// `agent`'s programs along `leaf`'s path, in order — the program-list
     /// projection (decision 8). Each `run_program` opens a program; a
     /// `resume` folds into the open one (same VM, one entry); `Invoke`,
     /// `ProgramResult`, `Console`, and the run's `Tool` result attach to
     /// it. Everything a finished program's panes need, no live VM.
-    pub fn programs_for(&self, frame: EventId, leaf: EventId) -> Vec<ProgramView> {
-        let mut cur_frame: Option<EventId> = None;
+    pub fn programs_for(&self, agent: EventId, leaf: EventId) -> Vec<ProgramView> {
+        let mut cur_agent: Option<EventId> = None;
         let mut programs: Vec<ProgramView> = Vec::new();
         for ev in self.path_events(leaf) {
-            if let EventPayload::FrameStart { .. } = ev.payload {
-                cur_frame = Some(ev.id);
+            if let EventPayload::Agent { .. } = ev.payload {
+                cur_agent = Some(ev.id);
                 continue;
             }
-            if cur_frame != Some(frame) {
+            if cur_agent != Some(agent) {
                 continue;
             }
             match &ev.payload {
@@ -419,13 +416,13 @@ impl Tree {
     }
 
     /// The set of spine leaves. A leaf is an event no *spine* event
-    /// follows: `FrameStart` children don't count — they root child
+    /// follows: `Agent` children don't count — they root child
     /// branches, so a call-site event stays its caller's leaf while a
     /// subagent is in flight.
     pub fn list_leaves(&self) -> Vec<(EventId, Option<String>)> {
         let mut spine_child_counts: HashMap<EventId, usize> = HashMap::new();
         for event in self.events.values() {
-            if matches!(event.payload, EventPayload::FrameStart { .. }) {
+            if matches!(event.payload, EventPayload::Agent { .. }) {
                 continue;
             }
             if let Some(parent) = event.parent_id {
@@ -523,11 +520,11 @@ mod tests {
                     .open(file.path())?,
             )
         };
-        let (frame, leaf);
+        let (agent, leaf);
         {
             let mut tree = open()?;
-            let mut spine = tree.start_frame(None, "root", json!(null))?;
-            frame = spine.leaf_id; // the FrameStart id is the frame id
+            let mut spine = tree.start_agent(None, "root", json!(null))?;
+            agent = spine.leaf_id; // the Agent id is the agent id
             tree.append(
                 &mut spine,
                 run_program_call("c1", "console.log('hi'); return 42;"),
@@ -556,16 +553,16 @@ mod tests {
 
         // Reload from disk — nothing live survives, only the log.
         let tree = open()?;
-        let frames = tree.frame_list();
-        assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0].id, frame);
-        assert_eq!(frames[0].prompt, "root");
-        assert!(!frames[0].complete, "root never logs a FrameResult");
+        let contexts = tree.agent_list();
+        assert_eq!(contexts.len(), 1);
+        assert_eq!(contexts[0].id, agent);
+        assert_eq!(contexts[0].prompt, "root");
+        assert!(!contexts[0].complete, "root never logs a FrameResult");
 
-        let progs = tree.programs_for(frame, leaf);
+        let progs = tree.programs_for(agent, leaf);
         assert_eq!(progs.len(), 1);
         let p = &progs[0];
-        assert_eq!(p.id, EventId::new(frame.as_u64() + 1)); // the run_program assistant event
+        assert_eq!(p.id, EventId::new(agent.as_u64() + 1)); // the run_program assistant event
         assert!(p.source.contains("return 42"));
         assert_eq!(p.invokes.len(), 1);
         assert_eq!(p.invokes[0].name, "bash");
@@ -584,8 +581,8 @@ mod tests {
     #[test]
     fn raise_then_resume_is_one_program() -> io::Result<()> {
         let mut tree = Tree::new(None);
-        let mut spine = tree.start_frame(None, "root", json!(null))?;
-        let frame = spine.leaf_id;
+        let mut spine = tree.start_agent(None, "root", json!(null))?;
+        let agent = spine.leaf_id;
         tree.append(&mut spine, run_program_call("c1", "raise('x');"))?;
         tree.append(&mut spine, tool_result("c1", "condition: x"))?; // suspend
         tree.append(&mut spine, resume_call("c2"))?; // continues the same program
@@ -604,7 +601,7 @@ mod tests {
         )?;
         let leaf = spine.leaf_id;
 
-        let progs = tree.programs_for(frame, leaf);
+        let progs = tree.programs_for(agent, leaf);
         assert_eq!(progs.len(), 1, "resume folds into one program");
         assert_eq!(progs[0].result, Some(json!("done")));
         assert_eq!(
@@ -618,58 +615,58 @@ mod tests {
     // --- Bootstrap & linear flow ---
 
     #[test]
-    fn test_bootstrap_root_frame() -> io::Result<()> {
+    fn test_bootstrap_root_agent() -> io::Result<()> {
         let mut tree = Tree::new(None);
-        let spine = tree.start_frame(None, "hello", json!(null))?;
+        let spine = tree.start_agent(None, "hello", json!(null))?;
         assert_eq!(spine.leaf_id.as_u64(), 1);
         assert!(tree.events[&spine.leaf_id].is_root());
-        assert_eq!(spine.frames.len(), 1);
-        assert_eq!(spine.frame().prompt, "hello");
+        assert_eq!(spine.contexts.len(), 1);
+        assert_eq!(spine.context().prompt, "hello");
         Ok(())
     }
 
     #[test]
-    #[should_panic(expected = "root FrameStart on a non-empty tree")]
-    fn test_second_root_frame_panics() {
+    #[should_panic(expected = "root Agent on a non-empty tree")]
+    fn test_second_root_agent_panics() {
         let mut tree = Tree::new(None);
-        tree.start_frame(None, "root", json!(null)).unwrap();
-        let _ = tree.start_frame(None, "another root", json!(null));
+        tree.start_agent(None, "root", json!(null)).unwrap();
+        let _ = tree.start_agent(None, "another root", json!(null));
     }
 
     #[test]
     fn test_linear_conversation() -> io::Result<()> {
         let mut tree = Tree::new(None);
-        let mut spine = tree.start_frame(None, "root", json!(null))?;
+        let mut spine = tree.start_agent(None, "root", json!(null))?;
         tree.append(&mut spine, user_msg("hello"))?;
         tree.append(&mut spine, assistant_msg("hi there"))?;
 
-        assert_eq!(spine.frames.len(), 1);
-        assert_eq!(spine.frame().messages.len(), 2);
-        assert_eq!(spine.frame().messages[0].text(), "hello");
-        assert_eq!(spine.frame().messages[1].text(), "hi there");
+        assert_eq!(spine.contexts.len(), 1);
+        assert_eq!(spine.context().messages.len(), 2);
+        assert_eq!(spine.context().messages[0].text(), "hello");
+        assert_eq!(spine.context().messages[1].text(), "hi there");
         Ok(())
     }
 
     #[test]
-    #[should_panic(expected = "FrameStart must go through start_frame")]
-    fn test_append_frame_start_panics() {
+    #[should_panic(expected = "Agent must go through start_agent")]
+    fn test_append_agent_root_panics() {
         let mut tree = Tree::new(None);
-        let mut spine = tree.start_frame(None, "root", json!(null)).unwrap();
+        let mut spine = tree.start_agent(None, "root", json!(null)).unwrap();
         let _ = tree.append(
             &mut spine,
-            EventPayload::FrameStart {
+            EventPayload::Agent {
                 prompt: "child".into(),
                 input: json!(null),
             },
         );
     }
 
-    // --- Frame completion ---
+    // --- Context completion ---
 
     #[test]
-    fn test_frame_result_completes_spine() -> io::Result<()> {
+    fn test_result_completes_spine() -> io::Result<()> {
         let mut tree = Tree::new(None);
-        let mut spine = tree.start_frame(None, "root", json!(null))?;
+        let mut spine = tree.start_agent(None, "root", json!(null))?;
         tree.append(&mut spine, assistant_msg("done"))?;
         assert!(!spine.is_complete());
 
@@ -680,15 +677,15 @@ mod tests {
             },
         )?;
         assert!(spine.is_complete());
-        assert_eq!(spine.frame().result, Some(json!({"ok": true})));
+        assert_eq!(spine.context().result, Some(json!({"ok": true})));
         Ok(())
     }
 
     #[test]
     #[should_panic(expected = "append after FrameResult")]
-    fn test_append_after_frame_result_panics() {
+    fn test_append_after_result_panics() {
         let mut tree = Tree::new(None);
-        let mut spine = tree.start_frame(None, "root", json!(null)).unwrap();
+        let mut spine = tree.start_agent(None, "root", json!(null)).unwrap();
         tree.append(&mut spine, EventPayload::FrameResult { result: json!(42) })
             .unwrap();
         let _ = tree.append(&mut spine, user_msg("too late"));
@@ -699,7 +696,7 @@ mod tests {
     #[test]
     fn test_invoke_and_program_result_are_artifacts_not_messages() -> io::Result<()> {
         let mut tree = Tree::new(None);
-        let mut spine = tree.start_frame(None, "root", json!(null))?;
+        let mut spine = tree.start_agent(None, "root", json!(null))?;
         let invoke_id = tree.append(
             &mut spine,
             EventPayload::Invoke {
@@ -715,10 +712,10 @@ mod tests {
             },
         )?;
 
-        // Spine leaf advanced past both, but the frame's chat transcript
+        // Spine leaf advanced past both, but the agent's chat transcript
         // is untouched — they're id-addressable artifacts.
         assert_eq!(spine.leaf_id, result_id);
-        assert!(spine.frame().messages.is_empty());
+        assert!(spine.context().messages.is_empty());
         assert!(matches!(
             tree.events[&invoke_id].payload,
             EventPayload::Invoke { .. }
@@ -730,16 +727,16 @@ mod tests {
         Ok(())
     }
 
-    // --- Branching: subagent frames ---
+    // --- Branching: subagent contexts ---
 
-    /// Caller spine + child frame branched at a call-site event, appends
+    /// Caller spine + child agent branched at a call-site event, appends
     /// interleaved between the two spines.
     fn build_branched_tree(tree: &mut Tree) -> io::Result<(Spine, Spine)> {
-        let mut caller = tree.start_frame(None, "root", json!(null))?;
+        let mut caller = tree.start_agent(None, "root", json!(null))?;
         tree.append(&mut caller, user_msg("m1"))?;
         let call_site = tree.append(&mut caller, assistant_msg("spawning"))?;
 
-        let mut child = tree.start_frame(Some(call_site), "child prompt", json!({"task": 1}))?;
+        let mut child = tree.start_agent(Some(call_site), "child prompt", json!({"task": 1}))?;
         // Interleave appends across the two spines.
         tree.append(&mut caller, user_msg("caller continues"))?;
         tree.append(&mut child, assistant_msg("child working"))?;
@@ -754,18 +751,18 @@ mod tests {
 
         // Live handles and from-scratch reconstruction agree.
         for spine in [&caller, &tree.spine_at(caller.leaf_id)] {
-            assert_eq!(spine.frames.len(), 1);
-            let msgs: Vec<&str> = spine.frame().messages.iter().map(|m| m.text()).collect();
+            assert_eq!(spine.contexts.len(), 1);
+            let msgs: Vec<&str> = spine.context().messages.iter().map(|m| m.text()).collect();
             assert_eq!(
                 msgs,
                 ["m1", "spawning", "caller continues", "caller answer"]
             );
         }
         for spine in [&child, &tree.spine_at(child.leaf_id)] {
-            assert_eq!(spine.frames.len(), 2, "child sits under the root frame");
-            assert_eq!(spine.frame().prompt, "child prompt");
-            assert_eq!(spine.frame().input, json!({"task": 1}));
-            let msgs: Vec<&str> = spine.frame().messages.iter().map(|m| m.text()).collect();
+            assert_eq!(spine.contexts.len(), 2, "child sits under the root agent");
+            assert_eq!(spine.context().prompt, "child prompt");
+            assert_eq!(spine.context().input, json!({"task": 1}));
+            let msgs: Vec<&str> = spine.context().messages.iter().map(|m| m.text()).collect();
             assert_eq!(msgs, ["child working"]);
         }
         Ok(())
@@ -786,13 +783,13 @@ mod tests {
 
     #[test]
     fn test_in_flight_branch_keeps_caller_leaf() -> io::Result<()> {
-        // A FrameStart child must not swallow the caller's leaf: with no
+        // A Agent child must not swallow the caller's leaf: with no
         // caller activity after the call site, the call-site event is
         // still the caller's resumable leaf.
         let mut tree = Tree::new(None);
-        let mut caller = tree.start_frame(None, "root", json!(null))?;
+        let mut caller = tree.start_agent(None, "root", json!(null))?;
         let call_site = tree.append(&mut caller, assistant_msg("spawning"))?;
-        let child = tree.start_frame(Some(call_site), "child", json!(null))?;
+        let child = tree.start_agent(Some(call_site), "child", json!(null))?;
 
         let mut leaves: Vec<EventId> = tree.list_leaves().into_iter().map(|(id, _)| id).collect();
         leaves.sort_by_key(|id| id.as_u64());
@@ -805,7 +802,7 @@ mod tests {
     #[test]
     fn test_fork_mid_spine_diverges_leaving_original_intact() -> io::Result<()> {
         let mut tree = Tree::new(None);
-        let mut spine = tree.start_frame(None, "root", json!(null))?;
+        let mut spine = tree.start_agent(None, "root", json!(null))?;
         tree.append(&mut spine, user_msg("q"))?;
         let fork_point = tree.append(&mut spine, assistant_msg("first answer"))?;
         let original_leaf = tree.append(&mut spine, user_msg("follow-up A"))?;
@@ -820,7 +817,7 @@ mod tests {
         assert_ne!(original_leaf, forked_leaf);
         let texts = |leaf: EventId| -> Vec<String> {
             tree.spine_at(leaf)
-                .frame()
+                .context()
                 .messages
                 .iter()
                 .map(|m| m.text().to_owned())
@@ -834,7 +831,7 @@ mod tests {
     #[test]
     fn test_fork_from_completed_spine_errors() -> io::Result<()> {
         let mut tree = Tree::new(None);
-        let mut spine = tree.start_frame(None, "root", json!(null))?;
+        let mut spine = tree.start_agent(None, "root", json!(null))?;
         tree.append(&mut spine, assistant_msg("done"))?;
         let result_id = tree.append(&mut spine, EventPayload::FrameResult { result: json!(1) })?;
         let err = tree.fork(result_id).unwrap_err();
@@ -854,7 +851,7 @@ mod tests {
     #[test]
     fn test_label_on_leaf() -> io::Result<()> {
         let mut tree = Tree::new(None);
-        let mut spine = tree.start_frame(None, "root", json!(null))?;
+        let mut spine = tree.start_agent(None, "root", json!(null))?;
         tree.append(&mut spine, user_msg("hi"))?;
         tree.append(&mut spine, EventPayload::Label("my branch".into()))?;
 
@@ -867,7 +864,7 @@ mod tests {
     #[test]
     fn test_label_earlier_on_spine() -> io::Result<()> {
         let mut tree = Tree::new(None);
-        let mut spine = tree.start_frame(None, "root", json!(null))?;
+        let mut spine = tree.start_agent(None, "root", json!(null))?;
         tree.append(&mut spine, EventPayload::Label("my branch".into()))?;
         tree.append(&mut spine, user_msg("hello"))?;
 
@@ -880,7 +877,7 @@ mod tests {
     #[test]
     fn test_unlabeled_leaf() -> io::Result<()> {
         let mut tree = Tree::new(None);
-        let mut spine = tree.start_frame(None, "root", json!(null))?;
+        let mut spine = tree.start_agent(None, "root", json!(null))?;
         tree.append(&mut spine, user_msg("hello"))?;
 
         let leaves = tree.list_leaves();
@@ -911,7 +908,7 @@ mod tests {
                 .open(&path)?;
             let mut tree = Tree::open(file)?;
             let (caller, child) = build_branched_tree(&mut tree)?;
-            // Child is in flight: FrameStart logged, no FrameResult yet.
+            // Child is in flight: Agent logged, no FrameResult yet.
             assert!(!child.is_complete());
             (caller.leaf_id, child.leaf_id)
         };
@@ -929,7 +926,7 @@ mod tests {
 
             // Resume the in-flight child: reconstruct and finish it.
             let mut child = tree.spine_at(child_leaf);
-            assert_eq!(child.frame().prompt, "child prompt");
+            assert_eq!(child.context().prompt, "child prompt");
             assert!(!child.is_complete());
             tree.append(
                 &mut child,
@@ -944,7 +941,7 @@ mod tests {
             let tree = Tree::open(file)?;
             let child = tree.spine_at(EventId::new(tree.id_counter));
             assert!(child.is_complete());
-            assert_eq!(child.frame().result, Some(json!("done")));
+            assert_eq!(child.context().result, Some(json!("done")));
         }
         Ok(())
     }
@@ -962,7 +959,7 @@ mod tests {
                 .truncate(false)
                 .open(&path)?;
             let mut tree = Tree::open(file)?;
-            let mut spine = tree.start_frame(None, "root", json!(null))?;
+            let mut spine = tree.start_agent(None, "root", json!(null))?;
             tree.append(&mut spine, user_msg("first msg"))?;
         }
 
@@ -972,10 +969,10 @@ mod tests {
             let leaves = tree.list_leaves();
             assert_eq!(leaves.len(), 1);
             let mut spine = tree.spine_at(leaves[0].0);
-            assert_eq!(spine.frame().messages.len(), 1);
+            assert_eq!(spine.context().messages.len(), 1);
 
             tree.append(&mut spine, assistant_msg("second msg"))?;
-            assert_eq!(spine.frame().messages.len(), 2);
+            assert_eq!(spine.context().messages.len(), 2);
         }
 
         {
@@ -984,9 +981,9 @@ mod tests {
             let leaves = tree.list_leaves();
             assert_eq!(leaves.len(), 1);
             let spine = tree.spine_at(leaves[0].0);
-            assert_eq!(spine.frame().messages.len(), 2);
-            assert_eq!(spine.frame().messages[0].text(), "first msg");
-            assert_eq!(spine.frame().messages[1].text(), "second msg");
+            assert_eq!(spine.context().messages.len(), 2);
+            assert_eq!(spine.context().messages[0].text(), "first msg");
+            assert_eq!(spine.context().messages[1].text(), "second msg");
         }
         Ok(())
     }
@@ -1005,9 +1002,9 @@ mod tests {
         let mut tree = Tree::open(file)?;
         assert!(tree.list_leaves().is_empty());
 
-        let spine = tree.start_frame(None, "first", json!(null))?;
-        assert_eq!(spine.frames.len(), 1);
-        assert_eq!(spine.frame().prompt, "first");
+        let spine = tree.start_agent(None, "first", json!(null))?;
+        assert_eq!(spine.contexts.len(), 1);
+        assert_eq!(spine.context().prompt, "first");
         Ok(())
     }
 
@@ -1017,6 +1014,6 @@ mod tests {
     fn test_spine_at_unknown_id_is_empty() {
         let tree = Tree::new(None);
         let spine = tree.spine_at(EventId::new(42));
-        assert!(spine.frames.is_empty());
+        assert!(spine.contexts.is_empty());
     }
 }

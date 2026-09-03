@@ -1,11 +1,11 @@
 //! The host layer (8_HARNESS Step 5): one main-loop thread owns the
-//! tree and the frame step machines and `recv()`s a single
+//! tree and the agent step machines and `recv()`s a single
 //! `std::sync::mpsc` inbox of one unified message enum. Worker threads
 //! exist only for blocking IO — one per in-flight LLM completion,
 //! spawn-per-call for tool fan-out — and only ever hold a cloned
 //! `Sender`. VM compute runs on the loop thread in fuel slices
 //! (`StepInput::Tick`), with a `Continue` message re-enqueued between
-//! slices so a hot program never starves other frames or the UI.
+//! slices so a hot program never starves other contexts or the UI.
 //!
 //! The single inbox gives one total arrival order, which *is* the
 //! logged resolution order (decision 7) — no select fairness anywhere.
@@ -38,15 +38,13 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Instant;
 
-use crate::machine::{
-    AgentState, LlmRequest, OutCall, SpawnFrame, StepInput, StepOutput, ToolResult,
-};
+use crate::machine::{LlmRequest, OutCall, Runner, SpawnAgent, StepInput, StepOutput, ToolResult};
 use crate::types::{EventId, EventPayload, Message, Spine, Tree};
 
 /// Instructions per VM slice on the loop thread (9_TUI decision 3).
 pub const FUEL_SLICE: u64 = 100_000;
 
-/// Default cap on LLM completions running at once across all frames
+/// Default cap on LLM completions running at once across all contexts
 /// (root + subagents). Overridable via `AGENT2_LLM_CONCURRENCY`.
 pub const DEFAULT_LLM_CONCURRENCY: usize = 4;
 
@@ -63,7 +61,7 @@ fn llm_concurrency() -> usize {
 /// A counting semaphore (std-only) bounding concurrent LLM completions.
 /// LLM worker threads block in `acquire` until a permit frees; the
 /// returned `Permit` returns it on drop. A permit is held only for the
-/// duration of one `complete()` call — never while a frame is parked
+/// duration of one `complete()` call — never while an agent is parked
 /// awaiting tool/subagent results — so it cannot deadlock a join.
 struct Semaphore {
     permits: Mutex<usize>,
@@ -112,22 +110,22 @@ pub type UiInput = ratatui::crossterm::event::Event;
 pub(crate) enum LoopMsg {
     Command(SessionCommand),
     LlmChunk {
-        frame: FrameId,
+        agent: AgentId,
         thinking: bool,
         text: String,
     },
     LlmDone {
-        frame: FrameId,
+        agent: AgentId,
         result: Result<Message, String>,
     },
     ToolDone {
-        frame: FrameId,
+        agent: AgentId,
         invoke_id: u64,
         result: Result<serde_json::Value, String>,
     },
     /// Fuel-slice continuation, re-enqueued between slices.
     Continue {
-        frame: FrameId,
+        agent: AgentId,
     },
     /// Terminal input for the embedding TUI; opaque to the loop.
     Ui(UiInput),
@@ -154,12 +152,12 @@ impl SessionHandle {
 
 pub struct Session {
     tree: Tree,
-    states: HashMap<FrameId, AgentState>,
-    root: FrameId,
-    /// Child frame → (caller frame, the caller's `agent` invoke id).
-    parents: HashMap<FrameId, (FrameId, u64)>,
+    states: HashMap<AgentId, Runner>,
+    root: AgentId,
+    /// Child agent → (caller agent, the caller's `agent` invoke id).
+    parents: HashMap<AgentId, (AgentId, u64)>,
     registry: ToolRegistry,
-    /// Shared client: `complete(&self)` lets several frames think at
+    /// Shared client: `complete(&self)` lets several contexts think at
     /// once. Concurrency is bounded by `llm_permits`, not by the client.
     llm: Arc<dyn LlmClient>,
     /// Caps concurrent LLM completions (root + subagents).
@@ -169,12 +167,12 @@ pub struct Session {
     events: Sender<SessionEvent>,
     /// High-water mark of event ids already surfaced as `SessionEvent`s.
     emitted: u64,
-    /// Frames whose VM the debugger paused: their `Continue` messages
+    /// Agents whose VM the debugger paused: their `Continue` messages
     /// are parked in `starved` instead of ticking.
-    paused: HashSet<FrameId>,
-    starved: HashSet<FrameId>,
+    paused: HashSet<AgentId>,
+    starved: HashSet<AgentId>,
     done: bool,
-    /// The root frame yielded its turn back to the user (it produced a
+    /// The root agent yielded its turn back to the user (it produced a
     /// final answer but, being the top conversation, did not complete).
     /// `run()` stops here; interactive front-ends keep going and clear it
     /// on the next `UserTurn`.
@@ -182,7 +180,7 @@ pub struct Session {
 }
 
 impl Session {
-    /// Open a session over `tree`: a fresh tree roots a new frame with
+    /// Open a session over `tree`: a fresh tree roots a new agent with
     /// `prompt`/`input`; a re-opened log auto-picks a resume anchor
     /// (`pick_resume_leaf`: lowest incomplete leaf, else — every spine
     /// complete — the lowest-id leaf, so the loop still lives for
@@ -198,7 +196,7 @@ impl Session {
     ) -> io::Result<Self> {
         if tree.events.is_empty() {
             let emitted = tree.id_counter;
-            let state = AgentState::new_root(&mut tree, prompt, input)?;
+            let state = Runner::new_root(&mut tree, prompt, input)?;
             Self::assemble(tree, state, registry, llm, events, emitted)
         } else {
             let leaf = pick_resume_leaf(&tree)?;
@@ -207,7 +205,7 @@ impl Session {
     }
 
     /// Open a re-loaded log anchored at a chosen `leaf` (M4 resume seam,
-    /// generalizing `new`'s auto-pick). The root frame is the one `leaf`
+    /// generalizing `new`'s auto-pick). The root agent is the one `leaf`
     /// belongs to; if `leaf`'s spine is already complete the session
     /// opens idle (a direct `UserTurn` is rejected — fork to continue).
     ///
@@ -229,22 +227,22 @@ impl Session {
         }
         let leaf = synthesize_if_interrupted(&mut tree, leaf)?;
         let emitted = 0; // replay all existing events into the chat pane
-        let state = AgentState::with_spine(tree.spine_at(leaf));
+        let state = Runner::with_spine(tree.spine_at(leaf));
         Self::assemble(tree, state, registry, llm, events, emitted)
     }
 
     /// Shared construction for `new`/`open_at`: card the state, derive
-    /// the root frame, wire the inbox, and surface any logged events.
+    /// the root agent, wire the inbox, and surface any logged events.
     fn assemble(
         tree: Tree,
-        mut state: AgentState,
+        mut state: Runner,
         registry: ToolRegistry,
         llm: Box<dyn LlmClient>,
         events: Sender<SessionEvent>,
         emitted: u64,
     ) -> io::Result<Self> {
         state.set_dialect_card(dialect_card(&registry));
-        let root = frame_start_id(&tree, state.spine.leaf_id);
+        let root = agent_root_of(&tree, state.spine.leaf_id);
 
         let (tx, rx) = channel();
         let mut session = Session {
@@ -278,17 +276,17 @@ impl Session {
         &self.tree
     }
 
-    pub fn root(&self) -> FrameId {
+    pub fn root(&self) -> AgentId {
         self.root
     }
 
-    pub fn state(&self, frame: FrameId) -> Option<&AgentState> {
-        self.states.get(&frame)
+    pub fn state(&self, agent: AgentId) -> Option<&Runner> {
+        self.states.get(&agent)
     }
 
-    /// Active frames, for frame lists (id, machine status).
-    pub fn frames(&self) -> Vec<(FrameId, &'static str)> {
-        let mut out: Vec<(FrameId, &'static str)> = self
+    /// Active contexts, for agent lists (id, machine status).
+    pub fn agents(&self) -> Vec<(AgentId, &'static str)> {
+        let mut out: Vec<(AgentId, &'static str)> = self
             .states
             .iter()
             .map(|(id, s)| (*id, s.status()))
@@ -297,7 +295,7 @@ impl Session {
         out
     }
 
-    /// Run until the root frame yields the turn back to the user or
+    /// Run until the root agent yields the turn back to the user or
     /// `Shutdown`. The root never *completes* (the top conversation
     /// never ends); `run()` is the one-shot convenience that stops at the
     /// yield. Interactive front-ends drive `pump_until` instead and keep
@@ -345,7 +343,7 @@ impl Session {
         }
     }
 
-    /// Whether the conversation is over (root frame done / `Shutdown`).
+    /// Whether the conversation is over (root agent done / `Shutdown`).
     /// The attached TUI keeps rendering past this for post-mortem
     /// reading; `run()` exits on it.
     #[allow(dead_code)]
@@ -353,8 +351,8 @@ impl Session {
         self.done
     }
 
-    /// Whether the root frame has yielded its turn back to the user (a
-    /// final answer is on the spine and the frame is idle, awaiting the
+    /// Whether the root agent has yielded its turn back to the user (a
+    /// final answer is on the spine and the agent is idle, awaiting the
     /// next `UserTurn`). Distinct from `is_done`: the conversation lives.
     #[allow(dead_code)]
     pub fn is_awaiting_user(&self) -> bool {
@@ -363,30 +361,30 @@ impl Session {
 
     // ── debugger controls (privileged: same thread as the loop) ──────
 
-    /// Pause/resume a frame's VM. Pausing parks its fuel-slice
+    /// Pause/resume an agent's VM. Pausing parks its fuel-slice
     /// continuations; resuming re-enqueues a parked one.
-    pub fn set_paused(&mut self, frame: FrameId, paused: bool) {
+    pub fn set_paused(&mut self, agent: AgentId, paused: bool) {
         if paused {
-            self.paused.insert(frame);
-        } else if self.paused.remove(&frame) && self.starved.remove(&frame) {
-            let _ = self.tx.send(LoopMsg::Continue { frame });
+            self.paused.insert(agent);
+        } else if self.paused.remove(&agent) && self.starved.remove(&agent) {
+            let _ = self.tx.send(LoopMsg::Continue { agent });
         }
     }
 
-    pub fn is_paused(&self, frame: FrameId) -> bool {
-        self.paused.contains(&frame)
+    pub fn is_paused(&self, agent: AgentId) -> bool {
+        self.paused.contains(&agent)
     }
 
     /// Run one slice of at most `fuel` instructions on a (paused)
-    /// frame — the debugger's step keys.
-    pub fn step_paused(&mut self, frame: FrameId, fuel: u64) {
-        let _ = self.step_frame(frame, StepInput::Tick { fuel });
+    /// agent — the debugger's step keys.
+    pub fn step_paused(&mut self, agent: AgentId, fuel: u64) {
+        let _ = self.step_agent(agent, StepInput::Tick { fuel });
     }
 
     fn on_msg(&mut self, msg: LoopMsg) {
         if let Err(e) = self.dispatch(msg) {
             self.emit(SessionEvent::Error {
-                frame: None,
+                agent: None,
                 message: format!("session io error: {e}"),
             });
             self.done = true;
@@ -405,11 +403,11 @@ impl Session {
                     return Ok(());
                 };
                 if !state.is_idle() {
-                    // Steering a busy frame is M2's host-injected
+                    // Steering a busy agent is M2's host-injected
                     // condition; until then the command is rejected.
                     self.emit(SessionEvent::Error {
-                        frame: Some(root),
-                        message: format!("frame is busy ({})", state.status()),
+                        agent: Some(root),
+                        message: format!("agent is busy ({})", state.status()),
                     });
                     return Ok(());
                 }
@@ -417,13 +415,13 @@ impl Session {
                     // Nothing may follow a `FrameResult`; fork from an
                     // earlier event to continue past a finished spine.
                     self.emit(SessionEvent::Error {
-                        frame: Some(root),
+                        agent: Some(root),
                         message: "spine is complete; fork from an earlier event to continue".into(),
                     });
                     return Ok(());
                 }
                 self.awaiting_user = false; // the user took their turn
-                self.step_frame(root, StepInput::UserTurn(text))
+                self.step_agent(root, StepInput::UserTurn(text))
             }
             LoopMsg::Command(SessionCommand::ListLeaves) => {
                 let leaves = self.leaf_infos();
@@ -434,29 +432,29 @@ impl Session {
             LoopMsg::Command(SessionCommand::Fork { from, label }) => self.cmd_fork(from, label),
             LoopMsg::Command(SessionCommand::Resume(leaf)) => self.cmd_resume(leaf),
             LoopMsg::LlmChunk {
-                frame,
+                agent,
                 thinking,
                 text,
             } => {
                 self.emit(SessionEvent::Chunk {
-                    frame,
+                    agent,
                     thinking,
                     text,
                 });
                 Ok(())
             }
-            LoopMsg::LlmDone { frame, result } => match result {
-                Ok(message) => self.step_frame(frame, StepInput::LlmResponse(message)),
+            LoopMsg::LlmDone { agent, result } => match result {
+                Ok(message) => self.step_agent(agent, StepInput::LlmResponse(message)),
                 Err(message) => {
                     self.emit(SessionEvent::Error {
-                        frame: Some(frame),
+                        agent: Some(agent),
                         message: message.clone(),
                     });
-                    match self.parents.get(&frame).copied() {
+                    match self.parents.get(&agent).copied() {
                         // A dead child rejects the caller's `agent` call.
                         Some((parent, invoke_id)) => {
                             let _ = self.tx.send(LoopMsg::ToolDone {
-                                frame: parent,
+                                agent: parent,
                                 invoke_id,
                                 result: Err(format!("subagent failed: {message}")),
                             });
@@ -467,38 +465,38 @@ impl Session {
                 }
             },
             LoopMsg::ToolDone {
-                frame,
+                agent,
                 invoke_id,
                 result,
-            } => self.step_frame(
-                frame,
+            } => self.step_agent(
+                agent,
                 StepInput::ToolResults(vec![ToolResult { invoke_id, result }]),
             ),
-            LoopMsg::Continue { frame } => {
-                if self.paused.contains(&frame) {
+            LoopMsg::Continue { agent } => {
+                if self.paused.contains(&agent) {
                     // Park the slice; `set_paused(false)` re-enqueues it.
-                    self.starved.insert(frame);
+                    self.starved.insert(agent);
                     return Ok(());
                 }
-                self.step_frame(frame, StepInput::Tick { fuel: FUEL_SLICE })
+                self.step_agent(agent, StepInput::Tick { fuel: FUEL_SLICE })
             }
             // Handled by `pump_until`; harmless if one reaches `run()`.
             LoopMsg::Ui(_) => Ok(()),
         }
     }
 
-    /// The active root frame's id if it is idle; otherwise emit a
+    /// The active root agent's id if it is idle; otherwise emit a
     /// rejection and return `None`. Fork/label/resume re-anchor the root
     /// and must not tear down a running VM (like `UserTurn`).
-    fn idle_root(&mut self) -> Option<FrameId> {
+    fn idle_root(&mut self) -> Option<AgentId> {
         let root = self.root;
         match self.states.get(&root) {
             Some(state) if state.is_idle() => Some(root),
             Some(state) => {
                 let status = state.status();
                 self.emit(SessionEvent::Error {
-                    frame: Some(root),
-                    message: format!("frame is busy ({status})"),
+                    agent: Some(root),
+                    message: format!("agent is busy ({status})"),
                 });
                 None
             }
@@ -513,7 +511,7 @@ impl Session {
         let state = self.states.get_mut(&root).expect("idle_root checked");
         if state.spine.is_complete() {
             self.emit(SessionEvent::Error {
-                frame: Some(root),
+                agent: Some(root),
                 message: "spine is complete; cannot label past a FrameResult".into(),
             });
             return Ok(());
@@ -534,7 +532,7 @@ impl Session {
             Ok(spine) => spine,
             Err(e) => {
                 self.emit(SessionEvent::Error {
-                    frame: None,
+                    agent: None,
                     message: format!("fork failed: {e}"),
                 });
                 return Ok(());
@@ -555,7 +553,7 @@ impl Session {
         }
         if !self.tree.events.contains_key(&leaf) {
             self.emit(SessionEvent::Error {
-                frame: None,
+                agent: None,
                 message: format!("cannot resume {leaf:?}: not in the log"),
             });
             return Ok(());
@@ -563,7 +561,7 @@ impl Session {
         let spine = self.tree.spine_at(leaf);
         if spine.is_complete() {
             self.emit(SessionEvent::Error {
-                frame: None,
+                agent: None,
                 message: format!(
                     "{leaf:?} is a completed spine; fork from an earlier event to continue"
                 ),
@@ -576,15 +574,15 @@ impl Session {
         Ok(())
     }
 
-    /// Make `spine` the active root: card a fresh `AgentState`, key it by
-    /// its frame's `FrameStart` (replacing any prior in-memory state for
-    /// that frame — the superseded branch stays in the tree, re-listable
+    /// Make `spine` the active root: card a fresh `Runner`, key it by
+    /// its agent's `Agent` (replacing any prior in-memory state for
+    /// that agent — the superseded branch stays in the tree, re-listable
     /// via `ListLeaves`), and point `root` at it. Any freshly logged
     /// events (a fork's `Label`) are surfaced.
     fn reanchor_root(&mut self, spine: Spine) {
-        let mut state = AgentState::with_spine(spine);
+        let mut state = Runner::with_spine(spine);
         state.set_dialect_card(dialect_card(&self.registry));
-        let root = frame_start_id(&self.tree, state.spine.leaf_id);
+        let root = agent_root_of(&self.tree, state.spine.leaf_id);
         self.states.insert(root, state);
         self.root = root;
         self.emit_new(root);
@@ -600,7 +598,7 @@ impl Session {
             .into_iter()
             .map(|(leaf, label)| LeafInfo {
                 leaf,
-                frame: frame_start_id(&self.tree, leaf),
+                agent: agent_root_of(&self.tree, leaf),
                 label,
                 complete: self.tree.spine_at(leaf).is_complete(),
                 active: Some(leaf) == active,
@@ -609,44 +607,44 @@ impl Session {
             .collect()
     }
 
-    fn step_frame(&mut self, frame: FrameId, input: StepInput) -> io::Result<()> {
-        let Some(state) = self.states.get_mut(&frame) else {
+    fn step_agent(&mut self, agent: AgentId, input: StepInput) -> io::Result<()> {
+        let Some(state) = self.states.get_mut(&agent) else {
             return Ok(());
         };
         let outputs = state.step(&mut self.tree, input)?;
         let transitions = state.take_status_transitions();
-        self.emit_new(frame);
+        self.emit_new(agent);
         for (program, status) in transitions {
             self.emit(SessionEvent::ProgramStatus {
-                frame,
+                agent,
                 program,
                 status,
             });
         }
-        self.process(frame, outputs)
+        self.process(agent, outputs)
     }
 
-    fn process(&mut self, frame: FrameId, outputs: Vec<StepOutput>) -> io::Result<()> {
+    fn process(&mut self, agent: AgentId, outputs: Vec<StepOutput>) -> io::Result<()> {
         for output in outputs {
             match output {
-                StepOutput::LlmRequest(request) => self.spawn_llm(frame, request),
-                StepOutput::ToolCalls(calls) => self.spawn_tools(frame, calls),
-                StepOutput::SpawnFrames(spawns) => {
+                StepOutput::LlmRequest(request) => self.spawn_llm(agent, request),
+                StepOutput::ToolCalls(calls) => self.spawn_tools(agent, calls),
+                StepOutput::SpawnAgents(spawns) => {
                     for spawn in spawns {
-                        self.spawn_child(frame, spawn)?;
+                        self.spawn_child(agent, spawn)?;
                     }
                 }
-                StepOutput::FrameDone(result) => match self.parents.get(&frame).copied() {
+                StepOutput::AgentDone(result) => match self.parents.get(&agent).copied() {
                     Some((parent, invoke_id)) => {
                         let _ = self.tx.send(LoopMsg::ToolDone {
-                            frame: parent,
+                            agent: parent,
                             invoke_id,
                             result: guard_size(Ok(result)),
                         });
                     }
-                    // A parentless frame finishing is the root; it yields
+                    // A parentless agent finishing is the root; it yields
                     // rather than completing (see `StepOutput::Yielded`).
-                    // Reaching here means a non-root frame had no caller —
+                    // Reaching here means a non-root agent had no caller —
                     // end the session rather than strand it.
                     None => self.done = true,
                 },
@@ -654,7 +652,7 @@ impl Session {
                 // the conversation stays open, idle, awaiting the user.
                 StepOutput::Yielded => self.awaiting_user = true,
                 StepOutput::Working => {
-                    let _ = self.tx.send(LoopMsg::Continue { frame });
+                    let _ = self.tx.send(LoopMsg::Continue { agent });
                 }
             }
         }
@@ -663,7 +661,7 @@ impl Session {
 
     /// One worker thread per in-flight completion (blocking reads live
     /// there; chunks and the final message come back through the inbox).
-    fn spawn_llm(&self, frame: FrameId, request: LlmRequest) {
+    fn spawn_llm(&self, agent: AgentId, request: LlmRequest) {
         let llm = Arc::clone(&self.llm);
         let permits = Arc::clone(&self.llm_permits);
         let tx = self.tx.clone();
@@ -677,20 +675,20 @@ impl Session {
                     LlmChunk::Thinking(t) => (true, t),
                 };
                 let _ = tx.send(LoopMsg::LlmChunk {
-                    frame,
+                    agent,
                     thinking,
                     text,
                 });
             };
             let result = llm.complete(&request, &mut on_chunk);
-            let _ = tx.send(LoopMsg::LlmDone { frame, result });
+            let _ = tx.send(LoopMsg::LlmDone { agent, result });
         });
     }
 
     /// Spawn-per-call fan-out; completions arrive at the inbox in
     /// whatever order the tools finish — that arrival order is the
     /// logged resolution order.
-    fn spawn_tools(&self, frame: FrameId, calls: Vec<OutCall>) {
+    fn spawn_tools(&self, agent: AgentId, calls: Vec<OutCall>) {
         for call in calls {
             match self.registry.get(&call.name) {
                 Some(def) => {
@@ -699,7 +697,7 @@ impl Session {
                     thread::spawn(move || {
                         let result = guard_size((def.handler)(call.args));
                         let _ = tx.send(LoopMsg::ToolDone {
-                            frame,
+                            agent,
                             invoke_id: call.invoke_id,
                             result,
                         });
@@ -707,7 +705,7 @@ impl Session {
                 }
                 None => {
                     let _ = self.tx.send(LoopMsg::ToolDone {
-                        frame,
+                        agent,
                         invoke_id: call.invoke_id,
                         result: Err(format!("unknown tool `{}`", call.name)),
                     });
@@ -716,19 +714,19 @@ impl Session {
         }
     }
 
-    /// The `agent` tool: a `SpawnFrame` becomes a child `AgentState` on
+    /// The `agent` tool: a `SpawnAgent` becomes a child `Runner` on
     /// a branch rooted at the caller's call site.
-    fn spawn_child(&mut self, parent: FrameId, spawn: SpawnFrame) -> io::Result<()> {
-        let SpawnFrame {
+    fn spawn_child(&mut self, parent: AgentId, spawn: SpawnAgent) -> io::Result<()> {
+        let SpawnAgent {
             invoke_id,
             prompt,
             input,
             budget,
         } = spawn;
         let call_site = self.states[&parent].spine.leaf_id;
-        let mut child = AgentState::new_child(&mut self.tree, call_site, prompt, input, budget)?;
+        let mut child = Runner::new_child(&mut self.tree, call_site, prompt, input, budget)?;
         child.set_dialect_card(dialect_card(&self.registry));
-        let child_id = child.spine.leaf_id; // the FrameStart it was rooted at
+        let child_id = child.spine.leaf_id; // the Agent it was rooted at
         self.emit_new(child_id);
         self.parents.insert(child_id, (parent, invoke_id));
         let outputs = child.kickoff(&mut self.tree)?;
@@ -737,22 +735,22 @@ impl Session {
     }
 
     /// Surface every newly logged event as a `SessionEvent`, attributed
-    /// to the frame just stepped (a `FrameStart` is its own frame).
-    fn emit_new(&mut self, frame: FrameId) {
+    /// to the agent just stepped (a `Agent` is its own agent).
+    fn emit_new(&mut self, agent: AgentId) {
         while self.emitted < self.tree.id_counter {
             self.emitted += 1;
             let id = EventId::new(self.emitted);
             let Some(event) = self.tree.events.get(&id) else {
                 continue;
             };
-            let owner = if matches!(event.payload, EventPayload::FrameStart { .. }) {
+            let owner = if matches!(event.payload, EventPayload::Agent { .. }) {
                 id
             } else {
-                frame
+                agent
             };
             let event = event.clone();
             let _ = self.events.send(SessionEvent::Event {
-                frame: owner,
+                agent: owner,
                 event,
             });
         }
@@ -769,7 +767,7 @@ impl Session {
 /// Returns the (possibly updated) leaf id.
 fn synthesize_if_interrupted(tree: &mut Tree, leaf: EventId) -> io::Result<EventId> {
     let spine = tree.spine_at(leaf);
-    let msgs = &spine.frame().messages;
+    let msgs = &spine.context().messages;
     let Some(Message::Assistant { tool_calls, .. }) = msgs.last() else {
         return Ok(leaf);
     };
@@ -787,7 +785,7 @@ fn synthesize_if_interrupted(tree: &mut Tree, leaf: EventId) -> io::Result<Event
         return Ok(leaf);
     }
 
-    // Collect artifacts from the frame's spine segment.
+    // Collect artifacts from the agent's spine segment.
     let mut artifacts = Vec::new();
     let mut current = leaf;
     while let Some(event) = tree.events.get(&current) {
@@ -800,7 +798,7 @@ fn synthesize_if_interrupted(tree: &mut Tree, leaf: EventId) -> io::Result<Event
                     crate::report::preview(args)
                 ));
             }
-            EventPayload::FrameStart { .. } => break,
+            EventPayload::Agent { .. } => break,
             _ => {}
         }
         match event.parent_id {
@@ -865,7 +863,7 @@ fn leaf_summary(tree: &Tree, leaf: EventId) -> String {
         return String::new();
     };
     let s = match &event.payload {
-        EventPayload::FrameStart { prompt, .. } => format!("FrameStart: {prompt}"),
+        EventPayload::Agent { prompt, .. } => format!("Agent: {prompt}"),
         EventPayload::FrameResult { result } => format!("FrameResult: {result}"),
         EventPayload::Message(Message::User { text }) => format!("User: {text}"),
         EventPayload::Message(Message::Assistant {
@@ -888,14 +886,14 @@ fn leaf_summary(tree: &Tree, leaf: EventId) -> String {
     crate::report::clip(&s, crate::report::PREVIEW_MAX_BYTES)
 }
 
-/// The innermost `FrameStart` at or above `leaf`.
-fn frame_start_id(tree: &Tree, leaf: EventId) -> FrameId {
+/// The innermost `Agent` at or above `leaf`.
+fn agent_root_of(tree: &Tree, leaf: EventId) -> AgentId {
     let mut current = leaf;
     loop {
         let Some(event) = tree.events.get(&current) else {
             return leaf;
         };
-        if matches!(event.payload, EventPayload::FrameStart { .. }) {
+        if matches!(event.payload, EventPayload::Agent { .. }) {
             return current;
         }
         match event.parent_id {
@@ -950,14 +948,14 @@ mod tests {
         (session, events)
     }
 
-    /// Payload kinds of one frame's spine segment, log order.
+    /// Payload kinds of one agent's spine segment, log order.
     fn kinds(tree: &Tree, leaf: EventId) -> Vec<&'static str> {
         let mut out = Vec::new();
         let mut current = leaf;
         loop {
             let event = &tree.events[&current];
             out.push(match &event.payload {
-                EventPayload::FrameStart { .. } => "FrameStart",
+                EventPayload::Agent { .. } => "Agent",
                 EventPayload::FrameResult { .. } => "FrameResult",
                 EventPayload::Message(Message::User { .. }) => "User",
                 EventPayload::Message(Message::Assistant { .. }) => "Assistant",
@@ -968,7 +966,7 @@ mod tests {
                 EventPayload::Console { .. } => "Console",
                 EventPayload::Label(_) => "Label",
             });
-            if matches!(event.payload, EventPayload::FrameStart { .. }) {
+            if matches!(event.payload, EventPayload::Agent { .. }) {
                 break;
             }
             match event.parent_id {
@@ -989,7 +987,7 @@ mod tests {
             .state(session.root())
             .unwrap()
             .spine
-            .frame()
+            .context()
             .messages
             .iter()
             .filter_map(|m| match m {
@@ -1009,7 +1007,7 @@ mod tests {
         assert_eq!(
             kinds(session.tree(), root_leaf(&session)),
             [
-                "FrameStart",
+                "Agent",
                 "System",
                 "User",
                 "Assistant",
@@ -1090,7 +1088,7 @@ mod tests {
         let (tx, _rx) = channel();
         let session = Session::new(
             Tree::new(None),
-            "frame prompt here",
+            "agent prompt here",
             json!(null),
             registry,
             Box::new(llm),
@@ -1105,8 +1103,8 @@ mod tests {
         assert!(system.starts_with("You act by writing JavaScript programs"));
         assert!(system.contains("- tools.fetch_page"), "{system}");
         assert!(
-            system.contains("frame prompt here"),
-            "frame prompt follows the card"
+            system.contains("agent prompt here"),
+            "agent prompt follows the card"
         );
     }
 
@@ -1384,22 +1382,22 @@ mod tests {
         );
     }
 
-    /// Step 2 (decision 4): the first event after a frame's `FrameStart`
+    /// Step 2 (decision 4): the first event after an agent's `Agent`
     /// is the stored `Message::System` — the assembled card + prompt.
     #[test]
-    fn frame_start_is_followed_by_the_stored_system_prompt() {
+    fn agent_root_is_followed_by_the_stored_system_prompt() {
         let mut registry = ToolRegistry::new();
         registry.register(tool("fetch_page", |_| Ok(json!(null))));
         let (session, _) = run_session(registry, vec![scripted_text("done")], "go");
         let tree = session.tree();
-        // FrameStart is #1; the system prompt is the next event, #2.
+        // Agent is #1; the system prompt is the next event, #2.
         let system = &tree.events[&EventId::new(2)];
         assert_eq!(system.parent_id, Some(EventId::new(1)));
         let EventPayload::Message(Message::System { text }) = &system.payload else {
-            panic!("the event after FrameStart must be the system prompt");
+            panic!("the event after Agent must be the system prompt");
         };
         assert!(text.contains("- tools.fetch_page"), "card present: {text}");
-        assert!(text.contains("test agent"), "frame prompt follows the card");
+        assert!(text.contains("test agent"), "agent prompt follows the card");
     }
 
     /// M2: a trapped runtime error reports, and the rewrite restart reuses
@@ -1409,7 +1407,7 @@ mod tests {
     fn trapped_error_rewrite_reuses_artifact_through_the_session() {
         let mut registry = ToolRegistry::new();
         registry.register(tool("fetch", |_| Ok(json!("DATA"))));
-        // Event ids are deterministic: FrameStart 1, System 2, User 3,
+        // Event ids are deterministic: Agent 1, System 2, User 3,
         // Assistant 4, the fetch Invoke 5 — so the rewrite names
         // `tool_result(5)` (the stored system prompt is id 2, decision 4).
         let script = vec![
@@ -1458,7 +1456,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_tool_spawns_child_frame_and_joins() {
+    fn agent_tool_spawns_child_agent_and_joins() {
         let script = vec![
             scripted_program(
                 "c1",
@@ -1476,9 +1474,9 @@ mod tests {
             .events
             .values()
             .find(|e| {
-                matches!(&e.payload, EventPayload::FrameStart { prompt, .. } if prompt == "child task")
+                matches!(&e.payload, EventPayload::Agent { prompt, .. } if prompt == "child task")
             })
-            .expect("child FrameStart");
+            .expect("child Agent");
         let child_leaf = tree
             .list_leaves()
             .into_iter()
@@ -1487,7 +1485,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             kinds(tree, child_leaf),
-            ["FrameStart", "System", "Assistant", "FrameResult"]
+            ["Agent", "System", "Assistant", "FrameResult"]
         );
 
         // The join: the child's result is the caller's logged artifact
@@ -1495,15 +1493,15 @@ mod tests {
         assert!(kinds(tree, root_leaf(&session)).contains(&"Invoke"));
         assert!(tool_texts(&session)[0].contains(r#"returned: "child says 42""#));
 
-        // Child events were attributed to the child frame.
+        // Child events were attributed to the child agent.
         assert!(events.iter().any(|e| matches!(
             e,
-            SessionEvent::Event { frame, event } if *frame == child_start.id && event.id == child_start.id
+            SessionEvent::Event { agent, event } if *agent == child_start.id && event.id == child_start.id
         )));
     }
 
     /// M3: `Promise.all` over two `tools.agent` calls spawns both child
-    /// frames concurrently (one fan-out batch, two branches) and joins
+    /// contexts concurrently (one fan-out batch, two branches) and joins
     /// both results back into the parent program.
     #[test]
     fn promise_all_over_concurrent_agents_joins_both() {
@@ -1528,12 +1526,12 @@ mod tests {
         // Three spines: the caller plus the two (completed) children.
         assert_eq!(tree.list_leaves().len(), 3);
 
-        // Both child frames were rooted, each with the prompt it was given.
+        // Both child contexts were rooted, each with the prompt it was given.
         let child_prompts: HashSet<String> = tree
             .events
             .values()
             .filter_map(|e| match &e.payload {
-                EventPayload::FrameStart { prompt, .. } => Some(prompt.clone()),
+                EventPayload::Agent { prompt, .. } => Some(prompt.clone()),
                 _ => None,
             })
             .collect();
@@ -1546,7 +1544,7 @@ mod tests {
             }
             assert_eq!(
                 kinds(tree, leaf),
-                ["FrameStart", "System", "Assistant", "FrameResult"]
+                ["Agent", "System", "Assistant", "FrameResult"]
             );
         }
 
@@ -1761,11 +1759,11 @@ mod tests {
         })
     }
 
-    /// An incomplete root frame: FrameStart(1), User(2 "q"),
+    /// An incomplete root agent: Agent(1), User(2 "q"),
     /// Assistant(3 "a1"). Leaf = #3 — open, so resumable and forkable.
     fn tree_with_open_root() -> Tree {
         let mut tree = Tree::new(None);
-        let mut spine = tree.start_frame(None, "root", json!(null)).unwrap();
+        let mut spine = tree.start_agent(None, "root", json!(null)).unwrap();
         tree.append(&mut spine, user("q")).unwrap();
         tree.append(&mut spine, assistant("a1")).unwrap();
         tree
@@ -1821,7 +1819,7 @@ mod tests {
         let leaves = last_leaves(&rx.try_iter().collect::<Vec<_>>());
         assert_eq!(leaves.len(), 1);
         assert_eq!(leaves[0].leaf, EventId::new(3));
-        assert_eq!(leaves[0].frame, EventId::new(1));
+        assert_eq!(leaves[0].agent, EventId::new(1));
         assert!(leaves[0].active && !leaves[0].complete);
         assert_eq!(leaves[0].summary, "Assistant: a1");
     }
@@ -1850,7 +1848,7 @@ mod tests {
     }
 
     #[test]
-    fn fork_then_user_turn_diverges_in_the_same_frame() {
+    fn fork_then_user_turn_diverges_in_the_same_agent() {
         let (session, rx) = open(tree_with_open_root(), vec![scripted_text("forked done")]);
         let h = session.handle();
         // Fork off the user message (#2), dropping the original a1 reply.
@@ -1859,14 +1857,14 @@ mod tests {
             label: Some("retry".into()),
         });
         h.send(SessionCommand::UserTurn("forked follow-up".into()));
-        let session = drain(session); // forked frame yields the turn back
+        let session = drain(session); // forked agent yields the turn back
         let tree = session.tree();
 
-        // Two leaves, both under the root frame (FrameStart #1).
+        // Two leaves, both under the root agent (Agent #1).
         let leaves = tree.list_leaves();
         assert_eq!(leaves.len(), 2);
         for (leaf, _) in &leaves {
-            assert_eq!(frame_start_id(tree, *leaf), EventId::new(1));
+            assert_eq!(agent_root_of(tree, *leaf), EventId::new(1));
         }
         // The original assistant leaf (#3) survived untouched.
         assert!(leaves.iter().any(|(id, _)| *id == EventId::new(3)));
@@ -1884,7 +1882,7 @@ mod tests {
         // Chat messages, minus the materialized system prompt (decision 4;
         // this legacy tree had none, so it's inserted on the first turn).
         let msgs: Vec<&str> = forked
-            .frame()
+            .context()
             .messages
             .iter()
             .filter(|m| !matches!(m, Message::System { .. }))
@@ -1935,7 +1933,7 @@ mod tests {
     }
 
     #[test]
-    fn mutating_commands_are_rejected_while_the_frame_is_busy() {
+    fn mutating_commands_are_rejected_while_the_agent_is_busy() {
         let (mut session, rx) = open(
             tree_with_open_root(),
             vec![scripted_program("c1", "while (true) {}")],
@@ -1945,7 +1943,7 @@ mod tests {
         for _ in 0..6 {
             session.pump_one();
         }
-        // The frame is now Running; every mutating command bounces.
+        // The agent is now Running; every mutating command bounces.
         h.send(SessionCommand::Label("late".into()));
         h.send(SessionCommand::Fork {
             from: EventId::new(2),
@@ -2006,10 +2004,10 @@ mod tests {
     fn interrupted_run_program_synthesizes_report_and_rewrite_continues() {
         // Build a tree with an unanswered run_program: the program was
         // interrupted before completing. Event ids are deterministic:
-        // FrameStart 1, User 2, Assistant 3 (run_program, no result).
+        // Agent 1, User 2, Assistant 3 (run_program, no result).
         let mut tree = Tree::new(None);
         let mut spine = tree
-            .start_frame(None, "you are an agent", json!(null))
+            .start_agent(None, "you are an agent", json!(null))
             .unwrap();
         tree.append(
             &mut spine,
@@ -2083,7 +2081,7 @@ mod tests {
         let kinds = kinds(session.tree(), root_leaf(&session));
         assert!(
             kinds.last() == Some(&"Assistant"),
-            "frame yielded its final answer: {kinds:?}"
+            "agent yielded its final answer: {kinds:?}"
         );
         assert!(session.is_awaiting_user());
 
@@ -2092,9 +2090,9 @@ mod tests {
 
     #[test]
     fn all_complete_log_opens_idle_for_fork() {
-        // A fully completed single-frame log: previously `new` errored.
+        // A fully completed single-agent log: previously `new` errored.
         let mut tree = Tree::new(None);
-        let mut spine = tree.start_frame(None, "root", json!(null)).unwrap();
+        let mut spine = tree.start_agent(None, "root", json!(null)).unwrap();
         tree.append(&mut spine, assistant("done")).unwrap();
         tree.append(&mut spine, EventPayload::FrameResult { result: json!(1) })
             .unwrap();

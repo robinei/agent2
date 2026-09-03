@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use interp::{InvokeCall, Program, StepResult, VM, Value};
 
 /// Instructions per `tick` while running: large enough to make progress,
-/// small enough that pause and render latency stay well under a frame.
+/// small enough that pause and render latency stay well under an agent.
 pub const RUN_SLICE: u64 = 20_000;
 
 /// Cap for one `step_line` keypress, so a hot loop confined to a single

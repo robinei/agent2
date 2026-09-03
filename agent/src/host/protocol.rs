@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::types::{Event, EventId};
 
-/// A frame is identified by its `FrameStart` event id.
-pub type FrameId = EventId;
+/// An agent is identified by its `Agent` event id.
+pub type AgentId = EventId;
 
 /// The live status of a program block (decision 5). Carried by
 /// `SessionEvent::ProgramStatus` so the chat pane — which is VM-free and
@@ -22,14 +22,14 @@ pub enum ProgramStatus {
     Suspended,
     /// Returned a value (ran to completion).
     Completed,
-    /// Abandoned — rewritten away or left suspended when the frame ended.
+    /// Abandoned — rewritten away or left suspended when the agent ended.
     Failed,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum SessionCommand {
-    /// A user message for the root frame (rejected with an error event
-    /// while the frame is busy — steering mid-program is M2 — or while
+    /// A user message for the root agent (rejected with an error event
+    /// while the agent is busy — steering mid-program is M2 — or while
     /// the active spine is already complete — fork to continue past it).
     UserTurn(String),
     /// Request the current leaf set (replied to with `SessionEvent::Leaves`).
@@ -51,11 +51,11 @@ pub enum SessionCommand {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum SessionEvent {
-    /// An event appended to the log, attributed to its frame.
-    Event { frame: FrameId, event: Event },
+    /// An event appended to the log, attributed to its agent.
+    Event { agent: AgentId, event: Event },
     /// Live streaming chunk (never logged).
     Chunk {
-        frame: FrameId,
+        agent: AgentId,
         thinking: bool,
         text: String,
     },
@@ -64,14 +64,14 @@ pub enum SessionEvent {
     /// that keys the clickable block to its record (a `resume` keeps the
     /// originating program's id).
     ProgramStatus {
-        frame: FrameId,
+        agent: AgentId,
         program: EventId,
         status: ProgramStatus,
     },
-    /// Something went wrong outside a frame's own condition machinery
+    /// Something went wrong outside an agent's own condition machinery
     /// (LLM client failure, rejected command).
     Error {
-        frame: Option<FrameId>,
+        agent: Option<AgentId>,
         message: String,
     },
     /// The tree's leaf set (reply to `ListLeaves`, also pushed after a
@@ -85,8 +85,8 @@ pub enum SessionEvent {
 pub struct LeafInfo {
     /// The leaf event itself (what `Resume`/`fork` anchor on).
     pub leaf: EventId,
-    /// The innermost `FrameStart` above the leaf (which frame it belongs to).
-    pub frame: FrameId,
+    /// The innermost `Agent` above the leaf (which agent it belongs to).
+    pub agent: AgentId,
     /// Nearest `Label` on the spine, if any.
     pub label: Option<String>,
     /// Whether the leaf's spine has recorded its `FrameResult`.
@@ -127,20 +127,20 @@ mod tests {
         roundtrip_cmd(SessionCommand::Shutdown);
 
         roundtrip_evt(SessionEvent::ProgramStatus {
-            frame: EventId::new(1),
+            agent: EventId::new(1),
             program: id,
             status: ProgramStatus::Completed,
         });
         roundtrip_evt(SessionEvent::Leaves(vec![LeafInfo {
             leaf: id,
-            frame: EventId::new(1),
+            agent: EventId::new(1),
             label: Some("branch A".into()),
             complete: false,
             active: true,
             summary: "Assistant: hello".into(),
         }]));
         roundtrip_evt(SessionEvent::Event {
-            frame: EventId::new(1),
+            agent: EventId::new(1),
             event: Event {
                 id,
                 parent_id: Some(EventId::new(1)),

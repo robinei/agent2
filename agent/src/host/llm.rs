@@ -75,7 +75,7 @@ pub fn scripted_resume(call_id: &str, value: serde_json::Value) -> Message {
     }
 }
 
-/// A scripted plain-text assistant turn (completes the frame).
+/// A scripted plain-text assistant turn (completes the agent).
 pub fn scripted_text(text: &str) -> Message {
     Message::Assistant {
         text: text.into(),

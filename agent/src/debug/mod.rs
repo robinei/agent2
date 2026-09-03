@@ -62,7 +62,7 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<
 
         if last_draw.elapsed() >= REDRAW_EVERY {
             terminal
-                .draw(|frame| ui::render(frame, app))
+                .draw(|agent| ui::render(agent, app))
                 .map_err(|e| e.to_string())?;
             last_draw = Instant::now();
         }

@@ -153,12 +153,12 @@ fn open_tree(log_path: Option<String>) -> Result<Tree, String> {
     Tree::open(file).map_err(|e| format!("{}: {e}", path.display()))
 }
 
-/// Frame prompt for real (M1) sessions; the dialect card carries the
+/// Context prompt for real (M1) sessions; the dialect card carries the
 /// mechanics, this carries the role.
 const REAL_PROMPT: &str = "You are a capable general-purpose agent. Solve the user's task; reply with \
      your final answer when done.";
 
-/// Registry + LLM client + frame prompt for a session: the real
+/// Registry + LLM client + agent prompt for a session: the real
 /// DeepSeek setup, or the scripted M0 demo.
 fn build_brain(
     real: bool,
@@ -275,18 +275,18 @@ fn print_session_event(event: &SessionEvent) {
         // message instead of interleaving partial text.
         SessionEvent::Chunk { .. } => {}
         SessionEvent::ProgramStatus {
-            frame,
+            agent,
             program,
             status,
         } => {
             println!(
-                "[frame {} · #{}] program status: {status:?}",
-                frame.as_u64(),
+                "[agent {} · #{}] program status: {status:?}",
+                agent.as_u64(),
                 program.as_u64(),
             );
         }
-        SessionEvent::Error { frame, message } => match frame {
-            Some(f) => eprintln!("!! [frame {}] {message}", f.as_u64()),
+        SessionEvent::Error { agent, message } => match agent {
+            Some(f) => eprintln!("!! [agent {}] {message}", f.as_u64()),
             None => eprintln!("!! {message}"),
         },
         SessionEvent::Leaves(leaves) => {
@@ -300,21 +300,21 @@ fn print_session_event(event: &SessionEvent) {
                     .map(|l| format!(" «{l}»"))
                     .unwrap_or_default();
                 println!(
-                    "  {mark} #{} [frame {} · {state}]{label}  {}",
+                    "  {mark} #{} [agent {} · {state}]{label}  {}",
                     leaf.leaf.as_u64(),
-                    leaf.frame.as_u64(),
+                    leaf.agent.as_u64(),
                     leaf.summary,
                 );
             }
         }
-        SessionEvent::Event { frame, event } => {
-            let head = format!("[frame {} · #{}]", frame.as_u64(), event.id.as_u64());
+        SessionEvent::Event { agent, event } => {
+            let head = format!("[agent {} · #{}]", agent.as_u64(), event.id.as_u64());
             match &event.payload {
-                EventPayload::FrameStart { prompt, input } => {
-                    println!("{head} frame start: {prompt} (input: {input})");
+                EventPayload::Agent { prompt, input } => {
+                    println!("{head} agent start: {prompt} (input: {input})");
                 }
                 EventPayload::FrameResult { result } => {
-                    println!("{head} frame result: {result}");
+                    println!("{head} agent result: {result}");
                 }
                 EventPayload::Message(Message::User { text }) => {
                     println!("{head} user: {text}");

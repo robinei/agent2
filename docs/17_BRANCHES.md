@@ -1166,16 +1166,16 @@ answer to the dead VM.
 Mechanical, no behavior change, its own commit so the diff is reviewable
 by eye.
 
-- [ ] `FrameStart` → `Agent`, `FrameId` → `AgentId`, `Frame` (tree) →
+- [x] `FrameStart` → `Agent`, `FrameId` → `AgentId`, `Frame` (tree) →
       `Context`, `frame()` → `context()`, `frame_list` → `agent_list`,
       `enclosing_frame` → `enclosing_agent`, `Session::frames()` →
       `agents()`, `AgentState` → `Runner`, `spawn_child`'s "child frame"
       comments, `SessionEvent::Event { frame }` → `{ agent }`, the TUI's
       "frames pane" → navigator. `VM::frames()`, `CallFrame`, and the
       stack pane keep their names.
-- [ ] `grep -rn "frame" agent/src` shows only VM-stack uses, the
+- [x] `grep -rn "frame" agent/src` shows only VM-stack uses, the
       `ratatui::Frame` render type, and this phase's doc references.
-- [ ] Gate: `cargo fmt && cargo clippy --workspace --all-targets &&
+- [x] Gate: `cargo fmt && cargo clippy --workspace --all-targets &&
       cargo test` green.
 
 ### Step A2 — Typed calls: `Send` / `Spawn` / `Invoke`, `Result`, `site` (`interp`, `types.rs`, `machine.rs`, `report.rs`)

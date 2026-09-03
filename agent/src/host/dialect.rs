@@ -1,6 +1,6 @@
 //! System-prompt dialect card (8_HARNESS Step 6).
 //!
-//! The generated-where-possible preamble every frame's system message
+//! The generated-where-possible preamble every agent's system message
 //! starts with: how to act, the program contract, restart semantics,
 //! the distilled dialect divergences, and the tool list rendered from
 //! the registry schemas. Deliberately short — the condition report
@@ -34,7 +34,7 @@ pack every body into one call. Pin the interfaces (paths, signatures, \
 shared types), spawn one `tools.agent` per file with those contracts, and \
 `await` them together. Two payoffs: the bodies generate concurrently \
 (not serially in your program text), and the work stays *visible* — each \
-file is its own progressing frame. One `run_program` carrying many large \
+file is its own progressing agent. One `run_program` carrying many large \
 attachments is the opposite: it emits silently while you write every body, \
 then lands everything at once with no progress in between. Keep the \
 orchestrator small; own the final cross-file check.
@@ -47,7 +47,7 @@ long orchestration alive — restarting from the top discards its progress \
 answer.
 
 ## program contract
-- `input` is a read-only const holding this frame's JSON input.
+- `input` is a read-only const holding this agent's JSON input.
 - `attachments` is a read-only const holding the name→string map you pass \
 as run_program's second argument. **Any file body or blob longer than a \
 few lines MUST be passed in `attachments` and read as `attachments.<name>` \
