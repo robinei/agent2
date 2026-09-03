@@ -2,7 +2,7 @@
 
 A multipanel ratatui frontend: chat on the left, toggleable debug panes
 on the right (source, disassembly, stack, promises/invokes, console,
-frame list). The motivation is visibility into the VM — it has become
+branch navigator). The motivation is visibility into the VM — it has become
 the lynchpin of the project — and the engineering case is that the
 introspection it needs (ip→line mapping, function names, local
 name→slot maps, promise states) is the same infrastructure Phase 3
@@ -14,7 +14,7 @@ transcripts" means watching them live.
 **Sequencing:** Steps 0–3 need only the interp — land them any time;
 Step 0 is a small independent interp change that should go first. Step
 4 (attached mode) needs Phase 8 M0 (host loop + scripted LLM); the
-frame switcher reaches full value at M3 (concurrent subagents) but
+branch navigator reaches full value at M3 (concurrent subagents) but
 works as soon as multiple leaves exist.
 
 ## Locked design decisions
@@ -34,11 +34,11 @@ works as soon as multiple leaves exist.
    `ResumeMode::RetrySameInstr` (its only user), and the uncatchable
    carve-out — out-of-fuel never enters the program's observable world
    at all.
-3. **Cooperative scheduling on the main loop thread.** All frame step
+3. **Cooperative scheduling on the main loop thread.** All agent step
    machines run on the host's single loop thread; the VM executes in
    fuel slices (e.g. 100k instructions), re-enqueueing a continue
    message to the inbox between slices so a hot program never starves
-   other frames or the UI. Only blocking IO (LLM streams, tool
+   other branches or the UI. Only blocking IO (LLM streams, tool
    execution) runs on worker threads. Single-stepping and slicing are
    the same mechanism at different fuel values.
 4. **Privileged debugger, channeled chat.** The TUI renders on the
@@ -59,11 +59,32 @@ works as soon as multiple leaves exist.
    not bolted on.** "Planning as JS program creation" is the core of
    the harness, so the program source earns screen space whenever a
    program is running: the chat session is the default full-width
-   view, and the source + console panes auto-pop on the right when a
-   frame starts executing a `run_program`. A mode key switches to
-   full debugger mode (the standalone configuration: console/result
+   view, and the source + console panes auto-pop on the right when the
+   selected branch starts executing a `run_program`. A mode key switches
+   to full debugger mode (the standalone configuration: console/result
    left, full debug pane stack right) and back. There is no separate
    "harness UI" to build later.
+
+   **Extended by 17_BRANCHES Part D — dancing.** The one-agent-per-row
+   frame switcher this decision originally named is a **branch navigator**
+   now: one tree, nested by `parent_branch`, a fork visually distinct from
+   a spawn (the difference `context()` turns on), because a fork is
+   invisible to a switcher keyed one row per agent (a fact C1 discovered
+   the hard way — see 17_BRANCHES's "What Part C deliberately left for
+   you"). Four things this decision now also covers, none of them a
+   separate mode: a branch waiting on you is **highlighted where it
+   already sits** — the tree comes to you, not the other way around — and
+   the navigator's header counts who's waiting and who's thinking; the
+   **input line is always live**, addressed at whichever branch is
+   selected, switching between `UserTurn`/tell and `Reply` by whether that
+   branch owes you an answer, because nothing here is ever rejected for
+   busy-ness (17_BRANCHES rule B); and **restart keys** — fork, spawn,
+   interrupt, resume-with-value, rewrite — are one keypress each, because
+   `Runner::eligible` already renders a self-sufficient refusal for a call
+   that doesn't apply, so the TUI never has to pre-check a branch's state
+   before offering a key. Built in 17_BRANCHES Steps D1 (the navigator
+   itself) and D2 (the keys); `debug/attach.rs`'s own doc comment is the
+   living version of this paragraph.
 
 ## Step 0 — interp: `step(fuel)`
 
@@ -182,18 +203,22 @@ terminal-free helpers in `panes.rs` (disasm window with function
 headers, stack rows with named locals + value previews incl. Upval
 cell deref, promise table), so it's all unit-testable.)*
 
-## Step 4 — attached mode + frame switcher (needs 8 M0)
+## Step 4 — attached mode + branch navigator (needs 8 M0)
 
 The same panes over a live harness session, per decision 6: this *is*
 the harness TUI. The chat pane renders `SessionEvent`s (chunks
 included); user input goes through `SessionCommand` — steering an
 in-flight program remains Phase 8's host-injected condition, not a
-TUI mechanism.
+TUI mechanism. *(This step named a per-agent "frame switcher"; it is a
+branch navigator now, keyed by `BranchId` — see decision 6's extension
+and 17_BRANCHES Part D. Left as originally written below, since it is
+still an accurate record of what M0's first cut looked like; the
+navigator's current shape is decision 6's job to state.)*
 
 Layout state machine (pure UI state — nothing in the host changes):
 
 - **Chat view** (default): full-width chat.
-- **Running view**: when the selected frame starts executing a
+- **Running view**: when the selected branch starts executing a
   `run_program`, the source and console panes auto-pop as a right
   column; chat stays left. Auto-popped panes are *sticky*: on program
   completion (result or condition) they remain, showing final state
@@ -202,13 +227,13 @@ Layout state machine (pure UI state — nothing in the host changes):
   here and override the auto-pop set.
 - **Full debugger mode**: a mode key swaps to the standalone layout —
   console/result left, full debug pane stack right, chat hidden —
-  and back. Run/pause/step keys apply to the selected frame's VM in
+  and back. Run/pause/step keys apply to the selected branch's VM in
   either view.
 
-Frame switcher: a frame-list pane shows active leaves; tab / `1`–`9`
-(in full debugger mode) switch which frame's VM the debug panes
-borrow. Auto-pop triggers off the *selected* frame; a busy indicator
-in the frame list covers the others.
+Frame switcher (now the branch navigator): a persistent pane shows every
+branch; tab / `1`–`9` (in full debugger mode) switch which branch's VM
+the debug panes borrow. Auto-pop triggers off the *selected* branch; a
+busy indicator in the navigator covers the others.
 
 Acceptance:
 
@@ -222,9 +247,10 @@ Acceptance:
 - [x] Full-debugger-mode key swaps to the standalone pane
       configuration and back without disturbing the session
       (`full_debugger_mode_swaps_and_returns_without_session_actions`).
-- [x] A session with two concurrent frames (or two leaves pre-M3)
-      renders both in the frame list; switching retargets all debug
-      panes (`concurrent_frames_list_and_retarget`: caller + in-flight
+- [x] A session with two concurrent branches (or two leaves pre-M3)
+      renders both in the navigator; switching retargets all debug
+      panes (`concurrent_agents_list_and_retarget` — renamed by
+      17_BRANCHES Step D1, branch-keyed now: caller + in-flight
       subagent, each pane borrow resolving to its own VM).
 - [x] Chat pane is driven only by `SessionEvent`s (no privileged
       reads) — asserted by module visibility, not discipline.
@@ -238,12 +264,14 @@ what crossed the serializable boundary. Keys are focus-modal so chat
 typing stays free: printable keys go to the input line, `Esc` swaps
 to debug-control focus where the doc's bare keys live (`c` collapse,
 `d` full debugger, `1`–`4` toggles, space/`s`/`n` VM control); Tab
-switches frames everywhere. Host support added for this step:
+switches branches everywhere. Host support added for this step:
 `Session::pump_until` (inbox drain with render deadline; terminal
-input arrives as inbox messages per decision 4), per-frame
-pause/step (`set_paused`/`step_paused` — pausing parks the frame's
+input arrives as inbox messages per decision 4), per-agent
+pause/step (`set_paused`/`step_paused` — pausing parks the agent's
 fuel-slice continues), and `AgentState` keeps the last run's VM so
-the sticky panes show final program state post-mortem.)*
+the sticky panes show final program state post-mortem. *(`AgentState`
+→ `Runner`, and pause/step → per-**branch** — 17_BRANCHES Steps A1 and
+D1 respectively; kept here as the record of what M0 actually built.)*)*
 
 ## Step 5 — docs sweep
 

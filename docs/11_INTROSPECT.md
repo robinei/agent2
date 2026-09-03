@@ -29,6 +29,23 @@ navigable.
 rest build on 9_TUI Step 4 (attached mode): Step 1 (retention) and Step 2
 (events) are host changes; Steps 3–5 are the TUI; Step 6 is docs.
 
+**Superseded by 17_BRANCHES Part D.** This phase's whole selection axis was
+`FrameId` (one row per agent); it is `BranchId` now (one row per branch, a
+fork and its original both addressable, nested by `parent_branch`), and the
+**frames pane** this phase built is the **branch navigator**. Three specific
+claims below no longer hold, flagged where they're made: decision 4's stored
+`Message::System` chat event does not exist — 17_BRANCHES A3 replaced it
+with `system` as a field on the `Agent` event itself, rebuilt into the
+request by `render_request` rather than replayed as a logged message;
+`FrameStart`/`FrameResult` (decisions 7–8) are `Agent`/`Fork` roots and
+outcome events (`Return`/`Condition`/`Answer`) — agents never close, so
+there is no terminal event to scan for; and `AgentState` is `Runner`. The
+*shape* of what this phase built — program blocks, the system-prompt block,
+click-to-select two axes, log-only reconstruction of finished programs — is
+still exactly right and carried forward unchanged; only the keying and the
+system-prompt storage mechanism moved. Left below as the record of what
+Phase 11 actually built, under the vocabulary of its time.
+
 ## Step 0 — cleanup: drop the vestigial chunk payloads
 
 `EventPayload::TextChunk`/`ThinkingChunk` are dead. Streaming flows

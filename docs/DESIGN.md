@@ -9,13 +9,13 @@ it — that's a design change, not a detail.
 
 This project now pursues **two first-class goals**:
 
-1. **The agent.** The condition-system runtime — the original thesis and
+1. **The harness.** The condition-system runtime — the original thesis and
    the product. Everything below about suspension, the event log, and "LLM
    as restart handler" serves this.
 2. **JavaScript compatibility, as an end in itself.** As the VM has grown
    into a capable language runtime, JS compat is pursued for its own sake —
    a deliberate hobby-project decision (`15_COMPAT.md`), not only where a
-   program demands it. It is fenced *only* by what the agent product
+   program demands it. It is fenced *only* by what the harness product
    actually needs: the two guardrails in "Compatibility as a terminal goal"
    below. **Determinism, once load-bearing here, is now a non-goal** — see
    the dependency spine.
@@ -239,7 +239,7 @@ including everything that was once a `4_FUTURE` non-goal (mutable
 prototypes, descriptors, getters/setters, `Symbol`, iterators,
 `ToPrimitive`, `Proxy`).
 
-The fence is short, and it is exactly what the *agent* product needs:
+The fence is short, and it is exactly what the *harness* product needs:
 
 1. **No host callback mid-instruction.** A feature that would make the VM
    call back into the host between two instructions breaks the suspension
@@ -256,10 +256,10 @@ explicit artifact reuse does not depend on a reproducible trace. This
 
 ## Product surface
 
-The condition report (8_HARNESS Step 4) is where the agent thesis succeeds
+The condition report (8_HARNESS Step 4) is where the harness thesis succeeds
 or fails — it is a prompt-engineering artifact with golden-render tests, not
 an error string. Its quality, and the M5 eval (conditions vs. plain tool
-loop vs. atomic code mode under injected failures), are how the *agent*
+loop vs. atomic code mode under injected failures), are how the *harness*
 side of this project is judged; the **conformance corpus** (`15_COMPAT.md`)
 is how the *language* side is judged. The debugger TUI (9_TUI) is the
 observation instrument for both: attached mode *is* the harness frontend,

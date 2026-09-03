@@ -86,10 +86,18 @@ write-back. Steps 4–7 are independent of each other.
    call; the `VM` lives only in `Phase::Running` and is dropped on crash; the
    `Tree` reconstructs the *spine* (chat + completed artifacts), and resume
    re-enters the session loop at the lowest incomplete leaf with a fresh
-   `AgentState`. A frame interrupted mid-`run_program` resumes by **synthesizing
+   `Runner`. A branch interrupted mid-`run_program` resumes by **synthesizing
    the interrupted-program tool result as a rewrite prompt** (artifacts still
    fetchable by id), which is on-thesis (a crash is just another condition) and
    reuses existing machinery with no determinism/version-match tax.
+   *(Further amended by 17_BRANCHES Steps C1–C2, which built the piece this
+   decision named but left informal: crash recovery is **reconciliation** —
+   `Tree::unmatched()` walks the closed loop of exchange ids and repairs every
+   half-finished one, and every addressed command re-hydrates a dormant branch
+   on demand rather than the log needing one live `Runner` per branch already
+   in memory. See 8_HARNESS decision 7's own amendment for the fuller
+   statement; this decision's substance — re-entry, not replay — is unchanged
+   by it.)*
 
 ## Step 1: The `bash` escape hatch *(built — record + one delta)*
 
@@ -349,10 +357,17 @@ and test helpers in `dialect.rs` + `mod.rs`. Tests replaced:
 
 ## Step 7: Crash-resume reframe + interrupted-`run_program` handling
 
+**Superseded by 17_BRANCHES Steps C1–C2.** `synthesize_if_interrupted` and its
+test are gone from the code — replaced by `Tree::unmatched()`'s
+`InterruptedRun` row and `Session::open`'s general reconciliation pass, which
+handles this case (and every other half-finished exchange) uniformly rather
+than as a special crash-resume path. Kept below as the record of the step
+that first closed this gap.
+
 Update the design record to match the implementation, then close the one real
-gap: a frame crashed mid-`run_program` leaves a dangling assistant tool-call with
-no result. On resume, synthesize that tool result as a rewrite prompt so the LLM
-continues, reusing completed artifacts by id.
+gap: a branch crashed mid-`run_program` leaves a dangling assistant tool-call
+with no result. On resume, synthesize that tool result as a rewrite prompt so
+the LLM continues, reusing completed artifacts by id.
 
 Targets: `docs/8_HARNESS.md` (decision 7), `agent/src/host/mod.rs`
 (`open_at`/`assemble`/`pick_resume_leaf`), `agent/src/machine.rs` (resume entry /
@@ -402,7 +417,7 @@ deterministic replay.)*
   real bytes, so a near-miss means a stale assumption, which should be loud).
 
 - **D2 — Write-counter staleness hint.** If evals show models trusting stale
-  reads, annotate the artifact menu with a per-frame epoch and mark entries born
+  reads, annotate the artifact menu with a per-agent epoch and mark entries born
   before the current count as "predates N writes". Note the snag created by
   removing `effectful` (decision 5): the harness can only recognize writes it can
   name — `create_file`/`replace_file` bump the counter, but `bash` writes are

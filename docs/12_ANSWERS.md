@@ -61,12 +61,18 @@ models into `/tmp`; Step 5 is the docs sweep (DESIGN.md already amended).
    product" fork, no error string, no lost work. This replaces the current
    loud rejection at `machine.rs:855`.
 
-4. **A subagent's answer is bounded identically, with one quiet retry.** Its
-   final prose is the deliverable into its caller; if it exceeds the
-   budget, the host re-prompts the child *once* (the existing
-   loud-refusal→retry shape, moved to the frame-terminal turn), then
-   hard-falls-back to truncate-with-note. The full prose remains on the
-   child's spine in the log regardless (no fidelity lost).
+4. **Budget is a rendering rule.** *(Rewritten — 17_BRANCHES B4/Part E. The
+   original text is kept below for the record; see Step 2's note for what
+   changed and why.)* A subagent's answer, like a program's `return`, is
+   stored whole in the log and clipped only where it is *rendered* into
+   someone's context, naming the artifact id it clipped from. There is no
+   retry and no context-side truncation step to get wrong: the value never
+   shrinks, only the copy a report shows does. ~~Its final prose is the
+   deliverable into its caller; if it exceeds the budget, the host
+   re-prompts the child *once* (the existing loud-refusal→retry shape,
+   moved to the frame-terminal turn), then hard-falls-back to
+   truncate-with-note. The full prose remains on the child's spine in the
+   log regardless (no fidelity lost).~~
 
 5. **Large *products* use `create_file` — the by-reference channel models
    already reach for.** A model asked to produce a big artifact writes a
@@ -118,7 +124,20 @@ Acceptance:
 
 ## Step 2 — bound the subagent answer the same way (`machine.rs`)
 
-A subagent's final prose is its deliverable into the caller (decision 4).
+**Superseded by 17_BRANCHES Step B4.** This step's stored-truncation +
+retry design — `answer_retries`, the "tighten it" re-prompt, and
+delivery-time `truncate_answer` clipping the value before it was logged —
+is gone. B4 replaced it with the rule decision 4 now states: values are
+stored whole; a report clips to `answer_budget` *at render time*, naming
+the id the full value is still fetchable at. The retry existed to avoid
+ever logging an oversized value; once storage stopped being the thing
+that was bounded, the retry had nothing left to protect and the "quiet
+retry" UX (an extra silent LLM turn nobody asked for) was pure cost. Kept
+below for the historical record of what Step 2 actually built and why it
+changed.
+
+A subagent's final prose is its deliverable into the caller (decision 4,
+as originally written).
 
 - Add `answer_retries: u8` to `AgentState`. In `finish_frame` (`:1010`),
   before logging `FrameResult`, measure the result string. If it exceeds

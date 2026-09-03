@@ -30,17 +30,45 @@ should be allowed to reorder plans 3–7.
    concurrency mechanism. The "frame stack" is the chain of `FrameStart`
    ancestors above a node (which `reconstruct_frames` essentially already
    computes); inline `PushFrame`/`PopFrame` stack semantics are removed.
+   *(Amended — 17_BRANCHES Part A/B1. "Subagents are tools" holds exactly
+   at the API — `tools.spawn`/`tools.ask`/`tools.agent` — 8_HARNESS's own
+   framing survives unchanged. What changed is the log: `dispatch_calls` no
+   longer records a spawn as a generic `Invoke`; it logs a typed `Call::Spawn`
+   settled by a `Result { agent }`, rooting an `Agent` event (`FrameStart`'s
+   replacement) as the child's clean-room branch root. A question to that
+   child is a typed `Call::Send`, not a bare tool call either — see Step 1's
+   note above for the full vocabulary.)*
 3. **Child frames are clean-room.** A child sees its prompt, its JSON
    `input`, and its tools — never ancestor transcripts (and never ancestor
    artifacts: artifact ids are scoped to the requesting frame's spine).
    Its result is a JSON value returned to the calling program as the tool
    result. (Context-sharing policies can come later as explicit options;
    the default stays hermetic.)
+   *(Amended — 17_BRANCHES B1. "Its result is a JSON value" was this
+   decision's promise from the start but was not actually true until now:
+   `finish_frame` could only produce a *string* (`machine.rs:1059`,
+   pre-phase-17), so a structured subagent answer was silently stringified.
+   B1's `Answer { question, value }` carries a real `serde_json::Value`
+   end to end — closed, not just decided. Clean-room isolation itself is
+   unchanged and, if anything, sharper: it is enforced from `spine.context()`
+   scoped to the branch's own path, and a `Fork` inherits history precisely
+   because it stays inside that same clean room rather than crossing into a
+   new one.)*
 4. **The restart loop is linear; forking is for users.** A condition does
    not fork: the spine reads program → condition (as the `run_program`
    tool result) → restart (the next tool call). Forking from an arbitrary
    event remains the mechanism for user-driven retry, exploration, and
    inspecting alternatives — it is UX, not control flow.
+   *(Amended — 17_BRANCHES Part C. Still true that a condition itself never
+   forks — the restart loop stays linear, exactly as written. What phase 17
+   adds is that forking became a first-class, structural gesture rather than
+   informal UX: `Fork { name }` roots a new, addressable branch and **never
+   moves you** — every other branch, including the one you forked from,
+   stays exactly as live as it was. A fork inherits *history, not
+   obligations*: it sees everything before its root as context but owes none
+   of the open questions or in-flight calls that predate it, which is what
+   makes retry ("fork before the question") and sidebar inspection ("fork at
+   the running leaf") the same one gesture rather than two.)*
 5. **No `state`. Programs are functions; the log holds the artifacts.**
    This supersedes COMPILER_PLAN §2 (the blessed `objects[0]` slot,
    seeding, and `state_to_json` are removed from the interp). A program
@@ -73,6 +101,46 @@ should be allowed to reorder plans 3–7.
     (artifacts still fetchable by id), which is on-thesis (a crash is just another
     condition) and reuses existing machinery with no determinism/version-match tax.
     VM snapshotting stays off the roadmap; so does positional replay.
+    *(Gains reconciliation and re-attach — 17_BRANCHES Steps C1–C2. This
+    decision named "re-enter at the lowest incomplete leaf" as a single-branch
+    idea; with many live branches and four-event exchanges crossing them,
+    "resume" generalizes to **reconciliation**: `Tree::unmatched()` walks the
+    closed loop of exchange ids (`Post.origin → Send`, `Result.call → Send`,
+    `Answer.question → Post`) and is the whole of the wait table — nothing
+    session-local (`parents`, `waits`) survives a crash because nothing needs
+    to. Every row the scan finds is repaired in place: a `Send` with no
+    `Post` gets one appended (idempotent — the `Send` *is* the message), an
+    answered post whose `Result` never made it home gets it appended, and a
+    branch a repair sets going has its `shown` mark lowered so the trigger
+    rule re-prompts it — the general form of "synthesize the interrupted
+    tool result as a rewrite prompt" above. **Re-attach** is the piece this
+    decision didn't anticipate: `tools.tool_result(id)` extends from
+    completed artifacts to *in-flight* ones — a pending `Send` re-entered
+    after a crash returns a promise that resolves when its `Result` lands,
+    so a rewritten or re-entered program **re-awaits** a still-pending ask
+    instead of asking again. And every command re-hydrates a dormant branch
+    on demand (`open_branch`), so "resume" is no longer a mode the session is
+    in or out of — any addressed branch is live the moment something
+    addresses it. See DESIGN.md's dependency spine (link 3) for why none of
+    this needed determinism.)*
+
+**A note on "frame," throughout what follows.** Steps 0–6, Known holes, and
+the milestones below are Phase 8's own build record, kept in the vocabulary
+of its time — including test names and struct names exactly as they were
+when each one landed. That word is retired (17_BRANCHES's own vocabulary
+section: "frame is reserved for the VM call stack... and means nothing else
+from here on"), so translate as you read: **frame** (the common noun) is what
+17_BRANCHES calls an **agent** — a clean-room context — except where the text
+is specifically about the *tree*, where it means what phase 17 formalized as
+a **branch**; **`FrameStart`** is the **`Agent`** event; **`FrameResult`**
+is the terminal event this phase gave every frame, which phase 17 replaced
+with a real split (`Return`/`Condition`/`Answer`) precisely because "the
+frame ended" was blurring three different things into one shape — see Step
+1's vocabulary note above; **`AgentState`** (confusingly already named with
+"Agent" despite meaning what this document calls a frame) is **`Runner`**;
+**`PushFrame`/`PopFrame`** were removed by this phase's own Step 1 and never
+came back. The decisions above are the current, amended reference; what
+follows is history.
 
 ## Step 0: Interp-side dialect change (do before/alongside Phase 2)
 
@@ -105,6 +173,38 @@ Acceptance:
 - [x] Gate: `cargo fmt && cargo clippy && cargo test` green.
 
 ## Step 1: Event vocabulary (`types.rs`)
+
+**Vocabulary rewritten — superseded by 17_BRANCHES Part A.** Every payload
+named below is gone. The current vocabulary, in the same two classes:
+**rendered** events (still what goes into an LLM request) are
+`Message::{Post, Turn}` — `Post { from, origin }` is a delivery (what
+`Message::User` and inbound agent messages became), `Turn { author, text,
+thinking, tool_calls }` is a context's own output (what `Message::Assistant`
+became; `author` is the LLM or a user taking the branch's turn); there is no
+`Message::Tool` — a tool-role message is *rendered*, never stored, from the
+run's outcome. **Structural/execution** events (harness-internal, an
+`Agent`/`Fork` root or logged at dispatch/settlement) are `Agent { name,
+charter, tools, system }` (`FrameStart`'s replacement — and `system` now
+rides *on* this event rather than a separate stored chat message, closing
+11_INTROSPECT decision 4's gap), `Fork { name }` (a divergent branch root —
+new; there was no forking-as-branch-root concept yet), `Call::{Send, Spawn,
+Invoke}` (typed variants where `Invoke` alone used to stand for all three),
+`Result { call, outcome }` (settles a call), `Return { value }`
+(`ProgramResult`'s replacement — the program's own output, not a call
+settlement), `Condition { cause, site, stack }` (everything a `FrameResult`
+used to blur together with "the frame ended": a raise, a trap, an arriving
+post, a compile failure, a refused restart, an interruption — a menu of
+*causes*, not one terminal shape), `Answer { question, value }` (an answer to
+a `Post`, not a frame closing — **agents never close**), `Console { lines }`,
+and `Rename { name }` (`Label`'s replacement, scoped to the branch it names
+rather than a free-floating bookmark). `PushFrame`/`PopFrame` were already
+gone by the time this step landed (deleted below); `FrameResult` is the one
+that turned out to be the wrong shape — see 17_BRANCHES A4/A6 for why a
+`Return`/`Condition`/`Answer` split replaced a single terminal event, and
+why an agent's own turn (`Turn` with no tool calls) went idle rather than
+"finished." The two classes below (chat/execution) are what became
+rendered/structural — same split, current names on it now: see
+17_BRANCHES.md "The primitives" for the authoritative table.
 
 Two classes of event, distinguished because they render differently:
 
@@ -428,10 +528,21 @@ children a narrower card without new plumbing.)*
   matter which restart the LLM picks — rewrite abandons the VM, never the
   physics. The report's artifact menu includes late arrivals on the next
   turn.
-- **User interruption / steering:** a `UserTurn` arriving mid-program is a
+- **User interruption / steering:** ~~a `UserTurn` arriving mid-program is a
   **host-injected condition** at the next `step()` boundary — same report
   machinery, payload = the user's message, restarts = resume (continue,
-  message noted) or rewrite. No second interruption mechanism.
+  message noted) or rewrite. No second interruption mechanism.~~ **Built —
+  17_BRANCHES Part C.** Exactly this shape, generalized from "the user" to
+  "anyone with something to say": rule B delivers a post at the next safe
+  point (every fuel-slice boundary), a running program suspends into
+  `Condition::Posted` whose report is the message(s) plus the **annotated
+  source** (every call site marked with its artifact state), and the
+  restarts are `answer`/`resume`/`run_program` — resume continues, rewrite
+  reuses by id. `Interrupt { branch }` is the one addition beyond what this
+  hole anticipated: it cancels an in-flight generation or pauses a VM at its
+  next slice so a post lands *now* rather than at the next natural safe
+  point, still through the same report machinery. Still no second
+  interruption mechanism.
 - **Per-frame tool scoping:** `tools.agent` spawns take a tool allowlist
   (default: caller's set minus effectful tools), enforced by the registry;
   the child's dialect card lists only its own tools.

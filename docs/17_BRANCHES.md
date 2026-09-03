@@ -1984,23 +1984,70 @@ just narrowed to the one place still wanting it.
 
 ## Part E — Docs sweep
 
-- [ ] 8_HARNESS: Step 1 vocabulary rewritten; decisions 2–4 amended
+- [x] 8_HARNESS: Step 1 vocabulary rewritten; decisions 2–4 amended
       (subagents are tools at the API and typed `Send`/`Spawn` in the log;
       results are
       JSON; fork adds a branch); "frame" → "agent"/"branch" throughout;
       the "user interruption" hole marked built; decision 7 gains
       reconciliation and re-attach.
-- [ ] 12_ANSWERS: Step 2's stored truncation and retry superseded by B4;
+      *(Decisions 2–4 and 7 amended in place with the specifics named
+      above; Step 1's event list gains a "vocabulary rewritten" note
+      pointing at the current primitives rather than being rewritten
+      wholesale, since it's also the historical record of what Step 1
+      literally shipped. The "frame" pass covers the decisions, Step 1's
+      note, and the "user interruption" hole directly; Steps 0–6, Known
+      holes' other bullets, and the M0–M4 milestone narratives are Phase
+      8's own build log — real dates, real bugs found, literal
+      then-current identifiers and test names — so rather than rewriting
+      93 more historical citations with uncertain fidelity, a single note
+      right after the decisions section translates the word for
+      everything that follows: frame → agent (or branch, where the text
+      is about the tree), `FrameStart` → `Agent`, `FrameResult` → the
+      `Return`/`Condition`/`Answer` split, `AgentState` → `Runner`. Same
+      policy applied to 9_TUI and 11_INTROSPECT below.)*
+- [x] 12_ANSWERS: Step 2's stored truncation and retry superseded by B4;
       decision 4 rewritten as "budget is a rendering rule."
-- [ ] 9_TUI: decision 6 extended — branch navigator, waiting-on-you
+- [x] 9_TUI: decision 6 extended — branch navigator, waiting-on-you
       highlighting, the input line always live, restart keys; "frame
       list" pane renamed; "frame" kept only for the stack pane.
-- [ ] 11_INTROSPECT / 10_EDITING: `FrameResult`, `Message::*`,
+      *(Step 4's own heading and body — "frame switcher," "frame-list
+      pane," `AgentState` — updated too, since unlike 8_HARNESS's
+      milestones this is the step the extended decision 6 directly
+      describes; a note marks what changed vs. what M0 originally
+      shipped. The stale acceptance-box test name
+      `concurrent_frames_list_and_retarget` is corrected to
+      `concurrent_agents_list_and_retarget`, its actual current name
+      after 17_BRANCHES Step D1.)*
+- [x] 11_INTROSPECT / 10_EDITING: `FrameResult`, `Message::*`,
       `PushFrame`-era wording, and conversational "frame" updated.
-- [ ] DESIGN.md: A0 re-read against what landed; sentences using "the
+      *(11_INTROSPECT gets a banner after "Sequencing" naming the three
+      concrete corrections a reader needs before the decisions section:
+      `Message::System` no longer exists as a stored chat event —
+      17_BRANCHES A3 made `system` a field on the `Agent` event itself,
+      closing this doc's own decision 4 gap; `FrameStart`/`FrameResult`
+      are `Agent`/`Fork` roots and outcome events, since agents never
+      close and so have no terminal event to log; `AgentState` is
+      `Runner`. 10_EDITING is lighter (a handful of mentions, not a
+      whole phase built on the word): decision 6 gets the same
+      `Runner`/branch correction plus a note that 17_BRANCHES C1–C2
+      built the reconciliation this decision only named; Step 7 — whose
+      `synthesize_if_interrupted` and its test are gone from the code,
+      superseded by `Tree::unmatched()`'s general reconciliation — gets
+      a superseded note rather than a rewrite, since every specific in
+      its body is now historical; D2's "per-frame epoch" becomes
+      "per-agent.")*
+- [x] DESIGN.md: A0 re-read against what landed; sentences using "the
       agent" for the product reworded to "the harness"/"the system", so
       "agent" means one context everywhere.
-- [ ] Gate: `cargo fmt && cargo clippy --workspace --all-targets &&
+      *(The Exchanges section A0 added is unchanged by D1/D2 — they
+      built a TUI over that vocabulary, not a vocabulary change. Fixed:
+      goal 1's "**The agent.**" → "**The harness.**", "the agent
+      product" → "the harness product" (×2), "the agent thesis" → "the
+      harness thesis", "the *agent* side of this project" → "the
+      *harness* side." Left alone: "code-mode agent system" in the
+      opening line and every use of "agent"/"subagent" meaning one
+      context — both already read the new way.)*
+- [x] Gate: `cargo fmt && cargo clippy --workspace --all-targets &&
       cargo test` green.
 
 ## Open questions (decide on contact)
