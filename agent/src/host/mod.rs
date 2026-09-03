@@ -42,6 +42,7 @@ use std::time::Instant;
 use crate::machine::{
     LlmRequest, LlmTurn, OutCall, Runner, SpawnRequest, StepInput, StepOutput, ToolResult,
 };
+use crate::tree::Unmatched;
 use crate::types::{
     Address, Author, Call, Cause, EventId, EventPayload, Message, Origin, Outcome, ToolCall, Tree,
 };
@@ -227,16 +228,16 @@ impl Session {
         }
     }
 
-    /// Open a re-loaded log anchored at a chosen `leaf` (M4 resume seam,
-    /// generalizing `new`'s auto-pick). The root agent is the one `leaf`
-    /// belongs to; if `leaf`'s spine is already complete the session
-    /// opens idle (a direct `UserTurn` is rejected — fork to continue).
+    /// Open a re-loaded log with `leaf`'s branch anchored at that leaf,
+    /// then **reconcile**: every unmatched half of an exchange is
+    /// repaired, and every branch the table says owes something is
+    /// re-hydrated live.
     ///
-    /// If the leaf's last assistant turn is an unanswered `run_program`
-    /// (the program was interrupted mid-execution), a synthesized report
-    /// is appended so the LLM receives it as that call's tool result.
+    /// The anchor is only about *where* that one branch sits — an event
+    /// may have several leaves under one branch — and it is not a
+    /// cursor: every other branch the table names comes back live too.
     pub fn open_at(
-        mut tree: Tree,
+        tree: Tree,
         leaf: EventId,
         registry: ToolRegistry,
         llm: Box<dyn LlmClient>,
@@ -248,10 +249,139 @@ impl Session {
                 format!("cannot open at {leaf:?}: not in the log"),
             ));
         }
-        let leaf = synthesize_if_interrupted(&mut tree, leaf)?;
         let emitted = 0; // replay all existing events into the chat pane
         let state = Runner::with_spine(&tree, tree.spine_at(leaf));
-        Self::assemble(tree, state, registry, llm, events, emitted)
+        let mut session = Self::assemble(tree, state, registry, llm, events, emitted)?;
+        session.reconcile()?;
+        session.tree.sync()?;
+        Ok(session)
+    }
+
+    /// **Crash recovery is reconciliation.** Scan the log for unmatched
+    /// halves, repair each one where it belongs, and bring back live
+    /// every branch that owes something.
+    ///
+    /// The guarantee this serves is precise, and it is deliberately not
+    /// determinism — recovery is re-execution: **after a resume, no
+    /// completed work is invisible.** A re-run program may ask again;
+    /// that is the model's informed choice against a full menu, never an
+    /// accident.
+    fn reconcile(&mut self) -> io::Result<()> {
+        // Repairs first, then waking: appending a lost `Post` makes its
+        // recipient owe an answer, and that branch has to prompt for it.
+        for row in self.tree.unmatched() {
+            match row {
+                // Crashed between the halves of the message. The `Send`
+                // **is** the message, so this is idempotent.
+                Unmatched::UndeliveredSend { send, to } => {
+                    if self.open_branch(to) {
+                        let from =
+                            Author::Agent(self.agent_of(self.tree.branch_of(send).unwrap_or(send)));
+                        self.deliver_post(to, from, Origin::Sent(send))?;
+                    }
+                }
+                Unmatched::MissingReceipt { branch, send, post } => {
+                    self.repair(
+                        branch,
+                        send,
+                        Outcome::Delivered(serde_json::json!({ "post": post.map(|p| p.as_u64()) })),
+                    )?;
+                }
+                Unmatched::LostDelivery {
+                    branch,
+                    send,
+                    value,
+                } => self.repair(branch, send, Outcome::Delivered(value))?,
+                Unmatched::UndeliveredHandle {
+                    branch,
+                    spawn,
+                    agent,
+                } => self.repair(
+                    branch,
+                    spawn,
+                    Outcome::Delivered(serde_json::json!({ "agent": agent.as_u64() })),
+                )?,
+                // Interrupted mid-program: give the run an outcome like
+                // any other, so its report renders from the log. There is
+                // no "the report was lost" case, because a report is
+                // never a thing that can be lost.
+                Unmatched::InterruptedRun { branch, leaf, turn } => {
+                    if self.open_branch(branch) {
+                        let missing = self.missing_outcomes(leaf, turn);
+                        let state = self.states.get_mut(&branch).expect("opened");
+                        for _ in 0..missing {
+                            self.tree.append(
+                                &mut state.spine,
+                                EventPayload::Condition {
+                                    cause: Cause::Interrupted,
+                                    site: 0,
+                                    stack: Vec::new(),
+                                },
+                            )?;
+                        }
+                    }
+                }
+                // Nothing to append. The branch still comes back live:
+                // it owes a reply, the human owes it one, or its menu has
+                // to say *may have happened*.
+                Unmatched::OwedAnswer { branch, .. }
+                | Unmatched::OwedByUser { branch, .. }
+                | Unmatched::PendingAsk { branch, .. }
+                | Unmatched::LostInvoke { branch, .. } => {
+                    self.open_branch(branch);
+                }
+            }
+        }
+        self.emit_new();
+
+        // Now the trigger rule, once, per live branch. `with_spine`
+        // starts `shown` at the leaf so a re-opened branch waits to be
+        // spoken to; `owe_prompt` lowers it exactly where the table says
+        // a cause was swallowed by the crash, and `wake` is still the
+        // one door — nothing here prompts without a cause event.
+        let branches: Vec<BranchId> = self.states.keys().copied().collect();
+        for branch in branches {
+            let outputs = {
+                let tree = &self.tree;
+                let state = self.states.get_mut(&branch).expect("live");
+                // A branch a repair already set going has its causes in
+                // hand and a request out; lowering its mark now would
+                // move the binding *under* that request, which is the
+                // one thing `shown` exists to make impossible.
+                if !state.is_idle() {
+                    continue;
+                }
+                if let Some(cause) = state.unrendered_cause(tree) {
+                    state.owe_prompt(cause);
+                }
+                state.wake(tree)
+            };
+            self.after_step(branch, outputs)?;
+        }
+        Ok(())
+    }
+
+    /// Append one repair `Result` on the branch that issued the call.
+    fn repair(&mut self, branch: BranchId, call: EventId, outcome: Outcome) -> io::Result<()> {
+        if !self.open_branch(branch) {
+            return Ok(());
+        }
+        let state = self.states.get_mut(&branch).expect("opened");
+        self.tree
+            .append(&mut state.spine, EventPayload::Result { call, outcome })?;
+        Ok(())
+    }
+
+    /// How many of `turn`'s tool calls never got an outcome.
+    fn missing_outcomes(&self, leaf: EventId, turn: EventId) -> usize {
+        let Some(EventPayload::Message(Message::Turn { tool_calls, .. })) =
+            self.tree.events.get(&turn).map(|e| &e.payload)
+        else {
+            return 0;
+        };
+        tool_calls
+            .len()
+            .saturating_sub(crate::report::outcomes_of_turn(&self.tree, leaf, turn).len())
     }
 
     /// Shared construction for `new`/`open_at`: card the state, key it by
@@ -1441,45 +1571,6 @@ impl Session {
     }
 }
 
-/// A `Turn(run_program)` with **no outcome** was interrupted mid-program
-/// and its VM is gone. Append `Condition{Interrupted}` so the run has an
-/// outcome like any other and its report renders from the log — the one
-/// repair the reconciliation table needs for this row.
-///
-/// A turn that *does* have an outcome needs nothing: the report renders
-/// from it, so "the report was lost" is not a case that can exist.
-/// Returns the (possibly updated) leaf id.
-fn synthesize_if_interrupted(tree: &mut Tree, leaf: EventId) -> io::Result<EventId> {
-    let path = tree.path_events(leaf);
-    let Some(turn) = path
-        .iter()
-        .rev()
-        .find(|e| matches!(e.payload, EventPayload::Message(Message::Turn { .. })))
-    else {
-        return Ok(leaf);
-    };
-    let EventPayload::Message(Message::Turn { tool_calls, .. }) = &turn.payload else {
-        return Ok(leaf);
-    };
-    if tool_calls.is_empty() {
-        return Ok(leaf); // a turn with no calls is idle, not interrupted
-    }
-    let turn_id = turn.id;
-    if !crate::report::outcomes_of_turn(tree, leaf, turn_id).is_empty() {
-        return Ok(leaf);
-    }
-
-    let mut spine = tree.spine_at(leaf);
-    tree.append(
-        &mut spine,
-        EventPayload::Condition {
-            cause: Cause::Interrupted,
-            site: 0,
-            stack: Vec::new(),
-        },
-    )
-}
-
 /// Auto-pick a resume anchor for a re-opened log: the lowest-id leaf
 /// that **owes something** — an open post, or a `run_program` turn with
 /// no outcome — else the lowest-id leaf, so the loop still lives for
@@ -1505,7 +1596,15 @@ fn owes_work(tree: &Tree, leaf: EventId) -> bool {
     if !tree.spine_at(leaf).context().open.is_empty() {
         return true;
     }
-    tree.path_events(leaf)
+    // Scoped to this branch's own **agent segment**: a turn above an
+    // `Agent` root belongs to the caller, and reading it here would make
+    // every spawned worker look like it owed its parent's run.
+    let path = tree.path_events(leaf);
+    let start = path
+        .iter()
+        .rposition(|e| matches!(e.payload, EventPayload::Agent { .. }))
+        .unwrap_or(0);
+    path[start..]
         .iter()
         .rev()
         .find(|e| matches!(e.payload, EventPayload::Message(Message::Turn { .. })))
@@ -2368,8 +2467,8 @@ mod tests {
     /// hand, which is exactly what a re-opened log would hold.)
     #[test]
     fn reply_settles_a_question_to_the_user() {
-        let mut tree = tree_with_open_root();
-        let mut spine = tree.spine_at(EventId::new(3));
+        let mut tree = tree_with_answered_root();
+        let mut spine = tree.spine_at(EventId::new(4));
         let send = tree
             .append(
                 &mut spine,
@@ -2807,11 +2906,33 @@ mod tests {
 
     /// An incomplete root agent: Agent(1), User(2 "q"),
     /// Assistant(3 "a1"). Leaf = #3 — open, so resumable and forkable.
+    /// Agent #1, the user's question #2, the reply #3 — and **no
+    /// `Answer`**, so #2 is still open. Reconciliation reads that as row
+    /// one of its table and brings the branch back live owing a reply,
+    /// which is what the tests about owing want.
     fn tree_with_open_root() -> Tree {
         let mut tree = Tree::new(None);
         let mut spine = tree.start_agent(None, None, "root", None, "").unwrap();
         tree.append(&mut spine, user("q")).unwrap();
         tree.append(&mut spine, assistant("a1")).unwrap();
+        tree
+    }
+
+    /// The same, finished: the reply logs its `Answer` (#4), so nothing
+    /// is open and re-opening the log wakes nobody. This is the honest
+    /// shape of a settled conversation, and the fixture for every test
+    /// where owing an answer is beside the point.
+    fn tree_with_answered_root() -> Tree {
+        let mut tree = tree_with_open_root();
+        let mut spine = tree.spine_at(EventId::new(3));
+        tree.append(
+            &mut spine,
+            EventPayload::Answer {
+                question: EventId::new(2),
+                value: json!("a1"),
+            },
+        )
+        .unwrap();
         tree
     }
 
@@ -2822,6 +2943,25 @@ mod tests {
             "ignored on resume",
             ToolRegistry::new(),
             Box::new(ScriptedLlm::new(script)),
+            tx,
+        )
+        .unwrap();
+        (session, rx)
+    }
+
+    /// `open`, but with turns routed by charter — needed the moment a
+    /// reopened log has more than one branch to wake, because a single
+    /// scripted queue pops in whatever order the threads win.
+    fn open_routed(
+        tree: Tree,
+        rules: impl IntoIterator<Item = (&'static str, Vec<LlmTurn>)>,
+    ) -> (Session, Receiver<SessionEvent>) {
+        let (tx, rx) = channel();
+        let session = Session::new(
+            tree,
+            "ignored on resume",
+            ToolRegistry::new(),
+            Box::new(RoutedLlm::new(rules)),
             tx,
         )
         .unwrap();
@@ -2929,7 +3069,7 @@ mod tests {
     /// would fail the run.
     #[test]
     fn rename_does_not_wake() {
-        let (session, rx) = open(tree_with_open_root(), vec![]);
+        let (session, rx) = open(tree_with_answered_root(), vec![]);
         let h = session.handle();
         h.send(SessionCommand::Rename {
             branch: session.conversation_branch(),
@@ -2942,7 +3082,11 @@ mod tests {
         assert!(errors(&events).is_empty(), "{:?}", errors(&events));
         // Nothing but the rename was appended, and no turn was taken.
         let kinds = kinds(session.tree(), root_leaf(&session));
-        assert_eq!(kinds, ["Agent", "Post", "Turn", "Rename"], "{kinds:?}");
+        assert_eq!(
+            kinds,
+            ["Agent", "Post", "Turn", "Answer", "Rename"],
+            "{kinds:?}"
+        );
     }
 
     /// **Fork adds a branch; it never moves you.** The user turn that
@@ -2951,16 +3095,19 @@ mod tests {
     /// untouched.
     #[test]
     fn fork_then_user_turn_diverges_in_the_same_agent() {
-        let (session, rx) = open(tree_with_open_root(), vec![scripted_text("forked done")]);
+        let (session, rx) = open(
+            tree_with_answered_root(),
+            vec![scripted_text("forked done")],
+        );
         let h = session.handle();
-        // Fork off the user message (#2), dropping the original a1 reply.
-        // The `Fork` is the next event logged, so its id — the new
-        // branch's id — is #4.
+        // Fork off the user message (#2), dropping the original a1
+        // reply (#3) and its `Answer` (#4). The `Fork` is the next event
+        // logged, so its id — the new branch's id — is #5.
         h.send(SessionCommand::Fork {
             from: EventId::new(2),
             name: Some("retry".into()),
         });
-        let fork = EventId::new(4);
+        let fork = EventId::new(5);
         h.send(SessionCommand::UserTurn {
             branch: fork,
             text: "forked follow-up".into(),
@@ -2975,14 +3122,14 @@ mod tests {
         for (leaf, _) in &leaves {
             assert_eq!(agent_root_of(tree, *leaf), EventId::new(1));
         }
-        // The original assistant leaf (#3) survived untouched.
-        assert!(leaves.iter().any(|(id, _)| *id == EventId::new(3)));
+        // The original's leaf (#4) survived untouched.
+        assert!(leaves.iter().any(|(id, _)| *id == EventId::new(4)));
         // The forked branch diverged off #2 (never saw "a1") and is a
         // branch of its own, rooted at the `Fork`.
         let forked_leaf = leaves
             .iter()
             .map(|(id, _)| *id)
-            .find(|id| *id != EventId::new(3))
+            .find(|id| *id != EventId::new(4))
             .unwrap();
         assert_eq!(tree.branch_of(forked_leaf), Some(fork));
         let forked = tree.spine_at(forked_leaf);
@@ -3017,7 +3164,7 @@ mod tests {
     fn resume_opens_a_branch_and_rejects_only_the_unknown() {
         // Open root (#3) plus a real second branch, forked off #2, that
         // has answered — under the old rules that spine was sealed.
-        let mut tree = tree_with_open_root();
+        let mut tree = tree_with_answered_root();
         let mut branch = tree.fork(EventId::new(2)).unwrap();
         let fork = tree
             .append(&mut branch, EventPayload::Fork { name: None })
@@ -3035,7 +3182,7 @@ mod tests {
 
         let (session, rx) = open(tree, vec![]);
         let h = session.handle();
-        h.send(SessionCommand::Resume(EventId::new(3)));
+        h.send(SessionCommand::Resume(EventId::new(4)));
         h.send(SessionCommand::Resume(answered_leaf)); // answered — still fine
         h.send(SessionCommand::Resume(EventId::new(99))); // unknown — rejected
         h.send(SessionCommand::Shutdown);
@@ -3046,7 +3193,7 @@ mod tests {
         assert_eq!(errs.len(), 1, "{errs:?}");
         assert!(errs[0].contains("not in the log"));
         // Each accepted resume announced the branch that leaf sits on —
-        // the root's own for #3, the fork's for the answered leaf.
+        // the root's own for #4, the fork's for the answered leaf.
         assert_eq!(opened(&events), [EventId::new(1), fork]);
         // …and the fork is live now, with its own leaf. The original
         // branch was never moved.
@@ -3061,7 +3208,7 @@ mod tests {
                 .unwrap()
                 .spine
                 .leaf_id,
-            EventId::new(3),
+            EventId::new(4),
         );
     }
 
@@ -3073,7 +3220,7 @@ mod tests {
     #[test]
     fn navigation_commands_are_accepted_while_a_branch_is_busy() {
         let (mut session, rx) = open(
-            tree_with_open_root(),
+            tree_with_answered_root(),
             vec![scripted_program("c1", "while (true) {}")],
         );
         let h = session.handle();
@@ -3158,7 +3305,7 @@ mod tests {
     }
 
     #[test]
-    fn interrupted_run_program_synthesizes_report_and_rewrite_continues() {
+    fn interrupted_run_program_reopens_and_the_rewrite_continues() {
         // Build a tree with an unanswered run_program: the program was
         // interrupted before completing. Event ids are deterministic:
         // Agent 1, User 2, Assistant 3 (run_program, no result).
@@ -3238,17 +3385,15 @@ mod tests {
             "{interrupted_report}"
         );
 
-        // Now send a user turn; the LLM sees the interrupted report and
-        // responds with a run_program rewrite.
-        session.handle().send(SessionCommand::UserTurn {
-            branch: session.conversation_branch(),
-            text: "continue".into(),
-            expects_reply: true,
-        });
+        // **Nothing had to be said to it.** Reconciliation gave the run
+        // an outcome, which is a cause event the trigger rule already
+        // knows — so the branch prompts with its own report on open, and
+        // the rewrite follows. That is the whole of what lowering
+        // `shown` buys: a crash costs a re-render, never a re-run.
         let session = session.run();
 
         // The rewrite should have produced a completion report, then a
-        // final text turn that yields the root's turn back to the user
+        // final text turn that answers the post the crash left open
         // (an `Answer`, then idle — the conversation never ends).
         let all_tools = tool_texts(&session);
         assert!(
@@ -4243,12 +4388,12 @@ mod tests {
     #[test]
     fn two_forks_of_one_agent_run_concurrently() {
         let (session, rx) = open(
-            tree_with_open_root(),
+            tree_with_answered_root(),
             vec![scripted_text("A answers"), scripted_text("B answers")],
         );
         let h = session.handle();
         // Two forks off the same point (#2). Their ids are the next two
-        // events logged: #4 and #5.
+        // events logged: #5 and #6.
         h.send(SessionCommand::Fork {
             from: EventId::new(2),
             name: Some("A".into()),
@@ -4257,7 +4402,7 @@ mod tests {
             from: EventId::new(2),
             name: Some("B".into()),
         });
-        let (a, b) = (EventId::new(4), EventId::new(5));
+        let (a, b) = (EventId::new(5), EventId::new(6));
         h.send(SessionCommand::UserTurn {
             branch: a,
             text: "to A".into(),
@@ -4287,7 +4432,7 @@ mod tests {
         // Each fork grew its own transcript from the shared prefix, and
         // the original's leaf (#3) never moved.
         let leaf_of = |branch| session.state(branch).unwrap().spine.leaf_id;
-        assert_eq!(leaf_of(EventId::new(1)), EventId::new(3));
+        assert_eq!(leaf_of(EventId::new(1)), EventId::new(4));
         let texts = |branch| -> Vec<String> {
             tree.spine_at(leaf_of(branch))
                 .context()
@@ -4312,7 +4457,7 @@ mod tests {
     /// eat it. Its first `UserTurn` is what wakes it.
     #[test]
     fn fork_is_born_idle() {
-        let (session, rx) = open(tree_with_open_root(), vec![scripted_text("only turn")]);
+        let (session, rx) = open(tree_with_answered_root(), vec![scripted_text("only turn")]);
         let h = session.handle();
         h.send(SessionCommand::Fork {
             from: EventId::new(2),
@@ -4320,10 +4465,10 @@ mod tests {
         });
         h.send(SessionCommand::Shutdown);
         let mut session = drain(session);
-        let fork = EventId::new(4);
+        let fork = EventId::new(5);
 
         // Nothing but the `Fork` was logged, and the fork is idle.
-        assert_eq!(session.tree().id_counter, 4);
+        assert_eq!(session.tree().id_counter, 5);
         assert_eq!(session.state(fork).unwrap().status(), "idle");
         assert!(errors(&rx.try_iter().collect::<Vec<_>>()).is_empty());
 
@@ -4349,20 +4494,20 @@ mod tests {
     /// that" and hiding history would defeat forking.
     #[test]
     fn fork_line_renders() {
-        let (session, _rx) = open(tree_with_open_root(), vec![]);
+        let (session, _rx) = open(tree_with_answered_root(), vec![]);
         session.handle().send(SessionCommand::Fork {
-            from: EventId::new(3),
+            from: EventId::new(4),
             name: None,
         });
         session.handle().send(SessionCommand::Shutdown);
         let session = drain(session);
 
-        let state = session.state(EventId::new(4)).unwrap();
+        let state = session.state(EventId::new(5)).unwrap();
         let rendered = state.render_messages_for_test(session.tree());
         assert_eq!(
             rendered.last(),
             Some(&crate::machine::Rendered::User(
-                "[harness] fork of branch #1 at #3 — questions before this line are being \
+                "[harness] fork of branch #1 at #4 — questions before this line are being \
                  handled there; do not redo its work unless asked."
                     .to_owned()
             )),
@@ -4376,7 +4521,7 @@ mod tests {
     #[test]
     fn mid_program_fork_answers_the_dangling_call() {
         let (mut session, _rx) = open(
-            tree_with_open_root(),
+            tree_with_answered_root(),
             vec![scripted_program(
                 "c1",
                 "tools.read_file('a'); while (true) {}",
@@ -4492,7 +4637,7 @@ mod tests {
     #[test]
     fn interrupt_pauses_program() {
         let (mut session, _rx) = open(
-            tree_with_open_root(),
+            tree_with_answered_root(),
             vec![
                 scripted_program("c1", "while (true) {}"),
                 scripted_text("stopped"),
@@ -4544,7 +4689,7 @@ mod tests {
     #[test]
     fn user_resumes_and_user_rewrites() {
         let (mut session, _rx) = open(
-            tree_with_open_root(),
+            tree_with_answered_root(),
             vec![scripted_program("c1", "return raise('need', {}) + 1;")],
         );
         let h = session.handle();
@@ -4622,20 +4767,50 @@ mod tests {
     /// makes exploring in a fork and then committing one gesture.
     #[test]
     fn user_answers_on_the_original_after_forking() {
-        let (session, rx) = open(tree_with_open_root(), vec![scripted_text("explored")]);
-        let h = session.handle();
+        // The root is woken by reconciliation (its "q" is open) and runs
+        // a program that parks on a question to the human — so #2 stays
+        // open, and nothing but the user can close it.
+        let (mut session, rx) = open(
+            tree_with_open_root(),
+            vec![
+                scripted_program(
+                    "c1",
+                    r#"return await tools.ask({ to: "user", text: "which one?" });"#,
+                ),
+                scripted_text("explored"),
+                scripted_text("noted"),
+            ],
+        );
         let branch = session.conversation_branch();
         let question = EventId::new(2); // the user's "q", open on #1
+        while session.pump_one() {}
+        assert_eq!(session.state(branch).unwrap().status(), "running");
+        assert_eq!(session.state(branch).unwrap().open(), [question]);
+
+        // Explore in a fork: it inherits the question as history and
+        // owes it nothing, so its own turn answers its own post.
+        let h = session.handle();
+        let at = session.state(branch).unwrap().spine.leaf_id;
         h.send(SessionCommand::Fork {
-            from: EventId::new(3),
+            from: at,
             name: Some("explore".into()),
         });
-        let fork = EventId::new(4);
+        while session.pump_one() {}
+        let fork = session
+            .branches()
+            .into_iter()
+            .map(|(id, _)| id)
+            .find(|id| *id != branch)
+            .expect("the fork is live");
         h.send(SessionCommand::UserTurn {
             branch: fork,
             text: "what would you say?".into(),
             expects_reply: true,
         });
+        while session.pump_one() {}
+
+        // Now make that answer **the** answer, by taking the original
+        // branch's turn — which is the gesture the fork exists for.
         h.send(SessionCommand::Restart {
             branch,
             call: UserCall::Answer {
@@ -4645,11 +4820,6 @@ mod tests {
         });
         let session = drain(session);
 
-        // The `Answer` is on the **original** branch, which is the one
-        // that owed it — and the fork logged none for that post.
-        let on = |b: EventId| -> Vec<&'static str> {
-            kinds(session.tree(), session.state(b).unwrap().spine.leaf_id)
-        };
         let answers_to = |b: EventId| -> Vec<EventId> {
             session
                 .tree()
@@ -4661,15 +4831,15 @@ mod tests {
                 })
                 .collect()
         };
-        assert!(answers_to(branch).contains(&question), "{:?}", on(branch));
+        assert!(answers_to(branch).contains(&question));
         // The fork answered its *own* post and never the inherited one:
         // a fork inherits history, not obligations.
         assert!(
             !answers_to(fork).contains(&question),
-            "{:?} / {:?}",
-            answers_to(fork),
-            on(fork)
+            "{:?}",
+            answers_to(fork)
         );
+        assert!(!answers_to(fork).is_empty(), "the fork answered its own");
         assert!(session.state(branch).unwrap().open().is_empty());
         let events: Vec<SessionEvent> = rx.try_iter().collect();
         assert!(events.iter().any(|e| matches!(
@@ -4678,10 +4848,6 @@ mod tests {
         )));
     }
 
-    /// **Quiet, not "awaiting user".** `run()` returns when no branch has
-    /// work in flight — which is *not* "no branch has anything left to
-    /// do": a branch parked on a question to the human is quiet, because
-    /// nothing will move it until someone speaks.
     #[test]
     fn run_returns_when_every_branch_is_quiet() {
         let registry = ToolRegistry::new();
@@ -4792,7 +4958,7 @@ mod tests {
     /// in the tail rather than in the system prompt.
     #[test]
     fn presence_flip_does_not_disturb_the_prefix() {
-        let (mut session, _rx) = open(tree_with_open_root(), vec![]);
+        let (mut session, _rx) = open(tree_with_answered_root(), vec![]);
         let branch = session.conversation_branch();
         let render = |session: &mut Session, attached: bool| -> LlmRequest {
             session.set_attached(attached);
@@ -4923,5 +5089,571 @@ mod tests {
             kinds(session.tree(), leaf)
         );
         assert!(session.state(branch).unwrap().open().is_empty());
+    }
+
+    // ── C2: crash recovery is reconciliation ─────────────────────────
+
+    /// One full exchange, logged event by event, so a test can cut the
+    /// log after any of them and reopen. The ids are deterministic:
+    ///
+    /// 1 `Agent` root · 2 `Post` (the user, open) · 3 `Turn` run_program ·
+    /// 4 `Spawn` · 5 `Agent` worker · 6 `Result` (the handle) ·
+    /// 7 `Send` (ask the worker) · 8 `Post` on the worker ·
+    /// 9 `Turn` on the worker · 10 `Answer` · 11 `Result` (the answer home)
+    fn exchange_log(keep: u64) -> Tree {
+        let mut tree = Tree::new(None);
+        let mut root = tree.start_agent(None, None, "root", None, "root").unwrap();
+        let step = |tree: &mut Tree, n: u64| -> bool { tree.id_counter < keep && n <= keep };
+        if !step(&mut tree, 2) {
+            return tree;
+        }
+        tree.append(&mut root, user("go")).unwrap();
+        if !step(&mut tree, 3) {
+            return tree;
+        }
+        tree.append(
+            &mut root,
+            EventPayload::Message(Message::Turn {
+                author: Author::Agent(EventId::new(1)),
+                text: String::new(),
+                thinking: None,
+                tool_calls: vec![ToolCall {
+                    id: "c1".into(),
+                    name: "run_program".into(),
+                    arguments: json!({ "source": "return await tools.ask({ to: w, text: \"q\" });" }),
+                }],
+            }),
+        )
+        .unwrap();
+        if !step(&mut tree, 4) {
+            return tree;
+        }
+        tree.append(
+            &mut root,
+            EventPayload::Call(Call::Spawn {
+                name: Some("w".into()),
+                charter: "worker".into(),
+                tools: None,
+                site: 0,
+            }),
+        )
+        .unwrap();
+        if !step(&mut tree, 5) {
+            return tree;
+        }
+        let mut worker = tree
+            .start_agent(
+                Some(EventId::new(4)),
+                Some("w".into()),
+                "worker",
+                None,
+                "worker",
+            )
+            .unwrap();
+        if !step(&mut tree, 6) {
+            return tree;
+        }
+        tree.append(
+            &mut root,
+            EventPayload::Result {
+                call: EventId::new(4),
+                outcome: Outcome::Delivered(json!({ "agent": 5 })),
+            },
+        )
+        .unwrap();
+        if !step(&mut tree, 7) {
+            return tree;
+        }
+        tree.append(
+            &mut root,
+            EventPayload::Call(Call::Send {
+                to: Address::Branch(EventId::new(5)),
+                text: "q".into(),
+                input: json!(null),
+                expects_reply: true,
+                site: 0,
+            }),
+        )
+        .unwrap();
+        if !step(&mut tree, 8) {
+            return tree;
+        }
+        tree.append(
+            &mut worker,
+            EventPayload::Message(Message::Post {
+                from: Author::Agent(EventId::new(1)),
+                origin: Origin::Sent(EventId::new(7)),
+            }),
+        )
+        .unwrap();
+        if !step(&mut tree, 9) {
+            return tree;
+        }
+        tree.append(&mut worker, assistant("answered")).unwrap();
+        if !step(&mut tree, 10) {
+            return tree;
+        }
+        tree.append(
+            &mut worker,
+            EventPayload::Answer {
+                question: EventId::new(8),
+                value: json!("answered"),
+            },
+        )
+        .unwrap();
+        if !step(&mut tree, 11) {
+            return tree;
+        }
+        tree.append(
+            &mut root,
+            EventPayload::Result {
+                call: EventId::new(7),
+                outcome: Outcome::Delivered(json!("answered")),
+            },
+        )
+        .unwrap();
+        tree
+    }
+
+    /// Payload kinds on a branch's whole path, log order.
+    fn path_kinds(tree: &Tree, leaf: EventId) -> Vec<&'static str> {
+        tree.path_events(leaf)
+            .into_iter()
+            .map(|e| match &e.payload {
+                EventPayload::Agent { .. } => "Agent",
+                EventPayload::Fork { .. } => "Fork",
+                EventPayload::Answer { .. } => "Answer",
+                EventPayload::Message(Message::Post { .. }) => "Post",
+                EventPayload::Message(Message::Turn { .. }) => "Turn",
+                EventPayload::Call(_) => "Call",
+                EventPayload::Result { .. } => "Result",
+                EventPayload::Return { .. } => "Return",
+                EventPayload::Condition { .. } => "Condition",
+                EventPayload::Console { .. } => "Console",
+                EventPayload::Rename { .. } => "Rename",
+            })
+            .collect()
+    }
+
+    /// Whether `call` has a `Result` anywhere in the log.
+    fn settled(tree: &Tree, call: EventId) -> Option<serde_json::Value> {
+        tree.events.values().find_map(|e| match &e.payload {
+            EventPayload::Result { call: c, outcome } if *c == call => outcome.value().cloned(),
+            _ => None,
+        })
+    }
+
+    /// **Crash recovery is reconciliation.** Cut the log after each of
+    /// the four events of one exchange and after the host call before
+    /// them; every unmatched half is repaired on open, from the log
+    /// alone — no in-memory table is consulted, because the four ids form
+    /// a closed loop that *is* the wait table.
+    #[test]
+    fn reconcile_after_cut_at_each_exchange_event() {
+        // Cut after the `Spawn`, before its `Agent`: nothing was created,
+        // so there is nothing to repair — re-execution re-spawns.
+        let tree = exchange_log(4);
+        assert_eq!(
+            tree.unmatched()
+                .iter()
+                .filter(|r| matches!(r, Unmatched::UndeliveredHandle { .. }))
+                .count(),
+            0
+        );
+
+        // Cut after the `Agent`, before the handle reached the caller.
+        let tree = exchange_log(5);
+        assert!(tree.unmatched().contains(&Unmatched::UndeliveredHandle {
+            branch: EventId::new(1),
+            spawn: EventId::new(4),
+            agent: EventId::new(5),
+        }));
+
+        // Cut after the `Send`, before its `Post`: crashed between the
+        // halves of the message. The `Send` **is** the message, so the
+        // repair is idempotent.
+        let tree = exchange_log(7);
+        assert!(tree.unmatched().contains(&Unmatched::UndeliveredSend {
+            send: EventId::new(7),
+            to: EventId::new(5),
+        }));
+        let (session, _rx) = open_routed(
+            tree,
+            [
+                ("root", vec![scripted_text("nothing to add")]),
+                ("worker", vec![scripted_text("late answer")]),
+            ],
+        );
+        let session = drain(session);
+        let worker = session.state(EventId::new(5)).expect("the worker is live");
+        assert_eq!(
+            kinds(session.tree(), worker.spine.leaf_id),
+            ["Agent", "Post", "Turn", "Answer"],
+            "the lost post was appended, and the worker answered it"
+        );
+        assert_eq!(
+            settled(session.tree(), EventId::new(7)),
+            Some(json!("late answer"))
+        );
+
+        // Cut after the `Post`, before the `Answer`: the callee still
+        // owes it. Nothing to append — it comes back live and answers.
+        let tree = exchange_log(8);
+        assert!(tree.unmatched().contains(&Unmatched::PendingAsk {
+            branch: EventId::new(1),
+            send: EventId::new(7),
+        }));
+        assert!(tree.unmatched().contains(&Unmatched::OwedAnswer {
+            branch: EventId::new(5),
+            post: EventId::new(8),
+        }));
+        let (session, _rx) = open_routed(
+            tree,
+            [
+                ("root", vec![scripted_text("nothing to add")]),
+                ("worker", vec![scripted_text("late answer")]),
+            ],
+        );
+        let session = drain(session);
+        assert_eq!(
+            settled(session.tree(), EventId::new(7)),
+            Some(json!("late answer"))
+        );
+
+        // Cut after the `Answer`, before its `Result`: delivery lost.
+        // The value is in the log; the repair carries it home.
+        let tree = exchange_log(10);
+        assert!(tree.unmatched().contains(&Unmatched::LostDelivery {
+            branch: EventId::new(1),
+            send: EventId::new(7),
+            value: json!("answered"),
+        }));
+        let (session, _rx) = open(tree, vec![]);
+        assert_eq!(
+            settled(session.tree(), EventId::new(7)),
+            Some(json!("answered")),
+            "the answer reached the branch that asked"
+        );
+
+        // The whole exchange: nothing about it is unmatched any more.
+        let tree = exchange_log(11);
+        assert!(
+            !tree.unmatched().iter().any(|r| matches!(
+                r,
+                Unmatched::UndeliveredSend { .. }
+                    | Unmatched::PendingAsk { .. }
+                    | Unmatched::LostDelivery { .. }
+                    | Unmatched::UndeliveredHandle { .. }
+            )),
+            "{:?}",
+            tree.unmatched()
+        );
+        // …and the run that made it still has no outcome, which is the
+        // one repair left: the VM went with the process.
+        assert!(tree.unmatched().contains(&Unmatched::InterruptedRun {
+            branch: EventId::new(1),
+            leaf: EventId::new(11),
+            turn: EventId::new(3),
+        }));
+    }
+
+    /// **A cut between `Agent` and its `Spawn`'s `Result`** reopens with
+    /// the handle delivered and no second agent created — otherwise
+    /// re-execution spawns a second and orphans the first.
+    #[test]
+    fn interrupted_spawn_does_not_orphan_its_agent() {
+        let (session, _rx) = open(exchange_log(5), vec![]);
+        assert_eq!(
+            settled(session.tree(), EventId::new(4)),
+            Some(json!({ "agent": 5 })),
+            "the handle the caller never got"
+        );
+        let workers = session
+            .tree()
+            .events
+            .values()
+            .filter(|e| matches!(&e.payload, EventPayload::Agent { charter, .. } if charter == "worker"))
+            .count();
+        assert_eq!(workers, 1, "no second agent, and none orphaned");
+    }
+
+    /// **A cut after `Return`** reopens with the completion report
+    /// rendered from the log and the branch idle: the program is *not*
+    /// re-run and no rewrite is requested. Either a run has an outcome —
+    /// in which case its report renders — or it does not, and the one
+    /// repair is to give it one.
+    #[test]
+    fn crash_after_return_completes_the_run() {
+        let mut tree = Tree::new(None);
+        let mut root = tree.start_agent(None, None, "root", None, "root").unwrap();
+        tree.append(&mut root, user("go")).unwrap();
+        tree.append(
+            &mut root,
+            EventPayload::Message(Message::Turn {
+                author: Author::Agent(EventId::new(1)),
+                text: String::new(),
+                thinking: None,
+                tool_calls: vec![ToolCall {
+                    id: "c1".into(),
+                    name: "run_program".into(),
+                    arguments: json!({ "source": "return 7;" }),
+                }],
+            }),
+        )
+        .unwrap();
+        tree.append(&mut root, EventPayload::Return { value: json!(7) })
+            .unwrap();
+
+        // Nothing to repair: the `Return` says the program finished.
+        assert!(
+            !tree
+                .unmatched()
+                .iter()
+                .any(|r| matches!(r, Unmatched::InterruptedRun { .. }))
+        );
+
+        let (session, _rx) = open(tree, vec![scripted_text("it returned 7")]);
+        let session = drain(session);
+        let tree = session.tree();
+        let leaf = root_leaf(&session);
+        // The report the branch read is the completion one, derived from
+        // the `Return` that was already there.
+        let reports = derived_reports(tree, leaf);
+        assert_eq!(reports.len(), 1, "{reports:?}");
+        assert!(reports[0].contains("program completed"), "{}", reports[0]);
+        assert!(reports[0].contains("returned: 7"), "{}", reports[0]);
+        // No re-run, no rewrite: exactly one `run_program` in the log,
+        // and no `Condition` at all.
+        let programs = tree
+            .path_events(leaf)
+            .into_iter()
+            .filter(|e| {
+                matches!(&e.payload,
+                EventPayload::Message(Message::Turn { tool_calls, .. })
+                if tool_calls.iter().any(|c| c.name == "run_program"))
+            })
+            .count();
+        assert_eq!(programs, 1);
+        assert!(!path_kinds(tree, leaf).contains(&"Condition"));
+        assert_eq!(
+            session
+                .state(session.conversation_branch())
+                .unwrap()
+                .status(),
+            "idle"
+        );
+    }
+
+    /// **A question pending for the human survives.** The branch reopens
+    /// live and highlighted with the question inline — the inbox is a
+    /// view over exactly this — and a host `Invoke` cut in flight reads
+    /// *may have happened*, which is why calls are logged at dispatch.
+    #[test]
+    fn user_owed_answer_survives() {
+        let mut tree = Tree::new(None);
+        let mut root = tree.start_agent(None, None, "root", None, "root").unwrap();
+        tree.append(&mut root, user("go")).unwrap();
+        tree.append(
+            &mut root,
+            EventPayload::Message(Message::Turn {
+                author: Author::Agent(EventId::new(1)),
+                text: String::new(),
+                thinking: None,
+                tool_calls: vec![ToolCall {
+                    id: "c1".into(),
+                    name: "run_program".into(),
+                    arguments: json!({ "source": "await tools.send_email(); return await tools.ask({ to: \"user\", text: \"which one?\" });" }),
+                }],
+            }),
+        )
+        .unwrap();
+        let invoke = tree
+            .append(
+                &mut root,
+                EventPayload::Call(Call::Invoke {
+                    name: "send_email".into(),
+                    args: json!([]),
+                    site: 0,
+                }),
+            )
+            .unwrap();
+        let ask = tree
+            .append(
+                &mut root,
+                EventPayload::Call(Call::Send {
+                    to: Address::User,
+                    text: "which one?".into(),
+                    input: json!(null),
+                    expects_reply: true,
+                    site: 47,
+                }),
+            )
+            .unwrap();
+
+        let rows = tree.unmatched();
+        assert!(rows.contains(&Unmatched::OwedByUser {
+            branch: EventId::new(1),
+            send: ask,
+        }));
+        assert!(rows.contains(&Unmatched::LostInvoke {
+            branch: EventId::new(1),
+            call: invoke,
+        }));
+
+        let (session, _rx) = open(tree, vec![scripted_text("ok, waiting on you")]);
+        let session = drain(session);
+        // The branch is live and the navigator can highlight it, with the
+        // question named inline.
+        let info = session
+            .branch_infos()
+            .into_iter()
+            .find(|b| b.branch == EventId::new(1))
+            .expect("the branch reopened");
+        assert_eq!(info.asking_user, Some(ask));
+        // Its report says the effectful call may have happened — the
+        // distinction logging at dispatch exists to make.
+        let reports = derived_reports(session.tree(), root_leaf(&session));
+        assert!(reports[0].contains("may have happened"), "{}", reports[0]);
+        // …and the human can still settle the question.
+        let session = {
+            let h = session.handle();
+            h.send(SessionCommand::Reply {
+                branch: EventId::new(1),
+                call: ask,
+                value: json!("the second one"),
+            });
+            h.send(SessionCommand::Shutdown);
+            drain(session)
+        };
+        assert_eq!(settled(session.tree(), ask), Some(json!("the second one")));
+    }
+
+    /// **Re-attach, not re-ask.** A child cut after its upward `Send`
+    /// re-enters, its rewrite awaits the same call by id, the parent
+    /// answers, and the child completes — with the parent holding
+    /// **one** `Post`, not two. Without this, "pending" in the menu is
+    /// amnesia with extra steps.
+    #[test]
+    fn reentered_child_reattaches_instead_of_reasking() {
+        // Root #1 with a worker #5 spawned under its program, and the
+        // worker mid-program with an upward `Send` (#9) whose `Post`
+        // never landed on the parent. Event ids stay deterministic, so
+        // the repaired post is #10.
+        let mut tree = exchange_log(6);
+        let mut worker = tree.spine_at(EventId::new(5));
+        tree.append(
+            &mut worker,
+            EventPayload::Message(Message::Post {
+                from: Author::Agent(EventId::new(1)),
+                origin: Origin::Direct {
+                    text: "do the thing".into(),
+                    input: json!(null),
+                    expects_reply: true,
+                },
+            }),
+        )
+        .unwrap();
+        tree.append(
+            &mut worker,
+            EventPayload::Message(Message::Turn {
+                author: Author::Agent(EventId::new(5)),
+                text: String::new(),
+                thinking: None,
+                tool_calls: vec![ToolCall {
+                    id: "w1".into(),
+                    name: "run_program".into(),
+                    arguments: json!({ "source": "return await tools.ask({ text: \"which one?\" });" }),
+                }],
+            }),
+        )
+        .unwrap();
+        let send = tree
+            .append(
+                &mut worker,
+                EventPayload::Call(Call::Send {
+                    to: Address::Branch(EventId::new(1)),
+                    text: "which one?".into(),
+                    input: json!(null),
+                    expects_reply: true,
+                    site: 0,
+                }),
+            )
+            .unwrap();
+        // Crashed here: the `Send` is logged, its `Post` is not.
+        assert!(tree.unmatched().contains(&Unmatched::UndeliveredSend {
+            send,
+            to: EventId::new(1),
+        }));
+        let post = EventId::new(send.as_u64() + 1);
+
+        let (session, _rx) = open_routed(
+            tree,
+            [
+                // A bare turn binds the **oldest** open post, which is
+                // the user's — so the child's question stays open and
+                // the parent stays free to answer it deliberately.
+                ("root", vec![scripted_text("noted")]),
+                // The child re-attaches to the call it already made,
+                // instead of asking a second time.
+                (
+                    "worker",
+                    vec![scripted_program(
+                        "w2",
+                        &format!("return await tools.tool_result({});", send.as_u64()),
+                    )],
+                ),
+            ],
+        );
+        let mut session = session.run();
+
+        // The child is parked on the call it re-attached to: no second
+        // `Send`, and its `Result` has not landed yet.
+        assert_eq!(
+            session.state(EventId::new(5)).unwrap().status(),
+            "running",
+            "the rewrite awaits the answer the dead VM would have got"
+        );
+        assert_eq!(settled(session.tree(), send), None);
+
+        // Now the answer, taken on the parent's branch — which is where
+        // the closed loop of ids says it belongs.
+        session.handle().send(SessionCommand::Restart {
+            branch: EventId::new(1),
+            call: UserCall::Answer {
+                question: post,
+                value: json!("the second one"),
+            },
+        });
+        while session.pump_one() {}
+        let tree = session.tree();
+
+        // The parent holds exactly one `Post` from that `Send`…
+        let posts = tree
+            .events
+            .values()
+            .filter(|e| {
+                matches!(&e.payload,
+                EventPayload::Message(Message::Post { origin: Origin::Sent(s), .. }) if *s == send)
+            })
+            .count();
+        assert_eq!(
+            posts, 1,
+            "the repair is idempotent: the `Send` *is* the message"
+        );
+        // …the child issued no second `Send`…
+        let sends = tree
+            .events
+            .values()
+            .filter(|e| {
+                matches!(&e.payload,
+                EventPayload::Call(Call::Send { text, .. }) if text == "which one?")
+            })
+            .count();
+        assert_eq!(sends, 1, "re-attach, not re-ask");
+        // …and the answer resolved the promise the rewrite awaited, so
+        // the rewritten program got what the dead VM was waiting for.
+        assert_eq!(settled(tree, send), Some(json!("the second one")));
+        let worker_leaf = session.state(EventId::new(5)).unwrap().spine.leaf_id;
+        assert_eq!(returned(tree, worker_leaf), json!("the second one"));
     }
 }

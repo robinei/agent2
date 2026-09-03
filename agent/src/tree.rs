@@ -4,6 +4,7 @@ use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 
 use jiff::Timestamp;
+use serde::{Deserialize, Serialize};
 
 /// One agent for the navigator pane, projected from the log (decision 8).
 #[derive(Debug, Clone, PartialEq)]
@@ -79,7 +80,22 @@ impl ProgramView {
     }
 }
 
+/// The log's format version. Bump it when the event vocabulary changes
+/// in a way an older build would misread; nothing migrates, because a
+/// misread log is worse than a refused one.
+pub const LOG_VERSION: u64 = 1;
+
+/// The log's first line: a version header, never an event.
+#[derive(Serialize, Deserialize)]
+struct LogHeader {
+    version: u64,
+}
+
 impl Tree {
+    /// An **in-memory** tree, or one over a file whose header the caller
+    /// has already written. Production creates through [`Tree::open`],
+    /// which writes the header for an empty file, so this is only ever
+    /// handed `None`.
     pub fn new(file: Option<File>) -> Self {
         Self {
             id_counter: 0,
@@ -91,6 +107,12 @@ impl Tree {
 
     /// Load the event log. Reconstructing spines is the caller's move:
     /// `list_leaves()` for the set, `spine_at(leaf)` for a handle.
+    ///
+    /// An **empty** file is a new log and gets the version header
+    /// written; anything else must carry one this build understands.
+    /// Nothing migrates a pre-17 log: the vocabulary changed under it, so
+    /// the honest answer is to refuse it by name rather than to read it
+    /// as something it is not.
     pub fn open(mut file: File) -> Result<Self, io::Error> {
         // Rewind to start in case the file was opened with append(true),
         // which positions the cursor at the end initially.
@@ -101,6 +123,11 @@ impl Tree {
         // Cursor is now at end of existing content — subsequent writes
         // will land there regardless of whether append(true) was used.
 
+        if content.trim().is_empty() {
+            let mut tree = Tree::new(Some(file));
+            tree.write_header()?;
+            return Ok(tree);
+        }
         let mut max_id: u64 = 0;
         let mut events = HashMap::<EventId, Event>::new();
         // A crash can now fall mid-line: the log syncs once per loop
@@ -109,6 +136,30 @@ impl Tree {
         // loses nothing reconciliation cannot repair. Anywhere else a bad
         // line is real corruption and must not be swallowed.
         let mut lines = content.lines().peekable();
+        let header = lines.next().unwrap_or_default();
+        match serde_json::from_str::<LogHeader>(header) {
+            Ok(LogHeader { version }) if version == LOG_VERSION => {}
+            Ok(LogHeader { version }) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "this log is format version {version}; this build reads \
+                         version {LOG_VERSION}. Nothing migrates it — the event \
+                         vocabulary changed — so open it with a matching build."
+                    ),
+                ));
+            }
+            Err(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "this log has no format-version header; this build reads \
+                         version {LOG_VERSION}. Pre-17 logs are not migrated — the \
+                         event vocabulary changed — so open it with a matching build."
+                    ),
+                ));
+            }
+        }
         let mut torn = false;
         while let Some(line) = lines.next() {
             let last = lines.peek().is_none();
@@ -227,6 +278,17 @@ impl Tree {
 
         self.events.insert(id, event);
         Ok(id)
+    }
+
+    /// Write the format-version header — the log's first line, and the
+    /// only line that is not an event.
+    fn write_header(&mut self) -> io::Result<()> {
+        if let Some(file) = &mut self.file {
+            writeln!(file, "{}", serde_json::json!({ "version": LOG_VERSION }))?;
+            file.flush()?;
+            file.sync_all()?;
+        }
+        Ok(())
     }
 
     /// Flush and fsync the log. Called **once per loop step**, not once
@@ -665,6 +727,177 @@ impl Tree {
         programs
     }
 
+    /// **The reconciliation table, as a scan.** Every unmatched half of
+    /// an exchange in the log, with the branch it belongs to.
+    ///
+    /// No in-memory table is consulted because none is needed: the four
+    /// events of an exchange form a closed loop of ids — `Post.origin →
+    /// Send`, `Result.call → Send`, `Answer.question → Post` — so the
+    /// wait table *is* this walk. That is why `parents` could be deleted
+    /// and why nothing session-local has to survive a crash.
+    ///
+    /// Rows that need no repair are included: the caller needs to know a
+    /// branch owes a reply, or that a call may have happened, even though
+    /// there is nothing to append for it.
+    pub fn unmatched(&self) -> Vec<Unmatched> {
+        // The three indexes the closed loop is walked through.
+        let mut settled: HashMap<EventId, &Event> = HashMap::new();
+        let mut post_of_send: HashMap<EventId, EventId> = HashMap::new();
+        let mut answer_of_post: HashMap<EventId, &Event> = HashMap::new();
+        let mut agent_of_spawn: HashMap<EventId, EventId> = HashMap::new();
+        for event in self.events.values() {
+            match &event.payload {
+                EventPayload::Result { call, .. } => {
+                    settled.insert(*call, event);
+                }
+                EventPayload::Message(Message::Post {
+                    origin: Origin::Sent(send),
+                    ..
+                }) => {
+                    post_of_send.insert(*send, event.id);
+                }
+                EventPayload::Answer { question, .. } => {
+                    answer_of_post.insert(*question, event);
+                }
+                EventPayload::Agent { .. } => {
+                    if let Some(parent) = event.parent_id {
+                        agent_of_spawn.insert(parent, event.id);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut rows = Vec::new();
+        let mut calls: Vec<&Event> = self
+            .events
+            .values()
+            .filter(|e| matches!(e.payload, EventPayload::Call(_)))
+            .collect();
+        calls.sort_by_key(|e| e.id.as_u64());
+        for event in calls {
+            let EventPayload::Call(call) = &event.payload else {
+                unreachable!()
+            };
+            let (id, Some(branch)) = (event.id, self.branch_of(event.id)) else {
+                continue;
+            };
+            let done = settled.contains_key(&id);
+            match call {
+                // A `Spawn` whose `Agent` exists but whose caller never
+                // got the handle: append the `Result`, or re-execution
+                // spawns a second agent and orphans the first. A `Spawn`
+                // with no `Agent` needs nothing — nothing was created.
+                Call::Spawn { .. } if !done => {
+                    if let Some(agent) = agent_of_spawn.get(&id) {
+                        rows.push(Unmatched::UndeliveredHandle {
+                            branch,
+                            spawn: id,
+                            agent: *agent,
+                        });
+                    }
+                }
+                // Lost in flight. Not repairable and not re-runnable: an
+                // effectful tool may have happened, which is exactly what
+                // logging at dispatch exists to record.
+                Call::Invoke { .. } if !done => {
+                    rows.push(Unmatched::LostInvoke { branch, call: id })
+                }
+                Call::Send {
+                    to, expects_reply, ..
+                } if !done => {
+                    let post = post_of_send.get(&id).copied();
+                    match (to, expects_reply, post) {
+                        // The human owes a reply: the branch reopens live
+                        // and highlighted, the question inline.
+                        (Address::User, true, _) => {
+                            rows.push(Unmatched::OwedByUser { branch, send: id })
+                        }
+                        // A tell to the human has no post to name.
+                        (Address::User, false, _) => rows.push(Unmatched::MissingReceipt {
+                            branch,
+                            send: id,
+                            post: None,
+                        }),
+                        // Crashed between the halves of the message. The
+                        // `Send` **is** the message, so appending the
+                        // `Post` is idempotent.
+                        (Address::Branch(to), _, None) => {
+                            rows.push(Unmatched::UndeliveredSend { send: id, to: *to })
+                        }
+                        // Landed, but the receipt never got back.
+                        (Address::Branch(_), false, Some(post)) => {
+                            rows.push(Unmatched::MissingReceipt {
+                                branch,
+                                send: id,
+                                post: Some(post),
+                            })
+                        }
+                        (Address::Branch(_), true, Some(post)) => {
+                            match answer_of_post.get(&post).map(|e| &e.payload) {
+                                // Answered, but the delivery was lost.
+                                Some(EventPayload::Answer { value, .. }) => {
+                                    rows.push(Unmatched::LostDelivery {
+                                        branch,
+                                        send: id,
+                                        value: value.clone(),
+                                    })
+                                }
+                                // The callee still owes it: it is live by
+                                // the open-post row, and the sender's menu
+                                // lists this one *pending — re-awaitable*.
+                                _ => rows.push(Unmatched::PendingAsk { branch, send: id }),
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        for (branch, leaf) in self.branches() {
+            // A post open on this branch: it owes a reply, and becomes
+            // live. `Context.open` is the same rule `replay_event`
+            // maintains, so a fork's inherited posts are already excluded.
+            for post in self.spine_at(leaf).context().open.iter().copied() {
+                rows.push(Unmatched::OwedAnswer { branch, post });
+            }
+            // A `Turn(run_program)` with no outcome: interrupted
+            // mid-program, and the VM went with the process.
+            //
+            // Scoped to this branch's **own agent segment**, not its
+            // whole path: a turn above an `Agent` root belongs to the
+            // caller, and reading it here would give every spawned
+            // worker its parent's interrupted run as an outcome to
+            // repair.
+            let path = self.path_events(leaf);
+            let start = path
+                .iter()
+                .rposition(|e| matches!(e.payload, EventPayload::Agent { .. }))
+                .unwrap_or(0);
+            let Some(turn) = path[start..]
+                .iter()
+                .rev()
+                .find(|e| matches!(e.payload, EventPayload::Message(Message::Turn { .. })))
+            else {
+                continue;
+            };
+            let EventPayload::Message(Message::Turn { tool_calls, .. }) = &turn.payload else {
+                continue;
+            };
+            if !tool_calls.is_empty()
+                && crate::report::outcomes_of_turn(self, leaf, turn.id).len() < tool_calls.len()
+            {
+                rows.push(Unmatched::InterruptedRun {
+                    branch,
+                    leaf,
+                    turn: turn.id,
+                });
+            }
+        }
+        rows
+    }
+
     /// The set of spine leaves. A leaf is an event no *spine* event
     /// follows: `Agent` children don't count — they root child
     /// branches, so a call-site event stays its caller's leaf while a
@@ -690,6 +923,65 @@ impl Tree {
             })
             .collect()
     }
+}
+
+/// One unmatched half of an exchange, found by [`Tree::unmatched`] — a
+/// row of the reconciliation table, with the branch it sits on.
+///
+/// The guarantee these serve is precise, and it is not determinism
+/// (recovery is re-execution): **after a resume, no completed work is
+/// invisible.**
+#[derive(Debug, Clone, PartialEq)]
+pub enum Unmatched {
+    /// An open `Post` with no `Answer`: this branch owes a reply, so it
+    /// becomes live.
+    OwedAnswer { branch: EventId, post: EventId },
+    /// A `Send { to: user }` with no `Result`: the **human** owes a
+    /// reply. Nothing to repair — the branch reopens live and
+    /// highlighted, its question inline.
+    OwedByUser { branch: EventId, send: EventId },
+    /// A `Send` with no `Post`: crashed between the halves of the
+    /// message. Repair by appending the `Post` on `to`.
+    UndeliveredSend { send: EventId, to: EventId },
+    /// A tell whose post landed but whose receipt did not. Repair by
+    /// appending the receipt on `branch`.
+    MissingReceipt {
+        branch: EventId,
+        send: EventId,
+        /// `None` for a tell to the human, which has no post to name.
+        post: Option<EventId>,
+    },
+    /// An ask whose `Post` was answered but whose `Result` never landed.
+    /// Repair by appending it, carrying the answer's value.
+    LostDelivery {
+        branch: EventId,
+        send: EventId,
+        value: serde_json::Value,
+    },
+    /// An ask the callee still owes. Nothing to repair: the callee is
+    /// live by [`Unmatched::OwedAnswer`], and the sender's menu lists
+    /// this one *pending — re-awaitable*.
+    PendingAsk { branch: EventId, send: EventId },
+    /// A `Spawn` whose `Agent` exists but whose handle never reached the
+    /// caller. Repair by appending `Result { value: { agent } }` —
+    /// otherwise re-execution spawns a second agent and orphans this one.
+    UndeliveredHandle {
+        branch: EventId,
+        spawn: EventId,
+        agent: EventId,
+    },
+    /// An `Invoke` with no `Result`: **issued; may have happened.** Not
+    /// repairable, and that is the point — it is why calls are logged at
+    /// dispatch rather than at resolution.
+    LostInvoke { branch: EventId, call: EventId },
+    /// A `Turn` whose calls never all produced an outcome: interrupted
+    /// mid-program, and the VM went with the process. Repair by appending
+    /// `Condition{Interrupted}` so the run has an outcome like any other.
+    InterruptedRun {
+        branch: EventId,
+        leaf: EventId,
+        turn: EventId,
+    },
 }
 
 /// Whether a payload **roots a branch**: an `Agent` (a clean-room
@@ -1626,5 +1918,61 @@ mod tests {
         let tree = Tree::new(None);
         let spine = tree.spine_at(EventId::new(42));
         assert!(spine.contexts.is_empty());
+    }
+    /// **Log versioning.** A new log gets a `{"version": N}` header; an
+    /// older or headerless one is refused by name rather than read as
+    /// something it is not. Nothing migrates a pre-17 log: the event
+    /// vocabulary changed under it, so a misread is worse than a refusal.
+    #[test]
+    fn log_version_header_is_written_and_enforced() -> io::Result<()> {
+        let file = NamedTempFile::new()?;
+        {
+            let mut tree = Tree::open(file.reopen()?)?;
+            let mut spine = tree.start_agent(None, None, "root", None, "")?;
+            tree.append(&mut spine, user_msg("hi"))?;
+            tree.sync()?;
+        }
+        // The header is the first line, and only the first line.
+        let content = std::fs::read_to_string(file.path())?;
+        let mut lines = content.lines();
+        assert_eq!(
+            lines.next(),
+            Some(format!("{{\"version\":{LOG_VERSION}}}").as_str())
+        );
+        assert_eq!(lines.count(), 2, "one header, two events");
+        // …and a log carrying it reopens with every event intact.
+        let tree = Tree::open(file.reopen()?)?;
+        assert_eq!(tree.events.len(), 2);
+        assert_eq!(tree.id_counter, 2);
+
+        // A pre-17 log — events, no header — is refused, naming both.
+        let old = NamedTempFile::new()?;
+        std::fs::write(
+            old.path(),
+            "{\"id\":1,\"parent_id\":null,\"timestamp\":0,\"payload\":{\"Rename\":{\"name\":\"x\"}}}\n",
+        )?;
+        let Err(err) = Tree::open(old.reopen()?) else {
+            panic!("a headerless log is refused");
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("no format-version header"),
+            "{err}"
+        );
+        assert!(
+            err.to_string().contains(&LOG_VERSION.to_string()),
+            "the message names the version this build reads: {err}"
+        );
+
+        // A log from another version is refused naming both numbers.
+        let future = NamedTempFile::new()?;
+        std::fs::write(future.path(), "{\"version\":99}\n")?;
+        let Err(err) = Tree::open(future.reopen()?) else {
+            panic!("a log from another version is refused");
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("99"), "{msg}");
+        assert!(msg.contains(&LOG_VERSION.to_string()), "{msg}");
+        Ok(())
     }
 }

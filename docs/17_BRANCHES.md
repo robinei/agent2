@@ -1278,6 +1278,14 @@ The load-bearing step of Part A: after it, no renderer touches the `VM`.
       (`derived_reports_are_stable_for_a_renderer`); another renders a
       completion, a condition, a post-condition, a compile error, an ack
       and a refusal from fixtures.
+      *(The **ack** was the one this box promised and did not deliver:
+      `is_outcome` covered `Return` and `Condition` only, so an `answer`
+      tool call had no outcome, no derived tool message, and a dangling
+      `tool_call_id` in the next request — the M2 400, latent since B2.
+      Built in C2, where `Restart{Answer}` reached it deterministically:
+      `Answer` is an outcome, and its report says what was answered and
+      where it went, walked out of the same closed loop of ids
+      (`an_answer_call_is_replied_to_like_any_other`).)*
 - [x] Derived reports are **memoised** on the `Tree` (`HashMap<EventId,
       String>` keyed by the outcome event id, cleared wholesale on
       renderer change) — never logged. The `Tree` is the right home
@@ -1654,39 +1662,65 @@ events per step.
 
 ### Step C2 — Reconciliation on open (`host/mod.rs`, `tree.rs`)
 
-- [ ] `Tree::unmatched()` returns the rows of the reconciliation table
-      from a scan;
-      `waits` is rebuilt from it and no longer maintained separately.
-- [ ] `Session::open` re-hydrates every branch with an open post or a
+- [x] `Tree::unmatched()` returns the rows of the reconciliation table
+      from a scan.
+      *(The box added "`waits` is rebuilt from it and no longer
+      maintained separately". `waits` was deleted in B1 — every call
+      settles through its logged `Call` id — so this reduces to
+      `unmatched()` alone, exactly as the C-part preamble said.)*
+- [x] `Session::open` re-hydrates every branch with an open post or a
       pending ask-to-user as live and applies the repairs; a fixture cut
       after each of the four exchange events and after a host `Invoke`
       reopens to the expected state
       (`reconcile_after_cut_at_each_exchange_event`).
-- [ ] A cut after `Return` but before the next turn reopens with the
+      *(And every branch the table names at all — a `LostInvoke` needs no
+      repair but its menu still has to say *may have happened*.)*
+- [x] A cut after `Return` but before the next turn reopens with the
       completion report rendered from the log and the branch idle — the
       program is **not** re-run and no rewrite is requested
-      (`crash_after_return_completes_the_run`).
-- [ ] A cut between `Agent` and its `Spawn`'s `Result` reopens with
+      (`crash_after_return_completes_the_run`). *("Idle" is the phase:
+      the branch holds no VM. It does take a turn, because the trigger
+      rule's own crash-recovery clause says so — a run whose report was
+      never sent still has its outcome, so the report renders and the
+      branch prompts normally. That is a **cause event**, which is why
+      lowering `shown` here is legal and re-prompting a branch that
+      merely stopped talking is not.)*
+- [x] A cut between `Agent` and its `Spawn`'s `Result` reopens with
       the handle delivered and **no second agent** created on re-execution
       (`interrupted_spawn_does_not_orphan_its_agent`).
-- [ ] A cut between `Answer` and `Result` reopens with the `Result`
+- [x] A cut between `Answer` and `Result` reopens with the `Result`
       appended and listed in the asker's menu; a cut after a host `Invoke`
       lists *may have happened*; a cut with a question pending for the
       user reopens with that branch live, highlighted, question inline
       (`user_owed_answer_survives`).
-- [ ] `tools.tool_result(id)` on a pending ask returns a promise resolved
+- [x] `tools.tool_result(id)` on a pending ask returns a promise resolved
       by its `Result`. A child cut after its upward `Send`
       re-enters, its scripted rewrite awaits by id, the parent answers,
       the child completes — the parent holds **one** `Post`, not two
       (`reentered_child_reattaches_instead_of_reasking`).
-- [ ] Log versioning **added** (none exists today): the first line of a
+      *(Two seams this needed. `reattachable` was gated on this session
+      still holding the call in `pending`, which after a crash is never
+      true; it now also accepts a `Send` the **log** says is unsettled,
+      because a `Send`'s answer routes home by logged ids alone while an
+      `Invoke`'s worker died with the process — which is the distinction
+      the menu already draws. And `on_tool_results` dropped any `Result`
+      with no `pending` entry, so an answer arriving home after a reopen
+      was logged nowhere; it now logs one for any unsettled call on the
+      branch's own path, which is what "after a resume, no completed work
+      is invisible" actually requires.)*
+- [x] Log versioning **added** (none exists today): the first line of a
       log is a `{"version": N}` header; `Tree::open` refuses a missing or
       older version with a message naming both. `Tree::new` writes it.
+      *(`Tree::new` has never been handed a file — production creates
+      through `Tree::open`, which now writes the header when it finds an
+      empty file. Putting it in `Tree::new` would make the in-memory
+      constructor fallible for no gain.)*
 - [ ] Live verification (user-driven, DeepSeek): a two-worker task,
       `Ctrl-C` mid-flight, reopen; both workers finish, both answers
       appear in the parent's menu, the parent's rewrite reuses them by id.
       Record the transcript note here.
-- [ ] Gate: `cargo fmt && cargo clippy --workspace --all-targets &&
+      *(Left unchecked: it needs the network and is yours to run.)*
+- [x] Gate: `cargo fmt && cargo clippy --workspace --all-targets &&
       cargo test` green.
 
 ---

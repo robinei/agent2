@@ -687,6 +687,58 @@ impl Runner {
             .collect()
     }
 
+    /// **Reconciliation's half of the trigger rule**: forget having shown
+    /// anything from `cause` onward, so the rule can fire for a cause the
+    /// crash swallowed.
+    ///
+    /// A fresh `Runner` starts `shown` at its leaf — a re-opened branch
+    /// waits to be spoken to, and a fork is born idle by the same line.
+    /// That is right for every branch the reconciliation table says
+    /// nothing about, and wrong for the two rows it does speak to, which
+    /// is what this lowers it for.
+    pub fn owe_prompt(&mut self, cause: EventId) {
+        self.shown = self.shown.min(cause.as_u64().saturating_sub(1));
+    }
+
+    /// The earliest event on this branch the trigger rule would call a
+    /// cause, **ignoring `shown`** — what reconciliation lowers the mark
+    /// to when a crash swallowed the request that cause was for.
+    ///
+    /// Two, exactly matching the table's two prompting rows: a post this
+    /// branch owes an answer to, and a run whose outcome was never
+    /// rendered. Nothing else re-prompts; a `Turn` with no tool calls is
+    /// still the only terminal, so a fully answered log opens idle.
+    pub fn unrendered_cause(&self, tree: &Tree) -> Option<EventId> {
+        let owed = self.open().first().copied();
+        let unreported = self
+            .agent_segment(tree)
+            .iter()
+            .rev()
+            .find(|e| matches!(e.payload, EventPayload::Message(_)))
+            .and_then(|last| match &last.payload {
+                EventPayload::Message(Message::Turn { tool_calls, .. })
+                    if !tool_calls.is_empty()
+                        && crate::report::outcomes_of_turn(tree, self.spine.leaf_id, last.id)
+                            .len()
+                            >= tool_calls.len() =>
+                {
+                    Some(last.id)
+                }
+                _ => None,
+            });
+        match (owed, unreported) {
+            (Some(a), Some(b)) => Some(if a.as_u64() <= b.as_u64() { a } else { b }),
+            (a, b) => a.or(b),
+        }
+    }
+
+    /// Render a request if the trigger rule says to — the public door
+    /// reconciliation wakes a re-hydrated branch through, so "never woken
+    /// without a cause" still holds in one place.
+    pub fn wake(&mut self, tree: &Tree) -> Vec<StepOutput> {
+        self.prompt_if_needed(tree)
+    }
+
     /// **The one eligibility check**, used for every restart — the LLM's
     /// and the user's alike. It changes no state: an ineligible call is
     /// answered with a refusal and costs one turn.
@@ -1026,10 +1078,23 @@ impl Runner {
             // The turn was answers only. Each is a tool call the API
             // needs replied to, so the branch takes another turn — the
             // program's state is untouched either way.
-            if matches!(self.phase, Phase::Idle) {
-                self.phase = Phase::AwaitingLlm;
+            match self.phase {
+                Phase::Idle => {
+                    self.phase = Phase::AwaitingLlm;
+                    answered.push(self.render_request(tree));
+                }
+                // A suspended branch already owes the restart choice, and
+                // this turn was not one: ask again, carrying the ack.
+                Phase::Suspended(..) | Phase::AwaitingLlm => {
+                    answered.push(self.render_request(tree))
+                }
+                // Only the **user** can answer on a running branch
+                // (`Restart`), and the driving rule is that the VM speaks
+                // through its outcome and never while it is running. So
+                // the ack rides the request that outcome causes, rather
+                // than a second one going out under the program's feet.
+                Phase::Running(_) => {}
             }
-            answered.push(self.render_request(tree));
             return Ok(answered);
         };
         // Every remaining call gets exactly one outcome, and outcomes are
@@ -1240,9 +1305,16 @@ impl Runner {
         // happens to them — see below.
         let mut unawaited: Vec<(EventId, EventId)> = Vec::new();
         for tr in batch {
-            let Some(p) = self.pending.remove(&tr.call) else {
+            // A call this session never issued can still settle here: an
+            // exchange the log left open routes home by its logged ids
+            // alone, so a re-entered branch receives the answer its dead
+            // VM was waiting for. Logging it is what makes "after a
+            // resume, no completed work is invisible" true; who (if
+            // anyone) was awaiting it is the next question, below.
+            let pending = self.pending.remove(&tr.call);
+            if pending.is_none() && !self.settleable(tree, tr.call) {
                 continue; // unknown or duplicate — nothing to log
-            };
+            }
             // Resolution order is arrival order: the `Result` lands now,
             // naming the `Call` logged at dispatch.
             let outcome = match &tr.result {
@@ -1259,6 +1331,10 @@ impl Runner {
 
             // Deliver only into the run that issued the call. Anything
             // else is an artifact **and** a notice (rule C, below).
+            let Some(p) = pending else {
+                unawaited.push((tr.call, result));
+                continue;
+            };
             if p.generation != self.generation
                 || !matches!(self.phase, Phase::Running(_) | Phase::Suspended(..))
             {
@@ -1356,6 +1432,17 @@ impl Runner {
             out.push(StepOutput::Working);
         }
         Ok(out)
+    }
+
+    /// Whether a `Result` for `call` still belongs on this branch: the
+    /// call is on its own path and nothing has settled it yet.
+    ///
+    /// This is the re-entry case — the session holds no `pending` entry
+    /// because it never issued the call — and it is why the check is the
+    /// log's and not the session's.
+    fn settleable(&self, tree: &Tree, call: EventId) -> bool {
+        let segment = self.agent_segment(tree);
+        segment.iter().any(|e| e.id == call) && settlement_of(&segment, call).is_none()
     }
 
     /// The body of the harness post that surfaces an unawaited `Result`.
@@ -1781,21 +1868,42 @@ impl Runner {
     /// The menu's wording is derived from the log alone, which cannot
     /// tell a call whose worker is still running from one whose worker
     /// died with the process — so it says the cautious thing for an
-    /// `Invoke`. The *session* knows better: an entry in `pending` means
-    /// a worker is genuinely in flight, whatever kind of call it was.
+    /// `Invoke`. Two things know better:
+    ///
+    /// - the **session**: an entry in `pending` means a worker is
+    ///   genuinely in flight, whatever kind of call it was;
+    /// - the **log**: a `Send` with no `Result` is an exchange still
+    ///   open, and its answer routes home by the logged ids alone — so a
+    ///   session that never issued it can still receive it. That is what
+    ///   makes re-entering after a crash a re-attach rather than a
+    ///   re-ask, and it is exactly the distinction the menu draws: an
+    ///   `Invoke`'s worker died with the process, a `Send`'s callee did
+    ///   not.
     fn reattachable(&self, tree: &Tree, call: &InvokeCall) -> Option<EventId> {
         let Some(Value::PosInt(id)) = call.args.first() else {
             return None;
         };
         let id = EventId::new(*id);
-        if !self.pending.contains_key(&id) {
+        // Scoped to this branch's own path, like every other fetch.
+        let segment = self.agent_segment(tree);
+        if !segment.iter().any(|e| e.id == id) {
             return None;
         }
-        // Scoped to this branch's own path, like every other fetch.
-        self.agent_segment(tree)
-            .iter()
-            .any(|e| e.id == id)
-            .then_some(id)
+        if self.pending.contains_key(&id) {
+            return Some(id);
+        }
+        let is_open_send = matches!(
+            tree.events.get(&id).map(|e| &e.payload),
+            Some(EventPayload::Call(Call::Send { .. }))
+        ) && settlement_of(&segment, id).is_none();
+        // A **pre-fork** pending `Send` is not this branch's to re-await:
+        // its `Result` lands on the branch that issued it, which this
+        // path does not include, so the promise could never resolve.
+        let inherited = tree
+            .events
+            .get(&id)
+            .is_some_and(|e| self.pre_fork_pending(tree, e).is_some());
+        (is_open_send && !inherited).then_some(id)
     }
 
     /// Serve `tools.tool_result(id)` from the log. Accepts a `Result` id
@@ -3524,6 +3632,52 @@ mod tests {
     /// Every tool call gets exactly one outcome event — including one
     /// that never ran. Without that, a refusal's tool message would have
     /// to be rebuilt by replaying eligibility to that path position.
+    /// An `answer` **is** a tool call, so the API needs it replied to.
+    /// Its outcome is the `Answer` it logs, and the request pairs the two
+    /// — without which the next request carries a dangling
+    /// `tool_call_id` and is rejected outright (the M2 400).
+    #[test]
+    fn an_answer_call_is_replied_to_like_any_other() {
+        let (mut tree, mut state) = setup();
+        let out = user_post(&mut state, &mut tree, "which one?");
+        let question = state.open()[0];
+        drain(&mut state, &mut tree, out);
+
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(llm_answer("a1", question, json!("the second"))),
+            )
+            .unwrap();
+        let req = expect_request(&out);
+        // Every assistant tool call in the request is answered.
+        let calls: usize = req
+            .messages
+            .iter()
+            .filter_map(|m| match m {
+                Rendered::Assistant { tool_calls, .. } => Some(tool_calls.len()),
+                _ => None,
+            })
+            .sum();
+        let replies: Vec<(&str, &str)> = req
+            .messages
+            .iter()
+            .filter_map(|m| match m {
+                Rendered::Tool { call_id, text } => Some((call_id.as_str(), text.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(calls, replies.len(), "{:?}", req.messages);
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].0, "a1");
+        assert!(replies[0].1.starts_with("## answered"), "{}", replies[0].1);
+        assert!(
+            replies[0].1.contains(&format!("#{}", question.as_u64())),
+            "{}",
+            replies[0].1
+        );
+    }
+
     #[test]
     fn every_tool_call_has_an_outcome_event() {
         let (mut tree, mut state) = setup();

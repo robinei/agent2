@@ -591,11 +591,15 @@ fn program_args(call: &ToolCall) -> (String, bool) {
     (source, had_attachments)
 }
 
-/// Whether a payload is one of the two outcome kinds.
+/// Whether a payload is an outcome — the event a tool call is answered
+/// from. **Every tool call has exactly one**, which is what lets every
+/// report derive from one event rather than from recomputed history:
+/// `run_program`/`resume` produce a `Return` or a `Condition`, an
+/// ineligible call a `Condition{Refused}`, and `answer` an `Answer`.
 fn is_outcome(payload: &EventPayload) -> bool {
     matches!(
         payload,
-        EventPayload::Return { .. } | EventPayload::Condition { .. }
+        EventPayload::Return { .. } | EventPayload::Condition { .. } | EventPayload::Answer { .. }
     )
 }
 
@@ -728,8 +732,47 @@ fn render_handback(h: &Handback<'_>, budget: usize) -> String {
             }
             .render(),
         },
+        // The **answer ack**: what was answered and where it went. The
+        // API needs every tool call replied to, and `answer` is a tool
+        // call — without this its `tool_call_id` dangles and the next
+        // request is rejected outright.
+        EventPayload::Answer { question, value } => answer_ack(h, *question, value, budget),
         _ => "(not an outcome)".to_owned(),
     }
+}
+
+/// The tool message answering an `answer(question, value)` call.
+///
+/// Where it went is walked out of the closed loop of ids —
+/// `Answer.question → Post`, `Post.origin → Send`, and the `Send`'s
+/// position **is** the asker's branch — so the ack is a pure function of
+/// the log like every other report.
+fn answer_ack(
+    h: &Handback<'_>,
+    question: EventId,
+    value: &serde_json::Value,
+    budget: usize,
+) -> String {
+    let id = question.as_u64();
+    let routed = match h.tree.events.get(&question).map(|e| &e.payload) {
+        Some(EventPayload::Message(Message::Post { from, origin })) => match origin {
+            Origin::Sent(send) => match h.tree.branch_of(*send) {
+                Some(branch) => format!("delivered to branch #{}", branch.as_u64()),
+                None => "delivered to whoever sent it".to_owned(),
+            },
+            // The user has no branch and no program, so there is nothing
+            // to settle: they read it where it sits.
+            Origin::Direct { .. } => match from {
+                Author::User => "read inline by the user, who has no branch to deliver to".into(),
+                _ => "read where it sits".to_owned(),
+            },
+        },
+        _ => format!("#{id} is not a post"),
+    };
+    format!(
+        "## answered\n#{id} — {routed}\n\nvalue: {}",
+        clip_answer(&value.to_string(), budget, None)
+    )
 }
 
 /// The "what happened" diagnostic, rebuilt from the logged cause, the
@@ -1166,6 +1209,65 @@ mod tests {
             derive_report(&tree, leaf, o, 64 * 1024),
             "refused: nothing to resume"
         );
+
+        // The answer ack: what was answered and where it went. The
+        // API needs every tool call replied to, and `answer` **is** a
+        // tool call, so without this its id dangles and the next request
+        // is rejected outright.
+        let (mut tree, _) = fixture("", EventPayload::Return { value: json!(1) });
+        let leaf = tree.list_leaves()[0].0;
+        let mut spine = tree.spine_at(leaf);
+        let post = tree
+            .append(
+                &mut spine,
+                EventPayload::Message(Message::Post {
+                    from: Author::User,
+                    origin: Origin::Direct {
+                        text: "which one?".into(),
+                        input: serde_json::Value::Null,
+                        expects_reply: true,
+                    },
+                }),
+            )
+            .unwrap();
+        tree.append(
+            &mut spine,
+            EventPayload::Message(Message::Turn {
+                author: Author::User,
+                text: String::new(),
+                thinking: None,
+                tool_calls: vec![crate::types::ToolCall {
+                    id: "a1".into(),
+                    name: "answer".into(),
+                    arguments: json!({ "question": post.as_u64(), "value": "the second" }),
+                }],
+            }),
+        )
+        .unwrap();
+        let o = tree
+            .append(
+                &mut spine,
+                EventPayload::Answer {
+                    question: post,
+                    value: json!("the second"),
+                },
+            )
+            .unwrap();
+        let leaf = spine.leaf_id;
+        // The `Answer` is an outcome like any other, so the turn's one
+        // call is paired with it positionally.
+        assert_eq!(
+            outcomes_of_turn(&tree, leaf, tree.events[&o].parent_id.unwrap()),
+            [o]
+        );
+        let text = derive_report(&tree, leaf, o, 64 * 1024);
+        assert!(text.starts_with("## answered"), "{text}");
+        assert!(text.contains(&format!("#{}", post.as_u64())), "{text}");
+        assert!(
+            text.contains("read inline by the user"),
+            "the user has no branch to deliver to: {text}"
+        );
+        assert!(text.contains(r#"value: "the second""#), "{text}");
 
         // Interruption: the VM went with the process; rewrite to continue.
         let (tree, o) = fixture(
