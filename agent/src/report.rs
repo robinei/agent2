@@ -176,6 +176,8 @@ pub struct ConditionReport {
     pub whence: Whence,
     /// Full console log (the renderer tails it).
     pub console: Vec<String>,
+    /// The `Console` event the tail comes from, named when it clips.
+    pub console_id: Option<u64>,
     /// Every artifact on the agent so far, oldest first (the renderer
     /// prunes to the most recent).
     pub artifacts: Vec<Artifact>,
@@ -193,7 +195,7 @@ impl ConditionReport {
             Whence::AnnotatedSource(source) => out.push_str(source),
         }
         out.push('\n');
-        out.push_str(&render_console(&self.console));
+        out.push_str(&render_console(&self.console, self.console_id));
         out.push_str("\n\n");
         out.push_str(&render_menu("artifacts", &self.artifacts));
         out.push_str("\n\n");
@@ -213,6 +215,8 @@ pub struct CompletionReport {
     pub budget: usize,
     /// Full console log (the renderer tails it).
     pub console: Vec<String>,
+    /// The `Console` event the tail comes from, named when it clips.
+    pub console_id: Option<u64>,
     /// Artifacts logged since the run started (its `ProgramResult`
     /// included), oldest first.
     pub new_artifacts: Vec<Artifact>,
@@ -220,6 +224,14 @@ pub struct CompletionReport {
     /// this run passed no `attachments` — nudge toward the attachments
     /// channel. Computed by the machine (it has the full, unclipped args).
     pub advise_attachments: bool,
+    /// How many of this run's calls came back `Failed`.
+    ///
+    /// The risk the "only handbacks log a condition" rule leaves is
+    /// **silent degradation**: a program that swallows five failures and
+    /// returns a thin result, with a completion report that reads as
+    /// success. The fix belongs in the report, not in a new event — so
+    /// the report counts them and says so.
+    pub failed_calls: usize,
 }
 
 impl CompletionReport {
@@ -233,9 +245,19 @@ impl CompletionReport {
             self.result_id(),
         ));
         out.push_str("\n\n");
-        out.push_str(&render_console(&self.console));
+        out.push_str(&render_console(&self.console, self.console_id));
         out.push_str("\n\n");
         out.push_str(&render_menu("new artifacts", &self.new_artifacts));
+
+        if self.failed_calls > 0 {
+            out.push_str(&format!(
+                "\n\n## calls that failed\n{} of this run's calls came back failed. If your \
+                 result reflects that, say so; if the program swallowed them, this report \
+                 is not the success it looks like. Each failure's reason is fetchable by \
+                 id from the menu above.",
+                self.failed_calls
+            ));
+        }
 
         let mut notes: Vec<&str> = Vec::new();
         if self.wrote_without_verifying() {
@@ -327,13 +349,23 @@ fn render_stack(stack: &[String]) -> String {
     }
 }
 
-fn render_console(lines: &[String]) -> String {
+/// The console tail. **Every clip names a fetchable id**, not just a
+/// count: the tail was the one truncation in the system with no way back
+/// to the whole, so when it clips it names its `Console` event and
+/// `tools.tool_result` reads that event's lines.
+fn render_console(lines: &[String], event: Option<u64>) -> String {
     if lines.is_empty() {
         return "console: (no output)".into();
     }
     let start = lines.len().saturating_sub(CONSOLE_TAIL_LINES);
     let shown = &lines[start..];
-    let mut out = format!("console (last {} of {} lines):", shown.len(), lines.len());
+    let mut out = format!("console (last {} of {} lines", shown.len(), lines.len());
+    // Only a clip names the id — an untruncated tail has nothing behind
+    // it to fetch, and the wording stays as it was.
+    if let (true, Some(id)) = (start > 0, event) {
+        out.push_str(&format!(" — tools.tool_result({id}) for all of them"));
+    }
+    out.push_str("):");
     for line in shown {
         out.push('\n');
         out.push_str(&clip(line, CONSOLE_LINE_MAX_BYTES));
@@ -522,8 +554,10 @@ struct Handback<'t> {
     had_attachments: bool,
     /// The one outcome event: a `Return` or a `Condition`.
     outcome: &'t Event,
-    /// The `Console` logged with the outcome, if any.
+    /// The `Console` logged with the outcome, if any, and its event id —
+    /// which the tail names when it clips, so the rest is fetchable.
     console: Vec<String>,
+    console_id: Option<u64>,
     /// The path up to `leaf`, for the artifact menu.
     path: Vec<&'t Event>,
     /// Index of `turn` within `path`.
@@ -605,11 +639,11 @@ fn handback<'t>(tree: &'t Tree, leaf: EventId, outcome: EventId) -> Option<Handb
         .unwrap_or_default();
     // The `Console` logged with this outcome sits immediately after it,
     // before the next outcome.
-    let console = path[at + 1..]
+    let (console, console_id) = path[at + 1..]
         .iter()
         .take_while(|e| !is_outcome(&e.payload))
         .find_map(|e| match &e.payload {
-            EventPayload::Console { lines } => Some(lines.clone()),
+            EventPayload::Console { lines } => Some((lines.clone(), Some(e.id.as_u64()))),
             _ => None,
         })
         .unwrap_or_default();
@@ -621,6 +655,7 @@ fn handback<'t>(tree: &'t Tree, leaf: EventId, outcome: EventId) -> Option<Handb
         had_attachments,
         outcome: path[at],
         console,
+        console_id,
         path: path.clone(),
         turn_at,
         outcome_at: at,
@@ -650,8 +685,21 @@ fn render_handback(h: &Handback<'_>, budget: usize) -> String {
             value: value.clone(),
             budget,
             console: h.console.clone(),
+            console_id: h.console_id,
             new_artifacts: menu_since(h, h.turn.id.as_u64()),
             advise_attachments: !h.had_attachments && inlined_large_body(h),
+            failed_calls: h.path[h.turn_at + 1..=h.outcome_at]
+                .iter()
+                .filter(|e| {
+                    matches!(
+                        &e.payload,
+                        EventPayload::Result {
+                            outcome: crate::types::Outcome::Failed(_),
+                            ..
+                        }
+                    )
+                })
+                .count(),
         }
         .render(),
         EventPayload::Condition { cause, site, stack } => match cause {
@@ -671,6 +719,7 @@ fn render_handback(h: &Handback<'_>, budget: usize) -> String {
                     _ => Whence::Stack(stack.clone()),
                 },
                 console: h.console.clone(),
+                console_id: h.console_id,
                 artifacts: menu_since(h, 0),
                 restarts: Restarts {
                     resume: resume_kind(cause),
@@ -1080,7 +1129,7 @@ mod tests {
     fn console_tails_with_counts_and_clips_lines() {
         let mut lines: Vec<String> = (0..30).map(|i| format!("line {i}")).collect();
         lines.push("y".repeat(1000));
-        let rendered = render_console(&lines);
+        let rendered = render_console(&lines, None);
         assert!(rendered.starts_with("console (last 20 of 31 lines):"));
         // 31 lines, tail of 20: lines 0–10 dropped, 11–29 + long kept.
         assert!(!rendered.contains("line 0"), "older lines dropped");
@@ -1150,6 +1199,7 @@ mod tests {
             what: "w".repeat(10_000),
             whence: Whence::Stack(vec!["<root>".into()]),
             console: Vec::new(),
+            console_id: None,
             artifacts: Vec::new(),
             restarts: Restarts {
                 resume: ResumeKind::Raise,
@@ -1170,8 +1220,10 @@ mod tests {
             value: json!("z".repeat(5_000)),
             budget: 64 * 1024,
             console: Vec::new(),
+            console_id: None,
             new_artifacts: Vec::new(),
             advise_attachments: false,
+            failed_calls: 0,
         };
         let rendered = report.render();
         let line = rendered.lines().nth(1).unwrap();
@@ -1190,8 +1242,10 @@ mod tests {
             value: json!("z".repeat(5_000)),
             budget: 1_000,
             console: Vec::new(),
+            console_id: None,
             new_artifacts: vec![artifact(9, "program result", json!("z".repeat(5_000)))],
             advise_attachments: false,
+            failed_calls: 0,
         };
         let rendered = report.render();
         let line = rendered.lines().nth(1).unwrap();
@@ -1204,6 +1258,7 @@ mod tests {
             what: "boom".into(),
             whence: Whence::Stack(vec!["<root>".into()]),
             console: Vec::new(),
+            console_id: None,
             artifacts: vec![artifact(7, "fetch([\"big\"])", json!("b".repeat(9000)))],
             restarts: Restarts {
                 resume: ResumeKind::Operation,
@@ -1234,8 +1289,10 @@ mod tests {
             value: json!({ "status": "done" }),
             budget: 64 * 1024,
             console: Vec::new(),
+            console_id: None,
             new_artifacts: artifacts,
             advise_attachments: false,
+            failed_calls: 0,
         }
         .render()
     }
@@ -1290,8 +1347,10 @@ mod tests {
             value: json!("done"),
             budget: 64 * 1024,
             console: Vec::new(),
+            console_id: None,
             new_artifacts: vec![artifact(5, "create_file([\"/x/a.js\", \"…\"])", json!({}))],
             advise_attachments: true,
+            failed_calls: 0,
         }
         .render();
         assert!(report.contains("## note"), "{report}");
@@ -1316,6 +1375,7 @@ mod tests {
             what: "stack overflow".into(),
             whence: Whence::Stack(Vec::new()),
             console: Vec::new(),
+            console_id: None,
             artifacts: Vec::new(),
             restarts: Restarts {
                 resume: ResumeKind::No,

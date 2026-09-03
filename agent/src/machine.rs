@@ -166,13 +166,11 @@ const MAX_PUMP_ROUNDS: usize = 100;
 /// agent) and a subagent's final turn (into its caller). Sized to a
 /// typical source file so an ordinary read or summary lands in one shot
 /// (DESIGN.md "The one exception"; 12_ANSWERS). The full value is always a
-/// fetchable artifact; only the context copy is truncated past this. A
-/// caller may raise a child's budget via `agent({ budget })`.
+/// fetchable artifact; **only the context copy is clipped past this** —
+/// the budget is a rendering rule, never a limit on what is stored or on
+/// what reaches a program. A caller may raise a child's budget via
+/// `agent({ budget })`.
 const DEFAULT_ANSWER_BUDGET: usize = 64 * 1024;
-
-/// How many times a subagent whose final answer exceeds its budget is
-/// re-prompted to tighten it before the host truncates it deterministically.
-const ANSWER_RETRY_LIMIT: u8 = 1;
 
 pub enum StepInput {
     /// The assistant's turn (logged with its author; tool calls
@@ -401,12 +399,12 @@ pub struct Runner {
     /// one step — a rewrite abandoning the old run as a new one starts —
     /// both surface, and so the sans-io output set is untouched.
     status_transitions: Vec<(EventId, ProgramStatus)>,
-    /// Byte budget for this agent's *answer* into context (decisions 2, 6):
-    /// program `return`s and (for a subagent) the final turn. Seeded from
-    /// the spawning `agent({ budget })` or `DEFAULT_ANSWER_BUDGET`.
+    /// Byte budget for this agent's *answer* **into context** — a
+    /// rendering bound and nothing else. Values are stored whole and
+    /// reach the asking program whole; a report clips its copy to this
+    /// and names the id the rest is behind. Seeded from the spawning
+    /// `agent({ budget })` or `DEFAULT_ANSWER_BUDGET`.
     answer_budget: usize,
-    /// Re-prompts spent tightening an over-budget final answer (decision 4).
-    answer_retries: u8,
     /// Refusals owed to the extra tool calls of the current turn. They are
     /// logged only once the first call's outcome has landed, so outcomes
     /// stay in call order and the positional pairing holds.
@@ -518,7 +516,6 @@ impl Runner {
             last_vm: None,
             status_transitions: Vec::new(),
             answer_budget: DEFAULT_ANSWER_BUDGET,
-            answer_retries: 0,
             deferred_refusals: Vec::new(),
             // A branch handed to a fresh `Runner` has said nothing to
             // *this* session's LLM and is owed no prompt for its
@@ -1642,6 +1639,17 @@ impl Runner {
                 },
             },
             EventPayload::Return { value } => Ok(value.clone()),
+            // Not a menu row — it is named at the point it is
+            // truncated, because it is context for one place rather than
+            // work to be reused. Fetchable all the same: every clip in a
+            // report names an id the whole thing is behind, and this is
+            // the one the console tail names.
+            EventPayload::Console { lines } => Ok(serde_json::Value::Array(
+                lines
+                    .iter()
+                    .map(|l| serde_json::Value::String(l.clone()))
+                    .collect(),
+            )),
             _ => Err(format!("event #{id} is not an artifact")),
         }
     }
@@ -1848,48 +1856,13 @@ impl Runner {
             return Ok(out);
         };
 
-        // Whether this answer is *mind-bound* is a fact about who asked:
-        // an answer to the human is delivered in full, an answer that
-        // crosses into another agent's context is budgeted (decision 4).
-        // That replaces `is_root`, which asked the same question of the
-        // branch instead of the asker.
-        let mind_bound = !matches!(
-            self.spine.context().messages.iter().find_map(|m| match m {
-                Message::Post { from, .. } => Some(*from),
-                _ => None,
-            }),
-            Some(Author::User)
-        ) && matches!(asker_of(tree, question), Some(Author::Agent(_)));
-
-        if mind_bound && text.len() > self.answer_budget && self.answer_retries < ANSWER_RETRY_LIMIT
-        {
-            self.answer_retries += 1;
-            let nudge = format!(
-                "Your answer is {} bytes; the budget is {}. Tighten it to a digest, or \
-                 write a large product with create_file and report its path.",
-                text.len(),
-                self.answer_budget
-            );
-            tree.append(
-                &mut self.spine,
-                EventPayload::Message(Message::Post {
-                    from: Author::Harness,
-                    origin: Origin::Direct {
-                        text: nudge,
-                        input: serde_json::Value::Null,
-                        expects_reply: false,
-                    },
-                }),
-            )?;
-            self.phase = Phase::AwaitingLlm;
-            return Ok(vec![self.render_request(tree)]);
-        }
-
-        let value = if mind_bound && text.len() > self.answer_budget {
-            serde_json::Value::String(truncate_answer(&text, self.answer_budget))
-        } else {
-            text_value(&text)
-        };
+        // **Budget is a rendering rule.** The value is stored whole and
+        // reaches the asking *program* whole; only a *context* copy of it
+        // clips, and every clip names the id the whole thing is behind.
+        // What went with that: the stored-truncated answer, and the
+        // "tighten it" re-prompt that spent an LLM turn making the log
+        // less faithful than the report.
+        let value = text_value(&text);
         tree.append(
             &mut self.spine,
             EventPayload::Answer {
@@ -2154,22 +2127,6 @@ fn value_json(vm: &VM, v: &Value) -> serde_json::Value {
 // Alias for call sites where `value_json` would shadow a local.
 fn value_json_of(vm: &VM, v: &Value) -> serde_json::Value {
     value_json(vm, v)
-}
-
-/// Truncate an over-budget subagent answer for delivery to its caller,
-/// with a note pointing at the two sound moves (ask for less / write a
-/// file). The full prose remains on the child's spine for the log/TUI.
-fn truncate_answer(text: &str, budget: usize) -> String {
-    let mut end = budget.min(text.len());
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!(
-        "{}… [answer truncated to {} of {} bytes — ask for less, or have me write a file]",
-        &text[..end],
-        end,
-        text.len()
-    )
 }
 
 fn render_diags(source: &str, diags: &[Diagnostic]) -> String {
@@ -3729,39 +3686,343 @@ got X
     }
 
     #[test]
-    fn over_budget_subagent_answer_reprompts_then_truncates() {
+    /// **Budget is a rendering rule.** An over-budget answer is stored
+    /// whole and delivered whole to the asking program; only a *context*
+    /// copy of it clips, and the clip names the id the rest is behind.
+    ///
+    /// (Re-pointed from the M-era test that asserted a "tighten it"
+    /// re-prompt and a stored-truncated value. Both are deleted: the
+    /// re-prompt spent an LLM turn making the log less faithful than the
+    /// report, and the truncation made the *stored* value the lossy one.)
+    fn over_budget_answer_is_stored_whole_and_rendered_clipped() {
         let (mut tree, mut root) = setup();
         let (mut child, _) = spawn_and_ask(&mut tree, &mut root, "summarize", json!({}));
         child.answer_budget = 50;
         let long = "y".repeat(500);
-        // First over-budget final answer → one re-prompt, not completion.
-        let out = child
-            .step(&mut tree, StepInput::LlmResponse(llm_text(&long)))
-            .unwrap();
-        assert!(
-            matches!(out[..], [StepOutput::LlmRequest(_)]),
-            "re-prompted once: {out:?}"
-        );
-        // Second over-budget answer → deterministic truncate-with-note.
         let out = child
             .step(&mut tree, StepInput::LlmResponse(llm_text(&long)))
             .unwrap();
         let result = match &out[..] {
             [StepOutput::Answered { value, .. }] => value.clone(),
-            other => panic!("expected Answered, got {other:?}"),
+            other => panic!("answered in one turn, with no nudge: {other:?}"),
         };
-        let delivered = result.as_str().unwrap();
-        assert!(delivered.contains("answer truncated"), "note: {delivered}");
-        assert!(delivered.len() < long.len(), "delivered value is bounded");
-        // The full prose stays on the child's spine (last Assistant message).
+        // Delivered whole — the asking *program* gets the value, and a
+        // program has no context to protect.
+        assert_eq!(result.as_str().unwrap().len(), 500);
+        // Stored whole, exactly once.
+        let stored: Vec<usize> = tree
+            .events
+            .values()
+            .filter_map(|e| match &e.payload {
+                EventPayload::Answer { value, .. } => Some(value.as_str().unwrap().len()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(stored, [500]);
+        // Nothing was re-prompted: no harness nudge on the child's spine.
         assert!(
-            child
-                .spine
-                .context()
-                .messages
-                .iter()
-                .any(|m| matches!(m, Message::Turn { text, .. } if text.len() == 500)),
-            "full prose retained on spine"
+            !child.spine.context().messages.iter().any(|m| matches!(
+                m,
+                Message::Post {
+                    from: Author::Harness,
+                    ..
+                }
+            )),
+            "the tighten-it re-prompt is gone"
+        );
+        // …and a *rendered* copy clips to the budget, naming its id.
+        let clipped = crate::report::clip_answer(&long, child.answer_budget, Some(7));
+        assert!(clipped.len() < long.len());
+        assert!(clipped.contains("tools.tool_result(#7)"), "{clipped}");
+    }
+
+    /// A large return is stored **exactly once** — because reports are
+    /// derived, the clipped copy the model read was never a second stored
+    /// thing that could drift from it.
+    #[test]
+    fn log_holds_the_returned_value_once() {
+        let (mut tree, mut state) = setup();
+        state.answer_budget = 200; // a budget the value exceeds
+        state.kickoff(&mut tree).unwrap();
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(llm_program("c1", r#"return "z".repeat(5000);"#)),
+            )
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+        let holders: Vec<&'static str> = tree
+            .events
+            .values()
+            .filter(|e| {
+                serde_json::to_string(&e.payload)
+                    .map(|s| s.matches("zzzzzzzzzz").count() > 100)
+                    .unwrap_or(false)
+            })
+            .map(|e| match &e.payload {
+                EventPayload::Return { .. } => "Return",
+                EventPayload::Message(_) => "Message",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(holders, ["Return"], "one holder, and it is the return");
+        // The report clips it and names that `Return`.
+        let report = last_report(&state, &tree);
+        let returned = report.lines().find(|l| l.starts_with("returned:")).unwrap();
+        assert!(returned.len() < 5000, "clipped at render time");
+        assert!(returned.contains("tools.tool_result(#"), "{returned}");
+    }
+
+    /// A clipped console tail names its `Console` event, and
+    /// `tools.tool_result` reads that event's lines. It was the one
+    /// truncation in the system with no way back to the whole.
+    #[test]
+    fn clipped_console_is_fetchable_by_id() {
+        let (mut tree, mut state) = setup();
+        state.kickoff(&mut tree).unwrap();
+        let src = "for (let i = 0; i < 40; i = i + 1) { console.log(\"line \" + i); }\nreturn 0;";
+        let out = state
+            .step(&mut tree, StepInput::LlmResponse(llm_program("c1", src)))
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+
+        let console = tree
+            .path_events(state.spine.leaf_id)
+            .iter()
+            .rev()
+            .find(|e| matches!(e.payload, EventPayload::Console { .. }))
+            .map(|e| e.id)
+            .expect("a Console event");
+        let report = last_report(&state, &tree);
+        assert!(
+            report.contains(&format!(
+                "console (last 20 of 40 lines — tools.tool_result({}) for all of them):",
+                console.as_u64()
+            )),
+            "the clip names its id: {report}"
+        );
+        assert!(!report.contains("line 0\n"), "the tail really is clipped");
+
+        // And that id fetches all forty lines.
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(llm_program(
+                    "c2",
+                    &format!(
+                        "const lines = await tools.tool_result({});\nreturn lines.length;",
+                        console.as_u64()
+                    ),
+                )),
+            )
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+        assert!(
+            last_report(&state, &tree).contains("returned: 40"),
+            "{}",
+            last_report(&state, &tree)
+        );
+    }
+
+    /// A `Failed` result **rejects the program's promise**, and that is
+    /// where the handler hierarchy starts: the program may `catch` it and
+    /// carry on (the innermost layer), and only an **uncaught** rejection
+    /// reaches top level and traps into `Condition{Trapped}`. So a tool
+    /// failure is a value first and a condition only if the program
+    /// declines to handle it.
+    #[test]
+    fn failed_call_rejects_then_traps_only_if_uncaught() {
+        // Caught: no condition at all, and the failure is still logged.
+        let (mut tree, mut state) = setup();
+        state.kickoff(&mut tree).unwrap();
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(llm_program(
+                    "c1",
+                    r#"try { await tools.fetch("x"); return "unreachable"; }
+                       catch (e) { return "handled: " + e; }"#,
+                )),
+            )
+            .unwrap();
+        let settled = drain(&mut state, &mut tree, out);
+        let call = expect_tool_calls(&settled)[0].call;
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::ToolResults(vec![ToolResult {
+                    call,
+                    result: Err("no such host".into()),
+                }]),
+            )
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+        assert!(
+            last_report(&state, &tree).contains("handled: no such host"),
+            "{}",
+            last_report(&state, &tree)
+        );
+        assert!(
+            !payload_kinds(&state, &tree).contains(&"Condition"),
+            "a caught failure leaves no condition: {:?}",
+            payload_kinds(&state, &tree)
+        );
+        // The fact is in the log either way — its `Result` carries it.
+        assert!(
+            tree.events.values().any(|e| matches!(
+                &e.payload,
+                EventPayload::Result { outcome: Outcome::Failed(msg), .. }
+                if msg == "no such host"
+            )),
+            "the failure is a logged value"
+        );
+
+        // Uncaught: the same rejection reaches top level and traps.
+        let (mut tree, mut state) = setup();
+        state.kickoff(&mut tree).unwrap();
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(llm_program("c1", r#"return await tools.fetch("x");"#)),
+            )
+            .unwrap();
+        let settled = drain(&mut state, &mut tree, out);
+        let call = expect_tool_calls(&settled)[0].call;
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::ToolResults(vec![ToolResult {
+                    call,
+                    result: Err("no such host".into()),
+                }]),
+            )
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+        let trapped = tree
+            .path_events(state.spine.leaf_id)
+            .iter()
+            .rev()
+            .find_map(|e| match &e.payload {
+                EventPayload::Condition { cause, .. } => Some(cause.clone()),
+                _ => None,
+            })
+            .expect("an uncaught rejection traps");
+        assert!(
+            matches!(trapped, Cause::Trapped { .. }),
+            "traps as a condition, not as a substituted value: {trapped:?}"
+        );
+    }
+
+    /// The oversized-result guard produces a **`Failed`**, not a
+    /// substituted value: a program must be able to tell "it did not
+    /// work" from "here is something smaller".
+    #[test]
+    fn oversized_result_guard_is_a_failure_not_a_substitution() {
+        let guarded =
+            crate::host::guard_size(Ok(json!("x".repeat(crate::host::MAX_RESULT_BYTES + 10))));
+        let msg = guarded.expect_err("oversized results fail");
+        assert!(msg.contains("result too large"), "{msg}");
+        assert!(msg.contains("return something smaller"), "{msg}");
+    }
+
+    /// Silent degradation is the risk "only handbacks log a condition"
+    /// leaves: a program that swallows failures and returns a thin result
+    /// would read as clean success. The fix is in the **report**, not in
+    /// a new event — it counts them and says so.
+    #[test]
+    fn completion_report_counts_failed_calls() {
+        let (mut tree, mut state) = setup();
+        state.kickoff(&mut tree).unwrap();
+        let src = r#"const rs = await Promise.allSettled(
+                       ["a", "b", "c"].map(n => tools.fetch(n)));
+                     return rs.filter(r => r.status === "fulfilled").length;"#;
+        let out = state
+            .step(&mut tree, StepInput::LlmResponse(llm_program("c1", src)))
+            .unwrap();
+        let settled = drain(&mut state, &mut tree, out);
+        let calls: Vec<EventId> = expect_tool_calls(&settled).iter().map(|c| c.call).collect();
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::ToolResults(vec![
+                    ToolResult {
+                        call: calls[0],
+                        result: Ok(json!("A")),
+                    },
+                    ToolResult {
+                        call: calls[1],
+                        result: Err("gone".into()),
+                    },
+                    ToolResult {
+                        call: calls[2],
+                        result: Err("gone".into()),
+                    },
+                ]),
+            )
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+        let report = last_report(&state, &tree);
+        assert!(report.contains("returned: 1"), "a thin result: {report}");
+        assert!(
+            report.contains("2 of this run's calls came back failed"),
+            "which does not read as clean success: {report}"
+        );
+    }
+
+    /// Exactly one outcome per **handback**, and one *report* per
+    /// handback: a run that raises, traps, traps again and finally
+    /// returns renders four reports, with `Return` only on the last.
+    ///
+    /// (The plan's "raises, resumes, traps, resumes and returns → four"
+    /// miscounts: that sequence is *three* handbacks, which is what
+    /// `one_outcome_per_handback_not_per_run` already pins. Four needs a
+    /// fourth stop, so this program traps twice.)
+    #[test]
+    fn each_handback_renders_its_own_report() {
+        let (mut tree, mut state) = setup();
+        state.kickoff(&mut tree).unwrap();
+        let src = r#"
+            const x = raise("need", null);
+            const a = null;
+            const b = null;
+            return a.p + b.q + x + 40;
+        "#;
+        let out = state
+            .step(&mut tree, StepInput::LlmResponse(llm_program("c1", src)))
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+        for (id, value) in [("c2", json!(1)), ("c3", json!(0)), ("c4", json!(1))] {
+            let out = state
+                .step(&mut tree, StepInput::LlmResponse(llm_resume(id, value)))
+                .unwrap();
+            drain(&mut state, &mut tree, out);
+        }
+        let outs = outcomes(&state, &tree);
+        assert_eq!(outs.len(), 4, "four handbacks: {outs:?}");
+        let reports: Vec<String> = outs
+            .iter()
+            .map(|o| crate::report::derive_report(&tree, state.spine.leaf_id, *o, 64 * 1024))
+            .collect();
+        assert!(
+            reports[0].contains("condition `need` raised"),
+            "{}",
+            reports[0]
+        );
+        assert!(
+            reports[1].contains("cannot read property 'p'"),
+            "{}",
+            reports[1]
+        );
+        assert!(
+            reports[2].contains("cannot read property 'q'"),
+            "{}",
+            reports[2]
+        );
+        assert!(reports[3].contains("returned: 42"), "{}", reports[3]);
+        assert_eq!(
+            reports.iter().filter(|r| r.contains("returned:")).count(),
+            1,
+            "`Return` only on the last"
         );
     }
 

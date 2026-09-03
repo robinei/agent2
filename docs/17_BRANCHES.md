@@ -1504,40 +1504,53 @@ events per step.
 
 ### Step B4 — Budget as a rendering rule (`machine.rs`, `report.rs`, `dialect.rs`)
 
-- [ ] Every clip in a report names a fetchable id, not just a count: a
+- [x] Every clip in a report names a fetchable id, not just a count: a
       clipped `returned:` names its `Return`, and a clipped console tail
       names its `Console` (today it says only `last X of Y`, so the rest
       is unreachable — the one truncation in the system with no way back
       to the whole). `tools.tool_result` accepts a `Console` id and
       returns its lines (`clipped_console_is_fetchable_by_id`).
-- [ ] Because reports are derived, a large return is stored exactly once
+- [x] Because reports are derived, a large return is stored exactly once
       (`log_holds_the_returned_value_once`); the report clips it to the
       budget at render time and names its `Return` id.
-- [ ] `Console` capped by named byte/line consts with a truncation marker;
+- [x] `Console` capped by named byte/line consts with a truncation marker;
       the marker names the event so the rest is fetchable
-      (`oversized_console_is_capped_and_marked`).
-- [ ] `Result { call, outcome }` with `Delivered(value)` / `Failed(message)`;
+      (`oversized_console_is_capped_and_marked`) — landed in A4; B4 adds
+      the *report*-side half (`clipped_console_is_fetchable_by_id`).
+- [x] `Result { call, outcome }` with `Delivered(value)` / `Failed(message)`;
       a `Failed` rejects the program's promise, and an uncaught rejection
       traps into `Condition{Trapped}` while a caught one leaves no
       condition at all (`failed_call_rejects_then_traps_only_if_uncaught`).
       The oversized-result guard produces a `Failed`, not a substituted
-      value.
-- [ ] The completion report states how many of the run's calls failed, so
+      value (`oversized_result_guard_is_a_failure_not_a_substitution`).
+- [x] The completion report states how many of the run's calls failed, so
       a program that swallowed errors and returned a thin result does not
       read as clean success (`completion_report_counts_failed_calls`).
-- [ ] A `run_program` that raises, resumes, traps, resumes and returns
+- [x] A `run_program` that raises, resumes, traps, resumes and returns
       logs four outcomes and renders four reports — one per handback —
       with `Return` only on the last
-      (`one_outcome_per_handback_not_per_run`).
-- [ ] Values stored whole; reports clip to `answer_budget` naming the id.
+      (`one_outcome_per_handback_not_per_run`,
+      `each_handback_renders_its_own_report`). *(The arithmetic in this
+      box is off by one: raise → resume → trap → resume → return is
+      **three** handbacks, which is what the A4 test pins. Four needs a
+      fourth stop, so the new test's program traps twice.)*
+- [x] Values stored whole; reports clip to `answer_budget` naming the id.
       `ANSWER_RETRY_LIMIT`, `answer_retries`, the tighten-it post,
       delivery-time `truncate_answer`: deleted. The over-budget test
-      asserts "stored whole, rendered clipped with id."
-- [ ] Card: the re-prompt sentence removed; "returns and answers are
+      asserts "stored whole, rendered clipped with id"
+      (`over_budget_answer_is_stored_whole_and_rendered_clipped`).
+      *(The `mind_bound` computation went with them: after B1 an answer
+      crosses to the asker as a `Result` — machine-bound, into its
+      **program** — so there was no longer a context copy for it to
+      guard. The remaining clips are the report's own.)*
+- [x] Card: the re-prompt sentence removed; "returns and answers are
       budgeted in *your context*, delivered whole to the asking program"
       stated once; "a pending ask in the menu is awaited with
       `tools.tool_result(#id)`, never re-asked" added under reuse.
-- [ ] Gate: `cargo fmt && cargo clippy --workspace --all-targets &&
+      *(The card never carried a re-prompt sentence — the "tighten it"
+      nudge was a runtime harness post, not card text. Nothing to
+      remove; the budget sentence is rewritten in place.)*
+- [x] Gate: `cargo fmt && cargo clippy --workspace --all-targets &&
       cargo test` green.
 
 ---

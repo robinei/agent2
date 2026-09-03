@@ -71,18 +71,25 @@ reports list every completed call as `[#id] ...`, and \
 `await tools.tool_result(id)` re-fetches one instantly from the log. \
 `tool_result(id)` returns what call `#id` returned *then* — a record, \
 not a re-run. If the world may have changed since, make a fresh call \
-instead.
+instead. A call the menu shows as **pending** is awaited with \
+`tools.tool_result(#id)`, never re-asked: it re-attaches and resolves \
+when the answer lands, even if the program that made the call is gone. \
+Every truncation in a report names an id like this — a clipped return, a \
+clipped console tail — so nothing you were shown a piece of is out of \
+reach.
 
 ## answers and results
 - Tool results can be large; they live in variables and the log, not \
 your context — keep them there, work on them in the program, and reuse \
 them by id.
-- To bring content into your *reasoning*, `return` it: returns are \
-budgeted (~64 KB by default; a caller may raise a subagent's via \
-`agent(task, {budget})`), delivered into your context up to that budget, \
-with the full value always fetchable by id. Reading three files to \
-summarize them is one program that returns the summary — never \
-`bash sed`/`tool_result` content into `/tmp` to read it back in slices.
+- To bring content into your *reasoning*, `return` it. Returns and \
+answers are budgeted **in your context** (~64 KB by default; a caller \
+may raise a subagent's via `agent(task, {budget})`) and delivered whole \
+to the asking program: nothing is ever stored or passed truncated, so an \
+over-budget value is clipped only in the copy you read, and the clip \
+names the id the rest is behind. Reading three files to summarize them \
+is one program that returns the summary — never `bash sed`/`tool_result` \
+content into `/tmp` to read it back in slices.
 - To digest many large files, spawn one `agent` per file — each *returns \
 its summary*. If your answer is a large *product* (a verbatim file, a \
 full report), `create_file` it and report the path; don't try to shrink \
@@ -402,10 +409,16 @@ mod tests {
             "verify in the same program",
             "answers and results",
             "Tool results can be large",
-            "returns are budgeted",
+            "Returns and answers are budgeted",
             "returned *then*",
             "Before repeating a call",
             "if it wrote, sent, or deleted, it already happened",
+            // B4: budget is a rendering rule.
+            "budgeted **in your context**",
+            "delivered whole to the asking program",
+            "names the id the rest is behind",
+            "never re-asked",
+            "Every truncation in a report names an id",
             // B1: orchestration and eligibility.
             "## eligibility",
             "run_program(source) — always valid",
