@@ -55,8 +55,9 @@ pub fn run_demo(tree: Tree, events: Sender<SessionEvent>) -> io::Result<Session>
         Box::new(demo_script()),
         events,
     )?;
-    session.handle().send(SessionCommand::UserTurn(
-        "Demonstrate a tool fan-out and report what came back.".into(),
-    ));
+    session.handle().send(SessionCommand::UserTurn {
+        branch: session.root(),
+        text: "Demonstrate a tool fan-out and report what came back.".into(),
+    });
     Ok(session.run())
 }

@@ -69,11 +69,29 @@ pub enum EventPayload {
         system: String,
     },
 
-    /// Execution event; the terminal event of an agent's spine. Parent:
-    /// the agent's last event. Nothing may be appended after it.
-    /// Renders to chat: no — the caller records the result on its own
-    /// spine (as the `tools.agent` call's `Tool` message).
-    FrameResult { result: serde_json::Value },
+    /// Structural event; roots a **divergent** branch. Parent: the event
+    /// forked from. Renders to chat: a harness line (C1).
+    ///
+    /// `context()` **carries through** a `Fork` — history and artifacts
+    /// cross it — but obligations do not: `replay_event` clears `open`
+    /// here, so pre-fork posts stay the original branch's to answer and
+    /// there is exactly one owner for every open post.
+    Fork {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
+
+    /// Settlement event; **this branch answered** the `Post` named by
+    /// `question`. Parent: the answering branch's spine. Renders to chat:
+    /// no — the answer's text is already this branch's `Turn`.
+    ///
+    /// The other half of the exchange is a `Result` on the *asker's*
+    /// branch, which names the `Send`. Neither copies the other: the
+    /// `Answer` holds the value and the `Result` names it.
+    Answer {
+        question: EventId,
+        value: serde_json::Value,
+    },
 
     /// Execution event; one per call a program issues, logged at
     /// **dispatch** (17_BRANCHES A2). Parent: the owning agent's spine,
@@ -373,8 +391,8 @@ impl Outcome {
 
 /// One agent's reconstructed conversation along a spine — its slice of
 /// the `Agent`-ancestor chain: what it is for, the system prompt it was
-/// rooted with, the rendered messages on its segment of the path, and the
-/// result if the agent has completed.
+/// rooted with, the rendered messages on its segment of the path, and
+/// what it still owes an answer to.
 ///
 /// Bodies here are **resolved**: a `Post` that names its `Send` in the log
 /// carries the body inline once it reaches a `Context`.
@@ -386,7 +404,11 @@ pub struct Context {
     /// rebuilt into every request verbatim.
     pub system: String,
     pub messages: Vec<Message>,
-    pub result: Option<serde_json::Value>,
+    /// Posts open on this branch, oldest first: unanswered, expecting a
+    /// reply, and at or after this branch's root. **Agents never close** —
+    /// a branch that has answered is `Idle`, not done — so this is what
+    /// "owes something" means, and it is the only such state.
+    pub open: Vec<EventId>,
 }
 
 impl Context {
@@ -425,11 +447,6 @@ impl Spine {
     /// agent's slice of the path.
     pub fn context(&self) -> &Context {
         self.contexts.last().expect("spine has no contexts")
-    }
-
-    /// Whether this spine's agent has recorded its `FrameResult`.
-    pub fn is_complete(&self) -> bool {
-        self.context().result.is_some()
     }
 }
 

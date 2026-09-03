@@ -122,6 +122,9 @@ impl ChatState {
                     });
                 }
             }
+            // The answer to a user's question is already this branch's
+            // `Turn` in the transcript — the event only says it landed.
+            SessionEvent::Answered { .. } => {}
             SessionEvent::Event { agent, event } => {
                 self.apply_payload(*agent, event.id, &event.payload);
             }
@@ -149,15 +152,31 @@ impl ChatState {
                     program: Some(id),
                 });
             }
-            EventPayload::FrameResult { result } => {
+            // A subagent answering is a marker, not an ending: agents
+            // never close, so the branch stays addressable after it.
+            EventPayload::Answer { value, .. } => {
                 if Some(agent) != self.main_agent {
                     self.entries.push(Entry::Line {
                         agent,
                         kind: ChatKind::Marker,
-                        text: format!("subagent finished: {result}"),
+                        text: format!("subagent answered: {}", short(value)),
                         program: None,
                     });
                 }
+            }
+            EventPayload::Fork { name } => {
+                self.entries.push(Entry::Line {
+                    agent,
+                    kind: ChatKind::Marker,
+                    text: format!(
+                        "forked{}",
+                        match name {
+                            Some(n) => format!(" as «{n}»"),
+                            None => String::new(),
+                        }
+                    ),
+                    program: None,
+                });
             }
             EventPayload::Message(Message::Post { from, origin }) => {
                 self.entries.push(Entry::Line {

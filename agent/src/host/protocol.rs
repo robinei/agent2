@@ -31,10 +31,22 @@ pub enum ProgramStatus {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum SessionCommand {
-    /// A user message for the root agent (rejected with an error event
-    /// while the agent is busy — steering mid-program is M2 — or while
-    /// the active spine is already complete — fork to continue past it).
-    UserTurn(String),
+    /// A user message **for one branch**. The user has no branch of
+    /// their own — they speak *inside* branches — so every utterance
+    /// names the one it lands in, and the reply is read there.
+    ///
+    /// (Rejected with an error event while that branch is busy; steering
+    /// mid-program is B3.)
+    UserTurn { branch: EventId, text: String },
+    /// The human's reply to a branch's question. An agent asks the user
+    /// with a `Send { to: user }`, which stays pending until this settles
+    /// it — the mirror image of `UserTurn`, where the user asks and the
+    /// branch answers.
+    Reply {
+        branch: EventId,
+        call: EventId,
+        value: serde_json::Value,
+    },
     /// Request the current leaf set (replied to with `SessionEvent::Leaves`).
     ListLeaves,
     /// Name the active branch from here on (idle only). A record, not a
@@ -76,8 +88,17 @@ pub enum SessionEvent {
         message: String,
     },
     /// The tree's leaf set (reply to `ListLeaves`, also pushed after a
-    /// `Fork`/`Resume`/`Label` so the UI reflects the new active leaf).
+    /// `Fork`/`Resume`/`Rename` so the UI reflects the new active leaf).
     Leaves(Vec<LeafInfo>),
+    /// A branch answered a question the **user** asked. The user has no
+    /// branch and no program, so there is nothing to settle: this is how
+    /// a UI learns the answer landed, and it is read inline in that
+    /// branch's chat.
+    Answered {
+        agent: AgentId,
+        question: EventId,
+        value: serde_json::Value,
+    },
 }
 
 /// One resumable leaf, for fork/leaf UX. The serializable summary a UI
@@ -91,8 +112,9 @@ pub struct LeafInfo {
     /// The branch's name: the last `Rename` at or after its root, else
     /// the root's own name. One concept, one field.
     pub name: Option<String>,
-    /// Whether the leaf's spine has recorded its `FrameResult`.
-    pub complete: bool,
+    /// How many posts this branch still owes an answer to. Agents never
+    /// close, so "owes something" is the only state there is.
+    pub open: usize,
     /// Whether this is the session's current active root leaf.
     pub active: bool,
     /// One-line preview of the leaf event (kind + clipped content).
@@ -118,7 +140,15 @@ mod tests {
     #[test]
     fn new_commands_and_events_round_trip() {
         let id = EventId::new(7);
-        roundtrip_cmd(SessionCommand::UserTurn("hi".into()));
+        roundtrip_cmd(SessionCommand::UserTurn {
+            branch: id,
+            text: "hi".into(),
+        });
+        roundtrip_cmd(SessionCommand::Reply {
+            branch: id,
+            call: id,
+            value: serde_json::json!("yes"),
+        });
         roundtrip_cmd(SessionCommand::ListLeaves);
         roundtrip_cmd(SessionCommand::Rename("branch A".into()));
         roundtrip_cmd(SessionCommand::Fork {
@@ -137,7 +167,7 @@ mod tests {
             leaf: id,
             agent: EventId::new(1),
             name: Some("branch A".into()),
-            complete: false,
+            open: 1,
             active: true,
             summary: "Assistant: hello".into(),
         }]));

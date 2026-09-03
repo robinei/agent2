@@ -1301,18 +1301,21 @@ events per step.
 
 ### Step A6 — `Answer`; agents never close (`types.rs`, `tree.rs`, `machine.rs`, `host/mod.rs`)
 
-- [ ] `Answer { question, value }` added; `FrameResult` deleted;
+- [x] `Answer { question, value }` added; `FrameResult` deleted;
       `Context.result` → `Context.open: Vec<EventId>` maintained by
       `replay_event`.
-- [ ] `Spine::is_complete`, the seal assert, `fork`'s completed-spine
+- [x] `Spine::is_complete`, the seal assert, `fork`'s completed-spine
       error, `Phase::Done`, `Yielded`, `is_root`: deleted. `finish_frame`
       → `answer_open`: logs `Answer` for the oldest open post, emits
       `StepOutput::Answered { question, value }`, phase → `Idle`.
-- [ ] `UserTurn { branch, text }` logs `Post { from: User, origin:
+- [x] `UserTurn { branch, text }` logs `Post { from: User, origin:
       Direct{…} }` on the branch; `Answered` for a user-authored post emits a
       `SessionEvent` only (the answer is read inline); for an
-      agent-authored post it routes by `origin` → `Result` on the asking
-      branch. `Context.open` counts only posts at or after the branch's
+      agent-authored post it routes to a `Result` on the asking branch.
+      *(Landed via `waits`, not `origin`: A6's agent-authored posts are
+      still `Direct` — nothing issues a `Send` until B1 — so there is no
+      `origin` to route by yet. The `Result` lands on the asking branch
+      either way; B1 switches the lookup.)* `Context.open` counts only posts at or after the branch's
       root: `replay_event` clears it on `Fork`, so a fork's bare turn
       logs no `Answer` for a pre-fork post while the original's does and
       delivers (`fork_does_not_owe_prefork_posts`). `Reply { branch,
@@ -1320,14 +1323,14 @@ events per step.
       `parents` deleted; a `waits: HashMap<EventId /*post*/, (BranchId,
       promise)>` is populated live for now (C2 rebuilds it from the log
       on open).
-- [ ] `pick_resume_leaf` picks the lowest leaf with an open post or an
+- [x] `pick_resume_leaf` picks the lowest leaf with an open post or an
       unanswered `run_program`, else the lowest-id leaf.
-- [ ] After a child answers and the parent joins, a second post to the
+- [x] After a child answers and the parent joins, a second post to the
       child gets a second `Answer` and the parent's branch is untouched
       (`answered_agent_stays_addressable`). A user turn is exactly one
       `Post` and its answer exactly one `Answer` — no `Invoke`/`Result`
       anywhere (`user_turn_is_a_post_on_the_branch`).
-- [ ] Gate: `cargo fmt && cargo clippy --workspace --all-targets &&
+- [x] Gate: `cargo fmt && cargo clippy --workspace --all-targets &&
       cargo test` green.
 
 ---

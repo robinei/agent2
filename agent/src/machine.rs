@@ -110,7 +110,7 @@ pub enum StepInput {
     LlmResponse(LlmTurn),
     /// Completed host tool calls, in resolution order.
     ToolResults(Vec<ToolResult>),
-    /// A child agent's `FrameResult` arriving at its call site.
+    /// A child branch's answer arriving at its call site.
     SubagentResult {
         invoke_id: u64,
         result: serde_json::Value,
@@ -134,13 +134,20 @@ pub enum StepOutput {
     ToolCalls(Vec<OutCall>),
     /// Spawn child contexts; feed each result back as `SubagentResult`.
     SpawnAgents(Vec<SpawnAgent>),
-    /// The agent completed; its `FrameResult` is logged.
-    AgentDone(serde_json::Value),
-    /// The root agent produced a final answer but does *not* complete:
-    /// the top conversation never ends, it yields the turn back to the
-    /// user. No `FrameResult` is logged (the spine stays appendable); the
-    /// agent goes idle awaiting the next `UserTurn`.
-    Yielded,
+    /// This branch took a bare turn and went **idle**. Agents never
+    /// close: idle costs nothing and the branch stays addressable, so a
+    /// later question to it — from anyone — is just another post.
+    ///
+    /// `question` is the `Post` the turn answered: the oldest that was
+    /// open, with an `Answer` naming it logged. It is `None` when nothing
+    /// was open — then no `Answer` is logged and the turn's text is read
+    /// where it sits. (The plan writes this output as
+    /// `Answered { question, value }`; the option is what "a bare turn
+    /// with nothing open logs no `Answer`" needs to stay expressible.)
+    Answered {
+        question: Option<EventId>,
+        value: serde_json::Value,
+    },
     /// The VM wants another `Tick`.
     Working,
 }
@@ -244,8 +251,6 @@ enum Phase {
     Running(Run),
     /// A condition report went out; waiting for the restart choice.
     Suspended(Run, ResumeWith),
-    /// `FrameResult` logged; terminal.
-    Done,
 }
 
 struct PendingCall {
@@ -265,11 +270,6 @@ pub struct Runner {
     /// branch is a conversation with. Resolved once at construction; the
     /// leaf moves, the agent does not.
     agent: EventId,
-    /// The session's top agent: the user-facing conversation. It never
-    /// completes — a final no-tool-call turn *yields* to the user
-    /// instead of logging a `FrameResult`. Child (subagent) contexts are
-    /// not root: they complete and return to their caller.
-    is_root: bool,
     phase: Phase,
     invoke_counter: u64,
     generation: u64,
@@ -350,20 +350,16 @@ impl Runner {
         )?;
         let mut state = Self::with_spine(tree, spine);
         state.dialect_card = card.to_owned();
-        state.is_root = false; // a subagent completes and returns
         state.answer_budget = budget.unwrap_or(DEFAULT_ANSWER_BUDGET);
         Ok(state)
     }
 
-    /// Resume an existing spine (re-opened log). This is the session's
-    /// top agent — `is_root` — whether freshly rooted (`new_root`) or
-    /// re-anchored on resume (`open_at`); `new_child` clears the flag.
+    /// Resume an existing spine: a re-opened log, a fork, a re-anchor.
     pub fn with_spine(tree: &Tree, spine: Spine) -> Self {
         let agent = tree.enclosing_agent(spine.leaf_id).unwrap_or(spine.leaf_id);
         Runner {
             spine,
             agent,
-            is_root: true,
             phase: Phase::Idle,
             invoke_counter: 0,
             generation: 0,
@@ -413,8 +409,12 @@ impl Runner {
             Phase::AwaitingLlm => "awaiting llm",
             Phase::Running(_) => "running",
             Phase::Suspended(..) => "suspended",
-            Phase::Done => "done",
         }
+    }
+
+    /// Posts this branch owes an answer to, oldest first.
+    pub fn open(&self) -> &[EventId] {
+        &self.spine.context().open
     }
 
     /// The VM the debugger TUI renders from (9_TUI dec. 4): the live
@@ -440,10 +440,6 @@ impl Runner {
         assert!(matches!(self.phase, Phase::Idle), "kickoff on a busy agent");
         self.phase = Phase::AwaitingLlm;
         Ok(vec![self.render_request(tree)])
-    }
-
-    pub fn is_done(&self) -> bool {
-        matches!(self.phase, Phase::Done)
     }
 
     pub fn step(&mut self, tree: &mut Tree, input: StepInput) -> io::Result<Vec<StepOutput>> {
@@ -473,7 +469,6 @@ impl Runner {
                 panic!("mid-program user turns are not implemented yet (M2)");
             }
             Phase::AwaitingLlm => panic!("user turn while an LLM request is in flight"),
-            Phase::Done => panic!("user turn on a completed agent"),
         }
         tree.append(
             &mut self.spine,
@@ -508,7 +503,7 @@ impl Runner {
 
         let Some(call) = tool_calls.first().cloned() else {
             // No tool call: the assistant's text completes the agent.
-            return self.finish_agent(tree);
+            return self.answer_open(tree);
         };
         // Every call gets exactly one outcome, and outcomes are logged in
         // **call order** so the positional pairing holds. The first call
@@ -648,11 +643,6 @@ impl Runner {
         tree: &mut Tree,
         batch: Vec<ToolResult>,
     ) -> io::Result<Vec<StepOutput>> {
-        if matches!(self.phase, Phase::Done) {
-            // The spine is complete (nothing may follow FrameResult);
-            // results of stragglers the agent outlived are dropped.
-            return Ok(Vec::new());
-        }
         let mut delivered = false;
         for tr in batch {
             let Some(p) = self.pending.remove(&tr.invoke_id) else {
@@ -1080,32 +1070,49 @@ impl Runner {
         Ok(out)
     }
 
-    fn finish_agent(&mut self, tree: &mut Tree) -> io::Result<Vec<StepOutput>> {
-        // Abandon any suspended program: a no-tool-call turn completes
-        // the agent, its text is the result.
+    /// A bare turn answers the **oldest post that was open** and the
+    /// branch goes idle. Nothing closes: idle costs nothing and the
+    /// branch stays addressable, so a later question to it — from anyone
+    /// — is just another post, answered to whoever asked *that* one.
+    fn answer_open(&mut self, tree: &mut Tree) -> io::Result<Vec<StepOutput>> {
+        // A no-tool-call turn abandons any suspended program — never the
+        // physics: in-flight calls stay pending and their results are
+        // still logged as artifacts when they arrive.
         if let Phase::Suspended(run, _) = std::mem::replace(&mut self.phase, Phase::Idle) {
             self.note_status(run.program_id, ProgramStatus::Failed);
             self.last_vm = Some(run.vm);
         }
         self.generation += 1;
+        self.phase = Phase::Idle;
+
         let text = match self.spine.context().messages.last() {
             Some(Message::Turn { text, .. }) => text.clone(),
             _ => String::new(),
         };
-        if self.is_root {
-            // The top conversation never ends: yield the turn to the user
-            // without logging a `FrameResult`, so the spine stays
-            // appendable for the next `UserTurn`. The root's answer goes to
-            // the *user*, not into another context — human-bound, delivered
-            // in full (the answer budget governs mind-bound answers only).
-            self.phase = Phase::Idle;
-            return Ok(vec![StepOutput::Yielded]);
-        }
-        // A subagent's final answer crosses into its caller's context — the
-        // one mind-bound deliverable (decision 4). Budget it: re-prompt
-        // once to tighten, then truncate-with-note. The full prose stays on
-        // the spine as the Assistant message regardless.
-        if text.len() > self.answer_budget && self.answer_retries < ANSWER_RETRY_LIMIT {
+        let Some(question) = self.spine.context().open.first().copied() else {
+            // Nothing was open: no `Answer` is logged and the branch is
+            // simply idle. The user reads the text where it sits.
+            return Ok(vec![StepOutput::Answered {
+                question: None,
+                value: text_value(&text),
+            }]);
+        };
+
+        // Whether this answer is *mind-bound* is a fact about who asked:
+        // an answer to the human is delivered in full, an answer that
+        // crosses into another agent's context is budgeted (decision 4).
+        // That replaces `is_root`, which asked the same question of the
+        // branch instead of the asker.
+        let mind_bound = !matches!(
+            self.spine.context().messages.iter().find_map(|m| match m {
+                Message::Post { from, .. } => Some(*from),
+                _ => None,
+            }),
+            Some(Author::User)
+        ) && matches!(asker_of(tree, question), Some(Author::Agent(_)));
+
+        if mind_bound && text.len() > self.answer_budget && self.answer_retries < ANSWER_RETRY_LIMIT
+        {
             self.answer_retries += 1;
             let nudge = format!(
                 "Your answer is {} bytes; the budget is {}. Tighten it to a digest, or \
@@ -1127,21 +1134,23 @@ impl Runner {
             self.phase = Phase::AwaitingLlm;
             return Ok(vec![self.render_request(tree)]);
         }
-        let result = if text.is_empty() {
-            serde_json::Value::Null
-        } else if text.len() > self.answer_budget {
+
+        let value = if mind_bound && text.len() > self.answer_budget {
             serde_json::Value::String(truncate_answer(&text, self.answer_budget))
         } else {
-            serde_json::Value::String(text)
+            text_value(&text)
         };
         tree.append(
             &mut self.spine,
-            EventPayload::FrameResult {
-                result: result.clone(),
+            EventPayload::Answer {
+                question,
+                value: value.clone(),
             },
         )?;
-        self.phase = Phase::Done;
-        Ok(vec![StepOutput::AgentDone(result)])
+        Ok(vec![StepOutput::Answered {
+            question: Some(question),
+            value,
+        }])
     }
 
     // ── rendering ───────────────────────────────────────────────────
@@ -1448,6 +1457,24 @@ fn span_at(vm: &VM, ip: usize) -> u32 {
     vm.spans.get(ip).copied().unwrap_or(0)
 }
 
+/// An empty final turn answers with `null` rather than an empty string —
+/// there was no answer, and the value says so.
+fn text_value(text: &str) -> serde_json::Value {
+    if text.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::Value::String(text.to_owned())
+    }
+}
+
+/// Who authored the post `question` — the author an answer is owed to.
+fn asker_of(tree: &Tree, question: EventId) -> Option<Author> {
+    match &tree.events.get(&question)?.payload {
+        EventPayload::Message(Message::Post { from, .. }) => Some(*from),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1540,7 +1567,8 @@ mod tests {
             .iter()
             .map(|e| match &e.payload {
                 EventPayload::Agent { .. } => "Agent",
-                EventPayload::FrameResult { .. } => "FrameResult",
+                EventPayload::Fork { .. } => "Fork",
+                EventPayload::Answer { .. } => "Answer",
                 EventPayload::Message(Message::Post { .. }) => "Post",
                 EventPayload::Message(Message::Turn { .. }) => "Turn",
                 EventPayload::Call(_) => "Call",
@@ -1988,21 +2016,28 @@ mod tests {
         let req = expect_request(&settled);
         assert!(matches!(req.messages.last(), Some(Rendered::Tool { .. })));
 
-        // Final text turn on the *root* agent yields to the user — the
-        // top conversation never ends, so no `FrameResult` is logged and
-        // the agent stays idle, ready for the next turn.
+        // A final text turn answers the user's post and the branch goes
+        // idle, ready for the next turn. Nothing closes.
         let out = state
             .step(
                 &mut tree,
                 StepInput::LlmResponse(llm_text("the answer is 42")),
             )
             .unwrap();
-        assert!(matches!(&out[..], [StepOutput::Yielded]), "{out:?}");
-        assert!(!state.is_done());
+        // The branch answered the user's post and went idle. Nothing
+        // closes: it is still addressable for the next turn.
+        assert!(
+            matches!(&out[..], [StepOutput::Answered { question: Some(_), value }]
+                     if value == &json!("the answer is 42")),
+            "{out:?}"
+        );
         assert!(state.is_idle());
+        assert!(state.open().is_empty(), "the user's post is answered");
         assert_eq!(
             payload_kinds(&state, &tree),
-            ["Agent", "Post", "Turn", "Return", "Console", "Turn"]
+            [
+                "Agent", "Post", "Turn", "Return", "Console", "Turn", "Answer"
+            ]
         );
 
         // A follow-up turn appends onto the same spine and runs again.
@@ -2264,8 +2299,8 @@ mod tests {
             .step(&mut tree, StepInput::LlmResponse(llm_text("child says hi")))
             .unwrap();
         let result = match &out[..] {
-            [StepOutput::AgentDone(v)] => v.clone(),
-            other => panic!("expected AgentDone, got {other:?}"),
+            [StepOutput::Answered { value, .. }] => value.clone(),
+            other => panic!("expected Answered, got {other:?}"),
         };
 
         // Join: the child's result resolves the caller's agent call.
@@ -2751,8 +2786,8 @@ got X
             .step(&mut tree, StepInput::LlmResponse(llm_text(&long)))
             .unwrap();
         let result = match &out[..] {
-            [StepOutput::AgentDone(v)] => v.clone(),
-            other => panic!("expected AgentDone, got {other:?}"),
+            [StepOutput::Answered { value, .. }] => value.clone(),
+            other => panic!("expected Answered, got {other:?}"),
         };
         let delivered = result.as_str().unwrap();
         assert!(delivered.contains("answer truncated"), "note: {delivered}");

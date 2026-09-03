@@ -577,7 +577,12 @@ pub fn run_attached(mut session: Session, events_rx: Receiver<SessionEvent>) -> 
                     match action {
                         KeyAction::None => {}
                         KeyAction::Submit(text) => {
-                            handle.send(SessionCommand::UserTurn(text));
+                            // The input line always sends to the selected
+                            // branch: the user speaks *inside* branches.
+                            handle.send(SessionCommand::UserTurn {
+                                branch: selected,
+                                text,
+                            });
                             app.reset_scrolls();
                         }
                         KeyAction::TogglePause => {
@@ -1009,7 +1014,8 @@ fn render_navigator(frame: &mut Frame, app: &AttachedApp, session: &Session, are
         .map(|(fv, prefix)| {
             let selected = app.selected == Some(fv.id);
             let live_status = live.get(&fv.id).copied();
-            let status = live_status.unwrap_or(if fv.complete { "done" } else { "idle" });
+            // Agents never close, so a non-live agent is idle, never done.
+            let status = live_status.unwrap_or("idle");
             let paused = live_status.is_some() && session.is_paused(fv.id);
             let busy = matches!(live_status, Some("running" | "awaiting llm"));
             let text = format!(
@@ -1027,14 +1033,8 @@ fn render_navigator(frame: &mut Frame, app: &AttachedApp, session: &Session, are
                 },
             );
             let style = if selected {
-                if fv.complete {
-                    Style::default()
-                        .add_modifier(Modifier::BOLD)
-                        .fg(Color::DarkGray)
-                } else {
-                    Style::default().add_modifier(Modifier::BOLD)
-                }
-            } else if fv.complete {
+                Style::default().add_modifier(Modifier::BOLD)
+            } else if fv.answered {
                 Style::default().fg(Color::DarkGray)
             } else {
                 Style::default().fg(Color::Gray)
@@ -1372,9 +1372,10 @@ mod tests {
             tx,
         )
         .unwrap();
-        session
-            .handle()
-            .send(SessionCommand::UserTurn("delegate".into()));
+        session.handle().send(SessionCommand::UserTurn {
+            branch: session.root(),
+            text: "delegate".into(),
+        });
 
         // Pump until both agents are live with running programs.
         for _ in 0..200 {

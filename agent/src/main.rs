@@ -214,7 +214,10 @@ fn queue_nav(session: &host::Session, nav: &SessionNav) {
         h.send(host::SessionCommand::Rename(text));
     }
     if let Some(text) = nav.turn.clone() {
-        h.send(host::SessionCommand::UserTurn(text));
+        h.send(host::SessionCommand::UserTurn {
+            branch: session.root(),
+            text,
+        });
     }
 }
 
@@ -289,11 +292,25 @@ fn print_session_event(event: &SessionEvent) {
             Some(f) => eprintln!("!! [agent {}] {message}", f.as_u64()),
             None => eprintln!("!! {message}"),
         },
+        SessionEvent::Answered {
+            agent,
+            question,
+            value,
+        } => {
+            println!(
+                "[agent {}] answered #{}: {value}",
+                agent.as_u64(),
+                question.as_u64()
+            );
+        }
         SessionEvent::Leaves(leaves) => {
             println!("leaves ({}):", leaves.len());
             for leaf in leaves {
                 let mark = if leaf.active { "*" } else { " " };
-                let state = if leaf.complete { "done" } else { "open" };
+                let state = match leaf.open {
+                    0 => "idle".to_owned(),
+                    n => format!("{n} open"),
+                };
                 let name = leaf
                     .name
                     .as_deref()
@@ -317,8 +334,15 @@ fn print_session_event(event: &SessionEvent) {
                         .unwrap_or_default();
                     println!("{head} agent{name}: {charter}");
                 }
-                EventPayload::FrameResult { result } => {
-                    println!("{head} agent result: {result}");
+                EventPayload::Fork { name } => {
+                    let name = name
+                        .as_deref()
+                        .map(|n| format!(" «{n}»"))
+                        .unwrap_or_default();
+                    println!("{head} fork{name}");
+                }
+                EventPayload::Answer { question, value } => {
+                    println!("{head} answer to #{}: {value}", question.as_u64());
                 }
                 EventPayload::Message(Message::Post { from, origin }) => {
                     println!("{head} post: {}", report::render_post(*from, origin));

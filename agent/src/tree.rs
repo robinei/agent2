@@ -15,8 +15,9 @@ pub struct AgentView {
     pub charter: String,
     /// The branch name at this agent's root, if it was given one.
     pub name: Option<String>,
-    /// A `FrameResult` was logged on this agent's spine.
-    pub complete: bool,
+    /// This agent has answered at least once. Agents never close, so
+    /// this is a fact about the past, not a lifecycle state.
+    pub answered: bool,
 }
 
 /// One inner call a program made, with its settlement if one landed.
@@ -169,11 +170,10 @@ impl Tree {
 
     /// Fork from any event: reconstruct the spine at `from` and return
     /// an appendable handle. The first `append` on the returned spine
-    /// creates a *sibling* of `from`'s existing spine child — a
-    /// divergent branch within the same agent (user-driven retry /
-    /// exploration, decision 4). Errors if `from` is unknown or its
-    /// spine is already complete (a `FrameResult` is on the path, so
-    /// nothing may follow it).
+    /// creates a *sibling* of `from`'s existing spine child.
+    ///
+    /// Nothing seals a branch — **agents never close** — so the only way
+    /// this fails is an id that is not in the tree.
     pub fn fork(&self, from: EventId) -> io::Result<Spine> {
         if !self.events.contains_key(&from) {
             return Err(io::Error::new(
@@ -181,31 +181,21 @@ impl Tree {
                 format!("cannot fork: event {from:?} not in tree"),
             ));
         }
-        let spine = self.spine_at(from);
-        if spine.is_complete() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("cannot fork from a completed spine at {from:?}"),
-            ));
-        }
-        Ok(spine)
+        Ok(self.spine_at(from))
     }
 
-    /// Append an event to a spine. The spine's leaf advances; the
-    /// innermost agent absorbs chat messages. `Agent` must go
-    /// through `start_agent`; nothing may follow a `FrameResult`.
+    /// Append an event to a spine. The spine's leaf advances and the
+    /// innermost context absorbs whatever the event changes. `Agent` must
+    /// go through `start_agent`.
     pub fn append(&mut self, spine: &mut Spine, payload: EventPayload) -> io::Result<EventId> {
         assert!(
             !matches!(payload, EventPayload::Agent { .. }),
             "Agent must go through start_agent"
         );
-        assert!(
-            !spine.is_complete(),
-            "append after FrameResult on a completed spine"
-        );
-
-        Self::replay_event(&mut spine.contexts, &self.events, &payload);
+        // Log first: an event's own id is part of what it contributes to
+        // a context (an open post is tracked *by id*).
         let id = self.log_event(Some(spine.leaf_id), payload)?;
+        Self::replay_event(&mut spine.contexts, &self.events, &self.events[&id]);
         spine.leaf_id = id;
         Ok(id)
     }
@@ -275,7 +265,7 @@ impl Tree {
 
         let mut contexts: Vec<Context> = Vec::new();
         for id in &path {
-            Self::replay_event(&mut contexts, &self.events, &self.events[id].payload);
+            Self::replay_event(&mut contexts, &self.events, &self.events[id]);
         }
         Spine { leaf_id, contexts }
     }
@@ -285,12 +275,8 @@ impl Tree {
     /// rather than copying it — resolving `Origin::Sent` is a map lookup,
     /// and the two borrows are disjoint (`spine_at` already holds
     /// `&self`).
-    fn replay_event(
-        contexts: &mut Vec<Context>,
-        events: &HashMap<EventId, Event>,
-        payload: &EventPayload,
-    ) {
-        match payload {
+    fn replay_event(contexts: &mut Vec<Context>, events: &HashMap<EventId, Event>, event: &Event) {
+        match &event.payload {
             // `context()` **resets** at an `Agent` — clean-room isolation
             // (decision 3) in the type rather than in an `is_some()`.
             EventPayload::Agent {
@@ -300,21 +286,39 @@ impl Tree {
                     charter: charter.clone(),
                     system: system.clone(),
                     messages: Vec::new(),
-                    result: None,
+                    open: Vec::new(),
                 });
             }
-            EventPayload::Message(msg) => {
-                contexts
-                    .last_mut()
-                    .expect("Message event with no enclosing agent")
-                    .messages
-                    .push(resolve_message(events, msg));
+            // A `Fork` carries history through — it is the same context,
+            // diverged — but **obligations do not cross it**. Pre-fork
+            // posts stay the original branch's to answer, so there is
+            // exactly one owner for every open post and "which branch
+            // delivers?" is never a race. This one line is the whole
+            // enforcement of that rule at replay time.
+            EventPayload::Fork { .. } => {
+                if let Some(ctx) = contexts.last_mut() {
+                    ctx.open.clear();
+                }
             }
-            EventPayload::FrameResult { result } => {
-                contexts
+            EventPayload::Message(msg) => {
+                let ctx = contexts
                     .last_mut()
-                    .expect("FrameResult event with no enclosing agent")
-                    .result = Some(result.clone());
+                    .expect("Message event with no enclosing agent");
+                let resolved = resolve_message(events, msg);
+                // Only a post that expects a reply is *open* — a `tell`,
+                // a harness notice, or the user's FYI lands, wakes the
+                // branch, and owes nothing.
+                if let Message::Post { origin, .. } = &resolved
+                    && matches!(origin.direct(), Some((_, _, true)))
+                {
+                    ctx.open.push(event.id);
+                }
+                ctx.messages.push(resolved);
+            }
+            EventPayload::Answer { question, .. } => {
+                if let Some(ctx) = contexts.last_mut() {
+                    ctx.open.retain(|id| id != question);
+                }
             }
             // Execution/record events carry no context-visible state; they
             // are queried from `events` by id (artifacts, replay, UI).
@@ -378,7 +382,9 @@ impl Tree {
             match &event.payload {
                 // A branch root resets the name: a rename before it named
                 // the branch this one came from, not this one.
-                EventPayload::Agent { name: n, .. } => name.clone_from(n),
+                EventPayload::Agent { name: n, .. } | EventPayload::Fork { name: n } => {
+                    name.clone_from(n)
+                }
                 EventPayload::Rename { name: n } => name = Some(n.clone()),
                 _ => {}
             }
@@ -423,15 +429,16 @@ impl Tree {
 
     /// Every agent in the log, in DFS tree order (root-first, children
     /// grouped under their parent and sorted by id): the agent-navigator
-    /// projection (decision 8). `complete` is whether a `FrameResult`
-    /// was logged on the agent's spine.
+    /// projection (decision 8). `answered` is whether this agent has ever
+    /// answered a question — agents never close, so it is a fact about
+    /// the past, not a lifecycle state.
     pub fn agent_list(&self) -> Vec<AgentView> {
-        let mut completed: HashSet<EventId> = HashSet::new();
+        let mut answered: HashSet<EventId> = HashSet::new();
         for event in self.events.values() {
-            if let EventPayload::FrameResult { .. } = event.payload
+            if let EventPayload::Answer { .. } = event.payload
                 && let Some(agent) = event.parent_id.and_then(|p| self.enclosing_agent(p))
             {
-                completed.insert(agent);
+                answered.insert(agent);
             }
         }
         let contexts: Vec<AgentView> = self
@@ -443,7 +450,7 @@ impl Tree {
                     parent: event.parent_id.and_then(|p| self.enclosing_agent(p)),
                     charter: charter.clone(),
                     name: name.clone(),
-                    complete: completed.contains(&event.id),
+                    answered: answered.contains(&event.id),
                 }),
                 _ => None,
             })
@@ -760,7 +767,7 @@ mod tests {
         assert_eq!(contexts.len(), 1);
         assert_eq!(contexts[0].id, agent);
         assert_eq!(contexts[0].charter, "root");
-        assert!(!contexts[0].complete, "root never logs a FrameResult");
+        assert!(!contexts[0].answered, "the root has answered nothing yet");
 
         let progs = tree.programs_for(agent, leaf);
         assert_eq!(progs.len(), 1);
@@ -890,34 +897,92 @@ mod tests {
         );
     }
 
-    // --- Context completion ---
+    // --- Open posts, and the fact that nothing closes ---
 
+    /// A post that expects a reply is **open** until an `Answer` names
+    /// it; answering does not seal the branch, it just clears the debt.
     #[test]
-    fn test_result_completes_spine() -> io::Result<()> {
+    fn an_answer_closes_a_post_not_the_branch() -> io::Result<()> {
         let mut tree = Tree::new(None);
         let mut spine = tree.start_agent(None, None, "root", "")?;
-        tree.append(&mut spine, assistant_msg("done"))?;
-        assert!(!spine.is_complete());
+        let question = tree.append(&mut spine, user_msg("q"))?;
+        assert_eq!(spine.context().open, [question]);
 
+        tree.append(&mut spine, assistant_msg("done"))?;
         tree.append(
             &mut spine,
-            EventPayload::FrameResult {
-                result: json!({"ok": true}),
+            EventPayload::Answer {
+                question,
+                value: json!({"ok": true}),
             },
         )?;
-        assert!(spine.is_complete());
-        assert_eq!(spine.context().result, Some(json!({"ok": true})));
+        assert!(spine.context().open.is_empty());
+
+        // …and the branch keeps taking messages afterwards. Agents never
+        // close: a later question is just another post.
+        let again = tree.append(&mut spine, user_msg("and another thing"))?;
+        assert_eq!(spine.context().open, [again]);
         Ok(())
     }
 
+    /// Only a post that expects a reply is open. A `tell` — from an
+    /// agent, the harness, or the user — lands, wakes the branch, and
+    /// owes nothing.
     #[test]
-    #[should_panic(expected = "append after FrameResult")]
-    fn test_append_after_result_panics() {
+    fn a_tell_opens_nothing() -> io::Result<()> {
         let mut tree = Tree::new(None);
-        let mut spine = tree.start_agent(None, None, "root", "").unwrap();
-        tree.append(&mut spine, EventPayload::FrameResult { result: json!(42) })
-            .unwrap();
-        let _ = tree.append(&mut spine, user_msg("too late"));
+        let mut spine = tree.start_agent(None, None, "root", "")?;
+        tree.append(
+            &mut spine,
+            EventPayload::Message(Message::Post {
+                from: Author::Harness,
+                origin: Origin::Direct {
+                    text: "fyi".into(),
+                    input: json!(null),
+                    expects_reply: false,
+                },
+            }),
+        )?;
+        assert!(spine.context().open.is_empty());
+        assert_eq!(spine.context().messages.len(), 1, "it still lands");
+        Ok(())
+    }
+
+    /// **A fork inherits history, not obligations.** A pre-fork post is
+    /// before the fork's root, so it stays the original branch's to
+    /// answer — which is what makes "which branch delivers?" never a
+    /// race. `replay_event` clearing `open` at the `Fork` is the whole
+    /// enforcement.
+    #[test]
+    fn fork_does_not_owe_prefork_posts() -> io::Result<()> {
+        let mut tree = Tree::new(None);
+        let mut spine = tree.start_agent(None, None, "root", "")?;
+        let question = tree.append(&mut spine, user_msg("which file?"))?;
+        assert_eq!(spine.context().open, [question]);
+
+        // Fork at the leaf — the "ask without pausing" gesture.
+        let mut forked = tree.fork(spine.leaf_id)?;
+        tree.append(&mut forked, EventPayload::Fork { name: None })?;
+
+        // The fork sees the question as history…
+        assert_eq!(
+            forked
+                .context()
+                .messages
+                .iter()
+                .map(|m| m.text())
+                .collect::<Vec<_>>(),
+            ["which file?"]
+        );
+        // …and owes it nothing.
+        assert!(forked.context().open.is_empty());
+        // The original still owes it.
+        assert_eq!(tree.spine_at(spine.leaf_id).context().open, [question]);
+
+        // A post *after* the fork root is the fork's own to answer.
+        let mine = tree.append(&mut forked, user_msg("what are you doing?"))?;
+        assert_eq!(forked.context().open, [mine]);
+        Ok(())
     }
 
     // --- Execution events ---
@@ -1082,13 +1147,21 @@ mod tests {
     }
 
     #[test]
-    fn test_fork_from_completed_spine_errors() -> io::Result<()> {
+    fn test_fork_from_an_answered_leaf_is_fine() -> io::Result<()> {
         let mut tree = Tree::new(None);
         let mut spine = tree.start_agent(None, None, "root", "")?;
+        let question = tree.append(&mut spine, user_msg("q"))?;
         tree.append(&mut spine, assistant_msg("done"))?;
-        let result_id = tree.append(&mut spine, EventPayload::FrameResult { result: json!(1) })?;
-        let err = tree.fork(result_id).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        let answered = tree.append(
+            &mut spine,
+            EventPayload::Answer {
+                question,
+                value: json!(1),
+            },
+        )?;
+        // Nothing seals a branch, so forking past an answer is ordinary.
+        let forked = tree.fork(answered)?;
+        assert_eq!(forked.leaf_id, answered);
         Ok(())
     }
 
@@ -1353,8 +1426,8 @@ mod tests {
                 .open(&path)?;
             let mut tree = Tree::open(file)?;
             let (caller, child) = build_branched_tree(&mut tree)?;
-            // Child is in flight: Agent logged, no FrameResult yet.
-            assert!(!child.is_complete());
+            // The child is in flight: it was asked and has not answered.
+            assert_eq!(child.context().open.len(), 1);
             (caller.leaf_id, child.leaf_id)
         };
 
@@ -1369,14 +1442,15 @@ mod tests {
             expected.sort_by_key(|id| id.as_u64());
             assert_eq!(leaves, expected);
 
-            // Resume the in-flight child: reconstruct and finish it.
+            // Resume the in-flight child: reconstruct and answer it.
             let mut child = tree.spine_at(child_leaf);
             assert_eq!(child.context().charter, "child prompt");
-            assert!(!child.is_complete());
+            let question = child.context().open[0];
             tree.append(
                 &mut child,
-                EventPayload::FrameResult {
-                    result: json!("done"),
+                EventPayload::Answer {
+                    question,
+                    value: json!("done"),
                 },
             )?;
         }
@@ -1385,8 +1459,8 @@ mod tests {
             let file = OpenOptions::new().read(true).write(true).open(&path)?;
             let tree = Tree::open(file)?;
             let child = tree.spine_at(EventId::new(tree.id_counter));
-            assert!(child.is_complete());
-            assert_eq!(child.context().result, Some(json!("done")));
+            // The debt is cleared, and the branch is still appendable.
+            assert!(child.context().open.is_empty());
         }
         Ok(())
     }
