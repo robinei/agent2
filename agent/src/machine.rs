@@ -23,6 +23,22 @@ use crate::types::*;
 pub const TOOL_RUN_PROGRAM: &str = "run_program";
 pub const TOOL_RESUME: &str = "resume";
 
+/// Program-facing tool names `dispatch_calls` interprets — **the one
+/// place a `tools.*` name becomes a `Call` variant** (A2). Everything
+/// downstream matches on the variant.
+pub const TOOL_SPAWN: &str = "spawn";
+pub const TOOL_ASK: &str = "ask";
+pub const TOOL_TELL: &str = "tell";
+/// `spawn` + `ask` in one call, kept verbatim from 8_HARNESS.
+pub const TOOL_AGENT: &str = "agent";
+pub const TOOL_TOOL_RESULT: &str = "tool_result";
+
+/// Discovery. A host tool in the program's view like any other, but its
+/// answer needs **live session state** (a branch's status), so the
+/// session serves it inline instead of the registry. This const is the
+/// one place the name is written.
+pub const TOOL_AGENTS: &str = "agents";
+
 /// A full tool definition offered to the LLM: what every client
 /// serializes into its wire format (name + JSON-schema'd parameters).
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
@@ -102,25 +118,25 @@ const DEFAULT_ANSWER_BUDGET: usize = 64 * 1024;
 const ANSWER_RETRY_LIMIT: u8 = 1;
 
 pub enum StepInput {
-    /// A user message. Valid while idle; arriving mid-program it becomes
-    /// a host-injected condition — deferred to M2 (panics until then).
-    UserTurn(String),
     /// The assistant's turn (logged with its author; tool calls
     /// dispatched).
     LlmResponse(LlmTurn),
-    /// Completed host tool calls, in resolution order.
+    /// Settled calls, in resolution order. One door for all three call
+    /// kinds: a host tool's result, a `Spawn`'s agent handle, a `Tell`'s
+    /// delivery receipt, or an `Ask`'s answer — routing is by the
+    /// **variant** already in the log, so the machine needs no second
+    /// input for subagents.
     ToolResults(Vec<ToolResult>),
-    /// A child branch's answer arriving at its call site.
-    SubagentResult {
-        invoke_id: u64,
-        result: serde_json::Value,
-    },
     /// Run one VM slice of at most `fuel` instructions.
     Tick { fuel: u64 },
 }
 
+/// One settled call. It is named by its **logged `Call` event id** — the
+/// log's own key, which is also what the artifact menu shows and what
+/// `tools.tool_result` takes, so there is no second id space to keep in
+/// step with it.
 pub struct ToolResult {
-    pub invoke_id: u64,
+    pub call: EventId,
     /// `Err` rejects the program-side promise with the message.
     pub result: Result<serde_json::Value, String>,
 }
@@ -132,8 +148,17 @@ pub enum StepOutput {
     /// Execute these tools (any order/concurrency); feed back as
     /// `ToolResults` in completion order.
     ToolCalls(Vec<OutCall>),
-    /// Spawn child contexts; feed each result back as `SubagentResult`.
-    SpawnAgents(Vec<SpawnAgent>),
+    /// Create these agents; settle each `Spawn` with `{ agent }`.
+    Spawns(Vec<SpawnRequest>),
+    /// Deliver these `Send`s. Each names a logged `Call::Send`, and the
+    /// address, body and `expects_reply` all live there — the host reads
+    /// the log rather than being handed a copy, which is the same
+    /// by-reference discipline the `Post` itself follows.
+    ///
+    /// An `ask` stays pending until the recipient's `Answer` produces its
+    /// `Result`; a `tell` is settled by its delivery receipt as soon as
+    /// the `Post` lands.
+    Sends(Vec<EventId>),
     /// This branch took a bare turn and went **idle**. Agents never
     /// close: idle costs nothing and the branch stays addressable, so a
     /// later question to it — from anyone — is just another post.
@@ -200,18 +225,21 @@ pub struct LlmRequest {
 
 #[derive(Debug)]
 pub struct OutCall {
-    pub invoke_id: u64,
+    /// The `Call::Invoke` event this settles.
+    pub call: EventId,
     pub name: String,
     /// Positional arguments as a JSON array.
     pub args: serde_json::Value,
 }
 
+/// One agent to create. `name`, `charter` and `tools` live on the
+/// `Call::Spawn` named by `call`, so the host reads them from the log.
 #[derive(Debug)]
-pub struct SpawnAgent {
-    pub invoke_id: u64,
-    pub prompt: String,
-    pub input: serde_json::Value,
+pub struct SpawnRequest {
+    pub call: EventId,
     /// The child's answer budget (`agent({ budget })`); `None` → default.
+    /// The one field not in the log: it is the *caller's* choice about
+    /// its own context, not part of what the agent is.
     pub budget: Option<usize>,
 }
 
@@ -253,15 +281,33 @@ enum Phase {
     Suspended(Run, ResumeWith),
 }
 
+/// One call in flight, keyed by the `Call` event logged at dispatch.
+/// The name, args and address live there, not here: the log is the
+/// record, and the session state only has to route the settlement.
 struct PendingCall {
-    /// The `Call` event logged at dispatch — what this call's `Result`
-    /// will name. The name and args live there, not here: the log is the
-    /// record, and the session state only has to route the settlement.
-    call: EventId,
-    promise: PromisePtr,
+    settle: Settle,
     /// Which run issued it: results from an abandoned run are still
     /// logged as artifacts (the physics happened) but not delivered.
     generation: u64,
+}
+
+/// What a landing `Result` does to the program.
+enum Settle {
+    /// Resolve (or reject) this promise with the outcome.
+    Promise(PromisePtr),
+    /// `tools.agent`'s sugar, the one call that is two: the `Spawn`'s
+    /// `{ agent }` is not the program's answer, so the first question is
+    /// issued to the new agent and **its** answer settles the promise.
+    /// Both halves are ordinary logged calls with ordinary `Result`s —
+    /// the desugaring lives here and nowhere downstream.
+    ThenAsk {
+        promise: PromisePtr,
+        text: String,
+        input: serde_json::Value,
+        /// The `tools.agent(...)` call site: the `Send` shares it,
+        /// because it *is* the same place in the source.
+        site: u32,
+    },
 }
 
 pub struct Runner {
@@ -271,9 +317,8 @@ pub struct Runner {
     /// leaf moves, the agent does not.
     agent: EventId,
     phase: Phase,
-    invoke_counter: u64,
     generation: u64,
-    pending: HashMap<u64, PendingCall>,
+    pending: HashMap<EventId, PendingCall>,
     /// The dialect card (8_HARNESS Step 6), prepended to every system
     /// message ahead of the agent prompt (host-fed, registry-generated).
     dialect_card: String,
@@ -314,40 +359,37 @@ impl Runner {
     pub fn new_root(tree: &mut Tree, charter: impl Into<String>, card: &str) -> io::Result<Self> {
         let charter = charter.into();
         let system = assemble_system(card, &charter);
-        let spine = tree.start_agent(None, None, charter, system)?;
+        let spine = tree.start_agent(None, None, charter, None, system)?;
         let mut state = Self::with_spine(tree, spine);
         state.dialect_card = card.to_owned();
         Ok(state)
     }
 
-    /// Child agent branching at `call_site` on the caller's spine (the
-    /// host maps each `SpawnAgent` to one of these). The first question is
-    /// a `Post` — the child's charter is what it is *for*, and the
-    /// question is what it was *asked*, which for `tools.agent`'s one-shot
-    /// sugar happen to be the same string.
-    pub fn new_child(
+    /// A new agent rooted at `call_site` — the `Spawn` on the caller's
+    /// branch (the host maps each `SpawnRequest` to one of these). The
+    /// `Agent` is the agent's own root and outlives the caller, its
+    /// program, and often the conversation that created it; `tools` sits
+    /// here, on that root, because the registry enforces a child's
+    /// allowlist from the agent itself and not from an event on its
+    /// parent's branch.
+    ///
+    /// It carries **no question**. A spawn creates; asking is a separate
+    /// act, and the first question arrives like every other — as a
+    /// `Post` naming the `Send` that dispatched it. So a bare
+    /// `tools.spawn` leaves an idle agent with nothing open, which is
+    /// exactly what the driving rule wants: nothing to say, no request.
+    pub fn new_agent(
         tree: &mut Tree,
         call_site: EventId,
-        caller: EventId,
+        name: Option<String>,
         charter: impl Into<String>,
-        input: serde_json::Value,
+        tools: Option<Vec<String>>,
         budget: Option<usize>,
         card: &str,
     ) -> io::Result<Self> {
         let charter = charter.into();
         let system = assemble_system(card, &charter);
-        let mut spine = tree.start_agent(Some(call_site), None, charter.clone(), system)?;
-        tree.append(
-            &mut spine,
-            EventPayload::Message(Message::Post {
-                from: Author::Agent(caller),
-                origin: Origin::Direct {
-                    text: charter,
-                    input,
-                    expects_reply: true,
-                },
-            }),
-        )?;
+        let spine = tree.start_agent(Some(call_site), name, charter, tools, system)?;
         let mut state = Self::with_spine(tree, spine);
         state.dialect_card = card.to_owned();
         state.answer_budget = budget.unwrap_or(DEFAULT_ANSWER_BUDGET);
@@ -361,7 +403,6 @@ impl Runner {
             spine,
             agent,
             phase: Phase::Idle,
-            invoke_counter: 0,
             generation: 0,
             pending: HashMap::new(),
             dialect_card: String::new(),
@@ -444,46 +485,49 @@ impl Runner {
 
     pub fn step(&mut self, tree: &mut Tree, input: StepInput) -> io::Result<Vec<StepOutput>> {
         match input {
-            StepInput::UserTurn(text) => self.on_user_turn(tree, text),
             StepInput::LlmResponse(message) => self.on_llm_response(tree, message),
             StepInput::ToolResults(batch) => self.on_tool_results(tree, batch),
-            StepInput::SubagentResult { invoke_id, result } => self.on_tool_results(
-                tree,
-                vec![ToolResult {
-                    invoke_id,
-                    result: Ok(result),
-                }],
-            ),
             StepInput::Tick { fuel } => self.on_tick(tree, fuel),
         }
     }
 
-    // ── input handlers ──────────────────────────────────────────────
-
-    fn on_user_turn(&mut self, tree: &mut Tree, text: String) -> io::Result<Vec<StepOutput>> {
-        match self.phase {
-            Phase::Idle => {}
-            Phase::Running(_) | Phase::Suspended(..) => {
-                // Known hole (8_HARNESS): a mid-program UserTurn becomes a
-                // host-injected condition. Lands with M2's restart work.
-                panic!("mid-program user turns are not implemented yet (M2)");
-            }
-            Phase::AwaitingLlm => panic!("user turn while an LLM request is in flight"),
-        }
-        tree.append(
+    /// Deliver a message into this branch — **rule A**: a post is logged
+    /// on the branch it is delivered into, whoever authored it. The user,
+    /// another agent's `Send`, and a harness notice all come through this
+    /// one door; who is speaking is `from`, and where the body lives is
+    /// `origin`.
+    ///
+    /// Returns the `Post`'s id — a `tell`'s delivery receipt names it —
+    /// beside what the branch does next: an idle branch starts a turn, a
+    /// busy one has the post on its path for its next request (rule B's
+    /// suspend-at-the-next-slice is B3).
+    ///
+    /// It is a door of its own rather than a `StepInput` because it
+    /// **returns a fact about the log** the caller needs, the way
+    /// `kickoff` does.
+    pub fn deliver(
+        &mut self,
+        tree: &mut Tree,
+        from: Author,
+        origin: Origin,
+    ) -> io::Result<(EventId, Vec<StepOutput>)> {
+        let post = tree.append(
             &mut self.spine,
-            EventPayload::Message(Message::Post {
-                from: Author::User,
-                origin: Origin::Direct {
-                    text,
-                    input: serde_json::Value::Null,
-                    expects_reply: true,
-                },
-            }),
+            EventPayload::Message(Message::Post { from, origin }),
         )?;
-        self.phase = Phase::AwaitingLlm;
-        Ok(vec![self.render_request(tree)])
+        let out = match self.phase {
+            Phase::Idle => {
+                self.phase = Phase::AwaitingLlm;
+                vec![self.render_request(tree)]
+            }
+            // Logged on arrival, so it is visible and crash-safe already;
+            // it reaches the LLM at the branch's next request.
+            Phase::AwaitingLlm | Phase::Running(_) | Phase::Suspended(..) => Vec::new(),
+        };
+        Ok((post, out))
     }
+
+    // ── input handlers ──────────────────────────────────────────────
 
     fn on_llm_response(&mut self, tree: &mut Tree, turn: LlmTurn) -> io::Result<Vec<StepOutput>> {
         assert!(
@@ -644,8 +688,9 @@ impl Runner {
         batch: Vec<ToolResult>,
     ) -> io::Result<Vec<StepOutput>> {
         let mut delivered = false;
+        let mut sends = Vec::new();
         for tr in batch {
-            let Some(p) = self.pending.remove(&tr.invoke_id) else {
+            let Some(p) = self.pending.remove(&tr.call) else {
                 continue; // unknown or duplicate — nothing to log
             };
             // Resolution order is arrival order: the `Result` lands now,
@@ -657,7 +702,7 @@ impl Runner {
             tree.append(
                 &mut self.spine,
                 EventPayload::Result {
-                    call: p.call,
+                    call: tr.call,
                     outcome,
                 },
             )?;
@@ -666,30 +711,85 @@ impl Runner {
             if p.generation != self.generation {
                 continue;
             }
-            let vm = match &mut self.phase {
-                Phase::Running(run) | Phase::Suspended(run, _) => &mut run.vm,
-                _ => continue,
+            if !matches!(self.phase, Phase::Running(_) | Phase::Suspended(..)) {
+                continue;
+            }
+            // `tools.agent` is the one call that is two: the spawn just
+            // settled, so now ask the new agent its first question and
+            // let *that* `Result` settle the program's promise.
+            if let Settle::ThenAsk {
+                promise,
+                text,
+                input,
+                site,
+            } = p.settle
+            {
+                match &tr.result {
+                    Ok(value) => {
+                        let agent = value
+                            .get("agent")
+                            .and_then(|v| v.as_u64())
+                            .map(EventId::new)
+                            .expect("a Spawn settles with { agent }");
+                        let send = self.issue_call(
+                            tree,
+                            Call::Send {
+                                to: Address::Branch(agent),
+                                text,
+                                input,
+                                expects_reply: true,
+                                site,
+                            },
+                            Settle::Promise(promise),
+                        )?;
+                        sends.push(send);
+                    }
+                    Err(msg) => {
+                        let val = Value::String(RcStr::from(msg.as_str()));
+                        self.settling_vm()
+                            .reject_promise(promise, val)
+                            .expect("pending promise is settleable");
+                        delivered = true;
+                    }
+                }
+                continue;
+            }
+            let Settle::Promise(promise) = p.settle else {
+                unreachable!("ThenAsk handled above");
             };
+            let vm = self.settling_vm();
             match tr.result {
                 Ok(v) => {
                     let val = json_arg(vm, &v);
-                    vm.resolve_promise(p.promise, val)
+                    vm.resolve_promise(promise, val)
                         .expect("pending promise is settleable");
                 }
                 Err(msg) => {
                     let val = Value::String(RcStr::from(msg.as_str()));
-                    vm.reject_promise(p.promise, val)
+                    vm.reject_promise(promise, val)
                         .expect("pending promise is settleable");
                 }
             }
             delivered = true;
         }
+        let mut out = Vec::new();
+        if !sends.is_empty() {
+            out.push(StepOutput::Sends(sends));
+        }
         // A suspended run stays suspended (results land for later); a
         // running one can make progress now.
         if delivered && matches!(self.phase, Phase::Running(_)) {
-            Ok(vec![StepOutput::Working])
-        } else {
-            Ok(Vec::new())
+            out.push(StepOutput::Working);
+        }
+        Ok(out)
+    }
+
+    /// The VM a landing `Result` settles into — live while running or
+    /// suspended (a suspended run's results land for later).
+    fn settling_vm(&mut self) -> &mut VM {
+        match &mut self.phase {
+            Phase::Running(run) | Phase::Suspended(run, _) => &mut run.vm,
+            _ => unreachable!("no VM to settle into"),
         }
     }
 
@@ -766,7 +866,8 @@ impl Runner {
     ///
     /// Artifact fetches are answered from the log immediately and log
     /// nothing (returns true if any were — the program can run again);
-    /// `tools.agent` becomes `SpawnAgents`; everything else becomes
+    /// `spawn`/`ask`/`tell` become `Spawn`/`Send` calls, `agent` desugars
+    /// to a spawn that then asks, and everything else becomes
     /// `ToolCalls`. Every call that leaves here is logged as a `Call`
     /// event *at dispatch*, settled later by exactly one `Result`.
     fn dispatch_calls(
@@ -777,11 +878,12 @@ impl Runner {
     ) -> io::Result<bool> {
         let mut tool_calls = Vec::new();
         let mut spawns = Vec::new();
+        let mut sends = Vec::new();
         let mut progressed = false;
 
         for call in calls {
             match call.name.as_str() {
-                "tool_result" => {
+                TOOL_TOOL_RESULT => {
                     let fetched = self.fetch_artifact(&*tree, &call);
                     let vm = self.running_vm();
                     match fetched {
@@ -796,48 +898,100 @@ impl Runner {
                     }
                     progressed = true;
                 }
-                "agent" => {
-                    let arg = {
-                        let vm = self.running_vm();
-                        call.args
-                            .first()
-                            .map(|v| value_json(vm, v))
-                            .unwrap_or(serde_json::Value::Null)
-                    };
-                    let prompt = arg
-                        .get("prompt")
-                        .and_then(|p| p.as_str())
-                        .map(str::to_owned);
-                    match prompt {
-                        Some(prompt) => {
-                            let input =
-                                arg.get("input").cloned().unwrap_or(serde_json::Value::Null);
-                            let budget = arg
-                                .get("budget")
-                                .and_then(|b| b.as_u64())
-                                .map(|b| b as usize);
-                            let id = self.issue_call(
+                TOOL_SPAWN => {
+                    let arg = self.first_arg(&call);
+                    match arg.get("charter").and_then(|c| c.as_str()) {
+                        Some(charter) => {
+                            let spawn = self.issue_call(
                                 tree,
-                                Call::Invoke {
-                                    name: "agent".into(),
-                                    args: serde_json::json!([arg]),
+                                Call::Spawn {
+                                    name: string_field(&arg, "name"),
+                                    charter: charter.to_owned(),
+                                    tools: allowlist_field(&arg),
                                     site: call.site,
                                 },
-                                call.promise,
+                                Settle::Promise(call.promise),
                             )?;
-                            spawns.push(SpawnAgent {
-                                invoke_id: id,
-                                prompt,
-                                input,
-                                budget,
+                            spawns.push(SpawnRequest {
+                                call: spawn,
+                                budget: None,
                             });
                         }
                         None => {
-                            let v =
-                                Value::String(RcStr::from("tools.agent needs { prompt, input }"));
-                            self.running_vm()
-                                .reject_promise(call.promise, v)
-                                .expect("fresh promise");
+                            self.reject_call(
+                                call.promise,
+                                "tools.spawn needs { charter } — what the agent is for \
+                                 (optionally { name, tools })",
+                            );
+                            progressed = true;
+                        }
+                    }
+                }
+                TOOL_ASK | TOOL_TELL => {
+                    let expects_reply = call.name == TOOL_ASK;
+                    let arg = self.first_arg(&call);
+                    let text = arg.get("text").and_then(|t| t.as_str()).map(str::to_owned);
+                    match (text, self.resolve_address(tree, arg.get("to"))) {
+                        (Some(text), Ok(to)) => {
+                            let send = self.issue_call(
+                                tree,
+                                Call::Send {
+                                    to,
+                                    text,
+                                    input: arg.get("input").cloned().unwrap_or_default(),
+                                    expects_reply,
+                                    site: call.site,
+                                },
+                                Settle::Promise(call.promise),
+                            )?;
+                            sends.push(send);
+                        }
+                        (None, _) => {
+                            self.reject_call(
+                                call.promise,
+                                &format!("tools.{} needs {{ text }}", call.name),
+                            );
+                            progressed = true;
+                        }
+                        (_, Err(msg)) => {
+                            self.reject_call(call.promise, &msg);
+                            progressed = true;
+                        }
+                    }
+                }
+                // Sugar, kept verbatim: spawn + ask. Two logged calls,
+                // one program promise — the `Spawn`'s `{ agent }` is not
+                // the answer, so the `Send` issued when it lands is what
+                // settles the program (`Settle::ThenAsk`).
+                TOOL_AGENT => {
+                    let arg = self.first_arg(&call);
+                    match arg.get("prompt").and_then(|p| p.as_str()) {
+                        Some(prompt) => {
+                            let spawn = self.issue_call(
+                                tree,
+                                Call::Spawn {
+                                    name: None,
+                                    charter: prompt.to_owned(),
+                                    tools: None,
+                                    site: call.site,
+                                },
+                                Settle::ThenAsk {
+                                    promise: call.promise,
+                                    text: prompt.to_owned(),
+                                    input: arg.get("input").cloned().unwrap_or_default(),
+                                    site: call.site,
+                                },
+                            )?;
+                            spawns.push(SpawnRequest {
+                                call: spawn,
+                                budget: arg
+                                    .get("budget")
+                                    .and_then(|b| b.as_u64())
+                                    .map(|b| b as usize),
+                            });
+                        }
+                        None => {
+                            self.reject_call(call.promise, "tools.agent needs { prompt, input }");
                             progressed = true;
                         }
                     }
@@ -856,10 +1010,10 @@ impl Runner {
                             args: args.clone(),
                             site: call.site,
                         },
-                        call.promise,
+                        Settle::Promise(call.promise),
                     )?;
                     tool_calls.push(OutCall {
-                        invoke_id: id,
+                        call: id,
                         name: call.name,
                         args,
                     });
@@ -870,9 +1024,103 @@ impl Runner {
             out.push(StepOutput::ToolCalls(tool_calls));
         }
         if !spawns.is_empty() {
-            out.push(StepOutput::SpawnAgents(spawns));
+            out.push(StepOutput::Spawns(spawns));
+        }
+        if !sends.is_empty() {
+            out.push(StepOutput::Sends(sends));
         }
         Ok(progressed)
+    }
+
+    /// The first argument of an options-object call (`spawn`/`ask`/
+    /// `tell`/`agent`), as JSON.
+    fn first_arg(&mut self, call: &InvokeCall) -> serde_json::Value {
+        let vm = self.running_vm();
+        call.args
+            .first()
+            .map(|v| value_json(vm, v))
+            .unwrap_or(serde_json::Value::Null)
+    }
+
+    /// Reject a malformed call in place. Nothing is logged: the call was
+    /// never dispatched, so it has no `Call` event and owes no `Result` —
+    /// the rejection is the program's to catch (6_LANGUAGE Part B), and
+    /// only an uncaught one traps into a condition.
+    fn reject_call(&mut self, promise: PromisePtr, message: &str) {
+        let v = Value::String(RcStr::from(message));
+        self.running_vm()
+            .reject_promise(promise, v)
+            .expect("fresh promise");
+    }
+
+    /// Resolve an `ask`/`tell` address **before** the `Send` is logged,
+    /// so nothing unresolved ever reaches the log.
+    ///
+    /// - omitted → the author of the oldest open post: *whoever asked
+    ///   you*. For a root conversation that is the human, for a subagent
+    ///   its parent, and a program never needs to know which.
+    /// - a branch id → that branch.
+    /// - an agent id with exactly one branch → that branch. An
+    ///   **ambiguous** agent id (it has been forked) is a rejected call
+    ///   naming the branches, because guessing which fork owes the answer
+    ///   is exactly the race the one-owner rule exists to prevent.
+    fn resolve_address(
+        &self,
+        tree: &Tree,
+        to: Option<&serde_json::Value>,
+    ) -> Result<Address, String> {
+        let Some(to) = to.filter(|v| !v.is_null()) else {
+            let Some(&question) = self.spine.context().open.first() else {
+                return Err(
+                    "tools.ask/tell with no `to` answers whoever asked you, but \
+                            nothing is open on this branch — pass { to } (an agent or \
+                            branch id from tools.agents())"
+                        .into(),
+                );
+            };
+            return match asker_of(tree, question) {
+                Some(Author::User) => Ok(Address::User),
+                Some(Author::Agent(agent)) => Ok(Address::Branch(agent)),
+                // A harness notice never expects a reply, so it cannot be
+                // the oldest *open* post.
+                _ => Err(format!(
+                    "post #{} has no author to reply to",
+                    question.as_u64()
+                )),
+            };
+        };
+        if to.as_str() == Some("user") {
+            return Ok(Address::User);
+        }
+        let Some(id) = to.as_u64().filter(|n| *n > 0).map(EventId::new) else {
+            return Err(format!(
+                "`to` must be an agent or branch id (a number), or \"user\"; got {to}"
+            ));
+        };
+        match tree.events.get(&id).map(|e| &e.payload) {
+            Some(EventPayload::Fork { .. }) => Ok(Address::Branch(id)),
+            Some(EventPayload::Agent { .. }) => {
+                let branches = tree.branches_of_agent(id);
+                match branches.len() {
+                    1 => Ok(Address::Branch(branches[0])),
+                    _ => Err(format!(
+                        "agent #{} has {} live branches ({}) — address one of them, \
+                         not the agent",
+                        id.as_u64(),
+                        branches.len(),
+                        branches
+                            .iter()
+                            .map(|b| format!("#{}", b.as_u64()))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )),
+                }
+            }
+            _ => Err(format!(
+                "#{} is not an agent or a branch — tools.agents() lists both ids",
+                id.as_u64()
+            )),
+        }
     }
 
     fn running_vm(&mut self) -> &mut VM {
@@ -883,19 +1131,18 @@ impl Runner {
     }
 
     /// Log a `Call` at dispatch and remember how to settle it. Returns the
-    /// session-local invoke id the host echoes back with the result.
-    fn issue_call(&mut self, tree: &mut Tree, call: Call, promise: PromisePtr) -> io::Result<u64> {
+    /// `Call` event's id — the log's own key, which the host echoes back
+    /// with the result and which the artifact menu names.
+    fn issue_call(&mut self, tree: &mut Tree, call: Call, settle: Settle) -> io::Result<EventId> {
         let logged = tree.append(&mut self.spine, EventPayload::Call(call))?;
-        self.invoke_counter += 1;
         self.pending.insert(
-            self.invoke_counter,
+            logged,
             PendingCall {
-                call: logged,
-                promise,
+                settle,
                 generation: self.generation,
             },
         );
-        Ok(self.invoke_counter)
+        Ok(logged)
     }
 
     /// Serve `tools.tool_result(id)` from the log. Accepts a `Result` id
@@ -956,10 +1203,10 @@ impl Runner {
                     args: args.clone(),
                     site: call.site,
                 },
-                call.promise,
+                Settle::Promise(call.promise),
             )?;
             fire_and_forget.push(OutCall {
-                invoke_id: id,
+                call: id,
                 name: call.name.clone(),
                 args,
             });
@@ -1327,6 +1574,24 @@ fn attachments_from_args(args: &serde_json::Value) -> Result<serde_json::Value, 
     }
 }
 
+/// An optional string field of an options object (`{ name }`).
+fn string_field(arg: &serde_json::Value, key: &str) -> Option<String> {
+    arg.get(key).and_then(|v| v.as_str()).map(str::to_owned)
+}
+
+/// A `{ tools: [...] }` allowlist, if the call named one. Absent means
+/// "inherit the caller's" — the registry resolves that from the child's
+/// own `Agent` root, not from this call.
+fn allowlist_field(arg: &serde_json::Value) -> Option<Vec<String>> {
+    let items = arg.get("tools")?.as_array()?;
+    Some(
+        items
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_owned))
+            .collect(),
+    )
+}
+
 fn json_arg(vm: &mut VM, json: &serde_json::Value) -> Value {
     vm.json_to_stack_value(json, 0).unwrap_or(Value::Null)
 }
@@ -1488,6 +1753,78 @@ mod tests {
         (tree, state)
     }
 
+    /// A post whose body is inline — the user's and the harness's shape,
+    /// the two authors with no send side.
+    fn direct(text: &str, expects_reply: bool) -> Origin {
+        Origin::Direct {
+            text: text.into(),
+            input: serde_json::Value::Null,
+            expects_reply,
+        }
+    }
+
+    /// The user speaks *inside* a branch: one `Post`, delivered.
+    fn user_post(state: &mut Runner, tree: &mut Tree, text: &str) -> Vec<StepOutput> {
+        state
+            .deliver(tree, Author::User, direct(text, true))
+            .unwrap()
+            .1
+    }
+
+    /// An agent's question, the full exchange shape: a `Send` on the
+    /// asker's branch, a `Post` naming it on the answerer's. Returns the
+    /// `Send` and what the answerer does next.
+    fn ask(
+        tree: &mut Tree,
+        asker: &mut Runner,
+        callee: &mut Runner,
+        text: &str,
+        input: serde_json::Value,
+    ) -> (EventId, Vec<StepOutput>) {
+        let to = Address::Branch(callee.agent_id());
+        let asker_id = asker.agent_id();
+        let send = tree
+            .append(
+                &mut asker.spine,
+                EventPayload::Call(Call::Send {
+                    to,
+                    text: text.into(),
+                    input,
+                    expects_reply: true,
+                    site: 0,
+                }),
+            )
+            .unwrap();
+        let (_, out) = callee
+            .deliver(tree, Author::Agent(asker_id), Origin::Sent(send))
+            .unwrap();
+        (send, out)
+    }
+
+    /// A spawned agent and its first question — the pair `tools.agent`
+    /// desugars to: `Spawn` → `Agent`, then `Send` → `Post`.
+    fn spawn_and_ask(
+        tree: &mut Tree,
+        asker: &mut Runner,
+        charter: &str,
+        input: serde_json::Value,
+    ) -> (Runner, Vec<StepOutput>) {
+        let spawn = tree
+            .append(
+                &mut asker.spine,
+                EventPayload::Call(Call::Spawn {
+                    name: None,
+                    charter: charter.into(),
+                    tools: None,
+                    site: 0,
+                }),
+            )
+            .unwrap();
+        let mut child = Runner::new_agent(tree, spawn, None, charter, None, None, "").unwrap();
+        let (_, out) = ask(tree, asker, &mut child, charter, input);
+        (child, out)
+    }
+
     fn llm_program(call_id: &str, source: &str) -> LlmTurn {
         LlmTurn {
             text: String::new(),
@@ -1616,19 +1953,15 @@ mod tests {
         let mut tree = Tree::new(None);
         let root = Runner::new_root(&mut tree, "root", "").unwrap();
         let big = "z".repeat(9_000);
-        let mut child = Runner::new_child(
+        let mut root = root;
+        let (mut child, out) = spawn_and_ask(
             &mut tree,
-            root.spine.leaf_id,
-            root.agent_id(),
+            &mut root,
             "summarize it",
             json!({ "body": big.clone(), "path": "PLAN.md" }),
-            None,
-            "",
-        )
-        .unwrap();
+        );
 
         // What the LLM sees: shape, keys, size — not the bytes.
-        let out = child.kickoff(&mut tree).unwrap();
         let req = expect_request(&out);
         let rendered = match &req.messages[0] {
             Rendered::User(text) => text.clone(),
@@ -1746,12 +2079,12 @@ mod tests {
             .step(&mut tree, StepInput::LlmResponse(llm_program("c1", src)))
             .unwrap();
         let settled = drain(&mut state, &mut tree, out);
-        let id = expect_tool_calls(&settled)[0].invoke_id;
+        let id = expect_tool_calls(&settled)[0].call;
         let out = state
             .step(
                 &mut tree,
                 StepInput::ToolResults(vec![ToolResult {
-                    invoke_id: id,
+                    call: id,
                     result: Ok(json!("DATA")),
                 }]),
             )
@@ -1810,12 +2143,12 @@ mod tests {
             .step(&mut tree, StepInput::LlmResponse(llm_program("c1", src)))
             .unwrap();
         let settled = drain(&mut state, &mut tree, out);
-        let id = expect_tool_calls(&settled)[0].invoke_id;
+        let id = expect_tool_calls(&settled)[0].call;
         let out = state
             .step(
                 &mut tree,
                 StepInput::ToolResults(vec![ToolResult {
-                    invoke_id: id,
+                    call: id,
                     result: Err("host is down".into()),
                 }]),
             )
@@ -1841,9 +2174,7 @@ mod tests {
     #[test]
     fn user_turn_renders_request() {
         let (mut tree, mut state) = setup();
-        let out = state
-            .step(&mut tree, StepInput::UserTurn("compute 6*7".into()))
-            .unwrap();
+        let out = user_post(&mut state, &mut tree, "compute 6*7");
         let req = expect_request(&out);
         assert!(req.system.contains("test agent"));
         assert!(matches!(&req.messages[0], Rendered::User(t) if t == "compute 6*7"));
@@ -1858,9 +2189,7 @@ mod tests {
         let mut tree = Tree::new(None);
         let mut state =
             Runner::new_root(&mut tree, "you are a test agent", "THE DIALECT CARD").unwrap();
-        let out = state
-            .step(&mut tree, StepInput::UserTurn("go".into()))
-            .unwrap();
+        let out = user_post(&mut state, &mut tree, "go");
         let req = expect_request(&out);
         assert!(
             req.system.starts_with("THE DIALECT CARD\n\n"),
@@ -1897,9 +2226,7 @@ mod tests {
         // the stored CARD A snapshot, not a CARD B re-derivation.
         let mut reopened = Runner::with_spine(&tree, tree.spine_at(root));
         reopened.set_dialect_card("CARD B — evolved".into());
-        let out = reopened
-            .step(&mut tree, StepInput::UserTurn("more".into()))
-            .unwrap();
+        let out = user_post(&mut reopened, &mut tree, "more");
         let req = expect_request(&out);
         assert_eq!(req.system, stored, "the snapshot replays verbatim");
         assert!(
@@ -1914,18 +2241,8 @@ mod tests {
     #[test]
     fn input_binding_reaches_the_program() {
         let mut tree = Tree::new(None);
-        let root = Runner::new_root(&mut tree, "root", "").unwrap();
-        let mut state = Runner::new_child(
-            &mut tree,
-            root.spine.leaf_id,
-            root.agent_id(),
-            "agent",
-            json!({ "n": 7 }),
-            None,
-            "",
-        )
-        .unwrap();
-        state.kickoff(&mut tree).unwrap();
+        let mut root = Runner::new_root(&mut tree, "root", "").unwrap();
+        let (mut state, _) = spawn_and_ask(&mut tree, &mut root, "agent", json!({ "n": 7 }));
         let out = state
             .step(
                 &mut tree,
@@ -1995,9 +2312,7 @@ mod tests {
     #[test]
     fn program_completion_then_root_yields() {
         let (mut tree, mut state) = setup();
-        state
-            .step(&mut tree, StepInput::UserTurn("go".into()))
-            .unwrap();
+        user_post(&mut state, &mut tree, "go");
         let out = state
             .step(
                 &mut tree,
@@ -2041,9 +2356,7 @@ mod tests {
         );
 
         // A follow-up turn appends onto the same spine and runs again.
-        state
-            .step(&mut tree, StepInput::UserTurn("more".into()))
-            .unwrap();
+        user_post(&mut state, &mut tree, "more");
         assert!(matches!(payload_kinds(&state, &tree).last(), Some(&"Post")));
     }
 
@@ -2066,12 +2379,12 @@ mod tests {
         assert_eq!(calls[1].args, json!(["y"]));
 
         // Resolve out of order: y first. Resolution order is what's logged.
-        let (xa, yb) = (calls[0].invoke_id, calls[1].invoke_id);
+        let (xa, yb) = (calls[0].call, calls[1].call);
         let out = state
             .step(
                 &mut tree,
                 StepInput::ToolResults(vec![ToolResult {
-                    invoke_id: yb,
+                    call: yb,
                     result: Ok(json!("Y")),
                 }]),
             )
@@ -2081,7 +2394,7 @@ mod tests {
             .step(
                 &mut tree,
                 StepInput::ToolResults(vec![ToolResult {
-                    invoke_id: xa,
+                    call: xa,
                     result: Ok(json!("X")),
                 }]),
             )
@@ -2148,12 +2461,12 @@ mod tests {
             .step(&mut tree, StepInput::LlmResponse(llm_program("c1", src)))
             .unwrap();
         let settled = drain(&mut state, &mut tree, out);
-        let id = expect_tool_calls(&settled)[0].invoke_id;
+        let id = expect_tool_calls(&settled)[0].call;
         let out = state
             .step(
                 &mut tree,
                 StepInput::ToolResults(vec![ToolResult {
-                    invoke_id: id,
+                    call: id,
                     result: Ok(json!(41)),
                 }]),
             )
@@ -2220,12 +2533,12 @@ mod tests {
             .step(&mut tree, StepInput::LlmResponse(llm_program("c1", src)))
             .unwrap();
         let settled = drain(&mut state, &mut tree, out);
-        let id = expect_tool_calls(&settled)[0].invoke_id;
+        let id = expect_tool_calls(&settled)[0].call;
         let out = state
             .step(
                 &mut tree,
                 StepInput::ToolResults(vec![ToolResult {
-                    invoke_id: id,
+                    call: id,
                     result: Ok(json!("DATA")),
                 }]),
             )
@@ -2263,8 +2576,13 @@ mod tests {
         assert!(last_report(&state, &tree).contains(r#"returned: "DATA""#));
     }
 
+    /// `tools.agent` is sugar for spawn **then** ask (B1): two logged
+    /// calls, one program promise. The `Spawn`'s `{ agent }` is not the
+    /// answer, so the `Send` issued when it lands is what settles the
+    /// program — and the caller's own report is rendered around its
+    /// `return`.
     #[test]
-    fn agent_call_spawns_child_agent() {
+    fn agent_call_desugars_to_spawn_then_ask() {
         let (mut tree, mut state) = setup();
         state.kickoff(&mut tree).unwrap();
         let src = r#"return await tools.agent({ prompt: "summarize", input: { n: 1 } });"#;
@@ -2272,29 +2590,60 @@ mod tests {
             .step(&mut tree, StepInput::LlmResponse(llm_program("c1", src)))
             .unwrap();
         let settled = drain(&mut state, &mut tree, out);
-        let spawn = settled
+        let spawn = *settled
             .iter()
             .find_map(|o| match o {
-                StepOutput::SpawnAgents(s) => Some(&s[0]),
+                StepOutput::Spawns(s) => Some(&s[0].call),
                 _ => None,
             })
-            .expect("a SpawnAgents output");
-        assert_eq!(spawn.prompt, "summarize");
-        assert_eq!(spawn.input, json!({ "n": 1 }));
+            .expect("a Spawns output");
+        let EventPayload::Call(Call::Spawn { charter, .. }) = &tree.events[&spawn].payload else {
+            panic!("#{} must be a Spawn", spawn.as_u64());
+        };
+        assert_eq!(charter, "summarize", "the prompt is the child's charter");
 
-        // Host side: run the child agent to completion on its own branch.
-        let mut child = Runner::new_child(
-            &mut tree,
-            state.spine.leaf_id,
-            state.agent_id(),
-            &spawn.prompt,
-            spawn.input.clone(),
-            spawn.budget,
-            "",
-        )
-        .unwrap();
-        assert_eq!(tree.list_leaves().len(), 2, "caller + in-flight child");
-        child.kickoff(&mut tree).unwrap();
+        // Host side: root the agent under the `Spawn` and settle it.
+        let mut child =
+            Runner::new_agent(&mut tree, spawn, None, "summarize", None, None, "").unwrap();
+        assert_eq!(tree.list_leaves().len(), 2, "caller + the new agent");
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::ToolResults(vec![ToolResult {
+                    call: spawn,
+                    result: Ok(json!({ "agent": child.agent_id().as_u64() })),
+                }]),
+            )
+            .unwrap();
+
+        // …which makes the machine issue the first question, not resolve
+        // the program: the `{ agent }` handle never reaches the source.
+        let send = match &out[..] {
+            [StepOutput::Sends(sends)] => sends[0],
+            other => panic!("expected Sends, got {other:?}"),
+        };
+        let EventPayload::Call(Call::Send {
+            to, text, input, ..
+        }) = &tree.events[&send].payload
+        else {
+            panic!("#{} must be a Send", send.as_u64());
+        };
+        assert_eq!(*to, Address::Branch(child.agent_id()));
+        assert_eq!(text, "summarize");
+        assert_eq!(*input, json!({ "n": 1 }));
+
+        // Deliver it, let the child answer, settle the `Send`.
+        let (_, out) = child
+            .deliver(
+                &mut tree,
+                Author::Agent(state.agent_id()),
+                Origin::Sent(send),
+            )
+            .unwrap();
+        let Rendered::User(rendered) = &expect_request(&out).messages[0] else {
+            panic!("the question renders as a user-role post");
+        };
+        assert!(rendered.starts_with("[agent 1] summarize"), "{rendered}");
         let out = child
             .step(&mut tree, StepInput::LlmResponse(llm_text("child says hi")))
             .unwrap();
@@ -2302,18 +2651,17 @@ mod tests {
             [StepOutput::Answered { value, .. }] => value.clone(),
             other => panic!("expected Answered, got {other:?}"),
         };
-
-        // Join: the child's result resolves the caller's agent call.
-        let invoke_id = spawn.invoke_id;
         let out = state
-            .step(&mut tree, StepInput::SubagentResult { invoke_id, result })
+            .step(
+                &mut tree,
+                StepInput::ToolResults(vec![ToolResult {
+                    call: send,
+                    result: Ok(result),
+                }]),
+            )
             .unwrap();
         drain(&mut state, &mut tree, out);
         assert!(last_report(&state, &tree).contains(r#"returned: "child says hi""#));
-        assert!(
-            payload_kinds(&state, &tree).contains(&"Call"),
-            "agent call logged as an artifact"
-        );
     }
 
     #[test]
@@ -2480,12 +2828,12 @@ mod tests {
             .step(&mut tree, StepInput::LlmResponse(llm_program("c1", src)))
             .unwrap();
         let settled = drain(&mut state, &mut tree, out);
-        let id = expect_tool_calls(&settled)[0].invoke_id;
+        let id = expect_tool_calls(&settled)[0].call;
         let out = state
             .step(
                 &mut tree,
                 StepInput::ToolResults(vec![ToolResult {
-                    invoke_id: id,
+                    call: id,
                     result: Ok(json!("X")),
                 }]),
             )
@@ -2585,12 +2933,12 @@ mod tests {
             .step(&mut tree, StepInput::LlmResponse(llm_program("c1", src)))
             .unwrap();
         let settled = drain(&mut state, &mut tree, out);
-        let id = expect_tool_calls(&settled)[0].invoke_id;
+        let id = expect_tool_calls(&settled)[0].call;
         let out = state
             .step(
                 &mut tree,
                 StepInput::ToolResults(vec![ToolResult {
-                    invoke_id: id,
+                    call: id,
                     result: Ok(json!(41)),
                 }]),
             )
@@ -2658,12 +3006,12 @@ console: (no output)
             .step(&mut tree, StepInput::LlmResponse(llm_program("c1", src)))
             .unwrap();
         let settled = drain(&mut state, &mut tree, out);
-        let id = expect_tool_calls(&settled)[0].invoke_id;
+        let id = expect_tool_calls(&settled)[0].call;
         let out = state
             .step(
                 &mut tree,
                 StepInput::ToolResults(vec![ToolResult {
-                    invoke_id: id,
+                    call: id,
                     result: Ok(json!("X")),
                 }]),
             )
@@ -2683,9 +3031,12 @@ got X
         );
     }
 
+    /// A post to a **running** branch is logged on arrival and is never
+    /// rejected: nothing you say is lost. B1 delivers it through the one
+    /// door every author uses, so the M2-era panic is gone; suspending
+    /// the program into `Condition::Posted` at its next slice is B3.
     #[test]
-    #[should_panic(expected = "mid-program user turns")]
-    fn mid_program_user_turn_panics_for_now() {
+    fn mid_program_post_is_logged_not_rejected() {
         let (mut tree, mut state) = setup();
         state.kickoff(&mut tree).unwrap();
         state
@@ -2694,7 +3045,18 @@ got X
                 StepInput::LlmResponse(llm_program("c1", "await tools.fetch(1); return 0;")),
             )
             .unwrap();
-        let _ = state.step(&mut tree, StepInput::UserTurn("are you done?".into()));
+        let out = user_post(&mut state, &mut tree, "are you done?");
+        assert!(out.is_empty(), "no request while the VM holds the branch");
+        assert_eq!(
+            payload_kinds(&state, &tree).last(),
+            Some(&"Post"),
+            "logged on arrival, at the position it landed"
+        );
+        assert_eq!(
+            state.open().len(),
+            1,
+            "and it is open — someone owes a reply"
+        );
     }
 
     fn program_result_value(state: &Runner, tree: &Tree) -> serde_json::Value {
@@ -2759,19 +3121,9 @@ got X
 
     #[test]
     fn over_budget_subagent_answer_reprompts_then_truncates() {
-        let (mut tree, root) = setup();
-        let call_site = root.spine.leaf_id;
-        let mut child = Runner::new_child(
-            &mut tree,
-            call_site,
-            root.agent_id(),
-            "summarize",
-            json!({}),
-            Some(50),
-            "",
-        )
-        .unwrap();
-        child.kickoff(&mut tree).unwrap();
+        let (mut tree, mut root) = setup();
+        let (mut child, _) = spawn_and_ask(&mut tree, &mut root, "summarize", json!({}));
+        child.answer_budget = 50;
         let long = "y".repeat(500);
         // First over-budget final answer → one re-prompt, not completion.
         let out = child

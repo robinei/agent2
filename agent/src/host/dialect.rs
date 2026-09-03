@@ -136,16 +136,61 @@ into one array (`create_file([path, content])` is wrong). A tool's \
 single array parameter. Every call returns a promise; `await` it. Calls \
 started before awaiting run in parallel (`Promise.all` works).
 - tools.tool_result(id) — re-fetch artifact [#id] from the log \
-(instant, free).
-- tools.agent({ prompt, input, budget? }) — delegate a subtask to a \
-fresh subagent; resolves to its JSON result. It sees only what you pass \
-it. `budget` (bytes) caps the answer it delivers into your context \
-(default ~64 KB); raise it when you want a large result back.
+(instant, free). On a call still shown as *pending* it re-attaches and \
+resolves when the answer lands — await it, never re-ask.
+- tools.agent({ prompt, input, budget? }) — the one-shot form: spawn a \
+fresh subagent and ask it one question; resolves to its JSON result. It \
+sees only what you pass it. `budget` (bytes) caps the answer it delivers \
+into your context (default ~64 KB); raise it when you want a large \
+result back.
+- tools.spawn({ name?, charter, tools? }) — create an agent under you \
+without asking it anything yet; resolves to { agent }. `tools` narrows \
+its allowlist (default: yours).
+- tools.ask({ to?, text, input? }) — one question, one answer; resolves \
+to the answer. `to` is an agent or branch id; omitted, it reaches \
+whoever asked *you*.
+- tools.tell({ to?, text, input? }) — inform without asking; resolves \
+with a delivery receipt as soon as the message lands. The recipient owes \
+you no answer.
+- tools.agents({ under?, deep? }) — list your subagents (or the whole \
+subtree), one row per branch: agent, branch, name, charter, parent, \
+status, open questions, last answer.
+
+**Orchestrating.** Split work by spawning workers: `const w = await \
+tools.spawn({ name, charter })` gives you an agent you can ask \
+repeatedly — `await tools.ask({ to: w.agent, text, input })` — and it \
+keeps its context between questions. Fan out with `Promise.all`. \
+Workers outlive your programs: in a later program, `await \
+tools.agents()` lists them (`{ deep: true }` for the whole subtree) with \
+status and open questions, so you can pick up where you left off. To \
+inform a worker without needing an answer, `tools.tell` it. A worker \
+that is stuck asks *you*: `await tools.ask({ text })` with no `to` \
+reaches whoever asked it; you will see it as a condition — answer with \
+`answer(...)`, then `resume()`. The person driving the session may speak \
+to you, or to any worker directly, at any time. A question to the human \
+may sit unanswered for a long time, so prefer proceeding on a stated \
+assumption (`tools.tell` it) over waiting on one. Nothing re-prompts you \
+when you stop talking — if there is more to do, keep doing it in the \
+program.
 - Before repeating a call shown in the menu, read the call — if it \
 wrote, sent, or deleted, it already happened; reuse its result with \
 `tool_result(id)` instead of re-running. Pure reads are free to repeat.";
 
 const CARD_TAIL: &str = "\
+## eligibility
+Three restarts are always offered; which one is *valid* depends on where \
+you are, and the report you are reading says which. The rules never \
+change:
+- run_program(source) — always valid.
+- resume(value) — valid only when your last message is a condition \
+report for a program that is still suspended.
+- answer(question, value) — valid only for a post that is open on **this** \
+branch. A post someone else was asked is not yours to answer.
+An ineligible call is not silently dropped: it is answered with a \
+refusal that states what is true and what is valid now, so it costs you \
+one turn and nothing else. Read the report's restart list rather than \
+guessing.
+
 ## conditions and restarts
 - raise(name, payload) suspends the program and sends the payload to \
 you as a condition report; it is not catchable in the program — \
@@ -361,6 +406,22 @@ mod tests {
             "returned *then*",
             "Before repeating a call",
             "if it wrote, sent, or deleted, it already happened",
+            // B1: orchestration and eligibility.
+            "## eligibility",
+            "run_program(source) — always valid",
+            "still suspended",
+            "open on **this** branch",
+            "answered with a refusal that states what is true",
+            "tools.spawn({ name?, charter, tools? })",
+            "tools.ask({ to?, text, input? })",
+            "tools.tell({ to?, text, input? })",
+            "tools.agents({ under?, deep? })",
+            "**Orchestrating.**",
+            "keeps its context between questions",
+            "Workers outlive your programs",
+            "reaches whoever asked it",
+            "Nothing re-prompts you",
+            "re-attaches and",
         ] {
             assert!(card.contains(needle), "card missing: {needle}");
         }

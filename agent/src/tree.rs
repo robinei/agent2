@@ -143,11 +143,16 @@ impl Tree {
     /// `parent_id` is the call-site event on the caller's spine (`None`
     /// only for the tree's root agent). The caller's own spine handle is
     /// untouched — its leaf does not advance past the call site.
+    /// `tools` is the agent's own allowlist, enforced by the registry
+    /// **from this root** rather than from an event on its parent's
+    /// branch — which is what makes the root agent, with no `Spawn`
+    /// above it, not a special case. `None` means "everything".
     pub fn start_agent(
         &mut self,
         parent_id: Option<EventId>,
         name: Option<String>,
         charter: impl Into<String>,
+        tools: Option<Vec<String>>,
         system: impl Into<String>,
     ) -> io::Result<Spine> {
         match parent_id {
@@ -161,7 +166,7 @@ impl Tree {
         let payload = EventPayload::Agent {
             name,
             charter: charter.into(),
-            tools: None,
+            tools,
             system: system.into(),
         };
         let id = self.log_event(parent_id, payload)?;
@@ -413,6 +418,83 @@ impl Tree {
         path
     }
 
+    /// The branch `leaf` is on: the nearest **branch root** at or above
+    /// it — an `Agent` for an agent's first branch, a `Fork` for a
+    /// divergent one. A branch is identified by its root event, so this
+    /// is the addressing function for everything keyed by branch.
+    pub fn branch_of(&self, leaf: EventId) -> Option<EventId> {
+        let mut current = Some(leaf);
+        while let Some(cur) = current {
+            let ev = self.events.get(&cur)?;
+            if is_branch_root(&ev.payload) {
+                return Some(cur);
+            }
+            current = ev.parent_id;
+        }
+        None
+    }
+
+    /// The branches of one agent: its `Agent` root, plus every `Fork`
+    /// under it that has not crossed into another agent. An agent has one
+    /// branch until someone forks it; then it has two, both live, both
+    /// its own — which is why an agent id is only an address while this
+    /// returns exactly one.
+    pub fn branches_of_agent(&self, agent: EventId) -> Vec<EventId> {
+        let mut out = vec![agent];
+        for event in self.events.values() {
+            if matches!(event.payload, EventPayload::Fork { .. })
+                && self.enclosing_agent(event.id) == Some(agent)
+            {
+                out.push(event.id);
+            }
+        }
+        out.sort_by_key(|id| id.as_u64());
+        out
+    }
+
+    /// Every branch in the log, as `(root, leaf)` pairs sorted by root:
+    /// the projection `agents()` and the navigator are rows of. The leaf
+    /// is found by descending spine children that are not themselves
+    /// branch roots — a `Fork` or a spawned `Agent` starts its own row
+    /// rather than continuing this one.
+    pub fn branches(&self) -> Vec<(EventId, EventId)> {
+        let mut children: HashMap<EventId, Vec<EventId>> = HashMap::new();
+        for event in self.events.values() {
+            if is_branch_root(&event.payload) {
+                continue;
+            }
+            if let Some(parent) = event.parent_id {
+                children.entry(parent).or_default().push(event.id);
+            }
+        }
+        let mut roots: Vec<EventId> = self
+            .events
+            .values()
+            .filter(|e| is_branch_root(&e.payload))
+            .map(|e| e.id)
+            .collect();
+        roots.sort_by_key(|id| id.as_u64());
+        roots
+            .into_iter()
+            .map(|root| {
+                let mut leaf = root;
+                let mut seen: HashSet<EventId> = HashSet::new();
+                // Lowest id wins if a branch ever grew two non-root
+                // children: the earlier continuation is the branch's own.
+                while seen.insert(leaf) {
+                    match children
+                        .get(&leaf)
+                        .and_then(|c| c.iter().min_by_key(|id| id.as_u64()))
+                    {
+                        Some(next) => leaf = *next,
+                        None => break,
+                    }
+                }
+                (root, leaf)
+            })
+            .collect()
+    }
+
     /// The innermost `Agent` at or above `event` — which agent an
     /// event belongs to.
     pub fn enclosing_agent(&self, event: EventId) -> Option<EventId> {
@@ -610,6 +692,16 @@ impl Tree {
     }
 }
 
+/// Whether a payload **roots a branch**: an `Agent` (a clean-room
+/// context) or a `Fork` (the same context diverged). The two are the
+/// structural roots, and a branch is named by whichever one it starts at.
+fn is_branch_root(payload: &EventPayload) -> bool {
+    matches!(
+        payload,
+        EventPayload::Agent { .. } | EventPayload::Fork { .. }
+    )
+}
+
 /// Resolve a logged `Message` into its context form: a `Post` whose body
 /// lives in a `Send` gets that body inline. The **log** stays copy-free;
 /// the reconstructed `Context` is where bodies are materialised, because
@@ -730,7 +822,7 @@ mod tests {
         let (agent, leaf);
         {
             let mut tree = open()?;
-            let mut spine = tree.start_agent(None, None, "root", "")?;
+            let mut spine = tree.start_agent(None, None, "root", None, "")?;
             agent = spine.leaf_id; // the Agent id is the agent id
             tree.append(
                 &mut spine,
@@ -795,7 +887,7 @@ mod tests {
     fn program_status_survives_reopen() -> io::Result<()> {
         use crate::host::ProgramStatus;
         let mut tree = Tree::new(None);
-        let mut spine = tree.start_agent(None, None, "root", "")?;
+        let mut spine = tree.start_agent(None, None, "root", None, "")?;
         let agent = spine.leaf_id;
         tree.append(&mut spine, run_program_call("c1", "raise('x');"))?;
         tree.append(&mut spine, raised("x"))?; // first handback: suspended
@@ -826,7 +918,7 @@ mod tests {
         assert_eq!(progs[0].status(), ProgramStatus::Completed);
 
         // A compile failure never ran, so it is Failed, not Suspended.
-        let mut other = tree.start_agent(Some(agent), None, "child", "")?;
+        let mut other = tree.start_agent(Some(agent), None, "child", None, "")?;
         tree.append(&mut other, run_program_call("c3", "let = ;"))?;
         tree.append(
             &mut other,
@@ -851,7 +943,7 @@ mod tests {
     #[test]
     fn test_bootstrap_root_agent() -> io::Result<()> {
         let mut tree = Tree::new(None);
-        let spine = tree.start_agent(None, None, "hello", "")?;
+        let spine = tree.start_agent(None, None, "hello", None, "")?;
         assert_eq!(spine.leaf_id.as_u64(), 1);
         assert!(tree.events[&spine.leaf_id].is_root());
         assert_eq!(spine.contexts.len(), 1);
@@ -863,14 +955,14 @@ mod tests {
     #[should_panic(expected = "root Agent on a non-empty tree")]
     fn test_second_root_agent_panics() {
         let mut tree = Tree::new(None);
-        tree.start_agent(None, None, "root", "").unwrap();
-        let _ = tree.start_agent(None, None, "another root", "");
+        tree.start_agent(None, None, "root", None, "").unwrap();
+        let _ = tree.start_agent(None, None, "another root", None, "");
     }
 
     #[test]
     fn test_linear_conversation() -> io::Result<()> {
         let mut tree = Tree::new(None);
-        let mut spine = tree.start_agent(None, None, "root", "")?;
+        let mut spine = tree.start_agent(None, None, "root", None, "")?;
         tree.append(&mut spine, user_msg("hello"))?;
         tree.append(&mut spine, assistant_msg("hi there"))?;
 
@@ -885,7 +977,7 @@ mod tests {
     #[should_panic(expected = "Agent must go through start_agent")]
     fn test_append_agent_root_panics() {
         let mut tree = Tree::new(None);
-        let mut spine = tree.start_agent(None, None, "root", "").unwrap();
+        let mut spine = tree.start_agent(None, None, "root", None, "").unwrap();
         let _ = tree.append(
             &mut spine,
             EventPayload::Agent {
@@ -904,7 +996,7 @@ mod tests {
     #[test]
     fn an_answer_closes_a_post_not_the_branch() -> io::Result<()> {
         let mut tree = Tree::new(None);
-        let mut spine = tree.start_agent(None, None, "root", "")?;
+        let mut spine = tree.start_agent(None, None, "root", None, "")?;
         let question = tree.append(&mut spine, user_msg("q"))?;
         assert_eq!(spine.context().open, [question]);
 
@@ -931,7 +1023,7 @@ mod tests {
     #[test]
     fn a_tell_opens_nothing() -> io::Result<()> {
         let mut tree = Tree::new(None);
-        let mut spine = tree.start_agent(None, None, "root", "")?;
+        let mut spine = tree.start_agent(None, None, "root", None, "")?;
         tree.append(
             &mut spine,
             EventPayload::Message(Message::Post {
@@ -956,7 +1048,7 @@ mod tests {
     #[test]
     fn fork_does_not_owe_prefork_posts() -> io::Result<()> {
         let mut tree = Tree::new(None);
-        let mut spine = tree.start_agent(None, None, "root", "")?;
+        let mut spine = tree.start_agent(None, None, "root", None, "")?;
         let question = tree.append(&mut spine, user_msg("which file?"))?;
         assert_eq!(spine.context().open, [question]);
 
@@ -990,7 +1082,7 @@ mod tests {
     #[test]
     fn test_calls_and_program_result_are_artifacts_not_messages() -> io::Result<()> {
         let mut tree = Tree::new(None);
-        let mut spine = tree.start_agent(None, None, "root", "")?;
+        let mut spine = tree.start_agent(None, None, "root", None, "")?;
         let call_id = tree.append(
             &mut spine,
             EventPayload::Call(Call::Invoke {
@@ -1037,11 +1129,11 @@ mod tests {
     /// Caller spine + child agent branched at a call-site event, appends
     /// interleaved between the two spines.
     fn build_branched_tree(tree: &mut Tree) -> io::Result<(Spine, Spine)> {
-        let mut caller = tree.start_agent(None, None, "root", "")?;
+        let mut caller = tree.start_agent(None, None, "root", None, "")?;
         tree.append(&mut caller, user_msg("m1"))?;
         let call_site = tree.append(&mut caller, assistant_msg("spawning"))?;
 
-        let mut child = tree.start_agent(Some(call_site), None, "child prompt", "")?;
+        let mut child = tree.start_agent(Some(call_site), None, "child prompt", None, "")?;
         // The first question is a `Post`, and it carries the caller's
         // machine-bound `input`.
         tree.append(
@@ -1105,9 +1197,9 @@ mod tests {
         // caller activity after the call site, the call-site event is
         // still the caller's resumable leaf.
         let mut tree = Tree::new(None);
-        let mut caller = tree.start_agent(None, None, "root", "")?;
+        let mut caller = tree.start_agent(None, None, "root", None, "")?;
         let call_site = tree.append(&mut caller, assistant_msg("spawning"))?;
-        let child = tree.start_agent(Some(call_site), None, "child", "")?;
+        let child = tree.start_agent(Some(call_site), None, "child", None, "")?;
 
         let mut leaves: Vec<EventId> = tree.list_leaves().into_iter().map(|(id, _)| id).collect();
         leaves.sort_by_key(|id| id.as_u64());
@@ -1120,7 +1212,7 @@ mod tests {
     #[test]
     fn test_fork_mid_spine_diverges_leaving_original_intact() -> io::Result<()> {
         let mut tree = Tree::new(None);
-        let mut spine = tree.start_agent(None, None, "root", "")?;
+        let mut spine = tree.start_agent(None, None, "root", None, "")?;
         tree.append(&mut spine, user_msg("q"))?;
         let fork_point = tree.append(&mut spine, assistant_msg("first answer"))?;
         let original_leaf = tree.append(&mut spine, user_msg("follow-up A"))?;
@@ -1149,7 +1241,7 @@ mod tests {
     #[test]
     fn test_fork_from_an_answered_leaf_is_fine() -> io::Result<()> {
         let mut tree = Tree::new(None);
-        let mut spine = tree.start_agent(None, None, "root", "")?;
+        let mut spine = tree.start_agent(None, None, "root", None, "")?;
         let question = tree.append(&mut spine, user_msg("q"))?;
         tree.append(&mut spine, assistant_msg("done"))?;
         let answered = tree.append(
@@ -1197,7 +1289,7 @@ mod tests {
         let turn;
         {
             let mut tree = open()?;
-            let mut spine = tree.start_agent(None, None, "root", "")?;
+            let mut spine = tree.start_agent(None, None, "root", None, "")?;
             tree.append(&mut spine, user_msg("go"))?;
             turn = tree.append(&mut spine, run_program_call("c1", "return 1;"))?;
             tree.sync()?;
@@ -1245,7 +1337,7 @@ mod tests {
     #[test]
     fn fanned_body_is_stored_once() -> io::Result<()> {
         let mut tree = Tree::new(None);
-        let mut caller = tree.start_agent(None, None, "orchestrator", "")?;
+        let mut caller = tree.start_agent(None, None, "orchestrator", None, "")?;
         let plan = "P".repeat(4096);
         let send = tree.append(
             &mut caller,
@@ -1261,7 +1353,7 @@ mod tests {
         // Three workers, each delivered the *same* body by reference.
         let mut workers = Vec::new();
         for _ in 0..3 {
-            let mut w = tree.start_agent(Some(send), None, "worker", "")?;
+            let mut w = tree.start_agent(Some(send), None, "worker", None, "")?;
             tree.append(
                 &mut w,
                 EventPayload::Message(Message::Post {
@@ -1306,7 +1398,7 @@ mod tests {
                 .truncate(false)
                 .open(&path)?;
             let mut tree = Tree::open(file)?;
-            let mut spine = tree.start_agent(None, None, "root", "")?;
+            let mut spine = tree.start_agent(None, None, "root", None, "")?;
             leaf = tree.append(
                 &mut spine,
                 EventPayload::Message(Message::Post {
@@ -1338,7 +1430,7 @@ mod tests {
     #[test]
     fn a_rename_names_the_branch() -> io::Result<()> {
         let mut tree = Tree::new(None);
-        let mut spine = tree.start_agent(None, None, "root", "")?;
+        let mut spine = tree.start_agent(None, None, "root", None, "")?;
         tree.append(&mut spine, user_msg("hi"))?;
         tree.append(
             &mut spine,
@@ -1360,7 +1452,7 @@ mod tests {
     fn rename_folds_from_the_branch_root() -> io::Result<()> {
         let mut tree = Tree::new(None);
         // A root that was born named.
-        let mut spine = tree.start_agent(None, Some("at birth".into()), "root", "")?;
+        let mut spine = tree.start_agent(None, Some("at birth".into()), "root", None, "")?;
         assert_eq!(tree.branch_name(spine.leaf_id).as_deref(), Some("at birth"));
 
         let fork_point = tree.append(&mut spine, user_msg("q"))?;
@@ -1395,7 +1487,7 @@ mod tests {
     #[test]
     fn an_unnamed_branch_has_no_name() -> io::Result<()> {
         let mut tree = Tree::new(None);
-        let mut spine = tree.start_agent(None, None, "root", "")?;
+        let mut spine = tree.start_agent(None, None, "root", None, "")?;
         tree.append(&mut spine, user_msg("hello"))?;
 
         let leaves = tree.list_leaves();
@@ -1478,7 +1570,7 @@ mod tests {
                 .truncate(false)
                 .open(&path)?;
             let mut tree = Tree::open(file)?;
-            let mut spine = tree.start_agent(None, None, "root", "")?;
+            let mut spine = tree.start_agent(None, None, "root", None, "")?;
             tree.append(&mut spine, user_msg("first msg"))?;
         }
 
@@ -1521,7 +1613,7 @@ mod tests {
         let mut tree = Tree::open(file)?;
         assert!(tree.list_leaves().is_empty());
 
-        let spine = tree.start_agent(None, None, "first", "")?;
+        let spine = tree.start_agent(None, None, "first", None, "")?;
         assert_eq!(spine.contexts.len(), 1);
         assert_eq!(spine.context().charter, "first");
         Ok(())

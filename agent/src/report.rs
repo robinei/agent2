@@ -721,7 +721,9 @@ mod tests {
     /// followed by whatever outcome the caller wants.
     fn fixture(source: &str, outcome: EventPayload) -> (Tree, crate::types::EventId) {
         let mut tree = Tree::new(None);
-        let mut spine = tree.start_agent(None, None, "root", "SYSTEM").unwrap();
+        let mut spine = tree
+            .start_agent(None, None, "root", None, "SYSTEM")
+            .unwrap();
         tree.append(
             &mut spine,
             EventPayload::Message(Message::Post {

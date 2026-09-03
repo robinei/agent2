@@ -41,6 +41,21 @@ impl ToolRegistry {
     pub fn iter(&self) -> impl Iterator<Item = &Arc<ToolDef>> {
         self.tools.values()
     }
+
+    /// This registry restricted to `allow` — a spawned agent's tool
+    /// allowlist. Handlers are shared (`Arc`), so narrowing is a map
+    /// filter, and the child's *card* is rendered from the narrowed
+    /// registry so it never advertises a tool its calls would refuse.
+    pub fn narrowed(&self, allow: &[String]) -> ToolRegistry {
+        ToolRegistry {
+            tools: self
+                .tools
+                .iter()
+                .filter(|(name, _)| allow.iter().any(|a| a == *name))
+                .map(|(name, def)| (name.clone(), Arc::clone(def)))
+                .collect(),
+        }
+    }
 }
 
 /// Result-size guard: nothing oversized enters the log. Applied to tool

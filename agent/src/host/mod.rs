@@ -39,9 +39,11 @@ use std::thread;
 use std::time::Instant;
 
 use crate::machine::{
-    LlmRequest, LlmTurn, OutCall, Runner, SpawnAgent, StepInput, StepOutput, ToolResult,
+    LlmRequest, LlmTurn, OutCall, Runner, SpawnRequest, StepInput, StepOutput, ToolResult,
 };
-use crate::types::{Address, Call, Cause, EventId, EventPayload, Message, Outcome, Spine, Tree};
+use crate::types::{
+    Address, Author, Call, Cause, EventId, EventPayload, Message, Origin, Outcome, Spine, Tree,
+};
 
 /// Instructions per VM slice on the loop thread (9_TUI decision 3).
 pub const FUEL_SLICE: u64 = 100_000;
@@ -122,7 +124,7 @@ pub(crate) enum LoopMsg {
     },
     ToolDone {
         agent: AgentId,
-        invoke_id: u64,
+        call: EventId,
         result: Result<serde_json::Value, String>,
     },
     /// Fuel-slice continuation, re-enqueued between slices.
@@ -156,15 +158,6 @@ pub struct Session {
     tree: Tree,
     states: HashMap<AgentId, Runner>,
     root: AgentId,
-    /// Who is waiting on an answer to a post: post id → (the asking
-    /// branch, the call to settle there).
-    ///
-    /// This replaces `parents`, which keyed the same fact by *agent* and
-    /// so could only express one question per subagent for its whole
-    /// life. Keyed by the post, a branch can be asked repeatedly and each
-    /// answer routes to the question it answers. C2 rebuilds it from the
-    /// log on open; for now it is populated live.
-    waits: HashMap<EventId, (AgentId, u64)>,
     registry: ToolRegistry,
     /// Shared client: `complete(&self)` lets several contexts think at
     /// once. Concurrency is bounded by `llm_permits`, not by the client.
@@ -257,7 +250,6 @@ impl Session {
             tree,
             states: HashMap::from([(root, state)]),
             root,
-            waits: HashMap::new(),
             registry,
             llm: Arc::from(llm),
             llm_permits: Arc::new(Semaphore::new(llm_concurrency())),
@@ -433,7 +425,16 @@ impl Session {
                     return Ok(());
                 }
                 self.awaiting_user = false; // the user took their turn
-                self.step_agent(root, StepInput::UserTurn(text))
+                self.deliver_post(
+                    root,
+                    Author::User,
+                    Origin::Direct {
+                        text,
+                        input: serde_json::Value::Null,
+                        expects_reply: true,
+                    },
+                )
+                .map(|_| ())
             }
             LoopMsg::Command(SessionCommand::Reply {
                 branch,
@@ -472,11 +473,10 @@ impl Session {
                     if owed.is_empty() {
                         self.done = true;
                     }
-                    for (post, (asker, invoke_id)) in owed {
-                        self.waits.remove(&post);
+                    for (asker, send) in owed {
                         let _ = self.tx.send(LoopMsg::ToolDone {
                             agent: asker,
-                            invoke_id,
+                            call: send,
                             result: Err(format!("subagent failed: {message}")),
                         });
                     }
@@ -485,11 +485,11 @@ impl Session {
             },
             LoopMsg::ToolDone {
                 agent,
-                invoke_id,
+                call,
                 result,
             } => self.step_agent(
                 agent,
-                StepInput::ToolResults(vec![ToolResult { invoke_id, result }]),
+                StepInput::ToolResults(vec![ToolResult { call, result }]),
             ),
             LoopMsg::Continue { agent } => {
                 if self.paused.contains(&agent) {
@@ -634,9 +634,14 @@ impl Session {
             match output {
                 StepOutput::LlmRequest(request) => self.spawn_llm(agent, request),
                 StepOutput::ToolCalls(calls) => self.spawn_tools(agent, calls),
-                StepOutput::SpawnAgents(spawns) => {
+                StepOutput::Spawns(spawns) => {
                     for spawn in spawns {
-                        self.spawn_child(agent, spawn)?;
+                        self.create_agent(agent, spawn)?;
+                    }
+                }
+                StepOutput::Sends(sends) => {
+                    for send in sends {
+                        self.deliver_send(agent, send)?;
                     }
                 }
                 // A branch answered and went idle. **The branch is the
@@ -685,6 +690,26 @@ impl Session {
     /// logged resolution order.
     fn spawn_tools(&self, agent: AgentId, calls: Vec<OutCall>) {
         for call in calls {
+            // `agents` is the one tool the registry cannot serve: its
+            // answer is a projection over the tree **plus live session
+            // state** (a branch's status), which no `ToolHandler` can
+            // see. Answered inline, on the loop thread — it reads memory.
+            if call.name == crate::machine::TOOL_AGENTS {
+                let _ = self.tx.send(LoopMsg::ToolDone {
+                    agent,
+                    call: call.call,
+                    result: self.serve_agents(agent, &call.args),
+                });
+                continue;
+            }
+            if let Err(refused) = self.check_allowlist(agent, &call.name) {
+                let _ = self.tx.send(LoopMsg::ToolDone {
+                    agent,
+                    call: call.call,
+                    result: Err(refused),
+                });
+                continue;
+            }
             match self.registry.get(&call.name) {
                 Some(def) => {
                     let def = Arc::clone(def);
@@ -693,7 +718,7 @@ impl Session {
                         let result = guard_size((def.handler)(call.args));
                         let _ = tx.send(LoopMsg::ToolDone {
                             agent,
-                            invoke_id: call.invoke_id,
+                            call: call.call,
                             result,
                         });
                     });
@@ -701,7 +726,7 @@ impl Session {
                 None => {
                     let _ = self.tx.send(LoopMsg::ToolDone {
                         agent,
-                        invoke_id: call.invoke_id,
+                        call: call.call,
                         result: Err(format!("unknown tool `{}`", call.name)),
                     });
                 }
@@ -709,36 +734,161 @@ impl Session {
         }
     }
 
-    /// The `agent` tool: a `SpawnAgent` becomes a child `Runner` on
-    /// a branch rooted at the caller's call site.
-    fn spawn_child(&mut self, parent: AgentId, spawn: SpawnAgent) -> io::Result<()> {
-        let SpawnAgent {
-            invoke_id,
-            prompt,
-            input,
-            budget,
-        } = spawn;
-        let call_site = self.states[&parent].spine.leaf_id;
-        let card = dialect_card(&self.registry);
-        let mut child = Runner::new_child(
-            &mut self.tree,
-            call_site,
-            parent,
-            prompt,
-            input,
-            budget,
-            &card,
-        )?;
-        let child_id = child.agent_id();
-        self.emit_new(child_id);
-        // The child's first `Post` is the question; its answer settles
-        // the caller's call.
-        if let Some(&question) = child.open().first() {
-            self.waits.insert(question, (parent, invoke_id));
+    /// An agent's tool allowlist, read from its **own `Agent` root** —
+    /// not from the `Spawn` on its parent's branch, which is why the root
+    /// agent (which has no `Spawn`) is not a special case. `None` is
+    /// "everything the registry has".
+    fn allowlist(&self, agent: AgentId) -> Option<Vec<String>> {
+        match self.tree.events.get(&agent).map(|e| &e.payload) {
+            Some(EventPayload::Agent { tools, .. }) => tools.clone(),
+            _ => None,
         }
-        let outputs = child.kickoff(&mut self.tree)?;
+    }
+
+    /// Enforce the allowlist at the call. A narrowed agent asking for a
+    /// tool it does not have gets a `Failed` result naming what it does
+    /// have — a value the program may catch, a condition only if it does
+    /// not (6_LANGUAGE Part B).
+    fn check_allowlist(&self, agent: AgentId, name: &str) -> Result<(), String> {
+        match self.allowlist(agent) {
+            Some(allowed) if !allowed.iter().any(|t| t == name) => Err(format!(
+                "tool `{name}` is not in this agent's allowlist (have: {})",
+                allowed.join(", ")
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    /// Serve one `Spawn`: root an `Agent` under the call and settle the
+    /// caller with `{ agent }`.
+    ///
+    /// The two events are the two ends of one act — `Spawn` is the
+    /// caller's request, settled by a `Result`; `Agent` is the agent's
+    /// own root and outlives the caller, its program, and often the
+    /// conversation that created it. Nothing is asked here: a spawned
+    /// agent is idle with nothing open, so the driving rule leaves it
+    /// silent until someone speaks to it.
+    fn create_agent(&mut self, parent: AgentId, spawn: SpawnRequest) -> io::Result<()> {
+        let SpawnRequest { call, budget } = spawn;
+        // `name`/`charter`/`tools` live on the logged `Spawn`; the host
+        // reads them there rather than being handed a copy.
+        let Some(EventPayload::Call(Call::Spawn {
+            name,
+            charter,
+            tools,
+            ..
+        })) = self.tree.events.get(&call).map(|e| &e.payload)
+        else {
+            unreachable!("a SpawnRequest names its logged Spawn");
+        };
+        let (name, charter) = (name.clone(), charter.clone());
+        // `tools` **narrows**: a child can never widen past its parent's
+        // allowlist, so an intersection is the only honest reading of
+        // "default: yours".
+        let tools = match (self.allowlist(parent), tools.clone()) {
+            (None, child) => child,
+            (Some(parent_tools), None) => Some(parent_tools),
+            (Some(parent_tools), Some(child)) => Some(
+                child
+                    .into_iter()
+                    .filter(|t| parent_tools.contains(t))
+                    .collect(),
+            ),
+        };
+        let card = match &tools {
+            Some(allowed) => dialect_card(&self.registry.narrowed(allowed)),
+            None => dialect_card(&self.registry),
+        };
+        let child = Runner::new_agent(&mut self.tree, call, name, charter, tools, budget, &card)?;
+        let child_id = child.agent_id();
         self.states.insert(child_id, child);
-        self.process(child_id, outputs)
+        self.emit_new(child_id);
+        let _ = self.tx.send(LoopMsg::ToolDone {
+            agent: parent,
+            call,
+            result: Ok(serde_json::json!({ "agent": child_id.as_u64() })),
+        });
+        Ok(())
+    }
+
+    /// Deliver one `Send` — rule A, the other half of the exchange the
+    /// asker already logged. The body, address and `expects_reply` are
+    /// read from the `Send` itself: neither side copies the other.
+    ///
+    /// - to an agent: a `Post` naming this `Send` lands on that branch.
+    ///   An `ask` then waits for its `Answer`; a `tell` is settled by its
+    ///   delivery receipt in the same step, so the recipient owes nothing.
+    /// - to the human: **no `Post` anywhere** — they have no branch to
+    ///   post into. An `ask` stays pending until `Reply` settles it; a
+    ///   `tell` is a receipt with no post to name.
+    fn deliver_send(&mut self, sender: AgentId, send: EventId) -> io::Result<()> {
+        let Some(EventPayload::Call(Call::Send {
+            to, expects_reply, ..
+        })) = self.tree.events.get(&send).map(|e| &e.payload)
+        else {
+            unreachable!("a Sends output names its logged Send");
+        };
+        let (to, expects_reply) = (*to, *expects_reply);
+        let branch = match to {
+            Address::User => {
+                if !expects_reply {
+                    let _ = self.tx.send(LoopMsg::ToolDone {
+                        agent: sender,
+                        call: send,
+                        result: Ok(serde_json::json!({ "post": serde_json::Value::Null })),
+                    });
+                }
+                return Ok(());
+            }
+            Address::Branch(branch) => branch,
+        };
+        if !self.states.contains_key(&branch) {
+            let _ = self.tx.send(LoopMsg::ToolDone {
+                agent: sender,
+                call: send,
+                result: Err(format!(
+                    "branch #{} is not live in this session",
+                    branch.as_u64()
+                )),
+            });
+            return Ok(());
+        }
+        let post = self.deliver_post(branch, Author::Agent(sender), Origin::Sent(send))?;
+        // A tell resolves as soon as its post lands: what a tell spares
+        // is the answer, not the attention.
+        if !expects_reply {
+            let _ = self.tx.send(LoopMsg::ToolDone {
+                agent: sender,
+                call: send,
+                result: Ok(serde_json::json!({ "post": post.map(|p| p.as_u64()) })),
+            });
+        }
+        Ok(())
+    }
+
+    /// Append a `Post` to `branch` and run whatever it wants to do next.
+    /// Returns the `Post`'s id — a `tell`'s receipt names it.
+    fn deliver_post(
+        &mut self,
+        branch: AgentId,
+        from: Author,
+        origin: Origin,
+    ) -> io::Result<Option<EventId>> {
+        let Some(state) = self.states.get_mut(&branch) else {
+            return Ok(None);
+        };
+        let (post, outputs) = state.deliver(&mut self.tree, from, origin)?;
+        let transitions = state.take_status_transitions();
+        self.emit_new(branch);
+        for (program, status) in transitions {
+            self.emit(SessionEvent::ProgramStatus {
+                agent: branch,
+                program,
+                status,
+            });
+        }
+        self.process(branch, outputs)?;
+        Ok(Some(post))
     }
 
     /// Settle a pending `Send { to: user }` with the human's reply. The
@@ -779,16 +929,40 @@ impl Session {
         Ok(())
     }
 
-    /// The posts `branch` owes an answer to that someone is waiting on.
-    fn owed_by(&self, branch: AgentId) -> Vec<(EventId, (AgentId, u64))> {
+    /// The exchanges `branch` still owes: `(asker, send)` for every open
+    /// post on it that names a `Send`. Read from the log — no wait table:
+    /// the four events form a closed loop of ids, so the asker and the
+    /// call to settle are both one lookup from the post.
+    fn owed_by(&self, branch: AgentId) -> Vec<(AgentId, EventId)> {
         let Some(state) = self.states.get(&branch) else {
             return Vec::new();
         };
         state
             .open()
             .iter()
-            .filter_map(|post| self.waits.get(post).map(|w| (*post, *w)))
+            .filter_map(|post| self.asking_branch(*post))
             .collect()
+    }
+
+    /// Where an answer to `post` goes: the `Send` it names and the branch
+    /// that `Send` sits on. `None` for a post with no send side — the
+    /// user's or the harness's — which is read inline instead.
+    ///
+    /// This is the closed loop of ids walked in one direction:
+    /// `Answer.question → Post`, `Post.origin → Send`, and the `Send`'s
+    /// position **is** the asker's branch. Nothing session-local is
+    /// consulted, so it survives a reopen as-is.
+    fn asking_branch(&self, post: EventId) -> Option<(AgentId, EventId)> {
+        let Some(EventPayload::Message(Message::Post {
+            origin: Origin::Sent(send),
+            ..
+        })) = self.tree.events.get(&post).map(|e| &e.payload)
+        else {
+            return None;
+        };
+        let send = *send;
+        let asker = self.tree.enclosing_agent(send)?;
+        Some((asker, send))
     }
 
     /// Deliver a branch's answer. Rule A: the answer is logged on the
@@ -806,16 +980,12 @@ impl Session {
             self.awaiting_user = true;
             return Ok(());
         };
-        // `waits` is where "who asked this" lives while a question has no
-        // send side. B1 gives every question a `Send`, and then this
-        // routes by `origin` — the post *names* the call to settle and
-        // the branch to settle it on, with no session state consulted.
-        match self.waits.remove(&question) {
-            // An agent asked: its call settles on its own branch.
-            Some((asker, invoke_id)) => {
+        match self.asking_branch(question) {
+            // An agent asked: its `Send` settles on its own branch.
+            Some((asker, send)) => {
                 let _ = self.tx.send(LoopMsg::ToolDone {
                     agent: asker,
-                    invoke_id,
+                    call: send,
                     result: guard_size(Ok(value)),
                 });
             }
@@ -831,6 +1001,100 @@ impl Session {
             }
         }
         Ok(())
+    }
+
+    /// Serve `tools.agents({ under?, deep? })`: **discovery**, the one
+    /// addition that makes long-running orchestration possible. Agents
+    /// outlive programs but a program's handles to them do not, so the
+    /// next program re-discovers its workers by query rather than by
+    /// memory.
+    ///
+    /// One row per **branch**, so a forked worker lists twice, sharing
+    /// its `agent`. Nondeterministic by construction — `status` is live
+    /// session state — which is fine: it is a tool result, never a
+    /// rendered message.
+    fn serve_agents(
+        &self,
+        caller: AgentId,
+        args: &serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let arg = args.get(0).cloned().unwrap_or(serde_json::Value::Null);
+        let under = match arg.get("under").filter(|v| !v.is_null()) {
+            Some(v) => v
+                .as_u64()
+                .filter(|n| *n > 0)
+                .map(EventId::new)
+                .ok_or_else(|| format!("`under` must be an agent id; got {v}"))?,
+            None => caller,
+        };
+        let deep = arg.get("deep").and_then(|v| v.as_bool()).unwrap_or(false);
+        let mut rows = Vec::new();
+        for (branch, leaf) in self.tree.branches() {
+            let Some(agent) = self.tree.enclosing_agent(branch) else {
+                continue;
+            };
+            if !self.is_under(agent, under, deep) {
+                continue;
+            }
+            let EventPayload::Agent { charter, .. } = &self.tree.events[&agent].payload else {
+                continue;
+            };
+            let last_answer = self
+                .tree
+                .path_events(leaf)
+                .iter()
+                .rev()
+                .find(|e| matches!(e.payload, EventPayload::Answer { .. }))
+                .map(|e| e.id.as_u64());
+            rows.push(serde_json::json!({
+                "agent": agent.as_u64(),
+                "branch": branch.as_u64(),
+                "name": self.tree.branch_name(leaf),
+                "charter": charter,
+                "parent": self.tree.events[&agent]
+                    .parent_id
+                    .and_then(|p| self.tree.enclosing_agent(p))
+                    .map(|a| a.as_u64()),
+                "status": self.branch_status(branch),
+                "open": self.tree.spine_at(leaf).context().open.len(),
+                "last_answer": last_answer,
+            }));
+        }
+        Ok(serde_json::Value::Array(rows))
+    }
+
+    /// Whether `agent` is a direct child of `under` — or anywhere in its
+    /// subtree with `deep`. `under` itself is never a row: `agents()`
+    /// answers "who works for me", not "who am I".
+    fn is_under(&self, agent: AgentId, under: AgentId, deep: bool) -> bool {
+        if agent == under {
+            return false;
+        }
+        let mut current = self.tree.events.get(&agent).and_then(|e| e.parent_id);
+        while let Some(cur) = current {
+            let Some(parent) = self.tree.enclosing_agent(cur) else {
+                return false;
+            };
+            if parent == under {
+                return true;
+            }
+            if !deep {
+                return false;
+            }
+            current = self.tree.events.get(&parent).and_then(|e| e.parent_id);
+        }
+        false
+    }
+
+    /// A branch's live status word. `dormant` is a branch with no runner
+    /// in this session — nothing is lost, it is re-hydrated when spoken
+    /// to (C1/C2); `thinking` is the model-facing name for awaiting-LLM.
+    fn branch_status(&self, branch: EventId) -> &'static str {
+        match self.states.get(&branch).map(|s| s.status()) {
+            Some("awaiting llm") => "thinking",
+            Some(word) => word,
+            None => "dormant",
+        }
     }
 
     /// Surface every newly logged event as a `SessionEvent`, attributed
@@ -1055,6 +1319,63 @@ mod tests {
         let session = session.run();
         let events = rx.try_iter().collect();
         (session, events)
+    }
+
+    /// Build a session, send one user turn, and drive the loop until it
+    /// goes momentarily quiet.
+    ///
+    /// Not `run()`: that stops the moment **any** branch answers and owes
+    /// nothing, which from B1 on includes a worker going idle while the
+    /// orchestrator is still running. It also keeps going where `run()`
+    /// would block forever — a branch still waiting on the human, which
+    /// is a legitimate end state for several of these tests.
+    fn run_routed(
+        registry: ToolRegistry,
+        rules: impl IntoIterator<Item = (&'static str, Vec<LlmTurn>)>,
+        user_turn: &str,
+    ) -> (Session, Vec<SessionEvent>) {
+        let (tx, rx) = channel();
+        let mut session = Session::new(
+            Tree::new(None),
+            "test agent",
+            registry,
+            Box::new(RoutedLlm::new(rules)),
+            tx,
+        )
+        .unwrap();
+        session.handle().send(SessionCommand::UserTurn {
+            branch: session.root(),
+            text: user_turn.into(),
+        });
+        session.pump_until(Instant::now() + QUIET, &mut Vec::new());
+        let events = rx.try_iter().collect();
+        (session, events)
+    }
+
+    /// How long `run_routed` waits for the inbox to fall quiet. Long
+    /// enough for a few LLM worker threads to hand back, short enough not
+    /// to slow the suite.
+    const QUIET: Duration = Duration::from_millis(300);
+
+    /// The value a branch's program returned — the `Return` on its path.
+    fn returned(tree: &Tree, leaf: EventId) -> serde_json::Value {
+        tree.path_events(leaf)
+            .iter()
+            .rev()
+            .find_map(|e| match &e.payload {
+                EventPayload::Return { value } => Some(value.clone()),
+                _ => None,
+            })
+            .expect("a Return on this branch")
+    }
+
+    /// Every `Agent` root in the log, by charter.
+    fn agent_by_charter(tree: &Tree, want: &str) -> EventId {
+        tree.events
+            .values()
+            .find(|e| matches!(&e.payload, EventPayload::Agent { charter, .. } if charter == want))
+            .map(|e| e.id)
+            .unwrap_or_else(|| panic!("no agent chartered {want:?}"))
     }
 
     /// Payload kinds of one agent's spine segment, log order.
@@ -1884,12 +2205,31 @@ mod tests {
             assert_eq!(kinds(tree, leaf), ["Agent", "Post", "Turn", "Answer"]);
         }
 
-        // The caller logged both agent calls as artifacts on its spine…
-        let invokes = kinds(tree, root_leaf(&session))
-            .iter()
-            .filter(|k| **k == "Call")
-            .count();
-        assert_eq!(invokes, 2, "both agent calls join as artifacts");
+        // The caller logged both agent calls as artifacts on its spine —
+        // and `tools.agent` is spawn **then** ask (B1), so each is two
+        // calls: the `Spawn` that made the agent and the `Send` that
+        // asked it, the second addressed at the first's result.
+        let mut spawns = Vec::new();
+        let mut sends = Vec::new();
+        for event in tree.path_events(root_leaf(&session)) {
+            match &event.payload {
+                EventPayload::Call(Call::Spawn { charter, .. }) => spawns.push(charter.clone()),
+                EventPayload::Call(Call::Send { to, text, .. }) => sends.push((*to, text.clone())),
+                _ => {}
+            }
+        }
+        assert_eq!(spawns.len(), 2, "one Spawn per agent call: {spawns:?}");
+        assert_eq!(sends.len(), 2, "one Send per agent call: {sends:?}");
+        for (to, text) in &sends {
+            let Address::Branch(branch) = to else {
+                panic!("a subagent question is addressed at its branch, got {to:?}");
+            };
+            assert!(
+                matches!(&tree.events[branch].payload,
+                         EventPayload::Agent { charter, .. } if charter == text),
+                "the Send goes to the agent its Spawn created"
+            );
+        }
 
         // …and both results joined into the program's returned array.
         let result = tree
@@ -2114,7 +2454,7 @@ mod tests {
     /// Assistant(3 "a1"). Leaf = #3 — open, so resumable and forkable.
     fn tree_with_open_root() -> Tree {
         let mut tree = Tree::new(None);
-        let mut spine = tree.start_agent(None, None, "root", "").unwrap();
+        let mut spine = tree.start_agent(None, None, "root", None, "").unwrap();
         tree.append(&mut spine, user("q")).unwrap();
         tree.append(&mut spine, assistant("a1")).unwrap();
         tree
@@ -2383,7 +2723,7 @@ mod tests {
         // Agent 1, User 2, Assistant 3 (run_program, no result).
         let mut tree = Tree::new(None);
         let mut spine = tree
-            .start_agent(None, None, "you are an agent", "")
+            .start_agent(None, None, "you are an agent", None, "")
             .unwrap();
         tree.append(
             &mut spine,
@@ -2489,7 +2829,7 @@ mod tests {
     #[test]
     fn a_fully_answered_log_opens_idle() {
         let mut tree = Tree::new(None);
-        let mut spine = tree.start_agent(None, None, "root", "").unwrap();
+        let mut spine = tree.start_agent(None, None, "root", None, "").unwrap();
         let question = tree.append(&mut spine, user("q")).unwrap();
         tree.append(&mut spine, assistant("done")).unwrap();
         tree.append(
@@ -2514,5 +2854,721 @@ mod tests {
         let state = session.state(session.root()).unwrap();
         assert!(state.is_idle());
         assert!(state.open().is_empty(), "nothing is owed");
+    }
+
+    // ── B1: spawn / ask / tell / agents ─────────────────────────────
+
+    /// The exchange is four events forming a **closed loop of ids** —
+    /// `Post.origin → Send`, `Result.call → Send`, `Answer.question →
+    /// Post` — so from any one the other three are one lookup away. That
+    /// is what reconciliation walks, what a renderer resolves a body
+    /// through, and how an answer finds the *branch* that asked.
+    #[test]
+    fn exchange_ids_form_a_closed_loop() {
+        let (session, _) = run_routed(
+            ToolRegistry::new(),
+            [
+                (
+                    "reads files",
+                    vec![scripted_text("PLAN.md, and it is 40 lines")],
+                ),
+                (
+                    "test agent",
+                    vec![
+                        scripted_program(
+                            "c1",
+                            r#"const w = await tools.spawn({ name: "r", charter: "reads files" });
+                               return await tools.ask({ to: w.agent, text: "which file?" });"#,
+                        ),
+                        scripted_text("done"),
+                    ],
+                ),
+            ],
+            "ask the researcher",
+        );
+        let tree = session.tree();
+        let worker = agent_by_charter(tree, "reads files");
+
+        // Start from the `Send` — the event that records "I asked" — and
+        // walk to the other three, then back.
+        let send = tree
+            .events
+            .values()
+            .find(|e| matches!(&e.payload, EventPayload::Call(Call::Send { .. })))
+            .map(|e| e.id)
+            .expect("the Send");
+        assert_eq!(
+            tree.enclosing_agent(send),
+            Some(session.root()),
+            "the Send sits on the asking branch"
+        );
+
+        // Send → Post: the delivery marker naming it, on the callee.
+        let post = tree
+            .events
+            .values()
+            .find(|e| {
+                matches!(&e.payload,
+                    EventPayload::Message(Message::Post { origin: Origin::Sent(s), .. })
+                    if *s == send)
+            })
+            .map(|e| e.id)
+            .expect("the Post naming that Send");
+        let EventPayload::Message(Message::Post { from, .. }) = &tree.events[&post].payload else {
+            unreachable!()
+        };
+        assert_eq!(*from, Author::Agent(session.root()));
+        assert_eq!(tree.enclosing_agent(post), Some(worker));
+
+        // Post → Answer: the reply, on the answerer's branch.
+        let (answer, value) = tree
+            .events
+            .values()
+            .find_map(|e| match &e.payload {
+                EventPayload::Answer { question, value } if *question == post => {
+                    Some((e.id, value.clone()))
+                }
+                _ => None,
+            })
+            .expect("the Answer naming that Post");
+        assert_eq!(value, json!("PLAN.md, and it is 40 lines"));
+        assert_eq!(tree.enclosing_agent(answer), Some(worker));
+
+        // Send → Result: the settlement, back on the asker's branch. No
+        // routing table was consulted to get it there.
+        let result = tree
+            .events
+            .values()
+            .find_map(|e| match &e.payload {
+                EventPayload::Result { call, outcome } if *call == send => {
+                    Some((e.id, outcome.clone()))
+                }
+                _ => None,
+            })
+            .expect("the Result naming that Send");
+        assert_eq!(result.1, Outcome::Delivered(value.clone()));
+        assert_eq!(tree.enclosing_agent(result.0), Some(session.root()));
+
+        // …and the program got the answer, whole.
+        assert_eq!(returned(tree, root_leaf(&session)), value);
+
+        // The agent's own root is a child of the `Spawn` that made it.
+        let spawn = tree
+            .events
+            .values()
+            .find(|e| matches!(&e.payload, EventPayload::Call(Call::Spawn { .. })))
+            .map(|e| e.id)
+            .expect("the Spawn");
+        assert_eq!(tree.events[&worker].parent_id, Some(spawn));
+    }
+
+    /// `tell` informs without asking: three events, no `Answer`. The
+    /// sender's receipt lands as soon as the post does — what a tell
+    /// spares is the answer, not the attention, so the recipient still
+    /// spends a turn noticing it.
+    #[test]
+    fn tell_delivers_receipt_and_opens_nothing() {
+        let (session, _) = run_routed(
+            ToolRegistry::new(),
+            [
+                ("takes notes", vec![scripted_text("noted")]),
+                (
+                    "test agent",
+                    vec![
+                        scripted_program(
+                            "c1",
+                            r#"const w = await tools.spawn({ name: "n", charter: "takes notes" });
+                               return await tools.tell({ to: w.agent, text: "fyi: skip the cache" });"#,
+                        ),
+                        scripted_text("told them"),
+                    ],
+                ),
+            ],
+            "inform the worker",
+        );
+        let tree = session.tree();
+        let worker = agent_by_charter(tree, "takes notes");
+        let worker_leaf = session.state(worker).unwrap().spine.leaf_id;
+
+        // The recipient: a post, a turn, and **no `Answer`** — it owes
+        // nothing, so nothing is open on it.
+        assert_eq!(kinds(tree, worker_leaf), ["Agent", "Post", "Turn"]);
+        assert!(
+            tree.spine_at(worker_leaf).context().open.is_empty(),
+            "a tell opens nothing"
+        );
+
+        // The sender: a receipt naming the post that landed.
+        let post = tree
+            .path_events(worker_leaf)
+            .iter()
+            .find(|e| {
+                matches!(
+                    e.payload,
+                    EventPayload::Message(Message::Post {
+                        origin: Origin::Sent(_),
+                        ..
+                    })
+                )
+            })
+            .map(|e| e.id)
+            .expect("the delivered post");
+        assert_eq!(
+            returned(tree, root_leaf(&session)),
+            json!({ "post": post.as_u64() })
+        );
+    }
+
+    /// **Agents outlive programs, but a program's handles to them do
+    /// not.** A later program — a new VM — re-discovers its workers by
+    /// query rather than by memory, which is what makes orchestration
+    /// across programs, hours and crashes possible.
+    #[test]
+    fn agents_survive_across_programs() {
+        let (session, _) = run_routed(
+            ToolRegistry::new(),
+            [(
+                "test agent",
+                vec![
+                    scripted_program(
+                        "c1",
+                        r#"const names = ["alpha", "beta", "gamma"];
+                           const made = await Promise.all(
+                             names.map(n => tools.spawn({ name: n, charter: "worker " + n })));
+                           return made.map(m => m.agent);"#,
+                    ),
+                    // A different program, a fresh VM: the handles above
+                    // are gone, and the workers are found by query.
+                    scripted_program("c2", "return await tools.agents();"),
+                    scripted_text("three workers, all idle"),
+                ],
+            )],
+            "spawn three workers",
+        );
+        let tree = session.tree();
+        // The *last* `Return` on the branch is the second program's.
+        let rows: Vec<serde_json::Value> = returned(tree, root_leaf(&session))
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(rows.len(), 3, "three rows: {rows:?}");
+
+        let mut listed: Vec<(String, u64, &'static str)> = rows
+            .iter()
+            .map(|r| {
+                (
+                    r["name"].as_str().unwrap().to_owned(),
+                    r["agent"].as_u64().unwrap(),
+                    match r["status"].as_str().unwrap() {
+                        "idle" => "idle",
+                        other => panic!("a spawned-but-unasked agent is idle, got {other}"),
+                    },
+                )
+            })
+            .collect();
+        listed.sort();
+        assert_eq!(
+            listed.iter().map(|(n, ..)| n.as_str()).collect::<Vec<_>>(),
+            ["alpha", "beta", "gamma"]
+        );
+        for row in &rows {
+            assert_eq!(row["parent"].as_u64(), Some(session.root().as_u64()));
+            assert_eq!(row["open"].as_u64(), Some(0), "nobody asked them anything");
+            assert!(row["last_answer"].is_null());
+            assert_eq!(
+                row["branch"], row["agent"],
+                "an unforked agent's one branch is rooted at the agent itself"
+            );
+            assert!(row["charter"].as_str().unwrap().starts_with("worker "));
+        }
+    }
+
+    /// `agents()` lists your **direct** children; `{ deep: true }` reaches
+    /// the whole subtree — a worker's own worker included.
+    #[test]
+    fn agents_deep_reaches_a_grandchild() {
+        let (session, _) = run_routed(
+            ToolRegistry::new(),
+            [
+                (
+                    "worker",
+                    vec![
+                        scripted_program(
+                            "w1",
+                            r#"const g = await tools.spawn({ name: "helper", charter: "helps" });
+                               return g.agent;"#,
+                        ),
+                        scripted_text("made a helper"),
+                    ],
+                ),
+                (
+                    "test agent",
+                    vec![
+                        scripted_program(
+                            "c1",
+                            r#"const w = await tools.spawn({ name: "w", charter: "worker" });
+                               return await tools.ask({ to: w.agent, text: "make a helper" });"#,
+                        ),
+                        scripted_program(
+                            "c2",
+                            r#"return { direct: await tools.agents(),
+                                        deep: await tools.agents({ deep: true }) };"#,
+                        ),
+                        scripted_text("done"),
+                    ],
+                ),
+            ],
+            "delegate a delegation",
+        );
+        let tree = session.tree();
+        let listing = returned(tree, root_leaf(&session));
+        let names = |key: &str| {
+            let mut out: Vec<String> = listing[key]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["name"].as_str().unwrap().to_owned())
+                .collect();
+            out.sort();
+            out
+        };
+        assert_eq!(names("direct"), ["w"], "direct children only by default");
+        assert_eq!(
+            names("deep"),
+            ["helper", "w"],
+            "deep reaches the grandchild"
+        );
+
+        // The grandchild's `parent` is the worker, not the root.
+        let worker = agent_by_charter(tree, "worker");
+        let helper = listing["deep"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["name"] == "helper")
+            .unwrap()
+            .clone();
+        assert_eq!(helper["parent"].as_u64(), Some(worker.as_u64()));
+    }
+
+    /// One row per **branch**. An agent has one branch until someone
+    /// forks it; then it has two, both live, both its own — and both list,
+    /// sharing the `agent` they are branches of.
+    #[test]
+    fn forked_agent_lists_two_branches() {
+        // Built as a log rather than driven: forking is a user gesture
+        // (C1's command), and what is under test is the projection.
+        let mut tree = Tree::new(None);
+        let mut root = tree
+            .start_agent(None, Some("root".into()), "test agent", None, "test agent")
+            .unwrap();
+        let spawn = tree
+            .append(
+                &mut root,
+                EventPayload::Call(Call::Spawn {
+                    name: Some("w".into()),
+                    charter: "worker".into(),
+                    tools: None,
+                    site: 0,
+                }),
+            )
+            .unwrap();
+        let mut worker = tree
+            .start_agent(Some(spawn), Some("w".into()), "worker", None, "worker")
+            .unwrap();
+        tree.append(&mut worker, user("first question")).unwrap();
+        let fork_point = worker.leaf_id;
+        let mut sidebar = tree.fork(fork_point).unwrap();
+        tree.append(
+            &mut sidebar,
+            EventPayload::Fork {
+                name: Some("sidebar".into()),
+            },
+        )
+        .unwrap();
+
+        let (tx, _rx) = channel();
+        let session = Session::open_at(
+            tree,
+            fork_point,
+            ToolRegistry::new(),
+            Box::new(ScriptedLlm::new([])),
+            tx,
+        )
+        .unwrap();
+        // Asked from the orchestrator: `under` defaults to the caller.
+        let orchestrator = agent_by_charter(session.tree(), "test agent");
+        let rows = session
+            .serve_agents(orchestrator, &json!([serde_json::Value::Null]))
+            .unwrap();
+        let rows = rows.as_array().unwrap();
+        assert_eq!(rows.len(), 2, "two branches of one agent: {rows:?}");
+        let agent = agent_by_charter(session.tree(), "worker").as_u64();
+        assert!(
+            rows.iter().all(|r| r["agent"].as_u64() == Some(agent)),
+            "both rows share the agent: {rows:?}"
+        );
+        let mut branches: Vec<(u64, &str)> = rows
+            .iter()
+            .map(|r| (r["branch"].as_u64().unwrap(), r["name"].as_str().unwrap()))
+            .collect();
+        branches.sort();
+        assert_eq!(branches[0].1, "w", "the agent's own branch keeps its name");
+        assert_eq!(
+            branches[1].1, "sidebar",
+            "the fork is named for how it differs"
+        );
+        assert_ne!(branches[0].0, branches[1].0, "two distinct branch ids");
+    }
+
+    /// Broadcast is not a primitive: it is `Promise.all` over `agents()`.
+    /// No relay, kill or subscribe tool exists either, because each would
+    /// be a tool doing what a line of program already does.
+    #[test]
+    fn broadcast_is_promise_all_over_agents() {
+        let (session, _) = run_routed(
+            ToolRegistry::new(),
+            [
+                ("worker a", vec![scripted_text("a: ok")]),
+                ("worker b", vec![scripted_text("b: ok")]),
+                ("worker c", vec![scripted_text("c: ok")]),
+                (
+                    "test agent",
+                    vec![
+                        scripted_program(
+                            "c1",
+                            r#"await Promise.all(["a", "b", "c"].map(n =>
+                                 tools.spawn({ name: n, charter: "worker " + n })));
+                               return "spawned";"#,
+                        ),
+                        scripted_program(
+                            "c2",
+                            r#"const rows = await tools.agents();
+                               return await Promise.all(
+                                 rows.map(r => tools.ask({ to: r.branch, text: "status?" })));"#,
+                        ),
+                        scripted_text("all three reported"),
+                    ],
+                ),
+            ],
+            "check on everyone",
+        );
+        let tree = session.tree();
+        let mut answers: Vec<String> = returned(tree, root_leaf(&session))
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_owned())
+            .collect();
+        answers.sort();
+        assert_eq!(answers, ["a: ok", "b: ok", "c: ok"]);
+        // One question each, and each answered on its own branch.
+        for charter in ["worker a", "worker b", "worker c"] {
+            let agent = agent_by_charter(tree, charter);
+            let leaf = session.state(agent).unwrap().spine.leaf_id;
+            assert_eq!(kinds(tree, leaf), ["Agent", "Post", "Turn", "Answer"]);
+        }
+    }
+
+    /// A worker keeps its context between questions: the second question
+    /// arrives in a conversation that already holds the first exchange.
+    /// **Agents never close** — that is what makes a second question just
+    /// another post.
+    #[test]
+    fn second_question_sees_first_exchange() {
+        let (session, _) = run_routed(
+            ToolRegistry::new(),
+            [
+                (
+                    "remembers",
+                    vec![scripted_text("seven"), scripted_text("still seven")],
+                ),
+                (
+                    "test agent",
+                    vec![
+                        scripted_program(
+                            "c1",
+                            r#"const w = await tools.spawn({ name: "m", charter: "remembers" });
+                               const first = await tools.ask({ to: w.agent, text: "how many?" });
+                               const second = await tools.ask({ to: w.agent, text: "sure?" });
+                               return [first, second];"#,
+                        ),
+                        scripted_text("asked twice"),
+                    ],
+                ),
+            ],
+            "ask twice",
+        );
+        let tree = session.tree();
+        let worker = agent_by_charter(tree, "remembers");
+        let leaf = session.state(worker).unwrap().spine.leaf_id;
+
+        // Two full exchanges on one branch, nothing sealed in between.
+        assert_eq!(
+            kinds(tree, leaf),
+            ["Agent", "Post", "Turn", "Answer", "Post", "Turn", "Answer"]
+        );
+        assert!(
+            tree.spine_at(leaf).context().open.is_empty(),
+            "both questions answered"
+        );
+
+        // The second question landed in a conversation that already held
+        // the first exchange — the worker kept its context.
+        let messages: Vec<String> = tree
+            .spine_at(leaf)
+            .context()
+            .messages
+            .iter()
+            .map(|m| m.text().to_owned())
+            .collect();
+        assert_eq!(messages, ["how many?", "seven", "sure?", "still seven"]);
+        assert_eq!(
+            returned(tree, root_leaf(&session)),
+            json!(["seven", "still seven"])
+        );
+    }
+
+    /// `ask` with `to` omitted means *the author of the question you are
+    /// answering*. For a root conversation that is the human; for a
+    /// subagent it is its parent — and a program never needs to know
+    /// which.
+    #[test]
+    fn default_to_is_the_current_asker() {
+        // Case 1: the root's asker is the human. The invoke is addressed
+        // `to: user` and stays pending — the user has no branch, so there
+        // is **no `Post` anywhere**, only the question inline.
+        let (session, _) = run_routed(
+            ToolRegistry::new(),
+            [(
+                "test agent",
+                vec![scripted_program(
+                    "c1",
+                    r#"return await tools.ask({ text: "which one did you mean?" });"#,
+                )],
+            )],
+            "do the thing",
+        );
+        let tree = session.tree();
+        let sends: Vec<&Call> = tree
+            .events
+            .values()
+            .filter_map(|e| match &e.payload {
+                EventPayload::Call(c @ Call::Send { .. }) => Some(c),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sends.len(), 1);
+        let Call::Send {
+            to, expects_reply, ..
+        } = sends[0]
+        else {
+            unreachable!()
+        };
+        assert_eq!(*to, Address::User, "the root's asker is the human");
+        assert!(*expects_reply);
+        assert!(
+            !tree.events.values().any(|e| matches!(
+                &e.payload,
+                EventPayload::Message(Message::Post {
+                    origin: Origin::Sent(_),
+                    ..
+                })
+            )),
+            "a question to the human posts nowhere"
+        );
+        assert!(
+            !tree
+                .events
+                .values()
+                .any(|e| matches!(e.payload, EventPayload::Result { .. })),
+            "and stays pending until the human replies"
+        );
+
+        // Case 2: a subagent's asker is its parent.
+        let (session, _) = run_routed(
+            ToolRegistry::new(),
+            [
+                (
+                    "needs guidance",
+                    vec![scripted_program(
+                        "w1",
+                        r#"return await tools.ask({ text: "which one?" });"#,
+                    )],
+                ),
+                (
+                    "test agent",
+                    vec![scripted_program(
+                        "c1",
+                        r#"const w = await tools.spawn({ name: "w", charter: "needs guidance" });
+                           return await tools.ask({ to: w.agent, text: "pick one" });"#,
+                    )],
+                ),
+            ],
+            "delegate",
+        );
+        let tree = session.tree();
+        let upward = tree
+            .events
+            .values()
+            .find_map(|e| match &e.payload {
+                EventPayload::Call(Call::Send { to, text, .. }) if text == "which one?" => {
+                    Some(*to)
+                }
+                _ => None,
+            })
+            .expect("the upward ask");
+        assert_eq!(
+            upward,
+            Address::Branch(session.root()),
+            "a subagent's asker is its parent's branch"
+        );
+        // It reached the parent: logged on arrival, even mid-program.
+        assert_eq!(
+            kinds(tree, root_leaf(&session)).last(),
+            Some(&"Post"),
+            "logged on the running parent's branch: {:?}",
+            kinds(tree, root_leaf(&session))
+        );
+    }
+
+    /// An agent id is an address only while the agent has one branch. A
+    /// forked one is **ambiguous**, and guessing which fork owes the
+    /// answer is exactly the race the one-owner rule exists to prevent —
+    /// so the call is rejected, naming the branches.
+    #[test]
+    fn ambiguous_agent_id_is_refused() {
+        let mut tree = Tree::new(None);
+        let mut root = tree
+            .start_agent(None, None, "test agent", None, "test agent")
+            .unwrap();
+        let spawn = tree
+            .append(
+                &mut root,
+                EventPayload::Call(Call::Spawn {
+                    name: Some("w".into()),
+                    charter: "worker".into(),
+                    tools: None,
+                    site: 0,
+                }),
+            )
+            .unwrap();
+        let worker = tree
+            .start_agent(Some(spawn), None, "worker", None, "worker")
+            .unwrap();
+        let mut sidebar = tree.fork(worker.leaf_id).unwrap();
+        tree.append(&mut sidebar, EventPayload::Fork { name: None })
+            .unwrap();
+        let anchor = root.leaf_id;
+        let worker_id = worker.leaf_id;
+
+        let (tx, rx) = channel();
+        let mut session = Session::open_at(
+            tree,
+            anchor,
+            ToolRegistry::new(),
+            Box::new(RoutedLlm::new([(
+                "test agent",
+                vec![scripted_program(
+                    "c1",
+                    &format!(
+                        r#"try {{ return await tools.ask({{ to: {}, text: "hi" }}); }}
+                           catch (e) {{ return "refused: " + e; }}"#,
+                        worker_id.as_u64()
+                    ),
+                )],
+            )])),
+            tx,
+        )
+        .unwrap();
+        session.handle().send(SessionCommand::UserTurn {
+            branch: session.root(),
+            text: "ask the worker".into(),
+        });
+        session.pump_until(Instant::now() + QUIET, &mut Vec::new());
+        drop(rx);
+
+        let refused = returned(session.tree(), root_leaf(&session));
+        let text = refused.as_str().expect("a rejected call is catchable");
+        assert!(text.contains("2 live branches"), "{text}");
+        assert!(text.contains("address one of them"), "{text}");
+        // Nothing was logged: the call was never dispatched, so it owes
+        // no `Result`.
+        assert!(
+            !session
+                .tree()
+                .events
+                .values()
+                .any(|e| matches!(&e.payload, EventPayload::Call(Call::Send { .. }))),
+            "a rejected address logs no Send"
+        );
+    }
+
+    /// `tools` narrows a child's allowlist, enforced by the registry from
+    /// the **child's own `Agent` root** — which is why the root agent,
+    /// having no `Spawn`, is not a special case. A child can never widen
+    /// past its parent, so "default: yours" is an intersection.
+    #[test]
+    fn spawned_tools_narrow_the_childs_allowlist() {
+        let mut registry = ToolRegistry::new();
+        registry.register(tool("allowed", |_| Ok(json!("ok"))));
+        registry.register(tool("forbidden", |_| Ok(json!("nope"))));
+        let (session, _) = run_routed(
+            registry,
+            [
+                (
+                    "narrowed",
+                    vec![
+                        scripted_program(
+                            "w1",
+                            r#"const ok = await tools.allowed();
+                               let denied;
+                               try { denied = await tools.forbidden(); }
+                               catch (e) { denied = "refused: " + e; }
+                               return [ok, denied];"#,
+                        ),
+                        scripted_text("one of two"),
+                    ],
+                ),
+                (
+                    "test agent",
+                    vec![
+                        scripted_program(
+                            "c1",
+                            r#"const w = await tools.spawn(
+                                 { name: "n", charter: "narrowed", tools: ["allowed"] });
+                               return await tools.ask({ to: w.agent, text: "try both" });"#,
+                        ),
+                        scripted_text("done"),
+                    ],
+                ),
+            ],
+            "narrow a child",
+        );
+        let tree = session.tree();
+        let child = agent_by_charter(tree, "narrowed");
+        let EventPayload::Agent { tools, .. } = &tree.events[&child].payload else {
+            unreachable!()
+        };
+        assert_eq!(
+            tools.as_deref(),
+            Some(&["allowed".to_owned()][..]),
+            "the allowlist lives on the agent's own root"
+        );
+        let leaf = session.state(child).unwrap().spine.leaf_id;
+        let pair = returned(tree, leaf);
+        assert_eq!(pair[0], json!("ok"));
+        let refused = pair[1].as_str().unwrap();
+        assert!(
+            refused.contains("not in this agent's allowlist"),
+            "{refused}"
+        );
+        assert!(refused.contains("have: allowed"), "{refused}");
+        // The child's card never advertised what its calls would refuse.
+        let EventPayload::Agent { system, .. } = &tree.events[&child].payload else {
+            unreachable!()
+        };
+        assert!(system.contains("- tools.allowed"), "narrowed card");
+        assert!(!system.contains("- tools.forbidden"), "narrowed card");
     }
 }

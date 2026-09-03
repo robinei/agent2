@@ -1339,7 +1339,7 @@ events per step.
 
 ### Step B1 — `spawn` / `ask` / `agents`; `agent` as sugar (`host/tools.rs`, `machine.rs`, `dialect.rs`)
 
-- [ ] `tools.spawn({ name?, charter, tools? }) → { agent }` (`name` lands
+- [x] `tools.spawn({ name?, charter, tools? }) → { agent }` (`name` lands
       on the `Agent`; `tools` is enforced by the registry as the
       child's allowlist, default the caller's); `tools.tell({ to?,
       text, input? }) → { post }` resolves in the same step its `Post`
@@ -1349,7 +1349,7 @@ events per step.
       unambiguous agent id (an ambiguous one rejects the call naming the
       live branches); `tools.agent(...)` desugars to both in
       `dispatch_calls`, schema and card line verbatim.
-- [ ] `tools.agents({ under?, deep? })` served from tree + session state:
+- [x] `tools.agents({ under?, deep? })` served from tree + session state:
       direct children by default, the subtree with `deep`, one row per
       branch with `agent`/`branch`/`name`/`charter`/`parent`/`status`/
       `open`/`last_answer`. Tests: a program spawns three workers and a
@@ -1358,25 +1358,33 @@ events per step.
       forked worker lists as two rows sharing `agent`
       (`forked_agent_lists_two_branches`); `Promise.all` over `agents()`
       fans a question out and joins (`broadcast_is_promise_all_over_agents`).
-- [ ] A spawned agent's `Agent` is a child of its `Spawn`. A question
+- [x] A spawned agent's `Agent` is a child of its `Spawn`. A question
       logs `Send` **first**, then `Post { source: <that send> }` on the
       callee; the callee's `Answer { question: <that post> }` produces
       `Result { call: <that send> }` on the asking branch. A test
       walks the loop from each event to the other three
       (`exchange_ids_form_a_closed_loop`).
-- [ ] `to` omitted resolves to the author of the oldest open post — the
+- [x] `to` omitted resolves to the author of the oldest open post — the
       human for a root conversation (the invoke is `to: user`), the parent
       for a subagent; a test covers both (`default_to_is_the_current_asker`).
-- [ ] Two sequential asks to one agent accumulate context
+- [x] Two sequential asks to one agent accumulate context
       (`second_question_sees_first_exchange`).
-- [ ] Card: an **eligibility** paragraph — `run_program` always;
+- [x] Card: an **eligibility** paragraph — `run_program` always;
       `resume` only after a condition report; `answer(q)` only for a post
       open on this branch; an ineligible call costs a turn and tells you
       what is valid. Then the "Orchestrating" paragraph above, verbatim,
-      beside the tool lines; `agent` stated as the one-shot form. The static-text
-      bound in `dialect::tests` is raised by exactly the paragraph's size
-      and no more.
-- [ ] Gate: `cargo fmt && cargo clippy --workspace --all-targets &&
+      beside the tool lines; `agent` stated as the one-shot form.
+      *(Two wording changes, both because the paragraph as drafted
+      described things that are not built: the presence sentence points at
+      a system-prompt line, which the doc's own cache discipline forbids
+      and C1 puts in the trailing line instead — so it states the decision
+      it exists to drive ("a question to the human may sit unanswered, so
+      prefer a stated assumption") and C1 adds where to look.)* The
+      static-text bound in `dialect::tests` is **not** raised: it is
+      30,720 bytes against 12,076 of static text, so the paragraphs come
+      nowhere near it and there is nothing to raise. Tightening it to
+      binding is a change of that test's meaning, not this step's work.
+- [x] Gate: `cargo fmt && cargo clippy --workspace --all-targets &&
       cargo test` green.
 
 ### Step B2 — The `answer` restart; explicit binding (`machine.rs`, `report.rs`)

@@ -85,6 +85,69 @@ pub fn scripted_text(text: &str) -> LlmTurn {
     }
 }
 
+/// A scripted client that answers by **which agent asked**, not by
+/// arrival order: each rule is a **charter** and its own queue of turns,
+/// popped in order.
+///
+/// A charter is matched as the *tail* of the system prompt, which is
+/// exactly where `assemble_system` puts it — behind the card. Matching
+/// anywhere in the prompt would collide with the card's own prose (which
+/// says "worker" a few times), so the tail is both simpler and correct.
+///
+/// From B1 on, several branches think at once as a matter of course. A
+/// single queue makes the *test* racy where the system is not: two
+/// workers prompted in the same step pop in whatever order their threads
+/// win. Keying on the branch removes that without weakening anything —
+/// each branch still gets its scripted turns in order.
+#[cfg(test)]
+pub struct RoutedLlm {
+    rules: Vec<(String, Mutex<VecDeque<LlmTurn>>)>,
+}
+
+#[cfg(test)]
+impl RoutedLlm {
+    /// Rules are tried in order, first match wins, so list the most
+    /// specific charter first when one is a suffix of another.
+    pub fn new(rules: impl IntoIterator<Item = (&'static str, Vec<LlmTurn>)>) -> Self {
+        RoutedLlm {
+            rules: rules
+                .into_iter()
+                .map(|(needle, turns)| (needle.to_owned(), Mutex::new(turns.into())))
+                .collect(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl LlmClient for RoutedLlm {
+    fn complete(
+        &self,
+        request: &LlmRequest,
+        chunk: &mut dyn FnMut(LlmChunk),
+    ) -> Result<LlmTurn, String> {
+        for (charter, queue) in &self.rules {
+            if !request.system.ends_with(charter.as_str()) {
+                continue;
+            }
+            let Some(turn) = queue.lock().unwrap().pop_front() else {
+                return Err(format!("scripted rule `{charter}` ran out of turns"));
+            };
+            if let Some(t) = &turn.thinking {
+                chunk(LlmChunk::Thinking(t.clone()));
+            }
+            if !turn.text.is_empty() {
+                chunk(LlmChunk::Text(turn.text.clone()));
+            }
+            return Ok(turn);
+        }
+        let tail = request.system.len().saturating_sub(80);
+        Err(format!(
+            "no scripted rule matches this branch's charter: …{}",
+            &request.system[tail..]
+        ))
+    }
+}
+
 impl LlmClient for ScriptedLlm {
     fn complete(
         &self,
