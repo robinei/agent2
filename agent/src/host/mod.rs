@@ -3571,4 +3571,75 @@ mod tests {
         assert!(system.contains("- tools.allowed"), "narrowed card");
         assert!(!system.contains("- tools.forbidden"), "narrowed card");
     }
+
+    // ── B2: structured answers ──────────────────────────────────────
+
+    /// `Answer.value` is JSON: a structured answer reaches the asking
+    /// **program** as an object, not as prose it would have to parse.
+    /// 8_HARNESS decision 3 said a subagent's result is a JSON value and
+    /// `finish_frame` could only produce a string. Closed.
+    #[test]
+    fn structured_answer_reaches_the_program() {
+        // Event ids are deterministic: Agent 1, Post 2, Turn 3, Spawn 4,
+        // Agent 5, Result 6, Send 7, Post 8 — so the worker's one open
+        // question is #8, which the assertion below guards.
+        let question = 8;
+        let (session, _) = run_routed(
+            ToolRegistry::new(),
+            [
+                (
+                    "counts things",
+                    vec![
+                        scripted_answer(
+                            "w1",
+                            EventId::new(question),
+                            json!({ "files": 3, "bytes": 1200 }),
+                        ),
+                        scripted_text("counted"),
+                    ],
+                ),
+                (
+                    "test agent",
+                    vec![
+                        scripted_program(
+                            "c1",
+                            r#"const w = await tools.spawn(
+                                 { name: "c", charter: "counts things" });
+                               const v = await tools.ask({ to: w.agent, text: "how many?" });
+                               return [typeof v, v.files, v.bytes];"#,
+                        ),
+                        scripted_text("structured"),
+                    ],
+                ),
+            ],
+            "count them",
+        );
+        let tree = session.tree();
+        // The hardcoded id really is the worker's open question.
+        let worker = agent_by_charter(tree, "counts things");
+        let worker_leaf = session.state(worker).unwrap().spine.leaf_id;
+        assert!(
+            matches!(
+                &tree.events[&EventId::new(question)].payload,
+                EventPayload::Message(Message::Post {
+                    origin: Origin::Sent(_),
+                    ..
+                })
+            ),
+            "#{question} must be the delivered question"
+        );
+
+        // An object, indexable — never a string the program must parse.
+        assert_eq!(
+            returned(tree, root_leaf(&session)),
+            json!(["object", 3, 1200])
+        );
+        // `answer` left the worker's phase alone, so it took another turn
+        // and then went idle owing nothing.
+        assert_eq!(
+            kinds(tree, worker_leaf),
+            ["Agent", "Post", "Turn", "Answer", "Turn"]
+        );
+        assert!(tree.spine_at(worker_leaf).context().open.is_empty());
+    }
 }

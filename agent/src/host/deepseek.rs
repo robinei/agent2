@@ -90,6 +90,13 @@ fn request_body(request: &LlmRequest, model: &str) -> serde_json::Value {
         "content": request.system,
     })];
     messages.extend(request.messages.iter().map(message_json));
+    // The trailing ephemeral line goes **last**, after the newest
+    // message — never into the system prompt, which is prefix. It is not
+    // logged, and next request it is re-emitted at the new end, so
+    // everything before it stays byte-identical.
+    if let Some(tail) = &request.tail {
+        messages.push(serde_json::json!({ "role": "user", "content": tail }));
+    }
     let tools: Vec<serde_json::Value> = request
         .tools
         .iter()
@@ -237,7 +244,7 @@ fn parse_sse(reader: impl BufRead, chunk: &mut dyn FnMut(LlmChunk)) -> Result<Ll
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::machine::{resume_spec, run_program_spec};
+    use crate::machine::tool_specs;
     use serde_json::json;
 
     #[test]
@@ -264,7 +271,8 @@ mod tests {
                     text: "## program completed".into(),
                 },
             ],
-            tools: vec![resume_spec(), run_program_spec()],
+            tools: tool_specs(),
+            tail: Some("2 questions are open on this branch: #4, #7.".into()),
         };
         let body = request_body(&request, "deepseek-v4-pro");
 
@@ -283,11 +291,30 @@ mod tests {
         assert!(messages[2].get("reasoning_content").is_none());
         assert_eq!(messages[3]["role"], "tool");
         assert_eq!(messages[3]["tool_call_id"], "c1");
-        // Tools: full definitions, OpenAI function shape.
+        // The ephemeral line goes **last**, after the newest message —
+        // never into the system prompt, which is prefix.
+        assert_eq!(messages[4]["role"], "user");
+        assert_eq!(
+            messages[4]["content"],
+            "2 questions are open on this branch: #4, #7."
+        );
+        assert_eq!(messages.len(), 5);
+        // Tools: full definitions, OpenAI function shape, and the same
+        // three in the same order on every request.
         let tools = body["tools"].as_array().unwrap();
-        assert_eq!(tools[0]["function"]["name"], "resume");
-        assert_eq!(tools[1]["function"]["name"], "run_program");
-        assert!(tools[1]["function"]["parameters"]["properties"]["source"].is_object());
+        let names: Vec<&str> = tools
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["run_program", "resume", "answer"]);
+        assert!(tools[0]["function"]["parameters"]["properties"]["source"].is_object());
+        // `resume`'s value is optional — resuming after a message
+        // arrived has nothing to supply.
+        assert!(tools[1]["function"]["parameters"].get("required").is_none());
+        assert_eq!(
+            tools[2]["function"]["parameters"]["required"],
+            json!(["question", "value"])
+        );
     }
 
     fn sse(events: &[&str]) -> String {

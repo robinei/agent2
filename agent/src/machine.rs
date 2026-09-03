@@ -18,10 +18,26 @@ use crate::host::ProgramStatus;
 use crate::report::{Artifact, ArtifactState, preview};
 use crate::types::*;
 
-/// Tool names offered to the LLM. `run_program` is the primary tool;
-/// `resume` appears only while suspended on a resumable condition.
+/// Tool names offered to the LLM. All three are offered on **every**
+/// request, in this order, for the branch's whole life: prompt caching
+/// keys on the longest common prefix and the tool array is assembled
+/// into the front of it, so a phase-varying list makes a varying prefix
+/// — and a branch with N conditions would pay 2N invalidations at the
+/// boundary this project crosses most.
+///
+/// What replaces the schema-level guardrail is a report-level one: the
+/// **rules** are static and live in the card, *which are eligible now*
+/// is in the report, and an ineligible call is answered with a refusal
+/// (`Runner::eligible`). An invalid restart becomes possible and
+/// corrected in one turn, instead of impossible.
 pub const TOOL_RUN_PROGRAM: &str = "run_program";
 pub const TOOL_RESUME: &str = "resume";
+pub const TOOL_ANSWER: &str = "answer";
+
+/// The tool list, constant for a branch's life.
+pub fn tool_specs() -> Vec<ToolSpec> {
+    vec![run_program_spec(), resume_spec(), answer_spec()]
+}
 
 /// Program-facing tool names `dispatch_calls` interprets — **the one
 /// place a `tools.*` name becomes a `Call` variant** (A2). Everything
@@ -79,25 +95,66 @@ pub fn run_program_spec() -> ToolSpec {
     }
 }
 
-/// The `resume` definition — offered only while suspended on a
-/// resumable condition.
+/// The `resume` definition. Offered always; valid only when your last
+/// message is a condition report for a program that is still suspended,
+/// which the report says.
+///
+/// `value` is **optional**: resuming a post-condition (nobody asked for a
+/// value — a message arrived) has nothing to supply, and requiring one
+/// would make the commonest restart of this phase read as an error.
 pub fn resume_spec() -> ToolSpec {
     ToolSpec {
         name: TOOL_RESUME.into(),
         description: "Resume the suspended program: execution continues with `value` as \
-                      the result of the failed operation (or of the raise expression)."
+                      the result of the failed operation (or of the raise expression). \
+                      Omit `value` when nothing asked for one — resuming after a message \
+                      arrived just continues."
             .into(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
                 "value": {
-                    "description": "the JSON value to resume with"
+                    "description": "the JSON value to resume with (optional)"
                 }
-            },
-            "required": ["value"]
+            }
         }),
     }
 }
+
+/// The `answer` definition — explicit binding. Offered always; valid only
+/// for a post that is open on **this** branch.
+///
+/// A bare turn already answers the oldest open post, so this is for the
+/// three cases it cannot express: a structured value, a specific one of
+/// several open posts, and answering an interrupting post **without
+/// ending the program**.
+pub fn answer_spec() -> ToolSpec {
+    ToolSpec {
+        name: TOOL_ANSWER.into(),
+        description: "Answer one open question on this branch, by id. Carries a JSON \
+                      value, picks a specific question when several are open, and leaves \
+                      any running or suspended program exactly as it is — so you can \
+                      answer an interrupting message and then resume."
+            .into(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "question": {
+                    "type": "integer",
+                    "description": "the id of the open post being answered (#N in the report)"
+                },
+                "value": {
+                    "description": "the answer, as any JSON value"
+                }
+            },
+            "required": ["question", "value"]
+        }),
+    }
+}
+
+/// Open-post ids named in the request's trailing note before it says
+/// "and N more" — a bounded line, like every other rendered bound.
+const OPEN_NOTE_MAX_IDS: usize = 8;
 
 /// Iteration cap for one `Tick`: each extra round requires a synchronous
 /// artifact fetch (`tools.tool_result`) to have unblocked the program,
@@ -220,7 +277,15 @@ pub struct LlmRequest {
     /// never alters an existing conversation's cached prefix.
     pub system: String,
     pub messages: Vec<Rendered>,
+    /// Constant for a branch's life — see [`TOOL_RUN_PROGRAM`].
     pub tools: Vec<ToolSpec>,
+    /// A trailing ephemeral line after the newest message: per-request
+    /// facts, never logged, re-emitted at the new end each time so the
+    /// prefix it followed stays byte-identical. The **only** place a
+    /// right-now fact may go; putting one in the system prompt or a
+    /// rendered message would invalidate every cached branch on every
+    /// flip. (C1 adds presence here.)
+    pub tail: Option<String>,
 }
 
 #[derive(Debug)]
@@ -344,6 +409,32 @@ pub struct Runner {
     deferred_refusals: Vec<String>,
 }
 
+/// A restart the branch was asked for — by its LLM, or by the user
+/// taking its turn (C1's `Restart`). The tool list is constant, so
+/// **which of these is valid is not a schema fact**, and this enum is
+/// what the one eligibility check is written against.
+#[derive(Clone, Copy, Debug)]
+pub enum Restart {
+    RunProgram,
+    Resume,
+    Answer(EventId),
+}
+
+/// Why a restart is ineligible — the text the refusal renders.
+///
+/// It is self-sufficient **by construction**: every one is built by
+/// [`Runner::refusal`], which appends what *is* valid now. A refusal that
+/// only says "no" costs a second turn, so saying no and saying what to do
+/// instead are one operation here rather than two conventions.
+#[derive(Debug)]
+pub struct Refusal(String);
+
+impl Refusal {
+    pub fn reason(&self) -> &str {
+        &self.0
+    }
+}
+
 enum SuspendCause {
     Raise {
         condition: String,
@@ -458,6 +549,140 @@ impl Runner {
         &self.spine.context().open
     }
 
+    /// **The one eligibility check**, used for every restart — the LLM's
+    /// and the user's alike. It changes no state: an ineligible call is
+    /// answered with a refusal and costs one turn.
+    ///
+    /// This is also the *only* enforcement of the fork-obligations rule.
+    /// A fork inherits history, not obligations, so a pre-fork post is
+    /// not on its `open` list — and the refusal says whose it is, which
+    /// explains the rule where it is violated instead of leaving it as
+    /// something the model must have absorbed.
+    pub fn eligible(&self, tree: &Tree, restart: Restart) -> Result<(), Refusal> {
+        match restart {
+            // Always valid: there is always a program you could write.
+            Restart::RunProgram => Ok(()),
+            Restart::Resume => match &self.phase {
+                Phase::Suspended(_, ResumeWith::Trapped(e))
+                    if matches!(e.resume, ResumeMode::NotResumable) =>
+                {
+                    Err(self.refusal(
+                        "this condition is not resumable — no value can stand in for what \
+                         failed.",
+                    ))
+                }
+                Phase::Suspended(..) => Ok(()),
+                // The distinctive case: a branch reopened at a `Condition`
+                // whose VM did not survive the restart. The log says a
+                // program is suspended; the session has no VM to re-enter,
+                // and saying only "nothing to resume" would read as a
+                // contradiction of the report the model is looking at.
+                _ if self.last_outcome_is_a_condition(tree) => Err(self.refusal(
+                    "that condition's program did not survive the restart — the VM is \
+                     gone, so there is nothing to re-enter. Its artifacts are all still \
+                     fetchable by id from the menu; rewrite with run_program and reuse \
+                     them.",
+                )),
+                _ => Err(self.refusal("nothing is suspended.")),
+            },
+            Restart::Answer(question) => {
+                if self.open().contains(&question) {
+                    return Ok(());
+                }
+                let id = question.as_u64();
+                let owner = self.owning_branch(tree, question);
+                Err(
+                    match (tree.events.get(&question).map(|e| &e.payload), owner) {
+                        // Open, but on the branch this one forked from: it
+                        // stays that branch's to answer, so there is exactly
+                        // one owner for every open post.
+                        (_, Some(branch)) => self.refusal(&format!(
+                            "#{id} belongs to branch #{}; this fork inherited it as history \
+                         and does not owe it. To make your answer the delivered one, the \
+                         user can take that branch's turn.",
+                            branch.as_u64()
+                        )),
+                        (Some(EventPayload::Message(Message::Post { .. })), None) => {
+                            self.refusal(&format!(
+                                "#{id} is not open on this branch — it was already answered, \
+                             or it is a notice that owes no answer."
+                            ))
+                        }
+                        _ => self.refusal(&format!("#{id} is not a post on this branch.")),
+                    },
+                )
+            }
+        }
+    }
+
+    /// A refusal that states what is true **and** what is valid now.
+    fn refusal(&self, what_is_true: &str) -> Refusal {
+        Refusal(format!("{what_is_true} {}", self.valid_now()))
+    }
+
+    /// The restarts that would be accepted right now, as the refusal's
+    /// closing sentence. Recency beats a rule stated far back in the
+    /// context, so a refusal repeats it rather than referring to it.
+    fn valid_now(&self) -> String {
+        let mut valid = vec!["run_program".to_owned()];
+        if matches!(&self.phase, Phase::Suspended(_, resume)
+                    if !matches!(resume, ResumeWith::Trapped(e)
+                                 if matches!(e.resume, ResumeMode::NotResumable)))
+        {
+            valid.push("resume".to_owned());
+        }
+        for post in self.open() {
+            valid.push(format!("answer(#{})", post.as_u64()));
+        }
+        format!("Valid now: {}.", valid.join(", "))
+    }
+
+    /// Whether this branch's last outcome was a `Condition` — the log
+    /// saying a program is suspended while the session holds no VM for
+    /// it, which is what a reopened log looks like.
+    fn last_outcome_is_a_condition(&self, tree: &Tree) -> bool {
+        matches!(
+            tree.path_events(self.spine.leaf_id)
+                .iter()
+                .rev()
+                .find(|e| matches!(
+                    e.payload,
+                    EventPayload::Return { .. } | EventPayload::Condition { .. }
+                ))
+                .map(|e| &e.payload),
+            Some(EventPayload::Condition { .. })
+        )
+    }
+
+    /// The branch that owes `question`, when it is not this one: an
+    /// unanswered post on this path but **before** this branch's root.
+    /// That is exactly the pre-fork case, and the answer is the branch
+    /// whose root it sits at or after.
+    fn owning_branch(&self, tree: &Tree, question: EventId) -> Option<EventId> {
+        let path = tree.path_events(self.spine.leaf_id);
+        let at = path.iter().position(|e| e.id == question)?;
+        let root = tree.branch_of(self.spine.leaf_id)?;
+        let root_at = path.iter().position(|e| e.id == root)?;
+        if at >= root_at {
+            return None; // on this branch; not the fork case
+        }
+        // Unanswered anywhere on this path, and expecting a reply.
+        let expects_reply = matches!(
+            tree.resolve(match &path[at].payload {
+                EventPayload::Message(m) => m,
+                _ => return None,
+            }),
+            Message::Post { origin, .. } if matches!(origin.direct(), Some((_, _, true)))
+        );
+        let answered = path.iter().any(
+            |e| matches!(&e.payload, EventPayload::Answer { question: q, .. } if *q == question),
+        );
+        if !expects_reply || answered {
+            return None;
+        }
+        tree.branch_of(path[at].id)
+    }
+
     /// The VM the debugger TUI renders from (9_TUI dec. 4): the live
     /// one while a program runs or is suspended, else the last run's
     /// final state (sticky post-mortem panes).
@@ -545,18 +770,101 @@ impl Runner {
         };
         let assistant_id = tree.append(&mut self.spine, EventPayload::Message(message))?;
 
-        let Some(call) = tool_calls.first().cloned() else {
+        if tool_calls.is_empty() {
             // No tool call: the assistant's text completes the agent.
             return self.answer_open(tree);
+        }
+        // `answer` settles **synchronously**, so a turn may carry one or
+        // more of them ahead of the single call that drives the VM —
+        // `answer(#42, v)` then `resume()` is the post-condition report's
+        // expected move, and each answer's outcome is logged before the
+        // next call runs, so outcomes stay in call order.
+        let mut answered = Vec::new();
+        let mut rest = &tool_calls[..];
+        while rest.first().is_some_and(|c| c.name == TOOL_ANSWER) {
+            self.apply_answer(tree, &rest[0], &mut answered)?;
+            rest = &rest[1..];
+        }
+        let Some(call) = rest.first().cloned() else {
+            // The turn was answers only. Each is a tool call the API
+            // needs replied to, so the branch takes another turn — the
+            // program's state is untouched either way.
+            if matches!(self.phase, Phase::Idle) {
+                self.phase = Phase::AwaitingLlm;
+            }
+            answered.push(self.render_request(tree));
+            return Ok(answered);
         };
-        // Every call gets exactly one outcome, and outcomes are logged in
-        // **call order** so the positional pairing holds. The first call
-        // may drive the VM and settle much later, so refusals of the ones
-        // after it are deferred until its outcome has landed.
-        self.deferred_refusals = (1..tool_calls.len())
-            .map(|_| "one tool call per turn; this call was ignored".to_owned())
+        // Every remaining call gets exactly one outcome, and outcomes are
+        // logged in **call order** so the positional pairing holds. The
+        // one that drives the VM may settle much later, so refusals of
+        // the ones after it are deferred until its outcome has landed.
+        self.deferred_refusals = (1..rest.len())
+            .map(|_| "one program-driving tool call per turn; this call was ignored".to_owned())
             .collect();
+        // The acks come first: they are earlier calls in the same turn,
+        // and the renderer pairs tool messages to calls positionally.
+        let mut out = answered;
+        out.extend(self.on_program_call(tree, assistant_id, call)?);
+        Ok(out)
+    }
 
+    /// Serve one `answer(question, value)`: explicit binding.
+    ///
+    /// It logs the `Answer` and **leaves `phase` exactly as it is** —
+    /// answering is not a program operation. `resume` and `run_program`
+    /// change the program's state; one turn may carry an `answer` and one
+    /// of those, which is how you answer an interrupting post without
+    /// abandoning the run.
+    fn apply_answer(
+        &mut self,
+        tree: &mut Tree,
+        call: &ToolCall,
+        out: &mut Vec<StepOutput>,
+    ) -> io::Result<()> {
+        let question = call
+            .arguments
+            .get("question")
+            .and_then(|q| q.as_u64())
+            .filter(|n| *n > 0)
+            .map(EventId::new);
+        let Some(question) = question else {
+            return self.refuse(
+                tree,
+                "answer needs a `question` id — the #N of an open post in the report",
+            );
+        };
+        if let Err(refusal) = self.eligible(tree, Restart::Answer(question)) {
+            return self.refuse(tree, refusal.reason());
+        }
+        let value = call
+            .arguments
+            .get("value")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        tree.append(
+            &mut self.spine,
+            EventPayload::Answer {
+                question,
+                value: value.clone(),
+            },
+        )?;
+        out.push(StepOutput::Answered {
+            question: Some(question),
+            value,
+        });
+        Ok(())
+    }
+
+    /// Serve the one call in a turn that drives the VM — `run_program`,
+    /// `resume`, or an unknown name. `answer` never reaches here: it
+    /// settles synchronously, ahead of this.
+    fn on_program_call(
+        &mut self,
+        tree: &mut Tree,
+        assistant_id: EventId,
+        call: ToolCall,
+    ) -> io::Result<Vec<StepOutput>> {
         match call.name.as_str() {
             TOOL_RUN_PROGRAM => {
                 let Some(source) = call.arguments.get("source").and_then(|s| s.as_str()) else {
@@ -614,6 +922,14 @@ impl Runner {
                 }
             }
             TOOL_RESUME => {
+                if let Err(refusal) = self.eligible(tree, Restart::Resume) {
+                    self.refuse(tree, refusal.reason())?;
+                    self.flush_refusals(tree)?;
+                    if !matches!(self.phase, Phase::Suspended(..)) {
+                        self.phase = Phase::AwaitingLlm;
+                    }
+                    return Ok(vec![self.render_request(tree)]);
+                }
                 let value = call
                     .arguments
                     .get("value")
@@ -638,40 +954,29 @@ impl Runner {
                                 ResumeMode::NotResumable => false,
                             },
                         };
-                        if resumed {
-                            // The next report (completion or re-suspension)
-                            // answers *this* resume call, not the original
-                            // run_program — the chat transcript requires every
-                            // assistant tool_call to be followed by a tool
-                            // message bearing its id.
-                            run.call_id = call.id.clone();
-                            let program_id = run.program_id;
-                            self.phase = Phase::Running(run);
-                            // Same block resumes — keep the originating id.
-                            self.note_status(program_id, ProgramStatus::Running);
-                            Ok(vec![StepOutput::Working])
-                        } else {
-                            self.phase = Phase::Suspended(run, suspension);
-                            self.refuse(tree, "this condition is not resumable; use run_program")?;
-                            self.flush_refusals(tree)?;
-                            Ok(vec![self.render_request(tree)])
-                        }
+                        assert!(resumed, "eligibility audited resumability");
+                        // The next report (completion or re-suspension)
+                        // answers *this* resume call, not the original
+                        // run_program — the chat transcript requires every
+                        // assistant tool_call to be followed by a tool
+                        // message bearing its id.
+                        run.call_id = call.id.clone();
+                        let program_id = run.program_id;
+                        self.phase = Phase::Running(run);
+                        // Same block resumes — keep the originating id.
+                        self.note_status(program_id, ProgramStatus::Running);
+                        Ok(vec![StepOutput::Working])
                     }
-                    other => {
-                        self.phase = other;
-                        self.refuse(tree, "nothing to resume")?;
-                        self.flush_refusals(tree)?;
-                        if !matches!(self.phase, Phase::Suspended(..)) {
-                            self.phase = Phase::AwaitingLlm;
-                        }
-                        Ok(vec![self.render_request(tree)])
-                    }
+                    _ => unreachable!("eligibility audited the phase"),
                 }
             }
             unknown => {
                 self.refuse(
                     tree,
-                    &format!("unknown tool `{unknown}` (have: run_program, resume)"),
+                    &format!(
+                        "unknown tool `{unknown}` (have: {TOOL_RUN_PROGRAM}, {TOOL_RESUME}, \
+                         {TOOL_ANSWER})"
+                    ),
                 )?;
                 self.flush_refusals(tree)?;
                 if !matches!(self.phase, Phase::Suspended(..)) {
@@ -1162,11 +1467,35 @@ impl Runner {
             EventPayload::Result { outcome, .. } => outcome_json(outcome),
             EventPayload::Call(_) => match settlement_of(&segment, event.id) {
                 Some(outcome) => outcome_json(outcome),
-                None => Err(format!("call #{id} has no result yet")),
+                // Artifacts cross a `Fork`; **in-flight calls do not**.
+                // A pending pre-fork `Send`'s `Result` will land on the
+                // original's branch, which this path does not include, so
+                // re-attaching could never resolve — the same
+                // `eligible()`-shaped rule as answering a pre-fork post,
+                // refused for the same reason and naming the same owner.
+                None => match self.pre_fork_pending(tree, event) {
+                    Some(branch) => Err(format!(
+                        "call #{id} is still pending on branch #{} — this fork inherited \
+                         it as history, and its result will land there, not here. Issue \
+                         your own call instead.",
+                        branch.as_u64()
+                    )),
+                    None => Err(format!("call #{id} has no result yet")),
+                },
             },
             EventPayload::Return { value } => Ok(value.clone()),
             _ => Err(format!("event #{id} is not an artifact")),
         }
+    }
+
+    /// The branch that owns a still-pending call, when this branch is a
+    /// fork that inherited it: the call sits before this branch's root.
+    fn pre_fork_pending(&self, tree: &Tree, call: &Event) -> Option<EventId> {
+        let root = tree.branch_of(self.spine.leaf_id)?;
+        if call.id.as_u64() >= root.as_u64() {
+            return None; // issued on this branch
+        }
+        tree.branch_of(call.id)
     }
 
     fn finish_program(
@@ -1417,20 +1746,48 @@ impl Runner {
         let system = self.spine.context().system.clone();
         let messages = self.render_messages(tree);
 
-        let tools = match &self.phase {
-            Phase::Suspended(_, ResumeWith::Trapped(e))
-                if matches!(e.resume, ResumeMode::NotResumable) =>
-            {
-                vec![run_program_spec()]
-            }
-            Phase::Suspended(..) => vec![resume_spec(), run_program_spec()],
-            _ => vec![run_program_spec()],
-        };
+        // Constant for the branch's life: the tool array is assembled
+        // into the front of the cached prefix, so a phase-varying list
+        // is a varying prefix. Which restarts are *valid* is in the
+        // report, and an ineligible call is refused (`eligible`).
         StepOutput::LlmRequest(LlmRequest {
             system,
             messages,
-            tools,
+            tools: tool_specs(),
+            tail: self.request_tail(),
         })
+    }
+
+    /// The trailing **ephemeral** line: per-request facts, emitted after
+    /// the newest message and never logged. Next request it is simply
+    /// re-emitted at the new end, so the prefix it followed stays intact —
+    /// which is why a right-now fact may live here and nowhere else.
+    ///
+    /// So far: which questions are open, when more than one is. A single
+    /// open post needs no note (a bare reply answers it, which is the
+    /// default anyway); several do, because the binding rule silently
+    /// picks the oldest and the model cannot see which that is.
+    fn request_tail(&self) -> Option<String> {
+        let open = self.open();
+        if open.len() < 2 {
+            return None;
+        }
+        let shown = open.len().min(OPEN_NOTE_MAX_IDS);
+        let ids: Vec<String> = open[..shown]
+            .iter()
+            .map(|id| format!("#{}", id.as_u64()))
+            .collect();
+        let more = match open.len() - shown {
+            0 => String::new(),
+            n => format!(", and {n} more"),
+        };
+        Some(format!(
+            "{} questions are open on this branch: {}{more}. A reply with no tool call \
+             answers the oldest ({}); answer(question, value) picks one.",
+            open.len(),
+            ids.join(", "),
+            ids[0],
+        ))
     }
 
     /// The rendered message list for a request: the branch's posts and
@@ -1849,6 +2206,19 @@ mod tests {
         }
     }
 
+    /// A scripted `answer(question, value)` turn — explicit binding.
+    fn llm_answer(call_id: &str, question: EventId, value: serde_json::Value) -> LlmTurn {
+        LlmTurn {
+            text: String::new(),
+            thinking: None,
+            tool_calls: vec![ToolCall {
+                id: call_id.into(),
+                name: TOOL_ANSWER.into(),
+                arguments: json!({ "question": question.as_u64(), "value": value }),
+            }],
+        }
+    }
+
     fn llm_text(text: &str) -> LlmTurn {
         LlmTurn {
             text: text.into(),
@@ -1931,6 +2301,10 @@ mod tests {
     fn tool_names(req: &LlmRequest) -> Vec<&str> {
         req.tools.iter().map(|t| t.name.as_str()).collect()
     }
+
+    /// The tool list, which never varies — see
+    /// `tool_schemas_are_constant_across_phases`.
+    const CONSTANT_TOOLS: [&str; 3] = [TOOL_RUN_PROGRAM, TOOL_RESUME, TOOL_ANSWER];
 
     fn expect_tool_calls(outputs: &[StepOutput]) -> &Vec<OutCall> {
         outputs
@@ -2178,7 +2552,7 @@ mod tests {
         let req = expect_request(&out);
         assert!(req.system.contains("test agent"));
         assert!(matches!(&req.messages[0], Rendered::User(t) if t == "compute 6*7"));
-        assert_eq!(tool_names(req), [TOOL_RUN_PROGRAM]);
+        assert_eq!(tool_names(req), CONSTANT_TOOLS);
         // The full definition rides along: schema'd parameters, not a name.
         assert!(req.tools[0].parameters["properties"]["source"].is_object());
         assert!(!req.tools[0].description.is_empty());
@@ -2441,7 +2815,7 @@ mod tests {
         // No Working: nothing ran.
         assert!(!out.iter().any(|o| matches!(o, StepOutput::Working)));
         let req = expect_request(&out);
-        assert_eq!(tool_names(req), [TOOL_RUN_PROGRAM]);
+        assert_eq!(tool_names(req), CONSTANT_TOOLS);
         assert!(last_report(&state, &tree).contains("compile error"));
         // No VM was built, so this run has no console and no artifacts —
         // the diagnostic alone, as its one outcome.
@@ -2475,8 +2849,8 @@ mod tests {
 
         // Suspended: report + restart tools (full definitions).
         let req = expect_request(&settled);
-        assert_eq!(tool_names(req), [TOOL_RESUME, TOOL_RUN_PROGRAM]);
-        assert!(req.tools[0].parameters["properties"]["value"].is_object());
+        assert_eq!(tool_names(req), CONSTANT_TOOLS);
+        assert!(req.tools[1].parameters["properties"]["value"].is_object());
         let report = last_report(&state, &tree);
         assert!(report.contains("condition `need_help`"), "{report}");
         assert!(report.contains(r#"{"got":41}"#), "{report}");
@@ -2509,7 +2883,7 @@ mod tests {
             .unwrap();
         let settled = drain(&mut state, &mut tree, out);
         let req = expect_request(&settled);
-        assert_eq!(tool_names(req), [TOOL_RESUME, TOOL_RUN_PROGRAM]);
+        assert_eq!(tool_names(req), CONSTANT_TOOLS);
 
         let out = state
             .step(
@@ -2997,6 +3371,44 @@ console: (no output)
         );
     }
 
+    /// The **restarts** section lists what is eligible *for this
+    /// suspension* — so a branch that also owes an answer is told so,
+    /// with a one-line reminder of what each restart does. The rules
+    /// themselves stay in the card; recency beats a rule stated far back
+    /// in the context.
+    #[test]
+    fn golden_condition_report_with_an_open_question() {
+        let (mut tree, mut state) = setup();
+        user_post(&mut state, &mut tree, "how many lines?");
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(llm_program("c1", "raise(\"need_path\", null);")),
+            )
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+        assert_eq!(
+            last_report(&state, &tree),
+            r#"## what happened
+1:1: condition `need_path` raised
+raise("need_path", null);
+^
+payload: null
+
+## where
+in <root>
+console: (no output)
+
+## artifacts — fetch with tools.tool_result(id)
+(none)
+
+## restarts
+- resume(value): continue past the raise; `value` becomes the result of the raise(...) expression
+- answer(#2, value): answer that question with a JSON value; the program is left exactly as it is
+- run_program(source): replace the program — new source runs in a fresh VM; results in the artifact menu stay fetchable via tools.tool_result(id), so reuse them instead of repeating calls"#
+        );
+    }
+
     #[test]
     fn golden_completion_report() {
         let (mut tree, mut state) = setup();
@@ -3154,5 +3566,388 @@ got X
                 .any(|m| matches!(m, Message::Turn { text, .. } if text.len() == 500)),
             "full prose retained on spine"
         );
+    }
+
+    // ── B2: the answer restart; explicit binding ────────────────────
+
+    /// **Cache discipline.** Prompt caching keys on the longest common
+    /// prefix, and the tool array is assembled into the front of it — so
+    /// a phase-varying list is a varying prefix, and a branch with N
+    /// conditions would pay 2N invalidations at the boundary this project
+    /// crosses most. All three restarts are offered always; the *report*
+    /// says which are valid.
+    ///
+    /// (Re-pointed from the M1-era test that asserted a *different* list
+    /// for idle vs suspended: the same phases are walked, and what is
+    /// asserted is that they no longer differ.)
+    #[test]
+    fn tool_schemas_are_constant_across_phases() {
+        let (mut tree, mut state) = setup();
+        let mut seen: Vec<Vec<ToolSpec>> = Vec::new();
+
+        // Idle → a request.
+        let out = user_post(&mut state, &mut tree, "go");
+        seen.push(expect_request(&out).tools.clone());
+
+        // Suspended on a raise.
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(llm_program("c1", r#"raise("need", null); return 1;"#)),
+            )
+            .unwrap();
+        let settled = drain(&mut state, &mut tree, out);
+        seen.push(expect_request(&settled).tools.clone());
+
+        // Suspended on a *non*-resumable trap — the phase that used to
+        // drop `resume` from the list entirely.
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(llm_program("c2", r#"throw new Error("boom");"#)),
+            )
+            .unwrap();
+        let settled = drain(&mut state, &mut tree, out);
+        seen.push(expect_request(&settled).tools.clone());
+
+        // Idle again, after a completion.
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(llm_program("c3", "return 1;")),
+            )
+            .unwrap();
+        let settled = drain(&mut state, &mut tree, out);
+        seen.push(expect_request(&settled).tools.clone());
+
+        for tools in &seen {
+            assert_eq!(
+                tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
+                CONSTANT_TOOLS,
+                "the tool list never varies"
+            );
+        }
+        assert!(
+            seen.windows(2).all(|w| w[0] == w[1]),
+            "byte-identical schemas, not just the same names"
+        );
+    }
+
+    /// An ineligible restart is **answered**, not dropped: it changes no
+    /// state, logs its own outcome (so every tool call has exactly one),
+    /// and the refusal states what is true *and* what is valid now — so
+    /// the model recovers on its next turn instead of guessing twice.
+    #[test]
+    fn ineligible_restart_reports_and_recovers() {
+        let (mut tree, mut state) = setup();
+        user_post(&mut state, &mut tree, "go");
+
+        // `resume` with nothing suspended.
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(llm_resume("c1", json!(1))),
+            )
+            .unwrap();
+        let report = last_report(&state, &tree);
+        assert!(report.contains("nothing is suspended"), "{report}");
+        assert!(report.contains("Valid now: run_program"), "{report}");
+        assert!(
+            report.contains(&format!("answer(#{})", state.open()[0].as_u64())),
+            "the open question is named: {report}"
+        );
+        assert!(!report.contains("resume,"), "resume is not valid: {report}");
+        // Nothing changed, and a request went back out.
+        assert!(!expect_request(&out).messages.is_empty());
+        assert_eq!(
+            payload_kinds(&state, &tree),
+            ["Agent", "Post", "Turn", "Condition"],
+            "the refusal is the call's one outcome"
+        );
+
+        // `answer` for a post that is not open.
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(llm_answer("c2", EventId::new(999), json!("x"))),
+            )
+            .unwrap();
+        let report = last_report(&state, &tree);
+        assert!(report.contains("#999 is not a post"), "{report}");
+        assert!(report.contains("Valid now:"), "{report}");
+        drop(out);
+
+        // …and the branch still answers normally afterwards.
+        let question = state.open()[0];
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(llm_answer("c3", question, json!({ "ok": true }))),
+            )
+            .unwrap();
+        assert!(
+            out.iter().any(|o| matches!(
+                o,
+                StepOutput::Answered { question: Some(q), .. } if *q == question
+            )),
+            "recovered in one turn: {out:?}"
+        );
+    }
+
+    /// A **non-resumable** condition and a branch reopened at a condition
+    /// whose VM did not survive are different refusals, because they are
+    /// different truths: one says no value can stand in for what failed,
+    /// the other that there is no VM left to re-enter and points at the
+    /// menu.
+    #[test]
+    fn resume_refusals_state_which_truth_it_is() {
+        // Not resumable: the VM is right there, but nothing can stand in.
+        let (mut tree, mut state) = setup();
+        state.kickoff(&mut tree).unwrap();
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(llm_program("c1", r#"throw new Error("boom");"#)),
+            )
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+        state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(llm_resume("c2", json!(1))),
+            )
+            .unwrap();
+        let report = last_report(&state, &tree);
+        assert!(report.contains("not resumable"), "{report}");
+        assert!(
+            report.contains("Valid now: run_program."),
+            "resume is not offered back: {report}"
+        );
+
+        // Reopened at a condition: the log says suspended, the session
+        // has no VM. Saying only "nothing is suspended" would read as a
+        // contradiction of the report the model is looking at.
+        let reopened = Runner::with_spine(&tree, tree.spine_at(state.spine.leaf_id));
+        let refusal = reopened
+            .eligible(&tree, Restart::Resume)
+            .expect_err("no VM survived");
+        assert!(
+            refusal.reason().contains("did not survive the restart"),
+            "{}",
+            refusal.reason()
+        );
+        assert!(
+            refusal.reason().contains("fetchable by id"),
+            "points at the menu: {}",
+            refusal.reason()
+        );
+    }
+
+    /// A fork inherits history, **not obligations**. `eligible` is the
+    /// only enforcement of that, and the refusal explains the rule where
+    /// it is violated — naming the branch that does owe the answer.
+    #[test]
+    fn fork_cannot_answer_a_prefork_post() {
+        let mut tree = Tree::new(None);
+        let mut original = Runner::new_root(&mut tree, "root", "").unwrap();
+        user_post(&mut original, &mut tree, "which file?");
+        let question = original.open()[0];
+
+        // A fork at the original's leaf, born idle.
+        let mut spine = tree.fork(original.spine.leaf_id).unwrap();
+        let fork_root = tree
+            .append(
+                &mut spine,
+                EventPayload::Fork {
+                    name: Some("sidebar".into()),
+                },
+            )
+            .unwrap();
+        let fork = Runner::with_spine(&tree, tree.spine_at(fork_root));
+
+        // The original still owes it; the fork does not.
+        assert_eq!(original.open(), [question]);
+        assert!(fork.open().is_empty(), "obligations do not cross a Fork");
+
+        let refusal = fork
+            .eligible(&tree, Restart::Answer(question))
+            .expect_err("a fork does not owe a pre-fork post");
+        assert!(
+            refusal.reason().contains(&format!(
+                "#{} belongs to branch #{}",
+                question.as_u64(),
+                original.agent_id().as_u64()
+            )),
+            "{}",
+            refusal.reason()
+        );
+        assert!(
+            refusal
+                .reason()
+                .contains("the user can take that branch's turn"),
+            "and says how to make the fork's answer the delivered one: {}",
+            refusal.reason()
+        );
+        // The original is still eligible — exactly one owner.
+        assert!(original.eligible(&tree, Restart::Answer(question)).is_ok());
+    }
+
+    /// Artifacts cross a `Fork`; **in-flight calls do not**. A pending
+    /// pre-fork `Send`'s `Result` will land on the original's branch, so
+    /// re-attaching from the fork could never resolve — refused, naming
+    /// the owner, by the same rule for the same reason.
+    #[test]
+    fn fork_cannot_reattach_a_prefork_pending_send() {
+        let mut tree = Tree::new(None);
+        let mut original = Runner::new_root(&mut tree, "root", "").unwrap();
+        // A done call and a pending `Send`, both before the fork point.
+        let done = tree
+            .append(
+                &mut original.spine,
+                EventPayload::Call(Call::Invoke {
+                    name: "fetch".into(),
+                    args: json!(["x"]),
+                    site: 0,
+                }),
+            )
+            .unwrap();
+        tree.append(
+            &mut original.spine,
+            EventPayload::Result {
+                call: done,
+                outcome: Outcome::Delivered(json!("DATA")),
+            },
+        )
+        .unwrap();
+        let pending = tree
+            .append(
+                &mut original.spine,
+                EventPayload::Call(Call::Send {
+                    to: Address::Branch(EventId::new(1)),
+                    text: "which file?".into(),
+                    input: json!(null),
+                    expects_reply: true,
+                    site: 0,
+                }),
+            )
+            .unwrap();
+
+        let mut spine = tree.fork(original.spine.leaf_id).unwrap();
+        let fork_root = tree
+            .append(&mut spine, EventPayload::Fork { name: None })
+            .unwrap();
+        let mut fork = Runner::with_spine(&tree, tree.spine_at(fork_root));
+        fork.kickoff(&mut tree).unwrap();
+        let out = fork
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(llm_program(
+                    "c1",
+                    &format!(
+                        r#"const reused = await tools.tool_result({});
+                           let denied;
+                           try {{ denied = await tools.tool_result({}); }}
+                           catch (e) {{ denied = "" + e; }}
+                           return [reused, denied];"#,
+                        done.as_u64(),
+                        pending.as_u64()
+                    ),
+                )),
+            )
+            .unwrap();
+        drain(&mut fork, &mut tree, out);
+        let report = last_report(&fork, &tree);
+        assert!(
+            report.contains(r#""DATA""#),
+            "the done result crosses the fork: {report}"
+        );
+        assert!(
+            report.contains(&format!(
+                "is still pending on branch #{}",
+                original.agent_id().as_u64()
+            )),
+            "the pending Send does not: {report}"
+        );
+    }
+
+    /// Two open posts: a bare turn binds to the **older**, `answer` to
+    /// the one it names. The bare-turn rule is what makes the note in the
+    /// request necessary — it picks silently, and the model cannot see
+    /// which.
+    #[test]
+    fn explicit_answer_binds_the_named_post() {
+        let (mut tree, mut state) = setup();
+        user_post(&mut state, &mut tree, "first question");
+        let (newer, _) = state
+            .deliver(&mut tree, Author::User, direct("second question", true))
+            .unwrap();
+        let older = state.open()[0];
+        assert_eq!(state.open(), [older, newer]);
+
+        // `answer` names the newer one; the older stays open.
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(llm_answer("c1", newer, json!("the second"))),
+            )
+            .unwrap();
+        assert!(out.iter().any(|o| matches!(
+            o,
+            StepOutput::Answered { question: Some(q), value } if *q == newer && value == "the second"
+        )));
+        assert_eq!(state.open(), [older], "only the named post was bound");
+
+        // A bare turn now binds the remaining one — the oldest.
+        let out = state
+            .step(&mut tree, StepInput::LlmResponse(llm_text("the first")))
+            .unwrap();
+        assert!(out.iter().any(|o| matches!(
+            o,
+            StepOutput::Answered { question: Some(q), .. } if *q == older
+        )));
+        assert!(state.open().is_empty());
+    }
+
+    /// A request with more than one open post carries a bounded one-line
+    /// note listing them by id. It rides the **trailing ephemeral line**,
+    /// never a rendered message: it is a right-now fact, and a rendered
+    /// message must render identically forever.
+    #[test]
+    fn many_open_posts_are_noted_in_the_request_tail() {
+        let (mut tree, mut state) = setup();
+        let out = user_post(&mut state, &mut tree, "first");
+        assert!(
+            expect_request(&out).tail.is_none(),
+            "one open post needs no note — a bare reply answers it"
+        );
+
+        let (second, _) = state
+            .deliver(&mut tree, Author::User, direct("second", true))
+            .unwrap();
+        // A tell lands and opens nothing, so it is not listed.
+        state
+            .deliver(&mut tree, Author::Harness, direct("fyi", false))
+            .unwrap();
+        // Any request rendered while both are open carries the note.
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(llm_program("c1", "return 1;")),
+            )
+            .unwrap();
+        let settled = drain(&mut state, &mut tree, out);
+        let tail = expect_request(&settled)
+            .tail
+            .clone()
+            .expect("two open posts get a note");
+        let first = state.open()[0];
+        assert!(tail.contains("2 questions are open"), "{tail}");
+        assert!(tail.contains(&format!("#{}", first.as_u64())), "{tail}");
+        assert!(tail.contains(&format!("#{}", second.as_u64())), "{tail}");
+        assert!(
+            tail.contains(&format!("answers the oldest (#{})", first.as_u64())),
+            "it says which one a bare reply takes: {tail}"
+        );
+        assert!(tail.len() < 300, "bounded: {}", tail.len());
     }
 }

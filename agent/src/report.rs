@@ -82,8 +82,70 @@ pub enum ResumeKind {
     /// Suspended on a trapped, resumable error: `value` stands in for
     /// the failed operation's result.
     Operation,
+    /// Suspended because a message arrived: nothing asked for a value,
+    /// so `resume()` just continues.
+    Continue,
     /// Not resumable: `run_program` is the only restart.
     No,
+}
+
+/// The **restarts** section: what is eligible for this suspension, one
+/// line each, with a reminder of what it does.
+///
+/// The tool list is constant (cache discipline), so which restarts are
+/// valid is a report-level fact rather than a schema one — and recency
+/// beats a rule stated far back in the context, which is why the lines
+/// are here and the *rules* are in the card.
+///
+/// Every input is read from the log at this handback's own position, so
+/// a historical report keeps rendering the same list forever.
+pub struct Restarts {
+    pub resume: ResumeKind,
+    /// Posts open on this branch **at this outcome**, oldest first.
+    pub open: Vec<EventId>,
+}
+
+impl Restarts {
+    fn render(&self) -> String {
+        let mut out = String::from("## restarts\n");
+        match self.resume {
+            ResumeKind::Raise => out.push_str(
+                "- resume(value): continue past the raise; `value` becomes \
+                 the result of the raise(...) expression\n",
+            ),
+            ResumeKind::Operation => out.push_str(
+                "- resume(value): continue as if the failed operation had \
+                 produced `value`\n",
+            ),
+            ResumeKind::Continue => out.push_str(
+                "- resume(): continue the program from where it stopped — nothing here \
+                 asked for a value\n",
+            ),
+            ResumeKind::No => {
+                out.push_str("(this condition is not resumable — resume is not offered)\n")
+            }
+        }
+        for (n, post) in self.open.iter().enumerate() {
+            if n >= MENU_MAX_ENTRIES {
+                out.push_str(&format!(
+                    "- ({} more open questions; every id stays answerable)\n",
+                    self.open.len() - n
+                ));
+                break;
+            }
+            out.push_str(&format!(
+                "- answer(#{}, value): answer that question with a JSON value; the \
+                 program is left exactly as it is\n",
+                post.as_u64()
+            ));
+        }
+        out.push_str(
+            "- run_program(source): replace the program — new source runs in a \
+             fresh VM; results in the artifact menu stay fetchable via \
+             tools.tool_result(id), so reuse them instead of repeating calls",
+        );
+        out
+    }
 }
 
 /// The `run_program` tool result for a raise/trapped error.
@@ -98,7 +160,7 @@ pub struct ConditionReport {
     /// Every artifact on the agent so far, oldest first (the renderer
     /// prunes to the most recent).
     pub artifacts: Vec<Artifact>,
-    pub resume: ResumeKind,
+    pub restarts: Restarts,
 }
 
 impl ConditionReport {
@@ -112,25 +174,8 @@ impl ConditionReport {
         out.push_str(&render_console(&self.console));
         out.push_str("\n\n");
         out.push_str(&render_menu("artifacts", &self.artifacts));
-        out.push_str("\n\n## restarts\n");
-        match self.resume {
-            ResumeKind::Raise => out.push_str(
-                "- resume(value): continue past the raise; `value` becomes \
-                 the result of the raise(...) expression\n",
-            ),
-            ResumeKind::Operation => out.push_str(
-                "- resume(value): continue as if the failed operation had \
-                 produced `value`\n",
-            ),
-            ResumeKind::No => {
-                out.push_str("(this condition is not resumable — resume is not offered)\n")
-            }
-        }
-        out.push_str(
-            "- run_program(source): replace the program — new source runs in a \
-             fresh VM; results in the artifact menu stay fetchable via \
-             tools.tool_result(id), so reuse them instead of repeating calls",
-        );
+        out.push_str("\n\n");
+        out.push_str(&self.restarts.render());
         out
     }
 }
@@ -465,6 +510,10 @@ struct Handback<'t> {
     /// must render identically **forever**, so a historical one cannot
     /// grow new rows as the branch continues past it.
     outcome_at: usize,
+    /// Posts open on this branch **at this outcome** — the same bound,
+    /// for the same reason: a historical report cannot offer to answer a
+    /// question that arrived after it.
+    open: Vec<EventId>,
 }
 
 /// The `run_program` source and attachment flag carried by a tool call.
@@ -539,6 +588,7 @@ fn handback<'t>(tree: &'t Tree, leaf: EventId, outcome: EventId) -> Option<Handb
             _ => None,
         })
         .unwrap_or_default();
+    let open = open_at(tree, &path[..=at]);
     Some(Handback {
         turn,
         source,
@@ -548,6 +598,7 @@ fn handback<'t>(tree: &'t Tree, leaf: EventId, outcome: EventId) -> Option<Handb
         path: path.clone(),
         turn_at,
         outcome_at: at,
+        open,
     })
 }
 
@@ -589,7 +640,10 @@ fn render_handback(h: &Handback<'_>, budget: usize) -> String {
                 stack: stack.clone(),
                 console: h.console.clone(),
                 artifacts: menu_since(h, 0),
-                resume: resume_kind(cause),
+                restarts: Restarts {
+                    resume: resume_kind(cause),
+                    open: h.open.clone(),
+                },
             }
             .render(),
         },
@@ -650,8 +704,42 @@ fn resume_kind(cause: &Cause) -> ResumeKind {
         Cause::Trapped {
             resumable: true, ..
         } => ResumeKind::Operation,
+        // A post suspended the program; nothing asked for a value, so
+        // `resume()` just continues (B3 renders this one).
+        Cause::Posted { .. } => ResumeKind::Continue,
         _ => ResumeKind::No,
     }
+}
+
+/// Posts open at a point on the path, oldest first — `replay_event`'s
+/// `open` rule applied to a **prefix**.
+///
+/// The prefix is the point: a rendered report must render identically
+/// forever, so a historical one cannot list a question that arrived
+/// after it. A branch root resets the list (an `Agent` starts a
+/// clean-room context; a `Fork` inherits history but not obligations),
+/// which is what makes a fork's report offer no `answer` for a pre-fork
+/// post — the same rule `eligible` enforces at the call.
+fn open_at(tree: &Tree, path: &[&Event]) -> Vec<EventId> {
+    let mut open: Vec<EventId> = Vec::new();
+    for event in path {
+        match &event.payload {
+            EventPayload::Agent { .. } | EventPayload::Fork { .. } => open.clear(),
+            EventPayload::Message(post @ Message::Post { .. }) => {
+                // Resolved first: a `Post` whose body lives in its `Send`
+                // carries `expects_reply` there, not inline.
+                if matches!(tree.resolve(post),
+                            Message::Post { origin, .. }
+                            if matches!(origin.direct(), Some((_, _, true))))
+                {
+                    open.push(event.id);
+                }
+            }
+            EventPayload::Answer { question, .. } => open.retain(|id| id != question),
+            _ => {}
+        }
+    }
+    open
 }
 
 /// The artifact menu for this handback: every call **up to this
@@ -939,7 +1027,10 @@ mod tests {
             stack: vec!["<root>".into()],
             console: Vec::new(),
             artifacts: Vec::new(),
-            resume: ResumeKind::Raise,
+            restarts: Restarts {
+                resume: ResumeKind::Raise,
+                open: Vec::new(),
+            },
         };
         let rendered = report.render();
         let what = rendered.split("\n\n## where").next().unwrap();
@@ -990,7 +1081,10 @@ mod tests {
             stack: vec!["<root>".into()],
             console: Vec::new(),
             artifacts: vec![artifact(7, "fetch([\"big\"])", json!("b".repeat(9000)))],
-            resume: ResumeKind::Operation,
+            restarts: Restarts {
+                resume: ResumeKind::Operation,
+                open: Vec::new(),
+            },
         };
         let rendered = report.render();
         let menu_line = rendered.lines().find(|l| l.starts_with("[#7]")).unwrap();
@@ -1099,7 +1193,10 @@ mod tests {
             stack: Vec::new(),
             console: Vec::new(),
             artifacts: Vec::new(),
-            resume: ResumeKind::No,
+            restarts: Restarts {
+                resume: ResumeKind::No,
+                open: Vec::new(),
+            },
         };
         let rendered = report.render();
         assert!(!rendered.contains("- resume(value)"));

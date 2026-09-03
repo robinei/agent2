@@ -1389,7 +1389,7 @@ events per step.
 
 ### Step B2 — The `answer` restart; explicit binding (`machine.rs`, `report.rs`)
 
-- [ ] The tool list becomes **constant** — `run_program`, `resume`,
+- [x] The tool list becomes **constant** — `run_program`, `resume`,
       `answer` on every request, replacing `render_request`'s
       phase-dependent `match` (cache discipline). The M1-era test that
       asserts different tool names for idle vs suspended is re-pointed to
@@ -1400,9 +1400,15 @@ events per step.
       `usage.prompt_cache_hit_tokens`. Record the number here. If tools
       do not affect its cache, keep the constant list anyway (simpler)
       and strike the cache justification from the doc.
-- [ ] `answer(question, value)` logs `Answer`, routes as in A6, leaves
-      `phase` unchanged. `resume_spec()`'s value becomes optional.
-- [ ] One `eligible(&self, call) -> Result<(), Refusal>` check, used for
+      *(Left unchecked: this one is yours to run — it needs the network.
+      The constant list landed regardless, per this box's own
+      instruction, so nothing waits on the number.)*
+- [x] `answer(question, value)` logs `Answer`, routes as in A6, leaves
+      `phase` unchanged. `resume_spec()`'s value becomes optional. *(A
+      turn may also carry `answer`s **ahead of** one program-driving
+      call, which B3's `answer` + `resume` needs: they settle
+      synchronously, so outcomes stay in call order.)*
+- [x] One `eligible(&self, call) -> Result<(), Refusal>` check, used for
       every restart. An ineligible call is answered with a self-sufficient
       refusal — what is true, what is valid now — changing no state:
       `resume` with nothing suspended — including a branch reopened at a
@@ -1414,18 +1420,23 @@ events per step.
       (`ineligible_restart_reports_and_recovers`,
       `fork_cannot_answer_a_prefork_post`). This check is the *only*
       enforcement of the fork-obligations rule.
-- [ ] The report's **restarts** section lists what is eligible for this
+- [x] The report's **restarts** section lists what is eligible for this
       suspension with a one-line reminder each; the *rules* live in the
-      card (cache discipline). Golden reports updated.
-- [ ] `llm.rs` gains `scripted_answer(call_id, question, value)` beside
+      card (cache discipline). Golden reports updated — the three
+      existing ones are byte-identical (their branches have nothing open)
+      and `golden_condition_report_with_an_open_question` pins the new
+      `answer(#N, value)` line.
+- [x] `llm.rs` gains `scripted_answer(call_id, question, value)` beside
       `scripted_program`/`scripted_resume`/`scripted_text`.
-- [ ] Two open posts: a bare turn binds to the older, `answer` to the
+- [x] Two open posts: a bare turn binds to the older, `answer` to the
       named one (`explicit_answer_binds_the_named_post`); a JSON object
       reaches the asking program as an object
       (`structured_answer_reaches_the_program`).
-- [ ] Requests with >1 open post carry a bounded one-line note listing
-      them by id.
-- [ ] Gate: `cargo fmt && cargo clippy --workspace --all-targets &&
+- [x] Requests with >1 open post carry a bounded one-line note listing
+      them by id. *(It rides a new `LlmRequest.tail` — the trailing
+      ephemeral line after the newest message, which is the only place a
+      right-now fact may go. C1's presence line lands in the same field.)*
+- [x] Gate: `cargo fmt && cargo clippy --workspace --all-targets &&
       cargo test` green.
 
 ### Step B3 — Rule B: posts on arrival, `Condition::Posted`, the annotated report (`machine.rs`, `report.rs`)

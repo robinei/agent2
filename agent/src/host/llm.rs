@@ -76,6 +76,25 @@ pub fn scripted_resume(call_id: &str, value: serde_json::Value) -> LlmTurn {
     }
 }
 
+/// A scripted assistant turn calling `answer(question, value)` — the
+/// restart that binds explicitly and leaves the program alone.
+#[cfg(test)]
+pub fn scripted_answer(
+    call_id: &str,
+    question: crate::types::EventId,
+    value: serde_json::Value,
+) -> LlmTurn {
+    LlmTurn {
+        text: String::new(),
+        thinking: None,
+        tool_calls: vec![crate::types::ToolCall {
+            id: call_id.into(),
+            name: crate::machine::TOOL_ANSWER.into(),
+            arguments: serde_json::json!({ "question": question.as_u64(), "value": value }),
+        }],
+    }
+}
+
 /// A scripted plain-text assistant turn (completes the agent).
 pub fn scripted_text(text: &str) -> LlmTurn {
     LlmTurn {
