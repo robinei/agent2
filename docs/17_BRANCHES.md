@@ -1293,10 +1293,10 @@ The load-bearing step of Part A: after it, no renderer touches the `VM`.
 Small and independent; land it before the log grows a fan-out's worth of
 events per step.
 
-- [ ] `Tree` syncs once per loop step rather than per event; a fixture cut
+- [x] `Tree` syncs once per loop step rather than per event; a fixture cut
       mid-step reopens to the step's start and reconciles
       (`sync_per_step_survives_a_torn_tail`).
-- [ ] Gate: `cargo fmt && cargo clippy --workspace --all-targets &&
+- [x] Gate: `cargo fmt && cargo clippy --workspace --all-targets &&
       cargo test` green.
 
 ### Step A6 — `Answer`; agents never close (`types.rs`, `tree.rs`, `machine.rs`, `host/mod.rs`)

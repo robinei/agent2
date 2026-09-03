@@ -102,10 +102,32 @@ impl Tree {
 
         let mut max_id: u64 = 0;
         let mut events = HashMap::<EventId, Event>::new();
-        for line in content.lines() {
-            let event: Event = serde_json::from_str(line)?;
+        // A crash can now fall mid-line: the log syncs once per loop
+        // step, so the tail of the step in progress may be torn. A torn
+        // **last** line was never acknowledged to anyone, so dropping it
+        // loses nothing reconciliation cannot repair. Anywhere else a bad
+        // line is real corruption and must not be swallowed.
+        let mut lines = content.lines().peekable();
+        let mut torn = false;
+        while let Some(line) = lines.next() {
+            let last = lines.peek().is_none();
+            let event: Event = match serde_json::from_str(line) {
+                Ok(event) => event,
+                Err(_) if last && !content.ends_with('\n') => {
+                    torn = true;
+                    break;
+                }
+                Err(e) => return Err(e.into()),
+            };
             max_id = std::cmp::max(max_id, event.id.as_u64());
             events.insert(event.id, event);
+        }
+        if torn {
+            // Truncate the partial record so the next append starts on a
+            // clean line boundary.
+            let keep = content.rfind('\n').map(|i| i + 1).unwrap_or(0) as u64;
+            file.set_len(keep)?;
+            file.seek(SeekFrom::Start(keep))?;
         }
 
         Ok(Self {
@@ -206,12 +228,27 @@ impl Tree {
         if let Some(file) = &mut self.file {
             let json = serde_json::to_string(&event)?;
             writeln!(file, "{json}")?;
-            file.flush()?;
-            file.sync_all()?;
         }
 
         self.events.insert(id, event);
         Ok(id)
+    }
+
+    /// Flush and fsync the log. Called **once per loop step**, not once
+    /// per event: a 50-call fan-out was 100 fsyncs on the loop thread —
+    /// the same thread that owes millisecond post delivery.
+    ///
+    /// The guarantee this weakens is precise: a crash could only fall
+    /// *between* events and can now fall inside a step, losing that
+    /// step's tail. That is exactly what reconciliation already
+    /// repairs — every unmatched half of an exchange is fixed on open —
+    /// so nothing downstream changes.
+    pub fn sync(&mut self) -> io::Result<()> {
+        if let Some(file) = &mut self.file {
+            file.flush()?;
+            file.sync_all()?;
+        }
+        Ok(())
     }
 
     /// Reconstruct a spine handle for a leaf: trace to the root via
@@ -1060,6 +1097,70 @@ mod tests {
         let tree = Tree::new(None);
         let err = tree.fork(EventId::new(99)).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    // --- Durability granularity ---
+
+    /// The log syncs once per loop **step**, so a crash can fall inside
+    /// one and tear the tail. A torn last line was never acknowledged to
+    /// anyone: reopening drops it, truncates back to the last clean
+    /// record, and keeps appending — which is the state reconciliation
+    /// already knows how to repair.
+    #[test]
+    fn sync_per_step_survives_a_torn_tail() -> io::Result<()> {
+        let tmp = NamedTempFile::new()?;
+        let path = tmp.path().to_path_buf();
+        let open = || -> io::Result<Tree> {
+            Tree::open(
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .open(&path)?,
+            )
+        };
+
+        let turn;
+        {
+            let mut tree = open()?;
+            let mut spine = tree.start_agent(None, None, "root", "")?;
+            tree.append(&mut spine, user_msg("go"))?;
+            turn = tree.append(&mut spine, run_program_call("c1", "return 1;"))?;
+            tree.sync()?;
+            // A step in progress: these are written but not yet synced.
+            tree.append(&mut spine, returned(json!(1)))?;
+        }
+
+        // Cut mid-record, the way a crash inside a step would.
+        let full = std::fs::read_to_string(&path)?;
+        let last = full[..full.len() - 1].rfind('\n').unwrap() + 1;
+        let cut = last + (full.len() - last) / 2;
+        std::fs::write(&path, &full[..cut])?;
+
+        // Reopening lands on the step's start — the complete records —
+        // and the partial one is gone from the file, not just from memory.
+        let mut tree = open()?;
+        assert_eq!(tree.events.len(), 3);
+        assert_eq!(tree.id_counter, 3);
+        assert_eq!(std::fs::read_to_string(&path)?, &full[..last]);
+
+        // The run now has no outcome, which is exactly the reconciliation
+        // row for it — and appending continues on a clean boundary.
+        let leaf = tree.list_leaves()[0].0;
+        assert_eq!(leaf, turn);
+        let mut spine = tree.spine_at(leaf);
+        tree.append(
+            &mut spine,
+            EventPayload::Condition {
+                cause: Cause::Interrupted,
+                site: 0,
+                stack: Vec::new(),
+            },
+        )?;
+        tree.sync()?;
+        assert_eq!(open()?.events.len(), 4);
+        Ok(())
     }
 
     // --- Bodies are stored once ---

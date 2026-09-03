@@ -264,6 +264,9 @@ impl Session {
             awaiting_user: false,
         };
         session.emit_new(root);
+        // Opening is a step of its own: the root `Agent`, or a repair
+        // appended by reconciliation, is durable before the loop runs.
+        session.tree.sync()?;
         Ok(session)
     }
 
@@ -379,11 +382,17 @@ impl Session {
     /// Run one slice of at most `fuel` instructions on a (paused)
     /// agent — the debugger's step keys.
     pub fn step_paused(&mut self, agent: AgentId, fuel: u64) {
-        let _ = self.step_agent(agent, StepInput::Tick { fuel });
+        let _ = self
+            .step_agent(agent, StepInput::Tick { fuel })
+            .and_then(|()| self.tree.sync());
     }
 
     fn on_msg(&mut self, msg: LoopMsg) {
-        if let Err(e) = self.dispatch(msg) {
+        // One inbox message is one loop step, and the log syncs once at
+        // the end of it — never once per event, which a fan-out turn
+        // would make hundreds of fsyncs on the loop thread.
+        let stepped = self.dispatch(msg).and_then(|()| self.tree.sync());
+        if let Err(e) = stepped {
             self.emit(SessionEvent::Error {
                 agent: None,
                 message: format!("session io error: {e}"),
