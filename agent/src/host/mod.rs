@@ -450,17 +450,6 @@ impl Session {
         self.states.get(&branch)
     }
 
-    /// Live branches, lowest id first (id, machine status).
-    pub fn branches(&self) -> Vec<(BranchId, &'static str)> {
-        let mut out: Vec<(BranchId, &'static str)> = self
-            .states
-            .iter()
-            .map(|(id, s)| (*id, s.status()))
-            .collect();
-        out.sort_by_key(|(id, _)| id.as_u64());
-        out
-    }
-
     /// Whether a client is attached. Presence is a per-request fact: this
     /// changes the next render's trailing line on every branch and not one
     /// byte of any cached prefix.
@@ -956,8 +945,11 @@ impl Session {
     }
 
     /// Every branch in the log as a navigator row: identity and shape
-    /// from the log, `status`/`thinking` from live session state.
-    fn branch_infos(&self) -> Vec<BranchInfo> {
+    /// from the log, `status`/`thinking` from live session state. Public
+    /// so a same-thread consumer (the attached TUI, 17_BRANCHES Step D1)
+    /// can read the projection directly instead of round-tripping
+    /// `ListBranches` through the command queue.
+    pub fn branch_infos(&self) -> Vec<BranchInfo> {
         self.tree
             .branches()
             .into_iter()
@@ -1712,6 +1704,22 @@ mod tests {
         }
     }
 
+    /// Live branches, lowest id first (id, machine status). This used to
+    /// be `Session::branches()`; 17_BRANCHES Step D1 moved the TUI onto
+    /// `branch_infos()`, which is a strict superset (dormant branches
+    /// included, plus name/parent/open) and is what production code
+    /// actually needs now — so the narrower query lives here, where the
+    /// tests that want exactly "who's live and doing what" still do.
+    fn live_branches(session: &Session) -> Vec<(BranchId, &'static str)> {
+        let mut out: Vec<(BranchId, &'static str)> = session
+            .states
+            .iter()
+            .map(|(id, s)| (*id, s.status()))
+            .collect();
+        out.sort_by_key(|(id, _)| id.as_u64());
+        out
+    }
+
     /// Build a session over a fresh tree, send one user turn, run to
     /// completion, and return it with the buffered `SessionEvent`s.
     fn run_session(
@@ -2419,17 +2427,14 @@ mod tests {
 
         // The child answered, and the parent joined its result.
         let root = session.conversation_branch();
-        let child = session
+        let (child, _) = session
             .tree()
-            .agent_list()
+            .branches()
             .into_iter()
-            .find(|v| v.id != root)
-            .expect("a child agent");
+            .find(|(branch, _)| *branch != root)
+            .expect("a child branch");
         assert_eq!(
-            kinds(
-                session.tree(),
-                session.state(child.id).unwrap().spine.leaf_id
-            ),
+            kinds(session.tree(), session.state(child).unwrap().spine.leaf_id),
             ["Agent", "Post", "Turn", "Answer"]
         );
         let parent_before = kinds(session.tree(), root_leaf(&session)).len();
@@ -2437,16 +2442,13 @@ mod tests {
         // Now speak to the child directly. It is idle, not done: the post
         // lands, it answers again, and nothing routes to the parent.
         session.handle().send(SessionCommand::UserTurn {
-            branch: child.id,
+            branch: child,
             text: "one more thing".into(),
             expects_reply: true,
         });
         while session.pump_one() {}
 
-        let child_kinds = kinds(
-            session.tree(),
-            session.state(child.id).unwrap().spine.leaf_id,
-        );
+        let child_kinds = kinds(session.tree(), session.state(child).unwrap().spine.leaf_id);
         assert_eq!(
             child_kinds,
             ["Agent", "Post", "Turn", "Answer", "Post", "Turn", "Answer"],
@@ -4422,8 +4424,7 @@ mod tests {
             [EventId::new(1), a, b]
         );
         assert_eq!(
-            session
-                .branches()
+            live_branches(&session)
                 .iter()
                 .map(|(id, _)| *id)
                 .collect::<Vec<_>>(),
@@ -4547,8 +4548,7 @@ mod tests {
         for _ in 0..4 {
             session.pump_one();
         }
-        let fork = session
-            .branches()
+        let fork = live_branches(&session)
             .into_iter()
             .map(|(id, _)| id)
             .find(|id| *id != branch)
@@ -4796,8 +4796,7 @@ mod tests {
             name: Some("explore".into()),
         });
         while session.pump_one() {}
-        let fork = session
-            .branches()
+        let fork = live_branches(&session)
             .into_iter()
             .map(|(id, _)| id)
             .find(|id| *id != branch)
@@ -4918,8 +4917,7 @@ mod tests {
         for _ in 0..40 {
             session.pump_one();
         }
-        let running = session
-            .branches()
+        let running = live_branches(&session)
             .into_iter()
             .filter(|(_, s)| *s == "running")
             .count();
@@ -4935,8 +4933,7 @@ mod tests {
         let cool = 'found: {
             for _ in 0..400 {
                 session.pump_one();
-                if let Some(b) = session
-                    .branches()
+                if let Some(b) = live_branches(&session)
                     .into_iter()
                     .find(|(id, _)| session.tree().branch_name(*id).as_deref() == Some("cool"))
                     .map(|(id, _)| id)

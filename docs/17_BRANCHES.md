@@ -1810,7 +1810,94 @@ be told apart from a crash, an interruption, or a model that lost track.
 
 ---
 
-## Part D — The TUI: dancing (`debug/attach.rs`, `debug/app.rs`, `debug/chat.rs`)
+## Part D — The TUI: dancing (`debug/attach.rs`, `debug/chat.rs`)
+
+Split into two steps rather than one box list with one gate, which gave no
+checkpoint across a large surface: **D1** re-keys selection, the chat
+pane, and the navigator from `AgentId` to `BranchId`, preserving
+behaviour — no new gestures. **D2** builds the gestures dancing actually
+needs: inline questions, the waiting-on-you header and jump key,
+fork/spawn/interrupt/restart keys, the reply-vs-turn input mode, the
+timeline filter, and the live annotated source.
+
+*(The heading originally also named `debug/app.rs` — that module is the
+standalone `agent debug` debugger's app state (9_TUI Step 2), untouched
+by this phase. The attached-session TUI's app state is `AttachedApp` in
+`attach.rs`, which is what D1 and D2's boxes below actually change; fixed
+here.)*
+
+### Step D1 — the navigator is a branch tree
+
+- [x] The navigator is **one tree of branches**, nested exactly as the log
+      nests them (`parent_branch`): a fork hangs under the branch it
+      diverged from; an agent's first branch hangs under the branch that
+      spawned it. Every node is named by its root — `Agent.name` or
+      `Fork.name`, falling back to a derived label — with status (`idle` /
+      `thinking` / `running` / `suspended` / `asking you`) and open count.
+      The **two edge kinds are visually distinct** (a `⑂` marks a fork;
+      an unmarked edge is a spawn — a new clean-room context), because
+      that is the difference `context()` turns on. Selection is by
+      branch; Tab cycles live branches; `1`–`9` select.
+      *(Built from `Session::branch_infos()` — already everything the
+      navigator needs; made `pub` so the same-thread TUI can call it
+      directly instead of round-tripping `ListBranches` through the
+      command queue, the way a UI on a different thread would.)*
+- [x] A nameless branch displays a derived label (the first line of its
+      own first post — at or after its root, so a fork's label is about
+      what makes *it* different rather than the shared prefix — clipped)
+      that is never logged; naming it replaces the derived label
+      everywhere. *(`report::derived_branch_label`. The **rename key**
+      itself is a gesture — a new one — and moves to D2 with the rest.)*
+- [x] The tree shows **where a branch came from, not who can reach it**:
+      a subagent spawned before a fork point appears under the original
+      branch, though the fork can address it too (it is in the fork's
+      inherited history). Reachability is `agents()`, and the two answers
+      differing is correct, not a bug. *(Falls out of nesting by
+      `parent_branch` rather than by agent — no separate mechanism
+      needed.)*
+- [x] `chat.rs` is re-keyed from `AgentId` to `BranchId`: `streaming`,
+      `current_program`, `program_status`, and every transcript `Entry`
+      now key on the branch an event landed on (`SessionEvent`'s `branch`
+      field, carried alongside `agent` since C1) rather than the agent —
+      so two forks of one agent no longer interleave into one stream. A
+      forked branch's rows are its own events *plus* the shared prefix it
+      inherited, reconstructed from the event stream alone (`fork_parent`,
+      populated from each `Fork` event's `parent_id`) — never from the
+      `Tree`, which this module is deliberately isolated from
+      (`fork_inherits_prefix_not_the_original_s_future`).
+- [x] `attach.rs`'s selection (`AttachedApp.selected`), `find_leaf`,
+      `vm_for_program`, and `resolve_program` are re-keyed to `BranchId`.
+      This is the bug C1 flagged, fixed: a forked branch now resolves its
+      **own** `Runner`/VM instead of silently falling through to whichever
+      branch happens to share the agent id ("it works only because an
+      agent's first branch id **is** its `Agent` event id, so an unforked
+      tree looks correct").
+- [x] `Tree::agent_list`/`AgentView` had no consumer left once the
+      navigator moved to `branch_infos`; deleted, along with the one
+      other production caller of `Session::branches()` (the navigator's
+      old status overlay) — see below.
+- [x] `attach.rs` tests cover selection over multiple branches per agent
+      (`concurrent_agents_list_and_retarget`, re-pointed at
+      `branch_infos`); `chat.rs` gains
+      `fork_inherits_prefix_not_the_original_s_future`, pinning that a
+      fork sees the shared prefix and nothing the original does
+      afterward.
+- [x] Gate: `cargo fmt && cargo clippy --workspace --all-targets &&
+      cargo test` green.
+
+**An incidental deletion: `Session::branches()`.** Its one production
+caller was the navigator's old `live` status overlay, which this step
+replaced with `branch_infos` — a strict superset (it also covers dormant
+branches, name, parent, and open count, from one query instead of two).
+With that caller gone, the method had no reachable caller outside
+`#[cfg(test)]`, which a binary crate's dead-code lint catches even though
+several `host::tests` still wanted exactly that narrower query; they now
+call a same-shaped `live_branches` helper kept in `host::tests` itself.
+Flagging this because the doc's own seam list ("Session::branches() for
+live status") named it something not to rebuild — it wasn't rebuilt,
+just narrowed to the one place still wanting it.
+
+### Step D2 — dancing
 
 - [ ] **There is no home; the tree comes to you.** An agent's question to
       you renders inline in that branch's chat, highlighted, and the
@@ -1819,24 +1906,8 @@ be told apart from a crash, an interruption, or a model that lost track.
       waiting on you. A timeline view (every post of yours across
       branches, each row jumping to its branch) is a filter you can open,
       not a place you live.
-- [ ] The navigator is **one tree of branches**, nested exactly as the log
-      nests them (`parent_id`): a fork hangs under the branch it diverged
-      from, at that point; an agent's first branch hangs under the branch
-      that spawned it. Every node is named by its root — `Agent.name` or
-      `Fork.name` — with status (`idle` / `thinking` / `running` /
-      `suspended` / `asking you`) and open count. The **two edge kinds are
-      visually distinct**: spawn (a new clean-room context) versus fork
-      (the same context diverged), because that is the difference
-      `context()` turns on. Selection is by branch; Tab cycles live
-      branches; `1`–`9` select.
-- [ ] A nameless branch displays a derived label (first line of its first
-      post, clipped) that is never logged; naming it replaces the derived
-      label everywhere. A rename key on the selection sends `Rename`.
-- [ ] The tree shows **where a branch came from, not who can reach it**:
-      a subagent spawned before a fork point appears under the original
-      branch, though the fork can address it too (it is in the fork's
-      inherited history). Reachability is `agents()`, and the two answers
-      differing is correct, not a bug.
+- [ ] A rename key on the selection sends `Rename`, replacing the derived
+      label (D1) everywhere it was standing in.
 - [ ] The input line always sends to the selected branch: `UserTurn` by
       default (a modifier sends it as a tell); `Reply` when the branch
       has a pending ask to you (the question sits above the input). Enter
@@ -1846,11 +1917,17 @@ be told apart from a crash, an interruption, or a model that lost track.
       branch — resume-with-value and rewrite-from-editor (`Restart`).
 - [ ] A running branch's chat shows the annotated source live (the same
       renderer as the report), so "how far along" never costs a turn.
+      *(Not satisfiable through the current seam as written — see "What
+      Part C deliberately left for you." The fix is splitting the
+      annotation into a pure function of `(source, calls-with-sites,
+      settlements-so-far)` that both `report::annotated_source` and the
+      live pane call, rather than rendering the live pane from
+      `Runner::vm()`.)*
 - [ ] Agent and branch references in chat (`agent 7`, an `agents()` row, a
       `spawn` result) are clickable and select that branch — the
       orchestrator can say "see the researcher" and you are there.
-- [ ] `app.rs` tests cover selection over multiple branches per agent, the
-      reply-vs-turn input mode, and the restart keys.
+- [ ] `attach.rs` tests cover the reply-vs-turn input mode and the restart
+      keys.
 - [ ] Gate: `cargo fmt && cargo clippy --workspace --all-targets &&
       cargo test` green.
 

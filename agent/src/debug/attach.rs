@@ -33,9 +33,10 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use super::app::PaneInfo;
 use super::chat::{ChatKind, ChatState, RowDetail};
 use super::ui;
-use crate::host::{AgentId, Session, SessionCommand, SessionEvent};
+use crate::host::{BranchId, BranchInfo, Session, SessionCommand, SessionEvent};
 use crate::machine::TOOL_RUN_PROGRAM;
-use crate::tree::{AgentView, ProgramView};
+use crate::report::derived_branch_label;
+use crate::tree::ProgramView;
 use crate::types::{Cause, EventId, EventPayload, Message, Outcome};
 
 /// Cap for one step-line key, so a hot loop on one source line cannot
@@ -101,16 +102,16 @@ pub struct AttachedApp {
     pub view: View,
     prev_view: View,
     pub focus: Focus,
-    pub selected: Option<AgentId>,
+    pub selected: Option<BranchId>,
     /// Which program the right-hand panes show (decision 1). `None` ⇒ the
-    /// selected agent's most-recent program (the default); a click on an
+    /// selected branch's most-recent program (the default); a click on an
     /// older chat block pins a specific one by its `run_program` event id.
     pub selected_program: Option<EventId>,
     /// A subitem within the selected program: an attachment or invoke to
     /// show in the right panel instead of the program console.
     pub selected_subitem: Option<Subitem>,
-    /// Agents whose `System` block is folded to its header (decision 7).
-    collapsed: HashSet<AgentId>,
+    /// Branches whose `System` block is folded to its header (decision 7).
+    collapsed: HashSet<BranchId>,
     pub input: String,
     pub quit: bool,
     pub show_source: bool,
@@ -128,7 +129,7 @@ pub struct AttachedApp {
 }
 
 impl AttachedApp {
-    pub fn new(root: AgentId) -> Self {
+    pub fn new(root: BranchId) -> Self {
         AttachedApp {
             chat: ChatState::new(),
             view: View::Chat,
@@ -156,11 +157,11 @@ impl AttachedApp {
     }
 
     /// Feed one `SessionEvent`: updates the transcript and drives the
-    /// auto-pop — the selected agent starting a `run_program` pops the
+    /// auto-pop — the selected branch starting a `run_program` pops the
     /// source + console column (decision 6).
     pub fn apply(&mut self, event: &SessionEvent) {
-        if let SessionEvent::Event { agent, event, .. } = event
-            && Some(*agent) == self.selected
+        if let SessionEvent::Event { branch, event, .. } = event
+            && Some(*branch) == self.selected
             && matches!(
                 &event.payload,
                 EventPayload::Message(Message::Turn { tool_calls, .. })
@@ -200,9 +201,9 @@ impl AttachedApp {
         }
     }
 
-    pub fn on_mouse(&mut self, column: u16, row: u16, kind: MouseEventKind, agents: &[AgentId]) {
+    pub fn on_mouse(&mut self, column: u16, row: u16, kind: MouseEventKind, branches: &[BranchId]) {
         if matches!(kind, MouseEventKind::Down(MouseButton::Left)) {
-            self.on_click(column, row, agents);
+            self.on_click(column, row, branches);
             return;
         }
         let delta: i64 = match kind {
@@ -239,9 +240,9 @@ impl AttachedApp {
     }
 
     /// Left-click hit-testing (decision 7): a navigator row retargets
-    /// the agent; a chat-block row pins the program; a `system` header
-    /// toggles its agent's fold.
-    fn on_click(&mut self, column: u16, row: u16, agents: &[AgentId]) {
+    /// the branch; a chat-block row pins the program; a `system` header
+    /// toggles its branch's fold.
+    fn on_click(&mut self, column: u16, row: u16, branches: &[BranchId]) {
         let Some((pane, info)) = self.pane_at(column, row) else {
             return;
         };
@@ -250,9 +251,9 @@ impl AttachedApp {
         match pane {
             Pane::Navigator => {
                 if let Some(idx) = body
-                    && let Some(&fid) = agents.get(idx)
+                    && let Some(&bid) = branches.get(idx)
                 {
-                    self.select_agent(fid);
+                    self.select_branch(bid);
                 }
             }
             Pane::Chat => {
@@ -261,10 +262,10 @@ impl AttachedApp {
                 let rows = self.chat.rows(self.selected);
                 if let Some((kind, _text, detail)) = rows.get(line) {
                     if *kind == ChatKind::System {
-                        if let Some(agent) = self.selected
-                            && !self.collapsed.remove(&agent)
+                        if let Some(branch) = self.selected
+                            && !self.collapsed.remove(&branch)
                         {
-                            self.collapsed.insert(agent);
+                            self.collapsed.insert(branch);
                         }
                         return;
                     }
@@ -304,10 +305,10 @@ impl AttachedApp {
         }
     }
 
-    /// Point both selection axes at `agent`: it becomes the chat focus and
-    /// the panes fall back to its most-recent program (decision 1).
-    fn select_agent(&mut self, agent: AgentId) {
-        self.selected = Some(agent);
+    /// Point both selection axes at `branch`: it becomes the chat focus
+    /// and the panes fall back to its most-recent program (decision 1).
+    fn select_branch(&mut self, branch: BranchId) {
+        self.selected = Some(branch);
         self.selected_program = None;
         self.reset_program_scrolls();
     }
@@ -368,17 +369,17 @@ impl AttachedApp {
         }
     }
 
-    pub fn on_key(&mut self, code: KeyCode, agents: &[AgentId]) -> KeyAction {
+    pub fn on_key(&mut self, code: KeyCode, branches: &[BranchId]) -> KeyAction {
         // Context switching works everywhere.
         if code == KeyCode::Tab {
-            self.cycle_agent(agents);
+            self.cycle_branch(branches);
             return KeyAction::None;
         }
         match self.view {
-            View::FullDebug => self.on_debug_key(code, agents),
+            View::FullDebug => self.on_debug_key(code, branches),
             View::Chat | View::Running => match self.focus {
                 Focus::Input => self.on_input_key(code),
-                Focus::Debug => self.on_debug_key(code, agents),
+                Focus::Debug => self.on_debug_key(code, branches),
             },
         }
     }
@@ -408,7 +409,7 @@ impl AttachedApp {
         }
     }
 
-    fn on_debug_key(&mut self, code: KeyCode, agents: &[AgentId]) -> KeyAction {
+    fn on_debug_key(&mut self, code: KeyCode, branches: &[BranchId]) -> KeyAction {
         match code {
             KeyCode::Char('q') => {
                 self.quit = true;
@@ -445,9 +446,9 @@ impl AttachedApp {
             KeyCode::Char(c @ '1'..='9') => {
                 let idx = (c as u8 - b'1') as usize;
                 if self.view == View::FullDebug {
-                    // 1–9 switch which agent the panes borrow.
-                    if let Some(id) = agents.get(idx) {
-                        self.select_agent(*id);
+                    // 1–9 switch which branch the panes borrow.
+                    if let Some(id) = branches.get(idx) {
+                        self.select_branch(*id);
                     }
                 } else if self.view == View::Running {
                     // 1–4 override the auto-pop set.
@@ -465,44 +466,44 @@ impl AttachedApp {
         }
     }
 
-    fn cycle_agent(&mut self, agents: &[AgentId]) {
-        if agents.is_empty() {
+    fn cycle_branch(&mut self, branches: &[BranchId]) {
+        if branches.is_empty() {
             return;
         }
         let next = match self
             .selected
-            .and_then(|s| agents.iter().position(|f| *f == s))
+            .and_then(|s| branches.iter().position(|f| *f == s))
         {
-            Some(i) => (i + 1) % agents.len(),
+            Some(i) => (i + 1) % branches.len(),
             None => 0,
         };
-        self.select_agent(agents[next]);
+        self.select_branch(branches[next]);
     }
 }
 
-/// The current spine leaf for `agent` — from the live state if available
-/// (resume-friendly session), or the first leaf in the agent's subtree
-/// from the tree projection (log-only, decision 8).
-fn find_leaf(session: &Session, agent: AgentId) -> Option<EventId> {
-    if let Some(state) = session.state(agent) {
+/// The current spine leaf for `branch` — from the live state if
+/// available (resume-friendly session), or the leaf the tree projection
+/// records for it (log-only, decision 8; a dormant branch has no
+/// `Runner`, C1's `dormant`).
+fn find_leaf(session: &Session, branch: BranchId) -> Option<EventId> {
+    if let Some(state) = session.state(branch) {
         return Some(state.spine.leaf_id);
     }
-    session.tree().list_leaves().iter().find_map(|(id, _)| {
-        session
-            .tree()
-            .enclosing_agent(*id)
-            .filter(|ef| *ef == agent)?;
-        Some(*id)
-    })
+    session
+        .tree()
+        .branches()
+        .into_iter()
+        .find_map(|(root, leaf)| (root == branch).then_some(leaf))
 }
 
-/// If `program` is the current (or most-recently-completed) program in
-/// `agent`, returns the VM for rich introspection — otherwise `None` (it
+/// If `program` is the current (or most-recently-completed) program on
+/// `branch`, returns the VM for rich introspection — otherwise `None` (it
 /// is an older program rendered from the log projection, Step 5).
-fn vm_for_program(session: &Session, agent: AgentId, program: EventId) -> Option<&interp::VM> {
-    let state = session.state(agent)?;
+fn vm_for_program(session: &Session, branch: BranchId, program: EventId) -> Option<&interp::VM> {
+    let state = session.state(branch)?;
     let vm = state.vm()?;
     let leaf = state.spine.leaf_id;
+    let agent = session.tree().enclosing_agent(branch)?;
     let programs = session.tree().programs_for(agent, leaf);
     if programs.last().map(|p| p.id) == Some(program) {
         Some(vm)
@@ -519,10 +520,13 @@ fn resolve_program<'a>(
     app: &AttachedApp,
     session: &'a Session,
 ) -> (Option<&'a interp::VM>, Option<ProgramView>) {
-    let Some(agent) = app.selected else {
+    let Some(branch) = app.selected else {
         return (None, None);
     };
-    let Some(leaf) = find_leaf(session, agent) else {
+    let Some(leaf) = find_leaf(session, branch) else {
+        return (None, None);
+    };
+    let Some(agent) = session.tree().enclosing_agent(branch) else {
         return (None, None);
     };
     let programs = session.tree().programs_for(agent, leaf);
@@ -530,7 +534,7 @@ fn resolve_program<'a>(
         .selected_program
         .or_else(|| programs.last().map(|p| p.id));
     let pv = effective.and_then(|id| programs.into_iter().find(|p| p.id == id));
-    let vm = effective.and_then(|prog_id| vm_for_program(session, agent, prog_id));
+    let vm = effective.and_then(|prog_id| vm_for_program(session, branch, prog_id));
     (vm, pv)
 }
 
@@ -564,13 +568,19 @@ pub fn run_attached(mut session: Session, events_rx: Receiver<SessionEvent>) -> 
             app.apply(&event);
         }
         app.auto_reset_chat_scroll();
-        // All agents root-first, from the log projection so the navigator
-        // survives resume (decision 8), not just the live `states`.
-        let agents: Vec<AgentId> = session.tree().agent_list().iter().map(|fv| fv.id).collect();
+        // Every branch, nested exactly as the log nests them (Part D):
+        // the navigator's row order, and what Tab/1–9/clicks index into.
+        // From `branch_infos` (identity + shape from the log,
+        // status/thinking from live session state) so it survives resume
+        // (decision 8), not just the live `states`.
+        let branches: Vec<BranchId> = ordered_branches(session.branch_infos())
+            .iter()
+            .map(|b| b.branch)
+            .collect();
         for input in inputs {
             match input {
                 CtEvent::Key(key) if key.is_press() => {
-                    let action = app.on_key(key.code, &agents);
+                    let action = app.on_key(key.code, &branches);
                     let Some(selected) = app.selected else {
                         continue;
                     };
@@ -602,7 +612,9 @@ pub fn run_attached(mut session: Session, events_rx: Receiver<SessionEvent>) -> 
                         }
                     }
                 }
-                CtEvent::Mouse(mouse) => app.on_mouse(mouse.column, mouse.row, mouse.kind, &agents),
+                CtEvent::Mouse(mouse) => {
+                    app.on_mouse(mouse.column, mouse.row, mouse.kind, &branches)
+                }
                 _ => {}
             }
         }
@@ -622,20 +634,20 @@ pub fn run_attached(mut session: Session, events_rx: Receiver<SessionEvent>) -> 
     result
 }
 
-/// Step the selected agent's VM until its source line changes (or the
+/// Step the selected branch's VM until its source line changes (or the
 /// program yields/finishes, or the cap is hit).
-fn step_line(session: &mut Session, agent: AgentId) {
-    session.set_paused(agent, true);
+fn step_line(session: &mut Session, branch: BranchId) {
+    session.set_paused(branch, true);
     let line_of = |session: &Session| {
         session
-            .state(agent)
+            .state(branch)
             .and_then(|s| s.vm())
             .and_then(super::panes::current_line)
     };
     let start = line_of(session);
     for _ in 0..LINE_STEP_CAP {
-        session.step_paused(agent, 1);
-        let state = session.state(agent);
+        session.step_paused(branch, 1);
+        let state = session.state(branch);
         if !state.map(|s| s.status() == "running").unwrap_or(false) {
             return; // blocked on the host, suspended, or finished
         }
@@ -694,7 +706,7 @@ fn render(frame: &mut Frame, app: &mut AttachedApp, session: &Session) {
             }
         }
         let slots = Layout::vertical(right_panes.iter().map(|p| match p {
-            Pane::Navigator => Constraint::Length(session.tree().agent_list().len() as u16 + 2),
+            Pane::Navigator => Constraint::Length(session.tree().branches().len() as u16 + 2),
             _ => Constraint::Fill(1),
         }))
         .split(right);
@@ -955,78 +967,112 @@ fn render_chat(
     (top, area)
 }
 
-fn build_navigator_lines(agents: &[AgentView]) -> Vec<(AgentView, String)> {
-    let mut children: std::collections::HashMap<Option<AgentId>, Vec<&AgentView>> =
-        std::collections::HashMap::new();
-    for fv in agents {
-        children.entry(fv.parent).or_default().push(fv);
+/// Every branch, nested exactly as the log nests them (`parent_branch`):
+/// a fork under the branch it diverged from, a spawned agent's first
+/// branch under the branch that spawned it. Root-first, children grouped
+/// under their parent and sorted by id — the navigator's row order and
+/// what Tab/`1`–`9`/clicks index into.
+fn ordered_branches(mut infos: Vec<BranchInfo>) -> Vec<BranchInfo> {
+    infos.sort_by_key(|b| b.branch.as_u64());
+    let mut children: HashMap<Option<BranchId>, Vec<BranchInfo>> = HashMap::new();
+    for info in infos {
+        children.entry(info.parent_branch).or_default().push(info);
     }
-    for list in children.values_mut() {
-        list.sort_by_key(|fv| fv.id.as_u64());
-    }
-
-    let mut result = Vec::with_capacity(agents.len());
+    let mut result = Vec::new();
     fn dfs(
-        parent: Option<AgentId>,
-        children: &std::collections::HashMap<Option<AgentId>, Vec<&AgentView>>,
-        ancestors_last: &mut Vec<bool>,
-        result: &mut Vec<(AgentView, String)>,
+        parent: Option<BranchId>,
+        children: &mut HashMap<Option<BranchId>, Vec<BranchInfo>>,
+        result: &mut Vec<BranchInfo>,
     ) {
-        let Some(kids) = children.get(&parent) else {
+        let Some(kids) = children.remove(&parent) else {
             return;
         };
-        let len = kids.len();
-        for (i, fv) in kids.iter().enumerate() {
-            let is_last = i == len - 1;
-            let mut prefix = String::new();
-            for &ancestor_last in ancestors_last.iter() {
-                if !ancestor_last {
-                    prefix.push_str("│   ");
-                } else {
-                    prefix.push_str("    ");
-                }
-            }
-            if is_last {
-                prefix.push_str("└── ");
-            } else {
-                prefix.push_str("├── ");
-            }
-            result.push(((*fv).clone(), prefix));
-            ancestors_last.push(is_last);
-            dfs(Some(fv.id), children, ancestors_last, result);
-            ancestors_last.pop();
+        for kid in kids {
+            let id = kid.branch;
+            result.push(kid);
+            dfs(Some(id), children, result);
         }
     }
+    dfs(None, &mut children, &mut result);
+    result
+}
 
-    let mut ancestors_last = Vec::new();
-    dfs(None, &children, &mut ancestors_last, &mut result);
+/// `ordered_branches` plus the box-drawing prefix and edge kind for each
+/// row: `is_fork` distinguishes a fork (the same context diverged) from
+/// a spawn (a new clean-room context) — the difference `context()` turns
+/// on, so the navigator marks it (17_BRANCHES Part D box 2).
+fn navigator_rows(infos: Vec<BranchInfo>) -> Vec<(BranchInfo, String, bool)> {
+    let ordered = ordered_branches(infos);
+    let mut children_count: HashMap<Option<BranchId>, usize> = HashMap::new();
+    for info in &ordered {
+        *children_count.entry(info.parent_branch).or_insert(0) += 1;
+    }
+    // Recompute is_last per row using each parent's remaining sibling
+    // count as we walk in DFS order (already the walk order `dfs` above
+    // produced), so no second tree pass is needed.
+    let mut seen: HashMap<Option<BranchId>, usize> = HashMap::new();
+    let mut depth_last: HashMap<BranchId, Vec<bool>> = HashMap::new();
+    let mut result = Vec::with_capacity(ordered.len());
+    for info in ordered {
+        let siblings = *children_count.get(&info.parent_branch).unwrap_or(&1);
+        let idx = seen.entry(info.parent_branch).or_insert(0);
+        *idx += 1;
+        let is_last = *idx == siblings;
+        let ancestors_last = info
+            .parent_branch
+            .and_then(|p| depth_last.get(&p).cloned())
+            .unwrap_or_default();
+        let mut prefix = String::new();
+        for &ancestor_last in &ancestors_last {
+            prefix.push_str(if ancestor_last { "    " } else { "│   " });
+        }
+        if info.parent_branch.is_some() {
+            prefix.push_str(if is_last { "└── " } else { "├── " });
+        }
+        let mut own_last = ancestors_last;
+        own_last.push(is_last);
+        depth_last.insert(info.branch, own_last);
+        let is_fork = info.agent != info.branch;
+        result.push((info, prefix, is_fork));
+    }
     result
 }
 
 fn render_navigator(frame: &mut Frame, app: &AttachedApp, session: &Session, area: Rect) {
-    // Agents from the log projection so the navigator survives resume
-    // (decision 8), with live status overlayed from the live branches.
-    // Part D replaces this with the branch tree; until then it shows an
-    // agent's *first* branch, whose id is the `Agent` event's own.
-    let live: std::collections::HashMap<AgentId, &'static str> =
-        session.branches().into_iter().collect();
-    let agent_views = session.tree().agent_list();
-    let tree_lines = build_navigator_lines(&agent_views);
-    let lines: Vec<Line> = tree_lines
+    // `branch_infos` is the navigator projection: identity and shape from
+    // the log (so it survives resume, decision 8), status/thinking from
+    // live session state.
+    let rows = navigator_rows(session.branch_infos());
+    let lines: Vec<Line> = rows
         .iter()
-        .map(|(fv, prefix)| {
-            let selected = app.selected == Some(fv.id);
-            let live_status = live.get(&fv.id).copied();
-            // Agents never close, so a non-live agent is idle, never done.
-            let status = live_status.unwrap_or("idle");
-            let paused = live_status.is_some() && session.is_paused(fv.id);
-            let busy = matches!(live_status, Some("running" | "awaiting llm"));
+        .map(|(info, prefix, is_fork)| {
+            let selected = app.selected == Some(info.branch);
+            let live = info.status != "dormant";
+            let status = if info.asking_user.is_some() {
+                "asking you".to_owned()
+            } else {
+                info.status.clone()
+            };
+            let paused = live && session.is_paused(info.branch);
+            let busy = matches!(info.status.as_str(), "running" | "thinking");
+            let name = info.name.clone().unwrap_or_else(|| {
+                derived_branch_label(session.tree(), info.branch, info.leaf)
+                    .unwrap_or_else(|| format!("branch #{}", info.branch.as_u64()))
+            });
+            let edge = if *is_fork { "⑂ " } else { "" };
+            let open = if info.open > 0 {
+                format!(" · {} open", info.open)
+            } else {
+                String::new()
+            };
             let text = format!(
-                "{} {}agent #{} · {}{}",
+                "{} {}{}{} · {}{}{}",
                 if selected { "▶" } else { " " },
                 prefix,
-                fv.id.as_u64(),
+                edge,
+                name,
                 status,
+                open,
                 if paused {
                     " ⏸"
                 } else if busy {
@@ -1037,8 +1083,8 @@ fn render_navigator(frame: &mut Frame, app: &AttachedApp, session: &Session, are
             );
             let style = if selected {
                 Style::default().add_modifier(Modifier::BOLD)
-            } else if fv.answered {
-                Style::default().fg(Color::DarkGray)
+            } else if info.asking_user.is_some() {
+                Style::default().fg(Color::Yellow)
             } else {
                 Style::default().fg(Color::Gray)
             };
@@ -1226,7 +1272,7 @@ mod tests {
     use serde_json::json;
     use std::sync::mpsc::channel;
 
-    fn fid(n: u64) -> AgentId {
+    fn fid(n: u64) -> BranchId {
         EventId::new(n)
     }
 
@@ -1382,20 +1428,35 @@ mod tests {
         });
 
         // Pump until both branches are live with running programs.
+        let live = |session: &Session| -> Vec<BranchInfo> {
+            session
+                .branch_infos()
+                .into_iter()
+                .filter(|b| b.status != "dormant")
+                .collect()
+        };
         for _ in 0..200 {
-            let branches = session.branches();
-            if branches.len() == 2 && branches.iter().all(|(_, s)| *s == "running") {
+            let branches = live(&session);
+            if branches.len() == 2 && branches.iter().all(|b| b.status == "running") {
                 break;
             }
             assert!(session.pump_one(), "session ended early");
         }
-        let agents = session.branches();
+        let agents = live(&session);
         assert_eq!(agents.len(), 2, "{agents:?}");
 
         // Selecting each branch yields its own VM: different programs.
         let sources: Vec<String> = agents
             .iter()
-            .map(|(id, _)| session.state(*id).unwrap().vm().unwrap().source.to_string())
+            .map(|b| {
+                session
+                    .state(b.branch)
+                    .unwrap()
+                    .vm()
+                    .unwrap()
+                    .source
+                    .to_string()
+            })
             .collect();
         assert!(sources[0].contains("tools.agent"), "{sources:?}");
         assert!(sources[1].contains("tools.slow"), "{sources:?}");

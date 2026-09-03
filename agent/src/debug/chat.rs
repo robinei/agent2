@@ -1,24 +1,28 @@
-//! Chat transcript state (9_TUI Step 4 · 11_INTROSPECT Step 3), driven
-//! **exclusively** by `SessionEvent`s — the serializable boundary a
-//! remote client would consume. Enforced structurally, not by
-//! discipline: `ChatState`'s fields are private to this module and its
-//! only mutator is `apply(&SessionEvent)`, so nothing privileged (VMs,
-//! tree, session) can leak into what this pane shows. Do not add imports
-//! from `crate::host` beyond the protocol types, and none from `interp`.
+//! Chat transcript state (9_TUI Step 4 · 11_INTROSPECT Step 3 ·
+//! 17_BRANCHES Step D1), driven **exclusively** by `SessionEvent`s — the
+//! serializable boundary a remote client would consume. Enforced
+//! structurally, not by discipline: `ChatState`'s fields are private to
+//! this module and its only mutator is `apply(&SessionEvent)`, so nothing
+//! privileged (VMs, tree, session) can leak into what this pane shows. Do
+//! not add imports from `crate::host` beyond the protocol types, and none
+//! from `interp`.
 //!
 //! A `run_program` execution renders as one **block** (decision 2): a
 //! `run_program: <status>` header (status tracked live from
 //! `ProgramStatus`) with the program's inner `Invoke`s listed beneath as
 //! `⚙` lines; a `resume` folds into the same block. The completion/
 //! condition report body is *not* inlined — it lives in the right
-//! console/result pane. The transcript is **per-agent** (decision 6):
-//! `rows(agent)` renders just that agent's slice, including its own
-//! clean-room `System` prompt.
+//! console/result pane. The transcript is **per-branch** (17_BRANCHES):
+//! `rows(branch)` renders that branch's own slice plus — for a forked
+//! branch — the shared prefix it inherited, reconstructed from the event
+//! stream alone (`fork_parent`, below), since a fork carries *history,
+//! not obligations* and this pane never reaches past the protocol into
+//! the `Tree` to get it.
 
 use std::collections::HashMap;
 
-use crate::host::{AgentId, ProgramStatus, SessionEvent};
-use crate::types::{Call, EventId, EventPayload, Message, Outcome};
+use crate::host::{AgentId, BranchId, ProgramStatus, SessionEvent};
+use crate::types::{Call, Event, EventId, EventPayload, Message, Outcome};
 
 /// What a transcript row is, for styling by the renderer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -55,7 +59,11 @@ pub enum RowDetail {
 /// program's `ProgramStatus`; every other entry is a fixed line.
 enum Entry {
     Line {
-        agent: AgentId,
+        /// The branch this entry's event landed on — the render key.
+        branch: BranchId,
+        /// This entry's own event id, so a forked branch's rendering can
+        /// tell "before the fork" from "after" (`rows`, below).
+        id: EventId,
         kind: ChatKind,
         text: String,
         /// The program this row belongs to (for click hit-testing): the
@@ -65,7 +73,7 @@ enum Entry {
     },
     /// A `run_program` block header, keyed by the program's event id.
     Header {
-        agent: AgentId,
+        branch: BranchId,
         program: EventId,
         /// Attachment names in definition order.
         attachments: Vec<String>,
@@ -75,21 +83,34 @@ enum Entry {
 #[derive(Default)]
 pub struct ChatState {
     entries: Vec<Entry>,
-    /// Accumulating streamed text per agent, shown until the logged
+    /// Accumulating streamed text per branch, shown until the logged
     /// assistant message replaces it.
-    streaming: Vec<(AgentId, String)>,
-    /// The first agent seen — the default transcript when none is selected.
+    streaming: Vec<(BranchId, String)>,
+    /// The first branch seen — the default transcript when none is
+    /// selected.
+    main_branch: Option<BranchId>,
+    /// The root agent, for the "is this a subagent" check on `Answer`
+    /// markers — an agent-level fact, not a branch-level one, so it stays
+    /// separate from `main_branch`.
     main_agent: Option<AgentId>,
     /// Transcript row index of each logged `Call`, so its `Result` can
     /// complete the row in place rather than pushing a second line.
     call_rows: HashMap<EventId, usize>,
-    /// The open `run_program` block per agent: its inner calls and a
+    /// The open `run_program` block per branch: its inner calls and a
     /// folding `resume` attach here.
-    current_program: HashMap<AgentId, EventId>,
+    current_program: HashMap<BranchId, EventId>,
     /// Live status per program block, titling its header.
     program_status: HashMap<EventId, ProgramStatus>,
     /// Attachment content per program: program_id → (name → content).
     pub attachment_content: HashMap<EventId, HashMap<String, String>>,
+    /// Every event's own branch, by id — including events that never
+    /// become a chat row (`Call`, `Result`, `Console`, …). What lets a
+    /// `Fork`'s parent branch be resolved from `event.parent_id` alone.
+    event_branch: HashMap<EventId, BranchId>,
+    /// A forked branch → (the branch it forked from, the fork-point event
+    /// id on that branch). `rows` walks this to reconstruct the inherited
+    /// prefix without ever touching the `Tree`.
+    fork_parent: HashMap<BranchId, (BranchId, EventId)>,
 }
 
 impl ChatState {
@@ -100,7 +121,7 @@ impl ChatState {
     pub fn apply(&mut self, event: &SessionEvent) {
         match event {
             SessionEvent::Chunk {
-                agent,
+                branch,
                 thinking,
                 text,
                 ..
@@ -108,15 +129,19 @@ impl ChatState {
                 if *thinking {
                     return; // thinking stays live-only and unrendered for now
                 }
-                match self.streaming.iter_mut().find(|(f, _)| f == agent) {
+                match self.streaming.iter_mut().find(|(b, _)| b == branch) {
                     Some((_, buf)) => buf.push_str(text),
-                    None => self.streaming.push((*agent, text.clone())),
+                    None => self.streaming.push((*branch, text.clone())),
                 }
             }
             SessionEvent::Error { branch, message } => {
-                if let Some(f) = branch.or(self.main_agent) {
+                if let Some(b) = branch.or(self.main_branch) {
+                    // Not tied to a log position — a live notification,
+                    // not history — so it is visible only on an exact
+                    // branch match, never inherited by a descendant fork.
                     self.entries.push(Entry::Line {
-                        agent: f,
+                        branch: b,
+                        id: EventId::new(u64::MAX),
                         kind: ChatKind::Error,
                         text: format!("error: {message}"),
                         program: None,
@@ -126,8 +151,13 @@ impl ChatState {
             // The answer to a user's question is already this branch's
             // `Turn` in the transcript — the event only says it landed.
             SessionEvent::Answered { .. } => {}
-            SessionEvent::Event { agent, event, .. } => {
-                self.apply_payload(*agent, event.id, &event.payload);
+            SessionEvent::Event {
+                agent,
+                branch,
+                event,
+            } => {
+                self.event_branch.insert(event.id, *branch);
+                self.apply_payload(*agent, *branch, event);
             }
             // Live program-block status titles the matching header.
             SessionEvent::ProgramStatus {
@@ -143,14 +173,17 @@ impl ChatState {
         }
     }
 
-    fn apply_payload(&mut self, agent: AgentId, id: EventId, payload: &EventPayload) {
-        match payload {
+    fn apply_payload(&mut self, agent: AgentId, branch: BranchId, event: &Event) {
+        let id = event.id;
+        match &event.payload {
             EventPayload::Agent { system, .. } => {
                 // The system prompt is a snapshot on the root, not a
-                // message: render it as this agent's leading block.
+                // message: render it as this branch's leading block.
+                self.main_branch.get_or_insert(branch);
                 self.main_agent.get_or_insert(agent);
                 self.entries.push(Entry::Line {
-                    agent,
+                    branch,
+                    id,
                     kind: ChatKind::System,
                     text: system.clone(),
                     program: Some(id),
@@ -161,7 +194,8 @@ impl ChatState {
             EventPayload::Answer { value, .. } => {
                 if Some(agent) != self.main_agent {
                     self.entries.push(Entry::Line {
-                        agent,
+                        branch,
+                        id,
                         kind: ChatKind::Marker,
                         text: format!("subagent answered: {}", short(value)),
                         program: None,
@@ -169,8 +203,18 @@ impl ChatState {
                 }
             }
             EventPayload::Fork { name } => {
+                // This branch's own root *is* the Fork event, so its id
+                // is `id`/`branch` alike; `event.parent_id` is the fork
+                // point on the branch it diverged from.
+                if let Some(parent_point) = event.parent_id
+                    && let Some(&parent_branch) = self.event_branch.get(&parent_point)
+                {
+                    self.fork_parent
+                        .insert(branch, (parent_branch, parent_point));
+                }
                 self.entries.push(Entry::Line {
-                    agent,
+                    branch,
+                    id,
                     kind: ChatKind::Marker,
                     text: format!(
                         "forked{}",
@@ -184,7 +228,8 @@ impl ChatState {
             }
             EventPayload::Message(Message::Post { from, origin }) => {
                 self.entries.push(Entry::Line {
-                    agent,
+                    branch,
+                    id,
                     kind: ChatKind::User,
                     text: crate::report::render_post(*from, origin),
                     program: None,
@@ -196,7 +241,7 @@ impl ChatState {
                 tool_calls,
                 ..
             }) => {
-                self.streaming.retain(|(f, _)| *f != agent);
+                self.streaming.retain(|(b, _)| *b != branch);
                 // A `Turn { author: User }` is the user taking this
                 // branch's turn (`Restart`). It renders as an assistant
                 // message to the API — the *branch* acted — but the
@@ -205,7 +250,8 @@ impl ChatState {
                 if !text.is_empty() || by_user {
                     let calls: Vec<&str> = tool_calls.iter().map(|c| c.name.as_str()).collect();
                     self.entries.push(Entry::Line {
-                        agent,
+                        branch,
+                        id,
                         kind: if by_user {
                             ChatKind::Marker
                         } else {
@@ -241,11 +287,11 @@ impl ChatState {
                         })
                         .unwrap_or_default();
                     self.entries.push(Entry::Header {
-                        agent,
+                        branch,
                         program: id,
                         attachments: attachment_names,
                     });
-                    self.current_program.insert(agent, id);
+                    self.current_program.insert(branch, id);
                     if !attachments.is_empty() {
                         self.attachment_content.insert(id, attachments);
                     }
@@ -254,7 +300,7 @@ impl ChatState {
             // A call is logged at dispatch, so its row appears the moment
             // it is issued; the `Result` completes the same row in place.
             EventPayload::Call(call) => {
-                if let Some(&program) = self.current_program.get(&agent) {
+                if let Some(&program) = self.current_program.get(&branch) {
                     let name = match call {
                         Call::Invoke { name, .. } => name.clone(),
                         Call::Send { expects_reply, .. } => {
@@ -264,7 +310,8 @@ impl ChatState {
                     };
                     self.call_rows.insert(id, self.entries.len());
                     self.entries.push(Entry::Line {
-                        agent,
+                        branch,
+                        id,
                         kind: ChatKind::ToolCall,
                         text: format!("⚙ {name} → …"),
                         program: Some(program),
@@ -296,24 +343,47 @@ impl ChatState {
         }
     }
 
-    /// Transcript rows for `agent` (or the main agent when `None`): one
-    /// `(kind, line, detail)` per visual line. `detail` carries click-hit
-    /// metadata: which program, attachment, or invoke a row targets.
-    /// Multi-line items split; the system prompt collapses to a single
-    /// header row.
-    pub fn rows(&self, agent: Option<AgentId>) -> Vec<(ChatKind, String, RowDetail)> {
-        let Some(target) = agent.or(self.main_agent) else {
+    /// The ancestor chain from `target` back to its root-most branch,
+    /// with the cutoff event id each non-final ancestor's own entries are
+    /// bounded by — the event at which the *next* branch in the chain
+    /// diverged from it. Reconstructs "history crosses a fork,
+    /// obligations do not" from the event stream alone.
+    fn ancestry(&self, target: BranchId) -> HashMap<BranchId, Option<EventId>> {
+        let mut chain = HashMap::new();
+        chain.insert(target, None);
+        let mut cur = target;
+        while let Some(&(parent, fork_point)) = self.fork_parent.get(&cur) {
+            chain.insert(parent, Some(fork_point));
+            cur = parent;
+        }
+        chain
+    }
+
+    /// Transcript rows for `branch` (or the main branch when `None`): one
+    /// `(kind, line, detail)` per visual line — this branch's own events
+    /// plus, for a fork, the shared prefix it inherited. `detail` carries
+    /// click-hit metadata: which program, attachment, or invoke a row
+    /// targets. Multi-line items split; the system prompt collapses to a
+    /// single header row.
+    pub fn rows(&self, branch: Option<BranchId>) -> Vec<(ChatKind, String, RowDetail)> {
+        let Some(target) = branch.or(self.main_branch) else {
             return Vec::new();
+        };
+        let chain = self.ancestry(target);
+        let visible = |branch: BranchId, id: EventId| match chain.get(&branch) {
+            None => false,
+            Some(None) => true,
+            Some(Some(cutoff)) => id.as_u64() <= cutoff.as_u64(),
         };
         let mut out = Vec::new();
         let mut invoke_index: HashMap<EventId, usize> = HashMap::new();
         for entry in &self.entries {
             match entry {
                 Entry::Header {
-                    agent,
+                    branch,
                     program,
                     attachments,
-                } if *agent == target => {
+                } if visible(*branch, *program) => {
                     let status = self
                         .program_status
                         .get(program)
@@ -333,11 +403,12 @@ impl ChatState {
                     }
                 }
                 Entry::Line {
-                    agent,
+                    branch,
+                    id,
                     kind,
                     text,
                     program,
-                } if *agent == target => {
+                } if visible(*branch, *id) => {
                     if *kind == ChatKind::System {
                         out.push((ChatKind::System, "system".into(), RowDetail::None));
                         continue;
@@ -359,8 +430,8 @@ impl ChatState {
                 _ => {}
             }
         }
-        for (f, buf) in &self.streaming {
-            if *f != target {
+        for (b, buf) in &self.streaming {
+            if *b != target {
                 continue;
             }
             for line in buf.lines() {
@@ -424,16 +495,20 @@ fn short(v: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Author, Event, Origin, ToolCall};
+    use crate::types::{Author, Origin, ToolCall};
     use jiff::Timestamp;
 
     fn ev(id: u64, payload: EventPayload) -> SessionEvent {
+        ev_on(1, id, None, payload)
+    }
+
+    fn ev_on(branch: u64, id: u64, parent: Option<u64>, payload: EventPayload) -> SessionEvent {
         SessionEvent::Event {
             agent: EventId::new(1),
-            branch: EventId::new(1),
+            branch: EventId::new(branch),
             event: Event {
                 id: EventId::new(id),
-                parent_id: None,
+                parent_id: parent.map(EventId::new),
                 timestamp: Timestamp::now(),
                 payload,
             },
@@ -477,6 +552,20 @@ mod tests {
         )
     }
 
+    fn post(id: u64, text: &str) -> SessionEvent {
+        ev(
+            id,
+            EventPayload::Message(Message::Post {
+                from: Author::User,
+                origin: Origin::Direct {
+                    text: text.into(),
+                    input: serde_json::Value::Null,
+                    expects_reply: true,
+                },
+            }),
+        )
+    }
+
     #[test]
     fn transcript_builds_from_session_events_only() {
         let mut chat = ChatState::new();
@@ -489,17 +578,7 @@ mod tests {
                 system: String::new(),
             },
         ));
-        chat.apply(&ev(
-            2,
-            EventPayload::Message(Message::Post {
-                from: Author::User,
-                origin: Origin::Direct {
-                    text: "hi".into(),
-                    input: serde_json::Value::Null,
-                    expects_reply: true,
-                },
-            }),
-        ));
+        chat.apply(&post(2, "hi"));
         chat.apply(&SessionEvent::Chunk {
             branch: EventId::new(1),
             agent: EventId::new(1),
@@ -618,12 +697,13 @@ mod tests {
     }
 
     /// `Agent.system` — the snapshot on the branch root — renders as the
-    /// leading `system` row of its agent, and selecting another agent
-    /// shows that agent's slice (its own system block), not the root's.
+    /// leading `system` row of its branch, and selecting another agent's
+    /// branch shows that branch's slice (its own system block), not the
+    /// root's.
     #[test]
-    fn system_block_is_leading_and_per_agent() {
+    fn system_block_is_leading_and_per_branch() {
         let mut chat = ChatState::new();
-        // Root agent #1.
+        // Root branch #1.
         chat.apply(&ev(
             1,
             EventPayload::Agent {
@@ -633,31 +713,13 @@ mod tests {
                 system: "ROOT SYSTEM PROMPT".into(),
             },
         ));
-        chat.apply(&ev(
-            3,
-            EventPayload::Message(Message::Post {
-                from: Author::User,
-                origin: Origin::Direct {
-                    text: "root q".into(),
-                    input: serde_json::Value::Null,
-                    expects_reply: true,
-                },
-            }),
-        ));
-        // Subagent agent #4 with its own system prompt.
+        chat.apply(&post(3, "root q"));
+        // Subagent branch #4 with its own system prompt.
         let child = EventId::new(4);
-        let child_event = |id: u64, payload| SessionEvent::Event {
-            branch: EventId::new(2),
-            agent: child,
-            event: Event {
-                id: EventId::new(id),
-                parent_id: None,
-                timestamp: Timestamp::now(),
-                payload,
-            },
-        };
-        chat.apply(&child_event(
+        chat.apply(&ev_on(
             4,
+            4,
+            None,
             EventPayload::Agent {
                 name: None,
                 charter: "child".into(),
@@ -683,5 +745,97 @@ mod tests {
         assert_eq!(child_rows[0].0, ChatKind::System);
         assert_eq!(child_rows[0].2, RowDetail::None);
         assert!(!child_rows.iter().any(|(_, t, _)| t.contains("root q")));
+    }
+
+    /// A fork's own rows include the shared prefix up to (and including)
+    /// its fork point, but nothing the original branch does afterward —
+    /// "history crosses a fork, obligations do not" (17_BRANCHES),
+    /// reconstructed here from the event stream alone.
+    #[test]
+    fn fork_inherits_prefix_not_the_original_s_future() {
+        let mut chat = ChatState::new();
+        chat.apply(&ev(
+            1,
+            EventPayload::Agent {
+                name: None,
+                charter: "root".into(),
+                tools: None,
+                system: "SYS".into(),
+            },
+        ));
+        chat.apply(&post(2, "shared question"));
+        // The fork point: an assistant turn on the original branch.
+        chat.apply(&ev_on(
+            1,
+            3,
+            Some(2),
+            EventPayload::Message(Message::Turn {
+                author: Author::Agent(EventId::new(1)),
+                text: "shared answer".into(),
+                thinking: None,
+                tool_calls: vec![],
+            }),
+        ));
+        // Fork at #3: branch id 10, rooted with parent_id = 3.
+        chat.apply(&ev_on(
+            10,
+            10,
+            Some(3),
+            EventPayload::Fork {
+                name: Some("try again".into()),
+            },
+        ));
+        // After the fork: the original keeps going...
+        chat.apply(&post(4, "original continues"));
+        // ...and the fork has its own new activity.
+        chat.apply(&ev_on(
+            10,
+            11,
+            Some(10),
+            EventPayload::Message(Message::Post {
+                from: Author::User,
+                origin: Origin::Direct {
+                    text: "fork continues".into(),
+                    input: serde_json::Value::Null,
+                    expects_reply: true,
+                },
+            }),
+        ));
+
+        let fork_rows = chat.rows(Some(EventId::new(10)));
+        assert!(
+            fork_rows
+                .iter()
+                .any(|(_, t, _)| t.contains("shared question"))
+        );
+        assert!(
+            fork_rows
+                .iter()
+                .any(|(_, t, _)| t.contains("shared answer"))
+        );
+        assert!(
+            fork_rows
+                .iter()
+                .any(|(_, t, _)| t.contains("fork continues"))
+        );
+        assert!(
+            !fork_rows
+                .iter()
+                .any(|(_, t, _)| t.contains("original continues")),
+            "a fork owes nothing of what the original does afterward"
+        );
+
+        let original_rows = chat.rows(Some(EventId::new(1)));
+        assert!(
+            original_rows
+                .iter()
+                .any(|(_, t, _)| t.contains("original continues"))
+        );
+        assert!(
+            !original_rows
+                .iter()
+                .any(|(_, t, _)| t.contains("fork continues")),
+            "the original does not see the fork's own history"
+        );
     }
 }

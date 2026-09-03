@@ -429,6 +429,48 @@ pub fn render_post(from: Author, origin: &Origin) -> String {
     out
 }
 
+/// Max bytes of a nameless branch's derived navigator label.
+pub const DERIVED_LABEL_MAX_BYTES: usize = 40;
+
+/// A nameless branch's display label (17_BRANCHES "a nameless branch is
+/// displayed, not renamed"): the first line of its own first post — at
+/// or after its root, so a fork's label is about what makes *it*
+/// different rather than the shared prefix — clipped short. Computed at
+/// render time, logged nowhere, and superseded the moment anyone names
+/// the branch. `None` when this branch has posted nothing of its own yet
+/// (a fork born idle, say), in which case the navigator falls back to
+/// the branch id.
+pub fn derived_branch_label(tree: &Tree, branch: EventId, leaf: EventId) -> Option<String> {
+    tree.path_events(leaf).into_iter().find_map(|e| {
+        if e.id.as_u64() < branch.as_u64() {
+            return None; // pre-root: the shared prefix, not this branch's own
+        }
+        let EventPayload::Message(Message::Post { from, origin }) = &e.payload else {
+            return None;
+        };
+        let first_line = render_post(*from, origin);
+        let first_line = first_line.lines().next().unwrap_or("").trim();
+        if first_line.is_empty() {
+            return None;
+        }
+        Some(clip_short(first_line, DERIVED_LABEL_MAX_BYTES))
+    })
+}
+
+/// Byte-bounded truncation with a bare ellipsis — for a display label,
+/// where [`clip`]'s "[truncated; N bytes total]" marker would be most of
+/// the label.
+fn clip_short(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_owned();
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end])
+}
+
 /// A bounded, *shape-first* preview of machine-bound data: what kind it
 /// is, which keys it has, how big it is — never the value itself.
 pub fn input_preview(v: &serde_json::Value) -> String {

@@ -6,21 +6,6 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
-/// One agent for the navigator pane, projected from the log (decision 8).
-#[derive(Debug, Clone, PartialEq)]
-pub struct AgentView {
-    pub id: EventId,
-    /// The enclosing agent of this agent's call site (`None` for root).
-    pub parent: Option<EventId>,
-    /// The agent's charter — what it is for.
-    pub charter: String,
-    /// The branch name at this agent's root, if it was given one.
-    pub name: Option<String>,
-    /// This agent has answered at least once. Agents never close, so
-    /// this is a fact about the past, not a lifecycle state.
-    pub answered: bool,
-}
-
 /// One inner call a program made, with its settlement if one landed.
 /// `outcome` is `None` while the call is still in flight — the same
 /// distinction the artifact menu draws.
@@ -571,58 +556,6 @@ impl Tree {
         None
     }
 
-    /// Every agent in the log, in DFS tree order (root-first, children
-    /// grouped under their parent and sorted by id): the agent-navigator
-    /// projection (decision 8). `answered` is whether this agent has ever
-    /// answered a question — agents never close, so it is a fact about
-    /// the past, not a lifecycle state.
-    pub fn agent_list(&self) -> Vec<AgentView> {
-        let mut answered: HashSet<EventId> = HashSet::new();
-        for event in self.events.values() {
-            if let EventPayload::Answer { .. } = event.payload
-                && let Some(agent) = event.parent_id.and_then(|p| self.enclosing_agent(p))
-            {
-                answered.insert(agent);
-            }
-        }
-        let contexts: Vec<AgentView> = self
-            .events
-            .values()
-            .filter_map(|event| match &event.payload {
-                EventPayload::Agent { name, charter, .. } => Some(AgentView {
-                    id: event.id,
-                    parent: event.parent_id.and_then(|p| self.enclosing_agent(p)),
-                    charter: charter.clone(),
-                    name: name.clone(),
-                    answered: answered.contains(&event.id),
-                }),
-                _ => None,
-            })
-            .collect();
-
-        let mut children: HashMap<Option<EventId>, Vec<&AgentView>> = HashMap::new();
-        for fv in &contexts {
-            children.entry(fv.parent).or_default().push(fv);
-        }
-        for list in children.values_mut() {
-            list.sort_by_key(|fv| fv.id.as_u64());
-        }
-
-        let mut ordered = Vec::with_capacity(contexts.len());
-        let mut stack: Vec<&AgentView> =
-            children.get(&None).into_iter().flatten().copied().collect();
-        stack.reverse();
-        while let Some(fv) = stack.pop() {
-            ordered.push(fv.clone());
-            if let Some(kids) = children.get(&Some(fv.id)) {
-                for kid in kids.iter().rev() {
-                    stack.push(kid);
-                }
-            }
-        }
-        ordered
-    }
-
     /// `agent`'s programs along `leaf`'s path, in order — the program-list
     /// projection (decision 8). Each `run_program` opens a program; a
     /// `resume` folds into the open one (same VM, one entry); `Invoke`,
@@ -1147,11 +1080,13 @@ mod tests {
 
         // Reload from disk — nothing live survives, only the log.
         let tree = open()?;
-        let contexts = tree.agent_list();
-        assert_eq!(contexts.len(), 1);
-        assert_eq!(contexts[0].id, agent);
-        assert_eq!(contexts[0].charter, "root");
-        assert!(!contexts[0].answered, "the root has answered nothing yet");
+        let branches = tree.branches();
+        assert_eq!(branches.len(), 1);
+        assert_eq!(branches[0].0, agent);
+        match &tree.events[&agent].payload {
+            EventPayload::Agent { charter, .. } => assert_eq!(charter, "root"),
+            _ => panic!("expected an Agent root"),
+        }
 
         let progs = tree.programs_for(agent, leaf);
         assert_eq!(progs.len(), 1);
