@@ -1246,7 +1246,7 @@ reshape of the two kinds that survive.
 
 The load-bearing step of Part A: after it, no renderer touches the `VM`.
 
-- [ ] `EventPayload::ProgramResult` renamed `Return`; `Condition { cause,
+- [x] `EventPayload::ProgramResult` renamed `Return`; `Condition { cause,
       site, stack }` added (`machine::Suspension` renamed to match,
       gaining `CompileFailed` and `Interrupted`) — exactly one outcome per
       handback, carrying every input its report needs.
@@ -1254,10 +1254,10 @@ The load-bearing step of Part A: after it, no renderer touches the `VM`.
       (`program_status_survives_reopen`); a run that raises, resumes,
       traps, resumes and returns logs four outcomes
       (`one_outcome_per_handback_not_per_run`).
-- [ ] `Message::Tool` **deleted, not ported**: tool-role messages are
+- [x] `Message::Tool` **deleted, not ported**: tool-role messages are
       rendered by `report.rs` from the run's outcome and the events
       around it, and paired to their call positionally.
-- [ ] **Every tool call has exactly one outcome event**, so no report is
+- [x] **Every tool call has exactly one outcome event**, so no report is
       derived from recomputed history: `run_program`/`resume` →
       `Return`/`Condition`, `answer` → `Answer`, and an ineligible call →
       `Condition{cause: Refused{reason}}` (a new cause beside
@@ -1265,7 +1265,7 @@ The load-bearing step of Part A: after it, no renderer touches the `VM`.
       refusal's tool message would have to be rebuilt by replaying
       eligibility to that path position — derivable, but fragile
       (`every_tool_call_has_an_outcome_event`).
-- [ ] `report.rs` renderers become pure functions of the log — no `VM`
+- [x] `report.rs` renderers become pure functions of the log — no `VM`
       access. Concretely each takes `(&Tree, leaf: EventId, turn:
       EventId)` and reads forward from `turn` to its outcome: the source
       from the turn's tool-call args, the outcome, the `Console`, and the
@@ -1274,7 +1274,7 @@ The load-bearing step of Part A: after it, no renderer touches the `VM`.
       (`derived_reports_are_stable_for_a_renderer`); another renders a
       completion, a condition, a post-condition, a compile error, an ack
       and a refusal from fixtures.
-- [ ] Derived reports are **memoised** on the `Tree` (`HashMap<EventId,
+- [x] Derived reports are **memoised** on the `Tree` (`HashMap<EventId,
       String>` keyed by the outcome event id, cleared wholesale on
       renderer change) — never logged. The `Tree` is the right home
       because renders happen per branch per request and the memo must
@@ -1282,10 +1282,10 @@ The load-bearing step of Part A: after it, no renderer touches the `VM`.
       report on the path and a session is quadratic in branch length; with
       it re-derivation is amortised O(1), and the memo is dropped when the
       renderer changes (`report_memo_avoids_rederiving_history`).
-- [ ] `Console` capped by named byte/line consts with a truncation marker
+- [x] `Console` capped by named byte/line consts with a truncation marker
       naming the event, so the rest stays fetchable
       (`oversized_console_is_capped_and_marked`).
-- [ ] Gate: `cargo fmt && cargo clippy --workspace --all-targets &&
+- [x] Gate: `cargo fmt && cargo clippy --workspace --all-targets &&
       cargo test` green.
 
 ### Step A5 — Durability granularity (`tree.rs`)

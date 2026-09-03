@@ -332,12 +332,6 @@ fn print_session_event(event: &SessionEvent) {
                         .collect();
                     println!("{head} turn: {}{}", text, calls.join(" "));
                 }
-                EventPayload::Message(Message::Tool { name, text, .. }) => {
-                    println!("{head} tool result ({name}):");
-                    for line in text.lines() {
-                        println!("    {line}");
-                    }
-                }
                 EventPayload::Call(call) => {
                     println!("{head} call: {}", describe_call(call));
                 }
@@ -349,8 +343,11 @@ fn print_session_event(event: &SessionEvent) {
                         println!("{head} result of #{}: failed: {msg}", call.as_u64())
                     }
                 },
-                EventPayload::ProgramResult { value } => {
-                    println!("{head} program result: {value}");
+                EventPayload::Return { value } => {
+                    println!("{head} returned: {value}");
+                }
+                EventPayload::Condition { cause, site, .. } => {
+                    println!("{head} condition at {site}: {cause:?}");
                 }
                 EventPayload::Rename { name } => println!("{head} rename: {name}"),
                 EventPayload::Console { lines } => {

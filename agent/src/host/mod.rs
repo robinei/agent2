@@ -41,7 +41,7 @@ use std::time::Instant;
 use crate::machine::{
     LlmRequest, LlmTurn, OutCall, Runner, SpawnAgent, StepInput, StepOutput, ToolResult,
 };
-use crate::types::{Call, EventId, EventPayload, Message, Outcome, Spine, Tree};
+use crate::types::{Call, Cause, EventId, EventPayload, Message, Outcome, Spine, Tree};
 
 /// Instructions per VM slice on the loop thread (9_TUI decision 3).
 pub const FUEL_SLICE: u64 = 100_000;
@@ -773,84 +773,43 @@ impl Session {
     }
 }
 
-/// If the leaf is an unanswered `run_program` (the program was
-/// interrupted before completing), synthesize a tool result so the LLM
-/// receives it as that call's response and can rewrite.
+/// A `Turn(run_program)` with **no outcome** was interrupted mid-program
+/// and its VM is gone. Append `Condition{Interrupted}` so the run has an
+/// outcome like any other and its report renders from the log — the one
+/// repair the reconciliation table needs for this row.
+///
+/// A turn that *does* have an outcome needs nothing: the report renders
+/// from it, so "the report was lost" is not a case that can exist.
 /// Returns the (possibly updated) leaf id.
 fn synthesize_if_interrupted(tree: &mut Tree, leaf: EventId) -> io::Result<EventId> {
-    let spine = tree.spine_at(leaf);
-    let msgs = &spine.context().messages;
-    let Some(Message::Turn { tool_calls, .. }) = msgs.last() else {
-        return Ok(leaf);
-    };
-    let Some(call) = tool_calls.first() else {
-        return Ok(leaf);
-    };
-    if call.name.as_str() != crate::machine::TOOL_RUN_PROGRAM {
-        return Ok(leaf);
-    }
-    // Already answered? (Tool message with matching call_id)
-    if msgs
+    let path = tree.path_events(leaf);
+    let Some(turn) = path
         .iter()
-        .any(|m| matches!(m, Message::Tool { call_id, .. } if *call_id == call.id))
-    {
+        .rev()
+        .find(|e| matches!(e.payload, EventPayload::Message(Message::Turn { .. })))
+    else {
+        return Ok(leaf);
+    };
+    let EventPayload::Message(Message::Turn { tool_calls, .. }) = &turn.payload else {
+        return Ok(leaf);
+    };
+    if tool_calls.is_empty() {
+        return Ok(leaf); // a turn with no calls is idle, not interrupted
+    }
+    let turn_id = turn.id;
+    if !crate::report::outcomes_of_turn(tree, leaf, turn_id).is_empty() {
         return Ok(leaf);
     }
-
-    // Collect artifacts from the agent's spine segment.
-    let mut artifacts = Vec::new();
-    let mut current = leaf;
-    while let Some(event) = tree.events.get(&current) {
-        match &event.payload {
-            EventPayload::Call(Call::Invoke { name, args, .. }) => {
-                artifacts.push(format!(
-                    "[#{}] {}({})",
-                    event.id.as_u64(),
-                    name,
-                    crate::report::preview(args)
-                ));
-            }
-            EventPayload::Agent { .. } => break,
-            _ => {}
-        }
-        match event.parent_id {
-            Some(parent) => current = parent,
-            None => break,
-        }
-    }
-    artifacts.reverse();
-
-    let mut report = String::from("## program interrupted\n");
-    report.push_str(
-        "This program was interrupted before completing. The artifacts \
-         below are still fetchable by id — rewrite to continue.\n",
-    );
-    report.push_str("\n## artifacts — fetch with tools.tool_result(id)\n");
-    if artifacts.is_empty() {
-        report.push_str("(none)\n");
-    } else {
-        for a in &artifacts {
-            report.push_str(a);
-            report.push('\n');
-        }
-    }
-    report.push_str("\n## restarts\n");
-    report.push_str(
-        "- run_program(source): rewrite the program to continue from \
-         where it left off; all artifacts above are still valid.\n",
-    );
 
     let mut spine = tree.spine_at(leaf);
-    let new_leaf = tree.append(
+    tree.append(
         &mut spine,
-        EventPayload::Message(Message::Tool {
-            name: crate::machine::TOOL_RUN_PROGRAM.into(),
-            call_id: call.id.clone(),
-            text: report,
-        }),
-    )?;
-
-    Ok(new_leaf)
+        EventPayload::Condition {
+            cause: Cause::Interrupted,
+            site: 0,
+            stack: Vec::new(),
+        },
+    )
 }
 
 /// Auto-pick a resume anchor for a re-opened log: the lowest-id
@@ -866,6 +825,18 @@ fn pick_resume_leaf(tree: &Tree) -> io::Result<EventId> {
         .find(|id| !tree.spine_at(*id).is_complete())
         .or_else(|| leaves.first().copied())
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "log has no leaves"))
+}
+
+/// One-word label for a logged condition's cause.
+fn cause_label(cause: &Cause) -> &'static str {
+    match cause {
+        Cause::Raised { .. } => "raised",
+        Cause::Trapped { .. } => "trapped",
+        Cause::Posted { .. } => "posted",
+        Cause::CompileFailed { .. } => "compile failed",
+        Cause::Refused { .. } => "refused",
+        Cause::Interrupted => "interrupted",
+    }
 }
 
 /// One-line preview of an event for the leaf list, clipped to the
@@ -890,7 +861,6 @@ fn leaf_summary(tree: &Tree, leaf: EventId) -> String {
                 format!("Turn: ⚙ {}", names.join(", "))
             }
         }
-        EventPayload::Message(Message::Tool { name, .. }) => format!("Tool: {name}"),
         EventPayload::Call(Call::Invoke { name, .. }) => format!("Invoke: {name}"),
         EventPayload::Call(Call::Send { expects_reply, .. }) => {
             format!("Send: {}", if *expects_reply { "ask" } else { "tell" })
@@ -902,7 +872,8 @@ fn leaf_summary(tree: &Tree, leaf: EventId) -> String {
             Outcome::Delivered(v) => format!("Result of #{}: {v}", call.as_u64()),
             Outcome::Failed(msg) => format!("Result of #{}: failed: {msg}", call.as_u64()),
         },
-        EventPayload::ProgramResult { value } => format!("ProgramResult: {value}"),
+        EventPayload::Return { value } => format!("Return: {value}"),
+        EventPayload::Condition { cause, .. } => format!("Condition: {}", cause_label(cause)),
         EventPayload::Rename { name } => format!("Rename: {name}"),
         EventPayload::Console { lines } => format!("Console: {} lines", lines.len()),
     };
@@ -981,10 +952,10 @@ mod tests {
                 EventPayload::FrameResult { .. } => "FrameResult",
                 EventPayload::Message(Message::Post { .. }) => "Post",
                 EventPayload::Message(Message::Turn { .. }) => "Turn",
-                EventPayload::Message(Message::Tool { .. }) => "Tool",
                 EventPayload::Call(_) => "Call",
                 EventPayload::Result { .. } => "Result",
-                EventPayload::ProgramResult { .. } => "ProgramResult",
+                EventPayload::Return { .. } => "Return",
+                EventPayload::Condition { .. } => "Condition",
                 EventPayload::Console { .. } => "Console",
                 EventPayload::Rename { .. } => "Rename",
             });
@@ -1004,18 +975,36 @@ mod tests {
         session.state(session.root()).unwrap().spine.leaf_id
     }
 
+    /// The reports the LLM read on the root branch. They are **derived,
+    /// not stored**, so a test derives them exactly the way a request
+    /// does — from each turn's outcome and the events around it.
     fn tool_texts(session: &Session) -> Vec<String> {
-        session
-            .state(session.root())
-            .unwrap()
-            .spine
-            .context()
-            .messages
-            .iter()
-            .filter_map(|m| match m {
-                Message::Tool { text, .. } => Some(text.clone()),
-                _ => None,
-            })
+        derived_reports(session.tree(), root_leaf(session))
+    }
+
+    /// Every derived tool message on a branch, in render order, paired
+    /// with the call id it answers.
+    fn derived_with_ids(tree: &Tree, leaf: EventId) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        for event in tree.path_events(leaf) {
+            let EventPayload::Message(Message::Turn { tool_calls, .. }) = &event.payload else {
+                continue;
+            };
+            let outcomes = crate::report::outcomes_of_turn(tree, leaf, event.id);
+            for (call, outcome) in tool_calls.iter().zip(outcomes) {
+                out.push((
+                    call.id.clone(),
+                    crate::report::derive_report(tree, leaf, outcome, 64 * 1024),
+                ));
+            }
+        }
+        out
+    }
+
+    fn derived_reports(tree: &Tree, leaf: EventId) -> Vec<String> {
+        derived_with_ids(tree, leaf)
+            .into_iter()
+            .map(|(_, text)| text)
             .collect()
     }
 
@@ -1029,17 +1018,9 @@ mod tests {
         assert_eq!(
             kinds(session.tree(), root_leaf(&session)),
             [
-                "Agent",
-                "Post",
-                "Turn",
+                "Agent", "Post", "Turn",
                 // Calls are logged at dispatch, their results at landing.
-                "Call",
-                "Call",
-                "Result",
-                "Result",
-                "ProgramResult",
-                "Tool",
-                "Console",
+                "Call", "Call", "Result", "Result", "Return", "Console",
                 "Turn",
                 // The root yields its final answer to the user; the top
                 // conversation never ends, so no `FrameResult` is logged.
@@ -1290,7 +1271,7 @@ mod tests {
             .events
             .values()
             .find_map(|e| match &e.payload {
-                EventPayload::ProgramResult { value } => value.as_str().map(str::to_owned),
+                EventPayload::Return { value } => value.as_str().map(str::to_owned),
                 _ => None,
             })
             .unwrap();
@@ -1338,18 +1319,10 @@ mod tests {
         // the original run_program ("c1") — otherwise the next chat
         // request has an assistant tool_call with no matching tool reply
         // and the provider 400s.
-        let completion_call_id = session
-            .tree()
-            .events
-            .values()
-            .find_map(|e| match &e.payload {
-                EventPayload::Message(Message::Tool { call_id, text, .. })
-                    if text.contains("returned: 42") =>
-                {
-                    Some(call_id.clone())
-                }
-                _ => None,
-            })
+        let completion_call_id = derived_with_ids(session.tree(), root_leaf(&session))
+            .into_iter()
+            .find(|(_, text)| text.contains("returned: 42"))
+            .map(|(id, _)| id)
             .expect("a completion report");
         assert_eq!(completion_call_id, "c2");
     }
@@ -1610,7 +1583,7 @@ mod tests {
             .events
             .values()
             .find_map(|e| match &e.payload {
-                EventPayload::ProgramResult { value } => Some(value.clone()),
+                EventPayload::Return { value } => Some(value.clone()),
                 _ => None,
             })
             .expect("a ProgramResult");
@@ -2120,12 +2093,25 @@ mod tests {
         )
         .expect("opens the interrupted log");
 
+        // The repair is one event — `Condition{Interrupted}` — and the
+        // report is *derived* from it, so "the report was lost" is not a
+        // case that can exist.
+        assert!(
+            session.tree().events.values().any(|e| matches!(
+                &e.payload,
+                EventPayload::Condition {
+                    cause: Cause::Interrupted,
+                    ..
+                }
+            )),
+            "the interrupted run was given an outcome"
+        );
         let tools = tool_texts(&session);
         let interrupted_report = tools
             .first()
-            .expect("a synthesized tool result for the interrupted run_program");
+            .expect("a derived report for the interrupted run_program");
         assert!(
-            interrupted_report.contains("program interrupted"),
+            interrupted_report.contains("interrupted before completing"),
             "{interrupted_report}"
         );
         assert!(

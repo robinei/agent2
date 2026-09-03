@@ -211,9 +211,6 @@ impl ChatState {
                     }
                 }
             }
-            // The report body lives in the right console/result pane, not
-            // the transcript (decision 2).
-            EventPayload::Message(Message::Tool { .. }) => {}
             // A call is logged at dispatch, so its row appears the moment
             // it is issued; the `Result` completes the same row in place.
             EventPayload::Call(call) => {
@@ -248,7 +245,11 @@ impl ChatState {
                 }
             }
             // Execution/marker events are debug-pane data, never transcript.
-            EventPayload::ProgramResult { .. } | EventPayload::Console { .. } => {}
+            // The report body lives in the right console/result pane, not
+            // the transcript (decision 2); it is derived from these.
+            EventPayload::Return { .. }
+            | EventPayload::Condition { .. }
+            | EventPayload::Console { .. } => {}
             // A rename is a record: it changes the navigator, never the
             // transcript, and never wakes the branch.
             EventPayload::Rename { .. } => {}
@@ -482,11 +483,11 @@ mod tests {
             && t == "run_program: running"
             && *p == RowDetail::Program(EventId::new(3))));
 
-        // ProgramResult/Rename never reach the transcript.
+        // Return/Rename never reach the transcript.
         let before = chat.rows(None).len();
         chat.apply(&ev(
             5,
-            EventPayload::ProgramResult {
+            EventPayload::Return {
                 value: serde_json::json!("done"),
             },
         ));
@@ -563,15 +564,8 @@ mod tests {
                 .any(|(_, t, _)| t == "run_program: completed")
         );
 
-        // The completion report body is not inlined.
-        chat.apply(&ev(
-            5,
-            EventPayload::Message(Message::Tool {
-                name: "run_program".into(),
-                call_id: "c1".into(),
-                text: "## program completed\nreturned: 1".into(),
-            }),
-        ));
+        // The report body is never in the transcript — and now it is
+        // never even an event: it is derived from the outcome.
         assert!(
             !chat
                 .rows(None)

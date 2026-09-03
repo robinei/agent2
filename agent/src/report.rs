@@ -1,14 +1,28 @@
-//! Condition + completion reports (8_HARNESS Step 4).
+//! Condition + completion reports (8_HARNESS Step 4; 17_BRANCHES A4).
 //!
 //! The `run_program` tool result is the product surface of the whole
 //! project: it is what the LLM reads to decide how to restart a failed
-//! program. The renderers here are pure — structured input in, string
-//! out, no `Tree`/`VM` access — so golden tests can assert exact bytes,
-//! and every section carries a hard size bound (the context-growth
-//! mitigation locked in the plan: bounded reports, menu pruned to
-//! recent entries, full data always fetchable by id).
+//! program.
+//!
+//! **Reports are derived, not stored.** Every report here is a pure
+//! function of the log: [`derive_report`] takes `(&Tree, leaf, turn)` and
+//! reads forward from that turn to its outcome — the source from the
+//! turn's tool-call args, the outcome, the `Console`, and the `Result`s
+//! and menu rows on the path. No renderer touches a `VM`.
+//!
+//! The gain is not disk. It is that a corpus of real logs can be
+//! re-rendered with a *new* report format and diffed — the iteration this
+//! project calls its product surface. The cost, stated plainly: the
+//! rendered prefix is stable only **for a given renderer**. Editing this
+//! file changes how an existing conversation re-renders; golden tests
+//! exist to pin that deliberately rather than by accident.
+//!
+//! Every section carries a hard size bound (bounded reports, menu pruned
+//! to recent entries, full data always fetchable by id).
 
-use crate::types::{Author, Origin};
+use crate::types::{
+    Author, Call, Cause, Event, EventId, EventPayload, Message, Origin, ToolCall, Tree,
+};
 
 /// Max bytes of the "what happened" section (diagnostic + payload).
 pub const WHAT_MAX_BYTES: usize = 2048;
@@ -16,8 +30,16 @@ pub const WHAT_MAX_BYTES: usize = 2048;
 pub const PAYLOAD_MAX_BYTES: usize = 1024;
 /// Max call-stack frames named in the where section (innermost kept).
 pub const STACK_MAX_FRAMES: usize = 8;
-/// Console lines quoted (tail — the latest output before the stop).
+/// Console lines quoted in a report (tail — the latest output before the
+/// stop). The `Console` event itself keeps more; see [`CONSOLE_MAX_LINES`].
 pub const CONSOLE_TAIL_LINES: usize = 20;
+/// Lines a logged `Console` keeps. It is a **diagnostic stream, not
+/// data** — a chatty loop can write megabytes — so it is capped with an
+/// explicit truncation marker, and the program's own `return` is the
+/// channel for anything that must survive whole.
+pub const CONSOLE_MAX_LINES: usize = 2_000;
+/// Bytes a logged `Console` keeps, across all its lines.
+pub const CONSOLE_MAX_BYTES: usize = 256 * 1024;
 /// Per-line clip for quoted console output.
 pub const CONSOLE_LINE_MAX_BYTES: usize = 200;
 /// Artifact-menu entries shown (most recent kept; older ids stay valid).
@@ -225,12 +247,12 @@ fn looks_like_build(label: &str) -> bool {
 
 fn render_stack(stack: &[String]) -> String {
     if stack.is_empty() {
-        return "in (no live contexts)".into();
+        return "in (no live frames)".into();
     }
     if stack.len() > STACK_MAX_FRAMES {
         let omitted = stack.len() - STACK_MAX_FRAMES;
         format!(
-            "in … ({omitted} outer contexts omitted) → {}",
+            "in … ({omitted} outer frames omitted) → {}",
             stack[omitted..].join(" → ")
         )
     } else {
@@ -391,6 +413,287 @@ pub fn clip_answer(s: &str, max: usize, id: Option<u64>) -> String {
     }
 }
 
+// ── derivation: reports as pure functions of the log ────────────────
+
+/// Bump when the rendered format changes. The report memo is a cache of
+/// *one* renderer's output, so a change drops it wholesale.
+pub const REPORT_FORMAT_VERSION: u32 = 1;
+
+/// Cap a program's console for the log: a diagnostic stream, not data.
+/// Keeps the **tail** (the latest output before the stop) and replaces
+/// what it drops with a marker naming how much went, so the truncation is
+/// never silent.
+pub fn cap_console(lines: &[String], event_hint: &str) -> Vec<String> {
+    let mut kept: Vec<String> = Vec::new();
+    let mut bytes = 0usize;
+    for line in lines.iter().rev() {
+        if kept.len() >= CONSOLE_MAX_LINES || bytes + line.len() > CONSOLE_MAX_BYTES {
+            break;
+        }
+        bytes += line.len();
+        kept.push(line.clone());
+    }
+    kept.reverse();
+    let dropped = lines.len() - kept.len();
+    if dropped > 0 {
+        kept.insert(
+            0,
+            format!("[console truncated: {dropped} earlier lines dropped; {event_hint}]"),
+        );
+    }
+    kept
+}
+
+/// One program run's slice of a branch's path: the turn that drove it,
+/// the outcome it produced, and the events in between.
+struct Handback<'t> {
+    /// The `Turn` whose tool call this report answers.
+    turn: &'t Event,
+    /// The source the turn asked to run (empty for a non-`run_program`).
+    source: String,
+    /// Whether the turn passed a non-empty `attachments` map.
+    had_attachments: bool,
+    /// The one outcome event: a `Return` or a `Condition`.
+    outcome: &'t Event,
+    /// The `Console` logged with the outcome, if any.
+    console: Vec<String>,
+    /// The path up to `leaf`, for the artifact menu.
+    path: Vec<&'t Event>,
+    /// Index of `turn` within `path`.
+    turn_at: usize,
+    /// Index of `outcome` within `path`. The menu stops here: a report
+    /// must render identically **forever**, so a historical one cannot
+    /// grow new rows as the branch continues past it.
+    outcome_at: usize,
+}
+
+/// The `run_program` source and attachment flag carried by a tool call.
+fn program_args(call: &ToolCall) -> (String, bool) {
+    let source = call
+        .arguments
+        .get("source")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_owned();
+    let had_attachments = call
+        .arguments
+        .get("attachments")
+        .and_then(|v| v.as_object())
+        .is_some_and(|m| !m.is_empty());
+    (source, had_attachments)
+}
+
+/// Whether a payload is one of the two outcome kinds.
+fn is_outcome(payload: &EventPayload) -> bool {
+    matches!(
+        payload,
+        EventPayload::Return { .. } | EventPayload::Condition { .. }
+    )
+}
+
+/// Every outcome a turn produced, in log order, ending before the next
+/// `Turn`. Pairing is **positional, not stored**: outcome `k` answers
+/// tool call `k`, which is why the machine logs a deferred refusal after
+/// the outcome of the call that preceded it.
+pub fn outcomes_of_turn(tree: &Tree, leaf: EventId, turn: EventId) -> Vec<EventId> {
+    let path = tree.path_events(leaf);
+    let Some(at) = path.iter().position(|e| e.id == turn) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for event in &path[at + 1..] {
+        if matches!(event.payload, EventPayload::Message(Message::Turn { .. })) {
+            break;
+        }
+        if is_outcome(&event.payload) {
+            out.push(event.id);
+        }
+    }
+    out
+}
+
+/// Assemble the inputs one report needs, all from the log.
+fn handback<'t>(tree: &'t Tree, leaf: EventId, outcome: EventId) -> Option<Handback<'t>> {
+    let path = tree.path_events(leaf);
+    let at = path.iter().position(|e| e.id == outcome)?;
+    // The turn this outcome belongs to: the nearest `Turn` above it.
+    let turn_at = path[..at]
+        .iter()
+        .rposition(|e| matches!(e.payload, EventPayload::Message(Message::Turn { .. })))?;
+    let turn = path[turn_at];
+    let EventPayload::Message(Message::Turn { tool_calls, .. }) = &turn.payload else {
+        return None;
+    };
+    let (source, had_attachments) = tool_calls
+        .iter()
+        .find(|c| c.name == crate::machine::TOOL_RUN_PROGRAM)
+        .map(program_args)
+        .unwrap_or_default();
+    // The `Console` logged with this outcome sits immediately after it,
+    // before the next outcome.
+    let console = path[at + 1..]
+        .iter()
+        .take_while(|e| !is_outcome(&e.payload))
+        .find_map(|e| match &e.payload {
+            EventPayload::Console { lines } => Some(lines.clone()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    Some(Handback {
+        turn,
+        source,
+        had_attachments,
+        outcome: path[at],
+        console,
+        path: path.clone(),
+        turn_at,
+        outcome_at: at,
+    })
+}
+
+/// Render the tool-role message answering the call that produced
+/// `outcome`. Memoised on the `Tree` by the outcome's id — the report is
+/// a pure function of the log, so the same outcome always renders the
+/// same string for a given renderer.
+pub fn derive_report(tree: &Tree, leaf: EventId, outcome: EventId, budget: usize) -> String {
+    if let Some(hit) = tree.memoised_report(outcome) {
+        return hit;
+    }
+    let text = match handback(tree, leaf, outcome) {
+        Some(h) => render_handback(&h, budget),
+        None => "(no outcome recorded for this call)".to_owned(),
+    };
+    tree.memoise_report(outcome, text.clone());
+    text
+}
+
+fn render_handback(h: &Handback<'_>, budget: usize) -> String {
+    match &h.outcome.payload {
+        EventPayload::Return { value } => CompletionReport {
+            value: value.clone(),
+            budget,
+            console: h.console.clone(),
+            new_artifacts: menu_since(h, h.turn.id.as_u64()),
+            advise_attachments: !h.had_attachments && inlined_large_body(h),
+        }
+        .render(),
+        EventPayload::Condition { cause, site, stack } => match cause {
+            // A compile failure ran no VM: the diagnostic alone, no
+            // console and no artifacts.
+            Cause::CompileFailed { message } => message.clone(),
+            // A refusal changes no state; it states what is true and what
+            // is valid now, so the model recovers on its next turn.
+            Cause::Refused { reason } => format!("refused: {reason}"),
+            _ => ConditionReport {
+                what: what_happened(cause, *site, &h.source),
+                stack: stack.clone(),
+                console: h.console.clone(),
+                artifacts: menu_since(h, 0),
+                resume: resume_kind(cause),
+            }
+            .render(),
+        },
+        _ => "(not an outcome)".to_owned(),
+    }
+}
+
+/// The "what happened" diagnostic, rebuilt from the logged cause, the
+/// logged site, and the source in the turn's tool-call args — the three
+/// inputs that used to live only in the VM.
+fn what_happened(cause: &Cause, site: u32, source: &str) -> String {
+    match cause {
+        Cause::Raised { name, payload } => {
+            let mut what = diagnostic(source, site, &format!("condition `{name}` raised"));
+            what.push_str("\npayload: ");
+            let rendered = payload
+                .as_ref()
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "(none)".into());
+            what.push_str(&clip(&rendered, PAYLOAD_MAX_BYTES));
+            what
+        }
+        Cause::Trapped { message, .. } => diagnostic(source, site, message),
+        Cause::Posted { ids } => {
+            let names: Vec<String> = ids.iter().map(|id| format!("#{}", id.as_u64())).collect();
+            format!(
+                "message(s) arrived while the program was running: {}",
+                names.join(", ")
+            )
+        }
+        Cause::Interrupted => {
+            "This program was interrupted before completing — the process died and the VM \
+             went with it. The artifacts below are still fetchable by id; rewrite to \
+             continue."
+                .to_owned()
+        }
+        Cause::CompileFailed { message } | Cause::Refused { reason: message } => message.clone(),
+    }
+}
+
+/// `line:col: message` with the source line and a caret, or the bare
+/// message when there is no source to point into.
+fn diagnostic(source: &str, site: u32, message: &str) -> String {
+    if source.is_empty() {
+        return message.to_owned();
+    }
+    interp::Diagnostic {
+        kind: interp::DiagKind::Semantic,
+        span: site,
+        message: message.to_owned(),
+    }
+    .render(source)
+}
+
+fn resume_kind(cause: &Cause) -> ResumeKind {
+    match cause {
+        Cause::Raised { .. } => ResumeKind::Raise,
+        Cause::Trapped {
+            resumable: true, ..
+        } => ResumeKind::Operation,
+        _ => ResumeKind::No,
+    }
+}
+
+/// The artifact menu for this handback: every call **up to this
+/// outcome** (settled or pending) plus prior returns, optionally
+/// restricted to what this run produced.
+///
+/// Both bounds matter. The lower one is clean-room scoping — a program
+/// may fetch ids on its own branch's path and no others (decision 3). The
+/// upper one is prefix immutability: without it a report rendered today
+/// would list artifacts that landed tomorrow, and every cached branch
+/// walking through it would change under the model.
+fn menu_since(h: &Handback<'_>, since: u64) -> Vec<Artifact> {
+    let start = h.path[..=h.turn_at]
+        .iter()
+        .rposition(|e| matches!(e.payload, EventPayload::Agent { .. }))
+        .unwrap_or(0);
+    let segment: Vec<&Event> = h.path[start..=h.outcome_at].to_vec();
+    crate::machine::menu_rows(&segment, since)
+}
+
+/// Whether this run inlined a file body longer than a snippet into
+/// `source` — the nudge condition, read off the logged call args.
+fn inlined_large_body(h: &Handback<'_>) -> bool {
+    h.path[h.turn_at + 1..=h.outcome_at]
+        .iter()
+        .any(|e| match &e.payload {
+            EventPayload::Call(Call::Invoke { name, args, .. })
+                if name == "create_file" || name == "replace_file" =>
+            {
+                args.as_array()
+                    .and_then(|a| a.last())
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|c| c.len() > INLINE_BODY_ADVICE_BYTES)
+            }
+            _ => false,
+        })
+}
+
+/// A `create_file`/`replace_file` whose inline content exceeds this draws
+/// the attachments nudge (when the run passed no `attachments`).
+pub const INLINE_BODY_ADVICE_BYTES: usize = 512;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -410,6 +713,141 @@ mod tests {
             label: label.into(),
             state,
         }
+    }
+
+    use crate::types::{Cause, EventPayload, Message, Origin, ToolCall, Tree};
+
+    /// A one-branch fixture log: a `Turn` carrying `run_program(source)`
+    /// followed by whatever outcome the caller wants.
+    fn fixture(source: &str, outcome: EventPayload) -> (Tree, crate::types::EventId) {
+        let mut tree = Tree::new(None);
+        let mut spine = tree.start_agent(None, None, "root", "SYSTEM").unwrap();
+        tree.append(
+            &mut spine,
+            EventPayload::Message(Message::Post {
+                from: Author::User,
+                origin: Origin::Direct {
+                    text: "go".into(),
+                    input: json!(null),
+                    expects_reply: true,
+                },
+            }),
+        )
+        .unwrap();
+        tree.append(
+            &mut spine,
+            EventPayload::Message(Message::Turn {
+                author: Author::Agent(crate::types::EventId::new(1)),
+                text: String::new(),
+                thinking: None,
+                tool_calls: vec![ToolCall {
+                    id: "c1".into(),
+                    name: "run_program".into(),
+                    arguments: json!({ "source": source }),
+                }],
+            }),
+        )
+        .unwrap();
+        let outcome = tree.append(&mut spine, outcome).unwrap();
+        (tree, outcome)
+    }
+
+    /// Every report kind renders from fixture events alone — no VM, no
+    /// live state. This is the whole claim of "reports are derived".
+    #[test]
+    fn every_report_kind_renders_from_the_log() {
+        // Completion.
+        let (tree, o) = fixture("return 1;", EventPayload::Return { value: json!(1) });
+        let leaf = tree.list_leaves()[0].0;
+        let text = derive_report(&tree, leaf, o, 64 * 1024);
+        assert!(text.starts_with("## program completed"), "{text}");
+        assert!(text.contains("returned: 1"), "{text}");
+
+        // Condition: a raise, with the caret placed from the logged site
+        // and the source read out of the turn's own tool-call args.
+        let src = "raise(\"need\", { got: 1 });";
+        let (tree, o) = fixture(
+            src,
+            EventPayload::Condition {
+                cause: Cause::Raised {
+                    name: "need".into(),
+                    payload: Some(json!({ "got": 1 })),
+                },
+                site: 0,
+                stack: vec!["<root>".into()],
+            },
+        );
+        let leaf = tree.list_leaves()[0].0;
+        let text = derive_report(&tree, leaf, o, 64 * 1024);
+        assert!(text.contains("1:1: condition `need` raised"), "{text}");
+        assert!(text.contains(src), "the source line is quoted: {text}");
+        assert!(text.contains(r#"payload: {"got":1}"#), "{text}");
+        assert!(text.contains("- resume(value)"), "{text}");
+
+        // Condition: a trapped error, not resumable → no resume offered.
+        let (tree, o) = fixture(
+            "return null.x;",
+            EventPayload::Condition {
+                cause: Cause::Trapped {
+                    kind: "TypeError".into(),
+                    message: "cannot read property 'x' on null".into(),
+                    resumable: false,
+                },
+                site: 7,
+                stack: Vec::new(),
+            },
+        );
+        let leaf = tree.list_leaves()[0].0;
+        let text = derive_report(&tree, leaf, o, 64 * 1024);
+        assert!(text.contains("1:8: cannot read property"), "{text}");
+        assert!(text.contains("not resumable"), "{text}");
+
+        // Compile error: the diagnostic alone — no VM was built, so this
+        // run has no console and no artifacts.
+        let (tree, o) = fixture(
+            "let = ;",
+            EventPayload::Condition {
+                cause: Cause::CompileFailed {
+                    message: "compile error:\n1:5: unexpected token".into(),
+                },
+                site: 0,
+                stack: Vec::new(),
+            },
+        );
+        let leaf = tree.list_leaves()[0].0;
+        let text = derive_report(&tree, leaf, o, 64 * 1024);
+        assert_eq!(text, "compile error:\n1:5: unexpected token");
+
+        // Refusal: what is true and what to do, changing no state.
+        let (tree, o) = fixture(
+            "",
+            EventPayload::Condition {
+                cause: Cause::Refused {
+                    reason: "nothing to resume".into(),
+                },
+                site: 0,
+                stack: Vec::new(),
+            },
+        );
+        let leaf = tree.list_leaves()[0].0;
+        assert_eq!(
+            derive_report(&tree, leaf, o, 64 * 1024),
+            "refused: nothing to resume"
+        );
+
+        // Interruption: the VM went with the process; rewrite to continue.
+        let (tree, o) = fixture(
+            "return 1;",
+            EventPayload::Condition {
+                cause: Cause::Interrupted,
+                site: 0,
+                stack: Vec::new(),
+            },
+        );
+        let leaf = tree.list_leaves()[0].0;
+        let text = derive_report(&tree, leaf, o, 64 * 1024);
+        assert!(text.contains("interrupted before completing"), "{text}");
+        assert!(text.contains("not resumable"), "{text}");
     }
 
     #[test]
@@ -487,7 +925,7 @@ mod tests {
     fn stack_keeps_innermost_frames() {
         let stack: Vec<String> = (0..12).map(|i| format!("f{i}")).collect();
         let rendered = render_stack(&stack);
-        assert!(rendered.contains("(4 outer contexts omitted)"));
+        assert!(rendered.contains("(4 outer frames omitted)"));
         assert!(!rendered.contains("f3 →"), "outer contexts gone");
         assert!(rendered.ends_with("f11"), "innermost kept: {rendered}");
     }

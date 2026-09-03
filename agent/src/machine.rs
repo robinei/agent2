@@ -15,10 +15,7 @@ use interp::{
 };
 
 use crate::host::ProgramStatus;
-use crate::report::{
-    Artifact, ArtifactState, CompletionReport, ConditionReport, PAYLOAD_MAX_BYTES, ResumeKind,
-    clip, preview,
-};
+use crate::report::{Artifact, ArtifactState, preview};
 use crate::types::*;
 
 /// Tool names offered to the LLM. `run_program` is the primary tool;
@@ -104,11 +101,6 @@ const DEFAULT_ANSWER_BUDGET: usize = 64 * 1024;
 /// re-prompted to tighten it before the host truncates it deterministically.
 const ANSWER_RETRY_LIMIT: u8 = 1;
 
-/// A `create_file`/`replace_file` whose inline content exceeds this draws
-/// the attachments nudge (when the run passed no `attachments`): more than
-/// a snippet belongs in the `attachments` channel, not the program source.
-const INLINE_BODY_ADVICE_BYTES: usize = 512;
-
 pub enum StepInput {
     /// A user message. Valid while idle; arriving mid-program it becomes
     /// a host-injected condition — deferred to M2 (panics until then).
@@ -166,13 +158,36 @@ pub struct LlmTurn {
     pub tool_calls: Vec<ToolCall>,
 }
 
+/// One message as it goes out to the API. Log `Message`s render into
+/// these, and the **tool-role entries are derived** — from the run's
+/// outcome and the events around it — never stored, which is why they
+/// have no `EventPayload` counterpart.
+///
+/// Each variant is exactly one API role, chosen by the variant and never
+/// by a flag.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Rendered {
+    /// user role: a `Post`, author-labelled, with any `input` previewed.
+    User(String),
+    /// assistant role: a `Turn`.
+    Assistant {
+        text: String,
+        thinking: Option<String>,
+        tool_calls: Vec<ToolCall>,
+    },
+    /// tool role: the derived report answering one of a `Turn`'s calls.
+    /// The API requires every `tool_call_id` to be answered, so the
+    /// renderer emits exactly one of these per tool call in a `Turn`.
+    Tool { call_id: String, text: String },
+}
+
 #[derive(Debug)]
 pub struct LlmRequest {
     /// The branch's system prompt, rebuilt verbatim from `Agent.system`.
     /// It is a *snapshot*, so a later card edit or a new registry tool
     /// never alters an existing conversation's cached prefix.
     pub system: String,
-    pub messages: Vec<Message>,
+    pub messages: Vec<Rendered>,
     pub tools: Vec<ToolSpec>,
 }
 
@@ -201,16 +216,18 @@ struct Run {
     /// LLM tool-call id the eventual tool result answers.
     call_id: String,
     vm: VM,
-    /// Event-id high-water mark when the run started: artifacts logged
-    /// after it are "new" in this run's completion report.
-    started_at: u64,
-    /// Whether this run was given a non-empty `attachments` map — used to
-    /// suppress the inline-body nudge once the model is using the channel.
-    had_attachments: bool,
 }
 
-/// Why a run is suspended, and how `resume(value)` re-enters it.
-enum Suspension {
+/// How `resume(value)` re-enters a suspended run — the *live* half of a
+/// suspension, kept beside the phase.
+///
+/// The vocabulary a suspension is described in lives in the log, as
+/// [`Cause`]: that is what a report renders from and what survives a
+/// crash. This is deliberately **not** the same value. A `VMError` is not
+/// serialisable and only a live VM can consume one, so a `Cause` cannot
+/// carry it — and the `Cause` variants that never ran a VM
+/// (`CompileFailed`, `Refused`, `Interrupted`) have no live half at all.
+enum ResumeWith {
     /// `raise(name, payload)` — resume via `VM::resume_raise`.
     Raise,
     /// Trapped VM error — resume via `VM::resume_with` when the error
@@ -226,7 +243,7 @@ enum Phase {
     /// A program is executing (waiting for `Tick`/`ToolResults`).
     Running(Run),
     /// A condition report went out; waiting for the restart choice.
-    Suspended(Run, Suspension),
+    Suspended(Run, ResumeWith),
     /// `FrameResult` logged; terminal.
     Done,
 }
@@ -276,6 +293,10 @@ pub struct Runner {
     answer_budget: usize,
     /// Re-prompts spent tightening an over-budget final answer (decision 4).
     answer_retries: u8,
+    /// Refusals owed to the extra tool calls of the current turn. They are
+    /// logged only once the first call's outcome has landed, so outcomes
+    /// stay in call order and the positional pairing holds.
+    deferred_refusals: Vec<String>,
 }
 
 enum SuspendCause {
@@ -352,6 +373,7 @@ impl Runner {
             status_transitions: Vec::new(),
             answer_budget: DEFAULT_ANSWER_BUDGET,
             answer_retries: 0,
+            deferred_refusals: Vec::new(),
         }
     }
 
@@ -417,7 +439,7 @@ impl Runner {
         let _ = tree;
         assert!(matches!(self.phase, Phase::Idle), "kickoff on a busy agent");
         self.phase = Phase::AwaitingLlm;
-        Ok(vec![self.render_request()])
+        Ok(vec![self.render_request(tree)])
     }
 
     pub fn is_done(&self) -> bool {
@@ -465,7 +487,7 @@ impl Runner {
             }),
         )?;
         self.phase = Phase::AwaitingLlm;
-        Ok(vec![self.render_request()])
+        Ok(vec![self.render_request(tree)])
     }
 
     fn on_llm_response(&mut self, tree: &mut Tree, turn: LlmTurn) -> io::Result<Vec<StepOutput>> {
@@ -488,16 +510,21 @@ impl Runner {
             // No tool call: the assistant's text completes the agent.
             return self.finish_agent(tree);
         };
-        for extra in &tool_calls[1..] {
-            self.log_tool_error(tree, extra, "one tool call per turn; this call was ignored")?;
-        }
+        // Every call gets exactly one outcome, and outcomes are logged in
+        // **call order** so the positional pairing holds. The first call
+        // may drive the VM and settle much later, so refusals of the ones
+        // after it are deferred until its outcome has landed.
+        self.deferred_refusals = (1..tool_calls.len())
+            .map(|_| "one tool call per turn; this call was ignored".to_owned())
+            .collect();
 
         match call.name.as_str() {
             TOOL_RUN_PROGRAM => {
                 let Some(source) = call.arguments.get("source").and_then(|s| s.as_str()) else {
-                    self.log_tool_error(tree, &call, "run_program needs a `source` string")?;
+                    self.refuse(tree, "run_program needs a `source` string")?;
+                    self.flush_refusals(tree)?;
                     self.phase = Phase::AwaitingLlm;
-                    return Ok(vec![self.render_request()]);
+                    return Ok(vec![self.render_request(tree)]);
                 };
                 // `attachments` is this run's authored content (name → string),
                 // seeded as the program's `attachments` const. A malformed
@@ -505,9 +532,10 @@ impl Runner {
                 let attachments = match attachments_from_args(&call.arguments) {
                     Ok(a) => a,
                     Err(msg) => {
-                        self.log_tool_error(tree, &call, &msg)?;
+                        self.refuse(tree, &msg)?;
+                        self.flush_refusals(tree)?;
                         self.phase = Phase::AwaitingLlm;
-                        return Ok(vec![self.render_request()]);
+                        return Ok(vec![self.render_request(tree)]);
                     }
                 };
                 // A rewrite abandons any suspended VM — never the physics:
@@ -527,19 +555,22 @@ impl Runner {
                         self.note_status(assistant_id, ProgramStatus::Running);
                         Ok(vec![StepOutput::Working])
                     }
-                    Err(report) => {
-                        // Compile (or input-binding) error: a cheap repair
-                        // loop — the report is the tool result, nothing ran.
+                    Err(message) => {
+                        // A compile (or input-binding) error is an outcome
+                        // like any other — no VM was built, so this run has
+                        // no console and no artifacts. The repair loop is
+                        // unchanged; only where the text lives has moved.
                         tree.append(
                             &mut self.spine,
-                            EventPayload::Message(Message::Tool {
-                                name: TOOL_RUN_PROGRAM.into(),
-                                call_id: call.id.clone(),
-                                text: report,
-                            }),
+                            EventPayload::Condition {
+                                cause: Cause::CompileFailed { message },
+                                site: 0,
+                                stack: Vec::new(),
+                            },
                         )?;
+                        self.flush_refusals(tree)?;
                         self.phase = Phase::AwaitingLlm;
-                        Ok(vec![self.render_request()])
+                        Ok(vec![self.render_request(tree)])
                     }
                 }
             }
@@ -552,12 +583,12 @@ impl Runner {
                 match std::mem::replace(&mut self.phase, Phase::Idle) {
                     Phase::Suspended(mut run, suspension) => {
                         let resumed = match &suspension {
-                            Suspension::Raise => {
+                            ResumeWith::Raise => {
                                 let v = json_arg(&mut run.vm, &value);
                                 run.vm.resume_raise(v);
                                 true
                             }
-                            Suspension::Trapped(e) => match e.resume {
+                            ResumeWith::Trapped(e) => match e.resume {
                                 ResumeMode::PushValueThenContinue => {
                                     let v = json_arg(&mut run.vm, &value);
                                     run.vm
@@ -582,34 +613,32 @@ impl Runner {
                             Ok(vec![StepOutput::Working])
                         } else {
                             self.phase = Phase::Suspended(run, suspension);
-                            self.log_tool_error(
-                                tree,
-                                &call,
-                                "this condition is not resumable; use run_program",
-                            )?;
-                            Ok(vec![self.render_request()])
+                            self.refuse(tree, "this condition is not resumable; use run_program")?;
+                            self.flush_refusals(tree)?;
+                            Ok(vec![self.render_request(tree)])
                         }
                     }
                     other => {
                         self.phase = other;
-                        self.log_tool_error(tree, &call, "nothing to resume")?;
+                        self.refuse(tree, "nothing to resume")?;
+                        self.flush_refusals(tree)?;
                         if !matches!(self.phase, Phase::Suspended(..)) {
                             self.phase = Phase::AwaitingLlm;
                         }
-                        Ok(vec![self.render_request()])
+                        Ok(vec![self.render_request(tree)])
                     }
                 }
             }
             unknown => {
-                self.log_tool_error(
+                self.refuse(
                     tree,
-                    &call,
                     &format!("unknown tool `{unknown}` (have: run_program, resume)"),
                 )?;
+                self.flush_refusals(tree)?;
                 if !matches!(self.phase, Phase::Suspended(..)) {
                     self.phase = Phase::AwaitingLlm;
                 }
-                Ok(vec![self.render_request()])
+                Ok(vec![self.render_request(tree)])
             }
         }
     }
@@ -693,7 +722,6 @@ impl Runner {
         call_id: String,
     ) -> Result<Run, String> {
         let program = compile(source).map_err(|diags| render_diags(source, &diags))?;
-        let had_attachments = attachments.as_object().is_some_and(|m| !m.is_empty());
         // The whole `input` reaches the program even though the context
         // saw only a bounded preview of it.
         let vm = VM::for_program_with(program, self.spine.context().input().clone(), attachments)
@@ -702,8 +730,6 @@ impl Runner {
             program_id,
             call_id,
             vm,
-            started_at: self.spine.leaf_id.as_u64(),
-            had_attachments,
         })
     }
 
@@ -901,7 +927,7 @@ impl Runner {
                 Some(outcome) => outcome_json(outcome),
                 None => Err(format!("call #{id} has no result yet")),
             },
-            EventPayload::ProgramResult { value } => Ok(value.clone()),
+            EventPayload::Return { value } => Ok(value.clone()),
             _ => Err(format!("event #{id} is not an artifact")),
         }
     }
@@ -920,13 +946,6 @@ impl Runner {
             .vm
             .stack_value_to_json(&value, 0)
             .unwrap_or_else(|_| serde_json::Value::String(format!("{value:?}")));
-
-        // The return is the program's *answer* into this agent's context —
-        // the one value that deliberately crosses into a mind (DESIGN.md
-        // "The one exception"). It is budgeted, not rejected: the full
-        // value is logged as a fetchable `ProgramResult` below, and only
-        // the context copy is truncated (naming its id) by the report.
-        let completion_value = value_json.clone();
 
         // Fire-and-forget calls the program never awaited: the host
         // decides whether to run them; results are logged as late
@@ -957,39 +976,27 @@ impl Runner {
         }
         self.generation += 1;
 
-        tree.append(
+        // "Completed ⇒ `Return`" holds without exception — a program that
+        // ends without a `return` still logs `Return { value: null }` —
+        // which is what makes recovery decidable from the log alone.
+        let outcome = tree.append(
             &mut self.spine,
-            EventPayload::ProgramResult {
+            EventPayload::Return {
                 value: value_json.clone(),
             },
         )?;
-
-        let advise_attachments =
-            !run.had_attachments && self.run_inlined_large_body(tree, run.started_at);
-        let report = CompletionReport {
-            value: completion_value,
-            budget: self.answer_budget,
-            console: run.vm.console_lines.clone(),
-            new_artifacts: self.new_artifacts(tree, run.started_at),
-            advise_attachments,
-        }
-        .render();
-        tree.append(
-            &mut self.spine,
-            EventPayload::Message(Message::Tool {
-                name: TOOL_RUN_PROGRAM.into(),
-                call_id: run.call_id,
-                text: report,
-            }),
-        )?;
-        // Faithful, unclipped console for the log/UI (decision 8): the
-        // report above carries only a clipped tail for the LLM.
+        // The console is a diagnostic stream, capped with an explicit
+        // marker; the report carries only a bounded tail of it.
         tree.append(
             &mut self.spine,
             EventPayload::Console {
-                lines: run.vm.console_lines.clone(),
+                lines: crate::report::cap_console(
+                    &run.vm.console_lines,
+                    &format!("console event follows #{}", outcome.as_u64()),
+                ),
             },
         )?;
+        self.flush_refusals(tree)?;
 
         if !fire_and_forget.is_empty() {
             out.push(StepOutput::ToolCalls(fire_and_forget));
@@ -997,7 +1004,7 @@ impl Runner {
         self.note_status(run.program_id, ProgramStatus::Completed);
         self.last_vm = Some(run.vm);
         self.phase = Phase::AwaitingLlm;
-        out.push(self.render_request());
+        out.push(self.render_request(tree));
         Ok(out)
     }
 
@@ -1011,60 +1018,65 @@ impl Runner {
             unreachable!()
         };
 
-        let (what, resume, suspension) = match cause {
+        // Split the live suspension in two: a serialisable `Cause` for
+        // the log (everything the report needs) and a `ResumeWith` handle
+        // the *live* VM needs to resume. A `VMError` is not serialisable
+        // and only a live VM can consume one, so the two cannot be the
+        // same value.
+        let (cause, site, suspension) = match cause {
             SuspendCause::Raise { condition, payload } => {
-                let payload = payload
-                    .map(|v| {
-                        run.vm
-                            .stack_value_to_json(&v, 0)
-                            .map(|j| j.to_string())
-                            .unwrap_or_else(|_| format!("{v:?}"))
-                    })
-                    .unwrap_or_else(|| "(none)".into());
-                let mut what = raise_location(&run.vm, &condition);
-                what.push_str("\npayload: ");
-                what.push_str(&clip(&payload, PAYLOAD_MAX_BYTES));
-                (what, ResumeKind::Raise, Suspension::Raise)
+                let payload = payload.map(|v| value_json(&run.vm, &v));
+                // `step()` advanced `ip` past the `Raise`, so the raise
+                // site is the previous slot.
+                let site = span_at(&run.vm, (run.vm.ip as usize).saturating_sub(1));
+                (
+                    Cause::Raised {
+                        name: condition,
+                        payload,
+                    },
+                    site,
+                    ResumeWith::Raise,
+                )
             }
             SuspendCause::Trapped(e) => {
-                let what = run.vm.render_error(&e);
-                let resume = match e.resume {
-                    ResumeMode::PushValueThenContinue => ResumeKind::Operation,
-                    ResumeMode::NotResumable => ResumeKind::No,
+                let site = span_at(&run.vm, e.ip as usize);
+                let cause = Cause::Trapped {
+                    kind: format!("{:?}", e.kind),
+                    message: e.message.clone(),
+                    resumable: matches!(e.resume, ResumeMode::PushValueThenContinue),
                 };
-                (what, resume, Suspension::Trapped(e))
+                (cause, site, ResumeWith::Trapped(e))
             }
         };
 
-        let report = ConditionReport {
-            what,
-            stack: run
-                .vm
-                .frames()
-                .iter()
-                .map(|f| f.name().to_owned())
-                .collect(),
-            console: run.vm.console_lines.clone(),
-            artifacts: self.agent_artifacts(tree),
-            resume,
-        }
-        .render();
+        let stack: Vec<String> = run
+            .vm
+            .frames()
+            .iter()
+            .map(|f| f.name().to_owned())
+            .collect();
         let console = run.vm.console_lines.clone();
-        let call_id = run.call_id.clone();
         let program_id = run.program_id;
         self.phase = Phase::Suspended(run, suspension);
         self.note_status(program_id, ProgramStatus::Suspended);
+        // The outcome carries the site and the stack because those were
+        // the last inputs that lived only in the VM, and the VM is never
+        // persisted.
+        let outcome = tree.append(
+            &mut self.spine,
+            EventPayload::Condition { cause, site, stack },
+        )?;
         tree.append(
             &mut self.spine,
-            EventPayload::Message(Message::Tool {
-                name: TOOL_RUN_PROGRAM.into(),
-                call_id,
-                text: report,
-            }),
+            EventPayload::Console {
+                lines: crate::report::cap_console(
+                    &console,
+                    &format!("console event follows #{}", outcome.as_u64()),
+                ),
+            },
         )?;
-        // Faithful, unclipped console for the log/UI (decision 8).
-        tree.append(&mut self.spine, EventPayload::Console { lines: console })?;
-        out.push(self.render_request());
+        self.flush_refusals(tree)?;
+        out.push(self.render_request(tree));
         Ok(out)
     }
 
@@ -1113,7 +1125,7 @@ impl Runner {
                 }),
             )?;
             self.phase = Phase::AwaitingLlm;
-            return Ok(vec![self.render_request()]);
+            return Ok(vec![self.render_request(tree)]);
         }
         let result = if text.is_empty() {
             serde_json::Value::Null
@@ -1134,16 +1146,23 @@ impl Runner {
 
     // ── rendering ───────────────────────────────────────────────────
 
-    fn render_request(&self) -> StepOutput {
+    /// Build the request from the **log**: the system prompt from the
+    /// `Agent`'s snapshot, the posts and turns from this branch's path,
+    /// and one derived tool message per tool call in each turn.
+    ///
+    /// Placing each tool message immediately after the `Turn` whose call
+    /// it answers is what keeps the API's adjacency rule satisfied — the
+    /// completion API rejects anything between an assistant tool call and
+    /// its tool result.
+    fn render_request(&self, tree: &Tree) -> StepOutput {
         // The system prompt is rebuilt from the `Agent`'s snapshot, not
         // re-derived from the registry: the prefix is immutable, so a
         // later card edit must not alter an existing conversation.
-        let context = self.spine.context();
-        let system = context.system.clone();
-        let messages = context.messages.clone();
+        let system = self.spine.context().system.clone();
+        let messages = self.render_messages(tree);
 
         let tools = match &self.phase {
-            Phase::Suspended(_, Suspension::Trapped(e))
+            Phase::Suspended(_, ResumeWith::Trapped(e))
                 if matches!(e.resume, ResumeMode::NotResumable) =>
             {
                 vec![run_program_spec()]
@@ -1158,14 +1177,81 @@ impl Runner {
         })
     }
 
-    fn log_tool_error(&mut self, tree: &mut Tree, call: &ToolCall, msg: &str) -> io::Result<()> {
+    /// The rendered message list for a request: the branch's posts and
+    /// turns, with each turn immediately followed by one derived tool
+    /// message per tool call it made.
+    ///
+    /// Pairing is **positional**: the k-th outcome after a turn answers
+    /// its k-th tool call. The machine keeps that true by deferring a
+    /// refusal until after the outcome of the call that preceded it.
+    fn render_messages(&self, tree: &Tree) -> Vec<Rendered> {
+        let leaf = self.spine.leaf_id;
+        let mut out = Vec::new();
+        for event in self.agent_segment(tree) {
+            let EventPayload::Message(msg) = &event.payload else {
+                continue;
+            };
+            match msg {
+                Message::Post { from, .. } => {
+                    // Resolve a by-reference body the way a `Context`
+                    // does — the log stays copy-free.
+                    let resolved = tree.resolve(msg);
+                    let Message::Post { origin, .. } = &resolved else {
+                        continue;
+                    };
+                    out.push(Rendered::User(crate::report::render_post(*from, origin)));
+                }
+                Message::Turn {
+                    text,
+                    thinking,
+                    tool_calls,
+                    ..
+                } => {
+                    out.push(Rendered::Assistant {
+                        text: text.clone(),
+                        thinking: thinking.clone(),
+                        tool_calls: tool_calls.clone(),
+                    });
+                    let outcomes = crate::report::outcomes_of_turn(tree, leaf, event.id);
+                    for (call, outcome) in tool_calls.iter().zip(outcomes) {
+                        out.push(Rendered::Tool {
+                            call_id: call.id.clone(),
+                            text: crate::report::derive_report(
+                                tree,
+                                leaf,
+                                outcome,
+                                self.answer_budget,
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Log the refusals deferred behind a VM-driving call, now that its
+    /// outcome has landed — keeping outcomes in call order.
+    fn flush_refusals(&mut self, tree: &mut Tree) -> io::Result<()> {
+        for reason in std::mem::take(&mut self.deferred_refusals) {
+            self.refuse(tree, &reason)?;
+        }
+        Ok(())
+    }
+
+    /// Refuse a call: log a `Condition{Refused}` so the call still has
+    /// exactly one outcome event, and the report renders from it rather
+    /// than from replayed eligibility.
+    fn refuse(&mut self, tree: &mut Tree, reason: &str) -> io::Result<()> {
         tree.append(
             &mut self.spine,
-            EventPayload::Message(Message::Tool {
-                name: call.name.clone(),
-                call_id: call.id.clone(),
-                text: format!("error: {msg}"),
-            }),
+            EventPayload::Condition {
+                cause: Cause::Refused {
+                    reason: reason.to_owned(),
+                },
+                site: 0,
+                stack: Vec::new(),
+            },
         )?;
         Ok(())
     }
@@ -1188,35 +1274,6 @@ impl Runner {
         }
         events.reverse();
         events
-    }
-
-    /// Artifact-menu entries for every artifact on this agent so far.
-    fn agent_artifacts(&self, tree: &Tree) -> Vec<Artifact> {
-        menu_rows(&self.agent_segment(tree), 0)
-    }
-
-    fn new_artifacts(&self, tree: &Tree, since: u64) -> Vec<Artifact> {
-        menu_rows(&self.agent_segment(tree), since)
-    }
-
-    /// Whether any `create_file`/`replace_file` logged by this run inlined
-    /// a content body past [`INLINE_BODY_ADVICE_BYTES`]. Content is the last
-    /// positional arg; the full (unclipped) args live on the `Invoke` event.
-    fn run_inlined_large_body(&self, tree: &Tree, since: u64) -> bool {
-        self.agent_segment(tree)
-            .into_iter()
-            .filter(|e| e.id.as_u64() > since)
-            .any(|e| match &e.payload {
-                EventPayload::Call(Call::Invoke { name, args, .. })
-                    if name == "create_file" || name == "replace_file" =>
-                {
-                    args.as_array()
-                        .and_then(|a| a.last())
-                        .and_then(|v| v.as_str())
-                        .is_some_and(|content| content.len() > INLINE_BODY_ADVICE_BYTES)
-                }
-                _ => false,
-            })
     }
 }
 
@@ -1311,7 +1368,7 @@ fn settlement_of<'e>(segment: &[&'e Event], call: EventId) -> Option<&'e Outcome
 ///
 /// Rows are named by the **call** id, which is what a program reuses:
 /// `tools.tool_result` resolves a call id through to its `Result`.
-fn menu_rows(segment: &[&Event], since: u64) -> Vec<Artifact> {
+pub(crate) fn menu_rows(segment: &[&Event], since: u64) -> Vec<Artifact> {
     segment
         .iter()
         .filter(|e| e.id.as_u64() > since)
@@ -1337,7 +1394,7 @@ fn menu_rows(segment: &[&Event], since: u64) -> Vec<Artifact> {
                         },
                     },
                 }),
-                EventPayload::ProgramResult { value } => Some(Artifact {
+                EventPayload::Return { value } => Some(Artifact {
                     id,
                     label: "program result".into(),
                     state: ArtifactState::Delivered(value.clone()),
@@ -1385,21 +1442,10 @@ fn outcome_json(outcome: &Outcome) -> Result<serde_json::Value, String> {
     }
 }
 
-/// "condition `name` raised" rendered at the raise site (source line +
-/// caret). `step()` advanced `ip` past the `Raise` instruction, so the
-/// raise site is the previous slot.
-fn raise_location(vm: &VM, condition: &str) -> String {
-    let message = format!("condition `{condition}` raised");
-    let ip = (vm.ip as usize).saturating_sub(1);
-    match vm.spans.get(ip) {
-        Some(&span) if !vm.source.is_empty() => Diagnostic {
-            kind: interp::DiagKind::Semantic,
-            span,
-            message,
-        }
-        .render(&vm.source),
-        _ => message,
-    }
+/// The source byte offset of instruction `ip` — what a `Condition`
+/// records so its report can point a caret without a live VM.
+fn span_at(vm: &VM, ip: usize) -> u32 {
+    vm.spans.get(ip).copied().unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -1468,18 +1514,24 @@ mod tests {
         panic!("machine never settled");
     }
 
-    fn last_tool_text(state: &Runner) -> String {
-        state
-            .spine
-            .context()
-            .messages
+    /// The most recent report the LLM read. Reports are **derived, not
+    /// stored**, so a test derives it the way a request does: from the
+    /// last outcome on the branch.
+    fn last_report(state: &Runner, tree: &Tree) -> String {
+        let leaf = state.spine.leaf_id;
+        let outcome = tree
+            .path_events(leaf)
             .iter()
             .rev()
-            .find_map(|m| match m {
-                Message::Tool { text, .. } => Some(text.clone()),
-                _ => None,
+            .find(|e| {
+                matches!(
+                    e.payload,
+                    EventPayload::Return { .. } | EventPayload::Condition { .. }
+                )
             })
-            .expect("a tool message")
+            .map(|e| e.id)
+            .expect("an outcome to render");
+        crate::report::derive_report(tree, leaf, outcome, state.answer_budget)
     }
 
     fn payload_kinds(state: &Runner, tree: &Tree) -> Vec<&'static str> {
@@ -1491,10 +1543,10 @@ mod tests {
                 EventPayload::FrameResult { .. } => "FrameResult",
                 EventPayload::Message(Message::Post { .. }) => "Post",
                 EventPayload::Message(Message::Turn { .. }) => "Turn",
-                EventPayload::Message(Message::Tool { .. }) => "Tool",
                 EventPayload::Call(_) => "Call",
                 EventPayload::Result { .. } => "Result",
-                EventPayload::ProgramResult { .. } => "ProgramResult",
+                EventPayload::Return { .. } => "Return",
+                EventPayload::Condition { .. } => "Condition",
                 EventPayload::Console { .. } => "Console",
                 EventPayload::Rename { .. } => "Rename",
             })
@@ -1551,8 +1603,8 @@ mod tests {
         let out = child.kickoff(&mut tree).unwrap();
         let req = expect_request(&out);
         let rendered = match &req.messages[0] {
-            Message::Post { from, origin } => crate::report::render_post(*from, origin),
-            other => panic!("expected a Post, got {other:?}"),
+            Rendered::User(text) => text.clone(),
+            other => panic!("expected a user message, got {other:?}"),
         };
         assert!(!rendered.contains(&big), "the body must not enter context");
         assert!(rendered.contains("summarize it"), "{rendered}");
@@ -1571,9 +1623,9 @@ mod tests {
             .unwrap();
         drain(&mut child, &mut tree, out);
         assert!(
-            last_tool_text(&child).contains("returned: 9000"),
+            last_report(&child, &tree).contains("returned: 9000"),
             "{}",
-            last_tool_text(&child)
+            last_report(&child, &tree)
         );
     }
 
@@ -1710,10 +1762,10 @@ mod tests {
                 "served from the log, no call re-issued"
             );
             assert!(
-                last_tool_text(&state).contains(r#"returned: "DATA""#),
+                last_report(&state, &tree).contains(r#"returned: "DATA""#),
                 "fetching #{} failed: {}",
                 fetch_by.as_u64(),
-                last_tool_text(&state)
+                last_report(&state, &tree)
             );
         }
     }
@@ -1752,7 +1804,7 @@ mod tests {
             .expect("a Result");
         assert!(matches!(&outcome, Outcome::Failed(m) if m == "host is down"));
         // And the menu says so rather than previewing a value.
-        let report = last_tool_text(&state);
+        let report = last_report(&state, &tree);
         assert!(report.contains("failed: host is down"), "{report}");
     }
 
@@ -1766,8 +1818,7 @@ mod tests {
             .unwrap();
         let req = expect_request(&out);
         assert!(req.system.contains("test agent"));
-        assert!(matches!(&req.messages[0], Message::Post { origin, .. }
-                     if origin.direct().unwrap().0 == "compute 6*7"));
+        assert!(matches!(&req.messages[0], Rendered::User(t) if t == "compute 6*7"));
         assert_eq!(tool_names(req), [TOOL_RUN_PROGRAM]);
         // The full definition rides along: schema'd parameters, not a name.
         assert!(req.tools[0].parameters["properties"]["source"].is_object());
@@ -1854,7 +1905,7 @@ mod tests {
             )
             .unwrap();
         drain(&mut state, &mut tree, out);
-        assert!(last_tool_text(&state).contains("returned: 7"));
+        assert!(last_report(&state, &tree).contains("returned: 7"));
     }
 
     #[test]
@@ -1880,9 +1931,9 @@ mod tests {
         drain(&mut state, &mut tree, out);
         // "hello world" is 11 bytes.
         assert!(
-            last_tool_text(&state).contains("returned: 11"),
+            last_report(&state, &tree).contains("returned: 11"),
             "{}",
-            last_tool_text(&state)
+            last_report(&state, &tree)
         );
     }
 
@@ -1905,7 +1956,7 @@ mod tests {
         let out = state.step(&mut tree, StepInput::LlmResponse(msg)).unwrap();
         // No program ran; the error is the tool result and a fresh request
         // follows (the repair loop), exactly like a missing `source`.
-        let report = last_tool_text(&state);
+        let report = last_report(&state, &tree);
         assert!(
             report.contains("attachments.body") && report.contains("must be a string"),
             "{report}"
@@ -1931,11 +1982,11 @@ mod tests {
         let settled = drain(&mut state, &mut tree, out);
 
         // Completion report is the tool result; the next request follows.
-        let report = last_tool_text(&state);
+        let report = last_report(&state, &tree);
         assert!(report.contains("returned: 42"), "{report}");
         assert!(report.contains("hi there"), "{report}");
         let req = expect_request(&settled);
-        assert!(matches!(req.messages.last(), Some(Message::Tool { .. })));
+        assert!(matches!(req.messages.last(), Some(Rendered::Tool { .. })));
 
         // Final text turn on the *root* agent yields to the user — the
         // top conversation never ends, so no `FrameResult` is logged and
@@ -1951,15 +2002,7 @@ mod tests {
         assert!(state.is_idle());
         assert_eq!(
             payload_kinds(&state, &tree),
-            [
-                "Agent",
-                "Post",
-                "Turn",
-                "ProgramResult",
-                "Tool",
-                "Console",
-                "Turn",
-            ]
+            ["Agent", "Post", "Turn", "Return", "Console", "Turn"]
         );
 
         // A follow-up turn appends onto the same spine and runs again.
@@ -2010,7 +2053,7 @@ mod tests {
             .unwrap();
         drain(&mut state, &mut tree, out);
 
-        assert!(last_tool_text(&state).contains(r#"returned: ["X","Y"]"#));
+        assert!(last_report(&state, &tree).contains(r#"returned: ["X","Y"]"#));
         // Calls are logged at dispatch, in the program's issue order…
         let issued: Vec<serde_json::Value> = state
             .agent_segment(&tree)
@@ -2051,9 +2094,10 @@ mod tests {
         assert!(!out.iter().any(|o| matches!(o, StepOutput::Working)));
         let req = expect_request(&out);
         assert_eq!(tool_names(req), [TOOL_RUN_PROGRAM]);
-        assert!(last_tool_text(&state).contains("compile error"));
-        // No execution events were logged.
-        assert_eq!(payload_kinds(&state, &tree), ["Agent", "Turn", "Tool"]);
+        assert!(last_report(&state, &tree).contains("compile error"));
+        // No VM was built, so this run has no console and no artifacts —
+        // the diagnostic alone, as its one outcome.
+        assert_eq!(payload_kinds(&state, &tree), ["Agent", "Turn", "Condition"]);
     }
 
     #[test]
@@ -2085,7 +2129,7 @@ mod tests {
         let req = expect_request(&settled);
         assert_eq!(tool_names(req), [TOOL_RESUME, TOOL_RUN_PROGRAM]);
         assert!(req.tools[0].parameters["properties"]["value"].is_object());
-        let report = last_tool_text(&state);
+        let report = last_report(&state, &tree);
         assert!(report.contains("condition `need_help`"), "{report}");
         assert!(report.contains(r#"{"got":41}"#), "{report}");
         assert!(
@@ -2102,7 +2146,7 @@ mod tests {
             )
             .unwrap();
         drain(&mut state, &mut tree, out);
-        assert!(last_tool_text(&state).contains("returned: 42"));
+        assert!(last_report(&state, &tree).contains("returned: 42"));
     }
 
     #[test]
@@ -2126,7 +2170,7 @@ mod tests {
             )
             .unwrap();
         drain(&mut state, &mut tree, out);
-        assert!(last_tool_text(&state).contains("returned: 42"));
+        assert!(last_report(&state, &tree).contains("returned: 42"));
     }
 
     #[test]
@@ -2181,7 +2225,7 @@ mod tests {
                 .any(|o| matches!(o, StepOutput::ToolCalls(_))),
             "{settled:?}"
         );
-        assert!(last_tool_text(&state).contains(r#"returned: "DATA""#));
+        assert!(last_report(&state, &tree).contains(r#"returned: "DATA""#));
     }
 
     #[test]
@@ -2230,7 +2274,7 @@ mod tests {
             .step(&mut tree, StepInput::SubagentResult { invoke_id, result })
             .unwrap();
         drain(&mut state, &mut tree, out);
-        assert!(last_tool_text(&state).contains(r#"returned: "child says hi""#));
+        assert!(last_report(&state, &tree).contains(r#"returned: "child says hi""#));
         assert!(
             payload_kinds(&state, &tree).contains(&"Call"),
             "agent call logged as an artifact"
@@ -2257,6 +2301,237 @@ mod tests {
                 "a hot loop keeps yielding, never blocks"
             );
         }
+    }
+
+    // ── outcomes and derived reports (A4) ───────────────────────────
+
+    /// Every outcome event on a branch, in log order.
+    fn outcomes(state: &Runner, tree: &Tree) -> Vec<EventId> {
+        state
+            .agent_segment(tree)
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.payload,
+                    EventPayload::Return { .. } | EventPayload::Condition { .. }
+                )
+            })
+            .map(|e| e.id)
+            .collect()
+    }
+
+    /// Exactly one outcome per **handback**, not per run: a single
+    /// `run_program` that raises, is resumed, traps, is resumed again and
+    /// finally returns logs four, with `Return` only on the last.
+    #[test]
+    fn one_outcome_per_handback_not_per_run() {
+        let (mut tree, mut state) = setup();
+        state.kickoff(&mut tree).unwrap();
+        // resume #1 lands 1 → `x` is 1; resume #2 stands in for the
+        // failed property read with 41, so the program returns 42.
+        let src = r#"
+            const x = raise("need", null);
+            const bad = null;
+            return bad.missing + x + 40;
+        "#;
+        let out = state
+            .step(&mut tree, StepInput::LlmResponse(llm_program("c1", src)))
+            .unwrap();
+        drain(&mut state, &mut tree, out); // handback 1: raised
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(llm_resume("c2", json!(1))),
+            )
+            .unwrap();
+        drain(&mut state, &mut tree, out); // handback 2: trapped
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(llm_resume("c3", json!(1))),
+            )
+            .unwrap();
+        drain(&mut state, &mut tree, out); // handback 3: returned
+
+        let kinds: Vec<&'static str> = outcomes(&state, &tree)
+            .iter()
+            .map(|id| match &tree.events[id].payload {
+                EventPayload::Return { .. } => "Return",
+                EventPayload::Condition {
+                    cause: Cause::Raised { .. },
+                    ..
+                } => "raised",
+                EventPayload::Condition {
+                    cause: Cause::Trapped { .. },
+                    ..
+                } => "trapped",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(kinds, ["raised", "trapped", "Return"], "{kinds:?}");
+        assert!(last_report(&state, &tree).contains("returned: 42"));
+    }
+
+    /// Every tool call gets exactly one outcome event — including one
+    /// that never ran. Without that, a refusal's tool message would have
+    /// to be rebuilt by replaying eligibility to that path position.
+    #[test]
+    fn every_tool_call_has_an_outcome_event() {
+        let (mut tree, mut state) = setup();
+        state.kickoff(&mut tree).unwrap();
+
+        // A `resume` with nothing suspended: refused, and the refusal is
+        // the call's outcome.
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(llm_resume("c1", json!(1))),
+            )
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+        // A run that compiles and returns.
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(llm_program("c2", "return 1;")),
+            )
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+        // A run that does not compile.
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(llm_program("c3", "let = ;")),
+            )
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+
+        // One outcome per turn, and the request answers every call id.
+        let leaf = state.spine.leaf_id;
+        for event in state.agent_segment(&tree) {
+            let EventPayload::Message(Message::Turn { tool_calls, .. }) = &event.payload else {
+                continue;
+            };
+            assert_eq!(
+                crate::report::outcomes_of_turn(&tree, leaf, event.id).len(),
+                tool_calls.len(),
+                "each call gets exactly one outcome"
+            );
+        }
+        let StepOutput::LlmRequest(req) = state.render_request(&tree) else {
+            panic!("expected a request");
+        };
+        let answered: Vec<&str> = req
+            .messages
+            .iter()
+            .filter_map(|m| match m {
+                Rendered::Tool { call_id, .. } => Some(call_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(answered, ["c1", "c2", "c3"]);
+    }
+
+    /// A report renders identically forever **for a given renderer**: the
+    /// same log rendered twice is byte-identical, because every input the
+    /// report needs is in the log and nothing decorates it with a fact
+    /// that was true at the time and logged nowhere.
+    #[test]
+    fn derived_reports_are_stable_for_a_renderer() {
+        let (mut tree, mut state) = setup();
+        state.kickoff(&mut tree).unwrap();
+        let src = "const a = await tools.fetch(\"x\");\nconsole.log(a);\nreturn a;";
+        let out = state
+            .step(&mut tree, StepInput::LlmResponse(llm_program("c1", src)))
+            .unwrap();
+        let settled = drain(&mut state, &mut tree, out);
+        let id = expect_tool_calls(&settled)[0].invoke_id;
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::ToolResults(vec![ToolResult {
+                    invoke_id: id,
+                    result: Ok(json!("X")),
+                }]),
+            )
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+
+        let first = state.render_messages(&tree);
+        tree.clear_report_memo();
+        let second = state.render_messages(&tree);
+        assert_eq!(first, second, "the same log renders the same bytes");
+        assert!(
+            first
+                .iter()
+                .any(|m| matches!(m, Rendered::Tool { text, .. } if text.contains("returned:"))),
+            "{first:?}"
+        );
+    }
+
+    /// Reports are derived, so without a memo every request re-derives
+    /// every report on the path and a session is quadratic in branch
+    /// length. With one, re-derivation is amortised O(1).
+    #[test]
+    fn report_memo_avoids_rederiving_history() {
+        let (mut tree, mut state) = setup();
+        state.kickoff(&mut tree).unwrap();
+        for (n, id) in ["c1", "c2", "c3"].into_iter().enumerate() {
+            let out = state
+                .step(
+                    &mut tree,
+                    StepInput::LlmResponse(llm_program(id, &format!("return {n};"))),
+                )
+                .unwrap();
+            drain(&mut state, &mut tree, out);
+        }
+        // Three runs, so three reports were derived — once each, even
+        // though each request re-rendered the whole path.
+        assert_eq!(tree.report_derivations(), 3);
+
+        let before = tree.report_derivations();
+        state.render_messages(&tree);
+        state.render_messages(&tree);
+        assert_eq!(
+            tree.report_derivations(),
+            before,
+            "history is served from the memo, not re-derived"
+        );
+
+        // The memo is a cache of one renderer's output: dropping it makes
+        // the next render pay again, and produce the same bytes.
+        let rendered = state.render_messages(&tree);
+        tree.clear_report_memo();
+        assert_eq!(state.render_messages(&tree), rendered);
+        assert!(tree.report_derivations() > before);
+    }
+
+    /// The console is a diagnostic stream, not data: it is capped with an
+    /// explicit marker rather than silently truncated, and the program's
+    /// own `return` is the channel for anything that must survive whole.
+    #[test]
+    fn oversized_console_is_capped_and_marked() {
+        let lines: Vec<String> = (0..crate::report::CONSOLE_MAX_LINES + 500)
+            .map(|i| format!("line {i}"))
+            .collect();
+        let capped = crate::report::cap_console(&lines, "console event follows #9");
+        assert!(capped.len() <= crate::report::CONSOLE_MAX_LINES + 1);
+        assert!(capped[0].contains("console truncated"), "{}", capped[0]);
+        assert!(
+            capped[0].contains("500 earlier lines dropped"),
+            "{}",
+            capped[0]
+        );
+        assert!(capped[0].contains("#9"), "the marker names the event");
+        // The tail is what is kept — the latest output before the stop.
+        assert_eq!(capped.last().unwrap(), "line 2499");
+
+        // A byte-heavy console is capped too, by the same marker.
+        let fat: Vec<String> = (0..40).map(|_| "z".repeat(10_000)).collect();
+        let capped = crate::report::cap_console(&fat, "x");
+        let bytes: usize = capped.iter().skip(1).map(|l| l.len()).sum();
+        assert!(bytes <= crate::report::CONSOLE_MAX_BYTES);
+        assert!(capped[0].contains("console truncated"));
     }
 
     // ── golden renders (8_HARNESS Step 4) ───────────────────────────
@@ -2287,7 +2562,7 @@ mod tests {
             .unwrap();
         drain(&mut state, &mut tree, out);
         assert_eq!(
-            last_tool_text(&state),
+            last_report(&state, &tree),
             r#"## what happened
 3:1: condition `need_help` raised
 raise("need_help", { got: x });
@@ -2320,7 +2595,7 @@ fetched: 41
             .unwrap();
         drain(&mut state, &mut tree, out);
         assert_eq!(
-            last_tool_text(&state),
+            last_report(&state, &tree),
             r#"## what happened
 2:10: cannot read property 'x' on null
 return v.x;
@@ -2360,7 +2635,7 @@ console: (no output)
             .unwrap();
         drain(&mut state, &mut tree, out);
         assert_eq!(
-            last_tool_text(&state),
+            last_report(&state, &tree),
             r#"## program completed
 returned: ["X",2]
 
@@ -2392,7 +2667,7 @@ got X
             .agent_segment(tree)
             .iter()
             .find_map(|e| match &e.payload {
-                EventPayload::ProgramResult { value } => Some(value.clone()),
+                EventPayload::Return { value } => Some(value.clone()),
                 _ => None,
             })
             .expect("a ProgramResult")
@@ -2410,7 +2685,7 @@ got X
             .step(&mut tree, StepInput::LlmResponse(llm_program("c1", src)))
             .unwrap();
         drain(&mut state, &mut tree, out);
-        let report = last_tool_text(&state);
+        let report = last_report(&state, &tree);
         assert!(report.contains(&"x".repeat(5000)), "delivered in full");
         assert!(!report.contains("tools.tool_result(#"), "no spill marker");
         assert_eq!(
@@ -2432,7 +2707,7 @@ got X
             .step(&mut tree, StepInput::LlmResponse(llm_program("c1", src)))
             .unwrap();
         drain(&mut state, &mut tree, out);
-        let report = last_tool_text(&state);
+        let report = last_report(&state, &tree);
         // The returned-value line is truncated with a marker naming the id.
         let returned = report.lines().nth(1).unwrap();
         assert!(

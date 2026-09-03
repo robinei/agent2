@@ -95,11 +95,41 @@ pub enum EventPayload {
     /// `Result`. Renders to chat: no.
     Result { call: EventId, outcome: Outcome },
 
-    /// Execution event; a program's top-level `return` value, logged
-    /// after each successful run. Parent: the owning agent's spine.
-    /// Renders to chat: no — an id-addressable artifact like any tool
-    /// result (the completion report quotes it).
-    ProgramResult { value: serde_json::Value },
+    /// Run event; the program finished, and this is its `return` value.
+    /// Parent: the owning branch's spine. Renders to chat: no — an
+    /// id-addressable artifact like any tool result; the completion
+    /// report is *rendered around* it.
+    ///
+    /// `Return` settles nothing and has no `call`: it is the program's own
+    /// output, flowing **into** its branch's LLM rather than back from a
+    /// call. A program that ends without a `return` still logs
+    /// `Return { value: null }`, so "completed ⇒ `Return`" holds without
+    /// exception — which is what makes recovery decidable from the log
+    /// alone.
+    Return { value: serde_json::Value },
+
+    /// Run event; **everything else** a handback can be — a raise, a
+    /// trapped error, an arriving post, a compile failure, a refused
+    /// restart, an interruption. Parent: the owning branch's spine.
+    /// Renders to chat: no — its *report* is rendered from it.
+    ///
+    /// Exactly one outcome per handback (not per run): a single
+    /// `run_program` may raise, be resumed, trap, be resumed again and
+    /// finally return, and each handback logs its own outcome.
+    ///
+    /// It carries `site` and `stack` because those were the last inputs
+    /// that lived only in the VM, and the VM is never persisted. With them
+    /// logged, **nothing the model ever saw depends on state outside the
+    /// log.**
+    Condition {
+        cause: Cause,
+        /// Where the program stopped: a source byte offset, for the
+        /// line-and-caret diagnostic. `0` when no program ran.
+        site: u32,
+        /// The VM call-stack chain, outermost first.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        stack: Vec<String>,
+    },
 
     /// This branch is called this from here on. Parent: the owning
     /// branch's spine. Renders to chat: **no** — a `Rename` is a record,
@@ -119,6 +149,45 @@ pub enum EventPayload {
     /// (the completion/condition report carries only a clipped tail), so
     /// a finished program's console survives reload. Never sent to the LLM.
     Console { lines: Vec<String> },
+}
+
+/// Why a run handed back. Lisp's word on purpose: there, `condition` is
+/// the supertype and `error` a subtype, so a condition need not be an
+/// error — which is exactly the claim that a raise, a trapped error and a
+/// user interrupt are rows of one table.
+///
+/// **Only handbacks log one.** A condition the program itself handles —
+/// a caught throw, a failed call it recovered from, a fuel slice — never
+/// reaches the LLM and is not one of these.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub enum Cause {
+    /// `raise(name, payload)` — the program asked for a decision.
+    Raised {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        payload: Option<serde_json::Value>,
+    },
+    /// A trapped VM error. `resumable` is whether `resume(value)` can
+    /// stand in for the failed operation, which the report must state and
+    /// which only the live error knew.
+    Trapped {
+        kind: String,
+        message: String,
+        resumable: bool,
+    },
+    /// Posts arrived at a running program; it suspended at its next fuel
+    /// slice so the branch could hear them (rule B).
+    Posted { ids: Vec<EventId> },
+    /// `run_program` did not compile. No VM was built, so this run has no
+    /// console and no artifacts — the repair loop.
+    CompileFailed { message: String },
+    /// An ineligible restart. Nothing ran; the refusal is still an
+    /// outcome, so "every tool call has exactly one outcome event" holds
+    /// without exception and no report is derived from replayed state.
+    Refused { reason: String },
+    /// The process died mid-program and the VM went with it. Written by
+    /// reconciliation so an interrupted run has an outcome like any other.
+    Interrupted,
 }
 
 /// The rendered kinds — one per API role, chosen by the **variant**,
@@ -144,16 +213,6 @@ pub enum Message {
         thinking: Option<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         tool_calls: Vec<ToolCall>,
-    },
-
-    /// A tool-role message answering one of a `Turn`'s tool calls.
-    ///
-    /// Deleted in A4: these are *rendered* from the run's outcome and the
-    /// events around it, never stored.
-    Tool {
-        name: String,
-        call_id: String,
-        text: String,
     },
 }
 
@@ -211,13 +270,13 @@ impl Message {
     /// which is what `replay_event` does when building a `Context`.
     pub fn text(&self) -> &str {
         match self {
-            Message::Turn { text, .. } | Message::Tool { text, .. } => text,
+            Message::Turn { text, .. } => text,
             Message::Post { origin, .. } => origin.direct().map(|(t, _, _)| t).unwrap_or(""),
         }
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct ToolCall {
     pub id: String,
     pub name: String,
@@ -378,6 +437,38 @@ pub struct Tree {
     pub id_counter: u64,
     pub events: HashMap<EventId, Event>,
     pub file: Option<std::fs::File>,
+    /// Derived reports, keyed by their **outcome event id** — never
+    /// logged. Reports are pure functions of the log, so without a memo
+    /// every request re-derives every report on the path and a session is
+    /// quadratic in branch length; with it, re-derivation is amortised
+    /// O(1).
+    ///
+    /// The `Tree` is the right home because renders happen per branch per
+    /// request and the memo must outlive any one `Runner`. It is dropped
+    /// wholesale when the renderer changes
+    /// (`Tree::clear_report_memo`) — a memo is a cache of one renderer's
+    /// output, and editing `report.rs` invalidates all of it.
+    pub(crate) reports: std::cell::RefCell<ReportMemo>,
+}
+
+/// The report cache, with a counter so a test can observe that history is
+/// not re-derived on every request.
+pub struct ReportMemo {
+    pub entries: HashMap<EventId, String>,
+    /// How many reports have actually been rendered (memo misses).
+    pub derivations: u64,
+    /// The renderer this cache belongs to.
+    pub version: u32,
+}
+
+impl Default for ReportMemo {
+    fn default() -> Self {
+        ReportMemo {
+            entries: HashMap::new(),
+            derivations: 0,
+            version: crate::report::REPORT_FORMAT_VERSION,
+        }
+    }
 }
 
 impl EventId {

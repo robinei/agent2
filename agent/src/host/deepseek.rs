@@ -11,8 +11,8 @@
 use std::io::BufRead;
 
 use crate::host::llm::{LlmChunk, LlmClient};
-use crate::machine::{LlmRequest, LlmTurn};
-use crate::types::{Message, ToolCall};
+use crate::machine::{LlmRequest, LlmTurn, Rendered};
+use crate::types::ToolCall;
 
 const DEFAULT_MODEL: &str = "deepseek-v4-pro";
 const DEFAULT_BASE_URL: &str = "https://api.deepseek.com";
@@ -114,18 +114,15 @@ fn request_body(request: &LlmRequest, model: &str) -> serde_json::Value {
 
 /// Each rendered kind maps to exactly one API role **by its variant**,
 /// never by a flag.
-fn message_json(message: &Message) -> serde_json::Value {
+fn message_json(message: &Rendered) -> serde_json::Value {
     match message {
-        Message::Post { from, origin } => serde_json::json!({
-            "role": "user",
-            "content": crate::report::render_post(*from, origin),
-        }),
-        Message::Tool { call_id, text, .. } => serde_json::json!({
+        Rendered::User(text) => serde_json::json!({ "role": "user", "content": text }),
+        Rendered::Tool { call_id, text } => serde_json::json!({
             "role": "tool",
             "tool_call_id": call_id,
             "content": text,
         }),
-        Message::Turn {
+        Rendered::Assistant {
             text, tool_calls, ..
         } => {
             let mut obj = serde_json::json!({ "role": "assistant", "content": text });
@@ -241,7 +238,6 @@ fn parse_sse(reader: impl BufRead, chunk: &mut dyn FnMut(LlmChunk)) -> Result<Ll
 mod tests {
     use super::*;
     use crate::machine::{resume_spec, run_program_spec};
-    use crate::types::{Author, EventId, Origin};
     use serde_json::json;
 
     #[test]
@@ -249,16 +245,8 @@ mod tests {
         let request = LlmRequest {
             system: "card".into(),
             messages: vec![
-                Message::Post {
-                    from: Author::User,
-                    origin: Origin::Direct {
-                        text: "go".into(),
-                        input: json!(null),
-                        expects_reply: true,
-                    },
-                },
-                Message::Turn {
-                    author: Author::Agent(EventId::new(1)),
+                Rendered::User("go".into()),
+                Rendered::Assistant {
                     text: String::new(),
                     thinking: Some("hidden".into()),
                     tool_calls: vec![ToolCall {
@@ -267,8 +255,11 @@ mod tests {
                         arguments: json!({ "source": "return 1;" }),
                     }],
                 },
-                Message::Tool {
-                    name: "run_program".into(),
+                // The tool message is *derived*, never stored — the
+                // request builder places it right after the turn whose
+                // call it answers, which is what the API's adjacency rule
+                // requires.
+                Rendered::Tool {
                     call_id: "c1".into(),
                     text: "## program completed".into(),
                 },

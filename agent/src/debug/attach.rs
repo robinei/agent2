@@ -36,7 +36,7 @@ use super::ui;
 use crate::host::{AgentId, Session, SessionCommand, SessionEvent};
 use crate::machine::TOOL_RUN_PROGRAM;
 use crate::tree::{AgentView, ProgramView};
-use crate::types::{EventId, EventPayload, Message, Outcome};
+use crate::types::{Cause, EventId, EventPayload, Message, Outcome};
 
 /// Cap for one step-line key, so a hot loop on one source line cannot
 /// wedge the UI (mirrors the standalone runner).
@@ -1096,9 +1096,11 @@ fn render_console_from_pv(
     let mut lines: Vec<Line> = pv.console.iter().map(|l| Line::from(l.as_str())).collect();
     if let Some(ref result) = pv.result {
         lines.push(Line::from(format!("⇒ {result}")).style(Style::default().fg(Color::Green)));
-    } else if let Some(ref report) = pv.report {
-        let first = report.lines().next().unwrap_or("");
-        lines.push(Line::from(format!("⚡ {first}")).style(Style::default().fg(Color::Yellow)));
+    } else if let Some(cause) = &pv.condition {
+        lines.push(
+            Line::from(format!("⚡ {}", condition_line(cause)))
+                .style(Style::default().fg(Color::Yellow)),
+        );
     }
     let visible = area.height.saturating_sub(2) as usize;
     let default_top = lines.len().saturating_sub(visible);
@@ -1197,6 +1199,18 @@ fn render_placeholder(frame: &mut Frame, pane: Pane, area: Rect) {
             .block(Block::default().borders(Borders::ALL).title(title)),
         area,
     );
+}
+
+/// One-line summary of a logged condition for the console footer.
+fn condition_line(cause: &Cause) -> String {
+    match cause {
+        Cause::Raised { name, .. } => format!("raised `{name}`"),
+        Cause::Trapped { message, .. } => message.clone(),
+        Cause::Posted { .. } => "a message arrived".to_owned(),
+        Cause::CompileFailed { .. } => "compile error".to_owned(),
+        Cause::Refused { reason } => format!("refused: {reason}"),
+        Cause::Interrupted => "interrupted".to_owned(),
+    }
 }
 
 #[cfg(test)]

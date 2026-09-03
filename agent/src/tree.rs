@@ -42,24 +42,39 @@ pub struct ProgramView {
     pub invokes: Vec<InvokeView>,
     /// The top-level `return` value (`Some` ⇒ ran to completion).
     pub result: Option<serde_json::Value>,
-    /// The run's `Tool` result text (completion or condition report).
-    pub report: Option<String>,
-    /// Full, unclipped console (from the `Console` event).
+    /// The id of this program's most recent outcome event — what its
+    /// report is derived from.
+    pub outcome: Option<EventId>,
+    /// The cause of that outcome, when it was a `Condition`.
+    pub condition: Option<Cause>,
+    /// Console (from the `Console` event, already capped at logging).
     pub console: Vec<String>,
 }
 
 impl ProgramView {
-    /// Log-derived status for the program-list display. The precise
-    /// suspended-vs-failed split for a *live* program comes from
-    /// `SessionEvent::ProgramStatus`; this is what the log alone shows.
-    pub fn status_label(&self) -> &'static str {
-        if self.result.is_some() {
-            "completed"
-        } else if self.report.is_some() {
-            "condition" // ended on a raise/trap (suspended or failed)
-        } else {
-            "running" // no tool result yet — in flight / interrupted
+    /// The program's status, **derived from the log**. `protocol.rs` used
+    /// to note that suspended-vs-failed "is not inferable from the report
+    /// text"; with one outcome event per handback it now is, so a reopened
+    /// log can say how a program ended.
+    pub fn status(&self) -> crate::host::ProgramStatus {
+        use crate::host::ProgramStatus;
+        match &self.condition {
+            // A `Return` clears the condition, so this is the last word.
+            None if self.result.is_some() => ProgramStatus::Completed,
+            // Issued, no outcome: in flight, or lost with the process.
+            None => ProgramStatus::Running,
+            // A raise or a trap is a suspension the LLM can restart.
+            Some(Cause::Raised { .. }) | Some(Cause::Trapped { .. }) => ProgramStatus::Suspended,
+            // Nothing ever ran, or the VM is gone.
+            Some(_) => ProgramStatus::Failed,
         }
+    }
+
+    /// The report the LLM read for this program's latest handback,
+    /// derived from the log (`None` while the run has no outcome).
+    pub fn report(&self, tree: &Tree, leaf: EventId, budget: usize) -> Option<String> {
+        self.outcome
+            .map(|o| crate::report::derive_report(tree, leaf, o, budget))
     }
 }
 
@@ -69,6 +84,7 @@ impl Tree {
             id_counter: 0,
             events: HashMap::new(),
             file,
+            reports: Default::default(),
         }
     }
 
@@ -96,6 +112,7 @@ impl Tree {
             id_counter: max_id,
             events,
             file: Some(file),
+            reports: Default::default(),
         })
     }
 
@@ -267,10 +284,50 @@ impl Tree {
             // A `Rename` is here on purpose: renaming never wakes a branch.
             EventPayload::Call(_)
             | EventPayload::Result { .. }
-            | EventPayload::ProgramResult { .. }
+            | EventPayload::Return { .. }
+            | EventPayload::Condition { .. }
             | EventPayload::Console { .. }
             | EventPayload::Rename { .. } => {}
         }
+    }
+
+    /// A memoised report, if this outcome has been rendered before.
+    pub fn memoised_report(&self, outcome: EventId) -> Option<String> {
+        self.reports.borrow().entries.get(&outcome).cloned()
+    }
+
+    /// Remember a rendered report. Never logged — reports are derived, so
+    /// this is a cache, not a record. The memo is dropped wholesale if the
+    /// renderer version has moved, because a memo is a cache of *one*
+    /// renderer's output.
+    pub fn memoise_report(&self, outcome: EventId, text: String) {
+        let mut memo = self.reports.borrow_mut();
+        if memo.version != crate::report::REPORT_FORMAT_VERSION {
+            memo.entries.clear();
+            memo.version = crate::report::REPORT_FORMAT_VERSION;
+        }
+        memo.derivations += 1;
+        memo.entries.insert(outcome, text);
+    }
+
+    /// How many reports have actually been rendered (memo misses) — the
+    /// observable that proves history is not re-derived per request.
+    pub fn report_derivations(&self) -> u64 {
+        self.reports.borrow().derivations
+    }
+
+    /// Drop every memoised report. A memo is a cache of **one renderer's**
+    /// output, so editing `report.rs` invalidates all of it at once. The
+    /// derivation counter is a lifetime statistic and survives.
+    pub fn clear_report_memo(&self) {
+        self.reports.borrow_mut().entries.clear();
+    }
+
+    /// Resolve a logged `Message` into its context form, materialising a
+    /// `Post` whose body lives in a `Send`. Renderers go through this so
+    /// the log can stay copy-free.
+    pub fn resolve(&self, msg: &Message) -> Message {
+        resolve_message(&self.events, msg)
     }
 
     /// The branch name in force at `leaf`: the last `Rename` at or after
@@ -422,7 +479,8 @@ impl Tree {
                                 attachments,
                                 invokes: Vec::new(),
                                 result: None,
-                                report: None,
+                                outcome: None,
+                                condition: None,
                                 console: Vec::new(),
                             });
                         }
@@ -457,19 +515,22 @@ impl Tree {
                         iv.outcome = Some(outcome.clone());
                     }
                 }
-                EventPayload::ProgramResult { value } => {
+                EventPayload::Return { value } => {
                     if let Some(p) = programs.last_mut() {
                         p.result = Some(value.clone());
+                        p.outcome = Some(ev.id);
+                        p.condition = None;
+                    }
+                }
+                EventPayload::Condition { cause, .. } => {
+                    if let Some(p) = programs.last_mut() {
+                        p.outcome = Some(ev.id);
+                        p.condition = Some(cause.clone());
                     }
                 }
                 EventPayload::Console { lines } => {
                     if let Some(p) = programs.last_mut() {
                         p.console = lines.clone();
-                    }
-                }
-                EventPayload::Message(Message::Tool { text, .. }) => {
-                    if let Some(p) = programs.last_mut() {
-                        p.report = Some(text.clone());
                     }
                 }
                 _ => {}
@@ -592,12 +653,19 @@ mod tests {
         })
     }
 
-    fn tool_result(call_id: &str, text: &str) -> EventPayload {
-        EventPayload::Message(Message::Tool {
-            name: "run_program".into(),
-            call_id: call_id.into(),
-            text: text.into(),
-        })
+    fn returned(value: serde_json::Value) -> EventPayload {
+        EventPayload::Return { value }
+    }
+
+    fn raised(name: &str) -> EventPayload {
+        EventPayload::Condition {
+            cause: Cause::Raised {
+                name: name.into(),
+                payload: None,
+            },
+            site: 0,
+            stack: Vec::new(),
+        }
     }
 
     // --- Log projections (decision 8: reconstructible from the log) ---
@@ -639,11 +707,7 @@ mod tests {
                     outcome: Outcome::Delivered(json!("file.txt")),
                 },
             )?;
-            tree.append(&mut spine, EventPayload::ProgramResult { value: json!(42) })?;
-            tree.append(
-                &mut spine,
-                tool_result("c1", "completed: 42 (clipped console…)"),
-            )?;
+            tree.append(&mut spine, returned(json!(42)))?;
             tree.append(
                 &mut spine,
                 EventPayload::Console {
@@ -674,27 +738,32 @@ mod tests {
             vec!["hi".to_string()],
             "full console, not the clipped report"
         );
-        assert_eq!(p.status_label(), "completed");
+        assert_eq!(p.status(), crate::host::ProgramStatus::Completed);
         Ok(())
     }
 
-    /// A raise that is later resumed to completion is one program; its
-    /// console spans both segments and the latest result wins.
+    /// A raise that is later resumed to completion is one program, but
+    /// **two handbacks**: each logs its own outcome, and the program's
+    /// status walks Suspended → Completed as they land. That the split is
+    /// readable from a reopened log at all is what one-outcome-per-handback
+    /// buys (`protocol.rs` used to say it was not inferable).
     #[test]
-    fn raise_then_resume_is_one_program() -> io::Result<()> {
+    fn program_status_survives_reopen() -> io::Result<()> {
+        use crate::host::ProgramStatus;
         let mut tree = Tree::new(None);
         let mut spine = tree.start_agent(None, None, "root", "")?;
         let agent = spine.leaf_id;
         tree.append(&mut spine, run_program_call("c1", "raise('x');"))?;
-        tree.append(&mut spine, tool_result("c1", "condition: x"))?; // suspend
+        tree.append(&mut spine, raised("x"))?; // first handback: suspended
+        let suspended_leaf = spine.leaf_id;
+        assert_eq!(
+            tree.programs_for(agent, suspended_leaf)[0].status(),
+            ProgramStatus::Suspended,
+            "a reopened log says how the run ended"
+        );
+
         tree.append(&mut spine, resume_call("c2"))?; // continues the same program
-        tree.append(
-            &mut spine,
-            EventPayload::ProgramResult {
-                value: json!("done"),
-            },
-        )?;
-        tree.append(&mut spine, tool_result("c2", "completed: done"))?;
+        tree.append(&mut spine, returned(json!("done")))?; // second handback
         tree.append(
             &mut spine,
             EventPayload::Console {
@@ -710,7 +779,26 @@ mod tests {
             progs[0].console,
             vec!["before".to_string(), "after".to_string()]
         );
-        assert_eq!(progs[0].status_label(), "completed");
+        assert_eq!(progs[0].status(), ProgramStatus::Completed);
+
+        // A compile failure never ran, so it is Failed, not Suspended.
+        let mut other = tree.start_agent(Some(agent), None, "child", "")?;
+        tree.append(&mut other, run_program_call("c3", "let = ;"))?;
+        tree.append(
+            &mut other,
+            EventPayload::Condition {
+                cause: Cause::CompileFailed {
+                    message: "compile error".into(),
+                },
+                site: 0,
+                stack: Vec::new(),
+            },
+        )?;
+        let child_agent = tree.enclosing_agent(other.leaf_id).unwrap();
+        assert_eq!(
+            tree.programs_for(child_agent, other.leaf_id)[0].status(),
+            ProgramStatus::Failed
+        );
         Ok(())
     }
 
@@ -818,7 +906,7 @@ mod tests {
         )?;
         let result_id = tree.append(
             &mut spine,
-            EventPayload::ProgramResult {
+            EventPayload::Return {
                 value: json!([1, 2]),
             },
         )?;
@@ -837,7 +925,7 @@ mod tests {
         ));
         assert!(matches!(
             tree.events[&result_id].payload,
-            EventPayload::ProgramResult { .. }
+            EventPayload::Return { .. }
         ));
         Ok(())
     }

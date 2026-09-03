@@ -10,10 +10,13 @@ use crate::types::{Event, EventId};
 /// An agent is identified by its `Agent` event id.
 pub type AgentId = EventId;
 
-/// The live status of a program block (decision 5). Carried by
+/// The status of a program block (decision 5). Carried by
 /// `SessionEvent::ProgramStatus` so the chat pane — which is VM-free and
-/// cannot read `Phase` — can title each `run_program` block precisely
-/// (suspended-vs-failed is not inferable from the report text).
+/// cannot read `Phase` — can title each `run_program` block live.
+///
+/// It is no longer live-*only*: with exactly one outcome event per
+/// handback, `ProgramView::status` derives the same answer from a
+/// reopened log, so suspended-vs-failed survives a restart.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProgramStatus {
     /// Executing (or resumed and executing again).
