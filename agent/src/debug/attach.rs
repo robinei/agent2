@@ -639,7 +639,12 @@ impl AttachedApp {
     }
 
     fn cycle_branch(&mut self, branches: &[BranchId]) {
-        if branches.is_empty() {
+        // With nothing else to cycle *to*, this would still call
+        // `select_branch` on the branch already selected — which resets
+        // the program/subitem selection and every pane's scroll
+        // position. Not a pure no-op like an empty list, so it needs
+        // its own guard rather than falling out of the modulo below.
+        if branches.len() <= 1 {
             return;
         }
         let next = match self
@@ -1180,25 +1185,40 @@ fn render(frame: &mut Frame, app: &mut AttachedApp, session: &Session) {
     // reply — otherwise it's a no-op key with a hint that just adds
     // noise, so it's only advertised while it would do something.
     let waiting = branch_counts(&session.branch_infos()).0 > 0;
+    // `tab`/`1-9` cycle or jump between branches — with only one, that
+    // targets the branch already selected, and `cycle_branch` guards
+    // against the real cost of that (it would otherwise silently reset
+    // the program/subitem selection and every pane's scroll position).
+    // Advertised the same way `waiting` is: only when it would move.
+    let multi_branch = session.tree().branches().len() > 1;
     let help = match (app.view, app.focus) {
-        (View::FullDebug, _) => {
-            " d/esc chat · tab/1-9 agent · space run/pause · s step · n step line · q quit "
-                .to_owned()
-        }
-        (_, Focus::Input) if app.ask_armed => {
-            " type to ask · enter send · esc clear/cancel · tab agent ".to_owned()
-        }
-        (_, Focus::Input) => " type to chat · enter send · tab agent · esc debug keys ".to_owned(),
+        (View::FullDebug, _) => format!(
+            " d/esc chat{} · space run/pause · s step · n step line · q quit ",
+            if multi_branch {
+                " · tab/1-9 agent"
+            } else {
+                ""
+            }
+        ),
+        (_, Focus::Input) if app.ask_armed => format!(
+            " type to ask · enter send · esc clear/cancel{} ",
+            if multi_branch { " · tab agent" } else { "" }
+        ),
+        (_, Focus::Input) => format!(
+            " type to chat · enter send{} · esc debug keys ",
+            if multi_branch { " · tab agent" } else { "" }
+        ),
         (View::Running, Focus::Debug) => format!(
             " esc/i type · c collapse · d debugger · 1-4 panes · f/F fork · p spawn · \
-             x interrupt · a ask · v resume · e rewrite · r rename{} · t timeline · tab agent \
-             · q quit ",
-            if waiting { " · w waiting" } else { "" }
+             x interrupt · a ask · v resume · e rewrite · r rename{} · t timeline{} · q quit ",
+            if waiting { " · w waiting" } else { "" },
+            if multi_branch { " · tab agent" } else { "" }
         ),
         (_, Focus::Debug) => format!(
             " esc/i type · c expand · d debugger · f/F fork · p spawn · x interrupt · a ask \
-             · v resume · e rewrite · r rename{} · t timeline · tab agent · q quit ",
-            if waiting { " · w waiting" } else { "" }
+             · v resume · e rewrite · r rename{} · t timeline{} · q quit ",
+            if waiting { " · w waiting" } else { "" },
+            if multi_branch { " · tab agent" } else { "" }
         ),
     };
     frame.render_widget(
@@ -2208,6 +2228,21 @@ mod tests {
             }
         );
         assert!(app.input.is_empty());
+    }
+
+    /// With nothing else to cycle to, Tab must not fall through to
+    /// `select_branch` on the branch already selected — that would
+    /// silently reset the program/subitem selection and every pane's
+    /// scroll position for no reason.
+    #[test]
+    fn tab_with_one_branch_is_a_true_no_op() {
+        let mut app = AttachedApp::new(fid(1));
+        app.selected_program = Some(fid(7));
+        app.source_scroll = Some(3);
+        app.on_key(KeyCode::Tab.into(), &[fid(1)]);
+        assert_eq!(app.selected, Some(fid(1)));
+        assert_eq!(app.selected_program, Some(fid(7)), "not reset");
+        assert_eq!(app.source_scroll, Some(3), "not reset");
     }
 
     #[test]
