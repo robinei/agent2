@@ -573,9 +573,18 @@ impl AttachedApp {
                 self.focus = Focus::Input;
                 KeyAction::None
             }
-            // The collapse key: back to full-width chat.
+            // The collapse key, both ways: `Running`'s source/console
+            // panes fold back to full-width chat, and — since this was
+            // otherwise a one-way door, reversible only by a fresh
+            // `run_program` re-triggering the auto-pop in `apply` —
+            // pressing it again from `Chat` reopens them.
             KeyCode::Char('c') if self.view == View::Running => {
                 self.view = View::Chat;
+                self.focus = Focus::Input;
+                KeyAction::None
+            }
+            KeyCode::Char('c') if self.view == View::Chat => {
+                self.view = View::Running;
                 self.focus = Focus::Input;
                 KeyAction::None
             }
@@ -1187,8 +1196,8 @@ fn render(frame: &mut Frame, app: &mut AttachedApp, session: &Session) {
             if waiting { " · w waiting" } else { "" }
         ),
         (_, Focus::Debug) => format!(
-            " esc/i type · d debugger · f/F fork · p spawn · x interrupt · a ask · v resume \
-             · e rewrite · r rename{} · t timeline · tab agent · q quit ",
+            " esc/i type · c expand · d debugger · f/F fork · p spawn · x interrupt · a ask \
+             · v resume · e rewrite · r rename{} · t timeline · tab agent · q quit ",
             if waiting { " · w waiting" } else { "" }
         ),
     };
@@ -2125,6 +2134,18 @@ mod tests {
                 right: vec![Pane::Navigator]
             }
         );
+        // It is not a one-way door: `c` again from `Chat` reopens the
+        // source/console panes without needing a fresh run_program to
+        // re-trigger the auto-pop. Collapsing left focus on `Input`
+        // (same as the original direction leaves it), so `Esc` back to
+        // `Focus::Debug` first, same as above.
+        app.on_key(KeyCode::Esc.into(), &[]);
+        assert_eq!(app.focus, Focus::Debug);
+        app.on_key(KeyCode::Char('c').into(), &[]);
+        assert_eq!(app.view, View::Running);
+        let panes = app.pane_set();
+        assert!(panes.right.contains(&Pane::Source));
+        assert!(panes.right.contains(&Pane::Console));
     }
 
     #[test]
