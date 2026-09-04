@@ -1475,6 +1475,18 @@ fn push_wrapped_width(lines: &mut Vec<Line<'static>>, text: &str, style: Style, 
     }
 }
 
+/// The input box's title while `mode` is armed — every explicit mode
+/// gets one (19_UX Step C0), so arming any of them is as visible as
+/// arming an ask already was.
+fn explicit_mode_title(mode: ExplicitMode) -> &'static str {
+    match mode {
+        ExplicitMode::Rename => " rename ",
+        ExplicitMode::ResumeWithValue => " resume ",
+        ExplicitMode::Rewrite => " rewrite ",
+        ExplicitMode::SpawnCharter => " spawn ",
+    }
+}
+
 /// Word-wraps an `InputBuffer`'s every line to `width` columns (no
 /// horizontal scrolling — a long line wraps, same as the transcript)
 /// and returns the rendered rows plus which one holds the cursor.
@@ -1620,10 +1632,13 @@ fn render_chat(
         // shows when nothing is armed to preempt it. (That an explicit
         // mode can silently eat an owed reply this way at all is a
         // sharper edge than this step means to fix — flagged, not
-        // addressed, here.)
-        (Focus::Input, _) if app.explicit_mode == Some(ExplicitMode::Rewrite) => {
-            (Style::default().fg(Color::Yellow), "▏", " rewrite ")
-        }
+        // addressed, here.) Armed is armed, regardless of which mode —
+        // same color, same style for all four.
+        (Focus::Input, _) if app.explicit_mode.is_some() => (
+            Style::default().fg(Color::Yellow),
+            "▏",
+            explicit_mode_title(app.explicit_mode.unwrap()),
+        ),
         (Focus::Input, Some(_)) => (Style::default().fg(Color::Yellow), "▏", " reply "),
         (Focus::Input, None) if app.ask_armed => (Style::default().fg(Color::Yellow), "▏", " ask "),
         (Focus::Input, None) => (Style::default().fg(Color::Cyan), "▏", " message "),
@@ -2319,6 +2334,23 @@ mod tests {
         let mut blank = Vec::new();
         push_wrapped_width(&mut blank, "", style, 20);
         assert_eq!(blank.len(), 1);
+    }
+
+    /// Every explicit mode gets its own title — arming any of them is
+    /// as visible as arming an ask already was (19_UX Step C0).
+    #[test]
+    fn every_explicit_mode_has_a_distinct_title() {
+        let titles = [
+            explicit_mode_title(ExplicitMode::Rename),
+            explicit_mode_title(ExplicitMode::ResumeWithValue),
+            explicit_mode_title(ExplicitMode::Rewrite),
+            explicit_mode_title(ExplicitMode::SpawnCharter),
+        ];
+        for title in titles {
+            assert!(title.starts_with(' ') && title.ends_with(' '), "{title}");
+        }
+        let unique: std::collections::HashSet<_> = titles.iter().collect();
+        assert_eq!(unique.len(), titles.len(), "no two modes share a title");
     }
 
     /// `wrap_input` places the cursor glyph exactly where wrapping
