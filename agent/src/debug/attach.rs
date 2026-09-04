@@ -1167,23 +1167,30 @@ fn render(frame: &mut Frame, app: &mut AttachedApp, session: &Session) {
         }
     }
 
+    // `w waiting` only means something when a branch actually owes you a
+    // reply — otherwise it's a no-op key with a hint that just adds
+    // noise, so it's only advertised while it would do something.
+    let waiting = branch_counts(&session.branch_infos()).0 > 0;
     let help = match (app.view, app.focus) {
         (View::FullDebug, _) => {
             " d/esc chat · tab/1-9 agent · space run/pause · s step · n step line · q quit "
+                .to_owned()
         }
         (_, Focus::Input) if app.ask_armed => {
-            " type to ask · enter send · esc clear/cancel · tab agent "
+            " type to ask · enter send · esc clear/cancel · tab agent ".to_owned()
         }
-        (_, Focus::Input) => " type to chat · enter send · tab agent · esc debug keys ",
-        (View::Running, Focus::Debug) => {
-            " esc/i type · c collapse · d debugger · 1-4 panes · f/F fork · p spawn · x interrupt \
-             · a ask · v resume · e rewrite · r rename · w waiting · t timeline · tab agent \
-             · q quit "
-        }
-        (_, Focus::Debug) => {
+        (_, Focus::Input) => " type to chat · enter send · tab agent · esc debug keys ".to_owned(),
+        (View::Running, Focus::Debug) => format!(
+            " esc/i type · c collapse · d debugger · 1-4 panes · f/F fork · p spawn · \
+             x interrupt · a ask · v resume · e rewrite · r rename{} · t timeline · tab agent \
+             · q quit ",
+            if waiting { " · w waiting" } else { "" }
+        ),
+        (_, Focus::Debug) => format!(
             " esc/i type · d debugger · f/F fork · p spawn · x interrupt · a ask · v resume \
-             · e rewrite · r rename · w waiting · t timeline · tab agent · q quit "
-        }
+             · e rewrite · r rename{} · t timeline · tab agent · q quit ",
+            if waiting { " · w waiting" } else { "" }
+        ),
     };
     frame.render_widget(
         Paragraph::new(help).style(Style::default().add_modifier(Modifier::REVERSED)),
