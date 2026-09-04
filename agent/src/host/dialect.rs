@@ -159,11 +159,16 @@ result back.
 without asking it anything yet; resolves to { agent }. `tools` narrows \
 its allowlist (default: yours).
 - tools.ask({ to?, text, input? }) — one question, one answer; resolves \
-to the answer. `to` is an agent or branch id; omitted, it reaches \
-whoever asked *you*.
+to the answer. `to` is an agent or branch id, or the literal `\"user\"` \
+for the person driving the session; omitted, it reaches whoever asked \
+*you* — which is an error, not a default, when nothing is open on this \
+branch (a lone orchestrator speaking up mid-program has no one who \
+asked it anything, so it must pass `to` explicitly).
 - tools.tell({ to?, text, input? }) — inform without asking; resolves \
 with a delivery receipt as soon as the message lands. The recipient owes \
-you no answer.
+you no answer. Same `to` rule as `ask`: to speak up unprompted — a \
+status line mid-loop, for instance — use `{ to: \"user\" }`, never a \
+bare `{ text }`.
 - tools.agents({ under?, deep? }) — list your subagents (or the whole \
 subtree), one row per branch: agent, branch, name, charter, parent, \
 status, open questions, last answer.
@@ -450,6 +455,8 @@ mod tests {
             "tools.spawn({ name?, charter, tools? })",
             "tools.ask({ to?, text, input? })",
             "tools.tell({ to?, text, input? })",
+            "the literal `\"user\"`",
+            "never a bare `{ text }`",
             "tools.agents({ under?, deep? })",
             "**Orchestrating.**",
             "keeps its context between questions",
