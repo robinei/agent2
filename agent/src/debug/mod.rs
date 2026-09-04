@@ -7,9 +7,6 @@ mod app;
 mod attach;
 mod chat;
 mod highlight;
-// Not yet consumed outside its own tests — Step A1 (19_UX.md) wires it
-// into attach.rs, which is when this comes off.
-#[allow(dead_code)]
 mod input;
 mod panes;
 mod runner;

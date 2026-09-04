@@ -24,7 +24,9 @@ use std::thread;
 use std::time::Instant;
 
 use ratatui::Frame;
-use ratatui::crossterm::event::{Event as CtEvent, KeyCode, KeyEvent, MouseButton, MouseEventKind};
+use ratatui::crossterm::event::{
+    Event as CtEvent, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind,
+};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
@@ -32,6 +34,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 
 use super::app::PaneInfo;
 use super::chat::{ChatKind, ChatState, RowDetail};
+use super::input::InputBuffer;
 use super::ui;
 use crate::host::{BranchId, BranchInfo, Session, SessionCommand, SessionEvent, UserCall};
 use crate::machine::TOOL_RUN_PROGRAM;
@@ -151,7 +154,7 @@ pub struct AttachedApp {
     pub selected_subitem: Option<Subitem>,
     /// Branches whose `System` block is folded to its header (decision 7).
     collapsed: HashSet<BranchId>,
-    pub input: String,
+    pub input: InputBuffer,
     pub quit: bool,
     pub show_source: bool,
     pub show_disasm: bool,
@@ -200,7 +203,7 @@ impl AttachedApp {
             selected_program: None,
             selected_subitem: None,
             collapsed: HashSet::new(),
-            input: String::new(),
+            input: InputBuffer::new(),
             quit: false,
             show_source: true,
             show_disasm: false,
@@ -494,9 +497,11 @@ impl AttachedApp {
     }
 
     fn on_input_key(&mut self, key: KeyEvent) -> KeyAction {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
         match key.code {
             KeyCode::Enter if !self.input.is_empty() => {
-                let text = std::mem::take(&mut self.input);
+                let text = std::mem::take(&mut self.input).to_string();
                 let ask = std::mem::take(&mut self.ask_armed);
                 match self.explicit_mode.take() {
                     Some(mode) => KeyAction::SubmitMode(mode, text),
@@ -508,8 +513,110 @@ impl AttachedApp {
                     },
                 }
             }
+            // The physical keys.
             KeyCode::Backspace => {
-                self.input.pop();
+                self.input.backspace();
+                KeyAction::None
+            }
+            KeyCode::Delete => {
+                self.input.delete_forward();
+                KeyAction::None
+            }
+            KeyCode::Left => {
+                self.input.left();
+                KeyAction::None
+            }
+            KeyCode::Right => {
+                self.input.right();
+                KeyAction::None
+            }
+            KeyCode::Up => {
+                self.input.up();
+                KeyAction::None
+            }
+            KeyCode::Down => {
+                self.input.down();
+                KeyAction::None
+            }
+            KeyCode::Home => {
+                self.input.home();
+                KeyAction::None
+            }
+            KeyCode::End => {
+                self.input.end();
+                KeyAction::None
+            }
+            // The readline/emacs subset (18_TARGETING Step A1's
+            // superseded note: Ctrl/Alt+letter is a reliable gesture
+            // everywhere modifier+Enter wasn't). One arm per table row;
+            // checked before the plain-character arm below, since
+            // crossterm reports these as `Char` too, with the modifier
+            // riding in `key.modifiers`.
+            KeyCode::Char('a') if ctrl => {
+                self.input.home();
+                KeyAction::None
+            }
+            KeyCode::Char('e') if ctrl => {
+                self.input.end();
+                KeyAction::None
+            }
+            KeyCode::Char('b') if ctrl => {
+                self.input.left();
+                KeyAction::None
+            }
+            KeyCode::Char('f') if ctrl => {
+                self.input.right();
+                KeyAction::None
+            }
+            KeyCode::Char('p') if ctrl => {
+                self.input.up();
+                KeyAction::None
+            }
+            KeyCode::Char('n') if ctrl => {
+                self.input.down();
+                KeyAction::None
+            }
+            // Ctrl-D deliberately does not carry readline's "EOF on an
+            // empty line" meaning — there is no exit gesture on this
+            // key here, only forward-delete, so it can't be hit by
+            // accident while editing.
+            KeyCode::Char('d') if ctrl => {
+                self.input.delete_forward();
+                KeyAction::None
+            }
+            // Some terminals send this in place of `KeyCode::Backspace`
+            // for the physical Backspace key — an alias, not a new
+            // gesture.
+            KeyCode::Char('h') if ctrl => {
+                self.input.backspace();
+                KeyAction::None
+            }
+            KeyCode::Char('k') if ctrl => {
+                self.input.kill_to_end();
+                KeyAction::None
+            }
+            KeyCode::Char('u') if ctrl => {
+                self.input.kill_to_start();
+                KeyAction::None
+            }
+            KeyCode::Char('w') if ctrl => {
+                self.input.delete_word_backward();
+                KeyAction::None
+            }
+            KeyCode::Char('o') if ctrl => {
+                self.input.insert_newline();
+                KeyAction::None
+            }
+            KeyCode::Char('b') if alt => {
+                self.input.word_left();
+                KeyAction::None
+            }
+            KeyCode::Char('f') if alt => {
+                self.input.word_right();
+                KeyAction::None
+            }
+            KeyCode::Char('d') if alt => {
+                self.input.delete_word_forward();
                 KeyAction::None
             }
             KeyCode::Esc => {
@@ -523,7 +630,7 @@ impl AttachedApp {
                 KeyAction::None
             }
             KeyCode::Char(c) => {
-                self.input.push(c);
+                self.input.insert_char(c);
                 KeyAction::None
             }
             _ => KeyAction::None,
@@ -2217,7 +2324,7 @@ mod tests {
         for c in "d1 sq".chars() {
             assert_eq!(app.on_key(KeyCode::Char(c).into(), &[]), KeyAction::None);
         }
-        assert_eq!(app.input, "d1 sq");
+        assert_eq!(app.input.to_string(), "d1 sq");
         assert_eq!(app.view, View::Running, "no debug keys fired while typing");
         assert!(!app.quit);
         assert_eq!(
@@ -2228,6 +2335,42 @@ mod tests {
             }
         );
         assert!(app.input.is_empty());
+    }
+
+    /// `on_input_key` reaches the right `InputBuffer` method for a
+    /// representative few of the readline/emacs bindings — the buffer's
+    /// own logic is exhaustively covered in `debug::input::tests`, this
+    /// only proves the wiring. `key.code == KeyCode::Char(_)` is how
+    /// crossterm reports every one of these, with the modifier riding
+    /// in `key.modifiers`, so the plain-character catch-all must not
+    /// swallow them.
+    #[test]
+    fn readline_bindings_reach_the_buffer() {
+        let mut app = AttachedApp::new(fid(1));
+        for c in "hello".chars() {
+            app.on_input_key(KeyEvent::from(KeyCode::Char(c)));
+        }
+        app.on_input_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        app.on_input_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
+        assert!(app.input.is_empty(), "Ctrl-A home, Ctrl-K kill-to-end");
+
+        for c in "foo bar".chars() {
+            app.on_input_key(KeyEvent::from(KeyCode::Char(c)));
+        }
+        app.on_input_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(
+            app.input.to_string(),
+            "foo ",
+            "Ctrl-W deletes the word behind the cursor"
+        );
+
+        app.on_input_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+        app.on_input_key(KeyEvent::from(KeyCode::Char('!')));
+        assert_eq!(
+            app.input.to_string(),
+            "foo \n!",
+            "Ctrl-O inserts a literal newline, not a submit"
+        );
     }
 
     /// With nothing else to cycle to, Tab must not fall through to

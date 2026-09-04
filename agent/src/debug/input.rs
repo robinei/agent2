@@ -30,6 +30,9 @@ impl InputBuffer {
 
     /// Cursor at the top — reviewing a prefilled program from the start
     /// is the common case, not resuming where someone else left off.
+    // Not yet consumed outside its own tests — 19_UX Part B's Step B1
+    // wires this in.
+    #[allow(dead_code)]
     pub fn prefilled(text: &str) -> Self {
         InputBuffer {
             lines: text
@@ -248,10 +251,14 @@ impl InputBuffer {
     }
 
     /// The line count and cursor position, for rendering.
+    // Not yet consumed outside tests — 19_UX Step A2 wires these into
+    // render_chat's multi-line/scrolling and cursor placement.
+    #[allow(dead_code)]
     pub fn line_count(&self) -> usize {
         self.lines.len()
     }
 
+    #[allow(dead_code)]
     pub fn cursor(&self) -> (usize, usize) {
         self.cursor
     }
