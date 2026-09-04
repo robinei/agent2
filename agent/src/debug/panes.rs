@@ -320,8 +320,8 @@ mod tests {
 
     #[test]
     fn promise_rows_track_pending_then_resolved() {
-        let mut r = paused_runner("const x = await tools.sleep(0); return x;");
-        // Run until the sleep is parked (Waiting), then check the pane.
+        let mut r = paused_runner("const x = await tools.wait_until(0); return x;");
+        // Run until the wait is parked (Waiting), then check the pane.
         r.state = RunState::Running;
         for _ in 0..100 {
             r.tick();

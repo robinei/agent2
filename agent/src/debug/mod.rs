@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use ratatui::crossterm::event::{self, Event};
 
 use app::App;
-use runner::{RunState, Runner};
+use runner::{RunState, Runner, now_ms};
 
 const REDRAW_EVERY: Duration = Duration::from_millis(30);
 
@@ -31,7 +31,9 @@ pub fn run(path: &str) -> Result<(), String> {
             .collect::<Vec<_>>()
             .join("\n")
     })?;
-    let runner = Runner::new(prog, serde_json::Value::Null)?;
+    // `input.now` stands in for the `Date.now()` this VM doesn't have yet,
+    // so a program can build an absolute `wait_until` deadline.
+    let runner = Runner::new(prog, serde_json::json!({ "now": now_ms() }))?;
     let mut app = App::new(runner, path.to_string());
 
     let mut terminal = ratatui::init();

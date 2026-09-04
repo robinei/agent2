@@ -16,7 +16,7 @@ use std::hash::{Hash, Hasher};
 use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::json;
 use wait_timeout::ChildExt;
@@ -55,6 +55,8 @@ pub fn real_registry() -> ToolRegistry {
     registry.register(replace_file_def());
     registry.register(super::structural::outline_def());
     registry.register(super::structural::parse_errors_def());
+    registry.register(now_def());
+    registry.register(wait_until_def());
     registry
 }
 
@@ -436,6 +438,58 @@ fn run_bash(command: &str, timeout: Duration) -> Result<serde_json::Value, Strin
     Ok(result)
 }
 
+/// Current wall-clock time as epoch milliseconds — this dialect has no
+/// `Date` builtin, so `wait_until` deadlines are built from `tools.now()`.
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+fn now_def() -> ToolDef {
+    ToolDef {
+        name: "now".into(),
+        description: "Current wall-clock time, in epoch milliseconds. Build a \
+                      `wait_until` deadline from it: `tools.wait_until((await \
+                      tools.now()) + 300000)` waits 5 minutes."
+            .into(),
+        input_schema: json!({ "type": "array", "items": [], "minItems": 0, "maxItems": 0 }),
+        handler: Box::new(|_args| Ok(json!(now_ms()))),
+    }
+}
+
+fn wait_until_def() -> ToolDef {
+    ToolDef {
+        name: "wait_until".into(),
+        description: "Block until wall-clock time reaches `epoch_ms` (an \
+                      absolute deadline from `tools.now()`), then resolve with \
+                      null; a deadline already past resolves immediately. This \
+                      is how you wait real time out — a polling loop, a \
+                      scheduled check-in — never a busy JS loop (burns fuel, \
+                      time never actually passes) or `bash(\"sleep …\")` (ties \
+                      up a subprocess for the same thing this does directly)."
+            .into(),
+        input_schema: json!({
+            "type": "array",
+            "items": [
+                { "type": "integer", "description": "epoch milliseconds to wait until" }
+            ],
+            "minItems": 1,
+            "maxItems": 1
+        }),
+        handler: Box::new(|args| {
+            let target_ms = args
+                .get(0)
+                .and_then(|v| v.as_i64())
+                .ok_or("wait_until(epoch_ms) needs a numeric epoch-ms deadline")?;
+            let delta_ms = (target_ms - now_ms()).max(0) as u64;
+            std::thread::sleep(Duration::from_millis(delta_ms));
+            Ok(json!(null))
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -716,5 +770,56 @@ mod tests {
         let err = bash(json!([long])).unwrap_err();
         assert!(err.contains("limit"), "{err}");
         assert!(err.contains("JS program"), "{err}");
+    }
+
+    // ── now / wait_until ───────────────────────────────────────────────
+
+    fn now() -> serde_json::Value {
+        (now_def().handler)(json!([])).unwrap()
+    }
+
+    fn wait_until(args: serde_json::Value) -> Result<serde_json::Value, String> {
+        (wait_until_def().handler)(args)
+    }
+
+    #[test]
+    fn now_returns_current_epoch_ms() {
+        let before = now_ms();
+        let reported = now().as_i64().unwrap();
+        let after = now_ms();
+        assert!(
+            (before..=after).contains(&reported),
+            "{before} <= {reported} <= {after}"
+        );
+    }
+
+    #[test]
+    fn wait_until_a_past_deadline_resolves_immediately() {
+        let start = std::time::Instant::now();
+        let result = wait_until(json!([0])).unwrap();
+        assert_eq!(result, json!(null));
+        assert!(
+            start.elapsed() < Duration::from_millis(200),
+            "{:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn wait_until_blocks_until_the_deadline() {
+        let deadline = now_ms() + 100;
+        let start = std::time::Instant::now();
+        wait_until(json!([deadline])).unwrap();
+        assert!(
+            start.elapsed() >= Duration::from_millis(90),
+            "{:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn wait_until_rejects_a_non_numeric_deadline() {
+        let err = wait_until(json!(["soon"])).unwrap_err();
+        assert!(err.contains("epoch-ms"), "{err}");
     }
 }

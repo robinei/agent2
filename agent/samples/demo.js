@@ -1,5 +1,5 @@
 // Demo program for `agent debug` (9_TUI Step 2): exercises calls,
-// stub-tool awaits (echo/sleep/fail), console output, and a raise.
+// stub-tool awaits (echo/wait_until/fail), console output, and a raise.
 
 function fib(n) {
   if (n < 2) {
@@ -20,7 +20,7 @@ const sum = await fetchSum(4, 5);
 console.log("echo sum:", sum);
 
 console.log("sleeping 800ms...");
-await tools.sleep(800);
+await tools.wait_until(input.now + 800);
 console.log("awake");
 
 let caught = "";

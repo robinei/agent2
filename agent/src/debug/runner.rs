@@ -3,7 +3,7 @@
 //! terminal-free and unit-testable; the TUI layer calls `tick` /
 //! `step_instr` / `step_line` and renders the state.
 
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use interp::{InvokeCall, Program, StepResult, VM, Value};
 
@@ -19,7 +19,7 @@ const LINE_STEP_CAP: u64 = 50_000;
 pub enum RunState {
     Paused,
     Running,
-    /// Blocked awaiting stub-tool results (e.g. a pending `sleep`).
+    /// Blocked awaiting stub-tool results (e.g. a pending `wait_until`).
     Waiting,
     /// Suspended on a `raise(...)`; `resume_condition` continues with
     /// `null` as the raise result.
@@ -35,10 +35,20 @@ pub enum RunState {
     },
 }
 
+/// Current wall-clock time as epoch milliseconds — this VM has no `Date`
+/// builtin yet, so this is how a debug run's `wait_until` deadlines and
+/// `input.now` seed are computed.
+pub(crate) fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 pub struct Runner {
     pub vm: VM,
     pub state: RunState,
-    /// Deferred `sleep` resolutions: (due, promise).
+    /// Deferred `wait_until` resolutions: (due, promise).
     sleeps: Vec<(Instant, interp::PromisePtr)>,
 }
 
@@ -106,8 +116,8 @@ impl Runner {
         }
     }
 
-    /// Resolve due `sleep` timers; a `Waiting` program becomes runnable
-    /// again once something resolved.
+    /// Resolve due `wait_until` timers; a `Waiting` program becomes
+    /// runnable again once something resolved.
     pub fn poll_timers(&mut self) {
         let now = Instant::now();
         let due: Vec<_> = {
@@ -189,7 +199,9 @@ impl Runner {
     /// `StepResult` path without a harness.
     ///
     /// - `echo(x)` → `x`
-    /// - `sleep(ms)` → `null`, resolved after `ms` (drives `Waiting`)
+    /// - `wait_until(epoch_ms)` → `null`, resolved once wall-clock time
+    ///   reaches `epoch_ms` (drives `Waiting`); a deadline already in the
+    ///   past resolves on the next `poll_timers`
     /// - `fail(msg)` → rejects with `msg`
     /// - anything else → rejects with an unknown-tool message
     fn serve(&mut self, call: InvokeCall) {
@@ -198,13 +210,14 @@ impl Runner {
                 let v = call.args.into_iter().next().unwrap_or(Value::Undefined);
                 let _ = self.vm.resolve_promise(call.promise, v);
             }
-            "sleep" => {
-                let ms = match call.args.first() {
-                    Some(Value::PosInt(n)) => *n,
-                    Some(Value::Float(f)) if *f >= 0.0 => *f as u64,
+            "wait_until" => {
+                let target_ms = match call.args.first() {
+                    Some(Value::PosInt(n)) => *n as i64,
+                    Some(Value::Float(f)) => *f as i64,
                     _ => 0,
                 };
-                let due = Instant::now() + Duration::from_millis(ms);
+                let delta_ms = (target_ms - now_ms()).max(0) as u64;
+                let due = Instant::now() + Duration::from_millis(delta_ms);
                 self.sleeps.push((due, call.promise));
             }
             "fail" => {
@@ -217,7 +230,7 @@ impl Runner {
             }
             other => {
                 let msg = Value::String(interp::RcStr::from(
-                    format!("unknown stub tool `{other}` (have: echo, sleep, fail)").as_str(),
+                    format!("unknown stub tool `{other}` (have: echo, wait_until, fail)").as_str(),
                 ));
                 let _ = self.vm.reject_promise(call.promise, msg);
             }
@@ -264,10 +277,20 @@ mod tests {
     }
 
     #[test]
-    fn echo_and_sleep_stubs_round_trip() {
-        let mut r = runner("const x = await tools.echo(7); await tools.sleep(1); return x;");
+    fn echo_and_wait_until_stubs_round_trip() {
+        let due = now_ms() + 1;
+        let mut r = runner(&format!(
+            "const x = await tools.echo(7); await tools.wait_until({due}); return x;"
+        ));
         run_to_end(&mut r);
         assert_eq!(r.state, RunState::Done { value: "7".into() });
+    }
+
+    #[test]
+    fn wait_until_in_the_past_resolves_immediately() {
+        let mut r = runner("await tools.wait_until(0); return 1;");
+        run_to_end(&mut r);
+        assert_eq!(r.state, RunState::Done { value: "1".into() });
     }
 
     #[test]
@@ -306,9 +329,11 @@ mod tests {
 
     #[test]
     fn demo_sample_runs_to_condition_then_done() {
-        // The committed demo exercises calls, echo/sleep/fail awaits,
+        // The committed demo exercises calls, echo/wait_until/fail awaits,
         // console output, and a raise — headless, same Runner the TUI uses.
-        let mut r = runner(include_str!("../../samples/demo.js"));
+        // `input.now` stands in for the `Date.now()` this VM doesn't have.
+        let prog = interp::compile(include_str!("../../samples/demo.js")).expect("compiles");
+        let mut r = Runner::new(prog, serde_json::json!({ "now": now_ms() })).expect("vm");
         run_to_end(&mut r);
         match &r.state {
             RunState::Condition { condition, .. } => assert_eq!(condition, "demo_condition"),

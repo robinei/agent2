@@ -43,6 +43,11 @@ continue the *same* program with `resume(value)`; don't return a final \
 answer just to start over with a fresh `run_program`. A `raise` keeps a \
 long orchestration alive — restarting from the top discards its progress \
 (variables, in-flight reads).
+- Need real time to pass — a polling loop, a scheduled check-in? \
+`await tools.wait_until(deadline)`, never a busy loop (burns fuel; time \
+never actually passes inside one) or `bash(\"sleep …\")`. A message \
+arriving while you're parked there interrupts you as its own turn; \
+answer it and `resume()` to keep waiting.
 - A reply with *no* tool call ends your turn; its text is your final \
 answer.
 
