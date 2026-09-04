@@ -21,22 +21,26 @@ pub struct DeepSeekClient {
     api_key: String,
     model: String,
     base_url: String,
+    thinking: bool,
     agent: ureq::Agent,
 }
 
 impl DeepSeekClient {
     /// Key from `DEEPSEEK_API_KEY` (required), model from
-    /// `DEEPSEEK_MODEL`, base URL from `DEEPSEEK_BASE_URL`.
+    /// `DEEPSEEK_MODEL`, base URL from `DEEPSEEK_BASE_URL`. Thinking is on
+    /// by default (the API's own default); set `DEEPSEEK_NO_THINKING` (to
+    /// any value) to send `"thinking": {"type": "disabled"}`.
     pub fn from_env() -> Result<Self, String> {
         let api_key = std::env::var("DEEPSEEK_API_KEY")
             .map_err(|_| "DEEPSEEK_API_KEY is not set".to_owned())?;
         let model = std::env::var("DEEPSEEK_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.into());
         let base_url =
             std::env::var("DEEPSEEK_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.into());
-        Ok(Self::new(api_key, model, base_url))
+        let thinking = std::env::var("DEEPSEEK_NO_THINKING").is_err();
+        Ok(Self::new(api_key, model, base_url, thinking))
     }
 
-    pub fn new(api_key: String, model: String, base_url: String) -> Self {
+    pub fn new(api_key: String, model: String, base_url: String, thinking: bool) -> Self {
         // Completions stream for minutes: connect gets a timeout, the
         // body read deliberately does not.
         let config = ureq::Agent::config_builder()
@@ -47,6 +51,7 @@ impl DeepSeekClient {
             api_key,
             model,
             base_url,
+            thinking,
             agent: config.into(),
         }
     }
@@ -60,7 +65,7 @@ impl LlmClient for DeepSeekClient {
         chunk: &mut dyn FnMut(LlmChunk),
     ) -> Result<LlmTurn, String> {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-        let body = request_body(request, &self.model);
+        let body = request_body(request, &self.model, self.thinking);
         let mut response = self
             .agent
             .post(&url)
@@ -83,7 +88,7 @@ impl LlmClient for DeepSeekClient {
 /// The chat-completions request body (OpenAI format, `stream: true`).
 /// Assistant `thinking` is never sent back: DeepSeek requires
 /// `reasoning_content` to be excluded from the next-turn context.
-fn request_body(request: &LlmRequest, model: &str) -> serde_json::Value {
+fn request_body(request: &LlmRequest, model: &str, thinking: bool) -> serde_json::Value {
     // The system prompt is rebuilt from `Agent.system` at the front of
     // every request — it is prefix, and prefix is immutable.
     let mut messages = vec![serde_json::json!({
@@ -112,12 +117,16 @@ fn request_body(request: &LlmRequest, model: &str) -> serde_json::Value {
             })
         })
         .collect();
-    serde_json::json!({
+    let mut body = serde_json::json!({
         "model": model,
         "messages": messages,
         "tools": tools,
         "stream": true,
-    })
+    });
+    if !thinking {
+        body["thinking"] = serde_json::json!({ "type": "disabled" });
+    }
+    body
 }
 
 /// Each rendered kind maps to exactly one API role **by its variant**,
@@ -285,10 +294,12 @@ mod tests {
             tools: tool_specs(),
             tail: Some("2 questions are open on this branch: #4, #7.".into()),
         };
-        let body = request_body(&request, "deepseek-v4-pro");
+        let body = request_body(&request, "deepseek-v4-pro", true);
 
         assert_eq!(body["model"], "deepseek-v4-pro");
         assert_eq!(body["stream"], true);
+        // Thinking on is the API's own default: no field sent at all.
+        assert!(body.get("thinking").is_none());
         let messages = body["messages"].as_array().unwrap();
         assert_eq!(messages[0]["role"], "system");
         assert_eq!(messages[1]["role"], "user");
@@ -326,6 +337,18 @@ mod tests {
             tools[2]["function"]["parameters"]["required"],
             json!(["question", "value"])
         );
+    }
+
+    #[test]
+    fn request_body_disables_thinking_on_request() {
+        let request = LlmRequest {
+            system: "card".into(),
+            messages: vec![],
+            tools: vec![],
+            tail: None,
+        };
+        let body = request_body(&request, "deepseek-v4-flash", false);
+        assert_eq!(body["thinking"], json!({ "type": "disabled" }));
     }
 
     fn sse(events: &[&str]) -> String {
