@@ -1332,30 +1332,22 @@ impl Session {
             });
             return Ok(());
         }
-        let Some(state) = self.states.get_mut(&branch) else {
-            return Ok(());
-        };
-        self.tree.append(
-            &mut state.spine,
-            EventPayload::Result {
+        // Settle through the same door every other tool result uses
+        // (`on_tool_results`, via `StepInput::ToolResults`): it logs the
+        // `Result` itself *and* resolves the VM's waiting promise. The
+        // previous hand-rolled `tree.append` + a generic `Tick` logged
+        // the answer but never touched the VM's actual pending promise
+        // (that lives in `self.pending`, keyed by this call's id, and
+        // only `on_tool_results` clears it) — so the suspended `await
+        // tools.ask(...)` just sat there forever, ticking on nothing
+        // that could ever advance it.
+        self.step_branch(
+            branch,
+            StepInput::ToolResults(vec![ToolResult {
                 call,
-                outcome: Outcome::Delivered(value),
-            },
-        )?;
-        self.emit_new();
-        // The human's reply is what the parked program was waiting on.
-        let outputs = self
-            .states
-            .get_mut(&branch)
-            .map(|s| {
-                if matches!(s.status(), "running") {
-                    vec![StepOutput::Working]
-                } else {
-                    Vec::new()
-                }
-            })
-            .unwrap_or_default();
-        self.process(branch, outputs)
+                result: Ok(value),
+            }]),
+        )
     }
 
     /// The exchanges `branch` still owes: `(asker, send)` for every open
@@ -2558,6 +2550,60 @@ mod tests {
             .expect("the question settled");
         assert_eq!(settled.0, send);
         assert_eq!(settled.1, Outcome::Delivered(json!("PLAN.md")));
+    }
+
+    /// **The live case** the test above doesn't cover: a genuinely
+    /// running program, not a hand-placed `Send` with no VM behind it.
+    /// `await tools.ask({ to: "user" })` never spends an LLM turn to
+    /// resume — it is an ordinary pending promise, so `Reply` must wake
+    /// the *same* VM and let it keep going on its own. (Regression: a
+    /// prior `cmd_reply` logged the `Result` but drove the branch with a
+    /// generic `Tick` instead of `StepInput::ToolResults`, so the VM's
+    /// actual pending promise never resolved and the program sat parked
+    /// forever no matter how many replies arrived.)
+    #[test]
+    fn reply_resumes_the_same_running_program_after_an_ask_to_the_user() {
+        let (session, _events) = run_session(
+            ToolRegistry::new(),
+            vec![scripted_program(
+                "c1",
+                r#"const a = await tools.ask({ to: "user", text: "continue?" });
+                   return "got: " + a;"#,
+            )],
+            "go",
+        );
+        let branch = session.conversation_branch();
+        let ask = session
+            .branch_infos()
+            .into_iter()
+            .find(|b| b.branch == branch)
+            .and_then(|b| b.asking_user)
+            .expect("parked on a question to the user, not stuck");
+
+        // No `Shutdown`: resolving the promise (inside `cmd_reply`) and
+        // actually running the VM past it are two steps — the second is
+        // a self-sent `Continue` tick — so this must run to **quiet**,
+        // not just drain whatever's already queued.
+        session.handle().send(SessionCommand::Reply {
+            branch,
+            call: ask,
+            value: json!("yes"),
+        });
+        let session = session.run();
+
+        let returned = session
+            .tree()
+            .events
+            .values()
+            .find_map(|e| match &e.payload {
+                EventPayload::Return { value } => Some(value.clone()),
+                _ => None,
+            });
+        assert_eq!(
+            returned,
+            Some(json!("got: yes")),
+            "the same VM resumed and finished the program, not just logged an unread Result"
+        );
     }
 
     /// A user turn is exactly one `Post` — no `Call`/`Result` anywhere.
