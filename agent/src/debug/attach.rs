@@ -512,7 +512,17 @@ impl AttachedApp {
         }
     }
 
-    pub fn on_key(&mut self, key: KeyEvent, branches: &[BranchId]) -> KeyAction {
+    /// `selected_status` is the selected branch's `BranchInfo.status`
+    /// (`None` when nothing is selected) — borrowed from the `infos` the
+    /// driving loop already computes each tick, not a new query. It
+    /// exists so `v`/`x` (19_UX Step F0) can tell whether they'd do
+    /// anything before arming/firing.
+    pub fn on_key(
+        &mut self,
+        key: KeyEvent,
+        branches: &[BranchId],
+        selected_status: Option<&str>,
+    ) -> KeyAction {
         // The timeline is a filter you open, not a place you live: while
         // it's open it owns every key, and closes on its own terms.
         if self.timeline {
@@ -524,10 +534,10 @@ impl AttachedApp {
             return KeyAction::None;
         }
         match self.view {
-            View::FullDebug => self.on_debug_key(key.code, branches),
+            View::FullDebug => self.on_debug_key(key.code, branches, selected_status),
             View::Chat | View::Running => match self.focus {
                 Focus::Input => self.on_input_key(key),
-                Focus::Debug => self.on_debug_key(key.code, branches),
+                Focus::Debug => self.on_debug_key(key.code, branches, selected_status),
             },
         }
     }
@@ -724,7 +734,13 @@ impl AttachedApp {
         KeyAction::ArmRewrite
     }
 
-    fn on_debug_key(&mut self, code: KeyCode, branches: &[BranchId]) -> KeyAction {
+    fn on_debug_key(
+        &mut self,
+        code: KeyCode,
+        branches: &[BranchId],
+        selected_status: Option<&str>,
+    ) -> KeyAction {
+        let _ = selected_status;
         match code {
             KeyCode::Char('q') => {
                 self.quit = true;
@@ -1079,7 +1095,11 @@ pub fn run_attached(mut session: Session, events_rx: Receiver<SessionEvent>) -> 
         for input in inputs {
             match input {
                 CtEvent::Key(key) if key.is_press() => {
-                    let action = app.on_key(key, &branches);
+                    let selected_status = app
+                        .selected
+                        .and_then(|s| infos.iter().find(|i| i.branch == s))
+                        .map(|i| i.status.as_str());
+                    let action = app.on_key(key, &branches, selected_status);
                     let Some(selected) = app.selected else {
                         continue;
                     };
@@ -2207,7 +2227,10 @@ mod tests {
         );
 
         app.focus = Focus::Debug;
-        assert_eq!(app.on_debug_key(KeyCode::Char('a'), &[]), KeyAction::None);
+        assert_eq!(
+            app.on_debug_key(KeyCode::Char('a'), &[], None),
+            KeyAction::None
+        );
         assert_eq!(app.focus, Focus::Input);
         assert!(app.ask_armed);
         for c in "hi".chars() {
@@ -2240,7 +2263,7 @@ mod tests {
     fn esc_disarms_the_ask_key() {
         let mut app = AttachedApp::new(fid(1));
         app.focus = Focus::Debug;
-        app.on_debug_key(KeyCode::Char('a'), &[]);
+        app.on_debug_key(KeyCode::Char('a'), &[], None);
         assert!(app.ask_armed);
         app.on_input_key(KeyEvent::from(KeyCode::Esc));
         assert!(!app.ask_armed);
@@ -2254,7 +2277,10 @@ mod tests {
     fn restart_keys_arm_an_explicit_mode_and_submit_the_right_command() {
         let mut app = AttachedApp::new(fid(1));
         app.focus = Focus::Debug;
-        assert_eq!(app.on_debug_key(KeyCode::Char('r'), &[]), KeyAction::None);
+        assert_eq!(
+            app.on_debug_key(KeyCode::Char('r'), &[], None),
+            KeyAction::None
+        );
         assert_eq!(app.explicit_mode, Some(ExplicitMode::Rename));
         assert_eq!(app.focus, Focus::Input);
         for c in "researcher".chars() {
@@ -2267,7 +2293,7 @@ mod tests {
         assert_eq!(app.explicit_mode, None, "cleared on submit");
 
         app.focus = Focus::Debug;
-        app.on_debug_key(KeyCode::Char('v'), &[]);
+        app.on_debug_key(KeyCode::Char('v'), &[], None);
         assert_eq!(app.explicit_mode, Some(ExplicitMode::ResumeWithValue));
         app.on_input_key(KeyEvent::from(KeyCode::Esc)); // Esc on empty input: disarm
         assert_eq!(app.explicit_mode, None);
@@ -2327,18 +2353,21 @@ mod tests {
     fn fork_interrupt_and_jump_keys() {
         let mut app = AttachedApp::new(fid(1));
         app.focus = Focus::Debug;
-        assert_eq!(app.on_debug_key(KeyCode::Char('f'), &[]), KeyAction::Fork);
+        assert_eq!(
+            app.on_debug_key(KeyCode::Char('f'), &[], None),
+            KeyAction::Fork
+        );
         app.last_clicked_event = Some(fid(42));
         assert_eq!(
-            app.on_debug_key(KeyCode::Char('f'), &[]),
+            app.on_debug_key(KeyCode::Char('f'), &[], None),
             KeyAction::ForkAt(fid(42))
         );
         assert_eq!(
-            app.on_debug_key(KeyCode::Char('x'), &[]),
+            app.on_debug_key(KeyCode::Char('x'), &[], None),
             KeyAction::Interrupt
         );
         assert_eq!(
-            app.on_debug_key(KeyCode::Char('w'), &[]),
+            app.on_debug_key(KeyCode::Char('w'), &[], None),
             KeyAction::JumpToWaiting
         );
     }
@@ -2569,9 +2598,9 @@ mod tests {
         assert!(state.vm().is_some(), "final program state kept");
 
         // The collapse key restores full-width chat.
-        app.on_key(KeyCode::Esc.into(), &[]); // input → debug focus
+        app.on_key(KeyCode::Esc.into(), &[], None); // input → debug focus
         assert_eq!(app.focus, Focus::Debug);
-        app.on_key(KeyCode::Char('c').into(), &[]);
+        app.on_key(KeyCode::Char('c').into(), &[], None);
         assert_eq!(app.view, View::Chat);
         assert_eq!(
             app.pane_set(),
@@ -2586,9 +2615,9 @@ mod tests {
         // re-trigger the auto-pop. Collapsing left focus on `Input`
         // (same as the original direction leaves it), so `Esc` back to
         // `Focus::Debug` first, same as above.
-        app.on_key(KeyCode::Esc.into(), &[]);
+        app.on_key(KeyCode::Esc.into(), &[], None);
         assert_eq!(app.focus, Focus::Debug);
-        app.on_key(KeyCode::Char('c').into(), &[]);
+        app.on_key(KeyCode::Char('c').into(), &[], None);
         assert_eq!(app.view, View::Running);
         let panes = app.pane_set();
         assert!(panes.right.contains(&Pane::Source));
@@ -2601,7 +2630,7 @@ mod tests {
         app.view = View::Running;
         app.focus = Focus::Debug;
         assert_eq!(
-            app.on_key(KeyCode::Char('d').into(), &[fid(1)]),
+            app.on_key(KeyCode::Char('d').into(), &[fid(1)], None),
             KeyAction::None
         );
         assert_eq!(app.view, View::FullDebug);
@@ -2619,7 +2648,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            app.on_key(KeyCode::Char('d').into(), &[fid(1)]),
+            app.on_key(KeyCode::Char('d').into(), &[fid(1)], None),
             KeyAction::None
         );
         assert_eq!(app.view, View::Running, "returns to the previous view");
@@ -2668,9 +2697,9 @@ mod tests {
         app.view = View::Running;
         app.focus = Focus::Debug;
         assert!(app.pane_set().right.contains(&Pane::Source));
-        app.on_key(KeyCode::Char('1').into(), &[]);
+        app.on_key(KeyCode::Char('1').into(), &[], None);
         assert!(!app.pane_set().right.contains(&Pane::Source));
-        app.on_key(KeyCode::Char('3').into(), &[]);
+        app.on_key(KeyCode::Char('3').into(), &[], None);
         assert!(app.pane_set().right.contains(&Pane::Stack));
     }
 
@@ -2679,13 +2708,16 @@ mod tests {
         let mut app = AttachedApp::new(fid(1));
         app.view = View::Running; // digits must still type, not toggle
         for c in "d1 sq".chars() {
-            assert_eq!(app.on_key(KeyCode::Char(c).into(), &[]), KeyAction::None);
+            assert_eq!(
+                app.on_key(KeyCode::Char(c).into(), &[], None),
+                KeyAction::None
+            );
         }
         assert_eq!(app.input.to_string(), "d1 sq");
         assert_eq!(app.view, View::Running, "no debug keys fired while typing");
         assert!(!app.quit);
         assert_eq!(
-            app.on_key(KeyCode::Enter.into(), &[]),
+            app.on_key(KeyCode::Enter.into(), &[], None),
             KeyAction::Submit {
                 text: "d1 sq".into(),
                 expects_reply: false,
@@ -2739,7 +2771,7 @@ mod tests {
         let mut app = AttachedApp::new(fid(1));
         app.selected_program = Some(fid(7));
         app.source_scroll = Some(3);
-        app.on_key(KeyCode::Tab.into(), &[fid(1)]);
+        app.on_key(KeyCode::Tab.into(), &[fid(1)], None);
         assert_eq!(app.selected, Some(fid(1)));
         assert_eq!(app.selected_program, Some(fid(7)), "not reset");
         assert_eq!(app.source_scroll, Some(3), "not reset");
@@ -2874,17 +2906,17 @@ mod tests {
     fn tab_cycles_agents_and_digits_select_in_full_debug() {
         let agents = [fid(1), fid(5)];
         let mut app = AttachedApp::new(fid(1));
-        app.on_key(KeyCode::Tab.into(), &agents);
+        app.on_key(KeyCode::Tab.into(), &agents, None);
         assert_eq!(app.selected, Some(fid(5)));
-        app.on_key(KeyCode::Tab.into(), &agents);
+        app.on_key(KeyCode::Tab.into(), &agents, None);
         assert_eq!(app.selected, Some(fid(1)));
 
         app.focus = Focus::Debug;
-        app.on_key(KeyCode::Char('d').into(), &agents);
+        app.on_key(KeyCode::Char('d').into(), &agents, None);
         assert_eq!(app.view, View::FullDebug);
-        app.on_key(KeyCode::Char('2').into(), &agents);
+        app.on_key(KeyCode::Char('2').into(), &agents, None);
         assert_eq!(app.selected, Some(fid(5)));
-        app.on_key(KeyCode::Char('1').into(), &agents);
+        app.on_key(KeyCode::Char('1').into(), &agents, None);
         assert_eq!(app.selected, Some(fid(1)));
     }
 
