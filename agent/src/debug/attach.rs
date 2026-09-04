@@ -179,9 +179,9 @@ pub struct AttachedApp {
     pub promises_scroll: Option<usize>,
     pub pane_rects: Vec<(Pane, PaneInfo)>,
     last_chat_lines: usize,
-    /// The event id of the last chat row clicked — what `F` (fork at
-    /// this point) forks from; `f` (fork-here) ignores it and uses the
-    /// branch's current leaf instead.
+    /// The currently selected chat row, toggled by clicking it — what
+    /// `f` forks from when set (19_UX Step C2); with nothing selected,
+    /// `f` forks from the branch's current leaf instead.
     pub last_clicked_event: Option<EventId>,
     /// What the next Enter submits, when it isn't the default ask/tell/
     /// reply — set by the rename/resume/rewrite/spawn keys, cleared on
@@ -341,11 +341,17 @@ impl AttachedApp {
                 let line = info.scroll_top + body;
                 let rows = self.chat.rows(self.selected);
                 if let Some((kind, text, detail, id)) = rows.get(line) {
-                    // "Fork at this point" (D2, `F`) forks from whatever
-                    // row was last clicked — a real logged event, never
-                    // the streaming sentinel.
+                    // "Fork at this point" (D2, `f`) forks from whatever
+                    // row is selected — a real logged event, never the
+                    // streaming sentinel. Clicking the already-selected
+                    // row deselects it (19_UX Step C2), same as any
+                    // other toggle in this file.
                     if id.as_u64() != u64::MAX {
-                        self.last_clicked_event = Some(*id);
+                        self.last_clicked_event = if self.last_clicked_event == Some(*id) {
+                            None
+                        } else {
+                            Some(*id)
+                        };
                     }
                     if *kind == ChatKind::System {
                         if let Some(branch) = self.selected
@@ -740,8 +746,10 @@ impl AttachedApp {
             // The dancing gestures (D2) — everywhere but FullDebug, which
             // keeps its own single-purpose letters (space/s/n/1-9) for
             // real instruction stepping.
-            KeyCode::Char('f') if self.view != View::FullDebug => KeyAction::Fork,
-            KeyCode::Char('F') if self.view != View::FullDebug => match self.last_clicked_event {
+            // A selected message forks from it; none selected forks
+            // from the branch's leaf (19_UX Step C2 — one key, not a
+            // Shift-cased pair only one half of which read the click).
+            KeyCode::Char('f') if self.view != View::FullDebug => match self.last_clicked_event {
                 Some(id) => KeyAction::ForkAt(id),
                 None => KeyAction::Fork,
             },
@@ -1381,13 +1389,13 @@ fn render(frame: &mut Frame, app: &mut AttachedApp, session: &Session) {
             if multi_branch { " · tab agent" } else { "" }
         ),
         (View::Running, Focus::Debug) => format!(
-            " esc/i type · c collapse · d debugger · 1-4 panes · f/F fork · p spawn · \
+            " esc/i type · c collapse · d debugger · 1-4 panes · f fork · p spawn · \
              x interrupt · a ask · v resume · r rename{} · t timeline{} · q quit ",
             if waiting { " · w waiting" } else { "" },
             if multi_branch { " · tab agent" } else { "" }
         ),
         (_, Focus::Debug) => format!(
-            " esc/i type · c expand · d debugger · f/F fork · p spawn · x interrupt · a ask \
+            " esc/i type · c expand · d debugger · f fork · p spawn · x interrupt · a ask \
              · v resume · r rename{} · t timeline{} · q quit ",
             if waiting { " · w waiting" } else { "" },
             if multi_branch { " · tab agent" } else { "" }
@@ -1572,7 +1580,7 @@ fn render_chat(
     let mut parity: HashMap<ChatKind, bool> = HashMap::new();
     let mut in_program: Option<EventId> = None;
     let mut prev_kind: Option<ChatKind> = None;
-    for (kind, text, detail, _id) in &rows {
+    for (kind, text, detail, id) in &rows {
         let even = match detail {
             RowDetail::Program(pid) | RowDetail::Attachment(pid, _) | RowDetail::Invoke(pid, _) => {
                 if in_program != Some(*pid) {
@@ -1611,6 +1619,12 @@ fn render_chat(
             if highlight {
                 style = style.add_modifier(Modifier::REVERSED);
             }
+        }
+        // Highlight the selected message (the fork-from-here target,
+        // 19_UX Step C2) the same way — one visual language for
+        // "selected," not a second one just for this.
+        if app.last_clicked_event == Some(*id) {
+            style = style.add_modifier(Modifier::REVERSED);
         }
         push_wrapped_width(&mut lines, text, style, wrap_width);
     }
@@ -2233,17 +2247,17 @@ mod tests {
         );
     }
 
-    /// `f`/`F`/`x`/`w` map to the right `KeyAction`, and `F` without a
-    /// prior click falls back to fork-here.
+    /// `f`/`x`/`w` map to the right `KeyAction`, and `f` without a
+    /// selected message falls back to fork-here (19_UX Step C2: one
+    /// key carries both of the old `f`/`F` pair's meanings).
     #[test]
     fn fork_interrupt_and_jump_keys() {
         let mut app = AttachedApp::new(fid(1));
         app.focus = Focus::Debug;
         assert_eq!(app.on_debug_key(KeyCode::Char('f'), &[]), KeyAction::Fork);
-        assert_eq!(app.on_debug_key(KeyCode::Char('F'), &[]), KeyAction::Fork);
         app.last_clicked_event = Some(fid(42));
         assert_eq!(
-            app.on_debug_key(KeyCode::Char('F'), &[]),
+            app.on_debug_key(KeyCode::Char('f'), &[]),
             KeyAction::ForkAt(fid(42))
         );
         assert_eq!(
@@ -2661,6 +2675,51 @@ mod tests {
         assert!(!app.ask_armed);
         assert_eq!(app.last_clicked_event, None);
         assert_eq!(app.input.to_string(), "half-typed", "draft survives");
+    }
+
+    /// Clicking a chat row selects it, clicking the same row again
+    /// deselects it, and clicking a different one replaces the
+    /// selection outright (19_UX Step C2).
+    #[test]
+    fn clicking_a_chat_row_toggles_its_selection() {
+        let (tx, rx) = channel();
+        let session = run_demo(Tree::new(None), tx).unwrap();
+        let branch = session.conversation_branch();
+        let mut app = AttachedApp::new(branch);
+        for event in rx.try_iter() {
+            app.apply(&event);
+        }
+        let rows = app.chat.rows(Some(branch));
+        assert!(rows.len() >= 2, "the demo logs more than one row");
+        let (first_id, second_id) = (rows[0].3, rows[1].3);
+        app.pane_rects.push((
+            Pane::Chat,
+            PaneInfo {
+                area: Rect {
+                    x: 0,
+                    y: 0,
+                    width: 80,
+                    height: 50,
+                },
+                scroll_top: 0,
+            },
+        ));
+
+        // Row 0 is at `row = 1` (the top border occupies row 0).
+        app.on_click(0, 1, &[branch]);
+        assert_eq!(app.last_clicked_event, Some(first_id));
+
+        app.on_click(0, 1, &[branch]);
+        assert_eq!(app.last_clicked_event, None, "clicking it again deselects");
+
+        app.on_click(0, 2, &[branch]);
+        assert_eq!(app.last_clicked_event, Some(second_id));
+        app.on_click(0, 1, &[branch]);
+        assert_eq!(
+            app.last_clicked_event,
+            Some(first_id),
+            "a different row replaces the selection outright"
+        );
     }
 
     #[test]
