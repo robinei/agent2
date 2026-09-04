@@ -75,6 +75,10 @@ pub enum Pane {
     Stack,
     Promises,
     Console,
+    /// The message/rewrite box (19_UX Step C3) — its own hit-testable
+    /// rect, distinct from `Chat`'s transcript, so a click there is
+    /// routed correctly instead of misread as a chat-transcript row.
+    Input,
 }
 
 /// What the current view state renders — the headless output of the
@@ -302,7 +306,7 @@ impl AttachedApp {
             Pane::Disasm => self.disasm_scroll = Some(new),
             Pane::Stack => self.stack_scroll = Some(new),
             Pane::Promises => self.promises_scroll = Some(new),
-            Pane::Navigator => {}
+            Pane::Navigator | Pane::Input => {}
         }
     }
 
@@ -404,6 +408,13 @@ impl AttachedApp {
                         }
                     }
                 }
+            }
+            // Clicking in to keep typing shouldn't cost a draft — only
+            // whatever mode or selection was active before (19_UX Step
+            // C3, same reasoning `disarm` was built for in C1).
+            Pane::Input => {
+                self.focus = Focus::Input;
+                self.disarm();
             }
             _ => {}
         }
@@ -1209,13 +1220,20 @@ fn render(frame: &mut Frame, app: &mut AttachedApp, session: &Session) {
         // to reply mode, exactly when this branch is waiting on you
         // (17_BRANCHES Part D).
         let asking_text = app.selected.and_then(|b| asking_question_text(session, b));
-        let (top, chat_area) =
+        let (top, transcript_area, input_area) =
             render_chat(frame, app, left, app.chat_scroll, asking_text.as_deref());
         app.pane_rects.push((
             Pane::Chat,
             PaneInfo {
-                area: chat_area,
+                area: transcript_area,
                 scroll_top: top,
+            },
+        ));
+        app.pane_rects.push((
+            Pane::Input,
+            PaneInfo {
+                area: input_area,
+                scroll_top: 0,
             },
         ));
     } else if panes.console_left {
@@ -1357,6 +1375,9 @@ fn render(frame: &mut Frame, app: &mut AttachedApp, session: &Session) {
                     }
                 }
                 Pane::Chat => render_placeholder(frame, Pane::Chat, *slot),
+                // Never a member of `panes.right` — the input box is
+                // registered separately by `render_chat`'s own caller.
+                Pane::Input => unreachable!("Pane::Input is not a debug pane slot"),
             }
         }
     }
@@ -1554,7 +1575,7 @@ fn render_chat(
     area: Rect,
     scroll: Option<usize>,
     asking: Option<&str>,
-) -> (usize, Rect) {
+) -> (usize, Rect, Rect) {
     // The input box grows to fit a prefilled/multi-line buffer (Part
     // B's rewrite gesture, or Ctrl-O), capped so a long one still
     // leaves the chat pane standing.
@@ -1693,7 +1714,7 @@ fn render_chat(
         ),
         input_area,
     );
-    (top, area)
+    (top, transcript_area, input_area)
 }
 
 /// Every branch, nested exactly as the log nests them (`parent_branch`):
@@ -2027,6 +2048,7 @@ fn render_placeholder(frame: &mut Frame, pane: Pane, area: Rect) {
         Pane::Promises => " promises [4] ",
         Pane::Navigator => " agents ",
         Pane::Console => " console ",
+        Pane::Input => unreachable!("Pane::Input is never a placeholder target"),
     };
     frame.render_widget(
         Paragraph::new("(no program yet)")
@@ -2720,6 +2742,34 @@ mod tests {
             Some(first_id),
             "a different row replaces the selection outright"
         );
+    }
+
+    #[test]
+    fn clicking_the_input_box_focuses_it_and_disarms() {
+        let mut app = AttachedApp::new(fid(1));
+        app.focus = Focus::Debug;
+        app.explicit_mode = Some(ExplicitMode::Rename);
+        app.last_clicked_event = Some(EventId::new(3));
+        app.input = InputBuffer::prefilled("draft text");
+        app.pane_rects.push((
+            Pane::Input,
+            PaneInfo {
+                area: Rect {
+                    x: 0,
+                    y: 40,
+                    width: 80,
+                    height: 5,
+                },
+                scroll_top: 0,
+            },
+        ));
+
+        app.on_click(0, 42, &[fid(1)]);
+
+        assert_eq!(app.focus, Focus::Input);
+        assert_eq!(app.explicit_mode, None);
+        assert_eq!(app.last_clicked_event, None);
+        assert_eq!(app.input.to_string(), "draft text");
     }
 
     #[test]
