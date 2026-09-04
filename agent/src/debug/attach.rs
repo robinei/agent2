@@ -1577,8 +1577,11 @@ fn render_navigator(frame: &mut Frame, app: &AttachedApp, session: &Session, are
         .collect();
     // "There is no home; the tree comes to you" (17_BRANCHES Part D): the
     // header counts what needs you, right where the tree already is.
+    // `w jump` only means something when the count beside it is nonzero
+    // — same reasoning as the footer hint's own `w waiting`.
+    let jump = if waiting > 0 { " · w jump" } else { "" };
     let title =
-        format!(" agents · {waiting} waiting on you · {thinking} thinking · w jump · t timeline ");
+        format!(" agents · {waiting} waiting on you · {thinking} thinking{jump} · t timeline ");
     frame.render_widget(
         Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title)),
         area,
