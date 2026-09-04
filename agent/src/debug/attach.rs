@@ -1826,14 +1826,32 @@ fn render_timeline(frame: &mut Frame, app: &AttachedApp, session: &Session, area
             })
             .collect()
     };
+    // No independent scroll input here (only `j`/`k`, which move
+    // `cursor`) — the viewport is a pure function of the cursor and the
+    // area height, recomputed every frame, same shape as the input box's
+    // own cursor-follow scrolling above.
+    let visible = area.height.saturating_sub(2) as usize;
+    let top = timeline_scroll_top(cursor, rows.len(), visible);
+    let end = (top + visible).min(lines.len());
     frame.render_widget(
-        Paragraph::new(lines).block(
+        Paragraph::new(lines[top..end].to_vec()).block(
             Block::default()
                 .borders(Borders::ALL)
                 .title(" timeline — every post of yours "),
         ),
         area,
     );
+}
+
+/// The timeline's scroll offset: the smallest `top` that keeps `cursor`
+/// inside `top..top+visible`, clamped so the window never runs past the
+/// end of the rows. Pure and ratatui-free so it can be tested directly,
+/// same reasoning as `wrap_input` (19_UX Step A2).
+fn timeline_scroll_top(cursor: usize, rows_len: usize, visible: usize) -> usize {
+    let max_top = rows_len.saturating_sub(visible);
+    cursor
+        .saturating_sub(visible.saturating_sub(1))
+        .min(max_top)
 }
 
 fn render_navigator(frame: &mut Frame, app: &AttachedApp, session: &Session, area: Rect) {
@@ -2456,6 +2474,22 @@ mod tests {
             ]
         );
         assert_eq!(cursor_row, 1);
+    }
+
+    #[test]
+    fn timeline_scroll_top_follows_the_cursor_past_the_bottom() {
+        // 10 rows, 4 visible: the cursor starts in view, so no scroll yet.
+        assert_eq!(timeline_scroll_top(0, 10, 4), 0);
+        assert_eq!(timeline_scroll_top(3, 10, 4), 0);
+
+        // Moved past the bottom of the window: `top` advances just enough
+        // to keep the cursor's row inside `top..top+visible`.
+        assert_eq!(timeline_scroll_top(4, 10, 4), 1);
+        assert_eq!(timeline_scroll_top(9, 10, 4), 6);
+
+        // Never scrolls past the point where the window would run off
+        // the end of the rows.
+        assert_eq!(timeline_scroll_top(9, 10, 20), 0);
     }
 
     /// `next_waiting` cycles from the current branch, wraps around, and
