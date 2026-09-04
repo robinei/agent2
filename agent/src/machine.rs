@@ -2338,7 +2338,9 @@ impl Runner {
                     let Message::Post { origin, .. } = &resolved else {
                         continue;
                     };
-                    out.push(Rendered::User(crate::report::render_post(*from, origin)));
+                    out.push(Rendered::User(crate::report::render_post(
+                        event.id, *from, origin,
+                    )));
                 }
                 Message::Turn {
                     text,
@@ -2892,10 +2894,16 @@ mod tests {
     }
 
     /// A post's author is rendered, not guessed: a harness notice reads
-    /// as one, and the user's own words carry no label.
+    /// as one, and the user's own words carry no label. Every post also
+    /// carries its own event id — the only way a chat message's id is
+    /// ever visible to the model, since nothing else in the rendered
+    /// request shows it (17_BRANCHES: the `open on this branch: #N` tail
+    /// note and `answer(question, value)` both reference ids the model
+    /// otherwise has no way to resolve to content).
     #[test]
-    fn post_rendering_labels_its_author() {
+    fn post_rendering_labels_its_author_and_carries_its_id() {
         let plain = crate::report::render_post(
+            EventId::new(2),
             Author::User,
             &Origin::Direct {
                 text: "hello".into(),
@@ -2903,8 +2911,9 @@ mod tests {
                 expects_reply: true,
             },
         );
-        assert_eq!(plain, "hello");
+        assert_eq!(plain, "[#2] hello");
         let harness = crate::report::render_post(
+            EventId::new(3),
             Author::Harness,
             &Origin::Direct {
                 text: "your answer is too long".into(),
@@ -2912,8 +2921,9 @@ mod tests {
                 expects_reply: false,
             },
         );
-        assert_eq!(harness, "[harness] your answer is too long");
+        assert_eq!(harness, "[#3] [harness] your answer is too long");
         let agent = crate::report::render_post(
+            EventId::new(4),
             Author::Agent(EventId::new(7)),
             &Origin::Direct {
                 text: "which file?".into(),
@@ -2921,7 +2931,7 @@ mod tests {
                 expects_reply: true,
             },
         );
-        assert_eq!(agent, "[agent 7] which file?");
+        assert_eq!(agent, "[#4] [agent 7] which file?");
     }
 
     // ── typed calls (A2) ────────────────────────────────────────────
@@ -3078,7 +3088,7 @@ mod tests {
         let out = user_post(&mut state, &mut tree, "compute 6*7");
         let req = expect_request(&out);
         assert!(req.system.contains("test agent"));
-        assert!(matches!(&req.messages[0], Rendered::User(t) if t == "compute 6*7"));
+        assert!(matches!(&req.messages[0], Rendered::User(t) if t.ends_with("compute 6*7")));
         assert_eq!(tool_names(req), CONSTANT_TOOLS);
         // The full definition rides along: schema'd parameters, not a name.
         assert!(req.tools[0].parameters["properties"]["source"].is_object());
@@ -3592,7 +3602,7 @@ mod tests {
         let Rendered::User(rendered) = &expect_request(&out).messages[0] else {
             panic!("the question renders as a user-role post");
         };
-        assert!(rendered.starts_with("[agent 1] summarize"), "{rendered}");
+        assert!(rendered.contains("[agent 1] summarize"), "{rendered}");
         let out = child
             .step(&mut tree, StepInput::LlmResponse(llm_text("child says hi")))
             .unwrap();
@@ -5307,7 +5317,7 @@ got X
             "the pending report still renders the same: {texts:?}"
         );
         assert!(
-            texts.iter().any(|t| t == "use PLAN.md"),
+            texts.iter().any(|t| t.ends_with("use PLAN.md")),
             "beside it: {texts:?}"
         );
     }
@@ -5611,8 +5621,8 @@ got X
             r#"## what happened
 Someone spoke to you while your program was running. It is paused at its last fuel slice; nothing was lost.
 
-[#7] the user — asks you
-b is gone; use a twice
+the user — asks you
+[#7] b is gone; use a twice
 
 ## where
 const a = tools.read("a");  // → #4 done

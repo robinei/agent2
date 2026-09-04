@@ -398,21 +398,25 @@ pub const INPUT_PREVIEW_MAX_BYTES: usize = 512;
 /// Object keys / array entries named in an `input` preview.
 pub const INPUT_PREVIEW_MAX_KEYS: usize = 12;
 
-/// Render a `Post` into the text an LLM sees: the body, author-labelled
-/// when it did not come from the person driving the session, plus a
-/// **bounded preview** of any machine-bound `input`.
+/// Render a `Post` into the text an LLM sees: its own event id (a chat
+/// message otherwise carries no id anywhere the model can read — the
+/// `open on this branch: #N` tail note, and `answer(question, value)`,
+/// were referencing ids with no way to resolve them to content until
+/// this), the body, author-labelled when it did not come from the
+/// person driving the session, plus a **bounded preview** of any
+/// machine-bound `input`.
 ///
 /// The preview is the whole point: the full value reaches the *program*
 /// as the `input` const, so rendering it in full would dump a caller's
 /// data into the callee's context — exactly what by-reference travel
 /// exists to prevent.
-pub fn render_post(from: Author, origin: &Origin) -> String {
+pub fn render_post(id: EventId, from: Author, origin: &Origin) -> String {
     let Some((text, input, _)) = origin.direct() else {
         // An unresolved reference should never reach a renderer: a
         // `Context` materialises bodies. Say so rather than render a lie.
         return "(message body unavailable)".to_owned();
     };
-    let mut out = String::new();
+    let mut out = format!("[#{}] ", id.as_u64());
     match from {
         Author::User => {}
         Author::Harness => out.push_str("[harness] "),
@@ -420,10 +424,7 @@ pub fn render_post(from: Author, origin: &Origin) -> String {
     }
     out.push_str(text);
     if !input.is_null() {
-        if !out.is_empty() {
-            out.push_str("\n\n");
-        }
-        out.push_str("input: ");
+        out.push_str("\n\ninput: ");
         out.push_str(&input_preview(input));
     }
     out
@@ -445,11 +446,14 @@ pub fn derived_branch_label(tree: &Tree, branch: EventId, leaf: EventId) -> Opti
         if e.id.as_u64() < branch.as_u64() {
             return None; // pre-root: the shared prefix, not this branch's own
         }
-        let EventPayload::Message(Message::Post { from, origin }) = &e.payload else {
+        let EventPayload::Message(Message::Post { origin, .. }) = &e.payload else {
             return None;
         };
-        let first_line = render_post(*from, origin);
-        let first_line = first_line.lines().next().unwrap_or("").trim();
+        // The bare body, not `render_post`'s rendering: a display label
+        // wants the words, not the `[#id]`/author decoration a request
+        // needs.
+        let (text, _, _) = origin.direct()?;
+        let first_line = text.lines().next().unwrap_or("").trim();
         if first_line.is_empty() {
             return None;
         }
@@ -854,11 +858,10 @@ fn what_happened(h: &Handback<'_>, cause: &Cause, site: u32) -> String {
                     _ => "tells you",
                 };
                 what.push_str(&format!(
-                    "\n[#{}] {} — {}\n{}\n",
-                    id.as_u64(),
+                    "\n{} — {}\n{}\n",
                     author_label(from),
                     owed,
-                    clip(&render_post(from, &origin), POST_MAX_BYTES),
+                    clip(&render_post(*id, from, &origin), POST_MAX_BYTES),
                 ));
             }
             what.trim_end().to_owned()
@@ -1680,6 +1683,34 @@ mod tests {
             artifact(5, "read_file([\"/x/a.js\"])", json!({ "content": "…" })),
         ]);
         assert!(!rendered.contains("## note"), "{rendered}");
+    }
+
+    /// A derived branch label is the post's bare words — no `[#id]`, no
+    /// author decoration. `render_post` adds both (so the model can
+    /// resolve `answer(question, value)`'s `question`), but a navigator
+    /// label is for a human's eye, not a restart target.
+    #[test]
+    fn derived_label_has_no_id_or_author_decoration() {
+        let mut tree = Tree::new(None);
+        let mut spine = tree
+            .start_agent(None, None, "root", None, "SYSTEM")
+            .unwrap();
+        tree.append(
+            &mut spine,
+            EventPayload::Message(Message::Post {
+                from: Author::User,
+                origin: Origin::Direct {
+                    text: "read the config and summarize it".into(),
+                    input: json!(null),
+                    expects_reply: true,
+                },
+            }),
+        )
+        .unwrap();
+        let (branch, leaf) = tree.branches()[0];
+        let label = derived_branch_label(&tree, branch, leaf).expect("a post exists");
+        assert_eq!(label, "read the config and summarize it");
+        assert!(!label.contains('#'), "{label}");
     }
 
     #[test]

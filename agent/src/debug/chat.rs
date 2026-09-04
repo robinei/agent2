@@ -231,7 +231,7 @@ impl ChatState {
                     branch,
                     id,
                     kind: ChatKind::User,
-                    text: crate::report::render_post(*from, origin),
+                    text: crate::report::render_post(id, *from, origin),
                     program: None,
                 });
             }

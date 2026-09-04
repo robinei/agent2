@@ -740,7 +740,7 @@ fn timeline_rows(session: &Session) -> Vec<(EventId, BranchId, String)> {
             Some((
                 e.id,
                 branch,
-                crate::report::render_post(crate::types::Author::User, origin),
+                crate::report::render_post(e.id, crate::types::Author::User, origin),
             ))
         })
         .collect();
@@ -1244,6 +1244,20 @@ fn asking_question_text(session: &Session, branch: BranchId) -> Option<String> {
     }
 }
 
+/// Word-wrap `text` to `width` columns and push one styled `Line` per
+/// wrapped row (a blank line still pushes one empty row, so intentional
+/// spacing in the transcript survives).
+fn push_wrapped_width(lines: &mut Vec<Line<'static>>, text: &str, style: Style, width: usize) {
+    let wrapped = textwrap::wrap(text, width);
+    if wrapped.is_empty() {
+        lines.push(Line::from(String::new()).style(style));
+        return;
+    }
+    for row in wrapped {
+        lines.push(Line::from(row.into_owned()).style(style));
+    }
+}
+
 fn render_chat(
     frame: &mut Frame,
     app: &AttachedApp,
@@ -1258,8 +1272,16 @@ fn render_chat(
     ])
     .areas(area);
 
+    // Ratatui's `Paragraph` clips an overlong line rather than wrapping it
+    // unless told to, and its own `.wrap()` would break the manual
+    // top/end slicing below (one row in `lines` must stay one scrollable
+    // unit). So wrap here, to the pane's inner width, before scrolling
+    // math ever sees the line count — a long error message (or any long
+    // single-line text with no `\n` of its own) gets to span rows instead
+    // of losing everything past the border.
+    let wrap_width = transcript_area.width.saturating_sub(2).max(1) as usize;
     let rows = app.chat.rows(app.selected);
-    let mut lines: Vec<Line> = Vec::with_capacity(rows.len());
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(rows.len());
     let mut parity: HashMap<ChatKind, bool> = HashMap::new();
     let mut in_program: Option<EventId> = None;
     let mut prev_kind: Option<ChatKind> = None;
@@ -1303,7 +1325,7 @@ fn render_chat(
                 style = style.add_modifier(Modifier::REVERSED);
             }
         }
-        lines.push(Line::from(text.as_str()).style(style));
+        push_wrapped_width(&mut lines, text, style, wrap_width);
     }
     let visible = transcript_area.height.saturating_sub(2) as usize;
     let default_top = lines.len().saturating_sub(visible);
@@ -1937,6 +1959,43 @@ mod tests {
         assert_eq!(agent_reference_in("Agent #12 is stuck"), Some(12));
         assert_eq!(agent_reference_in("no reference here"), None);
         assert_eq!(agent_reference_in("agent alone, no number"), None);
+    }
+
+    /// A line longer than the pane spans multiple rows instead of being
+    /// clipped at the border — `ratatui::Paragraph` clips by default, and
+    /// the chat pane's manual scroll math means its own `.wrap()` isn't
+    /// safe to reach for (one entry in `lines` must stay one scrollable
+    /// row), so `render_chat` wraps before that math ever runs.
+    #[test]
+    fn long_lines_wrap_instead_of_clipping() {
+        let mut lines = Vec::new();
+        let style = Style::default();
+        let long = "error: the request to the remote server timed out after \
+                    thirty seconds without a response from the host machine";
+        push_wrapped_width(&mut lines, long, style, 20);
+        assert!(lines.len() > 1, "a long line at width 20 must wrap");
+        for line in &lines {
+            let width: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+            assert!(width <= 20, "row exceeds wrap width: {width} > 20");
+        }
+        // Concatenating the rows recovers every word — nothing was
+        // dropped, only rebroken.
+        let rejoined: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.as_ref())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(
+            rejoined.split_whitespace().collect::<Vec<_>>(),
+            long.split_whitespace().collect::<Vec<_>>()
+        );
+
+        // A blank line still pushes exactly one (empty) row, not zero —
+        // intentional spacing in the transcript must survive.
+        let mut blank = Vec::new();
+        push_wrapped_width(&mut blank, "", style, 20);
+        assert_eq!(blank.len(), 1);
     }
 
     /// `next_waiting` cycles from the current branch, wraps around, and

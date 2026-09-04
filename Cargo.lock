@@ -18,6 +18,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "textwrap",
  "tree-sitter",
  "tree-sitter-javascript",
  "tree-sitter-python",

@@ -1636,7 +1636,10 @@ fn leaf_summary(tree: &Tree, leaf: EventId) -> String {
             format!("Answer to #{}: {value}", question.as_u64())
         }
         EventPayload::Message(Message::Post { from, origin }) => {
-            format!("Post: {}", crate::report::render_post(*from, origin))
+            format!(
+                "Post: {}",
+                crate::report::render_post(event.id, *from, origin)
+            )
         }
         EventPayload::Message(Message::Turn {
             text, tool_calls, ..

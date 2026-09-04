@@ -398,7 +398,10 @@ fn print_session_event(event: &SessionEvent) {
                     println!("{head} answer to #{}: {value}", question.as_u64());
                 }
                 EventPayload::Message(Message::Post { from, origin }) => {
-                    println!("{head} post: {}", report::render_post(*from, origin));
+                    println!(
+                        "{head} post: {}",
+                        report::render_post(event.id, *from, origin)
+                    );
                 }
                 EventPayload::Message(Message::Turn {
                     text, tool_calls, ..
