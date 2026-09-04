@@ -2211,9 +2211,14 @@ impl Runner {
     /// Two facts so far, presence **last** — every request's last line
     /// says whether anyone is attached:
     ///
-    /// - which questions are open (18_TARGETING: a plain reply answers
-    ///   none of them, so the model needs the ids to reach for `answer`
-    ///   even when only one post is open).
+    /// - which questions are open, **each beside who asked it**
+    ///   (18_TARGETING Step B2): a plain reply answers none of them, so
+    ///   the model needs the id to reach for `answer` even when only one
+    ///   post is open, and the asker is what tells apart a parked
+    ///   program's post — its `Send` stays pending until named — from a
+    ///   person's, which merely goes unread a while longer. The rule
+    ///   itself is card material and does not repeat here; this line is
+    ///   the now-fact.
     /// - **presence**: whether a client is attached right now. It is
     ///   honest about its limit — attached means a client is connected,
     ///   not that a human is reading — and it is what lets an agent that
@@ -2224,9 +2229,19 @@ impl Runner {
         let open = self.open();
         if !open.is_empty() {
             let shown = open.len().min(OPEN_NOTE_MAX_IDS);
+            // The asker rides beside the id — `render_post`'s body
+            // prefix says who a *shown* post is from, but a post that
+            // arrived after `shown` (or on a reopened log) may never
+            // have been rendered at all, so this is the only place its
+            // asker is guaranteed visible.
             let ids: Vec<String> = open[..shown]
                 .iter()
-                .map(|id| format!("#{}", id.as_u64()))
+                .map(|id| {
+                    let who = asker_of(tree, *id)
+                        .map(crate::report::author_label)
+                        .unwrap_or_else(|| "an unknown author".to_owned());
+                    format!("#{} ({who})", id.as_u64())
+                })
                 .collect();
             let more = match open.len() - shown {
                 0 => String::new(),
@@ -2237,10 +2252,10 @@ impl Runner {
                 n => format!("{n} questions are"),
             };
             lines.push(format!(
-                "{count} open on this branch: {}{more}. Each stays open until \
-                 answer(question, value) names it — a plain reply with no tool call answers \
-                 none of them. **Several answer calls may ride one turn**, optionally \
-                 followed by one run_program or resume.",
+                "{count} open on this branch: {}{more}. A post from an agent means that \
+                 agent's program is suspended on this value and stays suspended until \
+                 answer(question, value) names it. **Several answer calls may ride one \
+                 turn**, optionally followed by one run_program or resume.",
                 ids.join(", "),
             ));
         }
@@ -3972,11 +3987,11 @@ console: (no output)
             .clone()
             .expect("the tail always carries at least presence");
         assert!(
-            tail.contains("1 question is open on this branch: #2"),
+            tail.contains("1 question is open on this branch: #2 (the user)"),
             "{tail}"
         );
         assert!(
-            tail.contains("Each stays open until answer(question, value) names it"),
+            tail.contains("A post from an agent means that agent's program is suspended"),
             "{tail}"
         );
         assert!(
@@ -4813,7 +4828,7 @@ got X
         // exactly the case that assumption misses.
         let one = expect_request(&out).tail.clone().expect("a tail");
         assert!(
-            one.starts_with("1 question is open on this branch: #2."),
+            one.starts_with("1 question is open on this branch: #2 (the user)."),
             "{one}"
         );
         assert!(one.ends_with(ABSENT), "presence goes last: {one}");
@@ -4839,11 +4854,17 @@ got X
             .expect("two open posts get a note");
         let first = state.open()[0];
         assert!(tail.contains("2 questions are open"), "{tail}");
-        assert!(tail.contains(&format!("#{}", first.as_u64())), "{tail}");
-        assert!(tail.contains(&format!("#{}", second.as_u64())), "{tail}");
         assert!(
-            tail.contains("a plain reply with no tool call answers none of them"),
-            "it says a bare reply closes nothing: {tail}"
+            tail.contains(&format!("#{} (the user)", first.as_u64())),
+            "{tail}"
+        );
+        assert!(
+            tail.contains(&format!("#{} (the user)", second.as_u64())),
+            "{tail}"
+        );
+        assert!(
+            tail.contains("A post from an agent means that agent's program is suspended"),
+            "it says what a parked post costs: {tail}"
         );
         // The obligations *line* is the bounded one; the tail as a whole
         // also carries the artifact span and presence, each its own line.
@@ -4853,6 +4874,33 @@ got X
         assert!(tail.ends_with(ABSENT), "{tail}");
         // Nothing has been called yet, so there is no artifact line.
         assert!(!tail.contains("artifacts on this branch"), "{tail}");
+    }
+
+    /// The tail names each open post's asker, not just its id — a
+    /// person's post and a parked program's post carry different
+    /// consequences, and 18_TARGETING's own text (the current
+    /// paragraph) is what tells them apart (18_TARGETING Step B2).
+    #[test]
+    fn two_askers_are_both_named_in_the_tail() {
+        let (mut tree, mut state) = setup();
+        user_post(&mut state, &mut tree, "from the user");
+        state
+            .deliver(
+                &mut tree,
+                Author::Agent(EventId::new(7)),
+                direct("from an agent", true),
+            )
+            .unwrap();
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(llm_program("c1", "return 1;")),
+            )
+            .unwrap();
+        let settled = drain(&mut state, &mut tree, out);
+        let tail = expect_request(&settled).tail.clone().expect("a tail");
+        assert!(tail.contains("(the user)"), "{tail}");
+        assert!(tail.contains("(agent 7)"), "{tail}");
     }
 
     /// **A fan-in of n asks gets n answers.** A bare turn answers none of

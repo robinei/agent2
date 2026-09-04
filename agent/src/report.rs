@@ -876,7 +876,7 @@ fn what_happened(h: &Handback<'_>, cause: &Cause, site: u32) -> String {
 /// Who a post is from, for the report's author label. A post from the
 /// person driving the session is unlabelled in the transcript, but a
 /// report *about* an arrival has to name them.
-fn author_label(from: Author) -> String {
+pub(crate) fn author_label(from: Author) -> String {
     match from {
         Author::User => "the user".into(),
         Author::Harness => "the harness".into(),
