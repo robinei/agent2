@@ -119,6 +119,12 @@ pub enum KeyAction {
     JumpToWaiting,
     /// Jump to the timeline's currently highlighted branch and close it.
     JumpTimeline,
+    /// The rewrite gesture was armed (`r` in `FullDebug`) — the driving
+    /// loop resolves the current program's source and prefills the
+    /// input buffer with it (needs `Session`, which `on_key` doesn't
+    /// have). App-local state (view, focus, `explicit_mode`) is already
+    /// set by the time this is returned.
+    ArmRewrite,
 }
 
 /// An explicit input-line sub-mode (D2's restart/rename/spawn keys):
@@ -660,6 +666,20 @@ impl AttachedApp {
         KeyAction::None
     }
 
+    /// Arm the rewrite gesture: leave `FullDebug` for whichever view
+    /// was live before it — matching what `Esc` already does leaving
+    /// `FullDebug` — since `FullDebug` has no chat/input pane at all to
+    /// type the rewrite into. Focuses the input line and returns
+    /// `KeyAction::ArmRewrite` so the driving loop can prefill it with
+    /// the current program's source, which needs `Session` and so
+    /// can't happen here.
+    fn arm_rewrite(&mut self) -> KeyAction {
+        self.view = self.prev_view;
+        self.explicit_mode = Some(ExplicitMode::Rewrite);
+        self.focus = Focus::Input;
+        KeyAction::ArmRewrite
+    }
+
     fn on_debug_key(&mut self, code: KeyCode, branches: &[BranchId]) -> KeyAction {
         match code {
             KeyCode::Char('q') => {
@@ -723,10 +743,16 @@ impl AttachedApp {
             KeyCode::Char('v') if self.view != View::FullDebug => {
                 self.arm(ExplicitMode::ResumeWithValue)
             }
-            KeyCode::Char('e') if self.view != View::FullDebug => self.arm(ExplicitMode::Rewrite),
             KeyCode::Char('p') if self.view != View::FullDebug => {
                 self.arm(ExplicitMode::SpawnCharter)
             }
+            // Rewrite is a debugging/recovery gesture — replace a
+            // suspended or crashed program by hand — not something
+            // that belongs beside ordinary chat, so it lives only in
+            // `FullDebug` (19_UX Part B), on `r` where `Chat`/
+            // `Running`'s Rename sits — the two never overlap, since
+            // this arm is only reachable when the other isn't.
+            KeyCode::Char('r') if self.view == View::FullDebug => self.arm_rewrite(),
             KeyCode::Char(c @ '1'..='9') => {
                 let idx = (c as u8 - b'1') as usize;
                 if self.view == View::FullDebug {
@@ -848,6 +874,19 @@ fn resolve_submit_mode(mode: ExplicitMode, branch: BranchId, text: String) -> Se
             charter: text,
             text: None,
         },
+    }
+}
+
+/// What `KeyAction::ArmRewrite` prefills the input buffer with: the
+/// selected branch's current program source if one has ever run,
+/// empty otherwise — today's blank-line start. Pure given `app` and
+/// `session`, so it is directly testable the same way
+/// `resolve_submit`/`resolve_submit_mode` are.
+fn resolve_rewrite_prefill(app: &AttachedApp, session: &Session) -> InputBuffer {
+    let (_, pv) = resolve_program(app, session);
+    match pv {
+        Some(pv) => InputBuffer::prefilled(&pv.source),
+        None => InputBuffer::new(),
     }
 }
 
@@ -1061,6 +1100,13 @@ pub fn run_attached(mut session: Session, events_rx: Receiver<SessionEvent>) -> 
                                 app.select_branch(rows[idx].1);
                             }
                             app.timeline = false;
+                        }
+                        // View/focus/explicit_mode are already set
+                        // (arm_rewrite) — this only needs Session,
+                        // which on_key doesn't have: the current
+                        // program's source, if there is one.
+                        KeyAction::ArmRewrite => {
+                            app.input = resolve_rewrite_prefill(&app, &session);
                         }
                     }
                 }
@@ -1305,7 +1351,7 @@ fn render(frame: &mut Frame, app: &mut AttachedApp, session: &Session) {
     let multi_branch = session.tree().branches().len() > 1;
     let help = match (app.view, app.focus) {
         (View::FullDebug, _) => format!(
-            " d/esc chat{} · space run/pause · s step · n step line · q quit ",
+            " d/esc chat · r rewrite{} · space run/pause · s step · n step line · q quit ",
             if multi_branch {
                 " · tab/1-9 agent"
             } else {
@@ -1322,13 +1368,13 @@ fn render(frame: &mut Frame, app: &mut AttachedApp, session: &Session) {
         ),
         (View::Running, Focus::Debug) => format!(
             " esc/i type · c collapse · d debugger · 1-4 panes · f/F fork · p spawn · \
-             x interrupt · a ask · v resume · e rewrite · r rename{} · t timeline{} · q quit ",
+             x interrupt · a ask · v resume · r rename{} · t timeline{} · q quit ",
             if waiting { " · w waiting" } else { "" },
             if multi_branch { " · tab agent" } else { "" }
         ),
         (_, Focus::Debug) => format!(
             " esc/i type · c expand · d debugger · f/F fork · p spawn · x interrupt · a ask \
-             · v resume · e rewrite · r rename{} · t timeline{} · q quit ",
+             · v resume · r rename{} · t timeline{} · q quit ",
             if waiting { " · w waiting" } else { "" },
             if multi_branch { " · tab agent" } else { "" }
         ),
@@ -1566,10 +1612,19 @@ fn render_chat(
         );
     }
     let (border, cursor, title) = match (app.focus, asking) {
+        // `on_input_key`'s Enter checks `explicit_mode` before anything
+        // else, unconditionally — an armed mode fires on Enter even
+        // when this branch also owes a reply (`resolve_submit_mode`
+        // never looks at `asking_user`). So an armed mode's title wins
+        // here too, to say what Enter will actually do; "reply" only
+        // shows when nothing is armed to preempt it. (That an explicit
+        // mode can silently eat an owed reply this way at all is a
+        // sharper edge than this step means to fix — flagged, not
+        // addressed, here.)
+        (Focus::Input, _) if app.explicit_mode == Some(ExplicitMode::Rewrite) => {
+            (Style::default().fg(Color::Yellow), "▏", " rewrite ")
+        }
         (Focus::Input, Some(_)) => (Style::default().fg(Color::Yellow), "▏", " reply "),
-        // `asking_user` (a reply owed) wins regardless of `ask_armed` —
-        // `resolve_submit` sends a `Reply` either way — so the ask title
-        // only needs to show when it would actually change the outcome.
         (Focus::Input, None) if app.ask_armed => (Style::default().fg(Color::Yellow), "▏", " ask "),
         (Focus::Input, None) => (Style::default().fg(Color::Cyan), "▏", " message "),
         (Focus::Debug, _) => (Style::default().fg(Color::DarkGray), "", " message "),
@@ -2419,6 +2474,43 @@ mod tests {
             KeyAction::None
         );
         assert_eq!(app.view, View::Running, "returns to the previous view");
+    }
+
+    /// Arming rewrite prefills the buffer with the current program's
+    /// source — editing what's actually there, not a blank line
+    /// (19_UX Step B1) — cursor at the top for reviewing from the
+    /// start.
+    #[test]
+    fn arming_rewrite_prefills_from_the_current_program() {
+        let (tx, _rx) = channel();
+        let session = run_demo(Tree::new(None), tx).unwrap();
+        // `resolve_program` reads the log/tree directly — `app` only
+        // needs to know which branch, not to have replayed events.
+        let app = AttachedApp::new(session.conversation_branch());
+        let (_, pv) = resolve_program(&app, &session);
+        let source = pv.expect("the demo ran a program").source;
+
+        let buf = resolve_rewrite_prefill(&app, &session);
+        assert_eq!(buf.to_string(), source);
+        assert_eq!(buf.cursor(), (0, 0));
+    }
+
+    /// A branch that has never run a program has nothing to resolve —
+    /// arms with an empty buffer, same as today's blank-line start.
+    #[test]
+    fn arming_rewrite_with_nothing_to_resolve_is_empty() {
+        let (tx, _rx) = channel();
+        let session = Session::new(
+            Tree::new(None),
+            "idle agent",
+            ToolRegistry::new(),
+            Box::new(ScriptedLlm::new([])),
+            tx,
+        )
+        .unwrap();
+        let app = AttachedApp::new(session.conversation_branch());
+        let buf = resolve_rewrite_prefill(&app, &session);
+        assert!(buf.is_empty());
     }
 
     #[test]
