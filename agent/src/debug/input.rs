@@ -251,16 +251,18 @@ impl InputBuffer {
     }
 
     /// The line count and cursor position, for rendering.
-    // Not yet consumed outside tests — 19_UX Step A2 wires these into
-    // render_chat's multi-line/scrolling and cursor placement.
-    #[allow(dead_code)]
     pub fn line_count(&self) -> usize {
         self.lines.len()
     }
 
-    #[allow(dead_code)]
     pub fn cursor(&self) -> (usize, usize) {
         self.cursor
+    }
+
+    /// The chars of one line, for rendering — `row` must be a valid
+    /// line index (`< line_count()`).
+    pub fn line(&self, row: usize) -> &[char] {
+        &self.lines[row]
     }
 }
 

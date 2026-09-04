@@ -46,6 +46,11 @@ use crate::types::{Call, Cause, EventId, EventPayload, Message, Outcome};
 /// wedge the UI (mirrors the standalone runner).
 const LINE_STEP_CAP: u64 = 50_000;
 
+/// The input box's height caps at this fraction of the chat column's
+/// height (19_UX Step A2), so a long prefilled program still leaves
+/// the chat pane standing rather than filling the whole screen.
+const INPUT_MAX_HEIGHT_FRACTION: u16 = 4;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum View {
     Chat,
@@ -1424,6 +1429,45 @@ fn push_wrapped_width(lines: &mut Vec<Line<'static>>, text: &str, style: Style, 
     }
 }
 
+/// Word-wraps an `InputBuffer`'s every line to `width` columns (no
+/// horizontal scrolling — a long line wraps, same as the transcript)
+/// and returns the rendered rows plus which one holds the cursor.
+/// "❯ " marks the first rendered row; continuation rows align under it
+/// with two spaces instead.
+///
+/// When `show_cursor`, the cursor glyph (`▏`) is spliced into the
+/// buffer's own text *before* wrapping, so it lands exactly where
+/// wrapping would place a real character there — simpler and more
+/// accurate than computing its wrapped position separately afterward.
+/// Pure and `ratatui`-free so the cursor math is unit-testable without
+/// a rendered `Frame`.
+fn wrap_input(input: &InputBuffer, show_cursor: bool, width: usize) -> (Vec<String>, usize) {
+    let (cursor_row, cursor_col) = input.cursor();
+    let mut rows: Vec<String> = Vec::new();
+    let mut cursor_visual_row = 0usize;
+    for row in 0..input.line_count() {
+        let mut chars: Vec<char> = input.line(row).to_vec();
+        if row == cursor_row && show_cursor {
+            chars.insert(cursor_col.min(chars.len()), '▏');
+        }
+        let text: String = chars.into_iter().collect();
+        let wrapped = textwrap::wrap(&text, width);
+        let wrapped_rows: Vec<String> = if wrapped.is_empty() {
+            vec![String::new()]
+        } else {
+            wrapped.into_iter().map(|s| s.into_owned()).collect()
+        };
+        for r in wrapped_rows {
+            if r.contains('▏') {
+                cursor_visual_row = rows.len();
+            }
+            let prefix = if rows.is_empty() { "❯ " } else { "  " };
+            rows.push(format!("{prefix}{r}"));
+        }
+    }
+    (rows, cursor_visual_row)
+}
+
 fn render_chat(
     frame: &mut Frame,
     app: &AttachedApp,
@@ -1431,10 +1475,15 @@ fn render_chat(
     scroll: Option<usize>,
     asking: Option<&str>,
 ) -> (usize, Rect) {
+    // The input box grows to fit a prefilled/multi-line buffer (Part
+    // B's rewrite gesture, or Ctrl-O), capped so a long one still
+    // leaves the chat pane standing.
+    let max_input_height = (area.height / INPUT_MAX_HEIGHT_FRACTION).max(3);
+    let input_height = (app.input.line_count() as u16 + 2).clamp(3, max_input_height);
     let [transcript_area, question_area, input_area] = Layout::vertical([
         Constraint::Min(1),
         Constraint::Length(if asking.is_some() { 3 } else { 0 }),
-        Constraint::Length(3),
+        Constraint::Length(input_height),
     ])
     .areas(area);
 
@@ -1525,8 +1574,20 @@ fn render_chat(
         (Focus::Input, None) => (Style::default().fg(Color::Cyan), "▏", " message "),
         (Focus::Debug, _) => (Style::default().fg(Color::DarkGray), "", " message "),
     };
+    // No horizontal scrolling — a line wider than the box wraps, same
+    // as the transcript above.
+    let input_wrap_width = input_area.width.saturating_sub(2 + 2).max(1) as usize;
+    let (input_rows, cursor_visual_row) =
+        wrap_input(&app.input, !cursor.is_empty(), input_wrap_width);
+    let input_lines: Vec<Line<'static>> = input_rows.into_iter().map(Line::from).collect();
+    let input_visible = input_area.height.saturating_sub(2) as usize;
+    let input_max_top = input_lines.len().saturating_sub(input_visible);
+    let input_top = cursor_visual_row
+        .saturating_sub(input_visible.saturating_sub(1))
+        .min(input_max_top);
+    let input_end = (input_top + input_visible).min(input_lines.len());
     frame.render_widget(
-        Paragraph::new(format!("❯ {}{}", app.input, cursor)).block(
+        Paragraph::new(input_lines[input_top..input_end].to_vec()).block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(border)
@@ -2203,6 +2264,61 @@ mod tests {
         let mut blank = Vec::new();
         push_wrapped_width(&mut blank, "", style, 20);
         assert_eq!(blank.len(), 1);
+    }
+
+    /// `wrap_input` places the cursor glyph exactly where wrapping
+    /// would put a real character there, and reports which rendered
+    /// row holds it — the math `render_chat` leans on for scrolling.
+    #[test]
+    fn wrap_input_places_the_cursor_row_correctly() {
+        // Short, no wrap needed: one row, cursor at the end.
+        let mut buf = InputBuffer::new();
+        for c in "hi".chars() {
+            buf.insert_char(c);
+        }
+        let (rows, cursor_row) = wrap_input(&buf, true, 20);
+        assert_eq!(rows, vec!["❯ hi▏".to_owned()]);
+        assert_eq!(cursor_row, 0);
+
+        // Multi-line: continuation rows get the two-space alignment
+        // prefix, and the cursor row tracks which buffer line it's on.
+        let mut buf = InputBuffer::new();
+        for c in "one".chars() {
+            buf.insert_char(c);
+        }
+        buf.insert_newline();
+        for c in "two".chars() {
+            buf.insert_char(c);
+        }
+        let (rows, cursor_row) = wrap_input(&buf, true, 20);
+        assert_eq!(rows, vec!["❯ one".to_owned(), "  two▏".to_owned()]);
+        assert_eq!(cursor_row, 1);
+
+        // `show_cursor: false` — no glyph anywhere, and no panic
+        // finding a row for one.
+        let (rows, cursor_row) = wrap_input(&buf, false, 20);
+        assert_eq!(rows, vec!["❯ one".to_owned(), "  two".to_owned()]);
+        assert_eq!(cursor_row, 0);
+
+        // A line that actually wraps: inserting the glyph mid-word can
+        // shift which words share a row (here "cccc dddd" fits one row
+        // of width 9 on its own, but "cc▏cc dddd" no longer does), so
+        // the cursor must land on whichever row it actually ends up
+        // on, not just "the row the un-marked text would wrap to."
+        let mut buf = InputBuffer::prefilled("aaaa bbbb cccc dddd");
+        for _ in 0..12 {
+            buf.right();
+        }
+        let (rows, cursor_row) = wrap_input(&buf, true, 9);
+        assert_eq!(
+            rows,
+            vec![
+                "❯ aaaa bbbb".to_owned(),
+                "  cc▏cc".to_owned(),
+                "  dddd".to_owned()
+            ]
+        );
+        assert_eq!(cursor_row, 1);
     }
 
     /// `next_waiting` cycles from the current branch, wraps around, and
