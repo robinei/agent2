@@ -740,7 +740,6 @@ impl AttachedApp {
         branches: &[BranchId],
         selected_status: Option<&str>,
     ) -> KeyAction {
-        let _ = selected_status;
         match code {
             KeyCode::Char('q') => {
                 self.quit = true;
@@ -802,7 +801,14 @@ impl AttachedApp {
             }
             KeyCode::Char('a') if self.view != View::FullDebug => self.arm_ask(),
             KeyCode::Char('r') if self.view != View::FullDebug => self.arm(ExplicitMode::Rename),
-            KeyCode::Char('v') if self.view != View::FullDebug => {
+            // Only a `Phase::Suspended` branch is actually resumable
+            // (`Runner::eligible`'s `Restart::Resume` arm, `machine.rs`)
+            // — everywhere else it's a wasted round trip through
+            // cmd_restart that comes back refused, not a harmless no-op
+            // like `w` on an empty wait-list (19_UX Step F1).
+            KeyCode::Char('v')
+                if self.view != View::FullDebug && selected_status == Some("suspended") =>
+            {
                 self.arm(ExplicitMode::ResumeWithValue)
             }
             KeyCode::Char('p') if self.view != View::FullDebug => {
@@ -1426,14 +1432,48 @@ fn render(frame: &mut Frame, app: &mut AttachedApp, session: &Session) {
     // `w waiting` only means something when a branch actually owes you a
     // reply — otherwise it's a no-op key with a hint that just adds
     // noise, so it's only advertised while it would do something.
-    let waiting = branch_counts(&session.branch_infos()).0 > 0;
+    let infos = session.branch_infos();
+    let waiting = branch_counts(&infos).0 > 0;
+    // `v resume` only means something on a suspended branch (19_UX Step
+    // F1) — same "only advertised while it would do something" shape.
+    let resumable = app
+        .selected
+        .and_then(|s| infos.iter().find(|i| i.branch == s))
+        .is_some_and(|i| i.status == "suspended");
     // `tab`/`1-9` cycle or jump between branches — with only one, that
     // targets the branch already selected, and `cycle_branch` guards
     // against the real cost of that (it would otherwise silently reset
     // the program/subitem selection and every pane's scroll position).
     // Advertised the same way `waiting` is: only when it would move.
     let multi_branch = session.tree().branches().len() > 1;
-    let help = match (app.view, app.focus) {
+    let help = footer_hint(
+        app.view,
+        app.focus,
+        app.ask_armed,
+        waiting,
+        resumable,
+        multi_branch,
+    );
+    frame.render_widget(
+        Paragraph::new(help).style(Style::default().add_modifier(Modifier::REVERSED)),
+        footer,
+    );
+}
+
+/// The footer's key-hint line: a shortcut is only advertised while it
+/// would actually do something (`waiting`/`resumable`/`multi_branch`
+/// each gate their own `·` clause the same way, 19_UX Steps A.. /F1).
+/// Pure and ratatui-free so it can be tested directly, same reasoning
+/// as `wrap_input`.
+fn footer_hint(
+    view: View,
+    focus: Focus,
+    ask_armed: bool,
+    waiting: bool,
+    resumable: bool,
+    multi_branch: bool,
+) -> String {
+    match (view, focus) {
         (View::FullDebug, _) => format!(
             " d/esc chat · r rewrite{} · space run/pause · s step · n step line · q quit ",
             if multi_branch {
@@ -1442,7 +1482,7 @@ fn render(frame: &mut Frame, app: &mut AttachedApp, session: &Session) {
                 ""
             }
         ),
-        (_, Focus::Input) if app.ask_armed => format!(
+        (_, Focus::Input) if ask_armed => format!(
             " type to ask · enter send · esc clear/cancel{} ",
             if multi_branch { " · tab agent" } else { "" }
         ),
@@ -1452,21 +1492,19 @@ fn render(frame: &mut Frame, app: &mut AttachedApp, session: &Session) {
         ),
         (View::Running, Focus::Debug) => format!(
             " esc/i type · c collapse · d debugger · 1-4 panes · f fork · p spawn · \
-             x interrupt · a ask · v resume · r rename{} · t timeline{} · q quit ",
+             x interrupt · a ask · r rename{}{} · t timeline{} · q quit ",
+            if resumable { " · v resume" } else { "" },
             if waiting { " · w waiting" } else { "" },
             if multi_branch { " · tab agent" } else { "" }
         ),
         (_, Focus::Debug) => format!(
             " esc/i type · c expand · d debugger · f fork · p spawn · x interrupt · a ask \
-             · v resume · r rename{} · t timeline{} · q quit ",
+             · r rename{}{} · t timeline{} · q quit ",
+            if resumable { " · v resume" } else { "" },
             if waiting { " · w waiting" } else { "" },
             if multi_branch { " · tab agent" } else { "" }
         ),
-    };
-    frame.render_widget(
-        Paragraph::new(help).style(Style::default().add_modifier(Modifier::REVERSED)),
-        footer,
-    );
+    }
 }
 
 fn chat_style(kind: ChatKind, even: bool) -> Style {
@@ -2293,7 +2331,7 @@ mod tests {
         assert_eq!(app.explicit_mode, None, "cleared on submit");
 
         app.focus = Focus::Debug;
-        app.on_debug_key(KeyCode::Char('v'), &[], None);
+        app.on_debug_key(KeyCode::Char('v'), &[], Some("suspended"));
         assert_eq!(app.explicit_mode, Some(ExplicitMode::ResumeWithValue));
         app.on_input_key(KeyEvent::from(KeyCode::Esc)); // Esc on empty input: disarm
         assert_eq!(app.explicit_mode, None);
@@ -2344,6 +2382,36 @@ mod tests {
                 text: None,
             }
         );
+    }
+
+    /// `v` only arms Resume when the selected branch is actually
+    /// suspended — everywhere else it's a wasted round trip through
+    /// `cmd_restart` that comes back refused (19_UX Step F1).
+    #[test]
+    fn v_only_arms_resume_on_a_suspended_branch() {
+        let mut app = AttachedApp::new(fid(1));
+        app.focus = Focus::Debug;
+        assert_eq!(
+            app.on_debug_key(KeyCode::Char('v'), &[], Some("suspended")),
+            KeyAction::None
+        );
+        assert_eq!(app.explicit_mode, Some(ExplicitMode::ResumeWithValue));
+
+        let mut app = AttachedApp::new(fid(1));
+        app.focus = Focus::Debug;
+        assert_eq!(
+            app.on_debug_key(KeyCode::Char('v'), &[], Some("idle")),
+            KeyAction::None
+        );
+        assert_eq!(app.explicit_mode, None, "idle isn't resumable");
+
+        let mut app = AttachedApp::new(fid(1));
+        app.focus = Focus::Debug;
+        assert_eq!(
+            app.on_debug_key(KeyCode::Char('v'), &[], None),
+            KeyAction::None
+        );
+        assert_eq!(app.explicit_mode, None, "nothing selected isn't resumable");
     }
 
     /// `f`/`x`/`w` map to the right `KeyAction`, and `f` without a
@@ -2481,6 +2549,21 @@ mod tests {
         }
         let unique: std::collections::HashSet<_> = titles.iter().collect();
         assert_eq!(unique.len(), titles.len(), "no two modes share a title");
+    }
+
+    #[test]
+    fn footer_hint_shows_v_resume_only_when_resumable() {
+        let with = footer_hint(View::Chat, Focus::Debug, false, false, true, false);
+        assert!(with.contains("v resume"), "{with}");
+
+        let without = footer_hint(View::Chat, Focus::Debug, false, false, false, false);
+        assert!(!without.contains("v resume"), "{without}");
+
+        let running_with = footer_hint(View::Running, Focus::Debug, false, false, true, false);
+        assert!(running_with.contains("v resume"), "{running_with}");
+
+        let running_without = footer_hint(View::Running, Focus::Debug, false, false, false, false);
+        assert!(!running_without.contains("v resume"), "{running_without}");
     }
 
     /// `wrap_input` places the cursor glyph exactly where wrapping
