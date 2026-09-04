@@ -51,6 +51,11 @@ const LINE_STEP_CAP: u64 = 50_000;
 /// the chat pane standing rather than filling the whole screen.
 const INPUT_MAX_HEIGHT_FRACTION: u16 = 4;
 
+/// The navigator's height caps at this fraction of the right column's
+/// height (19_UX Step E0), so a deep fork/spawn tree still leaves room
+/// for chat/source/console instead of consuming the whole screen.
+const NAVIGATOR_HEIGHT_FRACTION: u16 = 3;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum View {
     Chat,
@@ -181,6 +186,11 @@ pub struct AttachedApp {
     pub disasm_scroll: Option<usize>,
     pub stack_scroll: Option<usize>,
     pub promises_scroll: Option<usize>,
+    /// `None` auto-follows the selected branch's row; `Some(n)` is a
+    /// manual wheel-scroll, reset back to auto-follow by `select_branch`
+    /// (19_UX Step E0) — needed now that the navigator's height is
+    /// capped instead of always growing to fit the whole tree.
+    pub navigator_scroll: Option<usize>,
     pub pane_rects: Vec<(Pane, PaneInfo)>,
     last_chat_lines: usize,
     /// The currently selected chat row, toggled by clicking it — what
@@ -230,6 +240,7 @@ impl AttachedApp {
             disasm_scroll: None,
             stack_scroll: None,
             promises_scroll: None,
+            navigator_scroll: None,
             pane_rects: Vec::new(),
             last_chat_lines: 0,
             last_clicked_event: None,
@@ -306,7 +317,8 @@ impl AttachedApp {
             Pane::Disasm => self.disasm_scroll = Some(new),
             Pane::Stack => self.stack_scroll = Some(new),
             Pane::Promises => self.promises_scroll = Some(new),
-            Pane::Navigator | Pane::Input => {}
+            Pane::Navigator => self.navigator_scroll = Some(new),
+            Pane::Input => {}
         }
     }
 
@@ -427,6 +439,7 @@ impl AttachedApp {
         self.selected_program = None;
         self.disarm();
         self.reset_program_scrolls();
+        self.navigator_scroll = None;
     }
 
     /// Back to the neutral state: clears `explicit_mode`, `ask_armed`,
@@ -1258,20 +1271,28 @@ fn render(frame: &mut Frame, app: &mut AttachedApp, session: &Session) {
                 right_panes.insert(1, Pane::Source);
             }
         }
+        // Uncapped, a deep fork/spawn tree would grow the navigator to
+        // consume the whole right column, squeezing everything else off
+        // (19_UX Step E0) — capped at a third of it instead, same
+        // fraction-of-the-area shape as the input box's own height cap
+        // (`INPUT_MAX_HEIGHT_FRACTION`).
+        let navigator_cap = (right.height / NAVIGATOR_HEIGHT_FRACTION).max(3);
         let slots = Layout::vertical(right_panes.iter().map(|p| match p {
-            Pane::Navigator => Constraint::Length(session.tree().branches().len() as u16 + 2),
+            Pane::Navigator => {
+                Constraint::Length((session.tree().branches().len() as u16 + 2).min(navigator_cap))
+            }
             _ => Constraint::Fill(1),
         }))
         .split(right);
         for (pane, slot) in right_panes.iter().zip(slots.iter()) {
             match pane {
                 Pane::Navigator => {
-                    render_navigator(frame, app, session, *slot);
+                    let top = render_navigator(frame, app, session, *slot);
                     app.pane_rects.push((
                         Pane::Navigator,
                         PaneInfo {
                             area: *slot,
-                            scroll_top: 0,
+                            scroll_top: top,
                         },
                     ));
                 }
@@ -1831,7 +1852,7 @@ fn render_timeline(frame: &mut Frame, app: &AttachedApp, session: &Session, area
     // area height, recomputed every frame, same shape as the input box's
     // own cursor-follow scrolling above.
     let visible = area.height.saturating_sub(2) as usize;
-    let top = timeline_scroll_top(cursor, rows.len(), visible);
+    let top = scroll_top_following(cursor, rows.len(), visible);
     let end = (top + visible).min(lines.len());
     frame.render_widget(
         Paragraph::new(lines[top..end].to_vec()).block(
@@ -1843,24 +1864,28 @@ fn render_timeline(frame: &mut Frame, app: &AttachedApp, session: &Session, area
     );
 }
 
-/// The timeline's scroll offset: the smallest `top` that keeps `cursor`
-/// inside `top..top+visible`, clamped so the window never runs past the
-/// end of the rows. Pure and ratatui-free so it can be tested directly,
-/// same reasoning as `wrap_input` (19_UX Step A2).
-fn timeline_scroll_top(cursor: usize, rows_len: usize, visible: usize) -> usize {
+/// A scroll offset that auto-follows one index: the smallest `top` that
+/// keeps `index` inside `top..top+visible`, clamped so the window never
+/// runs past the end of the rows. Shared by the timeline (follows
+/// `timeline_cursor`, 19_UX Step D0) and the navigator (follows the
+/// selected branch's row, Step E0) — pure and ratatui-free so it can be
+/// tested directly, same reasoning as `wrap_input` (Step A2).
+fn scroll_top_following(index: usize, rows_len: usize, visible: usize) -> usize {
     let max_top = rows_len.saturating_sub(visible);
-    cursor
-        .saturating_sub(visible.saturating_sub(1))
-        .min(max_top)
+    index.saturating_sub(visible.saturating_sub(1)).min(max_top)
 }
 
-fn render_navigator(frame: &mut Frame, app: &AttachedApp, session: &Session, area: Rect) {
+fn render_navigator(frame: &mut Frame, app: &AttachedApp, session: &Session, area: Rect) -> usize {
     // `branch_infos` is the navigator projection: identity and shape from
     // the log (so it survives resume, decision 8), status/thinking from
     // live session state.
     let infos = session.branch_infos();
     let (waiting, thinking) = branch_counts(&infos);
     let rows = navigator_rows(infos);
+    let selected_idx = rows
+        .iter()
+        .position(|(info, _, _)| Some(info.branch) == app.selected)
+        .unwrap_or(0);
     let lines: Vec<Line> = rows
         .iter()
         .map(|(info, prefix, is_fork)| {
@@ -1916,10 +1941,18 @@ fn render_navigator(frame: &mut Frame, app: &AttachedApp, session: &Session, are
     let jump = if waiting > 0 { " · w jump" } else { "" };
     let title =
         format!(" agents · {waiting} waiting on you · {thinking} thinking{jump} · t timeline ");
+    let visible = area.height.saturating_sub(2) as usize;
+    let top = app
+        .navigator_scroll
+        .unwrap_or_else(|| scroll_top_following(selected_idx, rows.len(), visible))
+        .min(rows.len().saturating_sub(visible));
+    let end = (top + visible).min(lines.len());
     frame.render_widget(
-        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title)),
+        Paragraph::new(lines[top..end].to_vec())
+            .block(Block::default().borders(Borders::ALL).title(title)),
         area,
     );
+    top
 }
 
 /// Console + status for the selected agent's VM (live or post-mortem).
@@ -2477,19 +2510,19 @@ mod tests {
     }
 
     #[test]
-    fn timeline_scroll_top_follows_the_cursor_past_the_bottom() {
+    fn scroll_top_following_follows_the_index_past_the_bottom() {
         // 10 rows, 4 visible: the cursor starts in view, so no scroll yet.
-        assert_eq!(timeline_scroll_top(0, 10, 4), 0);
-        assert_eq!(timeline_scroll_top(3, 10, 4), 0);
+        assert_eq!(scroll_top_following(0, 10, 4), 0);
+        assert_eq!(scroll_top_following(3, 10, 4), 0);
 
         // Moved past the bottom of the window: `top` advances just enough
         // to keep the cursor's row inside `top..top+visible`.
-        assert_eq!(timeline_scroll_top(4, 10, 4), 1);
-        assert_eq!(timeline_scroll_top(9, 10, 4), 6);
+        assert_eq!(scroll_top_following(4, 10, 4), 1);
+        assert_eq!(scroll_top_following(9, 10, 4), 6);
 
         // Never scrolls past the point where the window would run off
         // the end of the rows.
-        assert_eq!(timeline_scroll_top(9, 10, 20), 0);
+        assert_eq!(scroll_top_following(9, 10, 20), 0);
     }
 
     /// `next_waiting` cycles from the current branch, wraps around, and
@@ -2804,6 +2837,37 @@ mod tests {
         assert_eq!(app.explicit_mode, None);
         assert_eq!(app.last_clicked_event, None);
         assert_eq!(app.input.to_string(), "draft text");
+    }
+
+    #[test]
+    fn manual_navigator_scroll_resets_to_auto_follow_on_select() {
+        let branches = [fid(1), fid(2), fid(3)];
+        let mut app = AttachedApp::new(fid(1));
+        app.pane_rects.push((
+            Pane::Navigator,
+            PaneInfo {
+                area: Rect {
+                    x: 0,
+                    y: 0,
+                    width: 40,
+                    height: 5,
+                },
+                scroll_top: 0,
+            },
+        ));
+
+        // A wheel-scroll pins a manual offset (Step E0).
+        app.on_mouse(0, 2, MouseEventKind::ScrollDown, &branches);
+        assert_eq!(app.navigator_scroll, Some(3));
+
+        // Selecting a branch (row 1 in the pane = branches[1]) hands
+        // auto-follow back — the same reset `chat_scroll` already gets.
+        app.on_click(0, 2, &branches);
+        assert_eq!(app.selected, Some(fid(2)));
+        assert_eq!(
+            app.navigator_scroll, None,
+            "select_branch overrides the manual scroll back to auto-follow"
+        );
     }
 
     #[test]
