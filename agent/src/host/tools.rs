@@ -55,7 +55,6 @@ pub fn real_registry() -> ToolRegistry {
     registry.register(replace_file_def());
     registry.register(super::structural::outline_def());
     registry.register(super::structural::parse_errors_def());
-    registry.register(now_def());
     registry.register(wait_until_def());
     registry
 }
@@ -438,8 +437,8 @@ fn run_bash(command: &str, timeout: Duration) -> Result<serde_json::Value, Strin
     Ok(result)
 }
 
-/// Current wall-clock time as epoch milliseconds — this dialect has no
-/// `Date` builtin, so `wait_until` deadlines are built from `tools.now()`.
+/// Current wall-clock time as epoch milliseconds — matches `Date.now()`,
+/// which is how a program builds a `wait_until` deadline.
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -447,23 +446,11 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-fn now_def() -> ToolDef {
-    ToolDef {
-        name: "now".into(),
-        description: "Current wall-clock time, in epoch milliseconds. Build a \
-                      `wait_until` deadline from it: `tools.wait_until((await \
-                      tools.now()) + 300000)` waits 5 minutes."
-            .into(),
-        input_schema: json!({ "type": "array", "items": [], "minItems": 0, "maxItems": 0 }),
-        handler: Box::new(|_args| Ok(json!(now_ms()))),
-    }
-}
-
 fn wait_until_def() -> ToolDef {
     ToolDef {
         name: "wait_until".into(),
         description: "Block until wall-clock time reaches `epoch_ms` (an \
-                      absolute deadline from `tools.now()`), then resolve with \
+                      absolute deadline from `Date.now()`), then resolve with \
                       null; a deadline already past resolves immediately. This \
                       is how you wait real time out — a polling loop, a \
                       scheduled check-in — never a busy JS loop (burns fuel, \
@@ -772,25 +759,10 @@ mod tests {
         assert!(err.contains("JS program"), "{err}");
     }
 
-    // ── now / wait_until ───────────────────────────────────────────────
-
-    fn now() -> serde_json::Value {
-        (now_def().handler)(json!([])).unwrap()
-    }
+    // ── wait_until ───────────────────────────────────────────────────
 
     fn wait_until(args: serde_json::Value) -> Result<serde_json::Value, String> {
         (wait_until_def().handler)(args)
-    }
-
-    #[test]
-    fn now_returns_current_epoch_ms() {
-        let before = now_ms();
-        let reported = now().as_i64().unwrap();
-        let after = now_ms();
-        assert!(
-            (before..=after).contains(&reported),
-            "{before} <= {reported} <= {after}"
-        );
     }
 
     #[test]

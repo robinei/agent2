@@ -33,6 +33,7 @@ use crate::vm::{ErrorKind, RcStr, VM, VMError, Value};
 
 mod array;
 mod console;
+mod date;
 mod edit;
 mod function;
 mod json;
@@ -48,6 +49,7 @@ mod typedarray;
 
 use array::*;
 use console::*;
+use date::*;
 use edit::*;
 use function::*;
 use json::*;
@@ -425,6 +427,9 @@ builtins! {
     ConsoleError,BuiltinKind::Namespace("console"), "error",0, VARARG, console_error,false, false, false, false, false, false, false, false, false, false;
     ConsoleInfo, BuiltinKind::Namespace("console"), "info", 0, VARARG, console_info, false, false, false, false, false, false, false, false, false, false;
     ConsoleAssert,BuiltinKind::Namespace("console"), "assert", 1, VARARG, console_assert, false, false, false, false, false, false, false, false, false, false;
+
+    // ── Date static ──
+    DateNow, BuiltinKind::Namespace("Date"), "now", 0, 0, date_now, false, false, false, false, false, false, false, false, false, false;
 
     // ── JSON static ──
     JSONParse,     BuiltinKind::Namespace("JSON"), "parse",     1, 1, json_parse,     false, false, false, false, false, false, false, false, false, false;

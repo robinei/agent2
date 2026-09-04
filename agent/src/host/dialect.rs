@@ -44,8 +44,8 @@ answer just to start over with a fresh `run_program`. A `raise` keeps a \
 long orchestration alive — restarting from the top discards its progress \
 (variables, in-flight reads).
 - Need real time to pass — a polling loop, a scheduled check-in? \
-`await tools.wait_until(deadline)`, never a busy loop (burns fuel; time \
-never actually passes inside one) or `bash(\"sleep …\")`. A message \
+`await tools.wait_until(Date.now() + ms)`, never a busy loop (burns fuel; \
+time never actually passes inside one) or `bash(\"sleep …\")`. A message \
 arriving while you're parked there interrupts you as its own turn; \
 answer it and `resume()` to keep waiting.
 - A reply with *no* tool call ends your turn; its text is your final \
@@ -230,6 +230,8 @@ and factory functions.
 - `new Error(msg)`, `new RegExp(...)`, `new Map()`, and `new Set()` are \
 the allowed `new` forms. Absent: BigInt, labeled statements, \
 getters/setters.
+- `Date.now()` is the only `Date` surface: no `new Date()`, no instance \
+methods. It returns epoch milliseconds, same as real JS.
 - try/catch/finally work as in JS for `throw` and runtime errors; \
 `raise` is never catchable.
 - Promises exist only as tool-call results: no `new Promise`, no \
@@ -412,6 +414,7 @@ mod tests {
             "raise(name, payload)",
             "resume(value)",
             "No `this` or `class`",
+            "`Date.now()` is the only `Date` surface",
             "`new Map()`",
             "`Map` and `Set`",
             "$<name>",

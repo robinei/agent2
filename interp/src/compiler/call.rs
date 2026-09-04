@@ -82,7 +82,7 @@ impl super::Compiler {
                 if let ast::Expression::Identifier(obj) = &m.object {
                     match obj.name.as_str() {
                         "Math" | "Object" | "JSON" | "Number" | "Array" | "String" | "Map"
-                        | "Set" | "console" | "Edit" | "ArrayBuffer" => {
+                        | "Set" | "console" | "Edit" | "ArrayBuffer" | "Date" => {
                             return self.compile_namespace_call(
                                 obj.name.as_str(),
                                 method,
@@ -212,6 +212,7 @@ impl super::Compiler {
                             | "Set"
                             | "console"
                             | "Edit"
+                            | "Date"
                     )
                 } else {
                     true
