@@ -408,8 +408,22 @@ impl AttachedApp {
     fn select_branch(&mut self, branch: BranchId) {
         self.selected = Some(branch);
         self.selected_program = None;
-        self.last_clicked_event = None;
+        self.disarm();
         self.reset_program_scrolls();
+    }
+
+    /// Back to the neutral state: clears `explicit_mode`, `ask_armed`,
+    /// and `last_clicked_event` (the fork-from-here target) together —
+    /// everything that would otherwise silently fire against, or
+    /// target, something other than what armed it (19_UX Step C1, the
+    /// same shape as the `e` bug this whole file started from).
+    /// Deliberately does **not** touch `self.input` or `self.focus` — a
+    /// typed draft surviving a context change is normal chat-app
+    /// behavior; only the *armed* state is the danger.
+    fn disarm(&mut self) {
+        self.explicit_mode = None;
+        self.ask_armed = false;
+        self.last_clicked_event = None;
     }
 
     /// Reset scrolls for the right-hand panes (program-specific content
@@ -2626,6 +2640,27 @@ mod tests {
         assert_eq!(app.selected, Some(fid(1)));
         assert_eq!(app.selected_program, Some(fid(7)), "not reset");
         assert_eq!(app.source_scroll, Some(3), "not reset");
+    }
+
+    /// Switching branches disarms whatever mode/target was armed —
+    /// firing it against a branch you didn't mean is the `e` bug's
+    /// shape — but leaves a typed draft alone, since losing that on a
+    /// context change would be worse than the risk it guards against.
+    #[test]
+    fn selecting_a_branch_disarms_but_keeps_the_draft() {
+        let mut app = AttachedApp::new(fid(1));
+        app.explicit_mode = Some(ExplicitMode::Rewrite);
+        app.ask_armed = true;
+        app.last_clicked_event = Some(fid(42));
+        for c in "half-typed".chars() {
+            app.input.insert_char(c);
+        }
+        app.select_branch(fid(2));
+        assert_eq!(app.selected, Some(fid(2)));
+        assert_eq!(app.explicit_mode, None);
+        assert!(!app.ask_armed);
+        assert_eq!(app.last_clicked_event, None);
+        assert_eq!(app.input.to_string(), "half-typed", "draft survives");
     }
 
     #[test]
