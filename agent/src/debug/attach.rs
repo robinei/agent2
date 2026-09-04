@@ -533,6 +533,17 @@ impl AttachedApp {
             self.cycle_branch(branches);
             return KeyAction::None;
         }
+        // Ctrl-C: the universal "get me out of this." A non-empty input
+        // line is cleared first — a change of mind mid-message, not an
+        // exit — and only an already-empty line quits.
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            if self.input.is_empty() {
+                self.quit = true;
+            } else {
+                self.input.clear();
+            }
+            return KeyAction::None;
+        }
         match self.view {
             View::FullDebug => self.on_debug_key(key.code, branches, selected_status),
             View::Chat | View::Running => match self.focus {
@@ -2938,6 +2949,25 @@ mod tests {
             "foo \n!",
             "Ctrl-O inserts a literal newline, not a submit"
         );
+    }
+
+    /// Ctrl-C: clears a non-empty input line first (a change of mind,
+    /// not an exit) and only quits once the line is already empty. Fires
+    /// through `on_key`, so it works regardless of focus/view — same
+    /// "everywhere" category as Tab, checked right beside it.
+    #[test]
+    fn ctrl_c_clears_input_then_quits_on_empty() {
+        let mut app = AttachedApp::new(fid(1));
+        for c in "hello".chars() {
+            app.on_input_key(KeyEvent::from(KeyCode::Char(c)));
+        }
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(app.on_key(ctrl_c, &[], None), KeyAction::None);
+        assert!(app.input.is_empty(), "first Ctrl-C clears, does not quit");
+        assert!(!app.quit);
+
+        assert_eq!(app.on_key(ctrl_c, &[], None), KeyAction::None);
+        assert!(app.quit, "Ctrl-C on an already-empty line quits");
     }
 
     /// With nothing else to cycle to, Tab must not fall through to
