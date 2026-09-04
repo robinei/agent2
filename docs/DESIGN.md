@@ -3,7 +3,7 @@
 A code-mode agent system: the LLM writes JS programs that orchestrate tool
 calls; the programs run on a bespoke VM; and a Lisp-style condition system
 makes the LLM (and above it, the user) the interactive restart handler. The
-numbered plan files (`0_…` – `17_…`) are the roadmap; this file is the
+numbered plan files (`0_…` – `18_…`) are the roadmap; this file is the
 rationale they all serve. Where a plan file and this file disagree, surface
 it — that's a design change, not a detail.
 
@@ -184,6 +184,14 @@ Everything else is the same table with a column blanked: a host tool call
 is the left column only (`Invoke` … `Result`); a `tell` blanks the
 `Answer`; and the user blanks both program columns.
 
+**A bare turn answers nothing.** `open` — the posts a branch has not yet
+closed — is discharged only by `answer(question, value)`; a plain reply
+with no tool call is text, full stop, and a branch may sit idle while
+still owing one (`18_TARGETING.md`). The reason is the same one C3 used
+to refuse a silent decline: an implicit answer and an oblivious one
+produce identical bytes, so nothing short of the explicit call can be
+trusted to mean "this is the answer."
+
 ### The user is an author, not an agent
 
 The user has no branch. They speak *inside* branches: an utterance in
@@ -200,7 +208,9 @@ for one call. So the user is a blanked column in the exchange table: no
 program to `Send` with, no context to `Post` into. The same reading makes
 the user the outermost restart handler literal rather than metaphorical —
 they take a branch's turn directly, supplying a value, a rewrite, or an
-answer without spending an LLM turn.
+answer without spending an LLM turn. **Their default send is a tell, not
+an ask** — a deliberate gesture, not the ordinary case — because a human
+who gets no reply can just ask again, and a suspended program cannot.
 
 ## The one exception: the answer crosses into context
 
