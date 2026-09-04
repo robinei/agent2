@@ -446,6 +446,16 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// Longest a single `wait_until` call may block for. This tool's whole
+/// point is a real, uninterruptible wall-clock block on a worker thread —
+/// there is no mechanism to cancel one in flight — so a miscalculated
+/// deadline (wrong units, a bad `Date.now()` arithmetic slip) would
+/// otherwise wedge that thread for as long as the mistake says, same
+/// failure shape `bash`'s own timeout guards against (`BASH_TIMEOUT`),
+/// just with a much longer legitimate use case behind it. Loop with
+/// several calls for a wait longer than this.
+const WAIT_UNTIL_MAX: Duration = Duration::from_secs(15 * 60);
+
 fn wait_until_def() -> ToolDef {
     ToolDef {
         name: "wait_until".into(),
@@ -455,7 +465,9 @@ fn wait_until_def() -> ToolDef {
                       is how you wait real time out — a polling loop, a \
                       scheduled check-in — never a busy JS loop (burns fuel, \
                       time never actually passes) or `bash(\"sleep …\")` (ties \
-                      up a subprocess for the same thing this does directly)."
+                      up a subprocess for the same thing this does directly). \
+                      Capped at 15 minutes per call — for a longer wait, loop \
+                      with several calls instead of one big one."
             .into(),
         input_schema: json!({
             "type": "array",
@@ -470,8 +482,15 @@ fn wait_until_def() -> ToolDef {
                 .get(0)
                 .and_then(|v| v.as_i64())
                 .ok_or("wait_until(epoch_ms) needs a numeric epoch-ms deadline")?;
-            let delta_ms = (target_ms - now_ms()).max(0) as u64;
-            std::thread::sleep(Duration::from_millis(delta_ms));
+            let delta = Duration::from_millis((target_ms - now_ms()).max(0) as u64);
+            if delta > WAIT_UNTIL_MAX {
+                return Err(format!(
+                    "wait_until deadline is {delta:?} away (limit {WAIT_UNTIL_MAX:?}) — \
+                     likely a unit mistake (epoch_ms, not seconds). For a longer wait, \
+                     loop with several wait_until calls instead of one."
+                ));
+            }
+            std::thread::sleep(delta);
             Ok(json!(null))
         }),
     }
@@ -793,5 +812,18 @@ mod tests {
     fn wait_until_rejects_a_non_numeric_deadline() {
         let err = wait_until(json!(["soon"])).unwrap_err();
         assert!(err.contains("epoch-ms"), "{err}");
+    }
+
+    #[test]
+    fn wait_until_rejects_a_deadline_past_the_cap_instead_of_blocking() {
+        let start = std::time::Instant::now();
+        let far_future = now_ms() + Duration::from_secs(3600).as_millis() as i64; // 1h > 15m cap
+        let err = wait_until(json!([far_future])).unwrap_err();
+        assert!(err.contains("limit"), "{err}");
+        assert!(
+            start.elapsed() < Duration::from_millis(200),
+            "rejected fast, did not sleep: {:?}",
+            start.elapsed()
+        );
     }
 }
