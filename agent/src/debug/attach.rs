@@ -24,9 +24,7 @@ use std::thread;
 use std::time::Instant;
 
 use ratatui::Frame;
-use ratatui::crossterm::event::{
-    Event as CtEvent, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind,
-};
+use ratatui::crossterm::event::{Event as CtEvent, KeyCode, KeyEvent, MouseButton, MouseEventKind};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
@@ -175,6 +173,16 @@ pub struct AttachedApp {
     /// reply — set by the rename/resume/rewrite/spawn keys, cleared on
     /// submit or `Esc`.
     pub explicit_mode: Option<ExplicitMode>,
+    /// The next Enter submits as an **ask** (`expects_reply: true`)
+    /// instead of the default tell — armed by a dedicated key
+    /// (`arm_ask`), cleared on submit or `Esc`. A dedicated key rather
+    /// than a modifier on Enter: Alt+Enter is not reliably delivered —
+    /// many terminals and window managers claim it for their own
+    /// fullscreen toggle before it ever reaches the app, and
+    /// modifier+Enter chords are ambiguous in general without an
+    /// enhanced keyboard protocol, since Enter's own control code
+    /// already occupies the byte a modifier would need to alter.
+    pub ask_armed: bool,
     /// The timeline: every post of yours across branches, a filter you
     /// open rather than a place you live (17_BRANCHES Part D).
     pub timeline: bool,
@@ -208,6 +216,7 @@ impl AttachedApp {
             last_chat_lines: 0,
             last_clicked_event: None,
             explicit_mode: None,
+            ask_armed: false,
             timeline: false,
             timeline_cursor: 0,
         }
@@ -488,14 +497,14 @@ impl AttachedApp {
         match key.code {
             KeyCode::Enter if !self.input.is_empty() => {
                 let text = std::mem::take(&mut self.input);
+                let ask = std::mem::take(&mut self.ask_armed);
                 match self.explicit_mode.take() {
                     Some(mode) => KeyAction::SubmitMode(mode, text),
+                    // The default is a tell; `ask_armed` (set by the `a`
+                    // key, `arm_ask`) is the deliberate exception.
                     None => KeyAction::Submit {
                         text,
-                        // The ask modifier (18_TARGETING: Enter tells,
-                        // Alt+Enter asks — a human has recourse to ask
-                        // again, so the default costs nothing to skip).
-                        expects_reply: key.modifiers.contains(KeyModifiers::ALT),
+                        expects_reply: ask,
                     },
                 }
             }
@@ -506,6 +515,7 @@ impl AttachedApp {
             KeyCode::Esc => {
                 if self.input.is_empty() {
                     self.explicit_mode = None;
+                    self.ask_armed = false;
                     self.focus = Focus::Debug;
                 } else {
                     self.input.clear();
@@ -524,6 +534,16 @@ impl AttachedApp {
     /// next Enter to submit as `mode` instead of the default ask/tell.
     fn arm(&mut self, mode: ExplicitMode) -> KeyAction {
         self.explicit_mode = Some(mode);
+        self.focus = Focus::Input;
+        KeyAction::None
+    }
+
+    /// Arm the ask gesture: focus the input line, ready for the next
+    /// Enter to submit as an ask (`expects_reply: true`) instead of the
+    /// default tell. See `ask_armed`'s doc for why this is a dedicated
+    /// key rather than a modifier on Enter.
+    fn arm_ask(&mut self) -> KeyAction {
+        self.ask_armed = true;
         self.focus = Focus::Input;
         KeyAction::None
     }
@@ -577,6 +597,7 @@ impl AttachedApp {
                 self.timeline_cursor = 0;
                 KeyAction::None
             }
+            KeyCode::Char('a') if self.view != View::FullDebug => self.arm_ask(),
             KeyCode::Char('r') if self.view != View::FullDebug => self.arm(ExplicitMode::Rename),
             KeyCode::Char('v') if self.view != View::FullDebug => {
                 self.arm(ExplicitMode::ResumeWithValue)
@@ -1150,16 +1171,18 @@ fn render(frame: &mut Frame, app: &mut AttachedApp, session: &Session) {
         (View::FullDebug, _) => {
             " d/esc chat · tab/1-9 agent · space run/pause · s step · n step line · q quit "
         }
-        (_, Focus::Input) => {
-            " type to chat · enter send (alt+enter ask) · tab agent · esc debug keys "
+        (_, Focus::Input) if app.ask_armed => {
+            " type to ask · enter send · esc clear/cancel · tab agent "
         }
+        (_, Focus::Input) => " type to chat · enter send · tab agent · esc debug keys ",
         (View::Running, Focus::Debug) => {
             " esc/i type · c collapse · d debugger · 1-4 panes · f/F fork · p spawn · x interrupt \
-             · v resume · e rewrite · r rename · w waiting · t timeline · tab agent · q quit "
+             · a ask · v resume · e rewrite · r rename · w waiting · t timeline · tab agent \
+             · q quit "
         }
         (_, Focus::Debug) => {
-            " esc/i type · d debugger · f/F fork · p spawn · x interrupt · v resume · e rewrite \
-             · r rename · w waiting · t timeline · tab agent · q quit "
+            " esc/i type · d debugger · f/F fork · p spawn · x interrupt · a ask · v resume \
+             · e rewrite · r rename · w waiting · t timeline · tab agent · q quit "
         }
     };
     frame.render_widget(
@@ -1352,6 +1375,10 @@ fn render_chat(
     }
     let (border, cursor, title) = match (app.focus, asking) {
         (Focus::Input, Some(_)) => (Style::default().fg(Color::Yellow), "▏", " reply "),
+        // `asking_user` (a reply owed) wins regardless of `ask_armed` —
+        // `resolve_submit` sends a `Reply` either way — so the ask title
+        // only needs to show when it would actually change the outcome.
+        (Focus::Input, None) if app.ask_armed => (Style::default().fg(Color::Yellow), "▏", " ask "),
         (Focus::Input, None) => (Style::default().fg(Color::Cyan), "▏", " message "),
         (Focus::Debug, _) => (Style::default().fg(Color::DarkGray), "", " message "),
     };
@@ -1746,10 +1773,10 @@ mod tests {
         }
     }
 
-    /// The input line's default behaviour (18_TARGETING Part A): a plain
-    /// Enter tells, an Alt+Enter asks — both `UserTurn` — unless the
-    /// branch has a pending ask-to-user, in which case either one
-    /// replies.
+    /// The input line's default behaviour (18_TARGETING Part A, revised
+    /// to drop Alt+Enter for `a`/`arm_ask`): a plain Enter tells, an
+    /// armed one asks — both `UserTurn` — unless the branch has a
+    /// pending ask-to-user, in which case either one replies.
     #[test]
     fn reply_mode_wins_over_ask_or_tell_when_a_branch_is_waiting_on_you() {
         let b = fid(1);
@@ -1782,20 +1809,14 @@ mod tests {
         );
     }
 
-    /// Alt+Enter is the ask modifier; a plain Enter tells.
+    /// The `a` key arms an ask for the next Enter; a plain Enter tells
+    /// by default, and arming does not leak into the turn after —
+    /// exactly one bare reply's worth (18_TARGETING revision: a
+    /// dedicated key, not a modifier on Enter, because Alt+Enter is not
+    /// reliably delivered — see `ask_armed`'s doc).
     #[test]
-    fn alt_enter_is_the_ask_modifier() {
+    fn the_ask_key_arms_exactly_one_reply() {
         let mut app = AttachedApp::new(fid(1));
-        for c in "hi".chars() {
-            app.on_input_key(KeyEvent::from(KeyCode::Char(c)));
-        }
-        assert_eq!(
-            app.on_input_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)),
-            KeyAction::Submit {
-                text: "hi".into(),
-                expects_reply: true,
-            }
-        );
         for c in "fyi".chars() {
             app.on_input_key(KeyEvent::from(KeyCode::Char(c)));
         }
@@ -1806,6 +1827,46 @@ mod tests {
                 expects_reply: false,
             }
         );
+
+        app.focus = Focus::Debug;
+        assert_eq!(app.on_debug_key(KeyCode::Char('a'), &[]), KeyAction::None);
+        assert_eq!(app.focus, Focus::Input);
+        assert!(app.ask_armed);
+        for c in "hi".chars() {
+            app.on_input_key(KeyEvent::from(KeyCode::Char(c)));
+        }
+        assert_eq!(
+            app.on_input_key(KeyEvent::from(KeyCode::Enter)),
+            KeyAction::Submit {
+                text: "hi".into(),
+                expects_reply: true,
+            }
+        );
+        assert!(!app.ask_armed, "one reply, not a standing mode");
+
+        for c in "next".chars() {
+            app.on_input_key(KeyEvent::from(KeyCode::Char(c)));
+        }
+        assert_eq!(
+            app.on_input_key(KeyEvent::from(KeyCode::Enter)),
+            KeyAction::Submit {
+                text: "next".into(),
+                expects_reply: false,
+            }
+        );
+    }
+
+    /// `Esc` on an empty line disarms an ask the same way it disarms an
+    /// explicit mode — a change of mind costs nothing.
+    #[test]
+    fn esc_disarms_the_ask_key() {
+        let mut app = AttachedApp::new(fid(1));
+        app.focus = Focus::Debug;
+        app.on_debug_key(KeyCode::Char('a'), &[]);
+        assert!(app.ask_armed);
+        app.on_input_key(KeyEvent::from(KeyCode::Esc));
+        assert!(!app.ask_armed);
+        assert_eq!(app.focus, Focus::Debug);
     }
 
     /// The restart keys arm an explicit mode; typing and Enter submit it

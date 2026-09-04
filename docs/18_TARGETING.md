@@ -210,6 +210,16 @@ traffic shape the design assumes.
 - [x] Gate: `cargo fmt && cargo clippy --workspace --all-targets &&
       cargo test` green.
 
+**Superseded (post-phase revision).** Alt+Enter turned out not to be a
+reliable gesture in practice: many terminals and window managers claim
+it for their own fullscreen toggle before it ever reaches the app, and
+modifier+Enter chords are ambiguous in legacy terminal mode generally
+(Enter's own control code already occupies the byte a modifier would
+need to alter). The ask gesture is now a dedicated key (`a`,
+`AttachedApp::arm_ask`) that arms the input line the same way the
+rename/resume/rewrite/spawn keys already did, rather than a modifier
+read off the Enter keypress itself. Enter still tells by default.
+
 ---
 
 ## Part B — Answering is a declaration
