@@ -852,6 +852,10 @@ know the shape to use it well:
 
 ## Answers
 
+*(The bare-turn binding described here is superseded — see
+`docs/18_TARGETING.md` for the current rule: a bare turn answers
+nothing, and only `answer(question, value)` closes a post.)*
+
 - **Binding.** A `Post` with `expects_reply` is *open* until an `Answer`
   names it. A `Turn` with no tool calls answers the **oldest post that
   was open when its request was rendered** (the runner's `shown`
@@ -1807,6 +1811,17 @@ open post is owed until an `Answer` names it — and that is the reading
 the recovery table already had. If declining is ever wanted it needs its
 own **event**, for exactly the reason `Failed` is one: an absence cannot
 be told apart from a crash, an interruption, or a model that lost track.
+
+**Superseded (18_TARGETING).** The auto-close a bare reply performed —
+binding to the oldest open post — was this step's termination argument
+for waking on an open post: a bare turn discharges exactly one, so the
+count strictly decreases. 18_TARGETING removes both halves together:
+the auto-close (a bare reply now answers nothing) and the open-post
+wake clause it justified. Reconciliation's meaning of "live" (has
+unfinished business you can see) and the session's (will be prompted
+again) no longer have to agree — they are allowed to differ again,
+which is what they always did before this step made them agree. See
+`docs/18_TARGETING.md` for the current binding rule.
 
 ---
 
