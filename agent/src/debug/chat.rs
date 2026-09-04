@@ -22,7 +22,7 @@
 use std::collections::HashMap;
 
 use crate::host::{AgentId, BranchId, ProgramStatus, SessionEvent};
-use crate::types::{Call, Event, EventId, EventPayload, Message, Outcome};
+use crate::types::{Address, Call, Event, EventId, EventPayload, Message, Outcome};
 
 /// What a transcript row is, for styling by the renderer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -309,8 +309,22 @@ impl ChatState {
                 if !is_wait_until && let Some(&program) = self.current_program.get(&branch) {
                     let name = match call {
                         Call::Invoke { name, .. } => name.clone(),
-                        Call::Send { expects_reply, .. } => {
-                            if *expects_reply { "ask" } else { "tell" }.to_owned()
+                        // The text is the whole point of a Send — a bare
+                        // "ask"/"tell" hid it, and a message to the user
+                        // has nowhere else it could ever be read (unlike
+                        // one to another branch, visible there as a real
+                        // Post if you navigate to it).
+                        Call::Send {
+                            to,
+                            text,
+                            expects_reply,
+                            ..
+                        } => {
+                            let verb = if *expects_reply { "ask" } else { "tell" };
+                            match to {
+                                Address::User => format!("{verb} you: {text}"),
+                                Address::Branch(id) => format!("{verb} #{}: {text}", id.as_u64()),
+                            }
                         }
                         Call::Spawn { .. } => "spawn".to_owned(),
                     };
@@ -742,6 +756,58 @@ mod tests {
             .map(|(_, t, _, _)| t)
             .collect();
         assert_eq!(glyphs, vec!["⚙ fetch → \"A\""]);
+    }
+
+    /// A `tell`/`ask` to the user must show its actual text — it is the
+    /// only place that message could ever be read (unlike a Send to
+    /// another branch, visible there too as a real `Post`).
+    #[test]
+    fn tell_and_ask_to_the_user_show_their_text() {
+        let mut chat = ChatState::new();
+        chat.apply(&ev(
+            1,
+            EventPayload::Agent {
+                name: None,
+                charter: "p".into(),
+                tools: None,
+                system: String::new(),
+            },
+        ));
+        chat.apply(&run_program(2));
+        chat.apply(&ev(
+            3,
+            EventPayload::Call(Call::Send {
+                to: Address::User,
+                text: "hello 👋".into(),
+                input: serde_json::Value::Null,
+                expects_reply: false,
+                site: 0,
+            }),
+        ));
+        chat.apply(&ev(
+            4,
+            EventPayload::Call(Call::Send {
+                to: Address::User,
+                text: "what's your name?".into(),
+                input: serde_json::Value::Null,
+                expects_reply: true,
+                site: 0,
+            }),
+        ));
+
+        let glyphs: Vec<String> = chat
+            .rows(None)
+            .into_iter()
+            .filter(|(k, t, _, _)| *k == ChatKind::ToolCall && t.starts_with('⚙'))
+            .map(|(_, t, _, _)| t)
+            .collect();
+        assert_eq!(
+            glyphs,
+            vec![
+                "⚙ tell you: hello 👋 → …",
+                "⚙ ask you: what's your name? → …",
+            ]
+        );
     }
 
     /// `Agent.system` — the snapshot on the branch root — renders as the
