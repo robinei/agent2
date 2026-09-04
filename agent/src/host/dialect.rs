@@ -198,9 +198,11 @@ id, so reuse results instead of repeating the calls that made them.
 - resume(value) — valid only when your last message is a condition \
 report for a program that is still suspended.
 - answer(question, value) — valid only for a post that is open on **this** \
-branch. A post someone else was asked is not yours to answer. **Several \
-answer calls may ride one turn**, optionally followed by one run_program \
-or resume; each request's trailing line lists what is still open.
+branch. A post someone else was asked is not yours to answer. A plain \
+reply with no tool call is just text and answers nothing; a post stays \
+open until an answer() call names it. **Several answer calls may ride \
+one turn**, optionally followed by one run_program or resume; each \
+request's trailing line lists what is still open.
 An ineligible call is not silently dropped: it is answered with a \
 refusal that states what is true and what is valid now, so it costs you \
 one turn and nothing else. Read the report's restart list rather than \
@@ -432,6 +434,8 @@ mod tests {
             "run_program(source) — always valid",
             // C3: obligations are a now-fact, and answers batch.
             "answer calls may ride one turn",
+            // 18_TARGETING: a bare turn is text, not a binding.
+            "A plain reply with no tool call is just text and answers nothing",
             "still suspended",
             "open on **this** branch",
             "answered with a refusal that states what is true",

@@ -1688,6 +1688,7 @@ fn agent_root_of(tree: &Tree, leaf: EventId) -> AgentId {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::collections::VecDeque;
     use std::time::Duration;
 
     use crate::types::{Author, Origin, ToolCall};
@@ -1883,10 +1884,11 @@ mod tests {
             [
                 "Agent", "Post", "Turn",
                 // Calls are logged at dispatch, their results at landing.
-                "Call", "Call", "Result", "Result", "Return", "Console", "Turn",
-                // The final turn answers the user's post — and the branch
-                // is idle, not done. Agents never close.
-                "Answer",
+                "Call", "Call", "Result", "Result", "Return", "Console",
+                "Turn",
+                // The final turn is a bare reply — it answers nothing
+                // (18_TARGETING) — and the branch is idle, not done.
+                // Agents never close.
             ]
         );
         // Both fan-out results landed (order is completion order).
@@ -2179,9 +2181,9 @@ mod tests {
         // arc is program → condition → resume → completion → text.
         let spine = kinds(session.tree(), root_leaf(&session));
         assert!(!spine.contains(&"Call"), "{spine:?}");
-        // The final turn answers the user's post; the branch goes idle,
-        // not done.
-        assert_eq!(spine.last(), Some(&"Answer"));
+        // The final turn is a bare reply — it answers nothing
+        // (18_TARGETING), but the branch still goes idle, not done.
+        assert_eq!(spine.last(), Some(&"Turn"));
 
         // The completion report must answer the *resume* call ("c2"), not
         // the original run_program ("c1") — otherwise the next chat
@@ -2351,15 +2353,36 @@ mod tests {
 
     #[test]
     fn agent_tool_spawns_child_agent_and_joins() {
-        let script = vec![
-            scripted_program(
-                "c1",
-                r#"return await tools.agent({ prompt: "child task", input: { n: 1 } });"#,
-            ),
-            scripted_text("child says 42"),
-            scripted_text("parent done"),
-        ];
-        let (session, events) = run_session(ToolRegistry::new(), script, "delegate this");
+        // A bare turn answers nothing (18_TARGETING), so the child must
+        // `answer` its open post explicitly — and because that turn
+        // carries only an `answer` call, it is answers-only, which
+        // always forces one more request before the branch is done (the
+        // API still needs a reply to that tool call). Routed by charter
+        // so the child's extra request cannot race root's own and steal
+        // its queued turn.
+        let (session, events) = run_routed(
+            ToolRegistry::new(),
+            [
+                (
+                    "child task",
+                    vec![
+                        scripted_answer("w1", EventId::new(8), json!("child says 42")),
+                        scripted_text("noted"),
+                    ],
+                ),
+                (
+                    "test agent",
+                    vec![
+                        scripted_program(
+                            "c1",
+                            r#"return await tools.agent({ prompt: "child task", input: { n: 1 } });"#,
+                        ),
+                        scripted_text("parent done"),
+                    ],
+                ),
+            ],
+            "delegate this",
+        );
         let tree = session.tree();
 
         // Two spines: the caller's and the (now completed) child's.
@@ -2377,7 +2400,10 @@ mod tests {
             .map(|(id, _)| id)
             .find(|id| *id != root_leaf(&session))
             .unwrap();
-        assert_eq!(kinds(tree, child_leaf), ["Agent", "Post", "Turn", "Answer"]);
+        assert_eq!(
+            kinds(tree, child_leaf),
+            ["Agent", "Post", "Turn", "Answer", "Turn"]
+        );
 
         // The join: the child's result is the caller's logged artifact
         // and reaches the caller's program.
@@ -2397,27 +2423,35 @@ mod tests {
     /// to whoever asked *that* question.
     #[test]
     fn answered_agent_stays_addressable() {
-        let script = vec![
-            scripted_program(
-                "c1",
-                r#"return await tools.agent({ prompt: "child task", input: null });"#,
-            ),
-            scripted_text("first answer"),
-            scripted_text("parent done"),
-            scripted_text("second answer"),
-        ];
-        let (mut session, rx) = {
-            let (tx, rx) = channel();
-            let session = Session::new(
-                Tree::new(None),
-                "test agent",
-                ToolRegistry::new(),
-                Box::new(ScriptedLlm::new(script)),
-                tx,
-            )
-            .unwrap();
-            (session, rx)
+        // A bare turn answers nothing (18_TARGETING), so the child must
+        // `answer` explicitly — and an answers-only turn always forces
+        // one more request (the API still needs a reply to that tool
+        // call), so no fixed count of scripted turns lands reliably on
+        // "the next real question." `AutoAnswerLlm` answers whatever the
+        // request's own tail says is open, in order, and closes a
+        // reprompt with nothing open with a plain "ok".
+        let (tx, rx) = channel();
+        let llm = AutoAnswerLlm {
+            inner: ScriptedLlm::new([
+                scripted_program(
+                    "c1",
+                    r#"return await tools.agent({ prompt: "child task", input: null });"#,
+                ),
+                scripted_text("parent done"),
+            ]),
+            charters: vec![(
+                "child task",
+                Mutex::new(VecDeque::from(["first answer", "second answer"])),
+            )],
         };
+        let mut session = Session::new(
+            Tree::new(None),
+            "test agent",
+            ToolRegistry::new(),
+            Box::new(llm),
+            tx,
+        )
+        .unwrap();
         session.handle().send(SessionCommand::UserTurn {
             branch: session.conversation_branch(),
             text: "delegate this".into(),
@@ -2435,7 +2469,8 @@ mod tests {
             .expect("a child branch");
         assert_eq!(
             kinds(session.tree(), session.state(child).unwrap().spine.leaf_id),
-            ["Agent", "Post", "Turn", "Answer"]
+            ["Agent", "Post", "Turn", "Answer", "Turn"],
+            "answered, then the forced reprompt closed with a plain reply"
         );
         let parent_before = kinds(session.tree(), root_leaf(&session)).len();
 
@@ -2451,7 +2486,9 @@ mod tests {
         let child_kinds = kinds(session.tree(), session.state(child).unwrap().spine.leaf_id);
         assert_eq!(
             child_kinds,
-            ["Agent", "Post", "Turn", "Answer", "Post", "Turn", "Answer"],
+            [
+                "Agent", "Post", "Turn", "Answer", "Turn", "Post", "Turn", "Answer", "Turn"
+            ],
             "a second question gets a second answer"
         );
         assert_eq!(
@@ -2520,10 +2557,11 @@ mod tests {
         assert_eq!(settled.1, Outcome::Delivered(json!("PLAN.md")));
     }
 
-    /// A user turn is exactly one `Post`, and its answer exactly one
-    /// `Answer` — no `Call`/`Result` anywhere. The user has no program to
-    /// send with and no context to post into: they speak *inside* the
-    /// branch and read the reply there.
+    /// A user turn is exactly one `Post` — no `Call`/`Result` anywhere.
+    /// The user has no program to send with and no context to post into:
+    /// they speak *inside* the branch and read the reply there. A bare
+    /// reply answers nothing (18_TARGETING): no `Answer` is logged, and
+    /// the post stays open.
     #[test]
     fn user_turn_is_a_post_on_the_branch() {
         let (session, events) = run_session(
@@ -2532,10 +2570,7 @@ mod tests {
             "hello",
         );
         let tree = session.tree();
-        assert_eq!(
-            kinds(tree, root_leaf(&session)),
-            ["Agent", "Post", "Turn", "Answer"]
-        );
+        assert_eq!(kinds(tree, root_leaf(&session)), ["Agent", "Post", "Turn"]);
 
         // The post is the user's own, and it expected a reply.
         let post = tree
@@ -2554,17 +2589,14 @@ mod tests {
             Some(("hello", true))
         );
 
-        // The `Answer` names it, and nothing was sent or settled.
-        let answered = tree
-            .events
-            .values()
-            .find_map(|e| match &e.payload {
-                EventPayload::Answer { question, value } => Some((*question, value.clone())),
-                _ => None,
-            })
-            .expect("an Answer");
-        assert_eq!(answered.0, post.0);
-        assert_eq!(answered.1, json!("hello back"));
+        // No `Answer` was logged, and nothing was sent or settled.
+        assert!(
+            !tree
+                .events
+                .values()
+                .any(|e| matches!(e.payload, EventPayload::Answer { .. })),
+            "a bare reply logs no Answer"
+        );
         assert!(
             !tree.events.values().any(|e| matches!(
                 e.payload,
@@ -2573,11 +2605,22 @@ mod tests {
             "no call, no result: the user is an author, not an agent"
         );
 
-        // The UI hears about it, because the human has no branch to
-        // settle a call on.
+        // The UI still hears the reply, as the logged `Turn` on the
+        // ordinary event stream — `SessionEvent::Answered` is reserved
+        // for a post an explicit `answer()` actually closed, which this
+        // bare reply did not do (18_TARGETING).
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, SessionEvent::Answered { .. }))
+        );
         assert!(events.iter().any(|e| matches!(
             e,
-            SessionEvent::Answered { question, .. } if *question == post.0
+            SessionEvent::Event { event, .. }
+                if matches!(
+                    &event.payload,
+                    EventPayload::Message(Message::Turn { text, .. }) if text == "hello back"
+                )
         )));
     }
 
@@ -2586,22 +2629,45 @@ mod tests {
     /// both results back into the parent program.
     #[test]
     fn promise_all_over_concurrent_agents_joins_both() {
-        let script = vec![
-            scripted_program(
-                "c1",
-                r#"return await Promise.all([
-                    tools.agent({ prompt: "task A", input: { id: 1 } }),
-                    tools.agent({ prompt: "task B", input: { id: 2 } }),
-                ]);"#,
-            ),
-            // Two child turns; which child pops which is race-dependent
-            // (shared scripted client), so the assertions below are
-            // order-independent (set membership, not position).
-            scripted_text("done: A"),
-            scripted_text("done: B"),
-            scripted_text("both back"),
-        ];
-        let (session, _) = run_session(ToolRegistry::new(), script, "delegate two");
+        // A bare turn answers nothing (18_TARGETING), so each child must
+        // name its own open post with an explicit `answer()` — but which
+        // child's request lands first is race-dependent (`Promise.all`
+        // fans out two concurrently), so no id can be scripted ahead of
+        // time. `AutoAnswerLlm` reads the id straight out of whatever
+        // request actually arrives, keyed by the child's own system
+        // prompt (its charter, the literal `prompt` it was given).
+        let (tx, rx) = channel();
+        let llm = AutoAnswerLlm {
+            inner: ScriptedLlm::new([
+                scripted_program(
+                    "c1",
+                    r#"return await Promise.all([
+                        tools.agent({ prompt: "task A", input: { id: 1 } }),
+                        tools.agent({ prompt: "task B", input: { id: 2 } }),
+                    ]);"#,
+                ),
+                scripted_text("both back"),
+            ]),
+            charters: vec![
+                ("task A", Mutex::new(VecDeque::from(["done: A"]))),
+                ("task B", Mutex::new(VecDeque::from(["done: B"]))),
+            ],
+        };
+        let session = Session::new(
+            Tree::new(None),
+            "test agent",
+            ToolRegistry::new(),
+            Box::new(llm),
+            tx,
+        )
+        .unwrap();
+        session.handle().send(SessionCommand::UserTurn {
+            branch: session.conversation_branch(),
+            text: "delegate two".into(),
+            expects_reply: true,
+        });
+        let session = session.run();
+        let _events: Vec<SessionEvent> = rx.try_iter().collect();
         let tree = session.tree();
 
         // Three spines: the caller plus the two (completed) children.
@@ -2618,13 +2684,17 @@ mod tests {
             .collect();
         assert!(child_prompts.contains("task A") && child_prompts.contains("task B"));
 
-        // Each child answered its own question independently — and each
-        // is idle afterwards, still addressable.
+        // Each child answered its own question independently, took the
+        // forced reprompt an answers-only turn always gets, and is idle
+        // afterwards, still addressable.
         for (leaf, _) in tree.list_leaves() {
             if leaf == root_leaf(&session) {
                 continue;
             }
-            assert_eq!(kinds(tree, leaf), ["Agent", "Post", "Turn", "Answer"]);
+            assert_eq!(
+                kinds(tree, leaf),
+                ["Agent", "Post", "Turn", "Answer", "Turn"]
+            );
         }
 
         // The caller logged both agent calls as artifacts on its spine —
@@ -2672,6 +2742,63 @@ mod tests {
             joined,
             HashSet::from(["done: A".to_owned(), "done: B".to_owned()])
         );
+    }
+
+    /// Wraps another client and auto-answers whatever is open for each
+    /// named charter, reading the id straight out of the request's own
+    /// tail rather than a hardcoded one — for a branch whose exact event
+    /// ids are not practically predictable ahead of time (racing with
+    /// another concurrent branch, a spinning program, or its own
+    /// answers-only turn forcing a reprompt no fixed count of scripted
+    /// turns can land on reliably). A charter is told apart from the
+    /// rest by its system prompt (exactly the `charter`/`prompt` it was
+    /// given). Each matching request pops the next value off that
+    /// charter's queue, so a sequence of questions gets a sequence of
+    /// distinct answers; a reprompt with nothing open (the answers-only
+    /// case) gets a plain "ok" instead of touching the queue. Everything
+    /// else delegates to `inner`.
+    struct AutoAnswerLlm<T> {
+        inner: T,
+        charters: Vec<(&'static str, Mutex<VecDeque<&'static str>>)>,
+    }
+
+    impl<T: LlmClient> LlmClient for AutoAnswerLlm<T> {
+        fn complete(
+            &self,
+            request: &LlmRequest,
+            cancel: &Cancel,
+            chunk: &mut dyn FnMut(LlmChunk),
+        ) -> Result<LlmTurn, String> {
+            // The system prompt is the dialect card plus the charter
+            // (`assemble_system`), so a charter is a *suffix* of it, not
+            // the whole thing — same match `RoutedLlm` uses.
+            let Some((_, values)) = self
+                .charters
+                .iter()
+                .find(|(charter, _)| request.system.ends_with(charter))
+            else {
+                return self.inner.complete(request, cancel, chunk);
+            };
+            let tail = request.tail.as_deref().unwrap_or_default();
+            let Some(id) = tail
+                .split("open on this branch: #")
+                .nth(1)
+                .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
+                .and_then(|s| s.parse::<u64>().ok())
+            else {
+                // Nothing open — this is the forced reprompt an
+                // answers-only turn always gets (the API still needs a
+                // reply to that tool call). A bare turn closes nothing
+                // and starts nothing further.
+                return Ok(scripted_text("ok"));
+            };
+            let value = values
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("a scripted value for this open post");
+            Ok(scripted_answer("a1", EventId::new(id), json!(value)))
+        }
     }
 
     /// Records peak concurrent `complete()` calls, sleeping inside the
@@ -3395,8 +3522,9 @@ mod tests {
         let session = session.run();
 
         // The rewrite should have produced a completion report, then a
-        // final text turn that answers the post the crash left open
-        // (an `Answer`, then idle — the conversation never ends).
+        // final bare text turn — it answers nothing (18_TARGETING), but
+        // the branch still goes idle; the post the crash left open stays
+        // open, and the conversation never ends.
         let all_tools = tool_texts(&session);
         assert!(
             all_tools.iter().any(|t| t.contains("program completed")),
@@ -3404,8 +3532,8 @@ mod tests {
         );
         let kinds = kinds(session.tree(), root_leaf(&session));
         assert!(
-            kinds.last() == Some(&"Answer"),
-            "the branch answered and went idle: {kinds:?}"
+            kinds.last() == Some(&"Turn"),
+            "the branch replied and went idle: {kinds:?}"
         );
         assert!(session.quiet());
 
@@ -3459,7 +3587,15 @@ mod tests {
             [
                 (
                     "reads files",
-                    vec![scripted_text("PLAN.md, and it is 40 lines")],
+                    // A bare turn answers nothing (18_TARGETING); the
+                    // worker's one open post is deterministically #8
+                    // (Agent 1, Post 2, Turn 3, Spawn 4, Agent 5, Result
+                    // 6, Send 7, Post 8).
+                    vec![scripted_answer(
+                        "w1",
+                        EventId::new(8),
+                        json!("PLAN.md, and it is 40 lines"),
+                    )],
                 ),
                 (
                     "test agent",
@@ -3693,7 +3829,11 @@ mod tests {
                             r#"const g = await tools.spawn({ name: "helper", charter: "helps" });
                                return g.agent;"#,
                         ),
-                        scripted_text("made a helper"),
+                        // A bare turn answers nothing (18_TARGETING); the
+                        // worker's own open post — root's "make a
+                        // helper" ask — is deterministically #8, same
+                        // arithmetic as the closed-loop test above.
+                        scripted_answer("w2", EventId::new(8), json!("made a helper")),
                     ],
                 ),
                 (
@@ -3821,33 +3961,48 @@ mod tests {
     /// be a tool doing what a line of program already does.
     #[test]
     fn broadcast_is_promise_all_over_agents() {
-        let (session, _) = run_routed(
-            ToolRegistry::new(),
-            [
-                ("worker a", vec![scripted_text("a: ok")]),
-                ("worker b", vec![scripted_text("b: ok")]),
-                ("worker c", vec![scripted_text("c: ok")]),
-                (
-                    "test agent",
-                    vec![
-                        scripted_program(
-                            "c1",
-                            r#"await Promise.all(["a", "b", "c"].map(n =>
-                                 tools.spawn({ name: n, charter: "worker " + n })));
-                               return "spawned";"#,
-                        ),
-                        scripted_program(
-                            "c2",
-                            r#"const rows = await tools.agents();
-                               return await Promise.all(
-                                 rows.map(r => tools.ask({ to: r.branch, text: "status?" })));"#,
-                        ),
-                        scripted_text("all three reported"),
-                    ],
+        // Each worker must explicitly `answer` the status ask
+        // (18_TARGETING — a bare turn answers nothing), but three fan out
+        // at once (`Promise.all`) so which one's request lands first is
+        // race-dependent; `AutoAnswerLlm` reads the id straight out of
+        // whichever request arrives rather than a hardcoded one.
+        let (tx, _rx) = channel();
+        let llm = AutoAnswerLlm {
+            inner: ScriptedLlm::new([
+                scripted_program(
+                    "c1",
+                    r#"await Promise.all(["a", "b", "c"].map(n =>
+                         tools.spawn({ name: n, charter: "worker " + n })));
+                       return "spawned";"#,
                 ),
+                scripted_program(
+                    "c2",
+                    r#"const rows = await tools.agents();
+                       return await Promise.all(
+                         rows.map(r => tools.ask({ to: r.branch, text: "status?" })));"#,
+                ),
+                scripted_text("all three reported"),
+            ]),
+            charters: vec![
+                ("worker a", Mutex::new(VecDeque::from(["a: ok"]))),
+                ("worker b", Mutex::new(VecDeque::from(["b: ok"]))),
+                ("worker c", Mutex::new(VecDeque::from(["c: ok"]))),
             ],
-            "check on everyone",
-        );
+        };
+        let session = Session::new(
+            Tree::new(None),
+            "test agent",
+            ToolRegistry::new(),
+            Box::new(llm),
+            tx,
+        )
+        .unwrap();
+        session.handle().send(SessionCommand::UserTurn {
+            branch: session.conversation_branch(),
+            text: "check on everyone".into(),
+            expects_reply: true,
+        });
+        let session = session.run();
         let tree = session.tree();
         let mut answers: Vec<String> = returned(tree, root_leaf(&session))
             .as_array()
@@ -3857,11 +4012,15 @@ mod tests {
             .collect();
         answers.sort();
         assert_eq!(answers, ["a: ok", "b: ok", "c: ok"]);
-        // One question each, and each answered on its own branch.
+        // One question each, and each answered on its own branch, then
+        // took the forced reprompt an answers-only turn always gets.
         for charter in ["worker a", "worker b", "worker c"] {
             let agent = agent_by_charter(tree, charter);
             let leaf = session.state(agent).unwrap().spine.leaf_id;
-            assert_eq!(kinds(tree, leaf), ["Agent", "Post", "Turn", "Answer"]);
+            assert_eq!(
+                kinds(tree, leaf),
+                ["Agent", "Post", "Turn", "Answer", "Turn"]
+            );
         }
     }
 
@@ -3871,53 +4030,93 @@ mod tests {
     /// another post.
     #[test]
     fn second_question_sees_first_exchange() {
-        let (session, _) = run_routed(
+        // A bare turn answers nothing (18_TARGETING), so the worker must
+        // `answer` each question explicitly — and each of those turns is
+        // answers-only, which always forces one more request before the
+        // worker is done (the API still needs a reply to that tool
+        // call). `AutoAnswerLlm` answers whatever the request's own tail
+        // says is open, in order, rather than a hardcoded id no fixed
+        // count of scripted turns lands on reliably.
+        let (tx, _rx) = channel();
+        let llm = AutoAnswerLlm {
+            inner: RoutedLlm::new([(
+                "test agent",
+                vec![
+                    scripted_program(
+                        "c1",
+                        r#"const w = await tools.spawn({ name: "m", charter: "remembers" });
+                           const first = await tools.ask({ to: w.agent, text: "how many?" });
+                           const second = await tools.ask({ to: w.agent, text: "sure?" });
+                           return [first, second];"#,
+                    ),
+                    scripted_text("asked twice"),
+                ],
+            )]),
+            charters: vec![(
+                "remembers",
+                Mutex::new(VecDeque::from(["seven", "still seven"])),
+            )],
+        };
+        let session = Session::new(
+            Tree::new(None),
+            "test agent",
             ToolRegistry::new(),
-            [
-                (
-                    "remembers",
-                    vec![scripted_text("seven"), scripted_text("still seven")],
-                ),
-                (
-                    "test agent",
-                    vec![
-                        scripted_program(
-                            "c1",
-                            r#"const w = await tools.spawn({ name: "m", charter: "remembers" });
-                               const first = await tools.ask({ to: w.agent, text: "how many?" });
-                               const second = await tools.ask({ to: w.agent, text: "sure?" });
-                               return [first, second];"#,
-                        ),
-                        scripted_text("asked twice"),
-                    ],
-                ),
-            ],
-            "ask twice",
-        );
+            Box::new(llm),
+            tx,
+        )
+        .unwrap();
+        session.handle().send(SessionCommand::UserTurn {
+            branch: session.conversation_branch(),
+            text: "ask twice".into(),
+            expects_reply: true,
+        });
+        let session = session.run();
         let tree = session.tree();
         let worker = agent_by_charter(tree, "remembers");
         let leaf = session.state(worker).unwrap().spine.leaf_id;
 
-        // Two full exchanges on one branch, nothing sealed in between.
-        assert_eq!(
-            kinds(tree, leaf),
-            ["Agent", "Post", "Turn", "Answer", "Post", "Turn", "Answer"]
-        );
+        // Two full exchanges on one branch, nothing sealed in between —
+        // each answer-only turn forces one more reprompt, closed with a
+        // plain reply once nothing is left open. *Which* of the two —
+        // the first reprompt's bare "Turn" or the second question's
+        // "Post" — the log lands first is a genuine race (one is a
+        // request rendered and already in flight, unaware the other is
+        // about to be logged; the other is a synchronous continuation on
+        // a different branch), so this checks the multiset, not an exact
+        // sequence.
+        let worker_kinds = kinds(tree, leaf);
+        assert_eq!(worker_kinds[0], "Agent");
+        assert_eq!(worker_kinds.iter().filter(|k| **k == "Post").count(), 2);
+        assert_eq!(worker_kinds.iter().filter(|k| **k == "Turn").count(), 4);
+        assert_eq!(worker_kinds.iter().filter(|k| **k == "Answer").count(), 2);
+        assert_eq!(worker_kinds.len(), 9, "{worker_kinds:?}");
         assert!(
             tree.spine_at(leaf).context().open.is_empty(),
             "both questions answered"
         );
 
         // The second question landed in a conversation that already held
-        // the first exchange — the worker kept its context.
-        let messages: Vec<String> = tree
+        // the first exchange — the worker kept its context. Both posts
+        // are on the one spine; each answer's value is what the explicit
+        // `answer()` call carried, not turn text (18_TARGETING).
+        let posts: Vec<String> = tree
             .spine_at(leaf)
             .context()
             .messages
             .iter()
+            .filter(|m| matches!(m, Message::Post { .. }))
             .map(|m| m.text().to_owned())
             .collect();
-        assert_eq!(messages, ["how many?", "seven", "sure?", "still seven"]);
+        assert_eq!(posts, ["how many?", "sure?"]);
+        let answers: Vec<serde_json::Value> = tree
+            .path_events(leaf)
+            .into_iter()
+            .filter_map(|e| match &e.payload {
+                EventPayload::Answer { value, .. } => Some(value.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(answers, [json!("seven"), json!("still seven")]);
         assert_eq!(
             returned(tree, root_leaf(&session)),
             json!(["seven", "still seven"])
@@ -4287,7 +4486,18 @@ mod tests {
                             r#"const path = await tools.ask({ text: "which file?" });
                                return "read " + path;"#,
                         ),
-                        scripted_text("done, read PLAN.md"),
+                        // A bare turn answers nothing (18_TARGETING); the
+                        // child names its own open post (#8, the
+                        // parent's original ask) explicitly — and since
+                        // that turn is answers-only, it forces one more
+                        // reprompt (the API still needs a reply to that
+                        // tool call), closed with a plain reply.
+                        scripted_answer(
+                            "w2",
+                            EventId::new(child_question),
+                            json!("done, read PLAN.md"),
+                        ),
+                        scripted_text("noted"),
                     ],
                 ),
                 (
@@ -4367,17 +4577,28 @@ mod tests {
         assert_eq!(
             kinds(tree, child_leaf),
             [
-                "Agent", "Post", "Turn", "Call", "Result", "Return", "Console", "Turn", "Answer"
+                "Agent", "Post", "Turn", "Call", "Result", "Return", "Console", "Turn", "Answer",
+                "Turn"
             ],
-            "the child asked, was answered, finished, and answered in turn"
+            "the child asked, was answered, finished, and answered in turn — then took the \
+             forced reprompt an answers-only turn always gets"
         );
-        // Nothing is left owed anywhere.
+        // Both the exchange's posts are explicitly answered — nothing is
+        // left owed on the worker's own branch. The human's original
+        // kickoff (#2) is a different matter: root's own replies were
+        // all bare (18_TARGETING answers nothing), so it stays open —
+        // a branch may be idle and still owe.
         for (_, leaf) in tree.branches() {
-            assert!(
-                tree.spine_at(leaf).context().open.is_empty(),
-                "branch at #{} still owes an answer",
-                leaf.as_u64()
-            );
+            let open = tree.spine_at(leaf).context().open.clone();
+            if leaf == root_leaf(&session) {
+                assert_eq!(open, [EventId::new(2)], "the human's kickoff stays owed");
+            } else {
+                assert!(
+                    open.is_empty(),
+                    "branch at #{} still owes an answer",
+                    leaf.as_u64()
+                );
+            }
         }
     }
 
@@ -4484,7 +4705,7 @@ mod tests {
         let kinds = kinds(session.tree(), session.state(fork).unwrap().spine.leaf_id);
         assert_eq!(
             kinds,
-            ["Agent", "Post", "Fork", "Post", "Turn", "Answer"],
+            ["Agent", "Post", "Fork", "Post", "Turn"],
             "the fork diverged at #2, before the original's reply: {kinds:?}"
         );
     }
@@ -4618,15 +4839,25 @@ mod tests {
         let kinds = kinds(session.tree(), root_leaf(&session));
         assert_eq!(
             kinds,
-            ["Agent", "Post", "Post", "Turn", "Answer"],
-            "one turn, and it is the one that answered the second post: {kinds:?}"
+            ["Agent", "Post", "Post", "Turn"],
+            "one turn, a bare reply — it answers neither open post (18_TARGETING): {kinds:?}"
         );
-        // …and the turn that did happen answered the *oldest* open post,
-        // because both were unseen when its request was rendered.
+        // The bare turn's text still reaches the client, as the logged
+        // `Turn` on the ordinary event stream — `SessionEvent::Answered`
+        // is reserved for a post an explicit `answer()` actually closed.
         let events: Vec<SessionEvent> = rx.try_iter().collect();
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, SessionEvent::Answered { .. }))
+        );
         assert!(events.iter().any(|e| matches!(
             e,
-            SessionEvent::Answered { value, .. } if value == &json!("second thoughts")
+            SessionEvent::Event { event, .. }
+                if matches!(
+                    &event.payload,
+                    EventPayload::Message(Message::Turn { text, .. }) if text == "second thoughts"
+                )
         )));
     }
 
@@ -4761,10 +4992,12 @@ mod tests {
         assert_eq!(returned(session.tree(), leaf), json!("rewritten"));
     }
 
-    /// A fork's bare turn "answers" a pre-fork question for the reader,
-    /// not for the log. To make it **the** answer, the user takes the
-    /// original branch's turn with `answer(#post, value)` — which is what
-    /// makes exploring in a fork and then committing one gesture.
+    /// A fork inherits a pre-fork question as history, not as an
+    /// obligation — chatting in the fork answers nothing at all
+    /// (18_TARGETING: a bare turn is never a binding). To make an
+    /// explored answer **the** answer, the user takes the original
+    /// branch's turn with `answer(#post, value)` — which is what makes
+    /// exploring in a fork and then committing one gesture.
     #[test]
     fn user_answers_on_the_original_after_forking() {
         // The root is woken by reconciliation (its "q" is open) and runs
@@ -4831,14 +5064,10 @@ mod tests {
                 .collect()
         };
         assert!(answers_to(branch).contains(&question));
-        // The fork answered its *own* post and never the inherited one:
-        // a fork inherits history, not obligations.
-        assert!(
-            !answers_to(fork).contains(&question),
-            "{:?}",
-            answers_to(fork)
-        );
-        assert!(!answers_to(fork).is_empty(), "the fork answered its own");
+        // The fork answered nothing at all — neither the inherited
+        // question nor its own new one — because a bare turn never binds
+        // (18_TARGETING). A fork inherits history, not obligations.
+        assert!(answers_to(fork).is_empty(), "{:?}", answers_to(fork));
         assert!(session.state(branch).unwrap().open().is_empty());
         let events: Vec<SessionEvent> = rx.try_iter().collect();
         assert!(events.iter().any(|e| matches!(
@@ -4886,18 +5115,24 @@ mod tests {
     #[test]
     fn hot_programs_do_not_starve_other_branches() {
         let (tx, _rx) = channel();
+        // "cool"'s exact open-post id is not practically predictable
+        // ahead of time (it races against two spinning programs), so it
+        // auto-answers whatever the request's own tail says is open
+        // (18_TARGETING: a bare turn would answer nothing here).
         let mut session = Session::new(
             Tree::new(None),
             "test agent",
             ToolRegistry::new(),
-            Box::new(RoutedLlm::new([
-                (
-                    "test agent",
-                    vec![scripted_program("c1", "while (true) {}")],
-                ),
-                ("hot", vec![scripted_program("c2", "while (true) {}")]),
-                ("cool", vec![scripted_text("served")]),
-            ])),
+            Box::new(AutoAnswerLlm {
+                inner: RoutedLlm::new([
+                    (
+                        "test agent",
+                        vec![scripted_program("c1", "while (true) {}")],
+                    ),
+                    ("hot", vec![scripted_program("c2", "while (true) {}")]),
+                ]),
+                charters: vec![("cool", Mutex::new(VecDeque::from(["served"])))],
+            }),
             tx,
         )
         .unwrap();
@@ -4945,6 +5180,14 @@ mod tests {
             }
             panic!("the third branch was starved");
         };
+        // The answer-only turn forces one more reprompt (the API still
+        // needs a reply to that tool call) before the branch is idle.
+        for _ in 0..40 {
+            if session.state(cool).unwrap().status() == "idle" {
+                break;
+            }
+            session.pump_one();
+        }
         assert_eq!(session.state(cool).unwrap().status(), "idle");
         assert_eq!(running, 2, "and the hot programs were never stopped");
     }
@@ -5079,13 +5322,15 @@ mod tests {
             text.contains(&format!("tools.tool_result({})", call.as_u64())),
             "{text}"
         );
-        // The branch woke on it and owes nothing.
+        // The branch woke on it — a bare reply, closing nothing
+        // (18_TARGETING). The human's original "go" is still open; only
+        // an explicit `answer()` would have closed it.
         assert!(
             kinds(session.tree(), leaf).ends_with(&["Post", "Turn"]),
             "{:?}",
             kinds(session.tree(), leaf)
         );
-        assert!(session.state(branch).unwrap().open().is_empty());
+        assert_eq!(session.state(branch).unwrap().open(), [EventId::new(2)]);
     }
 
     // ── C2: crash recovery is reconciliation ─────────────────────────
@@ -5278,7 +5523,14 @@ mod tests {
             tree,
             [
                 ("root", vec![scripted_text("nothing to add")]),
-                ("worker", vec![scripted_text("late answer")]),
+                (
+                    "worker",
+                    // A bare turn answers nothing (18_TARGETING), so the
+                    // worker must name the reconciled post explicitly —
+                    // its id is deterministic: the repair appends it as
+                    // event 8, same as the full log above.
+                    vec![scripted_answer("w1", EventId::new(8), json!("late answer"))],
+                ),
             ],
         );
         let session = drain(session);
@@ -5308,7 +5560,10 @@ mod tests {
             tree,
             [
                 ("root", vec![scripted_text("nothing to add")]),
-                ("worker", vec![scripted_text("late answer")]),
+                (
+                    "worker",
+                    vec![scripted_answer("w1", EventId::new(8), json!("late answer"))],
+                ),
             ],
         );
         let session = drain(session);

@@ -124,10 +124,10 @@ pub fn resume_spec() -> ToolSpec {
 /// The `answer` definition — explicit binding. Offered always; valid only
 /// for a post that is open on **this** branch.
 ///
-/// A bare turn already answers the oldest open post, so this is for the
-/// three cases it cannot express: a structured value, a specific one of
-/// several open posts, and answering an interrupting post **without
-/// ending the program**.
+/// It is the **only** way to close an open post (18_TARGETING: a bare
+/// turn answers nothing) — a structured value, a specific one of several
+/// open posts, and answering an interrupting post **without ending the
+/// program** are all this call, never an implicit binding.
 pub fn answer_spec() -> ToolSpec {
     ToolSpec {
         name: TOOL_ANSWER.into(),
@@ -229,16 +229,19 @@ pub enum StepOutput {
     /// `Result`; a `tell` is settled by its delivery receipt as soon as
     /// the `Post` lands.
     Sends(Vec<EventId>),
-    /// This branch took a bare turn and went **idle**. Agents never
-    /// close: idle costs nothing and the branch stays addressable, so a
-    /// later question to it — from anyone — is just another post.
+    /// A turn produced an answer. Two producers, distinguished by
+    /// `question`:
     ///
-    /// `question` is the `Post` the turn answered: the oldest that was
-    /// open, with an `Answer` naming it logged. It is `None` when nothing
-    /// was open — then no `Answer` is logged and the turn's text is read
-    /// where it sits. (The plan writes this output as
-    /// `Answered { question, value }`; the option is what "a bare turn
-    /// with nothing open logs no `Answer`" needs to stay expressible.)
+    /// - A bare turn (`go_idle`): the branch goes **idle**, no `Answer`
+    ///   is logged, and `question` is always `None` — a bare turn answers
+    ///   nothing (18_TARGETING), whatever it still owes stays open. The
+    ///   turn's text is read where it sits.
+    /// - An explicit `answer(question, value)` (`apply_answer`):
+    ///   `question` is `Some`, and an `Answer` naming it was logged.
+    ///
+    /// Agents never close: idle costs nothing and the branch stays
+    /// addressable, so a later question to it — from anyone — is just
+    /// another post.
     Answered {
         question: Option<EventId>,
         value: serde_json::Value,
@@ -622,13 +625,18 @@ impl Runner {
     /// > one is a `Turn` whose calls all have outcomes.
     ///
     /// - A `Turn` with no tool calls is the only terminal: the branch is
-    ///   idle until a `Post` arrives.
+    ///   idle until a `Post` arrives. (18_TARGETING: this holds even when
+    ///   the branch still owes an `answer` — a post still open is not by
+    ///   itself a cause to re-prompt, only an unseen one is. `open` and
+    ///   `shown` are allowed to disagree; a branch may be idle and still
+    ///   owe.)
     /// - A `Turn` with tool calls hands the branch to the VM, which
     ///   speaks only through its outcome events — so the rule fires when
     ///   the VM has something to say and never while it is running.
     /// - Every request has a **cause event**. The LLM is never prompted
     ///   "just because", and never twice for the same thing: `shown`
-    ///   advances at each render.
+    ///   advances at each render — literally true again now that nothing
+    ///   re-opens a request for a cause already shown.
     ///
     /// The `Turn`-with-outcomes clause is what re-derives the state from
     /// the log after a crash: a run whose report was never sent still has
@@ -652,27 +660,6 @@ impl Runner {
         // have answered (its binding was fixed at `shown`), and including
         // a tell, which owes no answer but must still be seen.
         if !self.unseen_posts(tree).is_empty() {
-            return true;
-        }
-        // **Any post still open is a cause**, shown or not.
-        //
-        // `shown` and `open` answer different questions — *what have I
-        // rendered?* and *what do I still owe?* — and they diverge in
-        // exactly one place: a bare turn answers the **oldest** open post
-        // and no more, so a branch shown three questions answers one and
-        // has two left, both already past the mark. Reading the render
-        // mark as the obligation stranded them, and an agent-authored
-        // post stranded that way is a `Send` that never settles — a
-        // program parked forever, which is the deadlock rule B claims to
-        // have ruled out.
-        //
-        // It terminates by construction: each bare turn discharges
-        // exactly one open post, so the count strictly decreases, and
-        // "woke with nothing to discharge" is precisely
-        // `open.is_empty()`. And it is a **legal** wake — the `Post` is a
-        // cause event, logged, visible, and rendering identically
-        // forever, which is the whole of what the rule asks.
-        if !self.open().is_empty() {
             return true;
         }
         // The crash-recovery clause: a run whose report was never sent
@@ -1082,8 +1069,10 @@ impl Runner {
         let assistant_id = tree.append(&mut self.spine, EventPayload::Message(message))?;
 
         if tool_calls.is_empty() {
-            // No tool call: the assistant's text completes the agent.
-            return self.answer_open(tree);
+            // No tool call: the assistant's text is just a message, and
+            // the branch goes idle (18_TARGETING: a bare turn answers
+            // nothing).
+            return self.go_idle(tree);
         }
         // `answer` settles **synchronously**, so a turn may carry one or
         // more of them ahead of the single call that drives the VM —
@@ -2139,11 +2128,12 @@ impl Runner {
         Ok(out)
     }
 
-    /// A bare turn answers the **oldest post that was open** and the
-    /// branch goes idle. Nothing closes: idle costs nothing and the
-    /// branch stays addressable, so a later question to it — from anyone
-    /// — is just another post, answered to whoever asked *that* one.
-    fn answer_open(&mut self, tree: &mut Tree) -> io::Result<Vec<StepOutput>> {
+    /// A bare turn answers **nothing** (18_TARGETING). Nothing closes:
+    /// `open` is discharged only by `answer(question, value)`, so the
+    /// branch goes idle exactly as it was — possibly still owing — and
+    /// stays addressable, so a later question to it — from anyone — is
+    /// just another post.
+    fn go_idle(&mut self, tree: &mut Tree) -> io::Result<Vec<StepOutput>> {
         // A no-tool-call turn abandons any suspended program — never the
         // physics: in-flight calls stay pending and their results are
         // still logged as artifacts when they arrive.
@@ -2158,47 +2148,13 @@ impl Runner {
             Some(Message::Turn { text, .. }) => text.clone(),
             _ => String::new(),
         };
-        // The **oldest post that was open when this request was
-        // rendered** — `shown` fixes the binding at request time, so a
-        // post that arrived during the generation can never steal it.
-        let Some(question) = self
-            .spine
-            .context()
-            .open
-            .iter()
-            .copied()
-            .find(|id| id.as_u64() <= self.shown)
-        else {
-            // Nothing was open: no `Answer` is logged and the branch is
-            // simply idle. The user reads the text where it sits.
-            let mut out = vec![StepOutput::Answered {
-                question: None,
-                value: text_value(&text),
-            }];
-            out.extend(self.prompt_if_needed(tree));
-            return Ok(out);
-        };
-
-        // **Budget is a rendering rule.** The value is stored whole and
-        // reaches the asking *program* whole; only a *context* copy of it
-        // clips, and every clip names the id the whole thing is behind.
-        // What went with that: the stored-truncated answer, and the
-        // "tighten it" re-prompt that spent an LLM turn making the log
-        // less faithful than the report.
-        let value = text_value(&text);
-        tree.append(
-            &mut self.spine,
-            EventPayload::Answer {
-                question,
-                value: value.clone(),
-            },
-        )?;
+        // No `Answer` is logged. The user, or a re-attached client, reads
+        // the text where it sits; a suspended program someone is still
+        // owed a reply to stays suspended.
         let mut out = vec![StepOutput::Answered {
-            question: Some(question),
-            value,
+            question: None,
+            value: text_value(&text),
         }];
-        // A post that arrived during the generation was not answered by
-        // this turn — it starts the next one.
         out.extend(self.prompt_if_needed(tree));
         Ok(out)
     }
@@ -2255,10 +2211,9 @@ impl Runner {
     /// Two facts so far, presence **last** — every request's last line
     /// says whether anyone is attached:
     ///
-    /// - which questions are open, when more than one is. A single open
-    ///   post needs no note (a bare reply answers it, which is the
-    ///   default anyway); several do, because the binding rule silently
-    ///   picks the oldest and the model cannot see which that is.
+    /// - which questions are open (18_TARGETING: a plain reply answers
+    ///   none of them, so the model needs the ids to reach for `answer`
+    ///   even when only one post is open).
     /// - **presence**: whether a client is attached right now. It is
     ///   honest about its limit — attached means a client is connected,
     ///   not that a human is reading — and it is what lets an agent that
@@ -2282,12 +2237,11 @@ impl Runner {
                 n => format!("{n} questions are"),
             };
             lines.push(format!(
-                "{count} open on this branch: {}{more}. A reply with no tool call answers \
-                 the oldest ({}); answer(question, value) picks one, and **several answer \
-                 calls may ride one turn**, optionally followed by one run_program or \
-                 resume.",
+                "{count} open on this branch: {}{more}. Each stays open until \
+                 answer(question, value) names it — a plain reply with no tool call answers \
+                 none of them. **Several answer calls may ride one turn**, optionally \
+                 followed by one run_program or resume.",
                 ids.join(", "),
-                ids[0],
             ));
         }
         if let Some((count, first, last)) = self.artifact_span(tree) {
@@ -3262,28 +3216,28 @@ mod tests {
         let req = expect_request(&settled);
         assert!(matches!(req.messages.last(), Some(Rendered::Tool { .. })));
 
-        // A final text turn answers the user's post and the branch goes
-        // idle, ready for the next turn. Nothing closes.
+        // A final bare text turn answers nothing (18_TARGETING) and the
+        // branch goes idle, ready for the next turn.
         let out = state
             .step(
                 &mut tree,
                 StepInput::LlmResponse(llm_text("the answer is 42")),
             )
             .unwrap();
-        // The branch answered the user's post and went idle. Nothing
-        // closes: it is still addressable for the next turn.
         assert!(
-            matches!(&out[..], [StepOutput::Answered { question: Some(_), value }]
+            matches!(&out[..], [StepOutput::Answered { question: None, value }]
                      if value == &json!("the answer is 42")),
             "{out:?}"
         );
         assert!(state.is_idle());
-        assert!(state.open().is_empty(), "the user's post is answered");
+        assert_eq!(
+            state.open(),
+            [EventId::new(2)],
+            "the user's post stays owed"
+        );
         assert_eq!(
             payload_kinds(&state, &tree),
-            [
-                "Agent", "Post", "Turn", "Return", "Console", "Turn", "Answer"
-            ]
+            ["Agent", "Post", "Turn", "Return", "Console", "Turn"]
         );
 
         // A follow-up turn appends onto the same spine and runs again.
@@ -4021,9 +3975,12 @@ console: (no output)
             tail.contains("1 question is open on this branch: #2"),
             "{tail}"
         );
-        assert!(tail.contains("answer(question, value) picks one"), "{tail}");
         assert!(
-            tail.contains("several answer calls may ride one turn"),
+            tail.contains("Each stays open until answer(question, value) names it"),
+            "{tail}"
+        );
+        assert!(
+            tail.contains("Several answer calls may ride one turn"),
             "{tail}"
         );
     }
@@ -4168,13 +4125,30 @@ got X
         let (mut child, _) = spawn_and_ask(&mut tree, &mut root, "summarize", json!({}));
         child.answer_budget = 50;
         let long = "y".repeat(500);
+        // A bare turn answers nothing (18_TARGETING); the child names its
+        // own open post explicitly.
+        let question = child.open()[0];
         let out = child
-            .step(&mut tree, StepInput::LlmResponse(llm_text(&long)))
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(llm_answer("a1", question, json!(long))),
+            )
             .unwrap();
-        let result = match &out[..] {
-            [StepOutput::Answered { value, .. }] => value.clone(),
+        // An answers-only turn is not terminal — it always forces one
+        // more request too (the API still needs a reply to that tool
+        // call) — so the `Answered` rides alongside a fresh `LlmRequest`.
+        let result = match out.first() {
+            Some(StepOutput::Answered {
+                question: Some(q),
+                value,
+            }) if *q == question => value.clone(),
             other => panic!("answered in one turn, with no nudge: {other:?}"),
         };
+        assert!(
+            matches!(out.get(1), Some(StepOutput::LlmRequest(_))),
+            "the answers-only turn forces a reprompt: {out:?}"
+        );
+        assert_eq!(out.len(), 2, "{out:?}");
         // Delivered whole — the asking *program* gets the value, and a
         // program has no context to protect.
         assert_eq!(result.as_str().unwrap().len(), 500);
@@ -4823,16 +4797,6 @@ got X
             StepOutput::Answered { question: Some(q), value } if *q == newer && value == "the second"
         )));
         assert_eq!(state.open(), [older], "only the named post was bound");
-
-        // A bare turn now binds the remaining one — the oldest.
-        let out = state
-            .step(&mut tree, StepInput::LlmResponse(llm_text("the first")))
-            .unwrap();
-        assert!(out.iter().any(|o| matches!(
-            o,
-            StepOutput::Answered { question: Some(q), .. } if *q == older
-        )));
-        assert!(state.open().is_empty());
     }
 
     /// A request with more than one open post carries a bounded one-line
@@ -4878,8 +4842,8 @@ got X
         assert!(tail.contains(&format!("#{}", first.as_u64())), "{tail}");
         assert!(tail.contains(&format!("#{}", second.as_u64())), "{tail}");
         assert!(
-            tail.contains(&format!("answers the oldest (#{})", first.as_u64())),
-            "it says which one a bare reply takes: {tail}"
+            tail.contains("a plain reply with no tool call answers none of them"),
+            "it says a bare reply closes nothing: {tail}"
         );
         // The obligations *line* is the bounded one; the tail as a whole
         // also carries the artifact span and presence, each its own line.
@@ -4891,15 +4855,12 @@ got X
         assert!(!tail.contains("artifacts on this branch"), "{tail}");
     }
 
-    /// **A fan-in of n asks gets n answers.** A bare turn binds the
-    /// oldest open post and no more, so a branch shown several questions
-    /// used to answer one and strand the rest past the `shown` mark —
-    /// each stranded one an asker's `Send` that never settles and a
-    /// program parked forever. An open post is a cause, so the branch
-    /// keeps being woken until it owes nothing, and it terminates
-    /// because every bare turn discharges exactly one.
+    /// **A fan-in of n asks gets n answers.** A bare turn answers none of
+    /// them (18_TARGETING), so a branch shown several questions clears
+    /// its whole queue only by naming each one — which it can do in a
+    /// single turn, since several `answer` calls may ride one turn.
     #[test]
-    fn a_fan_in_of_asks_is_answered_to_the_last_one() {
+    fn a_fan_in_of_asks_is_answered_by_a_batch_of_answer_calls() {
         let (mut tree, mut state) = setup();
         let mut posts = Vec::new();
         let mut out = Vec::new();
@@ -4912,25 +4873,89 @@ got X
         }
         assert_eq!(state.open(), posts, "four questions owed");
 
-        let mut answered = Vec::new();
-        let mut turns = 0;
-        while out.iter().any(|o| matches!(o, StepOutput::LlmRequest(_))) {
-            turns += 1;
-            assert!(turns <= posts.len(), "one turn per question, at most");
-            out = state
-                .step(&mut tree, StepInput::LlmResponse(llm_text("ok")))
-                .unwrap();
-            answered.extend(out.iter().filter_map(|o| match o {
-                StepOutput::Answered { question, .. } => *question,
+        let tool_calls = posts
+            .iter()
+            .enumerate()
+            .map(|(i, post)| ToolCall {
+                id: format!("c{i}"),
+                name: TOOL_ANSWER.into(),
+                arguments: json!({ "question": post.as_u64(), "value": format!("a{i}") }),
+            })
+            .collect();
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(LlmTurn {
+                    text: String::new(),
+                    thinking: None,
+                    tool_calls,
+                }),
+            )
+            .unwrap();
+        let answered: Vec<EventId> = out
+            .iter()
+            .filter_map(|o| match o {
+                StepOutput::Answered {
+                    question: Some(q), ..
+                } => Some(*q),
                 _ => None,
-            }));
-        }
-        // Every one answered, oldest first, and the branch owes nothing.
-        assert_eq!(answered, posts);
+            })
+            .collect();
+        assert_eq!(answered, posts, "every post named, in call order");
         assert!(state.open().is_empty());
-        assert!(state.is_idle());
-        // …and it stops there: nothing wakes a branch that owes nothing.
+        // The batch was answers-only, so the branch still owes the API a
+        // reply to those tool calls — a request went back out — but it
+        // owes no *post* any more.
+        assert!(out.iter().any(|o| matches!(o, StepOutput::LlmRequest(_))));
         assert!(!state.needs_prompt(&tree));
+    }
+
+    /// **A bare turn answers nothing.** The post stays open, no `Answer`
+    /// is logged, and the turn's text is still delivered — it is read
+    /// where it sits, not bound to anything (18_TARGETING).
+    #[test]
+    fn a_bare_turn_leaves_every_open_post_open() {
+        let (mut tree, mut state) = setup();
+        user_post(&mut state, &mut tree, "how many lines?");
+        let question = state.open()[0];
+
+        let out = state
+            .step(&mut tree, StepInput::LlmResponse(llm_text("just chatting")))
+            .unwrap();
+
+        assert_eq!(state.open(), [question], "the post is still owed");
+        assert!(
+            !payload_kinds(&state, &tree).contains(&"Answer"),
+            "a bare turn logs no Answer"
+        );
+        assert!(out.iter().any(|o| matches!(
+            o,
+            StepOutput::Answered { question: None, value } if value == "just chatting"
+        )));
+    }
+
+    /// **The anti-loop test.** A branch left owing an answer goes idle
+    /// rather than being re-prompted — `needs_prompt`'s open-post clause
+    /// is gone, so a post staying open is not itself a wake cause. This
+    /// is the test that would have caught an unbounded prompt loop.
+    #[test]
+    fn a_branch_that_owes_an_answer_goes_idle() {
+        let (mut tree, mut state) = setup();
+        user_post(&mut state, &mut tree, "how many lines?");
+        let out = state
+            .step(&mut tree, StepInput::LlmResponse(llm_text("just chatting")))
+            .unwrap();
+
+        assert!(!state.open().is_empty(), "still owed");
+        assert!(state.is_idle());
+        assert!(
+            !state.needs_prompt(&tree),
+            "an open post alone does not wake it"
+        );
+        assert!(
+            !out.iter().any(|o| matches!(o, StepOutput::LlmRequest(_))),
+            "no request went back out: {out:?}"
+        );
     }
 
     /// A **tell** wakes the branch and owes nothing, so it must not join
@@ -5075,10 +5100,10 @@ got X
     }
 
     /// A post arriving **during a generation** is logged now (visible,
-    /// crash-safe) and acted on when the response lands. It cannot steal
-    /// the bare turn's binding, because `shown` fixed that at request
-    /// time — so the turn answers the older question and the new post
-    /// starts the next turn.
+    /// crash-safe) and acted on when the response lands. A bare reply
+    /// answers neither post (18_TARGETING), but `shown` still gates what
+    /// counts as unseen — so the newer post, logged mid-generation,
+    /// starts the next turn on its own once the bare reply's turn lands.
     #[test]
     fn post_during_generation_lands_after_it() {
         let (mut tree, mut state) = setup();
@@ -5091,8 +5116,9 @@ got X
             .unwrap();
         assert!(out.is_empty(), "no second request while one is in flight");
 
-        // A text answer binds the *older* post, then the newer one
-        // starts the next turn in the same step.
+        // A bare reply binds nothing, then the newer post — unseen,
+        // since `shown` was fixed at request time — starts the next turn
+        // in the same step.
         let out = state
             .step(
                 &mut tree,
@@ -5100,17 +5126,15 @@ got X
             )
             .unwrap();
         assert!(
-            out.iter().any(|o| matches!(
-                o,
-                StepOutput::Answered { question: Some(q), .. } if *q == first
-            )),
-            "the arriving post did not steal the binding: {out:?}"
+            out.iter()
+                .any(|o| matches!(o, StepOutput::Answered { question: None, .. })),
+            "a bare reply answers nothing: {out:?}"
         );
         assert!(
             out.iter().any(|o| matches!(o, StepOutput::LlmRequest(_))),
-            "and it started the next turn: {out:?}"
+            "and the unseen post started the next turn: {out:?}"
         );
-        assert_eq!(state.open(), [second]);
+        assert_eq!(state.open(), [first, second], "both still owed");
     }
 
     /// The other half of the same case: a `run_program` response means
