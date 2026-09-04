@@ -304,38 +304,54 @@ impl ChatState {
             // interesting output — the log itself is untouched, only this
             // derived transcript view.
             EventPayload::Call(call) => {
-                let is_wait_until =
-                    matches!(call, Call::Invoke { name, .. } if name.as_str() == "wait_until");
-                if !is_wait_until && let Some(&program) = self.current_program.get(&branch) {
-                    let name = match call {
-                        Call::Invoke { name, .. } => name.clone(),
-                        // The text is the whole point of a Send — a bare
-                        // "ask"/"tell" hid it, and a message to the user
-                        // has nowhere else it could ever be read (unlike
-                        // one to another branch, visible there as a real
-                        // Post if you navigate to it).
-                        Call::Send {
-                            to,
-                            text,
-                            expects_reply,
-                            ..
-                        } => {
-                            let verb = if *expects_reply { "ask" } else { "tell" };
-                            match to {
-                                Address::User => format!("{verb} you: {text}"),
-                                Address::Branch(id) => format!("{verb} #{}: {text}", id.as_u64()),
-                            }
-                        }
-                        Call::Spawn { .. } => "spawn".to_owned(),
-                    };
-                    self.call_rows.insert(id, self.entries.len());
+                // A message to the user is a message, not a tool call — it
+                // renders like the agent just spoke, same as a plain-text
+                // Turn, with no `⚙ .../→ ...` tool-call framing. This is the
+                // only place that text could ever be read; a Send to
+                // another branch stays a compact tool-call summary, since
+                // it's still readable in full there as a real Post.
+                if let Call::Send {
+                    to: Address::User,
+                    text,
+                    ..
+                } = call
+                {
                     self.entries.push(Entry::Line {
                         branch,
                         id,
-                        kind: ChatKind::ToolCall,
-                        text: format!("⚙ {name} → …"),
-                        program: Some(program),
+                        kind: ChatKind::Assistant,
+                        text: text.clone(),
+                        program: None,
                     });
+                } else {
+                    let is_wait_until =
+                        matches!(call, Call::Invoke { name, .. } if name.as_str() == "wait_until");
+                    if !is_wait_until && let Some(&program) = self.current_program.get(&branch) {
+                        let name = match call {
+                            Call::Invoke { name, .. } => name.clone(),
+                            Call::Send {
+                                to: Address::Branch(id),
+                                text,
+                                expects_reply,
+                                ..
+                            } => {
+                                let verb = if *expects_reply { "ask" } else { "tell" };
+                                format!("{verb} #{}: {text}", id.as_u64())
+                            }
+                            Call::Send {
+                                to: Address::User, ..
+                            } => unreachable!("handled above"),
+                            Call::Spawn { .. } => "spawn".to_owned(),
+                        };
+                        self.call_rows.insert(id, self.entries.len());
+                        self.entries.push(Entry::Line {
+                            branch,
+                            id,
+                            kind: ChatKind::ToolCall,
+                            text: format!("⚙ {name} → …"),
+                            program: Some(program),
+                        });
+                    }
                 }
             }
             EventPayload::Result { call, outcome } => {
@@ -762,7 +778,7 @@ mod tests {
     /// only place that message could ever be read (unlike a Send to
     /// another branch, visible there too as a real `Post`).
     #[test]
-    fn tell_and_ask_to_the_user_show_their_text() {
+    fn tell_and_ask_to_the_user_render_as_plain_assistant_messages() {
         let mut chat = ChatState::new();
         chat.apply(&ev(
             1,
@@ -795,18 +811,23 @@ mod tests {
             }),
         ));
 
-        let glyphs: Vec<String> = chat
+        // Neither is a `⚙` tool-call row at all — both are plain
+        // `Assistant`-kind messages, exactly like the agent's own text.
+        assert!(
+            !chat
+                .rows(None)
+                .iter()
+                .any(|(k, t, _, _)| *k == ChatKind::ToolCall && t.starts_with('⚙'))
+        );
+        let messages: Vec<String> = chat
             .rows(None)
             .into_iter()
-            .filter(|(k, t, _, _)| *k == ChatKind::ToolCall && t.starts_with('⚙'))
+            .filter(|(k, _, _, _)| *k == ChatKind::Assistant)
             .map(|(_, t, _, _)| t)
             .collect();
         assert_eq!(
-            glyphs,
-            vec![
-                "⚙ tell you: hello 👋 → …",
-                "⚙ ask you: what's your name? → …",
-            ]
+            messages,
+            vec!["agent ❯ hello 👋", "agent ❯ what's your name?"]
         );
     }
 
