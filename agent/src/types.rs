@@ -413,23 +413,31 @@ pub struct Context {
 
 impl Context {
     /// The `input` const a program binds: the machine-bound data of the
-    /// **oldest open post**, whole. The context sees only a bounded
-    /// preview of the same value, so a caller passing a large `input`
-    /// never dumps it into the callee's context.
+    /// **oldest still-open post**, whole. The context sees only a
+    /// bounded preview of the same value, so a caller passing a large
+    /// `input` never dumps it into the callee's context.
     ///
-    /// "Open" is refined in A6 to "unanswered, at or after this branch's
-    /// root"; here it is the oldest post that expects a reply.
-    pub fn input(&self) -> &serde_json::Value {
-        self.messages
-            .iter()
-            .find_map(|m| match m {
-                Message::Post { origin, .. } => match origin.direct() {
-                    Some((_, input, true)) => Some(input),
-                    _ => None,
-                },
-                _ => None,
-            })
-            .unwrap_or(&serde_json::Value::Null)
+    /// `open` is exactly this branch's obligations (18_TARGETING: only
+    /// `answer(question, value)` closes one), so `open.first()` — not a
+    /// scan of `messages` for the first post that merely *expected* a
+    /// reply — is the post a fresh program should bind to; after the
+    /// first is answered, the next `run_program` sees the next one.
+    /// `Value::Null` when nothing is open.
+    pub fn input(&self, tree: &Tree) -> serde_json::Value {
+        let Some(&question) = self.open.first() else {
+            return serde_json::Value::Null;
+        };
+        let Some(EventPayload::Message(msg)) = tree.events.get(&question).map(|e| &e.payload)
+        else {
+            return serde_json::Value::Null;
+        };
+        match tree.resolve(msg) {
+            Message::Post { origin, .. } => origin
+                .direct()
+                .map(|(_, input, _)| input.clone())
+                .unwrap_or(serde_json::Value::Null),
+            _ => serde_json::Value::Null,
+        }
     }
 }
 

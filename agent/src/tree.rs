@@ -1406,7 +1406,7 @@ mod tests {
         for spine in [&child, &tree.spine_at(child.leaf_id)] {
             assert_eq!(spine.contexts.len(), 2, "child sits under the root agent");
             assert_eq!(spine.context().charter, "child prompt");
-            assert_eq!(spine.context().input(), &json!({"task": 1}));
+            assert_eq!(spine.context().input(&tree), json!({"task": 1}));
             let msgs: Vec<&str> = spine.context().messages.iter().map(|m| m.text()).collect();
             assert_eq!(msgs, ["child prompt", "child working"]);
         }
@@ -1613,7 +1613,7 @@ mod tests {
             let ctx = ctx.context();
             assert_eq!(ctx.messages.len(), 1);
             assert_eq!(ctx.messages[0].text(), plan);
-            assert_eq!(ctx.input(), &json!({ "big": plan.clone() }));
+            assert_eq!(ctx.input(&tree), json!({ "big": plan.clone() }));
         }
         Ok(())
     }

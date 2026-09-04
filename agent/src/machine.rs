@@ -1209,7 +1209,7 @@ impl Runner {
                     self.last_vm = Some(run.vm);
                 }
                 self.generation += 1;
-                match self.start_program(assistant_id, source, attachments, call.id.clone()) {
+                match self.start_program(tree, assistant_id, source, attachments, call.id.clone()) {
                     Ok(run) => {
                         self.phase = Phase::Running(run);
                         self.note_status(assistant_id, ProgramStatus::Running);
@@ -1518,6 +1518,7 @@ impl Runner {
     /// from this run). `Err` is the rendered repair-loop report.
     fn start_program(
         &mut self,
+        tree: &Tree,
         program_id: EventId,
         source: &str,
         attachments: serde_json::Value,
@@ -1526,7 +1527,7 @@ impl Runner {
         let program = compile(source).map_err(|diags| render_diags(source, &diags))?;
         // The whole `input` reaches the program even though the context
         // saw only a bounded preview of it.
-        let vm = VM::for_program_with(program, self.spine.context().input().clone(), attachments)
+        let vm = VM::for_program_with(program, self.spine.context().input(tree), attachments)
             .map_err(|e| format!("program setup failed: {}", e.message))?;
         Ok(Run {
             program_id,
@@ -3151,6 +3152,54 @@ mod tests {
             .unwrap();
         drain(&mut state, &mut tree, out);
         assert!(last_report(&state, &tree).contains("returned: 7"));
+    }
+
+    /// `Context::input` binds the **oldest still-open** post, not the
+    /// first post that ever expected a reply (18_TARGETING Step B3) —
+    /// answering the first moves it to the second; answering that one
+    /// too leaves nothing to bind.
+    #[test]
+    fn input_moves_to_the_next_open_post_as_each_is_answered() {
+        let (mut tree, mut state) = setup();
+        let (first, _) = state
+            .deliver(
+                &mut tree,
+                Author::User,
+                Origin::Direct {
+                    text: "one".into(),
+                    input: json!({ "n": 1 }),
+                    expects_reply: true,
+                },
+            )
+            .unwrap();
+        let (second, _) = state
+            .deliver(
+                &mut tree,
+                Author::User,
+                Origin::Direct {
+                    text: "two".into(),
+                    input: json!({ "n": 2 }),
+                    expects_reply: true,
+                },
+            )
+            .unwrap();
+        assert_eq!(state.spine.context().input(&tree), json!({ "n": 1 }));
+
+        state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(llm_answer("a1", first, json!("ok"))),
+            )
+            .unwrap();
+        assert_eq!(state.spine.context().input(&tree), json!({ "n": 2 }));
+
+        state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(llm_answer("a2", second, json!("ok"))),
+            )
+            .unwrap();
+        assert_eq!(state.spine.context().input(&tree), serde_json::Value::Null);
     }
 
     #[test]
