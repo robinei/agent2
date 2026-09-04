@@ -792,7 +792,17 @@ impl AttachedApp {
                 Some(id) => KeyAction::ForkAt(id),
                 None => KeyAction::Fork,
             },
-            KeyCode::Char('x') if self.view != View::FullDebug => KeyAction::Interrupt,
+            // Only three statuses are actually interruptible — `Idle`
+            // (`Runner::interrupt`, `machine.rs`) and `dormant` (no live
+            // `Runner`, `cmd_interrupt` short-circuits) are both inert,
+            // spelled out rather than `!= "idle"` since `dormant` would
+            // otherwise wrongly count as live (19_UX Step F2).
+            KeyCode::Char('x')
+                if self.view != View::FullDebug
+                    && matches!(selected_status, Some("running" | "thinking" | "suspended")) =>
+            {
+                KeyAction::Interrupt
+            }
             KeyCode::Char('w') if self.view != View::FullDebug => KeyAction::JumpToWaiting,
             KeyCode::Char('t') if self.view != View::FullDebug => {
                 self.timeline = true;
@@ -1440,6 +1450,12 @@ fn render(frame: &mut Frame, app: &mut AttachedApp, session: &Session) {
         .selected
         .and_then(|s| infos.iter().find(|i| i.branch == s))
         .is_some_and(|i| i.status == "suspended");
+    // `x interrupt` only means something on a live, non-idle branch
+    // (19_UX Step F2) — same shape again.
+    let interruptible = app
+        .selected
+        .and_then(|s| infos.iter().find(|i| i.branch == s))
+        .is_some_and(|i| matches!(i.status.as_str(), "running" | "thinking" | "suspended"));
     // `tab`/`1-9` cycle or jump between branches — with only one, that
     // targets the branch already selected, and `cycle_branch` guards
     // against the real cost of that (it would otherwise silently reset
@@ -1452,6 +1468,7 @@ fn render(frame: &mut Frame, app: &mut AttachedApp, session: &Session) {
         app.ask_armed,
         waiting,
         resumable,
+        interruptible,
         multi_branch,
     );
     frame.render_widget(
@@ -1471,6 +1488,7 @@ fn footer_hint(
     ask_armed: bool,
     waiting: bool,
     resumable: bool,
+    interruptible: bool,
     multi_branch: bool,
 ) -> String {
     match (view, focus) {
@@ -1491,15 +1509,17 @@ fn footer_hint(
             if multi_branch { " · tab agent" } else { "" }
         ),
         (View::Running, Focus::Debug) => format!(
-            " esc/i type · c collapse · d debugger · 1-4 panes · f fork · p spawn · \
-             x interrupt · a ask · r rename{}{} · t timeline{} · q quit ",
+            " esc/i type · c collapse · d debugger · 1-4 panes · f fork · p spawn · a ask \
+             · r rename{}{}{} · t timeline{} · q quit ",
+            if interruptible { " · x interrupt" } else { "" },
             if resumable { " · v resume" } else { "" },
             if waiting { " · w waiting" } else { "" },
             if multi_branch { " · tab agent" } else { "" }
         ),
         (_, Focus::Debug) => format!(
-            " esc/i type · c expand · d debugger · f fork · p spawn · x interrupt · a ask \
-             · r rename{}{} · t timeline{} · q quit ",
+            " esc/i type · c expand · d debugger · f fork · p spawn · a ask \
+             · r rename{}{}{} · t timeline{} · q quit ",
+            if interruptible { " · x interrupt" } else { "" },
             if resumable { " · v resume" } else { "" },
             if waiting { " · w waiting" } else { "" },
             if multi_branch { " · tab agent" } else { "" }
@@ -2431,13 +2451,38 @@ mod tests {
             KeyAction::ForkAt(fid(42))
         );
         assert_eq!(
-            app.on_debug_key(KeyCode::Char('x'), &[], None),
+            app.on_debug_key(KeyCode::Char('x'), &[], Some("running")),
             KeyAction::Interrupt
         );
         assert_eq!(
             app.on_debug_key(KeyCode::Char('w'), &[], None),
             KeyAction::JumpToWaiting
         );
+    }
+
+    /// `x` only fires Interrupt on a live, non-idle branch — `Idle` is a
+    /// genuine no-op in `Runner::interrupt`, and `dormant` short-circuits
+    /// in `cmd_interrupt` before it even runs, so both stay silently
+    /// inert rather than a wasted (if harmless) round trip (19_UX Step
+    /// F2).
+    #[test]
+    fn x_only_interrupts_a_live_non_idle_branch() {
+        let mut app = AttachedApp::new(fid(1));
+        app.focus = Focus::Debug;
+        for status in ["running", "thinking", "suspended"] {
+            assert_eq!(
+                app.on_debug_key(KeyCode::Char('x'), &[], Some(status)),
+                KeyAction::Interrupt,
+                "{status} should be interruptible"
+            );
+        }
+        for status in [Some("idle"), Some("dormant"), None] {
+            assert_eq!(
+                app.on_debug_key(KeyCode::Char('x'), &[], status),
+                KeyAction::None,
+                "{status:?} should not be interruptible"
+            );
+        }
     }
 
     /// A branch waiting on you renders its question above the input line
@@ -2553,17 +2598,67 @@ mod tests {
 
     #[test]
     fn footer_hint_shows_v_resume_only_when_resumable() {
-        let with = footer_hint(View::Chat, Focus::Debug, false, false, true, false);
+        let with = footer_hint(View::Chat, Focus::Debug, false, false, true, false, false);
         assert!(with.contains("v resume"), "{with}");
 
-        let without = footer_hint(View::Chat, Focus::Debug, false, false, false, false);
+        let without = footer_hint(View::Chat, Focus::Debug, false, false, false, false, false);
         assert!(!without.contains("v resume"), "{without}");
 
-        let running_with = footer_hint(View::Running, Focus::Debug, false, false, true, false);
+        let running_with = footer_hint(
+            View::Running,
+            Focus::Debug,
+            false,
+            false,
+            true,
+            false,
+            false,
+        );
         assert!(running_with.contains("v resume"), "{running_with}");
 
-        let running_without = footer_hint(View::Running, Focus::Debug, false, false, false, false);
+        let running_without = footer_hint(
+            View::Running,
+            Focus::Debug,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
         assert!(!running_without.contains("v resume"), "{running_without}");
+    }
+
+    #[test]
+    fn footer_hint_shows_x_interrupt_only_when_interruptible() {
+        let with = footer_hint(View::Chat, Focus::Debug, false, false, false, true, false);
+        assert!(with.contains("x interrupt"), "{with}");
+
+        let without = footer_hint(View::Chat, Focus::Debug, false, false, false, false, false);
+        assert!(!without.contains("x interrupt"), "{without}");
+
+        let running_with = footer_hint(
+            View::Running,
+            Focus::Debug,
+            false,
+            false,
+            false,
+            true,
+            false,
+        );
+        assert!(running_with.contains("x interrupt"), "{running_with}");
+
+        let running_without = footer_hint(
+            View::Running,
+            Focus::Debug,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+        assert!(
+            !running_without.contains("x interrupt"),
+            "{running_without}"
+        );
     }
 
     /// `wrap_input` places the cursor glyph exactly where wrapping
