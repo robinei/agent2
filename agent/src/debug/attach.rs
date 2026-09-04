@@ -492,9 +492,10 @@ impl AttachedApp {
                     Some(mode) => KeyAction::SubmitMode(mode, text),
                     None => KeyAction::Submit {
                         text,
-                        // The tell modifier (17_BRANCHES: "the TUI
-                        // exposes it as a modifier on send").
-                        expects_reply: !key.modifiers.contains(KeyModifiers::ALT),
+                        // The ask modifier (18_TARGETING: Enter tells,
+                        // Alt+Enter asks — a human has recourse to ask
+                        // again, so the default costs nothing to skip).
+                        expects_reply: key.modifiers.contains(KeyModifiers::ALT),
                     },
                 }
             }
@@ -1150,7 +1151,7 @@ fn render(frame: &mut Frame, app: &mut AttachedApp, session: &Session) {
             " d/esc chat · tab/1-9 agent · space run/pause · s step · n step line · q quit "
         }
         (_, Focus::Input) => {
-            " type to chat · enter send (alt+enter tell) · tab agent · esc debug keys "
+            " type to chat · enter send (alt+enter ask) · tab agent · esc debug keys "
         }
         (View::Running, Focus::Debug) => {
             " esc/i type · c collapse · d debugger · 1-4 panes · f/F fork · p spawn · x interrupt \
@@ -1723,9 +1724,10 @@ mod tests {
         }
     }
 
-    /// The input line's default behaviour (D2): a plain Enter asks, an
-    /// Alt+Enter tells — both `UserTurn` — unless the branch has a
-    /// pending ask-to-user, in which case either one replies.
+    /// The input line's default behaviour (18_TARGETING Part A): a plain
+    /// Enter tells, an Alt+Enter asks — both `UserTurn` — unless the
+    /// branch has a pending ask-to-user, in which case either one
+    /// replies.
     #[test]
     fn reply_mode_wins_over_ask_or_tell_when_a_branch_is_waiting_on_you() {
         let b = fid(1);
@@ -1758,28 +1760,28 @@ mod tests {
         );
     }
 
-    /// Alt+Enter is the tell modifier; a plain Enter asks.
+    /// Alt+Enter is the ask modifier; a plain Enter tells.
     #[test]
-    fn alt_enter_is_the_tell_modifier() {
+    fn alt_enter_is_the_ask_modifier() {
         let mut app = AttachedApp::new(fid(1));
-        for c in "fyi".chars() {
+        for c in "hi".chars() {
             app.on_input_key(KeyEvent::from(KeyCode::Char(c)));
         }
         assert_eq!(
             app.on_input_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)),
             KeyAction::Submit {
-                text: "fyi".into(),
-                expects_reply: false,
+                text: "hi".into(),
+                expects_reply: true,
             }
         );
-        for c in "hi".chars() {
+        for c in "fyi".chars() {
             app.on_input_key(KeyEvent::from(KeyCode::Char(c)));
         }
         assert_eq!(
             app.on_input_key(KeyEvent::from(KeyCode::Enter)),
             KeyAction::Submit {
-                text: "hi".into(),
-                expects_reply: true,
+                text: "fyi".into(),
+                expects_reply: false,
             }
         );
     }
@@ -2051,7 +2053,7 @@ mod tests {
             app.on_key(KeyCode::Enter.into(), &[]),
             KeyAction::Submit {
                 text: "d1 sq".into(),
-                expects_reply: true,
+                expects_reply: false,
             }
         );
         assert!(app.input.is_empty());

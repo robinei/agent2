@@ -226,10 +226,12 @@ fn queue_nav(session: &host::Session, nav: &SessionNav) {
         h.send(host::SessionCommand::Rename { branch, name });
     }
     if let Some(text) = nav.turn.clone() {
+        // A kickoff line is a task instruction, not a question, and the
+        // agent's reply reaches the client either way (18_TARGETING).
         h.send(host::SessionCommand::UserTurn {
             branch,
             text,
-            expects_reply: true,
+            expects_reply: false,
         });
     }
 }
