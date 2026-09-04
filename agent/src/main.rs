@@ -412,8 +412,16 @@ fn print_session_event(event: &SessionEvent) {
                         .collect();
                     println!("{head} turn: {}{}", text, calls.join(" "));
                 }
+                // `wait_until` is exempt: a polling loop calls it repeatedly
+                // for no reason worth printing, and it never has interesting
+                // output. The log itself still records it in full — only
+                // this printer's view is thinned. Its `Result` line still
+                // prints on its own; not worth tracking ids to suppress that
+                // too.
                 EventPayload::Call(call) => {
-                    println!("{head} call: {}", describe_call(call));
+                    if !matches!(call, Call::Invoke { name, .. } if name.as_str() == "wait_until") {
+                        println!("{head} call: {}", describe_call(call));
+                    }
                 }
                 EventPayload::Result { call, outcome } => match outcome {
                     Outcome::Delivered(v) => {

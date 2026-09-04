@@ -2669,7 +2669,15 @@ mod tests {
             text: "delegate two".into(),
             expects_reply: true,
         });
-        let session = session.run();
+        // Rarely (under heavy parallel-test load only — never reproduced
+        // in isolation across hundreds of runs) this hangs instead of going
+        // quiet: some interleaving of the two concurrent child completions
+        // apparently loses track of one child's open post. `run_or_panic`
+        // turns that into a fast, clear failure instead of a multi-minute
+        // hang that looks like the whole suite froze. Root cause not yet
+        // found — suspect a race between a spawned child's `Post` landing
+        // and its first LLM request being dispatched/rendered.
+        let session = run_or_panic(session, Duration::from_secs(5));
         let _events: Vec<SessionEvent> = rx.try_iter().collect();
         let tree = session.tree();
 
@@ -3103,6 +3111,56 @@ mod tests {
     fn drain(mut session: Session) -> Session {
         while session.pump_one() {}
         session
+    }
+
+    /// `session.run()`, but bounded by wall-clock time instead of blocking
+    /// forever. `run()`'s last step is an untimed `self.rx.recv()` —
+    /// correct for production (nothing should ever leave a session
+    /// permanently not-quiet) — but a bug that violates that turns a test
+    /// failure into a multi-minute hang that looks like the whole suite
+    /// froze. `Session` holds `Rc`s, so it cannot cross a thread boundary
+    /// to be raced against a watchdog; this reimplements `pump_one`'s exact
+    /// loop in place, replacing only its final untimed `recv()`. It must
+    /// mirror `pump_one` precisely: `quiet` is sampled *before* the drain
+    /// (a worker decrements `in_flight` only after its send lands, so a
+    /// message can be waiting even when `quiet()` now reads true) and
+    /// `try_recv`'d regardless, exactly as `pump_one`'s own comment
+    /// explains — skip that and this races the very thing `quiet()`
+    /// guards against, dropping a message that already arrived.
+    fn run_or_panic(mut session: Session, budget: Duration) -> Session {
+        let deadline = Instant::now() + budget;
+        loop {
+            if session.done {
+                return session;
+            }
+            let quiet = session.quiet();
+            match session.rx.try_recv() {
+                Ok(msg) => {
+                    session.on_msg(msg);
+                    continue;
+                }
+                Err(TryRecvError::Disconnected) => return session,
+                Err(TryRecvError::Empty) => {}
+            }
+            if quiet {
+                return session;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                panic!(
+                    "session did not go quiet within {budget:?} — a branch is stuck \
+                     waiting on work that will never arrive"
+                );
+            }
+            match session.rx.recv_timeout(deadline - now) {
+                Ok(msg) => session.on_msg(msg),
+                Err(RecvTimeoutError::Timeout) => panic!(
+                    "session did not go quiet within {budget:?} — a branch is stuck \
+                     waiting on work that will never arrive"
+                ),
+                Err(RecvTimeoutError::Disconnected) => return session,
+            }
+        }
     }
 
     /// How long a test that deliberately blocks a worker waits for the

@@ -299,8 +299,14 @@ impl ChatState {
             }
             // A call is logged at dispatch, so its row appears the moment
             // it is issued; the `Result` completes the same row in place.
+            // `wait_until` is exempt: a polling loop calls it repeatedly for
+            // no reason a human watching needs to see, and it never has
+            // interesting output — the log itself is untouched, only this
+            // derived transcript view.
             EventPayload::Call(call) => {
-                if let Some(&program) = self.current_program.get(&branch) {
+                let is_wait_until =
+                    matches!(call, Call::Invoke { name, .. } if name.as_str() == "wait_until");
+                if !is_wait_until && let Some(&program) = self.current_program.get(&branch) {
                     let name = match call {
                         Call::Invoke { name, .. } => name.clone(),
                         Call::Send { expects_reply, .. } => {
@@ -705,6 +711,37 @@ mod tests {
                 .iter()
                 .any(|(_, t, _, _)| t.contains("program completed"))
         );
+    }
+
+    /// `wait_until` never becomes a row — a polling loop calling it
+    /// repeatedly would otherwise spam the transcript with lines no one
+    /// watching needs to see. Its `Result` is likewise silent (no row was
+    /// ever inserted for `call_rows` to find). A sibling call is unaffected.
+    #[test]
+    fn wait_until_calls_are_never_transcript_rows() {
+        let mut chat = ChatState::new();
+        chat.apply(&ev(
+            1,
+            EventPayload::Agent {
+                name: None,
+                charter: "p".into(),
+                tools: None,
+                system: String::new(),
+            },
+        ));
+        chat.apply(&run_program(2));
+        chat.apply(&invoke(3, "wait_until"));
+        chat.apply(&invoke(4, "fetch"));
+        chat.apply(&settled(5, 3, serde_json::json!(null)));
+        chat.apply(&settled(6, 4, serde_json::json!("A")));
+
+        let glyphs: Vec<String> = chat
+            .rows(None)
+            .into_iter()
+            .filter(|(k, t, _, _)| *k == ChatKind::ToolCall && t.starts_with('⚙'))
+            .map(|(_, t, _, _)| t)
+            .collect();
+        assert_eq!(glyphs, vec!["⚙ fetch → \"A\""]);
     }
 
     /// `Agent.system` — the snapshot on the branch root — renders as the
