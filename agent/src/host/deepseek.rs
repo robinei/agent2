@@ -14,7 +14,7 @@ use crate::host::llm::{Cancel, LlmChunk, LlmClient};
 use crate::machine::{LlmRequest, LlmTurn, Rendered};
 use crate::types::ToolCall;
 
-const DEFAULT_MODEL: &str = "deepseek-v4-flash";
+const DEFAULT_MODEL: &str = "muse-spark-1.2-contributor";
 const DEFAULT_BASE_URL: &str = "https://opencode.ai/zen/go/v1";
 
 pub struct DeepSeekClient {
