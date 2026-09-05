@@ -192,6 +192,15 @@ pub struct AttachedApp {
     /// capped instead of always growing to fit the whole tree.
     pub navigator_scroll: Option<usize>,
     pub pane_rects: Vec<(Pane, PaneInfo)>,
+    /// Wrapped chat line → logical row index, rebuilt by `render_chat`
+    /// every frame. A chat row wraps to one-or-more terminal lines
+    /// (`push_wrapped_width`), so `PaneInfo.scroll_top` and a click's
+    /// in-pane offset are both wrapped-line coordinates — indexing
+    /// `chat.rows()` with them directly (a row-space list) drifts by
+    /// however many extra lines any wrapped row above the click added,
+    /// landing clicks on the wrong row once anything has wrapped. This
+    /// is the one source of truth translating one space to the other.
+    pub chat_line_rows: Vec<usize>,
     last_chat_lines: usize,
     /// The currently selected chat row, toggled by clicking it — what
     /// `f` forks from when set (19_UX Step C2); with nothing selected,
@@ -242,6 +251,7 @@ impl AttachedApp {
             promises_scroll: None,
             navigator_scroll: None,
             pane_rects: Vec::new(),
+            chat_line_rows: Vec::new(),
             last_chat_lines: 0,
             last_clicked_event: None,
             explicit_mode: None,
@@ -356,7 +366,12 @@ impl AttachedApp {
                 let Some(body) = body else { return };
                 let line = info.scroll_top + body;
                 let rows = self.chat.rows(self.selected);
-                if let Some((kind, text, detail, id)) = rows.get(line) {
+                // `line` is a wrapped-line offset; translate it back to
+                // the logical row it belongs to before indexing `rows`.
+                let Some(&row_idx) = self.chat_line_rows.get(line) else {
+                    return;
+                };
+                if let Some((kind, text, detail, id)) = rows.get(row_idx) {
                     // "Fork at this point" (D2, `f`) forks from whatever
                     // row is selected — a real logged event, never the
                     // streaming sentinel. Clicking the already-selected
@@ -1280,8 +1295,9 @@ fn render(frame: &mut Frame, app: &mut AttachedApp, session: &Session) {
         // to reply mode, exactly when this branch is waiting on you
         // (17_BRANCHES Part D).
         let asking_text = app.selected.and_then(|b| asking_question_text(session, b));
-        let (top, transcript_area, input_area) =
+        let (top, transcript_area, input_area, row_at_line) =
             render_chat(frame, app, left, app.chat_scroll, asking_text.as_deref());
+        app.chat_line_rows = row_at_line;
         app.pane_rects.push((
             Pane::Chat,
             PaneInfo {
@@ -1685,7 +1701,7 @@ fn render_chat(
     area: Rect,
     scroll: Option<usize>,
     asking: Option<&str>,
-) -> (usize, Rect, Rect) {
+) -> (usize, Rect, Rect, Vec<usize>) {
     // The input box grows to fit a prefilled/multi-line buffer (Part
     // B's rewrite gesture, or Ctrl-O), capped so a long one still
     // leaves the chat pane standing.
@@ -1708,10 +1724,15 @@ fn render_chat(
     let wrap_width = transcript_area.width.saturating_sub(2).max(1) as usize;
     let rows = app.chat.rows(app.selected);
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(rows.len());
+    // One entry per wrapped line pushed below, naming which `rows` index
+    // it came from — the inverse of the one-to-many row→lines expansion
+    // `push_wrapped_width` does, and what lets a click (a wrapped-line
+    // coordinate) find its way back to a logical row.
+    let mut row_at_line: Vec<usize> = Vec::with_capacity(rows.len());
     let mut parity: HashMap<ChatKind, bool> = HashMap::new();
     let mut in_program: Option<EventId> = None;
     let mut prev_kind: Option<ChatKind> = None;
-    for (kind, text, detail, id) in &rows {
+    for (row_idx, (kind, text, detail, id)) in rows.iter().enumerate() {
         let even = match detail {
             RowDetail::Program(pid) | RowDetail::Attachment(pid, _) | RowDetail::Invoke(pid, _) => {
                 if in_program != Some(*pid) {
@@ -1757,7 +1778,10 @@ fn render_chat(
         if app.last_clicked_event == Some(*id) {
             style = style.add_modifier(Modifier::REVERSED);
         }
+        let before = lines.len();
         push_wrapped_width(&mut lines, text, style, wrap_width);
+        row_at_line.resize(lines.len(), row_idx);
+        debug_assert!(lines.len() > before, "every row pushes at least one line");
     }
     let visible = transcript_area.height.saturating_sub(2) as usize;
     let default_top = lines.len().saturating_sub(visible);
@@ -1824,7 +1848,7 @@ fn render_chat(
         ),
         input_area,
     );
-    (top, transcript_area, input_area)
+    (top, transcript_area, input_area, row_at_line)
 }
 
 /// Every branch, nested exactly as the log nests them (`parent_branch`):
@@ -3033,6 +3057,9 @@ mod tests {
                 scroll_top: 0,
             },
         ));
+        // Identity mapping — every row here is one line, no wrapping —
+        // standing in for what `render_chat` would otherwise build.
+        app.chat_line_rows = (0..rows.len()).collect();
 
         // Row 0 is at `row = 1` (the top border occupies row 0).
         app.on_click(0, 1, &[branch]);
@@ -3049,6 +3076,52 @@ mod tests {
             Some(first_id),
             "a different row replaces the selection outright"
         );
+    }
+
+    /// The bug report this guards against: a wrapped row pushes more
+    /// than one entry into `render_chat`'s wrapped-line `Paragraph`, so
+    /// screen row 2 is *not* logical row 2 once anything above it
+    /// wrapped — `chat_line_rows` is what translates back. Without it
+    /// (indexing `rows` with the wrapped-line offset directly, as the
+    /// code used to), this same click would have landed on `rows[2]`
+    /// instead of `rows[1]` — a click on the row after a wrapped one
+    /// hitting the wrong logical row, or landing past the end of a short
+    /// transcript and silently doing nothing (which looks exactly like
+    /// "the branch got deselected" once it happens to misfire onto a
+    /// stray "agent N" mention elsewhere in the transcript).
+    #[test]
+    fn clicking_past_a_wrapped_row_resolves_the_correct_logical_row() {
+        let (tx, rx) = channel();
+        let session = run_demo(Tree::new(None), tx).unwrap();
+        let branch = session.conversation_branch();
+        let mut app = AttachedApp::new(branch);
+        for event in rx.try_iter() {
+            app.apply(&event);
+        }
+        let rows = app.chat.rows(Some(branch));
+        assert!(rows.len() >= 3, "the demo logs at least three rows");
+        let (row1_id, row2_id) = (rows[1].3, rows[2].3);
+        app.pane_rects.push((
+            Pane::Chat,
+            PaneInfo {
+                area: Rect {
+                    x: 0,
+                    y: 0,
+                    width: 80,
+                    height: 50,
+                },
+                scroll_top: 0,
+            },
+        ));
+        // Row 0 wraps to two lines; every row after it shifts by one in
+        // wrapped-line space.
+        app.chat_line_rows = std::iter::once(0).chain(0..rows.len()).collect::<Vec<_>>();
+
+        // Wrapped-line 2 is logical row 1's line (row 0 occupied wrapped
+        // lines 0 and 1) — not logical row 2.
+        app.on_click(0, 3, &[branch]); // row 0 is border; wrapped-line 2 is screen row 3
+        assert_eq!(app.last_clicked_event, Some(row1_id));
+        assert_ne!(app.last_clicked_event, Some(row2_id));
     }
 
     #[test]
