@@ -1134,6 +1134,22 @@ pub fn run_attached(mut session: Session, events_rx: Receiver<SessionEvent>) -> 
         let infos = session.branch_infos();
         let ordered = ordered_branches(infos.clone());
         let branches: Vec<BranchId> = ordered.iter().map(|b| b.branch).collect();
+        // Render *before* resolving this tick's inputs, not after: a click
+        // is hit-tested against `pane_rects`/`chat_line_rows`, which this
+        // call is what refreshes. Rendering at the end of the loop (the
+        // old order) meant a click was always resolved against the
+        // *previous* tick's layout — stale by exactly the events just
+        // applied above. Usually harmless (nothing shifted), but a new
+        // chat row landing in that same window shifts every wrapped-line
+        // offset after it, so a click on what just became the newest row
+        // was the single likeliest way to hit this: the fresh content is
+        // in `chat.rows()` already (applied above) but not yet in the
+        // layout a click is about to be resolved against. Moving render
+        // here costs one tick (~30ms) of visual lag on a click's own
+        // on-screen effect — imperceptible against this loop's own cadence.
+        if let Err(e) = terminal.draw(|frame| render(frame, &mut app, &session)) {
+            break Err(e.to_string());
+        }
         for input in inputs {
             match input {
                 CtEvent::Key(key) if key.is_press() => {
@@ -1226,9 +1242,6 @@ pub fn run_attached(mut session: Session, events_rx: Receiver<SessionEvent>) -> 
         }
         if app.quit {
             break Ok(());
-        }
-        if let Err(e) = terminal.draw(|frame| render(frame, &mut app, &session)) {
-            break Err(e.to_string());
         }
     };
     ratatui::crossterm::execute!(
