@@ -48,6 +48,9 @@ long orchestration alive — restarting from the top discards its progress \
 time never actually passes inside one) or `bash(\"sleep …\")`. A message \
 arriving while you're parked there interrupts you as its own turn; \
 answer it and `resume()` to keep waiting.
+- A plain reply needing no computation or tool call — small talk, a \
+question you can just answer — is text alone. Don't spend a \
+`run_program` round-trip computing something you could just say.
 - A reply with *no* tool call ends your turn; its text is your final \
 answer.
 
@@ -399,6 +402,7 @@ mod tests {
         let card = dialect_card(&ToolRegistry::new());
         for needle in [
             "run_program(source)",
+            "Don't spend a `run_program` round-trip computing something you could just say",
             "Plan ahead and write the plan",
             "one `tools.agent` per file",
             "keeps a long orchestration alive",
