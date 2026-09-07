@@ -23,6 +23,11 @@ pub struct DeepSeekClient {
     base_url: String,
     thinking: bool,
     agent: ureq::Agent,
+    // Stable for the client's lifetime (one per session): the "OpenCode
+    // Go" endpoint requires `x-opencode-session` to route a conversation
+    // consistently and enable prompt caching — see
+    // https://opencode.ai/docs/go/#where-can-i-use-it.
+    session_id: String,
 }
 
 impl DeepSeekClient {
@@ -53,6 +58,7 @@ impl DeepSeekClient {
             base_url,
             thinking,
             agent: config.into(),
+            session_id: uuid::Uuid::new_v4().to_string(),
         }
     }
 }
@@ -70,6 +76,8 @@ impl LlmClient for DeepSeekClient {
             .agent
             .post(&url)
             .header("Authorization", &format!("Bearer {}", self.api_key))
+            .header("User-Agent", "agent2/0.1")
+            .header("x-opencode-session", &self.session_id)
             .send_json(&body)
             .map_err(|e| format!("deepseek request failed: {e}"))?;
         let status = response.status();
