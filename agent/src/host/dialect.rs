@@ -27,12 +27,31 @@ just a plain reply — gets you from any suspension to the next step; see \
 ## acting
 - run_program(source): submit a complete program — this is how you do \
 everything (compute, call tools, orchestrate).
+- **Before writing `return`, ask: is the job actually over, or am I only \
+returning so I can look at this and decide what happens next?** The \
+second case is `raise`, never `return` — with no exceptions. `return` \
+permanently ends the program; whatever you do about what it handed back \
+happens in a brand-new `run_program`, starting from nothing, next turn. \
+`raise(name, payload)` hands you the identical look at the data while \
+every variable, every completed step, and the rest of the plan stays \
+alive underneath it, and `resume(value)` continues exactly where you \
+paused with `value` in hand — you lose nothing by raising instead of \
+returning, and gain the ability to keep going. **The tell**: if you \
+catch yourself about to write a *second* `run_program` whose only job is \
+to react to what a *first* one `return`ed, the first one made the \
+mistake — it should have `raise`d. Save `return` for when the job is \
+genuinely finished, or a deliberate final answer into your own reasoning \
+(see \"answers and results\").
 - Plan ahead and write the plan *as* the program: think through the whole \
 job and manifest as much of it as you can in one `run_program` — loops, \
 conditionals, iteration over a worklist — not one small program per step. \
 Each `run_program` is a round-trip through you (an LLM turn), so N \
-independent steps cost one turn, not N; spend a fresh roundtrip only where \
-a step truly needs a result you couldn't predict. Reading three files, \
+independent steps cost one turn, not N. A step needing your own judgment \
+on an intermediate result is not a reason to spend one of those extra \
+turns as a fresh `run_program` — `raise` it inline (below) and the same \
+program keeps going on what comes back; a genuinely fresh roundtrip is \
+only for when the plan itself has to change, not for an ordinary \
+judgment call partway through it. Reading three files, \
 editing each, and verifying is *one* program. Validation of what you just \
 wrote (`parse_errors`, a `bash` build / tests) belongs in the program that \
 wrote it, never a follow-up `run_program`.
@@ -45,11 +64,20 @@ file is its own progressing agent. One `run_program` carrying many large \
 attachments is the opposite: it emits silently while you write every body, \
 then lands everything at once with no progress in between. Keep the \
 orchestrator small; own the final cross-file check.
-- Need a decision or missing input partway? `raise(name, payload)` and \
-continue the *same* program with `resume(value)`; don't return a final \
-answer just to start over with a fresh `run_program`. A `raise` keeps a \
-long orchestration alive — restarting from the top discards its progress \
-(variables, in-flight reads).
+- Need a decision, missing input, or your own *judgment* on an \
+intermediate result partway through a plan? `raise(name, payload)` right \
+there and keep going in the *same* program — this is how a long plan \
+stays one program even when a step needs your read on something, not a \
+reason to end it and start a fresh `run_program` per judgment call. \
+`raise` is an expression: `resume(value)` makes `value` its result, so \
+`const verdict = raise(\"pick_one\", { candidates, contract: \"index of \
+the best one\" });` suspends *there*, and the code that uses `verdict` \
+is whatever you wrote right after it — write that continuation now, \
+before the raise ever fires, since resuming runs exactly what follows. A \
+`raise` with nothing after it to consume the resumed value just ends the \
+program when resumed (an empty tail returns undefined). Restarting from \
+the top instead discards everything already done (variables, in-flight \
+reads); a `raise` doesn't.
 - Need real time to pass — a polling loop, a scheduled check-in? \
 `await tools.wait_until(Date.now() + ms)`, never a busy loop (burns fuel; \
 time never actually passes inside one) or `bash(\"sleep …\")`. A message \
@@ -326,6 +354,48 @@ if (c.ok === false) raise("syntax_error", c);
 return "bumped MAX to 100";
 ```
 
+THE MISTAKE THIS CARD KEEPS WARNING ABOUT — two programs where `raise` should
+have kept it to one. Program A returns just so "you" can look and react:
+```
+const files = await Promise.all(paths.map(p => tools.read_file(p)));
+return files.map(f => f.content.slice(0, 200));  // returning only to decide next
+```
+Program B, a whole fresh turn later, reacting to what A returned:
+```
+await tools.replace_file(paths[2], attachments.v, "next content");  // "2" from re-reading A's return
+return "done";
+```
+Both facts A's `return` threw away — `paths`, the full file contents, which
+candidate mattered — have to be reconstructed from scratch in B. The fix is
+never "write B better"; it's that A should not have returned at all:
+```
+const files = await Promise.all(paths.map(p => tools.read_file(p)));
+const verdict = raise("pick_one", {
+  contract: "index of the file that should change",
+  previews: files.map((f, i) => ({ i, head: f.content.slice(0, 200) })),
+});                                   // suspends; resume(value) becomes `verdict`
+await tools.replace_file(paths[verdict.index], files[verdict.index].version, "next content");
+return "done";
+```
+One program, one judgment call, nothing reconstructed.
+
+A judgment call mid-plan — raise, then keep going in the SAME program on
+whatever resume(value) sends back. Write the continuation (everything from
+`chosen` down) now, before the raise ever fires — resuming runs exactly that:
+```
+const candidates = ["/app/parser.v1.js", "/app/parser.v2.js"];
+const reads = await Promise.all(candidates.map(p => tools.read_file(p)));
+const verdict = raise("pick_one", {
+  contract: "return { index } naming the candidate that actually retries on failure",
+  candidates: reads.map((f, i) => ({ i, path: candidates[i], head: f.content.slice(0, 400) })),
+});                                 // suspends here; resume(value) becomes `verdict`
+const chosen = candidates[verdict.index];
+const kept = reads[verdict.index];
+await tools.bash(`rm ${candidates.filter(p => p !== chosen).join(" ")}`);
+await tools.replace_file(chosen, kept.version, kept.content);
+return `kept ${chosen}`;
+```
+
 Many files — author ONE detailed plan (it's a big string, so an attachment),
 hand the *same* plan to every subagent, and have each build just its slice.
 Shared spec → the independently-written files compose into a coherent whole:
@@ -433,7 +503,7 @@ mod tests {
             "Don't spend a `run_program` round-trip computing something you could just say",
             "Plan ahead and write the plan",
             "one `tools.agent` per file",
-            "keeps a long orchestration alive",
+            "is how a long plan stays one program",
             "`input` is a read-only const",
             "`attachments` is a read-only const",
             "attachments: { app:",
@@ -504,6 +574,18 @@ mod tests {
             "a real GFM table",
             "Indenting a block by 4+ spaces is not fencing it",
             "you have no way to see your own rendered output",
+            // raise as an in-plan judgment checkpoint, not a reason to
+            // fall back to a fresh run_program per decision.
+            "is the job actually over, or am I only",
+            "**The tell**",
+            "the first one made the mistake",
+            "THE MISTAKE THIS CARD KEEPS WARNING ABOUT",
+            "nothing reconstructed",
+            "is not a reason to spend one of those extra turns as a fresh",
+            "write that continuation now, before the raise ever fires",
+            "an empty tail returns undefined",
+            "A judgment call mid-plan",
+            "suspends here; resume(value) becomes",
         ] {
             assert!(card.contains(needle), "card missing: {needle}");
         }
