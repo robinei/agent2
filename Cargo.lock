@@ -24,6 +24,7 @@ dependencies = [
  "tree-sitter-python",
  "tree-sitter-rust",
  "tree-sitter-typescript",
+ "unicode-width",
  "ureq",
  "uuid",
  "wait-timeout",

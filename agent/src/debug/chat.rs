@@ -21,6 +21,8 @@
 
 use std::collections::HashMap;
 
+use unicode_width::UnicodeWidthStr;
+
 use crate::host::{AgentId, BranchId, ProgramStatus, SessionEvent};
 use crate::types::{Address, Call, Event, EventId, EventPayload, Message, Outcome};
 
@@ -102,6 +104,10 @@ enum Entry {
     },
 }
 
+/// One `Entry::Line`'s memoized `classify_entry_lines` output, `None`
+/// until first read.
+type LineCache = std::cell::RefCell<Vec<Option<Vec<(ChatKind, String)>>>>;
+
 #[derive(Default)]
 pub struct ChatState {
     entries: Vec<Entry>,
@@ -137,11 +143,39 @@ pub struct ChatState {
     /// id on that branch). `rows` walks this to reconstruct the inherited
     /// prefix without ever touching the `Tree`.
     fork_parent: HashMap<BranchId, (BranchId, EventId)>,
+    /// `classify_entry_lines`'s output for each `entries[i]`, memoized —
+    /// without it, `rows`/`rows_raw` re-run markdown classification
+    /// (fence-tracking, table lookahead) for the *entire* history on
+    /// every call, which in the attached TUI means every redraw tick,
+    /// forever, whether or not anything changed. Same "quadratic without
+    /// a memo, amortised O(1) with one" shape as `ReportMemo`
+    /// (`types.rs`), one layer up. Two vectors since `render_markdown`
+    /// changes an `Assistant`/`Streaming` entry's classification.
+    /// `RefCell`: `rows`/`rows_raw` — this pane's entire read contract —
+    /// only ever take `&self`. `push_entry` keeps both exactly as long
+    /// as `entries`, so an index is always valid to look up.
+    classified_line_cache: LineCache,
+    raw_line_cache: LineCache,
+    /// How many times `classify_entry_lines` has actually run (cache
+    /// misses) — mirrors `ReportMemo::derivations` (`types.rs`), a
+    /// counter for exactly this purpose: a test asserting the memo, not
+    /// just the output, is doing its job.
+    pub line_derivations: std::cell::Cell<u64>,
 }
 
 impl ChatState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The one choke point every `self.entries.push` goes through
+    /// instead — keeps both line caches exactly as long as `entries`, so
+    /// an index is always valid to look up and `apply` never has to know
+    /// the cache exists.
+    fn push_entry(&mut self, entry: Entry) {
+        self.entries.push(entry);
+        self.classified_line_cache.get_mut().push(None);
+        self.raw_line_cache.get_mut().push(None);
     }
 
     pub fn apply(&mut self, event: &SessionEvent) {
@@ -167,7 +201,7 @@ impl ChatState {
                     // Not tied to a log position — a live notification,
                     // not history — so it is visible only on an exact
                     // branch match, never inherited by a descendant fork.
-                    self.entries.push(Entry::Line {
+                    self.push_entry(Entry::Line {
                         branch: b,
                         id: EventId::new(u64::MAX),
                         kind: ChatKind::Error,
@@ -209,7 +243,7 @@ impl ChatState {
                 // message: render it as this branch's leading block.
                 self.main_branch.get_or_insert(branch);
                 self.main_agent.get_or_insert(agent);
-                self.entries.push(Entry::Line {
+                self.push_entry(Entry::Line {
                     branch,
                     id,
                     kind: ChatKind::System,
@@ -221,7 +255,7 @@ impl ChatState {
             // never close, so the branch stays addressable after it.
             EventPayload::Answer { value, .. } => {
                 if Some(agent) != self.main_agent {
-                    self.entries.push(Entry::Line {
+                    self.push_entry(Entry::Line {
                         branch,
                         id,
                         kind: ChatKind::Marker,
@@ -240,7 +274,7 @@ impl ChatState {
                     self.fork_parent
                         .insert(branch, (parent_branch, parent_point));
                 }
-                self.entries.push(Entry::Line {
+                self.push_entry(Entry::Line {
                     branch,
                     id,
                     kind: ChatKind::Marker,
@@ -255,7 +289,7 @@ impl ChatState {
                 });
             }
             EventPayload::Message(Message::Post { from, origin }) => {
-                self.entries.push(Entry::Line {
+                self.push_entry(Entry::Line {
                     branch,
                     id,
                     kind: ChatKind::User,
@@ -274,7 +308,7 @@ impl ChatState {
                 if let Some(thinking) = thinking
                     && !thinking.is_empty()
                 {
-                    self.entries.push(Entry::Line {
+                    self.push_entry(Entry::Line {
                         branch,
                         id,
                         kind: ChatKind::Thinking,
@@ -289,7 +323,7 @@ impl ChatState {
                 let by_user = matches!(author, crate::types::Author::User);
                 if !text.is_empty() || by_user {
                     let calls: Vec<&str> = tool_calls.iter().map(|c| c.name.as_str()).collect();
-                    self.entries.push(Entry::Line {
+                    self.push_entry(Entry::Line {
                         branch,
                         id,
                         kind: if by_user {
@@ -326,7 +360,7 @@ impl ChatState {
                                 .collect()
                         })
                         .unwrap_or_default();
-                    self.entries.push(Entry::Header {
+                    self.push_entry(Entry::Header {
                         branch,
                         program: id,
                         attachments: attachment_names,
@@ -356,7 +390,7 @@ impl ChatState {
                     ..
                 } = call
                 {
-                    self.entries.push(Entry::Line {
+                    self.push_entry(Entry::Line {
                         branch,
                         id,
                         kind: ChatKind::Assistant,
@@ -384,7 +418,7 @@ impl ChatState {
                             Call::Spawn { .. } => "spawn".to_owned(),
                         };
                         self.call_rows.insert(id, self.entries.len());
-                        self.entries.push(Entry::Line {
+                        self.push_entry(Entry::Line {
                             branch,
                             id,
                             kind: ChatKind::ToolCall,
@@ -404,6 +438,11 @@ impl ChatState {
                             Outcome::Delivered(v) => format!("{head} → {}", short(v)),
                             Outcome::Failed(msg) => format!("{head} → failed: {msg}"),
                         };
+                        // The row's own text just changed under it — the
+                        // memo must forget it, or the "→ …" pending line
+                        // never updates past its first render.
+                        self.classified_line_cache.get_mut()[row] = None;
+                        self.raw_line_cache.get_mut()[row] = None;
                     }
                 }
             }
@@ -477,7 +516,12 @@ impl ChatState {
         };
         let mut out = Vec::new();
         let mut invoke_index: HashMap<EventId, usize> = HashMap::new();
-        for entry in &self.entries {
+        let cache = if render_markdown {
+            &self.classified_line_cache
+        } else {
+            &self.raw_line_cache
+        };
+        for (entry_index, entry) in self.entries.iter().enumerate() {
             match entry {
                 Entry::Header {
                     branch,
@@ -527,7 +571,18 @@ impl ChatState {
                     } else {
                         RowDetail::None
                     };
-                    push_wrapped(&mut out, *kind, text, detail, *id, render_markdown);
+                    {
+                        let mut cache_mut = cache.borrow_mut();
+                        if cache_mut[entry_index].is_none() {
+                            self.line_derivations.set(self.line_derivations.get() + 1);
+                            cache_mut[entry_index] =
+                                Some(classify_entry_lines(*kind, text, render_markdown));
+                        }
+                    }
+                    let cache_ref = cache.borrow();
+                    for (k, line) in cache_ref[entry_index].as_ref().unwrap() {
+                        out.push((*k, line.clone(), detail.clone(), *id));
+                    }
                 }
                 _ => {}
             }
@@ -702,11 +757,19 @@ fn is_table_delimiter_row(line: &str) -> bool {
 /// tables routinely mismatch the delimiter's dash count or a row's cell
 /// count) can never panic or desync a later column. A floor of 3 keeps
 /// an empty column from collapsing to nothing.
+///
+/// Measured in display columns (`UnicodeWidthStr::width`), not
+/// `.chars().count()` — a wide glyph like `✅` is one `char` but renders
+/// two columns wide, and undercounting it here throws off every column
+/// after it on that one row (the border keeps its intended width, but
+/// that row's own padding falls one column short, misaligning it against
+/// every other row). The predecessor's own `cell_char_len`
+/// (`agent-cli/src/markdown.rs`) does the same width-aware measurement.
 fn column_widths(rows: &[Vec<String>], ncols: usize) -> Vec<usize> {
     let mut widths = vec![3usize; ncols];
     for row in rows {
         for (col, width) in widths.iter_mut().enumerate() {
-            let cell_width = row.get(col).map_or(0, |c| c.chars().count());
+            let cell_width = row.get(col).map_or(0, |c| c.width());
             *width = (*width).max(cell_width);
         }
     }
@@ -719,11 +782,18 @@ fn column_widths(rows: &[Vec<String>], ncols: usize) -> Vec<usize> {
 /// `|` — box-drawing to match the predecessor's own table rendering
 /// (`render_data_row`, `agent-cli/src/markdown.rs`), the fidelity this
 /// was found to have lost in the port.
+///
+/// Pads by display width, not `format!("{:<width$}")` — that pads by
+/// `.chars().count()`, which is exactly the same undercount
+/// `column_widths` avoids, just at render time instead of measurement
+/// time; using one and not the other would just move the misalignment
+/// rather than fix it.
 fn format_table_row(row: &[String], widths: &[usize], ncols: usize) -> String {
     let cells: Vec<String> = (0..ncols)
         .map(|col| {
             let cell = row.get(col).map_or("", String::as_str);
-            format!("{cell:<width$}", width = widths[col])
+            let pad = widths[col].saturating_sub(cell.width());
+            format!("{cell}{}", " ".repeat(pad))
         })
         .collect();
     format!("│ {} │", cells.join(" │ "))
@@ -759,19 +829,24 @@ fn heading_text(line: &str) -> Option<&str> {
     rest.strip_prefix(' ').or(rest.strip_prefix('\t'))
 }
 
-/// Push an item's visual lines, labelling user/assistant prose and
+/// One entry's visual lines — labelling user/assistant prose and
 /// indenting continuation lines under the label. `Assistant`/`Streaming`
 /// text additionally gets block-markdown classification per line — every
 /// other kind (`User`, `Error`, `ToolCall`, ...) goes out unclassified,
 /// the same scoping `render_chat` already applies to inline markdown.
-fn push_wrapped(
-    out: &mut Vec<(ChatKind, String, RowDetail, EventId)>,
+///
+/// Pure in `(kind, text, render_markdown)` — no `detail`/`id`, which are
+/// the same for every line one entry expands to and stay the caller's
+/// job to attach — which is exactly what makes this safe for
+/// `ChatState::classified_line_cache`/`raw_line_cache` to memoize per
+/// entry with no invalidation beyond the one place that needs it
+/// (`EventPayload::Result`, below): an `Entry::Line`'s `text` is never
+/// mutated after being pushed anywhere else.
+fn classify_entry_lines(
     kind: ChatKind,
     text: &str,
-    detail: RowDetail,
-    id: EventId,
     render_markdown: bool,
-) {
+) -> Vec<(ChatKind, String)> {
     let label = match kind {
         ChatKind::User => "you ❯ ",
         ChatKind::Assistant => "agent ❯ ",
@@ -783,6 +858,7 @@ fn push_wrapped(
         } else {
             text.lines().map(|l| (None, l.to_owned())).collect()
         };
+    let mut out = Vec::new();
     let mut any = false;
     for (i, (override_kind, line)) in classified.into_iter().enumerate() {
         any = true;
@@ -791,16 +867,12 @@ fn push_wrapped(
         } else {
             " ".repeat(label.chars().count())
         };
-        out.push((
-            override_kind.unwrap_or(kind),
-            format!("{head}{line}"),
-            detail.clone(),
-            id,
-        ));
+        out.push((override_kind.unwrap_or(kind), format!("{head}{line}")));
     }
     if !any {
-        out.push((kind, label.to_owned(), detail, id));
+        out.push((kind, label.to_owned()));
     }
+    out
 }
 
 fn status_label(status: ProgramStatus) -> &'static str {
@@ -1026,6 +1098,96 @@ mod tests {
                 .rows(None)
                 .iter()
                 .any(|(_, t, _, _)| t.contains("program completed"))
+        );
+    }
+
+    /// `rows()` re-scans every entry on every call (branch visibility is
+    /// call-dependent, so that part can't be memoized) — but the
+    /// expensive part, `classify_entry_lines`'s markdown parsing, must
+    /// not redo work for entries nothing changed about. This is the
+    /// direct check on the memo itself, not just on its output.
+    #[test]
+    fn repeated_rows_calls_do_not_re_derive_unchanged_entries() {
+        let mut chat = ChatState::new();
+        chat.apply(&agent_event());
+        chat.apply(&assistant_turn(2, "one **bold** line"));
+        chat.apply(&assistant_turn(3, "another line"));
+
+        chat.rows(None);
+        let after_first = chat.line_derivations.get();
+        assert!(after_first > 0, "the first call must actually derive");
+
+        chat.rows(None);
+        chat.rows(None);
+        assert_eq!(
+            chat.line_derivations.get(),
+            after_first,
+            "a later call with nothing new must not re-derive any entry"
+        );
+
+        // A genuinely new entry must derive exactly once more — not the
+        // whole history again.
+        chat.apply(&assistant_turn(4, "a third line"));
+        chat.rows(None);
+        assert_eq!(chat.line_derivations.get(), after_first + 1);
+    }
+
+    /// `classified_line_cache` and `raw_line_cache` are independent —
+    /// switching modes must not read the other mode's memoized text
+    /// (which would show classified content in raw view or vice versa).
+    #[test]
+    fn classified_and_raw_caches_do_not_cross_contaminate() {
+        let mut chat = ChatState::new();
+        chat.apply(&agent_event());
+        chat.apply(&assistant_turn(2, "# Heading"));
+
+        chat.rows(None); // primes the classified cache
+        chat.rows_raw(None); // primes the raw cache
+
+        let classified = chat.rows(None);
+        assert!(
+            classified
+                .iter()
+                .any(|(k, _, _, _)| *k == ChatKind::Heading)
+        );
+        let raw = chat.rows_raw(None);
+        assert!(
+            raw.iter()
+                .all(|(k, _, _, _)| matches!(k, ChatKind::System | ChatKind::Assistant)),
+            "raw must still be unclassified even though the classified cache is warm: {raw:?}"
+        );
+    }
+
+    /// A `Result` completing a `Call` row mutates that entry's `text`
+    /// after it was already cached — without invalidating that one slot,
+    /// the "⚙ name → …" pending line would never update to show the
+    /// actual outcome. Everything else's memo must survive untouched.
+    #[test]
+    fn a_completed_call_invalidates_only_its_own_cached_row() {
+        let mut chat = ChatState::new();
+        chat.apply(&agent_event());
+        chat.apply(&run_program(2));
+        chat.apply(&invoke(3, "fetch"));
+
+        assert!(
+            chat.rows(None)
+                .iter()
+                .any(|(_, t, _, _)| t.contains("fetch → …")),
+            "pending before the result lands"
+        );
+        let before = chat.line_derivations.get();
+
+        chat.apply(&settled(4, 3, serde_json::json!("A")));
+        assert!(
+            chat.rows(None)
+                .iter()
+                .any(|(_, t, _, _)| t.contains("fetch → \"A\"")),
+            "the row must reflect the outcome, not the stale cached pending text"
+        );
+        assert_eq!(
+            chat.line_derivations.get(),
+            before + 1,
+            "only the one row that actually changed re-derives"
         );
     }
 
@@ -1592,6 +1754,43 @@ mod tests {
         assert!(
             lens.windows(2).all(|w| w[0] == w[1]),
             "every row renders to the same width: {lens:?}"
+        );
+    }
+
+    /// The user's exact reported example: a `✅` cell (one `char`, two
+    /// display columns) must not throw off every row after it. Every
+    /// row — including the header, which has no wide glyph — must come
+    /// out to the identical rendered width; a `.chars().count()`-based
+    /// measurement would leave the `✅` rows one column narrower than
+    /// the rest, misaligning every border below them.
+    #[test]
+    fn wide_glyphs_do_not_misalign_later_rows() {
+        let mut chat = ChatState::new();
+        chat.apply(&agent_event());
+        chat.apply(&assistant_turn(
+            2,
+            "| Feature | Syntax | Renders? |\n\
+             |---|---|---|\n\
+             | Bold | `**text**` | ✅ |\n\
+             | Table | pipes & dashes | ✅ |\n\
+             | Quote | `> text` | ✅ |",
+        ));
+
+        let rows = chat.rows(None);
+        let label_width = "agent ❯ ".chars().count();
+        let widths: Vec<usize> = rows
+            .iter()
+            .filter(|(k, ..)| {
+                matches!(
+                    k,
+                    ChatKind::TableHeader | ChatKind::TableRow | ChatKind::TableBorder
+                )
+            })
+            .map(|(_, t, _, _)| t.width() - label_width)
+            .collect();
+        assert!(
+            widths.windows(2).all(|w| w[0] == w[1]),
+            "every table row/border must render to the same display width: {widths:?}"
         );
     }
 
