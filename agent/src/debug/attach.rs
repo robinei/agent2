@@ -29,12 +29,13 @@ use ratatui::crossterm::event::{
 };
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 use super::app::PaneInfo;
 use super::chat::{ChatKind, ChatState, RowDetail};
 use super::input::InputBuffer;
+use super::markdown;
 use super::ui;
 use crate::host::{BranchId, BranchInfo, Session, SessionCommand, SessionEvent, UserCall};
 use crate::machine::TOOL_RUN_PROGRAM;
@@ -180,6 +181,16 @@ pub struct AttachedApp {
     pub show_disasm: bool,
     pub show_stack: bool,
     pub show_promises: bool,
+    /// Ctrl-T: reasoning content is logged and always in `chat.rows()`,
+    /// hidden by default — most of it is noise once the final answer is
+    /// in, so showing it is an explicit ask, not the default.
+    pub show_thinking: bool,
+    /// `m`: markdown styling on by default; toggled off shows exactly
+    /// what the model emitted — no block classification (headings,
+    /// blockquotes, fences, tables), no inline emphasis. `chat.rows()`
+    /// always has the raw text to fall back to (`rows_raw`), so this
+    /// never loses anything, only re-derives from source on demand.
+    pub show_markdown: bool,
     pub chat_scroll: Option<usize>,
     pub console_scroll: Option<usize>,
     pub source_scroll: Option<usize>,
@@ -255,6 +266,8 @@ impl AttachedApp {
             show_disasm: false,
             show_stack: false,
             show_promises: false,
+            show_thinking: false,
+            show_markdown: true,
             chat_scroll: None,
             console_scroll: None,
             source_scroll: None,
@@ -609,6 +622,12 @@ impl AttachedApp {
             }
             return KeyAction::None;
         }
+        // Ctrl-T: show/hide reasoning content, everywhere — it's a
+        // transcript display toggle, not something either focus owns.
+        if key.code == KeyCode::Char('t') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.show_thinking = !self.show_thinking;
+            return KeyAction::None;
+        }
         match self.view {
             View::FullDebug => self.on_debug_key(key.code, branches, selected_status),
             View::Chat | View::Running => match self.focus {
@@ -906,6 +925,14 @@ impl AttachedApp {
             KeyCode::Char('t') if self.view != View::FullDebug => {
                 self.timeline = true;
                 self.timeline_cursor = 0;
+                KeyAction::None
+            }
+            // Raw view: what the model actually emitted, unclassified
+            // and unstyled — for settling exactly the kind of "did I
+            // really fence/indent that?" dispute the model itself can't
+            // reliably answer (it never sees its own rendered output).
+            KeyCode::Char('m') if self.view != View::FullDebug => {
+                self.show_markdown = !self.show_markdown;
                 KeyAction::None
             }
             KeyCode::Char('a') if self.view != View::FullDebug => self.arm_ask(),
@@ -1623,7 +1650,7 @@ fn footer_hint(
         ),
         (View::Running, Focus::Debug) => format!(
             " esc/i type · c collapse · d debugger · 1-4 panes · f fork · p spawn · a ask \
-             · r rename{}{}{} · t timeline{} · q quit ",
+             · r rename{}{}{} · t timeline · m markdown · ctrl-t thinking{} · q quit ",
             if interruptible { " · x interrupt" } else { "" },
             if resumable { " · v resume" } else { "" },
             if waiting { " · w waiting" } else { "" },
@@ -1631,7 +1658,7 @@ fn footer_hint(
         ),
         (_, Focus::Debug) => format!(
             " esc/i type · c expand · d debugger · f fork · p spawn · a ask \
-             · r rename{}{}{} · t timeline{} · q quit ",
+             · r rename{}{}{} · t timeline · m markdown · ctrl-t thinking{} · q quit ",
             if interruptible { " · x interrupt" } else { "" },
             if resumable { " · v resume" } else { "" },
             if waiting { " · w waiting" } else { "" },
@@ -1662,6 +1689,60 @@ fn chat_style(kind: ChatKind, even: bool) -> Style {
                 Color::Rgb(155, 155, 155)
             };
             Style::default().fg(fg)
+        }
+        ChatKind::Heading => {
+            let fg = if even {
+                Color::Rgb(220, 220, 220)
+            } else {
+                Color::Rgb(155, 155, 155)
+            };
+            Style::default()
+                .fg(fg)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+        }
+        ChatKind::Blockquote => {
+            let fg = if even {
+                Color::Rgb(130, 130, 130)
+            } else {
+                Color::Rgb(85, 85, 85)
+            };
+            Style::default()
+                .fg(fg)
+                .add_modifier(Modifier::DIM | Modifier::ITALIC)
+        }
+        // Flat, not even/odd-alternated: a code block reads as one
+        // continuous slab regardless of which row parity it lands on,
+        // the same "one look" the predecessor's own fenced-code styling
+        // used (this is that port).
+        ChatKind::Code => Style::default()
+            .bg(Color::Rgb(40, 40, 40))
+            .fg(Color::Rgb(210, 210, 210)),
+        ChatKind::TableHeader => {
+            let fg = if even {
+                Color::Rgb(220, 220, 220)
+            } else {
+                Color::Rgb(155, 155, 155)
+            };
+            Style::default().fg(fg).add_modifier(Modifier::BOLD)
+        }
+        ChatKind::TableRow => {
+            let fg = if even {
+                Color::Rgb(220, 220, 220)
+            } else {
+                Color::Rgb(155, 155, 155)
+            };
+            Style::default().fg(fg)
+        }
+        // Not even/odd-alternated, same reasoning as `Code`: a table's
+        // frame reads as one fixed structure, not a striped row.
+        ChatKind::TableBorder => Style::default().fg(Color::DarkGray),
+        ChatKind::Thinking => {
+            let fg = if even {
+                Color::Rgb(130, 130, 130)
+            } else {
+                Color::Rgb(85, 85, 85)
+            };
+            Style::default().fg(fg).add_modifier(Modifier::DIM)
         }
         ChatKind::Streaming => {
             let fg = if even {
@@ -1700,6 +1781,49 @@ fn chat_style(kind: ChatKind, even: bool) -> Style {
             Style::default().fg(fg)
         }
     }
+}
+
+/// A `run_program` header's severity color, read off its own status
+/// word — reusing the palette a call's outcome already uses elsewhere
+/// (a `⇒ result` line is green, an error line is red) instead of
+/// inventing a fourth scheme. `None` for `running`/`suspended`: nothing
+/// has gone right or wrong yet, so the header keeps its plain
+/// `ChatKind::ToolCall` color.
+fn program_header_severity(text: &str) -> Option<Color> {
+    if text.ends_with("failed") {
+        Some(Color::Red)
+    } else if text.ends_with("completed") {
+        Some(Color::Green)
+    } else {
+        None
+    }
+}
+
+/// Split a formatted table row (`"│ cell │ cell │"`, `chat.rs`'s
+/// `format_table_row`) into spans so every `│` gets the *same* color as
+/// the table's own border rows regardless of which row it's in — a
+/// header row's `│` must not turn bold along with "Name", nor a body
+/// row's `│` take on that row's plain color. `cell_style` is what
+/// `chat_style` already computed for this row's `ChatKind` (bold for a
+/// header, plain for a body); only the `│` characters override it.
+fn table_row_spans(text: &str, cell_style: Style) -> Vec<Span<'static>> {
+    let border_style = Style::default().fg(Color::DarkGray);
+    let mut spans = Vec::new();
+    let mut cell = String::new();
+    for c in text.chars() {
+        if c == '│' {
+            if !cell.is_empty() {
+                spans.push(Span::styled(std::mem::take(&mut cell), cell_style));
+            }
+            spans.push(Span::styled("│", border_style));
+        } else {
+            cell.push(c);
+        }
+    }
+    if !cell.is_empty() {
+        spans.push(Span::styled(cell, cell_style));
+    }
+    spans
 }
 
 /// The text of `branch`'s pending ask-to-user, if it has one — what
@@ -1808,7 +1932,11 @@ fn render_chat(
     // single-line text with no `\n` of its own) gets to span rows instead
     // of losing everything past the border.
     let wrap_width = transcript_area.width.saturating_sub(2).max(1) as usize;
-    let rows = app.chat.rows(app.selected);
+    let rows = if app.show_markdown {
+        app.chat.rows(app.selected)
+    } else {
+        app.chat.rows_raw(app.selected)
+    };
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(rows.len());
     // One entry per wrapped line pushed below, naming which `rows` index
     // it came from — the inverse of the one-to-many row→lines expansion
@@ -1819,6 +1947,9 @@ fn render_chat(
     let mut in_program: Option<EventId> = None;
     let mut prev_kind: Option<ChatKind> = None;
     for (row_idx, (kind, text, detail, id)) in rows.iter().enumerate() {
+        if *kind == ChatKind::Thinking && !app.show_thinking {
+            continue;
+        }
         let even = match detail {
             RowDetail::Program(pid) | RowDetail::Attachment(pid, _) | RowDetail::Invoke(pid, _) => {
                 if in_program != Some(*pid) {
@@ -1839,6 +1970,11 @@ fn render_chat(
         };
         prev_kind = Some(*kind);
         let mut style = chat_style(*kind, even);
+        if matches!(detail, RowDetail::Program(_))
+            && let Some(color) = program_header_severity(text)
+        {
+            style = style.fg(color);
+        }
         // Highlight the selected subitem line.
         if let Some(ref sel) = app.selected_subitem {
             let highlight = match (detail, sel) {
@@ -1865,7 +2001,28 @@ fn render_chat(
             style = style.add_modifier(Modifier::REVERSED);
         }
         let before = lines.len();
-        push_wrapped_width(&mut lines, text, style, wrap_width);
+        if app.show_markdown
+            && matches!(
+                kind,
+                ChatKind::Assistant
+                    | ChatKind::Streaming
+                    | ChatKind::Heading
+                    | ChatKind::Blockquote
+            )
+        {
+            let spans = markdown::inline_spans(text, style);
+            lines.extend(markdown::wrap_spans(&spans, style, wrap_width));
+        } else if matches!(kind, ChatKind::TableHeader | ChatKind::TableRow)
+            && text.chars().count() <= wrap_width
+        {
+            // Only when it fits unwrapped: reflowing a formatted table
+            // row word-by-word would misalign its columns regardless of
+            // color, so an overlong one falls back to the plain (single
+            // color) wrap below rather than to a broken table.
+            lines.push(Line::from(table_row_spans(text, style)));
+        } else {
+            push_wrapped_width(&mut lines, text, style, wrap_width);
+        }
         row_at_line.resize(lines.len(), row_idx);
         debug_assert!(lines.len() > before, "every row pushes at least one line");
     }
@@ -3157,6 +3314,553 @@ mod tests {
 
         assert_eq!(app.on_key(ctrl_c, &[], None), KeyAction::None);
         assert!(app.quit, "Ctrl-C on an already-empty line quits");
+    }
+
+    /// A `run_program` header colors by its own status word: red once
+    /// failed, green once completed, unstyled (`None`) while still
+    /// running or suspended — nothing to signal yet either way.
+    #[test]
+    fn program_header_severity_colors_failed_red_and_completed_green() {
+        assert_eq!(
+            program_header_severity("run_program: failed"),
+            Some(Color::Red)
+        );
+        assert_eq!(
+            program_header_severity("run_program: completed"),
+            Some(Color::Green)
+        );
+        assert_eq!(program_header_severity("run_program: running"), None);
+        assert_eq!(program_header_severity("run_program: suspended"), None);
+    }
+
+    /// Ctrl-T shows/hides reasoning content — a display toggle, hidden
+    /// by default, that fires through `on_key` regardless of focus,
+    /// same "everywhere" category as Ctrl-C right above.
+    #[test]
+    fn ctrl_t_toggles_thinking_visibility_from_either_focus() {
+        let mut app = AttachedApp::new(fid(1));
+        assert!(!app.show_thinking, "hidden by default");
+        let ctrl_t = KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL);
+
+        app.focus = Focus::Input;
+        assert_eq!(app.on_key(ctrl_t, &[], None), KeyAction::None);
+        assert!(app.show_thinking);
+
+        app.focus = Focus::Debug;
+        assert_eq!(app.on_key(ctrl_t, &[], None), KeyAction::None);
+        assert!(!app.show_thinking);
+    }
+
+    /// `m` toggles raw view, but only from `Focus::Debug` — unlike
+    /// Ctrl-T's global "everywhere" gesture, a bare `m` is an ordinary
+    /// character the input box must still be free to type.
+    #[test]
+    fn m_toggles_markdown_only_from_debug_focus() {
+        let mut app = AttachedApp::new(fid(1));
+        assert!(app.show_markdown, "on by default");
+        let m = KeyEvent::from(KeyCode::Char('m'));
+
+        app.focus = Focus::Input;
+        app.on_key(m, &[], None);
+        assert!(
+            app.show_markdown,
+            "typing in the input box must not toggle it"
+        );
+        assert_eq!(app.input.to_string(), "m", "and the letter is typed");
+
+        app.input.clear();
+        app.focus = Focus::Debug;
+        app.on_key(m, &[], None);
+        assert!(!app.show_markdown);
+        app.on_key(m, &[], None);
+        assert!(app.show_markdown);
+    }
+
+    /// With markdown off, `render_chat` reads `rows_raw` — a heading's
+    /// A table's `|---|---|` delimiter row is deliberately dropped when
+    /// markdown IS on (it's punctuation, not data) — but with raw view on,
+    /// nothing in the pipeline may touch it: it must reach the real
+    /// terminal buffer exactly as the model wrote it, dashes and all.
+    #[test]
+    fn raw_view_shows_the_table_delimiter_row_literally_in_the_real_chat_pane() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let (tx, rx) = channel();
+        let session = Session::new(
+            Tree::new(None),
+            "say hi",
+            ToolRegistry::new(),
+            Box::new(ScriptedLlm::new([scripted_text(
+                "| Name | Role |\n|------|------|\n| Ada | Engineer |",
+            )])),
+            tx,
+        )
+        .unwrap();
+        session.handle().send(SessionCommand::UserTurn {
+            branch: session.conversation_branch(),
+            text: "go".into(),
+            expects_reply: true,
+        });
+        let session = session.run();
+
+        let mut app = AttachedApp::new(session.conversation_branch());
+        for event in rx.try_iter() {
+            app.apply(&event);
+        }
+
+        // Sanity check on the data model first: with markdown ON, the
+        // delimiter row is gone by design.
+        let classified = app.chat.rows(app.selected);
+        assert!(
+            !classified.iter().any(|(_, t, _, _)| t.contains("------")),
+            "the delimiter row is dropped when markdown rendering is on"
+        );
+
+        app.show_markdown = false;
+        let raw = app.chat.rows_raw(app.selected);
+        assert!(
+            raw.iter().any(|(_, t, _, _)| t.contains("------")),
+            "but must survive verbatim in the raw row data: {raw:?}"
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_chat(frame, &app, area, None, None);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+
+        let mut delimiter_on_screen = false;
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                let run: String = (0..6)
+                    .filter_map(|i| buffer.cell((x + i, y)).map(|c| c.symbol().to_owned()))
+                    .collect();
+                if run == "------" {
+                    delimiter_on_screen = true;
+                }
+            }
+        }
+        assert!(
+            delimiter_on_screen,
+            "the delimiter row must reach the actual terminal cells in raw view"
+        );
+    }
+
+    /// `#` marker must survive to the real terminal buffer, unstripped.
+    #[test]
+    fn raw_view_shows_the_heading_marker_literally_in_the_real_chat_pane() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let (tx, rx) = channel();
+        let session = Session::new(
+            Tree::new(None),
+            "say hi",
+            ToolRegistry::new(),
+            Box::new(ScriptedLlm::new([scripted_text("# Heading\nplain text")])),
+            tx,
+        )
+        .unwrap();
+        session.handle().send(SessionCommand::UserTurn {
+            branch: session.conversation_branch(),
+            text: "go".into(),
+            expects_reply: true,
+        });
+        let session = session.run();
+
+        let mut app = AttachedApp::new(session.conversation_branch());
+        for event in rx.try_iter() {
+            app.apply(&event);
+        }
+        app.show_markdown = false;
+
+        let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_chat(frame, &app, area, None, None);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+
+        let mut marker_kept = false;
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                let marker: String = (0..9)
+                    .filter_map(|i| buffer.cell((x + i, y)).map(|c| c.symbol().to_owned()))
+                    .collect();
+                if marker == "# Heading" {
+                    marker_kept = true;
+                }
+            }
+        }
+        assert!(
+            marker_kept,
+            "raw view must show the literal \"# \" marker, unstripped"
+        );
+    }
+
+    /// The markdown wiring in `render_chat` (as opposed to
+    /// `markdown::inline_spans` in isolation, which `debug::markdown`'s
+    /// own tests already cover) was never actually exercised end to
+    /// end: every other `render_chat` test only checks its pure helpers
+    /// (`push_wrapped_width`, `chat_style`, ...), never a real draw. Draw
+    /// into a `TestBackend` and read the terminal cells back to prove an
+    /// assistant reply's `**bold**` actually reaches the screen styled.
+    #[test]
+    fn assistant_markdown_renders_bold_in_the_real_chat_pane() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let (tx, rx) = channel();
+        let session = Session::new(
+            Tree::new(None),
+            "say hi",
+            ToolRegistry::new(),
+            Box::new(ScriptedLlm::new([scripted_text("plain **bold** word")])),
+            tx,
+        )
+        .unwrap();
+        session.handle().send(SessionCommand::UserTurn {
+            branch: session.conversation_branch(),
+            text: "go".into(),
+            expects_reply: true,
+        });
+        let session = session.run();
+
+        let mut app = AttachedApp::new(session.conversation_branch());
+        for event in rx.try_iter() {
+            app.apply(&event);
+        }
+
+        let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_chat(frame, &app, area, None, None);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+
+        let mut bold_found = false;
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                let word: String = (0..4)
+                    .filter_map(|i| buffer.cell((x + i, y)).map(|c| c.symbol().to_owned()))
+                    .collect();
+                if word == "bold" {
+                    let cell = buffer.cell((x, y)).unwrap();
+                    if cell.modifier.contains(Modifier::BOLD) {
+                        bold_found = true;
+                    }
+                }
+            }
+        }
+        assert!(
+            bold_found,
+            "\"bold\" must render with the BOLD modifier somewhere in the pane; \
+             buffer:\n{}",
+            (0..buffer.area.height)
+                .map(|y| (0..buffer.area.width)
+                    .map(|x| buffer.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "))
+                    .collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
+    /// Same real-draw technique as `assistant_markdown_renders_bold_in_the_
+    /// real_chat_pane`, for a `# Heading` line: it must reach the screen
+    /// bold, not as a literal `#`.
+    #[test]
+    fn heading_renders_bold_in_the_real_chat_pane() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let (tx, rx) = channel();
+        let session = Session::new(
+            Tree::new(None),
+            "say hi",
+            ToolRegistry::new(),
+            Box::new(ScriptedLlm::new([scripted_text("# Heading\nplain text")])),
+            tx,
+        )
+        .unwrap();
+        session.handle().send(SessionCommand::UserTurn {
+            branch: session.conversation_branch(),
+            text: "go".into(),
+            expects_reply: true,
+        });
+        let session = session.run();
+
+        let mut app = AttachedApp::new(session.conversation_branch());
+        for event in rx.try_iter() {
+            app.apply(&event);
+        }
+
+        let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_chat(frame, &app, area, None, None);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+
+        let mut heading_bold = false;
+        let mut marker_kept = false;
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                let word: String = (0..7)
+                    .filter_map(|i| buffer.cell((x + i, y)).map(|c| c.symbol().to_owned()))
+                    .collect();
+                if word == "Heading"
+                    && buffer
+                        .cell((x, y))
+                        .unwrap()
+                        .modifier
+                        .contains(Modifier::BOLD)
+                {
+                    heading_bold = true;
+                }
+                let marker: String = (0..9)
+                    .filter_map(|i| buffer.cell((x + i, y)).map(|c| c.symbol().to_owned()))
+                    .collect();
+                if marker == "# Heading" {
+                    marker_kept = true;
+                }
+            }
+        }
+        assert!(heading_bold, "\"Heading\" must render bold");
+        assert!(
+            !marker_kept,
+            "the \"# \" marker must be stripped from the heading text"
+        );
+    }
+
+    /// A fenced code line's background must differ from a plain row's —
+    /// proof the flat `Code` style (not the even/odd-alternated prose
+    /// style) actually reaches the screen.
+    #[test]
+    fn fenced_code_line_has_a_distinct_background_in_the_real_chat_pane() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let (tx, rx) = channel();
+        let session = Session::new(
+            Tree::new(None),
+            "say hi",
+            ToolRegistry::new(),
+            Box::new(ScriptedLlm::new([scripted_text(
+                "plain line\n```\ncode line\n```",
+            )])),
+            tx,
+        )
+        .unwrap();
+        session.handle().send(SessionCommand::UserTurn {
+            branch: session.conversation_branch(),
+            text: "go".into(),
+            expects_reply: true,
+        });
+        let session = session.run();
+
+        let mut app = AttachedApp::new(session.conversation_branch());
+        for event in rx.try_iter() {
+            app.apply(&event);
+        }
+
+        let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_chat(frame, &app, area, None, None);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+
+        let bg_at_word = |word: &str| {
+            for y in 0..buffer.area.height {
+                for x in 0..buffer.area.width {
+                    let found: String = (0..word.chars().count() as u16)
+                        .filter_map(|i| buffer.cell((x + i, y)).map(|c| c.symbol().to_owned()))
+                        .collect();
+                    if found == word {
+                        return Some(buffer.cell((x, y)).unwrap().bg);
+                    }
+                }
+            }
+            None
+        };
+        let plain_bg = bg_at_word("plain").expect("the plain line renders");
+        let code_bg = bg_at_word("code").expect("the code line renders");
+        assert_ne!(
+            plain_bg, code_bg,
+            "a fenced code line must not share the plain row's background"
+        );
+    }
+
+    /// A table header cell renders bold, a body cell does not — same
+    /// real-draw technique as the heading/fence tests above.
+    #[test]
+    fn table_header_row_renders_bold_in_the_real_chat_pane() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let (tx, rx) = channel();
+        let session = Session::new(
+            Tree::new(None),
+            "say hi",
+            ToolRegistry::new(),
+            Box::new(ScriptedLlm::new([scripted_text(
+                "| Name | Role |\n|------|------|\n| Ada | Engineer |",
+            )])),
+            tx,
+        )
+        .unwrap();
+        session.handle().send(SessionCommand::UserTurn {
+            branch: session.conversation_branch(),
+            text: "go".into(),
+            expects_reply: true,
+        });
+        let session = session.run();
+
+        let mut app = AttachedApp::new(session.conversation_branch());
+        for event in rx.try_iter() {
+            app.apply(&event);
+        }
+
+        let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_chat(frame, &app, area, None, None);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+
+        let bold_at_word = |word: &str| {
+            for y in 0..buffer.area.height {
+                for x in 0..buffer.area.width {
+                    let found: String = (0..word.chars().count() as u16)
+                        .filter_map(|i| buffer.cell((x + i, y)).map(|c| c.symbol().to_owned()))
+                        .collect();
+                    if found == word {
+                        return Some(
+                            buffer
+                                .cell((x, y))
+                                .unwrap()
+                                .modifier
+                                .contains(Modifier::BOLD),
+                        );
+                    }
+                }
+            }
+            None
+        };
+        assert_eq!(
+            bold_at_word("Name"),
+            Some(true),
+            "the header cell must render bold"
+        );
+        assert_eq!(
+            bold_at_word("Ada"),
+            Some(false),
+            "a body cell must not render bold"
+        );
+    }
+
+    /// Every `│` in the pane — the frame borders and the ones inside a
+    /// header/body row alike — must share one color, never picking up a
+    /// header row's bold or a body row's own tint. Before `table_row_spans`
+    /// existed, a row was one uniformly-styled string, so a header's `│`
+    /// rendered bold right along with "Name".
+    #[test]
+    fn every_table_border_char_shares_one_color() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let (tx, rx) = channel();
+        let session = Session::new(
+            Tree::new(None),
+            "say hi",
+            ToolRegistry::new(),
+            Box::new(ScriptedLlm::new([scripted_text(
+                "| Name | Role |\n|------|------|\n| Ada | Engineer |",
+            )])),
+            tx,
+        )
+        .unwrap();
+        session.handle().send(SessionCommand::UserTurn {
+            branch: session.conversation_branch(),
+            text: "go".into(),
+            expects_reply: true,
+        });
+        let session = session.run();
+
+        let mut app = AttachedApp::new(session.conversation_branch());
+        for event in rx.try_iter() {
+            app.apply(&event);
+        }
+
+        let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_chat(frame, &app, area, None, None);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+
+        // Scoped to rows the table itself occupies — the pane chrome
+        // (`Block::bordered()`) uses these same glyphs at the terminal's
+        // own edges, which would otherwise contaminate the sample.
+        let row_of = |word: &str| -> u16 {
+            for y in 0..buffer.area.height {
+                for x in 0..buffer.area.width {
+                    let found: String = (0..word.chars().count() as u16)
+                        .filter_map(|i| buffer.cell((x + i, y)).map(|c| c.symbol().to_owned()))
+                        .collect();
+                    if found == word {
+                        return y;
+                    }
+                }
+            }
+            panic!("{word:?} not found in the rendered buffer");
+        };
+        // Excludes x=0 and the last column: the *pane's* own
+        // `Block::bordered()` draws `│` at the transcript area's own
+        // left/right edges on every row height, including these — a
+        // second, unrelated source of the same glyph this test must not
+        // sample from.
+        let border_cells_in_row = |y: u16| -> Vec<(Color, Modifier)> {
+            (1..buffer.area.width - 1)
+                .filter_map(|x| {
+                    let cell = buffer.cell((x, y))?;
+                    (cell.symbol() == "│").then_some((cell.fg, cell.modifier))
+                })
+                .collect()
+        };
+        let mut border_cells = border_cells_in_row(row_of("Name"));
+        border_cells.extend(border_cells_in_row(row_of("Ada")));
+        assert!(
+            border_cells.len() >= 4,
+            "expected │ cells in both the header and body rows: {border_cells:?}"
+        );
+        let (first_fg, first_mod) = border_cells[0];
+        assert!(
+            border_cells
+                .iter()
+                .all(|(fg, m)| *fg == first_fg && *m == first_mod),
+            "every │ must share one color/style, header row and body row alike: {border_cells:?}"
+        );
+        assert!(
+            !first_mod.contains(Modifier::BOLD),
+            "│ must not inherit the header row's bold"
+        );
     }
 
     /// With nothing else to cycle to, Tab must not fall through to

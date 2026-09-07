@@ -8,6 +8,7 @@ mod attach;
 mod chat;
 mod highlight;
 mod input;
+mod markdown;
 mod panes;
 mod runner;
 mod ui;
