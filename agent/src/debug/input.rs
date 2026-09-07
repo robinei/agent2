@@ -190,6 +190,17 @@ impl InputBuffer {
         self.sticky_col = self.cursor.1;
     }
 
+    /// Cursor to the end of the *last* line, regardless of the current
+    /// row — unlike `end`, which stays on the current line. Used when
+    /// recalling history forward (input.rs callers): landing on the
+    /// bottom row is what lets a repeated `Down` keep walking forward
+    /// instead of just moving within the recalled text.
+    pub fn bottom(&mut self) {
+        let row = self.lines.len() - 1;
+        self.cursor = (row, self.lines[row].len());
+        self.sticky_col = self.cursor.1;
+    }
+
     /// Skips any whitespace immediately before the cursor, then the
     /// word behind that. A line boundary counts as whitespace (`'\n'`
     /// `is_whitespace`), which is what makes this cross lines the same
@@ -327,6 +338,14 @@ mod tests {
         b.delete_forward();
         assert_eq!(b.to_string(), "onetwo");
         assert_eq!(b.cursor(), (0, 3));
+    }
+
+    #[test]
+    fn bottom_moves_cursor_to_the_end_of_the_last_line() {
+        let mut b = InputBuffer::prefilled("one\ntwo\nthree");
+        assert_eq!(b.cursor(), (0, 0));
+        b.bottom();
+        assert_eq!(b.cursor(), (2, 5));
     }
 
     #[test]

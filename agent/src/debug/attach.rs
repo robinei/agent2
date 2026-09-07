@@ -224,6 +224,18 @@ pub struct AttachedApp {
     /// open rather than a place you live (17_BRANCHES Part D).
     pub timeline: bool,
     pub timeline_cursor: usize,
+    /// Every message this attached session has submitted from the input
+    /// box, oldest first — the up-arrow history. In-memory only (not
+    /// read back from the log), scoped to one attach.
+    history: Vec<String>,
+    /// `Some(i)` while browsing `history` backward from the live draft
+    /// (`i` indexes `history`); `None` when `input` holds the live draft
+    /// rather than a recalled entry.
+    history_cursor: Option<usize>,
+    /// The draft `input` held before the first `Up` started browsing —
+    /// restored verbatim (cursor and all) when `Down` walks back past
+    /// the newest entry.
+    history_draft: Option<InputBuffer>,
 }
 
 impl AttachedApp {
@@ -258,6 +270,44 @@ impl AttachedApp {
             ask_armed: false,
             timeline: false,
             timeline_cursor: 0,
+            history: Vec::new(),
+            history_cursor: None,
+            history_draft: None,
+        }
+    }
+
+    /// `Up` at the top row: recall the previous history entry, stashing
+    /// the live draft on the way in. No-op with no (further) history.
+    fn history_up(&mut self) {
+        if self.history.is_empty() {
+            return;
+        }
+        let next = match self.history_cursor {
+            None => {
+                self.history_draft = Some(self.input.clone());
+                self.history.len() - 1
+            }
+            Some(0) => return,
+            Some(i) => i - 1,
+        };
+        self.history_cursor = Some(next);
+        self.input = InputBuffer::prefilled(&self.history[next]);
+    }
+
+    /// `Down` at the bottom row: recall the next (newer) history entry,
+    /// or the stashed live draft once the newest entry is passed. No-op
+    /// when not currently browsing history.
+    fn history_down(&mut self) {
+        let Some(i) = self.history_cursor else {
+            return;
+        };
+        if i + 1 == self.history.len() {
+            self.history_cursor = None;
+            self.input = self.history_draft.take().unwrap_or_default();
+        } else {
+            self.history_cursor = Some(i + 1);
+            self.input = InputBuffer::prefilled(&self.history[i + 1]);
+            self.input.bottom();
         }
     }
 
@@ -593,6 +643,9 @@ impl AttachedApp {
         match key.code {
             KeyCode::Enter if !self.input.is_empty() => {
                 let text = std::mem::take(&mut self.input).to_string();
+                self.history.push(text.clone());
+                self.history_cursor = None;
+                self.history_draft = None;
                 let ask = std::mem::take(&mut self.ask_armed);
                 match self.explicit_mode.take() {
                     Some(mode) => KeyAction::SubmitMode(mode, text),
@@ -621,12 +674,24 @@ impl AttachedApp {
                 self.input.right();
                 KeyAction::None
             }
+            // At the top/bottom row, Up/Down walk message history instead
+            // of moving the cursor — there is nowhere for it to go
+            // vertically anyway. Mid-buffer, they move the cursor as
+            // usual.
             KeyCode::Up => {
-                self.input.up();
+                if self.input.cursor().0 == 0 {
+                    self.history_up();
+                } else {
+                    self.input.up();
+                }
                 KeyAction::None
             }
             KeyCode::Down => {
-                self.input.down();
+                if self.input.cursor().0 + 1 == self.input.line_count() {
+                    self.history_down();
+                } else {
+                    self.input.down();
+                }
                 KeyAction::None
             }
             KeyCode::Home => {
@@ -660,11 +725,19 @@ impl AttachedApp {
                 KeyAction::None
             }
             KeyCode::Char('p') if ctrl => {
-                self.input.up();
+                if self.input.cursor().0 == 0 {
+                    self.history_up();
+                } else {
+                    self.input.up();
+                }
                 KeyAction::None
             }
             KeyCode::Char('n') if ctrl => {
-                self.input.down();
+                if self.input.cursor().0 + 1 == self.input.line_count() {
+                    self.history_down();
+                } else {
+                    self.input.down();
+                }
                 KeyAction::None
             }
             // Ctrl-D deliberately does not carry readline's "EOF on an
@@ -2950,6 +3023,85 @@ mod tests {
             }
         );
         assert!(app.input.is_empty());
+    }
+
+    /// `Up` walks back through submitted messages, newest first,
+    /// stashing whatever was being drafted; `Down` walks back forward
+    /// and, past the newest entry, restores that stashed draft.
+    #[test]
+    fn arrow_keys_walk_message_history_at_the_buffer_edges() {
+        let mut app = AttachedApp::new(fid(1));
+        for text in ["first", "second"] {
+            for c in text.chars() {
+                app.on_input_key(KeyEvent::from(KeyCode::Char(c)));
+            }
+            app.on_input_key(KeyEvent::from(KeyCode::Enter));
+        }
+        for c in "draft".chars() {
+            app.on_input_key(KeyEvent::from(KeyCode::Char(c)));
+        }
+
+        app.on_input_key(KeyEvent::from(KeyCode::Up));
+        assert_eq!(
+            app.input.to_string(),
+            "second",
+            "Up recalls the newest entry first"
+        );
+        app.on_input_key(KeyEvent::from(KeyCode::Up));
+        assert_eq!(app.input.to_string(), "first");
+        app.on_input_key(KeyEvent::from(KeyCode::Up));
+        assert_eq!(
+            app.input.to_string(),
+            "first",
+            "no further history: stays put"
+        );
+
+        app.on_input_key(KeyEvent::from(KeyCode::Down));
+        assert_eq!(app.input.to_string(), "second");
+        app.on_input_key(KeyEvent::from(KeyCode::Down));
+        assert_eq!(
+            app.input.to_string(),
+            "draft",
+            "Down past the newest entry restores the stashed draft"
+        );
+        app.on_input_key(KeyEvent::from(KeyCode::Down));
+        assert_eq!(
+            app.input.to_string(),
+            "draft",
+            "nothing further to go forward to"
+        );
+    }
+
+    /// Mid-buffer, Up/Down move the cursor within the current draft
+    /// instead of touching history — even when history is non-empty.
+    #[test]
+    fn arrow_keys_move_the_cursor_before_touching_history_mid_buffer() {
+        let mut app = AttachedApp::new(fid(1));
+        for c in "old".chars() {
+            app.on_input_key(KeyEvent::from(KeyCode::Char(c)));
+        }
+        app.on_input_key(KeyEvent::from(KeyCode::Enter));
+
+        for c in "line one".chars() {
+            app.on_input_key(KeyEvent::from(KeyCode::Char(c)));
+        }
+        app.on_input_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+        for c in "line two".chars() {
+            app.on_input_key(KeyEvent::from(KeyCode::Char(c)));
+        }
+        assert_eq!(app.input.cursor(), (1, 8));
+
+        app.on_input_key(KeyEvent::from(KeyCode::Up));
+        assert_eq!(
+            app.input.cursor().0,
+            0,
+            "moved within the buffer, not into history"
+        );
+        assert_eq!(
+            app.input.to_string(),
+            "line one\nline two",
+            "history untouched"
+        );
     }
 
     /// `on_input_key` reaches the right `InputBuffer` method for a
