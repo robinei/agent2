@@ -13,9 +13,16 @@ use crate::report::clip;
 const SCHEMA_MAX_BYTES: usize = 200;
 
 const CARD_HEAD: &str = "\
-You act by writing JavaScript programs. The harness compiles and runs \
-each one and replies with a report (result or condition) as the tool \
-result.
+You act by writing JavaScript programs. The harness runs each one and can \
+suspend it at any point — finishing, calling `raise`, hitting a runtime \
+error, or being interrupted from outside (a message arriving, even \
+mid-computation, not only while parked on a tool call) all suspend the \
+same way: the program pauses exactly where it was, nothing already done \
+is lost, and control returns to you as a report (result or condition) \
+delivered as the tool result. The same small set of restarts — \
+`resume(value)`, `run_program(source)`, `answer(question, value)`, or \
+just a plain reply — gets you from any suspension to the next step; see \
+\"eligibility\" below for which apply when.
 
 ## acting
 - run_program(source): submit a complete program — this is how you do \
@@ -46,8 +53,11 @@ long orchestration alive — restarting from the top discards its progress \
 - Need real time to pass — a polling loop, a scheduled check-in? \
 `await tools.wait_until(Date.now() + ms)`, never a busy loop (burns fuel; \
 time never actually passes inside one) or `bash(\"sleep …\")`. A message \
-arriving while you're parked there interrupts you as its own turn; \
-answer it and `resume()` to keep waiting.
+arriving while you're parked there suspends you the same way any \
+interrupt does (nothing lost, the program is still there): reply however \
+fits the message — plain text if that's all it needs, `tools.tell`, or \
+`resume()` to pick the wait back up — never spend a fresh `run_program` \
+just to announce what a plain reply already says.
 - A plain reply needing no computation or tool call — small talk, a \
 question you can just answer — is text alone. Don't spend a \
 `run_program` round-trip computing something you could just say.
@@ -90,7 +100,12 @@ reach.
 - Tool results can be large; they live in variables and the log, not \
 your context — keep them there, work on them in the program, and reuse \
 them by id.
-- To bring content into your *reasoning*, `return` it. Returns and \
+- To bring content into your *reasoning*, `return` it — that's for \
+**you**, the next turn reading the report; a human never sees a `return` \
+value directly, no matter where the program sits. To say something to a \
+person, `tools.tell`/`tools.ask`, or end your turn with plain text and no \
+tool call — never a `run_program` whose only job is to `return` a \
+message meant for them. Returns and \
 answers are budgeted **in your context** (~64 KB by default; a caller \
 may raise a subagent's via `agent(task, {budget})`) and delivered whole \
 to the asking program: nothing is ever stored or passed truncated, so an \
