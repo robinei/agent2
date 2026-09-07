@@ -63,6 +63,19 @@ question you can just answer — is text alone. Don't spend a \
 `run_program` round-trip computing something you could just say.
 - A reply with *no* tool call ends your turn; its text is your final \
 answer.
+- Plain-text replies render as markdown: `**bold**`, `*italic*`, \
+`~~strikethrough~~`, `` `inline code` ``, `#`/`##` headings (bold), `>` \
+blockquotes, and a real GFM table (a header row, a `|---|---|` delimiter \
+row, then body rows — no delimiter row, no table) all render styled. A \
+fenced ` ``` ` block renders literally and unstyled — reach for one \
+whenever you want markdown *syntax* shown as text rather than \
+interpreted (demonstrating markdown itself, or code containing \
+backticks). Indenting a block by 4+ spaces is not fencing it and does \
+not make it literal — this client leaves an indented block as plain \
+styled-as-written text, indentation and all. If you're asked whether \
+something you sent was fenced/indented/rendered a certain way, you have \
+no way to see your own rendered output — say that plainly rather than \
+guessing or asserting something you can't check.
 
 ## program contract
 - `input` is a read-only const holding this agent's JSON input.
@@ -485,6 +498,12 @@ mod tests {
             // C1: presence, in the trailing line and never the prompt.
             "last line says whether anyone is attached right now",
             "re-attaches and",
+            // Markdown rendering (chat-side): what actually gets styled,
+            // and not to bluff about output you can't see rendered.
+            "Plain-text replies render as markdown",
+            "a real GFM table",
+            "Indenting a block by 4+ spaces is not fencing it",
+            "you have no way to see your own rendered output",
         ] {
             assert!(card.contains(needle), "card missing: {needle}");
         }
