@@ -362,7 +362,7 @@ impl AttachedApp {
     }
 
     pub fn auto_reset_chat_scroll(&mut self) {
-        let current = self.chat.rows(self.selected).len();
+        let current = self.chat.rows(self.selected, self.chat_wrap_width()).len();
         if current != self.last_chat_lines {
             self.chat_scroll = None;
             self.last_chat_lines = current;
@@ -393,6 +393,21 @@ impl AttachedApp {
             Pane::Navigator => self.navigator_scroll = Some(new),
             Pane::Input => {}
         }
+    }
+
+    /// The width `render_chat` last wrapped (and now lays tables out)
+    /// against — table layout needs to be measured at the *same* width
+    /// `rows()` was called with there, or `chat_line_rows`'s wrapped-line
+    /// offsets (built off that render) desync from a `rows()` called here
+    /// at a different width. Before the first render there is no
+    /// geometry yet; 80 is a plain, unsurprising placeholder no real
+    /// terminal is likely to be narrower than.
+    fn chat_wrap_width(&self) -> usize {
+        self.pane_rects
+            .iter()
+            .find(|(p, _)| *p == Pane::Chat)
+            .map(|(_, info)| info.area.width.saturating_sub(2).max(1) as usize)
+            .unwrap_or(80)
     }
 
     /// The pane (and its last-rendered geometry) under a cell, if any.
@@ -428,7 +443,7 @@ impl AttachedApp {
             Pane::Chat => {
                 let Some(body) = body else { return };
                 let line = info.scroll_top + body;
-                let rows = self.chat.rows(self.selected);
+                let rows = self.chat.rows(self.selected, self.chat_wrap_width());
                 // `line` is a wrapped-line offset; translate it back to
                 // the logical row it belongs to before indexing `rows`.
                 let Some(&row_idx) = self.chat_line_rows.get(line) else {
@@ -1736,6 +1751,10 @@ fn chat_style(kind: ChatKind, even: bool) -> Style {
         // Not even/odd-alternated, same reasoning as `Code`: a table's
         // frame reads as one fixed structure, not a striped row.
         ChatKind::TableBorder => Style::default().fg(Color::DarkGray),
+        // Already a full line of `─` by the time it's here (`classify_
+        // markdown_lines` renders it at the pane's own width) — nothing
+        // left to style but the color.
+        ChatKind::Hr => Style::default().fg(Color::DarkGray),
         ChatKind::Thinking => {
             let fg = if even {
                 Color::Rgb(130, 130, 130)
@@ -1933,9 +1952,9 @@ fn render_chat(
     // of losing everything past the border.
     let wrap_width = transcript_area.width.saturating_sub(2).max(1) as usize;
     let rows = if app.show_markdown {
-        app.chat.rows(app.selected)
+        app.chat.rows(app.selected, wrap_width)
     } else {
-        app.chat.rows_raw(app.selected)
+        app.chat.rows_raw(app.selected, wrap_width)
     };
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(rows.len());
     // One entry per wrapped line pushed below, naming which `rows` index
@@ -3411,14 +3430,14 @@ mod tests {
 
         // Sanity check on the data model first: with markdown ON, the
         // delimiter row is gone by design.
-        let classified = app.chat.rows(app.selected);
+        let classified = app.chat.rows(app.selected, 80);
         assert!(
             !classified.iter().any(|(_, t, _, _)| t.contains("------")),
             "the delimiter row is dropped when markdown rendering is on"
         );
 
         app.show_markdown = false;
-        let raw = app.chat.rows_raw(app.selected);
+        let raw = app.chat.rows_raw(app.selected, 80);
         assert!(
             raw.iter().any(|(_, t, _, _)| t.contains("------")),
             "but must survive verbatim in the raw row data: {raw:?}"
@@ -3863,6 +3882,70 @@ mod tests {
         );
     }
 
+    /// The user's exact reported bug, through the real render pipeline
+    /// this time (not just the `chat.rs` data layer): a table whose
+    /// natural width overflows a realistic pane used to fall through to
+    /// `push_wrapped_width`, which has no notion of box-drawing and
+    /// treats an unbroken border line as one giant unsplittable "word" —
+    /// clipped mid-frame by `Paragraph`'s no-wrap rendering, corners
+    /// never reaching the screen. Now that `rows()` pre-fits the table to
+    /// `wrap_width` itself, every corner must actually render.
+    #[test]
+    fn wide_table_renders_a_complete_unclipped_frame_in_the_real_chat_pane() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let (tx, rx) = channel();
+        let session = Session::new(
+            Tree::new(None),
+            "say hi",
+            ToolRegistry::new(),
+            Box::new(ScriptedLlm::new([scripted_text(
+                "| Path | What it is |\n\
+                 |---|---|\n\
+                 | `agent/` | The agent crate (`src/`, `samples`) |\n\
+                 | `interp/` | The JS interpreter/VM crate (`src/`, `docs/`) |\n\
+                 | `conformance/` | Conformance suite: `tests/`, `expectations.json`, \
+                 custom `harness/` |",
+            )])),
+            tx,
+        )
+        .unwrap();
+        session.handle().send(SessionCommand::UserTurn {
+            branch: session.conversation_branch(),
+            text: "go".into(),
+            expects_reply: true,
+        });
+        let session = session.run();
+
+        let mut app = AttachedApp::new(session.conversation_branch());
+        for event in rx.try_iter() {
+            app.apply(&event);
+        }
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 16)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_chat(frame, &app, area, None, None);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+
+        let contains = |glyph: &str| {
+            (0..buffer.area.height).any(|y| {
+                (0..buffer.area.width).any(|x| buffer.cell((x, y)).unwrap().symbol() == glyph)
+            })
+        };
+        for glyph in ["┌", "┐", "├", "┤", "┼", "└", "┘"] {
+            assert!(
+                contains(glyph),
+                "frame glyph {glyph:?} never reached the screen — the row that carries \
+                 it was clipped instead of fitting the pane"
+            );
+        }
+    }
+
     /// With nothing else to cycle to, Tab must not fall through to
     /// `select_branch` on the branch already selected — that would
     /// silently reset the program/subitem selection and every pane's
@@ -3911,7 +3994,7 @@ mod tests {
         for event in rx.try_iter() {
             app.apply(&event);
         }
-        let rows = app.chat.rows(Some(branch));
+        let rows = app.chat.rows(Some(branch), 80);
         assert!(rows.len() >= 2, "the demo logs more than one row");
         let (first_id, second_id) = (rows[0].3, rows[1].3);
         app.pane_rects.push((
@@ -3967,7 +4050,7 @@ mod tests {
         for event in rx.try_iter() {
             app.apply(&event);
         }
-        let rows = app.chat.rows(Some(branch));
+        let rows = app.chat.rows(Some(branch), 80);
         assert!(rows.len() >= 3, "the demo logs at least three rows");
         let (row1_id, row2_id) = (rows[1].3, rows[2].3);
         app.pane_rects.push((

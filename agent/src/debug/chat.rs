@@ -64,6 +64,10 @@ pub enum ChatKind {
     /// the predecessor's own table rendering (`agent-cli/src/markdown.rs`
     /// `render_border_row`), the fidelity found lost in the port.
     TableBorder,
+    /// A markdown horizontal rule (`---`/`***`/`___`, 3+ of the same
+    /// char alone on a line) — rendered full-pane-width, matching the
+    /// predecessor's own `"─".repeat(term_width)` rule.
+    Hr,
 }
 
 /// Click-hit metadata for a transcript row.
@@ -104,9 +108,13 @@ enum Entry {
     },
 }
 
-/// One `Entry::Line`'s memoized `classify_entry_lines` output, `None`
-/// until first read.
-type LineCache = std::cell::RefCell<Vec<Option<Vec<(ChatKind, String)>>>>;
+/// One `Entry::Line`'s memoized `classify_entry_lines` output, alongside
+/// the width it was computed for — a table's layout depends on the pane
+/// width, so a cached entry is only valid for the width it was laid out
+/// against; a mismatch is treated as a plain cache miss (recompute and
+/// overwrite), the same "keyed by width" strategy the predecessor's own
+/// render cache uses. `None` until first read.
+type LineCache = std::cell::RefCell<Vec<Option<(usize, Vec<(ChatKind, String)>)>>>;
 
 #[derive(Default)]
 pub struct ChatState {
@@ -483,8 +491,17 @@ impl ChatState {
     /// row carries no logged id yet, so it gets a sentinel no branch root
     /// can ever equal. Multi-line items split; the system prompt
     /// collapses to a single header row.
-    pub fn rows(&self, branch: Option<BranchId>) -> Vec<(ChatKind, String, RowDetail, EventId)> {
-        self.rows_impl(branch, true)
+    /// `width` is the pane's own content width — needed now that a table
+    /// lays its columns out to fit it, not just its natural cell content:
+    /// a table wider than the pane used to fall through to the generic
+    /// word-wrapper, which has no notion of box-drawing structure and
+    /// shredded the frame.
+    pub fn rows(
+        &self,
+        branch: Option<BranchId>,
+        width: usize,
+    ) -> Vec<(ChatKind, String, RowDetail, EventId)> {
+        self.rows_impl(branch, true, width)
     }
 
     /// Same rows, but with markdown block/inline classification skipped
@@ -496,14 +513,16 @@ impl ChatState {
     pub fn rows_raw(
         &self,
         branch: Option<BranchId>,
+        width: usize,
     ) -> Vec<(ChatKind, String, RowDetail, EventId)> {
-        self.rows_impl(branch, false)
+        self.rows_impl(branch, false, width)
     }
 
     fn rows_impl(
         &self,
         branch: Option<BranchId>,
         render_markdown: bool,
+        width: usize,
     ) -> Vec<(ChatKind, String, RowDetail, EventId)> {
         let Some(target) = branch.or(self.main_branch) else {
             return Vec::new();
@@ -573,14 +592,17 @@ impl ChatState {
                     };
                     {
                         let mut cache_mut = cache.borrow_mut();
-                        if cache_mut[entry_index].is_none() {
+                        let stale = !matches!(&cache_mut[entry_index], Some((w, _)) if *w == width);
+                        if stale {
                             self.line_derivations.set(self.line_derivations.get() + 1);
-                            cache_mut[entry_index] =
-                                Some(classify_entry_lines(*kind, text, render_markdown));
+                            cache_mut[entry_index] = Some((
+                                width,
+                                classify_entry_lines(*kind, text, render_markdown, width),
+                            ));
                         }
                     }
                     let cache_ref = cache.borrow();
-                    for (k, line) in cache_ref[entry_index].as_ref().unwrap() {
+                    for (k, line) in &cache_ref[entry_index].as_ref().unwrap().1 {
                         out.push((*k, line.clone(), detail.clone(), *id));
                     }
                 }
@@ -605,7 +627,7 @@ impl ChatState {
                 continue;
             }
             if render_markdown {
-                for (override_kind, line) in classify_markdown_lines(buf) {
+                for (override_kind, line) in classify_markdown_lines(buf, width) {
                     out.push((
                         override_kind.unwrap_or(ChatKind::Streaming),
                         line,
@@ -649,7 +671,7 @@ impl ChatState {
 /// scratch with whatever rows have landed since — this can widen a
 /// column as a later, longer cell arrives, but never panics or garbles
 /// what's already there.
-fn classify_markdown_lines(text: &str) -> Vec<(Option<ChatKind>, String)> {
+fn classify_markdown_lines(text: &str, width: usize) -> Vec<(Option<ChatKind>, String)> {
     let lines: Vec<&str> = text.lines().collect();
     let mut out = Vec::new();
     let mut in_fence = false;
@@ -678,26 +700,32 @@ fn classify_markdown_lines(text: &str) -> Vec<(Option<ChatKind>, String)> {
                 rows.push(table_cells(lines[j]));
                 j += 1;
             }
-            let widths = column_widths(&rows, ncols);
+            let natural = column_widths(&rows, ncols);
+            let typical = column_typical_widths(&rows[1..], ncols);
+            // "│  " + cell + "  │  " between cells + "  │" to close —
+            // the same total `format_table_row_lines`/
+            // `format_table_border` actually spend per column (two
+            // padding spaces either side, not the predecessor's one).
+            let overhead = 5 * ncols + 1;
+            let available = width.saturating_sub(overhead);
+            let widths = distribute_widths(&natural, &typical, available);
             let mut rows = rows.into_iter().peekable();
             let header_row = rows.next().unwrap();
             out.push((
                 Some(ChatKind::TableBorder),
                 format_table_border(&widths, '┌', '┬', '┐'),
             ));
-            out.push((
-                Some(ChatKind::TableHeader),
-                format_table_row(&header_row, &widths, ncols),
-            ));
+            for line in format_table_row_lines(&header_row, &widths, ncols) {
+                out.push((Some(ChatKind::TableHeader), line));
+            }
             out.push((
                 Some(ChatKind::TableBorder),
                 format_table_border(&widths, '├', '┼', '┤'),
             ));
             while let Some(row) = rows.next() {
-                out.push((
-                    Some(ChatKind::TableRow),
-                    format_table_row(&row, &widths, ncols),
-                ));
+                for line in format_table_row_lines(&row, &widths, ncols) {
+                    out.push((Some(ChatKind::TableRow), line));
+                }
                 if rows.peek().is_some() {
                     out.push((
                         Some(ChatKind::TableBorder),
@@ -712,7 +740,9 @@ fn classify_markdown_lines(text: &str) -> Vec<(Option<ChatKind>, String)> {
             i = j;
             continue;
         }
-        if let Some(rest) = heading_text(line) {
+        if is_horizontal_rule(line) {
+            out.push((Some(ChatKind::Hr), "─".repeat(width)));
+        } else if let Some(rest) = heading_text(line) {
             out.push((Some(ChatKind::Heading), rest.to_owned()));
         } else if let Some(rest) = line.strip_prefix('>') {
             out.push((
@@ -776,33 +806,215 @@ fn column_widths(rows: &[Vec<String>], ncols: usize) -> Vec<usize> {
     widths
 }
 
-/// Left-justify `row`'s cells to `widths`, padding a short row's missing
-/// cells with empty ones and ignoring any past `ncols` — the same
-/// ragged-input tolerance `column_widths` measures against. `│`, not
-/// `|` — box-drawing to match the predecessor's own table rendering
-/// (`render_data_row`, `agent-cli/src/markdown.rs`), the fidelity this
-/// was found to have lost in the port.
+/// Each column's *median* cell width across `body_rows` (the header
+/// excluded — it's a deliberately chosen label, not a data sample) —
+/// what a column would want to be if only the typical row mattered.
+/// `column_widths`' natural width is a strict max, which lets a single
+/// rare outlier cell (one long path next to nine short ones, say)
+/// dictate the whole column's baseline size. `distribute_widths` uses
+/// this as each column's own resistance point: a column can shrink most
+/// of the way down to its typical width under pressure — the rare
+/// outlier just wraps across extra lines — without that shrinkage ever
+/// touching a column whose values are *uniformly* wide, where the
+/// typical width is close to the max anyway and there's really nothing
+/// to gain by calling it "just an outlier."
+fn column_typical_widths(body_rows: &[Vec<String>], ncols: usize) -> Vec<usize> {
+    (0..ncols)
+        .map(|col| {
+            let mut widths: Vec<usize> = body_rows
+                .iter()
+                .map(|row| row.get(col).map_or(0, |c| c.width()))
+                .collect();
+            if widths.is_empty() {
+                return 0;
+            }
+            widths.sort_unstable();
+            widths[widths.len() / 2]
+        })
+        .collect()
+}
+
+/// A column is never squeezed below this while another column still has
+/// more than its share to give — enough room for a few wrapped words to
+/// stay legible; below it a column stops reflowing and starts shredding
+/// individual words letter by letter.
+const MIN_COLUMN_WIDTH: usize = 8;
+
+/// Shrink `natural` column widths to fit `available`, when they don't
+/// already fit. Unchanged if they already fit.
+///
+/// This project first ported the predecessor's own `distribute_widths`
+/// (`agent-cli/src/markdown.rs`) — scale every column down proportional
+/// to its share of the *raw total* — but that's exactly wrong when one
+/// column (a free-text description, say) is wildly larger than the
+/// rest: its sheer size dominates the total, so the very first
+/// proportional pass rounds every other column down to nothing before
+/// any fairness logic ever runs. The next attempt overcorrected the
+/// other way — shrink only whichever single column is currently
+/// widest — which protects small columns completely, but *too*
+/// completely: a handful of medium columns (each comfortably above the
+/// floor, but none of them ever the single largest) never give up
+/// anything at all, no matter how much room the oversized column
+/// could actually use if they each gave a little.
+///
+/// The fix is what the predecessor was reaching for in the first place,
+/// corrected: scale proportional to each column's *slack* — how much
+/// natural width it has above `MIN_COLUMN_WIDTH` — not to its raw
+/// natural width. A column already near the floor has almost no slack
+/// and so gives up almost nothing, whatever its neighbor's size;
+/// several medium columns each contribute their fair share; and a truly
+/// oversized column, whose slack dwarfs everyone else's, still absorbs
+/// nearly all of the reduction, exactly as it should.
+fn distribute_widths(natural: &[usize], typical: &[usize], available: usize) -> Vec<usize> {
+    // Tier 1: shrink toward each column's own *typical* width first — a
+    // uniformly-wide column has little slack here and barely moves; a
+    // mostly-short column with a rare outlier has lots and gives most
+    // of it up (see `column_typical_widths`).
+    let typical_floor: Vec<usize> = typical.iter().map(|&t| t.max(MIN_COLUMN_WIDTH)).collect();
+    let widths = shrink_toward(natural, &typical_floor, available);
+    if widths.iter().sum::<usize>() <= available {
+        return widths;
+    }
+    // Tier 1 wasn't enough on its own — there's genuinely more content
+    // than fits even at every column's typical size (several
+    // legitimately wide columns, say), not just one column hoarding
+    // width relative to its neighbors. Shrinking no further here would
+    // silently let the table overflow the pane, exactly the bug this
+    // whole file exists to avoid — so drop the typical protection and
+    // shrink again, proportional to whatever's left above the hard
+    // floor, sharing that pain too instead of giving up early.
+    let hard_floor = vec![MIN_COLUMN_WIDTH; natural.len()];
+    shrink_toward(&widths, &hard_floor, available)
+}
+
+/// Shrink `current` widths toward `floor` (never below it) to fit
+/// `available`, proportional to each column's slack above its own
+/// floor — unchanged if it already fits, and allowed to still exceed
+/// `available` only once every column has hit its floor and there is
+/// truly nothing left to give (the caller decides what floor to try
+/// next, or to accept the overflow).
+fn shrink_toward(current: &[usize], floor: &[usize], available: usize) -> Vec<usize> {
+    let total: usize = current.iter().sum();
+    if total <= available {
+        return current.to_vec();
+    }
+    let slack: Vec<usize> = current
+        .iter()
+        .zip(floor)
+        .map(|(&w, &f)| w.saturating_sub(f))
+        .collect();
+    let total_slack: usize = slack.iter().sum();
+    let excess = total - available;
+    if total_slack == 0 || excess >= total_slack {
+        // Every column giving up its *entire* slack still isn't enough
+        // (or nothing has any slack to give) — floor everyone that can
+        // and let the caller decide whether that's the final answer.
+        return current.iter().zip(&slack).map(|(&w, &s)| w - s).collect();
+    }
+    let mut widths: Vec<usize> = current
+        .iter()
+        .zip(&slack)
+        .map(|(&w, &s)| w - (excess * s / total_slack))
+        .collect();
+    // Integer division leaves the reduction a little short of `excess`
+    // — trim the remainder one column at a time from whoever currently
+    // has the most slack left, same floor guarantee, until it actually
+    // fits.
+    loop {
+        let sum: usize = widths.iter().sum();
+        if sum <= available {
+            break;
+        }
+        let Some((idx, _)) = widths
+            .iter()
+            .enumerate()
+            .filter(|&(i, &w)| w > floor[i])
+            .max_by_key(|&(_, &w)| w)
+        else {
+            break;
+        };
+        widths[idx] -= 1;
+    }
+    widths
+}
+
+/// One cell's content, word-wrapped to `max_width` display columns —
+/// ported from the predecessor's `wrap_cell`, plain strings only (a
+/// table cell is never markdown-reinterpreted, so there are no styled
+/// spans to carry through). Existing `\n`s split first, since a cell can
+/// already be multi-line; `textwrap` (already a dependency, used the
+/// same way in `attach.rs`) handles the actual word-wrap per hard line —
+/// never split a word, an overlong single word gets its own overflowing
+/// line regardless, same contract as everywhere else this project wraps.
+fn wrap_table_cell(text: &str, max_width: usize) -> Vec<String> {
+    let max_width = max_width.max(1);
+    let mut out = Vec::new();
+    for line in text.split('\n') {
+        if line.is_empty() {
+            out.push(String::new());
+        } else if line.width() <= max_width {
+            out.push(line.to_owned());
+        } else {
+            out.extend(
+                textwrap::wrap(line, max_width)
+                    .into_iter()
+                    .map(String::from),
+            );
+        }
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
+}
+
+/// `row`'s cells wrapped to `widths` and re-assembled into however many
+/// output lines the tallest wrapped cell needs — a short cell pads with
+/// blank lines so every column stays aligned row-by-row, matching the
+/// predecessor's `render_data_row`. `│`, not `|` — box-drawing to match
+/// the predecessor's own table rendering, the fidelity this was found to
+/// have lost in the port. Ragged-input tolerant: a short row's missing
+/// cells become empty ones, anything past `ncols` is ignored, the same
+/// as `column_widths` already measures against.
 ///
 /// Pads by display width, not `format!("{:<width$}")` — that pads by
 /// `.chars().count()`, which is exactly the same undercount
 /// `column_widths` avoids, just at render time instead of measurement
 /// time; using one and not the other would just move the misalignment
 /// rather than fix it.
-fn format_table_row(row: &[String], widths: &[usize], ncols: usize) -> String {
-    let cells: Vec<String> = (0..ncols)
+///
+/// Two spaces of padding either side of every cell, not one — a single
+/// space read as asymmetric once a block's zero left margin (see
+/// `classify_entry_lines`) put the table's own `┌`/`│` flush against the
+/// pane's left border with nothing to balance the space already sitting
+/// between a short row's content and the pane's right border.
+fn format_table_row_lines(row: &[String], widths: &[usize], ncols: usize) -> Vec<String> {
+    let wrapped: Vec<Vec<String>> = (0..ncols)
         .map(|col| {
             let cell = row.get(col).map_or("", String::as_str);
-            let pad = widths[col].saturating_sub(cell.width());
-            format!("{cell}{}", " ".repeat(pad))
+            wrap_table_cell(cell, widths[col])
         })
         .collect();
-    format!("│ {} │", cells.join(" │ "))
+    let row_height = wrapped.iter().map(Vec::len).max().unwrap_or(1).max(1);
+    (0..row_height)
+        .map(|line_idx| {
+            let cells: Vec<String> = (0..ncols)
+                .map(|col| {
+                    let line = wrapped[col].get(line_idx).map_or("", String::as_str);
+                    let pad = widths[col].saturating_sub(line.width());
+                    format!("{line}{}", " ".repeat(pad))
+                })
+                .collect();
+            format!("│  {}  │", cells.join("  │  "))
+        })
+        .collect()
 }
 
 /// A border row — `┌───┬───┐` / `├───┼───┤` / `└───┴───┘` depending on
 /// which three chars the caller passes — one call site per position
-/// (`render_border_row`'s equivalent). `w + 2`: one padding space either
-/// side of a cell's content, matching `format_table_row`'s `"│ {cell} │"`.
+/// (`render_border_row`'s equivalent). `w + 4`: two padding spaces
+/// either side of a cell's content, matching `format_table_row_lines`'s
+/// `"│  {cell}  │"`.
 fn format_table_border(widths: &[usize], left: char, mid: char, right: char) -> String {
     let mut line = String::new();
     line.push(left);
@@ -810,12 +1022,24 @@ fn format_table_border(widths: &[usize], left: char, mid: char, right: char) -> 
         if i > 0 {
             line.push(mid);
         }
-        for _ in 0..w + 2 {
+        for _ in 0..w + 4 {
             line.push('─');
         }
     }
     line.push(right);
     line
+}
+
+/// A line that is nothing but 3+ of the same rule character (`-`, `*`,
+/// or `_`), optionally spaced out (CommonMark allows `- - -`) — GFM's
+/// thematic break. Checked before `heading_text`: a bare `---` must not
+/// fall through to "not a heading, so plain text."
+fn is_horizontal_rule(line: &str) -> bool {
+    let stripped: String = line.trim().chars().filter(|c| !c.is_whitespace()).collect();
+    stripped.len() >= 3
+        && (stripped.chars().all(|c| c == '-')
+            || stripped.chars().all(|c| c == '*')
+            || stripped.chars().all(|c| c == '_'))
 }
 
 /// `line` past its `#`..`######` marker, iff followed by whitespace (a
@@ -846,6 +1070,7 @@ fn classify_entry_lines(
     kind: ChatKind,
     text: &str,
     render_markdown: bool,
+    width: usize,
 ) -> Vec<(ChatKind, String)> {
     let label = match kind {
         ChatKind::User => "you ❯ ",
@@ -854,7 +1079,7 @@ fn classify_entry_lines(
     };
     let classified: Vec<(Option<ChatKind>, String)> =
         if render_markdown && matches!(kind, ChatKind::Assistant | ChatKind::Streaming) {
-            classify_markdown_lines(text)
+            classify_markdown_lines(text, width)
         } else {
             text.lines().map(|l| (None, l.to_owned())).collect()
         };
@@ -862,7 +1087,16 @@ fn classify_entry_lines(
     let mut any = false;
     for (i, (override_kind, line)) in classified.into_iter().enumerate() {
         any = true;
-        let head = if i == 0 {
+        // A block construct (heading/blockquote/code/table/rule) never
+        // shares its line with the label, even as its very first line —
+        // reserving that margin for it would mean every one of its
+        // lines (a table's column layout is uniform top to bottom) pays
+        // for a label it may not even carry, right when it needs every
+        // column it can get. Only plain prose keeps the "agent ❯ "/
+        // "you ❯ " label and its continuation-line indent.
+        let head = if override_kind.is_some() {
+            String::new()
+        } else if i == 0 {
             label.to_owned()
         } else {
             " ".repeat(label.chars().count())
@@ -990,7 +1224,7 @@ mod tests {
             thinking: false,
             text: "thinki".into(),
         });
-        let rows = chat.rows(None);
+        let rows = chat.rows(None, 80);
         assert!(
             rows.iter()
                 .any(|(k, t, _, _)| *k == ChatKind::User && t.contains("hi"))
@@ -1002,7 +1236,7 @@ mod tests {
 
         // The logged assistant message replaces the stream.
         chat.apply(&run_program(3));
-        let rows = chat.rows(None);
+        let rows = chat.rows(None, 80);
         assert!(!rows.iter().any(|(k, _, _, _)| *k == ChatKind::Streaming));
         // A run_program renders as a status-titled block header.
         assert!(rows.iter().any(|(k, t, p, _)| *k == ChatKind::ToolCall
@@ -1010,7 +1244,7 @@ mod tests {
             && *p == RowDetail::Program(EventId::new(3))));
 
         // Return/Rename never reach the transcript.
-        let before = chat.rows(None).len();
+        let before = chat.rows(None, 80).len();
         chat.apply(&ev(
             5,
             EventPayload::Return {
@@ -1023,7 +1257,7 @@ mod tests {
                 name: "note".into(),
             },
         ));
-        assert_eq!(chat.rows(None).len(), before);
+        assert_eq!(chat.rows(None, 80).len(), before);
     }
 
     /// A run_program with two inner calls renders as one block: a
@@ -1049,7 +1283,7 @@ mod tests {
         chat.apply(&settled(5, 3, serde_json::json!("A")));
         chat.apply(&settled(6, 4, serde_json::json!(true)));
 
-        let rows = chat.rows(None);
+        let rows = chat.rows(None, 80);
         let glyphs: Vec<&(ChatKind, String, RowDetail, EventId)> = rows
             .iter()
             .filter(|(k, t, _, _)| *k == ChatKind::ToolCall && t.starts_with('⚙'))
@@ -1074,7 +1308,7 @@ mod tests {
 
         // Header starts at running…
         assert!(
-            chat.rows(None)
+            chat.rows(None, 80)
                 .iter()
                 .any(|(_, t, _, _)| t == "run_program: running")
         );
@@ -1086,7 +1320,7 @@ mod tests {
             status: ProgramStatus::Completed,
         });
         assert!(
-            chat.rows(None)
+            chat.rows(None, 80)
                 .iter()
                 .any(|(_, t, _, _)| t == "run_program: completed")
         );
@@ -1095,7 +1329,7 @@ mod tests {
         // never even an event: it is derived from the outcome.
         assert!(
             !chat
-                .rows(None)
+                .rows(None, 80)
                 .iter()
                 .any(|(_, t, _, _)| t.contains("program completed"))
         );
@@ -1113,12 +1347,12 @@ mod tests {
         chat.apply(&assistant_turn(2, "one **bold** line"));
         chat.apply(&assistant_turn(3, "another line"));
 
-        chat.rows(None);
+        chat.rows(None, 80);
         let after_first = chat.line_derivations.get();
         assert!(after_first > 0, "the first call must actually derive");
 
-        chat.rows(None);
-        chat.rows(None);
+        chat.rows(None, 80);
+        chat.rows(None, 80);
         assert_eq!(
             chat.line_derivations.get(),
             after_first,
@@ -1128,7 +1362,7 @@ mod tests {
         // A genuinely new entry must derive exactly once more — not the
         // whole history again.
         chat.apply(&assistant_turn(4, "a third line"));
-        chat.rows(None);
+        chat.rows(None, 80);
         assert_eq!(chat.line_derivations.get(), after_first + 1);
     }
 
@@ -1141,16 +1375,16 @@ mod tests {
         chat.apply(&agent_event());
         chat.apply(&assistant_turn(2, "# Heading"));
 
-        chat.rows(None); // primes the classified cache
-        chat.rows_raw(None); // primes the raw cache
+        chat.rows(None, 80); // primes the classified cache
+        chat.rows_raw(None, 80); // primes the raw cache
 
-        let classified = chat.rows(None);
+        let classified = chat.rows(None, 80);
         assert!(
             classified
                 .iter()
                 .any(|(k, _, _, _)| *k == ChatKind::Heading)
         );
-        let raw = chat.rows_raw(None);
+        let raw = chat.rows_raw(None, 80);
         assert!(
             raw.iter()
                 .all(|(k, _, _, _)| matches!(k, ChatKind::System | ChatKind::Assistant)),
@@ -1170,7 +1404,7 @@ mod tests {
         chat.apply(&invoke(3, "fetch"));
 
         assert!(
-            chat.rows(None)
+            chat.rows(None, 80)
                 .iter()
                 .any(|(_, t, _, _)| t.contains("fetch → …")),
             "pending before the result lands"
@@ -1179,7 +1413,7 @@ mod tests {
 
         chat.apply(&settled(4, 3, serde_json::json!("A")));
         assert!(
-            chat.rows(None)
+            chat.rows(None, 80)
                 .iter()
                 .any(|(_, t, _, _)| t.contains("fetch → \"A\"")),
             "the row must reflect the outcome, not the stale cached pending text"
@@ -1214,7 +1448,7 @@ mod tests {
         chat.apply(&settled(6, 4, serde_json::json!("A")));
 
         let glyphs: Vec<String> = chat
-            .rows(None)
+            .rows(None, 80)
             .into_iter()
             .filter(|(k, t, _, _)| *k == ChatKind::ToolCall && t.starts_with('⚙'))
             .map(|(_, t, _, _)| t)
@@ -1263,12 +1497,12 @@ mod tests {
         // `Assistant`-kind messages, exactly like the agent's own text.
         assert!(
             !chat
-                .rows(None)
+                .rows(None, 80)
                 .iter()
                 .any(|(k, t, _, _)| *k == ChatKind::ToolCall && t.starts_with('⚙'))
         );
         let messages: Vec<String> = chat
-            .rows(None)
+            .rows(None, 80)
             .into_iter()
             .filter(|(k, _, _, _)| *k == ChatKind::Assistant)
             .map(|(_, t, _, _)| t)
@@ -1312,7 +1546,7 @@ mod tests {
         ));
 
         // Root's slice: leading system row, then the user message.
-        let root_rows = chat.rows(Some(EventId::new(1)));
+        let root_rows = chat.rows(Some(EventId::new(1)), 80);
         assert_eq!(root_rows[0].0, ChatKind::System);
         assert_eq!(root_rows[0].2, RowDetail::None);
         assert!(
@@ -1324,7 +1558,7 @@ mod tests {
         assert!(!root_rows.iter().any(|(_, t, _, _)| t.contains("CHILD")));
 
         // The child's slice leads with its own system header.
-        let child_rows = chat.rows(Some(child));
+        let child_rows = chat.rows(Some(child), 80);
         assert_eq!(child_rows[0].0, ChatKind::System);
         assert_eq!(child_rows[0].2, RowDetail::None);
         assert!(!child_rows.iter().any(|(_, t, _, _)| t.contains("root q")));
@@ -1385,7 +1619,7 @@ mod tests {
             }),
         ));
 
-        let fork_rows = chat.rows(Some(EventId::new(10)));
+        let fork_rows = chat.rows(Some(EventId::new(10)), 80);
         assert!(
             fork_rows
                 .iter()
@@ -1408,7 +1642,7 @@ mod tests {
             "a fork owes nothing of what the original does afterward"
         );
 
-        let original_rows = chat.rows(Some(EventId::new(1)));
+        let original_rows = chat.rows(Some(EventId::new(1)), 80);
         assert!(
             original_rows
                 .iter()
@@ -1447,7 +1681,7 @@ mod tests {
             }),
         ));
 
-        let rows = chat.rows(None);
+        let rows = chat.rows(None, 80);
         let thinking_idx = rows
             .iter()
             .position(|(k, t, _, _)| *k == ChatKind::Thinking && t.contains("6*7"))
@@ -1489,7 +1723,7 @@ mod tests {
             thinking: false,
             text: "partial answer".into(),
         });
-        let rows = chat.rows(None);
+        let rows = chat.rows(None, 80);
         assert!(
             rows.iter()
                 .any(|(k, t, _, _)| *k == ChatKind::Thinking && t.contains("reasoning"))
@@ -1508,7 +1742,7 @@ mod tests {
                 tool_calls: vec![],
             }),
         ));
-        let rows = chat.rows(None);
+        let rows = chat.rows(None, 80);
         assert!(
             !rows.iter().any(|(_, t, _, _)| t.contains("partial answer")),
             "the live text stream is replaced by the logged turn"
@@ -1561,7 +1795,7 @@ mod tests {
             "# Heading\n> quoted\n```\ncode line\n```\nplain",
         ));
 
-        let raw = chat.rows_raw(None);
+        let raw = chat.rows_raw(None, 80);
         assert!(
             raw.iter()
                 .all(|(k, _, _, _)| matches!(k, ChatKind::System | ChatKind::Assistant)),
@@ -1577,7 +1811,7 @@ mod tests {
 
         // The classified version is unaffected — this is a read-time
         // choice, not a destructive one.
-        let classified = chat.rows(None);
+        let classified = chat.rows(None, 80);
         assert!(
             classified
                 .iter()
@@ -1586,6 +1820,239 @@ mod tests {
     }
 
     /// A `# Heading` line becomes its own `Heading` row, stripped of its
+    /// `---`/`***`/`___` alone on a line is a thematic break, rendered
+    /// as a full-pane-width rule — not left as literal dashes, and not
+    /// mistaken for a table delimiter (no leading `|`) or misdetected
+    /// A block construct never pays for the "agent ❯ " label's margin,
+    /// even directly after a prose line that does carry it: a table
+    /// preceded by prose must be laid out identically to the same table
+    /// with no prose at all — the label's width must never leak into
+    /// its column math. A wide single-cell word (`x` × 30) makes this
+    /// table wide enough that the old `width - label.len()` bug would
+    /// A `distribute_widths` unit test isolated from the rest of the
+    /// table pipeline: the user's exact reported shape — one wildly
+    /// oversized free-text column next to several short label columns —
+    /// must not crush the short columns down to the floor. A naive
+    /// proportional scale does exactly that, since the oversized
+    /// column's sheer size dominates the total and rounds every other
+    /// column's *share* of it down to nothing before any fairness logic
+    /// runs.
+    #[test]
+    fn oversized_column_absorbs_shrinkage_alone() {
+        let natural = vec![7, 4, 10, 800]; // Entry, Type, Size/detail, free text
+        let widths = distribute_widths(&natural, &[0; 4], 100);
+        // Two of the three short columns have no slack above the floor
+        // at all (7 and 4 are already under MIN_COLUMN_WIDTH) and so
+        // are untouched; the third (10) gives up at most a sliver of
+        // its one column of slack — nothing close to what the huge
+        // column gives up.
+        assert_eq!(
+            &widths[..2],
+            &natural[..2],
+            "no-slack columns untouched: {widths:?}"
+        );
+        assert!(
+            widths[2] + 2 >= natural[2],
+            "a column with only 1-2 slack barely shrinks: {widths:?}"
+        );
+        assert!(
+            widths[3] < natural[3] / 2,
+            "the oversized column absorbs the overwhelming majority of the shrinkage: {widths:?}"
+        );
+        assert_eq!(
+            widths.iter().sum::<usize>(),
+            100,
+            "the widths still add up to exactly the available budget"
+        );
+    }
+
+    /// Every column keeps at least `MIN_COLUMN_WIDTH` even when the
+    /// *sum* of natural widths still can't fit after every column but
+    /// one has already hit the floor — there's nothing left to give, so
+    /// the result is allowed to overflow `available` rather than being
+    /// The user's second reported shape: several *medium* columns (each
+    /// comfortably above the floor, but none the single largest) next
+    /// to one huge free-text column. Every medium column must give up
+    /// *something* — proportional to its own slack — rather than being
+    /// fully exempt just because it never happens to be the current
+    /// A column with nine short values and one rare long one has a
+    /// *typical* (median) width close to the short case, not the
+    /// outlier — `column_widths`' own natural width, a strict max,
+    /// would report the outlier's width instead.
+    #[test]
+    fn column_typical_width_ignores_a_rare_outlier() {
+        let mut rows: Vec<Vec<String>> = (0..9).map(|_| vec!["dir".to_owned()]).collect();
+        rows.push(vec!["a very long one-off value".to_owned()]);
+        let typical = column_typical_widths(&rows, 1);
+        assert_eq!(
+            typical[0], 3,
+            "the median of nine 3-char values and one outlier is 3"
+        );
+    }
+
+    /// A column where *every* value is uniformly long has a typical
+    /// width close to its natural (max) one — there's no rare outlier
+    /// to discount, so this floor must not differ meaningfully from a
+    /// flat one.
+    #[test]
+    fn column_typical_width_tracks_natural_when_uniformly_wide() {
+        let rows: Vec<Vec<String>> = (0..5)
+            .map(|_| vec!["a fairly long and uniform value".to_owned()])
+            .collect();
+        let natural = column_widths(&rows, 1);
+        let typical = column_typical_widths(&rows, 1);
+        assert_eq!(typical[0], natural[0]);
+    }
+
+    /// The user's exact recollection: a column mostly full of short
+    /// values, with one rare long outlier, should shrink most of the
+    /// way to its *typical* size under pressure — leaving the outlier
+    /// to wrap across extra lines — rather than keeping the outlier's
+    /// full width just because a flat floor never got in its way. A
+    /// uniformly-wide neighbor column, by contrast, must not be shrunk
+    /// away just because it happens to look similar in `natural` width.
+    #[test]
+    fn mostly_short_column_shrinks_toward_its_typical_width_not_its_outlier() {
+        // Column 0: nine short + one 40-char outlier (natural 40, typical ~3).
+        // Column 1: uniformly ~40 chars every row (natural 40, typical ~40).
+        let natural = vec![40, 40];
+        let typical = vec![3, 40];
+        let widths = distribute_widths(&natural, &typical, 50);
+        assert_eq!(widths.iter().sum::<usize>(), 50);
+        assert!(
+            widths[0] < widths[1],
+            "the mostly-short column must shrink well below the uniformly-wide one: {widths:?}"
+        );
+        assert!(
+            widths[0] <= MIN_COLUMN_WIDTH.max(3) + 2,
+            "it should land close to its own typical width, not just any floor: {widths:?}"
+        );
+    }
+
+    /// max; the huge column still gives up the most by far.
+    #[test]
+    fn medium_columns_each_share_the_burden_proportional_to_their_own_slack() {
+        let natural = vec![18, 11, 9, 8, 700]; // Name, Type, Size, Modified, description
+        let widths = distribute_widths(&natural, &[0; 5], 100);
+        assert_eq!(widths.iter().sum::<usize>(), 100);
+        assert_eq!(
+            widths[3], 8,
+            "Modified had zero slack (already at the floor): untouched"
+        );
+        assert!(
+            widths[0] < natural[0],
+            "Name (10 slack) must give up something: {widths:?}"
+        );
+        assert!(
+            widths[1] < natural[1],
+            "Type (3 slack) must give up something: {widths:?}"
+        );
+        assert!(
+            widths[4] < natural[4] / 8,
+            "the description column still gives up the overwhelming majority: {widths:?}"
+        );
+        // Sharing the burden must leave the huge column with *more*
+        // room than the old "only the single max ever shrinks"
+        // approach would (it would have left every medium column at
+        // its full natural size, giving description only
+        // 100 - (18+11+9+8) = 54).
+        assert!(
+            widths[4] > 54,
+            "spreading the reduction across every column with slack must leave the \
+             oversized column with more room than shrinking it alone would: {widths:?}"
+        );
+    }
+
+    /// crushed into unreadable single-character columns.
+    #[test]
+    fn distribute_widths_gives_up_at_the_floor_rather_than_overflowing_columns_further() {
+        let natural = vec![50, 50, 50];
+        let widths = distribute_widths(&natural, &[0; 3], 10);
+        assert!(
+            widths.iter().all(|&w| w == MIN_COLUMN_WIDTH),
+            "every column floors out rather than going below it: {widths:?}"
+        );
+    }
+
+    #[test]
+    fn block_content_never_pays_for_the_label_margin() {
+        let table = "| Path | What it is |\n|---|---|\n| p | xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx |";
+
+        let mut with_prose = ChatState::new();
+        with_prose.apply(&agent_event());
+        with_prose.apply(&assistant_turn(
+            2,
+            &format!("Here's the layout:\n\n{table}"),
+        ));
+        let prose_rows = with_prose.rows(None, 40);
+        let (_, prose, _, _) = prose_rows
+            .iter()
+            .find(|(k, t, _, _)| *k == ChatKind::Assistant && t.contains("layout"))
+            .unwrap();
+        assert!(prose.starts_with("agent ❯ "));
+
+        let mut table_only = ChatState::new();
+        table_only.apply(&agent_event());
+        table_only.apply(&assistant_turn(2, table));
+        let bare_rows = table_only.rows(None, 40);
+
+        let border = |rows: &[(ChatKind, String, RowDetail, EventId)]| {
+            rows.iter()
+                .find(|(k, ..)| *k == ChatKind::TableBorder)
+                .unwrap()
+                .1
+                .clone()
+        };
+        let (with_prose_border, bare_border) = (border(&prose_rows), border(&bare_rows));
+        assert!(
+            with_prose_border.starts_with('┌'),
+            "no label margin before the table's own border: {with_prose_border:?}"
+        );
+        assert_eq!(
+            with_prose_border, bare_border,
+            "a preceding labeled prose line must not shrink the table that follows it"
+        );
+    }
+
+    /// from a spaced-out `- - -` variant.
+    #[test]
+    fn horizontal_rule_renders_full_width() {
+        let mut chat = ChatState::new();
+        chat.apply(&agent_event());
+        chat.apply(&assistant_turn(2, "before\n---\nafter"));
+
+        let rows = chat.rows(None, 20);
+        let (kind, text, _, _) = rows
+            .iter()
+            .find(|(k, ..)| *k == ChatKind::Hr)
+            .expect("an Hr row is present");
+        assert_eq!(*kind, ChatKind::Hr);
+        assert_eq!(text.width(), 20, "rendered at the full pane width");
+        assert!(
+            !text.contains('-'),
+            "literal dashes replaced with the rule glyph"
+        );
+
+        for variant in ["***", "___", "- - -"] {
+            let mut chat = ChatState::new();
+            chat.apply(&agent_event());
+            chat.apply(&assistant_turn(2, variant));
+            assert!(
+                chat.rows(None, 10).iter().any(|(k, ..)| *k == ChatKind::Hr),
+                "{variant:?} must be recognized as a rule"
+            );
+        }
+
+        // Two dashes is just a dash, not a rule; and a real table
+        // delimiter must still win over a bare-dashes misread.
+        let mut chat = ChatState::new();
+        chat.apply(&agent_event());
+        chat.apply(&assistant_turn(2, "--\n| a | b |\n|---|---|\n| 1 | 2 |"));
+        let rows = chat.rows(None, 20);
+        assert!(!rows.iter().any(|(k, ..)| *k == ChatKind::Hr));
+        assert!(rows.iter().any(|(k, ..)| *k == ChatKind::TableHeader));
+    }
+
     /// marker, ahead of the plain-text row that follows it.
     #[test]
     fn heading_line_becomes_its_own_row_ahead_of_plain_text() {
@@ -1593,7 +2060,7 @@ mod tests {
         chat.apply(&agent_event());
         chat.apply(&assistant_turn(2, "# Heading\ntext after"));
 
-        let rows = chat.rows(None);
+        let rows = chat.rows(None, 80);
         let heading_idx = rows
             .iter()
             .position(|(k, t, _, _)| *k == ChatKind::Heading && t.contains("Heading"))
@@ -1618,7 +2085,7 @@ mod tests {
         chat.apply(&agent_event());
         chat.apply(&assistant_turn(2, "> quoted\nplain"));
 
-        let rows = chat.rows(None);
+        let rows = chat.rows(None, 80);
         let (_, text, _, _) = rows
             .iter()
             .find(|(k, t, _, _)| *k == ChatKind::Blockquote && t.contains("quoted"))
@@ -1639,7 +2106,7 @@ mod tests {
         chat.apply(&agent_event());
         chat.apply(&assistant_turn(2, "before\n```\ncode line\n```\nafter"));
 
-        let rows = chat.rows(None);
+        let rows = chat.rows(None, 80);
         assert!(
             !rows.iter().any(|(_, t, _, _)| t.contains("```")),
             "delimiter lines must never appear as rows"
@@ -1668,7 +2135,7 @@ mod tests {
         chat.apply(&agent_event());
         chat.apply(&assistant_turn(2, "```markdown\n# Project Plan\n```"));
 
-        let rows = chat.rows(None);
+        let rows = chat.rows(None, 80);
         assert!(!rows.iter().any(|(_, t, _, _)| t.contains("```")));
         let (kind, text, _, _) = rows
             .iter()
@@ -1692,7 +2159,7 @@ mod tests {
             text: "```\nin progress\n".into(),
         });
 
-        let rows = chat.rows(None);
+        let rows = chat.rows(None, 80);
         assert!(
             rows.iter()
                 .any(|(k, t, _, _)| *k == ChatKind::Code && t.contains("in progress")),
@@ -1710,13 +2177,48 @@ mod tests {
         chat.apply(&agent_event());
         chat.apply(&post(2, "# not a heading"));
 
-        let rows = chat.rows(None);
+        let rows = chat.rows(None, 80);
         let (kind, text, _, _) = rows
             .iter()
             .find(|(_, t, _, _)| t.contains("not a heading"))
             .expect("the row is present");
         assert_eq!(*kind, ChatKind::User);
         assert!(text.contains('#'), "marker kept literally: {text}");
+    }
+
+    /// Two spaces of padding on both sides of every cell, symmetric —
+    /// not the one-space form that read as lopsided once a table's own
+    /// left edge sat flush against the pane border with nothing to
+    /// balance the padding already on its right.
+    #[test]
+    fn table_cell_padding_is_two_spaces_both_sides() {
+        let mut chat = ChatState::new();
+        chat.apply(&agent_event());
+        // 3-char cells match `column_widths`' own floor exactly, so no
+        // extra fill-to-floor padding muddies the assertion below.
+        chat.apply(&assistant_turn(
+            2,
+            "| AAA | BBB |\n|---|---|\n| 111 | 222 |",
+        ));
+
+        let rows = chat.rows(None, 80);
+        let header = &rows
+            .iter()
+            .find(|(k, ..)| *k == ChatKind::TableHeader)
+            .unwrap()
+            .1;
+        assert!(
+            header.starts_with("│  AAA"),
+            "two spaces after the opening │: {header:?}"
+        );
+        assert!(
+            header.contains("AAA  │  BBB"),
+            "two spaces on both sides of the inter-column │: {header:?}"
+        );
+        assert!(
+            header.ends_with("BBB  │"),
+            "two spaces before the closing │: {header:?}"
+        );
     }
 
     /// A well-formed table becomes one `TableHeader` row and one
@@ -1732,7 +2234,7 @@ mod tests {
             "| Name | Role |\n|------|------|\n| Ada | Engineer |\n| Grace | Admiral |",
         ));
 
-        let rows = chat.rows(None);
+        let rows = chat.rows(None, 80);
         assert!(!rows.iter().any(|(_, t, _, _)| t.contains('-')));
         let header = rows
             .iter()
@@ -1762,6 +2264,94 @@ mod tests {
     /// row — including the header, which has no wide glyph — must come
     /// out to the identical rendered width; a `.chars().count()`-based
     /// measurement would leave the `✅` rows one column narrower than
+    /// The user's exact reported bug: a short column next to one whose
+    /// natural content is wider than a realistic pane — previously this
+    /// fell through to the generic word-wrapper, which has no notion of
+    /// box-drawing and shredded the frame into garbled fragments. Every
+    /// row (border and content alike) must now fit the pane, agree on
+    /// one total width, and the long column must actually wrap rather
+    /// than overflow.
+    #[test]
+    fn wide_table_column_wraps_to_fit_the_pane_instead_of_overflowing() {
+        // The regression this reproduces: several columns that are each
+        // individually wide with little slack relative to their OWN
+        // typical width (every "Purpose" cell is a full sentence, every
+        // "Name" a real filename) — so tier 1 (shrink toward typical)
+        // isn't enough on its own, and without tier 2 falling back to
+        // the hard floor, this used to overflow the pane outright.
+        let mut probe = ChatState::new();
+        probe.apply(&agent_event());
+        probe.apply(&assistant_turn(
+            2,
+            "| Name | Kind | Size | Modified | Purpose |\n\
+             |---|---|---|---|---|\n\
+             | `Cargo.toml` | file | 72 B | Jun 18 | Workspace manifest; declares members `agent`, `interp`, `conformance` |\n\
+             | `Cargo.lock` | file | 76 KB | Sep 7 | Locked dependency versions for the whole workspace |\n\
+             | `agent/` | dir | — | Sep 7 | **Harness crate** — the product: branch-step machine, host loop, TUI, subagent tree |",
+        ));
+        for width in [60, 80, 100] {
+            let rows = probe.rows(None, width);
+            for (kind, t, _, _) in &rows {
+                if matches!(
+                    kind,
+                    ChatKind::TableHeader | ChatKind::TableRow | ChatKind::TableBorder
+                ) {
+                    assert!(
+                        t.width() <= width,
+                        "row exceeds pane width {width}: {} cols: {t:?}",
+                        t.width()
+                    );
+                }
+            }
+        }
+
+        let mut chat = ChatState::new();
+        chat.apply(&agent_event());
+        chat.apply(&assistant_turn(
+            2,
+            "| Path | What it is |\n\
+             |---|---|\n\
+             | `agent/` | The agent crate (`src/`, `samples`) |\n\
+             | `interp/` | The JS interpreter/VM crate (`src/`, `docs/`) |\n\
+             | `conformance/` | Conformance suite: `tests/`, `expectations.json`, custom `harness/` |",
+        ));
+
+        let width = 80;
+        let rows = chat.rows(None, width);
+        let table_rows: Vec<&(ChatKind, String, RowDetail, EventId)> = rows
+            .iter()
+            .filter(|(k, ..)| {
+                matches!(
+                    k,
+                    ChatKind::TableHeader | ChatKind::TableRow | ChatKind::TableBorder
+                )
+            })
+            .collect();
+        assert!(!table_rows.is_empty(), "the table must still be detected");
+
+        for (_, t, _, _) in &table_rows {
+            assert!(
+                t.width() <= width,
+                "row exceeds the pane width {width}: {} cols: {t:?}",
+                t.width()
+            );
+        }
+        let widths: Vec<usize> = table_rows.iter().map(|(_, t, _, _)| t.width()).collect();
+        assert!(
+            widths.windows(2).all(|w| w[0] == w[1]),
+            "every border and content row must share one rectangular frame width: {widths:?}"
+        );
+        let data_row_lines = table_rows
+            .iter()
+            .filter(|(k, ..)| *k == ChatKind::TableRow)
+            .count();
+        assert!(
+            data_row_lines > 3,
+            "the long column should have wrapped across extra lines for at least one of \
+             the 3 data rows, not stayed one line each: {data_row_lines}"
+        );
+    }
+
     /// the rest, misaligning every border below them.
     #[test]
     fn wide_glyphs_do_not_misalign_later_rows() {
@@ -1776,7 +2366,7 @@ mod tests {
              | Quote | `> text` | ✅ |",
         ));
 
-        let rows = chat.rows(None);
+        let rows = chat.rows(None, 80);
         let label_width = "agent ❯ ".chars().count();
         let widths: Vec<usize> = rows
             .iter()
@@ -1808,7 +2398,7 @@ mod tests {
             "| Name | Role |\n|------|------|\n| Ada | Engineer |\n| Grace | Admiral |",
         ));
 
-        let rows = chat.rows(None);
+        let rows = chat.rows(None, 80);
         let kinds: Vec<ChatKind> = rows.iter().map(|(k, ..)| *k).collect();
         assert_eq!(
             kinds,
@@ -1824,20 +2414,18 @@ mod tests {
             ],
             "border/header/border/row/border/row/border, no bare pipe rows"
         );
-        // The first line of the whole turn carries the literal
-        // "agent ❯ " label; every later line gets that many spaces
-        // instead (`push_wrapped`'s continuation indent) — strip exactly
-        // that many characters either way, rather than the literal label.
-        let label_width = "agent ❯ ".chars().count();
-        let strip_label = |s: &str| s.chars().skip(label_width).collect::<String>();
+        // Table rows carry no label/indent at all, even the very first
+        // one — a block construct never shares its line with "agent ❯ "
+        // (chat.rs, `classify_entry_lines`), so it can use the pane's
+        // full width instead of paying for a label it doesn't show.
         let text = |k: ChatKind| rows.iter().find(|(rk, ..)| *rk == k).unwrap().1.clone();
-        assert!(strip_label(&text(ChatKind::TableHeader)).starts_with('│'));
+        assert!(text(ChatKind::TableHeader).starts_with('│'));
         let mut borders = rows.iter().filter(|(k, ..)| *k == ChatKind::TableBorder);
-        assert!(strip_label(&borders.next().unwrap().1).starts_with('┌'));
-        let mid = strip_label(&borders.next().unwrap().1);
+        assert!(borders.next().unwrap().1.starts_with('┌'));
+        let mid = &borders.next().unwrap().1;
         assert!(mid.starts_with('├') && mid.contains('┼') && mid.ends_with('┤'));
         assert!(
-            strip_label(&borders.next_back().unwrap().1).ends_with('┘'),
+            borders.next_back().unwrap().1.ends_with('┘'),
             "the very last row is the bottom border"
         );
     }
@@ -1860,8 +2448,8 @@ mod tests {
         chat.apply(&assistant_turn(2, text));
 
         for (label, rows) in [
-            ("classified", chat.rows(None)),
-            ("raw", chat.rows_raw(None)),
+            ("classified", chat.rows(None, 80)),
+            ("raw", chat.rows_raw(None, 80)),
         ] {
             assert!(
                 !rows
@@ -1895,7 +2483,7 @@ mod tests {
              | Short |",
         ));
 
-        let rows = chat.rows(None);
+        let rows = chat.rows(None, 80);
         assert!(!rows.iter().any(|(_, t, _, _)| t.contains("---")));
         let table_rows: Vec<_> = rows
             .iter()
@@ -1929,7 +2517,7 @@ mod tests {
             "before\n| A | B |\n|---|---|\n| 1 | 2 |\nafter",
         ));
 
-        let rows = chat.rows(None);
+        let rows = chat.rows(None, 80);
         assert!(
             rows.iter()
                 .any(|(k, t, _, _)| *k == ChatKind::Assistant && t.contains("before"))
@@ -1948,7 +2536,7 @@ mod tests {
         chat.apply(&agent_event());
         chat.apply(&assistant_turn(2, "```\n| a | b |\n|---|---|\n```"));
 
-        let rows = chat.rows(None);
+        let rows = chat.rows(None, 80);
         assert!(!rows.iter().any(|(_, t, _, _)| t.contains("```")));
         assert!(
             !rows
