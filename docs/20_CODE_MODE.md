@@ -227,10 +227,15 @@ something to measure.
 
 ### The transport
 
-- [ ] **One transport: the document as a single user message, thinking
-      on, no prefill.** The model answers with the program itself, in
-      format (the no-fence rule below). That is the only variant every
-      provider supports, so it is the only one built.
+- [x] **One transport: the document as a role-delimited chat exchange
+      (Part B), thinking on, no prefill.** The model answers with the
+      program itself, in format (the no-fence rule below). That is the
+      only variant every provider supports, so it is the only one
+      built. (This bullet originally read "a single user message" —
+      written before the role-delimited flip later in this doc's own
+      design discussion; Part B's layout is what was actually agreed
+      and built, and this line is corrected to match it rather than
+      left contradicting Part B.)
 - [ ] **Why not prefill**, despite it being available on this project's
       provider: it works nowhere else (see the table), it is beta-gated
       where it does work, and the no-fence rule already took away most
@@ -244,7 +249,7 @@ something to measure.
       thesis says this bet pays most on a base model or a fine-tune,
       and that is the shape those want. Keeping the seam costs nothing;
       building the variant now does.
-- [ ] **The seam stays: the document is the interface.** One function
+- [x] **The seam stays: the document is the interface.** One function
       renders the bytes; how they reach the model is a thin layer
       behind it. Adding a transport later must not restructure
       anything, which is the whole reason the seam exists with a single
@@ -279,7 +284,7 @@ something to measure.
       | Anthropic | no (legacy API retired) | no — removed in Claude 4.6, returns 400; also unsupported with extended thinking before that | yes |
       | OpenAI | effectively no — legacy `/v1/completions` is instruct-class only, and the `gpt-3.5-turbo-completions` alias shuts down 2026-10-23 | no — a trailing assistant message starts a *new* turn; occasional continuation is happenstance, not contract | not exposed as content |
 
-- [ ] **Thinking is the one non-portable thing kept**, because writing
+- [x] **Thinking is the one non-portable thing kept**, because writing
       one long correct orchestration program is the most
       reasoning-heavy thing this system asks for. On DeepSeek:
       `thinking: {type: "enabled", reasoning_effort: "max"}`, enabled
@@ -337,7 +342,7 @@ something to measure.
       being the one after which a trained assistant turn follows. That
       single marker is the entire cost of not having prefill, and the
       no-fence rule plus the seed exemplar are what pay it down.
-- [ ] **The card goes in `system`.** An earlier draft kept it inside
+- [x] **The card goes in `system`.** An earlier draft kept it inside
       the document, arguing that the system region is conditioned for
       "instructions to an assistant" and that a uniform file register
       was worth protecting. That argument does not survive the
@@ -370,7 +375,7 @@ something to measure.
       already a condition with a handler, so non-compliance is told to
       the model and rewritten, not silently accepted. A checked
       constraint beats a requested one.
-- [ ] **Tolerate a stray fence silently.** The likeliest residual
+- [x] **Tolerate a stray fence silently.** The likeliest residual
       failure is habit — wrapping in ```javascript. Strip a leading or
       trailing fence before parsing so it costs nothing, and reserve
       the parse-failure condition for genuine syntax errors. Do not
@@ -400,7 +405,7 @@ something to measure.
       parsed as program source, and truncation is a condition (above),
       not a crash. If the raw variant is ever built it needs a sentinel
       line, since with no fence it has no stop marker at all.
-- [ ] The document is assembled by one function with a golden-render
+- [x] The document is assembled by one function with a golden-render
       test, the way the condition report is (`report.rs` precedent).
       The renderer emits the card, the grouped turns, and nothing else
       — so a future transport changes only how those bytes travel.
@@ -435,7 +440,7 @@ assistant    ← the model writes here
 
 ### Step B1 — Layout: role-delimited
 
-- [ ] **An assistant turn is one program, bare, with no entry header.**
+- [x] **An assistant turn is one program, bare, with no entry header.**
       The role marker is the delimiter. This is the point of the
       layout: every historical assistant turn is a **demonstration of
       what an assistant turn is here** — pure code, no preamble — sitting
@@ -450,21 +455,21 @@ assistant    ← the model writes here
       role-delimited layout answers that token with N worked examples.
       It also makes alternation natural, so nothing depends on a
       provider accepting consecutive same-role messages.
-- [ ] **User turns are plain text, not comments.** There is no JS
+- [x] **User turns are plain text, not comments.** There is no JS
       literal to escape, so the escaping and injection arguments that
       applied to a literal do not transfer; entry *spoofing* is equally
       possible either way and is handled by how untrusted text is
       delimited, not by a `//` prefix. Dropping the prefix saves a
       token per line.
-- [ ] **Status and effects belong to the following user turn**, not to
+- [x] **Status and effects belong to the following user turn**, not to
       the assistant turn — the model did not say them, the harness did.
       "The program above trapped at line 30" plus the effects lines are
       reported back exactly as a tool result is, which is the most
       heavily trained shape in any chat model. The grouping lands on
       the template rather than fighting it.
-- [ ] **`//:` narration stays, and only inside programs**, where it is
+- [x] **`//:` narration stays, and only inside programs**, where it is
       genuine JS and where the streaming contract needs it (Step G1b).
-- [ ] **Harness statements and untrusted content must be
+- [x] **Harness statements and untrusted content must be
       distinguishable, and no role marks that.** `tool` would be the
       semantically right role and is unusable — it requires a matching
       `tool_call_id` from the preceding assistant turn, and fabricating
@@ -489,11 +494,11 @@ assistant    ← the model writes here
       conventional agent every tool result is an injection vector by
       default; here the only automatic entrants are user messages and
       unsolicited posts.
-- [ ] **Ids survive, because they do the work:** `remove_history`,
+- [x] **Ids survive, because they do the work:** `remove_history`,
       `answer`, and artifact references all need them, and a consistent
       one-line entry shape keeps compaction a line rewrite. `[4] note:
       …`, `[5] robin: …`, `[3] effects: …`.
-- [ ] **Only assistant turns must parse.** A program that failed to
+- [x] **Only assistant turns must parse.** A program that failed to
       compile is reported in a user turn as text, so nothing in the
       historical record has to be valid JS. The golden-render test
       asserts the *model's output* parses.
@@ -506,7 +511,7 @@ assistant    ← the model writes here
       in history with no program waiting for it — a user message, an
       unsolicited post (Step B2) — renders the document and asks for a
       program. A `raise()` renders it for a handler. Nothing else does.
-- [ ] **The frame is regenerated; the record accumulates.** The card
+- [x] **The frame is regenerated; the record accumulates.** The card
       and the rendered turns are how the log is *presented*. Only the
       model's completion is a fact about what happened, so nothing is
       double-stored and the shape is identical every turn.
@@ -518,18 +523,18 @@ entries. **Nothing new is stored**, which is what makes the layout
 rendering comparisons deferred in Part H renderer swaps rather than
 schema changes.
 
-- [ ] Assistant message = one program's source. User message = every
+- [x] Assistant message = one program's source. User message = every
       event between that program and the next: its effects entry, posts
       that arrived, anything appended. Order is total along a spine, so
       the partition is deterministic.
-- [ ] **Two programs can never be adjacent**, since a completion is
+- [x] **Two programs can never be adjacent**, since a completion is
       only triggered by an event landing — so a user message is never
       empty, which some APIs reject. Assert it.
 - [ ] **Handler programs never appear as assistant turns.** They are
       transient (Step B2). A handler's own request still ends with
       `<|assistant|>` and still shows prior root programs as assistant
       turns, so it gets the same demonstrations.
-- [ ] **Grouping lives in the render function and is golden-tested.** A
+- [x] **Grouping lives in the render function and is golden-tested.** A
       change to how events partition into messages silently invalidates
       every session's cache — the same hazard class as editing the
       card.
@@ -544,12 +549,12 @@ enough on its own: the *rendering* must be append-only too.
       stable turn. Role-delimited turns make that natural — there is a
       real message boundary to mark. Verify breakpoint count, the
       minimum cacheable length (below it nothing caches), and TTL.
-- [ ] **Nothing in flight is rendered.** The trap is status: rendering
+- [x] **Nothing in flight is rendered.** The trap is status: rendering
       a running program and later rewriting its outcome mutates bytes
       inside the cached prefix. A program becomes part of the record
       only when finished; while it runs it lives in the transient tail
       with the condition report.
-- [ ] **The tail: what it is and where it goes.** Ephemeral content
+- [x] **The tail: what it is and where it goes.** Ephemeral content
       for one request only — the condition report when prompting a
       handler (Step D1), the `vm` pointer once Part F lands, anything
       the mind should see now and never again.
@@ -570,7 +575,7 @@ enough on its own: the *rendering* must be append-only too.
 
 ### Step B2 — What enters history automatically
 
-- [ ] **Exactly DESIGN.md's rule C, and nothing else: data enters
+- [x] **Exactly DESIGN.md's rule C, and nothing else: data enters
       context precisely when no program is waiting to receive it.**
       - a user message, or an unsolicited post from another agent →
         history, automatically;
@@ -580,7 +585,7 @@ enough on its own: the *rendering* must be append-only too.
         not history;
       - a root program's completion → nothing; it reaches people
         through `say()`.
-- [ ] **An effects row per program, automatic.** A program's source is
+- [x] **An effects row per program, automatic.** A program's source is
       *intent*, not outcome — a loop over a computed file list does not
       say which files were written. So each program entry is accompanied
       by a compact record of what it did to the world:
@@ -595,7 +600,7 @@ enough on its own: the *rendering* must be append-only too.
       and nobody was waiting for it, which makes it rule-C-shaped. What
       any of it *meant* is `append_history`, because only the mind can
       author that.
-- [ ] **Facts and identities, never content — not even truncated.**
+- [x] **Facts and identities, never content — not even truncated.**
       `#51` is the call id, not the output. Truncation is too
       little to work from and too much to be free, and it is exactly
       the machinery Part I deletes (`DEFAULT_ANSWER_BUDGET`, report
@@ -606,14 +611,14 @@ enough on its own: the *rendering* must be append-only too.
       the user has a better channel: the TUI renders reads and diffs
       live from `Call`/`Result` events (Step G3b). Once those are
       separate, the case for content in history disappears.
-- [ ] **Reads aggregate, writes itemize.** A read changed nothing and
+- [x] **Reads aggregate, writes itemize.** A read changed nothing and
       its only content is "I looked"; a program reading 500 files in a
       loop must not produce 500 entries, and its source already says it
       read every `.rs` file. Writes, commands and spawns are durable
       changes someone may need to review or undo, so they are named. A
       very long write list caps with a count and an id — capping a list
       of *names* is not truncating content.
-- [ ] **One row per program, never per call.** This is the property
+- [x] **One row per program, never per call.** This is the property
       that makes the row safe: effects grow with the number of programs
       written, never with the amount of work done. A program doing 500
       operations costs the same as one doing three.
@@ -629,11 +634,11 @@ enough on its own: the *rendering* must be append-only too.
       one line is what the deleted forks phase spent five parts trying
       to buy.
 - [ ] **Handler programs must be logged**, same as any other
-      completion: they are real programs with real effects, and Step
-      A3's raise-placement diagnostic — the one that matters — cannot
+      completion: they are real programs with real effects, and Part
+      H's raise-placement diagnostic — the one that matters — cannot
       read raise sites that were never written down. Not rendered, not
       lost: the artifact rule again.
-- [ ] Test: a root program that raises forty times and completes adds
+- [x] Test: a root program that raises forty times and completes adds
       exactly two entries to the rendered record — its own
       source-with-status, plus whatever it appended — and no entry per
       raise, while the log holds all forty handlers.
@@ -981,7 +986,7 @@ needs a **stack of VMs**.
 
 ## Part E — Compaction as a condition
 
-- [ ] **Fires at a headroom threshold, not at overflow.** The handler
+- [x] **Fires at a headroom threshold, not at overflow.** The handler
       is itself an inference whose prompt contains the history that
       already does not fit; there must be room for the handler's prompt
       and its program. Triggering at the failing `append_history()` is
@@ -994,14 +999,14 @@ needs a **stack of VMs**.
       projects from that point forward. The edit is auditable,
       replayable, and a branch forked before it still sees the
       original. Append-only survives.
-- [ ] **Never drop an id — only content.** A compacted entry leaves a
+- [x] **Never drop an id — only content.** A compacted entry leaves a
       stub: id, label, one line — a line rewrite, which is why the
       one-line entry shape (Step B1) suits compaction better than a
       literal would. Lossy but recoverable, because the
       result is still in the log and still fetchable. This is the same
       move the artifact model already makes, and it bounds the damage
       when the mind compacts wrong, which it will.
-- [ ] **The program is checked before it commits**: every id still
+- [x] **The program is checked before it commits**: every id still
       present as at least a stub, size actually below the threshold, no
       row silently emptied. On failure the condition re-fires. This is
       the real advantage over regenerative summarization, above speed —
@@ -1330,8 +1335,8 @@ rendering rule, no tree change.
 - How much the model appends per program, and whether compaction
   actually reclaims. This phase trades a *structural* leak for a
   *behavioural* one: everything in history is there because a mind chose
-  it, so growth is bounded by the model's discipline. Measure it in Part
-  A alongside program size.
+  it, so growth is bounded by the model's discipline. Measure it in
+  Part H alongside program size.
 - Whether the human fork gesture (`17_BRANCHES` Part D) still wants a
   `Fork` at all once branches exist only for minds, or whether it is
   better expressed as a new agent seeded with a projection of the

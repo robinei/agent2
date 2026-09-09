@@ -742,6 +742,145 @@ mod tests {
         }
     }
 
+    /// The plan doc's own "Gate before Part C", read literally: one
+    /// log exercising every entry kind at once — including a program
+    /// that failed to compile — with all four of the gate's own
+    /// assertions in one place, rather than scattered across the
+    /// more targeted tests above.
+    #[test]
+    fn gate_before_part_c() {
+        let log = vec![
+            (
+                id(1),
+                Entry::Message {
+                    from: "robin".into(),
+                    text: "go".into(),
+                },
+            ),
+            (
+                id(2),
+                Entry::Program {
+                    source: "const x = ;".into(),
+                    outcome: ProgramOutcome::Trapped {
+                        line: 1,
+                        message: "unexpected token `;`".into(),
+                    },
+                },
+            ),
+            (
+                id(3),
+                Entry::Note {
+                    from: Some(id(2)),
+                    text: "that attempt failed, trying again".into(),
+                },
+            ),
+            (
+                id(4),
+                Entry::Program {
+                    source: "say('fixed it');".into(),
+                    outcome: ProgramOutcome::Completed,
+                },
+            ),
+            (
+                id(5),
+                Entry::Effects {
+                    of: id(4),
+                    wrote: vec!["src/parse.rs".into()],
+                    ran: vec![RanCommand {
+                        cmd: "cargo test".into(),
+                        exit: 0,
+                        output: id(51),
+                    }],
+                    read: 2,
+                    spawned: vec!["reviewer".into()],
+                },
+            ),
+            (
+                id(6),
+                Entry::CompactedStub {
+                    label: "old_note".into(),
+                    text: "(removed)".into(),
+                },
+            ),
+        ];
+
+        // "A program that failed to compile is still an entry": entry
+        // 2's source does not parse, and rendering does not reject it.
+        let doc = render("CARD", &log).expect("a trapped program is still a valid entry");
+
+        // "The completion region parses": a *completed* program's
+        // turn parses. This is **not** "every assistant turn parses"
+        // — entry 2 is deliberately a `Trapped` program, and its
+        // whole reason for existing as a test fixture is that its
+        // turn does *not* parse (Step B1: "a program that failed to
+        // compile is still an entry"). Only completions the model
+        // actually finished successfully are asserted here.
+        let completed_sources: Vec<&str> = log
+            .iter()
+            .filter_map(|(_, e)| match e {
+                Entry::Program {
+                    source,
+                    outcome: ProgramOutcome::Completed,
+                } => Some(source.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            completed_sources.len(),
+            1,
+            "fixture sanity: one completed program"
+        );
+        for source in completed_sources {
+            interp::compile(source).expect("a completed program's turn must parse");
+        }
+        // And the converse, so this test cannot silently stop
+        // covering the trapped case if the fixture ever changes:
+        assert!(
+            interp::compile("const x = ;").is_err(),
+            "fixture sanity: the trapped program's source is genuinely invalid"
+        );
+
+        // "ids and labels round-trip": every entry's id round-trips
+        // into the rendered text — a `Program`'s own id surfaces via
+        // its status line in the *following* turn (Step B1), not
+        // inside its own assistant turn, but it surfaces. Every
+        // non-`Program` entry's label round-trips too (a `Program`'s
+        // generic "program" label is not literally required to appear
+        // as its own word; "the program above …" already carries it).
+        let rendered = doc
+            .messages
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for (entry_id, entry) in &log {
+            let marker = format!("[{}]", entry_id.as_u64());
+            assert!(
+                rendered.contains(&marker),
+                "entry {entry_id:?}'s id must round-trip into the rendered text"
+            );
+            if !matches!(entry, Entry::Program { .. }) {
+                assert!(
+                    rendered.contains(entry.label().as_str()),
+                    "entry {entry_id:?}'s label {:?} must round-trip",
+                    entry.label()
+                );
+            }
+        }
+
+        // "A forty-raise program contributes no interior": by
+        // construction, nothing in this API can represent raise
+        // interior at all — see `a_forty_raise_program_contributes_no_interior`
+        // for the dedicated version of this property.
+
+        // "Appending an entry leaves every preceding byte unchanged":
+        // covered end-to-end by `appending_an_entry_never_rewrites_earlier_messages`;
+        // spot-checked here for this specific log shape.
+        let shorter = &log[..log.len() - 1];
+        let before = render("CARD", shorter).unwrap();
+        assert!(is_append_only_extension(&before, &doc));
+    }
+
     #[test]
     fn tail_extends_the_open_user_turn_and_is_not_in_the_log() {
         let log = vec![(

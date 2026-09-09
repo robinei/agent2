@@ -11,6 +11,7 @@
 //! request is built from (Part A/B), and how a raw completion is
 //! turned back into a program (the no-fence rule, Part A).
 
+pub mod compaction;
 pub mod document;
 pub mod entry;
 pub mod fence;
