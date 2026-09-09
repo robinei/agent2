@@ -1,3 +1,7 @@
+// New in phase 20 (`docs/20_CODE_MODE.md`): additive, not yet wired
+// into the step loop or the tool surface — see the module doc.
+#[allow(dead_code)]
+mod codemode;
 mod debug;
 mod host;
 mod machine;
