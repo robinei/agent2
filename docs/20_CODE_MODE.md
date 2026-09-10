@@ -1387,6 +1387,87 @@ survived the fixes, left open rather than patched blind:
   the current behavior and shapes how many round trips a chain like
   this costs.
 
+**A tuning round on top of the above, same day (2026-09-10):** five
+card edits, one `verbs.rs` fix, and three `tasks.rs` fixture fixes,
+each driven by a specific live failure and each re-verified live
+afterward. Card: (1) `say`/`ask` gained a quoted-string worked example
+next to their signatures, and the seed exemplar's own `say()` calls
+were changed to the two-argument form — a live completion wrote
+`say(robin, ...)` with `robin` as a bare identifier, trapped
+(`ReferenceError`), correctly diagnosed and `abandon()`-ed its own
+mistake, then made the *identical* mistake twice more before finally
+sidestepping it by dropping the argument — a signature line alone
+wasn't enough, a worked example was; (2) "await at the top level,
+don't wrap in an unawaited async IIFE," from the open `Done`/
+`unstarted` finding above — sidesteps the question of whether that's a
+real interp bug by making the risky shape simply not worth writing;
+(3) "work from what you actually read, not what a file like this
+usually contains," directly from `judgment-in-the-middle`'s
+Kubernetes-heuristics-on-an-AWS-region-file failure; (4) "a comment
+that reads like a question is the ambiguity itself," a follow-up
+to (3) once a later run applied real-content checks that still didn't
+happen to ask about the actual ambiguity; (5) "look before you leap,
+once" narrowed to when the approach is genuinely undecidable before
+seeing the data — not licence to split an ordinary read-then-`ask()`
+into two programs, since `ask()` is a plain `await` and ending a
+program without finishing the task "has not paused — it has quietly
+failed to do the task."
+
+`verbs.rs`: `say`/`ask` now coerce a scalar (number, boolean, null)
+text argument via `text_arg`, matching JS's own `String()` — found
+live when `say(42)` failed `string_arg`'s strict check and silently
+misrouted through `parse_effect`'s error path to "no such tool `say`,"
+a confusing report for a call that used the *right* verb with the
+wrong argument type. Scoped narrowly (a new `text_arg`/
+`optional_text_arg`, not a change to `string_arg` itself): an existing
+test, `rewrite_history_with_a_non_string_value_is_rejected`, depends on
+`rewrite_history`'s value staying strictly a string, and that
+reasoning still holds — only `say`/`ask`'s user-facing text loosened.
+
+`tasks.rs`: (1) `RecordingTools::call()` used to error once a name's
+queued responses ran out; changed to keep repeating the last response
+instead. Found live: a program recovering from an `abandon()`/`raise()`
+cycle naturally re-reads a file it has no memory of already reading
+(per the finding above), and each re-read silently consumed another
+slot from a fixed, small queue meant for one read — by the third or
+fourth round the fixture was reporting "unreadable" for files that
+were never actually touched, cascading a recoverable model detour into
+a hard task failure the model never actually caused. (2) `retry-and-
+branch`'s check required the literal substring "succeed"; a
+live, entirely correct completion reported "the build passed" instead
+— an equally correct word the check just didn't know. Broadened to a
+case-insensitive any-of. (3) `judgment-in-the-middle`'s scripted
+`ask()` answer said "keep us-east-1" about a value that was already
+us-east-1 — a live completion read this, correctly detected the
+question-comment (the card's new guidance (4) working exactly as
+intended), asked, got told to keep what was already there, and
+reasonably wrote nothing — which the check couldn't distinguish from
+never having asked at all. Sharpened so the file's current value is
+actually wrong and the answer says so unambiguously, so a `write_file`
+is the only correct outcome.
+
+**Net effect, verified live:** task success went 1/4 → 3/4 and held
+there across three further live runs after these fixes, with mean
+round-trips per task dropping to 1.0 (every task, including the one
+that still fails, now settles in a single completion — no more
+trap/`abandon()` churn from bugs the fixture itself was causing) and
+`fan-out`/`retry-and-branch`/`trivial-question` each producing a clean,
+well-reasoned, single-shot program — one `fan-out` run even correctly
+recognized "pick the interesting line" as a reading-comprehension
+judgment better delegated to a `spawn()`'d child than solved by regex.
+`judgment-in-the-middle` remains the one holdout, and its failure mode
+kept changing rather than repeating, which is itself informative:
+early runs guessed a generic config shape instead of reading the real
+one (fixed by (3)/(4) above); a later run correctly read the real
+content, correctly flagged the question-comment, correctly asked — and
+then, in its own `//:` plan, listed four steps (read, inspect, fix-or-
+ask, report) but the executed code only carried out the first, an
+apparent follow-through gap between planning and code-writing rather
+than a card-comprehension failure, and not obviously something a
+card edit fixes. Left open rather than chased further this session —
+worth more live samples, or a stronger model tier, before concluding
+anything about it.
+
 - [x] **Four or five fixed tasks, scripted, no network**, each one where
       a large program is the right answer: fan-out over N inputs,
       retry-and-branch, a pipeline with a judgment call in the middle.
@@ -1410,9 +1491,10 @@ survived the fixes, left open rather than patched blind:
       before they are needed measures the wrong things — this list was
       seven, and the register proxy in it turned out to be a compliance
       check. Computed live by `agent codemode-harness`
-      (`codemode/harness.rs`) after each task run: 3/4 success, 2.5
-      mean round-trips, 2.5 median statements as of the second live
-      run above — real numbers now, not a placeholder.
+      (`codemode/harness.rs`) after each task run: 3/4 success, 1.0
+      mean round-trips, 2.5 median statements as of the latest tuning
+      round above — real numbers now, not a placeholder, and stable
+      across three consecutive live runs.
 - [ ] **Reading transcripts is the real instrument**, and the
       raise-placement diagnostic is a reading exercise, not an
       aggregate. `raise()` is the only way the mind can summon itself,
@@ -1424,8 +1506,13 @@ survived the fixes, left open rather than patched blind:
       *payload* carries the data, and an `append_history` of raw
       content followed immediately by a raise. Both are self-addressed
       tool results.
-- [ ] **Tune, and record what moved what.** Card, seed exemplar, raise
+- [x] **Tune, and record what moved what.** Card, seed exemplar, raise
       pricing. That log is the most valuable thing this part produces.
+      Done once, live, above: five card edits and a seed-exemplar
+      change, each traced to one specific observed failure and each
+      re-verified with a live rerun — 1/4 → 3/4, mean round-trips 1.0.
+      An ongoing habit, not a one-time bullet — the next tuning pass
+      starts from `judgment-in-the-middle`, still open above.
 - [ ] **Watch two failure shapes.** *Long and wrong*: longer programs
       that trap more or redo work are not a win, and recovery has to be
       seen working rather than assumed. *Self-reinforcement downward*:

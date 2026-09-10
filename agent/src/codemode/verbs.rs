@@ -127,7 +127,9 @@ fn string_arg(v: &serde_json::Value, which: &str) -> Result<String, VerbError> {
 }
 
 /// `None`/absent stays `None`; anything else must be a string. Used
-/// for the omittable address arguments (`say`'s `to`, `ask`'s `who`).
+/// for arguments where a value's shape genuinely matters (a
+/// compaction's rendered line, a spawn charter) — not `say`/`ask`,
+/// which use [`optional_text_arg`] instead.
 fn optional_string_arg(
     v: Option<&serde_json::Value>,
     which: &str,
@@ -135,6 +137,44 @@ fn optional_string_arg(
     match v {
         None | Some(serde_json::Value::Null) => Ok(None),
         Some(other) => string_arg(other, which).map(Some),
+    }
+}
+
+/// A user-facing text argument — a JSON scalar coerced the way JS's
+/// own `String()` would, since `say`/`ask` exist to carry whatever the
+/// program already has in hand, not to demand it be pre-stringified.
+/// Found live (2026-09-10): `say(42)` — a bare number where a string
+/// was clearly intended — otherwise fails to parse as the `say` verb
+/// at all (`string_arg` rejects it) and silently misroutes to "no
+/// such tool `say`", a confusing error for a call that used the right
+/// verb with the wrong argument type. Objects and arrays still reject:
+/// unlike a scalar there is no single obviously-right text form for
+/// those, so surfacing the mismatch beats guessing at one. Deliberately
+/// not used for `answer`/`spawn`/`remove_history`/`rewrite_history`'s
+/// string arguments, where a non-string value is a real bug worth
+/// catching, not a display nicety (see
+/// `rewrite_history_with_a_non_string_value_is_rejected`).
+fn text_arg(v: &serde_json::Value, which: &str) -> Result<String, VerbError> {
+    match v {
+        serde_json::Value::String(s) => Ok(s.clone()),
+        serde_json::Value::Number(n) => Ok(n.to_string()),
+        serde_json::Value::Bool(b) => Ok(b.to_string()),
+        serde_json::Value::Null => Ok("null".to_owned()),
+        _ => Err(err(format!(
+            "{which} must be text (a string, number, boolean, or null)"
+        ))),
+    }
+}
+
+/// `None`/absent stays `None`; anything else coerces via
+/// [`text_arg`]. Used for `say`'s `to` and `ask`'s `who`.
+fn optional_text_arg(
+    v: Option<&serde_json::Value>,
+    which: &str,
+) -> Result<Option<String>, VerbError> {
+    match v {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(other) => text_arg(other, which).map(Some),
     }
 }
 
@@ -161,18 +201,18 @@ pub fn parse_effect(vm: &VM, call: &InvokeCall) -> Result<HarnessEffect, VerbErr
         "say" => match args.as_slice() {
             [text] => Ok(HarnessEffect::Say {
                 to: None,
-                text: string_arg(text, "say's text")?,
+                text: text_arg(text, "say's text")?,
             }),
             [to, text] => Ok(HarnessEffect::Say {
-                to: optional_string_arg(Some(to), "say's `to`")?,
-                text: string_arg(text, "say's text")?,
+                to: optional_text_arg(Some(to), "say's `to`")?,
+                text: text_arg(text, "say's text")?,
             }),
             _ => Err(err("say(text) or say(to, text)")),
         },
         "ask" => match args.as_slice() {
             [who, text] => Ok(HarnessEffect::Ask {
-                who: optional_string_arg(Some(who), "ask's `who`")?,
-                text: string_arg(text, "ask's text")?,
+                who: optional_text_arg(Some(who), "ask's `who`")?,
+                text: text_arg(text, "ask's text")?,
             }),
             _ => Err(err("ask(who, text)")),
         },
@@ -280,6 +320,41 @@ mod tests {
     #[test]
     fn say_with_wrong_arity_is_rejected() {
         let (vm, call) = first_call("return await say();");
+        assert!(parse_effect(&vm, &call).is_err());
+    }
+
+    #[test]
+    fn say_coerces_a_numeric_text_argument_to_a_string() {
+        // Found live (2026-09-10): `say(42)` from a real completion —
+        // rejecting this misroutes to a confusing "no such tool `say`"
+        // instead of running the call the model clearly meant.
+        let (vm, call) = first_call("return await say(42);");
+        assert_eq!(
+            parse_effect(&vm, &call).unwrap(),
+            HarnessEffect::Say {
+                to: None,
+                text: "42".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn say_coerces_a_numeric_to_argument_to_a_string() {
+        let (vm, call) = first_call("return await say(42, 'hi');");
+        assert_eq!(
+            parse_effect(&vm, &call).unwrap(),
+            HarnessEffect::Say {
+                to: Some("42".into()),
+                text: "hi".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn say_still_rejects_an_object_text_argument() {
+        // Unlike a scalar, an object has no single obviously-right
+        // text form — surface the mismatch instead of guessing one.
+        let (vm, call) = first_call("return await say({ oops: true });");
         assert!(parse_effect(&vm, &call).is_err());
     }
 

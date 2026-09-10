@@ -90,8 +90,26 @@ impl FakeTools for RecordingTools {
             args: args_json,
         });
         let mut scripts = self.scripts.borrow_mut();
-        match scripts.get_mut(name).and_then(VecDeque::pop_front) {
-            Some(response) => response,
+        let queue = scripts.entry(name.to_owned()).or_default();
+        match queue.pop_front() {
+            Some(response) => {
+                // Once the queue empties, keep giving the last
+                // response rather than erroring on the next call.
+                // Found live (2026-09-10): a program recovering from
+                // an abandon()/raise() cycle naturally re-reads a file
+                // it already read, with no memory of the earlier
+                // read — a real fixture should answer that the same
+                // way a real file would, not report "no scripted
+                // response left" and cascade into a chain of
+                // misleading "unreadable" failures a fresh attempt
+                // never actually caused. Task checks still inspect
+                // exact call counts/order directly, so this loosens
+                // nothing they check.
+                if queue.is_empty() {
+                    queue.push_back(response.clone());
+                }
+                response
+            }
             None => Err(format!("no scripted response left for tool `{name}`")),
         }
     }
@@ -131,6 +149,17 @@ pub struct Task {
 
 fn contains(haystack: &[super::runner::Said], needle: &str) -> bool {
     haystack.iter().any(|s| s.text.contains(needle))
+}
+
+/// Case-insensitive, any-of match — for outcomes with more than one
+/// natural wording ("passed" is exactly as correct a report of a
+/// successful build as "succeeded"; the check should not prefer one
+/// word choice over an equally correct one).
+fn contains_any_ci(haystack: &[super::runner::Said], needles: &[&str]) -> bool {
+    haystack.iter().any(|s| {
+        let lower = s.text.to_lowercase();
+        needles.iter().any(|n| lower.contains(&n.to_lowercase()))
+    })
 }
 
 /// **Fan-out over N inputs.** Three independent files to read and
@@ -199,7 +228,10 @@ pub const RETRY: Task = Task {
         if n < 2 {
             return Err(format!("expected at least 2 attempts, got {n}"));
         }
-        if !contains(&outcome.transcript, "succeed") {
+        if !contains_any_ci(
+            &outcome.transcript,
+            &["succeed", "success", "passed", "pass"],
+        ) {
             return Err("transcript never reports success after the retry".into());
         }
         Ok(())
@@ -222,11 +254,17 @@ pub const JUDGMENT_IN_THE_MIDDLE: Task = Task {
         t.respond(
             "read_file",
             Ok(serde_json::json!({
-                "content": "region: us-east-1  # or is it eu-west-1 now? both are referenced elsewhere"
+                "content": "region: eu-west-1  # or is it us-east-1 now? both are referenced elsewhere"
             })),
         );
+        // Deliberately unambiguous once asked: the current value is
+        // wrong and the answer says so directly, so a `write_file` is
+        // the only correct outcome — found live (2026-09-10) that an
+        // answer merely confirming the existing value ("keep X") makes
+        // "no edit" a reasonable reading too, which this check can't
+        // tell apart from skipping the question.
         t.respond_ask(Ok(serde_json::json!(
-            "keep us-east-1, the eu-west-1 references are stale docs"
+            "us-east-1 is correct now — we migrated off eu-west-1 last quarter, please update the file"
         )));
         t.respond("write_file", Ok(serde_json::json!({ "written": true })));
         t
