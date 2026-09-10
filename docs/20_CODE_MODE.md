@@ -912,15 +912,21 @@ needs a **stack of VMs**.
 
 ### Step D1 — The stack
 
-- [ ] Host-side `Vec<Vm>`, innermost scheduled, outer frames frozen at
+- [x] Host-side `Vec<Vm>`, innermost scheduled, outer frames frozen at
       safe points. **No VM is ever on another VM's stack.** The
       load-bearing property is unchanged and a test asserts it.
-- [ ] **Outer frames are frozen for execution only — their in-flight
+      (`agent/src/codemode/stack.rs`'s `ProgramStack` — structurally
+      true by construction, since only `current_mut()`'s frame is ever
+      stepped; not a single dedicated assertion but the shape every
+      one of its 9 tests exercises.)
+- [x] **Outer frames are frozen for execution only — their in-flight
       calls keep landing.** A program that raises may have outstanding
       async calls; those keep resolving into the log while the handler
       deliberates (`17_BRANCHES` already requires this for interrupts),
       so promises may already be settled when the frame resumes. Work
-      continues during deliberation.
+      continues during deliberation. Built and tested
+      (`ProgramStack::resolve_promise_at`) at the VM-container level;
+      "resolving into the log" is event-log wiring, not built.
 - [ ] **The stack is session state. A crash collapses it, never
       rebuilds it.** VMs are never persisted and recovery is
       re-execution; with determinism a non-goal, re-running an outer
@@ -936,15 +942,28 @@ needs a **stack of VMs**.
       (outer frames are frozen for execution only). The interruption
       costs no progress; a chat agent interrupting a tool call has to
       abort it.
-- [ ] **`resume()` takes no value for a posted condition.** A `raise()`
+- [x] **`resume()` takes no value for a posted condition.** A `raise()`
       has an expression waiting for one; a user interrupt does not, so
       `return resume()` means "continue, nothing changed" and the frame
       resumes still awaiting its promise. The canonical interrupt
       handler is `say(…)` then `return resume()`; `return abandon()` is
       what you write when the remark means the plan should change.
-- [ ] Depth is bounded by host policy, and hitting the bound is itself
+- [x] Depth is bounded by host policy, and hitting the bound is itself
       a condition. Depth is expensive in a way stack depth normally is
-      not: every frame is a full-context inference.
+      not: every frame is a full-context inference. The bound itself
+      is enforced (`ProgramStack::push`'s `PushError::DepthExceeded`,
+      tested); turning that into an actual `raise`-shaped condition
+      back to the mind is host-loop wiring, not built.
+- [x] **Gap found doing this work, closed the same session:**
+      `Suspension::Posted` — resuming it calls no VM-level resume
+      method at all (nothing was raised or trapped, so there is no
+      slot for a value; the frame just continues on the next
+      `step()`), and `abandon()` needs no special case either. What is
+      still not built: **the delivery side** — actually stopping a
+      frame at a safe point *because* a post arrived (today's tests
+      just use an ordinary `OutOfFuel` boundary as the stand-in) and
+      "a frame blocked on `await` is the easy case" specifically, which
+      needs host/session wiring this module doesn't have.
 - [ ] The handler's prompt is the ordinary document plus a **transient
       condition report** for the frame it is deciding about. It vanishes
       as the stack unwinds and never becomes history. Part F is what
