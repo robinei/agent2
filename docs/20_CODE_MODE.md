@@ -1096,21 +1096,39 @@ all of that is spent rendering a *text report* the harness clips. A
 handler that can query it instead is the largest unrealized payoff in
 the architecture.
 
-- [ ] A handler binds **`vm`**: a read-only, stable projection of the
+- [x] A handler binds **`vm`**: a read-only, stable projection of the
       frozen frame it is deciding about — `vm.locals()`, `vm.frames()`,
       `vm.console()`, `vm.condition`, `vm.source`, and `vm.caller` to
       read further up the stack. Absent in a root program, which has no
       frame to decide about. A projection, not `CallFrame` itself —
       handler programs must not couple to interpreter internals, or
       `8_HARNESS`'s version-drift problem gets much worse.
-- [ ] **Read only, with no exceptions.** Nothing executes and no host
+      (`agent/src/codemode/introspect.rs`'s `VmSnapshot`/`snapshot()`:
+      most of the hard part already existed in `interp` for the
+      debugger — `VM::frames()` is already exactly this kind of
+      projection, not the raw `CallFrame`. Covers every field except
+      `vm.caller`, which is `ProgramStack::frame_mut` — a program-stack
+      concept, not a per-VM one, so it is one level up rather than
+      duplicated in. Not built: the actual language-level `vm` binding
+      a running handler program would read this through — that needs
+      compiler/host wiring this module doesn't have, same as every
+      other verb in this phase.)
+- [x] **Read only, with no exceptions.** Nothing executes and no host
       callback enters the VM, so reading is safe; writing would break
       the spine, since recovery is re-execution and a heap poke is not
       in the log. `vm` has no methods that change anything — the
       decision is a *returned value* (Step D2), which is why this rule
-      needs no carve-out.
-- [ ] Lazy and fuel-metered. A live heap can be large and cyclic;
-      access fetches on demand rather than serializing up front.
+      needs no carve-out. Structural in `introspect.rs`: every function
+      takes `&VM`, never `&mut`, and a dedicated test asserts
+      snapshotting is idempotent.
+- [ ] **Not built as specified — flagged, not glossed over.** Lazy
+      and fuel-metered. A live heap can be large and cyclic; access
+      fetches on demand rather than serializing up front.
+      `introspect.rs`'s `snapshot()` does the opposite: it eagerly
+      converts every frame's every local to JSON up front. Fine for
+      this session's tiny fixture programs; the wrong shape for a real
+      heap, and worth fixing before this is wired to anything live
+      rather than after.
 - [ ] **The report shrinks to a pointer.** Once `vm` is queryable,
       Step D1's rendered condition report collapses to one line —
       "trapped at line 30, bound as `vm`" — and the handler pulls what
