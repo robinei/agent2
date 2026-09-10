@@ -1276,6 +1276,34 @@ is nothing. Small on purpose: the card is the only steering wheel and it
 cannot be turned blind, but "not blind" is a handful of tasks and a
 habit of reading transcripts, not a benchmark suite.
 
+**Not this harness, but the informal signal that came before it:**
+`agent codemode-probe` (`main.rs`) — a single manual subcommand, one
+completion, no fixed task set, no success conditions, nothing recorded
+— exists as the cheaper question this harness's own numbers depend on
+having a real answer to first: does a completion against the actual
+card and document come back as bare, parseable JavaScript at all? Three
+live runs (2026-09-10, `deepseek-v4-flash` via the OpenCode/DeepSeek
+endpoint) found this genuinely true rather than assumed: the seed
+exemplar closed the fence-compliance gap outright (the same task
+without it came back fenced, tolerated silently by `fence::extract` as
+designed; with it, bare source, no fence); the model's own reasoning
+traces treated the exemplar's prior turn as real self-history ("my
+previous turn used tools.bash"); a genuinely judgment-heavy task
+produced one long, staged, safety-conscious program rather than the
+short-program-then-observe loop this whole phase exists to move away
+from, correctly reaching for `ask()` over the heavier `raise()` for a
+decision that only needed an answer, not a rewrite; and — the most
+concrete finding — a `max_tokens: 4000` ceiling was nowhere near
+"generous" as Step A1 asks for: reasoning alone burned past it on one
+task, landing exactly on "ran out while thinking" with an empty
+completion, which trivially "parsed" (an empty program is valid JS) and
+would have silently read as success without the while-thinking/
+while-writing distinction this step already calls for. None of this
+is a substitute for fixed tasks and checkable success — it is three
+data points, not a sweep — but it is real, live evidence for the
+mechanism this whole phase bets on, gathered before the harness that
+would formalize it.
+
 - [ ] **Four or five fixed tasks, scripted, no network**, each one where
       a large program is the right answer: fan-out over N inputs,
       retry-and-branch, a pipeline with a judgment call in the middle.
