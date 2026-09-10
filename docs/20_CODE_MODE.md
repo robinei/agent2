@@ -855,25 +855,25 @@ it the way `DESIGN.md` treats the condition report: a prompt-engineering
 artifact with golden tests, iterated against live transcripts, not a
 string constant someone edits in passing.
 
-- [ ] **A spec, not a persona.** `system` makes the temptation
+- [x] **A spec, not a persona.** `system` makes the temptation
       stronger, so state the rule: "You are a helpful assistant that…"
       is the failure mode; "programs are written here; emit only valid
       JavaScript; the whole response is parsed" is the register.
-- [ ] **One file, one golden test, versioned.** A card change is a
+- [x] **One file, one golden test, versioned.** A card change is a
       behaviour change; the tuning log (Part H) records which change
       moved which number.
-- [ ] **It carries the verb set and nothing else structural** — the
+- [x] **It carries the verb set and nothing else structural** — the
       tools in scope, `say`/`ask`/`answer`, `spawn`/`fork`/`raise`,
       `append_history`, and the decision values. No schemas: the
       signatures are the documentation.
-- [ ] **Seed with one worked exemplar, as a real user/assistant pair
+- [x] **Seed with one worked exemplar, as a real user/assistant pair
       opening `messages`.** It cannot live in the card — its point is to
       demonstrate an *assistant* turn (Step B1). The model's own prior
       programs are its few-shot evidence (the thesis), so turn one has
       nothing to imitate and a timid first program compounds. The
       exemplar is the restoring force, and it is cheap insurance rather
       than a remedy applied later.
-- [ ] The guidance it carries, collected from the parts that derived
+- [x] The guidance it carries, collected from the parts that derived
       each line:
       - **A root program that never calls `say()` is a silent no-op.**
         With no return value, that is the one new way to do nothing.
