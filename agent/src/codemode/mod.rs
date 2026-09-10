@@ -20,5 +20,6 @@ pub mod fence;
 pub mod introspect;
 pub mod runner;
 pub mod stack;
+pub mod tasks;
 pub mod transport;
 pub mod verbs;
