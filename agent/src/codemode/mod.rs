@@ -16,3 +16,4 @@ pub mod document;
 pub mod entry;
 pub mod fence;
 pub mod transport;
+pub mod verbs;
