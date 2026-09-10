@@ -76,6 +76,22 @@ pub fn compile_for_test262(source: &str, strict: bool) -> Result<Program, Vec<Di
     compile_with(source, source_type)
 }
 
+/// Top-level statement count, straight from the parse — no compilation,
+/// no prelude injection. A metric-only helper for `codemode`'s Part H
+/// harness ("median program length (statements)"); never used to gate
+/// behavior, so a source that fails to parse just counts as `0` rather
+/// than propagating a `Diagnostic` nobody there would act on.
+pub fn count_statements(source: &str) -> usize {
+    let allocator = Allocator::default();
+    let ret = Parser::new(&allocator, source, SourceType::mjs())
+        .with_options(oxc_parser::ParseOptions {
+            allow_return_outside_function: true,
+            ..Default::default()
+        })
+        .parse();
+    ret.program.body.len()
+}
+
 fn compile_with(source: &str, source_type: SourceType) -> Result<Program, Vec<Diagnostic>> {
     let allocator = Allocator::default();
 
@@ -444,3 +460,23 @@ fn number_key_to_string(value: f64) -> String {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod count_statements_tests {
+    use super::count_statements;
+
+    #[test]
+    fn counts_top_level_statements_only() {
+        assert_eq!(count_statements("let x = 1; f(x); if (x) { g(); h(); }"), 3);
+    }
+
+    #[test]
+    fn empty_source_is_zero() {
+        assert_eq!(count_statements(""), 0);
+    }
+
+    #[test]
+    fn unparseable_source_is_zero_not_a_panic() {
+        assert_eq!(count_statements("let ("), 0);
+    }
+}

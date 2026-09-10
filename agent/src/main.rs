@@ -36,7 +36,13 @@ const USAGE: &str = "usage: agent <command>
                                     completion against the card + a fixture
                                     log, no session, no log file. Needs
                                     DEEPSEEK_API_KEY. A throwaway manual probe,
-                                    not Part H's regression harness.";
+                                    not Part H's regression harness.
+  codemode-harness                  Part H's regression harness: runs the
+                                    fixed task set (codemode::tasks::ALL)
+                                    live, end to end, and reports median
+                                    program length, round-trips, and success
+                                    per task. Needs DEEPSEEK_API_KEY. Not part
+                                    of `cargo test` — talks to a real model.";
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -57,6 +63,9 @@ fn main() {
                 .cloned()
                 .unwrap_or_else(|| "print the numbers from 1 to 5, one per line".to_owned());
             codemode_probe(&task);
+        }
+        Some("codemode-harness") => {
+            codemode_harness();
         }
         Some("session") => {
             let mut headless = false;
@@ -594,6 +603,76 @@ fn codemode_probe(task: &str) {
                 eprintln!("{}", d.render(&extracted));
             }
         }
+    }
+}
+
+/// Part H's regression harness: `codemode::tasks::ALL`, run live and
+/// end to end (`codemode::harness::run_task`), reporting the three
+/// numbers Part H asks for — no more, until one fails to answer a
+/// question (Part H's own second bullet).
+fn codemode_harness() {
+    use codemode::{card, harness, tasks};
+
+    let api_key = std::env::var("DEEPSEEK_API_KEY")
+        .expect("DEEPSEEK_API_KEY must be set (this harness reads it directly)");
+    let base_url = std::env::var("DEEPSEEK_BASE_URL")
+        .unwrap_or_else(|_| "https://opencode.ai/zen/go/v1".to_owned());
+    let model = std::env::var("DEEPSEEK_MODEL").unwrap_or_else(|_| "deepseek-v4-flash".to_owned());
+    let session_id = uuid::Uuid::new_v4().to_string();
+
+    let mut all_lengths: Vec<usize> = Vec::new();
+    let mut all_round_trips: Vec<usize> = Vec::new();
+    let mut successes = 0usize;
+
+    println!(
+        "=== Part H harness: {} tasks, model {model} ===\n",
+        tasks::ALL.len()
+    );
+
+    for task in tasks::ALL {
+        let endpoint = codemode::transport::Endpoint {
+            base_url: &base_url,
+            api_key: &api_key,
+            session_id: &session_id,
+        };
+        let report = harness::run_task(task, card::CARD, endpoint, &model, 32_000);
+
+        let status = match &report.success {
+            Ok(()) => "PASS",
+            Err(_) => "FAIL",
+        };
+        println!(
+            "[{status}] {} — {} round-trip(s), program lengths (statements): {:?}",
+            report.task_name, report.round_trips, report.program_lengths
+        );
+        if let Err(reason) = &report.success {
+            println!("       reason: {reason}");
+        }
+
+        if report.success.is_ok() {
+            successes += 1;
+        }
+        all_round_trips.push(report.round_trips);
+        all_lengths.extend(report.program_lengths);
+    }
+
+    let median_len = harness::median(&all_lengths);
+    let avg_round_trips = if all_round_trips.is_empty() {
+        0.0
+    } else {
+        all_round_trips.iter().sum::<usize>() as f64 / all_round_trips.len() as f64
+    };
+
+    println!("\n=== aggregate ===");
+    println!(
+        "task success: {successes}/{} ({:.0}%)",
+        tasks::ALL.len(),
+        100.0 * successes as f64 / tasks::ALL.len() as f64
+    );
+    println!("mean round-trips per task: {avg_round_trips:.1}");
+    match median_len {
+        Some(m) => println!("median program length (statements): {m}"),
+        None => println!("median program length (statements): n/a (no completions produced)"),
     }
 }
 

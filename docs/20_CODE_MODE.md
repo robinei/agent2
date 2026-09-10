@@ -1304,11 +1304,23 @@ data points, not a sweep — but it is real, live evidence for the
 mechanism this whole phase bets on, gathered before the harness that
 would formalize it.
 
-- [ ] **Four or five fixed tasks, scripted, no network**, each one where
+- [x] **Four or five fixed tasks, scripted, no network**, each one where
       a large program is the right answer: fan-out over N inputs,
       retry-and-branch, a pipeline with a judgment call in the middle.
       Each has a checkable success condition. This exists so that
       tuning the card cannot silently break something that worked.
+      Built as `codemode/tasks.rs`: fan-out, retry-and-branch,
+      judgment-in-the-middle, and a fourth in the opposite direction —
+      a trivial question, to catch over-orchestration as its own
+      failure mode. `RecordingTools` logs `tools.*` calls and `ask()`
+      into one ordered history, which is what makes
+      judgment-in-the-middle's real check possible: not just that an
+      ask happened, but that it happened *before* the write it was
+      supposed to inform, not after. Each check is itself tested
+      against a hand-written ideal and a deliberately wrong program,
+      no model or network involved. What is not built yet: running
+      these against a live model and aggregating the numbers below —
+      that is the next bullet, still open.
 - [ ] **Three numbers per run**, and no more until one of them fails to
       answer a question: median program length (statements), LLM
       round-trips per user request, and task success. Adding metrics

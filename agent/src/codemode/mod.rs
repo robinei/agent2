@@ -17,6 +17,7 @@ pub mod decision;
 pub mod document;
 pub mod entry;
 pub mod fence;
+pub mod harness;
 pub mod introspect;
 pub mod runner;
 pub mod stack;
