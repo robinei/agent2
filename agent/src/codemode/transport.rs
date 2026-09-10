@@ -114,6 +114,18 @@ impl Completion {
 pub struct Endpoint<'a> {
     pub base_url: &'a str,
     pub api_key: &'a str,
+    /// Required by the OpenCode/DeepSeek endpoint — a request missing
+    /// `x-opencode-session` is refused outright (`MissingSessionID`),
+    /// found by actually calling it rather than assumed from reading
+    /// `host/deepseek.rs`'s own doc comment on this same requirement
+    /// (which this module deliberately does not import code from —
+    /// its *behavior* still had to be matched independently). Stable
+    /// across calls in one conversation for routing and prompt-cache
+    /// affinity (`host/deepseek.rs`'s doc comment, and the endpoint's
+    /// own docs: <https://opencode.ai/docs/go/#where-can-i-use-it>);
+    /// a caller making unrelated one-off calls can mint a fresh one
+    /// each time.
+    pub session_id: &'a str,
 }
 
 /// Send one code-mode request and return the completion. The only
@@ -143,6 +155,7 @@ pub fn complete(
         .post(&url)
         .header("Authorization", &format!("Bearer {}", endpoint.api_key))
         .header("User-Agent", "agent2-codemode-probe/0.1")
+        .header("x-opencode-session", endpoint.session_id)
         .send_json(&body)
         .map_err(|e| format!("request failed: {e}"))?;
     let status = response.status();

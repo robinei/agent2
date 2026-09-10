@@ -31,7 +31,12 @@ const USAGE: &str = "usage: agent <command>
     --fork <id>                     fork a divergent branch from event <id>
                                     and print its id
     --name <text>                   name the branch (with --fork), else rename
-                                    the conversation branch";
+                                    the conversation branch
+  codemode-probe [task]             phase 20 (docs/20_CODE_MODE.md): one live
+                                    completion against the card + a fixture
+                                    log, no session, no log file. Needs
+                                    DEEPSEEK_API_KEY. A throwaway manual probe,
+                                    not Part H's regression harness.";
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -45,6 +50,13 @@ fn main() {
                 eprintln!("{e}");
                 std::process::exit(1);
             }
+        }
+        Some("codemode-probe") => {
+            let task = args
+                .get(2)
+                .cloned()
+                .unwrap_or_else(|| "print the numbers from 1 to 5, one per line".to_owned());
+            codemode_probe(&task);
         }
         Some("session") => {
             let mut headless = false;
@@ -445,6 +457,141 @@ fn print_session_event(event: &SessionEvent) {
                 EventPayload::Console { lines } => {
                     println!("{head} console: {} lines", lines.len());
                 }
+            }
+        }
+    }
+}
+
+/// A throwaway, manual probe against a live model (phase 20,
+/// `docs/20_CODE_MODE.md`) — **not** Part H's regression harness (a
+/// separate, later, more structured opt-in binary with a fixed task
+/// set and success conditions). This is the single first question
+/// worth asking before building that: does a real completion, against
+/// our actual card and document, come back as bare, parseable
+/// JavaScript at all? A subcommand on the existing binary rather than
+/// a `cargo run --example` — the crate has no `[lib]` target to import
+/// from an example, and adding one is a build-shape change to the
+/// existing crate this phase has deliberately avoided all session.
+fn codemode_probe(task: &str) {
+    use codemode::document::{self, ChatMessage, ChatRole};
+    use codemode::entry::Entry;
+    use codemode::{card, fence, transport};
+
+    let api_key = std::env::var("DEEPSEEK_API_KEY")
+        .expect("DEEPSEEK_API_KEY must be set (this probe reads it directly)");
+    let base_url = std::env::var("DEEPSEEK_BASE_URL")
+        .unwrap_or_else(|_| "https://opencode.ai/zen/go/v1".to_owned());
+    let model = std::env::var("DEEPSEEK_MODEL").unwrap_or_else(|_| "deepseek-v4-flash".to_owned());
+    // Step C4's actual design always seeds the exemplar; the opt-out
+    // exists only so this probe can compare against it directly.
+    let with_exemplar = std::env::var("CODEMODE_PROBE_NO_EXEMPLAR").is_err();
+
+    let log = vec![(
+        EventId::new(1),
+        Entry::Message {
+            from: "robin".into(),
+            text: task.to_owned(),
+        },
+    )];
+    let mut doc = document::render(card::CARD, &log).expect("fixture log renders");
+    if with_exemplar {
+        // The seed exemplar opens `messages`, right after the card —
+        // a real user/assistant pair, never part of the card itself
+        // (Step C4).
+        doc.messages.splice(
+            1..1,
+            [
+                ChatMessage {
+                    role: ChatRole::User,
+                    content: card::SEED_EXEMPLAR.user.to_owned(),
+                },
+                ChatMessage {
+                    role: ChatRole::Assistant,
+                    content: card::SEED_EXEMPLAR.assistant.to_owned(),
+                },
+            ],
+        );
+    }
+
+    eprintln!("=== task ===\n{task}\n");
+    eprintln!("=== seed exemplar: {with_exemplar} ===\n");
+    eprintln!("=== sending to {base_url} (model {model}) ===\n");
+
+    let session_id = uuid::Uuid::new_v4().to_string();
+    let endpoint = transport::Endpoint {
+        base_url: &base_url,
+        api_key: &api_key,
+        session_id: &session_id,
+    };
+    // Generous on purpose (Step A1): must cover reasoning tokens *plus*
+    // a long program. 4000 was tried first and found wanting live — a
+    // genuinely judgment-heavy task burned the whole budget on
+    // thinking before writing a single character of program, landing
+    // exactly on the design's own anticipated "ran out while thinking"
+    // failure. 32000 leaves real room for both.
+    let req = transport::DeepSeekCodeModeRequest {
+        model: &model,
+        max_tokens: 32_000,
+    };
+
+    let completion = match transport::complete(&doc, &req, &endpoint) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("=== REQUEST FAILED ===\n{e}");
+            std::process::exit(1);
+        }
+    };
+
+    match &completion.thinking {
+        Some(t) => eprintln!("=== thinking ({} chars) ===\n{t}\n", t.len()),
+        None => eprintln!("=== thinking: none ===\n"),
+    }
+
+    eprintln!(
+        "=== raw completion ({} chars) ===\n{}\n",
+        completion.text.len(),
+        completion.text
+    );
+    eprintln!("=== finish_reason: {:?} ===\n", completion.finish_reason);
+    if completion.was_truncated() {
+        // Step A1: distinguish *which* budget ran out — an empty or
+        // very short `text` alongside real `thinking` means the
+        // reasoning channel ate the whole ceiling before writing any
+        // program at all (fix: lower reasoning_effort, or raise
+        // max_tokens further); a long, cut-off `text` means the
+        // program itself was still being written (fix: a shorter
+        // program). Distinct fixes, so the report must not conflate
+        // them into one "truncated" fact — observed live: an empty
+        // `text` after 11k+ chars of thinking on a genuinely
+        // judgment-heavy task, with `interp::compile("")` trivially
+        // "succeeding" (an empty program is syntactically valid),
+        // which would have silently hidden the failure if this probe
+        // only checked whether the completion parsed.
+        if completion.text.trim().is_empty() {
+            eprintln!("=== TRUNCATED WHILE THINKING — no program was ever started ===\n");
+        } else {
+            eprintln!("=== TRUNCATED WHILE WRITING — the program is incomplete ===\n");
+        }
+    }
+
+    if completion.text.trim().is_empty() {
+        eprintln!("=== nothing to parse — no program text was produced ===");
+        return;
+    }
+
+    // The no-fence rule (Step A1): tolerate a stray fence silently,
+    // then the response must be exactly a valid program — nothing else.
+    let extracted = fence::extract(&completion.text);
+    if extracted != completion.text {
+        eprintln!("=== a code fence was present and stripped ===\n");
+    }
+
+    match interp::compile(&extracted) {
+        Ok(_) => eprintln!("=== PARSES: the completion is valid, bare JavaScript ==="),
+        Err(diags) => {
+            eprintln!("=== DOES NOT PARSE ===");
+            for d in diags {
+                eprintln!("{}", d.render(&extracted));
             }
         }
     }
