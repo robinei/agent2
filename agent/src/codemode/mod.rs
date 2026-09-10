@@ -16,6 +16,7 @@ pub mod decision;
 pub mod document;
 pub mod entry;
 pub mod fence;
+pub mod introspect;
 pub mod stack;
 pub mod transport;
 pub mod verbs;
