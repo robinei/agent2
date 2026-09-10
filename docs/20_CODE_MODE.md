@@ -184,11 +184,18 @@ Surfaced explicitly, per DESIGN.md's own instruction.
   `OutOfFuel` as a condition with a handler (Part E). `8_HARNESS`
   already listed a memory budget as a row; this is that row, and it is
   the one resource limit currently handled by nobody.
-- **The model-facing `tools.` namespace goes.** `17_BRANCHES` froze
-  `tools.agent`'s name and card line on the grounds that tool, docs and
-  log would otherwise disagree. That constraint is moot here: the tool
-  surface is deleted outright (Part I), so there is no schema left to
-  keep in agreement, and every verb becomes a global (Step C1).
+- **The `tools.` namespace narrows; it does not go.** Revised after
+  this file first shipped: `tools.*` stays as the surface for a
+  specific agent's *configured capabilities* — `read_file`, `bash`,
+  whatever the registry holds, which the compiler has no static view
+  of and which `17_BRANCHES`'s naming constraint still applies to.
+  What changes is the **closed, harness-defined vocabulary** —
+  `say`/`ask`/`answer`/`spawn`/`fork`/`append_history`/`artifact`,
+  plus the pure decision constructors `resume`/`abandon` — which
+  becomes bare-global, joining `raise`, already unnamespaced today.
+  The line is language versus library: a fixed set every agent has,
+  known to the compiler exactly the way `raise` already is, versus a
+  set that varies per agent and the compiler cannot see (Step C1).
 - **"LLM as restart handler" becomes literal.** The handler is not an
   LLM turn choosing a restart from a menu — it is a program the LLM
   writes, running while the signaling frame is still live. That is
@@ -689,16 +696,36 @@ The verbs available to a completing model. Composition stays JS
       result.
 - [ ] Ordinary tool calls are plain async functions returning values.
       Nothing about calling one puts anything in context.
-- [ ] **No `tools.` namespace — every verb and tool is a global
-      function.** `read_file(path)`, not `tools.read_file(path)`. This
-      changes today's surface (`tools.spawn`, `tools.agent`,
-      `tools.tool_result`) and it is deliberate: a bare call is what
-      ordinary JS looks like, so it draws on the model's strongest
-      prior, while a namespaced object it has never seen draws on none.
-      It is also a token on every call, which is the one cost that
-      scales with program length — the thing this phase is trying to
-      increase. Shadowing is the model's own problem and JS handles it
-      the usual way.
+- [ ] **The harness vocabulary is bare-global; `tools.*` stays for
+      configured capabilities.** Revised from an earlier, broader "no
+      `tools.` namespace at all" — that version required either
+      teaching the compiler a runtime tool registry or changing the
+      undeclared-global fallback for *every* bare call (JS-conformance
+      relevant, touches `interp`'s core call resolution for a set the
+      compiler cannot see statically). Splitting instead:
+      - **Bare**: `say`, `ask`, `answer`, `spawn`, `fork`,
+        `append_history`, `artifact`, plus `resume`/`abandon` (Step
+        D2's decision constructors — not tool calls at all, so
+        `tools.resume(...)` would be actively misleading). All fixed,
+        closed, identical for every agent — the compiler can know the
+        whole list statically, exactly as it already knows `raise`
+        (precedent already in `interp/src/compiler/call.rs`).
+      - **Namespaced**: `tools.read_file`, `tools.bash`, and whatever
+        else an agent's registry holds — per-agent, dynamic, no static
+        list the compiler could ever see. Step C2 keeps this surface.
+      - `read_file(path)` is wrong; `tools.read_file(path)` is right.
+        `say(text)` is right; `tools.say(text)` is wrong (nothing is
+        being invoked as a *tool* — a bare call is what ordinary JS
+        looks like for a language-level verb, and it is a token saved
+        on exactly the calls that appear most often in any program).
+      - Compiler change: a small, closed set of new match arms in
+        `compile_global_call`'s existing name-based dispatch (where
+        `raise` already lives) — additive, does not touch the
+        undeclared-identifier fallback, so every other bare call keeps
+        today's `ReferenceError` semantics unchanged. Shadowing is
+        unaffected: `compile_user_call` resolves a local binding before
+        ever reaching this dispatch, so a program that declares its own
+        `function ask(){}` calls that, not the harness verb.
 - [ ] Errors take the same path as `raise()` — DESIGN.md's table
       already says a trapped error and a raise are rows of one shape;
       here they are literally one mechanism.
@@ -710,10 +737,11 @@ agent's users expect survive?** Read/edit/run tooling, seeing what the
 agent is doing, interrupting mid-flight. It survives, and two parts of
 it get better.
 
-- [ ] The tool surface is ordinary async functions in scope —
-      `read_file`, `write_file`, `edit_file`, `bash`, `grep`, `fetch`.
-      No schemas, no registry rendered into the document beyond the
-      card's list. The names and signatures are card surface.
+- [ ] The tool surface stays under `tools.*` (Step C1's revision) —
+      `tools.read_file`, `tools.write_file`, `tools.edit_file`,
+      `tools.bash`, `tools.grep`, `tools.fetch`. No schemas, no
+      registry rendered into the document beyond the card's list. The
+      names and signatures are card surface.
 - [ ] **Containment is the sandbox, not a dialog.** The program runs
       freely inside whatever boundary the process is given; there are
       no per-call approval prompts. Deliberate: forty prompts is worse
@@ -1247,9 +1275,15 @@ removes.
       definitions (`machine.rs`, `host/llm.rs`, `host/deepseek.rs`) —
       the *tool* definitions, not the program verbs that share two of
       those names.
-- [ ] The `tools.` namespace (Step C1): `tools.spawn` and
-      `tools.agent` become globals; `tools.tool_result` becomes
-      `artifact(id)`.
+- [ ] Just the harness-verb corner of the `tools.` namespace (Step
+      C1): `tools.spawn`, `tools.ask`, and `tools.tool_result` become
+      the bare globals `spawn`, `ask`, and `artifact`; `tools.agent`
+      (today's combined spawn-then-ask) has no direct successor — the
+      new vocabulary composes `spawn()` and `.ask()` in JS instead
+      (`17_BRANCHES`'s own rule), so it is dropped rather than renamed.
+      The namespace itself is not deleted — `tools.*` for configured
+      capabilities (`read_file`, `bash`, …) stays for the life of this
+      phase and past it.
 - [ ] The artifact menu as a rendered, accumulating surface
       (`menu_rows` as context; the log remains the store).
 - [ ] The answer budget and report clipping (`DEFAULT_ANSWER_BUDGET`,
