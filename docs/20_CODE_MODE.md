@@ -680,11 +680,15 @@ The verbs available to a completing model. Composition stays JS
       (Part B), for the same reason: `answer(7, "ask from planner", {…})`.
       Answering the wrong question is as silent as compacting the wrong
       row.
-- [ ] `spawn(charter)` → an agent handle (clean room); `fork()` → a
+- [x] `spawn(charter)` → an agent handle (clean room); `fork()` → a
       handle to a context inheriting this one's history.
       `list_agents()` for the subtree with status. **Branches exist for
       minds, not for programs.** Synchrony is `await`, not a parameter
-      — see Step C3.
+      — see Step C3. (Compiler + parsing for all three landed;
+      `list_agents` found missing on a later pass and closed the same
+      session. "An agent handle" / "the subtree with status" as live
+      objects needs the host wiring none of this phase's verbs have
+      yet — see `verbs.rs`'s own module doc.)
 - [ ] `artifact(id)` — fetch a completed call's value from the log by
       id, the mechanism behind every "one fetch away" in this file
       (DESIGN.md's `tools.tool_result`, renamed with the namespace).
