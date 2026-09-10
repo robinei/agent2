@@ -696,7 +696,7 @@ The verbs available to a completing model. Composition stays JS
       result.
 - [ ] Ordinary tool calls are plain async functions returning values.
       Nothing about calling one puts anything in context.
-- [ ] **The harness vocabulary is bare-global; `tools.*` stays for
+- [x] **The harness vocabulary is bare-global; `tools.*` stays for
       configured capabilities.** Revised from an earlier, broader "no
       `tools.` namespace at all" — that version required either
       teaching the compiler a runtime tool registry or changing the
@@ -726,6 +726,14 @@ The verbs available to a completing model. Composition stays JS
         unaffected: `compile_user_call` resolves a local binding before
         ever reaching this dispatch, so a program that declares its own
         `function ask(){}` calls that, not the harness verb.
+- [x] **Parsing lands** (`agent/src/codemode/verbs.rs`):
+      `parse_effect(vm, call)` turns one `Invoke` from any of the
+      seven into a typed `HarnessEffect`, arity- and shape-checked —
+      not wired to a host dispatcher or the event log yet (no
+      `machine.rs`/`tree.rs` change), so nothing actually delivers a
+      `say`, spawns an agent, or discharges a question. That is the
+      next layer, and it is squarely the tree/log integration this
+      phase has deliberately held off on.
 - [ ] Errors take the same path as `raise()` — DESIGN.md's table
       already says a trapped error and a raise are rows of one shape;
       here they are literally one mechanism.
@@ -944,19 +952,23 @@ needs a **stack of VMs**.
 
 ### Step D2 — The decision is the handler's return value
 
-- [ ] **`resume(value)` and `abandon()` are pure constructors.** They
+- [x] **`resume(value)` and `abandon()` are pure constructors.** They
       build a tagged decision and do nothing else. A handler expresses
       its choice by returning one: `return resume({rows: 4})` or
       `return abandon()`.
-- [ ] **Only a decision counts.** A handler that returns nothing,
+- [x] **Only a decision counts.** A handler that returns nothing,
       returns a non-decision, or falls off the end has decided nothing,
       and the condition re-fires with a report saying so. Neither
       default is safe — implicit `resume(undefined)` feeds garbage into
       a live program, implicit `abandon()` silently discards work —
       and this is `18_TARGETING`'s rule one layer down: an implicit
       answer and an oblivious one produce identical bytes, so nothing
-      short of the explicit value can be trusted.
-- [ ] **Misuse is inert, not wrong.** `resume(v)` on its own line has
+      short of the explicit value can be trusted. The detection side
+      (`agent/src/codemode/decision.rs`'s `read`, returning `None`
+      uniformly for all three non-decision shapes) is built and
+      tested; re-firing the condition on `None` is host-loop wiring,
+      not built.
+- [x] **Misuse is inert, not wrong.** `resume(v)` on its own line has
       no effect, so the failure mode is a loud re-fire rather than a
       silent resume with the wrong value. That is why these are
       constructors and not methods that record state on an object.
@@ -983,7 +995,7 @@ needs a **stack of VMs**.
 - [ ] Returning a *decision* from a root program **is** an error: there
       is no caller to decide about, so it means the model confused the
       two program kinds.
-- [ ] **Nothing here is control flow.** No unwinding, no bypassing user
+- [x] **Nothing here is control flow.** No unwinding, no bypassing user
       `try`/`catch`/`finally`, no JS semantics bent. `raise()` still
       bypasses in-program handlers (DESIGN.md) — that is suspension,
       which is a different thing from choosing.
@@ -999,7 +1011,7 @@ needs a **stack of VMs**.
       a raise nobody will answer is incoherent. The replacement becomes
       the new frame 2 and frame 1 continues as if nothing happened.
       Abandon is "rewrite my caller", safe at any depth.
-- [ ] **Naming: `resume`, not `answer`.** `answer(question, value)` is
+- [x] **Naming: `resume`, not `answer`.** `answer(question, value)` is
       already taken and means something else — discharging an inbound
       question, the only way to close an open post (`18_TARGETING`,
       `machine.rs`). `resume`/`abandon` is also the better pair: both
