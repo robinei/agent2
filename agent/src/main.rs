@@ -504,22 +504,24 @@ fn codemode_probe(task: &str) {
     )];
     let mut doc = document::render(card::CARD, &log).expect("fixture log renders");
     if with_exemplar {
-        // The seed exemplar opens `messages`, right after the card —
-        // a real user/assistant pair, never part of the card itself
-        // (Step C4).
-        doc.messages.splice(
-            1..1,
-            [
-                ChatMessage {
-                    role: ChatRole::User,
-                    content: card::SEED_EXEMPLAR.user.to_owned(),
-                },
-                ChatMessage {
-                    role: ChatRole::Assistant,
-                    content: card::SEED_EXEMPLAR.assistant.to_owned(),
-                },
-            ],
-        );
+        // The seed exemplars open `messages`, right after the card —
+        // real user/assistant pairs, never part of the card itself
+        // (Step C4), in order, earliest first.
+        for (i, ex) in card::SEED_EXEMPLARS.iter().enumerate() {
+            doc.messages.splice(
+                (1 + i * 2)..(1 + i * 2),
+                [
+                    ChatMessage {
+                        role: ChatRole::User,
+                        content: ex.user.to_owned(),
+                    },
+                    ChatMessage {
+                        role: ChatRole::Assistant,
+                        content: ex.assistant.to_owned(),
+                    },
+                ],
+            );
+        }
     }
 
     eprintln!("=== task ===\n{task}\n");

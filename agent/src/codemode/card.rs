@@ -39,7 +39,9 @@ namespace, which is reserved for this session's configured tools
                                     `to` is a quoted name: say("robin", "done")
   ask(who, text)                   ask a question; resolves to the answer
                                     `who` is a quoted name: await ask("robin", "which one?")
-  answer(question, label, value)   answer an inbound question by its id
+  answer(question, label, value)   discharge an `ask()` another program is
+                                    blocked on, by that question's own id —
+                                    not for an ordinary message: that is say()
   spawn(charter)                   a new agent, a clean room
   fork()                           a new context inheriting your whole history
   append_history(value)            remember a projection for your own future
@@ -127,16 +129,43 @@ pub struct Exemplar {
     pub assistant: &'static str,
 }
 
-pub const SEED_EXEMPLAR: Exemplar = Exemplar {
-    user: "can you check whether the tests pass and let robin know?",
-    assistant: r#"//: running the test suite, then reporting what happened
+/// Two demonstrations, not one, each carrying a shape the other
+/// can't: a tool call with an outcome to branch on, and — added
+/// 2026-09-10, after a live regression run's one consistently-failing
+/// task turned out to have no worked example of its own shape
+/// anywhere in context — reading real data, recognizing a genuine
+/// ambiguity, `ask()`-ing about it *inline*, and acting on the answer,
+/// all in one program that still ends by reporting what it did. The
+/// card's prose already says "ask() is a normal await, not a reason to
+/// end early"; a demonstration of a model actually doing that is a
+/// stronger restoring force than the sentence describing it.
+pub const SEED_EXEMPLARS: &[Exemplar] = &[
+    Exemplar {
+        user: "can you check whether the tests pass and let robin know?",
+        assistant: r#"//: running the test suite, then reporting what happened
 const result = await tools.bash("cargo test 2>&1 | tail -20");
 if (result.exit === 0) {
     say("robin", "tests pass.");
 } else {
     say("robin", `tests failed:\n${result.output}`);
 }"#,
-};
+    },
+    Exemplar {
+        user: "the retry count in ops/config.json looks off — can you fix it?",
+        assistant: r#"//: read the real value first — I can't tell what "off" means by guessing
+const cfg = await tools.read_file("ops/config.json");
+const parsed = JSON.parse(cfg.content);
+say("robin", `ops/config.json currently sets retries to ${parsed.retries}.`);
+
+//: the file doesn't say what it should be, and a wrong guess is worse
+//: than asking — resolve it here, in this same program, then act on it
+const target = await ask("robin", `retries is currently ${parsed.retries} — what should it be?`);
+
+parsed.retries = Number(target);
+await tools.write_file("ops/config.json", JSON.stringify(parsed, null, 2));
+say("robin", `set retries to ${target} in ops/config.json.`);"#,
+    },
+];
 
 #[cfg(test)]
 mod tests {
@@ -148,7 +177,7 @@ mod tests {
         // `CARD` shows up as a diff review must look at, not a byte
         // count that silently drifts. Comparing full text (not just a
         // hash) so the diff itself is legible in a failure message.
-        const EXPECTED_LEN: usize = 5234;
+        const EXPECTED_LEN: usize = 5394;
         assert_eq!(
             CARD.len(),
             EXPECTED_LEN,
@@ -205,25 +234,51 @@ mod tests {
 
     #[test]
     fn the_exemplars_assistant_turn_is_valid_javascript() {
-        // The one thing in this file that must actually compile: the
+        // The one thing in this file that must actually compile: each
         // exemplar's assistant turn is exactly what a real completion
         // would need to parse (Step B1's own rule for an assistant
         // turn), so it is held to the same standard here.
-        interp::compile(SEED_EXEMPLAR.assistant)
-            .unwrap_or_else(|e| panic!("seed exemplar does not parse: {e:?}"));
+        for ex in SEED_EXEMPLARS {
+            interp::compile(ex.assistant)
+                .unwrap_or_else(|e| panic!("seed exemplar does not parse: {e:?}"));
+        }
     }
 
     #[test]
     fn the_exemplars_assistant_turn_has_no_entry_header_and_no_fence() {
         // Step B1: an assistant turn is bare source, nothing else —
-        // the exemplar must model that, not just the card's prose
+        // each exemplar must model that, not just the card's prose
         // about it.
-        assert!(!SEED_EXEMPLAR.assistant.starts_with("```"));
-        assert!(!SEED_EXEMPLAR.assistant.starts_with('['));
+        for ex in SEED_EXEMPLARS {
+            assert!(!ex.assistant.starts_with("```"));
+            assert!(!ex.assistant.starts_with('['));
+        }
     }
 
     #[test]
-    fn the_exemplar_opens_with_a_plan_comment() {
-        assert!(SEED_EXEMPLAR.assistant.trim_start().starts_with("//:"));
+    fn the_exemplars_open_with_a_plan_comment() {
+        for ex in SEED_EXEMPLARS {
+            assert!(ex.assistant.trim_start().starts_with("//:"));
+        }
+    }
+
+    #[test]
+    fn the_second_exemplar_demonstrates_ask_inline_then_acting_on_it() {
+        // Card prose alone ("ask() is a normal await, not a reason to
+        // end early") wasn't enough to stop a live run from splitting
+        // an ordinary read-then-ask into two programs (2026-09-10) —
+        // this exemplar is the demonstration, so hold it to actually
+        // being one: `ask(` appears, and something runs after it in
+        // the same program (not the program's last line).
+        let ex = &SEED_EXEMPLARS[1];
+        let ask_at = ex
+            .assistant
+            .find("await ask(")
+            .expect("second exemplar should demonstrate ask()");
+        let after = &ex.assistant[ask_at..];
+        assert!(
+            after.lines().count() > 2,
+            "ask() should not be the last meaningful line of the exemplar"
+        );
     }
 }

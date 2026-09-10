@@ -1468,6 +1468,73 @@ card edit fixes. Left open rather than chased further this session —
 worth more live samples, or a stronger model tier, before concluding
 anything about it.
 
+**Chasing `judgment-in-the-middle` further, same day: a real wiring
+bug, a second exemplar, and a fixture fix that mattered more than any
+card wording.** Prompted by a direct question — does the seed exemplar
+actually demonstrate this task's own shape? — turned up something more
+basic first: it doesn't matter what the exemplar says, because
+`runner::run` (what `codemode-harness` actually calls) never spliced
+it into the document at all. `SEED_EXEMPLAR` was only ever read by
+`codemode-probe`'s own hand-rolled splice in `main.rs` — every one of
+this session's dozen-plus live harness runs, including all the card
+tuning above, ran with **no exemplar in context whatsoever**. Fixed by
+moving the splice into `runner::run` itself, as a `RunConfig.exemplars:
+&'static [Exemplar]` field (default `&[]`, so the loop's own 19
+scripted tests are unaffected) that `harness::run_task` now sets to
+the real seed exemplars — `codemode-probe` and a live task run finally
+see the same thing.
+
+With that fixed, the exemplar's actual content mattered: the one
+demonstration in `card.rs` showed a tool call with a branch, never an
+`ask()` at all — so the card's own prose ("`ask()` is a normal await,
+not a reason to end early") had no worked example anywhere in context.
+Added a second `Exemplar` (`SEED_EXEMPLARS` is now a slice, not a
+single struct): read real data, recognize a genuine ambiguity,
+`ask()` inline, act on the answer, report — the exact shape this task
+needs, with a test (`the_second_exemplar_demonstrates_ask_inline_then_
+acting_on_it`) pinning down that `ask()` isn't its last line.
+
+Wiring the exemplars in immediately surfaced a *different* bug on the
+very next live run: `trivial-question` failed because a completion
+called `answer(1, "sum", 42)` instead of `say()` — reading the card's
+"`answer(question, label, value)` — answer an inbound question by its
+id" as covering an ordinary user message, not specifically an `ask()`
+another running program is blocked on. Fixed by saying exactly that
+distinction in the card ("not for an ordinary message: that is
+`say()`"). The same run also reset `fan-out` to failing on a bizarre
+`</result>`-suffixed parse error, never seen in ten prior runs and not
+seen again since — recorded as sampling noise, not chased.
+
+The real remaining seam, found on the *next* run after both of those
+fixes: a completion for `judgment-in-the-middle` did everything right
+— read the real file, correctly flagged the question-comment as the
+ambiguity (the card's own guidance, working), asked a well-scoped
+question — and still failed, because it asked for a specific reply
+shape ("reply as `old => new` lines, or `ok`") that the fixture's
+full-sentence scripted answer didn't match, so its own parsing logic
+extracted nothing to act on. A live user could have adapted their
+wording to whatever format was requested; a static canned string
+can't, and different (individually reasonable) programs ask for
+different formats — this task's `ask()` fixture was punishing a
+model choice (request a structured reply) that is good practice, not
+a mistake. Simplified the scripted answer from a full sentence to just
+the corrected value (`"us-east-1"`), since the skill this task means
+to test is "did it ask and act on the answer," not "can it parse
+arbitrary prose" — trivially usable by any reasonable extraction
+strategy, structured or not.
+
+**Result: 4/4, mean round-trips 1.0, all four tasks in one completion
+each** — the first clean sweep this session, `judgment-in-the-middle`
+included, with a 5-statement program that states plainly it won't
+invent a "correct" value the file gives no reference for, asks for the
+corrected content directly, writes it, confirms. One run, and this
+session's own noise (task success has swung from 0/4 to 4/4 run to
+run against unrelated code) means this is a real result, not a
+verdict — worth more live samples before calling this task solved
+rather than currently-lucky. The wiring bug above is the more durable
+fix regardless of where the count lands: an exemplar that was silently
+never read is now silently never read by nothing.
+
 - [x] **Four or five fixed tasks, scripted, no network**, each one where
       a large program is the right answer: fan-out over N inputs,
       retry-and-branch, a pipeline with a judgment call in the middle.
@@ -1491,10 +1558,11 @@ anything about it.
       before they are needed measures the wrong things — this list was
       seven, and the register proxy in it turned out to be a compliance
       check. Computed live by `agent codemode-harness`
-      (`codemode/harness.rs`) after each task run: 3/4 success, 1.0
-      mean round-trips, 2.5 median statements as of the latest tuning
-      round above — real numbers now, not a placeholder, and stable
-      across three consecutive live runs.
+      (`codemode/harness.rs`) after each task run — real numbers now,
+      not a placeholder. Latest: 4/4 success, 1.0 mean round-trips, 5
+      median statements, though task success specifically has swung
+      from 0/4 to 4/4 run to run this session (see above) — read it as
+      a live signal to keep sampling, not a settled score.
 - [ ] **Reading transcripts is the real instrument**, and the
       raise-placement diagnostic is a reading exercise, not an
       aggregate. `raise()` is the only way the mind can summon itself,

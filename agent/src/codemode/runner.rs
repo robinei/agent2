@@ -156,6 +156,14 @@ pub enum RunError {
 pub struct RunConfig {
     pub max_depth: usize,
     pub max_completions: usize,
+    /// Worked user/assistant pairs to open `messages` with, right
+    /// after the card (Step C4's seed exemplars) — spliced in by
+    /// [`run`] itself so a live task run gets the same demonstrations
+    /// `codemode-probe` always has, instead of the two silently
+    /// drifting apart. Empty by default: this standalone loop's own
+    /// tests exercise dispatch and nesting, not register effects, and
+    /// a `ScriptedSource` doesn't care what the document says anyway.
+    pub exemplars: &'static [super::card::Exemplar],
 }
 
 impl Default for RunConfig {
@@ -163,6 +171,7 @@ impl Default for RunConfig {
         RunConfig {
             max_depth: 8,
             max_completions: 16,
+            exemplars: &[],
         }
     }
 }
@@ -303,7 +312,27 @@ pub fn run(
             text: user_message.to_owned(),
         },
     )];
-    let root_doc = document::render(card, &log).expect("a single-message log always renders");
+    let mut root_doc = document::render(card, &log).expect("a single-message log always renders");
+    // Seed exemplars open `messages`, right after the card (Step C4)
+    // — spliced once here so every completion this run ever takes,
+    // including a decider's or a regenerated replacement's (both
+    // clone `root_doc` via `docs_by_depth`), carries the same
+    // demonstrations `codemode-probe` always has.
+    for (i, ex) in config.exemplars.iter().enumerate() {
+        root_doc.messages.splice(
+            (1 + i * 2)..(1 + i * 2),
+            [
+                document::ChatMessage {
+                    role: document::ChatRole::User,
+                    content: ex.user.to_owned(),
+                },
+                document::ChatMessage {
+                    role: document::ChatRole::Assistant,
+                    content: ex.assistant.to_owned(),
+                },
+            ],
+        );
+    }
 
     let mut completions_used = 0;
     let mut take_completion =
@@ -784,6 +813,7 @@ mod tests {
             &RunConfig {
                 max_depth: 3,
                 max_completions: 100,
+                exemplars: &[],
             },
         );
         assert!(matches!(result, Err(RunError::Depth(_))));
@@ -800,6 +830,7 @@ mod tests {
             &RunConfig {
                 max_depth: 1000,
                 max_completions: 3,
+                exemplars: &[],
             },
         );
         assert!(matches!(result, Err(RunError::TooManyCompletions)));

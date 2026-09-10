@@ -262,10 +262,20 @@ pub const JUDGMENT_IN_THE_MIDDLE: Task = Task {
         // the only correct outcome — found live (2026-09-10) that an
         // answer merely confirming the existing value ("keep X") makes
         // "no edit" a reasonable reading too, which this check can't
-        // tell apart from skipping the question.
-        t.respond_ask(Ok(serde_json::json!(
-            "us-east-1 is correct now — we migrated off eu-west-1 last quarter, please update the file"
-        )));
+        // tell apart from skipping the question. Also found live: a
+        // full-sentence answer ("us-east-1 is correct now — we
+        // migrated...") let a well-reasoned program ask a properly
+        // scoped question, correctly flag the ambiguity, and still
+        // fail — its own reply-parsing logic requested a specific
+        // format ("old => new") the prose didn't match, so it found
+        // nothing to act on. A live user could adapt their phrasing to
+        // whatever format was asked for; this static fixture can't —
+        // and different (individually reasonable) programs ask for
+        // different formats. Since the skill this task means to test
+        // is "did it ask and act on the answer," not "can it parse
+        // arbitrary prose," the answer is just the corrected value:
+        // trivially usable by any reasonable extraction strategy.
+        t.respond_ask(Ok(serde_json::json!("us-east-1")));
         t.respond("write_file", Ok(serde_json::json!({ "written": true })));
         t
     },

@@ -88,13 +88,11 @@ pub fn run_task(
         lengths: Vec::new(),
         programs: Vec::new(),
     };
-    match runner::run(
-        card,
-        task.user_message,
-        &tools,
-        &mut source,
-        &RunConfig::default(),
-    ) {
+    let run_config = RunConfig {
+        exemplars: super::card::SEED_EXEMPLARS,
+        ..RunConfig::default()
+    };
+    match runner::run(card, task.user_message, &tools, &mut source, &run_config) {
         Ok(outcome) => TaskReport {
             task_name: task.name,
             success: (task.check)(&outcome, &tools),
