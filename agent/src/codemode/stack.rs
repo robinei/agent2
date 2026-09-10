@@ -21,12 +21,12 @@ use interp::{PromisePtr, ResumeMode, VM, VMError, Value};
 use super::decision::Decision;
 
 /// Why a frame is suspended, waiting for the frame above it (its
-/// handler) to decide. Recorded at push time from whatever `step()`
-/// (or the `Err` it returned) said stopped it — the two shapes
-/// DESIGN.md's suspension table lists that a *program* can hit and
-/// still be resumed with a value: `raise()` and a trapped, resumable
-/// error. (`OutOfFuel` never reaches this stack — the host just calls
-/// `step` again on the same frame; it never stops being current.)
+/// handler) to decide. Recorded at push time from whatever stopped
+/// it — the three suspension kinds DESIGN.md's table lists for a
+/// *program*: `raise()`, a trapped error, and a post arriving while
+/// it ran. (Plain `OutOfFuel` never reaches this stack — the host
+/// just calls `step` again on the same frame; it never stops being
+/// current on its own.)
 #[derive(Debug)]
 pub enum Suspension {
     /// `StepResult::Raise { condition, payload }` — resume via
@@ -41,12 +41,21 @@ pub enum Suspension {
     /// against one is a caller error, not something this stack
     /// silently coerces into an `Abandon`.
     Trapped(VMError),
+    /// A post (a user message, or another agent's) delivered while
+    /// this frame was running — stopped at a host-chosen safe point
+    /// rather than pushed here by `raise` or a trap. Nothing was
+    /// actually raised, so there is nothing to inject: `resume()`
+    /// takes no value for a posted condition (Step D1), and resuming
+    /// is just calling `step()` again — no VM-level resume call at
+    /// all, unlike the other two kinds. Any value given anyway is
+    /// silently ignored, matching that there was never a slot for one.
+    Posted,
 }
 
 impl Suspension {
     pub fn is_resumable(&self) -> bool {
         match self {
-            Suspension::Raised { .. } => true,
+            Suspension::Raised { .. } | Suspension::Posted => true,
             Suspension::Trapped(e) => matches!(e.resume, ResumeMode::PushValueThenContinue),
         }
     }
@@ -200,13 +209,25 @@ impl ProgramStack {
                     target.suspension = Some(suspension);
                     return Err(ApplyError::NotResumable);
                 }
-                let v = target
-                    .vm
-                    .json_to_stack_value(&value, 0)
-                    .map_err(ApplyError::Vm)?;
                 match suspension {
-                    Suspension::Raised { .. } => target.vm.resume_raise(v),
+                    // Nothing was raised, so there is nothing to
+                    // inject — no VM-level resume call at all; the
+                    // frame simply continues on the next `step()`.
+                    // `value` is silently ignored (there was never a
+                    // slot for one).
+                    Suspension::Posted => {}
+                    Suspension::Raised { .. } => {
+                        let v = target
+                            .vm
+                            .json_to_stack_value(&value, 0)
+                            .map_err(ApplyError::Vm)?;
+                        target.vm.resume_raise(v)
+                    }
                     Suspension::Trapped(e) => {
+                        let v = target
+                            .vm
+                            .json_to_stack_value(&value, 0)
+                            .map_err(ApplyError::Vm)?;
                         target.vm.resume_with(&e, v).map_err(ApplyError::Vm)?;
                     }
                 }
@@ -475,6 +496,67 @@ mod tests {
             .unwrap();
         // Frame 0 resumes and its already-settled `await p` completes
         // immediately with the value resolved while it was frozen.
+        match stack.current_mut().step(u64::MAX).unwrap() {
+            StepResult::Done { value, .. } => assert_eq!(value, Value::PosInt(7)),
+            other => panic!("expected Done, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn posted_condition_resumes_by_plain_stepping_no_injected_value() {
+        // A post arriving mid-program: the host stops the frame at a
+        // safe point (any `OutOfFuel` slice boundary serves), pushes a
+        // handler treating it as `Suspension::Posted`, and — unlike
+        // `Raised`/`Trapped` — resuming needs no VM-level resume call
+        // at all. `resume(99)`'s value is given but must be ignored:
+        // there was never a slot for one to land in.
+        let mut root = vm_for("return 1 + 1;");
+        match root.step(0).unwrap() {
+            StepResult::OutOfFuel => {}
+            other => panic!("expected OutOfFuel, got {other:?}"),
+        }
+        let mut stack = ProgramStack::new(root);
+        stack
+            .push(Suspension::Posted, vm_for("return resume(99);"), 8)
+            .unwrap();
+        let decision = match stack.current_mut().step(u64::MAX).unwrap() {
+            StepResult::Done { value, .. } => {
+                super::super::decision::read(stack.current(), &value).unwrap()
+            }
+            other => panic!("expected Done, got {other:?}"),
+        };
+        stack
+            .apply_decision(decision, || unreachable!("Resume never calls replacement"))
+            .unwrap();
+        assert_eq!(stack.depth(), 1);
+        // The root program continues exactly where it left off, wholly
+        // unaffected by the handler's `99` — it never had anywhere to go.
+        match stack.current_mut().step(u64::MAX).unwrap() {
+            StepResult::Done { value, .. } => assert_eq!(value, Value::Float(2.0)),
+            other => panic!("expected Done, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn abandon_still_works_on_a_posted_condition() {
+        // `return abandon()` is what you write when the remark means
+        // the plan should change (Step D1) — ordinary abandon
+        // sequencing, no special case for `Posted`.
+        let mut root = vm_for("return 1 + 1;");
+        root.step(0).unwrap();
+        let mut stack = ProgramStack::new(root);
+        stack
+            .push(Suspension::Posted, vm_for("return abandon();"), 8)
+            .unwrap();
+        let decision = match stack.current_mut().step(u64::MAX).unwrap() {
+            StepResult::Done { value, .. } => {
+                super::super::decision::read(stack.current(), &value).unwrap()
+            }
+            other => panic!("expected Done, got {other:?}"),
+        };
+        stack
+            .apply_decision(decision, || vm_for("return 7;"))
+            .unwrap();
         match stack.current_mut().step(u64::MAX).unwrap() {
             StepResult::Done { value, .. } => assert_eq!(value, Value::PosInt(7)),
             other => panic!("expected Done, got {other:?}"),
