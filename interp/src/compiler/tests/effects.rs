@@ -261,6 +261,20 @@ fn awaited_harness_verb_calls_yield_pending_effect() {
             "answer",
             vec![Value::PosInt(1), Value::PosInt(2)],
         ),
+        (
+            "remove_history(4, \"note\")",
+            "remove_history",
+            vec![Value::PosInt(4), Value::String("note".into())],
+        ),
+        (
+            "rewrite_history(4, \"note\", \"shorter\")",
+            "rewrite_history",
+            vec![
+                Value::PosInt(4),
+                Value::String("note".into()),
+                Value::String("shorter".into()),
+            ],
+        ),
     ] {
         let src = format!("return await {call};");
         let prog = compile(&src).unwrap_or_else(|e| panic!("{call} failed to compile: {e:?}"));

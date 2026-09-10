@@ -1,9 +1,10 @@
 //! Parsing the bare-global harness vocabulary's `Invoke` calls into
 //! typed effects (phase 20 doc, Step C1).
 //!
-//! `interp`'s compiler (`interp/src/compiler/call.rs`) now compiles `say`,
-//! `ask`, `answer`, `spawn`, `fork`, `append_history`, and `artifact`
-//! to `Instr::Invoke(name, argc)` — the same effect `tools.foo(...)`
+//! `interp`'s compiler (`interp/src/compiler/call.rs`) now compiles
+//! `say`, `ask`, `answer`, `spawn`, `fork`, `append_history`,
+//! `artifact`, `remove_history`, and `rewrite_history` to
+//! `Instr::Invoke(name, argc)` — the same effect `tools.foo(...)`
 //! already produces, arity-agnostic at the compiler level exactly as
 //! `tools.*` is. This module is the next layer down: turning one
 //! `InvokeCall` (a name plus raw `Value` args) into a validated
@@ -77,6 +78,13 @@ pub enum HarnessEffect {
     /// unlike `answer`/`remove_history`/`rewrite_history` its worked
     /// examples never show a second argument.
     Artifact { id: EntryId },
+    /// `remove_history(id, label)` / `rewrite_history(id, label,
+    /// value)` — a compaction handler's own verbs (Part E), not a
+    /// root program's, but the same fixed vocabulary and the same
+    /// `Invoke` mechanism either way. Reuses `compaction::CompactionOp`
+    /// directly rather than a parallel type: `compact()` is exactly
+    /// what a dispatcher would hand these to.
+    Compact(super::compaction::CompactionOp),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -191,6 +199,25 @@ pub fn parse_effect(vm: &VM, call: &InvokeCall) -> Result<HarnessEffect, VerbErr
                 id: entry_id_arg(id, "artifact's id")?,
             }),
             _ => Err(err("artifact(id)")),
+        },
+        "remove_history" => match args.as_slice() {
+            [id, label] => Ok(HarnessEffect::Compact(
+                super::compaction::CompactionOp::Remove {
+                    id: entry_id_arg(id, "remove_history's id")?,
+                    label: string_arg(label, "remove_history's label")?,
+                },
+            )),
+            _ => Err(err("remove_history(id, label)")),
+        },
+        "rewrite_history" => match args.as_slice() {
+            [id, label, value] => Ok(HarnessEffect::Compact(
+                super::compaction::CompactionOp::Rewrite {
+                    id: entry_id_arg(id, "rewrite_history's id")?,
+                    label: string_arg(label, "rewrite_history's label")?,
+                    text: string_arg(value, "rewrite_history's value")?,
+                },
+            )),
+            _ => Err(err("rewrite_history(id, label, value)")),
         },
         other => Err(err(format!("not a harness verb: `{other}`"))),
     }
@@ -351,6 +378,45 @@ mod tests {
     #[test]
     fn artifact_with_a_non_numeric_id_is_rejected() {
         let (vm, call) = first_call("return await artifact('nope');");
+        assert!(parse_effect(&vm, &call).is_err());
+    }
+
+    #[test]
+    fn remove_history_parses_as_a_compaction_op() {
+        let (vm, call) = first_call("return await remove_history(4, 'note');");
+        assert_eq!(
+            parse_effect(&vm, &call).unwrap(),
+            HarnessEffect::Compact(super::super::compaction::CompactionOp::Remove {
+                id: EventId::new(4),
+                label: "note".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn rewrite_history_parses_as_a_compaction_op() {
+        let (vm, call) = first_call("return await rewrite_history(4, 'note', 'shorter');");
+        assert_eq!(
+            parse_effect(&vm, &call).unwrap(),
+            HarnessEffect::Compact(super::super::compaction::CompactionOp::Rewrite {
+                id: EventId::new(4),
+                label: "note".into(),
+                text: "shorter".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn remove_history_with_wrong_arity_is_rejected() {
+        let (vm, call) = first_call("return await remove_history(4);");
+        assert!(parse_effect(&vm, &call).is_err());
+    }
+
+    #[test]
+    fn rewrite_history_with_a_non_string_value_is_rejected() {
+        // `CompactionOp::Rewrite.text` is a rendered line — must be a
+        // string, the same rule `entry.rs`'s render path relies on.
+        let (vm, call) = first_call("return await rewrite_history(4, 'note', 42);");
         assert!(parse_effect(&vm, &call).is_err());
     }
 

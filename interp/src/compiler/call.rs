@@ -572,7 +572,8 @@ impl super::Compiler {
                     self.emit(Instr::Raise(name, 0), span);
                 }
             }
-            "say" | "ask" | "answer" | "spawn" | "fork" | "append_history" | "artifact" => {
+            "say" | "ask" | "answer" | "spawn" | "fork" | "append_history" | "artifact"
+            | "remove_history" | "rewrite_history" => {
                 // The closed, harness-defined vocabulary (phase 20 doc,
                 // `docs/20_CODE_MODE.md` Step C1) — a fixed global
                 // surface, identical for every agent, known to this
@@ -580,10 +581,14 @@ impl super::Compiler {
                 // `tools.*` (the "tools" arm in `compile_call`) stays
                 // the surface for a specific agent's *configured*
                 // capabilities, which this compiler has no static view
-                // of; these seven never vary per agent, so they get the
+                // of; these nine never vary per agent, so they get the
                 // same bare-call treatment `tools.foo(...)` gives its
                 // own names — `Invoke`, arity-agnostic here too, left
                 // to the host to accept or refuse at runtime.
+                // `remove_history`/`rewrite_history` are Part E's
+                // compaction verbs — a compaction handler's own
+                // program, not a root program's, but the same fixed
+                // vocabulary either way.
                 self.compile_args(argv);
                 self.emit(Instr::Invoke(name.into(), argv.len() as u32), span);
             }
