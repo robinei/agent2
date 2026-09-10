@@ -42,6 +42,7 @@ namespace, which is reserved for this session's configured tools
   fork()                           a new context inheriting your whole history
   append_history(value)            remember a projection for your own future
   artifact(id)                     fetch a completed call's value by id
+  list_agents()                    every agent in this subtree, with status
   raise(name, payload?)            suspend for judgement
 
 `raise()` suspends this program and asks for a decision, made by
@@ -117,7 +118,7 @@ mod tests {
         // `CARD` shows up as a diff review must look at, not a byte
         // count that silently drifts. Comparing full text (not just a
         // hash) so the diff itself is legible in a failure message.
-        const EXPECTED_LEN: usize = 3249;
+        const EXPECTED_LEN: usize = 3325;
         assert_eq!(
             CARD.len(),
             EXPECTED_LEN,
@@ -159,6 +160,7 @@ mod tests {
             "abandon(",
             "remove_history(",
             "rewrite_history(",
+            "list_agents(",
         ] {
             assert!(CARD.contains(verb), "card is missing {verb}");
         }

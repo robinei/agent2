@@ -573,7 +573,7 @@ impl super::Compiler {
                 }
             }
             "say" | "ask" | "answer" | "spawn" | "fork" | "append_history" | "artifact"
-            | "remove_history" | "rewrite_history" => {
+            | "remove_history" | "rewrite_history" | "list_agents" => {
                 // The closed, harness-defined vocabulary (phase 20 doc,
                 // `docs/20_CODE_MODE.md` Step C1) — a fixed global
                 // surface, identical for every agent, known to this
@@ -581,7 +581,7 @@ impl super::Compiler {
                 // `tools.*` (the "tools" arm in `compile_call`) stays
                 // the surface for a specific agent's *configured*
                 // capabilities, which this compiler has no static view
-                // of; these nine never vary per agent, so they get the
+                // of; these ten never vary per agent, so they get the
                 // same bare-call treatment `tools.foo(...)` gives its
                 // own names — `Invoke`, arity-agnostic here too, left
                 // to the host to accept or refuse at runtime.

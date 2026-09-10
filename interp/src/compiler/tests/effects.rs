@@ -275,6 +275,7 @@ fn awaited_harness_verb_calls_yield_pending_effect() {
                 Value::String("shorter".into()),
             ],
         ),
+        ("list_agents()", "list_agents", vec![]),
     ] {
         let src = format!("return await {call};");
         let prog = compile(&src).unwrap_or_else(|e| panic!("{call} failed to compile: {e:?}"));

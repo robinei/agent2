@@ -3,8 +3,8 @@
 //!
 //! `interp`'s compiler (`interp/src/compiler/call.rs`) now compiles
 //! `say`, `ask`, `answer`, `spawn`, `fork`, `append_history`,
-//! `artifact`, `remove_history`, and `rewrite_history` to
-//! `Instr::Invoke(name, argc)` — the same effect `tools.foo(...)`
+//! `artifact`, `remove_history`, `rewrite_history`, and `list_agents`
+//! to `Instr::Invoke(name, argc)` — the same effect `tools.foo(...)`
 //! already produces, arity-agnostic at the compiler level exactly as
 //! `tools.*` is. This module is the next layer down: turning one
 //! `InvokeCall` (a name plus raw `Value` args) into a validated
@@ -85,6 +85,12 @@ pub enum HarnessEffect {
     /// directly rather than a parallel type: `compact()` is exactly
     /// what a dispatcher would hand these to.
     Compact(super::compaction::CompactionOp),
+    /// `list_agents()` — the subtree with status (Step C1). Discovery,
+    /// not history: the answer needs live session state (a branch's
+    /// status), the same reason `machine.rs`'s existing `TOOL_AGENTS`
+    /// ("agents") is served inline rather than through the tool
+    /// registry. No arguments.
+    ListAgents,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -148,7 +154,7 @@ fn args_as_json(vm: &VM, call: &InvokeCall) -> Vec<serde_json::Value> {
 
 /// Parse one `InvokeCall` produced by the bare harness vocabulary into
 /// a [`HarnessEffect`]. `Err` for a call whose `name` is not one of
-/// the seven verbs, or whose arguments don't match the chosen shape.
+/// the ten verbs, or whose arguments don't match the chosen shape.
 pub fn parse_effect(vm: &VM, call: &InvokeCall) -> Result<HarnessEffect, VerbError> {
     let args = args_as_json(vm, call);
     match call.name.as_str() {
@@ -218,6 +224,10 @@ pub fn parse_effect(vm: &VM, call: &InvokeCall) -> Result<HarnessEffect, VerbErr
                 },
             )),
             _ => Err(err("rewrite_history(id, label, value)")),
+        },
+        "list_agents" => match args.as_slice() {
+            [] => Ok(HarnessEffect::ListAgents),
+            _ => Err(err("list_agents() takes no arguments")),
         },
         other => Err(err(format!("not a harness verb: `{other}`"))),
     }
@@ -417,6 +427,14 @@ mod tests {
         // `CompactionOp::Rewrite.text` is a rendered line — must be a
         // string, the same rule `entry.rs`'s render path relies on.
         let (vm, call) = first_call("return await rewrite_history(4, 'note', 42);");
+        assert!(parse_effect(&vm, &call).is_err());
+    }
+
+    #[test]
+    fn list_agents_takes_no_arguments() {
+        let (vm, call) = first_call("return await list_agents();");
+        assert_eq!(parse_effect(&vm, &call).unwrap(), HarnessEffect::ListAgents);
+        let (vm, call) = first_call("return await list_agents(1);");
         assert!(parse_effect(&vm, &call).is_err());
     }
 
