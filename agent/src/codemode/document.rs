@@ -44,8 +44,9 @@ impl Document {
     /// triggered this completion — a user message, or the turn a
     /// now-suspended program was dispatched from). Starts a fresh
     /// `User` message only when the record ends on an `Assistant`
-    /// turn or is empty, which a real render never should (see
-    /// [`render`]'s doc on `RenderError::Empty`) but a defensive
+    /// turn (or holds just the card) — a shape [`render`] only
+    /// produces for a log with nothing open yet, which a real
+    /// completion request is never built from, but a defensive
     /// fallback costs nothing.
     pub fn with_tail(mut self, tail: &str) -> Self {
         if tail.is_empty() {
@@ -106,8 +107,18 @@ fn status_line(id: EntryId, outcome: &ProgramOutcome) -> String {
 /// defence — the card states the rule once and it never needs to
 /// change per caller.
 fn escape_untrusted(text: &str) -> String {
-    let looks_like_harness_line =
-        |line: &str| -> bool { line.starts_with('[') && line[1..].contains(']') };
+    // Specifically `[<digits>]`, matching the real entry-id shape —
+    // not any bracketed text. `[TODO] fix this` is ordinary content
+    // and must not pay an escaping cost that only real ids need.
+    let looks_like_harness_line = |line: &str| -> bool {
+        let Some(rest) = line.strip_prefix('[') else {
+            return false;
+        };
+        match rest.find(']') {
+            Some(i) => i > 0 && rest[..i].bytes().all(|b| b.is_ascii_digit()),
+            None => false,
+        }
+    };
     if !text.lines().any(looks_like_harness_line) {
         // Fast, allocation-free path for the overwhelmingly common
         // case: no line looks like a harness statement.
@@ -657,6 +668,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn bracketed_text_that_is_not_a_real_id_is_not_escaped() {
+        // The escape targets the real entry-id shape (`[<digits>]`),
+        // not any bracket at all -- ordinary text like a `[TODO]` tag
+        // must not pay a cost that only a forged id needs to pay.
+        let log = vec![(
+            id(1),
+            Entry::Message {
+                from: "robin".into(),
+                text: "[TODO] fix this\n[Music] playing".into(),
+            },
+        )];
+        let doc = render("CARD", &log).unwrap();
+        assert_eq!(
+            doc.messages[1].content,
+            "[1] robin: [TODO] fix this\n[Music] playing"
+        );
+    }
+
     /// Step B1c: "the document only ever grows at the end" — the
     /// invariant a real token-prefix cache relies on. This is
     /// **not** "the whole serialized request is a byte-prefix of the
@@ -861,7 +891,7 @@ mod tests {
             );
             if !matches!(entry, Entry::Program { .. }) {
                 assert!(
-                    rendered.contains(entry.label().as_str()),
+                    rendered.contains(entry.label()),
                     "entry {entry_id:?}'s label {:?} must round-trip",
                     entry.label()
                 );

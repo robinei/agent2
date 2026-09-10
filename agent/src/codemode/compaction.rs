@@ -134,7 +134,7 @@ pub fn compact(
         if actual_label != op.label() {
             return Err(CompactionError::LabelMismatch {
                 id: op.id(),
-                expected: actual_label,
+                expected: actual_label.to_owned(),
                 given: op.label().to_owned(),
             });
         }

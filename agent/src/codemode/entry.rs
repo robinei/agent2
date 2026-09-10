@@ -116,13 +116,13 @@ impl Entry {
     /// specifies (`remove_history(id, label)` must match). Kept here,
     /// next to the entry it describes, rather than recomputed at every
     /// call site.
-    pub fn label(&self) -> String {
+    pub fn label(&self) -> &str {
         match self {
-            Entry::Message { from, .. } => from.clone(),
-            Entry::Program { .. } => "program".into(),
-            Entry::Effects { .. } => "effects".into(),
-            Entry::Note { .. } => "note".into(),
-            Entry::CompactedStub { label, .. } => label.clone(),
+            Entry::Message { from, .. } => from,
+            Entry::Program { .. } => "program",
+            Entry::Effects { .. } => "effects",
+            Entry::Note { .. } => "note",
+            Entry::CompactedStub { label, .. } => label,
         }
     }
 }
