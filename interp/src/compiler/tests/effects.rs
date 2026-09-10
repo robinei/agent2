@@ -3,6 +3,7 @@
 //! `codegen_shape.rs`.
 
 use crate::compiler::compile;
+use crate::testutil::{eval, eval_str};
 use crate::vm::{StepResult, VM, Value};
 
 // ── effects (tools / raise) ───────────────────────────────────────
@@ -219,4 +220,148 @@ fn raise_too_many_args_is_compile_error() {
 fn raise_non_literal_name_is_compile_error() {
     let errs = crate::testutil::compile_errs("let n = \"x\"; raise(n);");
     assert!(!errs.is_empty(), "should be a compile error");
+}
+
+// ── phase 20 harness vocabulary: bare-global verbs + decision values
+// (`docs/20_CODE_MODE.md` Step C1/D2) ─────────────────────────────
+//
+// `say`/`ask`/`answer`/`spawn`/`fork`/`append_history`/`artifact` are
+// a fixed, closed surface — bare-global, `Invoke`-based, exactly like
+// `tools.*` above but without the namespace, since (unlike `tools.*`)
+// this set never varies per agent. `resume`/`abandon` are pure
+// decision-value constructors (Step D2): no `Invoke`, no promise —
+// the same shape `TypeError(...)` already builds, just tagged
+// `__decision` instead of `name`.
+
+#[test]
+fn awaited_harness_verb_calls_yield_pending_effect() {
+    // One representative per verb: each is bare (no `tools.` prefix)
+    // and produces the same `Invoke` effect `tools.*` does.
+    for (call, expected_name, expected_args) in [
+        ("say(\"hi\")", "say", vec![Value::String("hi".into())]),
+        (
+            "ask(\"who\", \"q\")",
+            "ask",
+            vec![Value::String("who".into()), Value::String("q".into())],
+        ),
+        (
+            "spawn(\"reviewer\")",
+            "spawn",
+            vec![Value::String("reviewer".into())],
+        ),
+        ("fork()", "fork", vec![]),
+        (
+            "append_history(1)",
+            "append_history",
+            vec![Value::PosInt(1)],
+        ),
+        ("artifact(7)", "artifact", vec![Value::PosInt(7)]),
+        (
+            "answer(1, 2)",
+            "answer",
+            vec![Value::PosInt(1), Value::PosInt(2)],
+        ),
+    ] {
+        let src = format!("return await {call};");
+        let prog = compile(&src).unwrap_or_else(|e| panic!("{call} failed to compile: {e:?}"));
+        let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
+        match vm.step(u64::MAX).unwrap() {
+            StepResult::Pending { calls } => {
+                assert_eq!(calls.len(), 1, "{call}");
+                assert_eq!(calls[0].name, expected_name, "{call}");
+                assert_eq!(calls[0].args, expected_args, "{call}");
+            }
+            other => panic!("{call}: expected Pending, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn unawaited_harness_verb_call_is_fire_and_forget() {
+    // Same fire-and-forget shape as an unawaited `tools.*` call.
+    let prog = compile("say(\"hi\"); return 1;").expect("compiles");
+    let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
+    match vm.step(u64::MAX).unwrap() {
+        StepResult::Done { value, unstarted } => {
+            assert_eq!(value, Value::PosInt(1));
+            assert_eq!(unstarted.len(), 1);
+            assert_eq!(unstarted[0].name, "say");
+        }
+        other => panic!("expected Done, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_local_declaration_shadows_the_harness_verb() {
+    // `compile_user_call` resolves a local binding before ever
+    // reaching the bare-global dispatch these verbs live in, so a
+    // program that declares its own `ask` calls that, not the
+    // harness verb — no `Invoke` at all.
+    assert_eq!(
+        eval("(function ask(x) { return x + 1; })(5)"),
+        Value::Float(6.0)
+    );
+    let prog = compile("function ask(x) { return x + 1; } return ask(5);").expect("compiles");
+    let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
+    match vm.step(u64::MAX).unwrap() {
+        StepResult::Done { value, .. } => assert_eq!(value, Value::Float(6.0)),
+        other => panic!("expected Done (no Invoke — shadowed), got {other:?}"),
+    }
+}
+
+#[test]
+fn resume_builds_a_plain_decision_object_no_invoke() {
+    assert_eq!(eval_str("resume(42).__decision"), "resume");
+    assert_eq!(eval("resume(42).value"), Value::PosInt(42));
+    // No host round-trip: running to completion never yields Pending.
+    let prog = compile("return resume(42);").expect("compiles");
+    let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
+    match vm.step(u64::MAX).unwrap() {
+        StepResult::Done { .. } => {}
+        other => panic!("expected Done (a pure value, no effect), got {other:?}"),
+    }
+}
+
+#[test]
+fn resume_with_no_argument_has_an_undefined_value() {
+    // `resume()` for a posted condition — "continue, nothing changed"
+    // (Step D1) — still a well-formed decision object.
+    assert_eq!(eval_str("resume().__decision"), "resume");
+    assert_eq!(eval("resume().value"), Value::Undefined);
+}
+
+#[test]
+fn abandon_builds_a_plain_decision_object_no_invoke() {
+    assert_eq!(eval_str("abandon().__decision"), "abandon");
+    let prog = compile("return abandon();").expect("compiles");
+    let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
+    match vm.step(u64::MAX).unwrap() {
+        StepResult::Done { .. } => {}
+        other => panic!("expected Done (a pure value, no effect), got {other:?}"),
+    }
+}
+
+#[test]
+fn resume_takes_at_most_one_argument() {
+    let errs = crate::testutil::compile_errs("resume(1, 2);");
+    assert!(!errs.is_empty(), "should be a compile error");
+}
+
+#[test]
+fn abandon_takes_no_arguments() {
+    let errs = crate::testutil::compile_errs("abandon(1);");
+    assert!(!errs.is_empty(), "should be a compile error");
+}
+
+#[test]
+fn resume_and_abandon_are_ordinary_values_not_reserved_words() {
+    // Neither is a keyword — a program can still use the name as a
+    // local binding (shadowing, same as any other bare-global verb).
+    let prog =
+        compile("function resume(x) { return x * 2; } return resume(21);").expect("compiles");
+    let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
+    match vm.step(u64::MAX).unwrap() {
+        StepResult::Done { value, .. } => assert_eq!(value, Value::Float(42.0)),
+        other => panic!("expected Done, got {other:?}"),
+    }
 }

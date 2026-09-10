@@ -572,6 +572,70 @@ impl super::Compiler {
                     self.emit(Instr::Raise(name, 0), span);
                 }
             }
+            "say" | "ask" | "answer" | "spawn" | "fork" | "append_history" | "artifact" => {
+                // The closed, harness-defined vocabulary (phase 20 doc,
+                // `docs/20_CODE_MODE.md` Step C1) — a fixed global
+                // surface, identical for every agent, known to this
+                // compiler exactly the way `raise` already is above.
+                // `tools.*` (the "tools" arm in `compile_call`) stays
+                // the surface for a specific agent's *configured*
+                // capabilities, which this compiler has no static view
+                // of; these seven never vary per agent, so they get the
+                // same bare-call treatment `tools.foo(...)` gives its
+                // own names — `Invoke`, arity-agnostic here too, left
+                // to the host to accept or refuse at runtime.
+                self.compile_args(argv);
+                self.emit(Instr::Invoke(name.into(), argv.len() as u32), span);
+            }
+            "resume" => {
+                // `resume(value?)` — a pure decision value (Step D2),
+                // not a host round-trip: no `Invoke`, no promise. A
+                // handler's `return resume(v)` continues the raising
+                // program with `v`; the harness reads the tag off the
+                // returned object rather than this ever being executed
+                // as a call, which is why it is a plain object
+                // construction — the same shape `TypeError(...)` below
+                // already builds.
+                if argv.len() > 1 {
+                    self.error(span, "`resume` takes at most one argument");
+                    return;
+                }
+                let tag = self.intern_string("resume");
+                self.emit(Instr::PushStr(tag), span);
+                match argv.first() {
+                    Some(v) => self.compile_expr(v),
+                    None => self.emit(Instr::PushUndefined, span),
+                }
+                self.emit(
+                    Instr::ObjNew(
+                        vec![
+                            crate::vm::RcStr::from("__decision"),
+                            crate::vm::RcStr::from("value"),
+                        ]
+                        .into(),
+                    ),
+                    span,
+                );
+            }
+            "abandon" => {
+                // The other decision constructor (Step D2): discards
+                // the raising program instead of continuing it. Takes
+                // no arguments — unlike the other six harness verbs,
+                // this is a fixed-shape constructor, so a wrong arg
+                // count is a clear mistake worth a compile error, the
+                // same call the error-ctor arm below makes for its own
+                // arity.
+                if !argv.is_empty() {
+                    self.error(span, "`abandon` takes no arguments");
+                    return;
+                }
+                let tag = self.intern_string("abandon");
+                self.emit(Instr::PushStr(tag), span);
+                self.emit(
+                    Instr::ObjNew(vec![crate::vm::RcStr::from("__decision")].into()),
+                    span,
+                );
+            }
             name if super::is_error_ctor(name) => {
                 // `TypeError("msg")` / `Error("msg")` → create error object
                 // (same logic as `compile_error_ctor` for `new`).
