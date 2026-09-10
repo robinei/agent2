@@ -12,6 +12,7 @@
 //! turned back into a program (the no-fence rule, Part A).
 
 pub mod compaction;
+pub mod decision;
 pub mod document;
 pub mod entry;
 pub mod fence;
