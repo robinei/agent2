@@ -1304,6 +1304,89 @@ data points, not a sweep — but it is real, live evidence for the
 mechanism this whole phase bets on, gathered before the harness that
 would formalize it.
 
+**The harness's first live runs, and what they found (2026-09-10,
+`deepseek-v4-flash`):** the first live run of all four tasks
+(`agent codemode-harness`) scored 1/4, and every one of the three
+failures traced to the harness, not the model or the design. None of
+the four tasks told the model what its own `tools.*` actually were —
+Step C2 says that surface is "card surface," but this harness has one
+shared base card and never appended a per-task addendum, so the model
+had genuinely no way to know. Faced with that, it did not guess: on
+`fan-out` it said so and asked robin to paste the files; on
+`retry-and-branch` it ran a reconnaissance `tools.bash` call to
+*discover* the build command (a real instance of the card's own "look
+before you leap"), and — a second, independent finding — that recon
+call, sent to a fixed FIFO of two canned responses meant for the two
+build attempts, silently consumed one of them, so the actual build was
+never run at all. Fixed by giving each `Task` a `tool_manifest` field
+(`tasks.rs`) naming its tools' signatures, and for `retry-and-branch`,
+the exact build command — appended to the card per run by
+`harness::run_task`, never touching the shared `codemode::card::CARD`
+itself. A third failure was a genuine card bug: the card said a
+handler decides by "returning `resume(value)`," and a live completion
+called `resume(r);` as a bare statement — not `return resume(r);` — on
+an otherwise perfectly correct diagnosis (it had just explained, in its
+own `//:` plan, exactly why the suspended frame needed that exact
+value). The decision was never read, `HandlerDidNotDecide`, one wasted
+round trip. Fixed by making the card say `return resume(value);` /
+`return abandon();` explicitly and stating the failure mode by name:
+"calling `resume(value)` or `abandon()` without returning it is not a
+decision, the same as never calling either."
+
+A rerun after both fixes went to 3/4, mean round-trips 2.5, median
+program length 2.5 statements — down from 6–7 in the tool-blind runs,
+since programs no longer needed name-guessing probes. Two findings
+survived the fixes, left open rather than patched blind:
+
+- **A live, reproducible `Done`/`unstarted` question in `interp`
+  itself.** The first `fan-out` attempt wrapped its body in an
+  unawaited top-level `(async () => { for (...) { await
+  tools.read_file(n); ... } })()` — a real `await` inside, on a call
+  the VM's own `continuations` mechanism should be tracking, but the
+  *outer* function's promise was never awaited by the top level. Only
+  one of the three intended `read_file` calls ever fired; `run`
+  reported the root `Done` (per `StepResult::Done`'s own contract:
+  "the program finishes without awaiting them") after dispatching
+  exactly one `unstarted` call, and never stepped the VM again to let
+  the newly-resolved promise wake the still-suspended inner
+  continuation. Whether that classification is correct JS semantics or
+  a real interp bug is not established — it would mean tracing
+  `vm/dispatch.rs`'s Done/Pending decision against a live continuation
+  that is genuinely subscribed to an outbox call whose *outer* promise
+  is orphaned, which is core VM stepping logic the ground rules
+  reserve for a dedicated pass, not a live-testing side quest. A
+  rewritten `fan-out` program that just `await`ed sequentially at the
+  top level, no wrapping IIFE, did not exhibit this and passed clean in
+  one round trip — so this is a real, reproducible gap in one specific
+  shape, not a blocker to using the harness.
+- **Pattern-matching against an imagined shape, instead of reading the
+  real one.** `judgment-in-the-middle`'s replacement program, on its
+  third rewrite (after two honest forgot-`await`-and-abandon cycles),
+  finally `await`ed the read and had the real config text in hand — a
+  one-line ambiguity about which AWS region is current — but instead
+  of reading it, ran forty-odd lines of generic Kubernetes-manifest
+  staleness heuristics (stale `apiVersion`s, unpinned image tags) built
+  from prior knowledge of what a file named `deploy.yaml` usually
+  looks like. None of those patterns matched, so it concluded "looks
+  current, no stale markers found" and gave up — never asking, despite
+  `ask()` being available and despite having the real ambiguous line
+  sitting in a variable it never `say()`-ed or reasoned about directly.
+  This is Part H's own "long and wrong" failure shape, caught live:
+  substituting a bigger, generic program for actually reading the
+  smaller, specific thing in front of it. Worth watching for
+  specifically as the card and exemplars are tuned further, not fixed
+  by this session.
+- **Also worth recording, not a failure of any run:** a replacement
+  program generated after `abandon()` is regenerated from exactly the
+  document its predecessor originally saw (`docs_by_depth`, `runner.rs`)
+  — none of the abandoned attempt's own `say()`/`append_history()`
+  calls are folded back in before regenerating. Every retry in an
+  abandon chain starts from the same blank slate, which is why each of
+  `judgment-in-the-middle`'s five rounds re-diagnosed the same trap from
+  scratch rather than building on the last. Intentional or not, it is
+  the current behavior and shapes how many round trips a chain like
+  this costs.
+
 - [x] **Four or five fixed tasks, scripted, no network**, each one where
       a large program is the right answer: fan-out over N inputs,
       retry-and-branch, a pipeline with a judgment call in the middle.
@@ -1321,12 +1404,15 @@ would formalize it.
       no model or network involved. What is not built yet: running
       these against a live model and aggregating the numbers below —
       that is the next bullet, still open.
-- [ ] **Three numbers per run**, and no more until one of them fails to
+- [x] **Three numbers per run**, and no more until one of them fails to
       answer a question: median program length (statements), LLM
       round-trips per user request, and task success. Adding metrics
       before they are needed measures the wrong things — this list was
       seven, and the register proxy in it turned out to be a compliance
-      check.
+      check. Computed live by `agent codemode-harness`
+      (`codemode/harness.rs`) after each task run: 3/4 success, 2.5
+      mean round-trips, 2.5 median statements as of the second live
+      run above — real numbers now, not a placeholder.
 - [ ] **Reading transcripts is the real instrument**, and the
       raise-placement diagnostic is a reading exercise, not an
       aggregate. `raise()` is the only way the mind can summon itself,

@@ -15,14 +15,18 @@ use super::tasks::Task;
 use super::transport::Completion;
 use super::{document::Document, fence};
 
-/// Wraps a live source to capture what Part H actually wants counted:
-/// the statement length of every program the model produced during
-/// the run, in order. A thin pass-through otherwise — `run`'s own
-/// fence-stripping and truncation handling are untouched, this just
-/// mirrors that same extraction on the side to measure it.
+/// Wraps a live source to capture what Part H actually wants counted
+/// *and* what it says is the real instrument: the statement length of
+/// every program the model produced during the run, in order, and the
+/// program's own extracted source — aggregate numbers alone don't
+/// explain a failure, reading the program does. A thin pass-through
+/// otherwise — `run`'s own fence-stripping and truncation handling are
+/// untouched, this just mirrors that same extraction on the side to
+/// capture it.
 struct RecordingSource<'a> {
     inner: LiveSource<'a>,
     lengths: Vec<usize>,
+    programs: Vec<String>,
 }
 
 impl CompletionSource for RecordingSource<'_> {
@@ -31,19 +35,23 @@ impl CompletionSource for RecordingSource<'_> {
         if !completion.was_truncated() && !completion.text.trim().is_empty() {
             let source = fence::extract(&completion.text);
             self.lengths.push(interp::count_statements(&source));
+            self.programs.push(source);
         }
         Ok(completion)
     }
 }
 
 /// One task's result: whether its own success condition held, the
-/// number of completions the run actually needed, and the length
-/// (statements) of each program along the way.
+/// number of completions the run actually needed, the length
+/// (statements) of each program along the way, and the programs
+/// themselves — Part H's "reading transcripts is the real instrument"
+/// bullet needs the text, not just the count.
 pub struct TaskReport {
     pub task_name: &'static str,
     pub success: Result<(), String>,
     pub round_trips: usize,
     pub program_lengths: Vec<usize>,
+    pub programs: Vec<String>,
 }
 
 /// Run one task live. `card` is the system prompt under test — passed
@@ -57,6 +65,19 @@ pub fn run_task(
     model: &str,
     max_tokens: u32,
 ) -> TaskReport {
+    // Step C2: "the names and signatures are card surface" — a real
+    // agent's card already bakes in its own configured tools; this
+    // harness has one shared base card, so a task's tool manifest is
+    // appended per run rather than duplicated into `codemode::card`
+    // itself, which stays the harness-vocabulary-only base every task
+    // shares (Step C4).
+    let card = if task.tool_manifest.is_empty() {
+        card.to_owned()
+    } else {
+        format!("{card}\n\n{}", task.tool_manifest)
+    };
+    let card = card.as_str();
+
     let tools = (task.tools)();
     let mut source = RecordingSource {
         inner: LiveSource {
@@ -65,6 +86,7 @@ pub fn run_task(
             max_tokens,
         },
         lengths: Vec::new(),
+        programs: Vec::new(),
     };
     match runner::run(
         card,
@@ -78,12 +100,14 @@ pub fn run_task(
             success: (task.check)(&outcome, &tools),
             round_trips: outcome.completions_used,
             program_lengths: source.lengths,
+            programs: source.programs,
         },
         Err(e) => TaskReport {
             task_name: task.name,
             success: Err(format!("run did not complete: {e:?}")),
             round_trips: source.lengths.len(),
             program_lengths: source.lengths,
+            programs: source.programs,
         },
     }
 }

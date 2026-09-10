@@ -117,6 +117,14 @@ impl FakeTools for RecordingTools {
 pub struct Task {
     pub name: &'static str,
     pub user_message: &'static str,
+    /// What this task's `tools.*` actually are, in the exact form Step
+    /// C2 says a tool surface is conveyed: "the names and signatures
+    /// are card surface" — no schema, no registry, appended to the
+    /// card as this agent's own fixed description of itself. Empty for
+    /// a task that configures none. Live-only: `ScriptedSource` never
+    /// sees the card at all, so this has no effect on this file's own
+    /// scripted tests — only `harness::run_task` reads it.
+    pub tool_manifest: &'static str,
     pub tools: fn() -> RecordingTools,
     pub check: fn(&RunOutcome, &RecordingTools) -> Result<(), String>,
 }
@@ -131,6 +139,7 @@ fn contains(haystack: &[super::runner::Said], needle: &str) -> bool {
 pub const FAN_OUT: Task = Task {
     name: "fan-out",
     user_message: "read a.txt, b.txt, and c.txt, and tell me one interesting thing from each",
+    tool_manifest: "This session's tools: tools.read_file(path) -> { content: string }.",
     tools: || {
         let t = RecordingTools::new();
         t.respond(
@@ -171,6 +180,8 @@ pub const FAN_OUT: Task = Task {
 pub const RETRY: Task = Task {
     name: "retry-and-branch",
     user_message: "run the build; if it fails, try once more before giving up",
+    tool_manifest: "This session's tools: tools.bash(command) -> { exit: number, output: string }. \
+                     The build command is exactly `npm run build` — do not run anything else with it.",
     tools: || {
         let t = RecordingTools::new();
         t.respond(
@@ -203,6 +214,9 @@ pub const RETRY: Task = Task {
 pub const JUDGMENT_IN_THE_MIDDLE: Task = Task {
     name: "judgment-in-the-middle",
     user_message: "the deploy config looks stale — check it and fix whatever's wrong",
+    tool_manifest: "This session's tools: tools.read_file(path) -> { content: string }; \
+                     tools.write_file(path, content) -> { written: boolean }. The config \
+                     path is 'deploy.yaml'.",
     tools: || {
         let t = RecordingTools::new();
         t.respond(
@@ -248,6 +262,7 @@ pub const JUDGMENT_IN_THE_MIDDLE: Task = Task {
 pub const TRIVIAL_QUESTION: Task = Task {
     name: "trivial-question",
     user_message: "what is 12 + 30?",
+    tool_manifest: "",
     tools: RecordingTools::new,
     check: |outcome, tools| {
         if !contains(&outcome.transcript, "42") {

@@ -47,9 +47,12 @@ namespace, which is reserved for this session's configured tools
 
 `raise()` suspends this program and asks for a decision, made by
 another program that runs while this one is still suspended. That
-program ends by returning `resume(value)` — continue with `value` — or
-`abandon()` — discard this program; a replacement follows next. Falling
-off the end without returning one of those means no decision was made.
+program's last line must be `return resume(value);` — continue with
+`value` — or `return abandon();` — discard this program; a replacement
+follows next. The `return` is not optional: calling `resume(value)` or
+`abandon()` without returning it is not a decision, the same as never
+calling either. Falling off the end without returning one of those
+means no decision was made.
 
 A root program's return value is read by nobody. Reach people through
 `say()` — a root program that never calls it is a silent no-op, the one
@@ -118,7 +121,7 @@ mod tests {
         // `CARD` shows up as a diff review must look at, not a byte
         // count that silently drifts. Comparing full text (not just a
         // hash) so the diff itself is legible in a failure message.
-        const EXPECTED_LEN: usize = 3325;
+        const EXPECTED_LEN: usize = 3486;
         assert_eq!(
             CARD.len(),
             EXPECTED_LEN,

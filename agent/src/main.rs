@@ -648,6 +648,13 @@ fn codemode_harness() {
         if let Err(reason) = &report.success {
             println!("       reason: {reason}");
         }
+        for (i, program) in report.programs.iter().enumerate() {
+            println!("       --- round {} program ---", i + 1);
+            for line in program.lines() {
+                println!("       {line}");
+            }
+        }
+        println!();
 
         if report.success.is_ok() {
             successes += 1;
