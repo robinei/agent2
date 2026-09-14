@@ -67,6 +67,12 @@ pub struct TaskReport {
     pub program_lengths: Vec<usize>,
     pub programs: Vec<String>,
     pub raise_count: usize,
+    /// Of `raise_count`, how many were a trapped runtime error rather
+    /// than a deliberate `raise()` call — see `runner::RunOutcome::
+    /// trap_count`'s doc for why a check gating on "was there a
+    /// deliberate decision point" must use `raise_count - trap_count`,
+    /// not `raise_count` alone.
+    pub trap_count: usize,
     pub resume_count: usize,
     pub handover_count: usize,
     pub abandon_count: usize,
@@ -121,6 +127,7 @@ pub fn run_task(
             program_lengths: source.lengths,
             programs: source.programs,
             raise_count: outcome.raise_count,
+            trap_count: outcome.trap_count,
             resume_count: outcome.resume_count,
             handover_count: outcome.handover_count,
             abandon_count: outcome.abandon_count,
@@ -135,6 +142,7 @@ pub fn run_task(
             program_lengths: source.lengths,
             programs: source.programs,
             raise_count: 0,
+            trap_count: 0,
             resume_count: 0,
             handover_count: 0,
             abandon_count: 0,
