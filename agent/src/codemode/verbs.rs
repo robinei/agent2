@@ -307,11 +307,11 @@ mod tests {
 
     #[test]
     fn say_with_two_arguments_names_the_target() {
-        let (vm, call) = first_call("return await say('robin', 'hi');");
+        let (vm, call) = first_call("return await say('user', 'hi');");
         assert_eq!(
             parse_effect(&vm, &call).unwrap(),
             HarnessEffect::Say {
-                to: Some("robin".into()),
+                to: Some("user".into()),
                 text: "hi".into(),
             }
         );
@@ -360,11 +360,11 @@ mod tests {
 
     #[test]
     fn ask_requires_exactly_two_arguments() {
-        let (vm, call) = first_call("return await ask('robin', 'q?');");
+        let (vm, call) = first_call("return await ask('user', 'q?');");
         assert_eq!(
             parse_effect(&vm, &call).unwrap(),
             HarnessEffect::Ask {
-                who: Some("robin".into()),
+                who: Some("user".into()),
                 text: "q?".into(),
             }
         );

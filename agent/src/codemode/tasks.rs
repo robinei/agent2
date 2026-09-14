@@ -414,7 +414,7 @@ mod tests {
     fn judgment_check_accepts_recon_then_ask_then_write() {
         let tools = (JUDGMENT_IN_THE_MIDDLE.tools)();
         let mut source = ScriptedSource::new(["const cfg = await tools.read_file('deploy.yml'); \
-             const region = await ask('robin', 'which region is right? ' + cfg.content); \
+             const region = await ask('user', 'which region is right? ' + cfg.content); \
              await tools.write_file('deploy.yml', 'region: ' + region); \
              say('updated the config');"]);
         let outcome = run(
@@ -455,7 +455,7 @@ mod tests {
         let tools = (JUDGMENT_IN_THE_MIDDLE.tools)();
         let mut source = ScriptedSource::new(["await tools.read_file('deploy.yml'); \
              await tools.write_file('deploy.yml', 'region: us-east-1'); \
-             await ask('robin', 'was that the right region?'); \
+             await ask('user', 'was that the right region?'); \
              say('fixed it, hope that was right');"]);
         let outcome = run(
             CARD,

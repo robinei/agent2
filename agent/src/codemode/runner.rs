@@ -308,7 +308,7 @@ pub fn run(
     let log = vec![(
         EntryId::new(1),
         Entry::Message {
-            from: "robin".into(),
+            from: "user".into(),
             text: user_message.to_owned(),
         },
     )];
@@ -555,7 +555,7 @@ mod tests {
 
     #[test]
     fn say_with_a_target_is_recorded() {
-        let mut source = ScriptedSource::new(["say('robin', 'done');"]);
+        let mut source = ScriptedSource::new(["say('user', 'done');"]);
         let outcome = run(
             CARD,
             "go",
@@ -567,7 +567,7 @@ mod tests {
         assert_eq!(
             outcome.transcript,
             vec![Said {
-                to: Some("robin".into()),
+                to: Some("user".into()),
                 text: "done".into()
             }]
         );
@@ -601,7 +601,7 @@ mod tests {
     #[test]
     fn ask_is_dispatched_to_the_fake_ask_handler() {
         let mut source =
-            ScriptedSource::new(["const a = await ask('robin', 'q?'); say(String(a));"]);
+            ScriptedSource::new(["const a = await ask('user', 'q?'); say(String(a));"]);
         let tools = TestTools::default().with_ask(Ok(serde_json::json!(42)));
         let outcome = run(CARD, "go", &tools, &mut source, &RunConfig::default()).unwrap();
         assert_eq!(outcome.transcript[0].text, "42");

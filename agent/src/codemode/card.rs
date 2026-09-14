@@ -36,9 +36,10 @@ namespace, which is reserved for this session's configured tools
 (listed separately, below):
 
   say(text) / say(to, text)        tell the user or another agent
-                                    `to` is a quoted name: say("robin", "done")
+                                    quote the address, always: say("user", "done")
+                                    "user" is the human; there is only one
   ask(who, text)                   ask a question; resolves to the answer
-                                    `who` is a quoted name: await ask("robin", "which one?")
+                                    await ask("user", "which one?")
   answer(question, label, value)   discharge an `ask()` another program is
                                     blocked on, by that question's own id —
                                     not for an ordinary message: that is say()
@@ -141,13 +142,13 @@ pub struct Exemplar {
 /// stronger restoring force than the sentence describing it.
 pub const SEED_EXEMPLARS: &[Exemplar] = &[
     Exemplar {
-        user: "can you check whether the tests pass and let robin know?",
+        user: "can you check whether the tests pass and let me know?",
         assistant: r#"//: running the test suite, then reporting what happened
 const result = await tools.bash("cargo test 2>&1 | tail -20");
 if (result.exit === 0) {
-    say("robin", "tests pass.");
+    say("tests pass.");
 } else {
-    say("robin", `tests failed:\n${result.output}`);
+    say(`tests failed:\n${result.output}`);
 }"#,
     },
     Exemplar {
@@ -155,15 +156,15 @@ if (result.exit === 0) {
         assistant: r#"//: read the real value first — I can't tell what "off" means by guessing
 const cfg = await tools.read_file("ops/config.json");
 const parsed = JSON.parse(cfg.content);
-say("robin", `ops/config.json currently sets retries to ${parsed.retries}.`);
+say(`ops/config.json currently sets retries to ${parsed.retries}.`);
 
 //: the file doesn't say what it should be, and a wrong guess is worse
 //: than asking — resolve it here, in this same program, then act on it
-const target = await ask("robin", `retries is currently ${parsed.retries} — what should it be?`);
+const target = await ask("user", `retries is currently ${parsed.retries} — what should it be?`);
 
 parsed.retries = Number(target);
 await tools.write_file("ops/config.json", JSON.stringify(parsed, null, 2));
-say("robin", `set retries to ${target} in ops/config.json.`);"#,
+say(`set retries to ${target} in ops/config.json.`);"#,
     },
 ];
 
@@ -177,7 +178,7 @@ mod tests {
         // `CARD` shows up as a diff review must look at, not a byte
         // count that silently drifts. Comparing full text (not just a
         // hash) so the diff itself is legible in a failure message.
-        const EXPECTED_LEN: usize = 5394;
+        const EXPECTED_LEN: usize = 5447;
         assert_eq!(
             CARD.len(),
             EXPECTED_LEN,

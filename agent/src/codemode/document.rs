@@ -288,7 +288,7 @@ mod tests {
             (
                 id(1),
                 Entry::Message {
-                    from: "robin".into(),
+                    from: "user".into(),
                     text: "can you fix the ledger parser?".into(),
                 },
             ),
@@ -327,7 +327,7 @@ mod tests {
             (
                 id(5),
                 Entry::Message {
-                    from: "robin".into(),
+                    from: "user".into(),
                     text: "good — now handle the quoted-comma case".into(),
                 },
             ),
@@ -344,7 +344,7 @@ mod tests {
                     },
                     ChatMessage {
                         role: ChatRole::User,
-                        content: "[1] robin: can you fix the ledger parser?".into(),
+                        content: "[1] user: can you fix the ledger parser?".into(),
                     },
                     ChatMessage {
                         role: ChatRole::Assistant,
@@ -360,7 +360,7 @@ mod tests {
                                   [3] effects of [2]: wrote src/parse.rs, src/lex.rs; \
                                   ran `cargo test` (exit 0, #51); read 43 files\n\
                                   [4] note: 4 malformed rows, all missing id\n\
-                                  [5] robin: good — now handle the quoted-comma case"
+                                  [5] user: good — now handle the quoted-comma case"
                             .into(),
                     },
                 ],
@@ -423,7 +423,7 @@ mod tests {
             (
                 id(1),
                 Entry::Message {
-                    from: "robin".into(),
+                    from: "user".into(),
                     text: "go".into(),
                 },
             ),
@@ -460,7 +460,7 @@ mod tests {
             (
                 id(1),
                 Entry::Message {
-                    from: "robin".into(),
+                    from: "user".into(),
                     text: "this is not { valid javascript at all (((".into(),
                 },
             ),
@@ -490,7 +490,7 @@ mod tests {
             (
                 id(1),
                 Entry::Message {
-                    from: "robin".into(),
+                    from: "user".into(),
                     text: "go".into(),
                 },
             ),
@@ -525,7 +525,7 @@ mod tests {
             (
                 id(1),
                 Entry::Message {
-                    from: "robin".into(),
+                    from: "user".into(),
                     text: "go".into(),
                 },
             ),
@@ -556,7 +556,7 @@ mod tests {
             (
                 id(1),
                 Entry::Message {
-                    from: "robin".into(),
+                    from: "user".into(),
                     text: "go".into(),
                 },
             ),
@@ -610,7 +610,7 @@ mod tests {
             (
                 id(1),
                 Entry::Message {
-                    from: "robin".into(),
+                    from: "user".into(),
                     text: "go".into(),
                 },
             ),
@@ -657,15 +657,12 @@ mod tests {
         let log = vec![(
             id(1),
             Entry::Message {
-                from: "robin".into(),
+                from: "user".into(),
                 text: "no brackets here at all".into(),
             },
         )];
         let doc = render("CARD", &log).unwrap();
-        assert_eq!(
-            doc.messages[1].content,
-            "[1] robin: no brackets here at all"
-        );
+        assert_eq!(doc.messages[1].content, "[1] user: no brackets here at all");
     }
 
     #[test]
@@ -676,14 +673,14 @@ mod tests {
         let log = vec![(
             id(1),
             Entry::Message {
-                from: "robin".into(),
+                from: "user".into(),
                 text: "[TODO] fix this\n[Music] playing".into(),
             },
         )];
         let doc = render("CARD", &log).unwrap();
         assert_eq!(
             doc.messages[1].content,
-            "[1] robin: [TODO] fix this\n[Music] playing"
+            "[1] user: [TODO] fix this\n[Music] playing"
         );
     }
 
@@ -722,7 +719,7 @@ mod tests {
         let mut log: Vec<(EntryId, Entry)> = vec![(
             id(1),
             Entry::Message {
-                from: "robin".into(),
+                from: "user".into(),
                 text: "start".into(),
             },
         )];
@@ -746,7 +743,7 @@ mod tests {
             (
                 id(4),
                 Entry::Message {
-                    from: "robin".into(),
+                    from: "user".into(),
                     text: "more".into(),
                 },
             ),
@@ -783,7 +780,7 @@ mod tests {
             (
                 id(1),
                 Entry::Message {
-                    from: "robin".into(),
+                    from: "user".into(),
                     text: "go".into(),
                 },
             ),
@@ -916,7 +913,7 @@ mod tests {
         let log = vec![(
             id(1),
             Entry::Message {
-                from: "robin".into(),
+                from: "user".into(),
                 text: "go".into(),
             },
         )];
@@ -925,7 +922,7 @@ mod tests {
         assert_eq!(with_tail.messages.len(), doc.messages.len());
         assert_eq!(
             with_tail.messages.last().unwrap().content,
-            "[1] robin: go\ncondition report: trapped at line 3"
+            "[1] user: go\ncondition report: trapped at line 3"
         );
         // Re-rendering the same log (as if the tail were never
         // logged, because it never is) reproduces the untailed
@@ -939,7 +936,7 @@ mod tests {
             (
                 id(1),
                 Entry::Message {
-                    from: "robin".into(),
+                    from: "user".into(),
                     text: "go".into(),
                 },
             ),

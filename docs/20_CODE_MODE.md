@@ -429,7 +429,7 @@ system       ── the card ── (fixed forever; the cache prefix)
              Programs are written here. Emit only valid JavaScript;
              the whole response is parsed. …
 
-user         [1] robin: can you fix the ledger parser?
+user         [1] user: can you fix the ledger parser?
 
 assistant    const rows = await read_file("ledger.csv");
              //: partitioning the malformed rows before touching the parser
@@ -440,7 +440,7 @@ user         [2] the program above completed
              [3] effects: wrote src/parse.rs; ran `cargo test` (exit 0, #51);
                  read 43 files
              [4] note: 4 malformed rows, all missing id
-             [5] robin: good — now handle the quoted-comma case
+             [5] user: good — now handle the quoted-comma case
 
 assistant    ← the model writes here
 ```
@@ -504,7 +504,7 @@ assistant    ← the model writes here
 - [x] **Ids survive, because they do the work:** `remove_history`,
       `answer`, and artifact references all need them, and a consistent
       one-line entry shape keeps compaction a line rewrite. `[4] note:
-      …`, `[5] robin: …`, `[3] effects: …`.
+      …`, `[5] user: …`, `[3] effects: …`.
 - [x] **Only assistant turns must parse.** A program that failed to
       compile is reported in a user turn as text, so nothing in the
       historical record has to be valid JS. The golden-render test
@@ -1312,7 +1312,7 @@ the four tasks told the model what its own `tools.*` actually were —
 Step C2 says that surface is "card surface," but this harness has one
 shared base card and never appended a per-task addendum, so the model
 had genuinely no way to know. Faced with that, it did not guess: on
-`fan-out` it said so and asked robin to paste the files; on
+`fan-out` it said so and asked the user to paste the files; on
 `retry-and-branch` it ran a reconnaissance `tools.bash` call to
 *discover* the build command (a real instance of the card's own "look
 before you leap"), and — a second, independent finding — that recon
@@ -1393,7 +1393,7 @@ each driven by a specific live failure and each re-verified live
 afterward. Card: (1) `say`/`ask` gained a quoted-string worked example
 next to their signatures, and the seed exemplar's own `say()` calls
 were changed to the two-argument form — a live completion wrote
-`say(robin, ...)` with `robin` as a bare identifier, trapped
+`say(<bare identifier>, ...)` for the address, trapped
 (`ReferenceError`), correctly diagnosed and `abandon()`-ed its own
 mistake, then made the *identical* mistake twice more before finally
 sidestepping it by dropping the argument — a signature line alone

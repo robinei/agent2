@@ -498,7 +498,7 @@ fn codemode_probe(task: &str) {
     let log = vec![(
         EventId::new(1),
         Entry::Message {
-            from: "robin".into(),
+            from: "user".into(),
             text: task.to_owned(),
         },
     )];

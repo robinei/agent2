@@ -293,7 +293,7 @@ mod tests {
             (
                 EventId::new(1),
                 Entry::Message {
-                    from: "robin".into(),
+                    from: "user".into(),
                     text: "go".into(),
                 },
             ),

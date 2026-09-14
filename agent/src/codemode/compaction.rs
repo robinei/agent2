@@ -211,7 +211,7 @@ mod tests {
             (
                 id(1),
                 Entry::Message {
-                    from: "robin".into(),
+                    from: "user".into(),
                     text: "go".into(),
                 },
             ),
