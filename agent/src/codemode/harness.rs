@@ -46,12 +46,33 @@ impl CompletionSource for RecordingSource<'_> {
 /// (statements) of each program along the way, and the programs
 /// themselves — Part H's "reading transcripts is the real instrument"
 /// bullet needs the text, not just the count.
+///
+/// `raise_count`/`resume_count`/`handover_count`/`abandon_count` and
+/// the `*_attempts` fields answer the question Part H's "no more,
+/// until one fails to answer a question" deliberately deferred: is the
+/// handler stack (Part D) actually exercised by real tasks, or is
+/// `raise()` rare enough — and its resumes overwhelmingly tail — that
+/// most of that machinery is carrying a case that seldom fires? See
+/// `runner::RunOutcome`'s doc for what each field actually measures
+/// (`handover_count` in particular is a runtime proxy, not a
+/// compile-time tail check) and why `fork`/`spawn` chain depth and
+/// artifact fetch *rate* aren't measurable yet — those verbs are
+/// honest-error stubs here, so only *attempts* are real signal.
+/// All five default to `0` when a run errors before producing an
+/// outcome (`RunError` carries no partial counts).
 pub struct TaskReport {
     pub task_name: &'static str,
     pub success: Result<(), String>,
     pub round_trips: usize,
     pub program_lengths: Vec<usize>,
     pub programs: Vec<String>,
+    pub raise_count: usize,
+    pub resume_count: usize,
+    pub handover_count: usize,
+    pub abandon_count: usize,
+    pub fork_attempts: usize,
+    pub spawn_attempts: usize,
+    pub artifact_attempts: usize,
 }
 
 /// Run one task live. `card` is the system prompt under test — passed
@@ -99,6 +120,13 @@ pub fn run_task(
             round_trips: outcome.completions_used,
             program_lengths: source.lengths,
             programs: source.programs,
+            raise_count: outcome.raise_count,
+            resume_count: outcome.resume_count,
+            handover_count: outcome.handover_count,
+            abandon_count: outcome.abandon_count,
+            fork_attempts: outcome.fork_attempts,
+            spawn_attempts: outcome.spawn_attempts,
+            artifact_attempts: outcome.artifact_attempts,
         },
         Err(e) => TaskReport {
             task_name: task.name,
@@ -106,6 +134,13 @@ pub fn run_task(
             round_trips: source.lengths.len(),
             program_lengths: source.lengths,
             programs: source.programs,
+            raise_count: 0,
+            resume_count: 0,
+            handover_count: 0,
+            abandon_count: 0,
+            fork_attempts: 0,
+            spawn_attempts: 0,
+            artifact_attempts: 0,
         },
     }
 }

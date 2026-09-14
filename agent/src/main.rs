@@ -625,6 +625,13 @@ fn codemode_harness() {
     let mut all_lengths: Vec<usize> = Vec::new();
     let mut all_round_trips: Vec<usize> = Vec::new();
     let mut successes = 0usize;
+    let mut total_raises = 0usize;
+    let mut total_resumes = 0usize;
+    let mut total_handovers = 0usize;
+    let mut total_abandons = 0usize;
+    let mut total_fork_attempts = 0usize;
+    let mut total_spawn_attempts = 0usize;
+    let mut total_artifact_attempts = 0usize;
 
     println!(
         "=== Part H harness: {} tasks, model {model} ===\n",
@@ -647,6 +654,17 @@ fn codemode_harness() {
             "[{status}] {} — {} round-trip(s), program lengths (statements): {:?}",
             report.task_name, report.round_trips, report.program_lengths
         );
+        println!(
+            "       raises: {} (resume {}, of which handover {}; abandon {}) — \
+             fork/spawn/artifact attempts: {}/{}/{}",
+            report.raise_count,
+            report.resume_count,
+            report.handover_count,
+            report.abandon_count,
+            report.fork_attempts,
+            report.spawn_attempts,
+            report.artifact_attempts,
+        );
         if let Err(reason) = &report.success {
             println!("       reason: {reason}");
         }
@@ -663,6 +681,13 @@ fn codemode_harness() {
         }
         all_round_trips.push(report.round_trips);
         all_lengths.extend(report.program_lengths);
+        total_raises += report.raise_count;
+        total_resumes += report.resume_count;
+        total_handovers += report.handover_count;
+        total_abandons += report.abandon_count;
+        total_fork_attempts += report.fork_attempts;
+        total_spawn_attempts += report.spawn_attempts;
+        total_artifact_attempts += report.artifact_attempts;
     }
 
     let median_len = harness::median(&all_lengths);
@@ -683,6 +708,32 @@ fn codemode_harness() {
         Some(m) => println!("median program length (statements): {m}"),
         None => println!("median program length (statements): n/a (no completions produced)"),
     }
+
+    // Not one of Part H's original three — added to answer whether
+    // Part D's handler stack is load-bearing for real tasks, or
+    // carrying a case (mid-program resume) that seldom fires against
+    // one that's mostly a handover (see `harness::TaskReport`'s doc).
+    println!("\n=== handler-stack usage (not one of Part H's three) ===");
+    println!("total raises: {total_raises}");
+    if total_raises > 0 {
+        println!(
+            "  resume: {total_resumes} ({:.0}% of raises), of which handover: {total_handovers} ({:.0}% of resumes)",
+            100.0 * total_resumes as f64 / total_raises as f64,
+            if total_resumes > 0 {
+                100.0 * total_handovers as f64 / total_resumes as f64
+            } else {
+                0.0
+            },
+        );
+        println!(
+            "  abandon: {total_abandons} ({:.0}% of raises)",
+            100.0 * total_abandons as f64 / total_raises as f64
+        );
+    }
+    println!(
+        "fork/spawn/artifact call attempts (all hard-error stubs in this harness — \
+         reach, not success): {total_fork_attempts}/{total_spawn_attempts}/{total_artifact_attempts}"
+    );
 }
 
 /// One-line rendering of a logged call for the headless printer.

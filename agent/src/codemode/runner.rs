@@ -125,6 +125,33 @@ pub struct RunOutcome {
     pub appended: Vec<serde_json::Value>,
     pub raise_count: usize,
     pub completions_used: usize,
+    /// How many of `raise_count`'s raises resolved via `resume()` (as
+    /// opposed to `abandon()`) — the measurement this field and
+    /// `handover_count` exist for: is `raise`'s "program keeps running
+    /// with an injected value" case actually exercised, or is
+    /// `abandon` (a fresh replacement) what handlers reach for.
+    pub resume_count: usize,
+    /// Of `resume_count`, how many resumed frames made **zero** further
+    /// calls before reaching their own `Done` — the runtime proxy for
+    /// "the raise's result was never used for anything but falling
+    /// through to completion," i.e. what a tail raise with preemptive
+    /// popping (see the design conversation this instruments) would
+    /// have handled as a handover instead of a genuine mid-program
+    /// resume. Not a compile-time tail check — this harness has none —
+    /// so a program that happens to do no more work *coincidentally*
+    /// still counts; it is a proxy, not a proof.
+    pub handover_count: usize,
+    /// How many raises resolved via `abandon()`.
+    pub abandon_count: usize,
+    /// `fork()`/`spawn()`/`artifact()` call attempts, regardless of
+    /// outcome — all three are honest-error stubs in this harness
+    /// (`dispatch_call`, below), so these count reach, not success.
+    /// Real fork/spawn chain depth and artifact fetch rate need the
+    /// verbs backed for real first; these are what's honestly
+    /// measurable before that.
+    pub fork_attempts: usize,
+    pub spawn_attempts: usize,
+    pub artifact_attempts: usize,
 }
 
 #[derive(Debug)]
@@ -220,6 +247,16 @@ fn handler_tail(raising_source: &str, suspension: &Suspension) -> String {
     )
 }
 
+/// Attempt counts `dispatch_call` bumps for verbs this harness stubs
+/// with an honest error — `RunOutcome`'s doc explains why these are
+/// "did the model reach for it," not "how deep did the chain go."
+#[derive(Default)]
+struct Attempts {
+    fork: usize,
+    spawn: usize,
+    artifact: usize,
+}
+
 /// Dispatch one settled `InvokeCall`: either a harness verb
 /// (`verbs::parse_effect`) or a task's fake tool. Resolves or rejects
 /// the call's promise on `vm` directly — the caller just needs to
@@ -231,6 +268,7 @@ fn dispatch_call(
     tools: &dyn FakeTools,
     transcript: &mut Vec<Said>,
     appended: &mut Vec<serde_json::Value>,
+    attempts: &mut Attempts,
 ) -> Result<(), RunError> {
     let promise: PromisePtr = call.promise;
     let effect = verbs::parse_effect(vm, call);
@@ -250,12 +288,15 @@ fn dispatch_call(
         }
         Ok(HarnessEffect::ListAgents) => Ok(serde_json::json!([])),
         Ok(HarnessEffect::Spawn { .. }) => {
+            attempts.spawn += 1;
             Err("this harness does not back spawn() with a real agent yet".into())
         }
         Ok(HarnessEffect::Fork) => {
+            attempts.fork += 1;
             Err("this harness does not back fork() with a real context yet".into())
         }
         Ok(HarnessEffect::Artifact { .. }) => {
+            attempts.artifact += 1;
             Err("this harness has no artifact store to fetch from yet".into())
         }
         Ok(HarnessEffect::Compact(_)) => {
@@ -356,18 +397,36 @@ pub fn run(
     let mut transcript = Vec::new();
     let mut appended = Vec::new();
     let mut raise_count = 0;
+    let mut resume_count = 0;
+    let mut handover_count = 0;
+    let mut abandon_count = 0;
+    let mut attempts = Attempts::default();
+    // Set the instant a `Resume` decision is applied to the raising
+    // frame, `Some(true)`; cleared to `Some(false)` by the first call
+    // that frame makes afterward. Read (and reset to `None`) the next
+    // time that same frame reaches `Done` — `Some(true)` there means
+    // the resumed value flowed straight to completion with no further
+    // work, `RunOutcome::handover_count`'s runtime proxy for a tail
+    // raise. Any intervening `Raise`/trap on the same frame (it
+    // suspended again instead of finishing) also clears it to `None`
+    // without counting — that resume didn't reach a `Done` at all.
+    let mut tracking_handover: Option<bool> = None;
 
     loop {
         let step = stack.current_mut().step(u64::MAX);
         match step {
             Ok(StepResult::Pending { calls }) => {
                 for call in &calls {
+                    if tracking_handover.is_some() {
+                        tracking_handover = Some(false);
+                    }
                     dispatch_call(
                         stack.current_mut(),
                         call,
                         tools,
                         &mut transcript,
                         &mut appended,
+                        &mut attempts,
                     )?;
                 }
             }
@@ -384,13 +443,20 @@ pub fn run(
                 // resolved value goes nowhere, since the VM that would
                 // have read it is finishing this same step.
                 for call in &unstarted {
+                    if tracking_handover.is_some() {
+                        tracking_handover = Some(false);
+                    }
                     dispatch_call(
                         stack.current_mut(),
                         call,
                         tools,
                         &mut transcript,
                         &mut appended,
+                        &mut attempts,
                     )?;
+                }
+                if tracking_handover.take() == Some(true) {
+                    handover_count += 1;
                 }
                 if stack.depth() == 1 {
                     // The root program finished. Its return value is
@@ -404,6 +470,12 @@ pub fn run(
                         appended,
                         raise_count,
                         completions_used,
+                        resume_count,
+                        handover_count,
+                        abandon_count,
+                        fork_attempts: attempts.fork,
+                        spawn_attempts: attempts.spawn,
+                        artifact_attempts: attempts.artifact,
                     });
                 }
                 // A handler finished — read and apply its decision.
@@ -412,12 +484,15 @@ pub fn run(
                 };
                 match decision {
                     Decision::Resume(v) => {
+                        resume_count += 1;
+                        tracking_handover = Some(true);
                         docs_by_depth.pop();
                         stack
                             .apply_decision(Decision::Resume(v), || unreachable!())
                             .map_err(RunError::Apply)?;
                     }
                     Decision::Abandon => {
+                        abandon_count += 1;
                         docs_by_depth.pop();
                         // The new top (post-pop) is the frame being
                         // replaced; regenerate from what *it* saw.
@@ -436,6 +511,7 @@ pub fn run(
             }
             Ok(StepResult::Raise { condition, payload }) => {
                 raise_count += 1;
+                tracking_handover = None;
                 let raising_source = stack.current().source.to_string();
                 let tail = handler_tail(
                     &raising_source,
@@ -462,6 +538,7 @@ pub fn run(
             }
             Err(vm_error) => {
                 raise_count += 1;
+                tracking_handover = None;
                 let raising_source = stack.current().source.to_string();
                 let suspension = Suspension::Trapped(vm_error);
                 let tail = handler_tail(&raising_source, &suspension);
