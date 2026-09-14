@@ -391,34 +391,73 @@ user
   bulk of Part D's apparatus (`ProgramStack`, `max_depth`,
   `decision.rs`, the transient tail, `introspect.rs`'s snapshot) is
   serving a case that rarely fires, versus the ordinary-agentic-loop
-  case handover exists to make cheap. Being instrumented now: raise
-  count and a `handover_count` proxy (a raise whose resumed frame goes
-  straight to completion with no further calls — an operational stand-in
-  for "the result was unused," pending real compile-time tail
-  detection). Placeholder below.
+  case handover exists to make cheap. First live run below: the fixed
+  task set turns out not to exercise the mechanism at all, so this is
+  still open, not answered.
 
-### Live numbers (pending)
+### Live numbers — one run, n=4, deepseek-v4-flash (flag sample size)
 
-*`raise_count` / `handover_count` are being measured now against the
-fixed task set, per task and aggregate — do not fill this in from
-estimation.*
+```
+total raises: 2, resume: 0, handover: 0/0, abandon: 2 (100%)
+fork/spawn/artifact attempts: 0/1/0
+task success: 2/4
+```
 
-**Fork/spawn depth and `artifact()` fetch rate are not measurable this
-pass, and that is a fact about the harness, not a zero.** `Fork`,
-`Spawn`, and `Artifact` are currently honest hard-error stubs in
-`runner.rs` (verbs the harness declines to back rather than fake), and
-none of the fixed tasks call them — there is no live path to produce a
-depth or a fetch rate yet. Building real backing for them is item 3's
-job ("`entry.rs` deleted... `Entry::Effects` becomes a fold"), not
-this instrumentation pass's. What this pass adds instead is an
-**attempt counter** — does a model reach for `fork`/`spawn`/`artifact`
-at all despite the stub — which is a weaker but real signal about
-whether the design's shape matches what models want to write. Report
-that as attempts-despite-stub, explicitly labeled open pending item 3,
-never as a fetch rate or a depth of zero.
+**The finding is not a rate — it's that the fixed task set never
+exercises `raise`/`resume`/`handover` at all, in either direction.**
+Both raises that occurred were *runtime traps* (an uncaught
+`.then()`-chaining error and an uncaught `spawn()`-stub rejection),
+not a deliberate `raise()` call — neither of the four tasks ever wrote
+one. Both traps were abandoned and rewritten, so `handover_count`'s
+denominator is 0: the metric wasn't measured-and-low, it was
+unexercised. Reporting a 0% or 100% handover rate from n=0 resumes
+would be extrapolating from nothing, which is worse than reporting the
+gap.
+
+Walking why, task by task: `fan-out` wants delegation (`spawn`,
+stubbed — the model never got as far as a decision to `raise()`
+about). `retry-and-branch` is pure control flow — no judgment call
+mid-computation. `judgment-in-the-middle` resolved its ambiguity with
+`ask("user", ...)`, a normal `await` — which is the *correct* choice
+per the card's own guidance ("`ask()` is a normal `await`, not a
+reason to raise"), not evidence against `raise`. `trivial-question`
+needs neither. **None of Part H's four tasks is shaped like the
+`which-region` example this doc uses to motivate deliberation** — live
+intermediate state, a judgment call mid-computation, continuing with
+the injected value. So "is Part D load-bearing" remains genuinely
+open, not answered low, pending a fifth task actually shaped to need
+it — proposed as the concrete next step rather than left as a vague
+gap.
+
+**A second finding, independent of the raise question: the stubs are
+distorting the measurement, not just leaving it incomplete.** The
+`fan-out` trace shows the model's third-round instinct was to
+`spawn()` a child to judge file contents — exactly the delegation
+pattern this doc's "fork/spawn depth" section reasons about — and
+hitting the honest-error stub forced an abandon-and-rewrite that fell
+back to inline judgment instead of delegation. A model reaching for the
+mechanism and being refused is a different outcome from a model not
+wanting the mechanism, and the harness as it stands can't tell the two
+apart. This is the strongest evidence yet for prioritizing "what this
+licenses" item 3 (backing `fork`/`spawn`/`artifact` for real) before
+trusting *any* number this harness produces about them — including the
+attempt counts above, which undercount for the same reason.
+
+Task success (2/4) sits below the historical 3/4–4/4 in the commit
+log; consistent with documented run-to-run variance (`9c794e9`: "1/4
+-> 3/4") and the instrumentation itself is read-only counters with no
+generation-path effect, so this is noted rather than treated as a
+regression.
 
 ## What this licenses, not yet done
 
+0. **A fifth fixed task, shaped to need `raise()`/`resume()`**: real
+   intermediate state (files read, commands run, a partial edit
+   applied) plus a genuine mid-computation judgment call the program
+   continues past with the injected value — the `which-region` shape,
+   not a `fan-out`/`retry`/`ask` variant. Add it before trusting any
+   raise/handover number from this harness; the current four tasks
+   structurally cannot produce one.
 1. Card renders its tool list from `ToolRegistry` (today `card.rs`
    ends with "Tools available in this session:" and nothing appends
    them — no caller passes a registry) and its worked exemplar's
@@ -426,9 +465,18 @@ never as a fetch rate or a depth of zero.
    which is what the real registry has.
 2. `verbs.rs` parses to `types::Call`/`EventPayload::Answer` in place
    of `HarnessEffect`.
-3. `entry.rs` deleted; `document::render` takes `&Tree`/the resolved
-   path directly; `Entry::Effects` becomes a fold over `Call`/`Result`
-   rather than a stored row.
+3. **`Fork`/`Spawn`/`Artifact` backed for real, ahead of further
+   measurement, not just for coverage.** The live run shows a model
+   reaching for `spawn()` mid-task and being refused by the honest-error
+   stub, then abandoning and falling back to inline work it shouldn't
+   have had to do — the stubs don't just leave fork/spawn/artifact
+   numbers at zero, they distort the *other* numbers (task success,
+   abandon rate, program shape) by forcing a fallback path the design
+   never intended. Any harness conclusion drawn before this lands
+   should be read with that in mind. `entry.rs` deleted in the same
+   pass; `document::render` takes `&Tree`/the resolved path directly;
+   `Entry::Effects` becomes a fold over `Call`/`Result` rather than a
+   stored row.
 4. `compaction.rs` operates on log entries, gated on "never drop an
    id."
 5. `LlmClient`'s request type becomes `Document`; `transport.rs`'s
