@@ -434,6 +434,22 @@ user
 
 ### Live numbers — one run, n=4, deepseek-v4-flash (flag sample size)
 
+**Superseded — pre-dates a session-id fix (`ab84868`), possible
+cross-task contamination.** `main.rs`'s harness runner minted one
+`x-opencode-session` id for the whole 5-task run rather than one per
+task, contrary to `Endpoint::session_id`'s own contract ("a caller
+making unrelated one-off calls can mint a fresh one each time"). Live
+evidence it wasn't cosmetic: in one run, `trivial-question`
+("what is 12+30?") opened by re-litigating `ops/config.json` —
+content belonging to `judgment-in-the-middle`'s task and never present
+in `trivial-question`'s own rendered document — because the endpoint's
+session-keyed routing/cache affinity carried real context across
+tasks that share nothing in the log the harness renders. Fixed at
+`ab84868`; a clean re-run is pending. The *qualitative* finding below
+(raise/resume/handover unexercised — an absence of `raise()` calls,
+not a claim about task content) likely survives the fix, but the
+specific counts are pre-fix and should not be cited as settled.
+
 ```
 total raises: 2, resume: 0, handover: 0/0, abandon: 2 (100%)
 fork/spawn/artifact attempts: 0/1/0
@@ -488,13 +504,11 @@ regression.
 
 ## What this licenses, not yet done
 
-0. **A fifth fixed task, shaped to need `raise()`/`resume()`**: real
-   intermediate state (files read, commands run, a partial edit
-   applied) plus a genuine mid-computation judgment call the program
-   continues past with the injected value — the `which-region` shape,
-   not a `fan-out`/`retry`/`ask` variant. Add it before trusting any
-   raise/handover number from this harness; the current four tasks
-   structurally cannot produce one.
+0. ~~A fifth fixed task, shaped to need `raise()`/`resume()`~~ —
+   **landed** (`84760a7`), the `which-region` shape this doc motivates
+   deliberation with. A clean 5-task run under the `ab84868` session-id
+   fix is pending; the "Live numbers" section above is superseded until
+   it lands.
 1. Card renders its tool list from `ToolRegistry` (today `card.rs`
    ends with "Tools available in this session:" and nothing appends
    them — no caller passes a registry) and its worked exemplar's
