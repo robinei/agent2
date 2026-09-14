@@ -134,28 +134,39 @@ pub struct Exemplar {
     pub assistant: &'static str,
 }
 
-/// Three demonstrations, each carrying a shape the others can't: a
+/// Four demonstrations, each carrying a shape the others can't: a
 /// tool call with an outcome to branch on; reading real data,
 /// recognizing a genuine ambiguity, `ask()`-ing about it *inline*, and
 /// acting on the answer, all in one program that still ends by
 /// reporting what it did (added 2026-09-10, after a live regression
 /// run's one consistently-failing task turned out to have no worked
-/// example of its own shape anywhere in context); and — added
-/// 2026-09-14, after the same thing happened again to a different rule
-/// — gathering several pieces of data and finishing the *judgment*
-/// about them in the same program, with no deferred step. The card's
-/// prose already said both "ask() is a normal await, not a reason to
-/// end early" and "ending a program... has quietly failed to do the
-/// task" before either fix; in both cases the sentence alone did not
-/// hold against a live run, and a demonstration of the model actually
-/// doing the right thing was the stronger restoring force. Live
-/// evidence for the third exemplar specifically: two independent
-/// tasks (`fan-out`, `judgment-in-the-middle`) each produced a
-/// genuinely well-reasoned recon-only program whose own closing `//:`
-/// comment planned a "next program" — nothing ever ran it, because
-/// nothing in the architecture continues a finished program on its
-/// own; the task silently went undone despite a plan that read like
-/// success.
+/// example of its own shape anywhere in context); gathering several
+/// pieces of data and finishing the *judgment* about them in the same
+/// program, with no deferred step (added 2026-09-14, after the same
+/// thing happened again to a different rule); and — added the same
+/// day, immediately after: recognizing a judgment that genuinely
+/// **cannot** be finished in the same program, because the data itself
+/// doesn't decide it, and calling `raise()` instead of stopping having
+/// merely noticed the problem. The card's prose already said "ask() is
+/// a normal await, not a reason to end early," "ending a program...
+/// has quietly failed to do the task," and described `raise()` three
+/// times before each of these landed; in every case the sentence alone
+/// did not hold against a live run, and a demonstration of the model
+/// actually doing the right thing was the stronger restoring force.
+///
+/// Live evidence for the third exemplar: two independent tasks
+/// (`fan-out`, `judgment-in-the-middle`) each produced a genuinely
+/// well-reasoned recon-only program whose own closing `//:` comment
+/// planned a "next program" — nothing ever ran it, because nothing in
+/// the architecture continues a finished program on its own. Live
+/// evidence for the fourth: fixing that exposed a *second*,
+/// narrower case of the identical failure the third exemplar's fix
+/// didn't reach — a program facing two conflicting numbers with no
+/// data-side way to break the tie read both, said so, and stopped,
+/// having recognized exactly the moment `raise()` exists for and not
+/// called it. `raise()` had prose in three places and no worked
+/// example anywhere — the one major verb that had never gotten this
+/// treatment until this exemplar.
 pub const SEED_EXEMPLARS: &[Exemplar] = &[
     Exemplar {
         user: "can you check whether the tests pass and let me know?",
@@ -197,6 +208,25 @@ const bErrors = (b.content.match(/ERROR/g) || []).length;
 say(aErrors > bErrors
     ? `server-a is failing: ${aErrors} ERROR lines vs server-b's ${bErrors}.`
     : `server-b is failing: ${bErrors} ERROR lines vs server-a's ${aErrors}.`);"#,
+    },
+    Exemplar {
+        user: "two synced backups of the same file disagree — which one should I keep?",
+        assistant: r#"//: read both — if they genuinely differ, that's not a fact more
+//: reading resolves; it's a judgement call, and I can't invent a
+//: reason to prefer one over the other from the files alone
+const [a, b] = await Promise.all([
+    tools.read_file("backup-1.txt"),
+    tools.read_file("backup-2.txt"),
+]);
+
+if (a.content === b.content) {
+    say("identical — no real conflict, either is fine.");
+} else {
+    //: genuinely undecidable from what's in front of me — raise it
+    //: instead of guessing, or noticing the problem and stopping here
+    const keep = await raise("conflicting_backups", { a: a.content, b: b.content });
+    say(`keeping ${keep}.`);
+}"#,
     },
 ];
 
@@ -339,5 +369,28 @@ mod tests {
         // The specific failure this exemplar answers: a program ending
         // on a forward-looking comment instead of doing the work.
         assert!(!ex.assistant.to_lowercase().contains("next program"));
+    }
+
+    #[test]
+    fn the_fourth_exemplar_actually_calls_raise() {
+        // raise() had prose in three places and no worked example
+        // anywhere — live 2026-09-14 found a program that read two
+        // genuinely conflicting, data-side-irresolvable numbers,
+        // correctly recognized it couldn't decide, and then just
+        // stopped instead of calling raise() — recognizing the
+        // moment isn't the same as acting on it, the same gap a
+        // worked example (not another sentence) closed for ask() and
+        // for finishing a judgement inline.
+        let ex = &SEED_EXEMPLARS[3];
+        assert!(
+            ex.assistant.contains("await raise("),
+            "the fourth exemplar exists specifically to demonstrate raise() \
+             actually being called, not just described"
+        );
+        // And it must not be the program's last line — same
+        // "reported, not just decided" standard the ask()-inline
+        // exemplar is held to.
+        let raise_at = ex.assistant.find("await raise(").unwrap();
+        assert!(ex.assistant[raise_at..].lines().count() > 1);
     }
 }
