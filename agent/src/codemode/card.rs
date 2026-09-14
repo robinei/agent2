@@ -79,15 +79,19 @@ in JavaScript.
 
 Look before you leap, once: when the shape of the data decides the
 approach, a small reconnaissance program followed by the real one beats
-guessing — two round trips, not twenty. That is for when you cannot
-decide the approach at all until you see the data — not for every read.
-If you already know what you would do with the data once you have it —
-including asking a question and acting on the answer — read it and
-finish the task in this same program; `ask()` is a normal `await`, not
-a reason to end early. Ending a program is not "pausing to think":
-nothing continues on its own, so a program that stops after reporting
-what it found, with the actual task still undone, has not paused —
-it has quietly failed to do the task.
+guessing — two round trips, not twenty, and the second one has to be a
+real `fork()`, not an implied continuation. Writing `//: next, I'll...`
+and then ending the program is not a plan: nothing reads that comment
+and nothing runs on its own, so whatever you meant to do next simply
+does not happen. That is for when you cannot decide the approach at all
+until you see the data — not for every read. If you already know what
+you would do with the data once you have it — including asking a
+question and acting on the answer, or characterizing and comparing what
+you just read — read it and finish the task in this same program;
+`ask()` is a normal `await`, not a reason to end early. Ending a
+program is not "pausing to think": nothing continues on its own, so a
+program that stops after reporting what it found, with the actual task
+still undone, has not paused — it has quietly failed to do the task.
 
 Work from what you actually read, not from what a file like this
 usually contains. A generic check tuned for a shape the real data
@@ -130,16 +134,28 @@ pub struct Exemplar {
     pub assistant: &'static str,
 }
 
-/// Two demonstrations, not one, each carrying a shape the other
-/// can't: a tool call with an outcome to branch on, and — added
-/// 2026-09-10, after a live regression run's one consistently-failing
-/// task turned out to have no worked example of its own shape
-/// anywhere in context — reading real data, recognizing a genuine
-/// ambiguity, `ask()`-ing about it *inline*, and acting on the answer,
-/// all in one program that still ends by reporting what it did. The
-/// card's prose already says "ask() is a normal await, not a reason to
-/// end early"; a demonstration of a model actually doing that is a
-/// stronger restoring force than the sentence describing it.
+/// Three demonstrations, each carrying a shape the others can't: a
+/// tool call with an outcome to branch on; reading real data,
+/// recognizing a genuine ambiguity, `ask()`-ing about it *inline*, and
+/// acting on the answer, all in one program that still ends by
+/// reporting what it did (added 2026-09-10, after a live regression
+/// run's one consistently-failing task turned out to have no worked
+/// example of its own shape anywhere in context); and — added
+/// 2026-09-14, after the same thing happened again to a different rule
+/// — gathering several pieces of data and finishing the *judgment*
+/// about them in the same program, with no deferred step. The card's
+/// prose already said both "ask() is a normal await, not a reason to
+/// end early" and "ending a program... has quietly failed to do the
+/// task" before either fix; in both cases the sentence alone did not
+/// hold against a live run, and a demonstration of the model actually
+/// doing the right thing was the stronger restoring force. Live
+/// evidence for the third exemplar specifically: two independent
+/// tasks (`fan-out`, `judgment-in-the-middle`) each produced a
+/// genuinely well-reasoned recon-only program whose own closing `//:`
+/// comment planned a "next program" — nothing ever ran it, because
+/// nothing in the architecture continues a finished program on its
+/// own; the task silently went undone despite a plan that read like
+/// success.
 pub const SEED_EXEMPLARS: &[Exemplar] = &[
     Exemplar {
         user: "can you check whether the tests pass and let me know?",
@@ -166,6 +182,22 @@ parsed.retries = Number(target);
 await tools.write_file("ops/config.json", JSON.stringify(parsed, null, 2));
 say(`set retries to ${target} in ops/config.json.`);"#,
     },
+    Exemplar {
+        user: "look at server-a.log and server-b.log and tell me which one is actually failing",
+        assistant: r#"//: read both — "failing" is a judgement on the real text, and once I
+//: have it there is no separate step to defer to: nothing runs after
+//: this program unless I make it, so the comparison happens right here
+const [a, b] = await Promise.all([
+    tools.read_file("server-a.log"),
+    tools.read_file("server-b.log"),
+]);
+
+const aErrors = (a.content.match(/ERROR/g) || []).length;
+const bErrors = (b.content.match(/ERROR/g) || []).length;
+say(aErrors > bErrors
+    ? `server-a is failing: ${aErrors} ERROR lines vs server-b's ${bErrors}.`
+    : `server-b is failing: ${bErrors} ERROR lines vs server-a's ${aErrors}.`);"#,
+    },
 ];
 
 #[cfg(test)]
@@ -178,7 +210,7 @@ mod tests {
         // `CARD` shows up as a diff review must look at, not a byte
         // count that silently drifts. Comparing full text (not just a
         // hash) so the diff itself is legible in a failure message.
-        const EXPECTED_LEN: usize = 5447;
+        const EXPECTED_LEN: usize = 5758;
         assert_eq!(
             CARD.len(),
             EXPECTED_LEN,
@@ -281,5 +313,31 @@ mod tests {
             after.lines().count() > 2,
             "ask() should not be the last meaningful line of the exemplar"
         );
+    }
+
+    #[test]
+    fn the_third_exemplar_finishes_the_judgment_in_the_same_program() {
+        // Card prose alone ("ending a program... has quietly failed to
+        // do the task") wasn't enough either — two independent live
+        // runs (2026-09-14) each wrote a genuinely well-reasoned
+        // recon-only program whose own closing comment planned a "next
+        // program," which nothing then ran. This exemplar is the
+        // demonstration: both reads happen, then the judgment (a
+        // say() call comparing what was actually read) happens in the
+        // same program, not a planned-but-absent one.
+        let ex = &SEED_EXEMPLARS[2];
+        let last_read = ex
+            .assistant
+            .rfind("tools.read_file(")
+            .expect("third exemplar should read more than one thing");
+        let after = &ex.assistant[last_read..];
+        assert!(
+            after.contains("say("),
+            "the judgement must be reported in the same program as the reads, \
+             not deferred to an implied next one"
+        );
+        // The specific failure this exemplar answers: a program ending
+        // on a forward-looking comment instead of doing the work.
+        assert!(!ex.assistant.to_lowercase().contains("next program"));
     }
 }
