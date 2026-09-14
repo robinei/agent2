@@ -737,13 +737,13 @@ fn codemode_harness() {
     println!("\n=== handler-stack usage (not one of Part H's three) ===");
     println!("total raises: {total_raises}");
     if total_raises > 0 {
+        let deliberate_raises = total_raises.saturating_sub(total_traps);
         println!(
-            "  of which trap: {total_traps} ({:.0}%), deliberate raise(): {} ({:.0}%) — \
+            "  of which trap: {total_traps} ({:.0}%), deliberate raise(): {deliberate_raises} ({:.0}%) — \
              a check gating on \"was there a deliberate decision\" must use the latter, \
              not total_raises (see harness::TaskReport::trap_count's doc)",
-            total_raises.saturating_sub(total_traps),
             100.0 * total_traps as f64 / total_raises as f64,
-            100.0 * total_raises.saturating_sub(total_traps) as f64 / total_raises as f64,
+            100.0 * deliberate_raises as f64 / total_raises as f64,
         );
         println!(
             "  resume: {total_resumes} ({:.0}% of raises), of which handover: {total_handovers} ({:.0}% of resumes)",

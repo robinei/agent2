@@ -76,6 +76,12 @@ pub struct RecordingTools {
     /// so the extra allocation is not worth a version-dependent bet.
     arg_scripts: Rc<RefCell<HashMap<(String, String), ScriptQueue>>>,
     ask_script: Rc<RefCell<ScriptQueue>>,
+    /// See [`respond_ask_with`](Self::respond_ask_with). `dyn Fn`, not
+    /// a generic on `RecordingTools` itself — `Task::tools` is a bare
+    /// `fn() -> RecordingTools`, so the closure's type can't leak into
+    /// the struct's own signature.
+    #[allow(clippy::type_complexity)]
+    ask_responder: Rc<RefCell<Option<Rc<dyn Fn(&str) -> ToolResult>>>>,
 }
 
 impl RecordingTools {
@@ -115,6 +121,31 @@ impl RecordingTools {
 
     pub fn respond_ask(&self, response: ToolResult) -> &Self {
         self.ask_script.borrow_mut().push_back(response);
+        self
+    }
+
+    /// Answer every `ask()` call by **inspecting the question text**
+    /// and computing a reply, rather than a fixed canned value — for
+    /// when no single string can satisfy an unbounded variety of
+    /// self-invented reply-parsing protocols a capable model can
+    /// write. Checked before [`respond_ask`](Self::respond_ask)'s
+    /// fixed queue.
+    ///
+    /// Live evidence a fixed value genuinely cannot keep up
+    /// (2026-09-14, on `judgment-in-the-middle`): an earlier fix
+    /// (2026-09-10) already found that a bare corrected value
+    /// ("us-east-1") beats a full sentence, since any reasonable
+    /// extraction strategy can use it — and a later live run still
+    /// failed the task, because a sufficiently careful program didn't
+    /// ask "what should it be?" at all; it asked for a *line-targeted*
+    /// edit (`` `N: <the line it should be>` ``, quoting its own
+    /// numbering), and "us-east-1" has no digit prefix to match either
+    /// of that program's own two parsers. A live, engaged human reads
+    /// the question and answers in whatever shape it asks for — the
+    /// fixture should do the same, not pick one shape in advance and
+    /// hope every model asks for that one.
+    pub fn respond_ask_with(&self, f: impl Fn(&str) -> ToolResult + 'static) -> &Self {
+        *self.ask_responder.borrow_mut() = Some(Rc::new(f));
         self
     }
 
@@ -177,6 +208,9 @@ impl FakeTools for RecordingTools {
             name: "ask".to_owned(),
             args: serde_json::json!([who, text]),
         });
+        if let Some(responder) = self.ask_responder.borrow().as_ref() {
+            return responder(text);
+        }
         self.ask_script
             .borrow_mut()
             .pop_front()
@@ -215,6 +249,30 @@ fn contains_any_ci(haystack: &[super::runner::Said], needles: &[&str]) -> bool {
         let lower = s.text.to_lowercase();
         needles.iter().any(|n| lower.contains(&n.to_lowercase()))
     })
+}
+
+/// Whether `s` contains a literal `<digits>:` — a program's own
+/// worked example of a line-targeted reply format (`` `7: image:
+/// registry/app:1.4.2` ``), the signal `respond_ask_with` uses to
+/// detect that kind of question without a regex dependency.
+fn contains_digit_colon(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_digit() {
+            let mut j = i;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b':' {
+                return true;
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    false
 }
 
 /// **Fan-out over N inputs.** Three independent files to read and
@@ -336,9 +394,27 @@ pub const JUDGMENT_IN_THE_MIDDLE: Task = Task {
         // and different (individually reasonable) programs ask for
         // different formats. Since the skill this task means to test
         // is "did it ask and act on the answer," not "can it parse
-        // arbitrary prose," the answer is just the corrected value:
-        // trivially usable by any reasonable extraction strategy.
-        t.respond_ask(Ok(serde_json::json!("us-east-1")));
+        // arbitrary prose," respond_ask_with reads the question and
+        // answers in whichever of the two shapes actually observed
+        // live it's asking for: a bare corrected value, or a
+        // line-targeted edit (the fixture's one line of content is
+        // always line 1, so that answer is always determined). A
+        // third shape found live once before (an "old => new" arrow
+        // format) is not covered — no single fixture can chase every
+        // format a sufficiently creative program invents; this covers
+        // the two actually seen more than once.
+        t.respond_ask_with(|question| {
+            let lower = question.to_lowercase();
+            let wants_line_targeted = lower.contains("line number")
+                || lower.contains("line(s)")
+                || lower.contains("n:")
+                || contains_digit_colon(question);
+            Ok(if wants_line_targeted {
+                serde_json::json!("1: region: us-east-1")
+            } else {
+                serde_json::json!("us-east-1")
+            })
+        });
         t.respond("write_file", Ok(serde_json::json!({ "written": true })));
         t
     },
@@ -636,6 +712,40 @@ mod tests {
              const region = await ask('user', 'which region is right? ' + cfg.content); \
              await tools.write_file('deploy.yml', 'region: ' + region); \
              say('updated the config');"]);
+        let outcome = run(
+            CARD,
+            JUDGMENT_IN_THE_MIDDLE.user_message,
+            &tools,
+            &mut source,
+            &RunConfig::default(),
+        )
+        .unwrap();
+        (JUDGMENT_IN_THE_MIDDLE.check)(&outcome, &tools).unwrap();
+    }
+
+    #[test]
+    fn judgment_check_accepts_a_line_targeted_reply_format() {
+        // The shape found live (2026-09-14): a program sophisticated
+        // enough to invent its own batch edit protocol — flag lines,
+        // ask for `N: <replacement>` per flagged line, parse that back
+        // — rather than the simple "what should it be?" question the
+        // other accept test above uses. A bare "us-east-1" answer
+        // fails both of a program like this one's own parsers (no
+        // digit prefix), which is exactly what happened live before
+        // `respond_ask_with` replaced the fixed canned value.
+        let tools = (JUDGMENT_IN_THE_MIDDLE.tools)();
+        let mut source =
+            ScriptedSource::new(["const cfg = await tools.read_file('deploy.yaml'); \
+             const reply = await ask('user', \
+                 'deploy.yaml has 1 line that reads stale.\\n' + \
+                 'reply one line per flagged line: `N: <the line it should be>`, or `N: leave`.'); \
+             const m = String(reply).match(/^\\s*(\\d+)\\s*:\\s*(.+)$/); \
+             if (m) { \
+                 await tools.write_file('deploy.yaml', m[2]); \
+                 say('updated line ' + m[1] + ' to: ' + m[2]); \
+             } else { \
+                 say('could not parse a line-targeted reply: ' + reply); \
+             }"]);
         let outcome = run(
             CARD,
             JUDGMENT_IN_THE_MIDDLE.user_message,
