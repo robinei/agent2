@@ -422,93 +422,109 @@ user
   bulk of Part D's apparatus (`ProgramStack`, `max_depth`,
   `decision.rs`, the transient tail, `introspect.rs`'s snapshot) is
   serving a case that rarely fires, versus the ordinary-agentic-loop
-  case handover exists to make cheap. First live run below: the fixed
-  task set turns out not to exercise the mechanism at all, so this is
-  still open, not answered. The *mechanism* computing the number is
-  now verified correct on scripted fixtures (6 new tests plus
+  case handover exists to make cheap. The counting mechanism is
+  verified correct on scripted fixtures first (6 new tests plus
   retrofitted assertions on 5 existing ones in `runner.rs`, covering a
   genuine handover, a resume with an intervening call, a resumable
   trap that's also a handover, and the nested-decision edge case
-  above) — so item 0 below (a fifth task that actually needs `raise`)
-  is now blocked only on a live run, not on trusting the counter.
+  above). The fifth task (`which-region`-shaped) landed and ran live
+  (below): its one raise was a *trap*, resumed, zero deliberate
+  `raise()` calls — still n=1 and still not evidence either way on
+  handover frequency, but for a different reason now: not "the task
+  set can't produce one" (fixed) but "one live run of one task is too
+  small a sample." A real answer needs several runs of a task that
+  reliably provokes deliberate `raise()`, which this one hasn't yet
+  been shown to do.
 
-### Live numbers — one run, n=4, deepseek-v4-flash (flag sample size)
+### Live numbers — final clean run, n=5, deepseek-v4-flash (flag sample size)
 
-**Superseded — pre-dates a session-id fix (`ab84868`), possible
-cross-task contamination.** `main.rs`'s harness runner minted one
-`x-opencode-session` id for the whole 5-task run rather than one per
-task, contrary to `Endpoint::session_id`'s own contract ("a caller
-making unrelated one-off calls can mint a fresh one each time"). Live
-evidence it wasn't cosmetic: in one run, `trivial-question`
-("what is 12+30?") opened by re-litigating `ops/config.json` —
-content belonging to `judgment-in-the-middle`'s task and never present
-in `trivial-question`'s own rendered document — because the endpoint's
-session-keyed routing/cache affinity carried real context across
-tasks that share nothing in the log the harness renders. Fixed at
-`ab84868`; a clean re-run is pending. The *qualitative* finding below
-(raise/resume/handover unexercised — an absence of `raise()` calls,
-not a claim about task content) likely survives the fix, but the
-specific counts are pre-fix and should not be cited as settled.
+The first n=4 run (below this section's earlier text, now replaced
+rather than reconciled) surfaced six real bugs, not measurement noise
+— each confirmed against the live transcript that exposed it, not
+just a constructed test case:
+
+- **Cross-task contamination** — the harness minted one
+  `x-opencode-session` id for all 5 tasks in a run, contrary to
+  `Endpoint::session_id`'s own contract ("a caller making unrelated
+  one-off calls can mint a fresh one each time"). Concretely:
+  `trivial-question` ("what is 12+30?") opened by re-litigating
+  `ops/config.json` — content belonging to a different task and never
+  present in `trivial-question`'s own rendered document — because the
+  endpoint's session-keyed routing/cache affinity carried real context
+  across tasks sharing nothing in the log. Fixed: per-task session ids.
+- **A fixture bug that silently corrupted retry data** — the scripted
+  tool queue was keyed by call *name*, not by its arguments, so a
+  retry-and-branch task's second call to the same tool with different
+  arguments silently got served the first call's canned response. Fixed,
+  args-keyed.
+- **A safety check that could false-pass** — `raise_count` conflated
+  an unrelated runtime trap with a deliberate decision-seeking
+  `raise()`; a `trap_count` now keeps them apart.
+- **`ask()` wasn't recognized as judgment-seeking** — an `ask()` that
+  traps (no configured handler, by design in the harness) is, like
+  `raise()`, the program asking for a decision it can't make alone.
+  Verified by replaying all three original live transcripts through
+  the fixed check, not just synthetic cases.
+- **A fixture too rigid for a capable model** — `judgment-in-the-middle`'s
+  `ask()` fixture answered with one fixed string; the model wrote its
+  own line-targeted edit protocol the fixed string couldn't satisfy.
+  Now answers adaptively by reading the question text.
+- **The repair loop named in `types.rs` was never implemented** —
+  `Cause::CompileFailed`'s own doc comment says "the repair loop," but
+  `runner::run` gave a parse failure zero retries while a runtime trap
+  got a full handler cycle — a real asymmetry, not a documentation
+  gap. Confirmed twice independently in one run: an unbalanced paren,
+  and a completion whose text literally contained `</invoke>` — tool-
+  call XML bleeding into what should have been plain JS. Implemented.
+
+With all six fixes in place and a fresh session id per task:
 
 ```
-total raises: 2, resume: 0, handover: 0/0, abandon: 2 (100%)
-fork/spawn/artifact attempts: 0/1/0
-task success: 2/4
+task success: 4/5
+mean round-trips: 1.2
+raises: 1 (100% trap, 0 deliberate)
+resume: 1/1, abandon: 0
 ```
 
-**The finding is not a rate — it's that the fixed task set never
-exercises `raise`/`resume`/`handover` at all, in either direction.**
-Both raises that occurred were *runtime traps* (an uncaught
-`.then()`-chaining error and an uncaught `spawn()`-stub rejection),
-not a deliberate `raise()` call — neither of the four tasks ever wrote
-one. Both traps were abandoned and rewritten, so `handover_count`'s
-denominator is 0: the metric wasn't measured-and-low, it was
-unexercised. Reporting a 0% or 100% handover rate from n=0 resumes
-would be extrapolating from nothing, which is worse than reporting the
-gap.
+**The most important thing this exercise found is a card/tuning
+problem, not a harness bug, and it bears directly on this doc's own
+"ordinary agentic loop" argument.** Observed independently in two
+tasks (`fan-out`, `judgment-in-the-middle`), both otherwise well-
+reasoned: the model writes a "look before you leap" recon-only
+program whose own closing comment says *"next program: do the fix"*
+or *"step 2: fix precisely what's off"* — and then the run simply
+ends, because nothing (no `raise`, no `ask`, no trap) triggers a
+second turn. This is precisely the failure the card already warns
+against by name ("ending a program is not pausing to think... has
+quietly failed to do the task"), and the warning alone isn't reliably
+followed. It is also exactly the gap this doc's "Tail raises" and
+"Verb selection" sections describe from the other side: a model that
+correctly recognizes it should continue but reaches for *nothing* —
+not `raise`, not `fork`, not a second statement in the same
+program — because the card teaches the two-round-trip recon pattern
+without ever showing what closes the loop between rounds. Not fixed
+here; flagged for a deliberate tuning pass on the card and exemplars.
 
-Walking why, task by task: `fan-out` wants delegation (`spawn`,
-stubbed — the model never got as far as a decision to `raise()`
-about). `retry-and-branch` is pure control flow — no judgment call
-mid-computation. `judgment-in-the-middle` resolved its ambiguity with
-`ask("user", ...)`, a normal `await` — which is the *correct* choice
-per the card's own guidance ("`ask()` is a normal `await`, not a
-reason to raise"), not evidence against `raise`. `trivial-question`
-needs neither. **None of Part H's four tasks is shaped like the
-`which-region` example this doc uses to motivate deliberation** — live
-intermediate state, a judgment call mid-computation, continuing with
-the injected value. So "is Part D load-bearing" remains genuinely
-open, not answered low, pending a fifth task actually shaped to need
-it — proposed as the concrete next step rather than left as a vague
-gap.
-
-**A second finding, independent of the raise question: the stubs are
-distorting the measurement, not just leaving it incomplete.** The
-`fan-out` trace shows the model's third-round instinct was to
-`spawn()` a child to judge file contents — exactly the delegation
-pattern this doc's "fork/spawn depth" section reasons about — and
-hitting the honest-error stub forced an abandon-and-rewrite that fell
-back to inline judgment instead of delegation. A model reaching for the
-mechanism and being refused is a different outcome from a model not
-wanting the mechanism, and the harness as it stands can't tell the two
-apart. This is the strongest evidence yet for prioritizing "what this
-licenses" item 3 (backing `fork`/`spawn`/`artifact` for real) before
-trusting *any* number this harness produces about them — including the
-attempt counts above, which undercount for the same reason.
-
-Task success (2/4) sits below the historical 3/4–4/4 in the commit
-log; consistent with documented run-to-run variance (`9c794e9`: "1/4
--> 3/4") and the instrumentation itself is read-only counters with no
-generation-path effect, so this is noted rather than treated as a
-regression.
+**Also flagged, not fixed:** `fan-out`'s own success check can be
+satisfied by a program that dumps raw file content without
+characterizing anything as "interesting" — a real check-strictness
+gap, left as a finding rather than patched under time pressure (which
+risks overfitting the check to whatever one run's programs happened to
+do).
 
 ## What this licenses, not yet done
 
 0. ~~A fifth fixed task, shaped to need `raise()`/`resume()`~~ —
-   **landed** (`84760a7`), the `which-region` shape this doc motivates
-   deliberation with. A clean 5-task run under the `ab84868` session-id
-   fix is pending; the "Live numbers" section above is superseded until
-   it lands.
+   **landed** (`84760a7`) and run clean; see "Live numbers" above.
+0b. **A card/exemplar tuning pass for the recon-then-act gap**: two of
+   five live tasks wrote a correctly-reasoned recon-only program, said
+   in their own closing comment what the next program would do, then
+   simply ended with nothing to trigger a second turn — the exact
+   failure the card already names ("ending a program is not pausing to
+   think") but doesn't reliably prevent. Not a harness bug; the fix is
+   in the card's own words or its exemplars, likely a worked example of
+   a recon program handing off (`fork`, per this doc's own recommended
+   default) rather than ending silently.
 1. Card renders its tool list from `ToolRegistry` (today `card.rs`
    ends with "Tools available in this session:" and nothing appends
    them — no caller passes a registry) and its worked exemplar's
