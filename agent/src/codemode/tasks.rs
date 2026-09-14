@@ -395,22 +395,35 @@ pub const JUDGMENT_IN_THE_MIDDLE: Task = Task {
         // different formats. Since the skill this task means to test
         // is "did it ask and act on the answer," not "can it parse
         // arbitrary prose," respond_ask_with reads the question and
-        // answers in whichever of the two shapes actually observed
-        // live it's asking for: a bare corrected value, or a
+        // answers in whichever shape it's actually asking for. Three
+        // shapes seen live so far: a bare corrected value; a
         // line-targeted edit (the fixture's one line of content is
-        // always line 1, so that answer is always determined). A
-        // third shape found live once before (an "old => new" arrow
-        // format) is not covered — no single fixture can chase every
-        // format a sufficiently creative program invents; this covers
-        // the two actually seen more than once.
+        // always line 1, so that answer is always determined); and
+        // (2026-09-14, after the "next program" card fix produced a
+        // program that finished the whole task in one shot instead of
+        // stopping after recon — a new shape reaching this fixture for
+        // the first time) `key=value`/`key:value` pairs, one per line.
+        // A fourth shape found live once before (an "old => new" arrow
+        // format) still isn't covered — no single fixture can chase
+        // every format a sufficiently creative program invents; this
+        // covers what's actually recurred.
         t.respond_ask_with(|question| {
             let lower = question.to_lowercase();
             let wants_line_targeted = lower.contains("line number")
                 || lower.contains("line(s)")
                 || lower.contains("n:")
                 || contains_digit_colon(question);
+            // A pairs-format question spells out its own separator
+            // ("key=value", "key: value") — mirror whichever one it
+            // asked for rather than guessing a fixed punctuation mark.
+            let wants_pairs = lower.contains("key=value")
+                || lower.contains("key: value")
+                || lower.contains("pairs");
             Ok(if wants_line_targeted {
                 serde_json::json!("1: region: us-east-1")
+            } else if wants_pairs {
+                let sep = if question.contains('=') { "=" } else { ":" };
+                serde_json::json!(format!("region{sep}us-east-1"))
             } else {
                 serde_json::json!("us-east-1")
             })
@@ -746,6 +759,44 @@ mod tests {
              } else { \
                  say('could not parse a line-targeted reply: ' + reply); \
              }"]);
+        let outcome = run(
+            CARD,
+            JUDGMENT_IN_THE_MIDDLE.user_message,
+            &tools,
+            &mut source,
+            &RunConfig::default(),
+        )
+        .unwrap();
+        (JUDGMENT_IN_THE_MIDDLE.check)(&outcome, &tools).unwrap();
+    }
+
+    #[test]
+    fn judgment_check_accepts_a_key_value_pairs_reply_format() {
+        // The shape found live (2026-09-14), right after the "next
+        // program" card fix landed: a program that now finished the
+        // whole task in one shot (no more recon-then-stop) invented a
+        // *third* reply protocol — flag suspect lines, ask for
+        // `key=value` pairs, parse those back — that neither of the
+        // two shapes `respond_ask_with` already covered could satisfy.
+        let tools = (JUDGMENT_IN_THE_MIDDLE.tools)();
+        let mut source = ScriptedSource::new([
+            "const cfg = await tools.read_file('deploy.yaml'); \
+             const reply = await ask('user', \
+                 'Which keys are stale and what should they be? Reply as key=value pairs, one per line.'); \
+             let out = cfg.content, wrote = false; \
+             for (const pair of String(reply).split(/[\\n;]+/)) { \
+                 const m = pair.match(/^\\s*([\\w.-]+)\\s*[:=]\\s*(.+?)\\s*$/); \
+                 if (!m) continue; \
+                 out = out.replace(new RegExp('^' + m[1] + ':.*$', 'm'), m[1] + ': ' + m[2]); \
+                 wrote = true; \
+             } \
+             if (wrote) { \
+                 await tools.write_file('deploy.yaml', out); \
+                 say('applied: ' + out); \
+             } else { \
+                 say('no parseable key=value pairs, nothing written'); \
+             }",
+        ]);
         let outcome = run(
             CARD,
             JUDGMENT_IN_THE_MIDDLE.user_message,
