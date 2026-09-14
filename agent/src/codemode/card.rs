@@ -26,10 +26,19 @@ nothing else — no prose, no code fence, no explanation outside the
 program itself. The whole response is parsed as JavaScript; a response
 that fails to parse comes back as a trap. Narrate inside the program
 instead, on lines starting `//: ` — these stream to whoever is
-watching as they are written. `//:` is what you are about to do;
-`say()` is what happened. Only `say()` can report a result, because
-only it runs. Open with a `//:` plan block: it streams first and
-doubles as the plan the rest of the program follows.
+watching as they are written, which means they all arrive before any
+of the program has run: nothing here executes until the whole response
+is generated. So `//:` belongs at the very top, as one plan block that
+streams first and doubles as the plan the rest of the program follows
+— a `//:` line anywhere later doesn't narrate something happening now,
+since nothing has run yet by the time it arrives either; it only makes
+the reader wait through more code to reach it. `say()` is what
+happened, and it is the only thing that can report a result, because
+only it runs. Document the body itself with plain `//` comments, the
+ordinary kind — they read alongside the code they're next to, not as
+a standalone message, so write them assuming the reader can already
+see the lines around them; `//:` narration has to stand on its own
+with no code in view.
 
 Verbs available in every program, as plain functions — not a `tools.`
 namespace, which is reserved for this session's configured tools
@@ -180,13 +189,14 @@ if (result.exit === 0) {
     },
     Exemplar {
         user: "the retry count in ops/config.json looks off — can you fix it?",
-        assistant: r#"//: read the real value first — I can't tell what "off" means by guessing
+        assistant: r#"//: read the real value first — I can't tell what "off" means by guessing.
+//: The file won't say what it should be either, and a wrong guess is
+//: worse than asking — so resolve that here, in this same program,
+//: rather than stopping once I've reported what's there now.
 const cfg = await tools.read_file("ops/config.json");
 const parsed = JSON.parse(cfg.content);
 say(`ops/config.json currently sets retries to ${parsed.retries}.`);
 
-//: the file doesn't say what it should be, and a wrong guess is worse
-//: than asking — resolve it here, in this same program, then act on it
 const target = await ask("user", `retries is currently ${parsed.retries} — what should it be?`);
 
 parsed.retries = Number(target);
@@ -211,9 +221,10 @@ say(aErrors > bErrors
     },
     Exemplar {
         user: "two synced backups of the same file disagree — which one should I keep?",
-        assistant: r#"//: read both — if they genuinely differ, that's not a fact more
-//: reading resolves; it's a judgement call, and I can't invent a
-//: reason to prefer one over the other from the files alone
+        assistant: r#"//: read both — if they genuinely differ, that's not a fact more reading
+//: resolves; it's a judgement call, and I can't invent a reason to
+//: prefer one over the other from the files alone. If so: raise it —
+//: not guess, and not stop here having only noticed the problem.
 const [a, b] = await Promise.all([
     tools.read_file("backup-1.txt"),
     tools.read_file("backup-2.txt"),
@@ -222,8 +233,6 @@ const [a, b] = await Promise.all([
 if (a.content === b.content) {
     say("identical — no real conflict, either is fine.");
 } else {
-    //: genuinely undecidable from what's in front of me — raise it
-    //: instead of guessing, or noticing the problem and stopping here
     const keep = await raise("conflicting_backups", { a: a.content, b: b.content });
     say(`keeping ${keep}.`);
 }"#,
@@ -240,7 +249,7 @@ mod tests {
         // `CARD` shows up as a diff review must look at, not a byte
         // count that silently drifts. Comparing full text (not just a
         // hash) so the diff itself is legible in a failure message.
-        const EXPECTED_LEN: usize = 5758;
+        const EXPECTED_LEN: usize = 6361;
         assert_eq!(
             CARD.len(),
             EXPECTED_LEN,
@@ -322,6 +331,38 @@ mod tests {
     fn the_exemplars_open_with_a_plan_comment() {
         for ex in SEED_EXEMPLARS {
             assert!(ex.assistant.trim_start().starts_with("//:"));
+        }
+    }
+
+    #[test]
+    fn no_exemplar_scatters_narration_mid_program() {
+        // `//:` streams to a live watcher purely in generation order —
+        // nothing executes until the whole completion is done, so a
+        // `//:` line past the opening block doesn't narrate anything
+        // happening "now" (found live 2026-09-14, on re-reading the
+        // card's own exemplars against docs/20_CODE_MODE.md Step
+        // G1b's disclaimer: "a debug surface, not a progress
+        // indicator"). It only makes a live watcher wait through more
+        // code to reach a line that was never going to correspond to
+        // execution timing anyway. `//:` belongs in one contiguous
+        // block at the top; anything documenting the body uses plain
+        // `//`, which stays inside the collapsed source (Step G3)
+        // instead of being pulled into the chat pane as a standalone,
+        // possibly context-free message (Step G1b).
+        for ex in SEED_EXEMPLARS {
+            let mut past_the_opening_block = false;
+            for line in ex.assistant.lines() {
+                let trimmed = line.trim_start();
+                if trimmed.starts_with("//:") {
+                    assert!(
+                        !past_the_opening_block,
+                        "`//:` line found after the opening block in: {:?}",
+                        ex.assistant
+                    );
+                } else if !trimmed.is_empty() {
+                    past_the_opening_block = true;
+                }
+            }
         }
     }
 
