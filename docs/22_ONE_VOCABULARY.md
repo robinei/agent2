@@ -377,23 +377,60 @@ user
 - **Handover vs. deliberation detection** needs the exact compiler-side
   rule stated (what "nothing but the epilogue follows" means precisely
   for `if`/`for`/`try` around the call site) before implementation.
+  `codemode::runner`'s `handover_count` proxy (no compiler yet — a
+  runtime "did any call happen after resume" flag) is now pinned down
+  by a scripted test exposing its sharpest edge:
+  `nested_raise_resolves_both_levels` has a middle frame whose entire
+  continuation after `resume(100)` is `return resume(y + 1);` — a pure
+  computation forwarding a decision, no call — which the proxy counts
+  as a handover exactly the same as a handler that did real work with
+  no more suspension. The counter cannot and does not try to tell
+  "forwarded a decision" from "took over and worked"; it only knows
+  whether a call happened. That's the concrete shape the eventual
+  compiler rule has to either preserve or explicitly change.
 - **Answering after the asker's program has ended** — DESIGN's rule C
   already prescribes the fallback (arrives as a `Post`, wakes the
   branch, logged either way), but which path a live delivery takes is
   decided from session state at delivery time, not from the log alone,
   and deserves its own worked-through case before Stage 1 of `21`
   builds the delivery path.
-- **The card's `spawn`-is-cheap / `fork`-is-expensive framing** is
-  likely backwards under prompt caching (a fork reuses the parent's
-  cached prefix; a spawn pays a fresh system prompt with no shared
-  prefix) — needs measuring on the harness, not asserting either way.
+- ~~The card's `spawn`-is-cheap / `fork`-is-expensive framing~~ —
+  **measured**, not asserted, in `document.rs`'s
+  `fork_inherits_and_grows_with_history_while_spawn_stays_flat`: no
+  live model needed, since the claim is entirely about what
+  `document::render` produces. Spawn's document stays flat (81 bytes,
+  card + charter, independent of history depth); fork's grows with
+  inherited history — 613B at 1 turn, 2745B at 5, 8095B at 15 turns of
+  realistic synthetic conversation, already ~100x spawn's cost. **On
+  total rendered document size — what the model actually attends to
+  this request, cache or no cache — the card's original framing holds:
+  `spawn()` is the cheap one.** The caching counter-argument raised in
+  this design conversation was reaching for a narrower, different, and
+  still-genuinely-untested axis: *marginal newly-billed* tokens under a
+  cache-aware provider. If the card is a byte-identical constant shared
+  by every agent (it is), a provider whose cache keys on raw prefix
+  bytes rather than session identity would treat spawn's system-prompt
+  prefix as a cache hit too, once any other agent exists this session —
+  on that axis fork and spawn could be comparable, both dominated by
+  their own kickoff text. That depends on the provider's actual
+  cache-key behavior, not on anything this codebase decides, and
+  remains unmeasured — the card's economics paragraph should keep its
+  current framing (total size is the axis that's settled) rather than
+  hedge toward the caching argument without measuring the provider
+  directly.
 - **Whether raises are, empirically, mostly handovers** — if so, the
   bulk of Part D's apparatus (`ProgramStack`, `max_depth`,
   `decision.rs`, the transient tail, `introspect.rs`'s snapshot) is
   serving a case that rarely fires, versus the ordinary-agentic-loop
   case handover exists to make cheap. First live run below: the fixed
   task set turns out not to exercise the mechanism at all, so this is
-  still open, not answered.
+  still open, not answered. The *mechanism* computing the number is
+  now verified correct on scripted fixtures (6 new tests plus
+  retrofitted assertions on 5 existing ones in `runner.rs`, covering a
+  genuine handover, a resume with an intervening call, a resumable
+  trap that's also a handover, and the nested-decision edge case
+  above) — so item 0 below (a fifth task that actually needs `raise`)
+  is now blocked only on a live run, not on trusting the counter.
 
 ### Live numbers — one run, n=4, deepseek-v4-flash (flag sample size)
 
