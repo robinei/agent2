@@ -404,9 +404,40 @@ pub fn run(
             completions_used += 1;
             source.complete(doc).map_err(RunError::Completion)
         };
+    // The repair loop `types.rs`'s `Cause::CompileFailed` doc comment
+    // names but this harness never implemented: a parse failure used
+    // to be `program_from_completion`'s `Err` propagating straight out
+    // of `run`, ending the whole task with zero chance to recover —
+    // exactly the asymmetry the card's own "a response that fails to
+    // parse comes back as a trap" promises the model but this code
+    // never delivered. Live evidence this was not academic
+    // (2026-09-14): a genuinely well-engineered ~80-line program
+    // failed the entire task over one unbalanced paren
+    // (`open.push("..." + x.join(", ")) — text");`, a slip at least as
+    // mechanically fixable as any runtime trap — the compiler even
+    // names the exact line and column. Bounded by `take_completion`'s
+    // own `max_completions` check, same as any other retry here — no
+    // separate limit needed.
+    let mut take_program =
+        |source: &mut dyn CompletionSource, doc: &Document| -> Result<VM, RunError> {
+            let mut current_doc = doc.clone();
+            loop {
+                let completion = take_completion(source, &current_doc)?;
+                match program_from_completion(&completion) {
+                    Ok(vm) => return Ok(vm),
+                    Err(RunError::DidNotParse { message, .. }) => {
+                        current_doc = current_doc.with_tail(&format!(
+                            "the previous response did not parse as JavaScript:\n{message}\n\n\
+                         reply again with corrected source — the whole response is \
+                         parsed as JavaScript, nothing else."
+                        ));
+                    }
+                    Err(other) => return Err(other),
+                }
+            }
+        };
 
-    let root_completion = take_completion(source, &root_doc)?;
-    let root_vm = program_from_completion(&root_completion)?;
+    let root_vm = take_program(source, &root_doc)?;
     let mut stack = ProgramStack::new(root_vm);
     // The document each currently-stacked frame was generated from —
     // same length and indexing as the stack, so an `Abandon` can
@@ -522,8 +553,7 @@ pub fn run(
                             .last()
                             .expect("a non-root frame always has a caller doc")
                             .clone();
-                        let completion = take_completion(source, &replacement_doc)?;
-                        let replacement_vm = program_from_completion(&completion)?;
+                        let replacement_vm = take_program(source, &replacement_doc)?;
                         stack
                             .apply_decision(Decision::Abandon, || replacement_vm)
                             .map_err(RunError::Apply)?;
@@ -547,8 +577,7 @@ pub fn run(
                     .expect("stack is never empty")
                     .clone()
                     .with_tail(&tail);
-                let completion = take_completion(source, &handler_doc)?;
-                let handler_vm = program_from_completion(&completion)?;
+                let handler_vm = take_program(source, &handler_doc)?;
                 stack
                     .push(
                         Suspension::Raised { condition, payload },
@@ -570,8 +599,7 @@ pub fn run(
                     .expect("stack is never empty")
                     .clone()
                     .with_tail(&tail);
-                let completion = take_completion(source, &handler_doc)?;
-                let handler_vm = program_from_completion(&completion)?;
+                let handler_vm = take_program(source, &handler_doc)?;
                 stack
                     .push(suspension, handler_vm, config.max_depth)
                     .map_err(RunError::Depth)?;
@@ -1017,7 +1045,13 @@ mod tests {
     }
 
     #[test]
-    fn a_completion_that_does_not_parse_is_reported_with_its_source() {
+    fn a_completion_that_does_not_parse_retries_and_reports_the_source_if_exhausted() {
+        // Only one program is scripted, so the repair loop's retry
+        // (below) has nothing left to try after this one fails — the
+        // surfaced error is `Completion` (the source ran dry), not
+        // `DidNotParse` directly, since a parse failure alone no
+        // longer terminates the run: see
+        // `a_parse_failure_recovers_via_the_repair_loop`.
         let mut source = ScriptedSource::new(["const x = ;"]);
         let result = run(
             CARD,
@@ -1026,10 +1060,50 @@ mod tests {
             &mut source,
             &RunConfig::default(),
         );
-        match result {
-            Err(RunError::DidNotParse { source, .. }) => assert_eq!(source, "const x = ;"),
-            other => panic!("expected DidNotParse, got {other:?}"),
-        }
+        assert!(
+            matches!(result, Err(RunError::Completion(_))),
+            "expected the retry to exhaust the scripted source, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn a_parse_failure_recovers_via_the_repair_loop() {
+        // `types.rs`'s `Cause::CompileFailed` doc comment names "the
+        // repair loop"; this is it actually working — a parse failure
+        // gets a chance to be corrected, the same way a resumable trap
+        // does, rather than ending the whole run.
+        let mut source = ScriptedSource::new(["const x = ;", "say('recovered');"]);
+        let outcome = run(
+            CARD,
+            "go",
+            &TestTools::default(),
+            &mut source,
+            &RunConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(outcome.transcript[0].text, "recovered");
+        assert_eq!(outcome.completions_used, 2);
+        // A parse-failure retry is not a raise/trap/handler — nothing
+        // suspended, no decision was asked for, just a corrected
+        // resubmission of the same "turn".
+        assert_eq!(outcome.raise_count, 0);
+    }
+
+    #[test]
+    fn repeated_parse_failures_are_bounded_by_max_completions() {
+        let mut source =
+            ScriptedSource::new(["const x = ;", "const y = ;", "const z = ;", "const w = ;"]);
+        let result = run(
+            CARD,
+            "go",
+            &TestTools::default(),
+            &mut source,
+            &RunConfig {
+                max_completions: 2,
+                ..RunConfig::default()
+            },
+        );
+        assert!(matches!(result, Err(RunError::TooManyCompletions)));
     }
 
     #[test]
