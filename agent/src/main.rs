@@ -620,7 +620,6 @@ fn codemode_harness() {
     let base_url = std::env::var("DEEPSEEK_BASE_URL")
         .unwrap_or_else(|_| "https://opencode.ai/zen/go/v1".to_owned());
     let model = std::env::var("DEEPSEEK_MODEL").unwrap_or_else(|_| "deepseek-v4-flash".to_owned());
-    let session_id = uuid::Uuid::new_v4().to_string();
 
     let mut all_lengths: Vec<usize> = Vec::new();
     let mut all_round_trips: Vec<usize> = Vec::new();
@@ -640,6 +639,24 @@ fn codemode_harness() {
     );
 
     for task in tasks::ALL {
+        // A fresh id per task, not one for the whole harness run:
+        // `Endpoint::session_id`'s own doc is explicit that it's for
+        // "one conversation" and "a caller making unrelated one-off
+        // calls can mint a fresh one each time" — five unrelated fixed
+        // tasks sharing one session_id is exactly that unrelated-calls
+        // case. Live evidence this was not cosmetic (2026-09-14):
+        // trivial-question's completion opened by treating "what is
+        // 12 + 30?" as a reply to judgment-in-the-middle's own earlier
+        // "what should retries be?" question and re-litigating
+        // ops/config.json — content this run's own document never
+        // contained, meaning the endpoint's session-keyed routing/cache
+        // affinity was carrying real context across tasks that share
+        // no history in the log this harness actually renders. Each
+        // task's own multi-round conversation (raise -> handler ->
+        // resume, abandon -> replacement) still correctly shares one id
+        // for its own duration, since this is minted once per task, not
+        // once per completion.
+        let session_id = uuid::Uuid::new_v4().to_string();
         let endpoint = codemode::transport::Endpoint {
             base_url: &base_url,
             api_key: &api_key,
