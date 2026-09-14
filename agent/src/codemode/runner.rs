@@ -163,15 +163,33 @@ pub struct RunOutcome {
     pub handover_count: usize,
     /// How many raises resolved via `abandon()`.
     pub abandon_count: usize,
-    /// `fork()`/`spawn()`/`artifact()` call attempts, regardless of
-    /// outcome — all three are honest-error stubs in this harness
-    /// (`dispatch_call`, below), so these count reach, not success.
-    /// Real fork/spawn chain depth and artifact fetch rate need the
-    /// verbs backed for real first; these are what's honestly
-    /// measurable before that.
+    /// `fork()`/`artifact()` call attempts, regardless of outcome —
+    /// both are still honest-error stubs in this harness
+    /// (`dispatch_call`, below: `fork()`'s current zero-arg signature
+    /// gives a child no task, and no live trace has ever attempted it
+    /// anyway — every delegation attempt observed live used
+    /// `spawn(charter)`), so these count reach, not success.
     pub fork_attempts: usize,
+    /// `spawn()` call attempts, regardless of outcome — kept alongside
+    /// `spawn_children` (below) rather than folded into it, since an
+    /// attempt can still fail (depth limit, the child's own run
+    /// erroring) without ever becoming a real child.
     pub spawn_attempts: usize,
     pub artifact_attempts: usize,
+    /// How many `spawn()` calls actually ran a real child to
+    /// completion — `spawn()` is backed for real (a full recursive
+    /// [`run`], not a stub), bounded by `RunConfig::max_agent_depth`.
+    /// The child's own `say()`s are merged into this run's
+    /// `transcript`, matching "an unawaited spawn's child reports
+    /// directly" — this harness has no real concurrency, so an
+    /// awaited spawn whose result is ignored (every live trace so far)
+    /// looks the same. Deliberately **not** aggregated across the
+    /// agent tree — a grandchild's own spawns don't count toward its
+    /// grandparent's `spawn_children`, the same way `raise_count`/
+    /// `trap_count` stay scoped to the run that actually suspended:
+    /// merging them would muddy what each level's own stats mean.
+    /// Only `transcript` and `appended` cross the boundary.
+    pub spawn_children: usize,
 }
 
 #[derive(Debug)]
@@ -211,6 +229,14 @@ pub struct RunConfig {
     /// tests exercise dispatch and nesting, not register effects, and
     /// a `ScriptedSource` doesn't care what the document says anyway.
     pub exemplars: &'static [super::card::Exemplar],
+    /// How many `spawn()`s deep a chain of children may nest —
+    /// `run`'s own recursion depth, a different axis from `max_depth`
+    /// (the raise/handler stack *within* one program). Guards the
+    /// pathological case (a model whose spawned child immediately
+    /// spawns another to do the same task) the design conversation
+    /// this instruments flagged as the real risk versus honest,
+    /// shallow delegation chains.
+    pub max_agent_depth: usize,
 }
 
 impl Default for RunConfig {
@@ -219,6 +245,7 @@ impl Default for RunConfig {
             max_depth: 8,
             max_completions: 16,
             exemplars: &[],
+            max_agent_depth: 2,
         }
     }
 }
@@ -277,6 +304,21 @@ struct Attempts {
     artifact: usize,
 }
 
+/// What `dispatch_call` needs to run a real `spawn()` child — a full
+/// recursive [`run_at_depth`], not a stub. Bundled rather than four
+/// more loose parameters alongside the six `dispatch_call` already
+/// has.
+struct SpawnContext<'a> {
+    card: &'a str,
+    source: &'a mut dyn CompletionSource,
+    config: &'a RunConfig,
+    /// How many `spawn()`s already nest above this call.
+    agent_depth: usize,
+    /// Shared with the caller — bumped once per child that actually
+    /// ran (not per attempt; `Attempts::spawn` already counts those).
+    children: &'a mut usize,
+}
+
 /// Dispatch one settled `InvokeCall`: either a harness verb
 /// (`verbs::parse_effect`) or a task's fake tool. Resolves or rejects
 /// the call's promise on `vm` directly — the caller just needs to
@@ -289,6 +331,7 @@ fn dispatch_call(
     transcript: &mut Vec<Said>,
     appended: &mut Vec<serde_json::Value>,
     attempts: &mut Attempts,
+    spawn_ctx: &mut SpawnContext,
 ) -> Result<(), RunError> {
     let promise: PromisePtr = call.promise;
     let effect = verbs::parse_effect(vm, call);
@@ -307,13 +350,62 @@ fn dispatch_call(
             Ok(serde_json::Value::Null)
         }
         Ok(HarnessEffect::ListAgents) => Ok(serde_json::json!([])),
-        Ok(HarnessEffect::Spawn { .. }) => {
+        Ok(HarnessEffect::Spawn { charter }) => {
             attempts.spawn += 1;
-            Err("this harness does not back spawn() with a real agent yet".into())
+            if spawn_ctx.agent_depth + 1 > spawn_ctx.config.max_agent_depth {
+                Err(format!(
+                    "spawn() refused: agent nesting depth would exceed the limit ({})",
+                    spawn_ctx.config.max_agent_depth
+                ))
+            } else {
+                // A real child, not a stub: the same card (Step C2's
+                // "the names and signatures are card surface" —
+                // `Spawn.tools: None inherits the caller's`, so the
+                // same tools are the honest default), a fresh
+                // clean-room document (`run_at_depth` builds
+                // `[System(card), User(charter)]` from scratch, same
+                // as any root run), and the *same* `tools`/`source` —
+                // a spawned child is a real completion, not a
+                // simulation of one. Bounded by `max_agent_depth`
+                // above, the same guard-rail discipline `max_depth`
+                // already gives the raise/handler stack.
+                match run_at_depth(
+                    spawn_ctx.card,
+                    &charter,
+                    tools,
+                    &mut *spawn_ctx.source,
+                    spawn_ctx.config,
+                    spawn_ctx.agent_depth + 1,
+                ) {
+                    Ok(child) => {
+                        *spawn_ctx.children += 1;
+                        // The child's own say()s enter *this*
+                        // transcript directly — "an unawaited spawn's
+                        // child reports directly" (the design
+                        // conversation this instruments), and every
+                        // live trace so far awaited the call but
+                        // ignored its resolved value, trusting the
+                        // child to have already reported — this
+                        // harness has no real concurrency, so the two
+                        // cases look the same here.
+                        transcript.extend(child.transcript);
+                        appended.extend(child.appended);
+                        Ok(serde_json::json!({
+                            "agent": format!("spawn-{}", *spawn_ctx.children)
+                        }))
+                    }
+                    Err(e) => Err(format!("spawned agent failed: {e:?}")),
+                }
+            }
         }
         Ok(HarnessEffect::Fork) => {
             attempts.fork += 1;
-            Err("this harness does not back fork() with a real context yet".into())
+            Err(
+                "this harness does not back fork() with a real context yet — its current \
+                 zero-arg signature gives a child no task to do, pending the fork(task) \
+                 redesign"
+                    .into(),
+            )
         }
         Ok(HarnessEffect::Artifact { .. }) => {
             attempts.artifact += 1;
@@ -365,6 +457,24 @@ pub fn run(
     tools: &dyn FakeTools,
     source: &mut dyn CompletionSource,
     config: &RunConfig,
+) -> Result<RunOutcome, RunError> {
+    run_at_depth(card, user_message, tools, source, config, 0)
+}
+
+/// [`run`]'s actual body, plus `agent_depth` — the number of `spawn()`
+/// calls already nested above this one. `run` is the public entry
+/// point (always depth 0); `spawn()`'s own dispatch (below) is the
+/// only other caller, recursing at `agent_depth + 1` and bounded by
+/// `RunConfig::max_agent_depth`, the same way a raise/handler stack
+/// is bounded by `max_depth` — a different axis of the same guard-rail
+/// discipline.
+fn run_at_depth(
+    card: &str,
+    user_message: &str,
+    tools: &dyn FakeTools,
+    source: &mut dyn CompletionSource,
+    config: &RunConfig,
+    agent_depth: usize,
 ) -> Result<RunOutcome, RunError> {
     let log = vec![(
         EntryId::new(1),
@@ -453,6 +563,7 @@ pub fn run(
     let mut handover_count = 0;
     let mut abandon_count = 0;
     let mut attempts = Attempts::default();
+    let mut spawn_children = 0;
     // Set the instant a `Resume` decision is applied to the raising
     // frame, `Some(true)`; cleared to `Some(false)` by the first call
     // that frame makes afterward. Read (and reset to `None`) the next
@@ -479,6 +590,13 @@ pub fn run(
                         &mut transcript,
                         &mut appended,
                         &mut attempts,
+                        &mut SpawnContext {
+                            card,
+                            source: &mut *source,
+                            config,
+                            agent_depth,
+                            children: &mut spawn_children,
+                        },
                     )?;
                 }
             }
@@ -505,6 +623,13 @@ pub fn run(
                         &mut transcript,
                         &mut appended,
                         &mut attempts,
+                        &mut SpawnContext {
+                            card,
+                            source: &mut *source,
+                            config,
+                            agent_depth,
+                            children: &mut spawn_children,
+                        },
                     )?;
                 }
                 if tracking_handover.take() == Some(true) {
@@ -529,6 +654,7 @@ pub fn run(
                         fork_attempts: attempts.fork,
                         spawn_attempts: attempts.spawn,
                         artifact_attempts: attempts.artifact,
+                        spawn_children,
                     });
                 }
                 // A handler finished — read and apply its decision.
@@ -765,7 +891,41 @@ mod tests {
     }
 
     #[test]
-    fn spawn_is_rejected_and_catchable_not_a_crash() {
+    fn spawn_runs_a_real_child_and_merges_its_transcript() {
+        // spawn() is backed for real — a full recursive `run`, not a
+        // stub. Two scripted programs: the root's own, then the
+        // child's (the same `ScriptedSource` queue serves both, in
+        // dispatch order — the root's spawn() call is what consumes
+        // the second one).
+        let mut source = ScriptedSource::new([
+            "await spawn('reviewer: say hello'); say('root done');",
+            "say('child reporting in');",
+        ]);
+        let outcome = run(
+            CARD,
+            "go",
+            &TestTools::default(),
+            &mut source,
+            &RunConfig::default(),
+        )
+        .unwrap();
+        // The child's say() lands in the same transcript as the
+        // root's — "an unawaited spawn's child reports directly," and
+        // this harness has no real concurrency to distinguish that
+        // from an awaited-but-ignored call.
+        assert_eq!(outcome.transcript[0].text, "child reporting in");
+        assert_eq!(outcome.transcript[1].text, "root done");
+        assert_eq!(outcome.spawn_attempts, 1);
+        assert_eq!(outcome.spawn_children, 1);
+    }
+
+    #[test]
+    fn spawn_is_rejected_and_catchable_when_the_child_cannot_run() {
+        // Still a real, catchable rejection — just for an honest
+        // reason now (the child's own run failing) rather than "no
+        // backing at all." Only one program is scripted, so the
+        // spawned child's own completion request finds the source
+        // exhausted.
         let mut source = ScriptedSource::new(["try { await spawn('reviewer'); say('spawned'); } \
              catch (e) { say('no spawn: ' + e.message); }"]);
         let outcome = run(
@@ -777,11 +937,57 @@ mod tests {
         )
         .unwrap();
         assert!(outcome.transcript[0].text.starts_with("no spawn:"));
-        // Reach, not success (module doc on `Attempts`): the stub
-        // rejects it, but the harness must still know the model asked.
         assert_eq!(outcome.spawn_attempts, 1);
+        assert_eq!(outcome.spawn_children, 0, "the child never actually ran");
         assert_eq!(outcome.fork_attempts, 0);
         assert_eq!(outcome.artifact_attempts, 0);
+    }
+
+    #[test]
+    fn spawn_is_refused_past_the_agent_depth_limit() {
+        // A child that immediately spawns another, forever, must not
+        // recurse without bound — `max_agent_depth`'s own guard,
+        // mirroring `max_depth`'s for the raise/handler stack. The
+        // refusal is a normal, catchable promise rejection (the depth
+        // check short-circuits before any recursive run, so it costs
+        // no completion) — matching every other "is refused" verb in
+        // this file, not a VM trap.
+        let mut source = ScriptedSource::new([
+            "await spawn('go'); say('root: after spawn');",
+            "try { await spawn('go'); say('should not reach here'); } \
+             catch (e) { say('depth-1 child: spawn refused: ' + e.message); }",
+        ]);
+        let outcome = run(
+            CARD,
+            "go",
+            &TestTools::default(),
+            &mut source,
+            &RunConfig {
+                max_agent_depth: 1,
+                ..RunConfig::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            outcome
+                .transcript
+                .iter()
+                .any(|s| s.text.starts_with("depth-1 child: spawn refused:")),
+            "the depth-1 child's own spawn() (agent depth 2, past the limit of 1) \
+             should be a clean, caught refusal: {:?}",
+            outcome.transcript
+        );
+        // Only the root's own attempt — `spawn_attempts`/`spawn_children`
+        // are scoped to the run that made the call, not aggregated
+        // across the agent tree (only `transcript`/`appended` merge
+        // up), the same deliberate scoping that keeps a parent's own
+        // `trap_count`/deliberate-raise stats from being muddied by
+        // what a child ran into.
+        assert_eq!(outcome.spawn_attempts, 1);
+        assert_eq!(
+            outcome.spawn_children, 1,
+            "the root's own spawn should have run"
+        );
     }
 
     #[test]
@@ -1147,6 +1353,7 @@ mod tests {
                 max_depth: 3,
                 max_completions: 100,
                 exemplars: &[],
+                max_agent_depth: 2,
             },
         );
         assert!(matches!(result, Err(RunError::Depth(_))));
@@ -1164,6 +1371,7 @@ mod tests {
                 max_depth: 1000,
                 max_completions: 3,
                 exemplars: &[],
+                max_agent_depth: 2,
             },
         );
         assert!(matches!(result, Err(RunError::TooManyCompletions)));

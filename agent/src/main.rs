@@ -632,6 +632,7 @@ fn codemode_harness() {
     let mut total_fork_attempts = 0usize;
     let mut total_spawn_attempts = 0usize;
     let mut total_artifact_attempts = 0usize;
+    let mut total_spawn_children = 0usize;
 
     println!(
         "=== Part H harness: {} tasks, model {model} ===\n",
@@ -674,7 +675,8 @@ fn codemode_harness() {
         );
         println!(
             "       raises: {} (of which {} a trap, {} deliberate) — resume {}, of which \
-             handover {}; abandon {} — fork/spawn/artifact attempts: {}/{}/{}",
+             handover {}; abandon {} — fork/spawn/artifact attempts: {}/{}/{} \
+             (spawn ran {} real child(ren))",
             report.raise_count,
             report.trap_count,
             report.raise_count.saturating_sub(report.trap_count),
@@ -684,6 +686,7 @@ fn codemode_harness() {
             report.fork_attempts,
             report.spawn_attempts,
             report.artifact_attempts,
+            report.spawn_children,
         );
         if let Err(reason) = &report.success {
             println!("       reason: {reason}");
@@ -709,6 +712,7 @@ fn codemode_harness() {
         total_fork_attempts += report.fork_attempts;
         total_spawn_attempts += report.spawn_attempts;
         total_artifact_attempts += report.artifact_attempts;
+        total_spawn_children += report.spawn_children;
     }
 
     let median_len = harness::median(&all_lengths);
@@ -760,8 +764,12 @@ fn codemode_harness() {
         );
     }
     println!(
-        "fork/spawn/artifact call attempts (all hard-error stubs in this harness — \
-         reach, not success): {total_fork_attempts}/{total_spawn_attempts}/{total_artifact_attempts}"
+        "fork/artifact call attempts (still hard-error stubs — reach, not success): \
+         {total_fork_attempts}/{total_artifact_attempts}"
+    );
+    println!(
+        "spawn: {total_spawn_attempts} attempt(s), {total_spawn_children} ran a real child \
+         to completion — backed for real, not a stub"
     );
 }
 

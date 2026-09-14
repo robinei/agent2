@@ -55,11 +55,12 @@ impl CompletionSource for RecordingSource<'_> {
 /// most of that machinery is carrying a case that seldom fires? See
 /// `runner::RunOutcome`'s doc for what each field actually measures
 /// (`handover_count` in particular is a runtime proxy, not a
-/// compile-time tail check) and why `fork`/`spawn` chain depth and
-/// artifact fetch *rate* aren't measurable yet — those verbs are
-/// honest-error stubs here, so only *attempts* are real signal.
-/// All five default to `0` when a run errors before producing an
-/// outcome (`RunError` carries no partial counts).
+/// compile-time tail check). `fork()` is still an honest-error stub
+/// (its current zero-arg signature gives a child no task, and no live
+/// trace has ever attempted it); `spawn()` is backed for real —
+/// `spawn_children` is real reach, `fork_attempts`/`artifact_attempts`
+/// still count reach only. All fields default to `0` when a run errors
+/// before producing an outcome (`RunError` carries no partial counts).
 pub struct TaskReport {
     pub task_name: &'static str,
     pub success: Result<(), String>,
@@ -79,6 +80,11 @@ pub struct TaskReport {
     pub fork_attempts: usize,
     pub spawn_attempts: usize,
     pub artifact_attempts: usize,
+    /// How many `spawn()` attempts actually ran a real child to
+    /// completion — see `runner::RunOutcome::spawn_children`'s doc on
+    /// why this is scoped to the task's own root run, not aggregated
+    /// across however deep a spawn chain went.
+    pub spawn_children: usize,
 }
 
 /// Run one task live. `card` is the system prompt under test — passed
@@ -134,6 +140,7 @@ pub fn run_task(
             fork_attempts: outcome.fork_attempts,
             spawn_attempts: outcome.spawn_attempts,
             artifact_attempts: outcome.artifact_attempts,
+            spawn_children: outcome.spawn_children,
         },
         Err(e) => TaskReport {
             task_name: task.name,
@@ -149,6 +156,7 @@ pub fn run_task(
             fork_attempts: 0,
             spawn_attempts: 0,
             artifact_attempts: 0,
+            spawn_children: 0,
         },
     }
 }
