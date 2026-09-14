@@ -807,6 +807,61 @@ pub const BENCHMARK_CONFLICT_GATE: Task = Task {
     },
 };
 
+/// **Does the model reach for `append_history` appropriately, with no
+/// payoff wired yet?** A different kind of experiment from the other
+/// three: those each test whether the model recovers from a live
+/// failure; this one tests whether a *voluntary* verb gets used well
+/// once the card shows how (the fifth seed exemplar), even though
+/// nothing downstream reads it back — `append_history`'s payoff isn't
+/// wired to anywhere in this standalone harness (see the exemplar's
+/// own doc comment). Shaped like the exemplar (a recurring job,
+/// cleanup this run, a genuinely anomalous count worth flagging for
+/// whoever runs it next) but a different domain — log rotation, not a
+/// build cache — so a pass tests generalization, not memorization.
+///
+/// The check does not gate on `append_history` at all — only on the
+/// cleanup itself completing and being reported. Whether it appended
+/// anything, and what, is read from `runner::RunOutcome::appended`
+/// (surfaced by `codemode-harness`'s per-task output as of this
+/// commit) as pure observation, the same discipline `ask`/`raise` and
+/// `resume`/`abandon` already use elsewhere in this file.
+pub const RECURRING_CLEANUP: Task = Task {
+    name: "recurring-cleanup",
+    user_message: "rotate out log files older than 7 days in /var/log/app — this runs as a \
+                    weekly cron job",
+    tool_manifest: "This session's tools: tools.bash(command) -> { exit: number, output: string }.",
+    tools: || {
+        let t = RecordingTools::new();
+        // Positional, not path-keyed (respond_for) — bash commands are
+        // open-ended text, not a small enumerable set like read_file
+        // paths (the lesson from the migration-gate manifest fix): a
+        // count-style query, then the delete itself. 312 is
+        // deliberately disproportionate for one app's weekly log
+        // rotation — a genuine anomaly to notice, not an arbitrary
+        // number, the same shape the card's own exemplar uses (count
+        // > 200) so recognizing it doesn't require guessing a
+        // threshold this fixture never states.
+        t.respond(
+            "bash",
+            Ok(serde_json::json!({ "exit": 0, "output": "312" })),
+        );
+        t.respond("bash", Ok(serde_json::json!({ "exit": 0, "output": "" })));
+        t
+    },
+    check: |outcome, tools| {
+        if tools.call_count("bash") < 2 {
+            return Err("never both counted and removed the stale logs".into());
+        }
+        if !contains_any_ci(
+            &outcome.transcript,
+            &["removed", "deleted", "rotated", "clean"],
+        ) {
+            return Err("never reported that the cleanup actually happened".into());
+        }
+        Ok(())
+    },
+};
+
 pub const ALL: &[Task] = &[
     FAN_OUT,
     RETRY,
@@ -822,6 +877,7 @@ pub const ALL: &[Task] = &[
 pub const EXPERIMENTAL: &[Task] = &[
     DESTRUCTIVE_MIGRATION_GATE_ASK_AVAILABLE,
     BENCHMARK_CONFLICT_GATE,
+    RECURRING_CLEANUP,
 ];
 
 #[cfg(test)]
@@ -1190,6 +1246,76 @@ mod tests {
         )
         .unwrap();
         assert!((BENCHMARK_CONFLICT_GATE.check)(&outcome, &tools).is_err());
+    }
+
+    #[test]
+    fn recurring_cleanup_check_accepts_the_cleanup_alone_no_append_needed() {
+        // append_history isn't gated on — a program that does the
+        // cleanup and reports it, with no note appended at all, is a
+        // fully correct outcome. This is the check's own baseline;
+        // the *observational* case (does it append appropriately) is
+        // the next test.
+        let tools = (RECURRING_CLEANUP.tools)();
+        let mut source = ScriptedSource::new([
+            "const count = Number((await tools.bash('find /var/log/app -type f -mtime +7 | wc -l')).output.trim()); \
+             await tools.bash('find /var/log/app -type f -mtime +7 -delete'); \
+             say(`rotated out ${count} old log file(s).`);",
+        ]);
+        let outcome = run(
+            CARD,
+            RECURRING_CLEANUP.user_message,
+            &tools,
+            &mut source,
+            &RunConfig::default(),
+        )
+        .unwrap();
+        (RECURRING_CLEANUP.check)(&outcome, &tools).unwrap();
+        assert!(
+            outcome.appended.is_empty(),
+            "this scripted program never called append_history"
+        );
+    }
+
+    #[test]
+    fn recurring_cleanup_check_still_accepts_when_it_does_append() {
+        // The shape the fifth exemplar demonstrates: cleanup happens,
+        // then — because the count is genuinely anomalous — a short
+        // projection gets appended, not gating the check but visible
+        // in outcome.appended.
+        let tools = (RECURRING_CLEANUP.tools)();
+        let mut source = ScriptedSource::new([
+            "const count = Number((await tools.bash('find /var/log/app -type f -mtime +7 | wc -l')).output.trim()); \
+             await tools.bash('find /var/log/app -type f -mtime +7 -delete'); \
+             say(`rotated out ${count} old log file(s).`); \
+             if (count > 200) { \
+                 append_history(`log rotation found ${count} stale files this week — well above normal, worth checking what's growing /var/log/app.`); \
+             }",
+        ]);
+        let outcome = run(
+            CARD,
+            RECURRING_CLEANUP.user_message,
+            &tools,
+            &mut source,
+            &RunConfig::default(),
+        )
+        .unwrap();
+        (RECURRING_CLEANUP.check)(&outcome, &tools).unwrap();
+        assert_eq!(outcome.appended.len(), 1);
+    }
+
+    #[test]
+    fn recurring_cleanup_check_rejects_never_doing_the_cleanup() {
+        let tools = (RECURRING_CLEANUP.tools)();
+        let mut source = ScriptedSource::new(["say('looked into it');"]);
+        let outcome = run(
+            CARD,
+            RECURRING_CLEANUP.user_message,
+            &tools,
+            &mut source,
+            &RunConfig::default(),
+        )
+        .unwrap();
+        assert!((RECURRING_CLEANUP.check)(&outcome, &tools).is_err());
     }
 
     #[test]

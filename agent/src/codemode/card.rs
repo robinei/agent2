@@ -143,7 +143,7 @@ pub struct Exemplar {
     pub assistant: &'static str,
 }
 
-/// Four demonstrations, each carrying a shape the others can't: a
+/// Five demonstrations, each carrying a shape the others can't: a
 /// tool call with an outcome to branch on; reading real data,
 /// recognizing a genuine ambiguity, `ask()`-ing about it *inline*, and
 /// acting on the answer, all in one program that still ends by
@@ -176,6 +176,22 @@ pub struct Exemplar {
 /// called it. `raise()` had prose in three places and no worked
 /// example anywhere — the one major verb that had never gotten this
 /// treatment until this exemplar.
+///
+/// The fifth is different in kind from the other four: it isn't
+/// fixing an observed live failure, because `append_history`'s
+/// payoff isn't wired to anywhere yet in this standalone harness — no
+/// multi-turn session, no compaction, and (checked directly,
+/// 2026-09-14) not even to a same-run handler; a raised program's own
+/// prior `append_history` calls never reach the completion that
+/// decides its fate. So there was nothing to observe failing. This
+/// exemplar exists to test the other half of that gap on purpose: does
+/// the model reach for `append_history` appropriately — voluntarily,
+/// for a genuinely recurring task, with a short projection rather than
+/// the raw data, and *not* used to read something back the same
+/// turn — once it's shown how, even with the payoff still unbuilt?
+/// `runner::RunOutcome::appended` is the instrument; nothing gates a
+/// task's pass/fail on it, the same observational discipline the
+/// ask/raise and resume/abandon experiments already use.
 pub const SEED_EXEMPLARS: &[Exemplar] = &[
     Exemplar {
         user: "can you check whether the tests pass and let me know?",
@@ -235,6 +251,26 @@ if (a.content === b.content) {
 } else {
     const keep = await raise("conflicting_backups", { a: a.content, b: b.content });
     say(`keeping ${keep}.`);
+}"#,
+    },
+    Exemplar {
+        user: "clean up temp files older than a day in /tmp/build-cache — this cleanup job runs nightly",
+        assistant: r#"//: find what's actually stale, remove it, then check whether tonight's
+//: count is ordinary or worth flagging for whoever looks at this next
+const found = await tools.bash("find /tmp/build-cache -type f -mtime +1 -printf '.' | wc -c");
+const count = Number(found.output.trim()) || 0;
+
+if (count === 0) {
+    say("nothing older than a day — /tmp/build-cache is already clean.");
+} else {
+    await tools.bash("find /tmp/build-cache -type f -mtime +1 -delete");
+    say(`removed ${count} stale file(s).`);
+    if (count > 200) {
+        // a short projection for whoever runs this next — not read
+        // back by me, I'm done; this run's own count is already in
+        // the variable I just used
+        append_history(`/tmp/build-cache had ${count} stale files tonight — well above the usual handful; worth checking what's writing there if it keeps climbing.`);
+    }
 }"#,
     },
 ];
@@ -433,5 +469,35 @@ mod tests {
         // exemplar is held to.
         let raise_at = ex.assistant.find("await raise(").unwrap();
         assert!(ex.assistant[raise_at..].lines().count() > 1);
+    }
+
+    #[test]
+    fn the_fifth_exemplar_uses_append_history_as_a_short_projection() {
+        // append_history's payoff isn't wired anywhere yet (see the
+        // doc comment on SEED_EXEMPLARS) — this exemplar tests only
+        // whether the model reaches for the verb appropriately once
+        // shown how, not whether anything downstream uses it.
+        let ex = &SEED_EXEMPLARS[4];
+        assert!(
+            ex.assistant.contains("append_history("),
+            "the fifth exemplar exists to demonstrate append_history actually \
+             being called, not just described"
+        );
+        // The card's own rule: "never the raw result." The appended
+        // string must be short — a projection, not a dump of the
+        // count() call's own output.
+        let call_start = ex.assistant.find("append_history(").unwrap();
+        let call_end = ex.assistant[call_start..].find(");").unwrap() + call_start;
+        let payload = &ex.assistant[call_start..call_end];
+        assert!(
+            payload.len() < 200,
+            "append_history's payload should be a short projection, not a \
+             dump: {} bytes",
+            payload.len()
+        );
+        // And the card's other rule: not to read something back the
+        // same turn. There is no matching artifact()/read of this
+        // call's own value anywhere in the exemplar.
+        assert!(!ex.assistant.contains("artifact("));
     }
 }

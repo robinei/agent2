@@ -699,6 +699,12 @@ fn codemode_harness_over(tasks: &[codemode::tasks::Task], label: &str) {
         if let Err(reason) = &report.success {
             println!("       reason: {reason}");
         }
+        if !report.appended.is_empty() {
+            println!("       append_history():");
+            for value in &report.appended {
+                println!("         {value}");
+            }
+        }
         for (i, program) in report.programs.iter().enumerate() {
             println!("       --- round {} program ---", i + 1);
             for line in program.lines() {

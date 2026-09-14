@@ -85,6 +85,15 @@ pub struct TaskReport {
     /// why this is scoped to the task's own root run, not aggregated
     /// across however deep a spawn chain went.
     pub spawn_children: usize,
+    /// Every `append_history(value)` call, verbatim — never printed by
+    /// `codemode-harness` before this field existed, despite
+    /// `runner::RunOutcome` capturing it the whole time. Purely
+    /// observational: no check gates on this being non-empty, the same
+    /// discipline `ask`/`raise` and `resume`/`abandon` already use —
+    /// this is what actually lets "did the model reach for it" be
+    /// read back out of a live run instead of only being visible to
+    /// the task's own check function.
+    pub appended: Vec<serde_json::Value>,
 }
 
 /// Run one task live. `card` is the system prompt under test — passed
@@ -141,6 +150,7 @@ pub fn run_task(
             spawn_attempts: outcome.spawn_attempts,
             artifact_attempts: outcome.artifact_attempts,
             spawn_children: outcome.spawn_children,
+            appended: outcome.appended,
         },
         Err(e) => TaskReport {
             task_name: task.name,
@@ -157,6 +167,7 @@ pub fn run_task(
             spawn_attempts: 0,
             artifact_attempts: 0,
             spawn_children: 0,
+            appended: Vec::new(),
         },
     }
 }
