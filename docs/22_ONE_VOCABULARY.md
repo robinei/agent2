@@ -486,26 +486,51 @@ raises: 1 (100% trap, 0 deliberate)
 resume: 1/1, abandon: 0
 ```
 
-**The most important thing this exercise found is a card/tuning
-problem, not a harness bug, and it bears directly on this doc's own
-"ordinary agentic loop" argument.** Observed independently in two
-tasks (`fan-out`, `judgment-in-the-middle`), both otherwise well-
-reasoned: the model writes a "look before you leap" recon-only
-program whose own closing comment says *"next program: do the fix"*
-or *"step 2: fix precisely what's off"* — and then the run simply
-ends, because nothing (no `raise`, no `ask`, no trap) triggers a
-second turn. This is precisely the failure the card already warns
-against by name ("ending a program is not pausing to think... has
-quietly failed to do the task"), and the warning alone isn't reliably
-followed. It is also exactly the gap this doc's "Tail raises" and
-"Verb selection" sections describe from the other side: a model that
-correctly recognizes it should continue but reaches for *nothing* —
-not `raise`, not `fork`, not a second statement in the same
-program — because the card teaches the two-round-trip recon pattern
-without ever showing what closes the loop between rounds. Not fixed
-here; flagged for a deliberate tuning pass on the card and exemplars.
+**The most important thing this exercise found was a card/tuning
+problem, not a harness bug, and it bore directly on this doc's own
+"ordinary agentic loop" argument — fixed and live-verified as a
+follow-on to this run.** Observed independently in two tasks
+(`fan-out`, `judgment-in-the-middle`), both otherwise well-reasoned:
+the model wrote a "look before you leap" recon-only program whose own
+closing comment said *"next program: do the fix"* or *"step 2: fix
+precisely what's off"* — and then the run simply ended, because
+nothing (no `raise`, no `ask`, no trap) triggered a second turn. This
+was precisely the failure the card already warned against by name
+("ending a program is not pausing to think... has quietly failed to
+do the task"), and the warning alone wasn't reliably followed. It was
+also exactly the gap this doc's "Tail raises" and "Verb selection"
+sections describe from the other side: a model that correctly
+recognizes it should continue but reaches for *nothing* — not
+`raise`, not `fork`, not a second statement in the same program —
+because the card taught the two-round-trip recon pattern without ever
+showing what closes the loop between rounds.
 
-**Also flagged, not fixed:** `fan-out`'s own success check can be
+**Fix** (`122f3dd`): the card's existing "ending is not pausing" prose
+was sharpened to name the exact symptom (a closing `//: next, I'll...`
+comment) at the point where the seductive "look before you leap"
+advice appears, and named `fork()` as the actual mechanism for a
+genuine second step. A third worked exemplar was added (read two
+logs, judge which is failing, all in one program) — the same lever
+that fixed the `ask()`-inline gap in the earlier tuning round
+(`9c794e9`/`3a95b91`), since prose alone hadn't held either time.
+Live-verified immediately: `fan-out` and `judgment-in-the-middle` both
+finished their judgment inline on the first try post-fix, no more
+recon-then-stop — one run's plan comment echoed the card almost
+verbatim ("the comparison/reporting happens in this same program, not
+a deferred step"). Two more full runs after landing: **5/5, 1.4 mean
+round-trips, 1 raise (trap, abandoned — unrelated to the recon
+pattern) — the first clean sweep across the whole set.**
+
+The fix also surfaced a third `ask()` reply-format shape (key=value
+pairs) the adaptive fixture didn't cover, fixed in `2e7bca4` the same
+way as the prior two gaps. Worth naming as a pattern rather than
+dismissing as fixture churn: **each card/behavior fix pushes programs
+further into the fixture than the recon-only ones that stopped short
+ever reached, which is itself confirmation the fixes are changing real
+behavior, not adding noise.** A harness whose fixture gaps keep
+surfacing in that direction is measuring something real.
+
+**Still flagged, not fixed:** `fan-out`'s own success check can be
 satisfied by a program that dumps raw file content without
 characterizing anything as "interesting" — a real check-strictness
 gap, left as a finding rather than patched under time pressure (which
@@ -516,15 +541,11 @@ do).
 
 0. ~~A fifth fixed task, shaped to need `raise()`/`resume()`~~ —
    **landed** (`84760a7`) and run clean; see "Live numbers" above.
-0b. **A card/exemplar tuning pass for the recon-then-act gap**: two of
-   five live tasks wrote a correctly-reasoned recon-only program, said
-   in their own closing comment what the next program would do, then
-   simply ended with nothing to trigger a second turn — the exact
-   failure the card already names ("ending a program is not pausing to
-   think") but doesn't reliably prevent. Not a harness bug; the fix is
-   in the card's own words or its exemplars, likely a worked example of
-   a recon program handing off (`fork`, per this doc's own recommended
-   default) rather than ending silently.
+0b. ~~A card/exemplar tuning pass for the recon-then-act gap~~ —
+   **fixed and live-verified** (`122f3dd`, `2e7bca4`): see "Live
+   numbers" above. 5/5 clean sweep after the fix; the fixture-shape
+   whack-a-mole it triggered is discussed there too, as confirming
+   evidence rather than noise.
 1. Card renders its tool list from `ToolRegistry` (today `card.rs`
    ends with "Tools available in this session:" and nothing appends
    them — no caller passes a registry) and its worked exemplar's
