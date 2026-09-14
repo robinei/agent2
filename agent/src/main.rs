@@ -42,7 +42,12 @@ const USAGE: &str = "usage: agent <command>
                                     live, end to end, and reports median
                                     program length, round-trips, and success
                                     per task. Needs DEEPSEEK_API_KEY. Not part
-                                    of `cargo test` — talks to a real model.";
+                                    of `cargo test` — talks to a real model.
+  codemode-experiment               Same reporting, over
+                                    codemode::tasks::EXPERIMENTAL instead —
+                                    targeted, one-off validation tasks, not
+                                    the stable regression set. Needs
+                                    DEEPSEEK_API_KEY.";
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -66,6 +71,9 @@ fn main() {
         }
         Some("codemode-harness") => {
             codemode_harness();
+        }
+        Some("codemode-experiment") => {
+            codemode_experiment();
         }
         Some("session") => {
             let mut headless = false;
@@ -608,12 +616,15 @@ fn codemode_probe(task: &str) {
     }
 }
 
-/// Part H's regression harness: `codemode::tasks::ALL`, run live and
-/// end to end (`codemode::harness::run_task`), reporting the three
-/// numbers Part H asks for — no more, until one fails to answer a
-/// question (Part H's own second bullet).
-fn codemode_harness() {
-    use codemode::{card, harness, tasks};
+/// Part H's regression harness: `codemode::tasks::ALL` by default, run
+/// live and end to end (`codemode::harness::run_task`), reporting the
+/// three numbers Part H asks for — no more, until one fails to answer
+/// a question (Part H's own second bullet). `tasks`/`label` let the
+/// `codemode-experiment` subcommand reuse this exact reporting for
+/// `codemode::tasks::EXPERIMENTAL` — targeted, one-off validation
+/// tasks that don't belong in the stable regression set.
+fn codemode_harness_over(tasks: &[codemode::tasks::Task], label: &str) {
+    use codemode::{card, harness};
 
     let api_key = std::env::var("DEEPSEEK_API_KEY")
         .expect("DEEPSEEK_API_KEY must be set (this harness reads it directly)");
@@ -634,12 +645,9 @@ fn codemode_harness() {
     let mut total_artifact_attempts = 0usize;
     let mut total_spawn_children = 0usize;
 
-    println!(
-        "=== Part H harness: {} tasks, model {model} ===\n",
-        tasks::ALL.len()
-    );
+    println!("=== {label}: {} tasks, model {model} ===\n", tasks.len());
 
-    for task in tasks::ALL {
+    for task in tasks {
         // A fresh id per task, not one for the whole harness run:
         // `Endpoint::session_id`'s own doc is explicit that it's for
         // "one conversation" and "a caller making unrelated one-off
@@ -725,8 +733,8 @@ fn codemode_harness() {
     println!("\n=== aggregate ===");
     println!(
         "task success: {successes}/{} ({:.0}%)",
-        tasks::ALL.len(),
-        100.0 * successes as f64 / tasks::ALL.len() as f64
+        tasks.len(),
+        100.0 * successes as f64 / tasks.len() as f64
     );
     println!("mean round-trips per task: {avg_round_trips:.1}");
     match median_len {
@@ -771,6 +779,17 @@ fn codemode_harness() {
         "spawn: {total_spawn_attempts} attempt(s), {total_spawn_children} ran a real child \
          to completion — backed for real, not a stub"
     );
+}
+
+fn codemode_harness() {
+    codemode_harness_over(codemode::tasks::ALL, "Part H harness");
+}
+
+/// `codemode::tasks::EXPERIMENTAL` — targeted, one-off validation
+/// tasks (see each task's own doc comment for what question it
+/// answers), run on demand rather than every harness pass.
+fn codemode_experiment() {
+    codemode_harness_over(codemode::tasks::EXPERIMENTAL, "experimental");
 }
 
 /// One-line rendering of a logged call for the headless printer.
