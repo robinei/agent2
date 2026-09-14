@@ -961,4 +961,164 @@ mod tests {
         assert_eq!(tailed.messages.last().unwrap().role, ChatRole::User);
         assert_eq!(tailed.messages.last().unwrap().content, "condition report");
     }
+
+    /// Total content bytes across every message — the thing that
+    /// scales (or doesn't) with history, independent of role.
+    fn doc_bytes(doc: &Document) -> usize {
+        doc.messages.iter().map(|m| m.content.len()).sum()
+    }
+
+    /// A realistic single (user request -> program -> effects) turn,
+    /// at deterministic ids starting from `base` — three log entries,
+    /// ~350 bytes rendered, standing in for one real exchange so a log
+    /// of N of these approximates N turns of an actual session rather
+    /// than a synthetic single long string.
+    fn synthetic_turn(base: u64) -> Vec<(EntryId, Entry)> {
+        vec![
+            (
+                id(base),
+                Entry::Message {
+                    from: "user".into(),
+                    text: "next: check the retry budget in ops/config.json and bump it \
+                           if it's below the new floor we agreed on"
+                        .into(),
+                },
+            ),
+            (
+                id(base + 1),
+                Entry::Program {
+                    source: "const { content } = await tools.read_file(\"ops/config.json\");\n\
+                             const cfg = JSON.parse(content);\n\
+                             if (cfg.retries < 5) {\n  \
+                               cfg.retries = 5;\n  \
+                               await tools.write_file(\"ops/config.json\", JSON.stringify(cfg, null, 2));\n  \
+                               say(`bumped retries from ${cfg.retries} to 5`);\n\
+                             } else {\n  \
+                               say(`retries already at ${cfg.retries}, no change needed`);\n\
+                             }"
+                        .into(),
+                    outcome: ProgramOutcome::Completed,
+                },
+            ),
+            (
+                id(base + 2),
+                Entry::Effects {
+                    of: id(base + 1),
+                    wrote: vec!["ops/config.json".into()],
+                    ran: vec![],
+                    read: 1,
+                    spawned: vec![],
+                },
+            ),
+        ]
+    }
+
+    /// **Measures, rather than asserts, the open question docs/22
+    /// carries forward** ("the card's `spawn`-is-cheap /
+    /// `fork`-is-expensive framing is likely backwards under prompt
+    /// caching ... needs measuring on the harness, not asserting
+    /// either way"). No live model needed — the claim is entirely
+    /// about what `document::render` produces, which is exactly what
+    /// this module owns.
+    ///
+    /// What this settles: **total rendered document size** — what the
+    /// model actually attends to this request, cache or no cache —
+    /// grows with `fork`'s inherited history and stays flat for
+    /// `spawn`'s fresh one. A fork call after N turns sends
+    /// approximately the parent's whole document (all of the history
+    /// below) plus its own small kickoff message; a spawn call sends
+    /// the card plus a charter, regardless of how long the parent's
+    /// conversation has grown. The card's original framing —
+    /// `spawn()` "nearly free," `fork()` a real cost because it
+    /// "inherits everything you know" — holds on this axis.
+    ///
+    /// What this does **not** settle, and the open item's caching
+    /// framing was reaching for a different, narrower axis: the
+    /// **marginal newly-billed** tokens a cache-aware provider charges
+    /// full price for. If the card is a byte-identical constant
+    /// shared by every agent in a session (it is —
+    /// `codemode::card::CARD`), a provider whose cache is keyed on raw
+    /// prefix bytes rather than session identity would treat `spawn`'s
+    /// system-prompt prefix as a cache hit too, once any other agent
+    /// has been created — so on *that* narrower axis fork and spawn
+    /// can be comparable, both dominated by their own small kickoff
+    /// text. That is a real, separate, and still-untested claim (it
+    /// depends on the provider's cache-key behavior, not on anything
+    /// `document::render` decides) — this test does not exercise it,
+    /// and the card's economics paragraph should not claim it either
+    /// without measuring the provider directly. What is unambiguous,
+    /// and settled here: total prompt size is not the axis on which
+    /// fork looks cheap.
+    #[test]
+    fn fork_inherits_and_grows_with_history_while_spawn_stays_flat() {
+        let card = "CARD";
+        // A `spawn`'s first document: nothing inherited, just its own
+        // kickoff — the charter — as the one open turn.
+        let spawn_only_log = vec![(
+            id(9_000),
+            Entry::Message {
+                from: "user".into(),
+                text: "review the diff on this branch for correctness bugs before merge".into(),
+            },
+        )];
+        let spawn_bytes = doc_bytes(&render(card, &spawn_only_log).unwrap());
+
+        let mut history: Vec<(EntryId, Entry)> = Vec::new();
+        let mut fork_bytes_by_turns = Vec::new();
+        for turns in [1usize, 5, 15] {
+            while history.len() < turns * 3 {
+                let base = 1 + history.len() as u64;
+                history.extend(synthetic_turn(base));
+            }
+            // A `fork`'s first document: the parent's entire history
+            // so far, plus its own kickoff appended as one more open
+            // message — modeled the same way `runner.rs`'s handler
+            // tail appends to an existing document, since a fork's
+            // kickoff is exactly a `Message` landing on the inherited
+            // log, not a fresh render.
+            let mut forked_log = history.clone();
+            forked_log.push((
+                id(90_000 + turns as u64),
+                Entry::Message {
+                    from: "user".into(),
+                    text: "review the diff on this branch for correctness bugs before merge".into(),
+                },
+            ));
+            let bytes = doc_bytes(&render(card, &forked_log).unwrap());
+            fork_bytes_by_turns.push((turns, bytes));
+        }
+
+        // Spawn's document is the same size regardless of how long
+        // the (unrelated, un-inherited) parent conversation has grown
+        // — it never even sees `history`.
+        assert_eq!(
+            doc_bytes(&render(card, &spawn_only_log).unwrap()),
+            spawn_bytes
+        );
+
+        // Fork's document strictly grows with history, and every
+        // measured depth is already larger than spawn's constant —
+        // the gap widens, it never closes.
+        let mut prev = 0;
+        for &(turns, bytes) in &fork_bytes_by_turns {
+            assert!(
+                bytes > prev,
+                "fork's document at {turns} turns ({bytes}B) should exceed the \
+                 previous depth ({prev}B) — it must grow monotonically with history"
+            );
+            assert!(
+                bytes > spawn_bytes,
+                "fork's document at {turns} turns ({bytes}B) should already exceed \
+                 spawn's constant {spawn_bytes}B"
+            );
+            prev = bytes;
+        }
+
+        // Concrete numbers for a human reading test output — this is
+        // a measurement as much as an assertion (`cargo test -- --nocapture`).
+        println!(
+            "spawn (fresh, any history depth): {spawn_bytes}B\n\
+             fork by history depth: {fork_bytes_by_turns:?}"
+        );
+    }
 }

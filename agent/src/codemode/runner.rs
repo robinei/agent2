@@ -726,6 +726,66 @@ mod tests {
         )
         .unwrap();
         assert!(outcome.transcript[0].text.starts_with("no spawn:"));
+        // Reach, not success (module doc on `Attempts`): the stub
+        // rejects it, but the harness must still know the model asked.
+        assert_eq!(outcome.spawn_attempts, 1);
+        assert_eq!(outcome.fork_attempts, 0);
+        assert_eq!(outcome.artifact_attempts, 0);
+    }
+
+    #[test]
+    fn fork_is_rejected_and_catchable_not_a_crash() {
+        let mut source = ScriptedSource::new(["try { await fork(); say('forked'); } \
+             catch (e) { say('no fork: ' + e.message); }"]);
+        let outcome = run(
+            CARD,
+            "go",
+            &TestTools::default(),
+            &mut source,
+            &RunConfig::default(),
+        )
+        .unwrap();
+        assert!(outcome.transcript[0].text.starts_with("no fork:"));
+        assert_eq!(outcome.fork_attempts, 1);
+        assert_eq!(outcome.spawn_attempts, 0);
+    }
+
+    #[test]
+    fn artifact_is_rejected_and_catchable_not_a_crash() {
+        let mut source = ScriptedSource::new(["try { await artifact(1); say('fetched'); } \
+             catch (e) { say('no artifact: ' + e.message); }"]);
+        let outcome = run(
+            CARD,
+            "go",
+            &TestTools::default(),
+            &mut source,
+            &RunConfig::default(),
+        )
+        .unwrap();
+        assert!(outcome.transcript[0].text.starts_with("no artifact:"));
+        assert_eq!(outcome.artifact_attempts, 1);
+    }
+
+    #[test]
+    fn attempt_counts_accumulate_across_repeated_calls_in_one_program() {
+        // A model that keeps reaching for the same refused verb should
+        // show up as more than one attempt — this is a count, not a
+        // "did it happen at all" flag.
+        let mut source = ScriptedSource::new(["try { await fork(); } catch (e) {}\n\
+             try { await fork(); } catch (e) {}\n\
+             try { await spawn('x'); } catch (e) {}\n\
+             say('done');"]);
+        let outcome = run(
+            CARD,
+            "go",
+            &TestTools::default(),
+            &mut source,
+            &RunConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(outcome.fork_attempts, 2);
+        assert_eq!(outcome.spawn_attempts, 1);
+        assert_eq!(outcome.artifact_attempts, 0);
     }
 
     #[test]
@@ -745,6 +805,85 @@ mod tests {
         assert_eq!(outcome.transcript[0].text, "got 42");
         assert_eq!(outcome.raise_count, 1);
         assert_eq!(outcome.completions_used, 2);
+        assert_eq!(outcome.resume_count, 1);
+        assert_eq!(outcome.abandon_count, 0);
+        // The resumed program's very next act is `say(...)` — a call —
+        // so this is exactly the case `handover_count` must NOT count:
+        // the resumed value was used for real work, not just carried
+        // straight out.
+        assert_eq!(
+            outcome.handover_count, 0,
+            "a say() after resume is real work, not a handover"
+        );
+    }
+
+    #[test]
+    fn resume_that_flows_straight_to_completion_is_a_handover() {
+        // The case `handover_count` exists to catch: nothing at all
+        // happens between `resume(v)` landing and the program ending —
+        // the resumed value is carried straight out, no further call.
+        let mut source = ScriptedSource::new([
+            "const x = raise('need_a_value'); return x;",
+            "return resume(42);",
+        ]);
+        let outcome = run(
+            CARD,
+            "go",
+            &TestTools::default(),
+            &mut source,
+            &RunConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(outcome.raise_count, 1);
+        assert_eq!(outcome.resume_count, 1);
+        assert_eq!(outcome.handover_count, 1);
+        assert_eq!(outcome.abandon_count, 0);
+    }
+
+    #[test]
+    fn resume_that_makes_another_tool_call_is_not_a_handover() {
+        // Same shape as the plain handover case, except the resumed
+        // frame does one more `tools.*` call before finishing — real
+        // orchestration work, so it must not count.
+        let mut source = ScriptedSource::new([
+            "const x = raise('need_a_value'); \
+             const r = await tools.echo(x); return r;",
+            "return resume(42);",
+        ]);
+        let outcome = run(
+            CARD,
+            "go",
+            &TestTools::default().with("echo", Ok(serde_json::json!("42-echoed"))),
+            &mut source,
+            &RunConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(outcome.resume_count, 1);
+        assert_eq!(outcome.handover_count, 0);
+    }
+
+    #[test]
+    fn a_resumable_trap_that_flows_straight_to_completion_is_also_a_handover() {
+        // `handover_count` is defined over `resume()`, not over
+        // `raise()` specifically — a resumed trap that does no further
+        // work is exactly as much a handover as a resumed `raise()`.
+        // This is the shape the live harness run actually hit: both of
+        // its raises were traps.
+        let mut source = ScriptedSource::new([
+            "const x = [].nonExistentMethod(); return x + 1;",
+            "return resume(4);",
+        ]);
+        let outcome = run(
+            CARD,
+            "go",
+            &TestTools::default(),
+            &mut source,
+            &RunConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(outcome.raise_count, 1);
+        assert_eq!(outcome.resume_count, 1);
+        assert_eq!(outcome.handover_count, 1);
     }
 
     #[test]
@@ -768,6 +907,9 @@ mod tests {
         // nothing about the replacement resumes it.
         assert_eq!(outcome.transcript.last().unwrap().text, "replacement ran");
         assert_eq!(outcome.completions_used, 3);
+        assert_eq!(outcome.abandon_count, 1);
+        assert_eq!(outcome.resume_count, 0);
+        assert_eq!(outcome.handover_count, 0);
     }
 
     #[test]
@@ -786,6 +928,8 @@ mod tests {
         .unwrap();
         assert_eq!(outcome.transcript[0].text, "recovered: 0");
         assert_eq!(outcome.raise_count, 1);
+        assert_eq!(outcome.resume_count, 1);
+        assert_eq!(outcome.handover_count, 0, "say() after resume intervenes");
     }
 
     #[test]
@@ -806,6 +950,21 @@ mod tests {
         assert_eq!(outcome.transcript[0].text, "outer got 101");
         assert_eq!(outcome.raise_count, 2);
         assert_eq!(outcome.completions_used, 3);
+        assert_eq!(outcome.resume_count, 2);
+        // Only the *inner* resume is a handover: the middle program's
+        // entire continuation after `resume(100)` lands is
+        // `return resume(y + 1);` — a pure computation forwarding a
+        // decision, no call. The outer resume is not: `say(...)`
+        // intervenes before the root program ends. This is the sharp
+        // edge of the proxy worth having pinned down explicitly —
+        // "forwarding a decision through a pure computation" and
+        // "a handler doing real work with no more suspension" both
+        // read as `handover_count` hits, because neither issues a call
+        // between resume and Done. The counter cannot tell them apart;
+        // only that a call did or didn't happen. See docs/22's
+        // "Handover vs. deliberation detection" open item — this test
+        // is the concrete case that open item is about.
+        assert_eq!(outcome.handover_count, 1);
     }
 
     #[test]
