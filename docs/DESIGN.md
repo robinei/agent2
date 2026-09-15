@@ -377,3 +377,36 @@ side of this project is judged; the **conformance corpus** (`15_COMPAT.md`)
 is how the *language* side is judged. The debugger TUI (9_TUI) is the
 observation instrument for both: attached mode *is* the harness frontend,
 and the report iterates against live transcripts watched there.
+
+### How M5 gets run, so it stops being deferred
+
+M5 has been named and postponed repeatedly. It is the measurement most
+likely to be unflattering, which is exactly why the method belongs here
+in advance rather than being designed at the moment it is needed.
+
+**The baseline is a third-party coding agent on the same model**, not a
+tool-calling loop written here. Building our own control invites
+building a weak one, and neither the author nor the reader could tell
+whether that had happened. Same weights, same provider, same tasks, an
+implementation nobody here is invested in defending.
+
+**The tasks must not all be code-mode-shaped.** The current five were
+designed for this harness, and `fan-out` — three parallel reads — is a
+loop in one program and three round trips in a tool loop. That is a
+real advantage and the most flattering possible framing of it. A fair
+comparison needs tasks weighted the other way: heavy on judgement
+*between* steps, where a tool loop's per-step reasoning is an asset
+rather than a tax. If code mode still wins there, the number means
+something.
+
+**Those tasks double as the held-out set.** The card has been tuned
+against the fixed five while watching their pass rate, which is
+overfitting however careful the checks are — the discipline that a
+check never gates on which verb fired does not protect against
+rewriting card prose while watching a task shaped for that prose.
+Tasks authored for the comparison are written to a different criterion
+and never used for tuning, which is what makes them a real holdout.
+
+**Report round trips per task and task success, per agent.** Not
+program length — that is not a thing the baseline has, and a metric
+only one side can post is not a comparison.
