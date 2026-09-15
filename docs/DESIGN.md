@@ -345,6 +345,29 @@ observed behaviour:
   is one assistant message and roles strictly alternate, is precisely
   the irrelevant kind of correctness.
 
+**Examples outrank prose, and it is not close.** Measured 2026-09-16 on
+one behaviour — a program that reports what it found and stops, leaving
+the task undone. Three card revisions argued against it in increasingly
+explicit terms, ending with "there are two ways to stop and only one of
+them continues"; the next run stopped anyway. **One exemplar** showing a
+long enumerate-mutate-verify program that tells the user five times and
+keeps going produced the shape immediately.
+
+The likely reason is worth keeping in view when teaching anything here:
+the competing behaviour is not ignorance, it is a prior. In a
+chat-tuned model, saying something to the user *is* how a turn ends, so
+a reporting `tell()` fires "I have responded, I am done" — which is
+`20_CODE_MODE.md`'s founding complaint reappearing inside a program
+rather than across programs. Prose asks the model to believe something;
+an exemplar shows it a turn where the belief was already acted on. The
+second wins against a prior.
+
+So: when a behaviour resists explanation, stop explaining it and show
+it. And keep the exemplar set spanning task *shapes* rather than
+accumulating by topic — a shape with no exemplar gets the default
+behaviour whatever the prose says, which is the overfitting risk in
+"How M5 gets run" from the other side.
+
 And behaviour outranks reasoning about behaviour. The card was wrong
 about `//:` for months on an argument that sounded good; two exemplars
 shipped traps because they were written from a doc rather than from
