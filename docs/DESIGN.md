@@ -310,6 +310,61 @@ nondeterministic builtin is freely compatible: nothing ever retraces a
 previous execution, so there is no trace for it to make diverge. This
 *shrinks* what compat must honor rather than enlarging it.
 
+## Confinement, not permission
+
+**The harness confines the process; it does not gate the call.** An
+agent runs inside a sandbox — `bwrap`, with its working directory bound
+read-write, a tmpfs everywhere else, and no network beyond what it is
+given — and inside that boundary its tools are unrestricted. There is
+no allowlist of permitted commands, no per-call confirmation prompt, no
+"this looks dangerous" interstitial, and no `effectful` flag on a tool
+definition.
+
+This is a single decision with a lot of consequences, so it is worth
+stating why rather than only what.
+
+**Permission gating does not survive code mode.** The unit a
+permission prompt is built for is one tool call, reviewed before it
+runs. Here the unit is a *program*: a hundred statements, branching on
+results the reviewer cannot see yet, whose interesting calls are
+constructed at runtime. Asking a human to approve that call-by-call
+either interrupts constantly — reintroducing exactly the per-step round
+trip this whole design exists to remove — or degrades into approving
+the program wholesale, which is confinement with extra steps and worse
+ergonomics.
+
+**It is also the honest boundary.** A call-site check asks "is this
+command dangerous?", which is undecidable in general and a guess in
+practice. A process boundary asks "what can this process reach?",
+which is a fact. The blast radius is a property of the sandbox, not of
+anyone's judgment about a string.
+
+**And it keeps the harness out of the model's decisions.** `8_HARNESS`
+once carried an `effectful` flag and a warning rendered into the
+report; both were removed, and the test `menu_has_no_effectful_warning`
+exists to keep them removed. Confinement is the generalisation of that
+removal: the harness decides *where* a program may act, and the model
+decides *what to do there* — including, as `22_ONE_VOCABULARY.md`'s
+"when to ask" says, stopping to ask a person before something
+irreversible. That judgment stays in the program, where it can be
+measured, rather than in a dialog the harness raises on the model's
+behalf.
+
+The eval inherits this directly, and the inheritance is the point:
+tasks run real tools against real files inside a real sandbox, so the
+only thing it simulates is the **absent human**. A fixture that fakes
+a tool cannot represent two semantically different commands, and has
+already produced a false *proceed* — a query returning unexpected text
+parsed as zero rows, skipping a safety gate the model had written for
+itself. A sandbox cannot lie that way.
+
+Two obligations follow. Sandboxing must be **self-enforcing** — a
+harness that relies on being launched correctly hands an unsandboxed
+shell to a live model the first time someone forgets. And eval tasks
+must need **nothing exotic**: a shell, coreutils, and real files. A
+task that needs a database daemon is a task that will be run outside
+the sandbox eventually.
+
 ## Product surface
 
 The condition report (8_HARNESS Step 4) is where the harness thesis succeeds
