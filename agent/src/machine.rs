@@ -11,8 +11,8 @@
 //! **The one substitution this file makes** (23_ONE_AGENT.md, "What is
 //! actually changing"): the model's entire turn used to be `Turn {
 //! text, tool_calls: [run_program|resume|answer] }`, chosen off three
-//! tool schemas offered on every request and policed by
-//! `Runner::eligible`. Now the model's entire turn **is** a program —
+//! tool schemas offered on every request and policed by a per-restart
+//! validity check on the `Runner`. Now the model's entire turn **is** a program —
 //! `Turn { source }`, bare — and there is nothing to choose among:
 //! every turn compiles and runs. A restart of a suspended run is no
 //! longer a distinguished tool call either; it is a direct,
@@ -117,6 +117,14 @@ const INTERRUPT_NOTICE: &str = "The user interrupted your program. It is paused 
 /// pathological program could chain those forever.
 const MAX_PUMP_ROUNDS: usize = 100;
 
+/// A fixed budget for tests calling [`Runner::document`]/
+/// [`Runner::render_messages_for_test`] — no production budget lives on
+/// `Runner` anymore (`document::render`'s own doc comment: it is
+/// per-agent, host-tracked configuration, supplied by the caller). Tests
+/// here don't track one either, so they need a stand-in.
+#[cfg(test)]
+const TEST_BUDGET: usize = 64 * 1024;
+
 pub enum StepInput {
     /// The assistant's turn (logged with its author; the program is
     /// compiled and run).
@@ -192,6 +200,16 @@ pub enum StepOutput {
 pub struct LlmTurn {
     pub source: String,
     pub thinking: Option<String>,
+    /// Set by the transport (`host/deepseek.rs`, off the SSE
+    /// `finish_reason`) when this completion was cut off by the token
+    /// budget mid-program. Detection lives there; **enforcement lives
+    /// here** (`apply_turn`), because only this file has the VM-stack
+    /// context to log `Cause::Truncated` with a `Disposition` at the
+    /// same time it decides whether to touch a suspended run. Per
+    /// `Cause::Truncated`'s own doc in `types.rs`: never compile a
+    /// truncated completion — checked before `interp::compile`, not
+    /// after.
+    pub truncated: bool,
 }
 
 /// A rendered request's **ephemeral** half only. Under code mode the
@@ -470,19 +488,21 @@ impl Runner {
     ///
     /// > Prompt iff the branch holds no VM and there is a rendered
     /// > `Message` other than a `Turn` with id > `shown` — or the newest
-    /// > `Turn`'s run has an outcome that has not yet been reported.
+    /// > `Turn`'s run has an outcome that has not been shown yet.
     ///
     /// - Every request has a **cause event**. The LLM is never prompted
     ///   "just because", and never twice for the same thing: `shown`
     ///   advances at each render.
-    /// - `finish_program`/`suspend`/a `CompileFailed` handback all log
-    ///   the harness's report as an ordinary `Post` from `Author::Harness`
-    ///   (23_ONE_AGENT.md A4: "the harness's reply is a Post, not a
-    ///   distinguished reply kind") and then render *unconditionally* —
-    ///   so in the overwhelming common case this rule's unseen-post
-    ///   clause alone already covers "a run just finished". The
-    ///   crash-recovery clause below only matters for the narrow window
-    ///   between logging a run's outcome and logging its report.
+    /// - `finish_program`/`suspend`/a `CompileFailed`/`Truncated`
+    ///   handback each render *unconditionally* (bypassing this rule
+    ///   entirely) rather than going through it, so this rule's own
+    ///   outcome clause only ever matters for **reconciliation** — a
+    ///   freshly reconstructed `Runner` (`with_spine`) starts `shown` at
+    ///   its leaf, i.e. "everything already shown", which is wrong for a
+    ///   branch a crash caught between logging an outcome and the
+    ///   `render_request` call right after it. `document.rs::render`
+    ///   derives the report straight off the `Return`/`Condition` event
+    ///   at render time — there is no second logged event to check for.
     ///
     /// There is no interactive/autonomous split here, deliberately: this
     /// design already deleted one such flag (`is_root`), and a mode would
@@ -498,16 +518,15 @@ impl Runner {
         // Any unseen `Post` is a cause — including one that arrived
         // during a generation, which the turn that just landed could not
         // have answered (its binding was fixed at `shown`), and including
-        // a tell, which owes no answer but must still be seen. The
-        // harness's own report `Post` is exactly this case too.
+        // a tell, which owes no answer but must still be seen.
         if !self.unseen_posts(tree).is_empty() {
             return true;
         }
-        // The crash-recovery clause: an outcome (`Return`/`Condition`)
-        // logged with no report `Post` after it means the process died
-        // in the narrow window between the two — `finish_program`'s and
-        // `suspend`'s own two appends are not atomic.
-        self.last_turn_report_pending(tree).is_some()
+        // The crash-recovery clause, `shown`-guarded like everything
+        // else this rule checks: a genuinely new (unseen) outcome on the
+        // most recent `Turn` is a cause even with no `Post` to find.
+        self.last_turn_outcome(tree)
+            .is_some_and(|id| id.as_u64() > self.shown)
     }
 
     /// Posts logged on this branch that its LLM has not been shown — the
@@ -522,33 +541,27 @@ impl Runner {
             .collect()
     }
 
-    /// The most recent `Turn` on this path whose run has an outcome
-    /// (`Return`/`Condition`) but no harness report `Post` after it —
-    /// the narrow crash window `needs_prompt` and `unrendered_cause`
-    /// both need, now that the report is an ordinary logged message
-    /// rather than something rebuilt fresh on every render.
-    fn last_turn_report_pending(&self, tree: &Tree) -> Option<EventId> {
+    /// The most recent `Turn` on this path whose run has logged an
+    /// outcome (`Return`/`Condition`) — regardless of `shown`. The two
+    /// callers differ only in whether they apply that guard themselves:
+    /// `needs_prompt` does (an already-shown outcome is not a fresh
+    /// cause), `unrendered_cause` deliberately does not (reconciliation
+    /// needs the fact independent of a `shown` a crash may have left
+    /// pointing past it).
+    fn last_turn_outcome(&self, tree: &Tree) -> Option<EventId> {
         let segment = self.agent_segment(tree);
         let at = segment
             .iter()
             .rposition(|e| matches!(e.payload, EventPayload::Message(Message::Turn { .. })))?;
-        let rest = &segment[at + 1..];
-        let outcome_at = rest.iter().position(|e| {
-            matches!(
-                e.payload,
-                EventPayload::Return { .. } | EventPayload::Condition { .. }
-            )
-        })?;
-        let reported = rest[outcome_at + 1..].iter().any(|e| {
-            matches!(
-                &e.payload,
-                EventPayload::Message(Message::Post {
-                    from: Author::Harness,
-                    ..
-                })
-            )
-        });
-        (!reported).then_some(segment[at].id)
+        segment[at + 1..]
+            .iter()
+            .any(|e| {
+                matches!(
+                    e.payload,
+                    EventPayload::Return { .. } | EventPayload::Condition { .. }
+                )
+            })
+            .then_some(segment[at].id)
     }
 
     /// **Reconciliation's half of the trigger rule**: forget having shown
@@ -566,13 +579,13 @@ impl Runner {
 
     /// The earliest event on this branch the trigger rule would call a
     /// cause, **ignoring `shown`** — what reconciliation lowers the mark
-    /// to when a crash swallowed the report a run's outcome was owed.
+    /// to when a crash swallowed the request a run's outcome was owed.
     ///
     /// Two, matching the table's two prompting rows: a post this branch
-    /// owes an answer to, and a run whose report was never logged.
+    /// owes an answer to, and a run whose outcome was never rendered.
     pub fn unrendered_cause(&self, tree: &Tree) -> Option<EventId> {
         let owed = self.open().first().copied();
-        let unreported = self.last_turn_report_pending(tree);
+        let unreported = self.last_turn_outcome(tree);
         match (owed, unreported) {
             (Some(a), Some(b)) => Some(if a.as_u64() <= b.as_u64() { a } else { b }),
             (a, b) => a.or(b),
@@ -650,7 +663,7 @@ impl Runner {
         match input {
             StepInput::LlmResponse(turn) => {
                 let author = Author::Agent(self.agent_id());
-                self.apply_turn(tree, turn.source, turn.thinking, author)
+                self.apply_turn(tree, turn.source, turn.thinking, turn.truncated, author)
             }
             StepInput::ToolResults(batch) => self.on_tool_results(tree, batch),
             StepInput::Tick { fuel } => self.on_tick(tree, fuel),
@@ -763,7 +776,7 @@ impl Runner {
     /// `resume(...)`/`answer(...)` expression (`v` and the answer
     /// gesture), matching `Message::Turn`'s own doc in `types.rs`.
     pub fn take_turn(&mut self, tree: &mut Tree, source: String) -> io::Result<Vec<StepOutput>> {
-        self.apply_turn(tree, source, None, Author::User)
+        self.apply_turn(tree, source, None, false, Author::User)
     }
 
     /// Log one turn — the whole of what the branch itself just said —
@@ -782,6 +795,7 @@ impl Runner {
         tree: &mut Tree,
         source: String,
         thinking: Option<String>,
+        truncated: bool,
         author: Author,
     ) -> io::Result<Vec<StepOutput>> {
         let message = Message::Turn {
@@ -790,6 +804,31 @@ impl Runner {
             thinking,
         };
         let assistant_id = tree.append(&mut self.spine, EventPayload::Message(message))?;
+
+        if truncated {
+            // **Never compile a truncated completion** (`Cause::Truncated`'s
+            // own doc in `types.rs`): cut off wherever the token budget ran
+            // out, it may still parse and run — half-written, on a program
+            // the model never actually finished emitting — which is
+            // strictly worse than a clean compile failure the repair loop
+            // can see and retry. `host/deepseek.rs` only *detects* this
+            // (off the SSE `finish_reason`); this is where detection
+            // becomes an enforced, logged outcome, checked before
+            // `start_program`/`compile` ever sees the text. Whatever was
+            // previously suspended is untouched, same as a `CompileFailed`
+            // handback — no VM ran here either.
+            tree.append(
+                &mut self.spine,
+                EventPayload::Condition {
+                    cause: Cause::Truncated,
+                    site: 0,
+                    stack: Vec::new(),
+                    disposition: Disposition::Pushed,
+                },
+            )?;
+            self.phase = Phase::AwaitingLlm;
+            return Ok(vec![self.render_request(tree)]);
+        }
 
         match self.start_program(tree, assistant_id, &source) {
             Ok(run) => {
@@ -808,10 +847,16 @@ impl Runner {
                 // was built, so this run has no console and no
                 // artifacts, and whatever was previously suspended is
                 // untouched (still there to resume once the model fixes
-                // its program). The repair loop is unchanged; only where
-                // the text lives has moved (a logged `Post`, not a tool
-                // result).
-                let outcome = tree.append(
+                // its program). This is also A5's (`host/mod.rs`) terminal
+                // case: its own `Session::on_llm_response` repair loop
+                // pre-checks `interp::compile` and re-asks up to
+                // `MAX_REPAIR_ATTEMPTS` times with the diagnostic appended
+                // *before* a source ever reaches here; once exhausted it
+                // falls through to `step_branch`, and this is the real,
+                // logged `Cause::CompileFailed` that produces. `document.rs`
+                // renders it straight off the `Condition` event (no
+                // separate "tool result" text to build).
+                tree.append(
                     &mut self.spine,
                     EventPayload::Condition {
                         cause: Cause::CompileFailed { message },
@@ -827,7 +872,7 @@ impl Runner {
                     },
                 )?;
                 self.phase = Phase::AwaitingLlm;
-                Ok(vec![self.report_outcome(tree, outcome)?])
+                Ok(vec![self.render_request(tree)])
             }
         }
     }
@@ -843,7 +888,15 @@ impl Runner {
     /// exactly what "ineligibility stops being an event kind"
     /// (23_ONE_AGENT.md A4) means: there is no LLM-facing refusal to
     /// construct here anymore, because the LLM never names this call.
-    pub fn resume(&mut self, tree: &mut Tree, value: serde_json::Value) -> io::Result<Vec<StepOutput>> {
+    ///
+    /// Takes `tree` only for signature symmetry with [`Runner::abandon`]
+    /// and every other host-facing step method — nothing is logged here,
+    /// so it goes unused.
+    pub fn resume(
+        &mut self,
+        _tree: &mut Tree,
+        value: serde_json::Value,
+    ) -> io::Result<Vec<StepOutput>> {
         let Phase::Suspended(mut run, suspension) = std::mem::replace(&mut self.phase, Phase::Idle)
         else {
             panic!("Runner::resume called with nothing suspended — a host bookkeeping bug");
@@ -873,7 +926,6 @@ impl Runner {
         let program_id = run.program_id;
         self.phase = Phase::Running(run);
         self.note_status(program_id, ProgramStatus::Running);
-        let _ = tree;
         Ok(vec![StepOutput::Working])
     }
 
@@ -883,6 +935,19 @@ impl Runner {
     /// are still logged as artifacts when they arrive; only the VM is
     /// dropped. Like [`Runner::resume`], this is a direct host call, not
     /// something the LLM names.
+    ///
+    /// FLAGGED (discovered writing this file against the already-finished
+    /// `document.rs`, not something this step fixes): an abandoned run
+    /// never logs a `Return` — nothing "completed" — so `depth_after`
+    /// (`tree.rs`, driving `document.rs::render`'s fold) never decrements
+    /// the depth the earlier `Pushed` `Condition` incremented. Every event
+    /// on this branch from here on renders as if still inside that
+    /// now-dead handler scope: permanently invisible, until something logs
+    /// a depth-decrementing `Return` for it. This looks like a real gap in
+    /// the disposition/depth design (`abandon()` needs *some* log-visible
+    /// way to close the scope it opened), not something `machine.rs` alone
+    /// should paper over by inventing a fake `Return` here — flag for
+    /// whoever next touches `depth_after`/`Cause`/`Condition`.
     pub fn abandon(&mut self, tree: &mut Tree) -> io::Result<Vec<StepOutput>> {
         let Phase::Suspended(run, _) = std::mem::replace(&mut self.phase, Phase::Idle) else {
             panic!("Runner::abandon called with nothing suspended — a host bookkeeping bug");
@@ -1647,7 +1712,16 @@ impl Runner {
         self.note_status(run.program_id, ProgramStatus::Completed);
         self.last_vm = Some(run.vm);
         self.phase = Phase::AwaitingLlm;
-        out.push(self.report_outcome(tree, outcome)?);
+        // `document.rs::render` derives the completion report straight
+        // off this `Return` event on every render (`derive_report`) — no
+        // separate "tool result"/harness `Post` for it to answer. This is
+        // a deliberate deviation from 23_ONE_AGENT.md A4's own text
+        // ("the harness's reply is a Post from Author::Harness"): reading
+        // `document.rs` (already finished by the concurrent A3 agent)
+        // shows the actual mechanism is inline derivation at render time,
+        // not a second logged event — logging one here would double the
+        // report in the rendered document. Flagged in this step's report.
+        out.push(self.render_request(tree));
         Ok(out)
     }
 
@@ -1749,39 +1823,33 @@ impl Runner {
                 ),
             },
         )?;
-        out.push(self.report_outcome(tree, outcome)?);
+        // Deliberately **no** `StepOutput::LlmRequest` here. Read
+        // `document.rs` (already finished by the concurrent A3 agent)
+        // before assuming otherwise: `document::render`'s fold treats a
+        // `Pushed`-disposition `Condition` as entering a nested,
+        // *invisible* scope (`depth_after` increments past it, and
+        // nothing renders again until a matching `Return` brings depth
+        // back to 0) — "root programs are rendered; handler programs are
+        // not". Since `suspend` always logs `Pushed` here (this file has
+        // no way to detect a real tail-call handover — see the flag
+        // above), the ordinary rolling `Document` would show **nothing
+        // new** for this branch right now regardless of whether we ask
+        // for one. The status transition already recorded above
+        // (`note_status(.., Suspended)`) is the real signal: it is the
+        // host's job, not this file's, to build whatever one-shot
+        // handler-triggering prompt it needs from the `Condition` event
+        // directly (`report::derive_report` on `outcome`), separate from
+        // this branch's rolling document.
+        //
+        // `shown` still advances, though, exactly as `render_request`
+        // would have: this outcome is accounted for by the trigger rule
+        // even though this file isn't the one acting on it, so
+        // `needs_prompt`'s crash-recovery clause doesn't re-fire for it
+        // on the next ordinary call (e.g. from `Runner::abandon`, which
+        // goes back through `prompt_if_needed` once the parked run is
+        // dropped).
+        self.shown = self.spine.leaf_id.as_u64();
         Ok(out)
-    }
-
-    /// Log the harness's report on a just-settled outcome as an ordinary
-    /// `Post` — the substitution 23_ONE_AGENT.md A4 makes throughout:
-    /// no more `Rendered::Tool` answering a `call_id`, because there is
-    /// no `call_id` anymore. The report is a message like any other,
-    /// `Author::Harness`, owing no reply.
-    ///
-    /// Unlike [`deliver`](Runner::deliver), this always renders
-    /// afterward rather than going through the trigger rule: a branch
-    /// that was just busy running a program is always due a reply about
-    /// what happened, whether or not anything else arrived in the
-    /// meantime (which would show up in the same rendered request
-    /// regardless, since a request always renders the whole path).
-    /// Callers set `self.phase` to whatever this handback leaves it in
-    /// (`AwaitingLlm` for a finished/failed run, `Suspended` for one still
-    /// parked) **before** calling this.
-    fn report_outcome(&mut self, tree: &mut Tree, outcome: EventId) -> io::Result<StepOutput> {
-        let report = crate::report::derive_report(tree, self.spine.leaf_id, outcome);
-        tree.append(
-            &mut self.spine,
-            EventPayload::Message(Message::Post {
-                from: Author::Harness,
-                origin: Origin::Direct {
-                    text: report,
-                    input: serde_json::Value::Null,
-                    expects_reply: false,
-                },
-            }),
-        )?;
-        Ok(self.render_request(tree))
     }
 
     /// Render a request iff the trigger rule says to. The one door an
@@ -1883,12 +1951,46 @@ impl Runner {
         Some((ids.len(), *ids.first()?, *ids.last()?))
     }
 
-    /// One request, for tests that inspect what would be sent.
+    /// The rendered `Document` for this branch's current path — a thin
+    /// passthrough to `document::render`, for the host to call once it
+    /// sees a `StepOutput::LlmRequest`.
+    ///
+    /// **This file deliberately does not build the `Document` itself**
+    /// (a deviation from A5's (`host/`) first assumption, made after
+    /// reading `document.rs` directly — see this step's report):
+    /// `document::render(tree, spine, budget)` takes `budget` as a
+    /// caller-supplied parameter *by design* (its own doc comment: "it
+    /// has to arrive as a parameter from whichever caller already tracks
+    /// it... rather than be smuggled onto a type that has no field for
+    /// it"), and `Runner` has no such field anymore — the whole point of
+    /// deleting `DEFAULT_ANSWER_BUDGET` was that this budget is a
+    /// per-agent, host-tracked configuration value, not branch state.
+    /// So the host calls this with whatever it tracks, then applies the
+    /// tail itself: `runner.document(tree, budget).with_tail(&tail)`.
+    pub fn document(&self, tree: &Tree, budget: usize) -> crate::document::Document {
+        crate::document::render(tree, &self.spine, budget)
+    }
+
+    /// One request's ephemeral half, for tests that inspect the tail.
     #[cfg(test)]
     pub fn render_request_for_test(&mut self, tree: &Tree) -> LlmRequest {
         match self.render_request(tree) {
             StepOutput::LlmRequest(r) => r,
             _ => unreachable!("render_request returns a request"),
+        }
+    }
+
+    /// The full rendered `Document` (card + history + tail), for tests
+    /// that assert on what an LLM would actually see. `budget` is a
+    /// fixed test constant (`TEST_BUDGET`) — no session tracks one in a
+    /// test harness.
+    #[cfg(test)]
+    pub fn render_messages_for_test(&mut self, tree: &Tree) -> crate::document::Document {
+        let tail = self.render_request_for_test(tree).tail;
+        let doc = self.document(tree, TEST_BUDGET);
+        match tail {
+            Some(t) => doc.with_tail(&t),
+            None => doc,
         }
     }
 
@@ -2192,22 +2294,24 @@ mod tests {
         panic!("machine never settled");
     }
 
-    /// The most recently logged harness report — the last `Post` from
-    /// `Author::Harness` on the path, which is now how a report reaches
-    /// the model (no more deriving one fresh from an outcome id).
+    /// The most recent report the LLM would read: derived (not stored —
+    /// `document.rs::render` does exactly this on every render) from the
+    /// last outcome (`Return`/`Condition`) on the branch.
     fn last_report(state: &Runner, tree: &Tree) -> String {
-        state
-            .agent_segment(tree)
+        let leaf = state.spine.leaf_id;
+        let outcome = tree
+            .path_events(leaf)
             .iter()
             .rev()
-            .find_map(|e| match &e.payload {
-                EventPayload::Message(Message::Post {
-                    from: Author::Harness,
-                    origin,
-                }) => origin.direct().map(|(t, _, _)| t.to_owned()),
-                _ => None,
+            .find(|e| {
+                matches!(
+                    e.payload,
+                    EventPayload::Return { .. } | EventPayload::Condition { .. }
+                )
             })
-            .expect("a harness report to have been logged")
+            .map(|e| e.id)
+            .expect("an outcome to render");
+        crate::report::derive_report(tree, leaf, outcome, TEST_BUDGET)
     }
 
     fn payload_kinds(state: &Runner, tree: &Tree) -> Vec<&'static str> {
@@ -2281,7 +2385,7 @@ mod tests {
         assert!(report.contains("hi there"), "{report}");
         assert_eq!(
             payload_kinds(&state, &tree),
-            ["Agent", "Post", "Turn", "Return", "Console", "Post"]
+            ["Agent", "Post", "Turn", "Return", "Console"]
         );
     }
 
@@ -2295,10 +2399,7 @@ mod tests {
         assert!(!out.iter().any(|o| matches!(o, StepOutput::Working)));
         let report = last_report(&state, &tree);
         assert!(report.contains("compile error"), "{report}");
-        assert_eq!(
-            payload_kinds(&state, &tree),
-            ["Agent", "Turn", "Condition", "Post"]
-        );
+        assert_eq!(payload_kinds(&state, &tree), ["Agent", "Turn", "Condition"]);
         assert!(state.is_idle() || matches!(state.status(), "awaiting llm"));
     }
 
