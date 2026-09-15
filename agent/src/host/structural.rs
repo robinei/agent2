@@ -62,10 +62,13 @@ pub fn outline_def() -> ToolDef {
                       { name, kind, start_line, end_line, signature }. Language is \
                       inferred from the extension. Read-only — no mutation.\n\
                       \n\
-                      NOT included: attributes/decorators, comments, doc comments, \
-                      imports, bodies, or anything inside a definition. It is an index, \
-                      not the text — if you need to find or match source text (an \
-                      attribute, a call site, a string), read the file or grep it."
+                      `attributes` carries any attributes/decorators verbatim \
+                      (`#[test]`, `#[allow(dead_code)]`, `@cached`) and `doc` the \
+                      first line of the doc comment.\n\
+                      \n\
+                      NOT included: bodies, call sites, imports, or comment prose \
+                      past that first line. It is an index, not the text — to find \
+                      or match source text, read the file or grep it."
             .into(),
         input_schema: json!({
             "type": "array",
@@ -108,6 +111,82 @@ struct OutlineEntry {
     end_line: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     signature: Option<String>,
+    /// Attributes and decorators attached to this definition, verbatim
+    /// and in source order: `#[test]`, `#[allow(dead_code)]`, `@cached`.
+    ///
+    /// Included because they are short and carry meaning the signature
+    /// does not — whether a function is a test, a lint is suppressed, a
+    /// field is serialised. A live run looked for `#[allow(dead_code)]`
+    /// by calling `outline` on sixteen files and got nothing back,
+    /// because an index that omits attributes cannot answer a question
+    /// about attributes.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    attributes: Vec<String>,
+    /// The **first line** of the doc comment, if any — a summary, not
+    /// the comment.
+    ///
+    /// First line only on purpose: this stays an index. A file whose
+    /// definitions each carry a paragraph would otherwise return most of
+    /// itself, and a caller who wants the prose can read the lines the
+    /// entry already points at.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    doc: Option<String>,
+}
+
+/// Attributes/decorators and the doc summary attached to `node`, read
+/// from the siblings immediately above it.
+///
+/// Tree-sitter puts these *before* the definition rather than inside it
+/// (in Rust an `attribute_item`, in most languages a comment node), so
+/// they are found by walking back from the definition until something
+/// that is neither runs out.
+fn leading_context(node: &Node, source: &str) -> (Vec<String>, Option<String>) {
+    let mut attributes = Vec::new();
+    let mut doc_lines: Vec<String> = Vec::new();
+    let mut cur = node.prev_sibling();
+    while let Some(sib) = cur {
+        let text = sib.utf8_text(source.as_bytes()).unwrap_or("").trim();
+        match sib.kind() {
+            "attribute_item" | "decorator" => attributes.push(text.to_owned()),
+            k if k.contains("comment") => {
+                // Doc comments only — an ordinary `//` note above a
+                // definition is about the code, not a summary of it.
+                let stripped = text
+                    .strip_prefix("///")
+                    .or_else(|| text.strip_prefix("//!"))
+                    .or_else(|| text.strip_prefix("/**"));
+                if let Some(rest) = stripped {
+                    doc_lines.push(rest.trim().to_owned());
+                } else {
+                    break;
+                }
+            }
+            _ => break,
+        }
+        cur = sib.prev_sibling();
+    }
+    attributes.reverse();
+    doc_lines.reverse();
+    let doc = doc_lines
+        .into_iter()
+        .find(|l| !l.is_empty())
+        .map(|l| crate::report::clip(&l, 160));
+    (attributes, doc)
+}
+
+/// One entry for a definition node, or `None` when it has no name.
+fn entry_for(node: &Node, source: &str, lang: &str) -> Option<OutlineEntry> {
+    let name = find_name(node, source)?;
+    let (attributes, doc) = leading_context(node, source);
+    Some(OutlineEntry {
+        name,
+        kind: node.kind().to_string(),
+        start_line: node.start_position().row + 1,
+        end_line: node.end_position().row + 1,
+        signature: signature_for(node, source, lang),
+        attributes,
+        doc,
+    })
 }
 
 fn collect_definitions(node: Node, source: &str, lang: &str) -> Vec<OutlineEntry> {
@@ -130,38 +209,16 @@ fn collect_definitions_impl(node: Node, source: &str, lang: &str, entries: &mut 
         }
     }
 
-    if is_def {
-        let name = find_name(&node, source);
-        if let Some(name) = name {
-            let start = node.start_position();
-            let end = node.end_position();
-            let sig = signature_for(&node, source, lang);
-            entries.push(OutlineEntry {
-                name,
-                kind: node.kind().to_string(),
-                start_line: (start.row + 1),
-                end_line: (end.row + 1),
-                signature: sig,
-            });
-        }
+    if is_def && let Some(entry) = entry_for(&node, source, lang) {
+        entries.push(entry);
     }
 
     // Process def children that were deferred.
     for child in def_children {
-        if is_definition_node(child.kind(), lang) {
-            let name = find_name(&child, source);
-            if let Some(name) = name {
-                let start = child.start_position();
-                let end = child.end_position();
-                let sig = signature_for(&child, source, lang);
-                entries.push(OutlineEntry {
-                    name,
-                    kind: child.kind().to_string(),
-                    start_line: (start.row + 1),
-                    end_line: (end.row + 1),
-                    signature: sig,
-                });
-            }
+        if is_definition_node(child.kind(), lang)
+            && let Some(entry) = entry_for(&child, source, lang)
+        {
+            entries.push(entry);
         }
     }
 }
@@ -420,6 +477,47 @@ mod tests {
             "missing function in {arr:?}"
         );
         assert!(kinds.contains(&"struct_item"), "missing struct in {arr:?}");
+    }
+
+    #[test]
+    fn outline_carries_attributes_and_a_doc_summary() {
+        // The question try8 asked and could not get answered: which
+        // definitions carry `#[allow(dead_code)]`. An index that omits
+        // attributes cannot answer a question about attributes, and the
+        // run spent sixteen calls finding that out.
+        let (_dir, path) = temp_path_with_ext("rs");
+        std::fs::write(
+            &path,
+            "/// Does the thing, briefly.\n\
+             /// More detail nobody needs in an index.\n\
+             #[allow(dead_code)]\n\
+             #[inline]\n\
+             pub fn probe(x: u32) -> u32 { x }\n\
+             \n\
+             // an ordinary note, not a summary\n\
+             pub struct Plain;\n",
+        )
+        .unwrap();
+        let result = call_handler(&outline_def(), json!([path.to_str().unwrap()])).unwrap();
+        let arr = result.as_array().unwrap();
+
+        let probe = arr.iter().find(|e| e["name"] == "probe").expect("probe");
+        let attrs: Vec<&str> = probe["attributes"]
+            .as_array()
+            .expect("attributes")
+            .iter()
+            .map(|a| a.as_str().unwrap())
+            .collect();
+        assert_eq!(attrs, vec!["#[allow(dead_code)]", "#[inline]"]);
+        assert_eq!(
+            probe["doc"], "Does the thing, briefly.",
+            "the first line only -- this stays an index"
+        );
+
+        // A plain `//` note is about the code, not a summary of it.
+        let plain = arr.iter().find(|e| e["name"] == "Plain").expect("Plain");
+        assert!(plain.get("doc").is_none(), "{plain:?}");
+        assert!(plain.get("attributes").is_none(), "{plain:?}");
     }
 
     #[test]
