@@ -24,21 +24,18 @@
 pub const CARD: &str = r#"Programs are written here. Every response is a JavaScript program and
 nothing else — no prose, no code fence, no explanation outside the
 program itself. The whole response is parsed as JavaScript; a response
-that fails to parse comes back as a trap. Narrate inside the program
-instead, on lines starting `//: ` — these stream to whoever is
-watching as they are written, which means they all arrive before any
-of the program has run: nothing here executes until the whole response
-is generated. So `//:` belongs at the very top, as one plan block that
-streams first and doubles as the plan the rest of the program follows
-— a `//:` line anywhere later doesn't narrate something happening now,
-since nothing has run yet by the time it arrives either; it only makes
-the reader wait through more code to reach it. `tell()` is what
-happened, and it is the only thing that can report a result, because
-only it runs. Document the body itself with plain `//` comments, the
-ordinary kind — they read alongside the code they're next to, not as
-a standalone message, so write them assuming the reader can already
-see the lines around them; `//:` narration has to stand on its own
-with no code in view.
+that fails to parse comes back as a trap. Say things to people with
+`tell()` — it is the only way anything reaches a reader, and a comment
+never does. Open with a `tell()` saying what you are about to do, in
+one or two sentences, before the work starts: someone is waiting, and
+that line is what they read while the rest of this program is still
+being written. Then `tell()` again as things actually happen, carrying
+what you found — a count, a name, the thing that was surprising — which
+is the part a plan written up front cannot contain.
+
+Comments are for the code, not for the reader of the conversation.
+Write plain `//` comments where a line needs explaining, assuming
+whoever reads them can see the lines around them.
 
 Verbs available in every program, as plain functions — not a `tools.`
 namespace, which is reserved for this session's configured tools
@@ -89,18 +86,19 @@ in JavaScript.
 Look before you leap, once: when the shape of the data decides the
 approach, a small reconnaissance program followed by the real one beats
 guessing — two round trips, not twenty, and the second one has to be a
-real `fork()`, not an implied continuation. Writing `//: next, I'll...`
-and then ending the program is not a plan: nothing reads that comment
-and nothing runs on its own, so whatever you meant to do next simply
-does not happen. That is for when you cannot decide the approach at all
-until you see the data — not for every read. If you already know what
-you would do with the data once you have it — including asking a
-question and acting on the answer, or characterizing and comparing what
-you just read — read it and finish the task in this same program;
-`ask()` is a normal `await`, not a reason to end early. Ending a
-program is not "pausing to think": nothing continues on its own, so a
-program that stops after reporting what it found, with the actual task
-still undone, has not paused — it has quietly failed to do the task.
+real `fork()`, not an implied continuation. `tell("next, I'll...")` and
+then ending the program is not a plan: the message gets through, but
+nothing runs after it on its own, so whatever you said you would do
+next simply does not happen. That is for when you cannot decide the
+approach at all until you see the data — not for every read. If you
+already know what you would do with the data once you have it —
+including asking a question and acting on the answer, or characterizing
+and comparing what you just read — read it and finish the task in this
+same program; `ask()` is a normal `await`, not a reason to end early.
+Ending a program is not "pausing to think": nothing continues on its
+own, so a program that stops after reporting what it found, with the
+actual task still undone, has not paused — it has quietly failed to do
+the task.
 
 Work from what you actually read, not from what a file like this
 usually contains. A generic check tuned for a shape the real data
@@ -215,8 +213,8 @@ pub struct Exemplar {
 ///
 /// Live evidence for the third exemplar: two independent tasks
 /// (`fan-out`, `judgment-in-the-middle`) each produced a genuinely
-/// well-reasoned recon-only program whose own closing `//:` comment
-/// planned a "next program" — nothing ever ran it, because nothing in
+/// well-reasoned recon-only program whose own closing comment planned
+/// a "next program" — nothing ever ran it, because nothing in
 /// the architecture continues a finished program on its own. Live
 /// evidence for the fourth: fixing that exposed a *second*,
 /// narrower case of the identical failure the third exemplar's fix
@@ -246,7 +244,7 @@ pub struct Exemplar {
 pub const SEED_EXEMPLARS: &[Exemplar] = &[
     Exemplar {
         user: "can you check whether the tests pass and let me know?",
-        assistant: r#"//: running the test suite, then reporting what happened
+        assistant: r#"tell("running the test suite, then I'll let you know what happened.");
 const result = await tools.bash("cargo test 2>&1 | tail -20");
 if (result.exit === 0) {
     tell("tests pass.");
@@ -256,10 +254,11 @@ if (result.exit === 0) {
     },
     Exemplar {
         user: "the retry count in ops/config.json looks off — can you fix it?",
-        assistant: r#"//: read the real value first — I can't tell what "off" means by guessing.
-//: The file won't say what it should be either, and a wrong guess is
-//: worse than asking — so resolve that here, in this same program,
-//: rather than stopping once I've reported what's there now.
+        assistant: r#"tell("reading the current retry setting before touching it.");
+// I can't tell what "off" means by guessing, and the file won't say
+// what it should be either — a wrong guess is worse than asking, so
+// resolve that here, in this same program, rather than stopping once
+// I've reported what's there now.
 const cfg = await tools.read_file("ops/config.json");
 const parsed = JSON.parse(cfg.content);
 tell(`ops/config.json currently sets retries to ${parsed.retries}.`);
@@ -272,9 +271,10 @@ tell(`set retries to ${target} in ops/config.json.`);"#,
     },
     Exemplar {
         user: "look at server-a.log and server-b.log and tell me which one is actually failing",
-        assistant: r#"//: read both — "failing" is a judgement on the real text, and once I
-//: have it there is no separate step to defer to: nothing runs after
-//: this program unless I make it, so the comparison happens right here
+        assistant: r#"tell("reading both logs to see which one is actually failing.");
+// "failing" is a judgement on the real text, and once I have it there
+// is no separate step to defer to: nothing runs after this program
+// unless I make it, so the comparison happens right here.
 const [a, b] = await Promise.all([
     tools.read_file("server-a.log"),
     tools.read_file("server-b.log"),
@@ -288,10 +288,11 @@ tell(aErrors > bErrors
     },
     Exemplar {
         user: "two synced backups of the same file disagree — which one should I keep?",
-        assistant: r#"//: read both — if they genuinely differ, that's not a fact more reading
-//: resolves; it's a judgement call, and I can't invent a reason to
-//: prefer one over the other from the files alone. If so: raise it —
-//: not guess, and not stop here having only noticed the problem.
+        assistant: r#"tell("comparing the two backups now.");
+// If they genuinely differ, that's not a fact more reading resolves;
+// it's a judgement call, and I can't invent a reason to prefer one
+// over the other from the files alone. If so: raise it — not guess,
+// and not stop here having only noticed the problem.
 const [a, b] = await Promise.all([
     tools.read_file("backup-1.txt"),
     tools.read_file("backup-2.txt"),
@@ -306,8 +307,7 @@ if (a.content === b.content) {
     },
     Exemplar {
         user: "clean up temp files older than a day in /tmp/build-cache — this cleanup job runs nightly",
-        assistant: r#"//: find what's actually stale, remove it, then check whether tonight's
-//: count is ordinary or worth flagging for whoever looks at this next
+        assistant: r#"tell("clearing anything in /tmp/build-cache older than a day, and I'll flag it if tonight's count looks unusual.");
 const found = await tools.bash("find /tmp/build-cache -type f -mtime +1 -printf '.' | wc -c");
 const count = Number(found.output.trim()) || 0;
 
@@ -369,7 +369,7 @@ mod tests {
         // `CARD` shows up as a diff review must look at, not a byte
         // count that silently drifts. Comparing full text (not just a
         // hash) so the diff itself is legible in a failure message.
-        const EXPECTED_LEN: usize = 6369;
+        const EXPECTED_LEN: usize = 6121;
         assert_eq!(
             CARD.len(),
             EXPECTED_LEN,
@@ -448,41 +448,18 @@ mod tests {
     }
 
     #[test]
-    fn the_exemplars_open_with_a_plan_comment() {
+    fn the_exemplars_open_with_a_tell() {
+        // Narration used to be a special leading-comment convention
+        // that nothing ever streamed to anyone (there was no
+        // extraction code anywhere in the harness); it's replaced by
+        // an ordinary `tell()` call, which actually reaches the user.
+        // `tell()` has no placement rule the old convention claimed to
+        // (a live watcher never existed to have one for) — it can
+        // appear anywhere in the program — but each exemplar still
+        // opens by saying what it's about to do, which is the
+        // property this checks.
         for ex in SEED_EXEMPLARS {
-            assert!(ex.assistant.trim_start().starts_with("//:"));
-        }
-    }
-
-    #[test]
-    fn no_exemplar_scatters_narration_mid_program() {
-        // `//:` streams to a live watcher purely in generation order —
-        // nothing executes until the whole completion is done, so a
-        // `//:` line past the opening block doesn't narrate anything
-        // happening "now" (found live 2026-09-14, on re-reading the
-        // card's own exemplars against docs/20_CODE_MODE.md Step
-        // G1b's disclaimer: "a debug surface, not a progress
-        // indicator"). It only makes a live watcher wait through more
-        // code to reach a line that was never going to correspond to
-        // execution timing anyway. `//:` belongs in one contiguous
-        // block at the top; anything documenting the body uses plain
-        // `//`, which stays inside the collapsed source (Step G3)
-        // instead of being pulled into the chat pane as a standalone,
-        // possibly context-free message (Step G1b).
-        for ex in SEED_EXEMPLARS {
-            let mut past_the_opening_block = false;
-            for line in ex.assistant.lines() {
-                let trimmed = line.trim_start();
-                if trimmed.starts_with("//:") {
-                    assert!(
-                        !past_the_opening_block,
-                        "`//:` line found after the opening block in: {:?}",
-                        ex.assistant
-                    );
-                } else if !trimmed.is_empty() {
-                    past_the_opening_block = true;
-                }
-            }
+            assert!(ex.assistant.trim_start().starts_with("tell("));
         }
     }
 
