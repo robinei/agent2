@@ -86,7 +86,17 @@ back can only be sliced by code — and code slicing text it cannot read
 is how a field dump ends up dressed as an answer. Text becomes
 readable only by being put in front of the next writer.
 
-So: fetch the material, then `next_program({ ... })` with it. The
+**Hand over the smallest thing that lets the next writer choose.** A
+payload costs context for the rest of the conversation, exactly like
+`append_history` does — so the same discipline applies to both. A list
+of file names is cheap and lets a mind pick; the files themselves are
+expensive and most of them will turn out to be beside the point.
+Reading ten files to answer one question, and passing all ten on, is
+the shape to avoid: it is a guess about relevance, made by code that
+cannot read them, paid for in full.
+
+So: fetch the *cheap* thing, hand it over, and let the next program —
+written by someone who has read it — fetch the few things that matter. The
 program after this one is written by someone who has *read* what you
 gathered, and can say what it means in a sentence rather than parsing
 for it. If what you gathered turns out to be thin — a manifest with no
@@ -396,32 +406,21 @@ tell(names.map((n, i) => `${n}: ${summaries[i]}`).join("\n"));"#,
     },
     Exemplar {
         user: "what is this project?",
-        assistant: r#"tell("reading the README and the manifest — then I'll tell you what it is, not what files it has.");
-const names = (await tools.bash("ls -1A")).stdout.split("\n").map(s => s.trim()).filter(Boolean);
-// Not just the top level: plenty of projects describe themselves in
-// docs/ or a design note and have no README at all. Vendored trees are
-// somebody else's project, and reporting their README as this one's is
-// the specific way this goes wrong.
-const found = await tools.bash("find . -maxdepth 2 \\( -iname 'readme*' -o -iname '*.md' \\) -not -path './node_modules/*' -not -path './target/*' -not -path './test262/*' -not -path './.git/*' | head -20");
-const wanted = [...found.stdout.split("\n").map(s => s.trim()).filter(Boolean),
-                ...names.filter(n => /^(Cargo\.toml|package\.json|pyproject\.toml|go\.mod)$/.test(n))];
+        assistant: r#"tell("looking at what's here, then I'll read the parts that actually say what this is.");
 
-const read = {};
-for (const n of wanted.slice(0, 10)) {
-    try { read[n] = (await tools.read_file(n)).content; } catch (e) {}
-}
+// Which files answer this is a judgement, and I cannot make it: I would
+// have to read them to know, and I cannot read anything this program
+// fetches. So gather the cheap thing — the names — and hand those over.
+// Whoever writes next has read this list and can pick the two or three
+// worth opening, instead of me globbing *.md and hoping.
+const layout = (await tools.bash("ls -1A")).stdout.split("\n").map(s => s.trim()).filter(Boolean);
+const docs = (await tools.bash("find . -maxdepth 2 -iname '*.md' -o -maxdepth 2 -iname 'Cargo.toml' -o -maxdepth 2 -iname 'package.json' 2>/dev/null | head -40")).stdout;
 
-if (!Object.keys(read).length) {
-    tell(`nothing self-describing here — the top level is ${names.join(", ")}. Tell me which part matters and I'll read it.`);
-} else {
-    // I have the text; what it *means* is not something more code can
-    // work out. A regex for `name =` would hand me a field, and the
-    // question asked what this is. Fetching was my job and I have done
-    // it — so end here and let the next program answer with the files
-    // in view. If they turn out to point somewhere else, that program
-    // can read on and hand over again.
-    next_program({ question: "what is this project?", files: read, layout: names });
-}"#,
+next_program({
+    question: "what is this project? — pick the few files that would actually say, read those, and answer",
+    layout,
+    candidates: docs.split("\n").map(s => s.trim()).filter(Boolean),
+});"#,
     },
     Exemplar {
         user: "clean up temp files older than a day in /tmp/build-cache — this cleanup job runs nightly",
@@ -487,7 +486,7 @@ mod tests {
         // `CARD` shows up as a diff review must look at, not a byte
         // count that silently drifts. Comparing full text (not just a
         // hash) so the diff itself is legible in a failure message.
-        const EXPECTED_LEN: usize = 9282;
+        const EXPECTED_LEN: usize = 9886;
         assert_eq!(
             CARD.len(),
             EXPECTED_LEN,
