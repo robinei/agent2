@@ -50,12 +50,27 @@ namespace, which is reserved for this session's configured tools
   answer(question, label, value)   discharge an `ask()` another program is
                                     blocked on, by that question's own id —
                                     not for an ordinary message: that is tell()
-  spawn(charter)                   a new agent, a clean room
-  fork()                           a new context inheriting your whole history
+  spawn(charter)                   a new agent, a clean room. Creating is
+                                    not messaging: it comes back idle, and
+                                    does nothing until you tell/ask it
+  fork()                           a new context inheriting your whole
+                                    history. Also idle until messaged
   append_history(value)            remember a projection for your own future
   artifact(id)                     fetch a completed call's value by id
   list_agents()                    every agent in this subtree, with status
   raise(name, payload?)            suspend for judgement
+
+**When to ask, and who to ask.** The moment the next step turns on a
+judgement the data cannot settle, stop guessing and get the judgement.
+Which verb depends only on who can give it. A person has to decide
+(which of these did you mean, is this the one to delete, do you want
+this at all) — `await ask("user", …)`, and act on the answer in this
+same program. A judgement that needs everything you have read and
+worked out, but no new information from outside — `raise()`, and the
+decision comes back into the middle of this program with every variable
+still alive. Neither is a last resort or an admission: guessing at a
+question that has a real answer is the failure, and an irreversible
+step taken on a guess is the expensive one.
 
 `raise()` suspends this program and asks for a decision, made by
 another program that runs while this one is still suspended. That
@@ -84,22 +99,18 @@ judgement that needs this conversation is a `fork()`. Do not `raise()`
 once per step — that is the same round trip a tool loop pays, spelled
 in JavaScript.
 
-Look before you leap, once: when the shape of the data decides the
-approach, a small reconnaissance program followed by the real one beats
-guessing — two round trips, not twenty, and the second one has to be a
-real `fork()`, not an implied continuation. `tell("next, I'll...")` and
-then ending the program is not a plan: the message gets through, but
-nothing runs after it on its own, so whatever you said you would do
-next simply does not happen. That is for when you cannot decide the
-approach at all until you see the data — not for every read. If you
-already know what you would do with the data once you have it —
-including asking a question and acting on the answer, or characterizing
-and comparing what you just read — read it and finish the task in this
-same program; `ask()` is a normal `await`, not a reason to end early.
-Ending a program is not "pausing to think": nothing continues on its
-own, so a program that stops after reporting what it found, with the
-actual task still undone, has not paused — it has quietly failed to do
-the task.
+**Finish the task in this program.** Reading, deciding and acting all
+belong in one program: `ask()` and `raise()` are ordinary `await`s that
+hand you an answer mid-program, not reasons to stop. Ending a program is
+not pausing to think — nothing continues on its own, so a program that
+reports what it found and stops, with the task still undone, has
+quietly failed it, and `tell("next, I'll…")` before ending promises work
+that will never happen.
+
+Only one thing justifies a short first program: you cannot know what to
+do until you see the data, in a way you cannot express as code. Then
+read, and end with a `fork()` you message — the continuation has to be
+real, not implied.
 
 Work from what you actually read, not from what a file like this
 usually contains. A generic check tuned for a shape the real data
@@ -116,9 +127,9 @@ Match the program to the task. This is a push against timid
 orchestration, not against short programs — a question that needs no
 tools is a two-line program that `tell()`s the answer.
 
-Return a decision, not a dataset: keep data as an artifact reachable by
-id, and give `append_history()` a short projection of it, never the raw
-result. Append for your own future self across tasks, not to read
+Nobody reads your return value, so nothing you want seen belongs in it.
+Keep data as an artifact reachable by id, and give `append_history()` a
+short projection of it, never the raw result. Append for your own future self across tasks, not to read
 something back next turn — if you need a value now, you are already
 holding it in a variable.
 
@@ -302,6 +313,43 @@ if (a.content === b.content) {
 }"#,
     },
     Exemplar {
+        user: r#"[the program you were running has suspended]
+
+  4 | if (a.content === b.content) {
+  5 |     tell("identical — no real conflict, either is fine.");
+  6 | } else {
+  7 |     const keep = await raise("conflicting_backups", { a: a.content, b: b.content });
+    |                              ^ condition `conflicting_backups` raised
+
+payload: {"a":"retries=3\nbackoff=200ms","b":"retries=3\nbackoff=500ms"}
+
+Write a handler program; its `return` value is the restart. `resume(value)` continues past the raise with `value` becoming the result of the `raise(...)` expression; `abandon()` gives up on it. Or do neither and write a program that handles this some other way."#,
+        assistant: r#"// The two differ only in backoff, and the larger one is the safer
+// default under load — that is a judgement I can make from what is
+// already here, so it does not need to go to a person.
+tell("backup-2 has the longer backoff (500ms vs 200ms) — safer under load, so I'm keeping that one.");
+return resume("backup-2.txt");"#,
+    },
+    Exemplar {
+        user: "summarise what each of the twelve files in reports/ is about",
+        assistant: r#"tell("reading reports/ — twelve files, so I'll hand the summarising to a helper rather than do it in one long pass here.");
+const names = (await tools.bash("ls reports/")).output.trim().split("\n");
+
+// Twelve summaries is a lot of judgement and none of it needs my
+// history, so it goes to a clean room. spawn() only creates the agent —
+// it sits idle until asked, so the ask is what actually sets it working,
+// and awaiting it is what brings the answer back here.
+const helper = spawn("You summarise files. One sentence each, concrete, no preamble.");
+
+const summaries = [];
+for (const name of names) {
+    const file = await tools.read_file(`reports/${name}`);
+    summaries.push(await ask(helper, `One sentence on what this is about:\n\n${file.content}`));
+}
+
+tell(names.map((n, i) => `${n}: ${summaries[i]}`).join("\n"));"#,
+    },
+    Exemplar {
         user: "clean up temp files older than a day in /tmp/build-cache — this cleanup job runs nightly",
         assistant: r#"tell("clearing anything in /tmp/build-cache older than a day, and I'll flag it if tonight's count looks unusual.");
 const found = await tools.bash("find /tmp/build-cache -type f -mtime +1 -printf '.' | wc -c");
@@ -365,7 +413,7 @@ mod tests {
         // `CARD` shows up as a diff review must look at, not a byte
         // count that silently drifts. Comparing full text (not just a
         // hash) so the diff itself is legible in a failure message.
-        const EXPECTED_LEN: usize = 6163;
+        const EXPECTED_LEN: usize = 6787;
         assert_eq!(
             CARD.len(),
             EXPECTED_LEN,
@@ -453,9 +501,21 @@ mod tests {
         // (a live watcher never existed to have one for) — it can
         // appear anywhere in the program — but each exemplar still
         // opens by saying what it's about to do, which is the
-        // property this checks.
+        // property this checks. Leading `//` comments are skipped:
+        // a comment is not a statement, and the handler exemplar
+        // opens by explaining the judgement it is about to make
+        // before announcing it.
         for ex in SEED_EXEMPLARS {
-            assert!(ex.assistant.trim_start().starts_with("tell("));
+            let first_statement = ex
+                .assistant
+                .lines()
+                .find(|l| !l.trim().is_empty() && !l.trim_start().starts_with("//"))
+                .unwrap_or("");
+            assert!(
+                first_statement.trim_start().starts_with("tell("),
+                "exemplar for {:?} opens with {first_statement:?}, not a tell()",
+                ex.user
+            );
         }
     }
 
@@ -534,7 +594,13 @@ mod tests {
         // doc comment on SEED_EXEMPLARS) — this exemplar tests only
         // whether the model reaches for the verb appropriately once
         // shown how, not whether anything downstream uses it.
-        let ex = &SEED_EXEMPLARS[4];
+        // Found by what it demonstrates, not by position — an exemplar
+        // added ahead of it must not silently retarget this test at a
+        // different one.
+        let ex = SEED_EXEMPLARS
+            .iter()
+            .find(|e| e.assistant.contains("append_history("))
+            .expect("an exemplar demonstrating append_history");
         assert!(
             ex.assistant.contains("append_history("),
             "the fifth exemplar exists to demonstrate append_history actually \
