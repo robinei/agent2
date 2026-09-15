@@ -1594,9 +1594,20 @@ impl Runner {
         if to.as_str() == Some("user") {
             return Ok(Address::User);
         }
+        // A handle, as `spawn()`/`fork()` hand it back — `{"agent": id}`.
+        // Accepted whole, so `const h = spawn(...); await ask(h, ...)`
+        // works, which is what the card teaches and an exemplar
+        // demonstrates. Requiring `ask(h.agent, ...)` would make the
+        // obvious spelling of the obvious task fail on an
+        // implementation detail of the settlement value, which is
+        // exactly the smell `DESIGN.md` names: if a model has to know a
+        // mechanism exists to get the ordinary case right, the
+        // mechanism is wrong.
+        let to = to.get("agent").unwrap_or(to);
         let Some(id) = to.as_u64().filter(|n| *n > 0).map(EventId::new) else {
             return Err(format!(
-                "the address must be a branch id (a number), or \"user\"; got {to}"
+                "the address must be an agent handle (from spawn()/fork()), a branch \
+                 id, or \"user\"; got {to}"
             ));
         };
         match tree.events.get(&id).map(|e| &e.payload) {
@@ -2663,6 +2674,31 @@ mod tests {
     /// expression; a *second* raise, handled the same way with
     /// `return abandon();`, discards it instead and leaves the branch
     /// idle, exactly like a direct `Runner::abandon` call would.
+    #[test]
+    fn a_spawn_handle_is_usable_as_an_address() {
+        // `spawn()` settles with `{"agent": id}` and the card teaches
+        // `const h = spawn(...); await ask(h, ...)`. Live run 2026-09-15
+        // trapped on exactly that: the handle was rejected because only
+        // a bare number was accepted, so the documented spelling of the
+        // documented pattern could not work.
+        let mut tree = Tree::new(None);
+        let root = tree.start_agent(None, None, "root", None, "card").unwrap();
+        let root_agent = root.leaf_id;
+        let child = tree
+            .start_agent(Some(root_agent), None, "worker", None, "card")
+            .unwrap();
+        let agent_id = child.leaf_id;
+        let state = Runner::with_spine(&tree, root);
+
+        let handle = serde_json::json!({ "agent": agent_id.as_u64() });
+        let bare = serde_json::json!(agent_id.as_u64());
+        assert_eq!(
+            state.resolve_address(&tree, Some(&handle)).is_ok(),
+            state.resolve_address(&tree, Some(&bare)).is_ok(),
+            "a handle must address whatever the bare id addresses"
+        );
+    }
+
     #[test]
     fn a_tagged_completion_is_routed_to_resume_or_abandon() {
         let (mut tree, mut state) = setup();
