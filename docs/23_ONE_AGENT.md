@@ -428,6 +428,17 @@ synthesize **programs** instead, so what the pane shows is exactly what
 ran. And `ProgramView.depth` wants a nested-handler rendering that has
 no equivalent today.
 
+**Where this is going, because it constrains the design.** The eval's
+end state is to drive the **real TUI** rather than a headless variant:
+launched with an initial user message and a flag that has an LLM answer
+as the user, so a run needs no input — and **`Ctrl-C` doing exactly
+what a person's interrupt does**, which is how the interrupt path gets
+exercised without a special eval entry point or a control socket. So
+the interrupt gesture must stay wired to `SessionCommand::Interrupt`
+through the ordinary path, and the TUI must be startable and drivable
+with no human present. Anything that only works because someone is
+watching is a thing the eval cannot reach.
+
 **Do not build any `//:` rendering.** That convention is gone from the
 card (narration is ordinary `tell()` now), and it never had an
 implementation to port — the streaming it promised was never built.
