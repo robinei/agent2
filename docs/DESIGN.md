@@ -310,6 +310,52 @@ nondeterministic builtin is freely compatible: nothing ever retraces a
 previous execution, so there is no trace for it to make diverge. This
 *shrinks* what compat must honor rather than enlarging it.
 
+## The UI boundary, and the one carve-out
+
+**Every consumer talks to the session loop through the same
+serializable pair** — `SessionCommand` in, `SessionEvent` out
+(`host/protocol.rs`). The CLI, the TUI's chat pane, and any future
+remote client over a socket are the same consumer; the loop has no
+second entrance. This is what makes server mode a thing the code
+already supports rather than a rewrite waiting to happen, and it is
+worth defending on purpose, because it is the kind of property that
+erodes one convenient direct call at a time.
+
+**One carve-out**: the attached debugger borrows the `Tree` and the
+live `Runner`s directly (`Session::tree`, `Session::state`) rather than
+going through the protocol, because encoding VM internals into the
+event vocabulary would have meant a protocol that grows every time the
+debugger wants to show something new. It renders on the loop thread,
+so the borrow is sound.
+
+**That carve-out has been shrinking, and should keep shrinking.**
+Derived-not-stored moved most of what once needed a live VM into the
+log: `ProgramView` — source, invokes, console, result, outcome, depth —
+is a fold over events (`tree::programs_for`); `ProgramStatus` is
+explicit that it is "no longer live-only"; reports are folds over
+`Return`/`Condition` rather than rows handed to a renderer. What still
+genuinely needs the VM is live introspection *during* a run — variable
+state, the current stack, fuel — and nothing post-hoc. **A new use of
+the carve-out is a smell**: check first whether the log already answers
+it, because it usually does now.
+
+**The conformance witness is `--headless`**, and that is its second
+job. It prints `SessionEvent`s off the channel and never reaches for
+`tree()` or `state()`, so it demonstrates in product code that the
+protocol is sufficient to follow a session. Keep it that way: the day
+headless needs privileged access is the day the protocol has a hole,
+and it should be fixed in the protocol rather than by reaching around
+it. This is why a *separate* client written to prove the boundary is
+not needed — it would be a second thing to keep honest, testing the
+boundary instead of the product.
+
+**Known gap for a remote client.** Because reports are derived rather
+than stored, a thin client receiving `Event`s cannot render one without
+`report::derive_report` and `document::render`. Either it ships the
+same fold logic, or the server sends rendered rows. That is a real
+decision for whoever builds the socket layer, not an oversight — and
+better known now than discovered halfway in.
+
 ## Confinement, not permission
 
 **The harness does not gate the call, and does not confine the process
