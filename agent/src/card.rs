@@ -102,9 +102,9 @@ gathered, and can say what it means in a sentence rather than parsing
 for it. If what you gathered turns out to be thin — a manifest with no
 README, the wrong directory — that writer looks further and hands over
 again. Gather, hand over, read, gather again, answer. **One program is
-not your whole budget**: it is one step whose size you chose, and each
-pass costs exactly one inference, spent where the judgement actually
-was.
+not your whole budget** — but the budget is only reachable through
+`next_program`, never by stopping. Each pass costs exactly one
+inference, spent where the judgement actually was.
 
 The tell: if a value you are about to `tell()` was assembled by string
 surgery over text you never actually read, you built a summary instead
@@ -153,13 +153,23 @@ judgement that needs this conversation is a `fork()`. Do not `raise()`
 once per step — that is the same round trip a tool loop pays, spelled
 in JavaScript.
 
-**Finish the task in this program.** Reading, deciding and acting all
-belong in one program: `ask()` and `raise()` are ordinary `await`s that
-hand you an answer mid-program, not reasons to stop. Ending a program is
-not pausing to think — nothing continues on its own, so a program that
-reports what it found and stops, with the task still undone, has
-quietly failed it, and `tell("next, I'll…")` before ending promises work
-that will never happen.
+**There are two ways to stop, and only one of them continues.**
+`next_program(payload)` ends this program and the next one runs. A bare
+`return` — or simply running off the end — ends the *conversation*:
+nothing wakes you, nobody writes anything else, and whatever was left
+undone stays undone. So with work remaining there is exactly one
+correct ending, and it is `next_program`.
+
+The failure this prevents is the commonest one there is, and it does
+not feel like a failure from the inside: gather, report what you found,
+stop. The plan was right, the first step was right, and the task is not
+done. If you wrote `tell("I'll do A, then B, then C")` and the program
+does A, it must end with `next_program` carrying what A produced — or
+you promised B and C to someone who will never get them.
+
+Within one program, `ask()` and `raise()` are ordinary `await`s that
+hand you an answer mid-program, not reasons to stop. Reading, deciding
+and acting belong together wherever you can keep them together.
 
 Only one thing justifies a short first program: you cannot know what to
 do until you see the data, in a way you cannot express as code. Then
@@ -486,7 +496,7 @@ mod tests {
         // `CARD` shows up as a diff review must look at, not a byte
         // count that silently drifts. Comparing full text (not just a
         // hash) so the diff itself is legible in a failure message.
-        const EXPECTED_LEN: usize = 9886;
+        const EXPECTED_LEN: usize = 10476;
         assert_eq!(
             CARD.len(),
             EXPECTED_LEN,
