@@ -344,6 +344,53 @@ DEEPSEEK_API_KEY=... cargo run -p agent -- eval
   must have survived the move into `host/mod.rs`)
 - at least one `spawn_children > 0` across the run
 
+### C2 result — 5/5 on the real session
+
+First clean sweep against a real model through the real `Session`, and
+the path to it is the useful part.
+
+| run | config | passed | mean RT | raise |
+|---|---|---|---|---|
+| 1 | as landed | 0/5 | 1.00 | 0 |
+| 2 | `tell` addressing fixed | 4/5 | 1.60 | 0 |
+| 3 | (repeat) | 3/5 | 1.00 | 0 |
+| 4 | exemplars back to turns | 4/5 | 1.00 | 0 |
+| 5 | card fixed | **5/5** | **1.40** | **2** |
+
+Three harness/prompt defects, none of them model behaviour:
+
+1. **`tell` with no address errored.** It required an open post, and a
+   task delivered as a statement leaves nothing open — so every `tell`
+   in every task was unroutable and every check reads the transcript.
+   `trivial-question` wrote `tell("12 + 30 = 42.");` — one statement,
+   one round-trip, exactly right — and scored as never answering.
+2. **Exemplars had been moved into the system prompt as prose**, on an
+   invariant argument that applied one category too wide: they are
+   preamble, like the system message, not conversation rows. As turns
+   again, recon-only endings stopped and `destructive-migration-gate`
+   began passing.
+3. **The card argued against the behaviour we wanted.** Every mention
+   of `raise()` was a cost or a prohibition and no sentence said when
+   to raise; `ask()`'s only mention warned against letting it end a
+   program. The card also still described `spawn`/`fork` as carrying a
+   first message, which "creating is not messaging" had deleted — a
+   model following it would fork and nothing would happen. With a
+   positive trigger, a corrected `spawn`/`fork`, and a **handler
+   exemplar** (the model had seen `raise()` but never seen itself write
+   `return resume(value)` against a condition report), `raise` went
+   from zero in sixteen task-runs to two in five.
+
+**What is measured, and what is not.** Round-trips hold at 1.0–1.4
+with programs of 3–14 statements doing parallel reads, retry-and-branch,
+transaction wrapping and post-hoc verification inline — the turn-count
+claim is the best-supported thing here. `spawn_children` was 0 in this
+run and 1 in two earlier ones: spawn usage is **variable between runs**
+and n=1 says nothing about it either way, so the "at least one real
+spawn child" gate is **not** met. And no exemplar gates a destructive
+action on purpose — `destructive-migration-gate` is an eval task, and
+exemplifying it would turn that check from a measurement of judgement
+into a test of exemplar-following.
+
 **C3.** Two things the POC never exercised and the real session now
 must: **multi-turn** (a second `UserTurn` on a live branch continues
 rather than restarts, and `append_history` from turn 1 is visible in
