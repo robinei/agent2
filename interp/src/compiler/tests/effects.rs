@@ -231,14 +231,16 @@ fn raise_non_literal_name_is_compile_error() {
 // this set never varies per agent. `resume`/`abandon` are pure
 // decision-value constructors (Step D2): no `Invoke`, no promise —
 // the same shape `TypeError(...)` already builds, just tagged
-// `__decision` instead of `name`.
+// `__decision` instead of `name`. `tell` is the one exception to
+// "`Invoke`-based": it lowers to `Notify` instead (23_ONE_AGENT.md
+// C0b), covered separately below rather than in this loop, because it
+// never yields `Pending` even when awaited.
 
 #[test]
 fn awaited_harness_verb_calls_yield_pending_effect() {
     // One representative per verb: each is bare (no `tools.` prefix)
     // and produces the same `Invoke` effect `tools.*` does.
     for (call, expected_name, expected_args) in [
-        ("tell(\"hi\")", "tell", vec![Value::String("hi".into())]),
         (
             "ask(\"who\", \"q\")",
             "ask",
@@ -303,6 +305,32 @@ fn unawaited_harness_verb_call_is_fire_and_forget() {
             assert_eq!(unstarted[0].name, "tell");
         }
         other => panic!("expected Done, got {other:?}"),
+    }
+}
+
+#[test]
+fn tell_never_yields_pending_awaited_or_not() {
+    // `tell()` lowers to `Notify` (23_ONE_AGENT.md C0b), which pushes
+    // `undefined` rather than a promise — so unlike every other bare
+    // verb, `await tell(...)` and a bare `tell(...)` are the identical
+    // expression: `Await`'s own rule is "a non-promise passes through
+    // unchanged," and there is no promise here to pass through
+    // *unchanged from*. Neither form ever produces a `Pending` effect;
+    // the call still reaches the outbox (the host still logs it and
+    // delivers it), just never as something the program waited on.
+    for src in ["return tell(\"hi\");", "return await tell(\"hi\");"] {
+        let prog = compile(src).unwrap_or_else(|e| panic!("{src} failed to compile: {e:?}"));
+        let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
+        match vm.step(u64::MAX).unwrap() {
+            StepResult::Done { value, unstarted } => {
+                assert_eq!(value, Value::Undefined, "{src}");
+                assert_eq!(unstarted.len(), 1, "{src}");
+                assert_eq!(unstarted[0].name, "tell", "{src}");
+            }
+            other => {
+                panic!("{src}: expected Done (no Pending — nothing to wait on), got {other:?}")
+            }
+        }
     }
 }
 

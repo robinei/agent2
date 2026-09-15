@@ -475,6 +475,23 @@ pub enum Instr {
     /// instructions.
     Invoke(RcStr, ArgCount), // any, ... -> promise
 
+    /// EFFECT: starts the named call exactly like `Invoke` — same outbox
+    /// entry, same host-visible `InvokeCall` — but pushes `undefined`
+    /// instead of a promise. For a call the host settles at dispatch
+    /// (a local append, never real IO), a promise has nothing to
+    /// represent: there is no interval during which the result is
+    /// unknown, so wrapping it in something awaitable only invents a
+    /// footgun (forget the `await` and the VM traps on a promise
+    /// nobody meant to keep) for no benefit. `tell()` is the one bare
+    /// verb this applies to today (23_ONE_AGENT.md C0b); `await
+    /// tell(...)` and a bare `tell(...)` are therefore the same
+    /// expression, since `Await` passes a non-promise through
+    /// unchanged. The outbox entry still carries a promise id — the
+    /// host's dispatch code is shared with `Invoke` and expects one —
+    /// but nothing in this VM ever constructs a `Value::Promise` from
+    /// it, so nothing can ever await it here even by accident.
+    Notify(RcStr, ArgCount), // any, ... -> undefined
+
     /// Await the top of stack. A non-promise passes through unchanged (JS
     /// `await x` on a plain value). A Resolved promise is replaced by its
     /// value (a promise resolved with a promise is adopted: the Await

@@ -2463,34 +2463,23 @@ mod tests {
         assert!(program_result.starts_with("rejected: result too large"));
     }
 
-    /// M2: a `raise` with payload round-trips through the full session
-    /// loop — condition report logged as a `Tool` event, the LLM's
-    /// `resume(value)` re-enters the *same* VM, and the resumed value
-    /// becomes the raise expression's result — **as far as the one-shot
-    /// prompt goes.** Scoped down from its original intent (asserting a
-    /// full round trip back to 42) to what `host/mod.rs` actually
-    /// implements today: `prompt_suspended` builds and sends the
-    /// condition's own report as a live-only tail (a `Pushed` condition
-    /// is invisible to `document::render`'s rolling fold, so this is
-    /// never observable in the log, only by capturing what crossed the
-    /// LLM trait) the moment a run suspends. What is **not** implemented
-    /// is the other half: recognizing that a completion answering that
-    /// prompt is a decision at all. `on_llm_response` always routes a
-    /// new completion through `apply_turn`, whose own doc is explicit
-    /// that a prior suspension is discarded (marked `Failed`, its VM
-    /// dropped into `last_vm`) the moment the *new* program is confirmed
-    /// to run — before anything could inspect its return value for the
-    /// `{__decision: "resume", value}` tag `interp`'s compiler gives
-    /// `resume(...)` (`call.rs`: "the harness reads the tag off the
-    /// returned object"). By the time such a check could run, the
-    /// original suspended VM this test would need resumed is already
-    /// gone — confirmed by the actual logged `Return`, which is the
-    /// literal tagged object, not `42`. `Runner::resume`/`Runner::abandon`
-    /// exist and work (`raise_suspends_with_pushed_disposition_and_host_
-    /// driven_resume_continues`, driven directly), but nothing yet
-    /// decides *when* to call them from a live completion — flagged in
-    /// this pass's report as a design gap for Pass C, not guessed at
-    /// here.
+    /// M2, half of it: `raise` with a payload sends the condition report
+    /// as a one-shot, live-only tail the moment a run suspends
+    /// (`prompt_suspended`) — a `Pushed` condition is invisible to
+    /// `document::render`'s rolling fold, so this prompt is never
+    /// observable in the log itself, only by capturing what crossed the
+    /// LLM trait, which is what this test does. Scoped to exactly that:
+    /// the script has no second turn to answer it, on purpose, so this
+    /// stays a test of the *prompt*, not the round trip.
+    ///
+    /// **The other half — a completion answering that prompt actually
+    /// being read as a decision and resuming the same VM — used to be
+    /// an unfixed gap this doc described at length; it is fixed (C0a,
+    /// 23_ONE_AGENT.md) and proven end to end elsewhere, not duplicated
+    /// here:** `program_status_tracks_raise_and_resume` and
+    /// `upward_clarification_does_not_deadlock` both drive a full
+    /// session with a second scripted `resume(...)` turn and assert the
+    /// resumed value actually comes back, not the raw decision object.
     #[test]
     fn raise_sends_the_condition_report_as_a_one_shot_prompt() {
         let script = vec![scripted_program(
@@ -2571,28 +2560,19 @@ mod tests {
         );
     }
 
-    /// Step 2 (decision 5), as it stood before code mode: a raise+resume
-    /// was meant to fold into one block whose status walks `Running →
-    /// Suspended → Running → Completed`, all under the original
-    /// `run_program` id, because `Runner::resume` keeps `run.program_id`
-    /// when it re-enters the same VM (its own code: `let program_id =
-    /// run.program_id; ...; self.note_status(program_id, Running)`).
-    ///
-    /// **That is not what happens here, and it is the same gap
-    /// `raise_sends_the_condition_report_as_a_one_shot_prompt`'s doc
-    /// documents at length: nothing yet recognizes a live completion's
-    /// `{__decision: "resume", value}` return and calls `Runner::resume`
-    /// with it.** `on_llm_response` routes `scripted_resume(7)`'s
-    /// completion through `apply_turn` like any other — which finds the
-    /// first program still `Suspended`, marks it `Failed` ("the
-    /// abandoned program never completed"), and starts a **second,
-    /// unrelated program** (`apply_turn`'s own doc) that happens to
-    /// evaluate to the same tagged object as its ordinary return value.
-    /// That second program has its own, different id, so
-    /// `statuses_for(&events, program)` — filtered on the *first*
-    /// program's id — never sees its `Running`/`Completed` pair at all;
-    /// only the first program's own truncated arc shows up. Flagged as a
-    /// Pass C design gap there, not guessed at here.
+    /// **Restored (C0a, 23_ONE_AGENT.md).** A raise+resume folds into one
+    /// block whose status walks `Running → Suspended → Running →
+    /// Completed`, all under the original `run_program` id, because
+    /// `Runner::resume` keeps `run.program_id` when it re-enters the same
+    /// VM (its own code: `let program_id = run.program_id; ...;
+    /// self.note_status(program_id, Running)`) and `finish_program` is
+    /// now the thing that calls it: it reads `scripted_resume(7)`'s
+    /// `{__decision: "resume", value: 7}` return off the handler's own
+    /// completion and routes it into the *original* suspended VM instead
+    /// of logging it as that handler's own ordinary result. The
+    /// handler's `Turn` gets its own `Running`/`Completed` pair (a
+    /// different id, not asserted here — `statuses_for` filters on the
+    /// original program), but the resumed program's arc is unbroken.
     #[test]
     fn program_status_tracks_raise_and_resume() {
         let script = vec![
@@ -2606,9 +2586,13 @@ mod tests {
             [
                 ProgramStatus::Running,
                 ProgramStatus::Suspended,
-                ProgramStatus::Failed,
+                ProgramStatus::Running,
+                ProgramStatus::Completed,
             ]
         );
+        // The raise expression really did resolve to 7, not to the raw
+        // decision object — the resumed VM carried on and returned it.
+        assert_eq!(returned(session.tree(), root_leaf(&session)), json!(7));
     }
 
     /// Step 2 (decision 4): the first event after an agent's `Agent`
@@ -2898,18 +2882,21 @@ mod tests {
         // whole turn *is* a program). "Answers nothing" (18_TARGETING,
         // asserted below) is about `answer()` discharging an open post,
         // not about whether the turn issued any call at all.
+        //
+        // No trailing `Post` here: addressed to "user", `tell()`'s
+        // delivery has no branch to post *into* (`Address::User`'s own
+        // doc — the human has none), and — the thing this specific
+        // assertion used to get wrong before C0b (23_ONE_AGENT.md) — an
+        // unawaited `tell()`'s own settlement is not a rule-C surprise
+        // either, so it never manufactured one here.
         assert_eq!(
             kinds(tree, root_leaf(&session)),
             [
-                "Agent", "Post", "Turn", "Call", "Return", "Console", "Result", "Post"
+                "Agent", "Post", "Turn", "Call", "Return", "Console", "Result"
             ]
         );
 
-        // The post is the user's own, and it expected a reply. There are
-        // now *two* `Post`s on this branch — the user's own, and the
-        // delivery of the assistant's `tell()` back to them — so this
-        // finds the user's specifically, not whichever `HashMap`
-        // iteration happens to see first.
+        // The one `Post` on this branch is the user's own kickoff.
         let post = tree
             .events
             .values()
@@ -3373,32 +3360,25 @@ mod tests {
         assert!(session.quiet());
         // The system prompt is on the branch root now, not a message.
         //
-        // Two things changed here from the pre-code-mode shape this
-        // assertion used to have. First, `Message::Turn::text()` is
-        // always the bare program `source` now — there is no more
-        // "plain reply" `Message.text` distinct from the program that
-        // produced it (23_ONE_AGENT's substitution), so the assistant's
-        // turn shows up as the whole `tell(...)` call, not just the
-        // string it told. Second, `scripted_text` writes a `tell()` the
-        // program never `await`s — the card's recommended shape for a
-        // reply that does nothing further — so the call is in the VM's
+        // `Message::Turn::text()` is always the bare program `source` now
+        // — there is no more "plain reply" `Message.text` distinct from
+        // the program that produced it (23_ONE_AGENT's substitution), so
+        // the assistant's turn shows up as the whole `tell(...)` call,
+        // not just the string it told. `scripted_text` writes a `tell()`
+        // the program never `await`s — the card's recommended shape for
+        // a reply that does nothing further — so the call is in the VM's
         // `unstarted` outbox when the program finishes: `finish_program`
-        // dispatches it anyway, but by construction no VM is left to
-        // receive the settle. That is precisely Rule C's other trigger
-        // ("the branch holds no VM", 17_BRANCHES.md), not a bug — the
-        // harness posts a notice so the branch isn't left with a result
-        // logged and nothing else to show for it.
+        // dispatches it anyway, and by construction no VM is left to
+        // receive the settle. That used to be rule C's other trigger
+        // ("the branch holds no VM", 17_BRANCHES.md) regardless of which
+        // call it was; since C0b (23_ONE_AGENT.md) a `tell`'s own
+        // settlement is specifically exempted (nothing was ever owed a
+        // reply for it to begin with), so nothing follows the program's
+        // own turn here.
         let msgs: Vec<&str> = forked.context().messages.iter().map(|m| m.text()).collect();
         assert_eq!(
             msgs,
-            [
-                "q",
-                "forked follow-up",
-                "tell(\"user\", \"forked done\");",
-                "A call you issued has settled with no program awaiting it: [#8] \
-                 tell(user, \"forked done\") → {\"post\":null}. Fetch the whole value with \
-                 artifact(8). Nothing is owed in reply.",
-            ]
+            ["q", "forked follow-up", "tell(\"user\", \"forked done\");"]
         );
         // The fork's id was announced, and both branches are live.
         let events: Vec<SessionEvent> = rx.try_iter().collect();
@@ -3829,6 +3809,15 @@ mod tests {
     /// sender's receipt lands as soon as the post does — what a tell
     /// spares is the answer, not the attention, so the recipient still
     /// spends a turn noticing it.
+    ///
+    /// The sender's own `return await tell(...)` used to surface that
+    /// receipt as the program's return value. Since C0b (23_ONE_AGENT.md)
+    /// `tell()` no longer produces a promise — `await tell(...)` and a
+    /// bare `tell(...)` are the same expression, `undefined`, because a
+    /// call the harness settles at dispatch has nothing to hand back —
+    /// so the receipt is only in the log now (this call's own `Result`),
+    /// not in the return value. Checked below directly off the `Call`
+    /// instead.
     #[test]
     fn tell_delivers_receipt_and_opens_nothing() {
         let (session, _) = run_routed(
@@ -3854,11 +3843,14 @@ mod tests {
 
         // The recipient: a post, a turn (itself a real `tell()` call
         // under code mode, settled by its own `Result`), and **no
-        // `Answer`** — it owes nothing, so nothing is open on it.
+        // `Answer`** — it owes nothing, so nothing is open on it. No
+        // trailing `Post` here either: the worker's own reply is an
+        // unawaited `tell()`, and (C0b) its settlement is never a rule-C
+        // surprise.
         assert_eq!(
             kinds(tree, worker_leaf),
             [
-                "Agent", "Post", "Turn", "Call", "Return", "Console", "Result", "Post"
+                "Agent", "Post", "Turn", "Call", "Return", "Console", "Result"
             ]
         );
         assert!(
@@ -3866,7 +3858,16 @@ mod tests {
             "a tell opens nothing"
         );
 
-        // The sender: a receipt naming the post that landed.
+        // The sender's program itself sees nothing back (its own doc
+        // above): `return await tell(...)` is `undefined`, which has no
+        // JSON form at the root (`stack_value_to_json`'s own doc: dropped
+        // in an object, coerced to `null` in an array, an error at the
+        // root) — `finish_program` falls back to the debug string for
+        // exactly that case, same as `return undefined;` always has.
+        assert_eq!(returned(tree, root_leaf(&session)), json!("Undefined"));
+
+        // The receipt is still in the log, on the `Send`'s own `Result`,
+        // naming the post that landed on the worker.
         let post = tree
             .path_events(worker_leaf)
             .iter()
@@ -3881,10 +3882,20 @@ mod tests {
             })
             .map(|e| e.id)
             .expect("the delivered post");
-        assert_eq!(
-            returned(tree, root_leaf(&session)),
-            json!({ "post": post.as_u64() })
-        );
+        let receipt = tree
+            .path_events(root_leaf(&session))
+            .iter()
+            .find_map(|e| match &e.payload {
+                EventPayload::Result {
+                    outcome: Outcome::Delivered(v),
+                    ..
+                } if v.get("post").and_then(|p| p.as_u64()) == Some(post.as_u64()) => {
+                    Some(v.clone())
+                }
+                _ => None,
+            })
+            .expect("the send's own Result carries the receipt");
+        assert_eq!(receipt, json!({ "post": post.as_u64() }));
     }
 
     /// **Agents outlive programs, but a program's handles to them do
@@ -4593,40 +4604,28 @@ mod tests {
     /// question suspends the run into a `Condition` (Rule B) rather than
     /// blocking anything on something that will never arrive.
     ///
-    /// **Scoped down twice from what this test originally asserted, for
-    /// two independent reasons — read `raise_sends_the_condition_
-    /// report_as_a_one_shot_prompt`'s doc first, this compounds on it:**
-    ///
-    /// 1. Completing a program is not, on its own, a reason to reprompt
-    ///    for anything still left open (`structured_answer_reaches_the_
-    ///    program`'s doc, same fix applied there) — under the old
-    ///    tool-calling protocol a turn with an unclosed tool call always
-    ///    got one more round; under code mode nothing wakes a branch
-    ///    without a *new* cause to name. The child's one program runs
-    ///    `ask()` then returns; the parent's original "read the plan"
-    ///    question (#8) was already accounted for when that program was
-    ///    prompted, so nothing re-invites it to a second turn, and the
-    ///    queued `answer(8, ...)`/`"noted"` responses this test used to
-    ///    expect are unreachable — deleted rather than left as dead
-    ///    weight. #8 is left genuinely, permanently open: asserted below,
-    ///    not hidden.
-    /// 2. Even answered, nothing yet recognizes a live completion's
-    ///    return value as a `{__decision: "resume", value}` tag and
-    ///    feeds it back into the parent's suspended VM — `on_llm_response`
-    ///    routes every completion through `apply_turn`, which discards a
-    ///    prior suspension outright before anything could read its
-    ///    return value. `Runner::resume` exists and works when the host
-    ///    calls it directly; nothing yet decides *when* to from a live
-    ///    completion. Flagged as a Pass C design gap there, not guessed
-    ///    at here — so the parent's `return resume();` logs a plain
-    ///    `Return` of the raw decision object, and that is what this
-    ///    test checks for now instead of a value no code path yet
-    ///    produces.
+    /// **Restored (C0a, 23_ONE_AGENT.md) to its full original intent** —
+    /// previously scoped down twice, for the two reasons
+    /// `raise_sends_the_condition_report_as_a_one_shot_prompt`'s doc
+    /// records at length: nothing recognized a live completion's
+    /// `{__decision: "resume", value}` tag, so the parent's own
+    /// `return resume();` used to log the raw decision object as an
+    /// ordinary `Return` instead of ever reaching back into the
+    /// suspended VM. Now it does: `finish_program` reads the tag off
+    /// the handler's completion and calls `Runner::resume` directly, so
+    /// the parent's original `ask(w.agent, "read the plan")` actually
+    /// resumes and — once the child (which now explicitly answers #8,
+    /// closing the parent's own pending ask) delivers its value —
+    /// settles for real. Completing a program is still not, on its own,
+    /// a reason to reprompt for anything left open
+    /// (`structured_answer_reaches_the_program`'s doc): the child's
+    /// script answers #8 itself rather than relying on a second,
+    /// re-invited turn.
     #[test]
     fn upward_clarification_does_not_deadlock() {
         // Ids are deterministic: Agent 1, Post 2, Turn 3, Spawn 4,
         // Agent 5, Result 6, Send 7 (parent→child), Post 8 (on the
-        // child, permanently open per point 1 above), Turn 9, Send 10
+        // child, answered once the child resumes), Turn 9, Send 10
         // (child→parent), Post 11 (on the parent, answered).
         let child_question = 8;
         let upward_question = 11;
@@ -4635,18 +4634,21 @@ mod tests {
             [
                 (
                     "needs a path",
-                    // One turn only (point 1 above): the child asks
-                    // upward with `to` explicitly `null` —
-                    // `resolve_address` treats an omitted or `null`
-                    // address the same way, resolving to whoever this
-                    // branch's oldest open post is from, here the
-                    // parent's own `ask`. It is parked, costing no fuel,
-                    // then answered and returns; nothing reprompts it a
-                    // second time.
-                    vec![scripted_program(
+                    // One turn only: the child asks upward with `to`
+                    // explicitly `null` — `resolve_address` treats an
+                    // omitted or `null` address the same way, resolving
+                    // to whoever this branch's oldest open post is from,
+                    // here the parent's own `ask`. It is parked, costing
+                    // no fuel, then answered and continues — explicitly
+                    // answering the parent's own question (#8) itself,
+                    // which is what lets the parent's own suspended
+                    // `ask()` resolve once C0a's resume routing reaches
+                    // it, rather than needing a second, re-invited turn.
+                    vec![scripted_program(&format!(
                         r#"const path = await ask(null, "which file?");
-                           return "read " + path;"#,
-                    )],
+                           answer({child_question}, "w1", "read " + path);
+                           return "read " + path;"#
+                    ))],
                 ),
                 (
                     "test agent",
@@ -4661,10 +4663,11 @@ mod tests {
                         // synchronously the moment the `Answer` is
                         // logged, so it can sit ahead of the handler's
                         // own `return resume(...)` in the same turn
-                        // exactly like any other statement. Point 2
-                        // above is why `resume()`'s value never reaches
-                        // anywhere: the object it builds is simply this
-                        // turn's own `Return` value.
+                        // exactly like any other statement. `resume()`'s
+                        // decision object is read by `finish_program`
+                        // once this handler's own program completes
+                        // (C0a) and routed into the parent's suspended
+                        // VM — it never becomes anyone's `Return` value.
                         scripted_program(&format!(
                             r#"answer({upward_question}, "w1", "PLAN.md");
                                return resume();"#
@@ -4708,15 +4711,19 @@ mod tests {
         assert_eq!(
             kinds(tree, child_leaf),
             [
-                "Agent", "Post", "Turn", "Call", "Result", "Return", "Console"
+                "Agent", "Post", "Turn", "Call", "Result", "Answer", "Return", "Console"
             ],
         );
-        // The parent's decision object is the literal `Return` value —
-        // point 2's other half: nothing consumed it as a restart.
-        assert_eq!(
-            returned(tree, root_leaf(&session)),
-            json!({ "__decision": "resume" })
-        );
+        // **C0a lands here.** The handler's `answer(...); return
+        // resume();` is recognized as a decision about the *suspended*
+        // parent, not a program in its own right: nothing routes its
+        // `{__decision: "resume"}` object anywhere near a `Return`, and
+        // the parent's own original `ask(w.agent, "read the plan")`
+        // resumes and settles for real once the child (now that it
+        // explicitly answers #8 above) delivers the value — so the
+        // parent's own `Return` is the ask's real result, the same
+        // value the child returned.
+        assert_eq!(returned(tree, root_leaf(&session)), json!("read PLAN.md"));
         assert_eq!(
             kinds(tree, root_leaf(&session)),
             [
@@ -4729,33 +4736,34 @@ mod tests {
                 "Post",
                 "Condition",
                 "Console",
+                // The handler's own `Turn` (`answer(...); return
+                // resume();`) — no `Condition`/`Return` of its own
+                // follows it: `Runner::resume`'s own doc is explicit
+                // that a decision says nothing new, and this `Turn`
+                // together with its `Answer` fold at the raise's nested
+                // depth (`Disposition::Pushed` from the `Condition`
+                // above), invisible to any future request, exactly like
+                // a handler's aside should be.
                 "Turn",
-                // The second `Condition` — `Cause::Abandoned`,
-                // `Handover` — is `apply_turn`'s own close on the first
-                // `Condition`'s still-open scope: this fresh completion
-                // is replacing a `Suspended` run, not continuing it, and
-                // logging that (mirroring `Runner::abandon`'s own
-                // precedent) is what keeps `depth_after` from staying
-                // incremented forever and hiding every later event on
-                // this branch from a future request.
-                "Condition",
                 "Answer",
+                // The parent's *original* run picks back up from here —
+                // same program, same `Turn` as above on the log (no new
+                // one gets logged for a resume) — and its call to the
+                // child finally settles.
+                "Result",
                 "Return",
                 "Console"
             ]
         );
-        // #11 (the upward question) is explicitly answered; #8 (the
-        // parent's original ask) is not — point 1's other half. The
-        // human's own kickoff (#2) stays open too, as always
-        // (18_TARGETING: a bare reply answers nothing).
+        // Both #11 (the upward question) and #8 (the parent's original
+        // ask, now that the child explicitly answers it above) are
+        // closed. The human's own kickoff (#2) stays open regardless, as
+        // always (18_TARGETING: a bare reply answers nothing).
         assert_eq!(
             tree.spine_at(root_leaf(&session)).context().open,
             [EventId::new(2)]
         );
-        assert_eq!(
-            tree.spine_at(child_leaf).context().open,
-            [EventId::new(child_question)]
-        );
+        assert!(tree.spine_at(child_leaf).context().open.is_empty());
     }
 
     // ── C1: branches are the address ─────────────────────────────────
@@ -4820,32 +4828,14 @@ mod tests {
                 .collect()
         };
         // As in `fork_then_user_turn_diverges_in_the_same_agent`: each
-        // reply is an unawaited `tell()` (`scripted_text`'s shape), so
-        // it settles with no VM left to receive it and Rule C posts a
-        // notice naming the artifact — the Turn's own text is the whole
-        // program, not just the string it told.
-        assert_eq!(
-            texts(a),
-            [
-                "q",
-                "to A",
-                "tell(\"user\", \"A answers\");",
-                "A call you issued has settled with no program awaiting it: [#11] \
-                 tell(user, \"A answers\") → {\"post\":null}. Fetch the whole value with \
-                 artifact(11). Nothing is owed in reply.",
-            ]
-        );
-        assert_eq!(
-            texts(b),
-            [
-                "q",
-                "to B",
-                "tell(\"user\", \"B answers\");",
-                "A call you issued has settled with no program awaiting it: [#14] \
-                 tell(user, \"B answers\") → {\"post\":null}. Fetch the whole value with \
-                 artifact(14). Nothing is owed in reply.",
-            ]
-        );
+        // reply is an unawaited `tell()` (`scripted_text`'s shape) — the
+        // Turn's own text is the whole program, not just the string it
+        // told. It used to settle with no VM left to receive it and fire
+        // a rule-C notice naming the artifact; since C0b (23_ONE_AGENT.md)
+        // a `tell`'s own settlement is never a rule-C surprise, so there
+        // is nothing after it.
+        assert_eq!(texts(a), ["q", "to A", "tell(\"user\", \"A answers\");"]);
+        assert_eq!(texts(b), ["q", "to B", "tell(\"user\", \"B answers\");"]);
 
         let events: Vec<SessionEvent> = rx.try_iter().collect();
         assert_eq!(opened(&events), [a, b]);
@@ -4887,11 +4877,11 @@ mod tests {
         assert_eq!(
             kinds,
             [
-                "Agent", "Post", "Fork", "Post", "Turn", "Call", "Return", "Console", "Result",
-                "Post"
+                "Agent", "Post", "Fork", "Post", "Turn", "Call", "Return", "Console", "Result"
             ],
-            "the fork diverged at #2, before the original's reply — and the reply itself is a \
-             real tell() call under code mode, not call-free prose: {kinds:?}"
+            "the fork diverged at #2, before the original's reply — the reply itself is a real \
+             tell() call under code mode, not call-free prose, but (C0b) an unawaited tell's own \
+             settlement is never a rule-C surprise, so nothing trails it: {kinds:?}"
         );
     }
 
@@ -4977,10 +4967,12 @@ mod tests {
         assert_eq!(
             kinds,
             [
-                "Agent", "Post", "Post", "Turn", "Call", "Return", "Console", "Result", "Post"
+                "Agent", "Post", "Post", "Turn", "Call", "Return", "Console", "Result"
             ],
             "one turn, a bare reply — it answers neither open post (18_TARGETING), but under \
-             code mode that reply is still a real tell() call, not call-free prose: {kinds:?}"
+             code mode that reply is still a real tell() call, not call-free prose; (C0b) its \
+             own unawaited settlement is never a rule-C surprise, so nothing trails it: \
+             {kinds:?}"
         );
         // The bare turn's text still reaches the client, as the logged
         // `Turn` on the ordinary event stream — `SessionEvent::Answered`
@@ -5056,32 +5048,18 @@ mod tests {
 
     /// **The user takes a branch's turn.** `Restart` logs a `Turn {
     /// author: User, source }` and dispatches `source` exactly as the
-    /// LLM's own completion would be.
-    ///
-    /// **The "resumed with 5" this doc used to promise does not happen
-    /// yet — same gap as `raise_sends_the_condition_report_as_a_one_
-    /// shot_prompt` and `program_status_tracks_raise_and_resume`, and a
-    /// more consequential instance of it: this is the `v` gesture, the
-    /// human's own manual-recovery path, going through `take_turn` →
-    /// `apply_turn` exactly like a live LLM completion does.**
-    /// `apply_turn` has no special case for the decision tag either way
-    /// — it does not distinguish "the host is host-authoring a resume on
-    /// purpose" from "a completion happens to return an object shaped
-    /// like one" — so `return resume(4);` here runs as a **second,
-    /// independent** program: the first (suspended, mid-`raise`) is
-    /// marked `Failed` and dropped, and this one's own `return`
-    /// evaluates `resume(4)` — a plain tagged-object construction, no VM
-    /// interaction — and logs *that object* as its own `Return` value.
-    /// Nothing ever adds 1 to it, because nothing ever re-enters the
-    /// original raise expression. `Runner::resume` exists and is
-    /// correct when the host calls it directly
-    /// (`raise_suspends_with_pushed_disposition_and_host_driven_resume_
-    /// continues`); nothing yet calls it from here. Flagged in this
-    /// pass's report as a design gap for Pass C — worth weighing there
-    /// against the other two instances, since unlike an LLM's own retry
-    /// this is the one gesture a human has for recovering a suspended
-    /// program by hand, and today it silently discards the suspension
-    /// instead.
+    /// LLM's own completion would be — including, now (C0a,
+    /// 23_ONE_AGENT.md), a `return resume(value);` actually resuming.
+    /// This is the `v` gesture, the human's own manual-recovery path,
+    /// going through `take_turn` → `apply_turn` exactly like a live LLM
+    /// completion does, so it needed no gesture-specific wiring of its
+    /// own once `finish_program` learned to read the decision tag off
+    /// *any* completion: **resumed with 5**, not the raw decision
+    /// object — `finish_program` recognizes `resume(4)`'s
+    /// `{__decision: "resume", value: 4}` tag on the synthesized
+    /// program's own completion, re-enters the original, still-live
+    /// `raise('need', {}) + 1` expression with `4`, and that program
+    /// itself finishes with `4 + 1`.
     #[test]
     fn user_resumes_and_user_rewrites() {
         let (mut session, _rx) = open(
@@ -5111,11 +5089,8 @@ mod tests {
             session.pump_one();
         }
         let leaf = session.state(branch).unwrap().spine.leaf_id;
-        // The raw decision object, not 5 — see this test's own doc.
-        assert_eq!(
-            returned(session.tree(), leaf),
-            json!({ "__decision": "resume", "value": 4 })
-        );
+        // 5, not the raw decision object — see this test's own doc.
+        assert_eq!(returned(session.tree(), leaf), json!(5));
 
         // Every user-authored turn is logged as one.
         let user_turns: Vec<&crate::types::Event> = session
@@ -5320,6 +5295,69 @@ mod tests {
         );
     }
 
+    /// **`tell` is the one exception to Rule C** (23_ONE_AGENT.md C0b),
+    /// and this is the regression test the step exists to leave behind:
+    /// the card's own recommended idiom is an *unawaited* `tell()`
+    /// (`card.rs`'s exemplars all open with one, none of them `await`ed),
+    /// and before this fix every single one of them cost a second
+    /// completion — Rule C's "nothing is owed in reply" notice, firing
+    /// for a delivery receipt nobody would ever have asked to see.
+    ///
+    /// A plain `tools.*` call in the same unawaited shape is the
+    /// contrast: it still wakes the branch (`unawaited_result_wakes_
+    /// the_branch_as_a_harness_post`, right below), because *that*
+    /// call's value really could go unseen after a resume. A `tell`'s
+    /// settlement carries no such value — it is a delivery receipt for
+    /// something already fully expressed in the log by its own `Call` —
+    /// so there is nothing for Rule C to protect.
+    #[test]
+    fn unawaited_tell_produces_no_post_and_no_extra_wake() {
+        let script = vec![scripted_program(
+            r#"tell("user", "fire and forget"); return 1;"#,
+        )];
+        let (session, events) = run_session(ToolRegistry::new(), script, "go");
+        let leaf = root_leaf(&session);
+        let tree = session.tree();
+
+        // The call and its delivery receipt are both logged — the
+        // physics happened and `artifact(id)` can still find it — but
+        // nothing about it is a `Post`, and the program's own turn is
+        // the only one on the branch.
+        assert_eq!(
+            kinds(tree, leaf),
+            [
+                "Agent", "Post", "Turn", "Call", "Return", "Console", "Result"
+            ]
+        );
+        assert_eq!(returned(tree, leaf), json!(1));
+        assert!(
+            !tree.path_events(leaf).iter().any(|e| matches!(
+                &e.payload,
+                EventPayload::Message(Message::Post {
+                    from: Author::Harness,
+                    ..
+                })
+            )),
+            "a fire-and-forget tell must not cost a harness post"
+        );
+        // No `ProgramStatus` event names a second program: one
+        // completion, exactly as the card promises when nothing it does
+        // is itself awaited.
+        let turn_count = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    SessionEvent::ProgramStatus {
+                        status: ProgramStatus::Running,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(turn_count, 1, "{events:?}");
+    }
+
     /// **Rule C's other half.** A `Result` that lands with no program
     /// awaiting it is logged as an artifact *and* surfaced as a harness
     /// post — a tell, so the branch notices without owing an answer.
@@ -5416,25 +5454,42 @@ mod tests {
         // (18_TARGETING). The human's original "go" is still open; only
         // an explicit `answer()` would have closed it.
         //
-        // The tail is `Result, Post`, not a bare `Post, Turn`: this
-        // reply is itself `scripted_text`'s unawaited `tell()` (the
-        // card's recommended shape for a reply that does nothing
-        // further, same as `fork_then_user_turn_diverges_in_the_same_
-        // agent`), so it lands in the VM's `unstarted` outbox exactly
-        // like the `slow` tool call above did — no VM survives to
-        // receive its own settle, Rule C fires again, and the harness
-        // posts a *second* notice. That is what queue entry `"noted the
-        // late answer"`'s own doc comment already banked on ("the
-        // harness post prompts this"): this test was always exercising
-        // the cascade two hops deep, one wake per queued reply: the
-        // late `slow` result wakes the branch into `"moved on"`, whose
-        // own unawaited `tell` wakes it once more into `"noted the late
-        // answer"`, whose settle is the final `Result, Post` here — this
-        // assertion had just not been ported to say so.
+        // **This queued reply used to demonstrate the opposite of what it
+        // now demonstrates.** `"noted the late answer"` is
+        // `scripted_text`'s unawaited `tell("user", ...)` — the card's
+        // recommended shape for a reply that does nothing further — so
+        // it lands in the VM's `unstarted` outbox exactly like the `slow`
+        // tool call above did: no VM survives to receive its own settle.
+        // Before C0b (23_ONE_AGENT.md) that made Rule C fire *again*,
+        // costing a second wake and a second completion for the crime of
+        // using the card's own idiom — the regression this whole step
+        // exists to close. Now a `tell`'s settlement is never a rule-C
+        // surprise (`Call::Send { expects_reply: false, .. }` is
+        // recognized on both `unawaited` paths in `on_tool_results`), so
+        // this second `tell` settles quietly: an artifact (`Call`,
+        // `Result`) with no harness post and no further wake. The tail is
+        // `Return, Console, Result` — the program's own ordinary
+        // completion, then the `tell`'s delivery receipt landing
+        // separately (dispatched from `finish_program`'s `unstarted`
+        // handling, settled by a later `on_tool_results`) — not a second
+        // `Post`.
         assert!(
-            kinds(session.tree(), leaf).ends_with(&["Result", "Post"]),
+            kinds(session.tree(), leaf).ends_with(&["Return", "Console", "Result"]),
             "{:?}",
             kinds(session.tree(), leaf)
+        );
+        let notice_count = path
+            .iter()
+            .filter(|e| {
+                matches!(&e.payload,
+                    EventPayload::Message(Message::Post { from: Author::Harness, origin })
+                    if origin.direct().is_some_and(|(t, _, r)| t.contains("no program awaiting it") && !r))
+            })
+            .count();
+        assert_eq!(
+            notice_count, 1,
+            "only the `slow` tool's settlement is a rule-C surprise; the tell's own \
+             settlement must not cost a second harness post"
         );
         assert_eq!(session.state(branch).unwrap().open(), [EventId::new(2)]);
     }

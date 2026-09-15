@@ -2316,6 +2316,32 @@ impl VM {
                     self.ip += 1;
                 }
 
+                Instr::Notify(name, nargs) => {
+                    // Same outbox bookkeeping as `Invoke` (see its own
+                    // comment) — the host's dispatch code reads one
+                    // `InvokeCall` shape regardless of which instruction
+                    // produced it — but the pushed value is `undefined`,
+                    // not the promise: this call is known to settle at
+                    // dispatch, so there is nothing for the program to
+                    // wait on (`Instr::Notify`'s own doc).
+                    let name = name.as_str().to_owned();
+                    let n = *nargs as usize;
+                    if n > self.stack.len() {
+                        return Err(self.fail(ErrorKind::StackUnderflow, "stack underflow"));
+                    }
+                    let args = self.stack.split_off(self.stack.len() - n);
+                    let id = self.alloc_promise();
+                    let site = self.spans.get(self.ip as usize).copied().unwrap_or(0);
+                    self.outbox.push(InvokeCall {
+                        promise: id,
+                        name,
+                        args,
+                        site,
+                    });
+                    self.stack.push(Value::Undefined);
+                    self.ip += 1;
+                }
+
                 Instr::Await => {
                     // Re-executing instruction: the operand is PEEKED while
                     // pending so the same Await can run again after the host

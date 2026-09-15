@@ -572,7 +572,23 @@ impl super::Compiler {
                     self.emit(Instr::Raise(name, 0), span);
                 }
             }
-            "tell" | "ask" | "answer" | "spawn" | "fork" | "append_history" | "artifact"
+            "tell" => {
+                // `tell()` is the one bare verb that settles at dispatch
+                // — a local append+deliver, never real IO (23_ONE_AGENT.md
+                // C0b) — so it gets its own instruction rather than the
+                // shared `Invoke` bucket below: `Notify` pushes the call's
+                // result (`undefined`) immediately instead of a promise,
+                // which is also what keeps an unawaited `tell()` from
+                // ever being mistaken for a value someone is still owed
+                // (`machine.rs`'s Rule C exists for exactly that
+                // question, and a `tell` should never be able to raise
+                // it). `ask` stays on the `Invoke` path below: it is the
+                // one call in this vocabulary with a value actually
+                // coming back, which `expects_reply` already names.
+                self.compile_args(argv);
+                self.emit(Instr::Notify(name.into(), argv.len() as u32), span);
+            }
+            "ask" | "answer" | "spawn" | "fork" | "append_history" | "artifact"
             | "remove_history" | "rewrite_history" | "list_agents" => {
                 // The closed, harness-defined vocabulary (phase 20 doc,
                 // `docs/20_CODE_MODE.md` Step C1) — a fixed global
@@ -581,7 +597,7 @@ impl super::Compiler {
                 // `tools.*` (the "tools" arm in `compile_call`) stays
                 // the surface for a specific agent's *configured*
                 // capabilities, which this compiler has no static view
-                // of; these ten never vary per agent, so they get the
+                // of; these nine never vary per agent, so they get the
                 // same bare-call treatment `tools.foo(...)` gives its
                 // own names — `Invoke`, arity-agnostic here too, left
                 // to the host to accept or refuse at runtime.

@@ -276,14 +276,21 @@ enum Phase {
     /// A condition report went out; waiting for a direct
     /// [`Runner::resume`]/[`Runner::abandon`] call from the host.
     ///
-    /// There is deliberately only ever **one** parked run here, not a
-    /// stack: nesting ("a handler for a handler") is a host-side
-    /// concern built from multiple independently-stepped `Runner`s
-    /// (DESIGN.md's load-bearing property — "the handler stack is a
-    /// host-side structure of independently-stepped VMs"), never a
-    /// property this single sans-io core represents internally. See
-    /// this file's own top doc comment for how a restart reaches this
-    /// state now.
+    /// There is still only ever **one** parked run in this variant —
+    /// `Phase` itself never represents nesting. What changed in C0a
+    /// (23_ONE_AGENT.md) is where a *new* program starting on top of
+    /// this one goes: not straight into `Cause::Abandoned`, but onto
+    /// [`Runner::beneath`], a stack of exactly these frozen `(Run,
+    /// ResumeWith)` pairs. That stack, not another dimension on this
+    /// enum, is "the handler stack is a host-side structure of
+    /// independently-stepped VMs" (DESIGN.md's load-bearing property):
+    /// only `phase`'s own run is ever stepped, everything in `beneath`
+    /// is inert data until its turn to be reactivated, and no VM here
+    /// is ever on another VM's stack. (An earlier version of this
+    /// comment said nesting would be built from multiple `Runner`
+    /// instances instead — a design this file never actually needed:
+    /// a handler's own `Turn` runs on the very same branch, so it
+    /// belongs on the very same `Runner`.)
     Suspended(Run, ResumeWith),
 }
 
@@ -348,6 +355,23 @@ pub struct Runner {
     /// starts at its `Fork` root, so history before it never triggers a
     /// prompt and the fork speaks only when spoken to.
     shown: u64,
+    /// Runs suspended **beneath** the one currently in `phase`, each
+    /// frozen exactly where it stopped, oldest first popped last (a
+    /// stack) — see `Phase::Suspended`'s own doc for why this, and not
+    /// another slot on that enum, is where nesting lives. Alongside
+    /// each `Run` sits the generation its own still-pending calls were
+    /// dispatched under (`finish_program` re-stamps them on a
+    /// successful resume, so an old in-flight exchange isn't read as
+    /// issued by a VM that's since moved on).
+    ///
+    /// Pushed by `apply_turn` when a new program starts on top of a
+    /// `Suspended` one — that new program might be the raise's own
+    /// handler — and popped by `finish_program` once *that* program's
+    /// own completion says what to do: a `{__decision: "resume"|
+    /// "abandon", ..}` tag routes to [`Runner::resume`]/
+    /// [`Runner::abandon`]; anything else is a genuine rewrite, and the
+    /// frame is discarded (`Cause::Abandoned`) instead.
+    beneath: Vec<(Run, ResumeWith, u64)>,
 }
 
 enum SuspendCause {
@@ -423,6 +447,7 @@ impl Runner {
             // history: a fork born at its `Fork` root speaks only when
             // spoken to, and a re-opened branch waits to be addressed.
             shown: leaf.as_u64(),
+            beneath: Vec::new(),
         }
     }
 
@@ -832,51 +857,26 @@ impl Runner {
 
         match self.start_program(tree, assistant_id, &source) {
             Ok(run) => {
-                if let Phase::Suspended(old, _) = std::mem::replace(&mut self.phase, Phase::Idle) {
-                    // The abandoned program never completed — Failed.
-                    self.note_status(old.program_id, ProgramStatus::Failed);
-                    self.last_vm = Some(old.vm);
-                    // Exactly the log-visible terminal `Runner::abandon`'s
-                    // own doc insists on, for exactly the reason it gives
-                    // there: a `Pushed` condition that never gets a
-                    // matching close leaves `depth_after` incremented
-                    // forever, so every later event on this branch
-                    // replays as though still nested inside a scope
-                    // nothing will ever close, and `document::render`'s
-                    // depth-0 filter hides it from every future request.
-                    // This is that same bug, reached from a different
-                    // door: a fresh completion (live or user-authored)
-                    // silently replacing a suspended one, rather than a
-                    // program explicitly deciding `return abandon()`.
-                    // `Handover`, not `Pushed`, because this condition is
-                    // closing the frame the old run opened, not opening a
-                    // new one for a handler to run at.
-                    //
-                    // **Known remaining gap, not fixed here:** `assistant_id`
-                    // — this very turn's own `Turn` event — was already
-                    // appended above, *before* this `Condition`, so it is
-                    // still evaluated at the old (unclosed) depth and
-                    // stays invisible to `document::render` until some
-                    // later event brings depth back to 0. Only what comes
-                    // *after* this `Condition` (this program's own `Call`/
-                    // `Return`, and anything later) renders correctly.
-                    // Closing that fully means deciding whether to
-                    // discard a suspension *before* compiling the
-                    // replacement, which changes where `assistant_id`
-                    // comes from — a bigger reshuffle of this function
-                    // than this pass's mandate, left for whoever next
-                    // touches replay depth counting (the same flag
-                    // `suspend`'s own doc already carries for the
-                    // adjacent `Disposition::Pushed`-on-every-raise gap).
-                    tree.append(
-                        &mut self.spine,
-                        EventPayload::Condition {
-                            cause: Cause::Abandoned,
-                            site: 0,
-                            stack: Vec::new(),
-                            disposition: Disposition::Handover,
-                        },
-                    )?;
+                if let Phase::Suspended(old, resume_with) =
+                    std::mem::replace(&mut self.phase, Phase::Idle)
+                {
+                    // Not discarded yet — **C0a** (23_ONE_AGENT.md):
+                    // this new program might be the raise's own handler,
+                    // "a program the LLM writes... whose return value
+                    // *is* the restart" (DESIGN.md's thesis). Its return
+                    // value is not known until `finish_program`, so the
+                    // decision — resume, abandon, or (a genuine rewrite)
+                    // neither — is made there, not here. Stashing rather
+                    // than discarding is also what fixes the depth-
+                    // rendering gap this comment used to carry: with
+                    // nothing closing the old raise's scope until this
+                    // program's own fate is known, its `Turn` and
+                    // whatever it does before deciding fold at the
+                    // raise's nested depth exactly like a handler's
+                    // should, instead of `assistant_id` alone rendering
+                    // at the wrong depth while its `Call`/`Return`
+                    // rendered at the right one.
+                    self.beneath.push((old, resume_with, self.generation));
                 }
                 self.generation += 1;
                 self.phase = Phase::Running(run);
@@ -1043,16 +1043,43 @@ impl Runner {
                 },
             )?;
 
+            // A `tell()`'s `Result` is a delivery receipt, not a value
+            // anyone asked for — `expects_reply: false` already says so
+            // (`Call::Send`'s own doc). It is logged above like any other
+            // artifact (`artifact(id)` can still fetch it), but Rule C
+            // exists to protect a call's *value* from going unseen after
+            // a resume, and a `tell` has no value to protect: nothing
+            // ever holds a promise for it (`Instr::Notify`,
+            // 23_ONE_AGENT.md C0b), so treating its settlement as a
+            // surprise nobody awaited would be wrong on every firing, not
+            // just some. Checked before either `unawaited` push below —
+            // both are reachable for a `tell` (the generation-mismatch
+            // arm is actually the common one: `finish_program` bumps
+            // `self.generation` immediately after dispatching an
+            // unstarted `tell`, so its own registration is stale by the
+            // time the result lands even when the branch never moved).
+            let is_unwaited_tell = matches!(
+                tree.events.get(&tr.call).map(|e| &e.payload),
+                Some(EventPayload::Call(Call::Send {
+                    expects_reply: false,
+                    ..
+                }))
+            );
             // Deliver only into the run that issued the call. Anything
-            // else is an artifact **and** a notice (rule C, below).
+            // else is an artifact **and** a notice (rule C, below) —
+            // unless it's a `tell`, which owes no one a notice either.
             let Some(pending) = pending else {
-                unawaited.push((tr.call, result));
+                if !is_unwaited_tell {
+                    unawaited.push((tr.call, result));
+                }
                 continue;
             };
             if pending.generation != self.generation
                 || !matches!(self.phase, Phase::Running(_) | Phase::Suspended(..))
             {
-                unawaited.push((tr.call, result));
+                if !is_unwaited_tell {
+                    unawaited.push((tr.call, result));
+                }
                 continue;
             }
             let vm = self.settling_vm();
@@ -1731,6 +1758,109 @@ impl Runner {
             .vm
             .stack_value_to_json(&value, 0)
             .unwrap_or_else(|_| serde_json::Value::String(format!("{value:?}")));
+
+        // **C0a (23_ONE_AGENT.md): a tagged completion is a decision about
+        // the suspended run beneath this one, not this program's own
+        // result.** `interp`'s compiler gives `resume(v)`/`abandon()`
+        // exactly one shape each — a plain object carrying `__decision`
+        // (`call.rs`) — and this is the one place that tag is read back.
+        // Checked only now, at completion, and not any earlier: a handler
+        // may do other work first (`answer(...)`, a `tell()` — see
+        // `upward_clarification_does_not_deadlock`) before deciding, or
+        // may never decide at all, and only its own return value says
+        // which. A handler that returns something untagged is an
+        // ordinary program completion; it does not implicitly resume
+        // anything (DESIGN.md's thesis table takes the tag as the whole
+        // interface, on purpose — an implicit resume would feed a live
+        // program a value nobody actually chose).
+        let decision = value_json.get("__decision").and_then(|v| v.as_str());
+        if matches!(decision, Some("resume") | Some("abandon")) && !self.beneath.is_empty() {
+            let decision = decision.expect("checked Some above").to_owned();
+            let (old_run, resume_with, home_generation) =
+                self.beneath.pop().expect("checked non-empty above");
+            // This program's own execution genuinely happened — its
+            // status is `Completed` and its final VM is kept for the
+            // sticky debugger pane like any other — but it gets no
+            // `Return`/`Console` row of its own: `Runner::resume`'s own
+            // doc is explicit that nothing new is *said* by a decision,
+            // and `program_status_survives_reopen` (tree.rs) already
+            // fixes this exact shape — the resumed run's *own* eventual
+            // `Return`/`Console` are what a report is derived from, not
+            // this one's.
+            self.note_status(run.program_id, ProgramStatus::Completed);
+            self.last_vm = Some(run.vm);
+            if decision == "resume" {
+                // Revive the old run's own in-flight calls. They were
+                // dispatched under `home_generation`, which this
+                // handler's own start-and-finish already left behind
+                // (two bumps: `apply_turn` starting it, this function
+                // finishing it) — without re-stamping them, a still
+                // -pending exchange the old run was waiting on (the
+                // parent's own `ask()` in `upward_clarification_does_
+                // not_deadlock`) would land marked stale and be routed
+                // to rule C instead of delivered, even though the VM
+                // that issued it is very much still the one running.
+                // `abandon` deliberately skips this: its whole point is
+                // that in-flight calls settle as artifacts nobody
+                // receives (`Cause::Abandoned`'s own doc), which is
+                // exactly what leaving their generation stale achieves.
+                for pending in self.pending.values_mut() {
+                    if pending.generation == home_generation {
+                        pending.generation = self.generation;
+                    }
+                }
+            }
+            // Mark the handler's own exchange as accounted-for before
+            // handing off — the same advance the ordinary completion
+            // path below makes before going idle. `Runner::abandon`
+            // calls `prompt_if_needed` itself, whose crash-recovery
+            // clause (`last_turn_outcome(tree) > self.shown`) would
+            // otherwise see *this* handler's own `Turn`, still ahead of
+            // a `shown` last advanced at the original suspend, followed
+            // by the fresh `Cause::Abandoned` `abandon()` is about to
+            // log — indistinguishable from a genuinely new, unshown
+            // completion — and fire a spurious prompt for an exchange
+            // the branch has already fully seen.
+            self.shown = self.spine.leaf_id.as_u64();
+            self.phase = Phase::Suspended(old_run, resume_with);
+            let decision_value = value_json
+                .get("value")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            let mut routed = match decision.as_str() {
+                "resume" => self.resume(tree, decision_value)?,
+                "abandon" => self.abandon(tree)?,
+                _ => unreachable!("matched Some(\"resume\") | Some(\"abandon\") above"),
+            };
+            out.append(&mut routed);
+            return Ok(out);
+        }
+        // Not a decision — either untagged, or tagged with nothing
+        // beneath to decide about (a root program's own `resume(...)`/
+        // `abandon()` misuse: DESIGN.md's Part D2 flags this as a
+        // real mistake worth its own compile/runtime error, not yet
+        // built — logged here as an ordinary, if odd-looking, `Return`
+        // rather than guessed at). If something **is** still stashed
+        // beneath this completion regardless (a genuine rewrite: a new
+        // program that never called `resume`/`abandon` at all, run
+        // straight over a still-suspended raise), that suspension is
+        // implicitly discarded now — the same "a fresh completion
+        // silently replacing a suspended one" case `apply_turn` used to
+        // close eagerly, moved here because the deciding fact (did this
+        // program decide, or not) isn't known until this point.
+        if let Some((old_run, _resume_with, _home_generation)) = self.beneath.pop() {
+            self.note_status(old_run.program_id, ProgramStatus::Failed);
+            self.last_vm = Some(old_run.vm);
+            tree.append(
+                &mut self.spine,
+                EventPayload::Condition {
+                    cause: Cause::Abandoned,
+                    site: 0,
+                    stack: Vec::new(),
+                    disposition: Disposition::Handover,
+                },
+            )?;
+        }
 
         // "Completed ⇒ `Return`" holds without exception — a program that
         // ends without a `return` still logs `Return { value: null }` —
@@ -2518,6 +2648,83 @@ mod tests {
         // request out.
         assert!(out.is_empty(), "{out:?}");
         assert_eq!(state.status(), "idle");
+    }
+
+    /// **C0a's routing, driven the way a live completion actually
+    /// arrives** — through `step(LlmResponse)`/`apply_turn`, not a direct
+    /// `resume`/`abandon` call — proving the *recognition* half works,
+    /// not just the mechanism `raise_suspends_with_pushed_disposition_
+    /// and_host_driven_resume_continues` already covers. A handler
+    /// completing with `return resume(41);` re-enters the same raise
+    /// expression; a *second* raise, handled the same way with
+    /// `return abandon();`, discards it instead and leaves the branch
+    /// idle, exactly like a direct `Runner::abandon` call would.
+    #[test]
+    fn a_tagged_completion_is_routed_to_resume_or_abandon() {
+        let (mut tree, mut state) = setup();
+        state.kickoff(&mut tree).unwrap();
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(llm_program(
+                    "const x = raise(\"need_help\", { got: 41 }); return x + 1;",
+                )),
+            )
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+        assert_eq!(state.status(), "suspended");
+
+        // The handler answers with a program, not a direct host call —
+        // `finish_program` is the one reading the tag off its
+        // completion.
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(llm_program("return resume(41);")),
+            )
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+        assert!(last_report(&state, &tree).contains("42"));
+        assert_eq!(state.status(), "idle");
+
+        // A second raise, this time abandoned the same way — through a
+        // handler's own completion, not a direct host call.
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(llm_program("raise(\"need\", null); return 1;")),
+            )
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+        assert_eq!(state.status(), "suspended");
+
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(llm_program("return abandon();")),
+            )
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+        assert_eq!(state.status(), "idle");
+        // The abandoned raise is a logged `Cause::Abandoned`, not a
+        // `Return` of the raw decision object anywhere on the branch.
+        assert!(
+            state.agent_segment(&tree).iter().any(|e| matches!(
+                &e.payload,
+                EventPayload::Condition {
+                    cause: Cause::Abandoned,
+                    ..
+                }
+            )),
+            "the abandon is a logged Condition"
+        );
+        assert!(
+            !state.agent_segment(&tree).iter().any(|e| matches!(
+                &e.payload,
+                EventPayload::Return { value } if value.get("__decision").is_some()
+            )),
+            "no decision object ever lands as a program's own Return"
+        );
     }
 
     #[test]
