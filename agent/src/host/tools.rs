@@ -162,18 +162,23 @@ fn read_file_def() -> ToolDef {
                       so the write is atomic and fails if the file changed \
                       since you read it.\n\
                       \n\
-                      Returns the **whole** file: there is no line range or \
-                      offset. A large file costs its full size wherever you put \
-                      it, so on anything sizeable use `bash` with grep/sed, or \
-                      `outline`, to find the part you want first."
+                      `read_file([path, start_line, end_line])` returns just that \
+                      span, 1-based and inclusive — pair it with `outline`, whose \
+                      entries carry the line numbers. On a large file read the span \
+                      you want rather than the file: the whole thing costs its full \
+                      size wherever you put it. The `version` hash always covers \
+                      the **whole** file, so a span still round-trips safely to \
+                      `replace_file`."
             .into(),
         input_schema: json!({
             "type": "array",
             "items": [
-                { "type": "string", "description": "absolute or cwd-relative path" }
+                { "type": "string", "description": "absolute or cwd-relative path" },
+                { "type": "integer", "description": "first line, 1-based (optional)" },
+                { "type": "integer", "description": "last line, inclusive (optional)" }
             ],
             "minItems": 1,
-            "maxItems": 1
+            "maxItems": 3
         }),
         handler: Box::new(|args| {
             let path = args
@@ -188,8 +193,42 @@ fn read_file_def() -> ToolDef {
                     meta.len()
                 ));
             }
-            let content = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
-            let version = hash_bytes(content.as_bytes());
+            let whole = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+            // The hash covers the whole file even when a span was asked
+            // for: it is what `replace_file` checks, and a version
+            // computed over a slice would let a write succeed against a
+            // file that changed everywhere else.
+            let version = hash_bytes(whole.as_bytes());
+            let (start, end) = (
+                args.get(1).and_then(|v| v.as_u64()),
+                args.get(2).and_then(|v| v.as_u64()),
+            );
+            let content = match (start, end) {
+                (None, None) => whole,
+                (Some(a), b) => {
+                    let total = whole.lines().count();
+                    if a == 0 {
+                        return Err("read_file line numbers are 1-based; got 0".into());
+                    }
+                    let last = b.unwrap_or(total as u64);
+                    if a as usize > total {
+                        return Err(format!(
+                            "start_line {a} is past the end of {path} ({total} lines)"
+                        ));
+                    }
+                    whole
+                        .lines()
+                        .skip(a as usize - 1)
+                        .take((last.saturating_sub(a) + 1) as usize)
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                }
+                (None, Some(_)) => {
+                    return Err(
+                        "read_file([path, start, end]) needs a start when given an end".into(),
+                    );
+                }
+            };
             Ok(json!({ "content": content, "version": version }))
         }),
     }
@@ -532,6 +571,35 @@ mod tests {
         assert_eq!(result["content"], json!("hello from a file"));
         assert!(result["version"].is_string());
         assert!(!result["version"].as_str().unwrap().is_empty());
+    }
+
+    #[test]
+    fn read_file_reads_a_line_span_and_still_versions_the_whole_file() {
+        // `outline` hands back start_line/end_line; without a span read
+        // those numbers point at something only `sed` could fetch. The
+        // version must still cover the whole file, or a write could
+        // succeed against a file that changed outside the span read.
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        write!(file, "one\ntwo\nthree\nfour\nfive").unwrap();
+        let path = file.path().to_str().unwrap();
+
+        let span = read_file(json!([path, 2, 4])).unwrap();
+        assert_eq!(span["content"], json!("two\nthree\nfour"));
+
+        let whole = read_file(json!([path])).unwrap();
+        assert_eq!(
+            span["version"], whole["version"],
+            "the hash covers the file, not the span"
+        );
+
+        // An open-ended span runs to the end.
+        let tail = read_file(json!([path, 4])).unwrap();
+        assert_eq!(tail["content"], json!("four\nfive"));
+
+        // 1-based, and a start past the end is an error rather than an
+        // empty string that reads like a truthful answer.
+        assert!(read_file(json!([path, 0, 2])).is_err());
+        assert!(read_file(json!([path, 99])).is_err());
     }
 
     #[test]
