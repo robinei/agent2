@@ -2,7 +2,6 @@ mod card;
 mod compaction;
 mod document;
 mod eval;
-mod fence;
 mod host;
 mod machine;
 mod report;
@@ -22,13 +21,13 @@ pub use types::*;
 use host::SessionEvent;
 
 const USAGE: &str = "usage: agent <command>
-  debug <file.js>                   standalone debugger TUI
-  session [options] [log.jsonl]     agent session (attached TUI by default)
-    --headless                      print events instead of the TUI
+  session [options] [log.jsonl]     agent session. Always headless for
+                                    now: the TUI is cut from the build
+                                    for phase 23 and returns in Pass D
+                                    (23_ONE_AGENT.md).
+    --headless                      accepted, and already the only mode
     --real                          use DeepSeek (needs DEEPSEEK_API_KEY);
-                                    the TUI picks it automatically when the
-                                    key is set — --headless stays scripted
-                                    unless --real is given
+                                    otherwise the session runs scripted
     --turn <text>                   queue a first user turn on the
                                     conversation branch (headless)
     --list-leaves                   print the log's leaf set and exit
@@ -39,48 +38,28 @@ const USAGE: &str = "usage: agent <command>
                                     and print its id
     --name <text>                   name the branch (with --fork), else rename
                                     the conversation branch
-  codemode-probe [task]             phase 20 (docs/20_CODE_MODE.md): one live
-                                    completion against the card + a fixture
-                                    log, no session, no log file. Needs
-                                    DEEPSEEK_API_KEY. A throwaway manual probe,
-                                    not Part H's regression harness.
-  codemode-harness                  Part H's regression harness: runs the
-                                    fixed task set (codemode::tasks::ALL)
-                                    live, end to end, and reports median
-                                    program length, round-trips, and success
-                                    per task. Needs DEEPSEEK_API_KEY. Not part
-                                    of `cargo test` — talks to a real model.
-  codemode-experiment               Same reporting, over
-                                    codemode::tasks::EXPERIMENTAL instead —
-                                    targeted, one-off validation tasks, not
-                                    the stable regression set. Needs
-                                    DEEPSEEK_API_KEY.";
+  eval [--experimental]             the acceptance harness (agent/src/eval/,
+                                    23_ONE_AGENT.md Pass C): runs a fixed
+                                    task set live, end to end, against a real
+                                    Session, and reports median program
+                                    length, round-trips, and success per
+                                    task. --experimental swaps in
+                                    eval::tasks::EXPERIMENTAL (targeted,
+                                    one-off validation tasks) instead of the
+                                    stable eval::tasks::ALL. Needs
+                                    DEEPSEEK_API_KEY. Not part of
+                                    `cargo test` — talks to a real model.
+
+The TUI is cut out of the build for Passes A-C (23_ONE_AGENT.md); the
+standalone `debug <file.js>` subcommand and attached-TUI `session` return
+in Pass D.";
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
-        Some("debug") => {
-            let Some(path) = args.get(2) else {
-                eprintln!("usage: agent debug <file.js>");
-                std::process::exit(2);
-            };
-            if let Err(e) = debug::run(path) {
-                eprintln!("{e}");
-                std::process::exit(1);
-            }
-        }
-        Some("codemode-probe") => {
-            let task = args
-                .get(2)
-                .cloned()
-                .unwrap_or_else(|| "print the numbers from 1 to 5, one per line".to_owned());
-            codemode_probe(&task);
-        }
-        Some("codemode-harness") => {
-            codemode_harness();
-        }
-        Some("codemode-experiment") => {
-            codemode_experiment();
+        Some("eval") => {
+            let experimental = args.get(2).map(String::as_str) == Some("--experimental");
+            run_eval(experimental);
         }
         Some("session") => {
             let mut headless = false;
@@ -278,16 +257,36 @@ fn queue_nav(session: &host::Session, nav: &SessionNav) {
 
 /// The attached TUI (9_TUI Step 4) — the harness's primary frontend.
 /// Type a message to kick it off.
+///
+/// **Falls back to headless for Passes A-C** (23_ONE_AGENT.md, "The TUI
+/// is deferred, not kept"): the debugger module is cut out of the build
+/// while the vocabulary underneath it is still moving, so there is no
+/// attached-TUI runner left to hand the session to here. Pass D restores
+/// this function to what it was — build the session, mark it attached,
+/// hand it and `rx` to the TUI — once the debugger is rebuilt on the
+/// settled log vocabulary (one document row per event).
 fn run_session_tui(
     log_path: Option<String>,
     real: bool,
     resume: Option<u64>,
 ) -> Result<(), String> {
+    eprintln!(
+        "agent: the attached TUI is deferred until Pass D (23_ONE_AGENT.md) — running headless"
+    );
     let (tx, rx) = std::sync::mpsc::channel();
     let mut session = build_session(log_path, real, resume, tx)?;
-    // The TUI *is* a client, so it is presence.
+    // The TUI *is* a client, so it is presence; headless standing in for
+    // it here inherits that same honesty about who's listening.
     session.set_attached(true);
-    debug::run_attached(session, rx)
+    let printer = std::thread::spawn(move || {
+        for event in rx {
+            print_session_event(&event);
+        }
+    });
+    let session = session.run(); // blocks until the session goes quiet
+    drop(session); // closes the event channel; the printer drains and exits
+    printer.join().map_err(|_| "printer thread panicked")?;
+    Ok(())
 }
 
 /// The headless session: print every `SessionEvent` from the channel —
@@ -443,14 +442,11 @@ fn print_session_event(event: &SessionEvent) {
                         report::render_post(event.id, *from, origin)
                     );
                 }
-                EventPayload::Message(Message::Turn {
-                    text, tool_calls, ..
-                }) => {
-                    let calls: Vec<String> = tool_calls
-                        .iter()
-                        .map(|c| format!("⚙ {}({})", c.name, c.arguments))
-                        .collect();
-                    println!("{head} turn: {}{}", text, calls.join(" "));
+                // The whole turn *is* a program now — no separate prose
+                // channel and no tool-call list beside it (23_ONE_AGENT.md's
+                // substitution table).
+                EventPayload::Message(Message::Turn { source, .. }) => {
+                    println!("{head} turn: {source}");
                 }
                 // `wait_until` is exempt: a polling loop calls it repeatedly
                 // for no reason worth printing, and it never has interesting
@@ -486,152 +482,34 @@ fn print_session_event(event: &SessionEvent) {
     }
 }
 
-/// A throwaway, manual probe against a live model (phase 20,
-/// `docs/20_CODE_MODE.md`) — **not** Part H's regression harness (a
-/// separate, later, more structured opt-in binary with a fixed task
-/// set and success conditions). This is the single first question
-/// worth asking before building that: does a real completion, against
-/// our actual card and document, come back as bare, parseable
-/// JavaScript at all? A subcommand on the existing binary rather than
-/// a `cargo run --example` — the crate has no `[lib]` target to import
-/// from an example, and adding one is a build-shape change to the
-/// existing crate this phase has deliberately avoided all session.
-fn codemode_probe(task: &str) {
-    use codemode::document::{self, ChatMessage, ChatRole};
-    use codemode::entry::Entry;
-    use codemode::{card, fence, transport};
-
-    let api_key = std::env::var("DEEPSEEK_API_KEY")
-        .expect("DEEPSEEK_API_KEY must be set (this probe reads it directly)");
-    let base_url = std::env::var("DEEPSEEK_BASE_URL")
-        .unwrap_or_else(|_| "https://opencode.ai/zen/go/v1".to_owned());
-    let model = std::env::var("DEEPSEEK_MODEL").unwrap_or_else(|_| "deepseek-v4-flash".to_owned());
-    // Step C4's actual design always seeds the exemplar; the opt-out
-    // exists only so this probe can compare against it directly.
-    let with_exemplar = std::env::var("CODEMODE_PROBE_NO_EXEMPLAR").is_err();
-
-    let log = vec![(
-        EventId::new(1),
-        Entry::Message {
-            from: "user".into(),
-            text: task.to_owned(),
-        },
-    )];
-    let mut doc = document::render(card::CARD, &log).expect("fixture log renders");
-    if with_exemplar {
-        // The seed exemplars open `messages`, right after the card —
-        // real user/assistant pairs, never part of the card itself
-        // (Step C4), in order, earliest first.
-        for (i, ex) in card::SEED_EXEMPLARS.iter().enumerate() {
-            doc.messages.splice(
-                (1 + i * 2)..(1 + i * 2),
-                [
-                    ChatMessage {
-                        role: ChatRole::User,
-                        content: ex.user.to_owned(),
-                    },
-                    ChatMessage {
-                        role: ChatRole::Assistant,
-                        content: ex.assistant.to_owned(),
-                    },
-                ],
-            );
-        }
-    }
-
-    eprintln!("=== task ===\n{task}\n");
-    eprintln!("=== seed exemplar: {with_exemplar} ===\n");
-    eprintln!("=== sending to {base_url} (model {model}) ===\n");
-
-    let session_id = uuid::Uuid::new_v4().to_string();
-    let endpoint = transport::Endpoint {
-        base_url: &base_url,
-        api_key: &api_key,
-        session_id: &session_id,
-    };
-    // Generous on purpose (Step A1): must cover reasoning tokens *plus*
-    // a long program. 4000 was tried first and found wanting live — a
-    // genuinely judgment-heavy task burned the whole budget on
-    // thinking before writing a single character of program, landing
-    // exactly on the design's own anticipated "ran out while thinking"
-    // failure. 32000 leaves real room for both.
-    let req = transport::DeepSeekCodeModeRequest {
-        model: &model,
-        max_tokens: 32_000,
-    };
-
-    let completion = match transport::complete(&doc, &req, &endpoint) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("=== REQUEST FAILED ===\n{e}");
-            std::process::exit(1);
-        }
-    };
-
-    match &completion.thinking {
-        Some(t) => eprintln!("=== thinking ({} chars) ===\n{t}\n", t.len()),
-        None => eprintln!("=== thinking: none ===\n"),
-    }
-
-    eprintln!(
-        "=== raw completion ({} chars) ===\n{}\n",
-        completion.text.len(),
-        completion.text
-    );
-    eprintln!("=== finish_reason: {:?} ===\n", completion.finish_reason);
-    if completion.was_truncated() {
-        // Step A1: distinguish *which* budget ran out — an empty or
-        // very short `text` alongside real `thinking` means the
-        // reasoning channel ate the whole ceiling before writing any
-        // program at all (fix: lower reasoning_effort, or raise
-        // max_tokens further); a long, cut-off `text` means the
-        // program itself was still being written (fix: a shorter
-        // program). Distinct fixes, so the report must not conflate
-        // them into one "truncated" fact — observed live: an empty
-        // `text` after 11k+ chars of thinking on a genuinely
-        // judgment-heavy task, with `interp::compile("")` trivially
-        // "succeeding" (an empty program is syntactically valid),
-        // which would have silently hidden the failure if this probe
-        // only checked whether the completion parsed.
-        if completion.text.trim().is_empty() {
-            eprintln!("=== TRUNCATED WHILE THINKING — no program was ever started ===\n");
-        } else {
-            eprintln!("=== TRUNCATED WHILE WRITING — the program is incomplete ===\n");
-        }
-    }
-
-    if completion.text.trim().is_empty() {
-        eprintln!("=== nothing to parse — no program text was produced ===");
-        return;
-    }
-
-    // The no-fence rule (Step A1): tolerate a stray fence silently,
-    // then the response must be exactly a valid program — nothing else.
-    let extracted = fence::extract(&completion.text);
-    if extracted != completion.text {
-        eprintln!("=== a code fence was present and stripped ===\n");
-    }
-
-    match interp::compile(&extracted) {
-        Ok(_) => eprintln!("=== PARSES: the completion is valid, bare JavaScript ==="),
-        Err(diags) => {
-            eprintln!("=== DOES NOT PARSE ===");
-            for d in diags {
-                eprintln!("{}", d.render(&extracted));
-            }
-        }
-    }
-}
-
-/// Part H's regression harness: `codemode::tasks::ALL` by default, run
-/// live and end to end (`codemode::harness::run_task`), reporting the
-/// three numbers Part H asks for — no more, until one fails to answer
-/// a question (Part H's own second bullet). `tasks`/`label` let the
-/// `codemode-experiment` subcommand reuse this exact reporting for
-/// `codemode::tasks::EXPERIMENTAL` — targeted, one-off validation
-/// tasks that don't belong in the stable regression set.
-fn codemode_harness_over(tasks: &[codemode::tasks::Task], label: &str) {
-    use codemode::{card, harness};
+/// The acceptance harness's CLI surface (`23_ONE_AGENT.md` Pass C;
+/// `agent/src/eval/`). Runs `tasks` live and end to end, reporting the
+/// three numbers Part H originally asked for — median program length,
+/// round-trips per task, and success — plus the handler-stack usage
+/// counters added since. `label` is just what the header line calls the
+/// run; `run_eval` picks `tasks`/`label` from `--experimental`.
+///
+/// This is the direct successor to the POC's `codemode-harness` /
+/// `codemode-experiment` / `codemode-probe`, collapsed into one `agent
+/// eval` command per this phase's own table ("What is actually
+/// changing"). The reporting body below is carried over unchanged from
+/// `codemode_harness_over` — only the module paths move, from the
+/// deleted `codemode::` crate onto `crate::eval::` and `crate::card`.
+///
+/// **One known gap, left for Pass C, not fixed here.** This step's job
+/// is the CLI surface, not `eval`'s internals (23_ONE_AGENT.md A6: "Pass
+/// C rewires the harness internals onto the real Session... you are
+/// doing the CLI surface only"). `eval::harness::run_task`'s `endpoint`
+/// parameter is still typed `super::transport::Endpoint` from the POC —
+/// but `transport.rs` no longer exists anywhere in the tree (its
+/// streaming/`Cancel` moved into `host/deepseek.rs`; see the "Where each
+/// POC file goes" table), so `crate::eval::transport::Endpoint` below
+/// does not actually resolve. Pass C's rewrite onto a real `Session`
+/// over `SessionCommand`/`SessionEvent` is what resolves this — the
+/// literal old shape is kept here rather than guessed at, so the gap is
+/// visible at this one call site instead of papered over.
+fn run_eval_over(tasks: &[crate::eval::tasks::Task], label: &str) {
+    use crate::eval::harness;
 
     let api_key = std::env::var("DEEPSEEK_API_KEY")
         .expect("DEEPSEEK_API_KEY must be set (this harness reads it directly)");
@@ -673,12 +551,12 @@ fn codemode_harness_over(tasks: &[codemode::tasks::Task], label: &str) {
         // for its own duration, since this is minted once per task, not
         // once per completion.
         let session_id = uuid::Uuid::new_v4().to_string();
-        let endpoint = codemode::transport::Endpoint {
+        let endpoint = crate::eval::transport::Endpoint {
             base_url: &base_url,
             api_key: &api_key,
             session_id: &session_id,
         };
-        let report = harness::run_task(task, card::CARD, endpoint, &model, 32_000);
+        let report = harness::run_task(task, crate::card::CARD, endpoint, &model, 32_000);
 
         let status = match &report.success {
             Ok(()) => "PASS",
@@ -794,15 +672,16 @@ fn codemode_harness_over(tasks: &[codemode::tasks::Task], label: &str) {
     );
 }
 
-fn codemode_harness() {
-    codemode_harness_over(codemode::tasks::ALL, "Part H harness");
-}
-
-/// `codemode::tasks::EXPERIMENTAL` — targeted, one-off validation
-/// tasks (see each task's own doc comment for what question it
-/// answers), run on demand rather than every harness pass.
-fn codemode_experiment() {
-    codemode_harness_over(codemode::tasks::EXPERIMENTAL, "experimental");
+/// `agent eval` / `agent eval --experimental`: `crate::eval::tasks::ALL`
+/// by default, or `crate::eval::tasks::EXPERIMENTAL` (targeted, one-off
+/// validation tasks that don't belong in the stable regression set) when
+/// `--experimental` is given.
+fn run_eval(experimental: bool) {
+    if experimental {
+        run_eval_over(crate::eval::tasks::EXPERIMENTAL, "experimental");
+    } else {
+        run_eval_over(crate::eval::tasks::ALL, "eval");
+    }
 }
 
 /// One-line rendering of a logged call for the headless printer.
@@ -826,6 +705,9 @@ fn describe_call(call: &Call) -> String {
                 "spawn {}: {charter}",
                 name.as_deref().unwrap_or("<unnamed>")
             )
+        }
+        Call::Fork { name, task, .. } => {
+            format!("fork {}: {task}", name.as_deref().unwrap_or("<unnamed>"))
         }
         Call::Invoke { name, args, .. } => format!("invoke {name}({args})"),
     }

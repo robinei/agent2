@@ -1,14 +1,23 @@
-//! Condition + completion reports (8_HARNESS Step 4; 17_BRANCHES A4).
+//! Condition + completion reports (8_HARNESS Step 4; 17_BRANCHES A4;
+//! 23_ONE_AGENT.md A6).
 //!
-//! The `run_program` tool result is the product surface of the whole
-//! project: it is what the LLM reads to decide how to restart a failed
-//! program.
+//! The harness's `Post` reply to a program's `Turn` is the product
+//! surface of the whole project: it is what the LLM reads to decide what
+//! program to write next. Under code mode that decision is never a pick
+//! off a menu of restart schemas — a suspension gets a **handler
+//! program**, a fresh completion whose `return` value *is* the restart
+//! (`resume(value)`/`abandon()`), free to do anything else instead. So a
+//! report's job is not to enumerate what's eligible; it is to **describe
+//! what happened accurately enough that a program can be written against
+//! it** (DESIGN.md, "The thesis").
 //!
 //! **Reports are derived, not stored.** Every report here is a pure
 //! function of the log: [`derive_report`] takes `(&Tree, leaf, turn)` and
-//! reads forward from that turn to its outcome — the source from the
-//! turn's tool-call args, the outcome, the `Console`, and the `Result`s
-//! and menu rows on the path. No renderer touches a `VM`.
+//! reads forward from that turn to its outcome — the source read
+//! directly off the driving `Turn.source` (bare program text now, not
+//! dug out of a tool-call arguments blob), the outcome, the `Console`,
+//! and the `Result`s and menu rows on the path. No renderer touches a
+//! `VM`.
 //!
 //! The gain is not disk. It is that a corpus of real logs can be
 //! re-rendered with a *new* report format and diffed — the iteration this
@@ -20,9 +29,7 @@
 //! Every section carries a hard size bound (bounded reports, menu pruned
 //! to recent entries, full data always fetchable by id).
 
-use crate::types::{
-    Author, Call, Cause, Event, EventId, EventPayload, Message, Origin, Outcome, ToolCall, Tree,
-};
+use crate::types::{Author, Call, Cause, Event, EventId, EventPayload, Message, Origin, Outcome, Tree};
 
 /// Max bytes of the "what happened" section (diagnostic + payload).
 pub const WHAT_MAX_BYTES: usize = 2048;
@@ -79,71 +86,6 @@ pub enum ArtifactState {
     PendingInvoke,
 }
 
-/// What `resume(value)` means for this suspension — the restart section
-/// states the exact semantics, which differ by suspension kind.
-pub enum ResumeKind {
-    /// Suspended on `raise(...)`: `value` becomes the result of the
-    /// raise expression.
-    Raise,
-    /// Suspended on a trapped, resumable error: `value` stands in for
-    /// the failed operation's result.
-    Operation,
-    /// Suspended because a message arrived: nothing asked for a value,
-    /// so `resume()` just continues.
-    Continue,
-    /// Not resumable: `run_program` is the only restart.
-    No,
-}
-
-/// The **restarts** section: what is eligible for *this suspension*.
-///
-/// It carries only what is a fact about this handback. The `resume`
-/// wording genuinely differs by suspension kind — what `value` means for
-/// a raise, for a failed operation, or for a program merely parked —
-/// so it belongs in a message that renders identically forever.
-///
-/// Two things that used to be here are not:
-///
-/// - **the open-post list.** Whether a question is still owed is a fact
-///   about the branch *now*, not about this handback, and a rendered
-///   message keeps saying it forever: `answer(#4, value)` stays correct
-///   for the moment it describes while becoming a standing invitation to
-///   make an ineligible call. Obligations ride the trailing ephemeral
-///   line, which is always exactly one and always current.
-/// - **the explanation of `run_program`.** That is a *rule*, constant in
-///   every report ever rendered, and the cache-discipline split puts
-///   rules in the card where they are cached for the branch's life. The
-///   name stays, because which restarts are eligible is still a
-///   report-level fact; the forty words do not.
-pub struct Restarts {
-    pub resume: ResumeKind,
-}
-
-impl Restarts {
-    fn render(&self) -> String {
-        let mut out = String::from("## restarts\n");
-        match self.resume {
-            ResumeKind::Raise => out.push_str(
-                "- resume(value): continue past the raise; `value` becomes \
-                 the result of the raise(...) expression\n",
-            ),
-            ResumeKind::Operation => out.push_str(
-                "- resume(value): continue as if the failed operation had \
-                 produced `value`\n",
-            ),
-            ResumeKind::Continue => out.push_str(
-                "- resume(): continue the program from where it stopped — nothing here \
-                 asked for a value\n",
-            ),
-            ResumeKind::No => {
-                out.push_str("(this condition is not resumable — resume is not offered)\n")
-            }
-        }
-        out.push_str("- run_program(source)");
-        out
-    }
-}
-
 /// The **where** section: where the program stopped.
 ///
 /// A raise or a trap stopped at a point, so the honest answer is the
@@ -158,10 +100,18 @@ pub enum Whence {
     AnnotatedSource(String),
 }
 
-/// The `run_program` tool result for a raise/trapped error.
+/// The harness `Post` for a raise/trapped error/arrival — the report a
+/// program's branch gets back when its run didn't return.
+///
+/// There is no separate "restarts" section any more: what `resume(value)`
+/// would mean for *this* suspension (if anything) is a fact about the
+/// suspension, not a menu of eligible next calls, so it is folded
+/// straight into [`what`](Self::what) by [`what_happened`] — the reader
+/// is writing a handler program, not choosing a tool schema.
 pub struct ConditionReport {
     /// Rendered diagnostic: condition name + payload, or the trapped
-    /// error with source line and caret.
+    /// error with source line and caret — plus, inline, what
+    /// `resume(value)` means here or why it doesn't apply.
     pub what: String,
     pub whence: Whence,
     /// Full console log (the renderer tails it).
@@ -173,7 +123,6 @@ pub struct ConditionReport {
     /// its artifacts instead of each one re-listing its predecessor's.
     /// The trailing line says how many exist in total and their id range.
     pub artifacts: Vec<Artifact>,
-    pub restarts: Restarts,
 }
 
 impl ConditionReport {
@@ -190,21 +139,27 @@ impl ConditionReport {
         out.push_str(&render_console(&self.console, self.console_id));
         out.push_str("\n\n");
         out.push_str(&render_menu("new artifacts", &self.artifacts));
-        out.push_str("\n\n");
-        out.push_str(&self.restarts.render());
         out
     }
 }
 
-/// The `run_program` tool result for a successful run.
+/// The harness `Post` for a program that finished with a `return`.
+///
+/// **No exception, not even for the return value** (DESIGN.md "No
+/// exception: nothing enters a context unchosen"). Earlier designs
+/// rendered the return generously — up to a per-agent answer budget,
+/// delivered whole when it fit — as the one deliberate channel for
+/// machine-bound data to cross into a context. Code mode dissolves the
+/// problem it was solving instead of widening the channel: a program
+/// that wants to hand its result to someone calls `tell()` itself, with
+/// no turn boundary in the way. So `value` gets exactly the bounded,
+/// shape-first [`preview`] every other artifact in the menu below gets —
+/// never a full copy, budget or no — with its id named so the whole
+/// value is one `tools.tool_result` away.
 pub struct CompletionReport {
-    /// The program's top-level return value — the agent's *answer* into
-    /// context, rendered up to [`Self::budget`] with the full value kept
-    /// as a fetchable `ProgramResult` artifact.
+    /// The program's top-level return value. Rendered as a bounded
+    /// preview only; the full value lives at [`Self::result_id`].
     pub value: serde_json::Value,
-    /// Byte budget for the returned-value section (the agent's answer
-    /// budget). Replaces the fixed `VALUE_MAX_BYTES` clip.
-    pub budget: usize,
     /// Full console log (the renderer tails it).
     pub console: Vec<String>,
     /// The `Console` event the tail comes from, named when it clips.
@@ -212,10 +167,6 @@ pub struct CompletionReport {
     /// Artifacts logged since the run started (its `ProgramResult`
     /// included), oldest first.
     pub new_artifacts: Vec<Artifact>,
-    /// A file body longer than a snippet was inlined into `source` while
-    /// this run passed no `attachments` — nudge toward the attachments
-    /// channel. Computed by the machine (it has the full, unclipped args).
-    pub advise_attachments: bool,
     /// How many of this run's calls came back `Failed`.
     ///
     /// The risk the "only handbacks log a condition" rule leaves is
@@ -230,12 +181,10 @@ impl CompletionReport {
     pub fn render(&self) -> String {
         let mut out = String::new();
         out.push_str("## program completed\n");
-        out.push_str("returned: ");
-        out.push_str(&clip_answer(
-            &self.value.to_string(),
-            self.budget,
-            self.result_id(),
-        ));
+        match self.result_id() {
+            Some(id) => out.push_str(&format!("returned [#{id}]: {}", preview(&self.value))),
+            None => out.push_str(&format!("returned: {}", preview(&self.value))),
+        }
         out.push_str("\n\n");
         out.push_str(&render_console(&self.console, self.console_id));
         out.push_str("\n\n");
@@ -251,37 +200,21 @@ impl CompletionReport {
             ));
         }
 
-        let mut notes: Vec<&str> = Vec::new();
         if self.wrote_without_verifying() {
-            notes.push(
-                "This program wrote files but didn't check them. Don't report success \
-                 unverified — verify now (`parse_errors`, a re-read, or a `bash` \
+            out.push_str(
+                "\n\n## note\n\nThis program wrote files but didn't check them. Don't report \
+                 success unverified — verify now (`parse_errors`, a re-read, or a `bash` \
                  build/test). Next time, fold that check into the same program that \
                  does the writing, not a separate one.",
             );
-        }
-        if self.advise_attachments {
-            notes.push(
-                "A file body longer than a few lines was inlined into `source`. Pass \
-                 it through run_program's `attachments` map instead and read it as \
-                 `attachments.<name>` — keeps `source` small and the content inert \
-                 (no JS-string escaping, no backtick/${} corruption).",
-            );
-        }
-        if !notes.is_empty() {
-            out.push_str("\n\n## note");
-            for note in notes {
-                out.push_str("\n\n");
-                out.push_str(note);
-            }
         }
         out
     }
 
     /// The `ProgramResult` artifact id (this run's full return value),
-    /// named in the truncation marker so an over-budget answer stays
-    /// fetchable. It is the `program result`-labelled entry among the
-    /// run's new artifacts (`machine.rs` logs exactly one).
+    /// named beside the preview so the full value stays one fetch away.
+    /// It is the `program result`-labelled entry among the run's new
+    /// artifacts (`machine.rs` logs exactly one).
     fn result_id(&self) -> Option<u64> {
         self.new_artifacts
             .iter()
@@ -292,8 +225,8 @@ impl CompletionReport {
 
     /// Whether this run created or replaced files but never inspected
     /// them in the same program — the nudge condition: validation of a
-    /// write belongs in the program that wrote it, not a follow-up
-    /// `run_program` (the split-validation habit the card warns against).
+    /// write belongs in the program that wrote it, not a follow-up turn
+    /// (the split-validation habit the card warns against).
     fn wrote_without_verifying(&self) -> bool {
         let mut wrote = false;
         let mut verified = false;
@@ -527,10 +460,24 @@ pub fn clip(s: &str, max: usize) -> String {
     format!("{}… [truncated; {} bytes total]", &s[..end], s.len())
 }
 
-/// Clip an agent's *answer* (the returned value) to its budget. Unlike
-/// [`clip`], an over-budget answer's marker names the fetch id so the full
-/// value stays reachable (`tools.tool_result(#id)`) — the answer is the
-/// one value the model may genuinely need in full (12_ANSWERS).
+/// Clip a value to a byte budget. Unlike [`clip`], an over-budget clip's
+/// marker names the fetch id so the full value stays reachable
+/// (`tools.tool_result(#id)`) when one is known.
+///
+/// **This step's one open question, not resolved here.** DESIGN.md's "No
+/// exception: nothing enters a context unchosen" retires the mechanism
+/// this existed for — a program's `return` rendered budgeted-and-generous
+/// into a completion report (12_ANSWERS) — and [`CompletionReport`] no
+/// longer calls this (see its own doc). The only caller left *in this
+/// file* is [`answer_ack`], echoing back a value the answering program
+/// just wrote itself — not the retired exception, so kept using this.
+/// But `machine.rs` (a different agent's file, mid-edit alongside this
+/// one) still calls `crate::report::clip_answer` directly, from its
+/// `answer_budget`/`DEFAULT_ANSWER_BUDGET` machinery, which DESIGN.md
+/// says goes in Pass B — so this function is **not actually orphaned
+/// yet**, and deleting it here would break a caller outside this file's
+/// scope. Left in place; finishing its removal (and `answer_budget`'s)
+/// is Pass B's job, coordinated with whoever owns `machine.rs` then.
 pub fn clip_answer(s: &str, max: usize, id: Option<u64>) -> String {
     if s.len() <= max {
         return s.to_owned();
@@ -584,10 +531,10 @@ pub fn cap_console(lines: &[String], event_hint: &str) -> Vec<String> {
 /// One program run's slice of a branch's path: the turn that drove it,
 /// the outcome it produced, and the events in between.
 struct Handback<'t> {
-    /// The source the turn asked to run (empty for a non-`run_program`).
+    /// The program the driving `Turn` ran — read straight off
+    /// `Message::Turn.source`. Under code mode that *is* the whole turn,
+    /// so there is no longer a tool-call arguments blob to dig it out of.
     source: String,
-    /// Whether the turn passed a non-empty `attachments` map.
-    had_attachments: bool,
     /// The one outcome event: a `Return` or a `Condition`.
     outcome: &'t Event,
     /// The `Console` logged with the outcome, if any, and its event id —
@@ -612,27 +559,12 @@ struct Handback<'t> {
     tree: &'t Tree,
 }
 
-/// The `run_program` source and attachment flag carried by a tool call.
-fn program_args(call: &ToolCall) -> (String, bool) {
-    let source = call
-        .arguments
-        .get("source")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_owned();
-    let had_attachments = call
-        .arguments
-        .get("attachments")
-        .and_then(|v| v.as_object())
-        .is_some_and(|m| !m.is_empty());
-    (source, had_attachments)
-}
-
-/// Whether a payload is an outcome — the event a tool call is answered
-/// from. **Every tool call has exactly one**, which is what lets every
-/// report derive from one event rather than from recomputed history:
-/// `run_program`/`resume` produce a `Return` or a `Condition`, an
-/// ineligible call a `Condition{Refused}`, and `answer` an `Answer`.
+/// Whether a payload is an outcome — the event a `Turn` is answered by.
+/// **Every `Turn` has exactly one**, which is what lets every report
+/// derive from one event rather than from recomputed history: a program
+/// that runs to completion produces a `Return`, one that suspends or
+/// fails produces a `Condition`, and a turn that was itself a handler
+/// answering a post produces an `Answer`.
 fn is_outcome(payload: &EventPayload) -> bool {
     matches!(
         payload,
@@ -640,10 +572,11 @@ fn is_outcome(payload: &EventPayload) -> bool {
     )
 }
 
-/// Every outcome a turn produced, in log order, ending before the next
-/// `Turn`. Pairing is **positional, not stored**: outcome `k` answers
-/// tool call `k`, which is why the machine logs a deferred refusal after
-/// the outcome of the call that preceded it.
+/// The outcome(s) a turn produced, in log order, ending before the next
+/// `Turn`. Under code mode a turn is one program with exactly one
+/// outcome, so in practice this returns at most one id — kept as a
+/// `Vec` rather than asserting that here, so a caller scanning a path
+/// never needs a special case at the boundary.
 pub fn outcomes_of_turn(tree: &Tree, leaf: EventId, turn: EventId) -> Vec<EventId> {
     let path = tree.path_events(leaf);
     let Some(at) = path.iter().position(|e| e.id == turn) else {
@@ -678,14 +611,10 @@ fn handback<'t>(tree: &'t Tree, leaf: EventId, outcome: EventId) -> Option<Handb
         .iter()
         .rposition(|e| matches!(e.payload, EventPayload::Message(Message::Turn { .. })))?;
     let turn = path[turn_at];
-    let EventPayload::Message(Message::Turn { tool_calls, .. }) = &turn.payload else {
+    let EventPayload::Message(Message::Turn { source, .. }) = &turn.payload else {
         return None;
     };
-    let (source, had_attachments) = tool_calls
-        .iter()
-        .find(|c| c.name == crate::machine::TOOL_RUN_PROGRAM)
-        .map(program_args)
-        .unwrap_or_default();
+    let source = source.clone();
     // The `Console` logged with this outcome sits immediately after it,
     // before the next outcome.
     let (console, console_id) = path[at + 1..]
@@ -699,7 +628,6 @@ fn handback<'t>(tree: &'t Tree, leaf: EventId, outcome: EventId) -> Option<Handb
     Some(Handback {
         tree,
         source,
-        had_attachments,
         outcome: path[at],
         console,
         console_id,
@@ -710,10 +638,18 @@ fn handback<'t>(tree: &'t Tree, leaf: EventId, outcome: EventId) -> Option<Handb
     })
 }
 
-/// Render the tool-role message answering the call that produced
+/// Render the harness `Post` answering the `Turn` that produced
 /// `outcome`. Memoised on the `Tree` by the outcome's id — the report is
 /// a pure function of the log, so the same outcome always renders the
 /// same string for a given renderer.
+///
+/// `budget` is still threaded through from the caller's configured
+/// per-agent answer budget (`machine.rs`'s `DEFAULT_ANSWER_BUDGET`), but
+/// only [`answer_ack`] still spends it — [`CompletionReport`] does not
+/// (see its own doc: no return value gets a budgeted copy any more). It
+/// stays a parameter here rather than being threaded away, since
+/// `machine.rs`/`host/mod.rs`/`tree.rs` call this across the whole tree
+/// and narrowing the signature is not this step's job.
 pub fn derive_report(tree: &Tree, leaf: EventId, outcome: EventId, budget: usize) -> String {
     if let Some(hit) = tree.memoised_report(outcome) {
         return hit;
@@ -730,11 +666,9 @@ fn render_handback(h: &Handback<'_>, budget: usize) -> String {
     match &h.outcome.payload {
         EventPayload::Return { value } => CompletionReport {
             value: value.clone(),
-            budget,
             console: h.console.clone(),
             console_id: h.console_id,
             new_artifacts: menu_since(h, h.previous_outcome),
-            advise_attachments: !h.had_attachments && inlined_large_body(h),
             failed_calls: h.path[h.turn_at + 1..=h.outcome_at]
                 .iter()
                 .filter(|e| {
@@ -749,13 +683,17 @@ fn render_handback(h: &Handback<'_>, budget: usize) -> String {
                 .count(),
         }
         .render(),
-        EventPayload::Condition { cause, site, stack } => match cause {
-            // A compile failure ran no VM: the diagnostic alone, no
-            // console and no artifacts.
+        EventPayload::Condition {
+            cause, site, stack, ..
+        } => match cause {
+            // These two never built a VM, so there is no console, no
+            // artifacts, and nothing for `what_happened` to annotate a
+            // stack or a program against — the diagnostic is the whole
+            // report. `Truncated` in particular must never reach the
+            // compiler (types.rs's own rule), so the harness catches it
+            // before a VM could exist to produce anything else.
             Cause::CompileFailed { message } => message.clone(),
-            // A refusal changes no state; it states what is true and what
-            // is valid now, so the model recovers on its next turn.
-            Cause::Refused { reason } => format!("refused: {reason}"),
+            Cause::Truncated => TRUNCATED_MESSAGE.to_owned(),
             _ => ConditionReport {
                 what: what_happened(h, cause, *site),
                 // A post stopped the program nowhere in particular: the
@@ -768,27 +706,41 @@ fn render_handback(h: &Handback<'_>, budget: usize) -> String {
                 console: h.console.clone(),
                 console_id: h.console_id,
                 artifacts: menu_since(h, h.previous_outcome),
-                restarts: Restarts {
-                    resume: resume_kind(cause),
-                },
             }
             .render(),
         },
-        // The **answer ack**: what was answered and where it went. The
-        // API needs every tool call replied to, and `answer` is a tool
-        // call — without this its `tool_call_id` dangles and the next
-        // request is rejected outright.
+        // The **answer ack**: what was answered and where it went. Every
+        // `Turn` gets exactly one harness `Post` back (the substitution
+        // table in 23_ONE_AGENT.md); a turn that ended by calling
+        // `answer(...)` is no exception, so this is that turn's ack.
         EventPayload::Answer { question, value } => answer_ack(h, *question, value, budget),
         _ => "(not an outcome)".to_owned(),
     }
 }
 
-/// The tool message answering an `answer(question, value)` call.
+/// `Cause::Truncated`'s report: a completion that hit `max_tokens`
+/// mid-program is discarded unread rather than compiled — types.rs's own
+/// rule, because a truncated program can still parse and run, half
+/// written, which is strictly worse than a clean failure the repair loop
+/// can see and retry. No VM ran, so — like `CompileFailed` — there is no
+/// console and no new artifacts to report.
+const TRUNCATED_MESSAGE: &str =
+    "the completion hit its token budget before the program finished and was discarded \
+     unread — a truncated program is never compiled, since a half-written one can still \
+     happen to parse and run. Write a shorter program, or spend less of the budget \
+     thinking before you start writing it.";
+
+/// The harness's ack for a turn that ended by calling `answer(question,
+/// value)`.
 ///
-/// Where it went is walked out of the closed loop of ids —
-/// `Answer.question → Post`, `Post.origin → Send`, and the `Send`'s
-/// position **is** the asker's branch — so the ack is a pure function of
-/// the log like every other report.
+/// Not the retired answer-into-context exception (`CompletionReport`'s
+/// own doc): `value` here is not foreign data arriving unchosen, it is
+/// the value the *answering* program itself just wrote, moments ago, as
+/// part of its own `source` — this is a receipt, not a delivery. Where
+/// it went is walked out of the closed loop of ids — `Answer.question →
+/// Post`, `Post.origin → Send`, and the `Send`'s position **is** the
+/// asker's branch — so the ack is a pure function of the log like every
+/// other report.
 fn answer_ack(
     h: &Handback<'_>,
     question: EventId,
@@ -818,8 +770,14 @@ fn answer_ack(
 }
 
 /// The "what happened" diagnostic, rebuilt from the logged cause, the
-/// logged site, and the source in the turn's tool-call args — the three
-/// inputs that used to live only in the VM.
+/// logged site, and the source read off the driving `Turn.source` — the
+/// three inputs that used to live only in the VM.
+///
+/// Folds in, inline, what `resume(value)` would mean for *this*
+/// suspension (or why it doesn't apply) — there is no separate "restarts"
+/// menu any more (DESIGN.md "The thesis": a suspension gets a handler
+/// *program*, not a pick off a schema list), so this is simply one more
+/// fact about what happened, stated where the reader is already looking.
 fn what_happened(h: &Handback<'_>, cause: &Cause, site: u32) -> String {
     let source = &h.source;
     match cause {
@@ -831,9 +789,27 @@ fn what_happened(h: &Handback<'_>, cause: &Cause, site: u32) -> String {
                 .map(|p| p.to_string())
                 .unwrap_or_else(|| "(none)".into());
             what.push_str(&clip(&rendered, PAYLOAD_MAX_BYTES));
+            what.push_str(
+                "\n\nWrite a handler program; its `return` value is the restart. \
+                 `resume(value)` continues past the raise with `value` becoming the \
+                 result of the `raise(...)` expression; `abandon()` gives up on it. Or \
+                 do neither and write a program that handles this some other way.",
+            );
             what
         }
-        Cause::Trapped { message, .. } => diagnostic(source, site, message),
+        Cause::Trapped {
+            message, resumable, ..
+        } => {
+            let mut what = diagnostic(source, site, message);
+            what.push_str(if *resumable {
+                "\n\nresume(value) continues as if the failed operation had produced \
+                 `value`."
+            } else {
+                "\n\nnot resumable — resume() will not stand in for this; write a program \
+                 that recovers a different way."
+            });
+            what
+        }
         // The product surface of this phase: the report a running branch
         // gets when someone speaks to it. What happened **is** the
         // message — author-labelled, and marked with what it owes you.
@@ -864,15 +840,25 @@ fn what_happened(h: &Handback<'_>, cause: &Cause, site: u32) -> String {
                     clip(&render_post(*id, from, &origin), POST_MAX_BYTES),
                 ));
             }
+            what.push_str(
+                "\nresume() continues the program from where it stopped — nothing here \
+                 asked for a value.",
+            );
             what.trim_end().to_owned()
         }
         Cause::Interrupted => {
             "This program was interrupted before completing — the process died and the VM \
-             went with it. The artifacts below are still fetchable by id; rewrite to \
-             continue."
+             went with it. Not resumable: there is nothing left to resume. The artifacts \
+             below are still fetchable by id; rewrite to continue."
                 .to_owned()
         }
-        Cause::CompileFailed { message } | Cause::Refused { reason: message } => message.clone(),
+        // Never reached: `render_handback` peels both of these off
+        // before calling here (no VM ran for either, so there is no
+        // stack or console for `ConditionReport` to carry). Kept only so
+        // this match stays exhaustive over `Cause` without a wildcard
+        // hiding a real case that gets added later.
+        Cause::CompileFailed { message } => message.clone(),
+        Cause::Truncated => TRUNCATED_MESSAGE.to_owned(),
     }
 }
 
@@ -899,19 +885,6 @@ fn diagnostic(source: &str, site: u32, message: &str) -> String {
         message: message.to_owned(),
     }
     .render(source)
-}
-
-fn resume_kind(cause: &Cause) -> ResumeKind {
-    match cause {
-        Cause::Raised { .. } => ResumeKind::Raise,
-        Cause::Trapped {
-            resumable: true, ..
-        } => ResumeKind::Operation,
-        // A post suspended the program; nothing asked for a value, so
-        // `resume()` just continues (B3 renders this one).
-        Cause::Posted { .. } => ResumeKind::Continue,
-        _ => ResumeKind::No,
-    }
 }
 
 /// The artifact menu for this handback: every call **up to this
@@ -1048,44 +1021,49 @@ fn annotated_source(h: &Handback<'_>) -> String {
 /// doing?". The same gesture, and this line is what tells the model which
 /// it is.
 ///
-/// Two shapes, chosen by whether the fork point left a tool call
-/// unanswered on this path:
+/// Always exactly **one** harness `Post`, not the old one-per-dangling-
+/// tool-call fan-out: there is no tool-call adjacency to keep satisfied
+/// any more (a `Turn` gets one `Post` back, full stop — 23_ONE_AGENT.md's
+/// substitution table), so what to say no longer depends on caller-
+/// tracked bookkeeping. It depends only on the log, derived fresh here
+/// (`is_outcome`, same as `handback`): did the fork point's last `Turn`
+/// already have its outcome by the time the fork was taken?
 ///
-/// - an **ordinary** fork point: a harness line naming the branch the
-///   pre-fork questions stayed with.
-/// - a **mid-program** fork point: that call's tool result, naming the
-///   original branch and the artifacts so far — which also keeps the
-///   API's adjacency rule satisfied instead of leaving a dangling call.
+/// - **already settled** (an ordinary fork point): a harness line naming
+///   the branch the pre-fork questions stayed with.
+/// - **not yet settled** (a **mid-program** fork point): the
+///   still-running program's own turn had no `Return`/`Condition` on
+///   this path yet, so the note instead names the original branch and
+///   the artifacts so far.
 ///
 /// Every input is an event id, so it renders identically forever.
-pub fn render_fork(
-    tree: &Tree,
-    leaf: EventId,
-    fork: EventId,
-    dangling: &[ToolCall],
-) -> Vec<crate::machine::Rendered> {
+pub fn render_fork(tree: &Tree, leaf: EventId, fork: EventId) -> String {
     let at = tree.events.get(&fork).and_then(|e| e.parent_id);
     let origin = at.and_then(|at| tree.branch_of(at));
     let branch = origin
         .map(|b| format!("#{}", b.as_u64()))
         .unwrap_or_else(|| "the original".to_owned());
-    if dangling.is_empty() {
-        let point = at
-            .map(|at| format!(" at #{}", at.as_u64()))
-            .unwrap_or_default();
-        return vec![crate::machine::Rendered::User(format!(
-            "[harness] fork of branch {branch}{point} — questions before this line are \
-             being handled there; do not redo its work unless asked."
-        ))];
-    }
-    // The fork point's last turn is still running on the original. Its
-    // artifacts crossed the fork (history and artifacts do); the run
-    // itself did not (the VM is never copied).
+
     let path = tree.path_events(leaf);
     let fork_at = path.iter().position(|e| e.id == fork).unwrap_or(0);
     let turn_at = path[..fork_at]
         .iter()
         .rposition(|e| matches!(e.payload, EventPayload::Message(Message::Turn { .. })));
+    // Mid-program iff that turn's outcome had not landed by the fork.
+    let running = turn_at.is_some_and(|ti| !path[ti + 1..fork_at].iter().any(|e| is_outcome(&e.payload)));
+
+    if !running {
+        let point = at
+            .map(|at| format!(" at #{}", at.as_u64()))
+            .unwrap_or_default();
+        return format!(
+            "[harness] fork of branch {branch}{point} — questions before this line are \
+             being handled there; do not redo its work unless asked."
+        );
+    }
+    // The fork point's last turn is still running on the original. Its
+    // artifacts crossed the fork (history and artifacts do); the run
+    // itself did not (the VM is never copied).
     let program = turn_at
         .map(|i| format!("#{}", path[i].id.as_u64()))
         .unwrap_or_else(|| "the program".to_owned());
@@ -1095,42 +1073,13 @@ pub fn render_fork(
         .unwrap_or(0);
     let segment: Vec<&Event> = path[start..fork_at].to_vec();
     let artifacts = crate::machine::menu_rows(&segment, 0);
-    let head = format!(
+    format!(
         "program {program} is running on branch {branch}, not here. This fork inherited \
          its history and its artifacts; the run itself stayed there, so nothing you do \
          here disturbs it.\n\n{}",
         render_menu("artifacts so far", &artifacts)
-    );
-    dangling
-        .iter()
-        .map(|call| crate::machine::Rendered::Tool {
-            call_id: call.id.clone(),
-            text: head.clone(),
-        })
-        .collect()
+    )
 }
-
-/// Whether this run inlined a file body longer than a snippet into
-/// `source` — the nudge condition, read off the logged call args.
-fn inlined_large_body(h: &Handback<'_>) -> bool {
-    h.path[h.turn_at + 1..=h.outcome_at]
-        .iter()
-        .any(|e| match &e.payload {
-            EventPayload::Call(Call::Invoke { name, args, .. })
-                if name == "create_file" || name == "replace_file" =>
-            {
-                args.as_array()
-                    .and_then(|a| a.last())
-                    .and_then(|v| v.as_str())
-                    .is_some_and(|c| c.len() > INLINE_BODY_ADVICE_BYTES)
-            }
-            _ => false,
-        })
-}
-
-/// A `create_file`/`replace_file` whose inline content exceeds this draws
-/// the attachments nudge (when the run passed no `attachments`).
-pub const INLINE_BODY_ADVICE_BYTES: usize = 512;
 
 #[cfg(test)]
 mod tests {
@@ -1153,10 +1102,11 @@ mod tests {
         }
     }
 
-    use crate::types::{Cause, EventPayload, Message, Origin, ToolCall, Tree};
+    use crate::types::{Cause, Disposition, EventPayload, Message, Origin, Tree};
 
-    /// A one-branch fixture log: a `Turn` carrying `run_program(source)`
-    /// followed by whatever outcome the caller wants.
+    /// A one-branch fixture log: a `Turn` whose entire content is a bare
+    /// program (`Turn.source` — no tool-call wrapper any more), followed
+    /// by whatever outcome the caller wants.
     fn fixture(source: &str, outcome: EventPayload) -> (Tree, crate::types::EventId) {
         let mut tree = Tree::new(None);
         let mut spine = tree
@@ -1178,13 +1128,8 @@ mod tests {
             &mut spine,
             EventPayload::Message(Message::Turn {
                 author: Author::Agent(crate::types::EventId::new(1)),
-                text: String::new(),
+                source: source.to_owned(),
                 thinking: None,
-                tool_calls: vec![ToolCall {
-                    id: "c1".into(),
-                    name: "run_program".into(),
-                    arguments: json!({ "source": source }),
-                }],
             }),
         )
         .unwrap();
@@ -1192,50 +1137,71 @@ mod tests {
         (tree, outcome)
     }
 
+    /// A `Condition` payload with `disposition: Pushed` — the ordinary
+    /// deliberation case every fixture below wants; only replay's depth
+    /// counter (not this renderer) reads it.
+    fn condition(cause: Cause, site: u32, stack: Vec<String>) -> EventPayload {
+        EventPayload::Condition {
+            cause,
+            site,
+            stack,
+            disposition: Disposition::Pushed,
+        }
+    }
+
     /// Every report kind renders from fixture events alone — no VM, no
     /// live state. This is the whole claim of "reports are derived".
     #[test]
     fn every_report_kind_renders_from_the_log() {
-        // Completion.
+        // Completion: the return value never gets a full copy, only a
+        // bounded preview — even a tiny one like this — named beside the
+        // `program result` artifact id the run itself logs (the `Return`
+        // is its own menu row; see `machine::menu_rows`).
         let (tree, o) = fixture("return 1;", EventPayload::Return { value: json!(1) });
         let leaf = tree.list_leaves()[0].0;
         let text = derive_report(&tree, leaf, o, 64 * 1024);
         assert!(text.starts_with("## program completed"), "{text}");
-        assert!(text.contains("returned: 1"), "{text}");
+        assert!(
+            text.contains(&format!("returned [#{}]: 1", o.as_u64())),
+            "{text}"
+        );
 
         // Condition: a raise, with the caret placed from the logged site
-        // and the source read out of the turn's own tool-call args.
+        // and the source read straight off the turn's own `source`. What
+        // `resume(value)` means for a raise is now inline in "what
+        // happened", not a separate restart menu.
         let src = "raise(\"need\", { got: 1 });";
         let (tree, o) = fixture(
             src,
-            EventPayload::Condition {
-                cause: Cause::Raised {
+            condition(
+                Cause::Raised {
                     name: "need".into(),
                     payload: Some(json!({ "got": 1 })),
                 },
-                site: 0,
-                stack: vec!["<root>".into()],
-            },
+                0,
+                vec!["<root>".into()],
+            ),
         );
         let leaf = tree.list_leaves()[0].0;
         let text = derive_report(&tree, leaf, o, 64 * 1024);
         assert!(text.contains("1:1: condition `need` raised"), "{text}");
         assert!(text.contains(src), "the source line is quoted: {text}");
         assert!(text.contains(r#"payload: {"got":1}"#), "{text}");
-        assert!(text.contains("- resume(value)"), "{text}");
+        assert!(text.contains("resume(value)"), "{text}");
 
-        // Condition: a trapped error, not resumable → no resume offered.
+        // Condition: a trapped error, not resumable — the report says so
+        // in prose now, inline with the diagnostic.
         let (tree, o) = fixture(
             "return null.x;",
-            EventPayload::Condition {
-                cause: Cause::Trapped {
+            condition(
+                Cause::Trapped {
                     kind: "TypeError".into(),
                     message: "cannot read property 'x' on null".into(),
                     resumable: false,
                 },
-                site: 7,
-                stack: Vec::new(),
-            },
+                7,
+                Vec::new(),
+            ),
         );
         let leaf = tree.list_leaves()[0].0;
         let text = derive_report(&tree, leaf, o, 64 * 1024);
@@ -1246,39 +1212,30 @@ mod tests {
         // run has no console and no artifacts.
         let (tree, o) = fixture(
             "let = ;",
-            EventPayload::Condition {
-                cause: Cause::CompileFailed {
+            condition(
+                Cause::CompileFailed {
                     message: "compile error:\n1:5: unexpected token".into(),
                 },
-                site: 0,
-                stack: Vec::new(),
-            },
+                0,
+                Vec::new(),
+            ),
         );
         let leaf = tree.list_leaves()[0].0;
         let text = derive_report(&tree, leaf, o, 64 * 1024);
         assert_eq!(text, "compile error:\n1:5: unexpected token");
 
-        // Refusal: what is true and what to do, changing no state.
-        let (tree, o) = fixture(
-            "",
-            EventPayload::Condition {
-                cause: Cause::Refused {
-                    reason: "nothing to resume".into(),
-                },
-                site: 0,
-                stack: Vec::new(),
-            },
-        );
+        // Truncated: hit its token budget mid-program, discarded unread
+        // — never compiled (types.rs's own rule), so this too has no
+        // console and no artifacts, exactly like a compile failure.
+        let (tree, o) = fixture("", condition(Cause::Truncated, 0, Vec::new()));
         let leaf = tree.list_leaves()[0].0;
-        assert_eq!(
-            derive_report(&tree, leaf, o, 64 * 1024),
-            "refused: nothing to resume"
-        );
+        let text = derive_report(&tree, leaf, o, 64 * 1024);
+        assert!(text.contains("never compiled"), "{text}");
+        assert!(text.contains("token budget"), "{text}");
 
-        // The answer ack: what was answered and where it went. The
-        // API needs every tool call replied to, and `answer` **is** a
-        // tool call, so without this its id dangles and the next request
-        // is rejected outright.
+        // The answer ack: what was answered and where it went. Every
+        // `Turn` gets exactly one harness `Post` back, and a turn that
+        // ended in `answer(...)` is no exception.
         let (mut tree, _) = fixture("", EventPayload::Return { value: json!(1) });
         let leaf = tree.list_leaves()[0].0;
         let mut spine = tree.spine_at(leaf);
@@ -1299,13 +1256,8 @@ mod tests {
             &mut spine,
             EventPayload::Message(Message::Turn {
                 author: Author::User,
-                text: String::new(),
+                source: "answer(#1, \"the second\");".into(),
                 thinking: None,
-                tool_calls: vec![crate::types::ToolCall {
-                    id: "a1".into(),
-                    name: "answer".into(),
-                    arguments: json!({ "question": post.as_u64(), "value": "the second" }),
-                }],
             }),
         )
         .unwrap();
@@ -1334,14 +1286,11 @@ mod tests {
         );
         assert!(text.contains(r#"value: "the second""#), "{text}");
 
-        // Interruption: the VM went with the process; rewrite to continue.
+        // Interruption: the VM went with the process; not resumable,
+        // rewrite to continue.
         let (tree, o) = fixture(
             "return 1;",
-            EventPayload::Condition {
-                cause: Cause::Interrupted,
-                site: 0,
-                stack: Vec::new(),
-            },
+            condition(Cause::Interrupted, 0, Vec::new()),
         );
         let leaf = tree.list_leaves()[0].0;
         let text = derive_report(&tree, leaf, o, 64 * 1024);
@@ -1367,13 +1316,8 @@ mod tests {
                 &mut spine,
                 EventPayload::Message(Message::Turn {
                     author: Author::Agent(EventId::new(1)),
-                    text: String::new(),
+                    source: "return 1;".into(),
                     thinking: None,
-                    tool_calls: vec![crate::types::ToolCall {
-                        id: format!("c{run}"),
-                        name: "run_program".into(),
-                        arguments: json!({ "source": "return 1;" }),
-                    }],
                 }),
             )
             .unwrap();
@@ -1519,9 +1463,6 @@ mod tests {
             console: Vec::new(),
             console_id: None,
             artifacts: Vec::new(),
-            restarts: Restarts {
-                resume: ResumeKind::Raise,
-            },
         };
         let rendered = report.render();
         let what = rendered.split("\n\n## where").next().unwrap();
@@ -1529,44 +1470,45 @@ mod tests {
         assert!(what.contains("[truncated; 10000 bytes total]"));
     }
 
+    /// **No exception, not even a small one**: a return value gets the
+    /// same bounded [`preview`] every other artifact gets, full stop —
+    /// there is no size-dependent branch that delivers it whole "because
+    /// it happened to fit a budget". A small value still reads whole
+    /// (`preview`/`clip` only ever clip when they must), but that is
+    /// `clip`'s ordinary behaviour, not a distinguished "answer" path.
     #[test]
-    fn answer_within_budget_is_verbatim() {
-        // An answer that fits the budget is delivered in full — the read /
-        // summarize happy path (12_ANSWERS).
+    fn small_return_value_is_shown_whole_beside_its_fetch_id() {
         let report = CompletionReport {
-            value: json!("z".repeat(5_000)),
-            budget: 64 * 1024,
+            value: json!("hello"),
             console: Vec::new(),
             console_id: None,
-            new_artifacts: Vec::new(),
-            advise_attachments: false,
+            new_artifacts: vec![artifact(9, "program result", json!("hello"))],
             failed_calls: 0,
         };
         let rendered = report.render();
         let line = rendered.lines().nth(1).unwrap();
-        assert!(line.contains(&"z".repeat(5_000)), "delivered in full");
-        assert!(
-            !line.contains("tools.tool_result"),
-            "no spill marker: {line}"
-        );
+        assert_eq!(line, r#"returned [#9]: "hello""#, "{line}");
     }
 
+    /// Past the preview bound, the value is clipped like any other
+    /// artifact — the marker plus its `program result` id is what keeps
+    /// the full value one `tools.tool_result` away, never a bigger inline
+    /// copy.
     #[test]
-    fn over_budget_answer_names_fetch_id() {
-        // Past budget the context copy is truncated, but the marker names
-        // the `ProgramResult` id so the full value stays fetchable.
+    fn large_return_value_is_previewed_with_fetch_id() {
         let report = CompletionReport {
             value: json!("z".repeat(5_000)),
-            budget: 1_000,
             console: Vec::new(),
             console_id: None,
             new_artifacts: vec![artifact(9, "program result", json!("z".repeat(5_000)))],
-            advise_attachments: false,
             failed_calls: 0,
         };
         let rendered = report.render();
         let line = rendered.lines().nth(1).unwrap();
-        assert!(line.contains("tools.tool_result(#9)"), "{line}");
+        assert!(line.starts_with("returned [#9]: "), "{line}");
+        assert!(line.len() < PREVIEW_MAX_BYTES + 100, "{line}");
+        assert!(!line.contains(&"z".repeat(5_000)), "not copied whole");
+        assert!(line.contains("[truncated;"), "{line}");
     }
 
     #[test]
@@ -1577,9 +1519,6 @@ mod tests {
             console: Vec::new(),
             console_id: None,
             artifacts: vec![artifact(7, "fetch([\"big\"])", json!("b".repeat(9000)))],
-            restarts: Restarts {
-                resume: ResumeKind::Operation,
-            },
         };
         let rendered = report.render();
         let menu_line = rendered.lines().find(|l| l.starts_with("[#7]")).unwrap();
@@ -1603,11 +1542,9 @@ mod tests {
     fn completion(artifacts: Vec<Artifact>) -> String {
         CompletionReport {
             value: json!({ "status": "done" }),
-            budget: 64 * 1024,
             console: Vec::new(),
             console_id: None,
             new_artifacts: artifacts,
-            advise_attachments: false,
             failed_calls: 0,
         }
         .render()
@@ -1658,23 +1595,6 @@ mod tests {
     }
 
     #[test]
-    fn inlined_body_draws_the_attachments_nudge() {
-        let report = CompletionReport {
-            value: json!("done"),
-            budget: 64 * 1024,
-            console: Vec::new(),
-            console_id: None,
-            new_artifacts: vec![artifact(5, "create_file([\"/x/a.js\", \"…\"])", json!({}))],
-            advise_attachments: true,
-            failed_calls: 0,
-        }
-        .render();
-        assert!(report.contains("## note"), "{report}");
-        assert!(report.contains("inlined into `source`"), "{report}");
-        assert!(report.contains("attachments"), "{report}");
-    }
-
-    #[test]
     fn no_write_no_nudge() {
         // A pure read/compute program never gets the write nudge, even
         // with a setup-only bash call.
@@ -1711,23 +1631,5 @@ mod tests {
         let label = derived_branch_label(&tree, branch, leaf).expect("a post exists");
         assert_eq!(label, "read the config and summarize it");
         assert!(!label.contains('#'), "{label}");
-    }
-
-    #[test]
-    fn not_resumable_drops_resume_and_says_so() {
-        let report = ConditionReport {
-            what: "stack overflow".into(),
-            whence: Whence::Stack(Vec::new()),
-            console: Vec::new(),
-            console_id: None,
-            artifacts: Vec::new(),
-            restarts: Restarts {
-                resume: ResumeKind::No,
-            },
-        };
-        let rendered = report.render();
-        assert!(!rendered.contains("- resume(value)"));
-        assert!(rendered.contains("not resumable"));
-        assert!(rendered.contains("- run_program(source)"));
     }
 }
