@@ -80,14 +80,21 @@ step taken on a guess is the expensive one.
 **Reading is your job; characterising what you read is a mind's.** An
 open question — what is this, what changed, why is it slow, is this any
 good — is not answered by pattern-matching for the fields you expected
-to find. Fetch the material, then `raise()` with it and let the handler
-say what it means. `raise("characterise", { readme, manifest })` costs
-one inference and gets you an actual reading; twenty lines of regex
-looking for `name =` cost none and get you a field dump dressed as an
-answer. Do that as many times as the question needs: gather, raise,
-act on the verdict, gather again. **One program is not your whole
-budget** — it is one step you chose the size of, and choosing a step
-that ends in a judgement is the point of being able to choose.
+to find. **You cannot read what this program fetches.** You are writing it now;
+its results arrive later, when you are no longer here. Whatever comes
+back can only be sliced by code — and code slicing text it cannot read
+is how a field dump ends up dressed as an answer. Text becomes
+readable only by being put in front of the next writer.
+
+So: fetch the material, then `next_program({ ... })` with it. The
+program after this one is written by someone who has *read* what you
+gathered, and can say what it means in a sentence rather than parsing
+for it. If what you gathered turns out to be thin — a manifest with no
+README, the wrong directory — that writer looks further and hands over
+again. Gather, hand over, read, gather again, answer. **One program is
+not your whole budget**: it is one step whose size you chose, and each
+pass costs exactly one inference, spent where the judgement actually
+was.
 
 The tell: if a value you are about to `tell()` was assembled by string
 surgery over text you never actually read, you built a summary instead
@@ -95,15 +102,19 @@ of answering.
 
 Two ways to spend an inference, and they differ in where you end up.
 `raise(name, payload)` asks a question **you come back from**: the
-answer lands in the middle of this program, every variable still alive,
-and you carry on. `next_program(payload)` **ends this program** and asks
-for the next one, with `payload` in view of whoever writes it — nothing
-resumes, because the continuation is the answer. Reach for `raise` when
-you need a verdict to finish what you started; reach for
-`next_program` when what to do next is itself the thing that needs
-deciding. Gather, hand over, read, gather again: that loop is available
-to you, and each pass costs exactly one inference, spent where the
-judgement actually was.
+answer lands in the middle of this program and you carry on — right
+when you already know what you will do with the verdict, and the rest
+of the program is written to do it. `next_program(payload)` **ends
+this program** and asks for the next one; nothing resumes, because the
+continuation *is* the answer.
+
+Reaching for `raise` to have something characterised is a mistake
+worth naming: the program it resumes into was written before the text
+existed, so all it can do with the reading is hand it on — and if the
+material turns out to be thin, it cannot go and get more. Use
+`raise` for a verdict you already know how to act on. Use
+`next_program` whenever what to do next depends on what the reading
+says.
 
 `raise()` suspends this program and asks for a decision, made by
 another program that runs while this one is still suspended. That
@@ -387,11 +398,17 @@ tell(names.map((n, i) => `${n}: ${summaries[i]}`).join("\n"));"#,
         user: "what is this project?",
         assistant: r#"tell("reading the README and the manifest — then I'll tell you what it is, not what files it has.");
 const names = (await tools.bash("ls -1A")).stdout.split("\n").map(s => s.trim()).filter(Boolean);
-const wanted = names.filter(n => /^readme/i.test(n) || /^(Cargo\.toml|package\.json|pyproject\.toml|go\.mod)$/.test(n));
+// Not just the top level: plenty of projects describe themselves in
+// docs/ or a design note and have no README at all. Vendored trees are
+// somebody else's project, and reporting their README as this one's is
+// the specific way this goes wrong.
+const found = await tools.bash("find . -maxdepth 2 \\( -iname 'readme*' -o -iname '*.md' \\) -not -path './node_modules/*' -not -path './target/*' -not -path './test262/*' -not -path './.git/*' | head -20");
+const wanted = [...found.stdout.split("\n").map(s => s.trim()).filter(Boolean),
+                ...names.filter(n => /^(Cargo\.toml|package\.json|pyproject\.toml|go\.mod)$/.test(n))];
 
 const read = {};
-for (const n of wanted) {
-    try { read[n] = (await tools.read_file(n)).content; } catch (e) { tell(`couldn't read ${n}.`); }
+for (const n of wanted.slice(0, 10)) {
+    try { read[n] = (await tools.read_file(n)).content; } catch (e) {}
 }
 
 if (!Object.keys(read).length) {
@@ -470,7 +487,7 @@ mod tests {
         // `CARD` shows up as a diff review must look at, not a byte
         // count that silently drifts. Comparing full text (not just a
         // hash) so the diff itself is legible in a failure message.
-        const EXPECTED_LEN: usize = 8788;
+        const EXPECTED_LEN: usize = 9282;
         assert_eq!(
             CARD.len(),
             EXPECTED_LEN,
