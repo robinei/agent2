@@ -119,7 +119,7 @@ fn main() {
             let result = if headless {
                 run_session_headless(log_path, use_real, nav)
             } else {
-                run_session_tui(log_path, use_real, nav.resume)
+                run_session_tui(log_path, use_real, &nav)
             };
             if let Err(e) = result {
                 eprintln!("{e}");
@@ -263,15 +263,23 @@ fn queue_nav(session: &host::Session, nav: &SessionNav) {
 
 /// The attached TUI (9_TUI Step 4) — the harness's primary frontend.
 /// Type a message to kick it off.
-fn run_session_tui(
-    log_path: Option<String>,
-    real: bool,
-    resume: Option<u64>,
-) -> Result<(), String> {
+/// The attached TUI. Takes the whole [`SessionNav`], not just
+/// `--resume`: the navigation commands are queued **before** the TUI
+/// takes over, exactly as the headless path does, so `--turn` lands a
+/// first user message on the conversation branch with nobody present to
+/// type one.
+///
+/// That is what makes an unattended run possible at all, and the eval's
+/// end state depends on it (`23_ONE_AGENT.md`, Pass D): the real TUI,
+/// launched with a first message and an answer-as-the-user flag, needs
+/// no human. Threading only `resume` here silently dropped `--turn` in
+/// TUI mode, which left the documented gesture with no code path.
+fn run_session_tui(log_path: Option<String>, real: bool, nav: &SessionNav) -> Result<(), String> {
     let (tx, rx) = std::sync::mpsc::channel();
-    let mut session = build_session(log_path, real, resume, tx)?;
+    let mut session = build_session(log_path, real, nav.resume, tx)?;
     // The TUI *is* a client, so it is presence.
     session.set_attached(true);
+    queue_nav(&session, nav);
     debug::run_attached(session, rx)
 }
 
