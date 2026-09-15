@@ -15,6 +15,14 @@
 //! fired.** Verb choice is the observational variable — gating on it
 //! would make the harness confirm its own card rather than measure it.
 //!
+//! Every task in `tasks.rs` runs `host::real_registry()` unmodified
+//! against real files in a real per-task directory — no fixture tool, no
+//! scripted response, except for the one thing this harness cannot help
+//! but simulate: the human `ask()` might reach (`tasks::Task::ask_answer`).
+//! Confining what the process can touch is a separate concern this
+//! module has no part in — see `scripts/eval.sh`, which is how `agent
+//! eval` is meant to be launched.
+//!
 //! Never part of `cargo test`: it talks to a live model over the
 //! network. It is reached through `agent eval`.
 

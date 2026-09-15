@@ -28,6 +28,9 @@ pub struct DeepSeekClient {
     model: String,
     base_url: String,
     thinking: bool,
+    /// Pinned reasoning level, sent as `reasoning_effort`. `None` leaves
+    /// the field off and lets the API choose.
+    effort: Option<String>,
     agent: ureq::Agent,
     // Stable for the client's lifetime (one per session): the "OpenCode
     // Go" endpoint requires `x-opencode-session` to route a conversation
@@ -41,6 +44,16 @@ impl DeepSeekClient {
     /// `DEEPSEEK_MODEL`, base URL from `DEEPSEEK_BASE_URL`. Thinking is on
     /// by default (the API's own default); set `DEEPSEEK_NO_THINKING` (to
     /// any value) to send `"thinking": {"type": "disabled"}`.
+    ///
+    /// `DEEPSEEK_REASONING_EFFORT` pins the level explicitly —
+    /// `minimal`/`low`/`medium`/`high`/`xhigh`/`max`, sent as
+    /// `reasoning_effort`. Unset, the request carries no such field and
+    /// the API picks, which is fine for ordinary use and **not** fine for
+    /// a comparison: `DESIGN.md`'s M5 measures this harness against a
+    /// third-party agent on the same model, and an unpinned level makes
+    /// "same model" untrue in the one way that would silently explain a
+    /// difference. The wire format is the one `pi` uses for this
+    /// provider, so the two are set the same way.
     pub fn from_env() -> Result<Self, String> {
         let api_key = std::env::var("DEEPSEEK_API_KEY")
             .map_err(|_| "DEEPSEEK_API_KEY is not set".to_owned())?;
@@ -48,7 +61,15 @@ impl DeepSeekClient {
         let base_url =
             std::env::var("DEEPSEEK_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.into());
         let thinking = std::env::var("DEEPSEEK_NO_THINKING").is_err();
-        Ok(Self::new(api_key, model, base_url, thinking))
+        let effort = std::env::var("DEEPSEEK_REASONING_EFFORT").ok();
+        Ok(Self::new(api_key, model, base_url, thinking).with_effort(effort))
+    }
+
+    /// Pin the reasoning level (builder form, so `new`'s signature is
+    /// untouched for its existing callers).
+    pub fn with_effort(mut self, effort: Option<String>) -> Self {
+        self.effort = effort;
+        self
     }
 
     pub fn new(api_key: String, model: String, base_url: String, thinking: bool) -> Self {
@@ -63,6 +84,7 @@ impl DeepSeekClient {
             model,
             base_url,
             thinking,
+            effort: None,
             agent: config.into(),
             session_id: uuid::Uuid::new_v4().to_string(),
         }
@@ -77,7 +99,7 @@ impl LlmClient for DeepSeekClient {
         chunk: &mut dyn FnMut(LlmChunk),
     ) -> Result<LlmTurn, String> {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-        let body = request_body(request, &self.model, self.thinking);
+        let body = request_body(request, &self.model, self.thinking, self.effort.as_deref());
         let mut response = self
             .agent
             .post(&url)
@@ -107,7 +129,12 @@ impl LlmClient for DeepSeekClient {
 /// schema — the model's whole response is the program, not a call into
 /// one of a menu of functions — so there is nothing here to build one
 /// from, unlike the pre-23 wire format this replaced.
-fn request_body(request: &Document, model: &str, thinking: bool) -> serde_json::Value {
+fn request_body(
+    request: &Document,
+    model: &str,
+    thinking: bool,
+    effort: Option<&str>,
+) -> serde_json::Value {
     let messages: Vec<serde_json::Value> = request.messages.iter().map(message_json).collect();
     let mut body = serde_json::json!({
         "model": model,
@@ -115,7 +142,11 @@ fn request_body(request: &Document, model: &str, thinking: bool) -> serde_json::
         "stream": true,
     });
     if !thinking {
+        // Exactly what `pi` sends to disable on this provider, so
+        // "both off" is the same request on both sides.
         body["thinking"] = serde_json::json!({ "type": "disabled" });
+    } else if let Some(effort) = effort {
+        body["reasoning_effort"] = serde_json::json!(effort);
     }
     body
 }
@@ -241,7 +272,7 @@ mod tests {
             msg(ChatRole::Assistant, "return 1;"),
             msg(ChatRole::User, "## program completed"),
         ]);
-        let body = request_body(&request, "deepseek-v4-pro", true);
+        let body = request_body(&request, "deepseek-v4-pro", true, None);
 
         assert_eq!(body["model"], "deepseek-v4-pro");
         assert_eq!(body["stream"], true);
@@ -262,9 +293,30 @@ mod tests {
     }
 
     #[test]
+    fn request_body_pins_reasoning_effort_when_asked() {
+        // `pi` sends `reasoning_effort: "<level>"` on this provider, and
+        // `thinking: {type: "disabled"}` to turn it off. Matching both
+        // exactly is what makes `DESIGN.md`'s M5 a comparison of two
+        // harnesses rather than of two reasoning budgets.
+        let request = Document {
+            messages: vec![ChatMessage {
+                role: ChatRole::System,
+                content: "c".into(),
+            }],
+        };
+        let body = request_body(&request, "deepseek-v4-flash", true, Some("medium"));
+        assert_eq!(body["reasoning_effort"], json!("medium"));
+        assert!(body.get("thinking").is_none());
+
+        // Unpinned: no field at all, and the API picks.
+        let body = request_body(&request, "deepseek-v4-flash", true, None);
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
     fn request_body_disables_thinking_on_request() {
         let request = doc(vec![]);
-        let body = request_body(&request, "deepseek-v4-flash", false);
+        let body = request_body(&request, "deepseek-v4-flash", false, None);
         assert_eq!(body["thinking"], json!({ "type": "disabled" }));
     }
 

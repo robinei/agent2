@@ -3,11 +3,20 @@
 //! numbers `docs/23_ONE_AGENT.md`'s Pass C asks for — round-trips,
 //! program length (statements), task success — per task, plus the
 //! aggregate. Everything underneath (`tasks::drive`, `tasks::Task`,
-//! `tasks::RecordingTools`) is already unit-tested on scripted
-//! completions with no network; this module's only job is wiring a live
-//! `DeepSeekClient` in and printing, so it has no tests of its own
-//! beyond what type-checks — a live model's actual behavior is not the
-//! thing to script (see `tasks.rs`'s own header).
+//! `tasks::make_sandbox`) is already unit-tested on scripted completions
+//! with no network; this module's only job is wiring a live
+//! `DeepSeekClient` in, giving each task a real sandbox directory, and
+//! printing — so it has no tests of its own beyond what type-checks — a
+//! live model's actual behavior is not the thing to script (see
+//! `tasks.rs`'s own header).
+//!
+//! **This module has no notion of sandboxing the process.** Whatever
+//! confinement `agent eval` runs under (see `scripts/eval.sh`) is a
+//! property of how the binary was launched, decided before `main`
+//! dispatches to `eval`; nothing here checks for it, requires it, or
+//! knows it exists. Each task still gets a fresh, real, per-task
+//! directory (`tasks::make_sandbox`) — that is ordinary fixture setup,
+//! not a security boundary.
 //!
 //! Reached through `agent eval [--experimental]`, never `cargo test`.
 
@@ -60,11 +69,14 @@ impl TaskReport {
     }
 }
 
-/// Run one task live against `llm`.
+/// Run one task live against `llm`: a fresh real sandbox directory
+/// (`tasks::make_sandbox`), a real `Session` driven through it
+/// (`tasks::drive`), then `task.check` reading the same directory back
+/// off disk.
 pub fn run_task(task: &Task, llm: Box<dyn host::LlmClient>) -> TaskReport {
-    let tools = (task.tools)();
-    let outcome = super::tasks::drive(task, tools.clone(), llm);
-    let success = (task.check)(&outcome, &tools);
+    let sandbox = super::tasks::make_sandbox(task);
+    let outcome = super::tasks::drive(task, sandbox.path(), llm);
+    let success = (task.check)(&outcome, sandbox.path());
     TaskReport::from_outcome(task, outcome, success)
 }
 
