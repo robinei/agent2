@@ -408,3 +408,29 @@ fn resume_and_abandon_are_ordinary_values_not_reserved_words() {
         other => panic!("expected Done, got {other:?}"),
     }
 }
+
+#[test]
+fn spawn_yields_its_handle_without_a_source_level_await() {
+    // `const h = spawn(...)` must evaluate to the handle, not a promise.
+    // The card and its exemplars spell it without `await`, and a model
+    // that copies them and passes `h` as an address must not be handing
+    // over a promise -- two live traps came from exactly that. Creating
+    // settles at dispatch, so the compiler emits the await itself.
+    let prog = compile("const h = spawn(\"charter\"); return h;").expect("compiles");
+    let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
+    let id = match vm.step(u64::MAX).unwrap() {
+        StepResult::Pending { calls } => {
+            assert_eq!(calls.len(), 1, "one spawn call");
+            assert_eq!(calls[0].name.as_str(), "spawn");
+            calls[0].promise
+        }
+        other => panic!("expected the spawn to yield, got {other:?}"),
+    };
+    vm.resolve_promise(id, Value::Float(7.0)).unwrap();
+    match vm.step(u64::MAX).unwrap() {
+        StepResult::Done { value, .. } => {
+            assert_eq!(value, Value::Float(7.0), "the handle itself, not a promise");
+        }
+        other => panic!("expected completion, got {other:?}"),
+    }
+}

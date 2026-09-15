@@ -588,8 +588,35 @@ impl super::Compiler {
                 self.compile_args(argv);
                 self.emit(Instr::Notify(name.into(), argv.len() as u32), span);
             }
-            "ask" | "answer" | "spawn" | "fork" | "append_history" | "artifact"
-            | "remove_history" | "rewrite_history" | "list_agents" => {
+            "spawn" | "fork" => {
+                // Creating an agent settles at dispatch: the host appends
+                // an `Agent`/`Fork` event and hands back its id, with no
+                // inference and no waiting on anyone. So the `await` is
+                // emitted here rather than required in the source, and
+                // `const h = spawn(...)` yields the handle itself.
+                //
+                // It cannot use `Notify` like `tell`: that pushes
+                // `undefined`, and these have a value to return. What it
+                // uses instead is the property `Instr::Await` already
+                // has — it re-executes, peeking while pending and
+                // leaving `ip` unchanged across `StepResult::Pending`, so
+                // the VM yields to the host and resumes with the value in
+                // place. The VM is never on the host's stack; it returns
+                // a `StepResult` and is stepped again.
+                //
+                // A source-level `await spawn(...)` still works: `Await`
+                // passes a non-promise straight through.
+                //
+                // The distinction this encodes (`22_ONE_VOCABULARY.md`,
+                // "Creating is not messaging"): a yield is not a round
+                // trip. This one costs a VM step; `ask` may cost a
+                // completion.
+                self.compile_args(argv);
+                self.emit(Instr::Invoke(name.into(), argv.len() as u32), span);
+                self.emit(Instr::Await, span);
+            }
+            "ask" | "answer" | "append_history" | "artifact" | "remove_history"
+            | "rewrite_history" | "list_agents" => {
                 // The closed, harness-defined vocabulary (phase 20 doc,
                 // `docs/20_CODE_MODE.md` Step C1) — a fixed global
                 // surface, identical for every agent, known to this

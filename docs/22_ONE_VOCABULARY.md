@@ -269,41 +269,47 @@ fence gives every reflective artifact — methods included — **no JSON
 form**, so a handle carrying methods could not be stored, logged, or
 passed across a boundary. A bare id can.
 
-**Both verbs are awaited, and that is not the same as costing a round
-trip.** An earlier draft of this paragraph said they were "local
-creations whose result exists immediately, so there is nothing to park
-for." That is true of inference cost and false of mechanism, and the
-difference cost two live traps: an exemplar written from this sentence
-said `const h = spawn(...)`, the model copied it faithfully, and `h`
-was a promise rather than a handle.
+**Creating settles at dispatch, so the `await` is emitted by the
+compiler, not written in the source.** `const h = spawn(...)` evaluates
+to the handle itself.
 
-The architecture forces it. `spawn`/`fork` hand back an id, an id comes
-from appending to the `Tree`, and only the host owns the tree — so the
-value must return through a promise, because the load-bearing property
-forbids the VM calling back into the host mid-instruction.
-`Instr::Notify` makes `tell` promise-free only because `tell` has **no
-value to return**; it pushes `undefined`. There is no such trick for a
-verb that produces a handle.
+This paragraph has been wrong twice, in opposite directions, and both
+errors reached live runs — worth recording, because the second one is
+the subtler mistake.
 
-So the axis that matters is not awaitable-vs-not, it is **what the
-await costs**:
+First it said spawn/fork were "local creations whose result exists
+immediately, so there is nothing to park for," which read as *not
+awaited*. An exemplar written from that sentence said `const h =
+spawn(...)`, the model copied it faithfully, `h` was a promise, and
+`ask(h, …)` trapped.
+
+Then it said the architecture *forced* a source-level `await`: the
+handle is an id, ids come from the `Tree`, only the host owns the tree,
+and the load-bearing property forbids the VM calling back into the host
+mid-instruction. Every step of that is true and the conclusion does not
+follow. **A yield is not a callback.** `Instr::Await` already
+re-executes — it peeks while pending and leaves `ip` unchanged across
+`StepResult::Pending` — so the VM can hand the call out, be stepped
+again, and resume with the value in place. It is never on the host's
+stack. The compiler simply emits `Invoke` + `Await` for these two
+verbs.
+
+So the axis that matters was never awaitable-vs-not. It is **what the
+wait costs**:
 
 | | settles at | costs |
 |---|---|---|
-| `await spawn(...)` / `await fork(...)` | dispatch, same step | a VM yield |
+| `spawn(...)` / `fork(...)` | dispatch, same step | a VM yield |
 | `await ask(...)` | when someone answers | possibly a completion |
 
-Both are `await`; only one is a round trip. Conflating them is what
-made "creating is not messaging" look like it implied "creating is not
-awaited." It does not. What it implies is that the *exchange* is
-separate from the *creation* — you await the handle, then you message
-it, and the second await is the expensive one.
+A yield is not a round trip. `tell` still uses `Instr::Notify` rather
+than this, for a different reason: it has no value to return at all, so
+it pushes `undefined` and never allocates a promise anyone could be
+owed.
 
-(If `spawn` ever did return a bare value, `Instr::Await` passes a
-non-promise through unchanged, so `await spawn(...)` would keep
-working. The card's spelling is forward-compatible either way.)
+A source-level `await spawn(...)` remains valid — `Await` passes a
+non-promise straight through — so both spellings work.
 
-## Verb selection
 
 Three verbs answer three different questions, and mixing them up is
 the main way a program wastes a completion:
