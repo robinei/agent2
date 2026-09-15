@@ -13,10 +13,26 @@
 //! `SessionCommand`/`SessionEvent` pair (`protocol.rs`); the debugger
 //! TUI additionally borrows VMs/tree directly because it renders on
 //! this same thread (9_TUI decision 4).
+//!
+//! Under code mode (23_ONE_AGENT) a request is not assembled here: it is
+//! `document::render`'s job, over `&Tree`/`Spine`, and this loop only
+//! calls into it and hands the result to the `LlmClient`. There is no
+//! tool-spec array on the wire and no per-role chat-message matching to
+//! pick apart — the model's whole response is one bare program
+//! (`Message::Turn { source }`), and the harness's own report on what
+//! that program did comes back as an ordinary `Post` from
+//! `Author::Harness`, not a distinguished reply kind. A user's restart
+//! (`SessionCommand::Restart`) carries a program source string for the
+//! same reason: there is no menu of restart kinds to pick from downstream
+//! of this loop, only a program to run, exactly like the LLM's own turn.
+//! A completion that fails to parse is not a dead end here either — the
+//! repair loop (`take_program`, below `spawn_llm`) re-asks with the parse
+//! error appended rather than failing the run outright, ported from the
+//! POC (`codemode/runner.rs`) after two live tasks were lost to a single
+//! unbalanced paren that the compiler already named exactly.
 
 mod deepseek;
 mod demo;
-mod dialect;
 mod llm;
 mod protocol;
 mod registry;
@@ -25,7 +41,6 @@ mod tools;
 
 pub use deepseek::*;
 pub use demo::*;
-pub use dialect::*;
 pub use llm::*;
 pub use protocol::*;
 pub use registry::*;
@@ -39,12 +54,11 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Instant;
 
-use crate::machine::{
-    LlmRequest, LlmTurn, OutCall, Runner, SpawnRequest, StepInput, StepOutput, ToolResult,
-};
+use crate::document::Document;
+use crate::machine::{LlmTurn, OutCall, Runner, SpawnRequest, StepInput, StepOutput, ToolResult};
 use crate::tree::Unmatched;
 use crate::types::{
-    Address, Author, Call, Cause, EventId, EventPayload, Message, Origin, Outcome, ToolCall, Tree,
+    Address, Author, Call, Cause, EventId, EventPayload, Message, Origin, Outcome, Tree,
 };
 
 /// Instructions per VM slice on the loop thread (9_TUI decision 3).
@@ -63,6 +77,38 @@ fn llm_concurrency() -> usize {
         .filter(|n| *n >= 1)
         .unwrap_or(DEFAULT_LLM_CONCURRENCY)
 }
+
+/// How many `spawn()`s deep a chain of agents may nest, ported from the
+/// deleted POC's `RunConfig::max_agent_depth` (`codemode/runner.rs`,
+/// 23_ONE_AGENT A5) — the guard against the pathological case a live
+/// design conversation flagged as the real risk versus honest, shallow
+/// delegation: a spawned child whose first act is to spawn another child
+/// to do the same task, nesting without any natural bound. A different
+/// axis from a program's own `raise`/handler stack depth (bounded per
+/// VM); this one is bounded across the whole agent tree. Overridable via
+/// `AGENT2_MAX_AGENT_DEPTH`.
+pub const DEFAULT_MAX_AGENT_DEPTH: usize = 2;
+
+fn max_agent_depth() -> usize {
+    std::env::var("AGENT2_MAX_AGENT_DEPTH")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_MAX_AGENT_DEPTH)
+}
+
+/// How many parse-repair round trips a single completion gets before a
+/// parse failure is let through to become a real, terminal
+/// `Cause::CompileFailed`. Ported from the deleted POC's repair loop
+/// (`codemode/runner.rs`'s `take_program`, 23_ONE_AGENT A5): live evidence
+/// (2026-09-14) found a genuinely well-engineered ~80-line program lose
+/// an entire task to one unbalanced paren the compiler already named
+/// exactly — a slip at least as mechanically fixable as any runtime trap,
+/// and this loop is what gives the model the chance to fix it instead of
+/// losing the run outright. Small on purpose: a program that still won't
+/// parse after this many corrections is not a typo any more, and the
+/// ordinary `Cause::CompileFailed` path (an artifact menu, a rewrite) is
+/// the more honest next step than retrying silently forever.
+const MAX_REPAIR_ATTEMPTS: u32 = 3;
 
 /// A counting semaphore (std-only) bounding concurrent LLM completions.
 /// LLM worker threads block in `acquire` until a permit frees; the
@@ -202,6 +248,12 @@ pub struct Session {
     /// Whether a client is attached. A per-request fact, pushed into each
     /// runner's trailing line and stored nowhere else.
     attached: bool,
+    /// How many parse-repair round trips each branch's *current* completion
+    /// has already used (the repair loop, `on_llm_response`) — cleared the
+    /// moment a completion actually parses and is handed to the branch, so
+    /// it only ever counts one program's own retries, never accumulates
+    /// across a whole conversation.
+    repair_attempts: HashMap<BranchId, u32>,
 }
 
 impl Session {
@@ -220,7 +272,7 @@ impl Session {
     ) -> io::Result<Self> {
         if tree.events.is_empty() {
             let emitted = tree.id_counter;
-            let state = Runner::new_root(&mut tree, charter, &dialect_card(&registry))?;
+            let state = Runner::new_root(&mut tree, charter, &crate::card::full_card(&registry))?;
             Self::assemble(tree, state, registry, llm, events, emitted)
         } else {
             let leaf = pick_resume_leaf(&tree)?;
@@ -394,7 +446,7 @@ impl Session {
         events: Sender<SessionEvent>,
         emitted: u64,
     ) -> io::Result<Self> {
-        state.set_dialect_card(dialect_card(&registry));
+        state.set_dialect_card(crate::card::full_card(&registry));
         let branch = state.branch_id();
 
         let (tx, rx) = channel();
@@ -415,6 +467,7 @@ impl Session {
             cancels: HashMap::new(),
             in_flight: Arc::new(AtomicUsize::new(0)),
             attached: false,
+            repair_attempts: HashMap::new(),
         };
         session.emit_new();
         // Opening is a step of its own: the root `Agent`, or a repair
@@ -613,8 +666,8 @@ impl Session {
                 call,
                 value,
             }) => self.cmd_reply(branch, call, value),
-            LoopMsg::Command(SessionCommand::Restart { branch, call }) => {
-                self.cmd_restart(branch, call)
+            LoopMsg::Command(SessionCommand::Restart { branch, source }) => {
+                self.cmd_restart(branch, source)
             }
             LoopMsg::Command(SessionCommand::Interrupt { branch }) => self.cmd_interrupt(branch),
             LoopMsg::Command(SessionCommand::Spawn {
@@ -665,7 +718,7 @@ impl Session {
                 }
                 self.cancels.remove(&branch);
                 match result {
-                    Ok(message) => self.step_branch(branch, StepInput::LlmResponse(message)),
+                    Ok(message) => self.on_llm_response(branch, message),
                     Err(message) => {
                         self.emit(SessionEvent::Error {
                             branch: Some(branch),
@@ -744,7 +797,7 @@ impl Session {
             return false;
         };
         let mut state = Runner::with_spine(&self.tree, self.tree.spine_at(leaf));
-        state.set_dialect_card(dialect_card(&self.registry));
+        state.set_dialect_card(crate::card::full_card(&self.registry));
         state.set_attached(self.attached);
         self.states.insert(branch, state);
         self.emit(SessionEvent::BranchOpened { branch });
@@ -785,7 +838,7 @@ impl Session {
         // cross it, obligations do not.
         let fork = self.tree.append(&mut spine, EventPayload::Fork { name })?;
         let mut state = Runner::with_spine(&self.tree, spine);
-        state.set_dialect_card(dialect_card(&self.registry));
+        state.set_dialect_card(crate::card::full_card(&self.registry));
         state.set_attached(self.attached);
         self.states.insert(fork, state);
         self.emit_new();
@@ -820,43 +873,24 @@ impl Session {
 
     /// **The user takes a branch's turn** — `Restart`, DESIGN.md's
     /// outermost handler made literal. Any in-flight generation is
-    /// cancelled, a `Turn { author: User }` carrying that one call is
-    /// logged, and it is applied exactly as if the LLM had made it: the
-    /// next report answers its `call_id` like any other, and the branch's
-    /// later history shows it resumed with 5, which is true.
-    fn cmd_restart(&mut self, branch: BranchId, call: UserCall) -> io::Result<()> {
+    /// cancelled, then `source` is applied exactly as if the LLM had
+    /// emitted it as its own completion: `Turn { author: User, source }`
+    /// is logged and dispatched through the same `take_turn` path a real
+    /// completion takes, so nothing downstream — parsing, dispatch,
+    /// suspension — is special-cased for who wrote the program.
+    ///
+    /// `source` arrives already synthesized by whichever gesture produced
+    /// it (`protocol.rs`'s `Restart` doc: a pasted rewrite verbatim, or a
+    /// `resume(value)`/`answer(...)` call synthesized from a value or a
+    /// post id) — this command never inspects *which* gesture it was.
+    fn cmd_restart(&mut self, branch: BranchId, source: String) -> io::Result<()> {
         if !self.open_branch(branch) {
             return self.unaddressable(branch);
         }
         self.cancel_generation(branch);
-        // Unique for the life of the log, like every other id here.
-        let id = format!("user-{}", self.tree.id_counter + 1);
         let turn = LlmTurn {
-            text: String::new(),
+            source,
             thinking: None,
-            tool_calls: vec![match call {
-                UserCall::RunProgram { source } => ToolCall {
-                    id,
-                    name: crate::machine::TOOL_RUN_PROGRAM.into(),
-                    arguments: serde_json::json!({ "source": source }),
-                },
-                UserCall::Resume { value } => ToolCall {
-                    id,
-                    name: crate::machine::TOOL_RESUME.into(),
-                    arguments: match value {
-                        Some(v) => serde_json::json!({ "value": v }),
-                        None => serde_json::json!({}),
-                    },
-                },
-                UserCall::Answer { question, value } => ToolCall {
-                    id,
-                    name: crate::machine::TOOL_ANSWER.into(),
-                    arguments: serde_json::json!({
-                        "question": question.as_u64(),
-                        "value": value,
-                    }),
-                },
-            }],
         };
         let state = self.states.get_mut(&branch).expect("open_branch inserted");
         let outputs = state.take_turn(&mut self.tree, turn)?;
@@ -904,8 +938,8 @@ impl Session {
         let at = self.states[&parent].spine.leaf_id;
         let tools = self.allowlist(self.agent_of(parent));
         let card = match &tools {
-            Some(allowed) => dialect_card(&self.registry.narrowed(allowed)),
-            None => dialect_card(&self.registry),
+            Some(allowed) => crate::card::full_card(&self.registry.narrowed(allowed)),
+            None => crate::card::full_card(&self.registry),
         };
         let mut child = Runner::new_agent(&mut self.tree, at, name, charter, tools, None, &card)?;
         child.set_attached(self.attached);
@@ -1059,9 +1093,73 @@ impl Session {
         Ok(())
     }
 
+    /// **The repair loop** (23_ONE_AGENT A5, ported from the deleted POC's
+    /// `take_program` — `codemode/runner.rs`): a completion that fails to
+    /// parse as JavaScript is not let through to become a terminal
+    /// `Cause::CompileFailed` — it is re-asked, with the parse diagnostic
+    /// appended to a fresh render's tail, up to `MAX_REPAIR_ATTEMPTS`
+    /// times. This is a *harness* behaviour, the one place the thesis
+    /// licenses hard-coding a decision about **when** a mind is invoked
+    /// (never **what** it decides, DESIGN.md): the card already promises
+    /// "a response that fails to parse comes back as a trap," and before
+    /// this loop existed that promise was broken by construction — live
+    /// evidence (2026-09-14) lost an entire task to one unbalanced paren
+    /// in an otherwise well-engineered ~80-line program, a slip at least
+    /// as mechanically fixable as any runtime trap the model recovers
+    /// from routinely.
+    ///
+    /// A **truncated** completion (`message.truncated`) never enters this
+    /// check: **never compile a truncated completion** (`types.rs`'s
+    /// `Cause::Truncated` doc — it may parse and run half-written, which
+    /// is strictly worse than a clean failure). It is forwarded to
+    /// `step_branch` exactly like any other response; only the VM layer
+    /// knows whether this response is a fresh completion or a suspended
+    /// handler's decision (the disposition a `Cause::Truncated` condition
+    /// needs to log), which this loop has no visibility into and must
+    /// not guess at.
+    fn on_llm_response(&mut self, branch: BranchId, message: LlmTurn) -> io::Result<()> {
+        if !message.truncated {
+            if let Err(diagnostics) = interp::compile(&message.source) {
+                let attempts = self.repair_attempts.entry(branch).or_insert(0);
+                *attempts += 1;
+                if *attempts <= MAX_REPAIR_ATTEMPTS {
+                    if let Some(state) = self.states.get(&branch) {
+                        let rendered = diagnostics
+                            .iter()
+                            .map(|d| d.render(&message.source))
+                            .collect::<Vec<_>>()
+                            .join("\n\n");
+                        let repair = format!(
+                            "the previous response did not parse as JavaScript:\n{rendered}\n\n\
+                             reply again with corrected source — the whole response is \
+                             parsed as JavaScript, nothing else."
+                        );
+                        let doc = crate::document::render(&self.tree, &state.spine)
+                            .unwrap_or_default()
+                            .with_tail(&repair);
+                        self.spawn_llm(branch, doc);
+                        return Ok(());
+                    }
+                }
+                // Attempts exhausted, or the branch vanished mid-retry:
+                // fall through and let `step_branch` log the real,
+                // terminal `Cause::CompileFailed` — it alone has the VM
+                // stack context (disposition, artifact menu) this loop
+                // cannot fabricate.
+            }
+        }
+        self.repair_attempts.remove(&branch);
+        self.step_branch(branch, StepInput::LlmResponse(message))
+    }
+
     /// One worker thread per in-flight completion (blocking reads live
     /// there; chunks and the final message come back through the inbox).
-    fn spawn_llm(&mut self, branch: BranchId, request: LlmRequest) {
+    /// `request` is the fully rendered [`Document`] — `document::render`
+    /// over `&Tree`/`Spine`, plus whatever ephemeral tail a caller folded
+    /// in (presence, a condition report) — never assembled here; this
+    /// function only ships it to the client and routes the result back
+    /// through the inbox like any other worker-thread message.
+    fn spawn_llm(&mut self, branch: BranchId, request: Document) {
         let epoch = self.llm_epoch.entry(branch).or_default();
         *epoch += 1;
         let epoch = *epoch;
@@ -1177,8 +1275,30 @@ impl Session {
         }
     }
 
+    /// How many `spawn()`s deep `agent` already sits below the root —
+    /// walked the same way `is_under` walks ancestors, via each `Agent`'s
+    /// own root `parent_id` (the call-site `Spawn` on its creator's
+    /// branch). The root agent is depth 0. Backs `create_agent`'s
+    /// `max_agent_depth` guard.
+    fn agent_depth(&self, agent: AgentId) -> usize {
+        let mut depth = 0;
+        let mut current = self.tree.events.get(&agent).and_then(|e| e.parent_id);
+        while let Some(cur) = current {
+            let Some(parent) = self.tree.enclosing_agent(cur) else {
+                break;
+            };
+            depth += 1;
+            current = self.tree.events.get(&parent).and_then(|e| e.parent_id);
+        }
+        depth
+    }
+
     /// Serve one `Spawn`: root an `Agent` under the call and settle the
-    /// caller with `{ agent }`.
+    /// caller with `{ agent }` — or, past `max_agent_depth`, fail the
+    /// call instead (the depth cap ported from the deleted POC's
+    /// `RunConfig::max_agent_depth`, 23_ONE_AGENT A5: the guard against a
+    /// spawned child whose first act is to spawn another to do the same
+    /// task, nesting without bound).
     ///
     /// The two events are the two ends of one act — `Spawn` is the
     /// caller's request, settled by a `Result`; `Agent` is the agent's
@@ -1189,6 +1309,17 @@ impl Session {
     fn create_agent(&mut self, parent: BranchId, spawn: SpawnRequest) -> io::Result<()> {
         let SpawnRequest { call, budget } = spawn;
         let parent_agent = self.agent_of(parent);
+        let limit = max_agent_depth();
+        if self.agent_depth(parent_agent) + 1 > limit {
+            let _ = self.tx.send(LoopMsg::ToolDone {
+                branch: parent,
+                call,
+                result: Err(format!(
+                    "spawn() refused: agent nesting depth would exceed the limit ({limit})"
+                )),
+            });
+            return Ok(());
+        }
         // `name`/`charter`/`tools` live on the logged `Spawn`; the host
         // reads them there rather than being handed a copy.
         let Some(EventPayload::Call(Call::Spawn {
@@ -1215,8 +1346,8 @@ impl Session {
             ),
         };
         let card = match &tools {
-            Some(allowed) => dialect_card(&self.registry.narrowed(allowed)),
-            None => dialect_card(&self.registry),
+            Some(allowed) => crate::card::full_card(&self.registry.narrowed(allowed)),
+            None => crate::card::full_card(&self.registry),
         };
         let mut child =
             Runner::new_agent(&mut self.tree, call, name, charter, tools, budget, &card)?;
@@ -1556,8 +1687,8 @@ impl Session {
 }
 
 /// Auto-pick a resume anchor for a re-opened log: the lowest-id leaf
-/// that **owes something** — an open post, or a `run_program` turn with
-/// no outcome — else the lowest-id leaf, so the loop still lives for
+/// that **owes something** — an open post, or a program `Turn` with no
+/// outcome — else the lowest-id leaf, so the loop still lives for
 /// `ListLeaves`/`Fork`/`Resume`.
 ///
 /// Nothing is "complete" any more (agents never close), so the question
@@ -1686,7 +1817,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::time::Duration;
 
-    use crate::types::{Author, Origin, ToolCall};
+    use crate::types::{Author, Origin};
 
     fn tool(
         name: &str,
@@ -1921,8 +2052,10 @@ mod tests {
         }
     }
 
-    /// Records each request's system message before delegating to the
-    /// scripted client — asserts on what actually crosses the LLM trait.
+    /// Records each request's system message (`Document.messages[0]`,
+    /// always `System` — `document::render`'s own invariant) before
+    /// delegating to the scripted client — asserts on what actually
+    /// crosses the LLM trait.
     struct CapturingLlm {
         inner: ScriptedLlm,
         seen: std::sync::Arc<Mutex<Vec<String>>>,
@@ -1931,17 +2064,26 @@ mod tests {
     impl LlmClient for CapturingLlm {
         fn complete(
             &self,
-            request: &LlmRequest,
+            request: &Document,
             cancel: &Cancel,
             chunk: &mut dyn FnMut(LlmChunk),
         ) -> Result<LlmTurn, String> {
-            self.seen.lock().unwrap().push(request.system.clone());
+            let system = request
+                .messages
+                .first()
+                .map(|m| m.content.clone())
+                .unwrap_or_default();
+            self.seen.lock().unwrap().push(system);
             self.inner.complete(request, cancel, chunk)
         }
     }
 
+    /// The card (`card::full_card`, snapshotted into `Agent.system` at
+    /// creation) reaches the wire with its tool manifest appended — the
+    /// one thing `dialect_card` used to do that `card.rs` couldn't, until
+    /// `23_ONE_AGENT` A5 moved the registry-schema renderer over.
     #[test]
-    fn dialect_card_reaches_the_llm_with_the_tool_list() {
+    fn card_reaches_the_llm_with_the_tool_list() {
         let mut registry = ToolRegistry::new();
         registry.register(tool("fetch_page", |_| Ok(json!(null))));
         let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
@@ -1967,7 +2109,7 @@ mod tests {
 
         let seen = seen.lock().unwrap();
         let system = seen.first().expect("a system message");
-        assert!(system.starts_with("You act by writing JavaScript programs"));
+        assert!(system.starts_with("Programs are written here."));
         assert!(system.contains("- tools.fetch_page"), "{system}");
         assert!(
             system.contains("agent prompt here"),
@@ -2192,18 +2334,21 @@ mod tests {
         assert_eq!(completion_call_id, "c2");
     }
 
-    /// The `run_program` Assistant event id — the program block key
-    /// (decision 2) the `ProgramStatus` events reference.
+    /// The original program `Turn`'s own event id — the program block key
+    /// (decision 2) the `ProgramStatus` events reference. Under code mode
+    /// a `Turn` *is* the program (`source`, whole, no tool-call wrapper
+    /// tagging what kind of restart it was), so "the original program" is
+    /// simply the **earliest** `Turn` on the path — a later one (a
+    /// handler's `resume(...)`) still keys its `ProgramStatus` events to
+    /// this same id (`protocol.rs`'s own doc: "a `resume` keeps the
+    /// originating program's id").
     fn run_program_id(tree: &Tree) -> EventId {
         tree.events
             .values()
-            .find(|e| {
-                matches!(&e.payload,
-                    EventPayload::Message(Message::Turn { tool_calls, .. })
-                        if tool_calls.first().is_some_and(|c| c.name == crate::machine::TOOL_RUN_PROGRAM))
-            })
+            .filter(|e| matches!(&e.payload, EventPayload::Message(Message::Turn { .. })))
+            .min_by_key(|e| e.id.as_u64())
             .map(|e| e.id)
-            .expect("a run_program Assistant event")
+            .expect("a Turn event")
     }
 
     /// The `ProgramStatus` statuses emitted for `program`, in order.
@@ -2822,31 +2967,40 @@ mod tests {
     impl<T: LlmClient> LlmClient for AutoAnswerLlm<T> {
         fn complete(
             &self,
-            request: &LlmRequest,
+            request: &Document,
             cancel: &Cancel,
             chunk: &mut dyn FnMut(LlmChunk),
         ) -> Result<LlmTurn, String> {
-            // The system prompt is the dialect card plus the charter
-            // (`assemble_system`), so a charter is a *suffix* of it, not
-            // the whole thing — same match `RoutedLlm` uses.
+            // The system prompt is the card plus the charter
+            // (`Agent.system`'s own snapshot), so a charter is a *suffix*
+            // of it, not the whole thing — same match `RoutedLlm` uses.
+            let system = request
+                .messages
+                .first()
+                .map(|m| m.content.as_str())
+                .unwrap_or_default();
             let Some((_, values)) = self
                 .charters
                 .iter()
-                .find(|(charter, _)| request.system.ends_with(charter))
+                .find(|(charter, _)| system.ends_with(charter))
             else {
                 return self.inner.complete(request, cancel, chunk);
             };
-            let tail = request.tail.as_deref().unwrap_or_default();
+            // The ephemeral tail rides on the trailing message's own
+            // content (`Document::with_tail` folds it in, rather than
+            // keeping a field of its own) — read it from there.
+            let tail = request
+                .messages
+                .last()
+                .map(|m| m.content.as_str())
+                .unwrap_or_default();
             let Some(id) = tail
                 .split("open on this branch: #")
                 .nth(1)
                 .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
                 .and_then(|s| s.parse::<u64>().ok())
             else {
-                // Nothing open — this is the forced reprompt an
-                // answers-only turn always gets (the API still needs a
-                // reply to that tool call). A bare turn closes nothing
-                // and starts nothing further.
+                // Nothing open — a plain reprompt with nothing to answer.
                 return Ok(scripted_text("ok"));
             };
             let value = values
@@ -2854,7 +3008,7 @@ mod tests {
                 .unwrap()
                 .pop_front()
                 .expect("a scripted value for this open post");
-            Ok(scripted_answer("a1", EventId::new(id), json!(value)))
+            Ok(scripted_answer(EventId::new(id), "answer", json!(value)))
         }
     }
 
@@ -2869,7 +3023,7 @@ mod tests {
     impl LlmClient for ConcurrencyProbe {
         fn complete(
             &self,
-            request: &LlmRequest,
+            request: &Document,
             cancel: &Cancel,
             chunk: &mut dyn FnMut(LlmChunk),
         ) -> Result<LlmTurn, String> {
@@ -4832,80 +4986,31 @@ mod tests {
         let session = drain(session);
 
         let state = session.state(EventId::new(5)).unwrap();
-        let rendered = state.render_messages_for_test(session.tree());
+        let doc = crate::document::render(session.tree(), &state.spine).expect("renders");
         assert_eq!(
-            rendered.last(),
-            Some(&crate::machine::Rendered::User(
-                "[harness] fork of branch #1 at #4 — questions before this line are being \
+            doc.messages.last(),
+            Some(&crate::document::ChatMessage {
+                role: crate::document::ChatRole::User,
+                content: "[harness] fork of branch #1 at #4 — questions before this line are being \
                  handled there; do not redo its work unless asked."
-                    .to_owned()
-            )),
-            "{rendered:?}"
+                    .to_owned(),
+            }),
+            "{doc:?}"
         );
     }
 
-    /// A fork taken **mid-program** renders as that call's tool result:
-    /// the run stayed on the original, and the dangling `run_program`
-    /// call still has to be answered or the next request is a 400.
-    #[test]
-    fn mid_program_fork_answers_the_dangling_call() {
-        let (mut session, _rx) = open(
-            tree_with_answered_root(),
-            vec![scripted_program(
-                "c1",
-                "tools.read_file('a'); while (true) {}",
-            )],
-        );
-        let h = session.handle();
-        let branch = session.conversation_branch();
-        h.send(SessionCommand::UserTurn {
-            branch,
-            text: "go".into(),
-            expects_reply: true,
-        });
-        for _ in 0..8 {
-            session.pump_one();
-        }
-        // Fork at the running leaf: the "ask a running agent something
-        // without pausing it" gesture.
-        let at = session.state(branch).unwrap().spine.leaf_id;
-        h.send(SessionCommand::Fork {
-            from: at,
-            name: Some("sidebar".into()),
-        });
-        for _ in 0..4 {
-            session.pump_one();
-        }
-        let fork = live_branches(&session)
-            .into_iter()
-            .map(|(id, _)| id)
-            .find(|id| *id != branch)
-            .expect("the fork is live");
-
-        let state = session.state(fork).unwrap();
-        let rendered = state.render_messages_for_test(session.tree());
-        let last = rendered.last().expect("something rendered");
-        let crate::machine::Rendered::Tool { call_id, text } = last else {
-            panic!("a mid-program fork answers the dangling call: {rendered:?}");
-        };
-        assert_eq!(call_id, "c1", "it answers the call that is running");
-        assert!(text.contains("is running on branch #1, not here"), "{text}");
-        assert!(text.contains("artifacts so far"), "{text}");
-        // Every assistant tool call in the rendered request is answered:
-        // the adjacency rule the API enforces.
-        let calls: usize = rendered
-            .iter()
-            .filter_map(|r| match r {
-                crate::machine::Rendered::Assistant { tool_calls, .. } => Some(tool_calls.len()),
-                _ => None,
-            })
-            .sum();
-        let tools = rendered
-            .iter()
-            .filter(|r| matches!(r, crate::machine::Rendered::Tool { .. }))
-            .count();
-        assert_eq!(calls, tools, "{rendered:?}");
-    }
+    // `mid_program_fork_answers_the_dangling_call` deleted here (23_ONE_AGENT
+    // A5): it asserted the tool-call/tool-result **adjacency rule** — every
+    // assistant `tool_calls` entry in the rendered request answered by a
+    // matching tool-role message, the OpenAI function-calling API's own
+    // requirement. Code mode never emits a `tool_calls` array (the
+    // substitution table: "tool list in request: on every request → nothing"),
+    // so there is no adjacency to keep and nothing left
+    // for this test to assert. The scenario it guarded — a program still
+    // running on the original branch after a mid-program fork must render
+    // as *something* sane in the fork's own request — is still real; it
+    // belongs to `document::render`'s own test suite now, against
+    // `&Tree`/`Spine` directly, not this session-level plumbing.
 
     /// **`Interrupt` cancels an in-flight generation**, and nothing is
     /// logged for it: from the API's view that turn did not happen. The
@@ -5021,9 +5126,10 @@ mod tests {
     }
 
     /// **The user takes a branch's turn.** `Restart` logs a `Turn {
-    /// author: User }` carrying one call, applied exactly as the LLM's
-    /// would be — so the report that follows answers its `call_id` like
-    /// any other, and the branch's later history shows it resumed with 5.
+    /// author: User, source }` and dispatches `source` exactly as the
+    /// LLM's own completion would be — so the branch's later history
+    /// shows it resumed with 5, which is true, whichever author supplied
+    /// the program that said so.
     #[test]
     fn user_resumes_and_user_rewrites() {
         let (mut session, _rx) = open(
@@ -5042,12 +5148,12 @@ mod tests {
         }
         assert_eq!(session.state(branch).unwrap().status(), "suspended");
 
-        // The user supplies the value the raise asked for — no LLM turn.
+        // The user supplies the value the raise asked for — no LLM turn,
+        // just a synthesized `resume(value)` program (the `v` gesture's
+        // own synthesis, per `protocol.rs`'s `Restart` doc).
         h.send(SessionCommand::Restart {
             branch,
-            call: UserCall::Resume {
-                value: Some(json!(4)),
-            },
+            source: "return resume(4);".into(),
         });
         for _ in 0..12 {
             session.pump_one();
@@ -5055,8 +5161,7 @@ mod tests {
         let leaf = session.state(branch).unwrap().spine.leaf_id;
         assert_eq!(returned(session.tree(), leaf), json!(5));
 
-        // Every user-authored turn is logged as one, and the report that
-        // followed it answers *its* synthetic call id.
+        // Every user-authored turn is logged as one.
         let user_turns: Vec<&crate::types::Event> = session
             .tree()
             .path_events(leaf)
@@ -5072,25 +5177,13 @@ mod tests {
             })
             .collect();
         assert_eq!(user_turns.len(), 1, "one user-authored turn");
-        let paired = derived_with_ids(session.tree(), leaf);
-        let EventPayload::Message(Message::Turn { tool_calls, .. }) = &user_turns[0].payload else {
-            unreachable!()
-        };
-        let id = tool_calls[0].id.clone();
-        assert!(id.starts_with("user-"), "{id}");
-        assert!(
-            paired
-                .iter()
-                .any(|(call, text)| *call == id && text.contains("program completed")),
-            "the completion report answers the user's own call id: {paired:?}"
-        );
 
-        // And a user *rewrite* is the same door: a fresh program runs.
+        // And a user *rewrite* is the same door: a fresh program runs,
+        // `source` this time typed by the user rather than synthesized
+        // (the `e` gesture: paste a rewrite verbatim).
         h.send(SessionCommand::Restart {
             branch,
-            call: UserCall::RunProgram {
-                source: "return 'rewritten';".into(),
-            },
+            source: "return 'rewritten';".into(),
         });
         for _ in 0..12 {
             session.pump_one();
@@ -5152,10 +5245,11 @@ mod tests {
         // branch's turn — which is the gesture the fork exists for.
         h.send(SessionCommand::Restart {
             branch,
-            call: UserCall::Answer {
-                question,
-                value: json!("explored, and this is the answer"),
-            },
+            source: format!(
+                "answer({}, \"answer\", {});",
+                question.as_u64(),
+                json!("explored, and this is the answer")
+            ),
         });
         let session = drain(session);
 
@@ -5307,7 +5401,7 @@ mod tests {
     fn presence_flip_does_not_disturb_the_prefix() {
         let (mut session, _rx) = open(tree_with_answered_root(), vec![]);
         let branch = session.conversation_branch();
-        let render = |session: &mut Session, attached: bool| -> LlmRequest {
+        let render = |session: &mut Session, attached: bool| -> Document {
             session.set_attached(attached);
             let tree = &session.tree;
             session
@@ -5319,24 +5413,29 @@ mod tests {
         let away = render(&mut session, false);
         let here = render(&mut session, true);
 
-        assert_eq!(away.system, here.system, "the snapshot never moves");
-        assert_eq!(away.messages, here.messages, "no rendered message varies");
-        assert_eq!(away.tools.len(), here.tools.len());
-        assert_ne!(away.tail, here.tail, "only the trailing line flips");
-        assert!(
-            away.tail
-                .as_deref()
-                .is_some_and(|t| t.contains("No one is attached"))
+        // The presence line is the ephemeral tail folded into the last
+        // message (`Document::with_tail`) — everything *before* it is the
+        // snapshot, unmoved by attaching or detaching.
+        let prefix = |doc: &Document| doc.messages[..doc.messages.len() - 1].to_vec();
+        let tail = |doc: &Document| -> String {
+            doc.messages
+                .last()
+                .map(|m| m.content.clone())
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            prefix(&away),
+            prefix(&here),
+            "no rendered message before the tail varies"
         );
-        assert!(
-            here.tail
-                .as_deref()
-                .is_some_and(|t| t.contains("Someone is attached"))
-        );
+        assert_ne!(tail(&away), tail(&here), "only the trailing line flips");
+        assert!(tail(&away).contains("No one is attached"));
+        assert!(tail(&here).contains("Someone is attached"));
         // Presence goes **last**, after any other per-request fact.
-        assert!(here.tail.as_deref().is_some_and(
-            |t| t.lines().last() == Some("Someone is attached to this session right now.")
-        ));
+        assert_eq!(
+            tail(&here).lines().last(),
+            Some("Someone is attached to this session right now.")
+        );
     }
 
     /// **Rule C's other half.** A `Result` that lands with no program
@@ -5389,9 +5488,7 @@ mod tests {
         // call itself is still in flight — the physics happened.
         h.send(SessionCommand::Restart {
             branch,
-            call: UserCall::RunProgram {
-                source: "return 'moved on';".into(),
-            },
+            source: "return 'moved on';".into(),
         });
         settle(&mut session);
         assert_eq!(session.state(branch).unwrap().status(), "idle");
@@ -5984,10 +6081,11 @@ mod tests {
         // the closed loop of ids says it belongs.
         session.handle().send(SessionCommand::Restart {
             branch: EventId::new(1),
-            call: UserCall::Answer {
-                question: post,
-                value: json!("the second one"),
-            },
+            source: format!(
+                "answer({}, \"answer\", {});",
+                post.as_u64(),
+                json!("the second one")
+            ),
         });
         while session.pump_one() {}
         let tree = session.tree();

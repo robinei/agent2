@@ -1,12 +1,25 @@
 //! The LLM client trait (8_HARNESS Step 5). M0 ships the scripted
 //! implementation only; the real HTTP client (M1) implements the same
 //! trait, so the session loop never knows the difference.
+//!
+//! Under code mode (23_ONE_AGENT) a request is a rendered [`Document`]
+//! (`document::render`, over `&Tree`/`Spine`) rather than a tool-spec'd
+//! `LlmRequest` — there is no `tools` array on the wire, because the
+//! model's whole response *is* the program, not a pick from a function
+//! menu. `LlmTurn` shrinks to match: `source` is the bare program text
+//! (`Message::Turn.source`, the same field name, because a scripted or
+//! live completion and a logged turn are the same shape all the way
+//! through), plus `thinking` and `truncated` — the one bit
+//! `host/deepseek.rs` must set before this turn ever reaches a compiler,
+//! per `types.rs`'s `Cause::Truncated`: **never compile a truncated
+//! completion**.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::machine::{LlmRequest, LlmTurn};
+use crate::document::Document;
+use crate::machine::LlmTurn;
 
 /// A cancellation token, one per in-flight completion.
 ///
@@ -55,14 +68,14 @@ pub enum LlmChunk {
 pub trait LlmClient: Send + Sync {
     fn complete(
         &self,
-        request: &LlmRequest,
+        request: &Document,
         cancel: &Cancel,
         chunk: &mut dyn FnMut(LlmChunk),
     ) -> Result<LlmTurn, String>;
 }
 
 /// Scripted client: pops canned assistant turns in order. Each turn's
-/// text is also streamed as a single chunk so the chunk path is
+/// source is also streamed as a single chunk so the chunk path is
 /// exercised end-to-end without a network. The queue is behind a `Mutex`
 /// so the shared `&self` client stays `Sync` under concurrent pops.
 pub struct ScriptedLlm {
@@ -77,70 +90,62 @@ impl ScriptedLlm {
     }
 }
 
-/// A scripted assistant turn calling `run_program` with `source`.
-pub fn scripted_program(call_id: &str, source: &str) -> LlmTurn {
+/// A scripted assistant turn: the bare program `source`, exactly what a
+/// real completion's whole response would be — no call id, no tool name,
+/// because there is no tool-call wrapper left to name (23_ONE_AGENT's
+/// substitution: the model's whole response *is* `Turn { source }`).
+pub fn scripted_program(source: &str) -> LlmTurn {
     LlmTurn {
-        text: String::new(),
+        source: source.into(),
         thinking: None,
-        tool_calls: vec![crate::types::ToolCall {
-            id: call_id.into(),
-            name: crate::machine::TOOL_RUN_PROGRAM.into(),
-            arguments: serde_json::json!({ "source": source }),
-        }],
+        truncated: false,
     }
 }
 
-/// A scripted assistant turn calling `resume` with `value` — the
-/// restart offered while a program is suspended on a condition.
+/// A scripted **handler** turn: a program whose only job is to decide a
+/// suspended raise/trap, `return resume(value);` — the restart a
+/// condition report offers, spelled as the program that makes it
+/// (DESIGN.md: "the handler is not a turn picking a restart off a menu —
+/// it is a program the LLM writes... whose return value **is** the
+/// restart").
 #[allow(dead_code)]
-pub fn scripted_resume(call_id: &str, value: serde_json::Value) -> LlmTurn {
-    LlmTurn {
-        text: String::new(),
-        thinking: None,
-        tool_calls: vec![crate::types::ToolCall {
-            id: call_id.into(),
-            name: crate::machine::TOOL_RESUME.into(),
-            arguments: serde_json::json!({ "value": value }),
-        }],
-    }
+pub fn scripted_resume(value: serde_json::Value) -> LlmTurn {
+    scripted_program(&format!("return resume({value});"))
 }
 
-/// A scripted assistant turn calling `answer(question, value)` — the
-/// restart that binds explicitly and leaves the program alone.
+/// A scripted handler turn that discharges an open `ask()` by the
+/// question's own id, `answer(question, label, value)`, and leaves the
+/// raising program alone — the restart that binds explicitly rather than
+/// supplying a `resume` value.
 #[cfg(test)]
-pub fn scripted_answer(
-    call_id: &str,
-    question: crate::types::EventId,
-    value: serde_json::Value,
-) -> LlmTurn {
-    LlmTurn {
-        text: String::new(),
-        thinking: None,
-        tool_calls: vec![crate::types::ToolCall {
-            id: call_id.into(),
-            name: crate::machine::TOOL_ANSWER.into(),
-            arguments: serde_json::json!({ "question": question.as_u64(), "value": value }),
-        }],
-    }
+pub fn scripted_answer(question: crate::types::EventId, label: &str, value: serde_json::Value) -> LlmTurn {
+    scripted_program(&format!(
+        "answer({}, {}, {value});",
+        question.as_u64(),
+        serde_json::json!(label)
+    ))
 }
 
-/// A scripted plain-text assistant turn (completes the agent).
+/// A scripted turn that only speaks — `tell("user", text)` — and returns
+/// nothing further. Under code mode there is no bare-text assistant
+/// reply any more (`card.rs`: "no prose, no code fence... the whole
+/// response is parsed as JavaScript"); the closest equivalent to the
+/// pre-code-mode "plain reply ends the turn" is a one-line program whose
+/// only act is to tell the user something and fall off the end.
 pub fn scripted_text(text: &str) -> LlmTurn {
-    LlmTurn {
-        text: text.into(),
-        thinking: None,
-        tool_calls: Vec::new(),
-    }
+    scripted_program(&format!("tell(\"user\", {});", serde_json::json!(text)))
 }
 
 /// A scripted client that answers by **which agent asked**, not by
 /// arrival order: each rule is a **charter** and its own queue of turns,
 /// popped in order.
 ///
-/// A charter is matched as the *tail* of the system prompt, which is
-/// exactly where `assemble_system` puts it — behind the card. Matching
-/// anywhere in the prompt would collide with the card's own prose (which
-/// says "worker" a few times), so the tail is both simpler and correct.
+/// A charter is matched as the *tail* of the system prompt (`Document`'s
+/// first message, always `System` — `document::render`'s own invariant),
+/// which is exactly where an agent's snapshotted `system` puts it —
+/// behind the card. Matching anywhere in the prompt would collide with
+/// the card's own prose (which says "worker" a few times), so the tail
+/// is both simpler and correct.
 ///
 /// From B1 on, several branches think at once as a matter of course. A
 /// single queue makes the *test* racy where the system is not: two
@@ -170,15 +175,20 @@ impl RoutedLlm {
 impl LlmClient for RoutedLlm {
     fn complete(
         &self,
-        request: &LlmRequest,
+        request: &Document,
         cancel: &Cancel,
         chunk: &mut dyn FnMut(LlmChunk),
     ) -> Result<LlmTurn, String> {
         if cancel.is_cancelled() {
             return Err("cancelled".into());
         }
+        let system = request
+            .messages
+            .first()
+            .map(|m| m.content.as_str())
+            .unwrap_or_default();
         for (charter, queue) in &self.rules {
-            if !request.system.ends_with(charter.as_str()) {
+            if !system.ends_with(charter.as_str()) {
                 continue;
             }
             let Some(turn) = queue.lock().unwrap().pop_front() else {
@@ -187,15 +197,15 @@ impl LlmClient for RoutedLlm {
             if let Some(t) = &turn.thinking {
                 chunk(LlmChunk::Thinking(t.clone()));
             }
-            if !turn.text.is_empty() {
-                chunk(LlmChunk::Text(turn.text.clone()));
+            if !turn.source.is_empty() {
+                chunk(LlmChunk::Text(turn.source.clone()));
             }
             return Ok(turn);
         }
-        let tail = request.system.len().saturating_sub(80);
+        let tail = system.len().saturating_sub(80);
         Err(format!(
             "no scripted rule matches this branch's charter: …{}",
-            &request.system[tail..]
+            &system[tail..]
         ))
     }
 }
@@ -203,7 +213,7 @@ impl LlmClient for RoutedLlm {
 impl LlmClient for ScriptedLlm {
     fn complete(
         &self,
-        _request: &LlmRequest,
+        _request: &Document,
         cancel: &Cancel,
         chunk: &mut dyn FnMut(LlmChunk),
     ) -> Result<LlmTurn, String> {
@@ -219,8 +229,8 @@ impl LlmClient for ScriptedLlm {
         if let Some(t) = &message.thinking {
             chunk(LlmChunk::Thinking(t.clone()));
         }
-        if !message.text.is_empty() {
-            chunk(LlmChunk::Text(message.text.clone()));
+        if !message.source.is_empty() {
+            chunk(LlmChunk::Text(message.source.clone()));
         }
         Ok(message)
     }
@@ -262,7 +272,7 @@ impl HoldingLlm {
 impl<T: LlmClient + ?Sized> LlmClient for Arc<T> {
     fn complete(
         &self,
-        request: &LlmRequest,
+        request: &Document,
         cancel: &Cancel,
         chunk: &mut dyn FnMut(LlmChunk),
     ) -> Result<LlmTurn, String> {
@@ -274,7 +284,7 @@ impl<T: LlmClient + ?Sized> LlmClient for Arc<T> {
 impl LlmClient for HoldingLlm {
     fn complete(
         &self,
-        request: &LlmRequest,
+        request: &Document,
         cancel: &Cancel,
         chunk: &mut dyn FnMut(LlmChunk),
     ) -> Result<LlmTurn, String> {

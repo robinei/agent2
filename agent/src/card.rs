@@ -131,6 +131,51 @@ only the rows that truly need shortening.
 Tools available in this session:
 "#;
 
+/// Per-tool clip for the rendered input schema, carried over unchanged
+/// from the deleted `host/dialect.rs` (22_ONE_VOCABULARY's licensed
+/// step 1: this ~80-line renderer was the one thing `dialect.rs` did
+/// that `card.rs` did not, so it moved here rather than being
+/// reinvented). A schema can run long (nested objects, enums); this
+/// keeps one misbehaving tool from dominating the cache-immutable
+/// prefix the rest of the card sits in front of.
+const SCHEMA_MAX_BYTES: usize = 200;
+
+/// The tool manifest appended after [`CARD`]: one line per registered
+/// tool, sorted by name, each with its description and a clipped
+/// preview of its positional-argument schema.
+///
+/// This is the one piece of the system prompt that is a property of
+/// *this session's* registry rather than static text — everything above
+/// it in [`CARD`] is the same for every agent everywhere. Kept as a
+/// separate function (not folded into `CARD` itself) so the immutable
+/// prefix — the part every request shares byte-for-byte, where cache
+/// hits actually pay off — stops at the end of `CARD`, and only the
+/// tail varies per session/allowlist.
+pub fn tool_manifest(registry: &crate::host::ToolRegistry) -> String {
+    let mut manifest = String::new();
+    let mut tools: Vec<_> = registry.iter().collect();
+    tools.sort_by(|a, b| a.name.cmp(&b.name));
+    for def in tools {
+        manifest.push_str(&format!(
+            "\n- tools.{} — {} args schema: {}",
+            def.name,
+            def.description,
+            crate::report::clip(&def.input_schema.to_string(), SCHEMA_MAX_BYTES),
+        ));
+    }
+    manifest
+}
+
+/// The full system prompt for one agent: [`CARD`] plus [`tool_manifest`]
+/// for its (possibly allowlist-narrowed) registry. Callers snapshot this
+/// once, at the agent's root (`Agent.system` — see `types::EventPayload`),
+/// never recompute it mid-conversation: the system prompt is the
+/// immutable cache prefix, and a later card edit or registry change must
+/// not alter an existing conversation's prompt out from under it.
+pub fn full_card(registry: &crate::host::ToolRegistry) -> String {
+    format!("{CARD}{}", tool_manifest(registry))
+}
+
 /// A worked exemplar: a real user/assistant pair opening `messages`,
 /// never part of the card — its whole point is to demonstrate an
 /// *assistant* turn (Step B1), which only a message in that role can
@@ -278,6 +323,39 @@ if (count === 0) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host::{ToolDef, ToolRegistry};
+    use serde_json::json;
+
+    fn registry_with_tools() -> ToolRegistry {
+        let mut registry = ToolRegistry::new();
+        registry.register(ToolDef {
+            name: "fetch_page".into(),
+            description: "Fetch a URL and return its body text.".into(),
+            input_schema: json!({ "type": "array", "items": [{ "type": "string" }] }),
+            handler: Box::new(|_| Ok(json!(null))),
+        });
+        registry
+    }
+
+    /// `dialect.rs`'s own test, ported: the manifest is generated from
+    /// the registry's schemas, not hand-maintained prose.
+    #[test]
+    fn tool_manifest_is_generated_from_schemas() {
+        let manifest = tool_manifest(&registry_with_tools());
+        let line = manifest
+            .lines()
+            .find(|l| l.starts_with("- tools.fetch_page"))
+            .expect("a fetch_page line");
+        assert!(line.contains("Fetch a URL and return its body text."));
+        assert!(line.contains(r#"{"type":"array","items":[{"type":"string"}]}"#));
+    }
+
+    #[test]
+    fn full_card_appends_the_manifest_after_the_card() {
+        let full = full_card(&registry_with_tools());
+        assert!(full.starts_with(CARD));
+        assert!(full.contains("- tools.fetch_page"));
+    }
 
     #[test]
     fn the_card_is_stable() {

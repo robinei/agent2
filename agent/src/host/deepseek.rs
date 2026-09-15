@@ -2,17 +2,23 @@
 //! `ureq` + SSE on the session loop's LLM worker thread.
 //!
 //! DeepSeek speaks the OpenAI chat-completions format natively, so the
-//! wire mapping is: `Message` → role objects, `ToolSpec` → function
-//! tools, streamed deltas → the chunk callback (`reasoning_content` →
-//! `Thinking`, `content` → `Text`), tool-call argument fragments
-//! accumulated by index. The request builder and SSE parser are pure
-//! functions — unit tests run on string fixtures, never the network.
+//! wire mapping is: `Document.messages` → role objects (`System`/
+//! `User`/`Assistant`, one each per `ChatRole`), streamed deltas → the
+//! chunk callback (`reasoning_content` → `Thinking`, `content` → `Text`).
+//! There is no `tools` array in the request under code mode
+//! (23_ONE_AGENT's substitution table: the tool list a request used to
+//! carry on every call is gone; the card is the surface) and no tool-call
+//! argument
+//! accumulation in the response — the model's whole reply is program
+//! text, accumulated the same way `content` always was. The request
+//! builder and SSE parser are pure functions — unit tests run on string
+//! fixtures, never the network.
 
 use std::io::BufRead;
 
+use crate::document::{ChatMessage, ChatRole, Document};
 use crate::host::llm::{Cancel, LlmChunk, LlmClient};
-use crate::machine::{LlmRequest, LlmTurn, Rendered};
-use crate::types::ToolCall;
+use crate::machine::LlmTurn;
 
 const DEFAULT_MODEL: &str = "deepseek-v4-flash";
 const DEFAULT_BASE_URL: &str = "https://opencode.ai/zen/go/v1";
@@ -66,7 +72,7 @@ impl DeepSeekClient {
 impl LlmClient for DeepSeekClient {
     fn complete(
         &self,
-        request: &LlmRequest,
+        request: &Document,
         cancel: &Cancel,
         chunk: &mut dyn FnMut(LlmChunk),
     ) -> Result<LlmTurn, String> {
@@ -96,39 +102,16 @@ impl LlmClient for DeepSeekClient {
 /// The chat-completions request body (OpenAI format, `stream: true`).
 /// Assistant `thinking` is never sent back: DeepSeek requires
 /// `reasoning_content` to be excluded from the next-turn context.
-fn request_body(request: &LlmRequest, model: &str, thinking: bool) -> serde_json::Value {
-    // The system prompt is rebuilt from `Agent.system` at the front of
-    // every request — it is prefix, and prefix is immutable.
-    let mut messages = vec![serde_json::json!({
-        "role": "system",
-        "content": request.system,
-    })];
-    messages.extend(request.messages.iter().map(message_json));
-    // The trailing ephemeral line goes **last**, after the newest
-    // message — never into the system prompt, which is prefix. It is not
-    // logged, and next request it is re-emitted at the new end, so
-    // everything before it stays byte-identical.
-    if let Some(tail) = &request.tail {
-        messages.push(serde_json::json!({ "role": "user", "content": tail }));
-    }
-    let tools: Vec<serde_json::Value> = request
-        .tools
-        .iter()
-        .map(|t| {
-            serde_json::json!({
-                "type": "function",
-                "function": {
-                    "name": t.name,
-                    "description": t.description,
-                    "parameters": t.parameters,
-                }
-            })
-        })
-        .collect();
+///
+/// **No `tools` array.** Code mode never offers a function-calling
+/// schema — the model's whole response is the program, not a call into
+/// one of a menu of functions — so there is nothing here to build one
+/// from, unlike the pre-23 wire format this replaced.
+fn request_body(request: &Document, model: &str, thinking: bool) -> serde_json::Value {
+    let messages: Vec<serde_json::Value> = request.messages.iter().map(message_json).collect();
     let mut body = serde_json::json!({
         "model": model,
         "messages": messages,
-        "tools": tools,
         "stream": true,
     });
     if !thinking {
@@ -137,58 +120,56 @@ fn request_body(request: &LlmRequest, model: &str, thinking: bool) -> serde_json
     body
 }
 
-/// Each rendered kind maps to exactly one API role **by its variant**,
-/// never by a flag.
-fn message_json(message: &Rendered) -> serde_json::Value {
-    match message {
-        Rendered::User(text) => serde_json::json!({ "role": "user", "content": text }),
-        Rendered::Tool { call_id, text } => serde_json::json!({
-            "role": "tool",
-            "tool_call_id": call_id,
-            "content": text,
-        }),
-        Rendered::Assistant {
-            text, tool_calls, ..
-        } => {
-            let mut obj = serde_json::json!({ "role": "assistant", "content": text });
-            if !tool_calls.is_empty() {
-                obj["tool_calls"] = tool_calls
-                    .iter()
-                    .map(|c| {
-                        serde_json::json!({
-                            "id": c.id,
-                            "type": "function",
-                            "function": {
-                                "name": c.name,
-                                // OpenAI format: arguments are a JSON *string*.
-                                "arguments": c.arguments.to_string(),
-                            }
-                        })
-                    })
-                    .collect();
-            }
-            obj
-        }
-    }
+/// Each `ChatMessage` maps to exactly one API role **by its `ChatRole`**,
+/// never by a flag. `Document.messages[0]` is always `System` (the
+/// snapshotted card + charter, `document::render`'s own invariant); every
+/// `Assistant` message is one program's bare `source`, no tool-call
+/// wrapper; every `User` message is a post (or the harness's own report,
+/// which renders as one) — there is no `Tool`-role message left to emit,
+/// because there is no separate tool-result channel under code mode.
+fn message_json(message: &ChatMessage) -> serde_json::Value {
+    let role = match message.role {
+        ChatRole::System => "system",
+        ChatRole::User => "user",
+        ChatRole::Assistant => "assistant",
+    };
+    serde_json::json!({ "role": role, "content": message.content })
 }
 
 #[derive(Default)]
-struct PartialCall {
-    id: String,
-    name: String,
-    arguments: String,
+struct Accumulated {
+    source: String,
+    thinking: String,
+    /// `"length"` once seen — DeepSeek's own signal that `max_tokens`
+    /// was hit before the model stopped on its own. Anything else
+    /// (`"stop"`, `"tool_calls"` — never sent since there is no `tools`
+    /// array to trigger it, a stray if the API sends it anyway) is an
+    /// ordinary, complete turn.
+    finish_reason: Option<String>,
 }
 
-/// Parse a chat-completions SSE stream into the final assistant
-/// message, forwarding deltas to `chunk` as they arrive.
+/// Parse a chat-completions SSE stream into the final assistant turn,
+/// forwarding deltas to `chunk` as they arrive.
+///
+/// **Truncation detection** (23_ONE_AGENT A5, porting the deleted POC's
+/// `Completion::was_truncated` — `git show 690561d:agent/src/codemode/
+/// transport.rs`): `finish_reason == "length"` means the completion
+/// ended because the token budget ran out, not because the model chose
+/// to stop — the resulting `source` may be a program cut off mid-token,
+/// which **must never reach the compiler** (`types.rs`'s
+/// `Cause::Truncated` doc: it might still parse and run, half-written,
+/// which is strictly worse than a clean failure the repair loop can see
+/// and retry). This function only *detects* the condition and reports it
+/// on `LlmTurn.truncated`; enforcing "never compile" is the caller's
+/// job, all the way up through the session loop to whichever layer logs
+/// `Cause::Truncated` — this parser has no compiler to withhold the text
+/// from.
 fn parse_sse(
     reader: impl BufRead,
     cancel: &Cancel,
     chunk: &mut dyn FnMut(LlmChunk),
 ) -> Result<LlmTurn, String> {
-    let mut text = String::new();
-    let mut thinking = String::new();
-    let mut calls: Vec<PartialCall> = Vec::new();
+    let mut acc = Accumulated::default();
 
     for line in reader.lines() {
         // The one place a cancellation lands: between SSE lines, so an
@@ -210,151 +191,79 @@ fn parse_sse(
         if let Some(err) = event.get("error") {
             return Err(format!("deepseek stream error: {err}"));
         }
-        let delta = &event["choices"][0]["delta"];
+        let choice = &event["choices"][0];
+        if let Some(r) = choice["finish_reason"].as_str() {
+            acc.finish_reason = Some(r.to_owned());
+        }
+        let delta = &choice["delta"];
         if let Some(t) = delta["reasoning_content"].as_str()
             && !t.is_empty()
         {
-            thinking.push_str(t);
+            acc.thinking.push_str(t);
             chunk(LlmChunk::Thinking(t.to_owned()));
         }
         if let Some(t) = delta["content"].as_str()
             && !t.is_empty()
         {
-            text.push_str(t);
+            acc.source.push_str(t);
             chunk(LlmChunk::Text(t.to_owned()));
-        }
-        if let Some(deltas) = delta["tool_calls"].as_array() {
-            for tc in deltas {
-                let index = tc["index"].as_u64().unwrap_or(0) as usize;
-                while calls.len() <= index {
-                    calls.push(PartialCall::default());
-                }
-                let call = &mut calls[index];
-                if let Some(id) = tc["id"].as_str() {
-                    call.id.push_str(id);
-                }
-                if let Some(name) = tc["function"]["name"].as_str() {
-                    call.name.push_str(name);
-                }
-                if let Some(args) = tc["function"]["arguments"].as_str() {
-                    call.arguments.push_str(args);
-                }
-            }
         }
     }
 
-    let tool_calls = calls
-        .into_iter()
-        .filter(|c| !c.name.is_empty())
-        .map(|c| {
-            let arguments = if c.arguments.trim().is_empty() {
-                serde_json::json!({})
-            } else {
-                serde_json::from_str(&c.arguments).map_err(|e| {
-                    format!("tool call `{}` arguments are not valid JSON: {e}", c.name)
-                })?
-            };
-            Ok(ToolCall {
-                id: c.id,
-                name: c.name,
-                arguments,
-            })
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-
     Ok(LlmTurn {
-        text,
-        thinking: (!thinking.is_empty()).then_some(thinking),
-        tool_calls,
+        source: acc.source,
+        thinking: (!acc.thinking.is_empty()).then_some(acc.thinking),
+        truncated: acc.finish_reason.as_deref() == Some("length"),
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::machine::tool_specs;
     use serde_json::json;
 
+    fn doc(messages: Vec<ChatMessage>) -> Document {
+        Document { messages }
+    }
+
+    fn msg(role: ChatRole, content: &str) -> ChatMessage {
+        ChatMessage {
+            role,
+            content: content.into(),
+        }
+    }
+
     #[test]
-    fn request_body_maps_messages_and_tools() {
-        let request = LlmRequest {
-            system: "card".into(),
-            messages: vec![
-                Rendered::User("go".into()),
-                Rendered::Assistant {
-                    text: String::new(),
-                    thinking: Some("hidden".into()),
-                    tool_calls: vec![ToolCall {
-                        id: "c1".into(),
-                        name: "run_program".into(),
-                        arguments: json!({ "source": "return 1;" }),
-                    }],
-                },
-                // The tool message is *derived*, never stored — the
-                // request builder places it right after the turn whose
-                // call it answers, which is what the API's adjacency rule
-                // requires.
-                Rendered::Tool {
-                    call_id: "c1".into(),
-                    text: "## program completed".into(),
-                },
-            ],
-            tools: tool_specs(),
-            tail: Some("2 questions are open on this branch: #4, #7.".into()),
-        };
+    fn request_body_maps_messages_and_omits_tools() {
+        let request = doc(vec![
+            msg(ChatRole::System, "card"),
+            msg(ChatRole::User, "go"),
+            msg(ChatRole::Assistant, "return 1;"),
+            msg(ChatRole::User, "## program completed"),
+        ]);
         let body = request_body(&request, "deepseek-v4-pro", true);
 
         assert_eq!(body["model"], "deepseek-v4-pro");
         assert_eq!(body["stream"], true);
         // Thinking on is the API's own default: no field sent at all.
         assert!(body.get("thinking").is_none());
+        // No function-calling schema under code mode — there is no
+        // longer a `tools` array to send at all.
+        assert!(body.get("tools").is_none());
         let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 4);
         assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[0]["content"], "card");
         assert_eq!(messages[1]["role"], "user");
-        // Assistant: tool-call arguments are a JSON string; thinking
-        // (reasoning_content) is never sent back.
         assert_eq!(messages[2]["role"], "assistant");
-        assert_eq!(
-            messages[2]["tool_calls"][0]["function"]["arguments"],
-            r#"{"source":"return 1;"}"#
-        );
-        assert!(messages[2].get("reasoning_content").is_none());
-        assert_eq!(messages[3]["role"], "tool");
-        assert_eq!(messages[3]["tool_call_id"], "c1");
-        // The ephemeral line goes **last**, after the newest message —
-        // never into the system prompt, which is prefix.
-        assert_eq!(messages[4]["role"], "user");
-        assert_eq!(
-            messages[4]["content"],
-            "2 questions are open on this branch: #4, #7."
-        );
-        assert_eq!(messages.len(), 5);
-        // Tools: full definitions, OpenAI function shape, and the same
-        // three in the same order on every request.
-        let tools = body["tools"].as_array().unwrap();
-        let names: Vec<&str> = tools
-            .iter()
-            .map(|t| t["function"]["name"].as_str().unwrap())
-            .collect();
-        assert_eq!(names, ["run_program", "resume", "answer"]);
-        assert!(tools[0]["function"]["parameters"]["properties"]["source"].is_object());
-        // `resume`'s value is optional — resuming after a message
-        // arrived has nothing to supply.
-        assert!(tools[1]["function"]["parameters"].get("required").is_none());
-        assert_eq!(
-            tools[2]["function"]["parameters"]["required"],
-            json!(["question", "value"])
-        );
+        assert_eq!(messages[2]["content"], "return 1;");
+        assert_eq!(messages[3]["role"], "user");
+        assert_eq!(messages[3]["content"], "## program completed");
     }
 
     #[test]
     fn request_body_disables_thinking_on_request() {
-        let request = LlmRequest {
-            system: "card".into(),
-            messages: vec![],
-            tools: vec![],
-            tail: None,
-        };
+        let request = doc(vec![]);
         let body = request_body(&request, "deepseek-v4-flash", false);
         assert_eq!(body["thinking"], json!({ "type": "disabled" }));
     }
@@ -375,12 +284,12 @@ mod tests {
         let stream = sse(&[
             r#"{"choices":[{"delta":{"role":"assistant","reasoning_content":"let me "}}]}"#,
             r#"{"choices":[{"delta":{"reasoning_content":"think"}}]}"#,
-            r#"{"choices":[{"delta":{"content":"the answer "}}]}"#,
-            r#"{"choices":[{"delta":{"content":"is 42"}}]}"#,
+            r#"{"choices":[{"delta":{"content":"const x = "}}]}"#,
+            r#"{"choices":[{"delta":{"content":"42;"}}]}"#,
             r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
         ]);
         let mut chunks = Vec::new();
-        let message = parse_sse(stream.as_bytes(), &Cancel::new(), &mut |c| {
+        let turn = parse_sse(stream.as_bytes(), &Cancel::new(), &mut |c| {
             chunks.push(match c {
                 LlmChunk::Text(t) => format!("T:{t}"),
                 LlmChunk::Thinking(t) => format!("R:{t}"),
@@ -388,32 +297,33 @@ mod tests {
         })
         .unwrap();
 
-        let LlmTurn {
-            text,
-            thinking,
-            tool_calls,
-        } = message;
-        assert_eq!(text, "the answer is 42");
-        assert_eq!(thinking.as_deref(), Some("let me think"));
-        assert!(tool_calls.is_empty());
-        assert_eq!(chunks, ["R:let me ", "R:think", "T:the answer ", "T:is 42"]);
+        assert_eq!(turn.source, "const x = 42;");
+        assert_eq!(turn.thinking.as_deref(), Some("let me think"));
+        assert!(!turn.truncated);
+        assert_eq!(chunks, ["R:let me ", "R:think", "T:const x = ", "T:42;"]);
     }
 
     #[test]
-    fn parse_sse_reassembles_tool_call_fragments() {
+    fn finish_reason_length_marks_the_turn_truncated() {
         let stream = sse(&[
-            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"run_program","arguments":""}}]}}]}"#,
-            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"source\":"}}]}}]}"#,
-            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"return 6*7;\"}"}}]}}]}"#,
-            r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+            r#"{"choices":[{"delta":{"content":"const x = "}}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"length"}]}"#,
         ]);
-        let message = parse_sse(stream.as_bytes(), &Cancel::new(), &mut |_| {}).unwrap();
+        let turn = parse_sse(stream.as_bytes(), &Cancel::new(), &mut |_| {}).unwrap();
+        assert!(turn.truncated, "max_tokens was hit before the model stopped");
+        // The cut-off text still comes back — detection, not
+        // suppression: the caller decides what "never compile" means.
+        assert_eq!(turn.source, "const x = ");
+    }
 
-        let LlmTurn { tool_calls, .. } = message;
-        assert_eq!(tool_calls.len(), 1);
-        assert_eq!(tool_calls[0].id, "call_1");
-        assert_eq!(tool_calls[0].name, "run_program");
-        assert_eq!(tool_calls[0].arguments, json!({ "source": "return 6*7;" }));
+    #[test]
+    fn an_ordinary_stop_is_not_truncated() {
+        let stream = sse(&[
+            r#"{"choices":[{"delta":{"content":"1;"}}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+        ]);
+        let turn = parse_sse(stream.as_bytes(), &Cancel::new(), &mut |_| {}).unwrap();
+        assert!(!turn.truncated);
     }
 
     #[test]

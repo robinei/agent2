@@ -40,7 +40,7 @@ pub fn demo_registry() -> ToolRegistry {
 
 pub fn demo_script() -> ScriptedLlm {
     ScriptedLlm::new([
-        scripted_program("demo-1", DEMO_SOURCE),
+        scripted_program(DEMO_SOURCE),
         scripted_text("Round trip complete: the fan-out returned alpha and beta."),
     ])
 }

@@ -21,7 +21,10 @@ pub type BranchId = EventId;
 
 /// The status of a program block (decision 5). Carried by
 /// `SessionEvent::ProgramStatus` so the chat pane — which is VM-free and
-/// cannot read `Phase` — can title each `run_program` block live.
+/// cannot read `Phase` — can title each `Turn`'s program live. Under
+/// code mode a "program block" is not a distinguished tool call inside
+/// a turn; it *is* the turn — `source`, whole — so this status tracks
+/// one `Turn` end to end.
 ///
 /// It is no longer live-*only*: with exactly one outcome event per
 /// handback, `ProgramView::status` derives the same answer from a
@@ -36,32 +39,6 @@ pub enum ProgramStatus {
     Completed,
     /// Abandoned — rewritten away or left suspended when the agent ended.
     Failed,
-}
-
-/// One restart, as the **user** takes a branch's turn — the handler
-/// hierarchy's outermost layer made literal (DESIGN.md).
-///
-/// These are exactly the calls the branch's own menu would offer, which
-/// is the point: a `Restart` is applied through the same path an LLM
-/// turn takes, so nothing downstream is special-cased. It carries values
-/// where `machine::Restart` carries only the kind, because the user is
-/// supplying the value.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub enum UserCall {
-    /// Paste a rewrite: replace the program.
-    RunProgram { source: String },
-    /// Supply the value the suspension asked for (or nothing, when it
-    /// asked for nothing and `resume()` just carries on).
-    Resume {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        value: Option<serde_json::Value>,
-    },
-    /// Answer an open post on this branch explicitly — including one a
-    /// fork explored and the original still owes.
-    Answer {
-        question: EventId,
-        value: serde_json::Value,
-    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -89,10 +66,22 @@ pub enum SessionCommand {
         call: EventId,
         value: serde_json::Value,
     },
-    /// The user takes a branch's turn: a `Turn { author: User }` carrying
-    /// one restart, applied exactly as if the LLM had made it. Any
+    /// The user takes a branch's turn: a `Turn { author: User, source }`
+    /// applied exactly as if the LLM had emitted `source` itself. Any
     /// in-flight generation on that branch is cancelled first.
-    Restart { branch: BranchId, call: UserCall },
+    ///
+    /// There is no restart *menu* here, only a program — DESIGN.md's
+    /// "no exception: nothing enters a context unchosen" and 23's
+    /// substitution table both cash out to the same fact: a restart is
+    /// whatever a handler program's `return` value is, and the user's
+    /// restart is the same shape as the LLM's, a source string, never a
+    /// pick from a schema. The gestures that used to be a three-variant
+    /// enum's own cases now synthesize `source` before sending it here — the
+    /// pasted rewrite (`e`) sends it verbatim; `v` sends
+    /// `return resume(<parsed JSON or bare string>);`; answering on the
+    /// user's behalf sends `answer(<question>, <label>, <value>);` — so
+    /// this command never has to know which gesture produced its text.
+    Restart { branch: BranchId, source: String },
     /// Cancel an in-flight generation, or stop a running program at its
     /// next fuel slice, so a post lands **now** rather than when the
     /// generation finishes. The one override on rule B's "next safe
@@ -158,9 +147,9 @@ pub enum SessionEvent {
         text: String,
     },
     /// A program block's live status changed (decision 5). Live-only,
-    /// like `Chunk`; `program` is the `run_program` Assistant event id
-    /// that keys the clickable block to its record (a `resume` keeps the
-    /// originating program's id).
+    /// like `Chunk`; `program` is the `Turn`'s own assistant event id
+    /// that keys the clickable block to its record (a handler program's
+    /// `resume` keeps the originating program's id).
     ProgramStatus {
         agent: AgentId,
         branch: BranchId,
@@ -272,20 +261,15 @@ mod tests {
         });
         roundtrip_cmd(SessionCommand::Restart {
             branch: id,
-            call: UserCall::Resume { value: None },
+            source: "return resume(null);".into(),
         });
         roundtrip_cmd(SessionCommand::Restart {
             branch: id,
-            call: UserCall::RunProgram {
-                source: "return 1;".into(),
-            },
+            source: "return 1;".into(),
         });
         roundtrip_cmd(SessionCommand::Restart {
             branch: id,
-            call: UserCall::Answer {
-                question: id,
-                value: serde_json::json!(5),
-            },
+            source: format!("answer({}, \"answer\", 5);", id.as_u64()),
         });
         roundtrip_cmd(SessionCommand::Interrupt { branch: id });
         roundtrip_cmd(SessionCommand::Spawn {
