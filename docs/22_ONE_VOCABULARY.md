@@ -327,6 +327,75 @@ own first program make that judgment while authoring the next step,
 instead of paying one inference to decide and a second to act on the
 decision.
 
+## `next_program(payload)` — end here, write the continuation
+
+Added after the vocabulary above, from a failure the rest of it could
+not express.
+
+**The gap.** A program that `return`s leaves the branch idle — nothing
+wakes it, completing is not a cause — so "return" was the only way to
+stop, and stopping was the only thing it could mean. That is the
+recon-only ending in one sentence: the model reports what it found and
+ends, because there is no way to say *I am not finished, run me again
+with this*.
+
+**The constraint underneath it**, which took three failed sessions to
+state: **a program cannot read what it fetches.** The mind writing a
+program never sees that program's runtime results, so anything fetched
+inside it can only be sliced by code. Text becomes readable exactly by
+being put in front of the next writer. A corollary cost a fourth
+session: **choosing which files to read is a judgement too**, so a
+program that globs and reads is guessing about relevance with code that
+cannot see what it grabbed.
+
+So the loop is: gather the *cheap* thing (an index, a listing), hand it
+over, let a mind that has read it pick, gather the few things that
+matter, hand those over, answer.
+
+**Against `raise`.** `raise` asks a question you come back from, into a
+program written *before* the answer existed — which is why
+`raise("characterise", …)` is a mistake: all that program can do with a
+reading is pass it on, and if the material turns out thin it cannot go
+and get more. `next_program` ends the program; the continuation *is*
+the answer, written with the payload in view.
+
+**Three bugs, each visible only once the previous was fixed**, all of
+them in the harness rather than the model:
+
+1. The payload was clipped to `PAYLOAD_MAX_BYTES` (1 KB). A run handed
+   over 190,891 bytes and 1,024 arrived. A `raise` payload is a preview
+   of a question; a handover payload *is* the next program's material,
+   so it gets the answer budget.
+2. It logged `Disposition::Pushed`, which `document::render` hides from
+   the rolling document — so the payload lived only in a one-shot
+   prompt and the program after next re-read everything. A handover
+   opens no scope: `Handover` renders and **stays**, in the stable
+   prefix, read once.
+3. `suspend`'s tail advanced `shown` past the outcome and never asked
+   for a completion — correct for a parked run, fatal here. The branch
+   handed over and sat idle.
+
+**First correct run** (2026-09-15, `deepseek-v4-flash`, thinking high),
+answering "what is this project?" against this repository:
+
+| program | did | handed over |
+|---|---|---|
+| 1 | `ls`, `find` | 1,434 B — names only |
+| 2 | read `Cargo.toml`, `DESIGN.md`, `6_LANGUAGE.md` | 5,068 B — selected |
+| 3 | `git remote -v` | the answer |
+
+Correct, and it found `DESIGN.md`, which the blind-glob version never
+opened. 3 programs, 6 tool calls, **40.7s wall — 36.6s of it
+inference**, over completions of 12.5s, 13.6s and 10.5s. Program
+execution is ~0.1s and rounds to nothing.
+
+**That last number is the one to keep looking at.** A tool loop would
+spend ~7 completions here, but each of ours writes a whole program and
+costs ~12s; if a tool loop averages 6s, seven of them is 42s against
+our 40.7. On judgement-dense work the structural win may convert to
+roughly nothing, and only M5 can say. The mechanical tasks — 9 to 12
+calls per program — are where the argument actually lives.
+
 ## Tail raises: handover, not deliberation
 
 A raise has two shapes, and they should be told apart at the type
