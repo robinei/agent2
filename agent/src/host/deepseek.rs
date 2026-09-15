@@ -159,6 +159,15 @@ fn request_body(
         // "both off" is the same request on both sides.
         body["thinking"] = serde_json::json!({ "type": "disabled" });
     } else if let Some(effort) = effort {
+        // **Both fields, together.** The provider wants
+        // `thinking: {"type": "enabled"}` alongside `reasoning_effort`
+        // — in the OpenAI SDK the first arrives via `extra_body`, which
+        // is the same top-level key on the wire. Sending the level
+        // alone leaves it to the API's own default, so two runs at
+        // different "levels" can be the same request: enough to make an
+        // effort comparison measure nothing, which is what it was about
+        // to do here.
+        body["thinking"] = serde_json::json!({ "type": "enabled" });
         body["reasoning_effort"] = serde_json::json!(effort);
     }
     body
@@ -319,7 +328,9 @@ mod tests {
         };
         let body = request_body(&request, "deepseek-v4-flash", true, Some("medium"));
         assert_eq!(body["reasoning_effort"], json!("medium"));
-        assert!(body.get("thinking").is_none());
+        // The level needs the enable flag beside it; alone it is a
+        // request the API may answer at whatever default it likes.
+        assert_eq!(body["thinking"], json!({ "type": "enabled" }));
 
         // Unpinned: no field at all, and the API picks.
         let body = request_body(&request, "deepseek-v4-flash", true, None);
