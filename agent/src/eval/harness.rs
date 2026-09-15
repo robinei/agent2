@@ -11,7 +11,7 @@
 //!
 //! Reached through `agent eval [--experimental]`, never `cargo test`.
 
-use super::tasks::{Outcome, Task};
+use super::tasks::{Outcome, Task, UnscriptedAsk};
 use crate::host;
 
 /// One task's result: whether its own success condition held, plus
@@ -31,6 +31,12 @@ pub struct TaskReport {
     pub abandon_count: usize,
     pub spawn_children: usize,
     pub appended: Vec<String>,
+    /// Every `ask()` the drive loop answered with the harness's own
+    /// fixed non-answer, because no fixture responder matched it — see
+    /// `tasks::UnscriptedAsk`'s own doc. Printed unconditionally, not
+    /// only on failure: an eval where a question got answered by the
+    /// harness itself, silently, is one nobody could debug.
+    pub unscripted_asks: Vec<UnscriptedAsk>,
     pub errors: Vec<String>,
 }
 
@@ -48,6 +54,7 @@ impl TaskReport {
             abandon_count: outcome.abandon_count,
             spawn_children: outcome.spawn_children,
             appended: outcome.appended,
+            unscripted_asks: outcome.unscripted_asks,
             errors: outcome.errors,
         }
     }
@@ -113,6 +120,13 @@ fn print_report(r: &TaskReport) {
     );
     if !r.appended.is_empty() {
         println!("  appended: {:?}", r.appended);
+    }
+    if !r.unscripted_asks.is_empty() {
+        println!("  unscripted ask(s) — harness answered, not a real user:");
+        for a in &r.unscripted_asks {
+            println!("    Q: {}", a.question);
+            println!("    A (harness non-answer): {}", a.answer);
+        }
     }
     if !r.errors.is_empty() {
         println!("  errors: {:?}", r.errors);

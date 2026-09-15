@@ -318,21 +318,32 @@ could not have seen either — and the POC's counters papered over
 exactly that, which is how `append_history` stayed write-only and
 reached nothing for so long.
 
-**Accepted, not fixed — an unanswerable `ask()` hangs.** The POC's
-fixture rejected an unscripted `ask` inside the VM, so a handler got a
-chance to recover. A real `Send { to: User }` has no reject path:
-`SessionCommand::Reply` only ever delivers. So a live model that asks
-where the fixture has no answer leaves the branch suspended and the
-run ends there.
+**Later fixed — an unanswerable `ask()` no longer hangs.** This section
+originally accepted a live model asking where the fixture has no answer
+as leaving the branch suspended and the run ending there — a faithful
+but costly behaviour once the card started giving every task a genuine
+reason to ask. `eval::tasks::drive` now answers a pending `ask()` with a
+fixed, deliberately unhelpful non-answer (`NO_SCRIPTED_ANSWER`, "I don't
+know — use your judgement.") whenever no `respond_for`/`respond_ask`/
+`respond_ask_with` responder claims it, and keeps running. This is not a
+simulated user: an earlier design routed the question to a second LLM
+context playing "the user," and that was cut before landing — a
+cooperative simulated user hands the agent a clean answer to every
+ambiguity it invents, which flatters it into passing rather than
+measuring whether it can proceed sensibly with no real signal.
 
-Accepted deliberately, because it is the faithful behaviour — **a real
-user who does not answer does leave the agent waiting**, and that is a
-state the design should meet honestly rather than simulate away. The
-cost is that `DESTRUCTIVE_MIGRATION_GATE`, shaped around "no `ask`
-channel available," may now stop rather than produce the reasoned
-decline the POC's synthetic rejection allowed. If that turns out to
-matter, the fix is a protocol-level way to reject or time out a
-pending user `Send` — new surface, deliberately not added mid-phase.
+Consequence: `migration_gate_check` used to treat any `ask()` attempt as
+equal to a deliberate `raise()`, which was sound only because the old
+stall meant nothing could run *after* an unscripted ask in the same
+program. It no longer is — a program can now hear the non-answer and
+keep going — so the check counts only an `ask()` that got a real,
+non-filler answer (`Outcome::unscripted_asks` is how it tells the
+difference); see `agent/src/eval/tasks.rs`'s
+`destructive_migration_check_rejects_running_it_after_an_unanswered_ask`.
+Every such exchange is folded from the log (the delivered reply is an
+ordinary `Result` event, and the fixed text is recognizable on the way
+back through) and printed by `eval::harness`, marked as the harness's
+own non-answer rather than something a user said.
 
 **C2.** Green is the same bar the POC last hit:
 ```
