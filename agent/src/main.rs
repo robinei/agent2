@@ -29,7 +29,9 @@ const USAGE: &str = "usage: agent <command>
                                     key is set — --headless stays scripted
                                     unless --real is given
     --turn <text>                   queue a first user turn on the
-                                    conversation branch (headless)
+                                    conversation branch, before the TUI
+                                    takes over — so a session can start
+                                    with nobody there to type one
     --list-leaves                   print the log's leaf set and exit
     --list-branches                 print the log's branch set and exit
     --resume <id>                   open the branch leaf <id> sits on (else
