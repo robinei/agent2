@@ -170,6 +170,15 @@ of what is kept.
 
 Surfaced explicitly, per DESIGN.md's own instruction.
 
+> **Folded into `DESIGN.md` as of Phase 23.** All four changes below now
+> live there: the suspension table gained its context-budget row, "LLM as
+> restart handler" is stated literally, the namespace split is recorded in
+> the dependency spine, and "The one exception" is retired in favour of
+> "No exception: nothing enters a context unchosen". This section is kept
+> as the record of where those changes were argued. Surfacing them and
+> never folding them in is what made Phases 21–23 each re-state the same
+> conclusion.
+
 - **"The one exception: the answer crosses into context" is retired.**
   There is no answer that crosses. A root program returns nothing to
   anyone — it reaches the user through `say()`. A handler's value goes

@@ -3,7 +3,7 @@
 A code-mode agent system: the LLM writes JS programs that orchestrate tool
 calls; the programs run on a bespoke VM; and a Lisp-style condition system
 makes the LLM (and above it, the user) the interactive restart handler. The
-numbered plan files (`0_…` – `18_…`) are the roadmap; this file is the
+numbered plan files (`0_…` – `23_…`) are the roadmap; this file is the
 rationale they all serve. Where a plan file and this file disagree, surface
 it — that's a design change, not a detail.
 
@@ -28,9 +28,10 @@ authority picks a restart. Every interaction is one instance of that shape:
 | Suspension | Report | Typical restart | Handler |
 |---|---|---|---|
 | `Invoke` (tool call) | the call(s) | deliver result(s) | host, automatically |
-| `raise(name, payload)` | condition report | resume(value) / rewrite | LLM |
-| trapped runtime error | rendered diagnostic + artifact menu | resume(value) / rewrite | LLM |
-| user interrupt / steering (17_BRANCHES) | condition report + user's message + the **annotated source** (every call site labelled with its artifact id and state) | answer / resume / rewrite | user → LLM |
+| `raise(name, payload)` | condition report | a handler program returning `resume(value)` or `abandon()` | LLM |
+| trapped runtime error | rendered diagnostic + artifact menu | the same, or a rewrite | LLM |
+| user interrupt / steering (17_BRANCHES) | condition report + user's message + the **annotated source** (every call site labelled with its artifact id and state) | a program — the user's, typed or synthesized | user → LLM |
+| context-budget headroom (20_CODE_MODE Part E) | the history itself, every row by id and label | a compaction program: `remove_history` / `rewrite_history`, then `resume()` | LLM, then host policy |
 | `OutOfFuel` / memory budget | report | top up / abort | host policy |
 | crash / version mismatch | interruption + artifact menu | rewrite with artifacts | LLM |
 
@@ -40,6 +41,14 @@ is the most common condition, one with an automatic handler. The handler
 nesting with the debugger replaced by progressively smarter authorities.
 In-program `try`/`catch` (6_LANGUAGE Part B) is the innermost layer of the
 same hierarchy; `raise` deliberately bypasses it.
+
+**"LLM as restart handler" is literal, not a metaphor.** The handler is not
+a turn picking a restart off a menu — it is a *program the LLM writes*,
+which runs while the signalling frame is still live and whose return value
+**is** the restart. That is Lisp's actual semantics rather than an analogy
+to it, and it is what forces the handler stack (20_CODE_MODE Part D): a
+host-side structure of independently-stepped VMs, no VM ever on another
+VM's stack, the load-bearing property intact.
 
 ## The load-bearing property
 
@@ -76,7 +85,7 @@ intact:
    above) →
 2. so completed work must live **outside** the VM — the append-only
    **event log** records every tool result as it lands →
-3. so reuse is **explicit artifacts by event id** (`tools.tool_result(id)`),
+3. so reuse is **explicit artifacts by event id** (`artifact(id)`),
    the program re-fetching prior results rather than recomputing them. **This
    is exactly why determinism is unnecessary:** reuse is keyed by an explicit
    id, not by a rerun retracing the original control flow position-for-
@@ -85,7 +94,7 @@ intact:
    (17_BRANCHES): **after a resume, no completed work is invisible** — every
    half-finished exchange in the log is reconciled on open, so a call that
    landed is an artifact and a call that was merely issued says so; and
-   **reuse by id covers in-flight exchanges too** — `tools.tool_result(id)` on
+   **reuse by id covers in-flight exchanges too** — `artifact(id)` on
    a still-pending ask returns a promise that resolves when its result lands,
    so a re-entered or rewritten program **re-awaits** rather than re-asks →
 4. so programs need **no durable `state`** — they are functions
@@ -104,6 +113,15 @@ determinism root is dropped and the chain re-anchors on the load-bearing
 suspension property. The explicit-artifact layer (then item 5, now item 3)
 was always the real reuse mechanism — "never an implicit args-matching
 cache" — and it carries recovery on its own without determinism.)
+
+**The program's vocabulary is split by who knows it.** The closed,
+harness-defined set — `tell`/`ask`/`answer`/`spawn`/`fork`/
+`append_history`/`artifact`, plus the decision constructors
+`resume`/`abandon`, joining `raise` — is **bare-global** and known to the
+compiler statically, the way `raise` already is. `tools.*` remains the
+surface for a *specific agent's configured capabilities* (`read_file`,
+`bash`, whatever the registry holds), which varies per agent and which
+the compiler has no static view of. The line is language versus library.
 
 Parallel spine for concurrency: it lives in the **program layer**
 (promises + outbox, 7_ASYNC), so the conversation tree never needs a
@@ -212,32 +230,46 @@ answer without spending an LLM turn. **Their default send is a tell, not
 an ask** — a deliberate gesture, not the ordinary case — because a human
 who gets no reply can just ask again, and a suspended program cannot.
 
-## The one exception: the answer crosses into context
+## No exception: nothing enters a context unchosen
 
 The spine keeps the LLM out of the *data* path — tool output lives in
-variables and the log, reachable by id, never re-sent in context. That
-invariant holds for everything except the one value that is the LLM's own
-deliverable: the **answer** a frame was asked to produce. Reading and
-summarizing are not orchestration; their product *is* data the model must
-take into its head and re-author. So the answer — a program's `return`
-rendered into the completion report, and a subagent's final turn rendered
-to its caller — is the sole channel by which bytes deliberately enter a
-context. It is **budgeted, not clipped to a token**: generous enough that
-an ordinary file read or summary lands in one shot, with the full value
-always kept as a fetchable artifact and only the context copy truncated
-(naming its id) past the budget.
+variables and the log, reachable by id, never re-sent in context. Under
+code mode that invariant has **no exception**, where it once had one.
 
-This supersedes the earlier "`return` only small, status-shaped values"
-discipline, which was right about orchestration data and wrong about
-deliverables — it forced read/summarize tasks to smuggle content through
-`/tmp` chunking (12_ANSWERS). The rule that replaces it: **machine-bound
-data travels by reference and never enters a context; mind-bound data is
-exactly the answer, and its budget rides in the request.** A model never
-opts into this — the obvious path (return what you want to read; write a
-large product with `create_file`) *is* the correct one, and the budget
-only fails safe when an answer is genuinely oversized. The test for any
-mechanism on this path: if the model has to *know it exists* to get the
-obvious task right, that is a smell, not a feature.
+The retired exception was the **answer**: a program's `return` rendered
+into a completion report, and a subagent's final turn rendered to its
+caller, budgeted generously so an ordinary read or summary landed in one
+shot. There is now no answer that crosses. A root program returns nothing
+to anyone — it reaches the user through `tell()`. A handler's value goes
+to the raising *program*, as a value, not into a context. What enters a
+history is exactly two things: **what nobody was waiting for** (an
+arriving post), and **what a mind explicitly appended**
+(`append_history`). The answer-budget machinery — `DEFAULT_ANSWER_BUDGET`,
+the answer clipping in `report.rs` — has no subject under this design and
+goes with it (23_ONE_AGENT, Pass B).
+
+So the rule is the whole rule: **machine-bound data travels by reference
+and never enters a context; mind-bound data is what a mind chose to put
+there.** Sharpened one level down (22_ONE_VOCABULARY): *ids are for data a
+program consumes; inline text is for data a mind consumes.* `artifact(id)`
+can never feed a judgment in the same turn — a program can fetch bytes and
+branch on them mechanically, but an actual judgment call requires a
+completion, and a completion sees only what was rendered into the
+document.
+
+Two earlier positions this supersedes, in order. First, **"`return` only
+small, status-shaped values"** — right about orchestration data, wrong
+about deliverables, and it forced read/summarize tasks to smuggle content
+through `/tmp` chunking (12_ANSWERS). Then **the budgeted answer** above,
+which fixed that by opening one deliberate channel. Code mode dissolves
+the problem instead of channelling it: a program that reads a file holds
+the content in a variable and acts on it, with no turn boundary to carry
+it across, so the deliverable never needed to enter a context in the first
+place.
+
+The test for any mechanism on this path is unchanged, and it is the reason
+this direction is the right one: if the model has to *know a mechanism
+exists* to get the obvious task right, that is a smell, not a feature.
 
 ## Compatibility as a terminal goal
 

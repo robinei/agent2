@@ -1,6 +1,7 @@
 # Phase 23 — one agent
 
-This supersedes `21_TUI_CUTOVER.md` in full and the staged tail of
+Replaces `21_TUI_CUTOVER.md` (deleted — its argument and the reason it
+was abandoned are recorded below) and the staged tail of
 `22_ONE_VOCABULARY.md` ("What this licenses, not yet done", steps 1–5).
 
 `21` planned an *additive* cutover: a code-mode session standing up
@@ -26,6 +27,34 @@ And the sequencing rule:
 > borrow checker. Pass B makes it compile. Pass C makes it run. Do not
 > interleave them — stopping to fix a build in the middle of Pass A is
 > what turns a two-week change into a two-month one.
+
+### What `21` argued, and what was right in it
+
+Recorded here rather than lost with the file. Its three stages were: a
+persistent code-mode session backend standing up headless; then TUI
+rendering against it; then a sweep deleting the old path. The staging
+was not arbitrary — it was chosen so that every stage left `cargo test`
+green and the agent usable, and so the TUI never rendered against a
+vocabulary still in motion.
+
+Two of its judgments survive into this plan and are worth naming,
+because they were the load-bearing ones:
+
+- **The TUI must not be rewritten against a moving `types.rs`.** `21`
+  solved this by doing the backend first and rendering second. This
+  plan solves it by cutting `debug/` out of the build entirely for
+  three passes. Same insight, cheaper execution.
+- **Its "What survives the cutover, and why" findings** — which parts
+  of the existing session loop, registry, and artifact model were
+  independent of the tool-call protocol and therefore worth keeping —
+  are the same findings that make the "where each existing file goes"
+  table below short. That analysis was not wasted; it is why this plan
+  can be confident about what is deletion and what is rewrite.
+
+What was wrong was only the fallback: keeping the `run_program`-tool
+path working through all three stages. That is a second implementation
+of every behaviour, maintained for the length of the transition, to
+hedge a direction that is no longer in doubt.
 
 ---
 

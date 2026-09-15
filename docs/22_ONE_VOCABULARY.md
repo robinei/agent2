@@ -1,12 +1,13 @@
 # Phase 22 — one vocabulary
 
-`codemode/` (`20_CODE_MODE.md`, staged for the TUI by `21_TUI_CUTOVER.md`)
-was built beside `types.rs`/`tree.rs` rather than on them: `codemode/
-entry.rs` is a second, parallel event log, with its own id space
+`codemode/` (`20_CODE_MODE.md`, staged for the TUI by the since-deleted
+`21_TUI_CUTOVER.md` — see `23_ONE_AGENT.md`) was built beside
+`types.rs`/`tree.rs` rather than on them: `codemode/entry.rs` is a
+second, parallel event log, with its own id space
 (`EntryId::new(1)`, minted by hand in `runner.rs`), its own message
 vocabulary (`Entry::{Message,Program,Effects,Note,CompactedStub}`),
 and its own render path (`document::render`) that nothing in `tree.rs`
-feeds. Meanwhile `21`'s own cutover plan proposes six *more* new
+feeds. Meanwhile `21`'s own cutover plan proposed six *more* new
 `EventPayload` variants for the TUI to consume.
 
 This doc is the check that should have preceded both: does the
