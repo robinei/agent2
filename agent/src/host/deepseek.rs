@@ -310,7 +310,10 @@ mod tests {
             r#"{"choices":[{"delta":{},"finish_reason":"length"}]}"#,
         ]);
         let turn = parse_sse(stream.as_bytes(), &Cancel::new(), &mut |_| {}).unwrap();
-        assert!(turn.truncated, "max_tokens was hit before the model stopped");
+        assert!(
+            turn.truncated,
+            "max_tokens was hit before the model stopped"
+        );
         // The cut-off text still comes back — detection, not
         // suppression: the caller decides what "never compile" means.
         assert_eq!(turn.source, "const x = ");

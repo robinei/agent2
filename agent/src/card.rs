@@ -183,6 +183,11 @@ pub fn full_card(registry: &crate::host::ToolRegistry) -> String {
 /// programs are its few-shot evidence, and there are none yet), so
 /// this is the restoring force against a timid first program —
 /// cheap insurance, not a remedy applied after the fact.
+#[allow(dead_code)] // caller returns in Pass C: the exemplars are
+// few-shot seed turns for `document::render`, not card text -- the POC
+// carried them on `RunConfig::exemplars` and the real session has no
+// equivalent yet. Deleting them would throw away the five worked
+// examples that fixed the recon-ending behaviour live.
 pub struct Exemplar {
     pub user: &'static str,
     pub assistant: &'static str,
@@ -237,6 +242,7 @@ pub struct Exemplar {
 /// `runner::RunOutcome::appended` is the instrument; nothing gates a
 /// task's pass/fail on it, the same observational discipline the
 /// ask/raise and resume/abandon experiments already use.
+#[allow(dead_code)] // see `Exemplar` -- restored in Pass C.
 pub const SEED_EXEMPLARS: &[Exemplar] = &[
     Exemplar {
         user: "can you check whether the tests pass and let me know?",

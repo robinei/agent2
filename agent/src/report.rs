@@ -29,7 +29,9 @@
 //! Every section carries a hard size bound (bounded reports, menu pruned
 //! to recent entries, full data always fetchable by id).
 
-use crate::types::{Author, Call, Cause, Event, EventId, EventPayload, Message, Origin, Outcome, Tree};
+use crate::types::{
+    Author, Call, Cause, Event, EventId, EventPayload, Message, Origin, Outcome, Tree,
+};
 
 /// Max bytes of the "what happened" section (diagnostic + payload).
 pub const WHAT_MAX_BYTES: usize = 2048;
@@ -364,6 +366,8 @@ pub fn render_post(id: EventId, from: Author, origin: &Origin) -> String {
 }
 
 /// Max bytes of a nameless branch's derived navigator label.
+#[allow(dead_code)] // caller returns in Pass D: only `debug/` used this,
+// and the TUI is cut from the build for Passes A-C.
 pub const DERIVED_LABEL_MAX_BYTES: usize = 40;
 
 /// A nameless branch's display label (17_BRANCHES "a nameless branch is
@@ -374,6 +378,8 @@ pub const DERIVED_LABEL_MAX_BYTES: usize = 40;
 /// the branch. `None` when this branch has posted nothing of its own yet
 /// (a fork born idle, say), in which case the navigator falls back to
 /// the branch id.
+#[allow(dead_code)] // caller returns in Pass D: only `debug/` used this,
+// and the TUI is cut from the build for Passes A-C.
 pub fn derived_branch_label(tree: &Tree, branch: EventId, leaf: EventId) -> Option<String> {
     tree.path_events(leaf).into_iter().find_map(|e| {
         if e.id.as_u64() < branch.as_u64() {
@@ -397,6 +403,8 @@ pub fn derived_branch_label(tree: &Tree, branch: EventId, leaf: EventId) -> Opti
 /// Byte-bounded truncation with a bare ellipsis — for a display label,
 /// where [`clip`]'s "[truncated; N bytes total]" marker would be most of
 /// the label.
+#[allow(dead_code)] // caller returns in Pass D: only `debug/` used this,
+// and the TUI is cut from the build for Passes A-C.
 fn clip_short(s: &str, max: usize) -> String {
     if s.len() <= max {
         return s.to_owned();
@@ -724,8 +732,7 @@ fn render_handback(h: &Handback<'_>, budget: usize) -> String {
 /// written, which is strictly worse than a clean failure the repair loop
 /// can see and retry. No VM ran, so — like `CompileFailed` — there is no
 /// console and no new artifacts to report.
-const TRUNCATED_MESSAGE: &str =
-    "the completion hit its token budget before the program finished and was discarded \
+const TRUNCATED_MESSAGE: &str = "the completion hit its token budget before the program finished and was discarded \
      unread — a truncated program is never compiled, since a half-written one can still \
      happen to parse and run. Write a shorter program, or spend less of the budget \
      thinking before you start writing it.";
@@ -981,6 +988,8 @@ pub fn annotate_calls<'a>(
 /// chat pane and the model's own report can never disagree
 /// (17_BRANCHES Part D: "a pane that shows something the model also
 /// sees must derive it the same way the model's copy is derived").
+#[allow(dead_code)] // caller returns in Pass D: only `debug/` used this,
+// and the TUI is cut from the build for Passes A-C.
 pub fn annotate_program(pv: &crate::tree::ProgramView) -> String {
     let calls: Vec<CallSite> = pv
         .invokes
@@ -1057,7 +1066,8 @@ pub fn render_fork(tree: &Tree, leaf: EventId, fork: EventId) -> String {
         .iter()
         .rposition(|e| matches!(e.payload, EventPayload::Message(Message::Turn { .. })));
     // Mid-program iff that turn's outcome had not landed by the fork.
-    let running = turn_at.is_some_and(|ti| !path[ti + 1..fork_at].iter().any(|e| is_outcome(&e.payload)));
+    let running =
+        turn_at.is_some_and(|ti| !path[ti + 1..fork_at].iter().any(|e| is_outcome(&e.payload)));
 
     if !running {
         let point = at
@@ -1295,14 +1305,11 @@ mod tests {
 
         // Interruption: the VM went with the process; not resumable,
         // rewrite to continue.
-        let (tree, o) = fixture(
-            "return 1;",
-            condition(Cause::Interrupted, 0, Vec::new()),
-        );
+        let (tree, o) = fixture("return 1;", condition(Cause::Interrupted, 0, Vec::new()));
         let leaf = tree.list_leaves()[0].0;
         let text = derive_report(&tree, leaf, o, 64 * 1024);
         assert!(text.contains("interrupted before completing"), "{text}");
-        assert!(text.contains("not resumable"), "{text}");
+        assert!(text.contains("Not resumable"), "{text}");
     }
 
     /// **Every artifact appears in exactly one report**: each menu is

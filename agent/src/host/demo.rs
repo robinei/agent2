@@ -10,7 +10,6 @@ use serde_json::json;
 
 use super::{
     ScriptedLlm, Session, SessionCommand, SessionEvent, ToolDef, ToolRegistry, scripted_program,
-    scripted_text,
 };
 use crate::types::Tree;
 
@@ -38,11 +37,16 @@ pub fn demo_registry() -> ToolRegistry {
     registry
 }
 
+/// One program, one round trip. `finish_program`'s own doc explains why
+/// there is no second scripted turn to consume: a completion with
+/// nothing left unaccounted for (no unseen post, nothing pending) does
+/// not manufacture a reason to prompt again — a holdover from the old
+/// tool-calling protocol, where a `tool_result` always needed a
+/// follow-up completion by the chat API's own rules, would have shown
+/// up here as a second, unconsumed `scripted_text` the demo never
+/// actually reaches.
 pub fn demo_script() -> ScriptedLlm {
-    ScriptedLlm::new([
-        scripted_program(DEMO_SOURCE),
-        scripted_text("Round trip complete: the fan-out returned alpha and beta."),
-    ])
+    ScriptedLlm::new([scripted_program(DEMO_SOURCE)])
 }
 
 /// Build the demo session over `tree`, queue the user turn, and run it

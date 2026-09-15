@@ -128,11 +128,22 @@ struct LogHeader {
 ///   closes one, so it is matched first. Without this arm an abandoned
 ///   run never decrements and every later event on the branch renders
 ///   as though still inside a scope nothing will ever close.
+/// - `Condition{cause: Interrupted}`: the process died and the VM went
+///   with it — reconciliation's repair (`host/mod.rs`'s `reconcile`)
+///   gives the run an outcome "like any other" precisely so it settles
+///   the same way a `Return` or an `Abandoned` does, **whatever
+///   disposition the repair stamped on it** (`Disposition::Pushed`,
+///   the type's own safe default — nothing is actually about to run at
+///   a deeper level, there is no handler "that runs next" for a crash).
+///   Matched before the disposition arms for the identical reason
+///   `Abandoned` is: without this, a crash below depth 0 would leave
+///   every later event on the branch permanently misrendered as still
+///   inside a scope nothing will ever close.
 /// - anything else leaves depth unaffected.
 pub fn depth_after(depth: usize, payload: &EventPayload) -> usize {
     match payload {
         EventPayload::Condition {
-            cause: Cause::Abandoned,
+            cause: Cause::Abandoned | Cause::Interrupted,
             ..
         } => depth.saturating_sub(1),
         EventPayload::Condition {
@@ -456,12 +467,22 @@ impl Tree {
             // Execution/record events carry no context-visible state; they
             // are queried from `events` by id (artifacts, replay, UI).
             // A `Rename` is here on purpose: renaming never wakes a branch.
+            // `Note` is here for the same reason — `document.rs` derives
+            // its rendered line straight from the log at render time
+            // (`EventPayload::Note`'s own doc: "a marker in the branch's
+            // own history, nothing more"), not from `Context.messages`,
+            // which holds only `Message`s. `Compacted` never touches
+            // context either: it shadows another row's *rendering*, not
+            // this branch's obligations — the row it targets already ran
+            // through this fold when it was first replayed.
             EventPayload::Call(_)
             | EventPayload::Result { .. }
             | EventPayload::Return { .. }
             | EventPayload::Condition { .. }
             | EventPayload::Console { .. }
-            | EventPayload::Rename { .. } => {}
+            | EventPayload::Rename { .. }
+            | EventPayload::Note { .. }
+            | EventPayload::Compacted { .. } => {}
         }
     }
 
@@ -677,6 +698,17 @@ impl Tree {
         // `Handover` `Condition`, left alone on a `Pushed` one.
         let mut stack: Vec<usize> = Vec::new();
         let mut depth: usize = 0;
+        // The program a `Console` event should attach to. `machine.rs`
+        // logs `Console` immediately *after* the `Return`/`Condition`
+        // that ends a run (`suspend`'s own doc: "the console is a
+        // diagnostic stream... the report carries only a bounded tail of
+        // it"), by which point `Return`/a `Handover` `Condition` has
+        // already popped that program off `stack` — so `stack.last()`
+        // alone would attach the console to the *next* frame out (or
+        // nowhere, at depth 0) instead of the program that actually
+        // produced it. Set whenever a program gets its outcome, consumed
+        // by the very next `Console`.
+        let mut last_outcome_idx: Option<usize> = None;
 
         for ev in self.path_events(leaf) {
             if let EventPayload::Agent { .. } = ev.payload {
@@ -688,6 +720,11 @@ impl Tree {
             }
             match &ev.payload {
                 EventPayload::Message(Message::Turn { source, .. }) => {
+                    // A new program starting invalidates any outcome
+                    // still waiting for its `Console` — that pairing is
+                    // adjacent-only in the log, never carried across a
+                    // later program.
+                    last_outcome_idx = None;
                     programs.push(ProgramView {
                         id: ev.id,
                         source: source.clone(),
@@ -740,6 +777,7 @@ impl Tree {
                         p.result = Some(value.clone());
                         p.outcome = Some(ev.id);
                         p.condition = None;
+                        last_outcome_idx = Some(idx);
                     }
                 }
                 EventPayload::Condition {
@@ -749,13 +787,14 @@ impl Tree {
                         let p = &mut programs[idx];
                         p.outcome = Some(ev.id);
                         p.condition = Some(cause.clone());
+                        last_outcome_idx = Some(idx);
                     }
                     if *disposition == Disposition::Handover {
                         stack.pop();
                     }
                 }
                 EventPayload::Console { lines } => {
-                    if let Some(&idx) = stack.last() {
+                    if let Some(idx) = last_outcome_idx.take().or_else(|| stack.last().copied()) {
                         programs[idx].console = lines.clone();
                     }
                 }
@@ -1113,38 +1152,19 @@ mod tests {
         })
     }
 
-    fn assistant_msg(text: &str) -> EventPayload {
+    /// An assistant turn: under code mode the whole turn **is** a
+    /// program, so this builds the one shape `Message::Turn` has —
+    /// `source` is the bare JavaScript text, no separate prose channel
+    /// and no tool-call wrapper (23_ONE_AGENT.md's substitution table).
+    /// Replaces the POC-era `run_program_call`/`resume_call` pair, which
+    /// built a `Turn` around a `run_program`/`resume` `ToolCall` that no
+    /// longer exists — a resume is just another program whose source
+    /// happens to be `return resume(value);`.
+    fn assistant_msg(source: &str) -> EventPayload {
         EventPayload::Message(Message::Turn {
             author: Author::Agent(EventId::new(1)),
-            text: text.into(),
+            source: source.into(),
             thinking: None,
-            tool_calls: Vec::new(),
-        })
-    }
-
-    fn run_program_call(id: &str, source: &str) -> EventPayload {
-        EventPayload::Message(Message::Turn {
-            author: Author::Agent(EventId::new(1)),
-            text: String::new(),
-            thinking: None,
-            tool_calls: vec![ToolCall {
-                id: id.into(),
-                name: "run_program".into(),
-                arguments: json!({ "source": source }),
-            }],
-        })
-    }
-
-    fn resume_call(id: &str) -> EventPayload {
-        EventPayload::Message(Message::Turn {
-            author: Author::Agent(EventId::new(1)),
-            text: String::new(),
-            thinking: None,
-            tool_calls: vec![ToolCall {
-                id: id.into(),
-                name: "resume".into(),
-                arguments: json!({ "value": null }),
-            }],
         })
     }
 
@@ -1160,6 +1180,7 @@ mod tests {
             },
             site: 0,
             stack: Vec::new(),
+            disposition: Disposition::Pushed,
         }
     }
 
@@ -1183,10 +1204,7 @@ mod tests {
             let mut tree = open()?;
             let mut spine = tree.start_agent(None, None, "root", None, "")?;
             agent = spine.leaf_id; // the Agent id is the agent id
-            tree.append(
-                &mut spine,
-                run_program_call("c1", "console.log('hi'); return 42;"),
-            )?;
+            tree.append(&mut spine, assistant_msg("console.log('hi'); return 42;"))?;
             let bash = tree.append(
                 &mut spine,
                 EventPayload::Call(Call::Invoke {
@@ -1250,7 +1268,7 @@ mod tests {
         let mut tree = Tree::new(None);
         let mut spine = tree.start_agent(None, None, "root", None, "")?;
         let agent = spine.leaf_id;
-        tree.append(&mut spine, run_program_call("c1", "raise('x');"))?;
+        tree.append(&mut spine, assistant_msg("raise('x');"))?;
         tree.append(&mut spine, raised("x"))?; // first handback: suspended
         let suspended_leaf = spine.leaf_id;
         assert_eq!(
@@ -1259,7 +1277,7 @@ mod tests {
             "a reopened log says how the run ended"
         );
 
-        tree.append(&mut spine, resume_call("c2"))?; // continues the same program
+        tree.append(&mut spine, assistant_msg("return resume(null);"))?; // continues the same program
         tree.append(&mut spine, returned(json!("done")))?; // second handback
         tree.append(
             &mut spine,
@@ -1269,18 +1287,27 @@ mod tests {
         )?;
         let leaf = spine.leaf_id;
 
+        // Handler programs get their own entry, not folded into the
+        // raiser's (`programs_for`'s own doc: "every one is independently
+        // addressable by its own id"). The raiser (`progs[0]`) stays
+        // `Suspended` — the log never says anything more about it once
+        // the handler's `resume(...)` takes over — and the handler
+        // (`progs[1]`, "return resume(null);") is the one that carries
+        // the eventual completion: its `Return`/`Console` are the next
+        // events on the spine, with no further `Turn` in between.
         let progs = tree.programs_for(agent, leaf);
-        assert_eq!(progs.len(), 1, "resume folds into one program");
-        assert_eq!(progs[0].result, Some(json!("done")));
+        assert_eq!(progs.len(), 2, "the handler is its own program entry");
+        assert_eq!(progs[0].status(), ProgramStatus::Suspended);
+        assert_eq!(progs[1].result, Some(json!("done")));
         assert_eq!(
-            progs[0].console,
+            progs[1].console,
             vec!["before".to_string(), "after".to_string()]
         );
-        assert_eq!(progs[0].status(), ProgramStatus::Completed);
+        assert_eq!(progs[1].status(), ProgramStatus::Completed);
 
         // A compile failure never ran, so it is Failed, not Suspended.
         let mut other = tree.start_agent(Some(agent), None, "child", None, "")?;
-        tree.append(&mut other, run_program_call("c3", "let = ;"))?;
+        tree.append(&mut other, assistant_msg("let = ;"))?;
         tree.append(
             &mut other,
             EventPayload::Condition {
@@ -1289,6 +1316,7 @@ mod tests {
                 },
                 site: 0,
                 stack: Vec::new(),
+                disposition: Disposition::Pushed,
             },
         )?;
         let child_agent = tree.enclosing_agent(other.leaf_id).unwrap();
@@ -1652,7 +1680,7 @@ mod tests {
             let mut tree = open()?;
             let mut spine = tree.start_agent(None, None, "root", None, "")?;
             tree.append(&mut spine, user_msg("go"))?;
-            turn = tree.append(&mut spine, run_program_call("c1", "return 1;"))?;
+            turn = tree.append(&mut spine, assistant_msg("return 1;"))?;
             tree.sync()?;
             // A step in progress: these are written but not yet synced.
             tree.append(&mut spine, returned(json!(1)))?;
@@ -1682,6 +1710,10 @@ mod tests {
                 cause: Cause::Interrupted,
                 site: 0,
                 stack: Vec::new(),
+                // Matches `host/mod.rs`'s real reconciliation repair:
+                // `Handover`, since an interrupted run settles the frame
+                // it was running in rather than opening one.
+                disposition: Disposition::Handover,
             },
         )?;
         tree.sync()?;

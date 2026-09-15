@@ -118,7 +118,11 @@ pub fn scripted_resume(value: serde_json::Value) -> LlmTurn {
 /// raising program alone — the restart that binds explicitly rather than
 /// supplying a `resume` value.
 #[cfg(test)]
-pub fn scripted_answer(question: crate::types::EventId, label: &str, value: serde_json::Value) -> LlmTurn {
+pub fn scripted_answer(
+    question: crate::types::EventId,
+    label: &str,
+    value: serde_json::Value,
+) -> LlmTurn {
     scripted_program(&format!(
         "answer({}, {}, {value});",
         question.as_u64(),
@@ -132,6 +136,8 @@ pub fn scripted_answer(question: crate::types::EventId, label: &str, value: serd
 /// response is parsed as JavaScript"); the closest equivalent to the
 /// pre-code-mode "plain reply ends the turn" is a one-line program whose
 /// only act is to tell the user something and fall off the end.
+#[allow(dead_code)] // used only from test modules, which the non-test
+// build does not compile; not dead.
 pub fn scripted_text(text: &str) -> LlmTurn {
     scripted_program(&format!("tell(\"user\", {});", serde_json::json!(text)))
 }

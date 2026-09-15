@@ -1110,7 +1110,12 @@ impl Runner {
 
     /// Compile + bind the host const (`input`, from the agent's oldest
     /// still-open post). `Err` is the repair-loop report.
-    fn start_program(&mut self, tree: &Tree, program_id: EventId, source: &str) -> Result<Run, String> {
+    fn start_program(
+        &mut self,
+        tree: &Tree,
+        program_id: EventId,
+        source: &str,
+    ) -> Result<Run, String> {
         let program = compile(source).map_err(|diags| render_diags(source, &diags))?;
         // The whole `input` reaches the program even though the context
         // saw only a bounded preview of it.
@@ -1329,8 +1334,7 @@ impl Runner {
                                     )?;
                                     let vm = self.running_vm();
                                     let v = json_arg(vm, &serde_json::Value::Bool(true));
-                                    vm.resolve_promise(call.promise, v)
-                                        .expect("fresh promise");
+                                    vm.resolve_promise(call.promise, v).expect("fresh promise");
                                     progressed = true;
                                     out.push(StepOutput::Answered {
                                         question,
@@ -1400,7 +1404,10 @@ impl Runner {
                             progressed = true;
                         }
                         None => {
-                            self.reject_call(call.promise, "append_history(value) needs one argument");
+                            self.reject_call(
+                                call.promise,
+                                "append_history(value) needs one argument",
+                            );
                             progressed = true;
                         }
                     }
@@ -1720,17 +1727,29 @@ impl Runner {
         }
         self.note_status(run.program_id, ProgramStatus::Completed);
         self.last_vm = Some(run.vm);
-        self.phase = Phase::AwaitingLlm;
         // `document.rs::render` derives the completion report straight
         // off this `Return` event on every render (`derive_report`) — no
-        // separate "tool result"/harness `Post` for it to answer. This is
-        // a deliberate deviation from 23_ONE_AGENT.md A4's own text
-        // ("the harness's reply is a Post from Author::Harness"): reading
-        // `document.rs` (already finished by the concurrent A3 agent)
-        // shows the actual mechanism is inline derivation at render time,
-        // not a second logged event — logging one here would double the
-        // report in the rendered document. Flagged in this step's report.
-        out.push(self.render_request(tree));
+        // separate "tool result"/harness `Post` for it to answer, and no
+        // subject to force one either. A root program that never calls
+        // `tell()` is a deliberately valid "silent no-op" (card.rs's own
+        // words), so completing must not, on its own, manufacture a
+        // reason to prompt again — that would make a silent no-op cost a
+        // second completion it explicitly doesn't owe, and would leave
+        // `Phase::Idle` unreachable after any ordinary `return` (nothing
+        // else in this file ever routes back to it once a run finishes).
+        // Matches `suspend`'s own depth>0 branch precedent exactly:
+        // `shown` still advances, marking this outcome accounted-for so
+        // `needs_prompt`'s crash-recovery clause doesn't spuriously
+        // re-fire for a completion this file just handled synchronously
+        // (that clause is for a reopened log's genuinely stale `shown`,
+        // not for "immediately after I logged this myself"). Idle is the
+        // resting phase; `prompt_if_needed` is the one door back out of
+        // it, firing only for what is left genuinely unaccounted for — a
+        // post that arrived mid-run and this completion could not have
+        // answered.
+        self.shown = self.spine.leaf_id.as_u64();
+        self.phase = Phase::Idle;
+        out.extend(self.prompt_if_needed(tree));
         Ok(out)
     }
 
@@ -1738,7 +1757,7 @@ impl Runner {
         &mut self,
         tree: &mut Tree,
         cause: SuspendCause,
-        mut out: Vec<StepOutput>,
+        out: Vec<StepOutput>,
     ) -> io::Result<Vec<StepOutput>> {
         let Phase::Running(run) = std::mem::replace(&mut self.phase, Phase::Idle) else {
             unreachable!()
@@ -1797,7 +1816,12 @@ impl Runner {
                 // "handler" in the raise/resume sense here, just the
                 // running program parking until its next fuel slice
                 // (rule B). `Pushed` is simply correct.
-                (Cause::Posted { ids }, site, ResumeWith::Continue, Disposition::Pushed)
+                (
+                    Cause::Posted { ids },
+                    site,
+                    ResumeWith::Continue,
+                    Disposition::Pushed,
+                )
             }
         };
 
@@ -1879,7 +1903,15 @@ impl Runner {
     /// job now; this only marks `shown` (so "never prompted twice for
     /// the same thing" holds by construction) and computes the trailing
     /// line.
-    fn render_request(&mut self, tree: &Tree) -> StepOutput {
+    ///
+    /// `pub(crate)` rather than private: `host/mod.rs`'s one-shot
+    /// handler prompt (built when a run suspends into a `Condition` —
+    /// `suspend`'s own doc explains why that file never renders one
+    /// itself) still needs `shown` advanced and the same open-
+    /// questions/presence tail every other request gets, even though the
+    /// rolling document it folds that tail onto is built by calling
+    /// `document` directly rather than through `StepOutput::LlmRequest`.
+    pub(crate) fn render_request(&mut self, tree: &Tree) -> StepOutput {
         // Everything logged so far is about to be shown. This is the one
         // place the mark moves.
         self.shown = self.spine.leaf_id.as_u64();
@@ -2156,7 +2188,10 @@ fn call_label(call: &Call) -> String {
             preview(&serde_json::Value::String(text.clone()))
         ),
         Call::Spawn { name, .. } => format!("spawn({})", name.as_deref().unwrap_or("<unnamed>")),
-        Call::Fork { task, .. } => format!("fork({})", preview(&serde_json::Value::String(task.clone()))),
+        Call::Fork { task, .. } => format!(
+            "fork({})",
+            preview(&serde_json::Value::String(task.clone()))
+        ),
         Call::Invoke { name, args, .. } => format!("{}({})", name, preview(args)),
     }
 }
@@ -2279,6 +2314,7 @@ mod tests {
         LlmTurn {
             source: source.into(),
             thinking: None,
+            truncated: false,
         }
     }
 
@@ -2382,9 +2418,7 @@ mod tests {
         let out = state
             .step(
                 &mut tree,
-                StepInput::LlmResponse(llm_program(
-                    "console.log(\"hi there\"); return 6 * 7;",
-                )),
+                StepInput::LlmResponse(llm_program("console.log(\"hi there\"); return 6 * 7;")),
             )
             .unwrap();
         drain(&mut state, &mut tree, out);
@@ -2475,18 +2509,30 @@ mod tests {
             .unwrap();
         assert!(matches!(&out[..], [StepOutput::Working]));
 
+        // `interrupt()` on a `Running` phase only delivers the notice
+        // (`Working`, per `deliver`'s own rule for a busy branch) — the
+        // program parks at its *next* fuel slice, rule B's job, so this
+        // drains to let that slice actually run. It settles into
+        // `Condition::Posted`, which deliberately produces no
+        // `StepOutput::LlmRequest` of its own (`suspend`'s own doc:
+        // "root programs are rendered; handler programs are not" — a
+        // `Pushed` condition is invisible to the rolling document, and
+        // building the one-shot handler prompt from it is the host's
+        // job); the `Post` this test actually checks is what proves the
+        // interrupt landed.
         let out = state.interrupt(&mut tree).unwrap();
-        let req = expect_request(&out);
-        let _ = req;
-        let posted = state.agent_segment(&tree).iter().rev().find_map(|e| {
-            match &e.payload {
+        drain(&mut state, &mut tree, out);
+        let posted = state
+            .agent_segment(&tree)
+            .iter()
+            .rev()
+            .find_map(|e| match &e.payload {
                 EventPayload::Message(Message::Post {
                     from: Author::Harness,
                     origin,
                 }) => origin.direct().map(|(t, _, _)| t.to_owned()),
                 _ => None,
-            }
-        });
+            });
         assert_eq!(posted.as_deref(), Some(INTERRUPT_NOTICE));
         assert!(
             !INTERRUPT_NOTICE.contains("run_program") && !INTERRUPT_NOTICE.contains("resume()"),
@@ -2523,7 +2569,10 @@ mod tests {
             .expect("a Sends output");
         assert_eq!(sends.len(), 1);
         let EventPayload::Call(Call::Send {
-            to, text, expects_reply, ..
+            to,
+            text,
+            expects_reply,
+            ..
         }) = &tree.events[&sends[0]].payload
         else {
             panic!("expected a Send");
@@ -2565,7 +2614,9 @@ mod tests {
         let out = state
             .step(
                 &mut tree,
-                StepInput::LlmResponse(llm_program("return await fork(\"try a different angle\");")),
+                StepInput::LlmResponse(llm_program(
+                    "return await fork(\"try a different angle\");",
+                )),
             )
             .unwrap();
         let settled = drain(&mut state, &mut tree, out);
@@ -2595,10 +2646,13 @@ mod tests {
             )
             .unwrap();
         drain(&mut state, &mut tree, out);
-        let note = state.agent_segment(&tree).iter().find_map(|e| match &e.payload {
-            EventPayload::Note { text } => Some(text.clone()),
-            _ => None,
-        });
+        let note = state
+            .agent_segment(&tree)
+            .iter()
+            .find_map(|e| match &e.payload {
+                EventPayload::Note { text } => Some(text.clone()),
+                _ => None,
+            });
         assert_eq!(note.as_deref(), Some("figured out the bug is in parsing"));
     }
 
@@ -2659,12 +2713,9 @@ mod tests {
             _ => None,
         });
         assert_eq!(answered, Some((question, json!("the second"))));
-        assert!(
-            state
-                .agent_segment(&tree)
-                .iter()
-                .any(|e| matches!(&e.payload, EventPayload::Answer { question: q, .. } if *q == question))
-        );
+        assert!(state.agent_segment(&tree).iter().any(
+            |e| matches!(&e.payload, EventPayload::Answer { question: q, .. } if *q == question)
+        ));
     }
 
     #[test]
@@ -2675,8 +2726,15 @@ mod tests {
         let question = original.open()[0];
 
         let mut spine = tree.fork(original.spine.leaf_id).unwrap();
-        let fork_root = spine.leaf_id;
-        let _ = &mut spine;
+        // `tree.fork` only anchors a `Spine` at the divergence point — it
+        // does not itself log anything (`Tree::fork`'s own doc: callers
+        // append the actual `Fork` event, `host/mod.rs`'s `cmd_fork` and
+        // `create_fork` both do). Without it, obligations *would* cross,
+        // because nothing ever cleared `open` — so appending it here is
+        // the fix, not a workaround.
+        let fork_root = tree
+            .append(&mut spine, EventPayload::Fork { name: None })
+            .unwrap();
         let mut fork = Runner::with_spine(&tree, tree.spine_at(fork_root));
         assert!(fork.open().is_empty(), "obligations do not cross a Fork");
         fork.kickoff(&mut tree).unwrap();
@@ -2814,6 +2872,20 @@ mod tests {
         assert!(last_report(&child, &tree).contains("9000"));
     }
 
+    /// `Context::input`/`open` bookkeeping only — deliberately not driven
+    /// through `step`/`StepInput::LlmResponse`. A scripted `answer(...)`
+    /// program racing a second `deliver` would run straight into rule B
+    /// (`on_tick`'s "a post logged since the last render suspends the
+    /// run here"): `finish_program` unconditionally re-arms a fresh
+    /// `LlmRequest` after every completion (the trigger rule's own
+    /// crash-recovery clause — "the newest Turn's run has an outcome
+    /// that has not been shown yet" — fires for a run's *own* outcome
+    /// just as much as for a crash), so the branch never actually
+    /// returns to `Phase::Idle` on its own and a second `deliver` cannot
+    /// count on a fresh render to pick it up. None of that is what this
+    /// test is about — it is about `open`'s ordering and `input()`
+    /// reading its head — so it appends the `Answer` directly, the same
+    /// event `dispatch_calls`'s `TOOL_ANSWER` arm would log.
     #[test]
     fn input_moves_to_the_next_open_post_as_each_is_answered() {
         let (mut tree, mut state) = setup();
@@ -2841,18 +2913,24 @@ mod tests {
             .unwrap();
         assert_eq!(state.spine.context().input(&tree), json!({ "n": 1 }));
 
-        let src = format!("await answer({}, \"q\", \"ok\"); return 1;", first.as_u64());
-        let out = state
-            .step(&mut tree, StepInput::LlmResponse(llm_program(&src)))
-            .unwrap();
-        drain(&mut state, &mut tree, out);
+        tree.append(
+            &mut state.spine,
+            EventPayload::Answer {
+                question: first,
+                value: json!("ok"),
+            },
+        )
+        .unwrap();
         assert_eq!(state.spine.context().input(&tree), json!({ "n": 2 }));
 
-        let src = format!("await answer({}, \"q\", \"ok\"); return 1;", second.as_u64());
-        let out = state
-            .step(&mut tree, StepInput::LlmResponse(llm_program(&src)))
-            .unwrap();
-        drain(&mut state, &mut tree, out);
+        tree.append(
+            &mut state.spine,
+            EventPayload::Answer {
+                question: second,
+                value: json!("ok"),
+            },
+        )
+        .unwrap();
         assert_eq!(state.spine.context().input(&tree), serde_json::Value::Null);
     }
 

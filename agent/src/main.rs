@@ -1,7 +1,11 @@
 mod card;
 mod compaction;
 mod document;
-mod eval;
+// `eval/` still imports the POC's `runner`/`transport`/`document`/`fence`/
+// `card` modules, which no longer exist -- Pass C rewires the harness onto
+// the real `Session` (`23_ONE_AGENT.md`, Pass C). Cut from the build until
+// then, same treatment as `debug/` below.
+// mod eval;
 mod host;
 mod machine;
 mod report;
@@ -38,29 +42,16 @@ const USAGE: &str = "usage: agent <command>
                                     and print its id
     --name <text>                   name the branch (with --fork), else rename
                                     the conversation branch
-  eval [--experimental]             the acceptance harness (agent/src/eval/,
-                                    23_ONE_AGENT.md Pass C): runs a fixed
-                                    task set live, end to end, against a real
-                                    Session, and reports median program
-                                    length, round-trips, and success per
-                                    task. --experimental swaps in
-                                    eval::tasks::EXPERIMENTAL (targeted,
-                                    one-off validation tasks) instead of the
-                                    stable eval::tasks::ALL. Needs
-                                    DEEPSEEK_API_KEY. Not part of
-                                    `cargo test` — talks to a real model.
-
 The TUI is cut out of the build for Passes A-C (23_ONE_AGENT.md); the
 standalone `debug <file.js>` subcommand and attached-TUI `session` return
-in Pass D.";
+in Pass D. `eval` (agent/src/eval/, the acceptance harness) is cut the
+same way for Passes A-B — it still imports the deleted POC's
+`runner`/`transport`/`document`/`fence`/`card` modules — and returns once
+Pass C rewires it onto a real `Session`.";
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
-        Some("eval") => {
-            let experimental = args.get(2).map(String::as_str) == Some("--experimental");
-            run_eval(experimental);
-        }
         Some("session") => {
             let mut headless = false;
             let mut real = false;
@@ -477,210 +468,12 @@ fn print_session_event(event: &SessionEvent) {
                 EventPayload::Console { lines } => {
                     println!("{head} console: {} lines", lines.len());
                 }
+                EventPayload::Note { text } => println!("{head} note: {text}"),
+                EventPayload::Compacted { of, label, .. } => {
+                    println!("{head} compacted #{}: {label}", of.as_u64());
+                }
             }
         }
-    }
-}
-
-/// The acceptance harness's CLI surface (`23_ONE_AGENT.md` Pass C;
-/// `agent/src/eval/`). Runs `tasks` live and end to end, reporting the
-/// three numbers Part H originally asked for — median program length,
-/// round-trips per task, and success — plus the handler-stack usage
-/// counters added since. `label` is just what the header line calls the
-/// run; `run_eval` picks `tasks`/`label` from `--experimental`.
-///
-/// This is the direct successor to the POC's `codemode-harness` /
-/// `codemode-experiment` / `codemode-probe`, collapsed into one `agent
-/// eval` command per this phase's own table ("What is actually
-/// changing"). The reporting body below is carried over unchanged from
-/// `codemode_harness_over` — only the module paths move, from the
-/// deleted `codemode::` crate onto `crate::eval::` and `crate::card`.
-///
-/// **One known gap, left for Pass C, not fixed here.** This step's job
-/// is the CLI surface, not `eval`'s internals (23_ONE_AGENT.md A6: "Pass
-/// C rewires the harness internals onto the real Session... you are
-/// doing the CLI surface only"). `eval::harness::run_task`'s `endpoint`
-/// parameter is still typed `super::transport::Endpoint` from the POC —
-/// but `transport.rs` no longer exists anywhere in the tree (its
-/// streaming/`Cancel` moved into `host/deepseek.rs`; see the "Where each
-/// POC file goes" table), so `crate::eval::transport::Endpoint` below
-/// does not actually resolve. Pass C's rewrite onto a real `Session`
-/// over `SessionCommand`/`SessionEvent` is what resolves this — the
-/// literal old shape is kept here rather than guessed at, so the gap is
-/// visible at this one call site instead of papered over.
-fn run_eval_over(tasks: &[crate::eval::tasks::Task], label: &str) {
-    use crate::eval::harness;
-
-    let api_key = std::env::var("DEEPSEEK_API_KEY")
-        .expect("DEEPSEEK_API_KEY must be set (this harness reads it directly)");
-    let base_url = std::env::var("DEEPSEEK_BASE_URL")
-        .unwrap_or_else(|_| "https://opencode.ai/zen/go/v1".to_owned());
-    let model = std::env::var("DEEPSEEK_MODEL").unwrap_or_else(|_| "deepseek-v4-flash".to_owned());
-
-    let mut all_lengths: Vec<usize> = Vec::new();
-    let mut all_round_trips: Vec<usize> = Vec::new();
-    let mut successes = 0usize;
-    let mut total_raises = 0usize;
-    let mut total_traps = 0usize;
-    let mut total_resumes = 0usize;
-    let mut total_handovers = 0usize;
-    let mut total_abandons = 0usize;
-    let mut total_fork_attempts = 0usize;
-    let mut total_spawn_attempts = 0usize;
-    let mut total_artifact_attempts = 0usize;
-    let mut total_spawn_children = 0usize;
-
-    println!("=== {label}: {} tasks, model {model} ===\n", tasks.len());
-
-    for task in tasks {
-        // A fresh id per task, not one for the whole harness run:
-        // `Endpoint::session_id`'s own doc is explicit that it's for
-        // "one conversation" and "a caller making unrelated one-off
-        // calls can mint a fresh one each time" — five unrelated fixed
-        // tasks sharing one session_id is exactly that unrelated-calls
-        // case. Live evidence this was not cosmetic (2026-09-14):
-        // trivial-question's completion opened by treating "what is
-        // 12 + 30?" as a reply to judgment-in-the-middle's own earlier
-        // "what should retries be?" question and re-litigating
-        // ops/config.json — content this run's own document never
-        // contained, meaning the endpoint's session-keyed routing/cache
-        // affinity was carrying real context across tasks that share
-        // no history in the log this harness actually renders. Each
-        // task's own multi-round conversation (raise -> handler ->
-        // resume, abandon -> replacement) still correctly shares one id
-        // for its own duration, since this is minted once per task, not
-        // once per completion.
-        let session_id = uuid::Uuid::new_v4().to_string();
-        let endpoint = crate::eval::transport::Endpoint {
-            base_url: &base_url,
-            api_key: &api_key,
-            session_id: &session_id,
-        };
-        let report = harness::run_task(task, crate::card::CARD, endpoint, &model, 32_000);
-
-        let status = match &report.success {
-            Ok(()) => "PASS",
-            Err(_) => "FAIL",
-        };
-        println!(
-            "[{status}] {} — {} round-trip(s), program lengths (statements): {:?}",
-            report.task_name, report.round_trips, report.program_lengths
-        );
-        println!(
-            "       raises: {} (of which {} a trap, {} deliberate) — resume {}, of which \
-             handover {}; abandon {} — fork/spawn/artifact attempts: {}/{}/{} \
-             (spawn ran {} real child(ren))",
-            report.raise_count,
-            report.trap_count,
-            report.raise_count.saturating_sub(report.trap_count),
-            report.resume_count,
-            report.handover_count,
-            report.abandon_count,
-            report.fork_attempts,
-            report.spawn_attempts,
-            report.artifact_attempts,
-            report.spawn_children,
-        );
-        if let Err(reason) = &report.success {
-            println!("       reason: {reason}");
-        }
-        if !report.appended.is_empty() {
-            println!("       append_history():");
-            for value in &report.appended {
-                println!("         {value}");
-            }
-        }
-        for (i, program) in report.programs.iter().enumerate() {
-            println!("       --- round {} program ---", i + 1);
-            for line in program.lines() {
-                println!("       {line}");
-            }
-        }
-        println!();
-
-        if report.success.is_ok() {
-            successes += 1;
-        }
-        all_round_trips.push(report.round_trips);
-        all_lengths.extend(report.program_lengths);
-        total_raises += report.raise_count;
-        total_traps += report.trap_count;
-        total_resumes += report.resume_count;
-        total_handovers += report.handover_count;
-        total_abandons += report.abandon_count;
-        total_fork_attempts += report.fork_attempts;
-        total_spawn_attempts += report.spawn_attempts;
-        total_artifact_attempts += report.artifact_attempts;
-        total_spawn_children += report.spawn_children;
-    }
-
-    let median_len = harness::median(&all_lengths);
-    let avg_round_trips = if all_round_trips.is_empty() {
-        0.0
-    } else {
-        all_round_trips.iter().sum::<usize>() as f64 / all_round_trips.len() as f64
-    };
-
-    println!("\n=== aggregate ===");
-    println!(
-        "task success: {successes}/{} ({:.0}%)",
-        tasks.len(),
-        100.0 * successes as f64 / tasks.len() as f64
-    );
-    println!("mean round-trips per task: {avg_round_trips:.1}");
-    match median_len {
-        Some(m) => println!("median program length (statements): {m}"),
-        None => println!("median program length (statements): n/a (no completions produced)"),
-    }
-
-    // Not one of Part H's original three — added to answer whether
-    // Part D's handler stack is load-bearing for real tasks, or
-    // carrying a case (mid-program resume) that seldom fires against
-    // one that's mostly a handover (see `harness::TaskReport`'s doc).
-    println!("\n=== handler-stack usage (not one of Part H's three) ===");
-    println!("total raises: {total_raises}");
-    if total_raises > 0 {
-        let deliberate_raises = total_raises.saturating_sub(total_traps);
-        println!(
-            "  of which trap: {total_traps} ({:.0}%), deliberate raise(): {deliberate_raises} ({:.0}%) — \
-             a check gating on \"was there a deliberate decision\" must use the latter, \
-             not total_raises (see harness::TaskReport::trap_count's doc)",
-            100.0 * total_traps as f64 / total_raises as f64,
-            100.0 * deliberate_raises as f64 / total_raises as f64,
-        );
-        println!(
-            "  resume: {total_resumes} ({:.0}% of raises), of which handover: {total_handovers} ({:.0}% of resumes)",
-            100.0 * total_resumes as f64 / total_raises as f64,
-            if total_resumes > 0 {
-                100.0 * total_handovers as f64 / total_resumes as f64
-            } else {
-                0.0
-            },
-        );
-        println!(
-            "  abandon: {total_abandons} ({:.0}% of raises)",
-            100.0 * total_abandons as f64 / total_raises as f64
-        );
-    }
-    println!(
-        "fork/artifact call attempts (still hard-error stubs — reach, not success): \
-         {total_fork_attempts}/{total_artifact_attempts}"
-    );
-    println!(
-        "spawn: {total_spawn_attempts} attempt(s), {total_spawn_children} ran a real child \
-         to completion — backed for real, not a stub"
-    );
-}
-
-/// `agent eval` / `agent eval --experimental`: `crate::eval::tasks::ALL`
-/// by default, or `crate::eval::tasks::EXPERIMENTAL` (targeted, one-off
-/// validation tasks that don't belong in the stable regression set) when
-/// `--experimental` is given.
-fn run_eval(experimental: bool) {
-    if experimental {
-        run_eval_over(crate::eval::tasks::EXPERIMENTAL, "experimental");
-    } else {
-        run_eval_over(crate::eval::tasks::ALL, "eval");
     }
 }
 

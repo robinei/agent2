@@ -27,9 +27,22 @@
 //! `23_ONE_AGENT.md`: a summary blob is opaque and cannot be asserted
 //! on; a proposed batch of `Compacted` events can be, before it ever
 //! touches the log.
+//!
+//! **Not wired into `dispatch_calls` yet — deliberately, not by
+//! oversight.** `machine.rs`'s `TOOL_REMOVE_HISTORY`/`TOOL_REWRITE_HISTORY`
+//! arm rejects both calls with an explicit message ("compaction is not
+//! wired into this session yet... leaves remove_history/rewrite_history
+//! to a later pass") rather than guessing at this module's API while it
+//! was still being rewritten in the same phase. That later pass has no
+//! caller for this module's public surface yet, so it trips `dead_code`
+//! under `-D warnings`; `#![allow(dead_code)]` here is the Pass B
+//! judgment call this module falls under (23_ONE_AGENT.md Pass B: "its
+//! caller is yet to be written"), not a blanket exemption — every item
+//! below still has its own doc and its own tests.
+#![allow(dead_code)]
 
 use crate::document::{self, label_of};
-use crate::tree::{CompactedView, Tree};
+use crate::tree::CompactedView;
 use crate::types::*;
 
 /// A compaction handler's request via `remove_history(id, label)` or
@@ -196,7 +209,11 @@ pub fn compact(
         return Err(CompactionError::StillOverThreshold { size, threshold });
     }
 
-    Ok(ops.iter().cloned().map(CompactionOp::into_payload).collect())
+    Ok(ops
+        .iter()
+        .cloned()
+        .map(CompactionOp::into_payload)
+        .collect())
 }
 
 /// Total content bytes across a rendered [`document::Document`] — a
@@ -231,9 +248,7 @@ mod tests {
     /// makes the size checks exercisable.
     fn sample_branch() -> (Tree, Spine, EventId, EventId) {
         let mut tree = Tree::new(None);
-        let mut spine = tree
-            .start_agent(None, None, "root", None, "CARD")
-            .unwrap();
+        let mut spine = tree.start_agent(None, None, "root", None, "CARD").unwrap();
         let agent = spine.leaf_id;
         tree.append(
             &mut spine,
@@ -257,8 +272,13 @@ mod tests {
                 }),
             )
             .unwrap();
-        tree.append(&mut spine, EventPayload::Return { value: serde_json::json!(1) })
-            .unwrap();
+        tree.append(
+            &mut spine,
+            EventPayload::Return {
+                value: serde_json::json!(1),
+            },
+        )
+        .unwrap();
         let note = tree
             .append(
                 &mut spine,

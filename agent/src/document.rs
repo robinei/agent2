@@ -27,7 +27,7 @@
 
 use std::collections::HashMap;
 
-use crate::tree::{CompactedView, Tree, depth_after};
+use crate::tree::{CompactedView, depth_after};
 use crate::types::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -207,6 +207,7 @@ fn compacted_program_comment(id: EventId, shadow: &CompactedView) -> String {
 /// originally was.
 fn pending_line(
     tree: &Tree,
+    leaf: EventId,
     event: &Event,
     compacted: &HashMap<EventId, CompactedView>,
 ) -> Option<String> {
@@ -233,13 +234,11 @@ fn pending_line(
             escape_untrusted(text)
         )),
         // Renders to chat as a harness line (`types.rs`'s own doc
-        // comment on `Fork`) — enough to tell the model a divergent
-        // branch started here, without inventing anything richer than
-        // the log actually records.
-        EventPayload::Fork { name } => Some(match name {
-            Some(n) => format!("[{}] forked as \"{n}\"", event.id.as_u64()),
-            None => format!("[{}] forked", event.id.as_u64()),
-        }),
+        // comment on `Fork`) — `report::render_fork` already carries the
+        // real logic (settled vs. mid-program fork point, which branch
+        // the pre-fork questions stayed with), so this calls into it
+        // rather than re-deriving a second, thinner rendering.
+        EventPayload::Fork { .. } => Some(crate::report::render_fork(tree, leaf, event.id)),
         // Everything else — `Call`, `Result`, `Console`, `Answer`,
         // `Rename`, `Agent`, and a `Compacted` event encountered at its
         // *own* log position (it shadows its target's row, not a row of
@@ -307,7 +306,14 @@ pub fn render(tree: &Tree, spine: &Spine, budget: usize) -> Document {
         .enclosing_agent(leaf)
         .expect("a spine's leaf always has an enclosing Agent — spine_at() built it from one");
     let card = &spine.context().system;
-    render_with_lookup(tree, agent, leaf, card, budget, &tree.compacted_lookup(leaf))
+    render_with_lookup(
+        tree,
+        agent,
+        leaf,
+        card,
+        budget,
+        &tree.compacted_lookup(leaf),
+    )
 }
 
 /// [`render`], but against an explicit compaction lookup instead of one
@@ -368,7 +374,7 @@ pub(crate) fn render_with_lookup(
                     }
                 }
                 _ => {
-                    if let Some(line) = pending_line(tree, ev, compacted) {
+                    if let Some(line) = pending_line(tree, leaf, ev, compacted) {
                         pending.push(line);
                     }
                 }
@@ -513,14 +519,17 @@ mod tests {
     #[test]
     fn a_completed_program_renders_card_user_assistant_user() {
         let mut tree = Tree::new(None);
-        let mut spine = tree
-            .start_agent(None, None, "root", None, "CARD")
-            .unwrap();
+        let mut spine = tree.start_agent(None, None, "root", None, "CARD").unwrap();
         tree.append(&mut spine, user_post("hello")).unwrap();
         tree.append(&mut spine, turn("tell('hi'); return 1;"))
             .unwrap();
-        tree.append(&mut spine, EventPayload::Return { value: serde_json::json!(1) })
-            .unwrap();
+        tree.append(
+            &mut spine,
+            EventPayload::Return {
+                value: serde_json::json!(1),
+            },
+        )
+        .unwrap();
 
         let doc = render(&tree, &spine, 64 * 1024);
         assert_eq!(doc.messages.len(), 4);
@@ -541,9 +550,7 @@ mod tests {
     #[test]
     fn a_pushed_deliberation_never_enters_the_document() {
         let mut tree = Tree::new(None);
-        let mut spine = tree
-            .start_agent(None, None, "root", None, "CARD")
-            .unwrap();
+        let mut spine = tree.start_agent(None, None, "root", None, "CARD").unwrap();
         tree.append(&mut spine, user_post("go")).unwrap();
         tree.append(&mut spine, turn("raise('x');")).unwrap();
         tree.append(
@@ -561,11 +568,21 @@ mod tests {
         .unwrap();
         // The handler: its own Turn and Return, both at depth 1.
         tree.append(&mut spine, turn("return resume(1);")).unwrap();
-        tree.append(&mut spine, EventPayload::Return { value: serde_json::json!({}) })
-            .unwrap();
+        tree.append(
+            &mut spine,
+            EventPayload::Return {
+                value: serde_json::json!({}),
+            },
+        )
+        .unwrap();
         // Back at depth 0: the raising program resumes and returns.
-        tree.append(&mut spine, EventPayload::Return { value: serde_json::json!(2) })
-            .unwrap();
+        tree.append(
+            &mut spine,
+            EventPayload::Return {
+                value: serde_json::json!(2),
+            },
+        )
+        .unwrap();
 
         let doc = render(&tree, &spine, 64 * 1024);
         // card, user("go"), assistant("raise('x');"), user(report) —
@@ -573,9 +590,7 @@ mod tests {
         assert_eq!(doc.messages.len(), 4);
         assert_eq!(doc.messages[2].content, "raise('x');");
         assert!(
-            !doc.messages
-                .iter()
-                .any(|m| m.content.contains("resume(1)")),
+            !doc.messages.iter().any(|m| m.content.contains("resume(1)")),
             "the handler's own deliberation must never reach this document: {doc:?}"
         );
     }
@@ -587,13 +602,16 @@ mod tests {
     #[test]
     fn a_compacted_program_renders_as_a_comment_only_assistant_turn() {
         let mut tree = Tree::new(None);
-        let mut spine = tree
-            .start_agent(None, None, "root", None, "CARD")
-            .unwrap();
+        let mut spine = tree.start_agent(None, None, "root", None, "CARD").unwrap();
         tree.append(&mut spine, user_post("go")).unwrap();
         let program = tree.append(&mut spine, turn("1 + 1;")).unwrap();
-        tree.append(&mut spine, EventPayload::Return { value: serde_json::json!(2) })
-            .unwrap();
+        tree.append(
+            &mut spine,
+            EventPayload::Return {
+                value: serde_json::json!(2),
+            },
+        )
+        .unwrap();
         tree.append(
             &mut spine,
             EventPayload::Compacted {
@@ -608,7 +626,11 @@ mod tests {
         let compacted_turn = &doc.messages[2];
         assert_eq!(compacted_turn.role, ChatRole::Assistant);
         assert!(compacted_turn.content.starts_with("//:"));
-        assert!(compacted_turn.content.contains(&program.as_u64().to_string()));
+        assert!(
+            compacted_turn
+                .content
+                .contains(&program.as_u64().to_string())
+        );
         interp::compile(&compacted_turn.content)
             .expect("a compacted program's turn is still valid JavaScript");
     }

@@ -30,7 +30,7 @@ impl Event {
 ///
 /// Each variant documents its parent rule, which spine it lands on, and
 /// whether it renders to chat.
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub enum EventPayload {
     /// Chat event. Parent: the previous event on the owning agent's
     /// spine. Renders to chat: yes — a `Turn` is the assistant message,
@@ -318,7 +318,7 @@ impl Default for Disposition {
 
 /// The rendered kinds — one per API role, chosen by the **variant**,
 /// never by a flag.
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub enum Message {
     /// A message delivered *here* (user role). Parent: the previous event
     /// on the receiving branch's spine.
@@ -371,7 +371,7 @@ pub enum Author {
 /// The in-memory `Context` is the other side of that trade: `replay_event`
 /// resolves `Sent` through the `Tree` and stores the resolved body inline,
 /// so only the *log* is free of copies.
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub enum Origin {
     /// The `Send` that dispatched this delivery; the body is read there.
     /// This is also what routes an answer back to the sender's branch.
