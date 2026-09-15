@@ -1,13 +1,20 @@
-// New in phase 20 (`docs/20_CODE_MODE.md`): additive, not yet wired
-// into the step loop or the tool surface — see the module doc.
-#[allow(dead_code)]
-mod codemode;
-mod debug;
+mod card;
+mod compaction;
+mod document;
+mod eval;
+mod fence;
 mod host;
 mod machine;
 mod report;
 mod tree;
 mod types;
+
+// The TUI is cut out of the build for Passes A-C (`23_ONE_AGENT.md`,
+// "The TUI is deferred, not kept"). It is 6.8k lines rendering a
+// vocabulary that is still in motion; Pass D restores it, rebuilt on
+// one-row-per-event. Nothing about it is kept alive in the meantime --
+// this is deferral of a UI, not a fallback path.
+// mod debug;
 
 pub use machine::*;
 pub use types::*;

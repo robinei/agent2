@@ -572,7 +572,7 @@ impl super::Compiler {
                     self.emit(Instr::Raise(name, 0), span);
                 }
             }
-            "say" | "ask" | "answer" | "spawn" | "fork" | "append_history" | "artifact"
+            "tell" | "ask" | "answer" | "spawn" | "fork" | "append_history" | "artifact"
             | "remove_history" | "rewrite_history" | "list_agents" => {
                 // The closed, harness-defined vocabulary (phase 20 doc,
                 // `docs/20_CODE_MODE.md` Step C1) — a fixed global

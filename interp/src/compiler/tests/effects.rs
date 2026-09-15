@@ -225,7 +225,7 @@ fn raise_non_literal_name_is_compile_error() {
 // ── phase 20 harness vocabulary: bare-global verbs + decision values
 // (`docs/20_CODE_MODE.md` Step C1/D2) ─────────────────────────────
 //
-// `say`/`ask`/`answer`/`spawn`/`fork`/`append_history`/`artifact` are
+// `tell`/`ask`/`answer`/`spawn`/`fork`/`append_history`/`artifact` are
 // a fixed, closed surface — bare-global, `Invoke`-based, exactly like
 // `tools.*` above but without the namespace, since (unlike `tools.*`)
 // this set never varies per agent. `resume`/`abandon` are pure
@@ -238,7 +238,7 @@ fn awaited_harness_verb_calls_yield_pending_effect() {
     // One representative per verb: each is bare (no `tools.` prefix)
     // and produces the same `Invoke` effect `tools.*` does.
     for (call, expected_name, expected_args) in [
-        ("say(\"hi\")", "say", vec![Value::String("hi".into())]),
+        ("tell(\"hi\")", "tell", vec![Value::String("hi".into())]),
         (
             "ask(\"who\", \"q\")",
             "ask",
@@ -294,13 +294,13 @@ fn awaited_harness_verb_calls_yield_pending_effect() {
 #[test]
 fn unawaited_harness_verb_call_is_fire_and_forget() {
     // Same fire-and-forget shape as an unawaited `tools.*` call.
-    let prog = compile("say(\"hi\"); return 1;").expect("compiles");
+    let prog = compile("tell(\"hi\"); return 1;").expect("compiles");
     let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
     match vm.step(u64::MAX).unwrap() {
         StepResult::Done { value, unstarted } => {
             assert_eq!(value, Value::PosInt(1));
             assert_eq!(unstarted.len(), 1);
-            assert_eq!(unstarted[0].name, "say");
+            assert_eq!(unstarted[0].name, "tell");
         }
         other => panic!("expected Done, got {other:?}"),
     }
