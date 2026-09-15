@@ -5,8 +5,10 @@
 //! only instrument that answers the question this project actually
 //! asks — what a real model does with a real card — and no scripted LLM
 //! can stand in for that. Pass C re-points it at the real `Session`
-//! over `SessionCommand`/`SessionEvent`; the tasks and their check
-//! functions carry over unchanged.
+//! over `SessionCommand`/`SessionEvent` (`tasks::drive`); the tasks and
+//! their check functions carry over, gating on the same properties they
+//! always did, reading them off `tasks::Outcome` — a fold over the real
+//! event log — instead of the POC's hand-threaded `RunOutcome`.
 //!
 //! The discipline the checks hold to, and must keep holding: **a check
 //! gates on the safety or correctness property, never on which verb

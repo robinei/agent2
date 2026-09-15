@@ -1,66 +1,24 @@
-//! Part H's regression harness, live: run `tasks::ALL` against a real
-//! `LiveSource` and report the three numbers Part H asks for — median
-//! program length (statements), LLM round-trips per user request, and
-//! task success — per task, plus the aggregate. Everything underneath
-//! (`runner::run`, `tasks::Task`, `tasks::RecordingTools`) is already
-//! unit-tested on scripted completions with no network; this module's
-//! only job is wiring a real `LiveSource` in and aggregating, so it
-//! has no tests of its own beyond what type-checks — a live model's
-//! actual behavior is not the thing to script (Part H's own header
-//! note: "Part G2's harness is not a test... a separate opt-in
-//! binary, never part of `cargo test`" — same reasoning applies here).
+//! The acceptance harness, live: run `tasks::ALL` (`+EXPERIMENTAL` on
+//! `--experimental`) against a real `host::DeepSeekClient` and print the
+//! numbers `docs/23_ONE_AGENT.md`'s Pass C asks for — round-trips,
+//! program length (statements), task success — per task, plus the
+//! aggregate. Everything underneath (`tasks::drive`, `tasks::Task`,
+//! `tasks::RecordingTools`) is already unit-tested on scripted
+//! completions with no network; this module's only job is wiring a live
+//! `DeepSeekClient` in and printing, so it has no tests of its own
+//! beyond what type-checks — a live model's actual behavior is not the
+//! thing to script (see `tasks.rs`'s own header).
+//!
+//! Reached through `agent eval [--experimental]`, never `cargo test`.
 
-use super::runner::{self, CompletionSource, LiveSource, RunConfig};
-use super::tasks::Task;
-use super::transport::Completion;
-use super::{document::Document, fence};
+use super::tasks::{Outcome, Task};
+use crate::host;
 
-/// Wraps a live source to capture what Part H actually wants counted
-/// *and* what it says is the real instrument: the statement length of
-/// every program the model produced during the run, in order, and the
-/// program's own extracted source — aggregate numbers alone don't
-/// explain a failure, reading the program does. A thin pass-through
-/// otherwise — `run`'s own fence-stripping and truncation handling are
-/// untouched, this just mirrors that same extraction on the side to
-/// capture it.
-struct RecordingSource<'a> {
-    inner: LiveSource<'a>,
-    lengths: Vec<usize>,
-    programs: Vec<String>,
-}
-
-impl CompletionSource for RecordingSource<'_> {
-    fn complete(&mut self, doc: &Document) -> Result<Completion, String> {
-        let completion = self.inner.complete(doc)?;
-        if !completion.was_truncated() && !completion.text.trim().is_empty() {
-            let source = fence::extract(&completion.text);
-            self.lengths.push(interp::count_statements(&source));
-            self.programs.push(source);
-        }
-        Ok(completion)
-    }
-}
-
-/// One task's result: whether its own success condition held, the
-/// number of completions the run actually needed, the length
-/// (statements) of each program along the way, and the programs
-/// themselves — Part H's "reading transcripts is the real instrument"
-/// bullet needs the text, not just the count.
-///
-/// `raise_count`/`resume_count`/`handover_count`/`abandon_count` and
-/// the `*_attempts` fields answer the question Part H's "no more,
-/// until one fails to answer a question" deliberately deferred: is the
-/// handler stack (Part D) actually exercised by real tasks, or is
-/// `raise()` rare enough — and its resumes overwhelmingly tail — that
-/// most of that machinery is carrying a case that seldom fires? See
-/// `runner::RunOutcome`'s doc for what each field actually measures
-/// (`handover_count` in particular is a runtime proxy, not a
-/// compile-time tail check). `fork()` is still an honest-error stub
-/// (its current zero-arg signature gives a child no task, and no live
-/// trace has ever attempted it); `spawn()` is backed for real —
-/// `spawn_children` is real reach, `fork_attempts`/`artifact_attempts`
-/// still count reach only. All fields default to `0` when a run errors
-/// before producing an outcome (`RunError` carries no partial counts).
+/// One task's result: whether its own success condition held, plus
+/// every number [`super::tasks::Outcome`] folded from the run. Nothing
+/// here is stored independently of that fold — see `tasks.rs`'s own
+/// header for why a hand-threaded counter would defeat the point of
+/// this harness.
 pub struct TaskReport {
     pub task_name: &'static str,
     pub success: Result<(), String>,
@@ -68,113 +26,44 @@ pub struct TaskReport {
     pub program_lengths: Vec<usize>,
     pub programs: Vec<String>,
     pub raise_count: usize,
-    /// Of `raise_count`, how many were a trapped runtime error rather
-    /// than a deliberate `raise()` call — see `runner::RunOutcome::
-    /// trap_count`'s doc for why a check gating on "was there a
-    /// deliberate decision point" must use `raise_count - trap_count`,
-    /// not `raise_count` alone.
     pub trap_count: usize,
     pub resume_count: usize,
-    pub handover_count: usize,
     pub abandon_count: usize,
-    pub fork_attempts: usize,
-    pub spawn_attempts: usize,
-    pub artifact_attempts: usize,
-    /// How many `spawn()` attempts actually ran a real child to
-    /// completion — see `runner::RunOutcome::spawn_children`'s doc on
-    /// why this is scoped to the task's own root run, not aggregated
-    /// across however deep a spawn chain went.
     pub spawn_children: usize,
-    /// Every `append_history(value)` call, verbatim — never printed by
-    /// `codemode-harness` before this field existed, despite
-    /// `runner::RunOutcome` capturing it the whole time. Purely
-    /// observational: no check gates on this being non-empty, the same
-    /// discipline `ask`/`raise` and `resume`/`abandon` already use —
-    /// this is what actually lets "did the model reach for it" be
-    /// read back out of a live run instead of only being visible to
-    /// the task's own check function.
-    pub appended: Vec<serde_json::Value>,
+    pub appended: Vec<String>,
+    pub errors: Vec<String>,
 }
 
-/// Run one task live. `card` is the system prompt under test — passed
-/// in, not read from `codemode::card::CARD` internally, so tuning runs
-/// (Part H: "tune, and record what moved what") can pass a variant
-/// without this module knowing anything changed.
-pub fn run_task(
-    task: &Task,
-    card: &str,
-    endpoint: super::transport::Endpoint<'_>,
-    model: &str,
-    max_tokens: u32,
-) -> TaskReport {
-    // Step C2: "the names and signatures are card surface" — a real
-    // agent's card already bakes in its own configured tools; this
-    // harness has one shared base card, so a task's tool manifest is
-    // appended per run rather than duplicated into `codemode::card`
-    // itself, which stays the harness-vocabulary-only base every task
-    // shares (Step C4).
-    let card = if task.tool_manifest.is_empty() {
-        card.to_owned()
-    } else {
-        format!("{card}\n\n{}", task.tool_manifest)
-    };
-    let card = card.as_str();
-
-    let tools = (task.tools)();
-    let mut source = RecordingSource {
-        inner: LiveSource {
-            endpoint,
-            model,
-            max_tokens,
-        },
-        lengths: Vec::new(),
-        programs: Vec::new(),
-    };
-    let run_config = RunConfig {
-        exemplars: super::card::SEED_EXEMPLARS,
-        ..RunConfig::default()
-    };
-    match runner::run(card, task.user_message, &tools, &mut source, &run_config) {
-        Ok(outcome) => TaskReport {
+impl TaskReport {
+    fn from_outcome(task: &Task, outcome: Outcome, success: Result<(), String>) -> Self {
+        TaskReport {
             task_name: task.name,
-            success: (task.check)(&outcome, &tools),
-            round_trips: outcome.completions_used,
-            program_lengths: source.lengths,
-            programs: source.programs,
+            success,
+            round_trips: outcome.round_trips,
+            program_lengths: outcome.program_lengths,
+            programs: outcome.programs,
             raise_count: outcome.raise_count,
             trap_count: outcome.trap_count,
             resume_count: outcome.resume_count,
-            handover_count: outcome.handover_count,
             abandon_count: outcome.abandon_count,
-            fork_attempts: outcome.fork_attempts,
-            spawn_attempts: outcome.spawn_attempts,
-            artifact_attempts: outcome.artifact_attempts,
             spawn_children: outcome.spawn_children,
             appended: outcome.appended,
-        },
-        Err(e) => TaskReport {
-            task_name: task.name,
-            success: Err(format!("run did not complete: {e:?}")),
-            round_trips: source.lengths.len(),
-            program_lengths: source.lengths,
-            programs: source.programs,
-            raise_count: 0,
-            trap_count: 0,
-            resume_count: 0,
-            handover_count: 0,
-            abandon_count: 0,
-            fork_attempts: 0,
-            spawn_attempts: 0,
-            artifact_attempts: 0,
-            spawn_children: 0,
-            appended: Vec::new(),
-        },
+            errors: outcome.errors,
+        }
     }
 }
 
-/// The middle of a sorted `Vec<usize>` — `None` on an empty run (a
-/// task that made zero completions, which is itself worth surfacing
-/// rather than reporting a fabricated median).
+/// Run one task live against `llm`.
+pub fn run_task(task: &Task, llm: Box<dyn host::LlmClient>) -> TaskReport {
+    let tools = (task.tools)();
+    let outcome = super::tasks::drive(task, tools.clone(), llm);
+    let success = (task.check)(&outcome, &tools);
+    TaskReport::from_outcome(task, outcome, success)
+}
+
+/// The middle of a sorted `Vec<usize>` — `None` on an empty run (a task
+/// that made zero completions, which is itself worth surfacing rather
+/// than reporting a fabricated median).
 pub fn median(values: &[usize]) -> Option<f64> {
     if values.is_empty() {
         return None;
@@ -187,6 +76,80 @@ pub fn median(values: &[usize]) -> Option<f64> {
     } else {
         Some(sorted[mid] as f64)
     }
+}
+
+/// `agent eval [--experimental]`'s whole job: run every fixed task (plus
+/// the experimental set when asked), print each one's numbers as it
+/// finishes, and close with the aggregate Pass C's bar is stated
+/// against (`docs/23_ONE_AGENT.md`, C2).
+pub fn run_cli(experimental: bool) -> Result<(), String> {
+    let mut tasks: Vec<&Task> = super::tasks::ALL.iter().collect();
+    if experimental {
+        tasks.extend(super::tasks::EXPERIMENTAL.iter());
+    }
+
+    let mut reports = Vec::with_capacity(tasks.len());
+    for task in &tasks {
+        eprintln!("=== {} ===", task.name);
+        let llm: Box<dyn host::LlmClient> = Box::new(host::DeepSeekClient::from_env()?);
+        let report = run_task(task, llm);
+        print_report(&report);
+        reports.push(report);
+    }
+    print_summary(&reports);
+    Ok(())
+}
+
+fn print_report(r: &TaskReport) {
+    match &r.success {
+        Ok(()) => println!("[{}] PASS", r.task_name),
+        Err(e) => println!("[{}] FAIL: {e}", r.task_name),
+    }
+    println!("  round-trips: {}", r.round_trips);
+    println!("  program lengths (statements): {:?}", r.program_lengths);
+    println!(
+        "  raise: {}  trap: {}  resume: {}  abandon: {}  spawned children: {}",
+        r.raise_count, r.trap_count, r.resume_count, r.abandon_count, r.spawn_children
+    );
+    if !r.appended.is_empty() {
+        println!("  appended: {:?}", r.appended);
+    }
+    if !r.errors.is_empty() {
+        println!("  errors: {:?}", r.errors);
+    }
+    // Reading the program is the real instrument when a number alone
+    // doesn't explain a failure (`tasks::Outcome::programs`'s own doc) —
+    // printed only on a failing task, so a passing run stays scannable.
+    if r.success.is_err() {
+        for (i, program) in r.programs.iter().enumerate() {
+            println!("  --- program {i} ---\n{program}");
+        }
+    }
+}
+
+fn print_summary(reports: &[TaskReport]) {
+    let passed = reports.iter().filter(|r| r.success.is_ok()).count();
+    println!("\n=== summary ===");
+    println!("{passed}/{} tasks passed", reports.len());
+    let round_trips: Vec<usize> = reports.iter().map(|r| r.round_trips).collect();
+    let mean_round_trips = if round_trips.is_empty() {
+        0.0
+    } else {
+        round_trips.iter().sum::<usize>() as f64 / round_trips.len() as f64
+    };
+    println!("mean round-trips per task: {mean_round_trips:.2}");
+    if let Some(m) = median(&round_trips) {
+        println!("median round-trips per task: {m}");
+    }
+    let all_lengths: Vec<usize> = reports
+        .iter()
+        .flat_map(|r| r.program_lengths.iter().copied())
+        .collect();
+    if let Some(m) = median(&all_lengths) {
+        println!("median program length (statements): {m}");
+    }
+    let total_spawn_children: usize = reports.iter().map(|r| r.spawn_children).sum();
+    println!("spawn_children across the run: {total_spawn_children}");
 }
 
 #[cfg(test)]

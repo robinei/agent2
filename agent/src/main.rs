@@ -1,11 +1,7 @@
 mod card;
 mod compaction;
 mod document;
-// `eval/` still imports the POC's `runner`/`transport`/`document`/`fence`/
-// `card` modules, which no longer exist -- Pass C rewires the harness onto
-// the real `Session` (`23_ONE_AGENT.md`, Pass C). Cut from the build until
-// then, same treatment as `debug/` below.
-// mod eval;
+mod eval;
 mod host;
 mod machine;
 mod report;
@@ -42,12 +38,17 @@ const USAGE: &str = "usage: agent <command>
                                     and print its id
     --name <text>                   name the branch (with --fork), else rename
                                     the conversation branch
+  eval [--experimental]             the acceptance harness (agent/src/eval/):
+                                    drives real Session runs against
+                                    DeepSeek (needs DEEPSEEK_API_KEY) over
+                                    the fixed task set, plus the
+                                    experimental set with --experimental.
+                                    Never part of `cargo test` -- it costs
+                                    real money and its numbers are read by
+                                    a human.
 The TUI is cut out of the build for Passes A-C (23_ONE_AGENT.md); the
 standalone `debug <file.js>` subcommand and attached-TUI `session` return
-in Pass D. `eval` (agent/src/eval/, the acceptance harness) is cut the
-same way for Passes A-B — it still imports the deleted POC's
-`runner`/`transport`/`document`/`fence`/`card` modules — and returns once
-Pass C rewires it onto a real `Session`.";
+in Pass D.";
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -114,6 +115,13 @@ fn main() {
                 run_session_tui(log_path, use_real, nav.resume)
             };
             if let Err(e) = result {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
+        Some("eval") => {
+            let experimental = args.get(2).map(String::as_str) == Some("--experimental");
+            if let Err(e) = eval::harness::run_cli(experimental) {
                 eprintln!("{e}");
                 std::process::exit(1);
             }
