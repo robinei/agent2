@@ -33,10 +33,27 @@ impl Event {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum EventPayload {
     /// Chat event. Parent: the previous event on the owning agent's
-    /// spine. Renders to chat: yes — `Assistant.tool_calls` carries
-    /// `run_program`/`resume`, `Tool` carries their results (completion
-    /// summaries, condition reports).
+    /// spine. Renders to chat: yes — a `Turn` is the assistant message,
+    /// its `source` the bare program the model ran; the harness's report
+    /// on what that program did comes back as a `Post` from
+    /// `Author::Harness`, not as a distinguished reply kind of its own.
     Message(Message),
+
+    /// Chat event. Parent: the previous event on the owning agent's
+    /// spine. Renders to chat: yes — as a marker in the branch's own
+    /// history, nothing more.
+    ///
+    /// `append_history` is what **I** should remember; a `tell`/`Post`
+    /// is what **someone else** needs to know. A `Note` has no
+    /// recipient and wakes no branch — where every `tell` is heard by
+    /// someone, a note is heard by no one but the branch's own future
+    /// self, reading its own history back on a later turn. It exists for
+    /// the program that has worked something out and wants it on the
+    /// record for its *next* program to see rendered, not merely held in
+    /// a variable this run's VM is about to drop — not to read something
+    /// back later in the *same* turn, since if you need the value now
+    /// you are already holding it.
+    Note { text: String },
 
     /// Structural event; roots an agent's first branch. Parent: the
     /// call-site event on the caller's spine (`None` for the tree
@@ -95,10 +112,10 @@ pub enum EventPayload {
 
     /// Execution event; one per call a program issues, logged at
     /// **dispatch** (17_BRANCHES A2). Parent: the owning agent's spine,
-    /// between the program's `run_program` tool-call message and its
-    /// `Tool` result. Renders to chat: no — queried for replay, the
-    /// artifact menu, and UI. Addressable via `tools.tool_result(id)`,
-    /// which resolves a call id through to its `Result`.
+    /// between the program's `Turn` and its eventual `Return`/`Condition`.
+    /// Renders to chat: no — queried for replay, the artifact menu, and
+    /// UI. Addressable via `tools.tool_result(id)`, which resolves a call
+    /// id through to its `Result`.
     ///
     /// Logging at issue rather than at resolution is what distinguishes a
     /// call that **definitively did not work** (a `Failed` `Result`) from
@@ -127,13 +144,13 @@ pub enum EventPayload {
     Return { value: serde_json::Value },
 
     /// Run event; **everything else** a handback can be — a raise, a
-    /// trapped error, an arriving post, a compile failure, a refused
-    /// restart, an interruption. Parent: the owning branch's spine.
+    /// trapped error, an arriving post, a compile failure, a truncated
+    /// completion, an interruption. Parent: the owning branch's spine.
     /// Renders to chat: no — its *report* is rendered from it.
     ///
-    /// Exactly one outcome per handback (not per run): a single
-    /// `run_program` may raise, be resumed, trap, be resumed again and
-    /// finally return, and each handback logs its own outcome.
+    /// Exactly one outcome per handback (not per run): a single program
+    /// may raise, be resumed, trap, be resumed again and finally return,
+    /// and each handback logs its own outcome.
     ///
     /// It carries `site` and `stack` because those were the last inputs
     /// that lived only in the VM, and the VM is never persisted. With them
@@ -147,6 +164,17 @@ pub enum EventPayload {
         /// The VM call-stack chain, outermost first.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         stack: Vec<String>,
+        /// Whether this raise **pushed a handler frame** onto the stack,
+        /// or was a **handover** — the raising frame had nothing left to
+        /// do but forward the decision, so no frame was pushed.
+        ///
+        /// Load-bearing for replay's derived depth counter: a `Pushed`
+        /// condition increments it, a `Handover` does not, and if the log
+        /// doesn't say which happened, every subsequent depth is wrong —
+        /// and with it the document's `depth > 0` filter and the
+        /// decision/completion reading of `Return`.
+        #[serde(default)]
+        disposition: Disposition,
     },
 
     /// This branch is called this from here on. Parent: the owning
@@ -159,6 +187,33 @@ pub enum EventPayload {
     /// its forks alone — which is what you want when a fork was named for
     /// how it differs.
     Rename { name: String },
+
+    /// Structural event; one per compaction operation. Parent: the owning
+    /// agent's spine. Renders to chat: replaces its target's row — `of`
+    /// names the event being compacted, `label` is the short marker shown
+    /// in its place, `text` is `None` when the target row is *removed*
+    /// and `Some` when it is *rewritten* to shorter text.
+    ///
+    /// **Never removes the target row from the log.** Replay builds a
+    /// lookup (target id → this event) that the renderer consults instead
+    /// of re-deriving the row from `of` directly — the log stays
+    /// append-only, and a branch forked before the compaction still sees
+    /// the original event exactly as it was, because nothing was ever
+    /// deleted, only shadowed for later renders.
+    ///
+    /// A compacted **program** (a `Turn`) renders as a comment-only
+    /// assistant turn — still valid JavaScript, still carrying its own
+    /// id, saying how to fetch the original (`artifact(id)`) — rather
+    /// than as a non-assistant stub. That is what keeps role alternation
+    /// intact under compaction with no special case: whatever occupies
+    /// the assistant's slot in the rendered transcript is still an
+    /// assistant turn.
+    Compacted {
+        of: EventId,
+        label: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+    },
 
     /// Execution event; the full, unclipped console output of one program
     /// run, logged at its terminal (success/suspend/abandon). Parent: the
@@ -196,16 +251,51 @@ pub enum Cause {
     /// Posts arrived at a running program; it suspended at its next fuel
     /// slice so the branch could hear them (rule B).
     Posted { ids: Vec<EventId> },
-    /// `run_program` did not compile. No VM was built, so this run has no
+    /// The program did not compile. No VM was built, so this run has no
     /// console and no artifacts — the repair loop.
     CompileFailed { message: String },
-    /// An ineligible restart. Nothing ran; the refusal is still an
-    /// outcome, so "every tool call has exactly one outcome event" holds
-    /// without exception and no report is derived from replayed state.
-    Refused { reason: String },
+    /// A completion that hit `max_tokens` mid-program. **Never compile a
+    /// truncated completion** — cut off wherever the token budget ran
+    /// out, it may still parse and run, half-written, on a program the
+    /// model never actually finished emitting, which is strictly worse
+    /// than a clean compile failure the repair loop can see and retry.
+    /// The harness detects this from the completion itself, before
+    /// attempting to compile, and logs it directly rather than letting
+    /// truncated text reach the compiler at all.
+    Truncated,
     /// The process died mid-program and the VM went with it. Written by
     /// reconciliation so an interrupted run has an outcome like any other.
     Interrupted,
+}
+
+/// Whether a raise pushed a handler frame onto the stack, or handed the
+/// decision to a frame already vacated. See `EventPayload::Condition`.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Disposition {
+    /// The raising program is still on the stack, suspended, waiting on
+    /// the handler's decision — ordinary deliberation. The handler
+    /// pushes, decides, and pops; the raising program resumes beneath it.
+    Pushed,
+    /// The raising program had nothing left to do but forward the
+    /// decision (a tail raise: `await raise(...)` with nothing done with
+    /// the result, nothing left but the epilogue). Its VM is popped
+    /// *before* the handler's is built, not stacked below it — a real
+    /// tail call, not merely tail-shaped — so no frame is pushed and the
+    /// handler **is** the continuation.
+    Handover,
+}
+
+impl Default for Disposition {
+    /// `Pushed` is the safe default for logs written before this field
+    /// existed: every one of them predates the handover mechanism, so
+    /// every raise in them really was deliberation. Defaulting the other
+    /// way would silently un-count a frame the depth counter is relying
+    /// on, turning an old log's `depth > 0` filter and decision reads
+    /// wrong; defaulting to `Pushed` only ever costs an unnecessary
+    /// nesting level in a render, never a miscounted depth.
+    fn default() -> Self {
+        Disposition::Pushed
+    }
 }
 
 /// The rendered kinds — one per API role, chosen by the **variant**,
@@ -224,13 +314,24 @@ pub enum Message {
     /// event on the branch's spine. `author` is the LLM, or the user
     /// taking a turn on this branch — it renders as an assistant message
     /// either way, because the *branch* acted.
+    ///
+    /// Under code mode the assistant's entire turn **is** a program:
+    /// `source` holds the complete JavaScript text the model emitted —
+    /// there is no separate prose channel and no tool-call wrapper around
+    /// it. A program that wants to speak calls `tell()`/`ask()` from
+    /// inside itself (`Call::Send`); it never returns prose alongside a
+    /// list of calls, because there is no second channel for the prose to
+    /// live in. A user-authored restart is the same shape: `source` is
+    /// either hand-typed text (the `e` gesture) or a synthesized
+    /// `resume(...)`/`answer(...)` call (`v` and the answer gesture) —
+    /// what's shown in the pane is exactly what ran. A compacted program
+    /// still lands here as a comment-only `source`, which is what keeps
+    /// role alternation intact under compaction with no special case.
     Turn {
         author: Author,
-        text: String,
+        source: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         thinking: Option<String>,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        tool_calls: Vec<ToolCall>,
     },
 }
 
@@ -283,25 +384,20 @@ impl Origin {
 }
 
 impl Message {
-    /// The message's own text. A `Post` whose body is still by-reference
-    /// (`Origin::Sent`) has none — resolve it through the `Tree` first,
-    /// which is what `replay_event` does when building a `Context`.
+    /// The message's own text: a `Turn`'s program `source`, or a `Post`
+    /// whose body is inline (`Origin::Direct`). A `Post` whose body is
+    /// still by-reference (`Origin::Sent`) has none — resolve it through
+    /// the `Tree` first, which is what `replay_event` does when building
+    /// a `Context`.
     pub fn text(&self) -> &str {
         match self {
-            Message::Turn { text, .. } => text,
+            Message::Turn { source, .. } => source,
             Message::Post { origin, .. } => origin.direct().map(|(t, _, _)| t).unwrap_or(""),
         }
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub struct ToolCall {
-    pub id: String,
-    pub name: String,
-    pub arguments: serde_json::Value,
-}
-
-/// What a program's branch waits on. Three **typed** kinds, not one
+/// What a program's branch waits on. Four **typed** kinds, not one
 /// `Invoke` with a magic `name`: from a program's view they are all
 /// `tools.*` calls ("subagents are tools", 8_HARNESS dec. 2, holds at the
 /// API), but `dispatch_calls` interprets the name exactly once, at
@@ -337,6 +433,27 @@ pub enum Call {
         tools: Option<Vec<String>>,
         site: u32,
     },
+    /// This branch's program forked itself — a divergent branch that
+    /// inherits the caller's history rather than starting clean. Settled
+    /// with the fork's handle; the `Fork` event it roots is a child of
+    /// this `Call::Fork`. `fork()` is program-initiated and awaited, so it
+    /// needs a call to settle, exactly `Spawn`'s existing pattern.
+    ///
+    /// The asymmetry with `Spawn`'s single string is intentional, not a
+    /// gap: `spawn`'s string is both identity and first task — it becomes
+    /// `Agent.charter` **and** the kickoff `Post` body, because a spawned
+    /// agent has a role to state before it has anything to do. `fork`'s
+    /// string is only the task, because a fork has no charter of its own
+    /// to state — it inherits the caller's context instead, so there is
+    /// nothing else for the string to be. Both verbs kick their child off
+    /// in the same call that creates it: a spawned or forked agent with
+    /// nothing to do never exists.
+    Fork {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        task: String,
+        site: u32,
+    },
     /// This branch's program called a host tool.
     Invoke {
         name: String,
@@ -348,7 +465,10 @@ pub enum Call {
 impl Call {
     pub fn site(&self) -> u32 {
         match self {
-            Call::Send { site, .. } | Call::Spawn { site, .. } | Call::Invoke { site, .. } => *site,
+            Call::Send { site, .. }
+            | Call::Spawn { site, .. }
+            | Call::Fork { site, .. }
+            | Call::Invoke { site, .. } => *site,
         }
     }
 }
@@ -421,7 +541,7 @@ impl Context {
     /// `answer(question, value)` closes one), so `open.first()` — not a
     /// scan of `messages` for the first post that merely *expected* a
     /// reply — is the post a fresh program should bind to; after the
-    /// first is answered, the next `run_program` sees the next one.
+    /// first is answered, the next program sees the next one.
     /// `Value::Null` when nothing is open.
     pub fn input(&self, tree: &Tree) -> serde_json::Value {
         let Some(&question) = self.open.first() else {
