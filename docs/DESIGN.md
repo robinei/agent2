@@ -310,6 +310,47 @@ nondeterministic builtin is freely compatible: nothing ever retraces a
 previous execution, so there is no trace for it to make diverge. This
 *shrinks* what compat must honor rather than enlarging it.
 
+## The model-facing surface is chosen by behaviour, not by symmetry
+
+**Every name, shape and spelling the model sees is decided by what it
+acts best on. Nothing about it is decided by how this codebase reads.**
+The model never sees `types.rs`. An internal name matching a card verb
+is worth exactly nothing to the only reader that matters, and reaching
+for that symmetry is how a surface drifts away from the thing it is
+supposed to be tuned against.
+
+This is easy to violate while sounding principled, so the tell is
+concrete: **if an argument for a name cites an identifier in this
+repository, it is not an argument.** Three were made in one sitting —
+that a verb should be `handover()` because `Disposition::Handover`
+exists, that it should be `next_turn()` because `Message::Turn` does,
+that `say` should become `tell` because `Call::Send`'s doc comment
+already said "tell". All three may reach a defensible answer; none of
+them is a reason.
+
+The arguments that do count are about the reader's priors and its
+observed behaviour:
+
+- `exec(payload)` was rejected because a model's dominant prior for
+  `exec(x)` is **run x as code** (Python, shell, `child_process`), not
+  POSIX's replace-this-process — a name whose common meaning is
+  actively wrong is worse than a vague one.
+- `handover(payload)` was rejected because "hand over to whom?" reads
+  as **delegation**, which is `spawn`/`fork` — a different mechanism on
+  a different branch.
+- `next_turn(payload)` was rejected because "turn" in the wider
+  literature usually means a whole user-request-to-answer cycle with
+  tool calls inside it, so the name suggests **ending the exchange**.
+  That it is exactly right *inside this codebase*, where `Message::Turn`
+  is one assistant message and roles strictly alternate, is precisely
+  the irrelevant kind of correctness.
+
+And behaviour outranks reasoning about behaviour. The card was wrong
+about `//:` for months on an argument that sounded good; two exemplars
+shipped traps because they were written from a doc rather than from
+what the model does with them. When a live run disagrees with a
+well-argued surface, the run is right.
+
 ## The UI boundary, and the one carve-out
 
 **Every consumer talks to the session loop through the same
