@@ -172,6 +172,11 @@ pub struct AttachedApp {
     collapsed: HashSet<BranchId>,
     pub input: InputBuffer,
     pub quit: bool,
+    /// A bare `Ctrl-C` with nothing to clear and nothing to interrupt
+    /// arms this instead of quitting; the next one quits. Any other key
+    /// disarms it, so the confirmation is about *this* keystroke rather
+    /// than a mode you can end up in without noticing.
+    pub quit_armed: bool,
     pub show_source: bool,
     pub show_disasm: bool,
     pub show_stack: bool,
@@ -257,6 +262,7 @@ impl AttachedApp {
             collapsed: HashSet::new(),
             input: InputBuffer::new(),
             quit: false,
+            quit_armed: false,
             show_source: true,
             show_disasm: false,
             show_stack: false,
@@ -604,17 +610,36 @@ impl AttachedApp {
             self.cycle_branch(branches);
             return KeyAction::None;
         }
-        // Ctrl-C: the universal "get me out of this." A non-empty input
-        // line is cleared first — a change of mind mid-message, not an
-        // exit — and only an already-empty line quits.
+        // Ctrl-C: the universal "get me out of this", as a ladder from
+        // the most local escape to the most final one. A half-typed line
+        // is a change of mind mid-message; a running program is the next
+        // thing you would want out of; only with neither to escape does
+        // it mean leave, and then only on the second press.
+        //
+        // Quitting used to be the *first* rung whenever the input was
+        // empty, which made the commonest gesture for "stop what you are
+        // doing" close the session instead — and left interrupt reachable
+        // only through `x`, which nobody reaches for by reflex. `x` stays
+        // as the explicit, branch-targeted spelling.
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            if self.input.is_empty() {
+            let was_armed = std::mem::replace(&mut self.quit_armed, false);
+            if !self.input.is_empty() {
+                self.input.clear();
+                return KeyAction::None;
+            }
+            if matches!(selected_status, Some("running" | "thinking" | "suspended")) {
+                return KeyAction::Interrupt;
+            }
+            if was_armed {
                 self.quit = true;
             } else {
-                self.input.clear();
+                self.quit_armed = true;
             }
             return KeyAction::None;
         }
+        // Any other key disarms a pending quit — the confirmation is
+        // about the very next keystroke, never a lingering state.
+        self.quit_armed = false;
         // Ctrl-T: show/hide reasoning content, everywhere — it's a
         // transcript display toggle, not something either focus owns.
         if key.code == KeyCode::Char('t') && key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -1605,15 +1630,23 @@ fn render(frame: &mut Frame, app: &mut AttachedApp, session: &Session) {
     // the program/subitem selection and every pane's scroll position).
     // Advertised the same way `waiting` is: only when it would move.
     let multi_branch = session.tree().branches().len() > 1;
-    let help = footer_hint(
-        app.view,
-        app.focus,
-        app.ask_armed,
-        waiting,
-        resumable,
-        interruptible,
-        multi_branch,
-    );
+    let help = if app.quit_armed {
+        // The armed quit replaces the hint line outright rather than
+        // appending to it: it is a question waiting on the very next
+        // keystroke, and a reader who has to find it among twelve other
+        // bindings has not been told anything.
+        " ctrl-c again to quit ".to_owned()
+    } else {
+        footer_hint(
+            app.view,
+            app.focus,
+            app.ask_armed,
+            waiting,
+            resumable,
+            interruptible,
+            multi_branch,
+        )
+    };
     frame.render_widget(
         Paragraph::new(help).style(Style::default().add_modifier(Modifier::REVERSED)),
         footer,
@@ -1654,7 +1687,11 @@ fn footer_hint(
         (View::Running, Focus::Debug) => format!(
             " esc/i type · c collapse · d debugger · 1-4 panes · f fork · p spawn · a ask \
              · r rename{}{}{} · t timeline · m markdown · ctrl-t thinking{} · q quit ",
-            if interruptible { " · x interrupt" } else { "" },
+            if interruptible {
+                " · ctrl-c/x interrupt"
+            } else {
+                ""
+            },
             if resumable { " · v resume" } else { "" },
             if waiting { " · w waiting" } else { "" },
             if multi_branch { " · tab agent" } else { "" }
@@ -1662,7 +1699,11 @@ fn footer_hint(
         (_, Focus::Debug) => format!(
             " esc/i type · c expand · d debugger · f fork · p spawn · a ask \
              · r rename{}{}{} · t timeline · m markdown · ctrl-t thinking{} · q quit ",
-            if interruptible { " · x interrupt" } else { "" },
+            if interruptible {
+                " · ctrl-c/x interrupt"
+            } else {
+                ""
+            },
             if resumable { " · v resume" } else { "" },
             if waiting { " · w waiting" } else { "" },
             if multi_branch { " · tab agent" } else { "" }
@@ -3292,8 +3333,63 @@ mod tests {
         assert!(app.input.is_empty(), "first Ctrl-C clears, does not quit");
         assert!(!app.quit);
 
+        // Nothing to clear and nothing running: arms, does not quit.
         assert_eq!(app.on_key(ctrl_c, &[], None), KeyAction::None);
-        assert!(app.quit, "Ctrl-C on an already-empty line quits");
+        assert!(
+            !app.quit,
+            "an empty line arms the quit, it does not take it"
+        );
+        assert!(app.quit_armed);
+
+        assert_eq!(app.on_key(ctrl_c, &[], None), KeyAction::None);
+        assert!(app.quit, "the second Ctrl-C quits");
+    }
+
+    #[test]
+    /// The middle rung, and the reason the ladder exists: Ctrl-C is what
+    /// people press to stop what is happening, and it used to close the
+    /// session instead. Interrupt was reachable only through `x`.
+    fn ctrl_c_interrupts_a_live_branch_before_it_ever_quits() {
+        let mut app = AttachedApp::new(fid(1));
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        for status in ["running", "thinking", "suspended"] {
+            assert_eq!(
+                app.on_key(ctrl_c, &[], Some(status)),
+                KeyAction::Interrupt,
+                "{status} is interruptible"
+            );
+            assert!(
+                !app.quit,
+                "{status}: never quits while there is a program to stop"
+            );
+            assert!(
+                !app.quit_armed,
+                "{status}: interrupting does not arm a quit"
+            );
+        }
+    }
+
+    #[test]
+    /// A pending quit is about the very next keystroke. Anything else
+    /// disarms it, so nobody ends up in a confirm state they cannot see.
+    fn any_other_key_disarms_a_pending_quit() {
+        let mut app = AttachedApp::new(fid(1));
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        app.on_key(ctrl_c, &[], None);
+        assert!(app.quit_armed);
+
+        // Esc, not a printable: with input focus a character would be
+        // typed, and the next Ctrl-C would then clear the line rather
+        // than reaching the quit rung at all.
+        app.on_key(KeyEvent::from(KeyCode::Esc), &[], None);
+        assert!(!app.quit_armed, "another key disarms");
+
+        app.on_key(ctrl_c, &[], None);
+        assert!(
+            !app.quit,
+            "so the next Ctrl-C arms again rather than quitting"
+        );
+        assert!(app.quit_armed);
     }
 
     /// A `run_program` header colors by its own status word: red once
