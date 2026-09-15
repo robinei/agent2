@@ -2088,6 +2088,20 @@ impl Runner {
                 ),
             },
         )?;
+        // A handover is the exception to everything below: it does ask,
+        // here, through the ordinary door. Its `Handover` disposition
+        // opens no scope, so the rolling document *does* show the report
+        // (unlike the `Pushed` case the rest of this comment describes),
+        // and no run is parked for the host to build a one-shot prompt
+        // around. `shown` is deliberately left where it is so
+        // `needs_prompt` sees an unseen outcome on the last turn and
+        // asks for the next program — which is the whole verb.
+        if handed_over {
+            let mut out = out;
+            out.extend(self.prompt_if_needed(tree));
+            return Ok(out);
+        }
+
         // Deliberately **no** `StepOutput::LlmRequest` here. Read
         // `document.rs` (already finished by the concurrent A3 agent)
         // before assuming otherwise: `document::render`'s fold treats a
@@ -2773,9 +2787,17 @@ mod tests {
             Disposition::Handover,
             "a handover opens no scope, so its report stays visible"
         );
-        assert!(
-            state.is_idle(),
-            "nothing resumes a handover, so it must not be left parked"
+        // Not parked -- nothing resumes a handover -- and not merely
+        // idle either: it asks for the next program straight away,
+        // through the ordinary trigger rule. A branch that handed over
+        // and then sat idle is the bug this test exists for; the TUI
+        // showed exactly that on 2026-09-15, because `suspend` advanced
+        // `shown` past the outcome and never asked.
+        assert_ne!(state.status(), "suspended", "a handover must not park");
+        assert_eq!(
+            state.status(),
+            "awaiting llm",
+            "a handover asks for the next program immediately"
         );
     }
 
