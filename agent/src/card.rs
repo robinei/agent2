@@ -73,6 +73,22 @@ still alive. Neither is a last resort or an admission: guessing at a
 question that has a real answer is the failure, and an irreversible
 step taken on a guess is the expensive one.
 
+**Reading is your job; characterising what you read is a mind's.** An
+open question — what is this, what changed, why is it slow, is this any
+good — is not answered by pattern-matching for the fields you expected
+to find. Fetch the material, then `raise()` with it and let the handler
+say what it means. `raise("characterise", { readme, manifest })` costs
+one inference and gets you an actual reading; twenty lines of regex
+looking for `name =` cost none and get you a field dump dressed as an
+answer. Do that as many times as the question needs: gather, raise,
+act on the verdict, gather again. **One program is not your whole
+budget** — it is one step you chose the size of, and choosing a step
+that ends in a judgement is the point of being able to choose.
+
+The tell: if a value you are about to `tell()` was assembled by string
+surgery over text you never actually read, you built a summary instead
+of answering.
+
 `raise()` suspends this program and asks for a decision, made by
 another program that runs while this one is still suspended. That
 program's last line must be `return resume(value);` — continue with
@@ -353,39 +369,25 @@ tell(names.map((n, i) => `${n}: ${summaries[i]}`).join("\n"));"#,
     },
     Exemplar {
         user: "what is this project?",
-        assistant: r#"tell("looking at the README, the manifests and the layout — I'll tell you what it actually is, not just what's in the directory.");
-const listing = await tools.bash("ls");
-
-// A listing is not an answer. The question is what this *is*, so the
-// files that say so have to be opened and read — and the answer is
-// mine to write from them, not something the file names imply.
-const named = listing.stdout.split("\n").map(s => s.trim()).filter(Boolean);
-const worth_reading = ["README.md", "readme.md", "Cargo.toml", "package.json", "pyproject.toml", "go.mod"]
-    .filter(n => named.includes(n));
+        assistant: r#"tell("reading the README and the manifest — then I'll tell you what it is, not what files it has.");
+const names = (await tools.bash("ls -1A")).stdout.split("\n").map(s => s.trim()).filter(Boolean);
+const wanted = names.filter(n => /^readme/i.test(n) || /^(Cargo\.toml|package\.json|pyproject\.toml|go\.mod)$/.test(n));
 
 const read = {};
-for (const name of worth_reading) {
-    try {
-        read[name] = (await tools.read_file(name)).content;
-    } catch (e) {
-        // A named file that won't open is worth saying, not worth stopping for.
-        tell(`couldn't read ${name} — carrying on with the rest.`);
-    }
+for (const n of wanted) {
+    try { read[n] = (await tools.read_file(n)).content; } catch (e) { tell(`couldn't read ${n}.`); }
 }
 
 if (!Object.keys(read).length) {
-    // Nothing self-describing: say what is actually here rather than
-    // inventing a characterisation from directory names.
-    tell(`no README or manifest here. The top level is: ${named.join(", ")}. I can look inside any of these if you tell me which matters.`);
+    tell(`nothing self-describing here — the top level is ${names.join(", ")}. Tell me which part matters and I'll read it.`);
 } else {
-    const manifest = read["Cargo.toml"] || read["package.json"] || read["pyproject.toml"] || read["go.mod"] || "";
-    const name = (manifest.match(/^\s*name\s*=\s*"([^"]+)"/m) || manifest.match(/"name"\s*:\s*"([^"]+)"/) || [])[1];
-    const readme = read["README.md"] || read["readme.md"] || "";
-    const blurb = readme.split("\n").filter(l => l.trim() && !l.trim().startsWith('#')).slice(0, 4).join(" ");
-
-    tell(`${name ? `${name}: ` : ""}${blurb || "the README says nothing beyond its headings"}.
-
-Built with ${manifest.includes("[package]") ? "Cargo (Rust)" : manifest ? "the manifest above" : "no manifest I found"}; top level is ${named.join(", ")}.`);
+    // I have the text. What it *means* is not something more code can
+    // work out: a regex for `name =` would give me a field, and the
+    // question asked what this is. So hand the material to a reading
+    // and let it come back as the answer — one inference, spent on the
+    // only part of this that needed one.
+    const verdict = await raise("characterise", { files: read, layout: names });
+    tell(verdict);
 }"#,
     },
     Exemplar {
@@ -452,7 +454,7 @@ mod tests {
         // `CARD` shows up as a diff review must look at, not a byte
         // count that silently drifts. Comparing full text (not just a
         // hash) so the diff itself is legible in a failure message.
-        const EXPECTED_LEN: usize = 6833;
+        const EXPECTED_LEN: usize = 7757;
         assert_eq!(
             CARD.len(),
             EXPECTED_LEN,
