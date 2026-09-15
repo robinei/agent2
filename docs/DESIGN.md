@@ -58,8 +58,8 @@ never "stop between two instructions with the heap, log, await-chain, and
 console buffer inspectable"). It exists here by construction: effects are
 `StepResult` returns, never host callbacks, so the VM is never on anyone's
 stack when a decision is needed. Everything else is downstream of this one
-property: fuel is "interrupt on budget," crash recovery is "re-reach the
-suspension point" by re-execution, stackless async is "suspension as a
+property: fuel is "interrupt on budget," a lost VM is "the run gets an
+outcome and the next program starts fresh," stackless async is "suspension as a
 value," steering is "interrupt with a restart menu." Protect this property
 in every design decision; features that would require the VM to call back
 into the host break the architecture.
@@ -72,44 +72,58 @@ reproducible execution trace.
 
 ## The dependency spine
 
-Recovery does **not** restore VM state — it **re-executes**. The VM is
-never serialized; on a crash, version mismatch, or resume, the program is
-rerun to re-reach its suspension point (and is often *rewritten* first by
-the LLM, with prior results already in hand). Each layer's hard problem is
-solved by a property the layer below guarantees — keep the directions
-intact:
+**Nothing is ever re-executed, and there is no path that could be.** The
+VM is never serialized, so state that was only in it is gone when it is
+gone — there is no replay to re-reach a suspension point, deterministic
+or otherwise. Two cases, and only two:
+
+- **The VM is still live** (a trapped error, an explicit `raise`). It
+  stays suspended exactly where it stopped, and a handler program
+  continues it: `resume(value)` injects a value in place of the failed
+  operation or the raise expression, and the raising program carries on
+  beneath it with every variable and completed step intact. `abandon()`
+  discards it instead. This is the only continuation there is.
+- **The VM is gone** (crash, version mismatch). The run gets an outcome
+  like any other, and whatever happens next is a **new program**, written
+  by a mind, with everything the dead run completed reachable as
+  artifacts by id. Not a rerun of the old source — a new one.
+
+Each layer's hard problem is solved by a property the layer below
+guarantees — keep the directions intact:
 
 1. The VM holds all in-flight state **in memory only** and is never
-   persisted; recovery re-reaches the suspension point by **re-execution**
-   (well-defined precisely because of the load-bearing suspension property
-   above) →
+   persisted; when it dies, everything that lived only inside it dies with
+   it, and no replay brings it back →
 2. so completed work must live **outside** the VM — the append-only
    **event log** records every tool result as it lands →
-3. so reuse is **explicit artifacts by event id** (`artifact(id)`),
-   the program re-fetching prior results rather than recomputing them. **This
-   is exactly why determinism is unnecessary:** reuse is keyed by an explicit
-   id, not by a rerun retracing the original control flow position-for-
-   position — so a nondeterministic rerun, or an LLM-rewritten program, still
-   reuses the right completed work. Two consequences the log must earn
+3. so reuse is **explicit artifacts by event id** (`artifact(id)`), the
+   next program fetching prior results rather than recomputing them. **This
+   is exactly why determinism is unnecessary:** nothing retraces a previous
+   control flow, so there is nothing for a reproducible trace to make line
+   up. A fresh program written against the same log reaches the same
+   completed work by naming its id. Two consequences the log must earn
    (17_BRANCHES): **after a resume, no completed work is invisible** — every
    half-finished exchange in the log is reconciled on open, so a call that
    landed is an artifact and a call that was merely issued says so; and
    **reuse by id covers in-flight exchanges too** — `artifact(id)` on
    a still-pending ask returns a promise that resolves when its result lands,
-   so a re-entered or rewritten program **re-awaits** rather than re-asks →
+   so a new program written after a cut **awaits the existing exchange**
+   rather than asking again →
 4. so programs need **no durable `state`** — they are functions
    `(input, tools, artifacts) → returned JSON + effects` →
 5. so the **condition report's artifact menu** is the complete restart
    interface →
 6. which is what "LLM as restart handler" needed to be cheap: out of the
-   loop on the happy path, re-entering exactly at decision points, with all
+   loop on the happy path, entering exactly at decision points, with all
    completed work preserved in the log.
 
-(This supersedes the earlier **"deterministic positional replay"** framing,
-in which determinism was the root of the spine — `1. VM deterministic →
-2. positional replay sound → …`. Recovery is now re-execution plus
-explicit artifact reuse, **not** a deterministic retrace, so the
-determinism root is dropped and the chain re-anchors on the load-bearing
+(This supersedes two earlier framings in turn. First **"deterministic
+positional replay"**, in which determinism was the root of the spine —
+`1. VM deterministic → 2. positional replay sound → …`. Then
+**"recovery is re-execution"**, which dropped the determinism root but
+still had the harness re-running a stored program to re-reach where it
+had been. Neither survives: nothing re-runs at all, so the chain
+re-anchors on the load-bearing
 suspension property. The explicit-artifact layer (then item 5, now item 3)
 was always the real reuse mechanism — "never an implicit args-matching
 cache" — and it carries recovery on its own without determinism.)
@@ -292,8 +306,8 @@ The fence is short, and it is exactly what the *harness* product needs:
    form**, exactly as `Closure`/`Promise`/`RegExp` already do.
 
 **Determinism is not on the fence** — it is a non-goal (see the spine). A
-nondeterministic builtin is freely compatible; recovery by re-execution +
-explicit artifact reuse does not depend on a reproducible trace. This
+nondeterministic builtin is freely compatible: nothing ever retraces a
+previous execution, so there is no trace for it to make diverge. This
 *shrinks* what compat must honor rather than enlarging it.
 
 ## Product surface
