@@ -1033,9 +1033,9 @@ impl Tree {
 /// One unmatched half of an exchange, found by [`Tree::unmatched`] — a
 /// row of the reconciliation table, with the branch it sits on.
 ///
-/// The guarantee these serve is precise, and it is not determinism
-/// (recovery is re-execution): **after a resume, no completed work is
-/// invisible.**
+/// The guarantee these serve is precise, and it is not determinism —
+/// nothing here is ever re-executed (`DESIGN.md`, the dependency
+/// spine): **after a resume, no completed work is invisible.**
 #[derive(Debug, Clone, PartialEq)]
 pub enum Unmatched {
     /// An open `Post` with no `Answer`: this branch owes a reply, so it

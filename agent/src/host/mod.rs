@@ -337,10 +337,11 @@ impl Session {
     /// every branch that owes something.
     ///
     /// The guarantee this serves is precise, and it is deliberately not
-    /// determinism — recovery is re-execution: **after a resume, no
-    /// completed work is invisible.** A re-run program may ask again;
-    /// that is the model's informed choice against a full menu, never an
-    /// accident.
+    /// determinism — **nothing is ever re-executed** (`DESIGN.md`, the
+    /// dependency spine; a dead VM is followed by a *new* program, never
+    /// a replay of the old source): **after a resume, no completed work
+    /// is invisible.** The new program may ask again; that is the
+    /// model's informed choice against a full menu, never an accident.
     fn reconcile(&mut self) -> io::Result<()> {
         // Repairs first, then waking: appending a lost `Post` makes its
         // recipient owe an answer, and that branch has to prompt for it.

@@ -318,6 +318,22 @@ could not have seen either — and the POC's counters papered over
 exactly that, which is how `append_history` stayed write-only and
 reached nothing for so long.
 
+**Accepted, not fixed — an unanswerable `ask()` hangs.** The POC's
+fixture rejected an unscripted `ask` inside the VM, so a handler got a
+chance to recover. A real `Send { to: User }` has no reject path:
+`SessionCommand::Reply` only ever delivers. So a live model that asks
+where the fixture has no answer leaves the branch suspended and the
+run ends there.
+
+Accepted deliberately, because it is the faithful behaviour — **a real
+user who does not answer does leave the agent waiting**, and that is a
+state the design should meet honestly rather than simulate away. The
+cost is that `DESTRUCTIVE_MIGRATION_GATE`, shaped around "no `ask`
+channel available," may now stop rather than produce the reasoned
+decline the POC's synthetic rejection allowed. If that turns out to
+matter, the fix is a protocol-level way to reject or time out a
+pending user `Send` — new surface, deliberately not added mid-phase.
+
 **C2.** Green is the same bar the POC last hit:
 ```
 DEEPSEEK_API_KEY=... cargo run -p agent -- eval
