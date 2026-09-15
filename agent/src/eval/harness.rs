@@ -145,8 +145,12 @@ fn print_report(r: &TaskReport) {
     }
     // Reading the program is the real instrument when a number alone
     // doesn't explain a failure (`tasks::Outcome::programs`'s own doc) —
-    // printed only on a failing task, so a passing run stays scannable.
-    if r.success.is_err() {
+    // printed on a failing task, so a passing run stays scannable, and
+    // **also whenever a program trapped**. A task that traps, abandons
+    // and rewrites still passes, and its round trips still count; the
+    // first program is where the reason lives, and printing only on
+    // failure hides exactly the case worth reading.
+    if r.success.is_err() || r.trap_count > 0 {
         for (i, program) in r.programs.iter().enumerate() {
             println!("  --- program {i} ---\n{program}");
         }
