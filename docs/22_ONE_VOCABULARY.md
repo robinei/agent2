@@ -269,9 +269,39 @@ fence gives every reflective artifact — methods included — **no JSON
 form**, so a handle carrying methods could not be stored, logged, or
 passed across a boundary. A bare id can.
 
-This also places both verbs in the awaitability taxonomy correctly:
-they are local creations whose result exists immediately, so there is
-nothing to park for. The awaitable thing is the `ask` written next.
+**Both verbs are awaited, and that is not the same as costing a round
+trip.** An earlier draft of this paragraph said they were "local
+creations whose result exists immediately, so there is nothing to park
+for." That is true of inference cost and false of mechanism, and the
+difference cost two live traps: an exemplar written from this sentence
+said `const h = spawn(...)`, the model copied it faithfully, and `h`
+was a promise rather than a handle.
+
+The architecture forces it. `spawn`/`fork` hand back an id, an id comes
+from appending to the `Tree`, and only the host owns the tree — so the
+value must return through a promise, because the load-bearing property
+forbids the VM calling back into the host mid-instruction.
+`Instr::Notify` makes `tell` promise-free only because `tell` has **no
+value to return**; it pushes `undefined`. There is no such trick for a
+verb that produces a handle.
+
+So the axis that matters is not awaitable-vs-not, it is **what the
+await costs**:
+
+| | settles at | costs |
+|---|---|---|
+| `await spawn(...)` / `await fork(...)` | dispatch, same step | a VM yield |
+| `await ask(...)` | when someone answers | possibly a completion |
+
+Both are `await`; only one is a round trip. Conflating them is what
+made "creating is not messaging" look like it implied "creating is not
+awaited." It does not. What it implies is that the *exchange* is
+separate from the *creation* — you await the handle, then you message
+it, and the second await is the expensive one.
+
+(If `spawn` ever did return a bare value, `Instr::Await` passes a
+non-promise through unchanged, so `await spawn(...)` would keep
+working. The card's spelling is forward-compatible either way.)
 
 ## Verb selection
 
