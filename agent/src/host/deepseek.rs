@@ -21,6 +21,12 @@ use crate::host::llm::{Cancel, LlmChunk, LlmClient};
 use crate::machine::LlmTurn;
 
 const DEFAULT_MODEL: &str = "deepseek-v4-flash";
+
+/// Reasoning effort, sent as `reasoning_effort`. `high` because that is
+/// what one would realistically run — the harness is measured in the
+/// configuration it is used in, not a cheaper one chosen to make the
+/// numbers move.
+const DEFAULT_EFFORT: &str = "high";
 const DEFAULT_BASE_URL: &str = "https://opencode.ai/zen/go/v1";
 
 pub struct DeepSeekClient {
@@ -45,15 +51,20 @@ impl DeepSeekClient {
     /// by default (the API's own default); set `DEEPSEEK_NO_THINKING` (to
     /// any value) to send `"thinking": {"type": "disabled"}`.
     ///
-    /// `DEEPSEEK_REASONING_EFFORT` pins the level explicitly —
+    /// Reasoning effort defaults to [`DEFAULT_EFFORT`] and is overridden
+    /// by `DEEPSEEK_REASONING_EFFORT` —
     /// `minimal`/`low`/`medium`/`high`/`xhigh`/`max`, sent as
-    /// `reasoning_effort`. Unset, the request carries no such field and
-    /// the API picks, which is fine for ordinary use and **not** fine for
-    /// a comparison: `DESIGN.md`'s M5 measures this harness against a
-    /// third-party agent on the same model, and an unpinned level makes
-    /// "same model" untrue in the one way that would silently explain a
+    /// `reasoning_effort`.
+    ///
+    /// It is pinned rather than left to the API's own default because
+    /// `DESIGN.md`'s M5 measures this harness against a third-party
+    /// agent on the same model, and an unpinned level makes "same model"
+    /// untrue in the one way that would silently explain away a
     /// difference. The wire format is the one `pi` uses for this
-    /// provider, so the two are set the same way.
+    /// provider — `reasoning_effort` to set a level, `thinking: {"type":
+    /// "disabled"}` to turn it off, the latter already byte-identical to
+    /// what `DEEPSEEK_NO_THINKING` sends — so both sides are set the
+    /// same way and can be checked against each other.
     pub fn from_env() -> Result<Self, String> {
         let api_key = std::env::var("DEEPSEEK_API_KEY")
             .map_err(|_| "DEEPSEEK_API_KEY is not set".to_owned())?;
@@ -61,7 +72,9 @@ impl DeepSeekClient {
         let base_url =
             std::env::var("DEEPSEEK_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.into());
         let thinking = std::env::var("DEEPSEEK_NO_THINKING").is_err();
-        let effort = std::env::var("DEEPSEEK_REASONING_EFFORT").ok();
+        let effort = std::env::var("DEEPSEEK_REASONING_EFFORT")
+            .ok()
+            .or_else(|| Some(DEFAULT_EFFORT.to_owned()));
         Ok(Self::new(api_key, model, base_url, thinking).with_effort(effort))
     }
 
