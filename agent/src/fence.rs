@@ -69,7 +69,7 @@ mod tests {
     fn a_fence_appearing_mid_text_is_left_alone() {
         // Not wrapped end-to-end — this is a genuine syntax error to
         // report as a trap, not something to salvage.
-        let raw = "const s = \"```\";\nsay(s);";
+        let raw = "const s = \"```\";\ntell(s);";
         assert_eq!(extract(raw), raw);
     }
 

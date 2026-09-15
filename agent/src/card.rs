@@ -32,7 +32,7 @@ is generated. So `//:` belongs at the very top, as one plan block that
 streams first and doubles as the plan the rest of the program follows
 — a `//:` line anywhere later doesn't narrate something happening now,
 since nothing has run yet by the time it arrives either; it only makes
-the reader wait through more code to reach it. `say()` is what
+the reader wait through more code to reach it. `tell()` is what
 happened, and it is the only thing that can report a result, because
 only it runs. Document the body itself with plain `//` comments, the
 ordinary kind — they read alongside the code they're next to, not as
@@ -44,14 +44,14 @@ Verbs available in every program, as plain functions — not a `tools.`
 namespace, which is reserved for this session's configured tools
 (listed separately, below):
 
-  say(text) / say(to, text)        tell the user or another agent
-                                    quote the address, always: say("user", "done")
+  tell(text) / tell(to, text)      message the user or another agent
+                                    quote the address, always: tell("user", "done")
                                     "user" is the human; there is only one
   ask(who, text)                   ask a question; resolves to the answer
                                     await ask("user", "which one?")
   answer(question, label, value)   discharge an `ask()` another program is
                                     blocked on, by that question's own id —
-                                    not for an ordinary message: that is say()
+                                    not for an ordinary message: that is tell()
   spawn(charter)                   a new agent, a clean room
   fork()                           a new context inheriting your whole history
   append_history(value)            remember a projection for your own future
@@ -69,7 +69,7 @@ calling either. Falling off the end without returning one of those
 means no decision was made.
 
 A root program's return value is read by nobody. Reach people through
-`say()` — a root program that never calls it is a silent no-op, the one
+`tell()` — a root program that never calls it is a silent no-op, the one
 new way to do nothing at all.
 
 Await at the top level directly — this dialect permits it. Do not wrap
@@ -115,7 +115,7 @@ a regex is exactly the false negative above.
 
 Match the program to the task. This is a push against timid
 orchestration, not against short programs — a question that needs no
-tools is a two-line program that `say()`s the answer.
+tools is a two-line program that `tell()`s the answer.
 
 Return a decision, not a dataset: keep data as an artifact reachable by
 id, and give `append_history()` a short projection of it, never the raw
@@ -198,9 +198,9 @@ pub const SEED_EXEMPLARS: &[Exemplar] = &[
         assistant: r#"//: running the test suite, then reporting what happened
 const result = await tools.bash("cargo test 2>&1 | tail -20");
 if (result.exit === 0) {
-    say("tests pass.");
+    tell("tests pass.");
 } else {
-    say(`tests failed:\n${result.output}`);
+    tell(`tests failed:\n${result.output}`);
 }"#,
     },
     Exemplar {
@@ -211,13 +211,13 @@ if (result.exit === 0) {
 //: rather than stopping once I've reported what's there now.
 const cfg = await tools.read_file("ops/config.json");
 const parsed = JSON.parse(cfg.content);
-say(`ops/config.json currently sets retries to ${parsed.retries}.`);
+tell(`ops/config.json currently sets retries to ${parsed.retries}.`);
 
 const target = await ask("user", `retries is currently ${parsed.retries} — what should it be?`);
 
 parsed.retries = Number(target);
 await tools.write_file("ops/config.json", JSON.stringify(parsed, null, 2));
-say(`set retries to ${target} in ops/config.json.`);"#,
+tell(`set retries to ${target} in ops/config.json.`);"#,
     },
     Exemplar {
         user: "look at server-a.log and server-b.log and tell me which one is actually failing",
@@ -231,7 +231,7 @@ const [a, b] = await Promise.all([
 
 const aErrors = (a.content.match(/ERROR/g) || []).length;
 const bErrors = (b.content.match(/ERROR/g) || []).length;
-say(aErrors > bErrors
+tell(aErrors > bErrors
     ? `server-a is failing: ${aErrors} ERROR lines vs server-b's ${bErrors}.`
     : `server-b is failing: ${bErrors} ERROR lines vs server-a's ${aErrors}.`);"#,
     },
@@ -247,10 +247,10 @@ const [a, b] = await Promise.all([
 ]);
 
 if (a.content === b.content) {
-    say("identical — no real conflict, either is fine.");
+    tell("identical — no real conflict, either is fine.");
 } else {
     const keep = await raise("conflicting_backups", { a: a.content, b: b.content });
-    say(`keeping ${keep}.`);
+    tell(`keeping ${keep}.`);
 }"#,
     },
     Exemplar {
@@ -261,10 +261,10 @@ const found = await tools.bash("find /tmp/build-cache -type f -mtime +1 -printf 
 const count = Number(found.output.trim()) || 0;
 
 if (count === 0) {
-    say("nothing older than a day — /tmp/build-cache is already clean.");
+    tell("nothing older than a day — /tmp/build-cache is already clean.");
 } else {
     await tools.bash("find /tmp/build-cache -type f -mtime +1 -delete");
-    say(`removed ${count} stale file(s).`);
+    tell(`removed ${count} stale file(s).`);
     if (count > 200) {
         // a short projection for whoever runs this next — not read
         // back by me, I'm done; this run's own count is already in
@@ -285,7 +285,7 @@ mod tests {
         // `CARD` shows up as a diff review must look at, not a byte
         // count that silently drifts. Comparing full text (not just a
         // hash) so the diff itself is legible in a failure message.
-        const EXPECTED_LEN: usize = 6361;
+        const EXPECTED_LEN: usize = 6369;
         assert_eq!(
             CARD.len(),
             EXPECTED_LEN,
@@ -315,7 +315,7 @@ mod tests {
     #[test]
     fn the_card_names_every_bare_verb() {
         for verb in [
-            "say(",
+            "tell(",
             "ask(",
             "answer(",
             "spawn(",
@@ -430,7 +430,7 @@ mod tests {
         // recon-only program whose own closing comment planned a "next
         // program," which nothing then ran. This exemplar is the
         // demonstration: both reads happen, then the judgment (a
-        // say() call comparing what was actually read) happens in the
+        // tell() call comparing what was actually read) happens in the
         // same program, not a planned-but-absent one.
         let ex = &SEED_EXEMPLARS[2];
         let last_read = ex
@@ -439,7 +439,7 @@ mod tests {
             .expect("third exemplar should read more than one thing");
         let after = &ex.assistant[last_read..];
         assert!(
-            after.contains("say("),
+            after.contains("tell("),
             "the judgement must be reported in the same program as the reads, \
              not deferred to an implied next one"
         );

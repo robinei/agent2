@@ -520,7 +520,7 @@ mod tests {
         // evidence for what to write next, and a wrapped exemplar
         // would teach it to declare a function and do nothing (the
         // hazard the doc calls out explicitly).
-        let source = "const x = 1;\nsay(String(x));";
+        let source = "const x = 1;\ntell(String(x));";
         let log = vec![
             (
                 id(1),
@@ -804,7 +804,7 @@ mod tests {
             (
                 id(4),
                 Entry::Program {
-                    source: "say('fixed it');".into(),
+                    source: "tell('fixed it');".into(),
                     outcome: ProgramOutcome::Completed,
                 },
             ),
@@ -992,9 +992,9 @@ mod tests {
                              if (cfg.retries < 5) {\n  \
                                cfg.retries = 5;\n  \
                                await tools.write_file(\"ops/config.json\", JSON.stringify(cfg, null, 2));\n  \
-                               say(`bumped retries from ${cfg.retries} to 5`);\n\
+                               tell(`bumped retries from ${cfg.retries} to 5`);\n\
                              } else {\n  \
-                               say(`retries already at ${cfg.retries}, no change needed`);\n\
+                               tell(`retries already at ${cfg.retries}, no change needed`);\n\
                              }"
                         .into(),
                     outcome: ProgramOutcome::Completed,
