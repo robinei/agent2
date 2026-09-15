@@ -50,11 +50,13 @@ namespace, which is reserved for this session's configured tools
   answer(question, label, value)   discharge an `ask()` another program is
                                     blocked on, by that question's own id —
                                     not for an ordinary message: that is tell()
-  spawn(charter)                   a new agent, a clean room. Creating is
-                                    not messaging: it comes back idle, and
-                                    does nothing until you tell/ask it
-  fork()                           a new context inheriting your whole
-                                    history. Also idle until messaged
+  spawn(charter)                   await it: hands back a handle to a new
+                                    agent, a clean room. Creating is not
+                                    messaging — it is idle until you
+                                    tell/ask that handle
+  fork()                           await it: a handle to a new context
+                                    inheriting your whole history. Also
+                                    idle until messaged
   append_history(value)            remember a projection for your own future
   artifact(id)                     fetch a completed call's value by id
   list_agents()                    every agent in this subtree, with status
@@ -336,10 +338,12 @@ return resume("backup-2.txt");"#,
 const names = (await tools.bash("ls reports/")).output.trim().split("\n");
 
 // Twelve summaries is a lot of judgement and none of it needs my
-// history, so it goes to a clean room. spawn() only creates the agent —
+// history, so it goes to a clean room. Await the spawn: it hands back
+// a handle, and that handle is what ask() addresses. spawn() only
+// creates the agent —
 // it sits idle until asked, so the ask is what actually sets it working,
 // and awaiting it is what brings the answer back here.
-const helper = spawn("You summarise files. One sentence each, concrete, no preamble.");
+const helper = await spawn("You summarise files. One sentence each, concrete, no preamble.");
 
 const summaries = [];
 for (const name of names) {
@@ -413,7 +417,7 @@ mod tests {
         // `CARD` shows up as a diff review must look at, not a byte
         // count that silently drifts. Comparing full text (not just a
         // hash) so the diff itself is legible in a failure message.
-        const EXPECTED_LEN: usize = 6787;
+        const EXPECTED_LEN: usize = 6900;
         assert_eq!(
             CARD.len(),
             EXPECTED_LEN,
