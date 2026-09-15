@@ -50,9 +50,22 @@ fn language_for(lang: &str) -> Result<tree_sitter::Language, String> {
 pub fn outline_def() -> ToolDef {
     ToolDef {
         name: "outline".into(),
-        description: "Read a source file and list its top-level definitions \
-                      (functions, classes, modules, …). Language is inferred from \
-                      the extension. Read-only — no mutation."
+        // What it *omits* is the load-bearing half of this description.
+        // Observed live 2026-09-15: a program looking for
+        // `#[allow(dead_code)]` attributes called `outline` on sixteen
+        // files, which structurally cannot answer that — sixteen calls
+        // that could only come back empty-handed. The old text ("list
+        // its top-level definitions") was accurate and said nothing
+        // about what is absent, which is what a reader needs in order to
+        // pick a different tool.
+        description: "Read a source file and list its top-level definitions: for each, \
+                      { name, kind, start_line, end_line, signature }. Language is \
+                      inferred from the extension. Read-only — no mutation.\n\
+                      \n\
+                      NOT included: attributes/decorators, comments, doc comments, \
+                      imports, bodies, or anything inside a definition. It is an index, \
+                      not the text — if you need to find or match source text (an \
+                      attribute, a call site, a string), read the file or grep it."
             .into(),
         input_schema: json!({
             "type": "array",

@@ -160,7 +160,12 @@ fn read_file_def() -> ToolDef {
         description: "Read a UTF-8 text file; returns { content, version }. \
                       `version` is a content hash — pass it to `replace_file` \
                       so the write is atomic and fails if the file changed \
-                      since you read it."
+                      since you read it.\n\
+                      \n\
+                      Returns the **whole** file: there is no line range or \
+                      offset. A large file costs its full size wherever you put \
+                      it, so on anything sizeable use `bash` with grep/sed, or \
+                      `outline`, to find the part you want first."
             .into(),
         input_schema: json!({
             "type": "array",
