@@ -1954,6 +1954,35 @@ impl Runner {
         // and only a live VM can consume one, so the two cannot be the
         // same value.
         let (cause, site, suspension, disposition) = match cause {
+            SuspendCause::Raise { condition, payload }
+                if condition == interp::NEXT_PROGRAM_CONDITION =>
+            {
+                // `next_program(payload)` is a **handover**, not a
+                // deliberation, and the disposition is the whole
+                // difference. `document::render` hides a `Pushed`
+                // condition from the rolling document -- nothing renders
+                // again until a matching `Return` closes the scope -- so
+                // logging this as `Pushed` would put the payload in the
+                // one-shot handler prompt and nowhere else. The program
+                // after next would see none of it and re-read every file,
+                // which is exactly what a live run did.
+                //
+                // `Handover` opens no scope, so the report renders into
+                // the rolling document and **stays there**: the material
+                // one program gathered is in front of every program that
+                // follows, in the stable prefix, read once.
+                let payload = payload.map(|v| value_json(&run.vm, &v));
+                let site = span_at(&run.vm, (run.vm.ip as usize).saturating_sub(1));
+                (
+                    Cause::Raised {
+                        name: condition,
+                        payload,
+                    },
+                    site,
+                    ResumeWith::Raise,
+                    Disposition::Handover,
+                )
+            }
             SuspendCause::Raise { condition, payload } => {
                 let payload = payload.map(|v| value_json(&run.vm, &v));
                 // `step()` advanced `ip` past the `Raise`, so the raise
@@ -2018,8 +2047,26 @@ impl Runner {
             .collect();
         let console = run.vm.console_lines.clone();
         let program_id = run.program_id;
-        self.phase = Phase::Suspended(run, suspension);
-        self.note_status(program_id, ProgramStatus::Suspended);
+        // A handover does not park. `next_program` ends its program --
+        // there is nothing to come back to, and nothing will resume it --
+        // so the VM is dropped here rather than left `Suspended` for a
+        // decision that is never coming. Two things follow, both wanted:
+        // the branch goes `Idle`, so the ordinary "unseen outcome on the
+        // last turn" rule asks for the next program (rather than
+        // `prompt_suspended`'s one-shot handler prompt, which would
+        // re-state a report the rolling document now already carries);
+        // and no run is left for `apply_turn` to discard, so no
+        // `Cause::Abandoned` is logged for a program that finished on
+        // purpose.
+        let handed_over = disposition == Disposition::Handover;
+        if handed_over {
+            self.last_vm = Some(run.vm);
+            self.phase = Phase::Idle;
+            self.note_status(program_id, ProgramStatus::Completed);
+        } else {
+            self.phase = Phase::Suspended(run, suspension);
+            self.note_status(program_id, ProgramStatus::Suspended);
+        }
         // The outcome carries the site and the stack because those were
         // the last inputs that lived only in the VM, and the VM is never
         // persisted.
@@ -2685,6 +2732,53 @@ mod tests {
     /// expression; a *second* raise, handled the same way with
     /// `return abandon();`, discards it instead and leaves the branch
     /// idle, exactly like a direct `Runner::abandon` call would.
+    #[test]
+    fn next_program_hands_over_and_its_payload_stays_in_the_document() {
+        // The whole point of the verb: what one program gathered is in
+        // front of every program that follows, read once. Logged as
+        // `Handover` rather than `Pushed`, because `document::render`
+        // hides a `Pushed` condition from the rolling document -- a live
+        // run handed over 190KB and the program after next saw none of
+        // it and re-read every file.
+        let mut tree = Tree::new(None);
+        let mut state = Runner::new_root(&mut tree, "root", "card").unwrap();
+        user_post(&mut state, &mut tree, "go");
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(llm_program("next_program({ found: \"the material\" });")),
+            )
+            .unwrap();
+        let mut queue = out;
+        while !queue.is_empty() {
+            queue = state
+                .step(&mut tree, StepInput::Tick { fuel: FUEL })
+                .unwrap();
+        }
+
+        let cond = tree
+            .events
+            .values()
+            .find_map(|e| match &e.payload {
+                EventPayload::Condition {
+                    cause: Cause::Raised { name, .. },
+                    disposition,
+                    ..
+                } if name == interp::NEXT_PROGRAM_CONDITION => Some(*disposition),
+                _ => None,
+            })
+            .expect("a handover condition");
+        assert_eq!(
+            cond,
+            Disposition::Handover,
+            "a handover opens no scope, so its report stays visible"
+        );
+        assert!(
+            state.is_idle(),
+            "nothing resumes a handover, so it must not be left parked"
+        );
+    }
+
     #[test]
     fn a_spawn_handle_is_usable_as_an_address() {
         // `spawn()` settles with `{"agent": id}` and the card teaches
