@@ -499,8 +499,8 @@ fn describe_call(call: &Call) -> String {
                 name.as_deref().unwrap_or("<unnamed>")
             )
         }
-        Call::Fork { name, task, .. } => {
-            format!("fork {}: {task}", name.as_deref().unwrap_or("<unnamed>"))
+        Call::Fork { name, .. } => {
+            format!("fork {}", name.as_deref().unwrap_or("<unnamed>"))
         }
         Call::Invoke { name, args, .. } => format!("invoke {name}({args})"),
     }

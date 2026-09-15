@@ -162,8 +162,10 @@ pub enum StepOutput {
     Spawns(Vec<EventId>),
     /// Create these forks — a divergent branch inheriting the caller's
     /// history, unlike `Spawns` which roots a clean-room agent. Settle
-    /// each with the fork's handle exactly as a `Spawn` is (DESIGN.md
-    /// "Exchanges": `fork()` kicks its child off like `spawn`).
+    /// each with the fork's handle exactly as a `Spawn` is. Neither verb
+    /// carries a first message: creating is not messaging
+    /// (`22_ONE_VOCABULARY.md`), so the child is told what to do in a
+    /// separate `tell`/`ask` afterwards.
     Forks(Vec<EventId>),
     /// Deliver these `Send`s. Each names a logged `Call::Send`, and the
     /// address, body and `expects_reply` all live there — the host reads
@@ -1320,25 +1322,20 @@ impl Runner {
                     }
                 }
                 TOOL_FORK => {
-                    let args = self.call_args_json(&call);
-                    match args.first().and_then(|v| v.as_str()) {
-                        Some(task) => {
-                            let fork = self.issue_call(
-                                tree,
-                                Call::Fork {
-                                    name: None,
-                                    task: task.to_owned(),
-                                    site: call.site,
-                                },
-                                call.promise,
-                            )?;
-                            forks.push(fork);
-                        }
-                        None => {
-                            self.reject_call(call.promise, "fork(task) needs a task string");
-                            progressed = true;
-                        }
-                    }
+                    // `fork()` takes nothing: it creates a divergent
+                    // branch and settles with its handle. What the child
+                    // should do is said afterwards, in its own `tell` or
+                    // `ask` — creating is not messaging
+                    // (`22_ONE_VOCABULARY.md`).
+                    let fork = self.issue_call(
+                        tree,
+                        Call::Fork {
+                            name: None,
+                            site: call.site,
+                        },
+                        call.promise,
+                    )?;
+                    forks.push(fork);
                 }
                 TOOL_ASK | TOOL_TELL => {
                     let expects_reply = call.name == TOOL_ASK;
@@ -2341,10 +2338,9 @@ fn call_label(call: &Call) -> String {
             preview(&serde_json::Value::String(text.clone()))
         ),
         Call::Spawn { name, .. } => format!("spawn({})", name.as_deref().unwrap_or("<unnamed>")),
-        Call::Fork { task, .. } => format!(
-            "fork({})",
-            preview(&serde_json::Value::String(task.clone()))
-        ),
+        Call::Fork { name, .. } => {
+            format!("fork({})", name.as_deref().unwrap_or(""))
+        }
         Call::Invoke { name, args, .. } => format!("{}({})", name, preview(args)),
     }
 }
@@ -2844,9 +2840,7 @@ mod tests {
         let out = state
             .step(
                 &mut tree,
-                StepInput::LlmResponse(llm_program(
-                    "return await fork(\"try a different angle\");",
-                )),
+                StepInput::LlmResponse(llm_program("return fork();")),
             )
             .unwrap();
         let settled = drain(&mut state, &mut tree, out);
@@ -2857,10 +2851,9 @@ mod tests {
                 _ => None,
             })
             .expect("a Forks output");
-        let EventPayload::Call(Call::Fork { task, .. }) = &tree.events[&forks[0]].payload else {
+        let EventPayload::Call(Call::Fork { .. }) = &tree.events[&forks[0]].payload else {
             panic!("expected a Fork call");
         };
-        assert_eq!(task, "try a different angle");
     }
 
     #[test]

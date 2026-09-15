@@ -454,22 +454,21 @@ pub enum Call {
     /// This branch's program forked itself — a divergent branch that
     /// inherits the caller's history rather than starting clean. Settled
     /// with the fork's handle; the `Fork` event it roots is a child of
-    /// this `Call::Fork`. `fork()` is program-initiated and awaited, so it
-    /// needs a call to settle, exactly `Spawn`'s existing pattern.
+    /// this `Call::Fork`.
     ///
-    /// The asymmetry with `Spawn`'s single string is intentional, not a
-    /// gap: `spawn`'s string is both identity and first task — it becomes
-    /// `Agent.charter` **and** the kickoff `Post` body, because a spawned
-    /// agent has a role to state before it has anything to do. `fork`'s
-    /// string is only the task, because a fork has no charter of its own
-    /// to state — it inherits the caller's context instead, so there is
-    /// nothing else for the string to be. Both verbs kick their child off
-    /// in the same call that creates it: a spawned or forked agent with
-    /// nothing to do never exists.
+    /// **Creating is not messaging** (`22_ONE_VOCABULARY.md`). `fork()`
+    /// takes nothing and carries no first task: it creates a branch and
+    /// hands back a handle, and whatever the child should do is said
+    /// afterwards, with `tell(agent, …)` to delegate and not wait or
+    /// `await ask(agent, …)` to delegate and use the result. `spawn`'s
+    /// single string is an identity — a charter — for the same reason,
+    /// not a task. An earlier design had both verbs kick their child off
+    /// implicitly, which needed a `task` field here and a paragraph
+    /// explaining why the two verbs' strings meant different things;
+    /// both are gone.
     Fork {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<String>,
-        task: String,
         site: u32,
     },
     /// This branch's program called a host tool.

@@ -130,12 +130,7 @@ splits them. The doc comments need both answers stated, not one:
    > with the rest of the tool-protocol sugar, and on review the
    > implicit kickoff should not come back. See "Creating is not
    > messaging," below.
-   >
-   > **Not yet true of the code**: `types::Call::Fork` still carries
-   > `task`, read in three places in `machine.rs`. Dropping it is a
-   > small mechanical change, deferred only because phase 23's Pass C0
-   > was mid-edit in that file when this was decided. Until it lands,
-   > the field is vestigial.
+
 
 4. **`Cause::Truncated`** — a completion that hit `max_tokens`. Real
    gap: `transport::Completion::was_truncated()` exists and has

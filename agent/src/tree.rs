@@ -749,10 +749,9 @@ impl Tree {
                                 "spawn".to_owned(),
                                 serde_json::json!({ "name": name, "charter": charter }),
                             ),
-                            Call::Fork { name, task, .. } => (
-                                "fork".to_owned(),
-                                serde_json::json!({ "name": name, "task": task }),
-                            ),
+                            Call::Fork { name, .. } => {
+                                ("fork".to_owned(), serde_json::json!({ "name": name }))
+                            }
                         };
                         programs[idx].invokes.push(InvokeView {
                             id: ev.id,
