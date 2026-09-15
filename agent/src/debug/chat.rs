@@ -1,30 +1,44 @@
 //! Chat transcript state (9_TUI Step 4 · 11_INTROSPECT Step 3 ·
-//! 17_BRANCHES Step D1), driven **exclusively** by `SessionEvent`s — the
-//! serializable boundary a remote client would consume. Enforced
-//! structurally, not by discipline: `ChatState`'s fields are private to
-//! this module and its only mutator is `apply(&SessionEvent)`, so nothing
-//! privileged (VMs, tree, session) can leak into what this pane shows. Do
-//! not add imports from `crate::host` beyond the protocol types, and none
-//! from `interp`.
+//! 17_BRANCHES Step D1 · 23_ONE_AGENT Pass D), driven **exclusively** by
+//! `SessionEvent`s — the serializable boundary a remote client would
+//! consume. Enforced structurally, not by discipline: `ChatState`'s
+//! fields are private to this module and its only mutator is
+//! `apply(&SessionEvent)`, so nothing privileged (VMs, tree, session) can
+//! leak into what this pane shows. Do not add imports from `crate::host`
+//! beyond the protocol types, and none from `interp`.
 //!
-//! A `run_program` execution renders as one **block** (decision 2): a
-//! `run_program: <status>` header (status tracked live from
-//! `ProgramStatus`) with the program's inner `Invoke`s listed beneath as
-//! `⚙` lines; a `resume` folds into the same block. The completion/
-//! condition report body is *not* inlined — it lives in the right
-//! console/result pane. The transcript is **per-branch** (17_BRANCHES):
-//! `rows(branch)` renders that branch's own slice plus — for a forked
-//! branch — the shared prefix it inherited, reconstructed from the event
-//! stream alone (`fork_parent`, below), since a fork carries *history,
-//! not obligations* and this pane never reaches past the protocol into
-//! the `Tree` to get it.
+//! **A turn is a program** (22_ONE_VOCABULARY.md): every logged
+//! `Message::Turn`, whoever authored it, opens one **block** keyed by its
+//! own event id — a `program: <status>` header (status tracked live from
+//! `ProgramStatus`) with the program's inner `Invoke`/`Send`/`Spawn`/
+//! `Fork` calls listed beneath as `⚙` lines. There is no separate
+//! `run_program`/`resume` split to fold together the way the old
+//! tool-call protocol needed: a handler program (a mind's answer to a
+//! `raise()`, LLM-authored or a `v`/rewrite gesture standing in for one)
+//! is a `Turn` in its own right, with its own id and its own block,
+//! nested under the program it is deliberating for by **depth** —
+//! `crate::tree::depth_after`'s fold over `Condition`/`Return`, replayed
+//! here from the same event stream `tree::programs_for` derives it from
+//! over the log, so the two can never silently disagree about how deep a
+//! program ran. The completion/condition report body is *not* inlined —
+//! it lives in the right console/result pane, derived from the log there
+//! (`report::derive_report`), never stored as a message of its own. The
+//! transcript is **per-branch** (17_BRANCHES): `rows(branch)` renders
+//! that branch's own slice plus — for a forked branch — the shared
+//! prefix it inherited, reconstructed from the event stream alone
+//! (`fork_parent`, below), since a fork carries *history, not
+//! obligations* and this pane never reaches past the protocol into the
+//! `Tree` to get it.
 
 use std::collections::HashMap;
 
 use unicode_width::UnicodeWidthStr;
 
 use crate::host::{AgentId, BranchId, ProgramStatus, SessionEvent};
-use crate::types::{Address, Call, Event, EventId, EventPayload, Message, Outcome};
+use crate::tree::depth_after;
+use crate::types::{
+    Address, Author, Call, Disposition, Event, EventId, EventPayload, Message, Outcome,
+};
 
 /// What a transcript row is, for styling by the renderer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -40,10 +54,11 @@ pub enum ChatKind {
     /// rendering choice the attached UI makes (`show_thinking`), not
     /// something this transcript model decides.
     Thinking,
-    /// A `run_program` block header or one of its `⚙` inner-call lines.
-    ToolCall,
-    /// An attachment line within a program block.
-    Attachment,
+    /// A program block's header, or one of its `⚙` inner-call lines
+    /// (`Call::Invoke`/`Send`/`Spawn`/`Fork`) — every `Turn` opens one of
+    /// these now, LLM-authored or a user restart standing in for a
+    /// handler alike (22_ONE_VOCABULARY's "a turn is a program").
+    Program,
     /// Context lifecycle markers.
     Marker,
     Error,
@@ -77,8 +92,6 @@ pub enum RowDetail {
     None,
     /// A program block header row — clicking selects the program.
     Program(EventId),
-    /// An attachment row — clicking selects the program + that attachment.
-    Attachment(EventId, String),
     /// An invoke row — clicking selects the program + that invoke.
     Invoke(EventId, usize),
 }
@@ -95,16 +108,31 @@ enum Entry {
         kind: ChatKind,
         text: String,
         /// The program this row belongs to (for click hit-testing): the
-        /// `run_program` event id for block rows, the `System` event id
-        /// for the system header, else `None`.
+        /// owning `Turn`'s event id for a `⚙` call row, the `System`
+        /// event id for the system header, else `None`.
         program: Option<EventId>,
     },
-    /// A `run_program` block header, keyed by the program's event id.
+    /// A program block header, keyed by its `Turn`'s own event id — every
+    /// `Turn` opens one of these now (see this module's own doc comment).
     Header {
         branch: BranchId,
         program: EventId,
-        /// Attachment names in definition order.
-        attachments: Vec<String>,
+        /// This program's handler-nesting depth (`tree::depth_after`):
+        /// `0` is the branch's own current program; `>0` is a
+        /// deliberating handler's interior, indented under the frame it
+        /// is deciding for (22_ONE_VOCABULARY's "nested handler block").
+        depth: usize,
+        /// Whose hand wrote this program. The *branch* acted either way
+        /// (`Message::Turn`'s own doc in `types.rs`) — this is purely so
+        /// the person driving can see when a restart gesture (`e`/`v`)
+        /// stood in for what would otherwise have been the model's turn.
+        by_user: bool,
+        /// Set once an `EventPayload::Compacted` op names this program:
+        /// the marker text shown in place of the ordinary status line.
+        /// The row is never removed from `entries` — only its rendering
+        /// is substituted (`Compacted`'s own doc: "never removes the
+        /// target row") — so the program stays fetchable by its id.
+        compacted: Option<String>,
     },
 }
 
@@ -133,16 +161,33 @@ pub struct ChatState {
     /// markers — an agent-level fact, not a branch-level one, so it stays
     /// separate from `main_branch`.
     main_agent: Option<AgentId>,
-    /// Transcript row index of each logged `Call`, so its `Result` can
-    /// complete the row in place rather than pushing a second line.
-    call_rows: HashMap<EventId, usize>,
-    /// The open `run_program` block per branch: its inner calls and a
-    /// folding `resume` attach here.
-    current_program: HashMap<BranchId, EventId>,
+    /// Transcript row index of every entry, by its own event id — the
+    /// organizing invariant made literal (22_ONE_VOCABULARY: "every
+    /// document row is exactly one event, addressed by its id"). What a
+    /// logged `Call`'s `Result` completes in place, an `Invoke` row
+    /// attaches beneath, and a `Compacted` op substitutes the rendering
+    /// of.
+    entry_index: HashMap<EventId, usize>,
+    /// Per branch, the ids of currently-open programs, innermost last —
+    /// mirrors `tree::programs_for`'s own `stack` exactly: pushed on
+    /// every `Turn`, popped on every `Return` and every `Condition` whose
+    /// `disposition` is `Handover`. Its top is where the branch's next
+    /// `Call` attaches, handler nesting included.
+    program_stack: HashMap<BranchId, Vec<EventId>>,
+    /// Per branch, the handler-nesting depth in effect right now —
+    /// `tree::depth_after`'s fold, replayed here from the same
+    /// `SessionEvent` stream `tree::programs_for` derives it from over
+    /// the log, so a new `Turn`'s `Entry::Header.depth` can never
+    /// disagree with what the log itself says. A fork inherits its
+    /// parent's *live* depth/stack at fork time — exact for the common
+    /// "fork the branch's current leaf" gesture; forking from an older
+    /// clicked row can under- or over-nest if the parent has since
+    /// closed a scope the fork point was still inside (a cosmetic risk
+    /// in this debug view only, never a correctness issue for the
+    /// session itself, which derives depth fresh from the log).
+    branch_depth: HashMap<BranchId, usize>,
     /// Live status per program block, titling its header.
     program_status: HashMap<EventId, ProgramStatus>,
-    /// Attachment content per program: program_id → (name → content).
-    pub attachment_content: HashMap<EventId, HashMap<String, String>>,
     /// Every event's own branch, by id — including events that never
     /// become a chat row (`Call`, `Result`, `Console`, …). What lets a
     /// `Fork`'s parent branch be resolved from `event.parent_id` alone.
@@ -178,10 +223,16 @@ impl ChatState {
 
     /// The one choke point every `self.entries.push` goes through
     /// instead — keeps both line caches exactly as long as `entries`, so
-    /// an index is always valid to look up and `apply` never has to know
-    /// the cache exists.
+    /// an index is always valid to look up, records the new row in
+    /// `entry_index` under its own event id, and `apply` never has to
+    /// know either exists.
     fn push_entry(&mut self, entry: Entry) {
+        let id = match &entry {
+            Entry::Line { id, .. } => *id,
+            Entry::Header { program, .. } => *program,
+        };
         self.entries.push(entry);
+        self.entry_index.insert(id, self.entries.len() - 1);
         self.classified_line_cache.get_mut().push(None);
         self.raw_line_cache.get_mut().push(None);
     }
@@ -281,6 +332,19 @@ impl ChatState {
                 {
                     self.fork_parent
                         .insert(branch, (parent_branch, parent_point));
+                    // Inherit the parent's open-program stack and depth
+                    // so a handler already in progress at the fork point
+                    // keeps nesting correctly on the new branch too
+                    // (`branch_depth`'s own doc: exact for forking the
+                    // parent's current leaf, the ordinary gesture).
+                    let stack = self
+                        .program_stack
+                        .get(&parent_branch)
+                        .cloned()
+                        .unwrap_or_default();
+                    self.program_stack.insert(branch, stack);
+                    let depth = *self.branch_depth.get(&parent_branch).unwrap_or(&0);
+                    self.branch_depth.insert(branch, depth);
                 }
                 self.push_entry(Entry::Line {
                     branch,
@@ -306,10 +370,7 @@ impl ChatState {
                 });
             }
             EventPayload::Message(Message::Turn {
-                author,
-                text,
-                thinking,
-                tool_calls,
+                author, thinking, ..
             }) => {
                 self.streaming.retain(|(b, _)| *b != branch);
                 self.thinking_streaming.retain(|(b, _)| *b != branch);
@@ -324,60 +385,23 @@ impl ChatState {
                         program: None,
                     });
                 }
-                // A `Turn { author: User }` is the user taking this
-                // branch's turn (`Restart`). It renders as an assistant
-                // message to the API — the *branch* acted — but the
-                // person driving needs to see whose hand it was.
-                let by_user = matches!(author, crate::types::Author::User);
-                if !text.is_empty() || by_user {
-                    let calls: Vec<&str> = tool_calls.iter().map(|c| c.name.as_str()).collect();
-                    self.push_entry(Entry::Line {
-                        branch,
-                        id,
-                        kind: if by_user {
-                            ChatKind::Marker
-                        } else {
-                            ChatKind::Assistant
-                        },
-                        text: if by_user {
-                            format!("you took this branch's turn: {}", calls.join(", "))
-                        } else {
-                            text.clone()
-                        },
-                        program: None,
-                    });
-                }
-                // A `run_program` opens a new block keyed by this event;
-                // a `resume` folds into the open one (decision 2).
-                if let Some(call) = tool_calls.first()
-                    && call.name == crate::machine::TOOL_RUN_PROGRAM
-                {
-                    let attachment_names: Vec<String> = call
-                        .arguments
-                        .get("attachments")
-                        .and_then(|v| v.as_object())
-                        .map(|obj| obj.keys().cloned().collect())
-                        .unwrap_or_default();
-                    let attachments: HashMap<String, String> = call
-                        .arguments
-                        .get("attachments")
-                        .and_then(|v| v.as_object())
-                        .map(|obj| {
-                            obj.iter()
-                                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    self.push_entry(Entry::Header {
-                        branch,
-                        program: id,
-                        attachments: attachment_names,
-                    });
-                    self.current_program.insert(branch, id);
-                    if !attachments.is_empty() {
-                        self.attachment_content.insert(id, attachments);
-                    }
-                }
+                // Every `Turn` is a program (22_ONE_VOCABULARY's "a turn
+                // is a program") — LLM-authored or a `Turn { author:
+                // User }` restart standing in for one (`e`/`v`, the
+                // answer gesture): there is no separate prose channel and
+                // no tool-call wrapper to special-case any more, so this
+                // always opens a fresh block, nested under whatever
+                // program is currently deliberating on this branch (`depth`).
+                let by_user = matches!(author, Author::User);
+                let depth = *self.branch_depth.get(&branch).unwrap_or(&0);
+                self.push_entry(Entry::Header {
+                    branch,
+                    program: id,
+                    depth,
+                    by_user,
+                    compacted: None,
+                });
+                self.program_stack.entry(branch).or_default().push(id);
             }
             // A call is logged at dispatch, so its row appears the moment
             // it is issued; the `Result` completes the same row in place.
@@ -408,7 +432,12 @@ impl ChatState {
                 } else {
                     let is_wait_until =
                         matches!(call, Call::Invoke { name, .. } if name.as_str() == "wait_until");
-                    if !is_wait_until && let Some(&program) = self.current_program.get(&branch) {
+                    let program = self
+                        .program_stack
+                        .get(&branch)
+                        .and_then(|stack| stack.last())
+                        .copied();
+                    if !is_wait_until && let Some(program) = program {
                         let name = match call {
                             Call::Invoke { name, .. } => name.clone(),
                             Call::Send {
@@ -424,20 +453,22 @@ impl ChatState {
                                 to: Address::User, ..
                             } => unreachable!("handled above"),
                             Call::Spawn { .. } => "spawn".to_owned(),
+                            Call::Fork { .. } => "fork".to_owned(),
                         };
-                        self.call_rows.insert(id, self.entries.len());
+                        let depth = *self.branch_depth.get(&branch).unwrap_or(&0);
+                        let indent = "  ".repeat(depth);
                         self.push_entry(Entry::Line {
                             branch,
                             id,
-                            kind: ChatKind::ToolCall,
-                            text: format!("⚙ {name} → …"),
+                            kind: ChatKind::Program,
+                            text: format!("{indent}⚙ {name} → …"),
                             program: Some(program),
                         });
                     }
                 }
             }
             EventPayload::Result { call, outcome } => {
-                if let Some(&row) = self.call_rows.get(call)
+                if let Some(&row) = self.entry_index.get(call)
                     && let Some(Entry::Line { text, .. }) = self.entries.get_mut(row)
                 {
                     let head = text.rsplit_once(" → ").map(|(h, _)| h.to_owned());
@@ -454,16 +485,67 @@ impl ChatState {
                     }
                 }
             }
-            // Execution/marker events are debug-pane data, never transcript.
-            // The report body lives in the right console/result pane, not
-            // the transcript (decision 2); it is derived from these.
-            EventPayload::Return { .. }
-            | EventPayload::Condition { .. }
-            | EventPayload::Console { .. } => {}
+            // Settles this branch's currently-open program: a plain
+            // `return` always pops one frame; a `Condition` pops only on
+            // a `Handover` disposition (a raise that pushes a handler
+            // leaves the raising program open, suspended, beneath it —
+            // `Cause::Abandoned`/`Interrupted` are always logged as a
+            // `Handover`, so they fall out of the same check). Exactly
+            // `tree::programs_for`'s own `stack` fold, so a chat block's
+            // attach point can never disagree with the log projection's.
+            EventPayload::Return { .. } => {
+                self.program_stack.entry(branch).or_default().pop();
+            }
+            EventPayload::Condition { disposition, .. } => {
+                if *disposition == Disposition::Handover {
+                    self.program_stack.entry(branch).or_default().pop();
+                }
+            }
+            // A note is heard by no one but the branch's own future self
+            // — a marker in its own history, same as `append_history`'s
+            // own doc in `types.rs` describes.
+            EventPayload::Note { text } => {
+                self.push_entry(Entry::Line {
+                    branch,
+                    id,
+                    kind: ChatKind::Marker,
+                    text: format!("note: {text}"),
+                    program: None,
+                });
+            }
+            // Never its own row — it replaces its target's rendering in
+            // place, per its own doc in `types.rs` ("never removes the
+            // target row... a renderer consults [a lookup] instead").
+            EventPayload::Compacted { of, label, text } => {
+                let marker = match text {
+                    Some(t) => format!("[compacted: {label}] {t}"),
+                    None => format!("[compacted: {label}]"),
+                };
+                if let Some(&row) = self.entry_index.get(of) {
+                    match self.entries.get_mut(row) {
+                        Some(Entry::Line { text, .. }) => *text = marker,
+                        Some(Entry::Header { compacted, .. }) => *compacted = Some(marker),
+                        None => {}
+                    }
+                    self.classified_line_cache.get_mut()[row] = None;
+                    self.raw_line_cache.get_mut()[row] = None;
+                }
+            }
+            // Console content is debug-pane data, never transcript — it
+            // is read from the log projection's `ProgramView.console`
+            // (`tree.rs`), never this incremental model.
+            EventPayload::Console { .. } => {}
             // A rename is a record: it changes the navigator, never the
             // transcript, and never wakes the branch.
             EventPayload::Rename { .. } => {}
         }
+        self.branch_depth.insert(
+            branch,
+            depth_after(
+                *self.branch_depth.get(&branch).unwrap_or(&0),
+                &event.payload,
+            ),
+        );
     }
 
     /// The ancestor chain from `target` back to its root-most branch,
@@ -545,27 +627,40 @@ impl ChatState {
                 Entry::Header {
                     branch,
                     program,
-                    attachments,
+                    depth,
+                    by_user,
+                    compacted,
                 } if visible(*branch, *program) => {
+                    let indent = "  ".repeat(*depth);
+                    if let Some(marker) = compacted {
+                        out.push((
+                            ChatKind::Marker,
+                            format!("{indent}{marker}"),
+                            RowDetail::Program(*program),
+                            *program,
+                        ));
+                        continue;
+                    }
                     let status = self
                         .program_status
                         .get(program)
                         .map(|s| status_label(*s))
                         .unwrap_or("running");
+                    // `depth == 0` is the branch's own current program; a
+                    // deeper one is a handler deliberating for it — a
+                    // "nested handler block" (22_ONE_VOCABULARY's
+                    // render-axes table), indented under the frame it is
+                    // deciding for. `by_user` marks a restart gesture
+                    // (`e`/`v`) standing in for whichever of the two the
+                    // model would otherwise have written.
+                    let label = if *depth == 0 { "program" } else { "handler" };
+                    let who = if *by_user { "you ▸ " } else { "" };
                     out.push((
-                        ChatKind::ToolCall,
-                        format!("run_program: {status}"),
+                        ChatKind::Program,
+                        format!("{indent}{who}{label}: {status}"),
                         RowDetail::Program(*program),
                         *program,
                     ));
-                    for name in attachments {
-                        out.push((
-                            ChatKind::Attachment,
-                            format!("⬡ attachment: {name}"),
-                            RowDetail::Attachment(*program, name.clone()),
-                            *program,
-                        ));
-                    }
                 }
                 Entry::Line {
                     branch,
@@ -578,7 +673,7 @@ impl ChatState {
                         out.push((ChatKind::System, "system".into(), RowDetail::None, *id));
                         continue;
                     }
-                    let detail = if *kind == ChatKind::ToolCall {
+                    let detail = if *kind == ChatKind::Program {
                         if let Some(pid) = program {
                             let idx = invoke_index.entry(*pid).or_insert(0);
                             let d = RowDetail::Invoke(*pid, *idx);
@@ -1056,7 +1151,7 @@ fn heading_text(line: &str) -> Option<&str> {
 /// One entry's visual lines — labelling user/assistant prose and
 /// indenting continuation lines under the label. `Assistant`/`Streaming`
 /// text additionally gets block-markdown classification per line — every
-/// other kind (`User`, `Error`, `ToolCall`, ...) goes out unclassified,
+/// other kind (`User`, `Error`, `Program`, ...) goes out unclassified,
 /// the same scoping `render_chat` already applies to inline markdown.
 ///
 /// Pure in `(kind, text, render_markdown)` — no `detail`/`id`, which are
@@ -1134,7 +1229,7 @@ fn short(v: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Author, Origin, ToolCall};
+    use crate::types::{Author, Origin};
     use jiff::Timestamp;
 
     fn ev(id: u64, payload: EventPayload) -> SessionEvent {
@@ -1154,18 +1249,16 @@ mod tests {
         }
     }
 
+    /// A bare program `Turn` — every one opens its own block now
+    /// (22_ONE_VOCABULARY's "a turn is a program"), so the source's
+    /// actual content is irrelevant to these tests.
     fn run_program(id: u64) -> SessionEvent {
         ev(
             id,
             EventPayload::Message(Message::Turn {
                 author: Author::Agent(EventId::new(1)),
-                text: String::new(),
+                source: "noop();".into(),
                 thinking: None,
-                tool_calls: vec![ToolCall {
-                    id: "c1".into(),
-                    name: "run_program".into(),
-                    arguments: serde_json::json!({}),
-                }],
             }),
         )
     }
@@ -1239,8 +1332,8 @@ mod tests {
         let rows = chat.rows(None, 80);
         assert!(!rows.iter().any(|(k, _, _, _)| *k == ChatKind::Streaming));
         // A run_program renders as a status-titled block header.
-        assert!(rows.iter().any(|(k, t, p, _)| *k == ChatKind::ToolCall
-            && t == "run_program: running"
+        assert!(rows.iter().any(|(k, t, p, _)| *k == ChatKind::Program
+            && t == "program: running"
             && *p == RowDetail::Program(EventId::new(3))));
 
         // Return/Rename never reach the transcript.
@@ -1286,7 +1379,7 @@ mod tests {
         let rows = chat.rows(None, 80);
         let glyphs: Vec<&(ChatKind, String, RowDetail, EventId)> = rows
             .iter()
-            .filter(|(k, t, _, _)| *k == ChatKind::ToolCall && t.starts_with('⚙'))
+            .filter(|(k, t, _, _)| *k == ChatKind::Program && t.starts_with('⚙'))
             .collect();
         assert_eq!(glyphs.len(), 2, "two inner-call lines");
         // Each ⚙ line carries the program id + invoke index for hit-testing.
@@ -1310,7 +1403,7 @@ mod tests {
         assert!(
             chat.rows(None, 80)
                 .iter()
-                .any(|(_, t, _, _)| t == "run_program: running")
+                .any(|(_, t, _, _)| t == "program: running")
         );
         // …and tracks ProgramStatus to completed.
         chat.apply(&SessionEvent::ProgramStatus {
@@ -1322,7 +1415,7 @@ mod tests {
         assert!(
             chat.rows(None, 80)
                 .iter()
-                .any(|(_, t, _, _)| t == "run_program: completed")
+                .any(|(_, t, _, _)| t == "program: completed")
         );
 
         // The report body is never in the transcript — and now it is
@@ -1428,7 +1521,8 @@ mod tests {
     /// `wait_until` never becomes a row — a polling loop calling it
     /// repeatedly would otherwise spam the transcript with lines no one
     /// watching needs to see. Its `Result` is likewise silent (no row was
-    /// ever inserted for `call_rows` to find). A sibling call is unaffected.
+    /// ever inserted for `entry_index` to find). A sibling call is
+    /// unaffected.
     #[test]
     fn wait_until_calls_are_never_transcript_rows() {
         let mut chat = ChatState::new();
@@ -1450,7 +1544,7 @@ mod tests {
         let glyphs: Vec<String> = chat
             .rows(None, 80)
             .into_iter()
-            .filter(|(k, t, _, _)| *k == ChatKind::ToolCall && t.starts_with('⚙'))
+            .filter(|(k, t, _, _)| *k == ChatKind::Program && t.starts_with('⚙'))
             .map(|(_, t, _, _)| t)
             .collect();
         assert_eq!(glyphs, vec!["⚙ fetch → \"A\""]);
@@ -1499,7 +1593,7 @@ mod tests {
             !chat
                 .rows(None, 80)
                 .iter()
-                .any(|(k, t, _, _)| *k == ChatKind::ToolCall && t.starts_with('⚙'))
+                .any(|(k, t, _, _)| *k == ChatKind::Program && t.starts_with('⚙'))
         );
         let messages: Vec<String> = chat
             .rows(None, 80)
@@ -1581,29 +1675,41 @@ mod tests {
             },
         ));
         chat.apply(&post(2, "shared question"));
-        // The fork point: an assistant turn on the original branch.
+        // The fork point: the original branch's program, and the `tell()`
+        // it made — the "message" a human actually sees.
         chat.apply(&ev_on(
             1,
             3,
             Some(2),
             EventPayload::Message(Message::Turn {
                 author: Author::Agent(EventId::new(1)),
-                text: "shared answer".into(),
+                source: "tell(\"user\", \"shared answer\");".into(),
                 thinking: None,
-                tool_calls: vec![],
             }),
         ));
-        // Fork at #3: branch id 10, rooted with parent_id = 3.
+        chat.apply(&ev_on(
+            1,
+            4,
+            Some(3),
+            EventPayload::Call(Call::Send {
+                to: Address::User,
+                text: "shared answer".into(),
+                input: serde_json::Value::Null,
+                expects_reply: false,
+                site: 0,
+            }),
+        ));
+        // Fork at #4: branch id 10, rooted with parent_id = 4.
         chat.apply(&ev_on(
             10,
             10,
-            Some(3),
+            Some(4),
             EventPayload::Fork {
                 name: Some("try again".into()),
             },
         ));
         // After the fork: the original keeps going...
-        chat.apply(&post(4, "original continues"));
+        chat.apply(&post(5, "original continues"));
         // ...and the fork has its own new activity.
         chat.apply(&ev_on(
             10,
@@ -1675,9 +1781,18 @@ mod tests {
             2,
             EventPayload::Message(Message::Turn {
                 author: Author::Agent(EventId::new(1)),
-                text: "42".into(),
+                source: "tell(\"user\", \"42\");".into(),
                 thinking: Some("let me compute 6*7".into()),
-                tool_calls: vec![],
+            }),
+        ));
+        chat.apply(&ev(
+            3,
+            EventPayload::Call(Call::Send {
+                to: Address::User,
+                text: "42".into(),
+                input: serde_json::Value::Null,
+                expects_reply: false,
+                site: 0,
             }),
         ));
 
@@ -1737,9 +1852,8 @@ mod tests {
             2,
             EventPayload::Message(Message::Turn {
                 author: Author::Agent(EventId::new(1)),
-                text: "final answer".into(),
+                source: "tell(\"user\", \"final answer\");".into(),
                 thinking: Some("done reasoning".into()),
-                tool_calls: vec![],
             }),
         ));
         let rows = chat.rows(None, 80);
@@ -1771,14 +1885,20 @@ mod tests {
         )
     }
 
+    /// The markdown-classification tests below want a plain `Assistant`
+    /// prose row — under code mode that is a `tell()` call's own text,
+    /// never a bare `Turn` (whose content is a *program*, not prose), so
+    /// this builds the `Call::Send` a `tell("user", text)` would dispatch
+    /// rather than a `Turn` directly.
     fn assistant_turn(id: u64, text: &str) -> SessionEvent {
         ev(
             id,
-            EventPayload::Message(Message::Turn {
-                author: Author::Agent(EventId::new(1)),
+            EventPayload::Call(Call::Send {
+                to: Address::User,
                 text: text.into(),
-                thinking: None,
-                tool_calls: vec![],
+                input: serde_json::Value::Null,
+                expects_reply: false,
+                site: 0,
             }),
         )
     }

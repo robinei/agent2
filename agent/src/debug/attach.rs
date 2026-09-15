@@ -8,10 +8,10 @@
 //!
 //! Layout state machine (pure UI state — nothing in the host changes):
 //! - **Chat** (default): full-width chat.
-//! - **Running**: auto-popped when the *selected* agent starts a
-//!   `run_program` — source + console as a right column, sticky after
-//!   completion for post-mortem reading; `c` collapses back, `1`–`4`
-//!   override the auto-pop set.
+//! - **Running**: auto-popped when the *selected* agent starts a new
+//!   program (every `Turn` is one now, 22_ONE_VOCABULARY) — source +
+//!   console as a right column, sticky after completion for post-mortem
+//!   reading; `c` collapses back, `1`–`4` override the auto-pop set.
 //! - **FullDebug** (`d`): the standalone layout — console/result left,
 //!   full debug pane stack right, chat hidden; `1`–`9` switch agents.
 //!
@@ -37,8 +37,7 @@ use super::chat::{ChatKind, ChatState, RowDetail};
 use super::input::InputBuffer;
 use super::markdown;
 use super::ui;
-use crate::host::{BranchId, BranchInfo, Session, SessionCommand, SessionEvent, UserCall};
-use crate::machine::TOOL_RUN_PROGRAM;
+use crate::host::{BranchId, BranchInfo, Session, SessionCommand, SessionEvent};
 use crate::report::derived_branch_label;
 use crate::tree::ProgramView;
 use crate::types::{Call, Cause, EventId, EventPayload, Message, Outcome};
@@ -143,21 +142,16 @@ pub enum KeyAction {
 pub enum ExplicitMode {
     /// `r` — `Rename { branch, name }`.
     Rename,
-    /// `v` — `Restart { branch, call: UserCall::Resume { value } }`; the
-    /// text is parsed as JSON, falling back to a bare string.
+    /// `v` — `Restart { branch, source: "return resume(<value>);" }`; the
+    /// text is parsed as JSON, falling back to a bare string, and
+    /// spliced into the synthesized program — what's shown in the pane
+    /// is exactly what runs (22_ONE_VOCABULARY's `UserCall` collapse).
     ResumeWithValue,
-    /// `e` — `Restart { branch, call: UserCall::RunProgram { source } }`,
-    /// pasting a full rewrite.
+    /// `e` — `Restart { branch, source }`, the pasted text verbatim: a
+    /// full rewrite, unchanged in spirit from before `UserCall` existed.
     Rewrite,
     /// `p` — `Spawn { parent: branch, charter, name: None, text: None }`.
     SpawnCharter,
-}
-
-/// A subitem selected within a program block.
-#[derive(Debug, Clone, PartialEq)]
-pub enum Subitem {
-    Attachment(String),
-    Invoke(usize),
 }
 
 pub struct AttachedApp {
@@ -168,11 +162,12 @@ pub struct AttachedApp {
     pub selected: Option<BranchId>,
     /// Which program the right-hand panes show (decision 1). `None` ⇒ the
     /// selected branch's most-recent program (the default); a click on an
-    /// older chat block pins a specific one by its `run_program` event id.
+    /// older chat block pins a specific one by its own `Turn` event id.
     pub selected_program: Option<EventId>,
-    /// A subitem within the selected program: an attachment or invoke to
-    /// show in the right panel instead of the program console.
-    pub selected_subitem: Option<Subitem>,
+    /// An invoke selected within the selected program (its index into
+    /// `ProgramView.invokes`), shown in the right panel instead of the
+    /// program console.
+    pub selected_subitem: Option<usize>,
     /// Branches whose `System` block is folded to its header (decision 7).
     collapsed: HashSet<BranchId>,
     pub input: InputBuffer,
@@ -325,19 +320,17 @@ impl AttachedApp {
     }
 
     /// Feed one `SessionEvent`: updates the transcript and drives the
-    /// auto-pop — the selected branch starting a `run_program` pops the
-    /// source + console column (decision 6).
+    /// auto-pop — the selected branch starting a new program (every
+    /// `Turn` is one now) pops the source + console column (decision 6).
     pub fn apply(&mut self, event: &SessionEvent) {
         if let SessionEvent::Event { branch, event, .. } = event
             && Some(*branch) == self.selected
-            && matches!(
-                &event.payload,
-                EventPayload::Message(Message::Turn { tool_calls, .. })
-                    if tool_calls.iter().any(|c| c.name == TOOL_RUN_PROGRAM)
-            )
+            && matches!(&event.payload, EventPayload::Message(Message::Turn { .. }))
         {
-            // Follow the live program: a fresh run on the selected agent
-            // drops any pinned older program.
+            // Follow the live program: every `Turn` is one now
+            // (22_ONE_VOCABULARY's "a turn is a program"), so a fresh one
+            // on the selected agent drops any pinned older program, the
+            // same way a `run_program` tool call used to trigger this.
             self.selected_program = None;
             if self.view == View::Chat {
                 self.view = View::Running;
@@ -489,26 +482,11 @@ impl AttachedApp {
                             self.selected_subitem = None;
                             self.reset_program_scrolls();
                         }
-                        RowDetail::Attachment(pid, name) => {
-                            let toggle_off = self.selected_program == Some(*pid)
-                                && self.selected_subitem == Some(Subitem::Attachment(name.clone()));
-                            self.selected_program = Some(*pid);
-                            if toggle_off {
-                                self.selected_subitem = None;
-                            } else {
-                                self.selected_subitem = Some(Subitem::Attachment(name.clone()));
-                            }
-                            self.reset_program_scrolls();
-                        }
                         RowDetail::Invoke(pid, idx) => {
                             let toggle_off = self.selected_program == Some(*pid)
-                                && self.selected_subitem == Some(Subitem::Invoke(*idx));
+                                && self.selected_subitem == Some(*idx);
                             self.selected_program = Some(*pid);
-                            if toggle_off {
-                                self.selected_subitem = None;
-                            } else {
-                                self.selected_subitem = Some(Subitem::Invoke(*idx));
-                            }
+                            self.selected_subitem = if toggle_off { None } else { Some(*idx) };
                             self.reset_program_scrolls();
                         }
                     }
@@ -900,8 +878,8 @@ impl AttachedApp {
             // The collapse key, both ways: `Running`'s source/console
             // panes fold back to full-width chat, and — since this was
             // otherwise a one-way door, reversible only by a fresh
-            // `run_program` re-triggering the auto-pop in `apply` —
-            // pressing it again from `Chat` reopens them.
+            // program re-triggering the auto-pop in `apply` — pressing it
+            // again from `Chat` reopens them.
             KeyCode::Char('c') if self.view == View::Running => {
                 self.view = View::Chat;
                 self.focus = Focus::Input;
@@ -952,11 +930,14 @@ impl AttachedApp {
             }
             KeyCode::Char('a') if self.view != View::FullDebug => self.arm_ask(),
             KeyCode::Char('r') if self.view != View::FullDebug => self.arm(ExplicitMode::Rename),
-            // Only a `Phase::Suspended` branch is actually resumable
-            // (`Runner::eligible`'s `Restart::Resume` arm, `machine.rs`)
-            // — everywhere else it's a wasted round trip through
-            // cmd_restart that comes back refused, not a harmless no-op
-            // like `w` on an empty wait-list (19_UX Step F1).
+            // Only a `Phase::Suspended` branch actually has a `resume`
+            // bound to hand a value to — everywhere else `resume` is just
+            // an unbound name, so the synthesized program would trap
+            // (22_ONE_VOCABULARY: "`resume` is unbound → a trap → a
+            // handler, like any other error") rather than doing anything
+            // useful. Gating the gesture here avoids that wasted round
+            // trip, not a harmless no-op like `w` on an empty wait-list
+            // (19_UX Step F1).
             KeyCode::Char('v')
                 if self.view != View::FullDebug && selected_status == Some("suspended") =>
             {
@@ -1077,15 +1058,22 @@ fn resolve_submit(
 fn resolve_submit_mode(mode: ExplicitMode, branch: BranchId, text: String) -> SessionCommand {
     match mode {
         ExplicitMode::Rename => SessionCommand::Rename { branch, name: text },
-        ExplicitMode::ResumeWithValue => SessionCommand::Restart {
-            branch,
-            call: UserCall::Resume {
-                value: Some(serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text))),
-            },
-        },
+        // `v` keeps the "type a JSON value" UX, but synthesizes the
+        // program that actually runs it, per 22_ONE_VOCABULARY's
+        // `UserCall` collapse: what's shown in the pane is exactly what
+        // ran, rather than a value tucked inside a tool-call struct.
+        ExplicitMode::ResumeWithValue => {
+            let value: serde_json::Value =
+                serde_json::from_str(&text).unwrap_or_else(|_| serde_json::Value::String(text));
+            SessionCommand::Restart {
+                branch,
+                source: format!("return resume({value});"),
+            }
+        }
+        // `e` is unchanged in spirit: the pasted text *is* the program.
         ExplicitMode::Rewrite => SessionCommand::Restart {
             branch,
-            call: UserCall::RunProgram { source: text },
+            source: text,
         },
         ExplicitMode::SpawnCharter => SessionCommand::Spawn {
             parent: branch,
@@ -1771,19 +1759,11 @@ fn chat_style(kind: ChatKind, even: bool) -> Style {
             };
             Style::default().fg(fg).add_modifier(Modifier::ITALIC)
         }
-        ChatKind::ToolCall => {
+        ChatKind::Program => {
             let fg = if even {
                 Color::Yellow
             } else {
                 Color::Rgb(180, 170, 0)
-            };
-            Style::default().fg(fg)
-        }
-        ChatKind::Attachment => {
-            let fg = if even {
-                Color::Rgb(120, 200, 255)
-            } else {
-                Color::Rgb(80, 140, 200)
             };
             Style::default().fg(fg)
         }
@@ -1802,12 +1782,12 @@ fn chat_style(kind: ChatKind, even: bool) -> Style {
     }
 }
 
-/// A `run_program` header's severity color, read off its own status
+/// A program block header's severity color, read off its own status
 /// word — reusing the palette a call's outcome already uses elsewhere
 /// (a `⇒ result` line is green, an error line is red) instead of
 /// inventing a fourth scheme. `None` for `running`/`suspended`: nothing
 /// has gone right or wrong yet, so the header keeps its plain
-/// `ChatKind::ToolCall` color.
+/// `ChatKind::Program` color.
 fn program_header_severity(text: &str) -> Option<Color> {
     if text.ends_with("failed") {
         Some(Color::Red)
@@ -1970,13 +1950,13 @@ fn render_chat(
             continue;
         }
         let even = match detail {
-            RowDetail::Program(pid) | RowDetail::Attachment(pid, _) | RowDetail::Invoke(pid, _) => {
+            RowDetail::Program(pid) | RowDetail::Invoke(pid, _) => {
                 if in_program != Some(*pid) {
                     in_program = Some(*pid);
-                    let e = parity.entry(ChatKind::ToolCall).or_insert(true);
+                    let e = parity.entry(ChatKind::Program).or_insert(true);
                     *e = !*e;
                 }
-                *parity.get(&ChatKind::ToolCall).unwrap_or(&true)
+                *parity.get(&ChatKind::Program).unwrap_or(&true)
             }
             RowDetail::None => {
                 in_program = None;
@@ -1995,20 +1975,12 @@ fn render_chat(
             style = style.fg(color);
         }
         // Highlight the selected subitem line.
-        if let Some(ref sel) = app.selected_subitem {
-            let highlight = match (detail, sel) {
-                (RowDetail::Attachment(pid, name), Subitem::Attachment(s))
-                    if app.selected_program == Some(*pid) && name == s =>
-                {
-                    true
-                }
-                (RowDetail::Invoke(pid, idx), Subitem::Invoke(i))
-                    if app.selected_program == Some(*pid) && idx == i =>
-                {
-                    true
-                }
-                _ => false,
-            };
+        if let Some(sel) = app.selected_subitem {
+            let highlight = matches!(
+                detail,
+                RowDetail::Invoke(pid, idx)
+                    if app.selected_program == Some(*pid) && *idx == sel
+            );
             if highlight {
                 style = style.add_modifier(Modifier::REVERSED);
             }
@@ -2404,20 +2376,9 @@ fn render_subitem(
     scroll: Option<usize>,
 ) -> (usize, Rect) {
     let mut lines: Vec<Line> = Vec::new();
-    let title = match &app.selected_subitem {
-        Some(Subitem::Attachment(name)) => {
-            let content = pv
-                .attachments
-                .get(name)
-                .map(|s| s.as_str())
-                .unwrap_or("(attachment not found)");
-            for l in content.lines() {
-                lines.push(Line::from(l.to_owned()));
-            }
-            format!(" attachment: {name} ")
-        }
-        Some(Subitem::Invoke(idx)) => {
-            if let Some(invoke) = pv.invokes.get(*idx) {
+    let title = match app.selected_subitem {
+        Some(idx) => {
+            if let Some(invoke) = pv.invokes.get(idx) {
                 lines.push(
                     Line::from(format!("⚙ {}", invoke.name))
                         .style(Style::default().fg(Color::Yellow)),
@@ -2491,8 +2452,14 @@ fn condition_line(cause: &Cause) -> String {
         Cause::Trapped { message, .. } => message.clone(),
         Cause::Posted { .. } => "a message arrived".to_owned(),
         Cause::CompileFailed { .. } => "compile error".to_owned(),
-        Cause::Refused { reason } => format!("refused: {reason}"),
+        // Never compiled at all (`Cause::Truncated`'s own doc in
+        // `types.rs`): cut off mid-program, it may still parse and run
+        // half-written, which is strictly worse than a clean failure.
+        Cause::Truncated => "truncated (hit the token limit)".to_owned(),
         Cause::Interrupted => "interrupted".to_owned(),
+        // A handler decided `return abandon()`: the suspended run was
+        // discarded, not continued.
+        Cause::Abandoned => "abandoned".to_owned(),
     }
 }
 
@@ -2666,18 +2633,14 @@ mod tests {
             resolve_submit_mode(ExplicitMode::ResumeWithValue, branch, "5".into()),
             SessionCommand::Restart {
                 branch,
-                call: UserCall::Resume {
-                    value: Some(json!(5))
-                },
+                source: "return resume(5);".into(),
             }
         );
         assert_eq!(
             resolve_submit_mode(ExplicitMode::ResumeWithValue, branch, "not json".into()),
             SessionCommand::Restart {
                 branch,
-                call: UserCall::Resume {
-                    value: Some(json!("not json")),
-                },
+                source: "return resume(\"not json\");".into(),
             },
             "a non-JSON value falls back to a bare string"
         );
@@ -2685,9 +2648,7 @@ mod tests {
             resolve_submit_mode(ExplicitMode::Rewrite, branch, "return 1;".into()),
             SessionCommand::Restart {
                 branch,
-                call: UserCall::RunProgram {
-                    source: "return 1;".into(),
-                },
+                source: "return 1;".into(),
             }
         );
         assert_eq!(
@@ -4167,14 +4128,27 @@ mod tests {
                 Ok(json!("done"))
             }),
         });
+        // The parent's one program spawns a child and asks it something,
+        // parking on the `await` — no second completion for the parent
+        // itself (a yield, not a round trip: 22_ONE_VOCABULARY's "you
+        // await an exchange, never a strand"). The child's own first
+        // program starts the slow tool call without answering yet, which
+        // is the concurrent-running window this test is probing; once
+        // that settles, the child still owes the parent's `ask` and gets
+        // a fresh turn to discharge it explicitly — `answer()` is the
+        // only thing that does (a bare `return` answers nothing).
+        // Event id 8 is the parent's `ask`-delivered `Post` on the
+        // child's branch, deterministic from this exact call sequence
+        // (Agent 1, Post 2, Turn 3, Spawn 4, Agent 5, Result 6, Send 7,
+        // Post 8) — the same numbering `exchange_ids_form_a_closed_loop`
+        // (`host/mod.rs`) documents for the identical spawn+ask shape.
         let script = vec![
             scripted_program(
-                "c1",
-                r#"return await tools.agent({ prompt: "child task", input: null });"#,
+                r#"const w = await spawn("child worker");
+                   return await ask(w.agent, "child task");"#,
             ),
-            scripted_program("c2", "return await tools.slow();"),
-            scripted_text("child done"),
-            scripted_text("parent done"),
+            scripted_program("return await tools.slow();"),
+            scripted_program(r#"return answer(8, "child", "done");"#),
         ];
         let (tx, _rx) = channel();
         let mut session = Session::new(
@@ -4222,7 +4196,7 @@ mod tests {
                     .to_string()
             })
             .collect();
-        assert!(sources[0].contains("tools.agent"), "{sources:?}");
+        assert!(sources[0].contains("spawn("), "{sources:?}");
         assert!(sources[1].contains("tools.slow"), "{sources:?}");
 
         // And the whole thing still settles cleanly: nothing *ends* —

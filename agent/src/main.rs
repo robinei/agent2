@@ -8,12 +8,10 @@ mod report;
 mod tree;
 mod types;
 
-// The TUI is cut out of the build for Passes A-C (`23_ONE_AGENT.md`,
-// "The TUI is deferred, not kept"). It is 6.8k lines rendering a
-// vocabulary that is still in motion; Pass D restores it, rebuilt on
-// one-row-per-event. Nothing about it is kept alive in the meantime --
-// this is deferral of a UI, not a fallback path.
-// mod debug;
+// Pass D (`23_ONE_AGENT.md`): the TUI is back in the build, rebuilt on
+// the settled vocabulary — one document row per event, addressed by its
+// id, rather than the old tool-call block model.
+mod debug;
 
 pub use machine::*;
 pub use types::*;
@@ -21,13 +19,15 @@ pub use types::*;
 use host::SessionEvent;
 
 const USAGE: &str = "usage: agent <command>
-  session [options] [log.jsonl]     agent session. Always headless for
-                                    now: the TUI is cut from the build
-                                    for phase 23 and returns in Pass D
-                                    (23_ONE_AGENT.md).
-    --headless                      accepted, and already the only mode
+  debug <file.js>                   standalone debugger TUI: compile and
+                                    step one program under the fuel
+                                    slicer, no session, no LLM.
+  session [options] [log.jsonl]     agent session (attached TUI by default)
+    --headless                      print events instead of the TUI
     --real                          use DeepSeek (needs DEEPSEEK_API_KEY);
-                                    otherwise the session runs scripted
+                                    the TUI picks it automatically when the
+                                    key is set — --headless stays scripted
+                                    unless --real is given
     --turn <text>                   queue a first user turn on the
                                     conversation branch (headless)
     --list-leaves                   print the log's leaf set and exit
@@ -45,14 +45,21 @@ const USAGE: &str = "usage: agent <command>
                                     experimental set with --experimental.
                                     Never part of `cargo test` -- it costs
                                     real money and its numbers are read by
-                                    a human.
-The TUI is cut out of the build for Passes A-C (23_ONE_AGENT.md); the
-standalone `debug <file.js>` subcommand and attached-TUI `session` return
-in Pass D.";
+                                    a human.";
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
+        Some("debug") => {
+            let Some(path) = args.get(2) else {
+                eprintln!("usage: agent debug <file.js>");
+                std::process::exit(2);
+            };
+            if let Err(e) = debug::run(path) {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
         Some("session") => {
             let mut headless = false;
             let mut real = false;
@@ -256,36 +263,16 @@ fn queue_nav(session: &host::Session, nav: &SessionNav) {
 
 /// The attached TUI (9_TUI Step 4) — the harness's primary frontend.
 /// Type a message to kick it off.
-///
-/// **Falls back to headless for Passes A-C** (23_ONE_AGENT.md, "The TUI
-/// is deferred, not kept"): the debugger module is cut out of the build
-/// while the vocabulary underneath it is still moving, so there is no
-/// attached-TUI runner left to hand the session to here. Pass D restores
-/// this function to what it was — build the session, mark it attached,
-/// hand it and `rx` to the TUI — once the debugger is rebuilt on the
-/// settled log vocabulary (one document row per event).
 fn run_session_tui(
     log_path: Option<String>,
     real: bool,
     resume: Option<u64>,
 ) -> Result<(), String> {
-    eprintln!(
-        "agent: the attached TUI is deferred until Pass D (23_ONE_AGENT.md) — running headless"
-    );
     let (tx, rx) = std::sync::mpsc::channel();
     let mut session = build_session(log_path, real, resume, tx)?;
-    // The TUI *is* a client, so it is presence; headless standing in for
-    // it here inherits that same honesty about who's listening.
+    // The TUI *is* a client, so it is presence.
     session.set_attached(true);
-    let printer = std::thread::spawn(move || {
-        for event in rx {
-            print_session_event(&event);
-        }
-    });
-    let session = session.run(); // blocks until the session goes quiet
-    drop(session); // closes the event channel; the printer drains and exits
-    printer.join().map_err(|_| "printer thread panicked")?;
-    Ok(())
+    debug::run_attached(session, rx)
 }
 
 /// The headless session: print every `SessionEvent` from the channel —
