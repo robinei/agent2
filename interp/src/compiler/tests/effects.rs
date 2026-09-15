@@ -465,3 +465,13 @@ fn next_program_takes_no_payload_too() {
         other => panic!("expected a raise, got {other:?}"),
     }
 }
+
+#[test]
+fn spread_takes_a_set_and_a_string() {
+    // `[...new Set(xs)]` is *the* JavaScript dedupe. It trapped live on
+    // 2026-09-15 with "array spread source must be an array", costing a
+    // recovery round trip in a real session.
+    assert_eq!(eval_str("[...new Set([1, 2, 2, 3])].join(',')"), "1,2,3");
+    assert_eq!(eval_str("[...'abc'].join('-')"), "a-b-c");
+    assert_eq!(eval_str("[...new Set(['a']), ...['b']].join(',')"), "a,b");
+}

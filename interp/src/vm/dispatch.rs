@@ -2142,10 +2142,43 @@ impl VM {
                             })?;
                             arr.extend(src_elts);
                         }
+                        // `[...new Set(xs)]` is the idiomatic dedupe in
+                        // JavaScript, and a `Set` is iterable, so spread
+                        // takes one. Observed live 2026-09-15: a program
+                        // wrote exactly that, trapped, and spent a
+                        // recovery round trip on it.
+                        Value::Set(set_ptr) => {
+                            let elts: ThinVec<Value> = self
+                                .sets
+                                .get(set_ptr as usize)
+                                .ok_or_else(|| {
+                                    VMError::fail_at(ip, ErrorKind::TypeError, "bad set pointer")
+                                })?
+                                .iter()
+                                .map(|k| k.0.clone())
+                                .collect();
+                            let arr = self.arrays.get_mut(arr_ptr as usize).ok_or_else(|| {
+                                VMError::fail_at(ip, ErrorKind::TypeError, "bad array pointer")
+                            })?;
+                            arr.extend(elts);
+                        }
+                        // `[..."abc"]` — a string is iterable too, by
+                        // code point.
+                        Value::String(ref s) => {
+                            let elts: ThinVec<Value> = s
+                                .as_str()
+                                .chars()
+                                .map(|c| Value::String(RcStr::from(c.to_string().as_str())))
+                                .collect();
+                            let arr = self.arrays.get_mut(arr_ptr as usize).ok_or_else(|| {
+                                VMError::fail_at(ip, ErrorKind::TypeError, "bad array pointer")
+                            })?;
+                            arr.extend(elts);
+                        }
                         _ => {
                             return Err(self.fail(
                                 ErrorKind::TypeError,
-                                "array spread source must be an array",
+                                "array spread source must be an array, a Set, or a string",
                             ));
                         }
                     }

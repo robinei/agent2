@@ -221,17 +221,19 @@ fn object_spread_multiple() {
     );
 }
 
-/// Spread of a non-array / non-object value is a TypeError (documented
-/// divergence: JS spreads any iterable in arrays — including strings — and
-/// copies index keys from arrays/strings in objects).
+/// Spread of a non-iterable value is a TypeError. Arrays, `Set`s and
+/// strings all spread in arrays, matching JS; the remaining divergence
+/// is narrower than it was — object spread still does not copy index
+/// keys from arrays/strings, and no other iterable protocol is honoured.
 #[test]
 fn spread_non_container_errors() {
     use crate::vm::ErrorKind;
-    // Array spread: strings and numbers are not spreadable.
-    assert!(matches!(
-        testutil::run_err_kind("let a = [...\"ab\"]; return a;"),
-        ErrorKind::TypeError
-    ));
+    // Array spread: a number is not iterable, so it is not spreadable.
+    // A *string* is — `[..."ab"]` is `["a", "b"]` in real JavaScript,
+    // and this used to assert the opposite (see
+    // `spread_takes_a_set_and_a_string` in `effects.rs`, and 15_COMPAT's
+    // "real JS does it" bar). A Set is iterable too, and
+    // `[...new Set(xs)]` trapped in a live session on 2026-09-15.
     assert!(matches!(
         testutil::run_err_kind("let n = 5; let a = [1, ...n]; return a;"),
         ErrorKind::TypeError

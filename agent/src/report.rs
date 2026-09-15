@@ -698,7 +698,7 @@ fn render_handback(h: &Handback<'_>, budget: usize) -> String {
             Cause::CompileFailed { message } => message.clone(),
             Cause::Truncated => TRUNCATED_MESSAGE.to_owned(),
             _ => ConditionReport {
-                what: what_happened(h, cause, *site),
+                what: what_happened(h, cause, *site, budget),
                 // A post stopped the program nowhere in particular: the
                 // useful "where" is the whole program with its progress
                 // marked, which is what a rewrite copy-edits.
@@ -780,7 +780,7 @@ fn answer_ack(
 /// menu any more (DESIGN.md "The thesis": a suspension gets a handler
 /// *program*, not a pick off a schema list), so this is simply one more
 /// fact about what happened, stated where the reader is already looking.
-fn what_happened(h: &Handback<'_>, cause: &Cause, site: u32) -> String {
+fn what_happened(h: &Handback<'_>, cause: &Cause, site: u32, budget: usize) -> String {
     let source = &h.source;
     match cause {
         Cause::Raised { name, payload } if name == interp::NEXT_PROGRAM_CONDITION => {
@@ -798,7 +798,17 @@ fn what_happened(h: &Handback<'_>, cause: &Cause, site: u32) -> String {
             );
             if let Some(p) = payload {
                 what.push_str("\n\nwhat it handed you:\n");
-                what.push_str(&clip(&p.to_string(), PAYLOAD_MAX_BYTES));
+                // The **answer budget**, not `PAYLOAD_MAX_BYTES`. A
+                // `raise` payload is a preview of a question you are
+                // being asked about; a handover payload *is* the
+                // material the next program is written from, and
+                // clipping it to a kilobyte is discarding the point of
+                // the verb. Observed 2026-09-15: a program handed over
+                // 190,892 bytes of gathered files, 1,024 arrived, and
+                // the next program re-gathered from scratch — the model
+                // carried its findings forward exactly as asked and the
+                // harness threw them away.
+                what.push_str(&clip(&p.to_string(), budget));
             }
             what
         }
