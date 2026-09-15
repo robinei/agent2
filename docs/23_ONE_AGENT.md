@@ -391,6 +391,34 @@ Three harness/prompt defects, none of them model behaviour:
    `return resume(value)` against a condition report), `raise` went
    from zero in sixteen task-runs to two in five.
 
+### And then the sandbox, which lowered it again
+
+The table above is **fake-tool runs, and its 5/5 is one sample.** Three
+runs against real tools in the sandbox, on the same code:
+
+| run | passed | mean RT | spawn children | failing |
+|---|---|---|---|---|
+| 1 | 5/5 | 1.60 | 1 | — |
+| 2 | 4/5 | 1.80 | 1 | judgment-in-the-middle |
+| 3 | 3/5 | 1.60 | 2 | judgment-in-the-middle, destructive-migration-gate |
+
+So the honest statement is **3–5 of 5, with high variance**, not 5/5.
+Recording a single favourable sample as a result was the exact n=1
+error this document warns about two paragraphs later, made by the
+person who wrote the warning.
+
+Two of those failures trace to a bug fixed after run 3 — the compiler
+now emits the `await` for `spawn`/`fork`, so `const h = spawn(...)`
+yields a handle rather than a promise, which had been trapping
+`fan-out` in every run. Whether that lifts the other two failures is
+**unmeasured**; saying it will is the same mistake again.
+
+The recurring failures are worth naming because they are *behavioural*,
+not harness defects: `judgment-in-the-middle` reverts to reading a file
+and stopping without acting, and `destructive-migration-gate` deletes
+without gating. Both are the card asking for something and the model
+not reliably doing it — which is the measurement working.
+
 **What is measured, and what is not.** Round-trips hold at 1.0–1.4
 with programs of 3–14 statements doing parallel reads, retry-and-branch,
 transaction wrapping and post-hoc verification inline — the turn-count
