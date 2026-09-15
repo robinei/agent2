@@ -298,6 +298,27 @@ event, addressed by its id; `RowDetail` folds over the log rather than
 mirroring a block model. Restore `mod debug;` and its `main.rs` arms.
 Not started until Pass C is green.
 
+The coupling is far smaller than `debug/`'s 9,349 lines suggest: about
+55 call sites, all in `chat.rs` and `attach.rs`. The other eight files
+— `input`, `markdown`, `ui`, `panes`, `highlight`, `app`, `runner`,
+`mod` — have **zero** hits on deleted vocabulary and carry over
+untouched.
+
+Two things are rebuilt rather than ported. The `e`/`v` gestures
+construct a `UserCall`, which no longer exists: per `22`, they
+synthesize **programs** instead, so what the pane shows is exactly what
+ran. And `ProgramView.depth` wants a nested-handler rendering that has
+no equivalent today.
+
+**Do not build any `//:` rendering.** That convention is gone from the
+card (narration is ordinary `tell()` now), and it never had an
+implementation to port — the streaming it promised was never built.
+**Assume instead that a turn's messages can arrive while the turn is
+still generating**, not only after it completes. Phase 24 makes that
+literally true by dispatching leading `tell()` calls off the token
+stream; a renderer that assumes messages land only at turn boundaries
+is the one thing here that would need rewriting twice.
+
 ---
 
 ## What this accepts losing
