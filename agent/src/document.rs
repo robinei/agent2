@@ -52,6 +52,18 @@ pub struct Document {
 }
 
 impl Document {
+    /// The conversation proper — everything after the preamble (the
+    /// system message and the worked examples). What a caller reasoning
+    /// about *this branch's* history wants, as opposed to what is sent
+    /// on the wire.
+    ///
+    /// The preamble is a fixed-size prefix that grows when an exemplar
+    /// is added, so positional indexing into `messages` is a latent
+    /// break in anything that means "the first real turn."
+    pub fn conversation(&self) -> &[ChatMessage] {
+        &self.messages[1 + worked_examples().len()..]
+    }
+
     /// Append ephemeral, one-request-only content to the open turn
     /// (Step B1c: the tail — a condition report, a `vm` pointer). It
     /// is never part of the log and never returned by [`render`] on its
@@ -336,6 +348,7 @@ pub(crate) fn render_with_lookup(
         role: ChatRole::System,
         content: card.to_owned(),
     }];
+    messages.extend(worked_examples());
     let mut pending: Vec<String> = Vec::new();
     let mut cur_agent: Option<EventId> = None;
     let mut depth: usize = 0;
@@ -391,6 +404,50 @@ pub(crate) fn render_with_lookup(
     }
 
     Document { messages }
+}
+
+/// The card's worked examples, as **real alternating turns** ahead of
+/// the conversation — a request in the user role, the program that
+/// answered it in the assistant role.
+///
+/// They were briefly rendered as prose quoted inside the system
+/// message, on the reasoning that a synthetic turn is a document row
+/// with no event behind it and `22_ONE_VOCABULARY.md` says every row is
+/// exactly one event. That was clean and measurably wrong: the first
+/// live runs of the real session lost both behaviours the examples
+/// exist to induce — programs went back to reading a file and stopping
+/// without acting, and `ask`/`raise` were not reached for once across
+/// ten task runs. A worked example in the assistant role is a far
+/// stronger signal than the same bytes quoted in a system prompt.
+///
+/// The invariant is not violated, because these are not conversation
+/// rows at all: they are **preamble**, in the same class as the system
+/// message, which is likewise not an event and carries no id. Seeding
+/// them as real events was considered and rejected — `programs_for`
+/// would list them as programs that ran, compaction could delete them,
+/// and the eval's own `round_trips` fold would count them as turns the
+/// model took. None of that is true of a prompt.
+///
+/// Each request is marked inline so the model can tell an example from
+/// its own history, and the pairs alternate strictly, so the
+/// conversation's own first user turn continues the alternation with
+/// no special case.
+fn worked_examples() -> Vec<ChatMessage> {
+    crate::card::SEED_EXEMPLARS
+        .iter()
+        .flat_map(|ex| {
+            [
+                ChatMessage {
+                    role: ChatRole::User,
+                    content: format!("[worked example, not this conversation] {}", ex.user),
+                },
+                ChatMessage {
+                    role: ChatRole::Assistant,
+                    content: ex.assistant.to_owned(),
+                },
+            ]
+        })
+        .collect()
 }
 
 /// Strip a single leading/trailing code fence if the **whole** trimmed
@@ -532,14 +589,15 @@ mod tests {
         .unwrap();
 
         let doc = render(&tree, &spine, 64 * 1024);
-        assert_eq!(doc.messages.len(), 4);
         assert_eq!(doc.messages[0].role, ChatRole::System);
         assert_eq!(doc.messages[0].content, "CARD");
-        assert_eq!(doc.messages[1].role, ChatRole::User);
-        assert!(doc.messages[1].content.contains("hello"));
-        assert_eq!(doc.messages[2].role, ChatRole::Assistant);
-        assert_eq!(doc.messages[2].content, "tell('hi'); return 1;");
-        assert_eq!(doc.messages[3].role, ChatRole::User);
+        let conv = doc.conversation();
+        assert_eq!(conv.len(), 3);
+        assert_eq!(conv[0].role, ChatRole::User);
+        assert!(conv[0].content.contains("hello"));
+        assert_eq!(conv[1].role, ChatRole::Assistant);
+        assert_eq!(conv[1].content, "tell('hi'); return 1;");
+        assert_eq!(conv[2].role, ChatRole::User);
     }
 
     /// A `Turn` at handler depth > 0 — a deliberation still being
@@ -587,8 +645,8 @@ mod tests {
         let doc = render(&tree, &spine, 64 * 1024);
         // card, user("go"), assistant("raise('x');"), user(report) —
         // never the handler's own turn.
-        assert_eq!(doc.messages.len(), 4);
-        assert_eq!(doc.messages[2].content, "raise('x');");
+        assert_eq!(doc.conversation().len(), 3);
+        assert_eq!(doc.conversation()[1].content, "raise('x');");
         assert!(
             !doc.messages.iter().any(|m| m.content.contains("resume(1)")),
             "the handler's own deliberation must never reach this document: {doc:?}"
@@ -623,7 +681,7 @@ mod tests {
         .unwrap();
 
         let doc = render(&tree, &spine, 64 * 1024);
-        let compacted_turn = &doc.messages[2];
+        let compacted_turn = &doc.conversation()[1];
         assert_eq!(compacted_turn.role, ChatRole::Assistant);
         assert!(compacted_turn.content.starts_with("//:"));
         assert!(

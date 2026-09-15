@@ -172,39 +172,7 @@ pub fn tool_manifest(registry: &crate::host::ToolRegistry) -> String {
 /// immutable cache prefix, and a later card edit or registry change must
 /// not alter an existing conversation's prompt out from under it.
 pub fn full_card(registry: &crate::host::ToolRegistry) -> String {
-    format!("{CARD}{}{}", tool_manifest(registry), worked_examples())
-}
-
-/// The exemplars, rendered into the **system prompt** rather than
-/// seeded as turns in the document.
-///
-/// The POC carried them on `RunConfig::exemplars` and its runner
-/// pushed them in as synthetic user/assistant pairs. That cannot
-/// survive `22_ONE_VOCABULARY.md`'s organizing invariant — *every
-/// document row is exactly one event, addressed by its id* — because a
-/// seeded pair is a row with no event and no id behind it. Compaction
-/// would have rows it cannot address, and `artifact(id)` would have
-/// ids that resolve to nothing. The system prompt is where prompt
-/// state that isn't in the log is *supposed* to live:
-/// `EventPayload::Agent.system` is documented as "the deliberate
-/// exception to 'nothing regenerable is stored'", snapshotted at the
-/// agent's root so a later card edit never alters an existing
-/// conversation's cached prefix.
-///
-/// Each example earns its place by having fixed an observed live
-/// failure — see `SEED_EXEMPLARS`' own doc for which fixed what.
-/// Without them the model reverts to recon-only programs that report
-/// findings and stop, which is the single behaviour that cost the most
-/// to correct.
-fn worked_examples() -> String {
-    let mut out = String::from(
-        "\n\nWorked examples. Each is a complete response to the request \
-         above it — the whole program, nothing else.\n",
-    );
-    for ex in SEED_EXEMPLARS {
-        out.push_str(&format!("\n--- asked: {}\n{}\n", ex.user, ex.assistant));
-    }
-    out
+    format!("{CARD}{}", tool_manifest(registry))
 }
 
 /// A worked exemplar: a real user/assistant pair opening `messages`,
