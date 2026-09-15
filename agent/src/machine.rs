@@ -836,6 +836,47 @@ impl Runner {
                     // The abandoned program never completed — Failed.
                     self.note_status(old.program_id, ProgramStatus::Failed);
                     self.last_vm = Some(old.vm);
+                    // Exactly the log-visible terminal `Runner::abandon`'s
+                    // own doc insists on, for exactly the reason it gives
+                    // there: a `Pushed` condition that never gets a
+                    // matching close leaves `depth_after` incremented
+                    // forever, so every later event on this branch
+                    // replays as though still nested inside a scope
+                    // nothing will ever close, and `document::render`'s
+                    // depth-0 filter hides it from every future request.
+                    // This is that same bug, reached from a different
+                    // door: a fresh completion (live or user-authored)
+                    // silently replacing a suspended one, rather than a
+                    // program explicitly deciding `return abandon()`.
+                    // `Handover`, not `Pushed`, because this condition is
+                    // closing the frame the old run opened, not opening a
+                    // new one for a handler to run at.
+                    //
+                    // **Known remaining gap, not fixed here:** `assistant_id`
+                    // — this very turn's own `Turn` event — was already
+                    // appended above, *before* this `Condition`, so it is
+                    // still evaluated at the old (unclosed) depth and
+                    // stays invisible to `document::render` until some
+                    // later event brings depth back to 0. Only what comes
+                    // *after* this `Condition` (this program's own `Call`/
+                    // `Return`, and anything later) renders correctly.
+                    // Closing that fully means deciding whether to
+                    // discard a suspension *before* compiling the
+                    // replacement, which changes where `assistant_id`
+                    // comes from — a bigger reshuffle of this function
+                    // than this pass's mandate, left for whoever next
+                    // touches replay depth counting (the same flag
+                    // `suspend`'s own doc already carries for the
+                    // adjacent `Disposition::Pushed`-on-every-raise gap).
+                    tree.append(
+                        &mut self.spine,
+                        EventPayload::Condition {
+                            cause: Cause::Abandoned,
+                            site: 0,
+                            stack: Vec::new(),
+                            disposition: Disposition::Handover,
+                        },
+                    )?;
                 }
                 self.generation += 1;
                 self.phase = Phase::Running(run);
@@ -1664,6 +1705,25 @@ impl Runner {
         unstarted: Vec<InvokeCall>,
         mut out: Vec<StepOutput>,
     ) -> io::Result<Vec<StepOutput>> {
+        // Fire-and-forget calls the program never awaited: classified
+        // exactly like any other call (`dispatch_calls` — the single
+        // place a bare verb's name becomes a `Call` variant), **while the
+        // VM is still `Running`**, so `tell`/`ask`/`spawn`/`fork` land as
+        // themselves instead of silently demoting to a generic
+        // `Call::Invoke` sent to the tool registry (which has no such
+        // tool and answers "unknown tool `tell`"). This used to build
+        // `Call::Invoke` unconditionally for every unstarted call — the
+        // bug 23_ONE_AGENT.md's Pass B flagged as a confirmed regression:
+        // an unawaited `tell()` reached here, not `dispatch_calls`'s
+        // `TOOL_ASK | TOOL_TELL` arm, because this was a second,
+        // parallel classifier that never got the memo. The host still
+        // decides whether to actually run them; the generation bump right
+        // after keeps every one of them log-only — the program can no
+        // longer observe them, whichever kind of call they turned out to
+        // be.
+        self.dispatch_calls(tree, unstarted, &mut out)?;
+        self.generation += 1;
+
         let Phase::Running(run) = std::mem::replace(&mut self.phase, Phase::Idle) else {
             unreachable!()
         };
@@ -1671,35 +1731,6 @@ impl Runner {
             .vm
             .stack_value_to_json(&value, 0)
             .unwrap_or_else(|_| serde_json::Value::String(format!("{value:?}")));
-
-        // Fire-and-forget calls the program never awaited: the host
-        // decides whether to run them; results are logged as late
-        // artifacts (the generation bump keeps them log-only — the
-        // program can no longer observe them).
-        let mut fire_and_forget = Vec::new();
-        for call in &unstarted {
-            let args = serde_json::Value::Array(
-                call.args
-                    .iter()
-                    .map(|v| value_json_of(&run.vm, v))
-                    .collect(),
-            );
-            let id = self.issue_call(
-                tree,
-                Call::Invoke {
-                    name: call.name.clone(),
-                    args: args.clone(),
-                    site: call.site,
-                },
-                call.promise,
-            )?;
-            fire_and_forget.push(OutCall {
-                call: id,
-                name: call.name.clone(),
-                args,
-            });
-        }
-        self.generation += 1;
 
         // "Completed ⇒ `Return`" holds without exception — a program that
         // ends without a `return` still logs `Return { value: null }` —
@@ -1722,9 +1753,6 @@ impl Runner {
             },
         )?;
 
-        if !fire_and_forget.is_empty() {
-            out.push(StepOutput::ToolCalls(fire_and_forget));
-        }
         self.note_status(run.program_id, ProgramStatus::Completed);
         self.last_vm = Some(run.vm);
         // `document.rs::render` derives the completion report straight
@@ -2106,11 +2134,6 @@ fn json_arg(vm: &mut VM, json: &serde_json::Value) -> Value {
 fn value_json(vm: &VM, v: &Value) -> serde_json::Value {
     vm.stack_value_to_json(v, 0)
         .unwrap_or_else(|_| serde_json::Value::String(format!("{v:?}")))
-}
-
-// Alias for call sites where `value_json` would shadow a local.
-fn value_json_of(vm: &VM, v: &Value) -> serde_json::Value {
-    value_json(vm, v)
 }
 
 fn render_diags(source: &str, diags: &[Diagnostic]) -> String {

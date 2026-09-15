@@ -2341,19 +2341,54 @@ mod tests {
         );
     }
 
+    /// The artifact menu a suspended `raise` hands the handler names
+    /// every call so far, `send_email` included — but that menu never
+    /// reaches the log as a stored row: `suspend`'s own doc says a
+    /// `Pushed` condition is invisible to `document::render`'s rolling
+    /// fold, so the report that names the call is built fresh by
+    /// `prompt_suspended` and folded in as an ephemeral tail
+    /// (`CapturingLlm`'s own doc: "only ever observable here, live,
+    /// never in `tool_texts`/the log"). This test used to read
+    /// `tool_texts` instead, which — being log-only — could never see it
+    /// (silently vacuous: `tool_texts` returned `[]` and the `.expect()`
+    /// on "a report listing the artifact" happened to still fire, for
+    /// the wrong reason). `CapturingLlm` is what actually crosses the
+    /// `LlmClient` trait, tail included, so this is the one mechanism
+    /// that can tell whether the resolved-but-effectful `send_email`
+    /// entry still carries its old "already happened; calling again"
+    /// warning.
     #[test]
     fn menu_has_no_effectful_warning() {
         let mut registry = ToolRegistry::new();
         registry.register(tool("send_email", |_| Ok(json!({ "sent": true }))));
-        let script = vec![
-            scripted_program(r#"await tools.send_email("hi"); raise("inspect", null);"#),
-            scripted_text("stopping here"),
-        ];
-        let (session, _) = run_session(registry, script, "send it");
+        let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let llm = CapturingLlm {
+            inner: ScriptedLlm::new([
+                scripted_program(r#"await tools.send_email("hi"); raise("inspect", null);"#),
+                scripted_text("stopping here"),
+            ]),
+            seen: std::sync::Arc::clone(&seen),
+        };
+        let (tx, _rx) = channel();
+        let session =
+            Session::new(Tree::new(None), "test agent", registry, Box::new(llm), tx).unwrap();
+        session.handle().send(SessionCommand::UserTurn {
+            branch: session.conversation_branch(),
+            text: "send it".into(),
+            expects_reply: true,
+        });
+        session.run();
 
-        let report = tool_texts(&session)
-            .into_iter()
-            .find(|t| t.contains("send_email"))
+        let seen = seen.lock().unwrap();
+        let report = seen
+            .iter()
+            .find_map(|doc| {
+                doc.messages
+                    .iter()
+                    .rev()
+                    .map(|m| m.content.as_str())
+                    .find(|t| t.contains("send_email"))
+            })
             .expect("a report listing the artifact");
         assert!(
             !report.contains("effectful"),
@@ -2536,15 +2571,33 @@ mod tests {
         );
     }
 
-    /// Step 2 (decision 5): a raise+resume folds into one block whose
-    /// status walks `Running → Suspended → Running → Completed`, all under
-    /// the original `run_program` id (the `resume` keeps it).
+    /// Step 2 (decision 5), as it stood before code mode: a raise+resume
+    /// was meant to fold into one block whose status walks `Running →
+    /// Suspended → Running → Completed`, all under the original
+    /// `run_program` id, because `Runner::resume` keeps `run.program_id`
+    /// when it re-enters the same VM (its own code: `let program_id =
+    /// run.program_id; ...; self.note_status(program_id, Running)`).
+    ///
+    /// **That is not what happens here, and it is the same gap
+    /// `raise_sends_the_condition_report_as_a_one_shot_prompt`'s doc
+    /// documents at length: nothing yet recognizes a live completion's
+    /// `{__decision: "resume", value}` return and calls `Runner::resume`
+    /// with it.** `on_llm_response` routes `scripted_resume(7)`'s
+    /// completion through `apply_turn` like any other — which finds the
+    /// first program still `Suspended`, marks it `Failed` ("the
+    /// abandoned program never completed"), and starts a **second,
+    /// unrelated program** (`apply_turn`'s own doc) that happens to
+    /// evaluate to the same tagged object as its ordinary return value.
+    /// That second program has its own, different id, so
+    /// `statuses_for(&events, program)` — filtered on the *first*
+    /// program's id — never sees its `Running`/`Completed` pair at all;
+    /// only the first program's own truncated arc shows up. Flagged as a
+    /// Pass C design gap there, not guessed at here.
     #[test]
     fn program_status_tracks_raise_and_resume() {
         let script = vec![
             scripted_program(r#"const x = raise("need", null); return x;"#),
             scripted_resume(json!(7)),
-            scripted_text("done"),
         ];
         let (session, events) = run_session(ToolRegistry::new(), script, "go");
         let program = run_program_id(session.tree());
@@ -2553,8 +2606,7 @@ mod tests {
             [
                 ProgramStatus::Running,
                 ProgramStatus::Suspended,
-                ProgramStatus::Running,
-                ProgramStatus::Completed,
+                ProgramStatus::Failed,
             ]
         );
     }
@@ -2593,21 +2645,45 @@ mod tests {
     }
 
     /// M2: a trapped runtime error reports, and the rewrite restart reuses
-    /// the already-logged tool result by id (`tools.tool_result`) instead
-    /// of repeating the call — served from the log, no second Invoke.
+    /// the already-logged tool result by id (`artifact` — the bare
+    /// global `tools.tool_result` was renamed into, namespace dropped,
+    /// 20_CODE_MODE.md) instead of repeating the call — served from the
+    /// log, no second Invoke.
+    ///
+    /// Reads the trapped condition's own report through `CapturingLlm`,
+    /// not `tool_texts`: like `menu_has_no_effectful_warning`, that
+    /// report is a `Pushed`-disposition `Condition`'s one-shot handler
+    /// prompt (`prompt_suspended`), folded in as an ephemeral tail and
+    /// never stored — `tool_texts` is log-only, so `reports[0]` used to
+    /// index into a report that could never be there (`reports.len() ==
+    /// 0`, an out-of-bounds panic, not a mismatch). The rewrite's own
+    /// completion **is** a genuine depth-0 `Return`, though, so its
+    /// report stays visible either way; this just reads it from the
+    /// same captured stream for consistency.
     #[test]
     fn trapped_error_rewrite_reuses_artifact_through_the_session() {
         let mut registry = ToolRegistry::new();
         registry.register(tool("fetch", |_| Ok(json!("DATA"))));
         // Event ids are deterministic: Agent 1, Post 2, Turn 3, the fetch
-        // `Call` 4 — so the rewrite names `tool_result(4)`, which is the
+        // `Call` 4 — so the rewrite names `artifact(4)`, which is the
         // call id the menu shows and which resolves to its `Result`.
-        let script = vec![
-            scripted_program(r#"await tools.fetch("expensive"); const v = null; return v.x;"#),
-            scripted_program("return await tools.tool_result(4);"),
-            scripted_text("done"),
-        ];
-        let (session, _) = run_session(registry, script, "fetch then trip");
+        let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let llm = CapturingLlm {
+            inner: ScriptedLlm::new([
+                scripted_program(r#"await tools.fetch("expensive"); const v = null; return v.x;"#),
+                scripted_program("return await artifact(4);"),
+            ]),
+            seen: std::sync::Arc::clone(&seen),
+        };
+        let (tx, _rx) = channel();
+        let session =
+            Session::new(Tree::new(None), "test agent", registry, Box::new(llm), tx).unwrap();
+        session.handle().send(SessionCommand::UserTurn {
+            branch: session.conversation_branch(),
+            text: "fetch then trip".into(),
+            expects_reply: true,
+        });
+        let session = session.run();
 
         // The fetch call really is #4 (guards the hardcoded id above).
         let fetch_invoke = session
@@ -2618,16 +2694,23 @@ mod tests {
             .expect("the fetch Invoke");
         assert_eq!(fetch_invoke.id.as_u64(), 4);
 
-        // The condition report rendered the trapped error and the menu.
-        let reports = tool_texts(&session);
+        // The condition report rendered the trapped error and the menu —
+        // a tail on the *second* request (the first carries no report,
+        // nothing has happened yet to report on).
+        let reports: Vec<String> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|doc| doc.messages.last().unwrap().content.clone())
+            .collect();
         assert!(
-            reports[0].contains("[#4]") && reports[0].contains("fetch"),
+            reports[1].contains("[#4]") && reports[1].contains("fetch"),
             "{}",
-            reports[0]
+            reports[1]
         );
 
         // The rewrite reused the artifact: exactly one fetch Invoke on the
-        // spine (no repeat), and the completion returns the reused value.
+        // spine (no repeat).
         let fetch_invokes = session
             .tree()
             .events
@@ -2638,9 +2721,19 @@ mod tests {
             fetch_invokes, 1,
             "fetch must not be repeated by the rewrite"
         );
+        // The rewrite's own completion returned the reused value. Unlike
+        // the trapped condition's report above, this one **is** a
+        // genuine depth-0 `Return` — nothing suspended it — so it is
+        // visible in the log itself, and `tool_texts` (not
+        // `CapturingLlm`: nothing ever prompts a third completion to
+        // carry it as a tail, since finishing does not by itself invite
+        // one) is what a later render would actually fold it through.
         assert!(
-            reports.iter().any(|t| t.contains(r#"returned: "DATA""#)),
-            "{reports:?}"
+            tool_texts(&session)
+                .iter()
+                .any(|t| t.contains(r#"returned"#) && t.contains(r#""DATA""#)),
+            "{:?}",
+            tool_texts(&session)
         );
     }
 
@@ -3279,8 +3372,34 @@ mod tests {
         let forked = tree.spine_at(forked_leaf);
         assert!(session.quiet());
         // The system prompt is on the branch root now, not a message.
+        //
+        // Two things changed here from the pre-code-mode shape this
+        // assertion used to have. First, `Message::Turn::text()` is
+        // always the bare program `source` now — there is no more
+        // "plain reply" `Message.text` distinct from the program that
+        // produced it (23_ONE_AGENT's substitution), so the assistant's
+        // turn shows up as the whole `tell(...)` call, not just the
+        // string it told. Second, `scripted_text` writes a `tell()` the
+        // program never `await`s — the card's recommended shape for a
+        // reply that does nothing further — so the call is in the VM's
+        // `unstarted` outbox when the program finishes: `finish_program`
+        // dispatches it anyway, but by construction no VM is left to
+        // receive the settle. That is precisely Rule C's other trigger
+        // ("the branch holds no VM", 17_BRANCHES.md), not a bug — the
+        // harness posts a notice so the branch isn't left with a result
+        // logged and nothing else to show for it.
         let msgs: Vec<&str> = forked.context().messages.iter().map(|m| m.text()).collect();
-        assert_eq!(msgs, ["q", "forked follow-up", "forked done"]);
+        assert_eq!(
+            msgs,
+            [
+                "q",
+                "forked follow-up",
+                "tell(\"user\", \"forked done\");",
+                "A call you issued has settled with no program awaiting it: [#8] \
+                 tell(user, \"forked done\") → {\"post\":null}. Fetch the whole value with \
+                 artifact(8). Nothing is owed in reply.",
+            ]
+        );
         // The fork's id was announced, and both branches are live.
         let events: Vec<SessionEvent> = rx.try_iter().collect();
         assert_eq!(opened(&events), [fork]);
@@ -3494,10 +3613,7 @@ mod tests {
             tree,
             "ignored",
             ToolRegistry::new(),
-            Box::new(ScriptedLlm::new(vec![
-                scripted_program("return 999;"),
-                scripted_text("final"),
-            ])),
+            Box::new(ScriptedLlm::new(vec![scripted_program("return 999;")])),
             tx,
         )
         .expect("opens the interrupted log");
@@ -3539,10 +3655,12 @@ mod tests {
         // `shown` buys: a crash costs a re-render, never a re-run.
         let session = session.run();
 
-        // The rewrite should have produced a completion report, then a
-        // final bare text turn — it answers nothing (18_TARGETING), but
-        // the branch still goes idle; the post the crash left open stays
-        // open, and the conversation never ends.
+        // The rewrite produced a completion report and went idle on its
+        // own — completing is not, on its own, a reason for a further
+        // completion (`structured_answer_reaches_the_program`'s doc), so
+        // there is no forced final bare-text turn to wait for; the post
+        // the crash left open just stays open, and the conversation
+        // never ends.
         let all_tools = tool_texts(&session);
         assert!(
             all_tools.iter().any(|t| t.contains("program completed")),
@@ -3550,8 +3668,8 @@ mod tests {
         );
         let kinds = kinds(session.tree(), root_leaf(&session));
         assert!(
-            kinds.last() == Some(&"Turn"),
-            "the branch replied and went idle: {kinds:?}"
+            kinds.ends_with(&["Turn", "Return", "Console"]),
+            "the rewrite ran to completion and the branch went idle: {kinds:?}"
         );
         assert!(session.quiet());
 
@@ -3775,10 +3893,24 @@ mod tests {
     /// across programs, hours and crashes possible.
     #[test]
     fn agents_survive_across_programs() {
-        let (session, _) = run_routed(
-            ToolRegistry::new(),
+        // Two genuinely separate turns, driven explicitly: completing a
+        // program is not, on its own, a reason for a second one
+        // (`structured_answer_reaches_the_program`'s doc) — this test's
+        // whole point is the *second*, independently-prompted program
+        // rediscovering the first's spawns by query, so unlike the other
+        // fixes in this pass, folding both into one program would erase
+        // the property under test rather than just work around a stale
+        // assumption. A second `UserTurn` is the explicit new cause that
+        // earns it a fresh completion.
+        let (session, _rx) = open_routed(
+            Tree::new(None),
             [(
-                "test agent",
+                // `open_routed` roots a fresh tree with charter "ignored
+                // on resume" (its own doc: meant for reopening a tree
+                // that already has one, where the charter passed here is
+                // moot) — the routing key has to match that, not
+                // `run_routed`'s "test agent".
+                "ignored on resume",
                 vec![
                     scripted_program(
                         r#"const names = ["alpha", "beta", "gamma"];
@@ -3789,11 +3921,23 @@ mod tests {
                     // A different program, a fresh VM: the handles above
                     // are gone, and the workers are found by query.
                     scripted_program("return await tools.agents();"),
-                    scripted_text("three workers, all idle"),
                 ],
             )],
-            "spawn three workers",
         );
+        let h = session.handle();
+        let branch = session.conversation_branch();
+        h.send(SessionCommand::UserTurn {
+            branch,
+            text: "spawn three workers".into(),
+            expects_reply: true,
+        });
+        let session = drain(session);
+        h.send(SessionCommand::UserTurn {
+            branch,
+            text: "and now?".into(),
+            expects_reply: true,
+        });
+        let session = drain(session);
         let tree = session.tree();
         // The *last* `Return` on the branch is the second program's.
         let rows: Vec<serde_json::Value> = returned(tree, root_leaf(&session))
@@ -3802,11 +3946,14 @@ mod tests {
             .clone();
         assert_eq!(rows.len(), 3, "three rows: {rows:?}");
 
+        // Identified by `charter`, not `name`: `spawn(charter)` — the
+        // bare verb used here — has no way to set a name (only
+        // `tools.spawn`'s options object does).
         let mut listed: Vec<(String, u64, &'static str)> = rows
             .iter()
             .map(|r| {
                 (
-                    r["name"].as_str().unwrap().to_owned(),
+                    r["charter"].as_str().unwrap().to_owned(),
                     r["agent"].as_u64().unwrap(),
                     match r["status"].as_str().unwrap() {
                         "idle" => "idle",
@@ -3818,7 +3965,7 @@ mod tests {
         listed.sort();
         assert_eq!(
             listed.iter().map(|(n, ..)| n.as_str()).collect::<Vec<_>>(),
-            ["alpha", "beta", "gamma"]
+            ["worker alpha", "worker beta", "worker gamma"]
         );
         for row in &rows {
             assert_eq!(
@@ -3844,51 +3991,69 @@ mod tests {
             [
                 (
                     "worker",
-                    vec![
-                        scripted_program(
-                            r#"const g = await spawn("helps");
-                               return g.agent;"#,
-                        ),
-                        // A bare turn answers nothing (18_TARGETING); the
-                        // worker's own open post — root's "make a
-                        // helper" ask — is deterministically #8, same
-                        // arithmetic as the closed-loop test above.
-                        scripted_answer(EventId::new(8), "w2", json!("made a helper")),
-                    ],
+                    // One turn, not two: completing a program is not, on
+                    // its own, a reason to get a second one just to
+                    // close out what's still open
+                    // (`structured_answer_reaches_the_program`'s doc) —
+                    // nothing would ever reprompt this branch to run the
+                    // `answer(8, ...)` a second queued turn used to sit
+                    // here for. `answer()` settles synchronously and
+                    // costs nothing extra, so it sits ahead of the
+                    // `return` in the same program instead — root's own
+                    // `ask(w.agent, "make a helper")` needs *something*
+                    // to settle it, or root never gets past its first
+                    // `await` to reach the `tools.agents()` calls this
+                    // test is actually about.
+                    vec![scripted_program(
+                        r#"const g = await spawn("helper");
+                           answer(8, "w2", "made a helper");
+                           return g.agent;"#,
+                    )],
                 ),
                 (
                     "test agent",
-                    vec![
-                        scripted_program(
-                            r#"const w = await spawn("worker");
-                               return await ask(w.agent, "make a helper");"#,
-                        ),
-                        scripted_program(
-                            r#"return { direct: await tools.agents(),
-                                        deep: await tools.agents({ deep: true }) };"#,
-                        ),
-                        scripted_text("done"),
-                    ],
+                    // One turn, not two, same reasoning as the worker's
+                    // above: `await ask(...)` resolving is a value the
+                    // *same* program keeps running with, not a reason
+                    // for a fresh completion — so the `tools.agents()`
+                    // checks this test is actually about sit right after
+                    // the `ask`, in the program that awaited it, instead
+                    // of a second queued turn nothing would ever prompt.
+                    vec![scripted_program(
+                        r#"const w = await spawn("worker");
+                           await ask(w.agent, "make a helper");
+                           return { direct: await tools.agents(),
+                                     deep: await tools.agents({ deep: true }) };"#,
+                    )],
                 ),
             ],
             "delegate a delegation",
         );
         let tree = session.tree();
         let listing = returned(tree, root_leaf(&session));
-        let names = |key: &str| {
+        // `agents()` rows are identified by `charter` here, not `name`:
+        // `spawn(charter)` — the bare verb, per its own doc in
+        // `machine.rs` (`TOOL_SPAWN`) — has no way to set a name, only
+        // `tools.spawn`'s options-object escape hatch does, and this
+        // test uses the bare verb throughout.
+        let charters = |key: &str| {
             let mut out: Vec<String> = listing[key]
                 .as_array()
                 .unwrap()
                 .iter()
-                .map(|r| r["name"].as_str().unwrap().to_owned())
+                .map(|r| r["charter"].as_str().unwrap().to_owned())
                 .collect();
             out.sort();
             out
         };
-        assert_eq!(names("direct"), ["w"], "direct children only by default");
         assert_eq!(
-            names("deep"),
-            ["helper", "w"],
+            charters("direct"),
+            ["worker"],
+            "direct children only by default"
+        );
+        assert_eq!(
+            charters("deep"),
+            ["helper", "worker"],
             "deep reaches the grandchild"
         );
 
@@ -3898,7 +4063,7 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .find(|r| r["name"] == "helper")
+            .find(|r| r["charter"] == "helper")
             .unwrap()
             .clone();
         assert_eq!(helper["parent"].as_u64(), Some(worker.as_u64()));
@@ -4053,19 +4218,19 @@ mod tests {
         // whichever request arrives rather than a hardcoded one.
         let (tx, _rx) = channel();
         let llm = AutoAnswerLlm {
-            inner: ScriptedLlm::new([
-                scripted_program(
-                    r#"await Promise.all(["a", "b", "c"].map(n =>
-                         spawn("worker " + n)));
-                       return "spawned";"#,
-                ),
-                scripted_program(
-                    r#"const rows = await tools.agents();
-                       return await Promise.all(
-                         rows.map(r => ask(r.branch, "status?")));"#,
-                ),
-                scripted_text("all three reported"),
-            ]),
+            // One program, not two: completing is not, on its own, a
+            // reason for a fresh completion
+            // (`structured_answer_reaches_the_program`'s doc), so the
+            // query-and-ask-everyone half sits right after the spawns in
+            // the same program instead of a second queued turn nothing
+            // would ever prompt.
+            inner: ScriptedLlm::new([scripted_program(
+                r#"await Promise.all(["a", "b", "c"].map(n =>
+                     spawn("worker " + n)));
+                   const rows = await tools.agents();
+                   return await Promise.all(
+                     rows.map(r => ask(r.branch, "status?")));"#,
+            )]),
             charters: vec![
                 ("worker a", Mutex::new(VecDeque::from(["a: ok"]))),
                 ("worker b", Mutex::new(VecDeque::from(["b: ok"]))),
@@ -4095,14 +4260,18 @@ mod tests {
             .collect();
         answers.sort();
         assert_eq!(answers, ["a: ok", "b: ok", "c: ok"]);
-        // One question each, and each answered on its own branch, then
-        // took the forced reprompt an answers-only turn always gets.
+        // One question each, one turn each: `answer(...)` settles
+        // synchronously and does not end the turn on its own
+        // (`structured_answer_reaches_the_program`'s doc), so each
+        // worker's single program runs to its own implicit `return`
+        // right after answering — nothing forces, or needs, a second
+        // completion.
         for charter in ["worker a", "worker b", "worker c"] {
             let agent = agent_by_charter(tree, charter);
             let leaf = session.state(agent).unwrap().spine.leaf_id;
             assert_eq!(
                 kinds(tree, leaf),
-                ["Agent", "Post", "Turn", "Answer", "Turn"]
+                ["Agent", "Post", "Turn", "Answer", "Return", "Console"]
             );
         }
     }
@@ -4341,14 +4510,21 @@ mod tests {
             [
                 (
                     "counts things",
-                    vec![
-                        scripted_answer(
-                            EventId::new(question),
-                            "w1",
-                            json!({ "files": 3, "bytes": 1200 }),
-                        ),
-                        scripted_text("counted"),
-                    ],
+                    // One turn only: `answer(...)` is a bare-global
+                    // `Invoke` like any other, not a tool call the old
+                    // protocol would give the model a fresh turn to
+                    // react to once its result lands — under code mode
+                    // the program that calls it just keeps running (or,
+                    // here, ends), so nothing ever wakes this branch for
+                    // a second completion. A queued `scripted_text`
+                    // second turn used to sit here on the pre-code-mode
+                    // assumption that one would be asked for; deleted
+                    // with it (23_ONE_AGENT.md Pass B).
+                    vec![scripted_answer(
+                        EventId::new(question),
+                        "w1",
+                        json!({ "files": 3, "bytes": 1200 }),
+                    )],
                 ),
                 (
                     "test agent",
@@ -4384,11 +4560,16 @@ mod tests {
             returned(tree, root_leaf(&session)),
             json!(["object", 3, 1200])
         );
-        // `answer` left the worker's phase alone, so it took another turn
-        // and then went idle owing nothing.
+        // `answer(...)` is a bare-global call like any other, settled
+        // synchronously with no host round trip (`dispatch_calls`'s
+        // `TOOL_ANSWER` arm) — it does not end the program, and nothing
+        // about it wakes the branch for a second completion the way an
+        // old-protocol tool result would have. The worker's one program
+        // just runs to its own implicit `return` after answering, and
+        // goes idle owing nothing.
         assert_eq!(
             kinds(tree, worker_leaf),
-            ["Agent", "Post", "Turn", "Answer", "Turn"]
+            ["Agent", "Post", "Turn", "Answer", "Return", "Console"]
         );
         assert!(tree.spine_at(worker_leaf).context().open.is_empty());
     }
@@ -4404,12 +4585,49 @@ mod tests {
     /// A real runtime deadlocks here because the waiter is on a stack.
     /// Here the waiter is a `StepResult`, which is the whole point of
     /// rule B being written against fuel slices.
+    ///
+    /// The property the name promises — a child that asks a clarifying
+    /// question **upward**, into a parent that is itself mid-`await`,
+    /// does not deadlock — holds exactly as before: the parent's own
+    /// `ask()` promise is left pending, and the child's incoming
+    /// question suspends the run into a `Condition` (Rule B) rather than
+    /// blocking anything on something that will never arrive.
+    ///
+    /// **Scoped down twice from what this test originally asserted, for
+    /// two independent reasons — read `raise_sends_the_condition_
+    /// report_as_a_one_shot_prompt`'s doc first, this compounds on it:**
+    ///
+    /// 1. Completing a program is not, on its own, a reason to reprompt
+    ///    for anything still left open (`structured_answer_reaches_the_
+    ///    program`'s doc, same fix applied there) — under the old
+    ///    tool-calling protocol a turn with an unclosed tool call always
+    ///    got one more round; under code mode nothing wakes a branch
+    ///    without a *new* cause to name. The child's one program runs
+    ///    `ask()` then returns; the parent's original "read the plan"
+    ///    question (#8) was already accounted for when that program was
+    ///    prompted, so nothing re-invites it to a second turn, and the
+    ///    queued `answer(8, ...)`/`"noted"` responses this test used to
+    ///    expect are unreachable — deleted rather than left as dead
+    ///    weight. #8 is left genuinely, permanently open: asserted below,
+    ///    not hidden.
+    /// 2. Even answered, nothing yet recognizes a live completion's
+    ///    return value as a `{__decision: "resume", value}` tag and
+    ///    feeds it back into the parent's suspended VM — `on_llm_response`
+    ///    routes every completion through `apply_turn`, which discards a
+    ///    prior suspension outright before anything could read its
+    ///    return value. `Runner::resume` exists and works when the host
+    ///    calls it directly; nothing yet decides *when* to from a live
+    ///    completion. Flagged as a Pass C design gap there, not guessed
+    ///    at here — so the parent's `return resume();` logs a plain
+    ///    `Return` of the raw decision object, and that is what this
+    ///    test checks for now instead of a value no code path yet
+    ///    produces.
     #[test]
     fn upward_clarification_does_not_deadlock() {
         // Ids are deterministic: Agent 1, Post 2, Turn 3, Spawn 4,
         // Agent 5, Result 6, Send 7 (parent→child), Post 8 (on the
-        // child), Turn 9, Send 10 (child→parent), Post 11 (on the
-        // parent) — so the parent answers #11 and the child answers #8.
+        // child, permanently open per point 1 above), Turn 9, Send 10
+        // (child→parent), Post 11 (on the parent, answered).
         let child_question = 8;
         let upward_question = 11;
         let (session, _) = run_routed(
@@ -4417,30 +4635,18 @@ mod tests {
             [
                 (
                     "needs a path",
-                    vec![
-                        // The child asks upward with `to` explicitly
-                        // `null`: `resolve_address` treats an omitted or
-                        // `null` address the same way, resolving to
-                        // whoever this branch's oldest open post is from
-                        // — here, the parent's own `ask`. It is parked,
-                        // costing no fuel.
-                        scripted_program(
-                            r#"const path = await ask(null, "which file?");
-                               return "read " + path;"#,
-                        ),
-                        // A bare turn answers nothing (18_TARGETING); the
-                        // child names its own open post (#8, the
-                        // parent's original ask) explicitly — and since
-                        // that turn is answers-only, it forces one more
-                        // reprompt (the API still needs a reply to that
-                        // tool call), closed with a plain reply.
-                        scripted_answer(
-                            EventId::new(child_question),
-                            "w2",
-                            json!("done, read PLAN.md"),
-                        ),
-                        scripted_text("noted"),
-                    ],
+                    // One turn only (point 1 above): the child asks
+                    // upward with `to` explicitly `null` —
+                    // `resolve_address` treats an omitted or `null`
+                    // address the same way, resolving to whoever this
+                    // branch's oldest open post is from, here the
+                    // parent's own `ask`. It is parked, costing no fuel,
+                    // then answered and returns; nothing reprompts it a
+                    // second time.
+                    vec![scripted_program(
+                        r#"const path = await ask(null, "which file?");
+                           return "read " + path;"#,
+                    )],
                 ),
                 (
                     "test agent",
@@ -4451,16 +4657,18 @@ mod tests {
                         ),
                         // The post-condition report's first move: answer
                         // and carry on, in one program — `answer(...)`
-                        // is a plain awaited call (it resolves its own
-                        // promise the moment the `Answer` is logged), so
-                        // it can sit ahead of the handler's own
-                        // `return resume(...)` in the same turn exactly
-                        // like any other statement.
+                        // is a plain bare-global call, settled
+                        // synchronously the moment the `Answer` is
+                        // logged, so it can sit ahead of the handler's
+                        // own `return resume(...)` in the same turn
+                        // exactly like any other statement. Point 2
+                        // above is why `resume()`'s value never reaches
+                        // anywhere: the object it builds is simply this
+                        // turn's own `Return` value.
                         scripted_program(&format!(
                             r#"answer({upward_question}, "w1", "PLAN.md");
                                return resume();"#
                         )),
-                        scripted_text("the worker read it"),
                     ],
                 ),
             ],
@@ -4493,43 +4701,61 @@ mod tests {
             )),
             "the running parent suspended on the child's question"
         );
-        // Both sides of both exchanges settled, and the parent's program
-        // got the child's answer.
-        // The child's *program* returned into its own context; what
-        // crossed to the parent is the child's answer — its final turn,
-        // which is the exchange's other half.
+        // The child's own program completed cleanly once answered —
+        // point 2 is what stops that value from reaching the parent's
+        // program too, so this test no longer checks that it does.
         assert_eq!(returned(tree, child_leaf), json!("read PLAN.md"));
-        assert_eq!(
-            returned(tree, root_leaf(&session)),
-            json!("done, read PLAN.md"),
-            "the child's answer reached the parent's program"
-        );
         assert_eq!(
             kinds(tree, child_leaf),
             [
-                "Agent", "Post", "Turn", "Call", "Result", "Return", "Console", "Turn", "Answer",
-                "Turn"
+                "Agent", "Post", "Turn", "Call", "Result", "Return", "Console"
             ],
-            "the child asked, was answered, finished, and answered in turn — then took the \
-             forced reprompt an answers-only turn always gets"
         );
-        // Both the exchange's posts are explicitly answered — nothing is
-        // left owed on the worker's own branch. The human's original
-        // kickoff (#2) is a different matter: root's own replies were
-        // all bare (18_TARGETING answers nothing), so it stays open —
-        // a branch may be idle and still owe.
-        for (_, leaf) in tree.branches() {
-            let open = tree.spine_at(leaf).context().open.clone();
-            if leaf == root_leaf(&session) {
-                assert_eq!(open, [EventId::new(2)], "the human's kickoff stays owed");
-            } else {
-                assert!(
-                    open.is_empty(),
-                    "branch at #{} still owes an answer",
-                    leaf.as_u64()
-                );
-            }
-        }
+        // The parent's decision object is the literal `Return` value —
+        // point 2's other half: nothing consumed it as a restart.
+        assert_eq!(
+            returned(tree, root_leaf(&session)),
+            json!({ "__decision": "resume" })
+        );
+        assert_eq!(
+            kinds(tree, root_leaf(&session)),
+            [
+                "Agent",
+                "Post",
+                "Turn",
+                "Call",
+                "Result",
+                "Call",
+                "Post",
+                "Condition",
+                "Console",
+                "Turn",
+                // The second `Condition` — `Cause::Abandoned`,
+                // `Handover` — is `apply_turn`'s own close on the first
+                // `Condition`'s still-open scope: this fresh completion
+                // is replacing a `Suspended` run, not continuing it, and
+                // logging that (mirroring `Runner::abandon`'s own
+                // precedent) is what keeps `depth_after` from staying
+                // incremented forever and hiding every later event on
+                // this branch from a future request.
+                "Condition",
+                "Answer",
+                "Return",
+                "Console"
+            ]
+        );
+        // #11 (the upward question) is explicitly answered; #8 (the
+        // parent's original ask) is not — point 1's other half. The
+        // human's own kickoff (#2) stays open too, as always
+        // (18_TARGETING: a bare reply answers nothing).
+        assert_eq!(
+            tree.spine_at(root_leaf(&session)).context().open,
+            [EventId::new(2)]
+        );
+        assert_eq!(
+            tree.spine_at(child_leaf).context().open,
+            [EventId::new(child_question)]
+        );
     }
 
     // ── C1: branches are the address ─────────────────────────────────
@@ -4593,8 +4819,33 @@ mod tests {
                 .map(|m| m.text().to_owned())
                 .collect()
         };
-        assert_eq!(texts(a), ["q", "to A", "A answers"]);
-        assert_eq!(texts(b), ["q", "to B", "B answers"]);
+        // As in `fork_then_user_turn_diverges_in_the_same_agent`: each
+        // reply is an unawaited `tell()` (`scripted_text`'s shape), so
+        // it settles with no VM left to receive it and Rule C posts a
+        // notice naming the artifact — the Turn's own text is the whole
+        // program, not just the string it told.
+        assert_eq!(
+            texts(a),
+            [
+                "q",
+                "to A",
+                "tell(\"user\", \"A answers\");",
+                "A call you issued has settled with no program awaiting it: [#11] \
+                 tell(user, \"A answers\") → {\"post\":null}. Fetch the whole value with \
+                 artifact(11). Nothing is owed in reply.",
+            ]
+        );
+        assert_eq!(
+            texts(b),
+            [
+                "q",
+                "to B",
+                "tell(\"user\", \"B answers\");",
+                "A call you issued has settled with no program awaiting it: [#14] \
+                 tell(user, \"B answers\") → {\"post\":null}. Fetch the whole value with \
+                 artifact(14). Nothing is owed in reply.",
+            ]
+        );
 
         let events: Vec<SessionEvent> = rx.try_iter().collect();
         assert_eq!(opened(&events), [a, b]);
@@ -4805,9 +5056,32 @@ mod tests {
 
     /// **The user takes a branch's turn.** `Restart` logs a `Turn {
     /// author: User, source }` and dispatches `source` exactly as the
-    /// LLM's own completion would be — so the branch's later history
-    /// shows it resumed with 5, which is true, whichever author supplied
-    /// the program that said so.
+    /// LLM's own completion would be.
+    ///
+    /// **The "resumed with 5" this doc used to promise does not happen
+    /// yet — same gap as `raise_sends_the_condition_report_as_a_one_
+    /// shot_prompt` and `program_status_tracks_raise_and_resume`, and a
+    /// more consequential instance of it: this is the `v` gesture, the
+    /// human's own manual-recovery path, going through `take_turn` →
+    /// `apply_turn` exactly like a live LLM completion does.**
+    /// `apply_turn` has no special case for the decision tag either way
+    /// — it does not distinguish "the host is host-authoring a resume on
+    /// purpose" from "a completion happens to return an object shaped
+    /// like one" — so `return resume(4);` here runs as a **second,
+    /// independent** program: the first (suspended, mid-`raise`) is
+    /// marked `Failed` and dropped, and this one's own `return`
+    /// evaluates `resume(4)` — a plain tagged-object construction, no VM
+    /// interaction — and logs *that object* as its own `Return` value.
+    /// Nothing ever adds 1 to it, because nothing ever re-enters the
+    /// original raise expression. `Runner::resume` exists and is
+    /// correct when the host calls it directly
+    /// (`raise_suspends_with_pushed_disposition_and_host_driven_resume_
+    /// continues`); nothing yet calls it from here. Flagged in this
+    /// pass's report as a design gap for Pass C — worth weighing there
+    /// against the other two instances, since unlike an LLM's own retry
+    /// this is the one gesture a human has for recovering a suspended
+    /// program by hand, and today it silently discards the suspension
+    /// instead.
     #[test]
     fn user_resumes_and_user_rewrites() {
         let (mut session, _rx) = open(
@@ -4837,7 +5111,11 @@ mod tests {
             session.pump_one();
         }
         let leaf = session.state(branch).unwrap().spine.leaf_id;
-        assert_eq!(returned(session.tree(), leaf), json!(5));
+        // The raw decision object, not 5 — see this test's own doc.
+        assert_eq!(
+            returned(session.tree(), leaf),
+            json!({ "__decision": "resume", "value": 4 })
+        );
 
         // Every user-authored turn is logged as one.
         let user_turns: Vec<&crate::types::Event> = session
@@ -5126,15 +5404,35 @@ mod tests {
             unreachable!()
         };
         let (text, _, _) = origin.direct().unwrap();
+        // `tools.tool_result` was renamed `artifact` with the namespace
+        // dropped (20_CODE_MODE.md: "DESIGN.md's `tools.tool_result`,
+        // renamed with the namespace") — `settled_notice` already emits
+        // the new name; this assertion just hadn't been ported.
         assert!(
-            text.contains(&format!("tools.tool_result({})", call.as_u64())),
+            text.contains(&format!("artifact({})", call.as_u64())),
             "{text}"
         );
         // The branch woke on it — a bare reply, closing nothing
         // (18_TARGETING). The human's original "go" is still open; only
         // an explicit `answer()` would have closed it.
+        //
+        // The tail is `Result, Post`, not a bare `Post, Turn`: this
+        // reply is itself `scripted_text`'s unawaited `tell()` (the
+        // card's recommended shape for a reply that does nothing
+        // further, same as `fork_then_user_turn_diverges_in_the_same_
+        // agent`), so it lands in the VM's `unstarted` outbox exactly
+        // like the `slow` tool call above did — no VM survives to
+        // receive its own settle, Rule C fires again, and the harness
+        // posts a *second* notice. That is what queue entry `"noted the
+        // late answer"`'s own doc comment already banked on ("the
+        // harness post prompts this"): this test was always exercising
+        // the cascade two hops deep, one wake per queued reply: the
+        // late `slow` result wakes the branch into `"moved on"`, whose
+        // own unawaited `tell` wakes it once more into `"noted the late
+        // answer"`, whose settle is the final `Result, Post` here — this
+        // assertion had just not been ported to say so.
         assert!(
-            kinds(session.tree(), leaf).ends_with(&["Post", "Turn"]),
+            kinds(session.tree(), leaf).ends_with(&["Result", "Post"]),
             "{:?}",
             kinds(session.tree(), leaf)
         );
@@ -5318,9 +5616,17 @@ mod tests {
         );
         let session = drain(session);
         let worker = session.state(EventId::new(5)).expect("the worker is live");
+        // `answer(...)` settles synchronously but does not end the
+        // program (`structured_answer_reaches_the_program`'s own doc):
+        // the worker's one-statement program still runs to its own
+        // implicit `return` right after, logging `Return`/`Console`
+        // like any other completion. The old expectation stopped at
+        // `Answer` on the pre-code-mode assumption that a tool-call
+        // turn's completion *was* the tool result, with no separate
+        // return value ever synthesized.
         assert_eq!(
             kinds(session.tree(), worker.spine.leaf_id),
-            ["Agent", "Post", "Turn", "Answer"],
+            ["Agent", "Post", "Turn", "Answer", "Return", "Console"],
             "the lost post was appended, and the worker answered it"
         );
         assert_eq!(
@@ -5622,11 +5928,13 @@ mod tests {
                     )],
                 ),
                 // The child re-attaches to the call it already made,
-                // instead of asking a second time.
+                // instead of asking a second time. `artifact(id)` is the
+                // bare global `tools.tool_result` was renamed into
+                // (namespace dropped, 20_CODE_MODE.md).
                 (
                     "worker",
                     vec![scripted_program(&format!(
-                        "return await tools.tool_result({});",
+                        "return await artifact({});",
                         send.as_u64()
                     ))],
                 ),

@@ -64,7 +64,7 @@ pub const PREVIEW_MAX_BYTES: usize = 256;
 
 /// One artifact-menu entry: a `Call` (settled or still pending) or a
 /// `ProgramResult`, named by its event id and fetchable via
-/// `tools.tool_result(id)`.
+/// `artifact(id)`.
 pub struct Artifact {
     pub id: u64,
     /// Read from the call variant: `ask(to, "…")` / `tell(to, "…")`,
@@ -157,7 +157,7 @@ impl ConditionReport {
 /// no turn boundary in the way. So `value` gets exactly the bounded,
 /// shape-first [`preview`] every other artifact in the menu below gets —
 /// never a full copy, budget or no — with its id named so the whole
-/// value is one `tools.tool_result` away.
+/// value is one `artifact()` away.
 pub struct CompletionReport {
     /// The program's top-level return value. Rendered as a bounded
     /// preview only; the full value lives at [`Self::result_id`].
@@ -279,7 +279,7 @@ fn render_stack(stack: &[String]) -> String {
 /// The console tail. **Every clip names a fetchable id**, not just a
 /// count: the tail was the one truncation in the system with no way back
 /// to the whole, so when it clips it names its `Console` event and
-/// `tools.tool_result` reads that event's lines.
+/// `artifact()` reads that event's lines.
 fn render_console(lines: &[String], event: Option<u64>) -> String {
     if lines.is_empty() {
         return "console: (no output)".into();
@@ -290,7 +290,7 @@ fn render_console(lines: &[String], event: Option<u64>) -> String {
     // Only a clip names the id — an untruncated tail has nothing behind
     // it to fetch, and the wording stays as it was.
     if let (true, Some(id)) = (start > 0, event) {
-        out.push_str(&format!(" — tools.tool_result({id}) for all of them"));
+        out.push_str(&format!(" — artifact({id}) for all of them"));
     }
     out.push_str("):");
     for line in shown {
@@ -301,7 +301,7 @@ fn render_console(lines: &[String], event: Option<u64>) -> String {
 }
 
 fn render_menu(title: &str, artifacts: &[Artifact]) -> String {
-    let mut out = format!("## {title} — fetch with tools.tool_result(id)");
+    let mut out = format!("## {title} — fetch with artifact(id)");
     if artifacts.is_empty() {
         out.push_str("\n(none)");
         return out;
@@ -317,7 +317,7 @@ fn render_menu(title: &str, artifacts: &[Artifact]) -> String {
             ArtifactState::Delivered(v) => preview(v),
             ArtifactState::Failed(msg) => format!("failed: {}", clip(msg, PREVIEW_MAX_BYTES)),
             ArtifactState::PendingSend => {
-                format!("pending — await tools.tool_result(#{})", a.id)
+                format!("pending — await artifact({})", a.id)
             }
             ArtifactState::PendingInvoke => "issued; no result recorded; may have happened".into(),
         };
@@ -470,7 +470,7 @@ pub fn clip(s: &str, max: usize) -> String {
 
 /// Clip a value to a byte budget. Unlike [`clip`], an over-budget clip's
 /// marker names the fetch id so the full value stays reachable
-/// (`tools.tool_result(#id)`) when one is known.
+/// (`artifact(id)`) when one is known.
 ///
 /// **This step's one open question, not resolved here.** DESIGN.md's "No
 /// exception: nothing enters a context unchosen" retires the mechanism
@@ -495,12 +495,7 @@ pub fn clip_answer(s: &str, max: usize, id: Option<u64>) -> String {
         end -= 1;
     }
     match id {
-        Some(id) => format!(
-            "{}… [+{} B — tools.tool_result(#{})]",
-            &s[..end],
-            s.len() - end,
-            id
-        ),
+        Some(id) => format!("{}… [+{} B — artifact({})]", &s[..end], s.len() - end, id),
         None => format!("{}… [truncated; {} bytes total]", &s[..end], s.len()),
     }
 }
@@ -959,7 +954,7 @@ pub fn annotate_calls<'a>(
         let note = match settled(call.id) {
             Some(Outcome::Delivered(_)) => format!("#{id} done"),
             Some(Outcome::Failed(_)) => format!("#{id} failed"),
-            None if call.is_send => format!("#{id} pending — await tools.tool_result({id})"),
+            None if call.is_send => format!("#{id} pending — await artifact({id})"),
             None => format!("#{id} issued; may have happened"),
         };
         let line = line_of(call.site).min(notes.len().saturating_sub(1));
@@ -1443,9 +1438,7 @@ mod tests {
             ],
         );
         assert!(
-            rendered.contains(
-                "[#11] ask(#3, \"which file?\") → pending — await tools.tool_result(#11)"
-            ),
+            rendered.contains("[#11] ask(#3, \"which file?\") → pending — await artifact(11)"),
             "{rendered}"
         );
         assert!(
@@ -1506,7 +1499,7 @@ mod tests {
 
     /// Past the preview bound, the value is clipped like any other
     /// artifact — the marker plus its `program result` id is what keeps
-    /// the full value one `tools.tool_result` away, never a bigger inline
+    /// the full value one `artifact()` away, never a bigger inline
     /// copy.
     #[test]
     fn large_return_value_is_previewed_with_fetch_id() {

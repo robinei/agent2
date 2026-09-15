@@ -114,8 +114,8 @@ pub enum EventPayload {
     /// **dispatch** (17_BRANCHES A2). Parent: the owning agent's spine,
     /// between the program's `Turn` and its eventual `Return`/`Condition`.
     /// Renders to chat: no — queried for replay, the artifact menu, and
-    /// UI. Addressable via `tools.tool_result(id)`, which resolves a call
-    /// id through to its `Result`.
+    /// UI. Addressable via `artifact(id)`, which resolves a call id
+    /// through to its `Result`.
     ///
     /// Logging at issue rather than at resolution is what distinguishes a
     /// call that **definitively did not work** (a `Failed` `Result`) from
