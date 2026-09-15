@@ -24,14 +24,17 @@ pub struct InvokeView {
 }
 
 /// One program execution, projected from the log: everything its panes
-/// need without a live VM (decision 8). `id` is the `run_program`
-/// Assistant event id; a `resume` folds into the same view.
+/// need without a live VM (decision 8). `id` is the `Turn` event's own
+/// id — under code mode every `Turn` **is** a program, so there is no
+/// `run_program`/`resume` split to fold into one entry the way the old
+/// tool-call protocol needed: a handler program (the mind's answer to a
+/// `raise()`) is a `Turn` in its own right, with its own id and its own
+/// `ProgramView`, distinguished from the program it is deliberating for
+/// only by `depth`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProgramView {
     pub id: EventId,
     pub source: String,
-    /// Attachment content: name → content string (from run_program args).
-    pub attachments: HashMap<String, String>,
     pub invokes: Vec<InvokeView>,
     /// The top-level `return` value (`Some` ⇒ ran to completion).
     pub result: Option<serde_json::Value>,
@@ -42,6 +45,17 @@ pub struct ProgramView {
     pub condition: Option<Cause>,
     /// Console (from the `Console` event, already capped at logging).
     pub console: Vec<String>,
+    /// The handler-nesting depth this program ran at — **derived** from
+    /// `Condition::disposition` on replay, never stored (see
+    /// [`depth_after`]). `0` is the branch's own document: a root
+    /// program, or a handover's continuation ("literally the branch's
+    /// current program", doc 22), which renders as a full turn with no
+    /// nesting. `> 0` is a deliberating handler's interior — invisible
+    /// to `document::render`'s request, but not to this projection:
+    /// `programs_for` is exactly the debug/TUI surface doc 22's
+    /// render-axes table calls a "nested handler block", and a caller
+    /// can only draw that nesting if the depth survives into the view.
+    pub depth: usize,
 }
 
 impl ProgramView {
@@ -80,6 +94,55 @@ pub const LOG_VERSION: u64 = 1;
 #[derive(Serialize, Deserialize)]
 struct LogHeader {
     version: u64,
+}
+
+/// Update the derived handler-nesting counter for one path event — the
+/// single fold both `programs_for`'s attach-target stack and
+/// `document::render`'s depth-0 filter apply, so the two consumers can
+/// never silently disagree about what depth an event ran at. Doc 22 is
+/// explicit about the stakes: "if the log doesn't say [which raise
+/// pushed a handler and which handed over], every subsequent depth is
+/// wrong — and with it the document's `depth > 0` filter and the
+/// decision/completion reading of `Return`."
+///
+/// - `Condition{disposition: Pushed}`: the raising frame is still on
+///   the stack, suspended, waiting on the handler that runs next —
+///   depth increases by one for whatever follows.
+/// - `Condition{disposition: Handover}`: the raising frame was popped
+///   *before* the handler was built (a real tail call — `stack.rs`'s
+///   old `ProgramStack::push`/`apply_decision` semantics, now derived
+///   instead of stored), so depth is unchanged: the handler that
+///   follows opens at exactly the depth the raise happened at, not one
+///   deeper.
+/// - `Return`: settles exactly one frame — the frame that just decided,
+///   however many chained handovers it took to get there (`stack.rs`'s
+///   `apply_decision` does exactly one `frames.pop()` per decision) —
+///   so depth decreases by one. Saturating: a depth-0 program's own
+///   ordinary `return`, with no raise anywhere in its history, is the
+///   common case and must not underflow.
+/// - anything else leaves depth unaffected.
+pub fn depth_after(depth: usize, payload: &EventPayload) -> usize {
+    match payload {
+        EventPayload::Condition {
+            disposition: Disposition::Pushed,
+            ..
+        } => depth + 1,
+        EventPayload::Return { .. } => depth.saturating_sub(1),
+        _ => depth,
+    }
+}
+
+/// A `Compacted` event, resolved: the label always shown in the
+/// target's place, and the rewritten text when the op was a rewrite
+/// rather than a removal. Returned by [`Tree::compacted_lookup`]; see
+/// `EventPayload::Compacted`'s own doc comment for why the target row
+/// is never actually removed from the log.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompactedView {
+    pub label: String,
+    /// `None` ⇒ the target row is removed (renders as a stub carrying
+    /// only its id and label); `Some` ⇒ rewritten to this shorter text.
+    pub text: Option<String>,
 }
 
 impl Tree {
@@ -563,13 +626,46 @@ impl Tree {
     }
 
     /// `agent`'s programs along `leaf`'s path, in order — the program-list
-    /// projection (decision 8). Each `run_program` opens a program; a
-    /// `resume` folds into the open one (same VM, one entry); `Invoke`,
-    /// `ProgramResult`, `Console`, and the run's `Tool` result attach to
-    /// it. Everything a finished program's panes need, no live VM.
+    /// projection (decision 8), now over code mode's flat vocabulary: a
+    /// `Turn` **is** a program, full stop, whether it is the branch's own
+    /// root program or a handler deliberating a `raise()` at some nested
+    /// depth. `Invoke`/`Send`/`Spawn`/`Fork` calls, their `Result`s,
+    /// `Console`, and the eventual `Return`/`Condition` all attach to
+    /// whichever program is currently open — tracked with a small stack
+    /// of open-program indices that mirrors [`depth_after`]'s fold
+    /// exactly, so a program's `depth` field and "which program a given
+    /// event attaches to" can never disagree.
+    ///
+    /// **Handler programs get their own entry, not a nested field.** A
+    /// `Condition{disposition: Pushed}` leaves the raising program open
+    /// (suspended, on the stack) and the next `Turn` — the handler —
+    /// opens a *new* `ProgramView` one level deeper; its own `Return`
+    /// pops it back off, and the raising program (still open beneath it)
+    /// resumes absorbing events with no new `Turn` of its own, exactly
+    /// as `stack.rs`'s `ProgramStack` ran it. A `Handover` disposition
+    /// closes the raising program outright — its VM was popped before
+    /// the handler was built — so the handler that follows opens at the
+    /// *same* depth, a flat sibling rather than a nested child. This is
+    /// the deliberate choice for what handler programs look like here:
+    /// every one is independently addressable by its own id (an
+    /// `artifact(id)` target, a debugger-pane row of its own), and the
+    /// `depth` field is what lets a caller draw the nesting doc 22's
+    /// render-axes table calls a "nested handler block" — a single flat
+    /// `Vec` was rejected because collapsing a deliberation into its
+    /// raising program's own entry would hide that the handler is a
+    /// separate completion with a separate id, and a caller (`report.rs`,
+    /// a debug pane) that wants to fetch or display it on its own would
+    /// have nothing to key on.
     pub fn programs_for(&self, agent: EventId, leaf: EventId) -> Vec<ProgramView> {
         let mut cur_agent: Option<EventId> = None;
         let mut programs: Vec<ProgramView> = Vec::new();
+        // Indices into `programs`, innermost (currently attaching) last.
+        // Its length is always the depth `depth_after` would report —
+        // pushed on every `Turn`, popped on every `Return` and every
+        // `Handover` `Condition`, left alone on a `Pushed` one.
+        let mut stack: Vec<usize> = Vec::new();
+        let mut depth: usize = 0;
+
         for ev in self.path_events(leaf) {
             if let EventPayload::Agent { .. } = ev.payload {
                 cur_agent = Some(ev.id);
@@ -579,43 +675,21 @@ impl Tree {
                 continue;
             }
             match &ev.payload {
-                EventPayload::Message(Message::Turn { tool_calls, .. }) => {
-                    for call in tool_calls {
-                        if call.name == crate::machine::TOOL_RUN_PROGRAM {
-                            let source = call
-                                .arguments
-                                .get("source")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("")
-                                .to_string();
-                            let attachments: std::collections::HashMap<String, String> = call
-                                .arguments
-                                .get("attachments")
-                                .and_then(|v| v.as_object())
-                                .map(|obj| {
-                                    obj.iter()
-                                        .filter_map(|(k, v)| {
-                                            v.as_str().map(|s| (k.clone(), s.to_string()))
-                                        })
-                                        .collect()
-                                })
-                                .unwrap_or_default();
-                            programs.push(ProgramView {
-                                id: ev.id,
-                                source,
-                                attachments,
-                                invokes: Vec::new(),
-                                result: None,
-                                outcome: None,
-                                condition: None,
-                                console: Vec::new(),
-                            });
-                        }
-                        // `resume` continues the open program — no new entry.
-                    }
+                EventPayload::Message(Message::Turn { source, .. }) => {
+                    programs.push(ProgramView {
+                        id: ev.id,
+                        source: source.clone(),
+                        invokes: Vec::new(),
+                        result: None,
+                        outcome: None,
+                        condition: None,
+                        console: Vec::new(),
+                        depth,
+                    });
+                    stack.push(programs.len() - 1);
                 }
                 EventPayload::Call(call) => {
-                    if let Some(p) = programs.last_mut() {
+                    if let Some(&idx) = stack.last() {
                         let (name, args) = match call {
                             Call::Invoke { name, args, .. } => (name.clone(), args.clone()),
                             Call::Send { to, text, .. } => (
@@ -626,8 +700,12 @@ impl Tree {
                                 "spawn".to_owned(),
                                 serde_json::json!({ "name": name, "charter": charter }),
                             ),
+                            Call::Fork { name, task, .. } => (
+                                "fork".to_owned(),
+                                serde_json::json!({ "name": name, "task": task }),
+                            ),
                         };
-                        p.invokes.push(InvokeView {
+                        programs[idx].invokes.push(InvokeView {
                             id: ev.id,
                             name,
                             args,
@@ -638,34 +716,71 @@ impl Tree {
                     }
                 }
                 EventPayload::Result { call, outcome } => {
-                    if let Some(p) = programs.last_mut()
-                        && let Some(iv) = p.invokes.iter_mut().find(|iv| iv.id == *call)
+                    if let Some(&idx) = stack.last()
+                        && let Some(iv) = programs[idx].invokes.iter_mut().find(|iv| iv.id == *call)
                     {
                         iv.outcome = Some(outcome.clone());
                     }
                 }
                 EventPayload::Return { value } => {
-                    if let Some(p) = programs.last_mut() {
+                    if let Some(idx) = stack.pop() {
+                        let p = &mut programs[idx];
                         p.result = Some(value.clone());
                         p.outcome = Some(ev.id);
                         p.condition = None;
                     }
                 }
-                EventPayload::Condition { cause, .. } => {
-                    if let Some(p) = programs.last_mut() {
+                EventPayload::Condition {
+                    cause, disposition, ..
+                } => {
+                    if let Some(&idx) = stack.last() {
+                        let p = &mut programs[idx];
                         p.outcome = Some(ev.id);
                         p.condition = Some(cause.clone());
                     }
+                    if *disposition == Disposition::Handover {
+                        stack.pop();
+                    }
                 }
                 EventPayload::Console { lines } => {
-                    if let Some(p) = programs.last_mut() {
-                        p.console = lines.clone();
+                    if let Some(&idx) = stack.last() {
+                        programs[idx].console = lines.clone();
                     }
                 }
                 _ => {}
             }
+            depth = depth_after(depth, &ev.payload);
         }
         programs
+    }
+
+    /// The compaction lookup for `leaf`'s path (see
+    /// `EventPayload::Compacted`'s own doc comment): target event id →
+    /// the op that shadows it. A renderer consults this **instead of**
+    /// re-deriving a row from `of` directly — the log never actually
+    /// removes the target, so a branch forked before the compaction (its
+    /// path holds no `Compacted` event past its own root) resolves this
+    /// lookup empty on that id and renders the original event exactly as
+    /// logged, with no special case for "was this ever compacted".
+    ///
+    /// Last-write-wins if a row is compacted more than once on the same
+    /// path — Part E's re-fire case, where a batch that didn't free
+    /// enough is asked again: `path_events` is root-first, so a plain
+    /// insert naturally keeps the latest attempt.
+    pub fn compacted_lookup(&self, leaf: EventId) -> HashMap<EventId, CompactedView> {
+        let mut lookup = HashMap::new();
+        for event in self.path_events(leaf) {
+            if let EventPayload::Compacted { of, label, text } = &event.payload {
+                lookup.insert(
+                    *of,
+                    CompactedView {
+                        label: label.clone(),
+                        text: text.clone(),
+                    },
+                );
+            }
+        }
+        lookup
     }
 
     /// **The reconciliation table, as a scan.** Every unmatched half of
@@ -803,8 +918,12 @@ impl Tree {
             for post in self.spine_at(leaf).context().open.iter().copied() {
                 rows.push(Unmatched::OwedAnswer { branch, post });
             }
-            // A `Turn(run_program)` with no outcome: interrupted
-            // mid-program, and the VM went with the process.
+            // A `Turn` with no outcome: interrupted mid-program, and the
+            // VM went with the process. Under code mode a `Turn` is
+            // exactly one program, so it owes exactly **one** outcome (a
+            // `Return` or a `Condition`) — never the N-tool-calls count
+            // the old tool-call protocol compared against. Zero outcomes
+            // means the VM never handed back at all.
             //
             // Scoped to this branch's **own agent segment**, not its
             // whole path: a turn above an `Agent` root belongs to the
@@ -823,12 +942,7 @@ impl Tree {
             else {
                 continue;
             };
-            let EventPayload::Message(Message::Turn { tool_calls, .. }) = &turn.payload else {
-                continue;
-            };
-            if !tool_calls.is_empty()
-                && crate::report::outcomes_of_turn(self, leaf, turn.id).len() < tool_calls.len()
-            {
+            if crate::report::outcomes_of_turn(self, leaf, turn.id).is_empty() {
                 rows.push(Unmatched::InterruptedRun {
                     branch,
                     leaf,

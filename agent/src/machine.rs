@@ -1,4 +1,5 @@
-//! Sans-io branch step machine (8_HARNESS Step 3).
+//! Sans-io branch step machine (8_HARNESS Step 3; substituted for code
+//! mode by 23_ONE_AGENT.md A4).
 //!
 //! One `Runner` drives one branch: a deterministic, IO-free core the
 //! host feeds with `StepInput`s and drains of `StepOutput`s. The host
@@ -6,6 +7,24 @@
 //! the core never blocks. VM compute is host-fueled: the machine runs
 //! one `step(fuel)` slice per `Tick` and reports `Working` when it
 //! wants another, so a hot program can't starve the host loop.
+//!
+//! **The one substitution this file makes** (23_ONE_AGENT.md, "What is
+//! actually changing"): the model's entire turn used to be `Turn {
+//! text, tool_calls: [run_program|resume|answer] }`, chosen off three
+//! tool schemas offered on every request and policed by
+//! `Runner::eligible`. Now the model's entire turn **is** a program —
+//! `Turn { source }`, bare — and there is nothing to choose among:
+//! every turn compiles and runs. A restart of a suspended run is no
+//! longer a distinguished tool call either; it is a direct,
+//! host-driven call to [`Runner::resume`]/[`Runner::abandon`], made
+//! only once the host has decided (by whatever means it uses to run a
+//! handler completion and read its `return resume(value)` /
+//! `return abandon()` decision — DESIGN.md's thesis table, built
+//! outside this file) that this branch is the one to reactivate.
+//! Because that decision never reaches here as a name the LLM typed,
+//! ineligibility stops being an event kind this file has to render: a
+//! host that calls `resume`/`abandon` with nothing suspended has a
+//! bug of its own, not a user-facing refusal to construct.
 
 use std::collections::HashMap;
 use std::io;
@@ -18,139 +37,55 @@ use crate::host::ProgramStatus;
 use crate::report::{Artifact, ArtifactState, preview};
 use crate::types::*;
 
-/// Tool names offered to the LLM. All three are offered on **every**
-/// request, in this order, for the branch's whole life: prompt caching
-/// keys on the longest common prefix and the tool array is assembled
-/// into the front of it, so a phase-varying list makes a varying prefix
-/// — and a branch with N conditions would pay 2N invalidations at the
-/// boundary this project crosses most.
+/// The closed, harness-defined verb names `dispatch_calls` recognizes
+/// when the VM yields an `Invoke` effect for one of them — the same
+/// strings `interp`'s compiler emits for a **bare** call (`tell(...)`,
+/// `ask(...)`, `spawn(...)`, ...; `interp/src/compiler/call.rs:575`),
+/// never for a `tools.foo(...)` call, which stays a configured
+/// capability the registry answers. This is "the one place a bare
+/// verb's name becomes a `Call` variant" (17_BRANCHES A2) generalized:
+/// folded in here from the deleted `verbs.rs`, whose job was exactly
+/// this parse, just not yet wired to a live session.
 ///
-/// What replaces the schema-level guardrail is a report-level one: the
-/// **rules** are static and live in the card, *which are eligible now*
-/// is in the report, and an ineligible call is answered with a refusal
-/// (`Runner::eligible`). An invalid restart becomes possible and
-/// corrected in one turn, instead of impossible.
-pub const TOOL_RUN_PROGRAM: &str = "run_program";
-pub const TOOL_RESUME: &str = "resume";
-pub const TOOL_ANSWER: &str = "answer";
-
-/// The tool list, constant for a branch's life.
-pub fn tool_specs() -> Vec<ToolSpec> {
-    vec![run_program_spec(), resume_spec(), answer_spec()]
-}
-
-/// Program-facing tool names `dispatch_calls` interprets — **the one
-/// place a `tools.*` name becomes a `Call` variant** (A2). Everything
-/// downstream matches on the variant.
+/// `resume`/`abandon` are deliberately **not** among these: they
+/// compile to a plain tagged object (`{ __decision: "resume", value
+/// }`), never to `Instr::Invoke` — a handler's `return resume(v)` is
+/// pure value construction the host reads off a `Return`, not a call
+/// this file ever sees arrive as a `Pending` effect. `raise` is
+/// likewise absent: it is its own `Instr::Raise`, handled in `pump`.
 pub const TOOL_SPAWN: &str = "spawn";
 pub const TOOL_ASK: &str = "ask";
 pub const TOOL_TELL: &str = "tell";
-/// `spawn` + `ask` in one call, kept verbatim from 8_HARNESS.
-pub const TOOL_AGENT: &str = "agent";
-pub const TOOL_TOOL_RESULT: &str = "tool_result";
-
-/// Discovery. A host tool in the program's view like any other, but its
-/// answer needs **live session state** (a branch's status), so the
-/// session serves it inline instead of the registry. This const is the
-/// one place the name is written.
-pub const TOOL_AGENTS: &str = "agents";
-
-/// A full tool definition offered to the LLM: what every client
-/// serializes into its wire format (name + JSON-schema'd parameters).
-#[derive(Clone, Debug, PartialEq, serde::Serialize)]
-pub struct ToolSpec {
-    pub name: String,
-    pub description: String,
-    /// JSON schema of the tool-call arguments object.
-    pub parameters: serde_json::Value,
-}
-
-/// The `run_program` definition — the single place its schema lives.
-pub fn run_program_spec() -> ToolSpec {
-    ToolSpec {
-        name: TOOL_RUN_PROGRAM.into(),
-        description: "Run a complete JavaScript program (harness dialect, per the system \
-                      message). The tool result is a report: the returned value, or a \
-                      condition with restart options."
-            .into(),
-        parameters: serde_json::json!({
-            "type": "object",
-            "properties": {
-                "source": {
-                    "type": "string",
-                    "description": "the complete program source"
-                },
-                "attachments": {
-                    "type": "object",
-                    "additionalProperties": { "type": "string" },
-                    "description": "optional name→content map for authored bodies \
-                                    (file contents, large blobs). The program reads \
-                                    them as the read-only const `attachments.<name>` — \
-                                    keep them out of `source` so it stays small and \
-                                    the content is inert (no JS escaping)."
-                }
-            },
-            "required": ["source"]
-        }),
-    }
-}
-
-/// The `resume` definition. Offered always; valid only when your last
-/// message is a condition report for a program that is still suspended,
-/// which the report says.
-///
-/// `value` is **optional**: resuming a post-condition (nobody asked for a
-/// value — a message arrived) has nothing to supply, and requiring one
-/// would make the commonest restart of this phase read as an error.
-pub fn resume_spec() -> ToolSpec {
-    ToolSpec {
-        name: TOOL_RESUME.into(),
-        description: "Resume the suspended program: execution continues with `value` as \
-                      the result of the failed operation (or of the raise expression). \
-                      Omit `value` when nothing asked for one — resuming after a message \
-                      arrived just continues."
-            .into(),
-        parameters: serde_json::json!({
-            "type": "object",
-            "properties": {
-                "value": {
-                    "description": "the JSON value to resume with (optional)"
-                }
-            }
-        }),
-    }
-}
-
-/// The `answer` definition — explicit binding. Offered always; valid only
-/// for a post that is open on **this** branch.
-///
-/// It is the **only** way to close an open post (18_TARGETING: a bare
-/// turn answers nothing) — a structured value, a specific one of several
-/// open posts, and answering an interrupting post **without ending the
-/// program** are all this call, never an implicit binding.
-pub fn answer_spec() -> ToolSpec {
-    ToolSpec {
-        name: TOOL_ANSWER.into(),
-        description: "Answer one open question on this branch, by id. Carries a JSON \
-                      value, picks a specific question when several are open, and leaves \
-                      any running or suspended program exactly as it is — so you can \
-                      answer an interrupting message and then resume."
-            .into(),
-        parameters: serde_json::json!({
-            "type": "object",
-            "properties": {
-                "question": {
-                    "type": "integer",
-                    "description": "the id of the open post being answered (#N in the report)"
-                },
-                "value": {
-                    "description": "the answer, as any JSON value"
-                }
-            },
-            "required": ["question", "value"]
-        }),
-    }
-}
+/// `fork()` — a divergent branch inheriting this agent's history,
+/// settled with the fork's handle exactly as `spawn` is (types.rs
+/// `Call::Fork`; DESIGN.md's "Exchanges").
+pub const TOOL_FORK: &str = "fork";
+/// `answer(question, label, value)` — discharges an open post from
+/// *inside* a program, unlike the old top-level `answer` tool call:
+/// there is no longer a distinguished "turn that only answers", so
+/// this is an ordinary dispatched call like any other bare verb.
+pub const TOOL_ANSWER: &str = "answer";
+/// `append_history(value)` — logs an `EventPayload::Note` (22's "one
+/// vocabulary decision" list; DESIGN.md "No exception"): what a mind
+/// chose to remember for its own later turns, never re-derived and
+/// never entering anyone else's context.
+pub const TOOL_APPEND_HISTORY: &str = "append_history";
+/// `artifact(id)` — the renamed `tools.tool_result(id)`: id-addressable
+/// fetch from the log, resolved synchronously without a host round
+/// trip. The **only** survivor of the old budgeted-answer machinery
+/// (DESIGN.md "No exception": the artifact model and id-addressable
+/// fetch stay; only the budgeted copy-into-context goes).
+pub const TOOL_ARTIFACT: &str = "artifact";
+/// `remove_history(id, label)` / `rewrite_history(id, label, value)` —
+/// Part E's compaction verbs. Recognized here so a malformed call gets
+/// a precise rejection rather than a confusing round trip to a host
+/// tool that doesn't exist, but **not dispatched**: `compaction.rs` is
+/// mid-rewrite in this same phase (re-rooting on `&Tree`/`&[Event]`,
+/// 23_ONE_AGENT.md A3) and wiring it in here would be guessing at an
+/// API that is still moving. Left for a later pass — flagged in A4's
+/// own report, not silently dropped.
+pub const TOOL_REMOVE_HISTORY: &str = "remove_history";
+pub const TOOL_REWRITE_HISTORY: &str = "rewrite_history";
 
 /// Open-post ids named in the request's trailing note before it says
 /// "and N more" — a bounded line, like every other rendered bound.
@@ -167,33 +102,28 @@ const ABSENT: &str = "No one is attached to this session right now; a question t
 /// What the harness says when the user interrupts a running program and
 /// has nothing else to add. It is a `tell` — the branch owes no answer —
 /// and it exists so the wake has a cause event in the log.
-const INTERRUPT_NOTICE: &str = "The user interrupted your program. It is paused at its last fuel slice; nothing was \
-     lost. Carry on with resume(), change course with run_program(source), or stop with a \
-     plain reply.";
+///
+/// Rewritten for code mode (23_ONE_AGENT.md A4 dec. 1): the old text
+/// offered a menu of three named tools (`resume()` /
+/// `run_program(source)` / "a plain reply"), none of which exist as
+/// distinguished choices anymore. There is exactly one thing to say:
+/// nothing was lost, and the next program is whatever the model writes.
+const INTERRUPT_NOTICE: &str = "The user interrupted your program. It is paused at its last fuel slice — nothing \
+     is lost, every completed call is already an artifact — and what happens next is \
+     whatever program you write.";
 
 /// Iteration cap for one `Tick`: each extra round requires a synchronous
-/// artifact fetch (`tools.tool_result`) to have unblocked the program,
-/// but a pathological program could chain those forever.
+/// artifact fetch (`artifact(id)`) to have unblocked the program, but a
+/// pathological program could chain those forever.
 const MAX_PUMP_ROUNDS: usize = 100;
 
-/// Default budget for an agent's *answer* — the one value that deliberately
-/// crosses into a mind's context: a program's `return` (into its own
-/// agent) and a subagent's final turn (into its caller). Sized to a
-/// typical source file so an ordinary read or summary lands in one shot
-/// (DESIGN.md "The one exception"; 12_ANSWERS). The full value is always a
-/// fetchable artifact; **only the context copy is clipped past this** —
-/// the budget is a rendering rule, never a limit on what is stored or on
-/// what reaches a program. A caller may raise a child's budget via
-/// `agent({ budget })`.
-const DEFAULT_ANSWER_BUDGET: usize = 64 * 1024;
-
 pub enum StepInput {
-    /// The assistant's turn (logged with its author; tool calls
-    /// dispatched).
+    /// The assistant's turn (logged with its author; the program is
+    /// compiled and run).
     LlmResponse(LlmTurn),
-    /// Settled calls, in resolution order. One door for all three call
-    /// kinds: a host tool's result, a `Spawn`'s agent handle, a `Tell`'s
-    /// delivery receipt, or an `Ask`'s answer — routing is by the
+    /// Settled calls, in resolution order. One door for all call
+    /// kinds: a host tool's result, a `Spawn`'s or `Fork`'s handle, or
+    /// a `Send`'s delivery receipt/answer — routing is by the
     /// **variant** already in the log, so the machine needs no second
     /// input for subagents.
     ToolResults(Vec<ToolResult>),
@@ -203,8 +133,8 @@ pub enum StepInput {
 
 /// One settled call. It is named by its **logged `Call` event id** — the
 /// log's own key, which is also what the artifact menu shows and what
-/// `tools.tool_result` takes, so there is no second id space to keep in
-/// step with it.
+/// `artifact(id)` takes, so there is no second id space to keep in step
+/// with it.
 pub struct ToolResult {
     pub call: EventId,
     /// `Err` rejects the program-side promise with the message.
@@ -218,8 +148,15 @@ pub enum StepOutput {
     /// Execute these tools (any order/concurrency); feed back as
     /// `ToolResults` in completion order.
     ToolCalls(Vec<OutCall>),
-    /// Create these agents; settle each `Spawn` with `{ agent }`.
-    Spawns(Vec<SpawnRequest>),
+    /// Create these agents; settle each `Spawn` with `{ agent }`. Named
+    /// by the logged `Call::Spawn` event id — the host reads name,
+    /// charter and allowlist from the log rather than a copy.
+    Spawns(Vec<EventId>),
+    /// Create these forks — a divergent branch inheriting the caller's
+    /// history, unlike `Spawns` which roots a clean-room agent. Settle
+    /// each with the fork's handle exactly as a `Spawn` is (DESIGN.md
+    /// "Exchanges": `fork()` kicks its child off like `spawn`).
+    Forks(Vec<EventId>),
     /// Deliver these `Send`s. Each names a logged `Call::Send`, and the
     /// address, body and `expects_reply` all live there — the host reads
     /// the log rather than being handed a copy, which is the same
@@ -229,78 +166,45 @@ pub enum StepOutput {
     /// `Result`; a `tell` is settled by its delivery receipt as soon as
     /// the `Post` lands.
     Sends(Vec<EventId>),
-    /// A turn produced an answer. Two producers, distinguished by
-    /// `question`:
-    ///
-    /// - A bare turn (`go_idle`): the branch goes **idle**, no `Answer`
-    ///   is logged, and `question` is always `None` — a bare turn answers
-    ///   nothing (18_TARGETING), whatever it still owes stays open. The
-    ///   turn's text is read where it sits.
-    /// - An explicit `answer(question, value)` (`apply_answer`):
-    ///   `question` is `Some`, and an `Answer` naming it was logged.
-    ///
-    /// Agents never close: idle costs nothing and the branch stays
-    /// addressable, so a later question to it — from anyone — is just
-    /// another post.
+    /// A program called `answer(question, label, value)`: the `Answer`
+    /// it logged, for the host to surface (e.g. mark the branch as
+    /// having discharged an obligation). There is no other producer —
+    /// under code mode a turn that answers nothing simply runs a
+    /// program that calls nothing (DESIGN.md "No exception": a bare
+    /// turn is not a distinguished shape anymore, just an ordinary
+    /// program with no calls in it).
     Answered {
-        question: Option<EventId>,
+        question: EventId,
         value: serde_json::Value,
     },
     /// The VM wants another `Tick`.
     Working,
 }
 
-/// One completed assistant turn, as an LLM client produced it.
+/// One completed assistant turn, as an LLM client produced it: the bare
+/// program source it decided to run, and any reasoning trace beside it.
 ///
 /// A client speaks *for* a branch; it does not decide **who acted**. So
-/// the `author` is not here: the harness stamps it when it logs the
+/// `author` is not here — the harness stamps it when it logs the
 /// `Message::Turn`, which is also what lets the user take a branch's turn
-/// through the very same path (`Restart`).
+/// through the very same path (`take_turn`).
 #[derive(Clone, Debug, Default)]
 pub struct LlmTurn {
-    pub text: String,
+    pub source: String,
     pub thinking: Option<String>,
-    pub tool_calls: Vec<ToolCall>,
 }
 
-/// One message as it goes out to the API. Log `Message`s render into
-/// these, and the **tool-role entries are derived** — from the run's
-/// outcome and the events around it — never stored, which is why they
-/// have no `EventPayload` counterpart.
-///
-/// Each variant is exactly one API role, chosen by the variant and never
-/// by a flag.
-#[derive(Clone, Debug, PartialEq)]
-pub enum Rendered {
-    /// user role: a `Post`, author-labelled, with any `input` previewed.
-    User(String),
-    /// assistant role: a `Turn`.
-    Assistant {
-        text: String,
-        thinking: Option<String>,
-        tool_calls: Vec<ToolCall>,
-    },
-    /// tool role: the derived report answering one of a `Turn`'s calls.
-    /// The API requires every `tool_call_id` to be answered, so the
-    /// renderer emits exactly one of these per tool call in a `Turn`.
-    Tool { call_id: String, text: String },
-}
-
-#[derive(Debug)]
+/// A rendered request's **ephemeral** half only. Under code mode the
+/// system prompt, message history and tool surface are no longer built
+/// here — `document.rs` renders those straight from the log and the
+/// card (23_ONE_AGENT.md A4: "the card is the surface", no tool array
+/// on any request). This is the one thing that genuinely can't move
+/// there: presence and "what's still open" are *session* state, not
+/// log content, so they can only ever be attached by whoever holds the
+/// `Runner`.
+#[derive(Debug, Default)]
 pub struct LlmRequest {
-    /// The branch's system prompt, rebuilt verbatim from `Agent.system`.
-    /// It is a *snapshot*, so a later card edit or a new registry tool
-    /// never alters an existing conversation's cached prefix.
-    pub system: String,
-    pub messages: Vec<Rendered>,
-    /// Constant for a branch's life — see [`TOOL_RUN_PROGRAM`].
-    pub tools: Vec<ToolSpec>,
-    /// A trailing ephemeral line after the newest message: per-request
-    /// facts, never logged, re-emitted at the new end each time so the
-    /// prefix it followed stays byte-identical. The **only** place a
-    /// right-now fact may go; putting one in the system prompt or a
-    /// rendered message would invalidate every cached branch on every
-    /// flip. (C1 adds presence here.)
+    /// The trailing ephemeral line — see [`Runner::request_tail`].
     pub tail: Option<String>,
 }
 
@@ -313,28 +217,16 @@ pub struct OutCall {
     pub args: serde_json::Value,
 }
 
-/// One agent to create. `name`, `charter` and `tools` live on the
-/// `Call::Spawn` named by `call`, so the host reads them from the log.
-#[derive(Debug)]
-pub struct SpawnRequest {
-    pub call: EventId,
-    /// The child's answer budget (`agent({ budget })`); `None` → default.
-    /// The one field not in the log: it is the *caller's* choice about
-    /// its own context, not part of what the agent is.
-    pub budget: Option<usize>,
-}
-
-/// One program execution: the `run_program` tool call being served.
+/// One program execution: the run a `Turn` started.
 struct Run {
-    /// The `run_program` Assistant event id — the program block's stable
-    /// key across `resume` (decision 2), carried by `ProgramStatus`.
+    /// The `Turn` event id — the program block's stable key, carried
+    /// through `resume`/`abandon` so status transitions stay attached
+    /// to the same block across a continuation.
     program_id: EventId,
-    /// LLM tool-call id the eventual tool result answers.
-    call_id: String,
     vm: VM,
 }
 
-/// How `resume(value)` re-enters a suspended run — the *live* half of a
+/// How `Runner::resume` re-enters a suspended run — the *live* half of a
 /// suspension, kept beside the phase.
 ///
 /// The vocabulary a suspension is described in lives in the log, as
@@ -342,7 +234,7 @@ struct Run {
 /// crash. This is deliberately **not** the same value. A `VMError` is not
 /// serialisable and only a live VM can consume one, so a `Cause` cannot
 /// carry it — and the `Cause` variants that never ran a VM
-/// (`CompileFailed`, `Refused`, `Interrupted`) have no live half at all.
+/// (`CompileFailed`, `Interrupted`) have no live half at all.
 enum ResumeWith {
     /// `raise(name, payload)` — resume via `VM::resume_raise`.
     Raise,
@@ -351,7 +243,8 @@ enum ResumeWith {
     Trapped(VMError),
     /// A post arrived and the run suspended at its next fuel slice (rule
     /// B). The VM is simply **parked between slices** — nothing asked for
-    /// a value and nothing failed — so `resume()` just carries on.
+    /// a value and nothing failed — so `resume(...)` just carries on,
+    /// ignoring whatever value it was given.
     Continue,
 }
 
@@ -362,7 +255,17 @@ enum Phase {
     AwaitingLlm,
     /// A program is executing (waiting for `Tick`/`ToolResults`).
     Running(Run),
-    /// A condition report went out; waiting for the restart choice.
+    /// A condition report went out; waiting for a direct
+    /// [`Runner::resume`]/[`Runner::abandon`] call from the host.
+    ///
+    /// There is deliberately only ever **one** parked run here, not a
+    /// stack: nesting ("a handler for a handler") is a host-side
+    /// concern built from multiple independently-stepped `Runner`s
+    /// (DESIGN.md's load-bearing property — "the handler stack is a
+    /// host-side structure of independently-stepped VMs"), never a
+    /// property this single sans-io core represents internally. See
+    /// this file's own top doc comment for how a restart reaches this
+    /// state now.
     Suspended(Run, ResumeWith),
 }
 
@@ -370,29 +273,15 @@ enum Phase {
 /// The name, args and address live there, not here: the log is the
 /// record, and the session state only has to route the settlement.
 struct PendingCall {
-    settle: Settle,
+    /// The program-side promise this call's `Result` resolves or
+    /// rejects. `tools.agent`'s old spawn-then-ask sugar (`Settle`,
+    /// two producers for one promise) is gone from the vocabulary
+    /// (23_ONE_AGENT.md A4: `agent` is not one of the closed verbs) —
+    /// every pending call now has exactly one thing waiting on it.
+    promise: PromisePtr,
     /// Which run issued it: results from an abandoned run are still
     /// logged as artifacts (the physics happened) but not delivered.
     generation: u64,
-}
-
-/// What a landing `Result` does to the program.
-enum Settle {
-    /// Resolve (or reject) this promise with the outcome.
-    Promise(PromisePtr),
-    /// `tools.agent`'s sugar, the one call that is two: the `Spawn`'s
-    /// `{ agent }` is not the program's answer, so the first question is
-    /// issued to the new agent and **its** answer settles the promise.
-    /// Both halves are ordinary logged calls with ordinary `Result`s —
-    /// the desugaring lives here and nowhere downstream.
-    ThenAsk {
-        promise: PromisePtr,
-        text: String,
-        input: serde_json::Value,
-        /// The `tools.agent(...)` call site: the `Send` shares it,
-        /// because it *is* the same place in the source.
-        site: u32,
-    },
 }
 
 pub struct Runner {
@@ -422,16 +311,6 @@ pub struct Runner {
     /// one step — a rewrite abandoning the old run as a new one starts —
     /// both surface, and so the sans-io output set is untouched.
     status_transitions: Vec<(EventId, ProgramStatus)>,
-    /// Byte budget for this agent's *answer* **into context** — a
-    /// rendering bound and nothing else. Values are stored whole and
-    /// reach the asking program whole; a report clips its copy to this
-    /// and names the id the rest is behind. Seeded from the spawning
-    /// `agent({ budget })` or `DEFAULT_ANSWER_BUDGET`.
-    answer_budget: usize,
-    /// Refusals owed to the extra tool calls of the current turn. They are
-    /// logged only once the first call's outcome has landed, so outcomes
-    /// stay in call order and the positional pairing holds.
-    deferred_refusals: Vec<String>,
     /// Whether a client is attached to the session right now.
     ///
     /// Presence is a **per-request fact**, never branch state that
@@ -451,32 +330,6 @@ pub struct Runner {
     /// starts at its `Fork` root, so history before it never triggers a
     /// prompt and the fork speaks only when spoken to.
     shown: u64,
-}
-
-/// A restart the branch was asked for — by its LLM, or by the user
-/// taking its turn (C1's `Restart`). The tool list is constant, so
-/// **which of these is valid is not a schema fact**, and this enum is
-/// what the one eligibility check is written against.
-#[derive(Clone, Copy, Debug)]
-pub enum Restart {
-    RunProgram,
-    Resume,
-    Answer(EventId),
-}
-
-/// Why a restart is ineligible — the text the refusal renders.
-///
-/// It is self-sufficient **by construction**: every one is built by
-/// [`Runner::refusal`], which appends what *is* valid now. A refusal that
-/// only says "no" costs a second turn, so saying no and saying what to do
-/// instead are one operation here rather than two conventions.
-#[derive(Debug)]
-pub struct Refusal(String);
-
-impl Refusal {
-    pub fn reason(&self) -> &str {
-        &self.0
-    }
 }
 
 enum SuspendCause {
@@ -503,7 +356,7 @@ impl Runner {
     }
 
     /// A new agent rooted at `call_site` — the `Spawn` on the caller's
-    /// branch (the host maps each `SpawnRequest` to one of these). The
+    /// branch (the host maps each `Spawns` id to one of these). The
     /// `Agent` is the agent's own root and outlives the caller, its
     /// program, and often the conversation that created it; `tools` sits
     /// here, on that root, because the registry enforces a child's
@@ -512,16 +365,15 @@ impl Runner {
     ///
     /// It carries **no question**. A spawn creates; asking is a separate
     /// act, and the first question arrives like every other — as a
-    /// `Post` naming the `Send` that dispatched it. So a bare
-    /// `tools.spawn` leaves an idle agent with nothing open, which is
-    /// exactly what the driving rule wants: nothing to say, no request.
+    /// `Post` naming the `Send` that dispatched it. So a bare `spawn(...)`
+    /// leaves an idle agent with nothing open, which is exactly what the
+    /// driving rule wants: nothing to say, no request.
     pub fn new_agent(
         tree: &mut Tree,
         call_site: EventId,
         name: Option<String>,
         charter: impl Into<String>,
         tools: Option<Vec<String>>,
-        budget: Option<usize>,
         card: &str,
     ) -> io::Result<Self> {
         let charter = charter.into();
@@ -529,7 +381,6 @@ impl Runner {
         let spine = tree.start_agent(Some(call_site), name, charter, tools, system)?;
         let mut state = Self::with_spine(tree, spine);
         state.dialect_card = card.to_owned();
-        state.answer_budget = budget.unwrap_or(DEFAULT_ANSWER_BUDGET);
         Ok(state)
     }
 
@@ -548,14 +399,11 @@ impl Runner {
             dialect_card: String::new(),
             last_vm: None,
             status_transitions: Vec::new(),
-            answer_budget: DEFAULT_ANSWER_BUDGET,
-            deferred_refusals: Vec::new(),
             attached: false,
             // A branch handed to a fresh `Runner` has said nothing to
             // *this* session's LLM and is owed no prompt for its
             // history: a fork born at its `Fork` root speaks only when
             // spoken to, and a re-opened branch waits to be addressed.
-            // (C2 lowers this where reconciliation owes a prompt.)
             shown: leaf.as_u64(),
         }
     }
@@ -622,66 +470,44 @@ impl Runner {
     ///
     /// > Prompt iff the branch holds no VM and there is a rendered
     /// > `Message` other than a `Turn` with id > `shown` — or the newest
-    /// > one is a `Turn` whose calls all have outcomes.
+    /// > `Turn`'s run has an outcome that has not yet been reported.
     ///
-    /// - A `Turn` with no tool calls is the only terminal: the branch is
-    ///   idle until a `Post` arrives. (18_TARGETING: this holds even when
-    ///   the branch still owes an `answer` — a post still open is not by
-    ///   itself a cause to re-prompt, only an unseen one is. `open` and
-    ///   `shown` are allowed to disagree; a branch may be idle and still
-    ///   owe.)
-    /// - A `Turn` with tool calls hands the branch to the VM, which
-    ///   speaks only through its outcome events — so the rule fires when
-    ///   the VM has something to say and never while it is running.
     /// - Every request has a **cause event**. The LLM is never prompted
     ///   "just because", and never twice for the same thing: `shown`
-    ///   advances at each render — literally true again now that nothing
-    ///   re-opens a request for a cause already shown.
-    ///
-    /// The `Turn`-with-outcomes clause is what re-derives the state from
-    /// the log after a crash: a run whose report was never sent still has
-    /// its outcome, so the report renders and the branch prompts
-    /// normally. Nothing about "awaiting the LLM" is a log state, so
-    /// nothing about it needs repair.
+    ///   advances at each render.
+    /// - `finish_program`/`suspend`/a `CompileFailed` handback all log
+    ///   the harness's report as an ordinary `Post` from `Author::Harness`
+    ///   (23_ONE_AGENT.md A4: "the harness's reply is a Post, not a
+    ///   distinguished reply kind") and then render *unconditionally* —
+    ///   so in the overwhelming common case this rule's unseen-post
+    ///   clause alone already covers "a run just finished". The
+    ///   crash-recovery clause below only matters for the narrow window
+    ///   between logging a run's outcome and logging its report.
     ///
     /// There is no interactive/autonomous split here, deliberately: this
     /// design already deleted one such flag (`is_root`), and a mode would
     /// resurrect it under a new name. What makes a branch autonomous is
     /// **the program still running**, not extra prompting.
     pub fn needs_prompt(&self, tree: &Tree) -> bool {
-        // Running or suspended: the branch holds a VM, and the VM speaks
-        // through its outcome events. Awaiting an LLM: a request is
-        // already out, and everything logged since will ride the next one.
+        // Running or suspended: the branch holds a VM. Awaiting an LLM: a
+        // request is already out, and everything logged since will ride
+        // the next one.
         if !matches!(self.phase, Phase::Idle) {
             return false;
         }
         // Any unseen `Post` is a cause — including one that arrived
         // during a generation, which the turn that just landed could not
         // have answered (its binding was fixed at `shown`), and including
-        // a tell, which owes no answer but must still be seen.
+        // a tell, which owes no answer but must still be seen. The
+        // harness's own report `Post` is exactly this case too.
         if !self.unseen_posts(tree).is_empty() {
             return true;
         }
-        // The crash-recovery clause: a run whose report was never sent
-        // still has its outcome, so the report renders and the branch
-        // prompts normally. A `Turn` with **no** calls is the only
-        // terminal, and a `Turn` whose calls have no outcome yet means
-        // the VM is still owed one.
-        let segment = self.agent_segment(tree);
-        let Some(last) = segment
-            .iter()
-            .rev()
-            .find(|e| matches!(e.payload, EventPayload::Message(_)))
-        else {
-            return false;
-        };
-        let EventPayload::Message(Message::Turn { tool_calls, .. }) = &last.payload else {
-            return false;
-        };
-        last.id.as_u64() > self.shown
-            && !tool_calls.is_empty()
-            && crate::report::outcomes_of_turn(tree, self.spine.leaf_id, last.id).len()
-                >= tool_calls.len()
+        // The crash-recovery clause: an outcome (`Return`/`Condition`)
+        // logged with no report `Post` after it means the process died
+        // in the narrow window between the two — `finish_program`'s and
+        // `suspend`'s own two appends are not atomic.
+        self.last_turn_report_pending(tree).is_some()
     }
 
     /// Posts logged on this branch that its LLM has not been shown — the
@@ -694,6 +520,35 @@ impl Runner {
             .filter(|e| matches!(e.payload, EventPayload::Message(Message::Post { .. })))
             .map(|e| e.id)
             .collect()
+    }
+
+    /// The most recent `Turn` on this path whose run has an outcome
+    /// (`Return`/`Condition`) but no harness report `Post` after it —
+    /// the narrow crash window `needs_prompt` and `unrendered_cause`
+    /// both need, now that the report is an ordinary logged message
+    /// rather than something rebuilt fresh on every render.
+    fn last_turn_report_pending(&self, tree: &Tree) -> Option<EventId> {
+        let segment = self.agent_segment(tree);
+        let at = segment
+            .iter()
+            .rposition(|e| matches!(e.payload, EventPayload::Message(Message::Turn { .. })))?;
+        let rest = &segment[at + 1..];
+        let outcome_at = rest.iter().position(|e| {
+            matches!(
+                e.payload,
+                EventPayload::Return { .. } | EventPayload::Condition { .. }
+            )
+        })?;
+        let reported = rest[outcome_at + 1..].iter().any(|e| {
+            matches!(
+                &e.payload,
+                EventPayload::Message(Message::Post {
+                    from: Author::Harness,
+                    ..
+                })
+            )
+        });
+        (!reported).then_some(segment[at].id)
     }
 
     /// **Reconciliation's half of the trigger rule**: forget having shown
@@ -711,30 +566,13 @@ impl Runner {
 
     /// The earliest event on this branch the trigger rule would call a
     /// cause, **ignoring `shown`** — what reconciliation lowers the mark
-    /// to when a crash swallowed the request that cause was for.
+    /// to when a crash swallowed the report a run's outcome was owed.
     ///
-    /// Two, exactly matching the table's two prompting rows: a post this
-    /// branch owes an answer to, and a run whose outcome was never
-    /// rendered. Nothing else re-prompts; a `Turn` with no tool calls is
-    /// still the only terminal, so a fully answered log opens idle.
+    /// Two, matching the table's two prompting rows: a post this branch
+    /// owes an answer to, and a run whose report was never logged.
     pub fn unrendered_cause(&self, tree: &Tree) -> Option<EventId> {
         let owed = self.open().first().copied();
-        let unreported = self
-            .agent_segment(tree)
-            .iter()
-            .rev()
-            .find(|e| matches!(e.payload, EventPayload::Message(_)))
-            .and_then(|last| match &last.payload {
-                EventPayload::Message(Message::Turn { tool_calls, .. })
-                    if !tool_calls.is_empty()
-                        && crate::report::outcomes_of_turn(tree, self.spine.leaf_id, last.id)
-                            .len()
-                            >= tool_calls.len() =>
-                {
-                    Some(last.id)
-                }
-                _ => None,
-            });
+        let unreported = self.last_turn_report_pending(tree);
         match (owed, unreported) {
             (Some(a), Some(b)) => Some(if a.as_u64() <= b.as_u64() { a } else { b }),
             (a, b) => a.or(b),
@@ -748,115 +586,16 @@ impl Runner {
         self.prompt_if_needed(tree)
     }
 
-    /// **The one eligibility check**, used for every restart — the LLM's
-    /// and the user's alike. It changes no state: an ineligible call is
-    /// answered with a refusal and costs one turn.
-    ///
-    /// This is also the *only* enforcement of the fork-obligations rule.
-    /// A fork inherits history, not obligations, so a pre-fork post is
-    /// not on its `open` list — and the refusal says whose it is, which
-    /// explains the rule where it is violated instead of leaving it as
-    /// something the model must have absorbed.
-    pub fn eligible(&self, tree: &Tree, restart: Restart) -> Result<(), Refusal> {
-        match restart {
-            // Always valid: there is always a program you could write.
-            Restart::RunProgram => Ok(()),
-            Restart::Resume => match &self.phase {
-                Phase::Suspended(_, ResumeWith::Trapped(e))
-                    if matches!(e.resume, ResumeMode::NotResumable) =>
-                {
-                    Err(self.refusal(
-                        "this condition is not resumable — no value can stand in for what \
-                         failed.",
-                    ))
-                }
-                Phase::Suspended(..) => Ok(()),
-                // The distinctive case: a branch reopened at a `Condition`
-                // whose VM did not survive the restart. The log says a
-                // program is suspended; the session has no VM to re-enter,
-                // and saying only "nothing to resume" would read as a
-                // contradiction of the report the model is looking at.
-                _ if self.last_outcome_is_a_condition(tree) => Err(self.refusal(
-                    "that condition's program did not survive the restart — the VM is \
-                     gone, so there is nothing to re-enter. Its artifacts are all still \
-                     fetchable by id from the menu; rewrite with run_program and reuse \
-                     them.",
-                )),
-                _ => Err(self.refusal("nothing is suspended.")),
-            },
-            Restart::Answer(question) => {
-                if self.open().contains(&question) {
-                    return Ok(());
-                }
-                let id = question.as_u64();
-                let owner = self.owning_branch(tree, question);
-                Err(
-                    match (tree.events.get(&question).map(|e| &e.payload), owner) {
-                        // Open, but on the branch this one forked from: it
-                        // stays that branch's to answer, so there is exactly
-                        // one owner for every open post.
-                        (_, Some(branch)) => self.refusal(&format!(
-                            "#{id} belongs to branch #{}; this fork inherited it as history \
-                         and does not owe it. To make your answer the delivered one, the \
-                         user can take that branch's turn.",
-                            branch.as_u64()
-                        )),
-                        (Some(EventPayload::Message(Message::Post { .. })), None) => {
-                            self.refusal(&format!(
-                                "#{id} is not open on this branch — it was already answered, \
-                             or it is a notice that owes no answer."
-                            ))
-                        }
-                        _ => self.refusal(&format!("#{id} is not a post on this branch.")),
-                    },
-                )
-            }
-        }
-    }
-
-    /// A refusal that states what is true **and** what is valid now.
-    fn refusal(&self, what_is_true: &str) -> Refusal {
-        Refusal(format!("{what_is_true} {}", self.valid_now()))
-    }
-
-    /// The restarts that would be accepted right now, as the refusal's
-    /// closing sentence. Recency beats a rule stated far back in the
-    /// context, so a refusal repeats it rather than referring to it.
-    fn valid_now(&self) -> String {
-        let mut valid = vec!["run_program".to_owned()];
-        if matches!(&self.phase, Phase::Suspended(_, resume)
-                    if !matches!(resume, ResumeWith::Trapped(e)
-                                 if matches!(e.resume, ResumeMode::NotResumable)))
-        {
-            valid.push("resume".to_owned());
-        }
-        for post in self.open() {
-            valid.push(format!("answer(#{})", post.as_u64()));
-        }
-        format!("Valid now: {}.", valid.join(", "))
-    }
-
-    /// Whether this branch's last outcome was a `Condition` — the log
-    /// saying a program is suspended while the session holds no VM for
-    /// it, which is what a reopened log looks like.
-    fn last_outcome_is_a_condition(&self, tree: &Tree) -> bool {
-        matches!(
-            tree.path_events(self.spine.leaf_id)
-                .iter()
-                .rev()
-                .find(|e| matches!(
-                    e.payload,
-                    EventPayload::Return { .. } | EventPayload::Condition { .. }
-                ))
-                .map(|e| &e.payload),
-            Some(EventPayload::Condition { .. })
-        )
-    }
-
     /// The branch that owes `question`, when it is not this one: an
     /// unanswered post on this path but **before** this branch's root.
     /// That is exactly the pre-fork case, and the answer is the branch
     /// whose root it sits at or after.
+    ///
+    /// Used by the `answer` dispatch arm to explain a rejected call —
+    /// this is also the *only* enforcement of the fork-obligations rule
+    /// now: a fork inherits history, not obligations, so a pre-fork post
+    /// is not on its `open` list, and the rejection says whose it is
+    /// rather than leaving it as something the model must have absorbed.
     fn owning_branch(&self, tree: &Tree, question: EventId) -> Option<EventId> {
         let path = tree.path_events(self.spine.leaf_id);
         let at = path.iter().position(|e| e.id == question)?;
@@ -909,7 +648,10 @@ impl Runner {
 
     pub fn step(&mut self, tree: &mut Tree, input: StepInput) -> io::Result<Vec<StepOutput>> {
         match input {
-            StepInput::LlmResponse(message) => self.on_llm_response(tree, message),
+            StepInput::LlmResponse(turn) => {
+                let author = Author::Agent(self.agent_id());
+                self.apply_turn(tree, turn.source, turn.thinking, author)
+            }
             StepInput::ToolResults(batch) => self.on_tool_results(tree, batch),
             StepInput::Tick { fuel } => self.on_tick(tree, fuel),
         }
@@ -921,14 +663,17 @@ impl Runner {
     /// one door; who is speaking is `from`, and where the body lives is
     /// `origin`.
     ///
+    /// This is for **ordinary conversation** — someone (or something)
+    /// speaking to the branch — and is a different door from
+    /// [`take_turn`]: a `Post` here is *heard*, and the trigger rule
+    /// decides whether it starts a fresh turn; a `Turn` there is the
+    /// branch *acting*, always compiled and run. Plain human chat is a
+    /// `Post`; a restart the user authors by hand is a `Turn`.
+    ///
     /// Returns the `Post`'s id — a `tell`'s delivery receipt names it —
     /// beside what the branch does next: an idle branch starts a turn, a
     /// busy one has the post on its path for its next request (rule B's
     /// suspend-at-the-next-slice is B3).
-    ///
-    /// It is a door of its own rather than a `StepInput` because it
-    /// **returns a fact about the log** the caller needs, the way
-    /// `kickoff` does.
     pub fn deliver(
         &mut self,
         tree: &mut Tree,
@@ -960,12 +705,6 @@ impl Runner {
     /// The request this branch was waiting on **failed**. Nothing is
     /// logged — that turn did not happen, the same as a cancellation —
     /// and the branch drops back to idle so it can be spoken to again.
-    ///
-    /// It is deliberately not re-prompted: a failed request is not a new
-    /// cause event, and retrying a failing client in a loop is exactly
-    /// the causeless wake this design forbids. What it *must* not do is
-    /// leave the branch claiming to be thinking with nothing in flight —
-    /// that state can never progress, and `quiet()` would never fire.
     pub fn abandon_request(&mut self) {
         if matches!(self.phase, Phase::AwaitingLlm) {
             self.phase = Phase::Idle;
@@ -977,12 +716,6 @@ impl Runner {
     /// The cancellation of an in-flight generation is the *session's*
     /// half (nothing is logged: from the API's view that turn did not
     /// happen); this is what the branch does once it is cancelled.
-    ///
-    /// Note what it never does: wake a branch that has nothing to hear.
-    /// An idle branch is left idle, and an interrupted generation
-    /// re-enters the trigger rule rather than bypassing it — a post that
-    /// arrived during the generation is the cause, and if there is none
-    /// there is no request.
     pub fn interrupt(&mut self, tree: &mut Tree) -> io::Result<Vec<StepOutput>> {
         match &self.phase {
             // Nothing is in flight and nothing is owed.
@@ -994,13 +727,11 @@ impl Runner {
                 self.phase = Phase::Idle;
                 Ok(self.prompt_if_needed(tree))
             }
-            // A suspended branch has its condition report out and is
-            // awaiting the restart choice, so B3 has an arriving post
-            // ride the *next* request rather than double-prompting. This
-            // is the override that makes it land now — and it is not a
-            // second prompt for the same cause: the request it replaces
-            // never reached the model.
-            Phase::Suspended(..) => Ok(vec![self.render_request(tree)]),
+            // A suspended branch is waiting on a direct host decision
+            // (`resume`/`abandon`), not a rendered request — nothing to
+            // interrupt here that isn't already the host's own call to
+            // make.
+            Phase::Suspended(..) => Ok(Vec::new()),
             // Rule B delivers to a running program at its next fuel
             // slice, so an interrupt's job is to **be a cause** for one.
             // If nothing is unseen, the harness says so itself — in a
@@ -1021,286 +752,144 @@ impl Runner {
         }
     }
 
-    // ── input handlers ──────────────────────────────────────────────
-
-    fn on_llm_response(&mut self, tree: &mut Tree, turn: LlmTurn) -> io::Result<Vec<StepOutput>> {
-        assert!(
-            matches!(self.phase, Phase::AwaitingLlm | Phase::Suspended(..)),
-            "LlmResponse with no request in flight"
-        );
-        let author = Author::Agent(self.agent_id());
-        self.apply_turn(tree, turn, author)
-    }
+    // ── turns ────────────────────────────────────────────────────────
 
     /// **The user takes this branch's turn** — the handler hierarchy's
-    /// outermost layer made literal. The `Turn` is logged with
-    /// `author: User` and applied by exactly the path an LLM turn takes,
-    /// so the report that follows answers its `call_id` like any other
-    /// and the branch's later history shows it resumed with 5, which is
-    /// true.
-    ///
-    /// It works on an **idle** branch as well as a suspended one: an
-    /// ineligible restart is refused here the same way, by the same one
-    /// check, so the user gets the same self-sufficient correction the
-    /// model would.
-    pub fn take_turn(&mut self, tree: &mut Tree, turn: LlmTurn) -> io::Result<Vec<StepOutput>> {
-        self.apply_turn(tree, turn, Author::User)
+    /// outermost layer made literal, and now the *only* way a user
+    /// restart works: there is no `UserCall` shape distinct from an
+    /// LLM's turn anymore. `source` is either hand-typed text (the `e`
+    /// gesture — which compiles and runs like anything else, and traps
+    /// like anything else if it isn't valid JS) or a synthesized
+    /// `resume(...)`/`answer(...)` expression (`v` and the answer
+    /// gesture), matching `Message::Turn`'s own doc in `types.rs`.
+    pub fn take_turn(&mut self, tree: &mut Tree, source: String) -> io::Result<Vec<StepOutput>> {
+        self.apply_turn(tree, source, None, Author::User)
     }
 
-    /// Log one turn on this branch and serve its calls. `author` is the
-    /// only difference between the LLM's turn and the user's: it renders
-    /// as an assistant message either way, because the **branch** acted.
+    /// Log one turn — the whole of what the branch itself just said —
+    /// and start it running. `author` is the only difference between the
+    /// LLM's turn and the user's: it renders as an assistant message
+    /// either way, because the **branch** acted.
+    ///
+    /// A prior suspension is not discarded until this new program is
+    /// known to actually run: the physics already happened (in-flight
+    /// calls stay pending, their results still land as artifacts when
+    /// they arrive), so the only thing genuinely at risk of being thrown
+    /// away is the *VM*, and a program that fails to compile shouldn't
+    /// cost you that.
     fn apply_turn(
         &mut self,
         tree: &mut Tree,
-        turn: LlmTurn,
+        source: String,
+        thinking: Option<String>,
         author: Author,
     ) -> io::Result<Vec<StepOutput>> {
-        let tool_calls = turn.tool_calls.clone();
-        // The author is stamped here, where the agent id is known, rather
-        // than asked of a client that speaks *for* a branch and does not
-        // decide who acted.
         let message = Message::Turn {
             author,
-            text: turn.text,
-            thinking: turn.thinking,
-            tool_calls: turn.tool_calls,
+            source: source.clone(),
+            thinking,
         };
         let assistant_id = tree.append(&mut self.spine, EventPayload::Message(message))?;
 
-        if tool_calls.is_empty() {
-            // No tool call: the assistant's text is just a message, and
-            // the branch goes idle (18_TARGETING: a bare turn answers
-            // nothing).
-            return self.go_idle(tree);
-        }
-        // `answer` settles **synchronously**, so a turn may carry one or
-        // more of them ahead of the single call that drives the VM —
-        // `answer(#42, v)` then `resume()` is the post-condition report's
-        // expected move, and each answer's outcome is logged before the
-        // next call runs, so outcomes stay in call order.
-        let mut answered = Vec::new();
-        let mut rest = &tool_calls[..];
-        while rest.first().is_some_and(|c| c.name == TOOL_ANSWER) {
-            self.apply_answer(tree, &rest[0], &mut answered)?;
-            rest = &rest[1..];
-        }
-        let Some(call) = rest.first().cloned() else {
-            // The turn was answers only. Each is a tool call the API
-            // needs replied to, so the branch takes another turn — the
-            // program's state is untouched either way.
-            match self.phase {
-                Phase::Idle => {
-                    self.phase = Phase::AwaitingLlm;
-                    answered.push(self.render_request(tree));
-                }
-                // A suspended branch already owes the restart choice, and
-                // this turn was not one: ask again, carrying the ack.
-                Phase::Suspended(..) | Phase::AwaitingLlm => {
-                    answered.push(self.render_request(tree))
-                }
-                // Only the **user** can answer on a running branch
-                // (`Restart`), and the driving rule is that the VM speaks
-                // through its outcome and never while it is running. So
-                // the ack rides the request that outcome causes, rather
-                // than a second one going out under the program's feet.
-                Phase::Running(_) => {}
-            }
-            return Ok(answered);
-        };
-        // Every remaining call gets exactly one outcome, and outcomes are
-        // logged in **call order** so the positional pairing holds. The
-        // one that drives the VM may settle much later, so refusals of
-        // the ones after it are deferred until its outcome has landed.
-        self.deferred_refusals = (1..rest.len())
-            .map(|_| "one program-driving tool call per turn; this call was ignored".to_owned())
-            .collect();
-        // The acks come first: they are earlier calls in the same turn,
-        // and the renderer pairs tool messages to calls positionally.
-        let mut out = answered;
-        out.extend(self.on_program_call(tree, assistant_id, call)?);
-        Ok(out)
-    }
-
-    /// Serve one `answer(question, value)`: explicit binding.
-    ///
-    /// It logs the `Answer` and **leaves `phase` exactly as it is** —
-    /// answering is not a program operation. `resume` and `run_program`
-    /// change the program's state; one turn may carry an `answer` and one
-    /// of those, which is how you answer an interrupting post without
-    /// abandoning the run.
-    fn apply_answer(
-        &mut self,
-        tree: &mut Tree,
-        call: &ToolCall,
-        out: &mut Vec<StepOutput>,
-    ) -> io::Result<()> {
-        let question = call
-            .arguments
-            .get("question")
-            .and_then(|q| q.as_u64())
-            .filter(|n| *n > 0)
-            .map(EventId::new);
-        let Some(question) = question else {
-            return self.refuse(
-                tree,
-                "answer needs a `question` id — the #N of an open post in the report",
-            );
-        };
-        if let Err(refusal) = self.eligible(tree, Restart::Answer(question)) {
-            return self.refuse(tree, refusal.reason());
-        }
-        let value = call
-            .arguments
-            .get("value")
-            .cloned()
-            .unwrap_or(serde_json::Value::Null);
-        tree.append(
-            &mut self.spine,
-            EventPayload::Answer {
-                question,
-                value: value.clone(),
-            },
-        )?;
-        out.push(StepOutput::Answered {
-            question: Some(question),
-            value,
-        });
-        Ok(())
-    }
-
-    /// Serve the one call in a turn that drives the VM — `run_program`,
-    /// `resume`, or an unknown name. `answer` never reaches here: it
-    /// settles synchronously, ahead of this.
-    fn on_program_call(
-        &mut self,
-        tree: &mut Tree,
-        assistant_id: EventId,
-        call: ToolCall,
-    ) -> io::Result<Vec<StepOutput>> {
-        match call.name.as_str() {
-            TOOL_RUN_PROGRAM => {
-                let Some(source) = call.arguments.get("source").and_then(|s| s.as_str()) else {
-                    self.refuse(tree, "run_program needs a `source` string")?;
-                    self.flush_refusals(tree)?;
-                    self.phase = Phase::AwaitingLlm;
-                    return Ok(vec![self.render_request(tree)]);
-                };
-                // `attachments` is this run's authored content (name → string),
-                // seeded as the program's `attachments` const. A malformed
-                // shape is a cheap repair loop, like a missing source.
-                let attachments = match attachments_from_args(&call.arguments) {
-                    Ok(a) => a,
-                    Err(msg) => {
-                        self.refuse(tree, &msg)?;
-                        self.flush_refusals(tree)?;
-                        self.phase = Phase::AwaitingLlm;
-                        return Ok(vec![self.render_request(tree)]);
-                    }
-                };
-                // A rewrite abandons any suspended VM — never the physics:
-                // in-flight calls stay pending and their results are still
-                // logged as artifacts when they arrive (the generation bump
-                // stops delivery to the dead VM). The abandoned VM is kept
-                // for post-mortem rendering.
-                if let Phase::Suspended(run, _) = std::mem::replace(&mut self.phase, Phase::Idle) {
+        match self.start_program(tree, assistant_id, &source) {
+            Ok(run) => {
+                if let Phase::Suspended(old, _) = std::mem::replace(&mut self.phase, Phase::Idle) {
                     // The abandoned program never completed — Failed.
-                    self.note_status(run.program_id, ProgramStatus::Failed);
-                    self.last_vm = Some(run.vm);
+                    self.note_status(old.program_id, ProgramStatus::Failed);
+                    self.last_vm = Some(old.vm);
                 }
                 self.generation += 1;
-                match self.start_program(tree, assistant_id, source, attachments, call.id.clone()) {
-                    Ok(run) => {
-                        self.phase = Phase::Running(run);
-                        self.note_status(assistant_id, ProgramStatus::Running);
-                        Ok(vec![StepOutput::Working])
-                    }
-                    Err(message) => {
-                        // A compile (or input-binding) error is an outcome
-                        // like any other — no VM was built, so this run has
-                        // no console and no artifacts. The repair loop is
-                        // unchanged; only where the text lives has moved.
-                        tree.append(
-                            &mut self.spine,
-                            EventPayload::Condition {
-                                cause: Cause::CompileFailed { message },
-                                site: 0,
-                                stack: Vec::new(),
-                            },
-                        )?;
-                        self.flush_refusals(tree)?;
-                        self.phase = Phase::AwaitingLlm;
-                        Ok(vec![self.render_request(tree)])
-                    }
-                }
+                self.phase = Phase::Running(run);
+                self.note_status(assistant_id, ProgramStatus::Running);
+                Ok(vec![StepOutput::Working])
             }
-            TOOL_RESUME => {
-                if let Err(refusal) = self.eligible(tree, Restart::Resume) {
-                    self.refuse(tree, refusal.reason())?;
-                    self.flush_refusals(tree)?;
-                    if !matches!(self.phase, Phase::Suspended(..)) {
-                        self.phase = Phase::AwaitingLlm;
-                    }
-                    return Ok(vec![self.render_request(tree)]);
-                }
-                let value = call
-                    .arguments
-                    .get("value")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null);
-                match std::mem::replace(&mut self.phase, Phase::Idle) {
-                    Phase::Suspended(mut run, suspension) => {
-                        let resumed = match &suspension {
-                            // Nothing to push: the VM was parked between
-                            // slices, not stopped at a raise or an error.
-                            ResumeWith::Continue => true,
-                            ResumeWith::Raise => {
-                                let v = json_arg(&mut run.vm, &value);
-                                run.vm.resume_raise(v);
-                                true
-                            }
-                            ResumeWith::Trapped(e) => match e.resume {
-                                ResumeMode::PushValueThenContinue => {
-                                    let v = json_arg(&mut run.vm, &value);
-                                    run.vm
-                                        .resume_with(e, v)
-                                        .expect("resume audited as resumable");
-                                    true
-                                }
-                                ResumeMode::NotResumable => false,
-                            },
-                        };
-                        assert!(resumed, "eligibility audited resumability");
-                        // The next report (completion or re-suspension)
-                        // answers *this* resume call, not the original
-                        // run_program — the chat transcript requires every
-                        // assistant tool_call to be followed by a tool
-                        // message bearing its id.
-                        run.call_id = call.id.clone();
-                        let program_id = run.program_id;
-                        self.phase = Phase::Running(run);
-                        // Same block resumes — keep the originating id.
-                        self.note_status(program_id, ProgramStatus::Running);
-                        Ok(vec![StepOutput::Working])
-                    }
-                    _ => unreachable!("eligibility audited the phase"),
-                }
-            }
-            unknown => {
-                self.refuse(
-                    tree,
-                    &format!(
-                        "unknown tool `{unknown}` (have: {TOOL_RUN_PROGRAM}, {TOOL_RESUME}, \
-                         {TOOL_ANSWER})"
-                    ),
+            Err(message) => {
+                // A compile error is an outcome like any other — no VM
+                // was built, so this run has no console and no
+                // artifacts, and whatever was previously suspended is
+                // untouched (still there to resume once the model fixes
+                // its program). The repair loop is unchanged; only where
+                // the text lives has moved (a logged `Post`, not a tool
+                // result).
+                let outcome = tree.append(
+                    &mut self.spine,
+                    EventPayload::Condition {
+                        cause: Cause::CompileFailed { message },
+                        site: 0,
+                        stack: Vec::new(),
+                        // No VM ran, so "did this push a handler frame"
+                        // has no subject. Flagged in 23_ONE_AGENT.md A4's
+                        // report as a default, not a determination —
+                        // `Disposition`'s own safe choice, and it costs
+                        // nothing here since a `CompileFailed` outcome is
+                        // never itself something `resume` re-enters.
+                        disposition: Disposition::Pushed,
+                    },
                 )?;
-                self.flush_refusals(tree)?;
-                if !matches!(self.phase, Phase::Suspended(..)) {
-                    self.phase = Phase::AwaitingLlm;
-                }
-                Ok(vec![self.render_request(tree)])
+                self.phase = Phase::AwaitingLlm;
+                Ok(vec![self.report_outcome(tree, outcome)?])
             }
         }
+    }
+
+    /// Continue a suspended program directly — the live half of a
+    /// handler's `return resume(value)` decision (DESIGN.md's thesis
+    /// table). Nothing new is **said**: no `Turn` is logged, because
+    /// nothing entered the log beyond the run continuing on its own
+    /// terms. The caller (host) is the one who ran the handler program
+    /// and read its return value; by the time this is called, "is
+    /// something suspended" is not this method's question — a host that
+    /// calls it on an unsuspended `Runner` has a bug of its own, which is
+    /// exactly what "ineligibility stops being an event kind"
+    /// (23_ONE_AGENT.md A4) means: there is no LLM-facing refusal to
+    /// construct here anymore, because the LLM never names this call.
+    pub fn resume(&mut self, tree: &mut Tree, value: serde_json::Value) -> io::Result<Vec<StepOutput>> {
+        let Phase::Suspended(mut run, suspension) = std::mem::replace(&mut self.phase, Phase::Idle)
+        else {
+            panic!("Runner::resume called with nothing suspended — a host bookkeeping bug");
+        };
+        match &suspension {
+            // Nothing to push: the VM was parked between slices, not
+            // stopped at a raise or an error.
+            ResumeWith::Continue => {}
+            ResumeWith::Raise => {
+                let v = json_arg(&mut run.vm, &value);
+                run.vm.resume_raise(v);
+            }
+            ResumeWith::Trapped(e) => match e.resume {
+                ResumeMode::PushValueThenContinue => {
+                    let v = json_arg(&mut run.vm, &value);
+                    run.vm
+                        .resume_with(e, v)
+                        .expect("resume audited as resumable by the host");
+                }
+                ResumeMode::NotResumable => {
+                    panic!(
+                        "Runner::resume called on a not-resumable trap — a host bookkeeping bug"
+                    );
+                }
+            },
+        }
+        let program_id = run.program_id;
+        self.phase = Phase::Running(run);
+        self.note_status(program_id, ProgramStatus::Running);
+        let _ = tree;
+        Ok(vec![StepOutput::Working])
+    }
+
+    /// Discard a suspended program without continuing it — the other
+    /// half of a handler's decision (`return abandon()`). The physics
+    /// already happened: in-flight calls stay pending and their results
+    /// are still logged as artifacts when they arrive; only the VM is
+    /// dropped. Like [`Runner::resume`], this is a direct host call, not
+    /// something the LLM names.
+    pub fn abandon(&mut self, tree: &mut Tree) -> io::Result<Vec<StepOutput>> {
+        let Phase::Suspended(run, _) = std::mem::replace(&mut self.phase, Phase::Idle) else {
+            panic!("Runner::abandon called with nothing suspended — a host bookkeeping bug");
+        };
+        self.note_status(run.program_id, ProgramStatus::Failed);
+        self.last_vm = Some(run.vm);
+        Ok(self.prompt_if_needed(tree))
     }
 
     fn on_tool_results(
@@ -1309,7 +898,6 @@ impl Runner {
         batch: Vec<ToolResult>,
     ) -> io::Result<Vec<StepOutput>> {
         let mut delivered = false;
-        let mut sends = Vec::new();
         // Calls that settled with **nothing awaiting them**: the run that
         // issued them has been rewritten away, or the branch holds no VM
         // at all (it re-entered after a crash). Rule C decides what
@@ -1342,92 +930,38 @@ impl Runner {
 
             // Deliver only into the run that issued the call. Anything
             // else is an artifact **and** a notice (rule C, below).
-            let Some(p) = pending else {
+            let Some(pending) = pending else {
                 unawaited.push((tr.call, result));
                 continue;
             };
-            if p.generation != self.generation
+            if pending.generation != self.generation
                 || !matches!(self.phase, Phase::Running(_) | Phase::Suspended(..))
             {
                 unawaited.push((tr.call, result));
                 continue;
             }
-            // `tools.agent` is the one call that is two: the spawn just
-            // settled, so now ask the new agent its first question and
-            // let *that* `Result` settle the program's promise.
-            if let Settle::ThenAsk {
-                promise,
-                text,
-                input,
-                site,
-            } = p.settle
-            {
-                match &tr.result {
-                    Ok(value) => {
-                        let agent = value
-                            .get("agent")
-                            .and_then(|v| v.as_u64())
-                            .map(EventId::new)
-                            .expect("a Spawn settles with { agent }");
-                        let send = self.issue_call(
-                            tree,
-                            Call::Send {
-                                to: Address::Branch(agent),
-                                text,
-                                input,
-                                expects_reply: true,
-                                site,
-                            },
-                            Settle::Promise(promise),
-                        )?;
-                        sends.push(send);
-                    }
-                    Err(msg) => {
-                        let val = Value::String(RcStr::from(msg.as_str()));
-                        self.settling_vm()
-                            .reject_promise(promise, val)
-                            .expect("pending promise is settleable");
-                        delivered = true;
-                    }
-                }
-                continue;
-            }
-            let Settle::Promise(promise) = p.settle else {
-                unreachable!("ThenAsk handled above");
-            };
             let vm = self.settling_vm();
             match tr.result {
                 Ok(v) => {
                     let val = json_arg(vm, &v);
-                    vm.resolve_promise(promise, val)
+                    vm.resolve_promise(pending.promise, val)
                         .expect("pending promise is settleable");
                 }
                 Err(msg) => {
                     let val = Value::String(RcStr::from(msg.as_str()));
-                    vm.reject_promise(promise, val)
+                    vm.reject_promise(pending.promise, val)
                         .expect("pending promise is settleable");
                 }
             }
             delivered = true;
         }
         let mut out = Vec::new();
-        if !sends.is_empty() {
-            out.push(StepOutput::Sends(sends));
-        }
         // **Rule C**, the other half: waiting is a property of the
         // awaiting program, never of the message. A value someone's
         // program awaits resolves its promise and never enters a context;
         // one **nobody** awaits is logged as an artifact *and* surfaced
         // as a harness post — a tell, so the branch notices without
         // owing anyone an answer.
-        //
-        // The post is what makes this a legal wake. The rule the design
-        // holds is not "never wake a branch" but "never wake one without
-        // a cause event you can name in the log": this cause is logged,
-        // visible, auditable, and renders identically forever, so the
-        // model can see *why* it woke. Without it an orchestrator whose
-        // program ended while its workers ran would have their answers
-        // logged and nothing else.
         for (call, result) in unawaited {
             let origin = Origin::Direct {
                 text: self.settled_notice(tree, call, result),
@@ -1447,20 +981,12 @@ impl Runner {
 
     /// Whether a `Result` for `call` still belongs on this branch: the
     /// call is on its own path and nothing has settled it yet.
-    ///
-    /// This is the re-entry case — the session holds no `pending` entry
-    /// because it never issued the call — and it is why the check is the
-    /// log's and not the session's.
     fn settleable(&self, tree: &Tree, call: EventId) -> bool {
         let segment = self.agent_segment(tree);
         segment.iter().any(|e| e.id == call) && settlement_of(&segment, call).is_none()
     }
 
     /// The body of the harness post that surfaces an unawaited `Result`.
-    ///
-    /// Built from the two logged events and nothing else, so it renders
-    /// identically forever — and it names the call id, because reuse is
-    /// by id and the whole value is a `tool_result` away.
     fn settled_notice(&self, tree: &Tree, call: EventId, result: EventId) -> String {
         let label = match tree.events.get(&call).map(|e| &e.payload) {
             Some(EventPayload::Call(c)) => call_label(c),
@@ -1468,15 +994,14 @@ impl Runner {
         };
         let outcome = match tree.events.get(&result).map(|e| &e.payload) {
             Some(EventPayload::Result { outcome, .. }) => match outcome {
-                Outcome::Delivered(v) => crate::report::preview(v),
+                Outcome::Delivered(v) => preview(v),
                 Outcome::Failed(msg) => format!("failed: {msg}"),
             },
             _ => String::new(),
         };
         format!(
             "A call you issued has settled with no program awaiting it: [#{}] {label} → \
-             {outcome}. Fetch the whole value with tools.tool_result({}). Nothing is owed \
-             in reply.",
+             {outcome}. Fetch the whole value with artifact({}). Nothing is owed in reply.",
             call.as_u64(),
             call.as_u64(),
         )
@@ -1500,11 +1025,6 @@ impl Runner {
         // before another instruction executes. That is what makes the
         // delivery guarantee ≤ one slice, and it costs nothing: the
         // boundary already has total state visibility.
-        //
-        // The load-bearing consequence is that upward questions cannot
-        // deadlock — a parent awaiting its child is one slice from being
-        // told. A real runtime deadlocks there because the waiter is on a
-        // stack; here the waiter is a `StepResult`.
         let unseen = self.unseen_posts(tree);
         if !unseen.is_empty() {
             return self.suspend(tree, SuspendCause::Posted(unseen), Vec::new());
@@ -1514,26 +1034,15 @@ impl Runner {
 
     // ── program driving ─────────────────────────────────────────────
 
-    /// Compile + bind the host consts (`input` from the agent, `attachments`
-    /// from this run). `Err` is the rendered repair-loop report.
-    fn start_program(
-        &mut self,
-        tree: &Tree,
-        program_id: EventId,
-        source: &str,
-        attachments: serde_json::Value,
-        call_id: String,
-    ) -> Result<Run, String> {
+    /// Compile + bind the host const (`input`, from the agent's oldest
+    /// still-open post). `Err` is the repair-loop report.
+    fn start_program(&mut self, tree: &Tree, program_id: EventId, source: &str) -> Result<Run, String> {
         let program = compile(source).map_err(|diags| render_diags(source, &diags))?;
         // The whole `input` reaches the program even though the context
         // saw only a bounded preview of it.
-        let vm = VM::for_program_with(program, self.spine.context().input(tree), attachments)
+        let vm = VM::for_program(program, self.spine.context().input(tree))
             .map_err(|e| format!("program setup failed: {}", e.message))?;
-        Ok(Run {
-            program_id,
-            call_id,
-            vm,
-        })
+        Ok(Run { program_id, vm })
     }
 
     /// Drive the VM until it blocks on the host, suspends, finishes, or
@@ -1572,17 +1081,23 @@ impl Runner {
         Ok(out)
     }
 
-    /// Classify one `Pending` batch. **This is the one place a `tools.*`
-    /// name becomes a `Call` variant** (17_BRANCHES A2): everything
-    /// downstream — the artifact menu, reconciliation, re-attach, routing
-    /// an answer home — matches on the variant, never on the string again.
+    /// Classify one `Pending` batch. **This is the one place a bare
+    /// harness verb's name becomes a `Call` variant / log effect**
+    /// (17_BRANCHES A2, folded in here from the deleted `verbs.rs`):
+    /// everything downstream — the artifact menu, reconciliation,
+    /// re-attach, routing an answer home — matches on the variant, never
+    /// on the string again.
     ///
-    /// Artifact fetches are answered from the log immediately and log
+    /// `artifact(id)` is answered from the log immediately and logs
     /// nothing (returns true if any were — the program can run again);
-    /// `spawn`/`ask`/`tell` become `Spawn`/`Send` calls, `agent` desugars
-    /// to a spawn that then asks, and everything else becomes
-    /// `ToolCalls`. Every call that leaves here is logged as a `Call`
-    /// event *at dispatch*, settled later by exactly one `Result`.
+    /// `spawn`/`ask`/`tell`/`fork` become logged `Call`s; `answer` and
+    /// `append_history` settle synchronously, with no host round trip at
+    /// all; everything else (`tools.*`, and any bare name this dispatcher
+    /// doesn't recognize, including `list_agents` — served by the host,
+    /// not the registry, but over the same `ToolCalls`/`ToolResults`
+    /// round trip as any other tool) becomes `ToolCalls`. Every call that
+    /// leaves here is logged as a `Call` event *at dispatch*, settled
+    /// later by exactly one `Result`.
     fn dispatch_calls(
         &mut self,
         tree: &mut Tree,
@@ -1591,12 +1106,13 @@ impl Runner {
     ) -> io::Result<bool> {
         let mut tool_calls = Vec::new();
         let mut spawns = Vec::new();
+        let mut forks = Vec::new();
         let mut sends = Vec::new();
         let mut progressed = false;
 
         for call in calls {
             match call.name.as_str() {
-                TOOL_TOOL_RESULT => {
+                TOOL_ARTIFACT => {
                     // **Re-attach, not re-ask.** A call this session
                     // still has in flight is re-registered against the
                     // *current* run, so a rewritten program awaits the
@@ -1606,7 +1122,7 @@ impl Runner {
                         self.pending.insert(
                             pending,
                             PendingCall {
-                                settle: Settle::Promise(call.promise),
+                                promise: call.promise,
                                 generation: self.generation,
                             },
                         );
@@ -1627,57 +1143,94 @@ impl Runner {
                     progressed = true;
                 }
                 TOOL_SPAWN => {
-                    let arg = self.first_arg(&call);
-                    match arg.get("charter").and_then(|c| c.as_str()) {
+                    let args = self.call_args_json(&call);
+                    // `spawn(charter)` — the folded-in verbs.rs
+                    // convention: one positional string, not the old
+                    // `tools.spawn({ charter, name, tools })` options
+                    // object. A name or a tool allowlist is not
+                    // expressible from the bare verb (verbs.rs never
+                    // showed a second argument either); `tools.spawn`
+                    // (a registry-configured capability, if the agent
+                    // has one) is the escape hatch for those.
+                    match args.first().and_then(|v| v.as_str()) {
                         Some(charter) => {
                             let spawn = self.issue_call(
                                 tree,
                                 Call::Spawn {
-                                    name: string_field(&arg, "name"),
+                                    name: None,
                                     charter: charter.to_owned(),
-                                    tools: allowlist_field(&arg),
+                                    tools: None,
                                     site: call.site,
                                 },
-                                Settle::Promise(call.promise),
+                                call.promise,
                             )?;
-                            spawns.push(SpawnRequest {
-                                call: spawn,
-                                budget: None,
-                            });
+                            spawns.push(spawn);
                         }
                         None => {
-                            self.reject_call(
+                            self.reject_call(call.promise, "spawn(charter) needs a charter string");
+                            progressed = true;
+                        }
+                    }
+                }
+                TOOL_FORK => {
+                    let args = self.call_args_json(&call);
+                    match args.first().and_then(|v| v.as_str()) {
+                        Some(task) => {
+                            let fork = self.issue_call(
+                                tree,
+                                Call::Fork {
+                                    name: None,
+                                    task: task.to_owned(),
+                                    site: call.site,
+                                },
                                 call.promise,
-                                "tools.spawn needs { charter } — what the agent is for \
-                                 (optionally { name, tools })",
-                            );
+                            )?;
+                            forks.push(fork);
+                        }
+                        None => {
+                            self.reject_call(call.promise, "fork(task) needs a task string");
                             progressed = true;
                         }
                     }
                 }
                 TOOL_ASK | TOOL_TELL => {
                     let expects_reply = call.name == TOOL_ASK;
-                    let arg = self.first_arg(&call);
-                    let text = arg.get("text").and_then(|t| t.as_str()).map(str::to_owned);
-                    match (text, self.resolve_address(tree, arg.get("to"))) {
+                    let args = self.call_args_json(&call);
+                    // `tell(text)` / `tell(to, text)`, always
+                    // `ask(who, text)` — positional, not an options
+                    // object; `input` alongside the text is no longer
+                    // expressible from the bare verb (verbs.rs never
+                    // carried one either). Omitted `to`/`who` resolves
+                    // to whoever this branch owes its oldest open post
+                    // to (`resolve_address`).
+                    let (to, text) = match (call.name.as_str(), args.as_slice()) {
+                        (TOOL_TELL, [text]) => (None, coerce_text(text)),
+                        (_, [to, text]) => (Some(to.clone()), coerce_text(text)),
+                        _ => (None, None),
+                    };
+                    match (text, self.resolve_address(tree, to.as_ref())) {
                         (Some(text), Ok(to)) => {
                             let send = self.issue_call(
                                 tree,
                                 Call::Send {
                                     to,
                                     text,
-                                    input: arg.get("input").cloned().unwrap_or_default(),
+                                    input: serde_json::Value::Null,
                                     expects_reply,
                                     site: call.site,
                                 },
-                                Settle::Promise(call.promise),
+                                call.promise,
                             )?;
                             sends.push(send);
                         }
                         (None, _) => {
                             self.reject_call(
                                 call.promise,
-                                &format!("tools.{} needs {{ text }}", call.name),
+                                &format!(
+                                    "{}({}text) needs a text argument",
+                                    call.name,
+                                    if expects_reply { "who, " } else { "[to, ]" }
+                                ),
                             );
                             progressed = true;
                         }
@@ -1687,42 +1240,109 @@ impl Runner {
                         }
                     }
                 }
-                // Sugar, kept verbatim: spawn + ask. Two logged calls,
-                // one program promise — the `Spawn`'s `{ agent }` is not
-                // the answer, so the `Send` issued when it lands is what
-                // settles the program (`Settle::ThenAsk`).
-                TOOL_AGENT => {
-                    let arg = self.first_arg(&call);
-                    match arg.get("prompt").and_then(|p| p.as_str()) {
-                        Some(prompt) => {
-                            let spawn = self.issue_call(
-                                tree,
-                                Call::Spawn {
-                                    name: None,
-                                    charter: prompt.to_owned(),
-                                    tools: None,
-                                    site: call.site,
-                                },
-                                Settle::ThenAsk {
-                                    promise: call.promise,
-                                    text: prompt.to_owned(),
-                                    input: arg.get("input").cloned().unwrap_or_default(),
-                                    site: call.site,
-                                },
-                            )?;
-                            spawns.push(SpawnRequest {
-                                call: spawn,
-                                budget: arg
-                                    .get("budget")
-                                    .and_then(|b| b.as_u64())
-                                    .map(|b| b as usize),
-                            });
+                TOOL_ANSWER => {
+                    let args = self.call_args_json(&call);
+                    match args.as_slice() {
+                        [question, _label, value] => {
+                            match question.as_u64().filter(|n| *n > 0).map(EventId::new) {
+                                Some(question) if self.open().contains(&question) => {
+                                    tree.append(
+                                        &mut self.spine,
+                                        EventPayload::Answer {
+                                            question,
+                                            value: value.clone(),
+                                        },
+                                    )?;
+                                    let vm = self.running_vm();
+                                    let v = json_arg(vm, &serde_json::Value::Bool(true));
+                                    vm.resolve_promise(call.promise, v)
+                                        .expect("fresh promise");
+                                    progressed = true;
+                                    out.push(StepOutput::Answered {
+                                        question,
+                                        value: value.clone(),
+                                    });
+                                    // NOTE: the `label` checksum
+                                    // verbs.rs describes (must match the
+                                    // question's own label, the same way
+                                    // `compaction.rs`'s `CompactionOp`
+                                    // checks one) is **not** enforced
+                                    // here — flagged prominently in
+                                    // 23_ONE_AGENT.md A4's report.
+                                    // verbs.rs's own doc said the same:
+                                    // "not implemented at this layer (no
+                                    // log to check against yet)".
+                                }
+                                Some(question) => {
+                                    let msg = match self.owning_branch(tree, question) {
+                                        Some(branch) => format!(
+                                            "#{} belongs to branch #{}; this fork inherited it \
+                                             as history and does not owe it. To make your \
+                                             answer the delivered one, the user can take that \
+                                             branch's turn.",
+                                            question.as_u64(),
+                                            branch.as_u64()
+                                        ),
+                                        None => format!(
+                                            "#{} is not open on this branch — it was already \
+                                             answered, or it is a notice that owes no answer.",
+                                            question.as_u64()
+                                        ),
+                                    };
+                                    self.reject_call(call.promise, &msg);
+                                    progressed = true;
+                                }
+                                None => {
+                                    self.reject_call(
+                                        call.promise,
+                                        "answer's question id must be a positive integer",
+                                    );
+                                    progressed = true;
+                                }
+                            }
                         }
-                        None => {
-                            self.reject_call(call.promise, "tools.agent needs { prompt, input }");
+                        _ => {
+                            self.reject_call(
+                                call.promise,
+                                "answer(question, label, value) takes exactly three arguments",
+                            );
                             progressed = true;
                         }
                     }
+                }
+                TOOL_APPEND_HISTORY => {
+                    let args = self.call_args_json(&call);
+                    match args.first() {
+                        Some(value) => {
+                            tree.append(
+                                &mut self.spine,
+                                EventPayload::Note {
+                                    text: note_text(value),
+                                },
+                            )?;
+                            let vm = self.running_vm();
+                            let v = json_arg(vm, &serde_json::Value::Null);
+                            vm.resolve_promise(call.promise, v).expect("fresh promise");
+                            progressed = true;
+                        }
+                        None => {
+                            self.reject_call(call.promise, "append_history(value) needs one argument");
+                            progressed = true;
+                        }
+                    }
+                }
+                TOOL_REMOVE_HISTORY | TOOL_REWRITE_HISTORY => {
+                    // See this const's own doc comment: compaction.rs is
+                    // mid-rewrite in this same phase and wiring it here
+                    // would be guessing at a moving API. A clear,
+                    // JS-catchable rejection beats a silent round trip to
+                    // a host tool that doesn't exist.
+                    self.reject_call(
+                        call.promise,
+                        "compaction is not wired into this session yet (23_ONE_AGENT.md A4 \
+                         leaves remove_history/rewrite_history to a later pass)",
+                    );
+                    progressed = true;
                 }
                 _ => {
                     let args = {
@@ -1738,7 +1358,7 @@ impl Runner {
                             args: args.clone(),
                             site: call.site,
                         },
-                        Settle::Promise(call.promise),
+                        call.promise,
                     )?;
                     tool_calls.push(OutCall {
                         call: id,
@@ -1754,20 +1374,21 @@ impl Runner {
         if !spawns.is_empty() {
             out.push(StepOutput::Spawns(spawns));
         }
+        if !forks.is_empty() {
+            out.push(StepOutput::Forks(forks));
+        }
         if !sends.is_empty() {
             out.push(StepOutput::Sends(sends));
         }
         Ok(progressed)
     }
 
-    /// The first argument of an options-object call (`spawn`/`ask`/
-    /// `tell`/`agent`), as JSON.
-    fn first_arg(&mut self, call: &InvokeCall) -> serde_json::Value {
+    /// Every argument of a dispatched call, as JSON — the uniform shape
+    /// every bare-verb parser above reads from (folded in from the
+    /// deleted `verbs.rs`'s `args_as_json`).
+    fn call_args_json(&mut self, call: &InvokeCall) -> Vec<serde_json::Value> {
         let vm = self.running_vm();
-        call.args
-            .first()
-            .map(|v| value_json(vm, v))
-            .unwrap_or(serde_json::Value::Null)
+        call.args.iter().map(|v| value_json(vm, v)).collect()
     }
 
     /// Reject a malformed call in place. Nothing is logged: the call was
@@ -1781,8 +1402,8 @@ impl Runner {
             .expect("fresh promise");
     }
 
-    /// Resolve an `ask`/`tell` address **before** the `Send` is logged,
-    /// so nothing unresolved ever reaches the log.
+    /// Resolve a bare `ask`/`tell` address **before** the `Send` is
+    /// logged, so nothing unresolved ever reaches the log.
     ///
     /// - omitted → the author of the oldest open post: *whoever asked
     ///   you*. For a root conversation that is the human, for a subagent
@@ -1800,9 +1421,8 @@ impl Runner {
         let Some(to) = to.filter(|v| !v.is_null()) else {
             let Some(&question) = self.spine.context().open.first() else {
                 return Err(
-                    "tools.ask/tell with no `to` answers whoever asked you, but \
-                            nothing is open on this branch — pass { to } (an agent or \
-                            branch id from tools.agents())"
+                    "ask/tell with no `to` answers whoever asked you, but nothing is open on \
+                     this branch — pass a branch id (from tools that list agents/branches)"
                         .into(),
                 );
             };
@@ -1822,7 +1442,7 @@ impl Runner {
         }
         let Some(id) = to.as_u64().filter(|n| *n > 0).map(EventId::new) else {
             return Err(format!(
-                "`to` must be an agent or branch id (a number), or \"user\"; got {to}"
+                "the address must be a branch id (a number), or \"user\"; got {to}"
             ));
         };
         match tree.events.get(&id).map(|e| &e.payload) {
@@ -1844,10 +1464,7 @@ impl Runner {
                     )),
                 }
             }
-            _ => Err(format!(
-                "#{} is not an agent or a branch — tools.agents() lists both ids",
-                id.as_u64()
-            )),
+            _ => Err(format!("#{} is not an agent or a branch", id.as_u64())),
         }
     }
 
@@ -1861,36 +1478,25 @@ impl Runner {
     /// Log a `Call` at dispatch and remember how to settle it. Returns the
     /// `Call` event's id — the log's own key, which the host echoes back
     /// with the result and which the artifact menu names.
-    fn issue_call(&mut self, tree: &mut Tree, call: Call, settle: Settle) -> io::Result<EventId> {
+    fn issue_call(
+        &mut self,
+        tree: &mut Tree,
+        call: Call,
+        promise: PromisePtr,
+    ) -> io::Result<EventId> {
         let logged = tree.append(&mut self.spine, EventPayload::Call(call))?;
         self.pending.insert(
             logged,
             PendingCall {
-                settle,
+                promise,
                 generation: self.generation,
             },
         );
         Ok(logged)
     }
 
-    /// The call `tools.tool_result(id)` should **re-attach** to rather
-    /// than read: one this session still has in flight, on this branch's
-    /// own path.
-    ///
-    /// The menu's wording is derived from the log alone, which cannot
-    /// tell a call whose worker is still running from one whose worker
-    /// died with the process — so it says the cautious thing for an
-    /// `Invoke`. Two things know better:
-    ///
-    /// - the **session**: an entry in `pending` means a worker is
-    ///   genuinely in flight, whatever kind of call it was;
-    /// - the **log**: a `Send` with no `Result` is an exchange still
-    ///   open, and its answer routes home by the logged ids alone — so a
-    ///   session that never issued it can still receive it. That is what
-    ///   makes re-entering after a crash a re-attach rather than a
-    ///   re-ask, and it is exactly the distinction the menu draws: an
-    ///   `Invoke`'s worker died with the process, a `Send`'s callee did
-    ///   not.
+    /// The call `artifact(id)` should **re-attach** to rather than read:
+    /// one this session still has in flight, on this branch's own path.
     fn reattachable(&self, tree: &Tree, call: &InvokeCall) -> Option<EventId> {
         let Some(Value::PosInt(id)) = call.args.first() else {
             return None;
@@ -1918,14 +1524,14 @@ impl Runner {
         (is_open_send && !inherited).then_some(id)
     }
 
-    /// Serve `tools.tool_result(id)` from the log. Accepts a `Result` id
-    /// or the id of the **call** it settles — the menu names calls, so a
-    /// program reuses exactly the ids it was shown. Ids are scoped to this
+    /// Serve `artifact(id)` from the log. Accepts a `Result` id or the id
+    /// of the **call** it settles — the menu names calls, so a program
+    /// reuses exactly the ids it was shown. Ids are scoped to this
     /// agent's spine segment (decision 3: never ancestor artifacts).
     fn fetch_artifact(&self, tree: &Tree, call: &InvokeCall) -> Result<serde_json::Value, String> {
         let id = match call.args.first() {
             Some(Value::PosInt(n)) => *n,
-            _ => return Err("tool_result needs a numeric artifact id".into()),
+            _ => return Err("artifact needs a numeric id".into()),
         };
         let segment = self.agent_segment(tree);
         let Some(event) = segment.iter().find(|e| e.id.as_u64() == id) else {
@@ -1936,11 +1542,6 @@ impl Runner {
             EventPayload::Call(_) => match settlement_of(&segment, event.id) {
                 Some(outcome) => outcome_json(outcome),
                 // Artifacts cross a `Fork`; **in-flight calls do not**.
-                // A pending pre-fork `Send`'s `Result` will land on the
-                // original's branch, which this path does not include, so
-                // re-attaching could never resolve — the same
-                // `eligible()`-shaped rule as answering a pre-fork post,
-                // refused for the same reason and naming the same owner.
                 None => match self.pre_fork_pending(tree, event) {
                     Some(branch) => Err(format!(
                         "call #{id} is still pending on branch #{} — this fork inherited \
@@ -1954,9 +1555,7 @@ impl Runner {
             EventPayload::Return { value } => Ok(value.clone()),
             // Not a menu row — it is named at the point it is
             // truncated, because it is context for one place rather than
-            // work to be reused. Fetchable all the same: every clip in a
-            // report names an id the whole thing is behind, and this is
-            // the one the console tail names.
+            // work to be reused. Fetchable all the same.
             EventPayload::Console { lines } => Ok(serde_json::Value::Array(
                 lines
                     .iter()
@@ -2011,7 +1610,7 @@ impl Runner {
                     args: args.clone(),
                     site: call.site,
                 },
-                Settle::Promise(call.promise),
+                call.promise,
             )?;
             fire_and_forget.push(OutCall {
                 call: id,
@@ -2041,7 +1640,6 @@ impl Runner {
                 ),
             },
         )?;
-        self.flush_refusals(tree)?;
 
         if !fire_and_forget.is_empty() {
             out.push(StepOutput::ToolCalls(fire_and_forget));
@@ -2049,7 +1647,7 @@ impl Runner {
         self.note_status(run.program_id, ProgramStatus::Completed);
         self.last_vm = Some(run.vm);
         self.phase = Phase::AwaitingLlm;
-        out.push(self.render_request(tree));
+        out.push(self.report_outcome(tree, outcome)?);
         Ok(out)
     }
 
@@ -2068,7 +1666,7 @@ impl Runner {
         // the *live* VM needs to resume. A `VMError` is not serialisable
         // and only a live VM can consume one, so the two cannot be the
         // same value.
-        let (cause, site, suspension) = match cause {
+        let (cause, site, suspension, disposition) = match cause {
             SuspendCause::Raise { condition, payload } => {
                 let payload = payload.map(|v| value_json(&run.vm, &v));
                 // `step()` advanced `ip` past the `Raise`, so the raise
@@ -2081,6 +1679,19 @@ impl Runner {
                     },
                     site,
                     ResumeWith::Raise,
+                    // FLAGGED (23_ONE_AGENT.md A4 — "record Disposition
+                    // on every Condition you log"): whether this raise
+                    // was a tail call (`Handover` — the raising frame
+                    // already popped, nothing left but the epilogue) or
+                    // ordinary deliberation (`Pushed`) is not derivable
+                    // from anything `StepResult::Raise`/`VM::frames()`
+                    // exposes here. `Pushed` is `Disposition`'s own safe
+                    // default: it only ever costs an unnecessary nesting
+                    // level on replay, never a miscounted depth. Detecting
+                    // a real tail-call handover (comparing frame depth
+                    // before/after, or a VM-side marker) is left for
+                    // whoever next touches replay depth counting.
+                    Disposition::Pushed,
                 )
             }
             SuspendCause::Trapped(e) => {
@@ -2090,11 +1701,20 @@ impl Runner {
                     message: e.message.clone(),
                     resumable: matches!(e.resume, ResumeMode::PushValueThenContinue),
                 };
-                (cause, site, ResumeWith::Trapped(e))
+                // Same flag as above: a trap has no tail-call shape to
+                // even ask the question of (it isn't a `raise`), so
+                // `Pushed` here is not a default standing in for an
+                // unknown answer — it is simply correct. Noted anyway so
+                // the two cases aren't confused when this is read later.
+                (cause, site, ResumeWith::Trapped(e), Disposition::Pushed)
             }
             SuspendCause::Posted(ids) => {
                 let site = span_at(&run.vm, run.vm.ip as usize);
-                (Cause::Posted { ids }, site, ResumeWith::Continue)
+                // A post arriving is never a tail call — there is no
+                // "handler" in the raise/resume sense here, just the
+                // running program parking until its next fuel slice
+                // (rule B). `Pushed` is simply correct.
+                (Cause::Posted { ids }, site, ResumeWith::Continue, Disposition::Pushed)
             }
         };
 
@@ -2113,7 +1733,12 @@ impl Runner {
         // persisted.
         let outcome = tree.append(
             &mut self.spine,
-            EventPayload::Condition { cause, site, stack },
+            EventPayload::Condition {
+                cause,
+                site,
+                stack,
+                disposition,
+            },
         )?;
         tree.append(
             &mut self.spine,
@@ -2124,40 +1749,39 @@ impl Runner {
                 ),
             },
         )?;
-        self.flush_refusals(tree)?;
-        out.push(self.render_request(tree));
+        out.push(self.report_outcome(tree, outcome)?);
         Ok(out)
     }
 
-    /// A bare turn answers **nothing** (18_TARGETING). Nothing closes:
-    /// `open` is discharged only by `answer(question, value)`, so the
-    /// branch goes idle exactly as it was — possibly still owing — and
-    /// stays addressable, so a later question to it — from anyone — is
-    /// just another post.
-    fn go_idle(&mut self, tree: &mut Tree) -> io::Result<Vec<StepOutput>> {
-        // A no-tool-call turn abandons any suspended program — never the
-        // physics: in-flight calls stay pending and their results are
-        // still logged as artifacts when they arrive.
-        if let Phase::Suspended(run, _) = std::mem::replace(&mut self.phase, Phase::Idle) {
-            self.note_status(run.program_id, ProgramStatus::Failed);
-            self.last_vm = Some(run.vm);
-        }
-        self.generation += 1;
-        self.phase = Phase::Idle;
-
-        let text = match self.spine.context().messages.last() {
-            Some(Message::Turn { text, .. }) => text.clone(),
-            _ => String::new(),
-        };
-        // No `Answer` is logged. The user, or a re-attached client, reads
-        // the text where it sits; a suspended program someone is still
-        // owed a reply to stays suspended.
-        let mut out = vec![StepOutput::Answered {
-            question: None,
-            value: text_value(&text),
-        }];
-        out.extend(self.prompt_if_needed(tree));
-        Ok(out)
+    /// Log the harness's report on a just-settled outcome as an ordinary
+    /// `Post` — the substitution 23_ONE_AGENT.md A4 makes throughout:
+    /// no more `Rendered::Tool` answering a `call_id`, because there is
+    /// no `call_id` anymore. The report is a message like any other,
+    /// `Author::Harness`, owing no reply.
+    ///
+    /// Unlike [`deliver`](Runner::deliver), this always renders
+    /// afterward rather than going through the trigger rule: a branch
+    /// that was just busy running a program is always due a reply about
+    /// what happened, whether or not anything else arrived in the
+    /// meantime (which would show up in the same rendered request
+    /// regardless, since a request always renders the whole path).
+    /// Callers set `self.phase` to whatever this handback leaves it in
+    /// (`AwaitingLlm` for a finished/failed run, `Suspended` for one still
+    /// parked) **before** calling this.
+    fn report_outcome(&mut self, tree: &mut Tree, outcome: EventId) -> io::Result<StepOutput> {
+        let report = crate::report::derive_report(tree, self.spine.leaf_id, outcome);
+        tree.append(
+            &mut self.spine,
+            EventPayload::Message(Message::Post {
+                from: Author::Harness,
+                origin: Origin::Direct {
+                    text: report,
+                    input: serde_json::Value::Null,
+                    expects_reply: false,
+                },
+            }),
+        )?;
+        Ok(self.render_request(tree))
     }
 
     /// Render a request iff the trigger rule says to. The one door an
@@ -2173,33 +1797,16 @@ impl Runner {
 
     // ── rendering ───────────────────────────────────────────────────
 
-    /// Build the request from the **log**: the system prompt from the
-    /// `Agent`'s snapshot, the posts and turns from this branch's path,
-    /// and one derived tool message per tool call in each turn.
-    ///
-    /// Placing each tool message immediately after the `Turn` whose call
-    /// it answers is what keeps the API's adjacency rule satisfied — the
-    /// completion API rejects anything between an assistant tool call and
-    /// its tool result.
+    /// The ephemeral half of a request — see [`LlmRequest`]'s own doc.
+    /// The card, system prompt and message history are `document.rs`'s
+    /// job now; this only marks `shown` (so "never prompted twice for
+    /// the same thing" holds by construction) and computes the trailing
+    /// line.
     fn render_request(&mut self, tree: &Tree) -> StepOutput {
         // Everything logged so far is about to be shown. This is the one
-        // place the mark moves, which is what makes "never prompted
-        // twice for the same thing" true by construction.
+        // place the mark moves.
         self.shown = self.spine.leaf_id.as_u64();
-        // The system prompt is rebuilt from the `Agent`'s snapshot, not
-        // re-derived from the registry: the prefix is immutable, so a
-        // later card edit must not alter an existing conversation.
-        let system = self.spine.context().system.clone();
-        let messages = self.render_messages(tree);
-
-        // Constant for the branch's life: the tool array is assembled
-        // into the front of the cached prefix, so a phase-varying list
-        // is a varying prefix. Which restarts are *valid* is in the
-        // report, and an ineligible call is refused (`eligible`).
         StepOutput::LlmRequest(LlmRequest {
-            system,
-            messages,
-            tools: tool_specs(),
             tail: self.request_tail(tree),
         })
     }
@@ -2215,26 +1822,13 @@ impl Runner {
     /// - which questions are open, **each beside who asked it**
     ///   (18_TARGETING Step B2): a plain reply answers none of them, so
     ///   the model needs the id to reach for `answer` even when only one
-    ///   post is open, and the asker is what tells apart a parked
-    ///   program's post — its `Send` stays pending until named — from a
-    ///   person's, which merely goes unread a while longer. The rule
-    ///   itself is card material and does not repeat here; this line is
-    ///   the now-fact.
-    /// - **presence**: whether a client is attached right now. It is
-    ///   honest about its limit — attached means a client is connected,
-    ///   not that a human is reading — and it is what lets an agent that
-    ///   needs input choose between waiting (free) and proceeding on a
-    ///   stated assumption.
+    ///   post is open.
+    /// - **presence**: whether a client is attached right now.
     fn request_tail(&self, tree: &Tree) -> Option<String> {
         let mut lines: Vec<String> = Vec::new();
         let open = self.open();
         if !open.is_empty() {
             let shown = open.len().min(OPEN_NOTE_MAX_IDS);
-            // The asker rides beside the id — `render_post`'s body
-            // prefix says who a *shown* post is from, but a post that
-            // arrived after `shown` (or on a reopened log) may never
-            // have been rendered at all, so this is the only place its
-            // asker is guaranteed visible.
             let ids: Vec<String> = open[..shown]
                 .iter()
                 .map(|id| {
@@ -2254,9 +1848,9 @@ impl Runner {
             };
             lines.push(format!(
                 "{count} open on this branch: {}{more}. A post from an agent means that \
-                 agent's program is suspended on this value and stays suspended until \
-                 answer(question, value) names it. **Several answer calls may ride one \
-                 turn**, optionally followed by one run_program or resume.",
+                 agent's program is suspended on this value and stays suspended until a \
+                 program on this branch calls answer(question, label, value) naming it — any \
+                 of your open questions, in any order, from anywhere in the program.",
                 ids.join(", "),
             ));
         }
@@ -2264,7 +1858,7 @@ impl Runner {
             lines.push(format!(
                 "{count} artifacts on this branch, #{first}–#{last}. A report lists only \
                  what is new since the last one; every id above stays fetchable with \
-                 tools.tool_result(id)."
+                 artifact(id)."
             ));
         }
         lines.push(if self.attached { PRESENT } else { ABSENT }.to_owned());
@@ -2273,12 +1867,7 @@ impl Runner {
 
     /// How many **menu rows** this branch's path holds, and the id range
     /// they span — the pointer that lets each report list only what is
-    /// *new* without putting an older id out of reach. Rows are keyed by
-    /// the call id, which is what a program reuses, so a `Result` is not
-    /// one of its own.
-    ///
-    /// Counted, never rendered: a menu row costs a preview, and this line
-    /// is re-emitted on every request.
+    /// *new* without putting an older id out of reach.
     fn artifact_span(&self, tree: &Tree) -> Option<(usize, u64, u64)> {
         let ids: Vec<u64> = self
             .agent_segment(tree)
@@ -2294,124 +1883,13 @@ impl Runner {
         Some((ids.len(), *ids.first()?, *ids.last()?))
     }
 
-    /// The rendered message list for a request: the branch's posts and
-    /// turns, with each turn immediately followed by one derived tool
-    /// message per tool call it made.
-    ///
-    /// Pairing is **positional**: the k-th outcome after a turn answers
-    /// its k-th tool call. The machine keeps that true by deferring a
-    /// refusal until after the outcome of the call that preceded it.
-    fn render_messages(&self, tree: &Tree) -> Vec<Rendered> {
-        let leaf = self.spine.leaf_id;
-        let mut out = Vec::new();
-        // Tool calls of the most recent `Turn` that no outcome on this
-        // path answers. On an ordinary branch this is always empty by
-        // the time anything else renders; on a **fork taken mid-program**
-        // it is the original's running call, and the `Fork` is what
-        // answers it (below).
-        let mut dangling: Vec<ToolCall> = Vec::new();
-        for event in self.agent_segment(tree) {
-            let msg = match &event.payload {
-                EventPayload::Message(msg) => msg,
-                // **`Fork` renders.** Once prompted, a fork's LLM sees
-                // the pre-fork question in its history with no answer on
-                // this path, and the card compels it to answer open
-                // questions. There is no API-level "do not address that"
-                // and hiding history would defeat forking, so the lever
-                // is rendering — the only honest one.
-                EventPayload::Fork { .. } => {
-                    out.extend(crate::report::render_fork(
-                        tree,
-                        leaf,
-                        event.id,
-                        &std::mem::take(&mut dangling),
-                    ));
-                    continue;
-                }
-                _ => continue,
-            };
-            match msg {
-                Message::Post { from, .. } => {
-                    // Resolve a by-reference body the way a `Context`
-                    // does — the log stays copy-free.
-                    let resolved = tree.resolve(msg);
-                    let Message::Post { origin, .. } = &resolved else {
-                        continue;
-                    };
-                    out.push(Rendered::User(crate::report::render_post(
-                        event.id, *from, origin,
-                    )));
-                }
-                Message::Turn {
-                    text,
-                    thinking,
-                    tool_calls,
-                    ..
-                } => {
-                    out.push(Rendered::Assistant {
-                        text: text.clone(),
-                        thinking: thinking.clone(),
-                        tool_calls: tool_calls.clone(),
-                    });
-                    let outcomes = crate::report::outcomes_of_turn(tree, leaf, event.id);
-                    for (call, outcome) in tool_calls.iter().zip(&outcomes) {
-                        out.push(Rendered::Tool {
-                            call_id: call.id.clone(),
-                            text: crate::report::derive_report(
-                                tree,
-                                leaf,
-                                *outcome,
-                                self.answer_budget,
-                            ),
-                        });
-                    }
-                    dangling = tool_calls[outcomes.len().min(tool_calls.len())..].to_vec();
-                }
-            }
-        }
-        out
-    }
-
-    /// The rendered message list, for tests that assert on what an LLM
-    /// would actually see (the fork lines, the adjacency rule).
-    #[cfg(test)]
-    pub fn render_messages_for_test(&self, tree: &Tree) -> Vec<Rendered> {
-        self.render_messages(tree)
-    }
-
-    /// One request, for tests that compare two renders (presence).
+    /// One request, for tests that inspect what would be sent.
     #[cfg(test)]
     pub fn render_request_for_test(&mut self, tree: &Tree) -> LlmRequest {
         match self.render_request(tree) {
             StepOutput::LlmRequest(r) => r,
             _ => unreachable!("render_request returns a request"),
         }
-    }
-
-    /// Log the refusals deferred behind a VM-driving call, now that its
-    /// outcome has landed — keeping outcomes in call order.
-    fn flush_refusals(&mut self, tree: &mut Tree) -> io::Result<()> {
-        for reason in std::mem::take(&mut self.deferred_refusals) {
-            self.refuse(tree, &reason)?;
-        }
-        Ok(())
-    }
-
-    /// Refuse a call: log a `Condition{Refused}` so the call still has
-    /// exactly one outcome event, and the report renders from it rather
-    /// than from replayed eligibility.
-    fn refuse(&mut self, tree: &mut Tree, reason: &str) -> io::Result<()> {
-        tree.append(
-            &mut self.spine,
-            EventPayload::Condition {
-                cause: Cause::Refused {
-                    reason: reason.to_owned(),
-                },
-                site: 0,
-                stack: Vec::new(),
-            },
-        )?;
-        Ok(())
     }
 
     /// Events of this agent's spine segment (its `Agent` down to
@@ -2451,47 +1929,31 @@ fn assemble_system(card: &str, charter: &str) -> String {
     system
 }
 
-/// Extract + validate the optional `attachments` map from a `run_program`
-/// call: an object of name → content string (this run's authored bodies).
-/// Absent/null yields an empty object. A malformed shape returns a message
-/// for the repair loop (the LLM fixes the call) rather than crashing.
-fn attachments_from_args(args: &serde_json::Value) -> Result<serde_json::Value, String> {
-    match args.get("attachments") {
-        None | Some(serde_json::Value::Null) => Ok(serde_json::Value::Object(Default::default())),
-        Some(serde_json::Value::Object(map)) => {
-            if let Some((k, _)) = map.iter().find(|(_, v)| !v.is_string()) {
-                return Err(format!(
-                    "run_program `attachments.{k}` must be a string — each attachment is \
-                     content text (e.g. a file body), read in the program as attachments.{k}"
-                ));
-            }
-            Ok(serde_json::Value::Object(map.clone()))
-        }
-        Some(_) => Err(
-            "run_program `attachments` must be an object mapping names to content \
-                        strings, e.g. {\"gameJs\": \"...\"}; read them in the program as \
-                        attachments.<name>"
-                .into(),
-        ),
+/// Coerce a JSON scalar to text the way `tell`/`ask` want their body:
+/// found live (the deleted `verbs.rs`, 2026-09-10) as `say(42)` — a bare
+/// number where a string was clearly meant, which otherwise silently
+/// misroutes to "no such tool" rather than running the call as intended.
+/// Objects/arrays have no single obviously-right text form, so they are
+/// rejected rather than guessed at.
+fn coerce_text(v: &serde_json::Value) -> Option<String> {
+    match v {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        serde_json::Value::Bool(b) => Some(b.to_string()),
+        serde_json::Value::Null => Some("null".to_owned()),
+        _ => None,
     }
 }
 
-/// An optional string field of an options object (`{ name }`).
-fn string_field(arg: &serde_json::Value, key: &str) -> Option<String> {
-    arg.get(key).and_then(|v| v.as_str()).map(str::to_owned)
-}
-
-/// A `{ tools: [...] }` allowlist, if the call named one. Absent means
-/// "inherit the caller's" — the registry resolves that from the child's
-/// own `Agent` root, not from this call.
-fn allowlist_field(arg: &serde_json::Value) -> Option<Vec<String>> {
-    let items = arg.get("tools")?.as_array()?;
-    Some(
-        items
-            .iter()
-            .filter_map(|v| v.as_str().map(str::to_owned))
-            .collect(),
-    )
+/// `append_history(value)` takes any JSON value, but `EventPayload::Note`
+/// stores rendered text: a JSON string is used verbatim, anything else is
+/// serialized. The card's own guidance is to append a short projection
+/// (a summary), not a raw result, so the common case is already a string.
+fn note_text(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
 }
 
 fn json_arg(vm: &mut VM, json: &serde_json::Value) -> Value {
@@ -2527,7 +1989,7 @@ pub(crate) fn settlement_of<'e>(segment: &[&'e Event], call: EventId) -> Option<
 /// log is the cache and the event id is the key.
 ///
 /// Rows are named by the **call** id, which is what a program reuses:
-/// `tools.tool_result` resolves a call id through to its `Result`.
+/// `artifact(id)` resolves a call id through to its `Result`.
 pub(crate) fn menu_rows(segment: &[&Event], since: u64) -> Vec<Artifact> {
     segment
         .iter()
@@ -2544,11 +2006,12 @@ pub(crate) fn menu_rows(segment: &[&Event], since: u64) -> Vec<Artifact> {
                         Some(Outcome::Delivered(v)) => ArtifactState::Delivered(v.clone()),
                         Some(Outcome::Failed(msg)) => ArtifactState::Failed(msg.clone()),
                         // Only one pending kind can be re-attached: a
-                        // `Send`'s answer is still coming, while an
-                        // `Invoke`'s worker died with the process.
+                        // `Send`'s answer is still coming, while a
+                        // `Spawn`/`Fork`/`Invoke`'s worker died with the
+                        // process.
                         None => match call {
                             Call::Send { .. } => ArtifactState::PendingSend,
-                            Call::Spawn { .. } | Call::Invoke { .. } => {
+                            Call::Spawn { .. } | Call::Fork { .. } | Call::Invoke { .. } => {
                                 ArtifactState::PendingInvoke
                             }
                         },
@@ -2582,6 +2045,7 @@ fn call_label(call: &Call) -> String {
             preview(&serde_json::Value::String(text.clone()))
         ),
         Call::Spawn { name, .. } => format!("spawn({})", name.as_deref().unwrap_or("<unnamed>")),
+        Call::Fork { task, .. } => format!("fork({})", preview(&serde_json::Value::String(task.clone()))),
         Call::Invoke { name, args, .. } => format!("{}({})", name, preview(args)),
     }
 }
@@ -2606,16 +2070,6 @@ fn outcome_json(outcome: &Outcome) -> Result<serde_json::Value, String> {
 /// records so its report can point a caret without a live VM.
 fn span_at(vm: &VM, ip: usize) -> u32 {
     vm.spans.get(ip).copied().unwrap_or(0)
-}
-
-/// An empty final turn answers with `null` rather than an empty string —
-/// there was no answer, and the value says so.
-fn text_value(text: &str) -> serde_json::Value {
-    if text.is_empty() {
-        serde_json::Value::Null
-    } else {
-        serde_json::Value::String(text.to_owned())
-    }
 }
 
 /// Who authored the post `question` — the author an answer is owed to.
@@ -2687,8 +2141,7 @@ mod tests {
         (send, out)
     }
 
-    /// A spawned agent and its first question — the pair `tools.agent`
-    /// desugars to: `Spawn` → `Agent`, then `Send` → `Post`.
+    /// A spawned agent and its first question.
     fn spawn_and_ask(
         tree: &mut Tree,
         asker: &mut Runner,
@@ -2706,53 +2159,15 @@ mod tests {
                 }),
             )
             .unwrap();
-        let mut child = Runner::new_agent(tree, spawn, None, charter, None, None, "").unwrap();
+        let mut child = Runner::new_agent(tree, spawn, None, charter, None, "").unwrap();
         let (_, out) = ask(tree, asker, &mut child, charter, input);
         (child, out)
     }
 
-    fn llm_program(call_id: &str, source: &str) -> LlmTurn {
+    fn llm_program(source: &str) -> LlmTurn {
         LlmTurn {
-            text: String::new(),
+            source: source.into(),
             thinking: None,
-            tool_calls: vec![ToolCall {
-                id: call_id.into(),
-                name: TOOL_RUN_PROGRAM.into(),
-                arguments: json!({ "source": source }),
-            }],
-        }
-    }
-
-    fn llm_resume(call_id: &str, value: serde_json::Value) -> LlmTurn {
-        LlmTurn {
-            text: String::new(),
-            thinking: None,
-            tool_calls: vec![ToolCall {
-                id: call_id.into(),
-                name: TOOL_RESUME.into(),
-                arguments: json!({ "value": value }),
-            }],
-        }
-    }
-
-    /// A scripted `answer(question, value)` turn — explicit binding.
-    fn llm_answer(call_id: &str, question: EventId, value: serde_json::Value) -> LlmTurn {
-        LlmTurn {
-            text: String::new(),
-            thinking: None,
-            tool_calls: vec![ToolCall {
-                id: call_id.into(),
-                name: TOOL_ANSWER.into(),
-                arguments: json!({ "question": question.as_u64(), "value": value }),
-            }],
-        }
-    }
-
-    fn llm_text(text: &str) -> LlmTurn {
-        LlmTurn {
-            text: text.into(),
-            thinking: None,
-            tool_calls: Vec::new(),
         }
     }
 
@@ -2777,24 +2192,22 @@ mod tests {
         panic!("machine never settled");
     }
 
-    /// The most recent report the LLM read. Reports are **derived, not
-    /// stored**, so a test derives it the way a request does: from the
-    /// last outcome on the branch.
+    /// The most recently logged harness report — the last `Post` from
+    /// `Author::Harness` on the path, which is now how a report reaches
+    /// the model (no more deriving one fresh from an outcome id).
     fn last_report(state: &Runner, tree: &Tree) -> String {
-        let leaf = state.spine.leaf_id;
-        let outcome = tree
-            .path_events(leaf)
+        state
+            .agent_segment(tree)
             .iter()
             .rev()
-            .find(|e| {
-                matches!(
-                    e.payload,
-                    EventPayload::Return { .. } | EventPayload::Condition { .. }
-                )
+            .find_map(|e| match &e.payload {
+                EventPayload::Message(Message::Post {
+                    from: Author::Harness,
+                    origin,
+                }) => origin.direct().map(|(t, _, _)| t.to_owned()),
+                _ => None,
             })
-            .map(|e| e.id)
-            .expect("an outcome to render");
-        crate::report::derive_report(tree, leaf, outcome, state.answer_budget)
+            .expect("a harness report to have been logged")
     }
 
     fn payload_kinds(state: &Runner, tree: &Tree) -> Vec<&'static str> {
@@ -2813,6 +2226,8 @@ mod tests {
                 EventPayload::Condition { .. } => "Condition",
                 EventPayload::Console { .. } => "Console",
                 EventPayload::Rename { .. } => "Rename",
+                EventPayload::Note { .. } => "Note",
+                EventPayload::Compacted { .. } => "Compacted",
             })
             .collect()
     }
@@ -2827,14 +2242,6 @@ mod tests {
             .expect("an LlmRequest output")
     }
 
-    fn tool_names(req: &LlmRequest) -> Vec<&str> {
-        req.tools.iter().map(|t| t.name.as_str()).collect()
-    }
-
-    /// The tool list, which never varies — see
-    /// `tool_schemas_are_constant_across_phases`.
-    const CONSTANT_TOOLS: [&str; 3] = [TOOL_RUN_PROGRAM, TOOL_RESUME, TOOL_ANSWER];
-
     fn expect_tool_calls(outputs: &[StepOutput]) -> &Vec<OutCall> {
         outputs
             .iter()
@@ -2845,149 +2252,253 @@ mod tests {
             .expect("a ToolCalls output")
     }
 
-    // ── rendered messages (A3) ──────────────────────────────────────
+    // ── the basic round trip ────────────────────────────────────────
 
-    /// Machine-bound data travels by reference: the *context* sees a
-    /// bounded shape preview, while the whole value reaches the
-    /// *program* as the `input` const. A caller passing a large `input`
-    /// must never dump it into the callee's context.
     #[test]
-    fn large_input_previews_in_context_and_binds_whole() {
-        let mut tree = Tree::new(None);
-        let root = Runner::new_root(&mut tree, "root", "").unwrap();
-        let big = "z".repeat(9_000);
-        let mut root = root;
-        let (mut child, out) = spawn_and_ask(
-            &mut tree,
-            &mut root,
-            "summarize it",
-            json!({ "body": big.clone(), "path": "PLAN.md" }),
-        );
-
-        // What the LLM sees: shape, keys, size — not the bytes.
+    fn user_turn_renders_request() {
+        let (mut tree, mut state) = setup();
+        let out = user_post(&mut state, &mut tree, "compute 6*7");
         let req = expect_request(&out);
-        let rendered = match &req.messages[0] {
-            Rendered::User(text) => text.clone(),
-            other => panic!("expected a user message, got {other:?}"),
-        };
-        assert!(!rendered.contains(&big), "the body must not enter context");
-        assert!(rendered.contains("summarize it"), "{rendered}");
-        assert!(
-            rendered.contains("object, 2 keys: body, path"),
-            "{rendered}"
-        );
-        assert!(rendered.len() < 500, "the preview is bounded: {rendered}");
+        assert!(req.tail.as_deref().unwrap_or("").contains("attached"));
+    }
 
-        // What the program sees: the whole value.
+    #[test]
+    fn program_completion_logs_a_harness_report_and_the_branch_goes_idle() {
+        let (mut tree, mut state) = setup();
+        user_post(&mut state, &mut tree, "go");
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(llm_program(
+                    "console.log(\"hi there\"); return 6 * 7;",
+                )),
+            )
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+
+        let report = last_report(&state, &tree);
+        assert!(report.contains("42"), "{report}");
+        assert!(report.contains("hi there"), "{report}");
+        assert_eq!(
+            payload_kinds(&state, &tree),
+            ["Agent", "Post", "Turn", "Return", "Console", "Post"]
+        );
+    }
+
+    #[test]
+    fn compile_error_is_a_repair_loop_and_leaves_no_vm_behind() {
+        let (mut tree, mut state) = setup();
+        state.kickoff(&mut tree).unwrap();
+        let out = state
+            .step(&mut tree, StepInput::LlmResponse(llm_program("let = ;")))
+            .unwrap();
+        assert!(!out.iter().any(|o| matches!(o, StepOutput::Working)));
+        let report = last_report(&state, &tree);
+        assert!(report.contains("compile error"), "{report}");
+        assert_eq!(
+            payload_kinds(&state, &tree),
+            ["Agent", "Turn", "Condition", "Post"]
+        );
+        assert!(state.is_idle() || matches!(state.status(), "awaiting llm"));
+    }
+
+    #[test]
+    fn raise_suspends_with_pushed_disposition_and_host_driven_resume_continues() {
+        let (mut tree, mut state) = setup();
+        state.kickoff(&mut tree).unwrap();
+        let src = r#"
+            const x = raise("need_help", { got: 41 });
+            return x + 1;
+        "#;
+        let out = state
+            .step(&mut tree, StepInput::LlmResponse(llm_program(src)))
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+        assert_eq!(state.status(), "suspended");
+
+        let disposition = state
+            .agent_segment(&tree)
+            .iter()
+            .find_map(|e| match &e.payload {
+                EventPayload::Condition { disposition, .. } => Some(*disposition),
+                _ => None,
+            })
+            .expect("a logged Condition");
+        assert_eq!(disposition, Disposition::Pushed);
+
+        // The host, not the LLM, drives the continuation directly.
+        let out = state.resume(&mut tree, json!(41)).unwrap();
+        drain(&mut state, &mut tree, out);
+        assert!(last_report(&state, &tree).contains("42"));
+    }
+
+    #[test]
+    fn abandon_discards_the_suspended_vm_and_leaves_the_branch_idle() {
+        let (mut tree, mut state) = setup();
+        state.kickoff(&mut tree).unwrap();
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(llm_program("raise(\"need\", null); return 1;")),
+            )
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+        assert_eq!(state.status(), "suspended");
+
+        let out = state.abandon(&mut tree).unwrap();
+        // Nothing new to say (no open question, no unseen post), so
+        // abandon leaves the branch quietly idle rather than forcing a
+        // request out.
+        assert!(out.is_empty(), "{out:?}");
+        assert_eq!(state.status(), "idle");
+    }
+
+    #[test]
+    fn interrupt_of_a_running_program_delivers_the_rewritten_notice() {
+        let (mut tree, mut state) = setup();
+        state.kickoff(&mut tree).unwrap();
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(llm_program("while (true) {}")),
+            )
+            .unwrap();
+        assert!(matches!(&out[..], [StepOutput::Working]));
+
+        let out = state.interrupt(&mut tree).unwrap();
+        let req = expect_request(&out);
+        let _ = req;
+        let posted = state.agent_segment(&tree).iter().rev().find_map(|e| {
+            match &e.payload {
+                EventPayload::Message(Message::Post {
+                    from: Author::Harness,
+                    origin,
+                }) => origin.direct().map(|(t, _, _)| t.to_owned()),
+                _ => None,
+            }
+        });
+        assert_eq!(posted.as_deref(), Some(INTERRUPT_NOTICE));
+        assert!(
+            !INTERRUPT_NOTICE.contains("run_program") && !INTERRUPT_NOTICE.contains("resume()"),
+            "the notice no longer names old tool-call restarts: {INTERRUPT_NOTICE}"
+        );
+    }
+
+    // ── bare-vocabulary dispatch ────────────────────────────────────
+
+    #[test]
+    fn bare_tell_and_ask_dispatch_to_send() {
+        let mut tree = Tree::new(None);
+        let mut root = Runner::new_root(&mut tree, "root", "").unwrap();
+        let (mut child, out) =
+            spawn_and_ask(&mut tree, &mut root, "child", serde_json::Value::Null);
+        drain(&mut root, &mut tree, out);
+
         let out = child
             .step(
                 &mut tree,
-                StepInput::LlmResponse(llm_program("c1", "return input.body.length;")),
+                StepInput::LlmResponse(llm_program(&format!(
+                    "return await ask({}, \"which file?\");",
+                    root.agent_id().as_u64()
+                ))),
             )
             .unwrap();
-        drain(&mut child, &mut tree, out);
-        assert!(
-            last_report(&child, &tree).contains("returned: 9000"),
-            "{}",
-            last_report(&child, &tree)
-        );
-    }
-
-    /// A post's author is rendered, not guessed: a harness notice reads
-    /// as one, and the user's own words carry no label. Every post also
-    /// carries its own event id — the only way a chat message's id is
-    /// ever visible to the model, since nothing else in the rendered
-    /// request shows it (17_BRANCHES: the `open on this branch: #N` tail
-    /// note and `answer(question, value)` both reference ids the model
-    /// otherwise has no way to resolve to content).
-    #[test]
-    fn post_rendering_labels_its_author_and_carries_its_id() {
-        let plain = crate::report::render_post(
-            EventId::new(2),
-            Author::User,
-            &Origin::Direct {
-                text: "hello".into(),
-                input: json!(null),
-                expects_reply: true,
-            },
-        );
-        assert_eq!(plain, "[#2] hello");
-        let harness = crate::report::render_post(
-            EventId::new(3),
-            Author::Harness,
-            &Origin::Direct {
-                text: "your answer is too long".into(),
-                input: json!(null),
-                expects_reply: false,
-            },
-        );
-        assert_eq!(harness, "[#3] [harness] your answer is too long");
-        let agent = crate::report::render_post(
-            EventId::new(4),
-            Author::Agent(EventId::new(7)),
-            &Origin::Direct {
-                text: "which file?".into(),
-                input: json!(null),
-                expects_reply: true,
-            },
-        );
-        assert_eq!(agent, "[#4] [agent 7] which file?");
-    }
-
-    // ── typed calls (A2) ────────────────────────────────────────────
-
-    /// A menu row's label comes from the `Call` **variant**, never from
-    /// re-parsing a tool name: `ask` vs `tell` is `expects_reply`, and
-    /// `spawn` shows the child's name.
-    #[test]
-    fn menu_labels_come_from_the_call_variant() {
-        let send = |expects_reply| Call::Send {
-            to: Address::Branch(EventId::new(3)),
-            text: "which file?".into(),
-            input: json!(null),
-            expects_reply,
-            site: 0,
+        let settled = drain(&mut child, &mut tree, out);
+        let sends = settled
+            .iter()
+            .find_map(|o| match o {
+                StepOutput::Sends(s) => Some(s.clone()),
+                _ => None,
+            })
+            .expect("a Sends output");
+        assert_eq!(sends.len(), 1);
+        let EventPayload::Call(Call::Send {
+            to, text, expects_reply, ..
+        }) = &tree.events[&sends[0]].payload
+        else {
+            panic!("expected a Send");
         };
-        assert_eq!(call_label(&send(true)), r#"ask(#3, "which file?")"#);
-        assert_eq!(call_label(&send(false)), r#"tell(#3, "which file?")"#);
-        assert_eq!(
-            call_label(&Call::Send {
-                to: Address::User,
-                text: "ok?".into(),
-                input: json!(null),
-                expects_reply: true,
-                site: 0,
-            }),
-            r#"ask(user, "ok?")"#
-        );
-        assert_eq!(
-            call_label(&Call::Spawn {
-                name: Some("researcher".into()),
-                charter: "read things".into(),
-                tools: None,
-                site: 0,
-            }),
-            "spawn(researcher)"
-        );
-        assert_eq!(
-            call_label(&Call::Invoke {
-                name: "fetch".into(),
-                args: json!(["x"]),
-                site: 0,
-            }),
-            r#"fetch(["x"])"#
-        );
+        assert_eq!(*to, Address::Branch(root.agent_id()));
+        assert_eq!(text, "which file?");
+        assert!(*expects_reply);
     }
 
-    /// `tools.tool_result` accepts either id the log offers: the `Result`
-    /// itself, or the **call** it settles — which is what the menu names.
     #[test]
-    fn tool_result_accepts_a_call_id_or_its_result_id() {
+    fn bare_spawn_dispatches_to_call_spawn() {
+        let (mut tree, mut state) = setup();
+        state.kickoff(&mut tree).unwrap();
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(llm_program("return await spawn(\"researcher\");")),
+            )
+            .unwrap();
+        let settled = drain(&mut state, &mut tree, out);
+        let spawns = settled
+            .iter()
+            .find_map(|o| match o {
+                StepOutput::Spawns(s) => Some(s.clone()),
+                _ => None,
+            })
+            .expect("a Spawns output");
+        let EventPayload::Call(Call::Spawn { charter, .. }) = &tree.events[&spawns[0]].payload
+        else {
+            panic!("expected a Spawn");
+        };
+        assert_eq!(charter, "researcher");
+    }
+
+    #[test]
+    fn bare_fork_dispatches_to_call_fork_and_is_settled_like_a_spawn() {
+        let (mut tree, mut state) = setup();
+        state.kickoff(&mut tree).unwrap();
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(llm_program("return await fork(\"try a different angle\");")),
+            )
+            .unwrap();
+        let settled = drain(&mut state, &mut tree, out);
+        let forks = settled
+            .iter()
+            .find_map(|o| match o {
+                StepOutput::Forks(f) => Some(f.clone()),
+                _ => None,
+            })
+            .expect("a Forks output");
+        let EventPayload::Call(Call::Fork { task, .. }) = &tree.events[&forks[0]].payload else {
+            panic!("expected a Fork call");
+        };
+        assert_eq!(task, "try a different angle");
+    }
+
+    #[test]
+    fn append_history_logs_a_note_and_is_never_re_sent_to_context() {
+        let (mut tree, mut state) = setup();
+        state.kickoff(&mut tree).unwrap();
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(llm_program(
+                    "await append_history(\"figured out the bug is in parsing\"); return 1;",
+                )),
+            )
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+        let note = state.agent_segment(&tree).iter().find_map(|e| match &e.payload {
+            EventPayload::Note { text } => Some(text.clone()),
+            _ => None,
+        });
+        assert_eq!(note.as_deref(), Some("figured out the bug is in parsing"));
+    }
+
+    #[test]
+    fn artifact_fetch_reuses_a_settled_call_by_id() {
         let (mut tree, mut state) = setup();
         state.kickoff(&mut tree).unwrap();
         let src = r#"await tools.fetch("a"); raise("stop", null);"#;
         let out = state
-            .step(&mut tree, StepInput::LlmResponse(llm_program("c1", src)))
+            .step(&mut tree, StepInput::LlmResponse(llm_program(src)))
             .unwrap();
         let settled = drain(&mut state, &mut tree, out);
         let id = expect_tool_calls(&settled)[0].call;
@@ -3002,56 +2513,127 @@ mod tests {
             .unwrap();
         drain(&mut state, &mut tree, out);
 
-        let segment = state.agent_segment(&tree);
-        let call = segment
-            .iter()
-            .find(|e| matches!(e.payload, EventPayload::Call(_)))
-            .unwrap()
-            .id;
-        let result = segment
-            .iter()
-            .find(|e| matches!(e.payload, EventPayload::Result { .. }))
-            .unwrap()
-            .id;
-        assert_ne!(call, result, "the two halves are separate events");
-
-        // Two successive rewrites on the same branch, each a fresh VM:
-        // one reuses by the call id the menu showed, one by the `Result`
-        // id. Neither re-issues the call.
-        for (n, fetch_by) in [call, result].into_iter().enumerate() {
-            let rewrite = format!("return await tools.tool_result({});", fetch_by.as_u64());
-            let out = state
-                .step(
-                    &mut tree,
-                    StepInput::LlmResponse(llm_program(&format!("c{}", n + 2), &rewrite)),
-                )
-                .unwrap();
-            let settled = drain(&mut state, &mut tree, out);
-            assert!(
-                !settled
-                    .iter()
-                    .any(|o| matches!(o, StepOutput::ToolCalls(_))),
-                "served from the log, no call re-issued"
-            );
-            assert!(
-                last_report(&state, &tree).contains(r#"returned: "DATA""#),
-                "fetching #{} failed: {}",
-                fetch_by.as_u64(),
-                last_report(&state, &tree)
-            );
-        }
+        let out = state.abandon(&mut tree).unwrap();
+        drain(&mut state, &mut tree, out);
+        let rewrite = format!("return await artifact({});", id.as_u64());
+        let out = state
+            .step(&mut tree, StepInput::LlmResponse(llm_program(&rewrite)))
+            .unwrap();
+        let settled = drain(&mut state, &mut tree, out);
+        assert!(
+            !settled
+                .iter()
+                .any(|o| matches!(o, StepOutput::ToolCalls(_))),
+            "served from the log, no call re-issued"
+        );
+        assert!(last_report(&state, &tree).contains("DATA"));
     }
 
-    /// A call that definitively failed is a `Failed` outcome on its
-    /// `Result` — distinguishable in the log from one that was merely
-    /// issued (no `Result` at all).
+    #[test]
+    fn answer_dispatches_from_inside_a_program() {
+        let (mut tree, mut state) = setup();
+        let out = user_post(&mut state, &mut tree, "which one?");
+        let question = state.open()[0];
+        drain(&mut state, &mut tree, out);
+
+        let src = format!(
+            "await answer({}, \"q\", \"the second\"); return 1;",
+            question.as_u64()
+        );
+        let out = state
+            .step(&mut tree, StepInput::LlmResponse(llm_program(&src)))
+            .unwrap();
+        let settled = drain(&mut state, &mut tree, out);
+        let answered = settled.iter().find_map(|o| match o {
+            StepOutput::Answered { question: q, value } => Some((*q, value.clone())),
+            _ => None,
+        });
+        assert_eq!(answered, Some((question, json!("the second"))));
+        assert!(
+            state
+                .agent_segment(&tree)
+                .iter()
+                .any(|e| matches!(&e.payload, EventPayload::Answer { question: q, .. } if *q == question))
+        );
+    }
+
+    #[test]
+    fn answer_on_an_unowned_pre_fork_post_is_rejected_in_program() {
+        let mut tree = Tree::new(None);
+        let mut original = Runner::new_root(&mut tree, "root", "").unwrap();
+        user_post(&mut original, &mut tree, "which one?");
+        let question = original.open()[0];
+
+        let mut spine = tree.fork(original.spine.leaf_id).unwrap();
+        let fork_root = spine.leaf_id;
+        let _ = &mut spine;
+        let mut fork = Runner::with_spine(&tree, tree.spine_at(fork_root));
+        assert!(fork.open().is_empty(), "obligations do not cross a Fork");
+        fork.kickoff(&mut tree).unwrap();
+
+        let src = format!(
+            "try {{ await answer({}, \"q\", 1); return \"unreachable\"; }} catch (e) {{ return \
+             \"caught: \" + e; }}",
+            question.as_u64()
+        );
+        let out = fork
+            .step(&mut tree, StepInput::LlmResponse(llm_program(&src)))
+            .unwrap();
+        drain(&mut fork, &mut tree, out);
+        let report = last_report(&fork, &tree);
+        assert!(report.contains("inherited it as history"), "{report}");
+    }
+
+    // ── fan-out / resolution order (unchanged substance) ────────────
+
+    #[test]
+    fn fanout_batch_and_resolution_order() {
+        let (mut tree, mut state) = setup();
+        state.kickoff(&mut tree).unwrap();
+        let src = r#"
+            const a = tools.fetch("x");
+            const b = tools.fetch("y");
+            return [await a, await b];
+        "#;
+        let out = state
+            .step(&mut tree, StepInput::LlmResponse(llm_program(src)))
+            .unwrap();
+        let settled = drain(&mut state, &mut tree, out);
+        let calls = expect_tool_calls(&settled);
+        assert_eq!(calls.len(), 2, "one fan-out batch");
+
+        let (xa, yb) = (calls[0].call, calls[1].call);
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::ToolResults(vec![ToolResult {
+                    call: yb,
+                    result: Ok(json!("Y")),
+                }]),
+            )
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::ToolResults(vec![ToolResult {
+                    call: xa,
+                    result: Ok(json!("X")),
+                }]),
+            )
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+
+        assert!(last_report(&state, &tree).contains(r#"["X","Y"]"#));
+    }
+
     #[test]
     fn a_failed_call_settles_with_its_reason() {
         let (mut tree, mut state) = setup();
         state.kickoff(&mut tree).unwrap();
         let src = r#"try { return await tools.fetch("a"); } catch (e) { return "caught: " + e; }"#;
         let out = state
-            .step(&mut tree, StepInput::LlmResponse(llm_program("c1", src)))
+            .step(&mut tree, StepInput::LlmResponse(llm_program(src)))
             .unwrap();
         let settled = drain(&mut state, &mut tree, out);
         let id = expect_tool_calls(&settled)[0].call;
@@ -3075,99 +2657,53 @@ mod tests {
             })
             .expect("a Result");
         assert!(matches!(&outcome, Outcome::Failed(m) if m == "host is down"));
-        // And the menu says so rather than previewing a value.
-        let report = last_report(&state, &tree);
-        assert!(report.contains("failed: host is down"), "{report}");
     }
 
-    // ── the scripted round-trip ─────────────────────────────────────
-
     #[test]
-    fn user_turn_renders_request() {
+    fn hot_loop_yields_per_tick() {
         let (mut tree, mut state) = setup();
-        let out = user_post(&mut state, &mut tree, "compute 6*7");
-        let req = expect_request(&out);
-        assert!(req.system.contains("test agent"));
-        assert!(matches!(&req.messages[0], Rendered::User(t) if t.ends_with("compute 6*7")));
-        assert_eq!(tool_names(req), CONSTANT_TOOLS);
-        // The full definition rides along: schema'd parameters, not a name.
-        assert!(req.tools[0].parameters["properties"]["source"].is_object());
-        assert!(!req.tools[0].description.is_empty());
-    }
-
-    #[test]
-    fn dialect_card_roots_the_system_prompt() {
-        let mut tree = Tree::new(None);
-        let mut state =
-            Runner::new_root(&mut tree, "you are a test agent", "THE DIALECT CARD").unwrap();
-        let out = user_post(&mut state, &mut tree, "go");
-        let req = expect_request(&out);
-        assert!(
-            req.system.starts_with("THE DIALECT CARD\n\n"),
-            "{}",
-            req.system
-        );
-        assert!(
-            req.system.contains("you are a test agent"),
-            "the charter follows the card: {}",
-            req.system
-        );
-        // The system prompt is the snapshot on the branch root — not a
-        // message on the spine.
-        assert_eq!(payload_kinds(&state, &tree), ["Agent", "Post"]);
-    }
-
-    /// The prefix is immutable: a request's system message **equals**
-    /// `Agent.system`, the snapshot taken when the agent was created. A
-    /// later card edit cannot alter an existing conversation.
-    #[test]
-    fn the_request_system_equals_the_agent_snapshot() {
-        let mut tree = Tree::new(None);
-        let state = Runner::new_root(&mut tree, "agent", "CARD A").unwrap();
-        let EventPayload::Agent { system: stored, .. } = &tree.events[&EventId::new(1)].payload
-        else {
-            panic!("#1 must be the root Agent");
-        };
-        let stored = stored.clone();
-        assert!(stored.starts_with("CARD A"));
-        let root = state.spine.leaf_id;
-
-        // Re-anchor a fresh runner on the logged spine, card the registry
-        // differently, take a new turn — the request's system prompt is
-        // the stored CARD A snapshot, not a CARD B re-derivation.
-        let mut reopened = Runner::with_spine(&tree, tree.spine_at(root));
-        reopened.set_dialect_card("CARD B — evolved".into());
-        let out = user_post(&mut reopened, &mut tree, "more");
-        let req = expect_request(&out);
-        assert_eq!(req.system, stored, "the snapshot replays verbatim");
-        assert!(
-            !req.system.contains("CARD B"),
-            "the evolved card must not leak in"
-        );
-    }
-
-    /// The whole `input` reaches the program as the `input` const — it
-    /// travels on the post that carried it, and a child's first `Post` is
-    /// where a caller's data lands.
-    #[test]
-    fn input_binding_reaches_the_program() {
-        let mut tree = Tree::new(None);
-        let mut root = Runner::new_root(&mut tree, "root", "").unwrap();
-        let (mut state, _) = spawn_and_ask(&mut tree, &mut root, "agent", json!({ "n": 7 }));
+        state.kickoff(&mut tree).unwrap();
         let out = state
             .step(
                 &mut tree,
-                StepInput::LlmResponse(llm_program("c1", "return input.n;")),
+                StepInput::LlmResponse(llm_program("while (true) {}")),
             )
             .unwrap();
-        drain(&mut state, &mut tree, out);
-        assert!(last_report(&state, &tree).contains("returned: 7"));
+        assert!(matches!(&out[..], [StepOutput::Working]));
+        for _ in 0..3 {
+            let out = state
+                .step(&mut tree, StepInput::Tick { fuel: 10_000 })
+                .unwrap();
+            assert!(
+                matches!(&out[..], [StepOutput::Working]),
+                "a hot loop keeps yielding, never blocks"
+            );
+        }
     }
 
-    /// `Context::input` binds the **oldest still-open** post, not the
-    /// first post that ever expected a reply (18_TARGETING Step B3) —
-    /// answering the first moves it to the second; answering that one
-    /// too leaves nothing to bind.
+    // ── input binding (unchanged substance) ─────────────────────────
+
+    #[test]
+    fn large_input_previews_in_context_and_binds_whole() {
+        let mut tree = Tree::new(None);
+        let mut root = Runner::new_root(&mut tree, "root", "").unwrap();
+        let big = "z".repeat(9_000);
+        let (mut child, _out) = spawn_and_ask(
+            &mut tree,
+            &mut root,
+            "summarize it",
+            json!({ "body": big.clone(), "path": "PLAN.md" }),
+        );
+        let out = child
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(llm_program("return input.body.length;")),
+            )
+            .unwrap();
+        drain(&mut child, &mut tree, out);
+        assert!(last_report(&child, &tree).contains("9000"));
+    }
+
     #[test]
     fn input_moves_to_the_next_open_post_as_each_is_answered() {
         let (mut tree, mut state) = setup();
@@ -3195,2506 +2731,43 @@ mod tests {
             .unwrap();
         assert_eq!(state.spine.context().input(&tree), json!({ "n": 1 }));
 
-        state
-            .step(
-                &mut tree,
-                StepInput::LlmResponse(llm_answer("a1", first, json!("ok"))),
-            )
+        let src = format!("await answer({}, \"q\", \"ok\"); return 1;", first.as_u64());
+        let out = state
+            .step(&mut tree, StepInput::LlmResponse(llm_program(&src)))
             .unwrap();
+        drain(&mut state, &mut tree, out);
         assert_eq!(state.spine.context().input(&tree), json!({ "n": 2 }));
 
-        state
-            .step(
-                &mut tree,
-                StepInput::LlmResponse(llm_answer("a2", second, json!("ok"))),
-            )
+        let src = format!("await answer({}, \"q\", \"ok\"); return 1;", second.as_u64());
+        let out = state
+            .step(&mut tree, StepInput::LlmResponse(llm_program(&src)))
             .unwrap();
+        drain(&mut state, &mut tree, out);
         assert_eq!(state.spine.context().input(&tree), serde_json::Value::Null);
     }
 
+    // ── trigger rule ─────────────────────────────────────────────────
+
     #[test]
-    fn attachments_reach_the_program_as_a_const() {
+    fn needs_prompt_iff_unseen_post_and_no_vm() {
         let (mut tree, mut state) = setup();
+        assert!(!state.needs_prompt(&tree), "nothing has happened yet");
         state.kickoff(&mut tree).unwrap();
-        // A run_program carrying authored content in `attachments`; the
-        // program reads it as the `attachments` const, never embedding it
-        // in `source`.
-        let msg = LlmTurn {
-            text: String::new(),
-            thinking: None,
-            tool_calls: vec![ToolCall {
-                id: "c1".into(),
-                name: TOOL_RUN_PROGRAM.into(),
-                arguments: json!({
-                    "source": "return attachments.greeting.length;",
-                    "attachments": { "greeting": "hello world" },
-                }),
-            }],
-        };
-        let out = state.step(&mut tree, StepInput::LlmResponse(msg)).unwrap();
-        drain(&mut state, &mut tree, out);
-        // "hello world" is 11 bytes.
-        assert!(
-            last_report(&state, &tree).contains("returned: 11"),
-            "{}",
-            last_report(&state, &tree)
-        );
+        assert!(!state.needs_prompt(&tree), "a request is already out");
     }
 
-    #[test]
-    fn malformed_attachments_is_a_repair_loop() {
-        let (mut tree, mut state) = setup();
-        state.kickoff(&mut tree).unwrap();
-        let msg = LlmTurn {
-            text: String::new(),
-            thinking: None,
-            tool_calls: vec![ToolCall {
-                id: "c1".into(),
-                name: TOOL_RUN_PROGRAM.into(),
-                arguments: json!({
-                    "source": "return 1;",
-                    "attachments": { "body": 42 }, // not a string
-                }),
-            }],
-        };
-        let out = state.step(&mut tree, StepInput::LlmResponse(msg)).unwrap();
-        // No program ran; the error is the tool result and a fresh request
-        // follows (the repair loop), exactly like a missing `source`.
-        let report = last_report(&state, &tree);
-        assert!(
-            report.contains("attachments.body") && report.contains("must be a string"),
-            "{report}"
-        );
-        assert!(expect_request(&out).messages.last().is_some());
-    }
-
-    #[test]
-    fn program_completion_then_root_yields() {
-        let (mut tree, mut state) = setup();
-        user_post(&mut state, &mut tree, "go");
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::LlmResponse(llm_program(
-                    "c1",
-                    "console.log(\"hi there\"); return 6 * 7;",
-                )),
-            )
-            .unwrap();
-        let settled = drain(&mut state, &mut tree, out);
-
-        // Completion report is the tool result; the next request follows.
-        let report = last_report(&state, &tree);
-        assert!(report.contains("returned: 42"), "{report}");
-        assert!(report.contains("hi there"), "{report}");
-        let req = expect_request(&settled);
-        assert!(matches!(req.messages.last(), Some(Rendered::Tool { .. })));
-
-        // A final bare text turn answers nothing (18_TARGETING) and the
-        // branch goes idle, ready for the next turn.
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::LlmResponse(llm_text("the answer is 42")),
-            )
-            .unwrap();
-        assert!(
-            matches!(&out[..], [StepOutput::Answered { question: None, value }]
-                     if value == &json!("the answer is 42")),
-            "{out:?}"
-        );
-        assert!(state.is_idle());
-        assert_eq!(
-            state.open(),
-            [EventId::new(2)],
-            "the user's post stays owed"
-        );
-        assert_eq!(
-            payload_kinds(&state, &tree),
-            ["Agent", "Post", "Turn", "Return", "Console", "Turn"]
-        );
-
-        // A follow-up turn appends onto the same spine and runs again.
-        user_post(&mut state, &mut tree, "more");
-        assert!(matches!(payload_kinds(&state, &tree).last(), Some(&"Post")));
-    }
-
-    #[test]
-    fn fanout_batch_and_resolution_order() {
-        let (mut tree, mut state) = setup();
-        state.kickoff(&mut tree).unwrap();
-        let src = r#"
-            const a = tools.fetch("x");
-            const b = tools.fetch("y");
-            return [await a, await b];
-        "#;
-        let out = state
-            .step(&mut tree, StepInput::LlmResponse(llm_program("c1", src)))
-            .unwrap();
-        let settled = drain(&mut state, &mut tree, out);
-        let calls = expect_tool_calls(&settled);
-        assert_eq!(calls.len(), 2, "one fan-out batch");
-        assert_eq!(calls[0].args, json!(["x"]));
-        assert_eq!(calls[1].args, json!(["y"]));
-
-        // Resolve out of order: y first. Resolution order is what's logged.
-        let (xa, yb) = (calls[0].call, calls[1].call);
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::ToolResults(vec![ToolResult {
-                    call: yb,
-                    result: Ok(json!("Y")),
-                }]),
-            )
-            .unwrap();
-        drain(&mut state, &mut tree, out); // still blocked on `a`
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::ToolResults(vec![ToolResult {
-                    call: xa,
-                    result: Ok(json!("X")),
-                }]),
-            )
-            .unwrap();
-        drain(&mut state, &mut tree, out);
-
-        assert!(last_report(&state, &tree).contains(r#"returned: ["X","Y"]"#));
-        // Calls are logged at dispatch, in the program's issue order…
-        let issued: Vec<serde_json::Value> = state
-            .agent_segment(&tree)
-            .iter()
-            .filter_map(|e| match &e.payload {
-                EventPayload::Call(Call::Invoke { args, .. }) => Some(args.clone()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(issued, vec![json!(["x"]), json!(["y"])], "issue order");
-        // …and their `Result`s in resolution order, which is arrival order.
-        let settled: Vec<serde_json::Value> = state
-            .agent_segment(&tree)
-            .iter()
-            .filter_map(|e| match &e.payload {
-                EventPayload::Result { outcome, .. } => outcome.value().cloned(),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            settled,
-            vec![json!("Y"), json!("X")],
-            "results logged in resolution order"
-        );
-    }
-
-    #[test]
-    fn compile_error_is_a_repair_loop() {
-        let (mut tree, mut state) = setup();
-        state.kickoff(&mut tree).unwrap();
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::LlmResponse(llm_program("c1", "let = ;")),
-            )
-            .unwrap();
-        // No Working: nothing ran.
-        assert!(!out.iter().any(|o| matches!(o, StepOutput::Working)));
-        let req = expect_request(&out);
-        assert_eq!(tool_names(req), CONSTANT_TOOLS);
-        assert!(last_report(&state, &tree).contains("compile error"));
-        // No VM was built, so this run has no console and no artifacts —
-        // the diagnostic alone, as its one outcome.
-        assert_eq!(payload_kinds(&state, &tree), ["Agent", "Turn", "Condition"]);
-    }
-
-    #[test]
-    fn raise_reports_and_resume_continues() {
-        let (mut tree, mut state) = setup();
-        state.kickoff(&mut tree).unwrap();
-        let src = r#"
-            const x = await tools.fetch("a");
-            raise("need_help", { got: x });
-            return x + 1;
-        "#;
-        let out = state
-            .step(&mut tree, StepInput::LlmResponse(llm_program("c1", src)))
-            .unwrap();
-        let settled = drain(&mut state, &mut tree, out);
-        let id = expect_tool_calls(&settled)[0].call;
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::ToolResults(vec![ToolResult {
-                    call: id,
-                    result: Ok(json!(41)),
-                }]),
-            )
-            .unwrap();
-        let settled = drain(&mut state, &mut tree, out);
-
-        // Suspended: report + restart tools (full definitions).
-        let req = expect_request(&settled);
-        assert_eq!(tool_names(req), CONSTANT_TOOLS);
-        assert!(req.tools[1].parameters["properties"]["value"].is_object());
-        let report = last_report(&state, &tree);
-        assert!(report.contains("condition `need_help`"), "{report}");
-        assert!(report.contains(r#"{"got":41}"#), "{report}");
-        assert!(
-            report.contains("fetch"),
-            "artifact menu lists the call: {report}"
-        );
-        assert!(report.contains("resume(value)"), "{report}");
-
-        // Resume: same VM continues.
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::LlmResponse(llm_resume("c2", json!(null))),
-            )
-            .unwrap();
-        drain(&mut state, &mut tree, out);
-        assert!(last_report(&state, &tree).contains("returned: 42"));
-    }
-
-    #[test]
-    fn trapped_type_error_resumes_with_value() {
-        let (mut tree, mut state) = setup();
-        state.kickoff(&mut tree).unwrap();
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::LlmResponse(llm_program("c1", "const v = null; return v.x;")),
-            )
-            .unwrap();
-        let settled = drain(&mut state, &mut tree, out);
-        let req = expect_request(&settled);
-        assert_eq!(tool_names(req), CONSTANT_TOOLS);
-
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::LlmResponse(llm_resume("c2", json!(42))),
-            )
-            .unwrap();
-        drain(&mut state, &mut tree, out);
-        assert!(last_report(&state, &tree).contains("returned: 42"));
-    }
-
-    #[test]
-    fn rewrite_reuses_artifact_from_the_log() {
-        let (mut tree, mut state) = setup();
-        state.kickoff(&mut tree).unwrap();
-        let src = r#"
-            const a = await tools.fetch("expensive");
-            raise("stop", null);
-        "#;
-        let out = state
-            .step(&mut tree, StepInput::LlmResponse(llm_program("c1", src)))
-            .unwrap();
-        let settled = drain(&mut state, &mut tree, out);
-        let id = expect_tool_calls(&settled)[0].call;
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::ToolResults(vec![ToolResult {
-                    call: id,
-                    result: Ok(json!("DATA")),
-                }]),
-            )
-            .unwrap();
-        drain(&mut state, &mut tree, out); // suspended on the raise
-
-        // Find the logged call's id from the report's menu — the menu
-        // names calls, and `tool_result` resolves one to its `Result`.
-        let artifact_id = state
-            .agent_segment(&tree)
-            .iter()
-            .find_map(|e| match &e.payload {
-                EventPayload::Call(_) => Some(e.id.as_u64()),
-                _ => None,
-            })
-            .unwrap();
-
-        // Rewrite: fetch the artifact instead of repeating the call.
-        let rewrite = format!("return await tools.tool_result({artifact_id});");
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::LlmResponse(llm_program("c2", &rewrite)),
-            )
-            .unwrap();
-        let settled = drain(&mut state, &mut tree, out);
-
-        // Served from the log: no ToolCalls went out.
-        assert!(
-            !settled
-                .iter()
-                .any(|o| matches!(o, StepOutput::ToolCalls(_))),
-            "{settled:?}"
-        );
-        assert!(last_report(&state, &tree).contains(r#"returned: "DATA""#));
-    }
-
-    /// `tools.agent` is sugar for spawn **then** ask (B1): two logged
-    /// calls, one program promise. The `Spawn`'s `{ agent }` is not the
-    /// answer, so the `Send` issued when it lands is what settles the
-    /// program — and the caller's own report is rendered around its
-    /// `return`.
-    #[test]
-    fn agent_call_desugars_to_spawn_then_ask() {
-        let (mut tree, mut state) = setup();
-        state.kickoff(&mut tree).unwrap();
-        let src = r#"return await tools.agent({ prompt: "summarize", input: { n: 1 } });"#;
-        let out = state
-            .step(&mut tree, StepInput::LlmResponse(llm_program("c1", src)))
-            .unwrap();
-        let settled = drain(&mut state, &mut tree, out);
-        let spawn = *settled
-            .iter()
-            .find_map(|o| match o {
-                StepOutput::Spawns(s) => Some(&s[0].call),
-                _ => None,
-            })
-            .expect("a Spawns output");
-        let EventPayload::Call(Call::Spawn { charter, .. }) = &tree.events[&spawn].payload else {
-            panic!("#{} must be a Spawn", spawn.as_u64());
-        };
-        assert_eq!(charter, "summarize", "the prompt is the child's charter");
-
-        // Host side: root the agent under the `Spawn` and settle it.
-        let mut child =
-            Runner::new_agent(&mut tree, spawn, None, "summarize", None, None, "").unwrap();
-        assert_eq!(tree.list_leaves().len(), 2, "caller + the new agent");
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::ToolResults(vec![ToolResult {
-                    call: spawn,
-                    result: Ok(json!({ "agent": child.agent_id().as_u64() })),
-                }]),
-            )
-            .unwrap();
-
-        // …which makes the machine issue the first question, not resolve
-        // the program: the `{ agent }` handle never reaches the source.
-        let send = match &out[..] {
-            [StepOutput::Sends(sends)] => sends[0],
-            other => panic!("expected Sends, got {other:?}"),
-        };
-        let EventPayload::Call(Call::Send {
-            to, text, input, ..
-        }) = &tree.events[&send].payload
-        else {
-            panic!("#{} must be a Send", send.as_u64());
-        };
-        assert_eq!(*to, Address::Branch(child.agent_id()));
-        assert_eq!(text, "summarize");
-        assert_eq!(*input, json!({ "n": 1 }));
-
-        // Deliver it, let the child answer, settle the `Send`.
-        let (_, out) = child
-            .deliver(
-                &mut tree,
-                Author::Agent(state.agent_id()),
-                Origin::Sent(send),
-            )
-            .unwrap();
-        let Rendered::User(rendered) = &expect_request(&out).messages[0] else {
-            panic!("the question renders as a user-role post");
-        };
-        assert!(rendered.contains("[agent 1] summarize"), "{rendered}");
-        let out = child
-            .step(&mut tree, StepInput::LlmResponse(llm_text("child says hi")))
-            .unwrap();
-        let result = match &out[..] {
-            [StepOutput::Answered { value, .. }] => value.clone(),
-            other => panic!("expected Answered, got {other:?}"),
-        };
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::ToolResults(vec![ToolResult {
-                    call: send,
-                    result: Ok(result),
-                }]),
-            )
-            .unwrap();
-        drain(&mut state, &mut tree, out);
-        assert!(last_report(&state, &tree).contains(r#"returned: "child says hi""#));
-    }
-
-    #[test]
-    fn hot_loop_yields_per_tick() {
-        let (mut tree, mut state) = setup();
-        state.kickoff(&mut tree).unwrap();
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::LlmResponse(llm_program("c1", "while (true) {}")),
-            )
-            .unwrap();
-        assert!(matches!(&out[..], [StepOutput::Working]));
-        for _ in 0..3 {
-            let out = state
-                .step(&mut tree, StepInput::Tick { fuel: 10_000 })
-                .unwrap();
-            assert!(
-                matches!(&out[..], [StepOutput::Working]),
-                "a hot loop keeps yielding, never blocks"
-            );
-        }
-    }
-
-    // ── outcomes and derived reports (A4) ───────────────────────────
-
-    /// Every outcome event on a branch, in log order.
-    fn outcomes(state: &Runner, tree: &Tree) -> Vec<EventId> {
-        state
-            .agent_segment(tree)
-            .iter()
-            .filter(|e| {
-                matches!(
-                    e.payload,
-                    EventPayload::Return { .. } | EventPayload::Condition { .. }
-                )
-            })
-            .map(|e| e.id)
-            .collect()
-    }
-
-    /// Exactly one outcome per **handback**, not per run: a single
-    /// `run_program` that raises, is resumed, traps, is resumed again and
-    /// finally returns logs four, with `Return` only on the last.
-    #[test]
-    fn one_outcome_per_handback_not_per_run() {
-        let (mut tree, mut state) = setup();
-        state.kickoff(&mut tree).unwrap();
-        // resume #1 lands 1 → `x` is 1; resume #2 stands in for the
-        // failed property read with 41, so the program returns 42.
-        let src = r#"
-            const x = raise("need", null);
-            const bad = null;
-            return bad.missing + x + 40;
-        "#;
-        let out = state
-            .step(&mut tree, StepInput::LlmResponse(llm_program("c1", src)))
-            .unwrap();
-        drain(&mut state, &mut tree, out); // handback 1: raised
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::LlmResponse(llm_resume("c2", json!(1))),
-            )
-            .unwrap();
-        drain(&mut state, &mut tree, out); // handback 2: trapped
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::LlmResponse(llm_resume("c3", json!(1))),
-            )
-            .unwrap();
-        drain(&mut state, &mut tree, out); // handback 3: returned
-
-        let kinds: Vec<&'static str> = outcomes(&state, &tree)
-            .iter()
-            .map(|id| match &tree.events[id].payload {
-                EventPayload::Return { .. } => "Return",
-                EventPayload::Condition {
-                    cause: Cause::Raised { .. },
-                    ..
-                } => "raised",
-                EventPayload::Condition {
-                    cause: Cause::Trapped { .. },
-                    ..
-                } => "trapped",
-                _ => "other",
-            })
-            .collect();
-        assert_eq!(kinds, ["raised", "trapped", "Return"], "{kinds:?}");
-        assert!(last_report(&state, &tree).contains("returned: 42"));
-    }
-
-    /// Every tool call gets exactly one outcome event — including one
-    /// that never ran. Without that, a refusal's tool message would have
-    /// to be rebuilt by replaying eligibility to that path position.
-    /// An `answer` **is** a tool call, so the API needs it replied to.
-    /// Its outcome is the `Answer` it logs, and the request pairs the two
-    /// — without which the next request carries a dangling
-    /// `tool_call_id` and is rejected outright (the M2 400).
-    #[test]
-    fn an_answer_call_is_replied_to_like_any_other() {
-        let (mut tree, mut state) = setup();
-        let out = user_post(&mut state, &mut tree, "which one?");
-        let question = state.open()[0];
-        drain(&mut state, &mut tree, out);
-
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::LlmResponse(llm_answer("a1", question, json!("the second"))),
-            )
-            .unwrap();
-        let req = expect_request(&out);
-        // Every assistant tool call in the request is answered.
-        let calls: usize = req
-            .messages
-            .iter()
-            .filter_map(|m| match m {
-                Rendered::Assistant { tool_calls, .. } => Some(tool_calls.len()),
-                _ => None,
-            })
-            .sum();
-        let replies: Vec<(&str, &str)> = req
-            .messages
-            .iter()
-            .filter_map(|m| match m {
-                Rendered::Tool { call_id, text } => Some((call_id.as_str(), text.as_str())),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(calls, replies.len(), "{:?}", req.messages);
-        assert_eq!(replies.len(), 1);
-        assert_eq!(replies[0].0, "a1");
-        assert!(replies[0].1.starts_with("## answered"), "{}", replies[0].1);
-        assert!(
-            replies[0].1.contains(&format!("#{}", question.as_u64())),
-            "{}",
-            replies[0].1
-        );
-    }
-
-    #[test]
-    fn every_tool_call_has_an_outcome_event() {
-        let (mut tree, mut state) = setup();
-        state.kickoff(&mut tree).unwrap();
-
-        // A `resume` with nothing suspended: refused, and the refusal is
-        // the call's outcome.
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::LlmResponse(llm_resume("c1", json!(1))),
-            )
-            .unwrap();
-        drain(&mut state, &mut tree, out);
-        // A run that compiles and returns.
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::LlmResponse(llm_program("c2", "return 1;")),
-            )
-            .unwrap();
-        drain(&mut state, &mut tree, out);
-        // A run that does not compile.
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::LlmResponse(llm_program("c3", "let = ;")),
-            )
-            .unwrap();
-        drain(&mut state, &mut tree, out);
-
-        // One outcome per turn, and the request answers every call id.
-        let leaf = state.spine.leaf_id;
-        for event in state.agent_segment(&tree) {
-            let EventPayload::Message(Message::Turn { tool_calls, .. }) = &event.payload else {
-                continue;
-            };
-            assert_eq!(
-                crate::report::outcomes_of_turn(&tree, leaf, event.id).len(),
-                tool_calls.len(),
-                "each call gets exactly one outcome"
-            );
-        }
-        let StepOutput::LlmRequest(req) = state.render_request(&tree) else {
-            panic!("expected a request");
-        };
-        let answered: Vec<&str> = req
-            .messages
-            .iter()
-            .filter_map(|m| match m {
-                Rendered::Tool { call_id, .. } => Some(call_id.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(answered, ["c1", "c2", "c3"]);
-    }
-
-    /// A report renders identically forever **for a given renderer**: the
-    /// same log rendered twice is byte-identical, because every input the
-    /// report needs is in the log and nothing decorates it with a fact
-    /// that was true at the time and logged nowhere.
-    #[test]
-    fn derived_reports_are_stable_for_a_renderer() {
-        let (mut tree, mut state) = setup();
-        state.kickoff(&mut tree).unwrap();
-        let src = "const a = await tools.fetch(\"x\");\nconsole.log(a);\nreturn a;";
-        let out = state
-            .step(&mut tree, StepInput::LlmResponse(llm_program("c1", src)))
-            .unwrap();
-        let settled = drain(&mut state, &mut tree, out);
-        let id = expect_tool_calls(&settled)[0].call;
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::ToolResults(vec![ToolResult {
-                    call: id,
-                    result: Ok(json!("X")),
-                }]),
-            )
-            .unwrap();
-        drain(&mut state, &mut tree, out);
-
-        let first = state.render_messages(&tree);
-        tree.clear_report_memo();
-        let second = state.render_messages(&tree);
-        assert_eq!(first, second, "the same log renders the same bytes");
-        assert!(
-            first
-                .iter()
-                .any(|m| matches!(m, Rendered::Tool { text, .. } if text.contains("returned:"))),
-            "{first:?}"
-        );
-    }
-
-    /// Reports are derived, so without a memo every request re-derives
-    /// every report on the path and a session is quadratic in branch
-    /// length. With one, re-derivation is amortised O(1).
-    #[test]
-    fn report_memo_avoids_rederiving_history() {
-        let (mut tree, mut state) = setup();
-        state.kickoff(&mut tree).unwrap();
-        for (n, id) in ["c1", "c2", "c3"].into_iter().enumerate() {
-            let out = state
-                .step(
-                    &mut tree,
-                    StepInput::LlmResponse(llm_program(id, &format!("return {n};"))),
-                )
-                .unwrap();
-            drain(&mut state, &mut tree, out);
-        }
-        // Three runs, so three reports were derived — once each, even
-        // though each request re-rendered the whole path.
-        assert_eq!(tree.report_derivations(), 3);
-
-        let before = tree.report_derivations();
-        state.render_messages(&tree);
-        state.render_messages(&tree);
-        assert_eq!(
-            tree.report_derivations(),
-            before,
-            "history is served from the memo, not re-derived"
-        );
-
-        // The memo is a cache of one renderer's output: dropping it makes
-        // the next render pay again, and produce the same bytes.
-        let rendered = state.render_messages(&tree);
-        tree.clear_report_memo();
-        assert_eq!(state.render_messages(&tree), rendered);
-        assert!(tree.report_derivations() > before);
-    }
-
-    /// The console is a diagnostic stream, not data: it is capped with an
-    /// explicit marker rather than silently truncated, and the program's
-    /// own `return` is the channel for anything that must survive whole.
-    #[test]
-    fn oversized_console_is_capped_and_marked() {
-        let lines: Vec<String> = (0..crate::report::CONSOLE_MAX_LINES + 500)
-            .map(|i| format!("line {i}"))
-            .collect();
-        let capped = crate::report::cap_console(&lines, "console event follows #9");
-        assert!(capped.len() <= crate::report::CONSOLE_MAX_LINES + 1);
-        assert!(capped[0].contains("console truncated"), "{}", capped[0]);
-        assert!(
-            capped[0].contains("500 earlier lines dropped"),
-            "{}",
-            capped[0]
-        );
-        assert!(capped[0].contains("#9"), "the marker names the event");
-        // The tail is what is kept — the latest output before the stop.
-        assert_eq!(capped.last().unwrap(), "line 2499");
-
-        // A byte-heavy console is capped too, by the same marker.
-        let fat: Vec<String> = (0..40).map(|_| "z".repeat(10_000)).collect();
-        let capped = crate::report::cap_console(&fat, "x");
-        let bytes: usize = capped.iter().skip(1).map(|l| l.len()).sum();
-        assert!(bytes <= crate::report::CONSOLE_MAX_BYTES);
-        assert!(capped[0].contains("console truncated"));
-    }
-
-    // ── golden renders (8_HARNESS Step 4) ───────────────────────────
-    //
-    // Exact full-string asserts: the reports are a prompt-engineering
-    // artifact, so format changes should be deliberate diffs here, not
-    // incidental. Driven through the real machine (real event ids,
-    // real console output).
-
-    #[test]
-    fn golden_condition_report_raise_with_payload() {
-        let (mut tree, mut state) = setup();
-        state.kickoff(&mut tree).unwrap();
-        let src = "const x = await tools.fetch(\"a\");\nconsole.log(\"fetched: \" + x);\nraise(\"need_help\", { got: x });\nreturn x + 1;";
-        let out = state
-            .step(&mut tree, StepInput::LlmResponse(llm_program("c1", src)))
-            .unwrap();
-        let settled = drain(&mut state, &mut tree, out);
-        let id = expect_tool_calls(&settled)[0].call;
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::ToolResults(vec![ToolResult {
-                    call: id,
-                    result: Ok(json!(41)),
-                }]),
-            )
-            .unwrap();
-        drain(&mut state, &mut tree, out);
-        assert_eq!(
-            last_report(&state, &tree),
-            r#"## what happened
-3:1: condition `need_help` raised
-raise("need_help", { got: x });
-^
-payload: {"got":41}
-
-## where
-in <root>
-console (last 1 of 1 lines):
-fetched: 41
-
-## new artifacts — fetch with tools.tool_result(id)
-[#3] fetch(["a"]) → 41
-
-## restarts
-- resume(value): continue past the raise; `value` becomes the result of the raise(...) expression
-- run_program(source)"#
-        );
-    }
-
-    #[test]
-    fn golden_condition_report_trapped_type_error() {
-        let (mut tree, mut state) = setup();
-        state.kickoff(&mut tree).unwrap();
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::LlmResponse(llm_program("c1", "const v = null;\nreturn v.x;")),
-            )
-            .unwrap();
-        drain(&mut state, &mut tree, out);
-        assert_eq!(
-            last_report(&state, &tree),
-            r#"## what happened
-2:10: cannot read property 'x' on null
-return v.x;
-         ^
-
-## where
-in <root>
-console: (no output)
-
-## new artifacts — fetch with tools.tool_result(id)
-(none)
-
-## restarts
-- resume(value): continue as if the failed operation had produced `value`
-- run_program(source)"#
-        );
-    }
-
-    /// **An open question is not a fact about this handback.** The
-    /// report says what is eligible for *this suspension* and nothing
-    /// else; what the branch still owes rides the trailing ephemeral
-    /// line, where it is always exactly one list and always current.
-    ///
-    /// This used to pin an `answer(#2, value)` line in the report. It
-    /// pins the same fact, in the place a now-fact may live.
-    #[test]
-    fn golden_condition_report_with_an_open_question() {
-        let (mut tree, mut state) = setup();
-        user_post(&mut state, &mut tree, "how many lines?");
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::LlmResponse(llm_program("c1", "raise(\"need_path\", null);")),
-            )
-            .unwrap();
-        let settled = drain(&mut state, &mut tree, out);
-        assert_eq!(
-            last_report(&state, &tree),
-            r#"## what happened
-1:1: condition `need_path` raised
-raise("need_path", null);
-^
-payload: null
-
-## where
-in <root>
-console: (no output)
-
-## new artifacts — fetch with tools.tool_result(id)
-(none)
-
-## restarts
-- resume(value): continue past the raise; `value` becomes the result of the raise(...) expression
-- run_program(source)"#
-        );
-        // The obligation is in the trailing line instead, named by id and
-        // with the batching rule stated where the model will act on it.
-        let tail = expect_request(&settled)
-            .tail
-            .clone()
-            .expect("the tail always carries at least presence");
-        assert!(
-            tail.contains("1 question is open on this branch: #2 (the user)"),
-            "{tail}"
-        );
-        assert!(
-            tail.contains("A post from an agent means that agent's program is suspended"),
-            "{tail}"
-        );
-        assert!(
-            tail.contains("Several answer calls may ride one turn"),
-            "{tail}"
-        );
-    }
-
-    #[test]
-    fn golden_completion_report() {
-        let (mut tree, mut state) = setup();
-        state.kickoff(&mut tree).unwrap();
-        let src = "const a = await tools.fetch(\"x\");\nconsole.log(\"got \" + a);\nreturn [a, 2];";
-        let out = state
-            .step(&mut tree, StepInput::LlmResponse(llm_program("c1", src)))
-            .unwrap();
-        let settled = drain(&mut state, &mut tree, out);
-        let id = expect_tool_calls(&settled)[0].call;
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::ToolResults(vec![ToolResult {
-                    call: id,
-                    result: Ok(json!("X")),
-                }]),
-            )
-            .unwrap();
-        drain(&mut state, &mut tree, out);
-        assert_eq!(
-            last_report(&state, &tree),
-            r#"## program completed
-returned: ["X",2]
-
-console (last 1 of 1 lines):
-got X
-
-## new artifacts — fetch with tools.tool_result(id)
-[#3] fetch(["x"]) → "X"
-[#5] program result → ["X",2]"#
-        );
-    }
-
-    /// A post to a **running** branch is logged on arrival and is never
-    /// rejected: nothing you say is lost. It asks for a fuel slice rather
-    /// than a request, because a running branch hears a post as a
-    /// condition (rule B) and not as a second prompt.
-    /// (Re-pointed from the M2-era test that pinned the panic.)
-    #[test]
-    fn mid_program_post_is_logged_not_rejected() {
-        let (mut tree, mut state) = setup();
-        state.kickoff(&mut tree).unwrap();
-        state
-            .step(
-                &mut tree,
-                StepInput::LlmResponse(llm_program("c1", "await tools.fetch(1); return 0;")),
-            )
-            .unwrap();
-        let out = user_post(&mut state, &mut tree, "are you done?");
-        assert!(
-            matches!(&out[..], [StepOutput::Working]),
-            "a slice, not a request — the VM holds the branch: {out:?}"
-        );
-        assert_eq!(
-            payload_kinds(&state, &tree).last(),
-            Some(&"Post"),
-            "logged on arrival, at the position it landed"
-        );
-        assert_eq!(
-            state.open().len(),
-            1,
-            "and it is open — someone owes a reply"
-        );
-    }
-
-    fn program_result_value(state: &Runner, tree: &Tree) -> serde_json::Value {
-        state
-            .agent_segment(tree)
-            .iter()
-            .find_map(|e| match &e.payload {
-                EventPayload::Return { value } => Some(value.clone()),
-                _ => None,
-            })
-            .expect("a ProgramResult")
-    }
-
-    #[test]
-    fn program_return_is_delivered_up_to_budget() {
-        let (mut tree, mut state) = setup();
-        state.kickoff(&mut tree).unwrap();
-        // A moderate return (well under the 64 KB answer budget) is
-        // delivered in full and logged in full — the read/summarize happy
-        // path that the old 4 KB reject broke (12_ANSWERS).
-        let src = "return \"x\".repeat(5000);";
-        let out = state
-            .step(&mut tree, StepInput::LlmResponse(llm_program("c1", src)))
-            .unwrap();
-        drain(&mut state, &mut tree, out);
-        let report = last_report(&state, &tree);
-        assert!(report.contains(&"x".repeat(5000)), "delivered in full");
-        assert!(!report.contains("tools.tool_result(#"), "no spill marker");
-        assert_eq!(
-            program_result_value(&state, &tree).as_str().unwrap().len(),
-            5000,
-            "full value logged"
-        );
-    }
-
-    #[test]
-    fn over_budget_return_truncates_with_fetch_id() {
-        let (mut tree, mut state) = setup();
-        state.kickoff(&mut tree).unwrap();
-        // Force a tiny budget so a modest return is over it deterministically
-        // (the VM caps `String.repeat` at 10 KB, well under the default).
-        state.answer_budget = 100;
-        let src = "return \"x\".repeat(5000);";
-        let out = state
-            .step(&mut tree, StepInput::LlmResponse(llm_program("c1", src)))
-            .unwrap();
-        drain(&mut state, &mut tree, out);
-        let report = last_report(&state, &tree);
-        // The returned-value line is truncated with a marker naming the id.
-        let returned = report.lines().nth(1).unwrap();
-        assert!(
-            returned.contains("tools.tool_result(#"),
-            "spill marker on returned line: {returned}"
-        );
-        // The full value is logged for fetching.
-        assert_eq!(
-            program_result_value(&state, &tree).as_str().unwrap().len(),
-            5000,
-            "full value logged"
-        );
-    }
-
-    #[test]
-    /// **Budget is a rendering rule.** An over-budget answer is stored
-    /// whole and delivered whole to the asking program; only a *context*
-    /// copy of it clips, and the clip names the id the rest is behind.
-    ///
-    /// (Re-pointed from the M-era test that asserted a "tighten it"
-    /// re-prompt and a stored-truncated value. Both are deleted: the
-    /// re-prompt spent an LLM turn making the log less faithful than the
-    /// report, and the truncation made the *stored* value the lossy one.)
-    fn over_budget_answer_is_stored_whole_and_rendered_clipped() {
-        let (mut tree, mut root) = setup();
-        let (mut child, _) = spawn_and_ask(&mut tree, &mut root, "summarize", json!({}));
-        child.answer_budget = 50;
-        let long = "y".repeat(500);
-        // A bare turn answers nothing (18_TARGETING); the child names its
-        // own open post explicitly.
-        let question = child.open()[0];
-        let out = child
-            .step(
-                &mut tree,
-                StepInput::LlmResponse(llm_answer("a1", question, json!(long))),
-            )
-            .unwrap();
-        // An answers-only turn is not terminal — it always forces one
-        // more request too (the API still needs a reply to that tool
-        // call) — so the `Answered` rides alongside a fresh `LlmRequest`.
-        let result = match out.first() {
-            Some(StepOutput::Answered {
-                question: Some(q),
-                value,
-            }) if *q == question => value.clone(),
-            other => panic!("answered in one turn, with no nudge: {other:?}"),
-        };
-        assert!(
-            matches!(out.get(1), Some(StepOutput::LlmRequest(_))),
-            "the answers-only turn forces a reprompt: {out:?}"
-        );
-        assert_eq!(out.len(), 2, "{out:?}");
-        // Delivered whole — the asking *program* gets the value, and a
-        // program has no context to protect.
-        assert_eq!(result.as_str().unwrap().len(), 500);
-        // Stored whole, exactly once.
-        let stored: Vec<usize> = tree
-            .events
-            .values()
-            .filter_map(|e| match &e.payload {
-                EventPayload::Answer { value, .. } => Some(value.as_str().unwrap().len()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(stored, [500]);
-        // Nothing was re-prompted: no harness nudge on the child's spine.
-        assert!(
-            !child.spine.context().messages.iter().any(|m| matches!(
-                m,
-                Message::Post {
-                    from: Author::Harness,
-                    ..
-                }
-            )),
-            "the tighten-it re-prompt is gone"
-        );
-        // …and a *rendered* copy clips to the budget, naming its id.
-        let clipped = crate::report::clip_answer(&long, child.answer_budget, Some(7));
-        assert!(clipped.len() < long.len());
-        assert!(clipped.contains("tools.tool_result(#7)"), "{clipped}");
-    }
-
-    /// A large return is stored **exactly once** — because reports are
-    /// derived, the clipped copy the model read was never a second stored
-    /// thing that could drift from it.
-    #[test]
-    fn log_holds_the_returned_value_once() {
-        let (mut tree, mut state) = setup();
-        state.answer_budget = 200; // a budget the value exceeds
-        state.kickoff(&mut tree).unwrap();
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::LlmResponse(llm_program("c1", r#"return "z".repeat(5000);"#)),
-            )
-            .unwrap();
-        drain(&mut state, &mut tree, out);
-        let holders: Vec<&'static str> = tree
-            .events
-            .values()
-            .filter(|e| {
-                serde_json::to_string(&e.payload)
-                    .map(|s| s.matches("zzzzzzzzzz").count() > 100)
-                    .unwrap_or(false)
-            })
-            .map(|e| match &e.payload {
-                EventPayload::Return { .. } => "Return",
-                EventPayload::Message(_) => "Message",
-                _ => "other",
-            })
-            .collect();
-        assert_eq!(holders, ["Return"], "one holder, and it is the return");
-        // The report clips it and names that `Return`.
-        let report = last_report(&state, &tree);
-        let returned = report.lines().find(|l| l.starts_with("returned:")).unwrap();
-        assert!(returned.len() < 5000, "clipped at render time");
-        assert!(returned.contains("tools.tool_result(#"), "{returned}");
-    }
-
-    /// A clipped console tail names its `Console` event, and
-    /// `tools.tool_result` reads that event's lines. It was the one
-    /// truncation in the system with no way back to the whole.
-    #[test]
-    fn clipped_console_is_fetchable_by_id() {
-        let (mut tree, mut state) = setup();
-        state.kickoff(&mut tree).unwrap();
-        let src = "for (let i = 0; i < 40; i = i + 1) { console.log(\"line \" + i); }\nreturn 0;";
-        let out = state
-            .step(&mut tree, StepInput::LlmResponse(llm_program("c1", src)))
-            .unwrap();
-        drain(&mut state, &mut tree, out);
-
-        let console = tree
-            .path_events(state.spine.leaf_id)
-            .iter()
-            .rev()
-            .find(|e| matches!(e.payload, EventPayload::Console { .. }))
-            .map(|e| e.id)
-            .expect("a Console event");
-        let report = last_report(&state, &tree);
-        assert!(
-            report.contains(&format!(
-                "console (last 20 of 40 lines — tools.tool_result({}) for all of them):",
-                console.as_u64()
-            )),
-            "the clip names its id: {report}"
-        );
-        assert!(!report.contains("line 0\n"), "the tail really is clipped");
-
-        // And that id fetches all forty lines.
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::LlmResponse(llm_program(
-                    "c2",
-                    &format!(
-                        "const lines = await tools.tool_result({});\nreturn lines.length;",
-                        console.as_u64()
-                    ),
-                )),
-            )
-            .unwrap();
-        drain(&mut state, &mut tree, out);
-        assert!(
-            last_report(&state, &tree).contains("returned: 40"),
-            "{}",
-            last_report(&state, &tree)
-        );
-    }
-
-    /// A `Failed` result **rejects the program's promise**, and that is
-    /// where the handler hierarchy starts: the program may `catch` it and
-    /// carry on (the innermost layer), and only an **uncaught** rejection
-    /// reaches top level and traps into `Condition{Trapped}`. So a tool
-    /// failure is a value first and a condition only if the program
-    /// declines to handle it.
-    #[test]
-    fn failed_call_rejects_then_traps_only_if_uncaught() {
-        // Caught: no condition at all, and the failure is still logged.
-        let (mut tree, mut state) = setup();
-        state.kickoff(&mut tree).unwrap();
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::LlmResponse(llm_program(
-                    "c1",
-                    r#"try { await tools.fetch("x"); return "unreachable"; }
-                       catch (e) { return "handled: " + e; }"#,
-                )),
-            )
-            .unwrap();
-        let settled = drain(&mut state, &mut tree, out);
-        let call = expect_tool_calls(&settled)[0].call;
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::ToolResults(vec![ToolResult {
-                    call,
-                    result: Err("no such host".into()),
-                }]),
-            )
-            .unwrap();
-        drain(&mut state, &mut tree, out);
-        assert!(
-            last_report(&state, &tree).contains("handled: no such host"),
-            "{}",
-            last_report(&state, &tree)
-        );
-        assert!(
-            !payload_kinds(&state, &tree).contains(&"Condition"),
-            "a caught failure leaves no condition: {:?}",
-            payload_kinds(&state, &tree)
-        );
-        // The fact is in the log either way — its `Result` carries it.
-        assert!(
-            tree.events.values().any(|e| matches!(
-                &e.payload,
-                EventPayload::Result { outcome: Outcome::Failed(msg), .. }
-                if msg == "no such host"
-            )),
-            "the failure is a logged value"
-        );
-
-        // Uncaught: the same rejection reaches top level and traps.
-        let (mut tree, mut state) = setup();
-        state.kickoff(&mut tree).unwrap();
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::LlmResponse(llm_program("c1", r#"return await tools.fetch("x");"#)),
-            )
-            .unwrap();
-        let settled = drain(&mut state, &mut tree, out);
-        let call = expect_tool_calls(&settled)[0].call;
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::ToolResults(vec![ToolResult {
-                    call,
-                    result: Err("no such host".into()),
-                }]),
-            )
-            .unwrap();
-        drain(&mut state, &mut tree, out);
-        let trapped = tree
-            .path_events(state.spine.leaf_id)
-            .iter()
-            .rev()
-            .find_map(|e| match &e.payload {
-                EventPayload::Condition { cause, .. } => Some(cause.clone()),
-                _ => None,
-            })
-            .expect("an uncaught rejection traps");
-        assert!(
-            matches!(trapped, Cause::Trapped { .. }),
-            "traps as a condition, not as a substituted value: {trapped:?}"
-        );
-    }
-
-    /// The oversized-result guard produces a **`Failed`**, not a
-    /// substituted value: a program must be able to tell "it did not
-    /// work" from "here is something smaller".
-    #[test]
-    fn oversized_result_guard_is_a_failure_not_a_substitution() {
-        let guarded =
-            crate::host::guard_size(Ok(json!("x".repeat(crate::host::MAX_RESULT_BYTES + 10))));
-        let msg = guarded.expect_err("oversized results fail");
-        assert!(msg.contains("result too large"), "{msg}");
-        assert!(msg.contains("return something smaller"), "{msg}");
-    }
-
-    /// Silent degradation is the risk "only handbacks log a condition"
-    /// leaves: a program that swallows failures and returns a thin result
-    /// would read as clean success. The fix is in the **report**, not in
-    /// a new event — it counts them and says so.
-    #[test]
-    fn completion_report_counts_failed_calls() {
-        let (mut tree, mut state) = setup();
-        state.kickoff(&mut tree).unwrap();
-        let src = r#"const rs = await Promise.allSettled(
-                       ["a", "b", "c"].map(n => tools.fetch(n)));
-                     return rs.filter(r => r.status === "fulfilled").length;"#;
-        let out = state
-            .step(&mut tree, StepInput::LlmResponse(llm_program("c1", src)))
-            .unwrap();
-        let settled = drain(&mut state, &mut tree, out);
-        let calls: Vec<EventId> = expect_tool_calls(&settled).iter().map(|c| c.call).collect();
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::ToolResults(vec![
-                    ToolResult {
-                        call: calls[0],
-                        result: Ok(json!("A")),
-                    },
-                    ToolResult {
-                        call: calls[1],
-                        result: Err("gone".into()),
-                    },
-                    ToolResult {
-                        call: calls[2],
-                        result: Err("gone".into()),
-                    },
-                ]),
-            )
-            .unwrap();
-        drain(&mut state, &mut tree, out);
-        let report = last_report(&state, &tree);
-        assert!(report.contains("returned: 1"), "a thin result: {report}");
-        assert!(
-            report.contains("2 of this run's calls came back failed"),
-            "which does not read as clean success: {report}"
-        );
-    }
-
-    /// Exactly one outcome per **handback**, and one *report* per
-    /// handback: a run that raises, traps, traps again and finally
-    /// returns renders four reports, with `Return` only on the last.
-    ///
-    /// (The plan's "raises, resumes, traps, resumes and returns → four"
-    /// miscounts: that sequence is *three* handbacks, which is what
-    /// `one_outcome_per_handback_not_per_run` already pins. Four needs a
-    /// fourth stop, so this program traps twice.)
-    #[test]
-    fn each_handback_renders_its_own_report() {
-        let (mut tree, mut state) = setup();
-        state.kickoff(&mut tree).unwrap();
-        let src = r#"
-            const x = raise("need", null);
-            const a = null;
-            const b = null;
-            return a.p + b.q + x + 40;
-        "#;
-        let out = state
-            .step(&mut tree, StepInput::LlmResponse(llm_program("c1", src)))
-            .unwrap();
-        drain(&mut state, &mut tree, out);
-        for (id, value) in [("c2", json!(1)), ("c3", json!(0)), ("c4", json!(1))] {
-            let out = state
-                .step(&mut tree, StepInput::LlmResponse(llm_resume(id, value)))
-                .unwrap();
-            drain(&mut state, &mut tree, out);
-        }
-        let outs = outcomes(&state, &tree);
-        assert_eq!(outs.len(), 4, "four handbacks: {outs:?}");
-        let reports: Vec<String> = outs
-            .iter()
-            .map(|o| crate::report::derive_report(&tree, state.spine.leaf_id, *o, 64 * 1024))
-            .collect();
-        assert!(
-            reports[0].contains("condition `need` raised"),
-            "{}",
-            reports[0]
-        );
-        assert!(
-            reports[1].contains("cannot read property 'p'"),
-            "{}",
-            reports[1]
-        );
-        assert!(
-            reports[2].contains("cannot read property 'q'"),
-            "{}",
-            reports[2]
-        );
-        assert!(reports[3].contains("returned: 42"), "{}", reports[3]);
-        assert_eq!(
-            reports.iter().filter(|r| r.contains("returned:")).count(),
-            1,
-            "`Return` only on the last"
-        );
-    }
-
-    // ── B2: the answer restart; explicit binding ────────────────────
-
-    /// **Cache discipline.** Prompt caching keys on the longest common
-    /// prefix, and the tool array is assembled into the front of it — so
-    /// a phase-varying list is a varying prefix, and a branch with N
-    /// conditions would pay 2N invalidations at the boundary this project
-    /// crosses most. All three restarts are offered always; the *report*
-    /// says which are valid.
-    ///
-    /// (Re-pointed from the M1-era test that asserted a *different* list
-    /// for idle vs suspended: the same phases are walked, and what is
-    /// asserted is that they no longer differ.)
-    #[test]
-    fn tool_schemas_are_constant_across_phases() {
-        let (mut tree, mut state) = setup();
-        let mut seen: Vec<Vec<ToolSpec>> = Vec::new();
-
-        // Idle → a request.
-        let out = user_post(&mut state, &mut tree, "go");
-        seen.push(expect_request(&out).tools.clone());
-
-        // Suspended on a raise.
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::LlmResponse(llm_program("c1", r#"raise("need", null); return 1;"#)),
-            )
-            .unwrap();
-        let settled = drain(&mut state, &mut tree, out);
-        seen.push(expect_request(&settled).tools.clone());
-
-        // Suspended on a *non*-resumable trap — the phase that used to
-        // drop `resume` from the list entirely.
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::LlmResponse(llm_program("c2", r#"throw new Error("boom");"#)),
-            )
-            .unwrap();
-        let settled = drain(&mut state, &mut tree, out);
-        seen.push(expect_request(&settled).tools.clone());
-
-        // Idle again, after a completion.
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::LlmResponse(llm_program("c3", "return 1;")),
-            )
-            .unwrap();
-        let settled = drain(&mut state, &mut tree, out);
-        seen.push(expect_request(&settled).tools.clone());
-
-        for tools in &seen {
-            assert_eq!(
-                tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
-                CONSTANT_TOOLS,
-                "the tool list never varies"
-            );
-        }
-        assert!(
-            seen.windows(2).all(|w| w[0] == w[1]),
-            "byte-identical schemas, not just the same names"
-        );
-    }
-
-    /// An ineligible restart is **answered**, not dropped: it changes no
-    /// state, logs its own outcome (so every tool call has exactly one),
-    /// and the refusal states what is true *and* what is valid now — so
-    /// the model recovers on its next turn instead of guessing twice.
-    #[test]
-    fn ineligible_restart_reports_and_recovers() {
-        let (mut tree, mut state) = setup();
-        user_post(&mut state, &mut tree, "go");
-
-        // `resume` with nothing suspended.
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::LlmResponse(llm_resume("c1", json!(1))),
-            )
-            .unwrap();
-        let report = last_report(&state, &tree);
-        assert!(report.contains("nothing is suspended"), "{report}");
-        assert!(report.contains("Valid now: run_program"), "{report}");
-        assert!(
-            report.contains(&format!("answer(#{})", state.open()[0].as_u64())),
-            "the open question is named: {report}"
-        );
-        assert!(!report.contains("resume,"), "resume is not valid: {report}");
-        // Nothing changed, and a request went back out.
-        assert!(!expect_request(&out).messages.is_empty());
-        assert_eq!(
-            payload_kinds(&state, &tree),
-            ["Agent", "Post", "Turn", "Condition"],
-            "the refusal is the call's one outcome"
-        );
-
-        // `answer` for a post that is not open.
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::LlmResponse(llm_answer("c2", EventId::new(999), json!("x"))),
-            )
-            .unwrap();
-        let report = last_report(&state, &tree);
-        assert!(report.contains("#999 is not a post"), "{report}");
-        assert!(report.contains("Valid now:"), "{report}");
-        drop(out);
-
-        // …and the branch still answers normally afterwards.
-        let question = state.open()[0];
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::LlmResponse(llm_answer("c3", question, json!({ "ok": true }))),
-            )
-            .unwrap();
-        assert!(
-            out.iter().any(|o| matches!(
-                o,
-                StepOutput::Answered { question: Some(q), .. } if *q == question
-            )),
-            "recovered in one turn: {out:?}"
-        );
-    }
-
-    /// A **non-resumable** condition and a branch reopened at a condition
-    /// whose VM did not survive are different refusals, because they are
-    /// different truths: one says no value can stand in for what failed,
-    /// the other that there is no VM left to re-enter and points at the
-    /// menu.
-    #[test]
-    fn resume_refusals_state_which_truth_it_is() {
-        // Not resumable: the VM is right there, but nothing can stand in.
-        let (mut tree, mut state) = setup();
-        state.kickoff(&mut tree).unwrap();
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::LlmResponse(llm_program("c1", r#"throw new Error("boom");"#)),
-            )
-            .unwrap();
-        drain(&mut state, &mut tree, out);
-        state
-            .step(
-                &mut tree,
-                StepInput::LlmResponse(llm_resume("c2", json!(1))),
-            )
-            .unwrap();
-        let report = last_report(&state, &tree);
-        assert!(report.contains("not resumable"), "{report}");
-        assert!(
-            report.contains("Valid now: run_program."),
-            "resume is not offered back: {report}"
-        );
-
-        // Reopened at a condition: the log says suspended, the session
-        // has no VM. Saying only "nothing is suspended" would read as a
-        // contradiction of the report the model is looking at.
-        let reopened = Runner::with_spine(&tree, tree.spine_at(state.spine.leaf_id));
-        let refusal = reopened
-            .eligible(&tree, Restart::Resume)
-            .expect_err("no VM survived");
-        assert!(
-            refusal.reason().contains("did not survive the restart"),
-            "{}",
-            refusal.reason()
-        );
-        assert!(
-            refusal.reason().contains("fetchable by id"),
-            "points at the menu: {}",
-            refusal.reason()
-        );
-    }
-
-    /// A fork inherits history, **not obligations**. `eligible` is the
-    /// only enforcement of that, and the refusal explains the rule where
-    /// it is violated — naming the branch that does owe the answer.
-    #[test]
-    fn fork_cannot_answer_a_prefork_post() {
-        let mut tree = Tree::new(None);
-        let mut original = Runner::new_root(&mut tree, "root", "").unwrap();
-        user_post(&mut original, &mut tree, "which file?");
-        let question = original.open()[0];
-
-        // A fork at the original's leaf, born idle.
-        let mut spine = tree.fork(original.spine.leaf_id).unwrap();
-        let fork_root = tree
-            .append(
-                &mut spine,
-                EventPayload::Fork {
-                    name: Some("sidebar".into()),
-                },
-            )
-            .unwrap();
-        let fork = Runner::with_spine(&tree, tree.spine_at(fork_root));
-
-        // The original still owes it; the fork does not.
-        assert_eq!(original.open(), [question]);
-        assert!(fork.open().is_empty(), "obligations do not cross a Fork");
-
-        let refusal = fork
-            .eligible(&tree, Restart::Answer(question))
-            .expect_err("a fork does not owe a pre-fork post");
-        assert!(
-            refusal.reason().contains(&format!(
-                "#{} belongs to branch #{}",
-                question.as_u64(),
-                original.agent_id().as_u64()
-            )),
-            "{}",
-            refusal.reason()
-        );
-        assert!(
-            refusal
-                .reason()
-                .contains("the user can take that branch's turn"),
-            "and says how to make the fork's answer the delivered one: {}",
-            refusal.reason()
-        );
-        // The original is still eligible — exactly one owner.
-        assert!(original.eligible(&tree, Restart::Answer(question)).is_ok());
-    }
-
-    /// Artifacts cross a `Fork`; **in-flight calls do not**. A pending
-    /// pre-fork `Send`'s `Result` will land on the original's branch, so
-    /// re-attaching from the fork could never resolve — refused, naming
-    /// the owner, by the same rule for the same reason.
-    #[test]
-    fn fork_cannot_reattach_a_prefork_pending_send() {
-        let mut tree = Tree::new(None);
-        let mut original = Runner::new_root(&mut tree, "root", "").unwrap();
-        // A done call and a pending `Send`, both before the fork point.
-        let done = tree
-            .append(
-                &mut original.spine,
-                EventPayload::Call(Call::Invoke {
-                    name: "fetch".into(),
-                    args: json!(["x"]),
-                    site: 0,
-                }),
-            )
-            .unwrap();
-        tree.append(
-            &mut original.spine,
-            EventPayload::Result {
-                call: done,
-                outcome: Outcome::Delivered(json!("DATA")),
-            },
-        )
-        .unwrap();
-        let pending = tree
-            .append(
-                &mut original.spine,
-                EventPayload::Call(Call::Send {
-                    to: Address::Branch(EventId::new(1)),
-                    text: "which file?".into(),
-                    input: json!(null),
-                    expects_reply: true,
-                    site: 0,
-                }),
-            )
-            .unwrap();
-
-        let mut spine = tree.fork(original.spine.leaf_id).unwrap();
-        let fork_root = tree
-            .append(&mut spine, EventPayload::Fork { name: None })
-            .unwrap();
-        let mut fork = Runner::with_spine(&tree, tree.spine_at(fork_root));
-        fork.kickoff(&mut tree).unwrap();
-        let out = fork
-            .step(
-                &mut tree,
-                StepInput::LlmResponse(llm_program(
-                    "c1",
-                    &format!(
-                        r#"const reused = await tools.tool_result({});
-                           let denied;
-                           try {{ denied = await tools.tool_result({}); }}
-                           catch (e) {{ denied = "" + e; }}
-                           return [reused, denied];"#,
-                        done.as_u64(),
-                        pending.as_u64()
-                    ),
-                )),
-            )
-            .unwrap();
-        drain(&mut fork, &mut tree, out);
-        let report = last_report(&fork, &tree);
-        assert!(
-            report.contains(r#""DATA""#),
-            "the done result crosses the fork: {report}"
-        );
-        assert!(
-            report.contains(&format!(
-                "is still pending on branch #{}",
-                original.agent_id().as_u64()
-            )),
-            "the pending Send does not: {report}"
-        );
-    }
-
-    /// Two open posts: a bare turn binds to the **older**, `answer` to
-    /// the one it names. The bare-turn rule is what makes the note in the
-    /// request necessary — it picks silently, and the model cannot see
-    /// which.
-    #[test]
-    fn explicit_answer_binds_the_named_post() {
-        let (mut tree, mut state) = setup();
-        user_post(&mut state, &mut tree, "first question");
-        let (newer, _) = state
-            .deliver(&mut tree, Author::User, direct("second question", true))
-            .unwrap();
-        let older = state.open()[0];
-        assert_eq!(state.open(), [older, newer]);
-
-        // `answer` names the newer one; the older stays open.
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::LlmResponse(llm_answer("c1", newer, json!("the second"))),
-            )
-            .unwrap();
-        assert!(out.iter().any(|o| matches!(
-            o,
-            StepOutput::Answered { question: Some(q), value } if *q == newer && value == "the second"
-        )));
-        assert_eq!(state.open(), [older], "only the named post was bound");
-    }
-
-    /// A request with more than one open post carries a bounded one-line
-    /// note listing them by id. It rides the **trailing ephemeral line**,
-    /// never a rendered message: it is a right-now fact, and a rendered
-    /// message must render identically forever.
-    #[test]
-    fn many_open_posts_are_noted_in_the_request_tail() {
-        let (mut tree, mut state) = setup();
-        let out = user_post(&mut state, &mut tree, "first");
-        // **Every** open post is listed, one included: the old threshold
-        // rested on "a bare reply answers it, which is the default
-        // anyway", and a branch left owing a question it was shown is
-        // exactly the case that assumption misses.
-        let one = expect_request(&out).tail.clone().expect("a tail");
-        assert!(
-            one.starts_with("1 question is open on this branch: #2 (the user)."),
-            "{one}"
-        );
-        assert!(one.ends_with(ABSENT), "presence goes last: {one}");
-
-        let (second, _) = state
-            .deliver(&mut tree, Author::User, direct("second", true))
-            .unwrap();
-        // A tell lands and opens nothing, so it is not listed.
-        state
-            .deliver(&mut tree, Author::Harness, direct("fyi", false))
-            .unwrap();
-        // Any request rendered while both are open carries the note.
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::LlmResponse(llm_program("c1", "return 1;")),
-            )
-            .unwrap();
-        let settled = drain(&mut state, &mut tree, out);
-        let tail = expect_request(&settled)
-            .tail
-            .clone()
-            .expect("two open posts get a note");
-        let first = state.open()[0];
-        assert!(tail.contains("2 questions are open"), "{tail}");
-        assert!(
-            tail.contains(&format!("#{} (the user)", first.as_u64())),
-            "{tail}"
-        );
-        assert!(
-            tail.contains(&format!("#{} (the user)", second.as_u64())),
-            "{tail}"
-        );
-        assert!(
-            tail.contains("A post from an agent means that agent's program is suspended"),
-            "it says what a parked post costs: {tail}"
-        );
-        // The obligations *line* is the bounded one; the tail as a whole
-        // also carries the artifact span and presence, each its own line.
-        let note = tail.lines().next().expect("the obligations line");
-        assert!(note.len() < 300, "bounded: {}", note.len());
-        // Presence goes **last**, after every other per-request fact.
-        assert!(tail.ends_with(ABSENT), "{tail}");
-        // Nothing has been called yet, so there is no artifact line.
-        assert!(!tail.contains("artifacts on this branch"), "{tail}");
-    }
-
-    /// The tail names each open post's asker, not just its id — a
-    /// person's post and a parked program's post carry different
-    /// consequences, and 18_TARGETING's own text (the current
-    /// paragraph) is what tells them apart (18_TARGETING Step B2).
-    #[test]
-    fn two_askers_are_both_named_in_the_tail() {
-        let (mut tree, mut state) = setup();
-        user_post(&mut state, &mut tree, "from the user");
-        state
-            .deliver(
-                &mut tree,
-                Author::Agent(EventId::new(7)),
-                direct("from an agent", true),
-            )
-            .unwrap();
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::LlmResponse(llm_program("c1", "return 1;")),
-            )
-            .unwrap();
-        let settled = drain(&mut state, &mut tree, out);
-        let tail = expect_request(&settled).tail.clone().expect("a tail");
-        assert!(tail.contains("(the user)"), "{tail}");
-        assert!(tail.contains("(agent 7)"), "{tail}");
-    }
-
-    /// **A fan-in of n asks gets n answers.** A bare turn answers none of
-    /// them (18_TARGETING), so a branch shown several questions clears
-    /// its whole queue only by naming each one — which it can do in a
-    /// single turn, since several `answer` calls may ride one turn.
-    #[test]
-    fn a_fan_in_of_asks_is_answered_by_a_batch_of_answer_calls() {
-        let (mut tree, mut state) = setup();
-        let mut posts = Vec::new();
-        let mut out = Vec::new();
-        for n in 0..4 {
-            let (post, o) = state
-                .deliver(&mut tree, Author::User, direct(&format!("q{n}"), true))
-                .unwrap();
-            posts.push(post);
-            out.extend(o);
-        }
-        assert_eq!(state.open(), posts, "four questions owed");
-
-        let tool_calls = posts
-            .iter()
-            .enumerate()
-            .map(|(i, post)| ToolCall {
-                id: format!("c{i}"),
-                name: TOOL_ANSWER.into(),
-                arguments: json!({ "question": post.as_u64(), "value": format!("a{i}") }),
-            })
-            .collect();
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::LlmResponse(LlmTurn {
-                    text: String::new(),
-                    thinking: None,
-                    tool_calls,
-                }),
-            )
-            .unwrap();
-        let answered: Vec<EventId> = out
-            .iter()
-            .filter_map(|o| match o {
-                StepOutput::Answered {
-                    question: Some(q), ..
-                } => Some(*q),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(answered, posts, "every post named, in call order");
-        assert!(state.open().is_empty());
-        // The batch was answers-only, so the branch still owes the API a
-        // reply to those tool calls — a request went back out — but it
-        // owes no *post* any more.
-        assert!(out.iter().any(|o| matches!(o, StepOutput::LlmRequest(_))));
-        assert!(!state.needs_prompt(&tree));
-    }
-
-    /// **A bare turn answers nothing.** The post stays open, no `Answer`
-    /// is logged, and the turn's text is still delivered — it is read
-    /// where it sits, not bound to anything (18_TARGETING).
-    #[test]
-    fn a_bare_turn_leaves_every_open_post_open() {
-        let (mut tree, mut state) = setup();
-        user_post(&mut state, &mut tree, "how many lines?");
-        let question = state.open()[0];
-
-        let out = state
-            .step(&mut tree, StepInput::LlmResponse(llm_text("just chatting")))
-            .unwrap();
-
-        assert_eq!(state.open(), [question], "the post is still owed");
-        assert!(
-            !payload_kinds(&state, &tree).contains(&"Answer"),
-            "a bare turn logs no Answer"
-        );
-        assert!(out.iter().any(|o| matches!(
-            o,
-            StepOutput::Answered { question: None, value } if value == "just chatting"
-        )));
-    }
-
-    /// **The anti-loop test.** A branch left owing an answer goes idle
-    /// rather than being re-prompted — `needs_prompt`'s open-post clause
-    /// is gone, so a post staying open is not itself a wake cause. This
-    /// is the test that would have caught an unbounded prompt loop.
-    #[test]
-    fn a_branch_that_owes_an_answer_goes_idle() {
-        let (mut tree, mut state) = setup();
-        user_post(&mut state, &mut tree, "how many lines?");
-        let out = state
-            .step(&mut tree, StepInput::LlmResponse(llm_text("just chatting")))
-            .unwrap();
-
-        assert!(!state.open().is_empty(), "still owed");
-        assert!(state.is_idle());
-        assert!(
-            !state.needs_prompt(&tree),
-            "an open post alone does not wake it"
-        );
-        assert!(
-            !out.iter().any(|o| matches!(o, StepOutput::LlmRequest(_))),
-            "no request went back out: {out:?}"
-        );
-    }
-
-    /// A **tell** wakes the branch and owes nothing, so it must not join
-    /// the queue the rule above drains — otherwise a chatty notifier
-    /// would keep a branch talking forever.
-    #[test]
-    fn a_tell_wakes_once_and_owes_nothing() {
-        let (mut tree, mut state) = setup();
-        let (_, out) = state
-            .deliver(&mut tree, Author::Harness, direct("fyi", false))
-            .unwrap();
-        assert!(
-            out.iter().any(|o| matches!(o, StepOutput::LlmRequest(_))),
-            "an unseen tell is still a cause"
-        );
-        let out = state
-            .step(&mut tree, StepInput::LlmResponse(llm_text("noted")))
-            .unwrap();
-        assert!(state.open().is_empty());
-        assert!(!state.needs_prompt(&tree), "and it does not wake again");
-        assert!(!out.iter().any(|o| matches!(o, StepOutput::LlmRequest(_))));
-    }
-
-    /// Because a report now lists only what is **new**, the trailing line
-    /// carries the pointer back: how many artifacts the branch holds and
-    /// the ids they span, so an older one is never out of reach.
-    #[test]
-    fn the_tail_points_at_every_artifact_a_report_no_longer_lists() {
-        let (mut tree, mut state) = setup();
-        user_post(&mut state, &mut tree, "go");
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::LlmResponse(llm_program("c1", "return await tools.read(\"a\");")),
-            )
-            .unwrap();
-        // Serve the call, then let the program finish and re-render.
-        let served = drain(&mut state, &mut tree, out);
-        let calls = expect_tool_calls(&served);
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::ToolResults(vec![ToolResult {
-                    call: calls[0].call,
-                    result: Ok(json!("A")),
-                }]),
-            )
-            .unwrap();
-        let settled = drain(&mut state, &mut tree, out);
-        let tail = expect_request(&settled).tail.clone().expect("a tail");
-        let line = tail
-            .lines()
-            .find(|l| l.contains("artifacts on this branch"))
-            .unwrap_or_else(|| panic!("{tail}"));
-        // Two **rows**: the call and the run's `Return`. A `Result` is
-        // not a row of its own — the menu is keyed by the call id, which
-        // is what a program reuses.
-        assert!(line.starts_with("2 artifacts on this branch, #"), "{line}");
-        assert!(
-            line.contains("A report lists only what is new since the last one"),
-            "{line}"
-        );
-    }
-
-    // ── B3: rule B — posts on arrival ───────────────────────────────
-
-    /// **The trigger rule**, and the whole of it: prompt iff the branch
-    /// holds no VM and the newest rendered message past `shown` is a
-    /// `Post`, or a `Turn` whose calls all have outcomes. Every request
-    /// has a cause event; the LLM is never prompted "just because", and
-    /// never twice for the same thing.
-    #[test]
-    fn prompt_iff_unseen_post_and_no_vm() {
-        let (mut tree, mut state) = setup();
-        // A fresh branch has said nothing: no cause, no request.
-        assert!(!state.needs_prompt(&tree), "nothing to say");
-
-        // A post is a cause.
-        let out = user_post(&mut state, &mut tree, "go");
-        assert!(!out.is_empty(), "the post started a turn");
-        assert!(
-            !state.needs_prompt(&tree),
-            "a request is already out — never twice for the same thing"
-        );
-
-        // A VM holds the branch: the VM speaks through its outcomes.
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::LlmResponse(llm_program("c1", "while (true) {}")),
-            )
-            .unwrap();
-        assert!(matches!(&out[..], [StepOutput::Working]));
-        assert!(!state.needs_prompt(&tree), "no prompting while a VM runs");
-        // Even with an unseen post: rule B suspends it at the next slice
-        // instead, which is a *report*, not a second request.
-        state
-            .deliver(&mut tree, Author::User, direct("still there?", true))
-            .unwrap();
-        assert!(!state.needs_prompt(&tree));
-
-        // A bare turn is the only terminal.
-        let out = state
-            .step(&mut tree, StepInput::Tick { fuel: FUEL })
-            .unwrap();
-        drain(&mut state, &mut tree, out);
-        state
-            .step(&mut tree, StepInput::LlmResponse(llm_text("done")))
-            .unwrap();
-        assert!(
-            !state.needs_prompt(&tree),
-            "idle after a bare turn — a branch is never woken without a cause"
-        );
-
-        // …until someone speaks again.
-        state
-            .deliver(&mut tree, Author::User, direct("one more thing", true))
-            .unwrap();
-        assert!(matches!(state.phase, Phase::AwaitingLlm));
-    }
-
-    /// **Forks are born idle.** A fork's `shown` starts at its `Fork`
-    /// root, so history before it never triggers a prompt — the fork
-    /// speaks only when spoken to. That is the same mark that stops a
-    /// post arriving during a generation from stealing the next turn's
-    /// binding: triggering and fork suppression are one mechanism.
     #[test]
     fn fork_is_born_idle() {
         let mut tree = Tree::new(None);
         let mut original = Runner::new_root(&mut tree, "root", "").unwrap();
-        user_post(&mut original, &mut tree, "which file?");
-
+        user_post(&mut original, &mut tree, "hello");
         let mut spine = tree.fork(original.spine.leaf_id).unwrap();
-        let root = tree
-            .append(&mut spine, EventPayload::Fork { name: None })
-            .unwrap();
-        let fork = Runner::with_spine(&tree, tree.spine_at(root));
+        let fork_root = spine.leaf_id;
+        let _ = &mut spine;
+        let fork = Runner::with_spine(&tree, tree.spine_at(fork_root));
         assert!(
             !fork.needs_prompt(&tree),
-            "the pre-fork question is history here, not a cause"
-        );
-    }
-
-    /// A post arriving **during a generation** is logged now (visible,
-    /// crash-safe) and acted on when the response lands. A bare reply
-    /// answers neither post (18_TARGETING), but `shown` still gates what
-    /// counts as unseen — so the newer post, logged mid-generation,
-    /// starts the next turn on its own once the bare reply's turn lands.
-    #[test]
-    fn post_during_generation_lands_after_it() {
-        let (mut tree, mut state) = setup();
-        user_post(&mut state, &mut tree, "first");
-        let first = state.open()[0];
-
-        // Mid-generation.
-        let (second, out) = state
-            .deliver(&mut tree, Author::User, direct("second", true))
-            .unwrap();
-        assert!(out.is_empty(), "no second request while one is in flight");
-
-        // A bare reply binds nothing, then the newer post — unseen,
-        // since `shown` was fixed at request time — starts the next turn
-        // in the same step.
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::LlmResponse(llm_text("about the first")),
-            )
-            .unwrap();
-        assert!(
-            out.iter()
-                .any(|o| matches!(o, StepOutput::Answered { question: None, .. })),
-            "a bare reply answers nothing: {out:?}"
-        );
-        assert!(
-            out.iter().any(|o| matches!(o, StepOutput::LlmRequest(_))),
-            "and the unseen post started the next turn: {out:?}"
-        );
-        assert_eq!(state.open(), [first, second], "both still owed");
-    }
-
-    /// The other half of the same case: a `run_program` response means
-    /// the program starts and suspends at its **first slice** with the
-    /// post — the delivery guarantee is one fuel slice, not one program.
-    #[test]
-    fn post_during_generation_suspends_the_program_it_started() {
-        let (mut tree, mut state) = setup();
-        user_post(&mut state, &mut tree, "count to a million");
-        state
-            .deliver(&mut tree, Author::User, direct("actually, stop", true))
-            .unwrap();
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::LlmResponse(llm_program("c1", "while (true) {}")),
-            )
-            .unwrap();
-        assert!(matches!(&out[..], [StepOutput::Working]));
-        let out = state
-            .step(&mut tree, StepInput::Tick { fuel: FUEL })
-            .unwrap();
-        drain(&mut state, &mut tree, out);
-        let report = last_report(&state, &tree);
-        assert!(report.contains("actually, stop"), "{report}");
-        assert!(report.contains("asks you"), "{report}");
-    }
-
-    /// Suspended on a condition, a post is appended **beside the pending
-    /// report** and the next request shows both — with the same menu. It
-    /// does not re-prompt: a request is already out, and `Interrupt` (C1)
-    /// is the one override that makes a post land *now*.
-    #[test]
-    fn post_while_suspended_is_shown_beside_the_report() {
-        let (mut tree, mut state) = setup();
-        user_post(&mut state, &mut tree, "go");
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::LlmResponse(llm_program("c1", r#"raise("need_path", null);"#)),
-            )
-            .unwrap();
-        drain(&mut state, &mut tree, out);
-        let condition_report = last_report(&state, &tree);
-
-        let (post, out) = state
-            .deliver(&mut tree, Author::User, direct("use PLAN.md", true))
-            .unwrap();
-        assert!(out.is_empty(), "the report is already out");
-        assert!(state.open().contains(&post), "logged and owed");
-
-        // The next request carries both, in log order, and the condition
-        // report is byte-identical — reports are derived and immutable.
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::LlmResponse(llm_resume("c2", json!(1))),
-            )
-            .unwrap();
-        let settled = drain(&mut state, &mut tree, out);
-        let req = expect_request(&settled);
-        let texts: Vec<String> = req
-            .messages
-            .iter()
-            .map(|m| match m {
-                Rendered::User(t) => t.clone(),
-                Rendered::Tool { text, .. } => text.clone(),
-                Rendered::Assistant { text, .. } => text.clone(),
-            })
-            .collect();
-        assert!(
-            texts.contains(&condition_report),
-            "the pending report still renders the same: {texts:?}"
-        );
-        assert!(
-            texts.iter().any(|t| t.ends_with("use PLAN.md")),
-            "beside it: {texts:?}"
-        );
-    }
-
-    /// The log is arrival order; the API is not. The completion API
-    /// rejects anything between an assistant tool call and its tool
-    /// result, and a post logged mid-run precedes the report in the log —
-    /// so the request builder places each derived tool message
-    /// immediately after the `Turn` whose call it answers and renders
-    /// intervening posts **after** it.
-    #[test]
-    fn mid_run_post_renders_after_the_report() {
-        let (mut tree, mut state) = setup();
-        user_post(&mut state, &mut tree, "go");
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::LlmResponse(llm_program("c1", "while (true) {}")),
-            )
-            .unwrap();
-        assert!(matches!(&out[..], [StepOutput::Working]));
-        // Logged mid-run: the post precedes the outcome in the log.
-        let (post, _) = state
-            .deliver(&mut tree, Author::User, direct("wait — stop", true))
-            .unwrap();
-        let out = state
-            .step(&mut tree, StepInput::Tick { fuel: FUEL })
-            .unwrap();
-        let settled = drain(&mut state, &mut tree, out);
-
-        let path = tree.path_events(state.spine.leaf_id);
-        let at = |id: EventId| path.iter().position(|e| e.id == id).unwrap();
-        let outcome = path
-            .iter()
-            .rev()
-            .find(|e| matches!(e.payload, EventPayload::Condition { .. }))
-            .unwrap()
-            .id;
-        assert!(at(post) < at(outcome), "log order: the post arrived first");
-
-        let req = expect_request(&settled);
-        let kinds: Vec<&str> = req
-            .messages
-            .iter()
-            .map(|m| match m {
-                Rendered::User(_) => "user",
-                Rendered::Assistant { .. } => "assistant",
-                Rendered::Tool { .. } => "tool",
-            })
-            .collect();
-        // …and render order puts the tool message straight after the
-        // turn whose call it answers, with the post after it.
-        assert_eq!(kinds, ["user", "assistant", "tool", "user"]);
-        let Rendered::Tool { text, .. } = &req.messages[2] else {
-            unreachable!()
-        };
-        assert!(
-            text.contains(&format!("[#{}]", post.as_u64())),
-            "and the report names when the message arrived: {text}"
-        );
-    }
-
-    /// The three moves a post-condition report is shaped for: answer and
-    /// carry on, change course, or stop. This is the first — `resume()`
-    /// re-enters the **same** VM, and results outstanding when the post
-    /// arrived still land in it.
-    #[test]
-    fn post_to_running_program_resumes_cleanly() {
-        let (mut tree, mut state) = setup();
-        user_post(&mut state, &mut tree, "fetch it");
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::LlmResponse(llm_program(
-                    "c1",
-                    r#"const v = await tools.fetch("x"); return v + 1;"#,
-                )),
-            )
-            .unwrap();
-        let settled = drain(&mut state, &mut tree, out);
-        let fetch = expect_tool_calls(&settled)[0].call;
-
-        // Someone speaks while the fetch is still out.
-        state
-            .deliver(&mut tree, Author::User, direct("make it snappy", true))
-            .unwrap();
-        let out = state
-            .step(&mut tree, StepInput::Tick { fuel: FUEL })
-            .unwrap();
-        drain(&mut state, &mut tree, out);
-        let report = last_report(&state, &tree);
-        assert!(report.contains("make it snappy"), "{report}");
-        assert!(report.contains("resume()"), "the restart menu: {report}");
-
-        // The outstanding result lands in the parked VM…
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::ToolResults(vec![ToolResult {
-                    call: fetch,
-                    result: Ok(json!(41)),
-                }]),
-            )
-            .unwrap();
-        assert!(
-            !out.iter().any(|o| matches!(o, StepOutput::Working)),
-            "a suspended run stays suspended: {out:?}"
-        );
-
-        // …and `resume()` re-enters the same VM, which finishes.
-        let question = state.open()[1];
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::LlmResponse(LlmTurn {
-                    text: String::new(),
-                    thinking: None,
-                    tool_calls: vec![
-                        ToolCall {
-                            id: "a1".into(),
-                            name: TOOL_ANSWER.into(),
-                            arguments: json!({ "question": question.as_u64(),
-                                               "value": "will do" }),
-                        },
-                        ToolCall {
-                            id: "r1".into(),
-                            name: TOOL_RESUME.into(),
-                            arguments: json!({}),
-                        },
-                    ],
-                }),
-            )
-            .unwrap();
-        assert!(
-            out.iter().any(|o| matches!(
-                o,
-                StepOutput::Answered { question: Some(q), .. } if *q == question
-            )),
-            "answer and carry on, in one turn: {out:?}"
-        );
-        drain(&mut state, &mut tree, out);
-        assert!(
-            last_report(&state, &tree).contains("returned: 42"),
-            "the same VM finished with the result it already had: {}",
-            last_report(&state, &tree)
-        );
-    }
-
-    /// The second move: **change course**. The report's *where* is the
-    /// program source with every call site annotated by its artifact, so
-    /// the rewrite is a copy-edit — it reuses two done results by id and
-    /// awaits the pending one, and no call is re-issued.
-    #[test]
-    fn post_rewrite_reuses_done_and_pending_by_id() {
-        let (mut tree, mut state) = setup();
-        user_post(&mut state, &mut tree, "read three files");
-        let src = "const a = tools.read(\"a\");\nconst b = tools.read(\"b\");\nconst c = tools.read(\"c\");\nreturn [await a, await b, await c];";
-        let out = state
-            .step(&mut tree, StepInput::LlmResponse(llm_program("c1", src)))
-            .unwrap();
-        let settled = drain(&mut state, &mut tree, out);
-        let calls: Vec<EventId> = expect_tool_calls(&settled).iter().map(|c| c.call).collect();
-        assert_eq!(calls.len(), 3);
-
-        // Two land; the third is still out when the user speaks.
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::ToolResults(vec![
-                    ToolResult {
-                        call: calls[0],
-                        result: Ok(json!("A")),
-                    },
-                    ToolResult {
-                        call: calls[1],
-                        result: Ok(json!("B")),
-                    },
-                ]),
-            )
-            .unwrap();
-        drain(&mut state, &mut tree, out);
-        state
-            .deliver(
-                &mut tree,
-                Author::User,
-                direct("skip c, just a and b", true),
-            )
-            .unwrap();
-        let out = state
-            .step(&mut tree, StepInput::Tick { fuel: FUEL })
-            .unwrap();
-        drain(&mut state, &mut tree, out);
-
-        // The annotated source is the rewrite's working copy.
-        let report = last_report(&state, &tree);
-        assert!(
-            report.contains(&format!(
-                "const a = tools.read(\"a\");  // → #{} done",
-                calls[0].as_u64()
-            )),
-            "{report}"
-        );
-        assert!(
-            report.contains(&format!(
-                "const c = tools.read(\"c\");  // → #{} issued; may have happened",
-                calls[2].as_u64()
-            )),
-            "{report}"
-        );
-
-        // The rewrite reuses both done results and re-attaches to the
-        // pending one — never re-issuing a call.
-        let rewrite = format!(
-            "const a = await tools.tool_result({});\n\
-             const b = await tools.tool_result({});\n\
-             const c = await tools.tool_result({});\n\
-             return [a, b, c];",
-            calls[0].as_u64(),
-            calls[1].as_u64(),
-            calls[2].as_u64()
-        );
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::LlmResponse(llm_program("c2", &rewrite)),
-            )
-            .unwrap();
-        let settled = drain(&mut state, &mut tree, out);
-        assert!(
-            !settled
-                .iter()
-                .any(|o| matches!(o, StepOutput::ToolCalls(_))),
-            "no call re-issued: {settled:?}"
-        );
-        // The rewritten program is parked on the re-attached call — and
-        // the answer the dead VM would have got lands in it instead.
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::ToolResults(vec![ToolResult {
-                    call: calls[2],
-                    result: Ok(json!("C")),
-                }]),
-            )
-            .unwrap();
-        drain(&mut state, &mut tree, out);
-        assert!(
-            last_report(&state, &tree).contains(r#"returned: ["A","B","C"]"#),
-            "{}",
-            last_report(&state, &tree)
-        );
-        // Exactly three `read` calls in the whole log.
-        let reads = tree
-            .events
-            .values()
-            .filter(|e| {
-                matches!(&e.payload,
-                EventPayload::Call(Call::Invoke { name, .. }) if name == "read")
-            })
-            .count();
-        assert_eq!(reads, 3, "the rewrite issued none of its own");
-    }
-
-    /// The post-condition report, pinned. Every section is bounded by a
-    /// named const, and the *where* is the annotated source — the whole
-    /// point of the phase's product surface.
-    #[test]
-    fn golden_post_condition_report() {
-        let (mut tree, mut state) = setup();
-        user_post(&mut state, &mut tree, "read a and b");
-        let src = "const a = tools.read(\"a\");\nconsole.log(\"reading\");\nconst b = tools.read(\"b\");\nreturn [await a, await b];";
-        let out = state
-            .step(&mut tree, StepInput::LlmResponse(llm_program("c1", src)))
-            .unwrap();
-        let settled = drain(&mut state, &mut tree, out);
-        let calls: Vec<EventId> = expect_tool_calls(&settled).iter().map(|c| c.call).collect();
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::ToolResults(vec![ToolResult {
-                    call: calls[0],
-                    result: Ok(json!("A")),
-                }]),
-            )
-            .unwrap();
-        drain(&mut state, &mut tree, out);
-        state
-            .deliver(
-                &mut tree,
-                Author::User,
-                direct("b is gone; use a twice", true),
-            )
-            .unwrap();
-        let out = state
-            .step(&mut tree, StepInput::Tick { fuel: FUEL })
-            .unwrap();
-        drain(&mut state, &mut tree, out);
-
-        assert_eq!(
-            last_report(&state, &tree),
-            r#"## what happened
-Someone spoke to you while your program was running. It is paused at its last fuel slice; nothing was lost.
-
-the user — asks you
-[#7] b is gone; use a twice
-
-## where
-const a = tools.read("a");  // → #4 done
-console.log("reading");
-const b = tools.read("b");  // → #5 issued; may have happened
-return [await a, await b];
-console (last 1 of 1 lines):
-reading
-
-## new artifacts — fetch with tools.tool_result(id)
-[#4] read(["a"]) → "A"
-[#5] read(["b"]) → issued; no result recorded; may have happened
-
-## restarts
-- resume(): continue the program from where it stopped — nothing here asked for a value
-- run_program(source)"#
-        );
-    }
-
-    /// The live pane and the report it stands in for must never disagree
-    /// (17_BRANCHES Part D): both derive the annotated source the same
-    /// way — from the log, never a VM — so `report::annotate_program`
-    /// (over `Tree::programs_for`, what a running branch's chat pane
-    /// calls) and the settled-run annotation the report above pins
-    /// produce byte-identical lines for the same calls.
-    #[test]
-    fn live_annotation_agrees_with_the_report_it_stands_in_for() {
-        let (mut tree, mut state) = setup();
-        user_post(&mut state, &mut tree, "read a and b");
-        let src = "const a = tools.read(\"a\");\nconsole.log(\"reading\");\nconst b = tools.read(\"b\");\nreturn [await a, await b];";
-        let out = state
-            .step(&mut tree, StepInput::LlmResponse(llm_program("c1", src)))
-            .unwrap();
-        let settled = drain(&mut state, &mut tree, out);
-        let calls: Vec<EventId> = expect_tool_calls(&settled).iter().map(|c| c.call).collect();
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::ToolResults(vec![ToolResult {
-                    call: calls[0],
-                    result: Ok(json!("A")),
-                }]),
-            )
-            .unwrap();
-        drain(&mut state, &mut tree, out);
-
-        // Still running — no outcome yet, so there is no `Handback` and
-        // no report; only `programs_for`'s live projection exists.
-        let programs = tree.programs_for(state.branch_id(), state.spine.leaf_id);
-        let pv = programs.last().expect("the program is running");
-        let live = crate::report::annotate_program(pv);
-        assert!(live.contains(r#"const a = tools.read("a");  // → #4 done"#));
-        assert!(live.contains(r#"const b = tools.read("b");  // → #5 issued; may have happened"#));
-
-        // Now let the post arrive and the run suspend — the same two
-        // calls settle the same way in the report `golden_post_condition_report`
-        // pins, byte-for-byte with what the live pane already showed.
-        state
-            .deliver(
-                &mut tree,
-                Author::User,
-                direct("b is gone; use a twice", true),
-            )
-            .unwrap();
-        let out = state
-            .step(&mut tree, StepInput::Tick { fuel: FUEL })
-            .unwrap();
-        drain(&mut state, &mut tree, out);
-        let report = last_report(&state, &tree);
-        assert!(report.contains(r#"const a = tools.read("a");  // → #4 done"#));
-        assert!(
-            report.contains(r#"const b = tools.read("b");  // → #5 issued; may have happened"#)
+            "a fork speaks only when spoken to"
         );
     }
 }
