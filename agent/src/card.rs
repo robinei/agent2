@@ -59,7 +59,11 @@ namespace, which is reserved for this session's configured tools
   append_history(value)            remember a projection for your own future
   artifact(id)                     fetch a completed call's value by id
   list_agents()                    every agent in this subtree, with status
-  raise(name, payload?)            suspend for judgement
+  raise(name, payload?)            suspend for judgement; the answer comes
+                                    back here and this program carries on
+  next_program(payload?)           end here and write the next program with
+                                    `payload` in view. Nothing resumes — the
+                                    next program is the continuation
 
 **When to ask, and who to ask.** The moment the next step turns on a
 judgement the data cannot settle, stop guessing and get the judgement.
@@ -88,6 +92,18 @@ that ends in a judgement is the point of being able to choose.
 The tell: if a value you are about to `tell()` was assembled by string
 surgery over text you never actually read, you built a summary instead
 of answering.
+
+Two ways to spend an inference, and they differ in where you end up.
+`raise(name, payload)` asks a question **you come back from**: the
+answer lands in the middle of this program, every variable still alive,
+and you carry on. `next_program(payload)` **ends this program** and asks
+for the next one, with `payload` in view of whoever writes it — nothing
+resumes, because the continuation is the answer. Reach for `raise` when
+you need a verdict to finish what you started; reach for
+`next_program` when what to do next is itself the thing that needs
+deciding. Gather, hand over, read, gather again: that loop is available
+to you, and each pass costs exactly one inference, spent where the
+judgement actually was.
 
 `raise()` suspends this program and asks for a decision, made by
 another program that runs while this one is still suspended. That
@@ -381,13 +397,13 @@ for (const n of wanted) {
 if (!Object.keys(read).length) {
     tell(`nothing self-describing here — the top level is ${names.join(", ")}. Tell me which part matters and I'll read it.`);
 } else {
-    // I have the text. What it *means* is not something more code can
-    // work out: a regex for `name =` would give me a field, and the
-    // question asked what this is. So hand the material to a reading
-    // and let it come back as the answer — one inference, spent on the
-    // only part of this that needed one.
-    const verdict = await raise("characterise", { files: read, layout: names });
-    tell(verdict);
+    // I have the text; what it *means* is not something more code can
+    // work out. A regex for `name =` would hand me a field, and the
+    // question asked what this is. Fetching was my job and I have done
+    // it — so end here and let the next program answer with the files
+    // in view. If they turn out to point somewhere else, that program
+    // can read on and hand over again.
+    next_program({ question: "what is this project?", files: read, layout: names });
 }"#,
     },
     Exemplar {
@@ -454,7 +470,7 @@ mod tests {
         // `CARD` shows up as a diff review must look at, not a byte
         // count that silently drifts. Comparing full text (not just a
         // hash) so the diff itself is legible in a failure message.
-        const EXPECTED_LEN: usize = 7757;
+        const EXPECTED_LEN: usize = 8788;
         assert_eq!(
             CARD.len(),
             EXPECTED_LEN,

@@ -434,3 +434,34 @@ fn spawn_yields_its_handle_without_a_source_level_await() {
         other => panic!("expected completion, got {other:?}"),
     }
 }
+
+#[test]
+fn next_program_raises_its_reserved_condition() {
+    // `next_program(payload)` ends this program and asks for the next
+    // one, with `payload` what its writer gets to see. It shares the
+    // `Raise` instruction with `raise` because both suspend and hand a
+    // payload to a mind; the host tells them apart by the condition
+    // name, since what differs is what the mind is asked for.
+    let prog = compile("next_program({ found: 3 });").expect("compiles");
+    let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
+    match vm.step(u64::MAX).unwrap() {
+        StepResult::Raise { condition, payload } => {
+            assert_eq!(condition, "next_program");
+            assert!(payload.is_some(), "the payload reaches the next writer");
+        }
+        other => panic!("expected a raise, got {other:?}"),
+    }
+}
+
+#[test]
+fn next_program_takes_no_payload_too() {
+    let prog = compile("next_program();").expect("compiles");
+    let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
+    match vm.step(u64::MAX).unwrap() {
+        StepResult::Raise { condition, payload } => {
+            assert_eq!(condition, "next_program");
+            assert!(payload.is_none());
+        }
+        other => panic!("expected a raise, got {other:?}"),
+    }
+}

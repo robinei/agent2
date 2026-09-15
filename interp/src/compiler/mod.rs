@@ -22,7 +22,7 @@ use crate::vm::{Instr, Value};
 
 mod analysis;
 mod assign;
-mod call;
+pub mod call;
 mod class;
 mod control_flow;
 mod destructure;

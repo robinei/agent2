@@ -16,6 +16,7 @@ pub mod vm;
 #[cfg(test)]
 pub(crate) mod testutil;
 
+pub use compiler::call::NEXT_PROGRAM_CONDITION;
 pub use compiler::{Program, compile, compile_for_test262, count_statements};
 pub use debuginfo::{DebugTable, FnDebug};
 pub use diag::{DiagKind, Diagnostic};

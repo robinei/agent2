@@ -783,6 +783,25 @@ fn answer_ack(
 fn what_happened(h: &Handback<'_>, cause: &Cause, site: u32) -> String {
     let source = &h.source;
     match cause {
+        Cause::Raised { name, payload } if name == interp::NEXT_PROGRAM_CONDITION => {
+            // `next_program(payload)` ends the program and asks for the
+            // next one. Rendering the resume/abandon menu here would be
+            // actively wrong: nothing is waiting to be continued, and the
+            // writer of this report is being asked for a program, not a
+            // decision about one.
+            let mut what = String::from(
+                "The program handed over: it finished what it could do without a \
+                 reading, and asked for the next one.\n\nWrite that program. \
+                 Nothing is suspended and nothing is waiting on a value — you have \
+                 the branch, and whatever comes next is yours to write, including \
+                 another handover when you have gathered more.",
+            );
+            if let Some(p) = payload {
+                what.push_str("\n\nwhat it handed you:\n");
+                what.push_str(&clip(&p.to_string(), PAYLOAD_MAX_BYTES));
+            }
+            what
+        }
         Cause::Raised { name, payload } => {
             let mut what = diagnostic(source, site, &format!("condition `{name}` raised"));
             what.push_str("\npayload: ");
