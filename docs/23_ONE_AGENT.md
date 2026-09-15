@@ -267,12 +267,56 @@ intermittent hang unrelated to this work.)
 The acceptance gate is the harness that already exists, pointed at the
 real thing instead of the POC's standalone loop.
 
+**C0 — two things must be wired before the harness can measure
+anything.** Both were found by Pass B and neither is optional.
+
+*Resume recognition.* `Runner::resume` and `Runner::abandon` have **no
+production callers at all** — only test call sites. Nothing reads a
+handler program's `{__decision: "resume", value}` return, so
+`apply_turn` discards the suspension and starts fresh. The whole
+handler-program path — a program raises, a mind writes a handler, its
+`return` value is the restart — is therefore unwired. That is the
+condition system, which `DESIGN.md` calls the original thesis and the
+product; `judgment-in-the-middle` cannot pass without it, and the `v`
+gesture (the human's own manual-recovery path) is silently
+non-functional until it lands.
+
+*`tell` stops being awaitable.* There is no exemption for `Call::Send
+{ expects_reply: false }` in the settlement path, so an unawaited
+`tell()` — the card's own idiom — lands a `Result` nobody awaits and
+Rule C delivers a harness `Post` saying nothing is owed. That **wakes
+the branch and costs a completion, per `tell`.** Rule C exists so a
+completed call's *value* is never invisible after a resume; a `tell`'s
+result is a delivery receipt carrying nothing. So `tell()` returns
+nothing, settles at dispatch (appending and delivering are local, not
+IO), and never enters `pending`, so Rule C cannot fire for it. `ask`
+stays awaitable, because it is the one with a value coming back —
+which is what `expects_reply` already names. Address failures reject
+synchronously; `resolve_address` already runs before the call is
+logged.
+
+Measure nothing before both land: the POC's 1.2–1.4 round-trips were
+recorded with no Rule C in the loop at all, so a per-`tell` wake would
+corrupt the one number this phase is judged on.
+
 **C1.** `agent/src/eval/` drives a real `Session` over
 `SessionCommand::UserTurn` and reads `SessionEvent`, instead of calling
 `runner::run`. Same five fixed tasks, same three experimental ones,
 same check functions — the checks gate on the safety/correctness
 property, never on which verb fired, and that discipline carries over
 unchanged.
+
+`RunOutcome`'s hand-threaded counters do not carry over. Every one of
+them is a **fold over the real event log**: `raise_count` is
+`Condition{Raised}`, `trap_count` is `Condition{Trapped}`,
+`abandon_count` is `Condition{Abandoned}`, `spawn_children` is
+`Call::Spawn` with a settled `Result`, `appended` is `Note`. Same
+derived-not-stored doctrine as the rest of the phase, with a useful
+side effect: it makes the eval a test of the vocabulary. A number that
+cannot be folded out of the log is something a mind reading that log
+could not have seen either — and the POC's counters papered over
+exactly that, which is how `append_history` stayed write-only and
+reached nothing for so long.
 
 **C2.** Green is the same bar the POC last hit:
 ```
