@@ -396,15 +396,15 @@ pub struct Outcome {
     /// suspended, waiting on the handler's decision"), and that
     /// obligation is closed by exactly one of two things — the
     /// suspended program's own eventual `Return` (a resume happened,
-    /// however much work came between), or a `Condition { Abandoned }`
-    /// (`abandon_count` already counts these directly, and its
-    /// `disposition` is always `Handover`, so it never itself opens a
-    /// new obligation to double-count). So: `resume_count = (count of
-    /// Pushed conditions) - abandon_count` — whatever wasn't closed by
-    /// abandoning must have been closed by continuing. This holds for
-    /// any log where every suspension was eventually settled, which
-    /// [`drive`] only ever hands back once the session has gone quiet
-    /// with no handler decision still pending.
+    /// however much work came between), or a `Condition { Abandoned }`.
+    ///
+    /// Tracked as a **stack, not a subtraction.** `pushed -
+    /// abandon_count` is only right if every suspension was eventually
+    /// settled, and that assumption fails in exactly the case this
+    /// harness is most likely to meet: a task ending with a live
+    /// `ask()` the fixture cannot answer leaves a scope open forever,
+    /// and subtracting would score it as a resume that never happened.
+    /// Scopes still open when the log ends are counted as neither.
     pub resume_count: usize,
     /// `Call::Spawn` calls with a **delivered** `Result` — a spawn that
     /// actually produced a live child, not merely one the program
@@ -605,7 +605,8 @@ fn fold(session: host::Session, errors: Vec<String>) -> Outcome {
     let mut raise_count = 0usize;
     let mut trap_count = 0usize;
     let mut abandon_count = 0usize;
-    let mut pushed = 0usize;
+    let mut open_scopes: Vec<EventId> = Vec::new();
+    let mut resume_count = 0usize;
     let mut spawn_calls: HashSet<EventId> = HashSet::new();
     let mut spawn_children = 0usize;
     let mut appended = Vec::new();
@@ -625,8 +626,15 @@ fn fold(session: host::Session, errors: Vec<String>) -> Outcome {
                     Cause::Abandoned => abandon_count += 1,
                     _ => {}
                 }
-                if *disposition == Disposition::Pushed {
-                    pushed += 1;
+                // An open scope, tracked as a stack rather than a
+                // tally: `Abandoned` closes the innermost one, and a
+                // `Return` (below) closes one by continuing. What is
+                // still on this stack when the log ends was never
+                // settled either way, and must not be read as a resume.
+                if matches!(cause, Cause::Abandoned) {
+                    open_scopes.pop();
+                } else if *disposition == Disposition::Pushed {
+                    open_scopes.push(e.id);
                 }
             }
             EventPayload::Call(Call::Spawn { .. }) => {
@@ -635,6 +643,14 @@ fn fold(session: host::Session, errors: Vec<String>) -> Outcome {
             EventPayload::Result { call, outcome } => {
                 if spawn_calls.contains(call) && matches!(outcome, CallOutcome::Delivered(_)) {
                     spawn_children += 1;
+                }
+            }
+            EventPayload::Return { .. } => {
+                // The suspended program ran to completion, so whatever
+                // scope it was under was closed by continuing — that is
+                // a resume, whether or not anything was logged for it.
+                if open_scopes.pop().is_some() {
+                    resume_count += 1;
                 }
             }
             EventPayload::Note { text } => appended.push(text.clone()),
@@ -655,7 +671,6 @@ fn fold(session: host::Session, errors: Vec<String>) -> Outcome {
             _ => {}
         }
     }
-    let resume_count = pushed.saturating_sub(abandon_count);
 
     Outcome {
         session,
