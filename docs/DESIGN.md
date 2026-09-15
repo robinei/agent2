@@ -312,13 +312,15 @@ previous execution, so there is no trace for it to make diverge. This
 
 ## Confinement, not permission
 
-**The harness confines the process; it does not gate the call.** An
-agent runs inside a sandbox — `bwrap`, with its working directory bound
-read-write, a tmpfs everywhere else, and no network beyond what it is
-given — and inside that boundary its tools are unrestricted. There is
-no allowlist of permitted commands, no per-call confirmation prompt, no
-"this looks dangerous" interstitial, and no `effectful` flag on a tool
-definition.
+**The harness does not gate the call, and does not confine the process
+either — it is *run inside* a confinement chosen by whoever runs it.**
+An agent's tools are unrestricted: no allowlist of permitted commands,
+no per-call confirmation prompt, no "this looks dangerous"
+interstitial, no `effectful` flag on a tool definition. And no
+sandboxing code — the harness contains no `bwrap` invocation, no check
+for whether it is confined, and no refusal to start when it isn't.
+Whoever runs an agent decides what it can reach, by the ordinary means
+their operating system already provides.
 
 This is a single decision with a lot of consequences, so it is worth
 stating why rather than only what.
@@ -358,12 +360,12 @@ already produced a false *proceed* — a query returning unexpected text
 parsed as zero rows, skipping a safety gate the model had written for
 itself. A sandbox cannot lie that way.
 
-Two obligations follow. Sandboxing must be **self-enforcing** — a
-harness that relies on being launched correctly hands an unsandboxed
-shell to a live model the first time someone forgets. And eval tasks
-must need **nothing exotic**: a shell, coreutils, and real files. A
-task that needs a database daemon is a task that will be run outside
-the sandbox eventually.
+So the eval is *launched* confined rather than confining itself —
+a script that runs it under `bwrap`, which is the only place the
+sandbox is named. The obligation that does fall on the task set is to
+need **nothing exotic**: a shell, coreutils, and real files. A task
+requiring a database daemon is one that gets run outside the sandbox
+eventually, whatever the script says.
 
 ## Product surface
 
