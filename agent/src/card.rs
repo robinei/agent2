@@ -106,6 +106,21 @@ not your whole budget** — but the budget is only reachable through
 `next_program`, never by stopping. Each pass costs exactly one
 inference, spent where the judgement actually was.
 
+**And only where it actually was.** Hand over when what to do next
+depends on *reading* what you just found — which files matter, what
+this text means, whether these two things agree. Do not hand over when
+you already know what comes next and only the data was missing: write
+the loop, and let the program find out at runtime what you would have
+been told.
+
+The tell is exact: **if you can write down what the next program should
+do, you can write the program.** A handover whose payload says "for
+each of these, do X" spent an inference to hand yourself a to-do list —
+and the next writer, having been told X, will do what you could have
+done without asking. A handover earns its inference only when you
+genuinely cannot say what the next step is until someone has read
+what you gathered.
+
 The tell: if a value you are about to `tell()` was assembled by string
 surgery over text you never actually read, you built a summary instead
 of answering.
@@ -496,7 +511,7 @@ mod tests {
         // `CARD` shows up as a diff review must look at, not a byte
         // count that silently drifts. Comparing full text (not just a
         // hash) so the diff itself is legible in a failure message.
-        const EXPECTED_LEN: usize = 10476;
+        const EXPECTED_LEN: usize = 11271;
         assert_eq!(
             CARD.len(),
             EXPECTED_LEN,
