@@ -41,8 +41,9 @@ Verbs available in every program, as plain functions — not a `tools.`
 namespace, which is reserved for this session's configured tools
 (listed separately, below):
 
-  tell(text) / tell(to, text)      message the user or another agent
-                                    quote the address, always: tell("user", "done")
+  tell(text) / tell(to, text)      message someone. Bare, it reaches
+                                    whoever is waiting on you, or the
+                                    user when no one is
                                     "user" is the human; there is only one
   ask(who, text)                   ask a question; resolves to the answer
                                     await ask("user", "which one?")
@@ -396,7 +397,7 @@ mod tests {
         // `CARD` shows up as a diff review must look at, not a byte
         // count that silently drifts. Comparing full text (not just a
         // hash) so the diff itself is legible in a failure message.
-        const EXPECTED_LEN: usize = 6121;
+        const EXPECTED_LEN: usize = 6163;
         assert_eq!(
             CARD.len(),
             EXPECTED_LEN,

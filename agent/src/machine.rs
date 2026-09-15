@@ -1565,12 +1565,20 @@ impl Runner {
         to: Option<&serde_json::Value>,
     ) -> Result<Address, String> {
         let Some(to) = to.filter(|v| !v.is_null()) else {
+            // Nothing open: the address is the user. An agent with
+            // something to say and no one waiting on it is talking to
+            // the person driving the session — who is always reachable,
+            // having no branch of their own to be absent from. This is
+            // also what makes a delegated child's "report directly
+            // rather than through the parent" work without the child
+            // having to know who spawned it (`22_ONE_VOCABULARY.md`,
+            // "Creating is not messaging").
+            //
+            // This is deliberately *not* an answer: `18_TARGETING`'s
+            // rule is that only `answer(question, value)` discharges an
+            // open post, and a `tell` never does, whoever it reaches.
             let Some(&question) = self.spine.context().open.first() else {
-                return Err(
-                    "ask/tell with no `to` answers whoever asked you, but nothing is open on \
-                     this branch — pass a branch id (from tools that list agents/branches)"
-                        .into(),
-                );
+                return Ok(Address::User);
             };
             return match asker_of(tree, question) {
                 Some(Author::User) => Ok(Address::User),
