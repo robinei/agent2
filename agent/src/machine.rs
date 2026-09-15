@@ -1770,10 +1770,21 @@ impl Runner {
         let Phase::Running(run) = std::mem::replace(&mut self.phase, Phase::Idle) else {
             unreachable!()
         };
-        let value_json = run
-            .vm
-            .stack_value_to_json(&value, 0)
-            .unwrap_or_else(|_| serde_json::Value::String(format!("{value:?}")));
+        // `undefined` has no JSON form, so `stack_value_to_json` rightly
+        // refuses it — but a program that simply ends without a `return`
+        // is the *ordinary* case, not an unrepresentable value, and
+        // `types.rs` promises it logs `Return { value: null }`: that is
+        // what makes "completed ⇒ Return" decidable from the log alone.
+        // Falling through to the debug-repr fallback logged the string
+        // `"Undefined"` instead, indistinguishable from a program that
+        // really did return that text.
+        let value_json = if matches!(value, interp::Value::Undefined) {
+            serde_json::Value::Null
+        } else {
+            run.vm
+                .stack_value_to_json(&value, 0)
+                .unwrap_or_else(|_| serde_json::Value::String(format!("{value:?}")))
+        };
 
         // **C0a (23_ONE_AGENT.md): a tagged completion is a decision about
         // the suspended run beneath this one, not this program's own

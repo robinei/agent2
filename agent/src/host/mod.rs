@@ -3860,12 +3860,19 @@ mod tests {
         );
 
         // The sender's program itself sees nothing back (its own doc
-        // above): `return await tell(...)` is `undefined`, which has no
-        // JSON form at the root (`stack_value_to_json`'s own doc: dropped
-        // in an object, coerced to `null` in an array, an error at the
-        // root) — `finish_program` falls back to the debug string for
-        // exactly that case, same as `return undefined;` always has.
-        assert_eq!(returned(tree, root_leaf(&session)), json!("Undefined"));
+        // above): `return await tell(...)` is `undefined`. `undefined`
+        // has no JSON form at the root, and the log records that as
+        // **null**, per `types.rs`: "a program that ends without a
+        // `return` still logs `Return { value: null }`, so 'completed ⇒
+        // Return' holds without exception — which is what makes recovery
+        // decidable from the log alone."
+        //
+        // This assertion used to expect `"Undefined"`, the debug repr of
+        // the VM value, which is what `finish_program` logged before
+        // 2026-09-15. That made the commonest case in the system — a
+        // program that does its work and ends — indistinguishable in the
+        // log from one that genuinely returned the text "Undefined".
+        assert_eq!(returned(tree, root_leaf(&session)), json!(null));
 
         // The receipt is still in the log, on the `Send`'s own `Result`,
         // naming the post that landed on the worker.
