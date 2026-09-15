@@ -103,8 +103,7 @@ splits them. The doc comments need both answers stated, not one:
    arguing it might collapse into `say`: a note has no recipient and
    wakes no branch, where every `say` is heard by someone. The
    distinction that survived scrutiny: **`append_history` is what I
-   should remember; a kickoff post or `say` is what someone else needs
-   to know.** Worth re-litigating if it turns out models rarely use it
+   should remember; a `tell` is what someone else needs to know.** Worth re-litigating if it turns out models rarely use it
    correctly, since it is the one verb whose own card entry warns
    against the obvious misuse ("not to read something back next turn
    — if you need a value now, you are already holding it in a
@@ -119,22 +118,24 @@ splits them. The doc comments need both answers stated, not one:
    which is what keeps role alternation intact under compaction with
    no special case.
 
-3. **`Call::Fork { name, task, site }`** — `fork()` is program-initiated
-   and awaited, so it needs a call to settle, exactly `Call::Spawn`'s
-   existing pattern. `task` is new: both `spawn(charter)` and
-   `fork(task)` **kick the child off** — the existing `Settle::ThenAsk`
-   sugar (`machine.rs`'s `tools.agent`, spawn + immediate ask promoted
-   from convenience to the only form), so a spawned or forked agent
-   with nothing to do never exists. The asymmetry between the two
-   verbs' single string is real and intentional: `spawn`'s string is
-   both identity and first task (`Agent.charter` and the post body);
-   `fork`'s string is only the task, because a fork has no charter — it
-   inherits the caller's context instead. Left unawaited, the child
-   reports directly (`say`) rather than through the parent, and no VM
-   parks waiting on the answer — this should be the card's recommended
-   default over the awaited form, since a program that awaits a
-   delegation it does nothing further with has wasted a turn holding a
-   parked VM for no reason (see "Fork/spawn depth," below).
+3. **`Call::Fork { name, site }`** — `fork()` is program-initiated, so
+   it needs a call to settle, exactly `Call::Spawn`'s existing pattern.
+   It settles with a **handle**, and that is all it does.
+
+   > **Superseded during phase 23's implementation.** This entry
+   > originally said both verbs **kick the child off** — `Settle::ThenAsk`
+   > promoted from convenience to the only form, so that "a spawned or
+   > forked agent with nothing to do never exists" — and carried a `task`
+   > field for `fork` to make that work. Phase 23 deleted `Settle::ThenAsk`
+   > with the rest of the tool-protocol sugar, and on review the
+   > implicit kickoff should not come back. See "Creating is not
+   > messaging," below.
+   >
+   > **Not yet true of the code**: `types::Call::Fork` still carries
+   > `task`, read in three places in `machine.rs`. Dropping it is a
+   > small mechanical change, deferred only because phase 23's Pass C0
+   > was mid-edit in that file when this was decided. Until it lands,
+   > the field is vestigial.
 
 4. **`Cause::Truncated`** — a completion that hit `max_tokens`. Real
    gap: `transport::Completion::was_truncated()` exists and has
@@ -206,15 +207,76 @@ Consequence for `raise()`: its payload should carry a **projection**
 needs to fetch — never raw evidence inline, by the same rule that
 governs `append_history`.
 
-Consequence for `fork(task)`: when the delegate needs to *read and
+Consequence for a delegation: when the delegate needs to *read and
 judge* data the parent already has in hand, that data has to be text
-in `task`, not an id — the parent's recon program cannot hand off "go
-figure it out" plus a citation and expect the fork to form a judgment
+in the `ask`/`tell` that follows the `fork()`, not an id — the parent's
+recon program cannot hand off "go figure it out" plus a citation and
+expect the fork to form a judgment
 from the citation alone in its first program. If the projection isn't
 enough to fix the issue outright (usually: a specific file needs
 reading and patching), the honest shape is one more internal step
 inside the fork — read, then judge — not a second round trip back to
 the parent.
+
+## You await an exchange, never a strand
+
+Three rules, learned by trying to answer "should `fork`/`spawn` be
+awaitable?" and finding the question malformed.
+
+**An execution strand has no ending to await.** A spawned agent answers
+and goes `Idle`; it does not finish. `Context.open` calls that "owes
+nothing," never "done" — agents are interactable forever. So
+`await spawn(...)` cannot mean "wait for the agent," and any design
+that reads that way is incoherent rather than merely awkward.
+
+**An exchange does have an ending, and it is `answer()`.** The
+four-event shape — `Send` → `Post` → `Answer` → `Result` — terminates
+at the answerer's explicit `answer(question, value)`. That is the only
+thing that discharges an `open` post (`18_TARGETING`: a bare turn
+answers nothing), so **a `tell` never ends an exchange, however
+final it sounds.** What a caller awaits is the `Result` its `ask`
+produces, never the child's existence.
+
+The live risk this creates is a real one and belongs in the eval, not
+in card prose: an awaited child that only `tell`s and never `answer`s
+leaves its caller parked indefinitely. `upward_clarification_does_not_
+deadlock` already names the case. A model reaching for `tell` where it
+owes an `answer` is the most likely way to produce a hung agent, and
+only a live run can say whether it does.
+
+## Creating is not messaging
+
+`spawn(charter)` and `fork()` **create, and return a handle.** They do
+not carry an implicit first message. If the child should do something,
+say so: `tell(agent, "…")` to delegate and not wait, `await ask(agent,
+"…")` to delegate and use the result.
+
+What this removes, which is why it wins:
+
+- **The charter/task asymmetry.** The superseded entry above needed a
+  paragraph explaining why `spawn`'s string is "both identity and first
+  task" while `fork`'s is "only the task." With no implicit kickoff the
+  distinction evaporates: `spawn` takes an identity, `fork` takes
+  nothing and inherits, and both are then messaged like anything else.
+- **The dual settlement.** Handle or answer? Handle, always. A program
+  wanting the answer awaits the `ask` it wrote itself, which is visible
+  in the source rather than implied by the absence of `await`.
+- **An implicit rule you had to know** — "left unawaited, the child
+  reports directly." Now it is just what the code says.
+- **A structural guarantee nobody needed.** "An agent with nothing to
+  do never exists" survives as a mistake a model can make, like any
+  other, rather than something the vocabulary must prevent.
+
+Handles stay **plain values**, and `ask(agent, text)` stays flat rather
+than becoming `agent.ask(text)`. `ask(who, text)` already has that
+signature, so the flat form is zero new surface; and DESIGN.md's compat
+fence gives every reflective artifact — methods included — **no JSON
+form**, so a handle carrying methods could not be stored, logged, or
+passed across a boundary. A bare id can.
+
+This also places both verbs in the awaitability taxonomy correctly:
+they are local creations whose result exists immediately, so there is
+nothing to park for. The awaitable thing is the `ask` written next.
 
 ## Verb selection
 
@@ -224,7 +286,7 @@ the main way a program wastes a completion:
 | verb | when |
 |---|---|
 | `raise(name, payload)` | *this* program has read something and must continue with a value |
-| `fork(task)` / `spawn(charter)` | a mind needs data it doesn't have and will author the next step from it |
+| `fork()` / `spawn(charter)`, then `ask`/`tell` | a mind needs data it doesn't have and will author the next step from it |
 | `artifact(id)` | a program needs bytes whose meaning it already knows |
 
 The sharpest test for a misused `raise`: **if the resumed value is
@@ -305,8 +367,8 @@ asker) were considered and rejected: `Answer { question }` names a
 `Post` on the *answering* branch, and "exactly one owner for every
 open post" is enforced by `replay_event` clearing `open` at a `Fork` in
 one line. Forwarding an open post across branches would need a new
-event and a new exception to that invariant for a case the unawaited
-form already handles for free.
+event and a new exception to that invariant for a case a plain
+`tell(agent, …)` — delegate, don't wait — already handles for free.
 
 ## The artifact menu is history, with a caveat
 
