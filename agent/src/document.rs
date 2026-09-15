@@ -443,7 +443,16 @@ fn worked_examples() -> Vec<ChatMessage> {
                 },
                 ChatMessage {
                     role: ChatRole::Assistant,
-                    content: ex.assistant.to_owned(),
+                    // Marked on **both** sides. Only the request used to
+                    // carry the marker, which meant that once a provider's
+                    // chat template flattened these into one token stream,
+                    // the model saw N assistant turns indistinguishable
+                    // from its own prior output — an apparent history of
+                    // programs it had already written, every one of them
+                    // short and single-purpose. That is a demonstration of
+                    // the wrong thing, delivered in the most persuasive
+                    // position available: its own mouth.
+                    content: format!("// [worked example]\n{}", ex.assistant),
                 },
             ]
         })

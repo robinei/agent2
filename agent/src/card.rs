@@ -352,6 +352,43 @@ for (const name of names) {
 tell(names.map((n, i) => `${n}: ${summaries[i]}`).join("\n"));"#,
     },
     Exemplar {
+        user: "what is this project?",
+        assistant: r#"tell("looking at the README, the manifests and the layout — I'll tell you what it actually is, not just what's in the directory.");
+const listing = await tools.bash("ls");
+
+// A listing is not an answer. The question is what this *is*, so the
+// files that say so have to be opened and read — and the answer is
+// mine to write from them, not something the file names imply.
+const named = listing.stdout.split("\n").map(s => s.trim()).filter(Boolean);
+const worth_reading = ["README.md", "readme.md", "Cargo.toml", "package.json", "pyproject.toml", "go.mod"]
+    .filter(n => named.includes(n));
+
+const read = {};
+for (const name of worth_reading) {
+    try {
+        read[name] = (await tools.read_file(name)).content;
+    } catch (e) {
+        // A named file that won't open is worth saying, not worth stopping for.
+        tell(`couldn't read ${name} — carrying on with the rest.`);
+    }
+}
+
+if (!Object.keys(read).length) {
+    // Nothing self-describing: say what is actually here rather than
+    // inventing a characterisation from directory names.
+    tell(`no README or manifest here. The top level is: ${named.join(", ")}. I can look inside any of these if you tell me which matters.`);
+} else {
+    const manifest = read["Cargo.toml"] || read["package.json"] || read["pyproject.toml"] || read["go.mod"] || "";
+    const name = (manifest.match(/^\s*name\s*=\s*"([^"]+)"/m) || manifest.match(/"name"\s*:\s*"([^"]+)"/) || [])[1];
+    const readme = read["README.md"] || read["readme.md"] || "";
+    const blurb = readme.split("\n").filter(l => l.trim() && !l.trim().startsWith('#')).slice(0, 4).join(" ");
+
+    tell(`${name ? `${name}: ` : ""}${blurb || "the README says nothing beyond its headings"}.
+
+Built with ${manifest.includes("[package]") ? "Cargo (Rust)" : manifest ? "the manifest above" : "no manifest I found"}; top level is ${named.join(", ")}.`);
+}"#,
+    },
+    Exemplar {
         user: "clean up temp files older than a day in /tmp/build-cache — this cleanup job runs nightly",
         assistant: r#"tell("clearing anything in /tmp/build-cache older than a day, and I'll flag it if tonight's count looks unusual.");
 const found = await tools.bash("find /tmp/build-cache -type f -mtime +1 -printf '.' | wc -c");

@@ -40,6 +40,11 @@ const USAGE: &str = "usage: agent <command>
                                     and print its id
     --name <text>                   name the branch (with --fork), else rename
                                     the conversation branch
+  document <log.jsonl>              print the exact document the log's
+                                    newest leaf would be sent as — every
+                                    message, role and size. The prompt is
+                                    otherwise the one thing you cannot
+                                    look at.
   eval [--experimental]             the acceptance harness (agent/src/eval/):
                                     drives real Session runs against
                                     DeepSeek (needs DEEPSEEK_API_KEY) over
@@ -135,11 +140,57 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Some("document") => {
+            if let Err(e) = print_document(args.get(2).map(String::as_str)) {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
         _ => {
             eprintln!("{USAGE}");
             std::process::exit(2);
         }
     }
+}
+
+/// Print the exact document a log's newest leaf would be sent as —
+/// every message, its role, and its size.
+///
+/// This exists because the prompt was, for a long time, the one thing
+/// nobody could look at. The card was edited a fragment at a time and
+/// reasoned about as prose, while the thing the model actually receives
+/// — a system message, then N worked-example turns, then the
+/// conversation — was never laid out end to end. Two findings came
+/// within minutes of finally printing it, both invisible from the
+/// source: the exemplars occupied most of the context, and their
+/// assistant halves carried no marker at all, so once a provider's chat
+/// template flattened the list the model saw them as its own prior
+/// output.
+///
+/// A prompt you cannot read is a prompt you will reason about wrongly.
+fn print_document(log: Option<&str>) -> Result<(), String> {
+    let path = log.ok_or("usage: agent document <log.jsonl>")?;
+    let file = std::fs::File::open(path).map_err(|e| format!("{path}: {e}"))?;
+    let tree = types::Tree::open(file).map_err(|e| format!("{path}: {e}"))?;
+    let leaf = *tree
+        .events
+        .keys()
+        .max_by_key(|id| id.as_u64())
+        .ok_or("the log is empty")?;
+    let doc = document::render(&tree, &tree.spine_at(leaf), 64 * 1024);
+
+    let total: usize = doc.messages.iter().map(|m| m.content.len()).sum();
+    println!("{} messages, {total} bytes\n", doc.messages.len());
+    for (i, m) in doc.messages.iter().enumerate() {
+        println!(
+            "──── [{i}] {:?} · {} bytes {}",
+            m.role,
+            m.content.len(),
+            "─".repeat(28)
+        );
+        println!("{}\n", m.content);
+    }
+    Ok(())
 }
 
 /// The state directory: `$AGENT2_STATE_DIR`, else `$HOME/.agent2`. Trees,
