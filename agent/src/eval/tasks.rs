@@ -195,6 +195,18 @@ pub struct Outcome {
     /// this harness issues no `Restart`, so none occur) — one per LLM
     /// completion the run actually used.
     pub round_trips: usize,
+    /// `Call::Invoke` events — every tool call the run made, across all
+    /// its programs.
+    ///
+    /// With `round_trips`, this gives **calls per program**, which is
+    /// the number the thesis actually claims. Round trips alone cannot
+    /// tell "batched the work" from "the task was small"; this can.
+    /// `20_CODE_MODE.md`'s founding complaint was a model writing "a
+    /// short program that gets one result into context, then a new short
+    /// program responding to what it saw" — one call per program. A
+    /// collapse of this ratio toward 1 is that failure returning, and it
+    /// is the earliest signal there is.
+    pub tool_calls: usize,
     /// `interp::count_statements` over each agent-authored `Turn`'s
     /// `source`, in the same order as `round_trips` counts them.
     pub program_lengths: Vec<usize>,
@@ -484,6 +496,7 @@ fn fold(session: host::Session, errors: Vec<String>) -> Outcome {
     let mut abandon_count = 0usize;
     let mut open_scopes: Vec<EventId> = Vec::new();
     let mut resume_count = 0usize;
+    let mut tool_calls = 0usize;
     let mut spawn_calls: HashSet<EventId> = HashSet::new();
     let mut spawn_children = 0usize;
     let mut appended = Vec::new();
@@ -527,6 +540,7 @@ fn fold(session: host::Session, errors: Vec<String>) -> Outcome {
                     open_scopes.push(e.id);
                 }
             }
+            EventPayload::Call(Call::Invoke { .. }) => tool_calls += 1,
             EventPayload::Call(Call::Spawn { .. }) => {
                 spawn_calls.insert(e.id);
             }
@@ -580,6 +594,7 @@ fn fold(session: host::Session, errors: Vec<String>) -> Outcome {
         spawn_children,
         appended,
         round_trips,
+        tool_calls,
         program_lengths,
         programs,
         transcript,

@@ -32,6 +32,11 @@ pub struct TaskReport {
     pub task_name: &'static str,
     pub success: Result<(), String>,
     pub round_trips: usize,
+    /// Every `Call::Invoke` in the run. With `round_trips` this is
+    /// **calls per program** — see `tasks::Outcome::tool_calls` for why
+    /// that ratio, not the round-trip count alone, is the number the
+    /// thesis claims.
+    pub tool_calls: usize,
     pub program_lengths: Vec<usize>,
     pub programs: Vec<String>,
     pub raise_count: usize,
@@ -47,14 +52,27 @@ pub struct TaskReport {
     /// harness itself, silently, is one nobody could debug.
     pub unscripted_asks: Vec<UnscriptedAsk>,
     pub errors: Vec<String>,
+    /// Wall clock for the whole task, end to end.
+    ///
+    /// The metric that can invalidate the others. Fewer completions is
+    /// only a win if the user waits less: one completion that reads
+    /// 190KB and thinks for ninety seconds is worse than twelve that
+    /// take three, and a report of round trips alone would call that a
+    /// twelve-fold improvement. Measured because the thing being
+    /// optimised is somebody's waiting, not a count.
+    pub elapsed: std::time::Duration,
 }
 
 impl TaskReport {
     fn from_outcome(task: &Task, outcome: Outcome, success: Result<(), String>) -> Self {
         TaskReport {
+            // Set by `run_task`, which is the only thing that can time
+            // the run; `from_outcome` sees only the finished log.
+            elapsed: std::time::Duration::ZERO,
             task_name: task.name,
             success,
             round_trips: outcome.round_trips,
+            tool_calls: outcome.tool_calls,
             program_lengths: outcome.program_lengths,
             programs: outcome.programs,
             raise_count: outcome.raise_count,
@@ -75,9 +93,13 @@ impl TaskReport {
 /// off disk.
 pub fn run_task(task: &Task, llm: Box<dyn host::LlmClient>) -> TaskReport {
     let sandbox = super::tasks::make_sandbox(task);
+    let started = std::time::Instant::now();
     let outcome = super::tasks::drive(task, sandbox.path(), llm);
+    let elapsed = started.elapsed();
     let success = (task.check)(&outcome, sandbox.path());
-    TaskReport::from_outcome(task, outcome, success)
+    let mut report = TaskReport::from_outcome(task, outcome, success);
+    report.elapsed = elapsed;
+    report
 }
 
 /// The middle of a sorted `Vec<usize>` — `None` on an empty run (a task
@@ -124,7 +146,13 @@ fn print_report(r: &TaskReport) {
         Ok(()) => println!("[{}] PASS", r.task_name),
         Err(e) => println!("[{}] FAIL: {e}", r.task_name),
     }
-    println!("  round-trips: {}", r.round_trips);
+    println!(
+        "  round-trips: {}  tool calls: {}  calls/program: {:.1}  wall: {:.1}s",
+        r.round_trips,
+        r.tool_calls,
+        r.tool_calls as f64 / r.round_trips.max(1) as f64,
+        r.elapsed.as_secs_f64(),
+    );
     println!("  program lengths (statements): {:?}", r.program_lengths);
     println!(
         "  raise: {}  trap: {}  resume: {}  abandon: {}  spawned children: {}",
@@ -168,6 +196,30 @@ fn print_summary(reports: &[TaskReport]) {
         round_trips.iter().sum::<usize>() as f64 / round_trips.len() as f64
     };
     println!("mean round-trips per task: {mean_round_trips:.2}");
+
+    // The two numbers that keep the round-trip count honest.
+    //
+    // Calls per program is what the thesis actually claims: a tool loop
+    // pays one completion per call, and the whole argument is that the
+    // mechanical ones collapse into a program the model wrote ahead of
+    // time. If this trends to 1, the founding complaint of
+    // `20_CODE_MODE.md` has returned and round trips will not show it.
+    //
+    // Wall clock is what can invalidate the rest. Fewer completions is a
+    // win only if somebody waits less; one completion that reads 190KB
+    // and thinks for ninety seconds beats twelve three-second ones on
+    // every count here except the one that matters.
+    let total_calls: usize = reports.iter().map(|r| r.tool_calls).sum();
+    let total_trips: usize = round_trips.iter().sum();
+    println!(
+        "calls per program: {:.1} ({total_calls} calls over {total_trips} programs)",
+        total_calls as f64 / total_trips.max(1) as f64
+    );
+    let wall: f64 = reports.iter().map(|r| r.elapsed.as_secs_f64()).sum();
+    println!(
+        "wall clock: {wall:.1}s total, {:.1}s per task",
+        wall / reports.len().max(1) as f64
+    );
     if let Some(m) = median(&round_trips) {
         println!("median round-trips per task: {m}");
     }

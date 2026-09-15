@@ -494,6 +494,27 @@ rewriting card prose while watching a task shaped for that prose.
 Tasks authored for the comparison are written to a different criterion
 and never used for tuning, which is what makes them a real holdout.
 
-**Report round trips per task and task success, per agent.** Not
-program length — that is not a thing the baseline has, and a metric
-only one side can post is not a comparison.
+**Report, per agent: task success, wall clock, calls per program, and
+round trips.** Not program length — the baseline has no such thing, and
+a metric only one side can post is not a comparison.
+
+**Wall clock outranks the rest, and can invalidate them.** Fewer
+completions is a win only if somebody waits less. One completion that
+reads 190KB and thinks for ninety seconds beats twelve three-second
+ones on every structural count and loses the only race that matters;
+reporting a twelvefold reduction there would be true and misleading.
+Token counts — input, output, thinking — belong beside it for the same
+reason: round trips silently assume the completion is the unit of cost,
+which is right for latency and prompt-cache invalidation and wrong for
+the bill.
+
+**Calls per program is the claim itself.** A tool loop pays one
+completion per call; the argument for code mode is that the mechanical
+ones collapse into a program written ahead of time, *when the model can
+know what the next step should be*. Round trips alone cannot separate
+"batched the work" from "the task was small". Observed here on one
+open-ended question: 9.0, 5.4 and 12.0 calls per program across three
+runs, against a tool loop's ~1 — and `20_CODE_MODE.md`'s founding
+complaint was exactly one result per program, so a collapse of this
+ratio toward 1 is that failure returning, visible here before it is
+visible anywhere else.
