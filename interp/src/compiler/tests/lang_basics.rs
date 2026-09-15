@@ -34,6 +34,102 @@ fn arithmetic_and_operators() {
     assert_eq!(eval_str("\"a\" + \"b\""), "ab");
 }
 
+// ── condition-report messages: what was attempted, not just the kind ──
+//
+// These pin the *content* of a handful of `dispatch.rs` trap messages so a
+// future edit can't quietly regress one back to a placeholder like "type
+// error". The model reading a trapped condition report has no way to act on
+// that text (see docs/DESIGN.md on the condition report) — the 2026-09-15
+// live incident was exactly this: a placeholder "type error" left the model
+// unable to tell what failed, so it discarded and restarted the program
+// instead of resuming past the trap.
+
+#[test]
+fn increment_non_number_names_the_variable_and_value() {
+    // `++` on an object: TypeError, and the message says which local, what
+    // kind of value it held, and (cheaply) its size — enough to decide
+    // whether e.g. `resume(0)` makes sense.
+    let err = testutil::run_runtime_err("let count = {}; count++;");
+    assert_eq!(err.kind, crate::vm::ErrorKind::TypeError);
+    assert_eq!(
+        err.message,
+        "cannot increment `count`: an object with 0 properties"
+    );
+}
+
+#[test]
+fn decrement_non_number_names_the_variable_and_value() {
+    // `--` on an array: same site, the other direction (`p` sign), a
+    // different container.
+    let err = testutil::run_runtime_err("let arr = []; arr--;");
+    assert_eq!(err.kind, crate::vm::ErrorKind::TypeError);
+    assert_eq!(err.message, "cannot decrement `arr`: an array of 0");
+}
+
+#[test]
+fn bitnot_string_reports_the_string() {
+    // `~` never coerces strings (unlike arithmetic `+`) — the short string
+    // itself is safe to include and tells the model exactly what it passed.
+    let err = testutil::run_runtime_err(r#"return ~"foo";"#);
+    assert_eq!(err.kind, crate::vm::ErrorKind::TypeError);
+    assert_eq!(
+        err.message,
+        "cannot apply bitwise NOT (~) to a string (\"foo\")"
+    );
+}
+
+#[test]
+fn bitnot_non_integer_number_explains_the_truncation() {
+    // A non-integer float is the one case where "a number" alone would
+    // mislead (the value already looks numeric) — call out why it still
+    // fails.
+    let err = testutil::run_runtime_err("return ~3.5;");
+    assert_eq!(err.kind, crate::vm::ErrorKind::TypeError);
+    assert_eq!(
+        err.message,
+        "cannot apply bitwise NOT (~) to non-integer number 3.5: bitwise operators require a 64-bit integer"
+    );
+}
+
+#[test]
+fn negative_index_reports_the_index_and_container_type() {
+    let err = testutil::run_runtime_err("let a = [1, 2]; return a[-1];");
+    assert_eq!(err.kind, crate::vm::ErrorKind::ValueError);
+    assert_eq!(
+        err.message,
+        "cannot index into array with negative index -1"
+    );
+
+    let err = testutil::run_runtime_err("let a = [1, 2]; a[-1] = 5;");
+    assert_eq!(err.kind, crate::vm::ErrorKind::ValueError);
+    assert_eq!(
+        err.message,
+        "cannot index into array with negative index -1"
+    );
+}
+
+#[test]
+fn shift_out_of_range_reports_the_amount() {
+    let err = testutil::run_runtime_err("return 1 << 100;");
+    assert_eq!(err.kind, crate::vm::ErrorKind::ValueError);
+    assert_eq!(
+        err.message,
+        "left shift (<<) amount 100 out of range: must be 0-63"
+    );
+}
+
+#[test]
+fn string_mid_codepoint_index_reports_the_offset() {
+    // Strings index by UTF-8 byte offset here (see the module doc on
+    // string indexing); "é" is 2 bytes, so byte 1 lands inside it.
+    let err = testutil::run_runtime_err("return \"\u{e9}\"[1];");
+    assert_eq!(err.kind, crate::vm::ErrorKind::ValueError);
+    assert_eq!(
+        err.message,
+        "cannot index string at byte offset 1: falls inside a multi-byte UTF-8 character"
+    );
+}
+
 #[test]
 fn comparisons_and_equality() {
     assert_eq!(eval("1 < 2"), Value::Bool(true));

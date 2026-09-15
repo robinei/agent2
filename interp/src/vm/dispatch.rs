@@ -12,7 +12,61 @@ fn await_hint(v: &Value) -> &'static str {
     }
 }
 
+/// Indefinite-article phrase for a type name in a type/value-error message,
+/// e.g. "a string", "an object". `null`/`undefined` take no article
+/// ("cannot increment null", not "an null").
+fn describe_kind(type_name: &str) -> String {
+    match type_name {
+        "null" | "undefined" => type_name.to_string(),
+        "object" | "array" | "arraybuffer" | "upval" => format!("an {type_name}"),
+        _ => format!("a {type_name}"),
+    }
+}
+
 impl VM {
+    /// Render a trapped operand for a condition report: the actual value for
+    /// scalars a model could plausibly `resume` in place of (number, bool,
+    /// null/undefined, a short string), a bounded structural summary
+    /// otherwise (array length, object property count — never contents).
+    /// Strings go through `preview` for its existing ~40-char clip, so a
+    /// stray multi-KB string caught in a trap cannot bloat the report.
+    fn describe_operand(&self, v: &Value) -> String {
+        match v {
+            Value::Undefined => "undefined".to_string(),
+            Value::Null => "null".to_string(),
+            Value::Bool(b) => format!("a boolean ({b})"),
+            Value::Float(n) => format!("a number ({})", js_number_to_string(*n)),
+            Value::PosInt(n) => format!("a number ({n})"),
+            Value::NegInt(n) => format!("a number ({n})"),
+            Value::String(_) => format!("a string ({})", self.preview(v)),
+            Value::Array(p) => match self.arrays.get(*p as usize) {
+                Some(a) => format!("an array of {}", a.len()),
+                None => "an array".to_string(),
+            },
+            Value::Object(p) => match self.objects.get(*p as usize) {
+                Some(o) => {
+                    let n = o.map.len();
+                    format!(
+                        "an object with {n} propert{}",
+                        if n == 1 { "y" } else { "ies" }
+                    )
+                }
+                None => "an object".to_string(),
+            },
+            _ => describe_kind(v.type_name()),
+        }
+    }
+
+    /// The declared source name of local slot `local` at the current
+    /// instruction, when debug info is available (hand-assembled programs
+    /// built via `VM::new` for unit tests have none, so this is a graceful
+    /// `None`, not an error). A single span→function lookup — cheap enough
+    /// to call from an error path, unlike `frames()`'s full call-stack walk.
+    fn local_name_at(&self, local: LocalIndex) -> Option<&str> {
+        let (_, f) = self.function_at(self.ip)?;
+        f.slot_names.get(local as usize)?.as_deref()
+    }
+
     // ── Step 2e: the canonical property read/write pair ────────────
     //
     /// The one property *read* ladder for every receiver type. Resolves in
@@ -51,7 +105,17 @@ impl VM {
                     ),
                 ));
             }
-            Value::Upval(_) => return Err(self.fail(ErrorKind::ValueError, "value error")),
+            Value::Upval(_) => {
+                let name = self.to_js_string(key, 0);
+                return Err(self.fail(
+                    ErrorKind::ValueError,
+                    format!(
+                        "cannot read property '{}' on {}",
+                        name.as_str(),
+                        receiver.type_name()
+                    ),
+                ));
+            }
             Value::Promise(_) => {
                 let name = self.to_js_string(key, 0);
                 return Err(self.fail(
@@ -98,7 +162,13 @@ impl VM {
             }
 
             if idx < 0 {
-                return Err(self.fail(ErrorKind::ValueError, "value error"));
+                return Err(self.fail(
+                    ErrorKind::ValueError,
+                    format!(
+                        "cannot index into {} with negative index {idx}",
+                        receiver.type_name()
+                    ),
+                ));
             }
             let idx = idx as usize;
             match receiver {
@@ -114,7 +184,16 @@ impl VM {
                         return Ok(Value::Undefined);
                     }
                     if !s.is_char_boundary(idx) {
-                        return Err(self.fail(ErrorKind::ValueError, "value error"));
+                        // Strings here index by UTF-8 byte offset, not code point
+                        // (see the module doc on string indexing) — landing
+                        // mid-codepoint is the price of that, surfaced rather
+                        // than silently coerced.
+                        return Err(self.fail(
+                            ErrorKind::ValueError,
+                            format!(
+                                "cannot index string at byte offset {idx}: falls inside a multi-byte UTF-8 character"
+                            ),
+                        ));
                     }
                     let ch = s[idx..].chars().next().unwrap();
                     return Ok(Value::String(RcStr::from(ch.to_string())));
@@ -469,7 +548,13 @@ impl VM {
             }
 
             if idx < 0 {
-                return Err(self.fail(ErrorKind::ValueError, "value error"));
+                return Err(self.fail(
+                    ErrorKind::ValueError,
+                    format!(
+                        "cannot index into {} with negative index {idx}",
+                        receiver.type_name()
+                    ),
+                ));
             }
             let idx = idx as usize;
             if let Value::Array(p) = receiver {
@@ -1501,7 +1586,7 @@ impl VM {
                         Value::Upval(c) => self
                             .cells
                             .get(*c as usize)
-                            .ok_or_else(|| self.fail(ErrorKind::ValueError, "value error"))?
+                            .ok_or_else(|| self.fail(ErrorKind::ValueError, "bad cell pointer"))?
                             .clone(),
                         other => other.clone(),
                     };
@@ -1598,7 +1683,13 @@ impl VM {
                     };
                     // NotResumable: reads local by peek (no stack pop), so operand not consumed.
                     let old_num = old.to_number().ok_or_else(|| {
-                        self.fail_not_resumable(ErrorKind::TypeError, "type error")
+                        let op = if *p < 0.0 { "increment" } else { "decrement" };
+                        let operand = self.describe_operand(&old);
+                        let msg = match self.local_name_at(*local) {
+                            Some(name) => format!("cannot {op} `{name}`: {operand}"),
+                            None => format!("cannot {op} {operand}"),
+                        };
+                        self.fail_not_resumable(ErrorKind::TypeError, msg)
                     })?;
                     // Compute new value: subtract p (p = -1 for ++, p = 1 for --).
                     let new_num = old_num - *p;
@@ -1643,7 +1734,14 @@ impl VM {
                         | Value::TypedArray(_)
                         | Value::DataView(_) => "object",
                         Value::Upval(_) => {
-                            return Err(self.fail(ErrorKind::ValueError, "value error"));
+                            // Unreachable via normal execution: GetLocal/SetLocal/etc.
+                            // dereference a Boxed slot's Upval marker before the value
+                            // reaches the expression stack (see the comment there), so
+                            // typeof should never observe one.
+                            return Err(self.fail(
+                                ErrorKind::ValueError,
+                                "cannot apply typeof to an internal upvalue marker",
+                            ));
                         }
                     };
                     self.push_str_value(tag);
@@ -1732,7 +1830,23 @@ impl VM {
                             self.stack.push(Value::Float(!i as f64));
                             self.ip += 1;
                         }
-                        None => return Err(self.fail(ErrorKind::TypeError, "type error")),
+                        // `as_i64` also rejects a non-integer number (e.g. `3.5`) — call
+                        // that out specifically, since "a number" alone would be
+                        // confusing for a value that already looks numeric.
+                        None => {
+                            let msg = if let Value::Float(n) = &val {
+                                format!(
+                                    "cannot apply bitwise NOT (~) to non-integer number {}: bitwise operators require a 64-bit integer",
+                                    js_number_to_string(*n)
+                                )
+                            } else {
+                                format!(
+                                    "cannot apply bitwise NOT (~) to {}",
+                                    self.describe_operand(&val)
+                                )
+                            };
+                            return Err(self.fail(ErrorKind::TypeError, msg));
+                        }
                     }
                 }
 
@@ -1836,7 +1950,10 @@ impl VM {
                     let b = self.pop_int()?;
                     let a = self.pop_int()?;
                     if !(0..64).contains(&b) {
-                        return Err(self.fail(ErrorKind::ValueError, "value error"));
+                        return Err(self.fail(
+                            ErrorKind::ValueError,
+                            format!("left shift (<<) amount {b} out of range: must be 0-63"),
+                        ));
                     }
                     self.stack.push(Value::Float((a << b) as f64));
                     self.ip += 1;
@@ -1845,7 +1962,10 @@ impl VM {
                     let b = self.pop_int()?;
                     let a = self.pop_int()?;
                     if !(0..64).contains(&b) {
-                        return Err(self.fail(ErrorKind::ValueError, "value error"));
+                        return Err(self.fail(
+                            ErrorKind::ValueError,
+                            format!("right shift (>>) amount {b} out of range: must be 0-63"),
+                        ));
                     }
                     self.stack.push(Value::Float((a >> b) as f64));
                     self.ip += 1;
@@ -1854,7 +1974,12 @@ impl VM {
                     let b = self.pop_int()?;
                     let a = self.pop_int()?;
                     if !(0..64).contains(&b) {
-                        return Err(self.fail(ErrorKind::ValueError, "value error"));
+                        return Err(self.fail(
+                            ErrorKind::ValueError,
+                            format!(
+                                "unsigned right shift (>>>) amount {b} out of range: must be 0-63"
+                            ),
+                        ));
                     }
                     self.stack
                         .push(Value::Float(((a as u64) >> (b as u32)) as f64));
@@ -2219,20 +2344,21 @@ impl VM {
                         Value::Array(p) => Value::Float(
                             self.arrays
                                 .get(p as usize)
-                                .ok_or_else(|| self.fail(ErrorKind::ValueError, "value error"))?
+                                .ok_or_else(|| {
+                                    self.fail(ErrorKind::ValueError, "bad array pointer")
+                                })?
                                 .len() as f64,
                         ),
                         Value::TypedArray(p) => {
-                            let view = self
-                                .typed_arrays
-                                .get(p as usize)
-                                .ok_or_else(|| self.fail(ErrorKind::ValueError, "value error"))?;
+                            let view = self.typed_arrays.get(p as usize).ok_or_else(|| {
+                                self.fail(ErrorKind::ValueError, "bad typed array pointer")
+                            })?;
                             Value::Float(view.length() as f64)
                         }
                         Value::Object(p) => self
                             .objects
                             .get(p as usize)
-                            .ok_or_else(|| self.fail(ErrorKind::ValueError, "value error"))?
+                            .ok_or_else(|| self.fail(ErrorKind::ValueError, "bad object pointer"))?
                             .map
                             .get("length")
                             .cloned()
@@ -2261,7 +2387,12 @@ impl VM {
                             let n = target.saturating_sub(b.bound_args.len() as u16);
                             Value::Float(n as f64)
                         }
-                        _ => return Err(self.fail(ErrorKind::TypeError, "type error")),
+                        _ => {
+                            return Err(self.fail(
+                                ErrorKind::TypeError,
+                                format!("cannot read .length of {}", self.describe_operand(&val)),
+                            ));
+                        }
                     };
                     self.stack.push(result);
                     self.ip += 1;
@@ -2275,24 +2406,29 @@ impl VM {
                         Value::Map(p) => Value::Float(
                             self.maps
                                 .get(p as usize)
-                                .ok_or_else(|| self.fail(ErrorKind::ValueError, "value error"))?
+                                .ok_or_else(|| self.fail(ErrorKind::ValueError, "bad map pointer"))?
                                 .len() as f64,
                         ),
                         Value::Set(p) => Value::Float(
                             self.sets
                                 .get(p as usize)
-                                .ok_or_else(|| self.fail(ErrorKind::ValueError, "value error"))?
+                                .ok_or_else(|| self.fail(ErrorKind::ValueError, "bad set pointer"))?
                                 .len() as f64,
                         ),
                         Value::Object(p) => self
                             .objects
                             .get(p as usize)
-                            .ok_or_else(|| self.fail(ErrorKind::ValueError, "value error"))?
+                            .ok_or_else(|| self.fail(ErrorKind::ValueError, "bad object pointer"))?
                             .map
                             .get("size")
                             .cloned()
                             .unwrap_or(Value::Undefined),
-                        _ => return Err(self.fail(ErrorKind::TypeError, "type error")),
+                        _ => {
+                            return Err(self.fail(
+                                ErrorKind::TypeError,
+                                format!("cannot read .size of {}", self.describe_operand(&val)),
+                            ));
+                        }
                     };
                     self.stack.push(result);
                     self.ip += 1;
@@ -2311,7 +2447,15 @@ impl VM {
                     let val = self.pop()?;
                     match val.to_number() {
                         Some(num) => self.stack.push(Value::Float(num)),
-                        None => return Err(self.fail(ErrorKind::TypeError, "type error")),
+                        None => {
+                            return Err(self.fail(
+                                ErrorKind::TypeError,
+                                format!(
+                                    "cannot convert {} to a number",
+                                    self.describe_operand(&val)
+                                ),
+                            ));
+                        }
                     }
                     self.ip += 1;
                 }
