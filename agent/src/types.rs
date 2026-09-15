@@ -266,6 +266,24 @@ pub enum Cause {
     /// The process died mid-program and the VM went with it. Written by
     /// reconciliation so an interrupted run has an outcome like any other.
     Interrupted,
+    /// A handler decided `return abandon()`: the suspended run is
+    /// discarded rather than continued. In-flight calls it issued stay
+    /// pending and still land as artifacts; only the VM is dropped.
+    ///
+    /// This exists because **a run must have exactly one log-visible
+    /// terminal, or nothing downstream can be derived from the log
+    /// alone.** `Return`'s doc states the rule for the completing case
+    /// ("a program that ends without a `return` still logs `Return {
+    /// value: null }`"); abandonment is the other way a run ends, and
+    /// before this it logged nothing at all — so a branch that abandoned
+    /// read, forever after, as still suspended.
+    ///
+    /// It settles exactly one frame, the same as `Return`: the frame
+    /// that decided. `depth_after` pops on it for that reason, and must
+    /// pop regardless of the condition's own `disposition` — the
+    /// disposition describes the raise that *opened* a scope, while this
+    /// cause describes a decision that *closes* one.
+    Abandoned,
 }
 
 /// Whether a raise pushed a handler frame onto the stack, or handed the

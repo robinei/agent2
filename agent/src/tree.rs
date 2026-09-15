@@ -120,9 +120,21 @@ struct LogHeader {
 ///   so depth decreases by one. Saturating: a depth-0 program's own
 ///   ordinary `return`, with no raise anywhere in its history, is the
 ///   common case and must not underflow.
+/// - `Condition{cause: Abandoned}`: `return abandon()` discarded the
+///   suspended run, which settles exactly one frame the same way a
+///   `Return` does — so depth decreases by one, **whatever the
+///   condition's own disposition says.** The disposition describes the
+///   raise that opened a scope; this cause describes a decision that
+///   closes one, so it is matched first. Without this arm an abandoned
+///   run never decrements and every later event on the branch renders
+///   as though still inside a scope nothing will ever close.
 /// - anything else leaves depth unaffected.
 pub fn depth_after(depth: usize, payload: &EventPayload) -> usize {
     match payload {
+        EventPayload::Condition {
+            cause: Cause::Abandoned,
+            ..
+        } => depth.saturating_sub(1),
         EventPayload::Condition {
             disposition: Disposition::Pushed,
             ..

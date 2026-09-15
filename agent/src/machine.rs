@@ -936,23 +936,32 @@ impl Runner {
     /// dropped. Like [`Runner::resume`], this is a direct host call, not
     /// something the LLM names.
     ///
-    /// FLAGGED (discovered writing this file against the already-finished
-    /// `document.rs`, not something this step fixes): an abandoned run
-    /// never logs a `Return` — nothing "completed" — so `depth_after`
-    /// (`tree.rs`, driving `document.rs::render`'s fold) never decrements
-    /// the depth the earlier `Pushed` `Condition` incremented. Every event
-    /// on this branch from here on renders as if still inside that
-    /// now-dead handler scope: permanently invisible, until something logs
-    /// a depth-decrementing `Return` for it. This looks like a real gap in
-    /// the disposition/depth design (`abandon()` needs *some* log-visible
-    /// way to close the scope it opened), not something `machine.rs` alone
-    /// should paper over by inventing a fake `Return` here — flag for
-    /// whoever next touches `depth_after`/`Cause`/`Condition`.
+    /// It logs `Cause::Abandoned`, and must: a run needs exactly one
+    /// log-visible terminal or nothing downstream can be derived from the
+    /// log alone. `Return` is the completing case; this is the other one.
+    /// Logging nothing — which is what this did before — left the branch
+    /// reading as permanently suspended, and left `depth_after`
+    /// (`tree.rs`, driving `document::render`'s fold) never decrementing
+    /// the depth the raise had incremented, so every later event rendered
+    /// inside a scope nothing would ever close.
     pub fn abandon(&mut self, tree: &mut Tree) -> io::Result<Vec<StepOutput>> {
         let Phase::Suspended(run, _) = std::mem::replace(&mut self.phase, Phase::Idle) else {
             panic!("Runner::abandon called with nothing suspended — a host bookkeeping bug");
         };
         self.note_status(run.program_id, ProgramStatus::Failed);
+        // `Handover`: this condition closes the frame that decided, it
+        // does not open one. `depth_after` matches the cause ahead of the
+        // disposition for exactly this reason, so the value here is
+        // belt-and-braces rather than load-bearing.
+        tree.append(
+            &mut self.spine,
+            EventPayload::Condition {
+                cause: Cause::Abandoned,
+                site: 0,
+                stack: Vec::new(),
+                disposition: Disposition::Handover,
+            },
+        )?;
         self.last_vm = Some(run.vm);
         Ok(self.prompt_if_needed(tree))
     }

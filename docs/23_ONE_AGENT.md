@@ -73,13 +73,24 @@ The whole of this phase is one substitution:
 | | before | after |
 |---|---|---|
 | assistant message | `Turn { text, tool_calls }` | `Turn { source }` — bare program text |
-| harness message | `Rendered::Tool { call_id, text }` | a `Post` from `Author::Harness` carrying the report |
+| harness message | `Rendered::Tool { call_id, text }` | the report, **derived at render time** from the `Return`/`Condition` event, occupying the user role |
 | restart choice | one of three tool schemas | whatever the handler program `return`s |
 | invalid restart | `Runner::eligible` → `Cause::Refused` | `resume` is unbound → a trap → a handler, like any other error |
 | tool list in request | `tool_specs()` on every request | nothing; the card is the surface |
 
 Everything deleted below falls out of that one substitution. Nothing
 below is deleted for tidiness.
+
+**Corrected during implementation.** This table first said the harness's
+reply was *a `Post` from `Author::Harness` carrying the report* — a
+stored row. That was wrong, and building it that way would have either
+duplicated the report or had it silently swallowed, depending on the
+condition's disposition. `document::render` already derives the report
+inline from the `Return`/`Condition` event, via `report::derive_report`,
+memoised per outcome id. So the report is never stored as a message at
+all. This is the derived-not-stored doctrine holding where the plan
+briefly forgot it: the outcome event **is** the row, and its rendering
+is a fold, exactly as `22`'s organizing invariant says.
 
 ### Vocabulary, as settled in `22`
 

@@ -852,6 +852,13 @@ fn what_happened(h: &Handback<'_>, cause: &Cause, site: u32) -> String {
              below are still fetchable by id; rewrite to continue."
                 .to_owned()
         }
+        Cause::Abandoned => {
+            "A handler abandoned this program: it was discarded rather than continued, and \
+             its VM is gone. Calls it had already issued still settle, and everything it \
+             completed is below, fetchable by id. Nothing is suspended — whatever happens \
+             next is a fresh program."
+                .to_owned()
+        }
         // Never reached: `render_handback` peels both of these off
         // before calling here (no VM ran for either, so there is no
         // stack or console for `ConditionReport` to carry). Kept only so
