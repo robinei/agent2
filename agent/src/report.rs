@@ -762,6 +762,8 @@ fn compaction_message(rendered: usize, budget: usize) -> String {
          against the row, so a wrong id is rejected rather than compacting the wrong thing, \
          and the whole batch is validated before any of it commits — a mistake costs a retry \
          and never the log.\n\n\
+         Only the numbered rows above can be compacted — this card and the worked examples \
+         before the conversation are fixed, and nothing addresses them.\n\n\
          Prefer removing outright and keeping the rest verbatim; rewrite only what truly \
          needs shortening. The largest tool results you have already acted on are the first \
          targets. The task itself is the last. Nothing is deleted: a compacted row keeps its \

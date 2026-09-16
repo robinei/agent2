@@ -118,6 +118,17 @@ pub enum CompactionError {
     /// (which one wins?) and always a mistake, since a handler run
     /// gets one shot at each row.
     DuplicateTarget(EventId),
+    /// The op named something that is on the path but is not a row of
+    /// the conversation — the agent's own root, a structural event.
+    ///
+    /// `label_of`'s fallback is the literal `"event"`, which means "no
+    /// name for this kind of row", and those never render into the
+    /// document at all. Compacting one is a no-op that would look like
+    /// a success and free nothing, so it is a refusal instead: a live
+    /// compaction program on 2026-09-16 opened with
+    /// `remove_history(1, "system")`, aiming at the card, which is not
+    /// a row and cannot be made smaller this way.
+    NotARow(EventId),
     /// The batch, once applied, is still at or above the threshold —
     /// the real advantage of program-based compaction over
     /// regenerative summarization: this is checkable before commit,
@@ -159,6 +170,13 @@ impl std::fmt::Display for CompactionError {
             CompactionError::DuplicateTarget(id) => write!(
                 f,
                 "#{} was named twice in one batch — each row gets one operation",
+                id.as_u64()
+            ),
+            CompactionError::NotARow(id) => write!(
+                f,
+                "#{} is not a row of the conversation — it is structural, and the card and \
+                 the worked examples above it are fixed. Only the numbered rows can be \
+                 compacted. Nothing was changed.",
                 id.as_u64()
             ),
             CompactionError::StillOverThreshold { size, threshold } => write!(
@@ -221,6 +239,9 @@ pub fn compact(
             return Err(CompactionError::UnknownId(op.id()));
         };
         let expected = label_of(&target.payload);
+        if expected == "event" {
+            return Err(CompactionError::NotARow(op.id()));
+        }
         if expected != op.label() {
             return Err(CompactionError::LabelMismatch {
                 id: op.id(),
@@ -492,5 +513,37 @@ mod tests {
         assert!(!should_fire(799, 1000, 0.2));
         assert!(should_fire(800, 1000, 0.2));
         assert!(should_fire(1000, 1000, 0.2));
+    }
+    /// Something structural is refused by name, not quietly accepted.
+    ///
+    /// A live compaction program opened with
+    /// `remove_history(1, "system")` — aiming at the card, which is not
+    /// a row, renders nowhere, and could not be made smaller by
+    /// compacting it. Accepted, that op would have committed, freed
+    /// nothing, and left the model believing it had worked.
+    #[test]
+    fn a_structural_event_is_not_a_row() {
+        let (tree, spine, _, _) = sample_branch();
+        let agent = tree
+            .enclosing_agent(spine.leaf_id)
+            .expect("the branch has an agent");
+        let err = compact(
+            &tree,
+            &spine,
+            &[CompactionOp::Remove {
+                id: agent,
+                label: "event".into(),
+            }],
+            64 * 1024,
+            1,
+        )
+        .unwrap_err();
+        assert!(matches!(err, CompactionError::NotARow(id) if id == agent));
+        let said = err.to_string();
+        assert!(said.contains("not a row"), "{said}");
+        assert!(
+            said.contains("fixed"),
+            "says what cannot be touched: {said}"
+        );
     }
 }
