@@ -147,6 +147,51 @@ The short-program instinct still looks right; it is just no longer
 obvious that `return`-continues is the only way to get there, when
 deleting prose got half of it for free.
 
+## The 2x2, and the failure that survives all four cells
+
+Card size against model capability, n=3 a cell:
+
+  task               flash minimal    flash mid    PRO minimal     PRO mid
+  ambiguous-config    3/3  18.4KB    3/3  24.0KB   1/3   0.8KB    3/3  29.3KB
+  dead-code-sweep     1/2  77.3KB    1/2 203.1KB   1/1 150.3KB    2/2  83.4KB
+  plain-question      3/3   1.9KB    3/3   0.8KB   3/3   2.3KB    3/3   1.6KB
+  skipped-tests       1/3  37.4KB    3/3 121.0KB   2/3   5.5KB    0/3   0.9KB
+  suite              8/11 135.0KB  10/11 348.9KB  7/10 158.9KB   8/11 115.2KB
+
+**No cell dominates, and the differences between cells are comparable
+to the variance inside them.** At two or three runs apiece, with the
+provider cutting one or two off in every column, this instrument can
+see a large effect — sketch exemplars at 4/12 — and cannot rank
+minimal against mid, or flash against pro. That is a statement about
+the eval, and the fix is more repeats before more variants, not another
+card.
+
+One cell is worth noting anyway: pro with `mid` is the best
+`dead-code-sweep` result measured anywhere, 2/2 at 83KB against flash's
+1/2 at 203KB. Twice the pass rate at 40% of the reasoning.
+
+What is *not* noise is the failure that shows up in four different
+cells. flash with `minimal`, flash with `sketch`, pro with `minimal`,
+pro with `mid`:
+
+    tell("I'll find which tests are skipped, un-skip each in turn, and
+          run it to see whether it actually passes now.");
+    const root = (await tools.bash("pwd && ls -1A")).stdout;
+    tell(`Current directory listing:\n${root}`);
+
+Announce the plan, make one recon call, stop. Every configuration
+produces it, a stronger model produces it, a bigger card produces it,
+and it is the same shape that opened 2026-09-16 on `try11`. Neither
+card size nor capability reliably prevents it, and the whole reason it
+is a failure is that nothing continues a program that ends.
+
+That is the strongest argument this phase has. The program above is a
+perfectly good first step; it is only wrong because the architecture
+requires one program to carry the task. Under `return`-continues it
+returns the listing and the next program goes on. The failure that
+survives every cell of this table is the failure the design change
+deletes.
+
 ## What would refute it
 
 **The ablation, still running.** Two explanations predict opposite
