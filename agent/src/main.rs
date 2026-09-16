@@ -5,6 +5,7 @@ mod eval;
 mod host;
 mod machine;
 mod report;
+mod score;
 mod tree;
 mod types;
 
@@ -57,6 +58,12 @@ const USAGE: &str = "usage: agent <command>
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
+        Some("score") => {
+            if let Err(e) = score::run_cli(&args[2..]) {
+                eprintln!("{e}");
+                std::process::exit(2);
+            }
+        }
         Some("debug") => {
             let Some(path) = args.get(2) else {
                 eprintln!("usage: agent debug <file.js>");
@@ -235,6 +242,14 @@ fn open_tree(log_path: Option<String>) -> Result<Tree, String> {
         .open(&path)
         .map_err(|e| format!("{}: {e}", path.display()))?;
     Tree::open(file).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// Open a log without taking a write handle to it — `agent score` reads
+/// a finished run, including one still being written by another
+/// process, and must never resume or truncate it.
+fn open_tree_read_only(path: &str) -> Result<Tree, String> {
+    let file = std::fs::File::open(path).map_err(|e| format!("{path}: {e}"))?;
+    Tree::open(file).map_err(|e| format!("{path}: {e}"))
 }
 
 /// Context prompt for real (M1) sessions; the dialect card carries the

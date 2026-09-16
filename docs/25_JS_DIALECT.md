@@ -69,6 +69,34 @@ error, so it costs nothing at runtime), labeled `break`/`continue`,
 `Promise.race`/`any`, `new Promise`, BigInt, getters/setters, static
 class members, array holes.
 
+## 25.0 — `agent score <log…>` (landed)
+
+The instrument the rest of this phase is judged by, and the thing that
+stops each question being answered by a throwaway JSONL parser that
+agrees with nothing. One pass over a finished log, sharing its
+definitions with `eval::tasks::fold` — a test asserts the two agree on
+the same tree, which is the guard against them drifting.
+
+What it reports, and why each: `calls_per_program` (the thesis in one
+number — a change that keeps tasks passing while this falls has given
+the advantage back), `provider_ms` split out of `span_ms` (the same
+task ran in 34s and 1195s on 2026-09-16; the second spent 99.6% of
+itself waiting on the endpoint, so raw wall clock is unreadable),
+`trap_messages` rather than a count (a trap is the dialect surprising
+the model, and *which* surprise is the whole finding), `handovers`
+separated from `raises` (`next_program` lowers to a raise, so a bare
+count conflates opposite behaviours), and `silent` (a run whose
+programs never reached a person).
+
+It earned itself immediately: run over the week's logs it found a
+second trap in `try18` that hand-reading had missed —
+`localeCompare` was not implemented, so `sites.sort((a, b) =>
+a.path.localeCompare(b.path))`, which is simply how a string sort is
+written, trapped as a call to `undefined` and cost that run a program.
+Added in the same commit: code-point order, no locale, since this
+dialect has no locale data and inventing one would make the result
+depend on something the program cannot see.
+
 ## 25.1 — String indexing
 
 `"aéb".length` is 4, not 3: strings count UTF-8 bytes. Indexing

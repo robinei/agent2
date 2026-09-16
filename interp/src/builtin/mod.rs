@@ -510,6 +510,7 @@ builtins! {
     StrRepeat,       BuiltinKind::Method, "repeat",       2, 2, str_repeat,        false, true, false, false, false, false, false, false, false, false;
     StrTrimStart,    BuiltinKind::Method, "trimStart",    1, 1, str_trim_start,    false, true, false, false, false, false, false, false, false, false;
     StrTrimEnd,      BuiltinKind::Method, "trimEnd",      1, 1, str_trim_end,      false, true, false, false, false, false, false, false, false, false;
+    StrLocaleCompare,BuiltinKind::Method, "localeCompare", 2, 2, str_locale_compare,  false, true, false, false, false, false, false, false, false, false;
     StrCharAt,       BuiltinKind::Method, "charAt",       2, 2, str_char_at,       false, true, false, false, false, false, false, false, false, false;
     StrAt,           BuiltinKind::Method, "at",           2, 2, at_poly,           true,  true, false, false, false, false, false, false, false, false;
     StrConcat,       BuiltinKind::Method, "concat",       1, VARARG, concat_poly,  true,  true, false, false, false, false, false, false, false, false;

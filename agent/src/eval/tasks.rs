@@ -1374,7 +1374,7 @@ pub const EXPERIMENTAL: &[Task] = &[
 ];
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Build `task`'s real sandbox, wrap `turns` (bare program sources)
@@ -1382,7 +1382,7 @@ mod tests {
     /// this module's stand-in for a live model. Returns the sandbox
     /// alongside the outcome so a test's own filesystem assertions (and
     /// `task.check`) can read the exact directory the run actually used.
-    fn drive_scripted(task: &Task, turns: Vec<&str>) -> (tempfile::TempDir, Outcome) {
+    pub(crate) fn drive_scripted(task: &Task, turns: Vec<&str>) -> (tempfile::TempDir, Outcome) {
         let sandbox = make_sandbox(task);
         let llm: Box<dyn host::LlmClient> = Box::new(host::ScriptedLlm::new(
             turns.into_iter().map(host::scripted_program),

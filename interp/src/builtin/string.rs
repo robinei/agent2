@@ -300,6 +300,29 @@ pub fn str_replace_all(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     )))
 }
 
+/// `s.localeCompare(other)` → -1 / 0 / 1.
+///
+/// Plain code-point order, no locale and no collation: this dialect has
+/// no locale data and inventing one would make the result depend on
+/// something the program cannot see. That matches what it is actually
+/// reached for — `xs.sort((a, b) => a.localeCompare(b))` is simply how
+/// a string sort is written, and every other spelling of it works here
+/// already.
+///
+/// Observed live 2026-09-16: a program sorting edit sites by path wrote
+/// exactly that comparator and trapped with "cannot call a undefined as
+/// a function", costing the run a program. Found by `agent score` on
+/// the log, which is what that command is for.
+pub fn str_locale_compare(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    let s = args.string_receiver(vm)?;
+    let other = vm.to_js_string(args.get(vm, 1), 0);
+    Ok(match s.as_str().cmp(other.as_str()) {
+        std::cmp::Ordering::Less => Value::NegInt(-1),
+        std::cmp::Ordering::Equal => Value::PosInt(0),
+        std::cmp::Ordering::Greater => Value::PosInt(1),
+    })
+}
+
 /// Upper bound on a built string's byte length. JS engines cap string length
 /// (V8 ≈2^30) and throw `RangeError`; this dialect has no `RangeError` kind, so
 /// the string builders raise a loud `ValueError` instead of attempting a
@@ -1278,5 +1301,18 @@ mod tests {
             testutil::run_ret("return 'hello'.substring(-3, 2);"),
             serde_json::json!("he")
         );
+    }
+
+    /// `xs.sort((a, b) => a.localeCompare(b))` is simply how a string
+    /// sort is written; it used to trap as a call to `undefined`.
+    #[test]
+    fn locale_compare_orders_by_code_point() {
+        assert_eq!(
+            testutil::eval_str("['b','a','c'].sort((x, y) => x.localeCompare(y)).join('')"),
+            "abc"
+        );
+        assert_eq!(testutil::run_ret("return 'a'.localeCompare('a');"), 0);
+        assert_eq!(testutil::run_ret("return 'b'.localeCompare('a');"), 1);
+        assert_eq!(testutil::run_ret("return 'a'.localeCompare('b');"), -1);
     }
 }
