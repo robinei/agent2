@@ -9,6 +9,31 @@ use crate::vm::{ErrorKind, RcStr, VM, VMError, Value};
 /// `Edit.replaceOnce(text, old, new)` → string.
 /// Replace `old` (string or RegExp) with `new` iff `old` matches exactly once
 /// in `text`. Errors with the actual match count on ambiguity.
+/// What a failed `replaceOnce` should say.
+///
+/// "expected 1 match, found 4" names the problem and not the remedy,
+/// and a trap is only affordable when it teaches — a program pays one
+/// round trip for it either way, so the message is where the round trip
+/// either buys something or does not. Observed 2026-09-16: two of three
+/// eval runs trapped here, on `#[allow(dead_code)]`, which occurs four
+/// times in one file. Widening the needle to include the line beneath
+/// it is the fix, and nothing said so.
+fn ambiguous(n: usize, needle: &str) -> String {
+    let mut shown: String = needle.chars().take(50).collect();
+    if shown.len() < needle.len() {
+        shown.push('…');
+    }
+    if n == 0 {
+        format!(
+            "replaceOnce found no match for `{shown}` — the text has to appear exactly as written, whitespace included"
+        )
+    } else {
+        format!(
+            "replaceOnce expected 1 match, found {n} of `{shown}` — widen it with the surrounding text (the line above or below) until it names one place"
+        )
+    }
+}
+
 pub fn edit_replace_once(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let text_s = vm.string_from(args.get(vm, 0))?;
     let text = text_s.as_str();
@@ -19,10 +44,8 @@ pub fn edit_replace_once(vm: &mut VM, args: Args) -> Result<Value, VMError> {
         let matches: Vec<_> = rx.compiled.find_iter(text).collect();
         let n = matches.len();
         if n != 1 {
-            return Err(vm.fail(
-                ErrorKind::ValueError,
-                format!("replaceOnce expected 1 match, found {n}"),
-            ));
+            let shown = format!("{:?}", rx.compiled);
+            return Err(vm.fail(ErrorKind::ValueError, ambiguous(n, &shown)));
         }
         let m = &matches[0];
         let mut out = String::with_capacity(text.len());
@@ -42,10 +65,7 @@ pub fn edit_replace_once(vm: &mut VM, args: Args) -> Result<Value, VMError> {
         let indices: Vec<_> = text.match_indices(old).collect();
         let n = indices.len();
         if n != 1 {
-            return Err(vm.fail(
-                ErrorKind::ValueError,
-                format!("replaceOnce expected 1 match, found {n}"),
-            ));
+            return Err(vm.fail(ErrorKind::ValueError, ambiguous(n, old)));
         }
         let (pos, _) = indices[0];
         let mut out = String::with_capacity(text.len());
@@ -898,5 +918,27 @@ mod tests {
              catch (e) { return 'caught mismatch'; }",
         );
         assert_eq!(out, json!("caught mismatch"));
+    }
+
+    /// The message has to name the remedy, not only the count — see
+    /// `ambiguous`'s own doc for the runs that argued for it.
+    #[test]
+    fn replace_once_ambiguity_says_how_to_disambiguate() {
+        let err = testutil::run_runtime_err(
+            "return Edit.replaceOnce('#[a]\\nfn x\\n#[a]\\nfn y', '#[a]', '');",
+        );
+        assert!(err.message.contains("found 2"), "{}", err.message);
+        assert!(
+            err.message.contains("widen") && err.message.contains("surrounding"),
+            "the trap has to teach: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn replace_once_absence_says_it_must_match_exactly() {
+        let err = testutil::run_runtime_err("return Edit.replaceOnce('abc', 'zz', '');");
+        assert!(err.message.contains("no match"), "{}", err.message);
+        assert!(err.message.contains("whitespace"), "{}", err.message);
     }
 }
