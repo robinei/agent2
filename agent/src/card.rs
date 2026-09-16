@@ -139,13 +139,16 @@ started changing things goes stale as you use it: take a line out and
 everything under it renumbers. Get either wrong and the loop reports a
 clean sweep of work it did not do.
 
-And make sure the check can say no. A verdict that comes back the same
-for every item usually means the thing you are testing for never
-appears in what you captured — a warning is not a failing status, and
-a filtered pipeline drops the error that mattered. So get one no out of
-it before you believe twenty yeses: run it against the state you
-started from, or a case you already know is bad. A check you have never
-seen fail is not yet a check.
+And make sure the check can say no — in this same program, and without
+stopping to do it. Establishing that takes a call and a comparison, not
+a round trip: prove it and carry straight on into the loop. A verdict
+that comes back the same for every item usually means the thing you
+were testing for never appears in what you captured — a warning is not
+a failing status, an exit code of 0 covers "ran and passed" and "never
+ran at all" alike, and a filtered pipeline drops the error that
+mattered. Twenty-nine of twenty-nine removable is a result about your
+check, not about the code. If the check turns out to be unable to fail,
+that is the finding: say it, rather than reporting a clean sweep.
 
 The tell is exact: **if you can write down what the next program should
 do, you can write the program.** A handover whose payload says "for
@@ -563,7 +566,12 @@ for (const site of sites) {
     // pipefail, or the status is `tail`'s and `tail` always succeeds:
     // the test could fail to compile at all and this would read as a pass.
     const run = await tools.bash(`set -o pipefail; cargo test ${name} -- --exact 2>&1 | tail -5`);
-    if (run.status === 0) {
+
+    // And a 0 status is not yet an answer: a filter that matches
+    // nothing exits 0 too, as does a run where the test was still
+    // ignored. Make the runner say it ran one and it passed — otherwise
+    // this check has no way to tell me no, and every test "passes".
+    if (run.status === 0 && /1 passed/.test(run.stdout)) {
         freed.push(name);
     } else {
         // put it back — my own write moved the version on, so re-read it
@@ -622,7 +630,7 @@ mod tests {
         // `CARD` shows up as a diff review must look at, not a byte
         // count that silently drifts. Comparing full text (not just a
         // hash) so the diff itself is legible in a failure message.
-        const EXPECTED_LEN: usize = 13295;
+        const EXPECTED_LEN: usize = 13547;
         assert_eq!(
             CARD.len(),
             EXPECTED_LEN,
