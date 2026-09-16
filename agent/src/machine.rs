@@ -3743,6 +3743,11 @@ mod tests {
             )
             .unwrap();
         drain(&mut state, &mut tree, out);
+        // Before firing: once the leaf is a compaction condition,
+        // `render` returns the inventory, so the conversation has to be
+        // measured while it is still the conversation.
+        let conversation =
+            crate::compaction::rendered_size(&crate::document::render(&tree, &state.spine, budget));
         state.compaction_if_needed(&mut tree, budget, 0.25).unwrap();
         let doc = crate::document::render(&tree, &state.spine, 64 * 1024);
         let text = doc
@@ -3753,6 +3758,31 @@ mod tests {
             .join("\n");
         assert!(text.contains("compaction program"), "not in the document");
         assert!(text.contains("remove_history"), "the verbs are not there");
+
+        // And it is an *inventory*, not the conversation: the rows are
+        // listed by id, label and size, and their content is not there.
+        // Three live runs were handed the whole document with the
+        // request appended and did the unfinished task instead.
+        assert!(text.contains("the conversation so far, by row"), "{text}");
+        assert!(text.contains("bytes:"), "rows carry their size: {text}");
+        // Each row is one clipped line: enough to tell a tool result
+        // from the task, never the content itself.
+        let longest = text
+            .lines()
+            .filter(|l| l.starts_with('[') && l.contains(" bytes: "))
+            .map(str::len)
+            .max()
+            .expect("inventory rows");
+        assert!(longest < 200, "a row line ran to {longest} bytes");
+
+        // And the whole turn is far smaller than the conversation it is
+        // about — the cheapest turn in the system rather than the
+        // dearest, which is what sending an inventory buys.
+        assert!(
+            text.len() * 2 < conversation,
+            "compaction turn {} bytes vs a {conversation}-byte conversation",
+            text.len()
+        );
     }
 
     /// Already compacting, it does not fire again — which is what stops

@@ -625,8 +625,15 @@ def main():
     if not usable:
         return 1
 
-    if not AGENT.exists():
-        print(f"{AGENT} not built", file=sys.stderr)
+    # Built here rather than checked for existence: `cargo test` and
+    # `cargo clippy` do not produce this binary, so a session that runs
+    # both after an edit still leaves a stale one on disk. A live run on
+    # 2026-09-16 measured a fix that was not in the binary it ran.
+    build = subprocess.run(
+        ["cargo", "build", "-q", "-p", "agent", "--bin", "agent"], cwd=REPO
+    )
+    if build.returncode != 0 or not AGENT.exists():
+        print(f"{AGENT} did not build", file=sys.stderr)
         return 2
 
     if args.rescore:

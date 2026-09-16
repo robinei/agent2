@@ -729,7 +729,7 @@ fn render_handback(h: &Handback<'_>, budget: usize) -> String {
 /// own id and label, so restating them here would spend the budget this
 /// condition exists to reclaim. What the handler needs from this
 /// message is the instruction and the size of the problem.
-fn compaction_message(rendered: usize, budget: usize) -> String {
+pub(crate) fn compaction_message(rendered: usize, budget: usize) -> String {
     format!(
         "This conversation is {rendered} bytes against a {budget}-byte budget, so the next \
          program is a compaction program: shrink the history above, then return.\n\n\
