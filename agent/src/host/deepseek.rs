@@ -93,17 +93,21 @@ impl DeepSeekClient {
         // machine slept mid-request: ten minutes on a connection nothing
         // was ever coming back on.
         //
-        // Two bounds, neither of which a healthy long completion can
-        // trip. `recv_response` covers time to the first response
-        // headers, which is where a dead connection actually sits; the
-        // server answers in well under this even when it then thinks for
-        // minutes. `recv_body` is a backstop for a stream that dies
-        // mid-flight, set far beyond any real completion.
+        // Two bounds, both deliberately far past anything healthy.
+        // `recv_response` covers time to the first response headers,
+        // which is where a dead connection sits. It was 180s, chosen
+        // because a direct probe showed headers arriving in under a
+        // second — and that was wrong twice in one evening: under load
+        // this endpoint *queues* rather than refusing, so a busy moment
+        // looks exactly like a dead socket and two real runs were killed
+        // mid-task by their own client. A timeout meant to catch a
+        // hardware event should never be tight enough to catch a slow
+        // one.
         let config = ureq::Agent::config_builder()
             .http_status_as_error(false)
             .timeout_connect(Some(std::time::Duration::from_secs(15)))
-            .timeout_recv_response(Some(std::time::Duration::from_secs(180)))
-            .timeout_recv_body(Some(std::time::Duration::from_secs(20 * 60)))
+            .timeout_recv_response(Some(std::time::Duration::from_secs(10 * 60)))
+            .timeout_recv_body(Some(std::time::Duration::from_secs(30 * 60)))
             .build();
         DeepSeekClient {
             api_key,
