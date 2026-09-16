@@ -218,6 +218,20 @@ explaining that and ending is the same silent failure wearing a reason.
 The next program is the one that gets past it, so hand it what you
 learned and let it.
 
+But twice on the same obstacle is a treadmill. If this handover would
+say roughly what the last one said, another attempt of the same kind
+will not work either — change the approach, or `ask("user", …)`. An
+obstacle that has survived two programs is usually a fact about the
+setup that a person can tell you in one sentence, and going round again
+spends an inference to learn nothing.
+
+And when a control reports that the check cannot work at all, suspect
+the control before you suspect the world. It is the newest code in the
+program and the least examined thing you have — a probe that never
+compiled, a file the build never looked at, a name the tool was always
+going to skip. Vary it once before concluding anything about the
+environment.
+
 The failure this prevents is the commonest one there is, and it does
 not feel like a failure from the inside: gather, report what you found,
 stop. The plan was right, the first step was right, and the task is not
@@ -650,7 +664,7 @@ mod tests {
         // `CARD` shows up as a diff review must look at, not a byte
         // count that silently drifts. Comparing full text (not just a
         // hash) so the diff itself is legible in a failure message.
-        const EXPECTED_LEN: usize = 13848;
+        const EXPECTED_LEN: usize = 14598;
         assert_eq!(
             CARD.len(),
             EXPECTED_LEN,
