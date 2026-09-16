@@ -1,0 +1,10 @@
+[package]
+name = "widget"
+version = "0.1.0"
+edition = "2021"
+
+# No dependencies on purpose: the sandbox has no registry, and the whole
+# point of this fixture is that `cargo check` answers in well under the
+# 30s a bash call gets.
+
+[workspace]
