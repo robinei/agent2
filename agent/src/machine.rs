@@ -2323,7 +2323,18 @@ impl Runner {
                 cause: Cause::Compaction { rendered, budget },
                 site: 0,
                 stack: Vec::new(),
-                disposition: Disposition::Pushed,
+                // `Handover`, not `Pushed`, for the same reason
+                // `next_program` is: `document::render` inserts a
+                // report for a `Handover` and *hides* a `Pushed` one,
+                // because a pushed condition means a nested handler is
+                // about to run and nothing chat-visible has happened
+                // yet. Logged as `Pushed`, the request to compact went
+                // into the rolling document nowhere at all — two live
+                // runs on 2026-09-16 saw an ordinary conversation with
+                // an unanswered task, and did the task. Nothing opens a
+                // scope here: the compaction program is this branch's
+                // next turn, not a deliberation beneath it.
+                disposition: Disposition::Handover,
             },
         )?;
         self.compacting = Some(Vec::new());
@@ -3708,6 +3719,40 @@ mod tests {
                 .is_none(),
             "past the bound it stops asking"
         );
+    }
+
+    /// The request has to reach the document the handler is written
+    /// from. Logged `Pushed` it did not: `document::render` hides a
+    /// pushed condition, so two live runs saw only the conversation and
+    /// its unanswered task, and answered the task. Every other test
+    /// here passed throughout — they checked that the condition was
+    /// logged and that its report *renders*, never that the model would
+    /// be shown it.
+    #[test]
+    fn the_compaction_request_reaches_the_rendered_document() {
+        let (mut tree, mut state, budget) = crowded();
+        // A real conversation has run a program before it is big enough
+        // to compact, and the fold inserts a report where a program
+        // handed back — so a branch with no `Turn` on it would not
+        // exercise the path a live run takes.
+        user_post(&mut state, &mut tree, "go");
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(llm_program("tell(\"working\");")),
+            )
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+        state.compaction_if_needed(&mut tree, budget, 0.25).unwrap();
+        let doc = crate::document::render(&tree, &state.spine, 64 * 1024);
+        let text = doc
+            .messages
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("compaction program"), "not in the document");
+        assert!(text.contains("remove_history"), "the verbs are not there");
     }
 
     /// Already compacting, it does not fire again — which is what stops
