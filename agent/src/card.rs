@@ -92,6 +92,21 @@ They fail loudly rather than landing somewhere you didn't mean:
   Edit.extractByIndent(text, lineIndex)          { start, end }, by dedent
   Edit.extractEnclosing(text, index, open, close)
 
+Three places this dialect answers differently from JavaScript without
+saying so — everything else that differs stops the program and tells you:
+
+  "aéb".length is 4          strings count UTF-8 bytes, not
+                                 characters; ASCII text is identical,
+                                 and an em dash or an accent is not
+  1 < "2" is false               `<` `>` `<=` `>=` do not coerce across
+                                 types. A number parsed out of a tool's
+                                 output is a *string* until you say
+                                 `Number(x)`, and comparing it raw is
+                                 quietly always false
+  e instanceof Error is false    a caught error is a plain
+                                 `{ name, message }`; branch on
+                                 `e.name`, not on its type
+
 **When to ask, and who to ask.** The moment the next step turns on a
 judgement the data cannot settle, stop guessing and get the judgement.
 Which verb depends only on who can give it. A person has to decide
@@ -694,7 +709,7 @@ mod tests {
         // `CARD` shows up as a diff review must look at, not a byte
         // count that silently drifts. Comparing full text (not just a
         // hash) so the diff itself is legible in a failure message.
-        const EXPECTED_LEN: usize = 16416;
+        const EXPECTED_LEN: usize = 17281;
         assert_eq!(
             CARD.len(),
             EXPECTED_LEN,

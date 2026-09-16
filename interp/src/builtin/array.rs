@@ -677,4 +677,23 @@ mod tests {
             serde_json::json!([])
         );
     }
+
+    /// `const out = []; out[0] = x` is how anyone grows an array by
+    /// index, and it used to be a loud error like any other
+    /// out-of-bounds write. Appending at exactly `length` makes no
+    /// hole, so the invariant that bound protects is untouched.
+    #[test]
+    fn writing_at_exactly_length_appends() {
+        assert_eq!(
+            testutil::run_ret("const a = []; a[0] = 7; a[1] = 8; return a;"),
+            serde_json::json!([7, 8])
+        );
+    }
+
+    #[test]
+    fn writing_past_length_still_errors_and_says_how_to_grow() {
+        let err = testutil::run_runtime_err("const a = []; a[3] = 1;");
+        assert_eq!(err.kind, crate::ErrorKind::ValueError);
+        assert!(err.message.contains("push()"), "{}", err.message);
+    }
 }

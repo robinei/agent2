@@ -569,11 +569,30 @@ impl VM {
                         ));
                     }
                 };
-                if idx >= arr.len() {
+                if idx == arr.len() {
+                    // Appending at exactly `length` is how JS grows an
+                    // array by index, and `const out = []; out[0] = x`
+                    // is how anyone writes it. It creates no hole, so
+                    // the no-holes invariant the bound below protects
+                    // is untouched. Observed 2026-09-16: every other
+                    // index write is a loud error, which is right, but
+                    // this one was too and cost a recovery round trip
+                    // for the most ordinary line in JavaScript.
+                    arr.push(val.clone());
+                    return Ok(match mode {
+                        SetMode::New => val,
+                        // Nothing was there to be displaced.
+                        SetMode::Old => Value::Undefined,
+                    });
+                }
+                if idx > arr.len() {
                     let len = arr.len();
                     return Err(self.fail(
                         ErrorKind::ValueError,
-                        format!("cannot write array index {idx}: out of bounds (length {len})"),
+                        format!(
+                            "cannot write array index {idx}: out of bounds (length {len}) — \
+                             an array grows by push() or by writing at exactly its length"
+                        ),
                     ));
                 }
                 let old = std::mem::replace(&mut arr[idx], val);
