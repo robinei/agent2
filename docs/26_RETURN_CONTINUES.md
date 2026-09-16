@@ -98,6 +98,48 @@ card*. That moderates this sketch rather than confirming it: the
 current architecture is substantially cheaper than it looked an hour
 ago, and the honest next step is a card cut, not a rewrite.
 
+### The correction: it is volume, not which paragraphs
+
+A third variant found where the curve turns, and it is not where the
+paragraph above guessed. `mid` (14.0KB) is the full card with exactly
+the 2026-09-16 engineering-hygiene additions removed — the
+pipefail/status block, "make sure the check can say no", "blocked is
+not done", the treadmill, "suspect the control", the transcript
+sentence — and nothing else touched.
+
+  dead-code-sweep     passed   c/p    reasoning   out tokens   in tokens
+    full  17.3KB        0/2   24.7      170.1KB      51,140      20,116
+    mid   14.0KB        1/2   14.2      203.1KB      60,138      18,833
+    minimal 5.6KB       1/2   20.0       77.3KB      22,214       9,258
+
+  per task, mid -> minimal
+    ambiguous-config   3/3 ->  3/3      24.0KB ->  18.4KB
+    dead-code-sweep    1/2 ->  1/2     203.1KB ->  77.3KB
+    plain-question     3/3 ->  3/3       0.8KB ->   1.9KB
+    skipped-tests      3/3 ->  1/3     121.0KB ->  37.4KB
+  whole suite         10/11 -> 8/11
+
+Removing precisely the paragraphs added today did **not** reduce the
+cost — `mid` reasons at least as hard as the full card. So the earlier
+reading, that today's additions were the blowup, was wrong. The cost
+tracks the *volume* of guidance rather than which guidance: the model
+appears to deliberate roughly in proportion to how much it has been
+told, largely regardless of what it says.
+
+And correctness runs the other way. `mid` is the best card measured —
+10/11, including 3/3 on `skipped-tests` where `minimal` manages 1/3 —
+while `minimal` is by far the cheapest. That is an ordinary trade-off
+curve, not a free lunch, and the honest summary is that two thirds of
+the card buys roughly a third more correctness for two and a half times
+the cost.
+
+Which sharpens the question this phase asks. If guidance costs
+reasoning by the kilobyte, the way out is not a better-worded card but
+an architecture that needs less telling — and "let the program be
+short, and let `return` continue" is exactly a proposal to need less
+telling, because most of what the card explains is how to carry a whole
+task in one program.
+
 What survives the moderation is the direction. 77KB of reasoning is
 still thirteen times pi's 5.8KB, and pi was 3/3 at a 56-second median
 against our 1/2 at seven minutes. Halving a 24x gap leaves a 13x gap.
