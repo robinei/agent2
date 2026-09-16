@@ -86,11 +86,24 @@ impl DeepSeekClient {
     }
 
     pub fn new(api_key: String, model: String, base_url: String, thinking: bool) -> Self {
-        // Completions stream for minutes: connect gets a timeout, the
-        // body read deliberately does not.
+        // Completions stream for minutes, so the body read cannot be
+        // held to a short deadline — but "no deadline at all" means a
+        // dead socket hangs the branch forever, with the TUI showing a
+        // session that is simply never going to continue. Seen after the
+        // machine slept mid-request: ten minutes on a connection nothing
+        // was ever coming back on.
+        //
+        // Two bounds, neither of which a healthy long completion can
+        // trip. `recv_response` covers time to the first response
+        // headers, which is where a dead connection actually sits; the
+        // server answers in well under this even when it then thinks for
+        // minutes. `recv_body` is a backstop for a stream that dies
+        // mid-flight, set far beyond any real completion.
         let config = ureq::Agent::config_builder()
             .http_status_as_error(false)
             .timeout_connect(Some(std::time::Duration::from_secs(15)))
+            .timeout_recv_response(Some(std::time::Duration::from_secs(180)))
+            .timeout_recv_body(Some(std::time::Duration::from_secs(20 * 60)))
             .build();
         DeepSeekClient {
             api_key,
