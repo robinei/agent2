@@ -223,20 +223,36 @@ def run_once(task, card: Path | None, timeout: int, keep: Path | None = None) ->
                 text=True,
                 timeout=timeout,
             )
-            timed_out, rc = False, proc.returncode
-        except subprocess.TimeoutExpired:
-            timed_out, rc = True, None
+            timed_out, rc, out = False, proc.returncode, proc.stdout
+        except subprocess.TimeoutExpired as e:
+            # A timeout still has output worth keeping, and `proc` never
+            # gets bound on this path — reading it below is how the
+            # first kept run died.
+            timed_out, rc, out = True, None, e.stdout or ""
         wall = time.time() - started
 
         score = score_log(log) if log.exists() else {"error": "no log written"}
-        env = Env(task.DIR, sandbox, score)
-        try:
-            task.check(env)
-            ok, why = True, ""
-        except CheckFailed as e:
-            ok, why = False, str(e)
-        except Exception as e:
-            ok, why = False, f"checker raised {e!r}"
+
+        # A run that never got a completion is not evidence about
+        # anything we changed. The provider stalls: the same task, card
+        # and model took 34s and 1195s on 2026-09-16, the second spending
+        # 99.6% of itself waiting. Scoring that as a failure would read a
+        # queue as a regression, so it is counted apart and never as a
+        # verdict on the card.
+        if timed_out or score.get("programs", 0) == 0:
+            ok, why = None, (
+                "no program was ever written — "
+                + ("the run hit its timeout" if timed_out else "the log has no completion")
+            )
+        else:
+            env = Env(task.DIR, sandbox, score)
+            try:
+                task.check(env)
+                ok, why = True, ""
+            except CheckFailed as e:
+                ok, why = False, str(e)
+            except Exception as e:
+                ok, why = False, f"checker raised {e!r}"
 
         if keep is not None:
             kept = keep / f"{task.NAME}-{time.strftime('%H%M%S')}"
@@ -245,7 +261,7 @@ def run_once(task, card: Path | None, timeout: int, keep: Path | None = None) ->
             if log.exists():
                 shutil.copy2(log, kept / "run.jsonl")
             (kept / "verdict.txt").write_text(
-                f"pass={ok}\n{why}\n\nstdout:\n{getattr(proc, 'stdout', '')[-4000:]}\n"
+                f"pass={ok}  timed_out={timed_out}  exit={rc}\n{why}\n\nstdout:\n{out[-4000:]}\n"
             )
 
     return {
@@ -271,28 +287,32 @@ def aggregate(runs: list) -> dict:
         by_task.setdefault(r["task"], []).append(r)
     summary = {}
     for name, rs in by_task.items():
-        scores = [r["score"] for r in rs if "error" not in r["score"]]
+        scores = [
+            r["score"] for r in rs if "error" not in r["score"] and r["pass"] is not None
+        ]
         traps = {}
         for s in scores:
             for t in s.get("trap_messages", []):
                 traps[t] = traps.get(t, 0) + 1
         summary[name] = {
-            "runs": len(rs),
-            "passed": sum(1 for r in rs if r["pass"]),
+            "runs": sum(1 for r in rs if r["pass"] is not None),
+            "passed": sum(1 for r in rs if r["pass"] is True),
+            "no_run": sum(1 for r in rs if r["pass"] is None),
             "calls_per_program": med([s["calls_per_program"] for s in scores]),
             "programs": med([s["programs"] for s in scores]),
             "handovers": med([s["handovers"] for s in scores]),
             "exec_s": med([s["exec_ms"] / 1000 for s in scores]),
             "provider_s": med([s["provider_ms"] / 1000 for s in scores]),
             "traps": traps,
-            "failures": [r["why"] for r in rs if not r["pass"]],
+            "failures": [r["why"] for r in rs if r["pass"] is False],
         }
     return summary
 
 
 def print_summary(summary: dict):
     for name, s in summary.items():
-        print(f"\n=== {name}  {s['passed']}/{s['runs']} passed")
+        no_run = f"   ({s['no_run']} never got a completion)" if s["no_run"] else ""
+        print(f"\n=== {name}  {s['passed']}/{s['runs']} passed{no_run}")
         print(
             f"  calls/program {s['calls_per_program']}   programs {s['programs']}"
             f"   handovers {s['handovers']}"
@@ -319,6 +339,8 @@ def compare(before: Path, after: Path):
             continue
         print(f"\n=== {name}")
         print(f"  passed          {x['passed']}/{x['runs']}  ->  {y['passed']}/{y['runs']}")
+        if x.get("no_run") or y.get("no_run"):
+            print(f"  no completion   {x.get('no_run', 0)}  ->  {y.get('no_run', 0)}")
         for key in ("calls_per_program", "programs", "handovers", "exec_s"):
             print(f"  {key:<15} {x[key]}  ->  {y[key]}")
 
@@ -380,7 +402,9 @@ def main():
         for i in range(args.repeat):
             print(f"[{task.NAME}] run {i + 1}/{args.repeat}", flush=True)
             r = run_once(task, args.card, args.timeout, args.keep)
-            verdict = "pass" if r["pass"] else f"FAIL: {r['why']}"
+            verdict = (
+                "pass" if r["pass"] else ("FAIL: " + r["why"] if r["pass"] is False else "NO RUN: " + r["why"])
+            )
             s = r["score"]
             print(
                 f"  {verdict}  ({s.get('programs', '?')} programs, "
