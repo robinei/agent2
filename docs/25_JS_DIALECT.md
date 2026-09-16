@@ -318,6 +318,44 @@ larger than that noise, but a second task — `skipped-tests`, the same
 shape on another surface — is what would separate "this task" from
 "this design".
 
+## 25.6c — Three kinds of trap, and why none are discounted
+
+A failing run that trapped is not automatically a verdict on the agent,
+so `drive.py` classifies the trap *message* — once, in a reviewable
+table — rather than deciding per run, which is where a disappointing
+result would otherwise get reclassified into something comfortable:
+
+  gap      standard JavaScript this dialect does not implement. Ours to
+           fix, and a cost a tool loop never pays, because `bash` and
+           `read` have no dialect to be unfaithful to.
+  program  the model's own bug — a wrong argument type, a regex that
+           matches nothing it meant. A verdict on the agent.
+  guard    a primitive refusing what it was built to refuse.
+           `Edit.replaceOnce` declining an ambiguous needle is the
+           design working, and counting it as a defect would penalise
+           the safety it exists to provide.
+
+**Reported beside the pass count, never subtracted from it.** Two
+reasons. A gap's cost is not only the failure but the recovery — a trap
+buys a round trip and a re-plan, which inflates reasoning and latency
+whether or not the run goes on to pass, so discounting the failure
+while keeping the inflated cost columns would be inconsistent in our
+own favour. And the class is open-ended: JavaScript is enormous, the
+tail is never finished, and that asymmetry against a tool loop is
+structural rather than incidental. Hiding it would flatter this design
+in precisely the dimension where it is weakest.
+
+The deflating measurement that motivated writing it down: swept across
+every kept run of all five card variants, the whole suite contains
+exactly **one** genuine fidelity gap — `cannot read property 'catch' on
+promise` — in one run. Everything else is a program error or a guard
+working. The gaps that cost whole runs on 2026-09-16 (byte-indexed
+strings, `Map` iteration, `localeCompare`) all happened on the real
+repository, not here. So discounting would move today's numbers by
+nothing, and **the 13x reasoning gap to pi is not explained by our
+interpreter's incompleteness** — worth knowing before spending on
+fidelity work in the expectation that it closes the gap.
+
 ## 25.7 — What the suite still cannot ask
 
 **Nothing answers an `ask()`.** The internal eval module had one fixed

@@ -49,6 +49,50 @@ AGENT = REPO / "target" / "debug" / "agent"
 PI_HOME = Path(os.environ.get("PI_HOME", Path.home()))
 
 
+# How to read a trap, decided once per message rather than per run.
+#
+# A failing run that trapped is not automatically a verdict on the
+# agent: the three kinds below have three different meanings, and
+# lumping them together lets whichever number is convenient stand for
+# all of them. Classifying the *message* keeps the judgement in one
+# reviewable table instead of being remade, differently, each time a
+# result is disappointing.
+#
+#   gap      standard JavaScript this dialect does not implement. Ours
+#            to fix, and a cost a tool-loop agent never pays — bash and
+#            read have no dialect to be unfaithful to. Reported apart
+#            so the tail stays visible rather than absorbed, because
+#            the set is open-ended and never finished.
+#   program  the model's own bug: wrong argument type, a regex that
+#            matches nothing it meant. A verdict on the agent.
+#   guard    a primitive refusing an operation it was built to refuse.
+#            `Edit.replaceOnce` declining an ambiguous needle is the
+#            design working; counting it as a defect would penalise the
+#            safety it exists to provide.
+TRAP_KINDS = [
+    ("gap", "cannot read .length of a map"),
+    ("gap", "falls inside a multi-byte UTF-8 character"),
+    ("gap", "on promise (did you forget"),
+    ("gap", "array spread source must be"),
+    ("gap", "cannot call a undefined as a function"),
+    ("gap", "cannot write array index"),
+    ("guard", "replaceOnce expected 1 match"),
+    ("guard", "replaceOnce found no"),
+    ("guard", "file changed: expected version"),
+]
+
+
+def classify_trap(message: str) -> str:
+    for kind, needle in TRAP_KINDS:
+        if needle in message:
+            return kind
+    return "program"
+
+
+def trap_kinds(score: dict) -> set:
+    return {classify_trap(m) for m in score.get("trap_messages", [])}
+
+
 class CheckFailed(Exception):
     """A task's own success condition did not hold."""
 
@@ -444,6 +488,12 @@ def aggregate(runs: list) -> dict:
             "completion_out": med([s.get("completion_out", 0) for s in scores]),
             "provider_s": med([s["provider_ms"] / 1000 for s in scores]),
             "traps": traps,
+            # Failures a dialect gap is implicated in — reported beside
+            # the pass count, never subtracted from it.
+            "failed_with_gap": sum(
+                1 for r in rs if r["pass"] is False and "gap" in trap_kinds(r["score"])
+            ),
+            "trap_kinds": sorted({k for r in rs for k in trap_kinds(r["score"])}),
             "failures": [r["why"] for r in rs if r["pass"] is False],
         }
     return summary
@@ -452,7 +502,12 @@ def aggregate(runs: list) -> dict:
 def print_summary(summary: dict):
     for name, s in summary.items():
         no_run = f"   ({s['no_run']} never got a completion)" if s["no_run"] else ""
-        print(f"\n=== {name}  {s['passed']}/{s['runs']} passed{no_run}")
+        gap = (
+            f"   ({s['failed_with_gap']} of the failures hit a dialect gap)"
+            if s.get("failed_with_gap")
+            else ""
+        )
+        print(f"\n=== {name}  {s['passed']}/{s['runs']} passed{no_run}{gap}")
         print(
             f"  calls/program {s['calls_per_program']}   programs {s['programs']}"
             f"   handovers {s['handovers']}"
@@ -467,7 +522,7 @@ def print_summary(summary: dict):
             f"   {s['completion_out']} out"
         )
         for trap, n in s["traps"].items():
-            print(f"  trap x{n}: {trap}")
+            print(f"  trap [{classify_trap(trap)}] x{n}: {trap}")
         for why in s["failures"]:
             print(f"  FAIL: {why}")
 
