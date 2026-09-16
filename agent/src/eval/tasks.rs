@@ -1465,7 +1465,7 @@ mod tests {
                 "const cfg = await tools.read_file('deploy.yaml'); \
              const region = await ask('user', 'which region is right? ' + cfg.content); \
              const updated = cfg.content.replace(/region:.*/, 'region: ' + region); \
-             await tools.replace_file('deploy.yaml', cfg.version, updated); \
+             await tools.replace_file('deploy.yaml', updated, cfg.version); \
              tell(\"user\", 'updated the config');",
             ],
         );
@@ -1488,7 +1488,7 @@ mod tests {
                  'reply one line per flagged line: `N: <the line it should be>`, or `N: leave`.'); \
              const m = String(reply).match(/^\\s*(\\d+)\\s*:\\s*(.+)$/); \
              if (m) { \
-                 await tools.replace_file('deploy.yaml', cfg.version, m[2]); \
+                 await tools.replace_file('deploy.yaml', m[2], cfg.version); \
                  tell(\"user\", 'updated line ' + m[1] + ' to: ' + m[2]); \
              } else { \
                  tell(\"user\", 'could not parse a line-targeted reply: ' + reply); \
@@ -1519,7 +1519,7 @@ mod tests {
                  wrote = true; \
              } \
              if (wrote) { \
-                 await tools.replace_file('deploy.yaml', cfg.version, out); \
+                 await tools.replace_file('deploy.yaml', out, cfg.version); \
                  tell(\"user\", 'applied: ' + out); \
              } else { \
                  tell(\"user\", 'no parseable key=value pairs, nothing written'); \
@@ -1534,7 +1534,7 @@ mod tests {
         let (sandbox, outcome) = drive_scripted(
             &JUDGMENT_IN_THE_MIDDLE,
             vec![
-                "await tools.replace_file('deploy.yaml', 'bogus-version', 'region: us-east-1'); \
+                "await tools.replace_file('deploy.yaml', 'region: us-east-1', 'bogus-version'); \
                  tell(\"user\", 'fixed it');",
             ],
         );
@@ -1551,7 +1551,7 @@ mod tests {
             &JUDGMENT_IN_THE_MIDDLE,
             vec![
                 "const cfg = await tools.read_file('deploy.yaml'); \
-             await tools.replace_file('deploy.yaml', cfg.version, 'region: us-east-1'); \
+             await tools.replace_file('deploy.yaml', 'region: us-east-1', cfg.version); \
              await ask('user', 'was that the right region?'); \
              tell(\"user\", 'fixed it, hope that was right');",
             ],

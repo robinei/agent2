@@ -267,7 +267,7 @@ fn create_file_def() -> ToolDef {
                 .map_err(|e| {
                     if e.kind() == std::io::ErrorKind::AlreadyExists {
                         format!(
-                            "{path}: already exists — use replace_file(path, version, content) \
+                            "{path}: already exists — use replace_file(path, content, version) \
                              instead (read the file first for its version)"
                         )
                     } else {
@@ -284,18 +284,19 @@ fn create_file_def() -> ToolDef {
 fn replace_file_def() -> ToolDef {
     ToolDef {
         name: "replace_file".into(),
-        description: "Replace a file atomically iff its current version matches \
-                      `expected_version` (CAS). Returns { version, diff? }. On \
-                      mismatch errors with the current version and a diff so you \
-                      can re-read and re-apply. Always requires a version — blind \
+        description: "`replace_file(path, content, expected_version)` — writes \
+                      atomically iff the file still matches `expected_version` \
+                      (from `read_file`). Returns { version, diff? }. On mismatch \
+                      errors with the current version and a diff, so you can \
+                      re-read and re-apply. Always requires a version — blind \
                       overwrite is structurally impossible."
             .into(),
         input_schema: json!({
             "type": "array",
             "items": [
                 { "type": "string", "description": "absolute or cwd-relative path" },
-                { "type": "string", "description": "expected version (from read_file)" },
-                { "type": "string", "description": "new UTF-8 content" }
+                { "type": "string", "description": "new UTF-8 content" },
+                { "type": "string", "description": "expected version (from read_file)" }
             ],
             "minItems": 3,
             "maxItems": 3
@@ -304,15 +305,22 @@ fn replace_file_def() -> ToolDef {
             let path = args
                 .get(0)
                 .and_then(|v| v.as_str())
-                .ok_or("replace_file(path, expected_version, content) needs a string path")?;
-            let expected = args
+                .ok_or("replace_file(path, content, expected_version) needs a string path")?;
+            // Content before version: it is the order a model writes
+            // unprompted, and two live runs out of three got the old
+            // (path, version, content) wrong — passing file text where
+            // the hash goes, which fails as a version mismatch and reads
+            // like someone else edited the file. `fs.writeFile(path,
+            // content)` is the shape everyone has; the CAS token is the
+            // afterthought and belongs last.
+            let new_content = args
                 .get(1)
                 .and_then(|v| v.as_str())
-                .ok_or("replace_file(path, expected_version, content) needs a version string")?;
-            let new_content = args
+                .ok_or("replace_file(path, content, expected_version) needs string content")?;
+            let expected = args
                 .get(2)
                 .and_then(|v| v.as_str())
-                .ok_or("replace_file(path, expected_version, content) needs string content")?;
+                .ok_or("replace_file(path, content, expected_version) needs a version string")?;
             let p = Path::new(path);
 
             let current = std::fs::read_to_string(p).map_err(|e| {
@@ -686,7 +694,7 @@ mod tests {
         let result = create_file(json!([path.to_str().unwrap(), "original"])).unwrap();
         let version = result["version"].as_str().unwrap();
 
-        let result = replace_file(json!([path.to_str().unwrap(), version, "modified"])).unwrap();
+        let result = replace_file(json!([path.to_str().unwrap(), "modified", version])).unwrap();
         assert!(result["version"].is_string());
         assert_ne!(result["version"].as_str().unwrap(), version);
         let on_disk = std::fs::read_to_string(&path).unwrap();
@@ -705,7 +713,7 @@ mod tests {
         assert_ne!(current_version, old_version);
 
         let err =
-            replace_file(json!([path.to_str().unwrap(), old_version, "third write"])).unwrap_err();
+            replace_file(json!([path.to_str().unwrap(), "third write", old_version])).unwrap_err();
         assert!(err.contains("file changed"), "{err}");
         assert!(err.contains(old_version), "{err}");
         assert!(err.contains(&current_version), "{err}");
@@ -718,7 +726,7 @@ mod tests {
     fn replace_file_on_absent_path_redirects_to_create_file() {
         let (_dir, path) = temp_path();
         let err =
-            replace_file(json!([path.to_str().unwrap(), "any-version", "content"])).unwrap_err();
+            replace_file(json!([path.to_str().unwrap(), "content", "any-version"])).unwrap_err();
         assert!(err.contains("no such file"), "{err}");
         assert!(err.contains("create_file"), "{err}");
     }
@@ -731,8 +739,8 @@ mod tests {
 
         let result = replace_file(json!([
             path.to_str().unwrap(),
-            version,
-            "line1\nline2b\nline3\n"
+            "line1\nline2b\nline3\n",
+            version
         ]))
         .unwrap();
         assert!(result["diff"].is_string());
@@ -752,7 +760,7 @@ mod tests {
         // either the rename succeeds (new content visible) or it doesn't
         // (old content preserved).  We verify that `persist` semantics
         // hold: the file is either fully the new content or untouched.
-        let ok = replace_file(json!([path.to_str().unwrap(), version, "replaced"]));
+        let ok = replace_file(json!([path.to_str().unwrap(), "replaced", version]));
         match ok {
             Ok(_) => {
                 assert_eq!(std::fs::read_to_string(&path).unwrap(), "replaced");

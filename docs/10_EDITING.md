@@ -37,7 +37,7 @@ write-back. Steps 4–7 are independent of each other.
    so no false "unchanged"). Writing is split, never overloaded with a sentinel:
    - `create_file(path, content)` — create-exclusive (`O_CREAT|O_EXCL`, atomic);
      errors if the path exists. Precondition: **absent**.
-   - `replace_file(path, expected_version, content)` — optimistic CAS overwrite
+   - `replace_file(path, content, expected_version)` — optimistic CAS overwrite
      (temp + rename in the same dir) **iff** the current version still equals
      `expected_version`; errors if absent or on mismatch. Precondition:
      **present + version matches**.
@@ -206,7 +206,7 @@ Acceptance:
       Create-exclusive (`OpenOptions::create_new(true)`, atomic — no
       check-then-create TOCTOU). Errors if the path exists, redirecting to
       `replace_file`.
-- [x] `replace_file([path, expected_version, content]) -> { version, diff }`,
+- [x] `replace_file([path, content, expected_version]) -> { version, diff }`,
       `effectful: true`. Read current bytes, compute current version; **iff** it
       equals `expected_version`, write atomically (temp file in the target's
       directory + `rename`) and return the new `version` + a clipped unified diff
