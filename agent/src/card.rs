@@ -31,7 +31,13 @@ one or two sentences, before the work starts: someone is waiting, and
 that line is what they read while the rest of this program is still
 being written. Then `tell()` again as things actually happen, carrying
 what you found — a count, a name, the thing that was surprising — which
-is the part a plan written up front cannot contain.
+is the part a plan written up front cannot contain. Say what you
+concluded, never what came back: raw output is for the code to read,
+and a `tell` that pastes a command's stdout hands your reading to
+someone else. Two or three of these across a whole program is right;
+one per command is a transcript, and a program shaped like a
+transcript tends to end like one — at the first thing worth reporting,
+with the work still ahead of it.
 
 Comments are for the code, not for the reader of the conversation.
 Write plain `//` comments where a line needs explaining, assuming
@@ -112,6 +118,17 @@ this text means, whether these two things agree. Do not hand over when
 you already know what comes next and only the data was missing: write
 the loop, and let the program find out at runtime what you would have
 been told.
+
+A verdict per item is still one loop — not one program each, and not a
+handover carrying the list — whenever something other than a mind can
+give the verdict: take the line out and see whether it still builds,
+run that one test, compare the two files. Twenty candidates settled
+that way is twenty iterations of a loop you could write before you had
+the list. And note which way round that goes: the check is to *change
+the thing and ask again*, not to ask about it as it stands. A question
+put to a tool that was never going to answer it comes back empty, and
+empty reads as "all fine" — the false negative above, arrived at by a
+command that ran perfectly.
 
 The tell is exact: **if you can write down what the next program should
 do, you can write the program.** A handover whose payload says "for
@@ -332,10 +349,10 @@ pub const SEED_EXEMPLARS: &[Exemplar] = &[
         user: "can you check whether the tests pass and let me know?",
         assistant: r#"tell("running the test suite, then I'll let you know what happened.");
 const result = await tools.bash("cargo test 2>&1 | tail -20");
-if (result.exit === 0) {
+if (result.status === 0) {
     tell("tests pass.");
 } else {
-    tell(`tests failed:\n${result.output}`);
+    tell(`tests failed:\n${result.stdout}`);
 }"#,
     },
     Exemplar {
@@ -412,7 +429,7 @@ return resume("backup-2.txt");"#,
     Exemplar {
         user: "summarise what each of the twelve files in reports/ is about",
         assistant: r#"tell("reading reports/ — twelve files, so I'll hand the summarising to a helper rather than do it in one long pass here.");
-const names = (await tools.bash("ls reports/")).output.trim().split("\n");
+const names = (await tools.bash("ls reports/")).stdout.trim().split("\n");
 
 // Twelve summaries is a lot of judgement and none of it needs my
 // history, so it goes to a clean room. spawn() hands back a handle,
@@ -451,7 +468,7 @@ next_program({
         user: "clean up temp files older than a day in /tmp/build-cache — this cleanup job runs nightly",
         assistant: r#"tell("clearing anything in /tmp/build-cache older than a day, and I'll flag it if tonight's count looks unusual.");
 const found = await tools.bash("find /tmp/build-cache -type f -mtime +1 -printf '.' | wc -c");
-const count = Number(found.output.trim()) || 0;
+const count = Number(found.stdout.trim()) || 0;
 
 if (count === 0) {
     tell("nothing older than a day — /tmp/build-cache is already clean.");
@@ -499,6 +516,44 @@ if (build.status === 0) {
     });
 }"#,
     },
+    Exemplar {
+        user: "a bunch of the tests in this repo are marked #[ignore] — work out which ones actually pass now and un-ignore those",
+        assistant: r#"tell("taking the #[ignore] off each one in turn and running it, so the test runner decides rather than me.");
+const sites = (await tools.bash("grep -rn '#\\[ignore\\]' --include='*.rs' . 2>/dev/null")).stdout
+    .split("\n").map(s => s.trim()).filter(Boolean)
+    .map(line => { const [path, lineno] = line.split(":"); return { path, lineno: Number(lineno) }; });
+tell(`${sites.length} ignored test(s) to try.`);
+
+// I knew this procedure before I knew the list, so it is a loop, not a
+// handover and not a program per test. And the check has to *change*
+// the code and ask again: leaving the marker on and running the suite
+// tells me nothing, because an ignored test is exactly the one that
+// doesn't run. Take it off, run that test alone, put it back if it fails.
+const freed = [], kept = [];
+for (const site of sites) {
+    const before = await tools.read_file(site.path);
+    const lines = before.content.split("\n");
+    const name = (lines.slice(site.lineno).find(l => l.includes("fn ")) || "").match(/fn\s+(\w+)/)?.[1];
+    if (!name) continue;
+
+    lines.splice(site.lineno - 1, 1);
+    await tools.replace_file(site.path, lines.join("\n"), before.version);
+
+    const run = await tools.bash(`cargo test ${name} -- --exact 2>&1 | tail -5`);
+    if (run.status === 0) {
+        freed.push(name);
+    } else {
+        // put it back — my own write moved the version on, so re-read it
+        const after = await tools.read_file(site.path);
+        await tools.replace_file(site.path, before.content, after.version);
+        kept.push(name);
+    }
+}
+
+tell(freed.length
+    ? `un-ignored ${freed.length}: ${freed.join(", ")}. ${kept.length} still fail and keep the marker.`
+    : `none of the ${kept.length} pass yet — every marker stays.`);"#,
+    },
 ];
 
 #[cfg(test)]
@@ -544,7 +599,7 @@ mod tests {
         // `CARD` shows up as a diff review must look at, not a byte
         // count that silently drifts. Comparing full text (not just a
         // hash) so the diff itself is legible in a failure message.
-        const EXPECTED_LEN: usize = 11271;
+        const EXPECTED_LEN: usize = 12320;
         assert_eq!(
             CARD.len(),
             EXPECTED_LEN,
@@ -608,6 +663,98 @@ mod tests {
         for ex in SEED_EXEMPLARS {
             interp::compile(ex.assistant)
                 .unwrap_or_else(|e| panic!("seed exemplar does not parse: {e:?}"));
+        }
+    }
+
+    /// Parsing is not enough. Four exemplars have shipped with bugs a
+    /// parse could never catch — a `.output` field the `bash` tool
+    /// does not return, arguments in the wrong order, a version used
+    /// after the program's own write moved it on — and each one taught
+    /// the model the bug, because an exemplar outranks the manifest
+    /// that says otherwise. So every exemplar is *run* here, against
+    /// stub tools shaped like the real registry's results, and must
+    /// reach the end without trapping.
+    ///
+    /// The stubs answer the shape, not the content: a trap is a real
+    /// defect in the exemplar, but a passing run says only that the
+    /// program is well-formed against the tools it calls — never that
+    /// its judgement is right.
+    #[test]
+    fn the_exemplars_run_to_completion_against_stub_tools() {
+        for ex in SEED_EXEMPLARS {
+            run_against_stubs(ex.assistant)
+                .unwrap_or_else(|e| panic!("exemplar for {:?} trapped: {e}", ex.user));
+        }
+    }
+
+    /// One stub result per verb the exemplars call, in the shape the
+    /// real registry documents (`host::tools::real_registry`): `bash`
+    /// resolves to `{ status, stdout, stderr }`, a read to
+    /// `{ content, version }`, a write to a fresh `{ version }`.
+    fn stub_result(name: &str, args: &[interp::Value]) -> serde_json::Value {
+        let path = match args.first() {
+            Some(interp::Value::String(s)) => s.to_string(),
+            _ => String::new(),
+        };
+        match name {
+            // A grep-shaped listing: `path:lineno:text`, which also
+            // reads as a plain file list for the exemplars that want one.
+            "bash" => json!({
+                "status": 0,
+                "stdout": "src/lib.rs:2:#[ignore]\nsrc/other.rs:9:#[ignore]\n",
+                "stderr": "",
+            }),
+            "read_file" if path.ends_with(".json") => {
+                json!({ "content": "{\"retries\": 3}", "version": "v1" })
+            }
+            "read_file" => json!({
+                "content": "// one\n#[ignore]\nfn thing() {}\n",
+                "version": "v1",
+            }),
+            "replace_file" | "write_file" | "create_file" => json!({ "version": "v2" }),
+            "ask" => json!("4"),
+            "spawn" | "fork" => json!({ "agent": 2 }),
+            _ => json!(null),
+        }
+    }
+
+    /// Drive one program on a bare VM: every call answered by
+    /// [`stub_result`], every `raise` resumed with a plausible answer.
+    /// Deliberately not the real machine — this checks the program
+    /// against its tools, and wants no conversation around it.
+    fn run_against_stubs(src: &str) -> Result<(), String> {
+        use interp::{StepResult, VM};
+        let program = interp::compile(src).map_err(|e| format!("{e:?}"))?;
+        let mut vm = VM::for_program(program, serde_json::Value::Null)
+            .map_err(|e| format!("could not start: {e:?}"))?;
+        loop {
+            match vm.step(u64::MAX).map_err(|e| format!("{e:?}"))? {
+                StepResult::Done { .. } => return Ok(()),
+                StepResult::Pending { calls } => {
+                    for call in calls {
+                        let result = stub_result(&call.name, &call.args);
+                        let value = vm
+                            .json_to_stack_value(&result, 0)
+                            .map_err(|e| format!("{e:?}"))?;
+                        vm.resolve_promise(call.promise, value)
+                            .map_err(|e| format!("{e:?}"))?;
+                    }
+                }
+                StepResult::Raise { condition, .. } => {
+                    // `next_program` is a raise too, and it ends the
+                    // program rather than resuming into it.
+                    if condition == interp::NEXT_PROGRAM_CONDITION {
+                        return Ok(());
+                    }
+                    let value = vm
+                        .json_to_stack_value(&json!("backup-2.txt"), 0)
+                        .map_err(|e| format!("{e:?}"))?;
+                    vm.resume_raise(value);
+                }
+                // Unreachable with `u64::MAX` fuel, and there is
+                // nothing to do about it but step again.
+                StepResult::OutOfFuel => {}
+            }
         }
     }
 
