@@ -301,6 +301,50 @@ def run_once(task, card: Path | None, timeout: int, keep: Path | None = None) ->
     }
 
 
+def rescore(keep_dir: Path, tasks: list) -> list:
+    """Re-run the checkers over runs that already happened.
+
+    A `--keep` directory holds everything a check needs: the sandbox as
+    the run left it, and the log the score folds from. So a checker
+    edit costs nothing — no completions, no waiting on the provider,
+    and the same runs judged before and after, which is the only way to
+    see what a checker change did rather than what the model did that
+    time.
+
+    This exists because the first `ambiguous-config` checker was wrong
+    in a way its own fixtures could not show, and re-running three live
+    tasks to find that out twice would have been the expensive way to
+    learn it.
+    """
+    by_name = {t.NAME: t for t in tasks}
+    runs = []
+    for run_dir in sorted(keep_dir.iterdir()):
+        if not (run_dir / "work").exists():
+            continue
+        # `<task-name>-<HHMMSS>`, which is how run_once names them.
+        name = run_dir.name.rsplit("-", 1)[0]
+        task = by_name.get(name)
+        if task is None:
+            print(f"  {run_dir.name}: no such task, skipped", file=sys.stderr)
+            continue
+        log = run_dir / "run.jsonl"
+        score = score_log(log) if log.exists() else {"error": "no log kept"}
+        if score.get("programs", 0) == 0:
+            runs.append({"task": name, "pass": None, "why": "no completion", "kept": str(run_dir), "score": score})
+            continue
+        env = Env(task.DIR, run_dir / "work", score)
+        try:
+            task.check(env)
+            ok, why = True, ""
+        except CheckFailed as e:
+            ok, why = False, str(e)
+        except Exception as e:
+            ok, why = False, f"checker raised {e!r}"
+        print(f"  {run_dir.name}: {'pass' if ok else 'FAIL: ' + why}")
+        runs.append({"task": name, "pass": ok, "why": why, "kept": str(run_dir), "score": score})
+    return runs
+
+
 def med(values):
     vals = [v for v in values if v is not None]
     return round(statistics.median(vals), 1) if vals else None
@@ -381,6 +425,7 @@ def main():
     p.add_argument("--verify-only", action="store_true", help="check the checkers, run nothing")
     p.add_argument("--keep", type=Path, help="keep each run's sandbox and log under here")
     p.add_argument("--compare", nargs=2, type=Path, metavar=("BEFORE", "AFTER"))
+    p.add_argument("--rescore", type=Path, help="re-judge a --keep directory, no completions")
     args = p.parse_args()
 
     if args.compare:
@@ -418,6 +463,15 @@ def main():
     if not AGENT.exists():
         print(f"{AGENT} not built", file=sys.stderr)
         return 2
+
+    if args.rescore:
+        summary = aggregate(rescore(args.rescore, usable))
+        print_summary(summary)
+        if args.out:
+            args.out.write_text(json.dumps(summary, indent=2))
+            print(f"\nwrote {args.out}")
+        return 0
+
     if "DEEPSEEK_API_KEY" not in os.environ:
         print("DEEPSEEK_API_KEY is not set", file=sys.stderr)
         return 2
