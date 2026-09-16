@@ -267,9 +267,15 @@ def run_once(task, card: Path | None, timeout: int, keep: Path | None = None) ->
         # queue as a regression, so it is counted apart and never as a
         # verdict on the card.
         if timed_out or score.get("programs", 0) == 0:
+            # Two different things, and the message has to say which:
+            # a run cut off mid-flight wrote programs and was stopped
+            # by us, which is not a verdict on anything; a run with no
+            # completion at all never heard back from the provider.
+            wrote = score.get("programs", 0)
             ok, why = None, (
-                "no program was ever written — "
-                + ("the run hit its timeout" if timed_out else "the log has no completion")
+                f"cut off at the timeout after {wrote} program(s) — incomplete, not failed"
+                if timed_out and wrote
+                else "no completion ever arrived"
             )
         else:
             env = Env(task.DIR, sandbox, score)

@@ -233,6 +233,37 @@ per program**, not pass rate: a minimal card will very likely still
 complete tasks, at two or three calls per program, which is a tool loop
 wearing JavaScript and gives the whole advantage back.
 
+## 25.6a — The first measurement: thinking off is not a shortcut
+
+The question that opened this (2026-09-16: "could thinking=off even be
+potentially a good approach?") has an answer now, on four tasks at n=3
+with the checkers held fixed:
+
+                    off      on
+  ambiguous-config  0/3  ->  3/3
+  dead-code-sweep   0/3  ->  1/1   (2 cut off at the cap)
+  plain-question    3/3  ->  3/3
+  skipped-tests     0/2  ->  1/2   (1 cut off)
+
+  calls/program     2.5  ->  23.0  (dead-code-sweep)
+                    4.8  ->  10.8  (skipped-tests)
+  handovers         1.5  ->  0.5   (skipped-tests)
+
+Three of eleven becomes eight of nine. But the number that matters for
+the thesis is the second block: **calls per program rises and handovers
+fall**. Thinking off is not "the same work, cheaper" — it produces the
+transcript shape, small programs that hand themselves a to-do list,
+which is the tool loop this architecture exists to escape. Thinking on
+produces the program shape: one program doing twenty-three calls'
+worth of work.
+
+`plain-question` is identical at 3/3 either way, which is the control
+doing its job — the task with no work in it is not where effort helps.
+
+The cost is wall clock per run: 300-420s against 6-40s, and three of
+twelve runs hit the 420s cap. That is a real trade, and it is the trade
+the suite exists to price.
+
 ## 25.7 — What the suite still cannot ask
 
 **Nothing answers an `ask()`.** The internal eval module had one fixed
