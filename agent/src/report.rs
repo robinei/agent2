@@ -1277,6 +1277,30 @@ mod tests {
         assert!(text.contains("1:8: cannot read property"), "{text}");
         assert!(text.contains("not resumable"), "{text}");
 
+        // Compaction: the handler has to be told what it is being asked
+        // for and how much, or it reads the report as an ordinary
+        // interruption and carries on with the task — which is what a
+        // live run did on 2026-09-16, answering the user's question
+        // instead of compacting anything.
+        let (tree, o) = fixture(
+            "tell(\"hi\");",
+            condition(
+                Cause::Compaction {
+                    rendered: 60_555,
+                    budget: 32_768,
+                },
+                0,
+                Vec::new(),
+            ),
+        );
+        let leaf = tree.list_leaves()[0].0;
+        let text = derive_report(&tree, leaf, o, 64 * 1024);
+        assert!(text.contains("60555"), "says how big it is: {text}");
+        assert!(text.contains("32768"), "and what the budget is: {text}");
+        assert!(text.contains("compaction program"), "{text}");
+        assert!(text.contains("remove_history"), "names the verbs: {text}");
+        assert!(text.contains("rewrite_history"), "{text}");
+
         // Compile error: the diagnostic alone — no VM was built, so this
         // run has no console and no artifacts.
         let (tree, o) = fixture(
