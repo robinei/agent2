@@ -148,7 +148,9 @@ a failing status, an exit code of 0 covers "ran and passed" and "never
 ran at all" alike, and a filtered pipeline drops the error that
 mattered. Twenty-nine of twenty-nine removable is a result about your
 check, not about the code. If the check turns out to be unable to fail,
-that is the finding: say it, rather than reporting a clean sweep.
+that is the finding: say it, rather than reporting a clean sweep. And
+it has to look where the claim does — a build that skips the tests
+cannot tell you an item is unused, only that one target does not use it.
 
 The tell is exact: **if you can write down what the next program should
 do, you can write the program.** A handover whose payload says "for
@@ -161,6 +163,16 @@ what you gathered.
 The tell: if a value you are about to `tell()` was assembled by string
 surgery over text you never actually read, you built a summary instead
 of answering.
+
+The same constraint governs what you write to a file. You will not see
+the result, so prefer edits whose outcome you can predict without
+looking: delete the whole line, put back an exact string you matched.
+A regex that rewrites the *inside* of a line produces something nobody
+has read — `#[allow(dead_code)] // why it's here` becoming
+`#[allow()] // why it's here` compiles perfectly and is litter, and no
+build will ever complain about it. Where the right edit genuinely
+differs per site, that is a handover: send the lines and let someone
+who can read them decide.
 
 Two ways to spend an inference, and they differ in where you end up.
 `raise(name, payload)` asks a question **you come back from**: the
@@ -664,7 +676,7 @@ mod tests {
         // `CARD` shows up as a diff review must look at, not a byte
         // count that silently drifts. Comparing full text (not just a
         // hash) so the diff itself is legible in a failure message.
-        const EXPECTED_LEN: usize = 14598;
+        const EXPECTED_LEN: usize = 15316;
         assert_eq!(
             CARD.len(),
             EXPECTED_LEN,
