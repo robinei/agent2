@@ -84,6 +84,11 @@ pub const TOOL_ARTIFACT: &str = "artifact";
 /// 23_ONE_AGENT.md A3) and wiring it in here would be guessing at an
 /// API that is still moving. Left for a later pass — flagged in A4's
 /// own report, not silently dropped.
+/// How many compaction programs a branch will ask for before giving up
+/// and carrying on over budget. See [`Runner::compaction_attempts`] for
+/// the floor that makes a bound necessary at all.
+const COMPACTION_ATTEMPTS: u32 = 2;
+
 pub const TOOL_REMOVE_HISTORY: &str = "remove_history";
 pub const TOOL_REWRITE_HISTORY: &str = "rewrite_history";
 
@@ -375,6 +380,17 @@ pub struct Runner {
     /// also what makes the two verbs an error anywhere else: outside a
     /// compaction program there is nothing to add them to.
     compacting: Option<Vec<crate::compaction::CompactionOp>>,
+    /// Compaction attempts since the last one that committed.
+    ///
+    /// A document has a floor no handler can reach: the card and the
+    /// worked examples open every request and are not rows, so a budget
+    /// set near that floor makes every batch fail `StillOverThreshold`,
+    /// and the condition would re-fire on the next prompt, forever.
+    /// After [`COMPACTION_ATTEMPTS`] the branch stops asking and carries
+    /// on over budget, which is the lesser failure: an over-long
+    /// document still works, an infinite loop of compaction programs
+    /// does not.
+    compaction_attempts: u32,
     /// Runs suspended **beneath** the one currently in `phase`, each
     /// frozen exactly where it stopped, oldest first popped last (a
     /// stack) — see `Phase::Suspended`'s own doc for why this, and not
@@ -453,6 +469,7 @@ impl Runner {
         let leaf = spine.leaf_id;
         Runner {
             compacting: None,
+            compaction_attempts: 0,
             spine,
             agent,
             branch,
@@ -2292,7 +2309,7 @@ impl Runner {
         budget: usize,
         headroom: f64,
     ) -> io::Result<Option<StepOutput>> {
-        if self.compacting.is_some() {
+        if self.compacting.is_some() || self.compaction_attempts >= COMPACTION_ATTEMPTS {
             return Ok(None);
         }
         let doc = crate::document::render(tree, &self.spine, budget);
@@ -2310,6 +2327,7 @@ impl Runner {
             },
         )?;
         self.compacting = Some(Vec::new());
+        self.compaction_attempts += 1;
         self.phase = Phase::AwaitingLlm;
         Ok(Some(self.render_request(tree)))
     }
@@ -2337,6 +2355,9 @@ impl Runner {
                 for event in events {
                     tree.append(&mut self.spine, event)?;
                 }
+                // Committed: the next time the document grows, this is a
+                // fresh problem rather than the same one again.
+                self.compaction_attempts = 0;
                 Ok(Ok(n))
             }
             Err(e) => Ok(Err(e.to_string())),
@@ -3656,6 +3677,37 @@ mod tests {
         };
         assert_eq!(b, budget);
         assert!(rendered > budget, "{rendered} should exceed {budget}");
+    }
+
+    /// A document has a floor no handler can reach — the card and the
+    /// worked examples are 21KB before a conversation starts, and are
+    /// not rows — so a budget set near it makes every batch fail and the
+    /// condition re-fire on every prompt. The bound is what makes that
+    /// terminate: after two attempts the branch carries on over budget,
+    /// which is the lesser failure.
+    #[test]
+    fn compaction_gives_up_rather_than_looping_when_it_cannot_help() {
+        let (mut tree, mut state, _) = crowded();
+        // A budget under the floor: nothing the handler removes can
+        // bring the document beneath it.
+        let impossible = 1024;
+        for _ in 0..COMPACTION_ATTEMPTS {
+            assert!(
+                state
+                    .compaction_if_needed(&mut tree, impossible, 0.25)
+                    .unwrap()
+                    .is_some(),
+                "each attempt within the bound still asks"
+            );
+            state.compacting = None; // the handler returned, batch rejected
+        }
+        assert!(
+            state
+                .compaction_if_needed(&mut tree, impossible, 0.25)
+                .unwrap()
+                .is_none(),
+            "past the bound it stops asking"
+        );
     }
 
     /// Already compacting, it does not fire again — which is what stops

@@ -253,9 +253,21 @@ fn open_tree(log_path: Option<String>) -> Result<Tree, String> {
     };
     let file = std::fs::OpenOptions::new()
         .read(true)
-        .write(true)
+        // `append`, not plain `write`: with O_APPEND the kernel places
+        // every write at the current end of file, so a second process
+        // holding the same log cannot land a line inside one this
+        // process is writing. Without it both seek to *their* idea of
+        // the end — observed 2026-09-16, two sessions on one log, and
+        // the result was a truncated event with the next one's JSON
+        // beginning inside it, which neither `Tree::open` nor
+        // `agent score` could read back.
+        //
+        // This makes corruption impossible, not concurrency safe: two
+        // writers still interleave whole lines and mint colliding ids.
+        // An advisory lock is the fix for that, and wants a dependency
+        // this crate does not have yet.
+        .append(true)
         .create(true)
-        .truncate(false) // an existing log is resumed, not wiped
         .open(&path)
         .map_err(|e| format!("{}: {e}", path.display()))?;
     Tree::open(file).map_err(|e| format!("{}: {e}", path.display()))

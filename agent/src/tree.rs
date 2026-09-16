@@ -191,14 +191,18 @@ impl Tree {
     /// the honest answer is to refuse it by name rather than to read it
     /// as something it is not.
     pub fn open(mut file: File) -> Result<Self, io::Error> {
-        // Rewind to start in case the file was opened with append(true),
-        // which positions the cursor at the end initially.
+        // Rewind to start: the file is opened with `append(true)`, which
+        // positions the cursor at the end.
         file.seek(SeekFrom::Start(0))?;
 
         let mut content = String::new();
         file.read_to_string(&mut content)?;
-        // Cursor is now at end of existing content — subsequent writes
-        // will land there regardless of whether append(true) was used.
+        // Where the cursor sits now does not matter: under O_APPEND the
+        // kernel moves every write to the end of the file as it makes
+        // it. That is what keeps a second process holding the same log
+        // from writing *into* a line this one is emitting (see
+        // `open_tree`), and it is the only reason reading the whole file
+        // through the same handle we later write through is safe.
 
         if content.trim().is_empty() {
             let mut tree = Tree::new(Some(file));
