@@ -71,6 +71,27 @@ namespace, which is reserved for this session's configured tools
                                     `payload` in view. Nothing resumes — the
                                     next program is the continuation
 
+Editing text is `Edit.*` — pure functions over strings, not tools, so a
+whole batch of edits costs one write at the end rather than one apiece.
+They fail loudly rather than landing somewhere you didn't mean:
+
+  Edit.replaceOnce(text, old, new)  replace iff `old` occurs exactly
+                                     once; errors with the real count,
+                                     so widen `old` with surrounding
+                                     text until it names one place
+  Edit.replaceCount(text, old, new) -> { result, count }
+  Edit.count(text, needle)          occurrences
+  Edit.applyEdits(text, edits)      [{ old, new }, …] at once: each must
+                                     occur once, the spans must be
+                                     disjoint, and they are applied
+                                     right-to-left so no offset goes
+                                     stale behind an earlier edit
+  Edit.replaceLines(text, start, end, newText)   1-indexed, inclusive
+  Edit.insertAt(text, lineNo, newText)           insert before lineNo
+  Edit.extractBlock(text, headIndex)             { start, end }, by braces
+  Edit.extractByIndent(text, lineIndex)          { start, end }, by dedent
+  Edit.extractEnclosing(text, index, open, close)
+
 **When to ask, and who to ask.** The moment the next step turns on a
 judgement the data cannot settle, stop guessing and get the judgement.
 Which verb depends only on who can give it. A person has to decide
@@ -134,10 +155,8 @@ Two more things make a loop like that lie, and both look exactly like
 success. A pipeline's status is its *last* stage's, so `cmd | grep x |
 head` reports 0 when `cmd` never ran — write `set -o pipefail` in front
 of any pipeline whose status you intend to believe, and read `status`
-before you read `stdout`. And a position you measured before you
-started changing things goes stale as you use it: take a line out and
-everything under it renumbers. Get either wrong and the loop reports a
-clean sweep of work it did not do.
+before you read `stdout`. Get that wrong and the loop reports a clean
+sweep of work it did not do.
 
 And make sure the check can say no — in this same program, and without
 stopping to do it. Establishing that takes a call and a comparison, not
@@ -165,14 +184,13 @@ surgery over text you never actually read, you built a summary instead
 of answering.
 
 The same constraint governs what you write to a file. You will not see
-the result, so prefer edits whose outcome you can predict without
-looking: delete the whole line, put back an exact string you matched.
-A regex that rewrites the *inside* of a line produces something nobody
-has read — `#[allow(dead_code)] // why it's here` becoming
-`#[allow()] // why it's here` compiles perfectly and is litter, and no
-build will ever complain about it. Where the right edit genuinely
-differs per site, that is a handover: send the lines and let someone
-who can read them decide.
+the result, so name the edit by text you have in hand and let
+`Edit.replaceOnce` refuse it if that text does not pick out one place —
+rather than computing a line number and splicing, which is how
+`#[allow(dead_code)] // why it's here` becomes `#[allow()] // why it's
+here`: valid, unread, and litter no build will ever complain about.
+Where the right edit genuinely differs per site, that is a handover:
+send the lines and let someone who can read them decide.
 
 Two ways to spend an inference, and they differ in where you end up.
 `raise(name, payload)` asks a question **you come back from**: the
@@ -571,18 +589,13 @@ if (build.status === 0) {
     Exemplar {
         user: "a bunch of the tests in this repo are marked #[ignore] — work out which ones actually pass now and un-ignore those",
         assistant: r#"tell("taking the #[ignore] off each one in turn and running it, so the test runner decides rather than me.");
-const sites = (await tools.bash("grep -rn '#\\[ignore\\]' --include='*.rs' . 2>/dev/null")).stdout
-    .split("\n").map(s => s.trim()).filter(Boolean)
-    .map(line => { const [path, lineno] = line.split(":"); return { path, lineno: Number(lineno) }; })
-    // Bottom of each file upwards: taking a line out renumbers
-    // everything below it, and these numbers were all measured before
-    // any of that. Going up, every number I still hold is still true.
-    .sort((a, b) => b.lineno - a.lineno);
-tell(`${sites.length} ignored test(s) to try.`);
+const paths = (await tools.bash("grep -rl '#\\[ignore\\]' --include='*.rs' . 2>/dev/null")).stdout
+    .split("\n").map(s => s.trim()).filter(Boolean);
+tell(`${paths.length} file(s) carry ignored tests.`);
 
 // The control, inline: if the suite is already red, a failure after
-// un-ignoring something is not attributable to that test, and the
-// whole loop below would be measuring nothing.
+// un-ignoring something is not attributable to that test, and the whole
+// loop below would be measuring nothing.
 const base = await tools.bash("set -o pipefail; cargo test 2>&1 | tail -5");
 if (base.status !== 0) {
     // Blocked is not done. Nothing after this line runs, and the
@@ -590,7 +603,6 @@ if (base.status !== 0) {
     next_program({
         question: "the suite is already failing, so un-ignoring can't be attributed — read these, decide whether they're worth fixing first",
         failures: base.stdout,
-        ignored: sites.length,
     });
 }
 
@@ -598,32 +610,38 @@ if (base.status !== 0) {
 // handover and not a program per test. And the check has to *change*
 // the code and ask again: leaving the marker on and running the suite
 // tells me nothing, because an ignored test is exactly the one that
-// doesn't run. Take it off, run that test alone, put it back if it fails.
+// doesn't run.
 const freed = [], kept = [];
-for (const site of sites) {
-    const before = await tools.read_file(site.path);
-    const lines = before.content.split("\n");
-    const name = (lines.slice(site.lineno).find(l => l.includes("fn ")) || "").match(/fn\s+(\w+)/)?.[1];
-    if (!name) continue;
+for (const path of paths) {
+    let file = await tools.read_file(path);
+    // The marker plus the fn line under it. `#[ignore]` on its own
+    // repeats within a file; the pair names one test — and it is text I
+    // am holding, not a line number that goes stale the moment I edit.
+    const sites = [...file.content.matchAll(/^[ \t]*#\[ignore\][ \t]*\n([ \t]*(?:pub )?(?:async )?fn (\w+))/gm)];
 
-    lines.splice(site.lineno - 1, 1);
-    await tools.replace_file(site.path, lines.join("\n"), before.version);
+    for (const site of sites) {
+        const name = site[2];
+        // Fails loudly if that text does not pick out exactly one place,
+        // so the edit either lands where I meant or does not happen.
+        const stripped = Edit.replaceOnce(file.content, site[0], site[1]);
+        const wrote = await tools.replace_file(path, stripped, file.version);
 
-    // pipefail, or the status is `tail`'s and `tail` always succeeds:
-    // the test could fail to compile at all and this would read as a pass.
-    const run = await tools.bash(`set -o pipefail; cargo test ${name} -- --exact 2>&1 | tail -5`);
-
-    // And a 0 status is not yet an answer: a filter that matches
-    // nothing exits 0 too, as does a run where the test was still
-    // ignored. Make the runner say it ran one and it passed — otherwise
-    // this check has no way to tell me no, and every test "passes".
-    if (run.status === 0 && /1 passed/.test(run.stdout)) {
-        freed.push(name);
-    } else {
-        // put it back — my own write moved the version on, so re-read it
-        const after = await tools.read_file(site.path);
-        await tools.replace_file(site.path, before.content, after.version);
-        kept.push(name);
+        // pipefail, or the status is `tail`'s and `tail` always succeeds.
+        // And a 0 status is not yet an answer: a filter that matches
+        // nothing exits 0 too, as does a run where the test was still
+        // ignored. Make the runner say it ran one and it passed —
+        // otherwise this check has no way to tell me no.
+        const run = await tools.bash(`set -o pipefail; cargo test ${name} -- --exact 2>&1 | tail -5`);
+        if (run.status === 0 && /1 passed/.test(run.stdout)) {
+            freed.push(name);
+            file = { content: stripped, version: wrote.version };
+        } else {
+            // put it back — the write handed me the version it produced,
+            // so there is nothing to re-read
+            const back = await tools.replace_file(path, file.content, wrote.version);
+            file = { content: file.content, version: back.version };
+            kept.push(name);
+        }
     }
 }
 
@@ -676,7 +694,7 @@ mod tests {
         // `CARD` shows up as a diff review must look at, not a byte
         // count that silently drifts. Comparing full text (not just a
         // hash) so the diff itself is legible in a failure message.
-        const EXPECTED_LEN: usize = 15316;
+        const EXPECTED_LEN: usize = 16416;
         assert_eq!(
             CARD.len(),
             EXPECTED_LEN,
