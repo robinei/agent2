@@ -697,6 +697,14 @@ fn render_handback(h: &Handback<'_>, budget: usize) -> String {
             // before a VM could exist to produce anything else.
             Cause::CompileFailed { message } => message.clone(),
             Cause::Truncated => TRUNCATED_MESSAGE.to_owned(),
+            // Same reason, and the same absence of a VM: compaction is
+            // raised by the harness on an idle branch, so there is no
+            // stack, no console and no artifact menu — and wrapping it
+            // in `## what happened` / `## where: in (no live frames)`
+            // framed a *directive* as a post-mortem of an event. Four
+            // live runs read it that way and carried on with the task.
+            // The message is the whole report.
+            Cause::Compaction { rendered, budget } => compaction_message(*rendered, *budget),
             _ => ConditionReport {
                 what: what_happened(h, cause, *site, budget),
                 // A post stopped the program nowhere in particular: the
@@ -1316,6 +1324,11 @@ mod tests {
         // Read as a request rather than a stop, this loses to the pull
         // of visible unfinished work — measured three times.
         assert!(text.contains("STOP"), "{text}");
+        // And it is the whole report: no VM ran, so the condition
+        // scaffolding around it ("## where", an empty artifact menu)
+        // is noise that framed a directive as a post-mortem.
+        assert!(!text.contains("## where"), "{text}");
+        assert!(!text.contains("new artifacts"), "{text}");
         assert!(text.contains("remove_history"), "names the verbs: {text}");
         assert!(text.contains("rewrite_history"), "{text}");
 
