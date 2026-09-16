@@ -28,18 +28,13 @@
 //! on; a proposed batch of `Compacted` events can be, before it ever
 //! touches the log.
 //!
-//! **Not wired into `dispatch_calls` yet — deliberately, not by
-//! oversight.** `machine.rs`'s `TOOL_REMOVE_HISTORY`/`TOOL_REWRITE_HISTORY`
-//! arm rejects both calls with an explicit message ("compaction is not
-//! wired into this session yet... leaves remove_history/rewrite_history
-//! to a later pass") rather than guessing at this module's API while it
-//! was still being rewritten in the same phase. That later pass has no
-//! caller for this module's public surface yet, so it trips `dead_code`
-//! under `-D warnings`; `#![allow(dead_code)]` here is the Pass B
-//! judgment call this module falls under (23_ONE_AGENT.md Pass B: "its
-//! caller is yet to be written"), not a blanket exemption — every item
-//! below still has its own doc and its own tests.
-#![allow(dead_code)]
+//! **Wired, as of phase 27.** `machine.rs` fires
+//! [`Cause::Compaction`] from `prompt_if_needed` when [`should_fire`]
+//! says the document has outgrown its budget, collects the handler's
+//! `remove_history`/`rewrite_history` calls into a batch, and commits
+//! that batch through [`compact`] when the handler's program returns.
+//! The `#![allow(dead_code)]` this module carried while its caller was
+//! unwritten is gone with it.
 
 use crate::document::{self, label_of};
 use crate::tree::CompactedView;
@@ -130,6 +125,49 @@ pub enum CompactionError {
     /// asked again (the condition re-fires) rather than silently
     /// accepted.
     StillOverThreshold { size: usize, threshold: usize },
+}
+
+impl std::fmt::Display for CompactionError {
+    /// Written for the model, not for a log: each one says what was
+    /// wrong *and* what to do about it, because every one of these is
+    /// a retry rather than a failure — the log is untouched, the
+    /// condition re-fires, and the next program gets another go.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CompactionError::UnknownId(id) => write!(
+                f,
+                "#{} is not a row on this conversation — only the rows shown above can be \
+                 compacted, by the id each one carries",
+                id.as_u64()
+            ),
+            CompactionError::LabelMismatch {
+                id,
+                expected,
+                given,
+            } => write!(
+                f,
+                "#{} is a `{expected}`, not a `{given}` — the label is checked against the \
+                 row so a wrong id cannot compact the wrong thing. Nothing was changed.",
+                id.as_u64()
+            ),
+            CompactionError::EmptyRewrite(id) => write!(
+                f,
+                "the rewrite for #{0} was empty — use `remove_history(#{0}, label)` to drop \
+                 a row's content; a rewrite has to leave something readable behind",
+                id.as_u64()
+            ),
+            CompactionError::DuplicateTarget(id) => write!(
+                f,
+                "#{} was named twice in one batch — each row gets one operation",
+                id.as_u64()
+            ),
+            CompactionError::StillOverThreshold { size, threshold } => write!(
+                f,
+                "that batch would leave {size} bytes against a {threshold}-byte threshold, so \
+                 it was not applied. Nothing changed — compact more of it and return again."
+            ),
+        }
+    }
 }
 
 /// The fixed marker a bare `remove_history` leaves in place of

@@ -620,6 +620,25 @@ impl super::Compiler {
                     span,
                 );
             }
+            "remove_history" | "rewrite_history" => {
+                // Same reasoning as `spawn`/`fork` below: these settle at
+                // dispatch. The harness adds the op to the batch the
+                // running compaction handler is building and answers
+                // immediately — nothing leaves the process, nothing is
+                // pending, and there is no round trip to wait on.
+                //
+                // Emitted with the `Await` rather than requiring one in
+                // the source because a compaction program reads as a
+                // list of edits, and the card writes them that way
+                // (`remove_history(id, label)`). Without this an
+                // unawaited call's rejection — a wrong label, a call
+                // made outside a compaction program — would settle a
+                // promise nobody reads, and the mistake would look to
+                // the model exactly like a call that worked.
+                self.compile_args(argv);
+                self.emit(Instr::Invoke(name.into(), argv.len() as u32), span);
+                self.emit(Instr::Await, span);
+            }
             "spawn" | "fork" => {
                 // Creating an agent settles at dispatch: the host appends
                 // an `Agent`/`Fork` event and hands back its id, with no
@@ -647,8 +666,7 @@ impl super::Compiler {
                 self.emit(Instr::Invoke(name.into(), argv.len() as u32), span);
                 self.emit(Instr::Await, span);
             }
-            "ask" | "answer" | "append_history" | "artifact" | "remove_history"
-            | "rewrite_history" | "list_agents" => {
+            "ask" | "answer" | "append_history" | "artifact" | "list_agents" => {
                 // The closed, harness-defined vocabulary (phase 20 doc,
                 // `docs/20_CODE_MODE.md` Step C1) — a fixed global
                 // surface, identical for every agent, known to this

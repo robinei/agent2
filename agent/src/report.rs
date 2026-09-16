@@ -721,6 +721,32 @@ fn render_handback(h: &Handback<'_>, budget: usize) -> String {
     }
 }
 
+/// [`Cause::Compaction`]'s report: what the next program is being asked
+/// to do, and the two numbers that say how much.
+///
+/// Deliberately does not list the rows. The document *is* the rows —
+/// every one of them is already in front of the model, each with its
+/// own id and label, so restating them here would spend the budget this
+/// condition exists to reclaim. What the handler needs from this
+/// message is the instruction and the size of the problem.
+fn compaction_message(rendered: usize, budget: usize) -> String {
+    format!(
+        "This conversation is {rendered} bytes against a {budget}-byte budget, so the next \
+         program is a compaction program: shrink the history above, then return.\n\n\
+         `remove_history(id, label)` drops a row's content, keeping its id and label as a \
+         stub. `rewrite_history(id, label, value)` replaces the content with something \
+         shorter. Both take the row's own label as a checksum — a wrong id with a wrong \
+         label is rejected rather than compacting the wrong row, and the whole batch is \
+         validated before any of it commits, so a mistake costs a retry and never the log.\n\n\
+         Prefer removing outright and keeping the rest verbatim; rewrite only the rows that \
+         truly need shortening. Tool results that have already been acted on are the usual \
+         first targets, and the task itself is the last. Nothing is deleted: a compacted row \
+         keeps its id, and its artifacts stay fetchable.\n\n\
+         Nothing else happens in this program — do the compaction and return. The work \
+         resumes on its own afterwards."
+    )
+}
+
 /// `Cause::Truncated`'s report: a completion that hit `max_tokens`
 /// mid-program is discarded unread rather than compiled — types.rs's own
 /// rule, because a truncated program can still parse and run, half
@@ -890,6 +916,7 @@ fn what_happened(h: &Handback<'_>, cause: &Cause, site: u32, budget: usize) -> S
              next is a fresh program."
                 .to_owned()
         }
+        Cause::Compaction { rendered, budget } => compaction_message(*rendered, *budget),
         // Never reached: `render_handback` peels both of these off
         // before calling here (no VM ran for either, so there is no
         // stack or console for `ConditionReport` to carry). Kept only so

@@ -240,6 +240,23 @@ pub enum Cause {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         payload: Option<serde_json::Value>,
     },
+    /// The rolling document outgrew its budget, so the next completion
+    /// is asked to shrink it before the work goes on.
+    ///
+    /// Harness-raised, like [`Cause::Truncated`]: no program asked for
+    /// this and none is suspended under it in the usual sense — the
+    /// branch was idle and about to be prompted. It is a `Condition`
+    /// rather than a special prompt because the answer is a *program*,
+    /// written by the model, calling `remove_history`/`rewrite_history`
+    /// — which is exactly what a condition is for, and it means
+    /// compaction inherits the one-shot handler rendering, the `Pushed`
+    /// scope, and the resume accounting already built for `raise()`
+    /// rather than needing a second mechanism beside them.
+    ///
+    /// `rendered` and `budget` are the two numbers the handler needs to
+    /// know how much to cut, and they are logged rather than recomputed
+    /// so a report reads the same on replay as it did live.
+    Compaction { rendered: usize, budget: usize },
     /// A trapped VM error. `resumable` is whether `resume(value)` can
     /// stand in for the failed operation, which the report must state and
     /// which only the live error knew.

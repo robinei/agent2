@@ -2497,6 +2497,9 @@ fn condition_line(cause: &Cause) -> String {
         // `types.rs`): cut off mid-program, it may still parse and run
         // half-written, which is strictly worse than a clean failure.
         Cause::Truncated => "truncated (hit the token limit)".to_owned(),
+        Cause::Compaction { rendered, budget } => {
+            format!("compaction ({rendered} of {budget} bytes)")
+        }
         Cause::Interrupted => "interrupted".to_owned(),
         // A handler decided `return abandon()`: the suspended run was
         // discarded, not continued.

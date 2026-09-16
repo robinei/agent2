@@ -107,12 +107,31 @@ fn max_agent_depth() -> usize {
 /// override is needed. Overridable via `AGENT2_DOCUMENT_BUDGET`.
 pub const DEFAULT_DOCUMENT_BUDGET: usize = 64 * 1024;
 
-fn document_budget() -> usize {
+pub(crate) fn document_budget() -> usize {
     std::env::var("AGENT2_DOCUMENT_BUDGET")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|n| *n >= 1)
         .unwrap_or(DEFAULT_DOCUMENT_BUDGET)
+}
+
+/// How full the rolling document may get before the next completion is
+/// spent compacting it instead of working — the fraction of the budget
+/// held back. Overridable via `AGENT2_COMPACTION_HEADROOM`, following
+/// the same `AGENT2_*` pattern as the budget above, so a session can be
+/// told to compact earlier or later without a rebuild.
+///
+/// A quarter by default: compaction has to leave room for the handler's
+/// own report and the program that follows it, and firing at 100% would
+/// mean the request that asks for compaction is itself over budget.
+pub const DEFAULT_COMPACTION_HEADROOM: f64 = 0.25;
+
+pub(crate) fn compaction_headroom() -> f64 {
+    std::env::var("AGENT2_COMPACTION_HEADROOM")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|f| *f > 0.0 && *f < 1.0)
+        .unwrap_or(DEFAULT_COMPACTION_HEADROOM)
 }
 
 /// How many parse-repair round trips a single completion gets before a
@@ -440,7 +459,7 @@ impl Session {
         let branches: Vec<BranchId> = self.states.keys().copied().collect();
         for branch in branches {
             let outputs = {
-                let tree = &self.tree;
+                let tree = &mut self.tree;
                 let state = self.states.get_mut(&branch).expect("live");
                 // A branch a repair already set going has its causes in
                 // hand and a request out; lowering its mark now would
@@ -452,7 +471,7 @@ impl Session {
                 if let Some(cause) = state.unrendered_cause(tree) {
                     state.owe_prompt(cause);
                 }
-                state.wake(tree)
+                state.wake(tree)?
             };
             self.after_step(branch, outputs)?;
         }
@@ -1904,6 +1923,7 @@ fn cause_label(cause: &Cause) -> &'static str {
         Cause::Posted { .. } => "posted",
         Cause::CompileFailed { .. } => "compile failed",
         Cause::Truncated => "truncated",
+        Cause::Compaction { .. } => "compaction",
         Cause::Interrupted => "interrupted",
         Cause::Abandoned => "abandoned",
     }

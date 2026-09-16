@@ -360,6 +360,21 @@ pub struct Runner {
     /// starts at its `Fork` root, so history before it never triggers a
     /// prompt and the fork speaks only when spoken to.
     shown: u64,
+    /// The `remove_history`/`rewrite_history` calls a compaction
+    /// handler has made so far, held until it returns.
+    ///
+    /// They are collected rather than applied one at a time because
+    /// `compaction::compact` validates the **batch**: no duplicate
+    /// target, every label matching, and the result actually under the
+    /// threshold. A row removed the moment its call is dispatched could
+    /// not be un-removed when a later call in the same program turns out
+    /// to be wrong, and the log is append-only, so the batch is the unit
+    /// that either commits or does not.
+    ///
+    /// `Some` exactly while a compaction handler is running, which is
+    /// also what makes the two verbs an error anywhere else: outside a
+    /// compaction program there is nothing to add them to.
+    compacting: Option<Vec<crate::compaction::CompactionOp>>,
     /// Runs suspended **beneath** the one currently in `phase`, each
     /// frozen exactly where it stopped, oldest first popped last (a
     /// stack) — see `Phase::Suspended`'s own doc for why this, and not
@@ -437,6 +452,7 @@ impl Runner {
         let branch = tree.branch_of(spine.leaf_id).unwrap_or(spine.leaf_id);
         let leaf = spine.leaf_id;
         Runner {
+            compacting: None,
             spine,
             agent,
             branch,
@@ -625,7 +641,7 @@ impl Runner {
     /// Render a request if the trigger rule says to — the public door
     /// reconciliation wakes a re-hydrated branch through, so "never woken
     /// without a cause" still holds in one place.
-    pub fn wake(&mut self, tree: &Tree) -> Vec<StepOutput> {
+    pub fn wake(&mut self, tree: &mut Tree) -> io::Result<Vec<StepOutput>> {
         self.prompt_if_needed(tree)
     }
 
@@ -775,7 +791,7 @@ impl Runner {
             // now starts a fresh turn.
             Phase::AwaitingLlm => {
                 self.phase = Phase::Idle;
-                Ok(self.prompt_if_needed(tree))
+                self.prompt_if_needed(tree)
             }
             // A suspended branch is waiting on a direct host decision
             // (`resume`/`abandon`), not a rendered request — nothing to
@@ -1018,7 +1034,7 @@ impl Runner {
             },
         )?;
         self.last_vm = Some(run.vm);
-        Ok(self.prompt_if_needed(tree))
+        self.prompt_if_needed(tree)
     }
 
     fn on_tool_results(
@@ -1490,16 +1506,15 @@ impl Runner {
                     }
                 }
                 TOOL_REMOVE_HISTORY | TOOL_REWRITE_HISTORY => {
-                    // See this const's own doc comment: compaction.rs is
-                    // mid-rewrite in this same phase and wiring it here
-                    // would be guessing at a moving API. A clear,
-                    // JS-catchable rejection beats a silent round trip to
-                    // a host tool that doesn't exist.
-                    self.reject_call(
-                        call.promise,
-                        "compaction is not wired into this session yet (23_ONE_AGENT.md A4 \
-                         leaves remove_history/rewrite_history to a later pass)",
-                    );
+                    // Not a host call: nothing leaves the process and
+                    // nothing settles later. The op joins the batch this
+                    // handler is building and the promise resolves at
+                    // once, so a compaction program reads as ordinary
+                    // straight-line code.
+                    match self.record_compaction(&call) {
+                        Ok(()) => self.resolve_call(call.promise, serde_json::Value::Null),
+                        Err(why) => self.reject_call(call.promise, &why),
+                    }
                     progressed = true;
                 }
                 _ => {
@@ -1547,6 +1562,63 @@ impl Runner {
     fn call_args_json(&mut self, call: &InvokeCall) -> Vec<serde_json::Value> {
         let vm = self.running_vm();
         call.args.iter().map(|v| value_json(vm, v)).collect()
+    }
+
+    /// Resolve a call that never left the process — the compaction
+    /// verbs, whose answer is known the moment they are made.
+    fn resolve_call(&mut self, promise: PromisePtr, value: serde_json::Value) {
+        let vm = self.running_vm();
+        let v = vm.json_to_stack_value(&value, 0).expect("plain json");
+        vm.resolve_promise(promise, v).expect("fresh promise");
+    }
+
+    /// Add one `remove_history`/`rewrite_history` call to the batch the
+    /// running compaction handler is building.
+    ///
+    /// Refuses outside a compaction program rather than quietly doing
+    /// nothing: history is not a thing an ordinary program edits, and a
+    /// silently-ignored call would look to the model exactly like one
+    /// that worked.
+    fn record_compaction(&mut self, call: &InvokeCall) -> Result<(), String> {
+        use crate::compaction::CompactionOp;
+        if self.compacting.is_none() {
+            return Err(format!(
+                "{} is only available in a compaction program, which the harness asks for \
+                 when the conversation outgrows its budget",
+                call.name
+            ));
+        }
+        let args = self.call_args_json(call);
+        let id = match args.first().and_then(|v| v.as_u64()) {
+            Some(n) if n > 0 => EventId::new(n),
+            _ => return Err(format!("{}(id, label, …) needs the row's id", call.name)),
+        };
+        let label = match args.get(1).and_then(|v| v.as_str()) {
+            Some(l) => l.to_owned(),
+            None => {
+                return Err(format!(
+                    "{}(id, label, …) needs the row's label, which is checked against the \
+                     row itself so a wrong id cannot compact the wrong thing",
+                    call.name
+                ));
+            }
+        };
+        let op = if call.name == TOOL_REMOVE_HISTORY {
+            CompactionOp::Remove { id, label }
+        } else {
+            let Some(text) = args.get(2).and_then(|v| v.as_str()) else {
+                return Err(format!(
+                    "{TOOL_REWRITE_HISTORY}(id, label, value) needs the replacement text"
+                ));
+            };
+            CompactionOp::Rewrite {
+                id,
+                label,
+                text: text.to_owned(),
+            }
+        };
+        self.compacting.as_mut().expect("checked above").push(op);
+        Ok(())
     }
 
     /// Reject a malformed call in place. Nothing is logged: the call was
@@ -1790,6 +1862,35 @@ impl Runner {
         self.dispatch_calls(tree, unstarted, &mut out)?;
         self.generation += 1;
 
+        // A compaction handler's batch commits here, at the end of the
+        // program that built it, because that is when it is complete.
+        // Nothing about the ops is applied before this point, so a
+        // handler that traps or is abandoned halfway leaves the log
+        // exactly as it found it.
+        if self.compacting.is_some() {
+            let budget = crate::host::document_budget();
+            let headroom = crate::host::compaction_headroom();
+            match self.finish_compaction(tree, budget, headroom)? {
+                Ok(_) => {}
+                Err(why) => {
+                    // Not a failure: the log is untouched, so the
+                    // condition simply fires again with the reason in
+                    // front of the next program.
+                    tree.append(
+                        &mut self.spine,
+                        EventPayload::Message(Message::Post {
+                            from: Author::Harness,
+                            origin: Origin::Direct {
+                                text: why,
+                                input: serde_json::Value::Null,
+                                expects_reply: false,
+                            },
+                        }),
+                    )?;
+                }
+            }
+        }
+
         let Phase::Running(run) = std::mem::replace(&mut self.phase, Phase::Idle) else {
             unreachable!()
         };
@@ -1957,7 +2058,7 @@ impl Runner {
         // answered.
         self.shown = self.spine.leaf_id.as_u64();
         self.phase = Phase::Idle;
-        out.extend(self.prompt_if_needed(tree));
+        out.extend(self.prompt_if_needed(tree)?);
         Ok(out)
     }
 
@@ -2121,7 +2222,7 @@ impl Runner {
         // asks for the next program — which is the whole verb.
         if handed_over {
             let mut out = out;
-            out.extend(self.prompt_if_needed(tree));
+            out.extend(self.prompt_if_needed(tree)?);
             return Ok(out);
         }
 
@@ -2157,12 +2258,89 @@ impl Runner {
     /// Render a request iff the trigger rule says to. The one door an
     /// idle branch re-enters its LLM through, so "never woken without a
     /// cause" holds in one place.
-    fn prompt_if_needed(&mut self, tree: &Tree) -> Vec<StepOutput> {
+    fn prompt_if_needed(&mut self, tree: &mut Tree) -> io::Result<Vec<StepOutput>> {
         if !self.needs_prompt(tree) {
-            return Vec::new();
+            return Ok(Vec::new());
+        }
+        // Checked before the request is built, not after: a document
+        // over budget is over budget *for this request*, and the whole
+        // point is to not send it. The handler's own request is built
+        // from the compacted document on the next pass through here.
+        let budget = crate::host::document_budget();
+        let headroom = crate::host::compaction_headroom();
+        if let Some(request) = self.compaction_if_needed(tree, budget, headroom)? {
+            return Ok(vec![request]);
         }
         self.phase = Phase::AwaitingLlm;
-        vec![self.render_request(tree)]
+        Ok(vec![self.render_request(tree)])
+    }
+
+    /// Fire a compaction condition if the document has outgrown its
+    /// budget, returning the request that asks for the handler.
+    ///
+    /// Checked here, at the one door an idle branch re-enters its LLM
+    /// through, because that is the only moment the size is both known
+    /// and actionable: a document is only ever too large *for a request*,
+    /// and this is where requests are made.
+    ///
+    /// Returns `None` when there is nothing to do — under budget, or
+    /// already compacting, which is what stops a handler that fails to
+    /// shrink anything from firing itself again forever.
+    fn compaction_if_needed(
+        &mut self,
+        tree: &mut Tree,
+        budget: usize,
+        headroom: f64,
+    ) -> io::Result<Option<StepOutput>> {
+        if self.compacting.is_some() {
+            return Ok(None);
+        }
+        let doc = crate::document::render(tree, &self.spine, budget);
+        let rendered = crate::compaction::rendered_size(&doc);
+        if !crate::compaction::should_fire(rendered, budget, headroom) {
+            return Ok(None);
+        }
+        tree.append(
+            &mut self.spine,
+            EventPayload::Condition {
+                cause: Cause::Compaction { rendered, budget },
+                site: 0,
+                stack: Vec::new(),
+                disposition: Disposition::Pushed,
+            },
+        )?;
+        self.compacting = Some(Vec::new());
+        self.phase = Phase::AwaitingLlm;
+        Ok(Some(self.render_request(tree)))
+    }
+
+    /// Commit a finished compaction handler's batch, or say why not.
+    ///
+    /// `compaction::compact` validates the whole batch against the log
+    /// before anything is appended, so this either appends every
+    /// `Compacted` event or none of them. A rejection is returned as a
+    /// string for the caller to hand back to the model, which is a
+    /// retry rather than a failure: the log is untouched either way.
+    fn finish_compaction(
+        &mut self,
+        tree: &mut Tree,
+        budget: usize,
+        headroom: f64,
+    ) -> io::Result<Result<usize, String>> {
+        let Some(ops) = self.compacting.take() else {
+            return Ok(Ok(0));
+        };
+        let threshold = (budget as f64 * (1.0 - headroom)) as usize;
+        match crate::compaction::compact(tree, &self.spine, &ops, budget, threshold) {
+            Ok(events) => {
+                let n = events.len();
+                for event in events {
+                    tree.append(&mut self.spine, event)?;
+                }
+                Ok(Ok(n))
+            }
+            Err(e) => Ok(Err(e.to_string())),
+        }
     }
 
     // ── rendering ───────────────────────────────────────────────────
@@ -3401,6 +3579,168 @@ mod tests {
         assert!(
             !fork.needs_prompt(&tree),
             "a fork speaks only when spoken to"
+        );
+    }
+    // ── compaction ──────────────────────────────────────────────────
+
+    /// A branch with twenty real posts on it, and the budget that makes
+    /// it over-large.
+    ///
+    /// The budget is returned rather than passed in because an empty
+    /// branch is *already* about thirty kilobytes — the worked examples
+    /// open every document — so "add rows until it exceeds N" only
+    /// terminates for an N larger than the floor. Sizing the budget to
+    /// the branch instead of the branch to the budget avoids an
+    /// infinite loop that cost a test run to find.
+    fn crowded() -> (Tree, Runner, usize) {
+        let (mut tree, mut state) = setup();
+        for _ in 0..20 {
+            tree.append(
+                &mut state.spine,
+                EventPayload::Message(Message::Post {
+                    from: Author::User,
+                    origin: direct(&"filler ".repeat(40), false),
+                }),
+            )
+            .unwrap();
+        }
+        let size = crate::compaction::rendered_size(&crate::document::render(
+            &tree,
+            &state.spine,
+            64 * 1024,
+        ));
+        (tree, state, size / 2)
+    }
+
+    /// Under budget, nothing fires — the check has to be able to say no
+    /// before its yes means anything.
+    #[test]
+    fn compaction_does_not_fire_under_budget() {
+        let (mut tree, mut state) = setup();
+        let fired = state
+            .compaction_if_needed(&mut tree, 1024 * 1024, 0.25)
+            .unwrap();
+        assert!(fired.is_none());
+        assert!(state.compacting.is_none());
+        assert!(
+            !tree
+                .events
+                .values()
+                .any(|e| matches!(e.payload, EventPayload::Condition { .. }))
+        );
+    }
+
+    /// Over budget, a `Compaction` condition is logged carrying both
+    /// numbers, and a request goes out for the handler.
+    #[test]
+    fn compaction_fires_over_budget_and_asks_for_a_program() {
+        let (mut tree, mut state, budget) = crowded();
+        let fired = state.compaction_if_needed(&mut tree, budget, 0.25).unwrap();
+        assert!(matches!(fired, Some(StepOutput::LlmRequest(_))));
+        assert!(state.compacting.is_some(), "the batch is open");
+
+        let logged = tree
+            .events
+            .values()
+            .find_map(|e| match &e.payload {
+                EventPayload::Condition { cause, .. } => Some(cause.clone()),
+                _ => None,
+            })
+            .expect("a condition");
+        let Cause::Compaction {
+            rendered,
+            budget: b,
+        } = logged
+        else {
+            panic!("wrong cause: {logged:?}");
+        };
+        assert_eq!(b, budget);
+        assert!(rendered > budget, "{rendered} should exceed {budget}");
+    }
+
+    /// Already compacting, it does not fire again — which is what stops
+    /// a handler that frees nothing from asking for itself forever.
+    #[test]
+    fn compaction_does_not_fire_while_already_compacting() {
+        let (mut tree, mut state, budget) = crowded();
+        state.compaction_if_needed(&mut tree, budget, 0.25).unwrap();
+        let again = state.compaction_if_needed(&mut tree, budget, 0.25).unwrap();
+        assert!(again.is_none());
+    }
+
+    /// The whole cycle: fire, run a handler that removes a row, and
+    /// find the `Compacted` event on the log with the original still
+    /// present underneath it.
+    #[test]
+    fn a_compaction_handler_commits_its_batch() {
+        let (mut tree, mut state, budget) = crowded();
+        let target = tree
+            .events
+            .values()
+            .filter(|e| matches!(e.payload, EventPayload::Message(Message::Post { .. })))
+            .map(|e| e.id.as_u64())
+            .min()
+            .map(EventId::new)
+            .expect("a post to compact");
+
+        state.compaction_if_needed(&mut tree, budget, 0.25).unwrap();
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(llm_program(&format!(
+                    "remove_history({}, \"post\");",
+                    target.as_u64()
+                ))),
+            )
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+        assert!(state.compacting.is_none(), "the batch closed");
+        let compacted: Vec<_> = tree
+            .events
+            .values()
+            .filter_map(|e| match &e.payload {
+                EventPayload::Compacted { of, .. } => Some(*of),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(compacted, vec![target], "exactly the row it named");
+        assert!(
+            tree.events.contains_key(&target),
+            "the original row is shadowed, never removed"
+        );
+    }
+
+    /// Outside a compaction program the verbs are refused rather than
+    /// quietly doing nothing — history is not something an ordinary
+    /// program edits, and a silently-ignored call looks exactly like one
+    /// that worked.
+    #[test]
+    fn history_verbs_are_refused_outside_a_compaction_program() {
+        let (mut tree, mut state) = setup();
+        user_post(&mut state, &mut tree, "go");
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(llm_program(
+                    "try { remove_history(1, \"post\"); tell(\"no trap\"); } \
+                     catch (e) { tell(`refused: ${e}`); }",
+                )),
+            )
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+        let said: Vec<String> = tree
+            .events
+            .values()
+            .filter_map(|e| match &e.payload {
+                EventPayload::Call(Call::Send { text, .. }) => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            said.iter()
+                .any(|t| t.contains("refused")
+                    && t.contains("only available in a compaction program")),
+            "{said:?}"
         );
     }
 }
