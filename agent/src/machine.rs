@@ -1604,7 +1604,18 @@ impl Runner {
         // mechanism exists to get the ordinary case right, the
         // mechanism is wrong.
         let to = to.get("agent").unwrap_or(to);
-        let Some(id) = to.as_u64().filter(|n| *n > 0).map(EventId::new) else {
+        // `"#16"` as well as `16`. Every id a program sees is *rendered*
+        // `#16` — the artifact menu, the reports, the post lines — so a
+        // model reading one back writes the form it was shown. Observed
+        // live: a program held a fork from an earlier turn, found its id
+        // in the menu, and wrote `ask("#16", …)`, which was refused. The
+        // display teaches the spelling; the parser should accept it.
+        let id = to.as_u64().or_else(|| {
+            to.as_str()
+                .map(|s| s.trim().trim_start_matches('#'))
+                .and_then(|s| s.parse::<u64>().ok())
+        });
+        let Some(id) = id.filter(|n| *n > 0).map(EventId::new) else {
             return Err(format!(
                 "the address must be an agent handle (from spawn()/fork()), a branch \
                  id, or \"user\"; got {to}"
@@ -2799,6 +2810,33 @@ mod tests {
             "awaiting llm",
             "a handover asks for the next program immediately"
         );
+    }
+
+    #[test]
+    fn an_id_is_addressable_in_the_form_it_is_displayed() {
+        // Ids are rendered `#16` everywhere a program can see one -- the
+        // artifact menu, reports, post lines -- so that is the form a
+        // model writes back. Live 2026-09-16: a program held a fork from
+        // an earlier turn, read its id off the menu, wrote
+        // `ask("#16", ...)`, and was refused.
+        let mut tree = Tree::new(None);
+        let root = tree.start_agent(None, None, "root", None, "card").unwrap();
+        let child = tree
+            .start_agent(Some(root.leaf_id), None, "worker", None, "card")
+            .unwrap();
+        let id = child.leaf_id.as_u64();
+        let state = Runner::with_spine(&tree, root);
+
+        for form in [
+            serde_json::json!(id),
+            serde_json::json!(format!("{id}")),
+            serde_json::json!(format!("#{id}")),
+        ] {
+            assert!(
+                state.resolve_address(&tree, Some(&form)).is_ok(),
+                "{form} should address the same branch"
+            );
+        }
     }
 
     #[test]
