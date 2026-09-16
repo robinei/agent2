@@ -24,6 +24,7 @@ what a variant is, and whether a checker can be trusted.
 """
 
 import argparse
+import concurrent.futures
 import importlib.util
 import json
 import os
@@ -33,6 +34,7 @@ import statistics
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -418,6 +420,9 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--tasks", help="comma-separated task names (default: all)")
     p.add_argument("--repeat", type=int, default=3)
+    p.add_argument(
+        "--jobs", type=int, default=4, help="runs in flight at once (they are network-bound)"
+    )
     p.add_argument("--card", type=Path, help="card directory for this variant")
     p.add_argument("--timeout", type=int, default=900)
     p.add_argument("--out", type=Path, help="write the aggregate here as JSON")
@@ -476,22 +481,39 @@ def main():
         print("DEEPSEEK_API_KEY is not set", file=sys.stderr)
         return 2
 
+    # Runs are independent and spend nearly all their time waiting on a
+    # completion — one 2026-09-16 run sat 317 seconds for its second
+    # program with the CPU idle — so they overlap. Serial, the suite is
+    # paced by the slowest queue in the provider rather than by anything
+    # being measured.
+    work = [(task, i) for task in usable for i in range(args.repeat)]
+    printing = threading.Lock()
     runs = []
-    for task in usable:
-        for i in range(args.repeat):
-            print(f"[{task.NAME}] run {i + 1}/{args.repeat}", flush=True)
-            r = run_once(task, args.card, args.timeout, args.keep)
-            verdict = (
-                "pass" if r["pass"] else ("FAIL: " + r["why"] if r["pass"] is False else "NO RUN: " + r["why"])
-            )
-            s = r["score"]
+
+    def one(item):
+        task, i = item
+        r = run_once(task, args.card, args.timeout, args.keep)
+        verdict = (
+            "pass"
+            if r["pass"]
+            else ("FAIL: " + r["why"] if r["pass"] is False else "NO RUN: " + r["why"])
+        )
+        sc = r["score"]
+        with printing:
             print(
-                f"  {verdict}  ({s.get('programs', '?')} programs, "
-                f"{s.get('calls_per_program', '?')} calls/program, "
-                f"{r['wall_s']}s)" + (f"  kept: {r['kept']}" if r["kept"] else ""),
+                f"[{task.NAME}] run {i + 1}/{args.repeat}  {verdict}  "
+                f"({sc.get('programs', '?')} programs, "
+                f"{sc.get('calls_per_program', '?')} calls/program, {r['wall_s']}s)"
+                + (f"  kept: {r['kept']}" if r["kept"] else ""),
                 flush=True,
             )
-            runs.append(r)
+        return r
+
+    if args.jobs == 1:
+        runs = [one(item) for item in work]
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
+            runs = list(pool.map(one, work))
 
     summary = aggregate(runs)
     print_summary(summary)
