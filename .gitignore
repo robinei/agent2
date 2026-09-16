@@ -1,3 +1,4 @@
 /target
 /agent/.claude/
 /.reasonix/
+try*.jsonl

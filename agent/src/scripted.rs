@@ -1,62 +1,30 @@
-//! Fixed and experimental task set for `agent eval`
-//! (`docs/23_ONE_AGENT.md`, Pass C) — what `eval::harness` drives
-//! against a real [`host::Session`] and reports on.
+//! Scripted end-to-end runs of the real machine.
 //!
-//! **Every task runs real tools against real files.** [`drive`] builds
-//! [`host::real_registry()`] unmodified — the exact tool set a live
-//! session uses, no sandbox parameter, no scripted stand-in — and points
-//! the session's working directory at a fresh, real directory
-//! ([`make_sandbox`]) that `task.setup` has populated with that task's
-//! actual fixture files before the first turn runs. A finished task's
-//! `check` then reads the same directory back off disk: did the file
-//! actually change, was the data actually deleted, rather than
-//! inferring either from the transcript.
+//! Formerly `eval/tasks.rs`, and before that the POC's
+//! `codemode/tasks.rs`. It was written to hold a live model to a set of
+//! acceptance tasks, and that job has left this binary: evaluation now
+//! drives the real `agent session` from outside, in `evals/drive.py`,
+//! because the harness is not allowed to know that evaluation exists
+//! (DESIGN.md, "confinement, not permission"). `agent eval` and its
+//! live runner are gone with it.
 //!
-//! The discipline this replaces: a fake `bash` that returns `{ exit,
-//! output }` while the real one returns `{ status, stdout, stderr }` is
-//! a fixture testing a contract that does not exist in production, and
-//! nothing on either side of that gap could ever catch it — found live,
-//! 2026-09-14, when `retry-and-branch` "passed" on `first.exit === 0`,
-//! which is `undefined` against the real registry. A fixture that fakes
-//! a tool cannot represent two semantically different commands; a real
-//! `bash` against a real script can't drift from itself.
+//! What stayed is what this file had quietly become: the only place a
+//! whole `Session` is driven end to end under `cargo test`. Thirty of
+//! its thirty-one tests build a real sandbox, register
+//! `host::real_registry()` unmodified, run a real `Runner` over a real
+//! VM against real files, and answer the model with a scripted program
+//! instead of a network call. That is integration coverage of the
+//! machine, spelled as tasks and checks because of where it came from.
 //!
-//! **The only thing this harness simulates is the human on the other
-//! end of `ask()`.** There is no user in `agent eval`, so a task names
-//! its own [`Task::ask_answer`] — `None` for "no one is reachable here,
-//! answer honestly with [`NO_SCRIPTED_ANSWER`]," `Some(value)` for "a
-//! real, reachable reviewer exists for this task, and this is what they
-//! would say." That is the *only* place any task in this file scripts a
-//! response to anything. Every other call — `read_file`, `bash`,
-//! `create_file`, `replace_file` — reaches the real tool, unmodified,
-//! against the real sandbox directory `task.setup` built.
+//! The one thing it still simulates is the person an `ask()` might
+//! reach ([`Task::ask_answer`]), and deliberately not cooperatively —
+//! see [`NO_SCRIPTED_ANSWER`].
 //!
-//! Runnable two ways, same as before this rewrite: through [`drive`]
-//! with a scripted [`host::ScriptedLlm`] (this file's own `#[cfg(test)]`
-//! module — a hand-written "ideal" program per task, verifying the
-//! *success check itself* is correct, no network) and through [`drive`]
-//! with a live `host::DeepSeekClient` (`agent eval`,
-//! `eval::harness::run_cli` — never `cargo test`, per the ground rule
-//! that a live model's actual behaviour is not the thing to script).
-//!
-//! **Every number a check reads off a finished run is folded from the
-//! real event log — nothing is hand-threaded.** See [`Outcome`]'s own
-//! doc for each field's fold. This is the same derived-not-stored
-//! doctrine as the rest of `23_ONE_AGENT.md`: a number that could only
-//! be produced by instrumenting the runner by hand is a number a mind
-//! reading the log could never have seen either.
-//!
-//! **A check gates on the safety or correctness property, never on
-//! which verb fired.** Verb choice is the observational variable —
-//! gating on it would make the harness confirm its own card rather than
-//! measure it.
-//!
-//! **This module has no idea whether it is running confined.** Whoever
-//! launches `agent eval` (a wrapper script, a human at a shell) decides
-//! what the process can touch; the harness just does file I/O and shells
-//! out, the same as any other program. See `scripts/eval.sh`.
+//! A `Task` here is a *fixture*, not a benchmark. The benchmark is
+//! `evals/tasks/`, where a task is a directory anyone can add to
+//! without rebuilding anything.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
 
 use crate::host;
@@ -183,10 +151,6 @@ pub struct Outcome {
     /// scopes still open when the log ends are counted as neither, not
     /// silently subtracted as a resume that never happened.
     pub resume_count: usize,
-    /// `Call::Spawn` calls with a **delivered** `Result` — a spawn that
-    /// actually produced a live child, not merely one the program
-    /// attempted.
-    pub spawn_children: usize,
     /// The text of every `EventPayload::Note` (`append_history`) event,
     /// in log order.
     pub appended: Vec<String>,
@@ -206,13 +170,6 @@ pub struct Outcome {
     /// collapse of this ratio toward 1 is that failure returning, and it
     /// is the earliest signal there is.
     pub tool_calls: usize,
-    /// `interp::count_statements` over each agent-authored `Turn`'s
-    /// `source`, in the same order as `round_trips` counts them.
-    pub program_lengths: Vec<usize>,
-    /// The programs themselves, same order as `program_lengths` —
-    /// reading the program is the real instrument when a number alone
-    /// doesn't explain a failure.
-    pub programs: Vec<String>,
     /// The text of every `tell()` (`Call::Send { expects_reply: false
     /// }`), in log order — what a task's check reads to see what was
     /// actually reported, regardless of who it was told to.
@@ -502,12 +459,8 @@ fn fold(session: host::Session, errors: Vec<String>) -> Outcome {
     let mut open_scopes: Vec<EventId> = Vec::new();
     let mut resume_count = 0usize;
     let mut tool_calls = 0usize;
-    let mut spawn_calls: HashSet<EventId> = HashSet::new();
-    let mut spawn_children = 0usize;
     let mut appended = Vec::new();
     let mut round_trips = 0;
-    let mut program_lengths = Vec::new();
-    let mut programs = Vec::new();
     let mut transcript = Vec::new();
     // Every `ask()` to the user still waiting on its `Result`, by the
     // `Send` event's own id — matched up below when that `Result`
@@ -546,13 +499,7 @@ fn fold(session: host::Session, errors: Vec<String>) -> Outcome {
                 }
             }
             EventPayload::Call(Call::Invoke { .. }) => tool_calls += 1,
-            EventPayload::Call(Call::Spawn { .. }) => {
-                spawn_calls.insert(e.id);
-            }
             EventPayload::Result { call, outcome } => {
-                if spawn_calls.contains(call) && matches!(outcome, CallOutcome::Delivered(_)) {
-                    spawn_children += 1;
-                }
                 if let Some(question) = open_asks.remove(call)
                     && let CallOutcome::Delivered(value) = outcome
                     && value.as_str() == Some(NO_SCRIPTED_ANSWER)
@@ -574,12 +521,9 @@ fn fold(session: host::Session, errors: Vec<String>) -> Outcome {
             EventPayload::Note { text } => appended.push(text.clone()),
             EventPayload::Message(Message::Turn {
                 author: Author::Agent(_),
-                source,
                 ..
             }) => {
                 round_trips += 1;
-                program_lengths.push(interp::count_statements(source));
-                programs.push(source.clone());
             }
             EventPayload::Call(Call::Send {
                 text,
@@ -596,12 +540,9 @@ fn fold(session: host::Session, errors: Vec<String>) -> Outcome {
         trap_count,
         abandon_count,
         resume_count,
-        spawn_children,
         appended,
         round_trips,
         tool_calls,
-        program_lengths,
-        programs,
         transcript,
         unscripted_asks,
         errors,
@@ -1359,23 +1300,12 @@ fn multi_turn_continuity_check(outcome: &Outcome, _dir: &Path) -> Result<(), Str
     Ok(())
 }
 
-pub const ALL: &[Task] = &[
+const ALL: &[Task] = &[
     FAN_OUT,
     RETRY,
     JUDGMENT_IN_THE_MIDDLE,
     TRIVIAL_QUESTION,
     DESTRUCTIVE_MIGRATION_GATE,
-];
-
-/// Targeted, one-off validation experiments — not a stable regression
-/// set like [`ALL`], and not run by default `agent eval` passes. Each
-/// earns its place by answering a specific open question (see each
-/// task's own doc comment for which).
-pub const EXPERIMENTAL: &[Task] = &[
-    DESTRUCTIVE_MIGRATION_GATE_ASK_AVAILABLE,
-    BENCHMARK_CONFLICT_GATE,
-    RECURRING_CLEANUP,
-    MULTI_TURN_CONTINUITY,
 ];
 
 #[cfg(test)]

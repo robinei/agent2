@@ -3,7 +3,7 @@
 //!
 //! Everything here is derived, never stored: a log is the record, and a
 //! score is one pass over it (`DESIGN.md`'s derived-not-stored rule, the
-//! same discipline `eval::tasks::fold` already follows — this *is* that
+//! same discipline `scripted::fold` already follows — this *is* that
 //! fold, lifted off `Session` so it also runs on a log from a live run
 //! rather than only on one the eval harness drove).
 //!
@@ -161,7 +161,7 @@ pub fn score(tree: &Tree) -> Score {
         reasoning_out: 0,
     };
 
-    // The same stack `eval::tasks::fold` keeps, and for the same reason:
+    // The same stack `scripted::fold` keeps, and for the same reason:
     // `resume()` logs nothing of its own, so a resume is an open scope
     // closed by a `Return` rather than by an `Abandoned`. A stack, not a
     // subtraction, so a suspension still open when the log ends counts
@@ -307,8 +307,8 @@ mod tests {
     /// the whole reason `score` exists rather than a throwaway parser.
     #[test]
     fn score_agrees_with_the_eval_fold() {
-        let (sandbox, outcome) = crate::eval::tasks::tests::drive_scripted(
-            &crate::eval::tasks::FAN_OUT,
+        let (sandbox, outcome) = crate::scripted::tests::drive_scripted(
+            &crate::scripted::FAN_OUT,
             vec![
                 "const [a, b, c] = await Promise.all([tools.read_file('a.txt'), \
                  tools.read_file('b.txt'), tools.read_file('c.txt')]); \

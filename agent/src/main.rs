@@ -1,11 +1,14 @@
 mod card;
 mod compaction;
 mod document;
-mod eval;
 mod host;
 mod machine;
 mod report;
+// Fixtures and scripted end-to-end runs: test-only, and compiled only
+// for `cargo test` now that no binary path reaches them.
 mod score;
+#[cfg(test)]
+mod scripted;
 mod tree;
 mod types;
 
@@ -46,14 +49,13 @@ const USAGE: &str = "usage: agent <command>
                                     message, role and size. The prompt is
                                     otherwise the one thing you cannot
                                     look at.
-  eval [--experimental]             the acceptance harness (agent/src/eval/):
-                                    drives real Session runs against
-                                    DeepSeek (needs DEEPSEEK_API_KEY) over
-                                    the fixed task set, plus the
-                                    experimental set with --experimental.
-                                    Never part of `cargo test` -- it costs
-                                    real money and its numbers are read by
-                                    a human.";
+  score <log.jsonl ...>             fold each finished log into the
+                                    numbers a change is argued from:
+                                    programs, calls per program, tokens
+                                    in and out, reasoning, and the time
+                                    inside completions split from the
+                                    time everywhere else. JSON per log,
+                                    so a before/after is diff or jq.";
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -158,13 +160,6 @@ fn main() {
                 run_session_tui(log_path, use_real, &nav)
             };
             if let Err(e) = result {
-                eprintln!("{e}");
-                std::process::exit(1);
-            }
-        }
-        Some("eval") => {
-            let experimental = args.get(2).map(String::as_str) == Some("--experimental");
-            if let Err(e) = eval::harness::run_cli(experimental) {
                 eprintln!("{e}");
                 std::process::exit(1);
             }

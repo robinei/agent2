@@ -431,10 +431,11 @@ fn bash_def() -> ToolDef {
 /// found: `bash_returns_status_stdout_stderr` failed three runs in four
 /// at full parallelism and passed every time alone.
 ///
-/// `eval::tasks` already had a mutex for this, but scoped to itself, so
+/// `scripted` already had a mutex for this, but scoped to itself, so
 /// it serialised the eval tests against each other and not against the
 /// `bash` tests here. One process has one cwd, so the lock belongs
 /// beside the thing that inherits it.
+#[cfg(test)]
 pub(crate) static PROCESS_CWD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Spawn `bash -c <command>`, enforce the timeout, and shape the outcome
