@@ -233,6 +233,32 @@ per program**, not pass rate: a minimal card will very likely still
 complete tasks, at two or three calls per program, which is a tool loop
 wearing JavaScript and gives the whole advantage back.
 
+## 25.7 — What the suite still cannot ask
+
+**Nothing answers an `ask()`.** The internal eval module had one fixed
+non-answer for this (`NO_SCRIPTED_ANSWER`, and its own doc explains why
+a *cooperative* simulated user is worse than none: it hands the agent a
+clean answer to every ambiguity it invents and flatters it into
+passing). The external driver has nothing — a run that asks ends with
+the question outstanding. That is the correct end state for
+`ambiguous-config`, which is why it can be checked today, but it rules
+out every multi-turn task, and multi-turn continuity is a whole
+mechanism the suite currently cannot reach. The original plan's answer
+is an LLM-as-user flag driving the real TUI; the smaller step is a
+`--reply` path on `agent session` so the driver can discharge a pending
+`ask` the way the in-process harness does.
+
+**A verified checker can still check the wrong thing.** The first
+`ambiguous-config` checker required exactly one program, and failed a
+run that read the file in one, handed the text to a second, recognised
+the ambiguity there and asked exactly the right question — the handover
+the card endorses, for the reason it endorses it. The fixture
+verification passed throughout, because the fixtures were written to
+match the same belief the checker encoded. Verification catches a
+checker that cannot fail; it cannot catch one that fails the right
+answer. The only thing that caught it was reading a failing run, which
+is what `--keep` is for.
+
 ## Not in scope
 
 Card *prose*. This phase adds no engineering-hygiene guidance; the
