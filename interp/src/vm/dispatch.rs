@@ -2287,6 +2287,31 @@ impl VM {
                             })?;
                             arr.extend(elts);
                         }
+                        // `[...someMap]` — a Map spreads to its
+                        // `[key, value]` pairs, the same thing
+                        // `for-of` over it yields. Observed live
+                        // 2026-09-16 as a recovery attempt after
+                        // `for (const [k, v] of map)` had already
+                        // trapped: both now work.
+                        Value::Map(map_ptr) => {
+                            let entries: Vec<(Value, Value)> = self
+                                .maps
+                                .get(map_ptr as usize)
+                                .ok_or_else(|| {
+                                    VMError::fail_at(ip, ErrorKind::TypeError, "bad map pointer")
+                                })?
+                                .iter()
+                                .map(|(k, v)| (k.0.clone(), v.clone()))
+                                .collect();
+                            let pairs: ThinVec<Value> = entries
+                                .into_iter()
+                                .map(|(k, v)| self.alloc_array(vec![k, v].into()))
+                                .collect();
+                            let arr = self.arrays.get_mut(arr_ptr as usize).ok_or_else(|| {
+                                VMError::fail_at(ip, ErrorKind::TypeError, "bad array pointer")
+                            })?;
+                            arr.extend(pairs);
+                        }
                         // `[..."abc"]` — a string is iterable too, by
                         // code point.
                         Value::String(ref s) => {
@@ -2303,7 +2328,7 @@ impl VM {
                         _ => {
                             return Err(self.fail(
                                 ErrorKind::TypeError,
-                                "array spread source must be an array, a Set, or a string",
+                                "array spread source must be an array, a Map, a Set, or a string",
                             ));
                         }
                     }

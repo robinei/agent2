@@ -139,6 +139,14 @@ started changing things goes stale as you use it: take a line out and
 everything under it renumbers. Get either wrong and the loop reports a
 clean sweep of work it did not do.
 
+And make sure the check can say no. A verdict that comes back the same
+for every item usually means the thing you are testing for never
+appears in what you captured — a warning is not a failing status, and
+a filtered pipeline drops the error that mattered. So get one no out of
+it before you believe twenty yeses: run it against the state you
+started from, or a case you already know is bad. A check you have never
+seen fail is not yet a check.
+
 The tell is exact: **if you can write down what the next program should
 do, you can write the program.** A handover whose payload says "for
 each of these, do X" spent an inference to hand yourself a to-do list —
@@ -614,7 +622,7 @@ mod tests {
         // `CARD` shows up as a diff review must look at, not a byte
         // count that silently drifts. Comparing full text (not just a
         // hash) so the diff itself is legible in a failure message.
-        const EXPECTED_LEN: usize = 12847;
+        const EXPECTED_LEN: usize = 13295;
         assert_eq!(
             CARD.len(),
             EXPECTED_LEN,

@@ -180,6 +180,26 @@ pub fn map_set_entries(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     }
 }
 
+/// The `for (const x of …)` source, normalised. `for-of` lowers to an
+/// index loop over a container, which an array and a string already
+/// are; a `Map` iterates as `[key, value]` pairs and a `Set` as its
+/// values, so those become the array the loop can actually index.
+/// Anything else is passed through untouched, so the loop's own
+/// `GetLength` still raises the type error for it.
+///
+/// Observed live 2026-09-16: a program grouped work with
+/// `new Map()` — the obvious way to write it — and then
+/// `for (const [path, lines] of byFile)` trapped with "cannot read
+/// .length of a map". It cost three of that run's four programs, all
+/// spent recovering from a dialect gap rather than on the task.
+pub fn iter_source(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    match args.get(vm, 0) {
+        Value::Map(_) => map_entries(vm, args),
+        Value::Set(_) => super::set_values(vm, args),
+        other => Ok(other.clone()),
+    }
+}
+
 // ── tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -247,5 +267,41 @@ mod tests {
     fn map_is_map() {
         let out = testutil::run_ret("const m = new Map(); return [Map.isMap(m), Map.isMap({})];");
         assert_eq!(out, serde_json::json!([true, false]));
+    }
+
+    /// Live 2026-09-16: `for (const [path, lines] of byFile)` over a
+    /// `Map` trapped with "cannot read .length of a map", and the
+    /// recovery attempt `[...byFile]` trapped too. A `Map` is the
+    /// obvious way to group work by key, so both now iterate.
+    #[test]
+    fn for_of_over_a_map_yields_key_value_pairs() {
+        let out = testutil::eval_str(
+            "(() => { const m = new Map(); m.set('a', 1); m.set('b', 2);              const seen = []; for (const [k, v] of m) seen.push(k + v);              return seen.join(','); })()",
+        );
+        assert_eq!(out, "a1,b2");
+    }
+
+    #[test]
+    fn for_of_over_a_set_yields_its_values() {
+        let out = testutil::eval_str(
+            "(() => { const s = new Set(['a', 'b', 'a']); const seen = [];              for (const v of s) seen.push(v); return seen.join(','); })()",
+        );
+        assert_eq!(out, "a,b");
+    }
+
+    #[test]
+    fn spreading_a_map_gives_its_entries() {
+        let out = testutil::eval_str(
+            "(() => [...new Map([['a', 1]])].map(p => p[0] + p[1]).join(','))()",
+        );
+        assert_eq!(out, "a1");
+    }
+
+    #[test]
+    fn for_of_over_a_plain_value_still_fails() {
+        // The normalising step passes non-iterables through untouched,
+        // so the loop's own `GetLength` raises, as it always has.
+        let err = testutil::run_runtime_err("for (const x of 42) {}");
+        assert_eq!(err.kind, crate::ErrorKind::TypeError);
     }
 }

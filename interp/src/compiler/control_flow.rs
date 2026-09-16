@@ -420,7 +420,9 @@ impl super::Compiler {
     /// VM has no iterator protocol, so this lowers to an index counter: the
     /// iterable and the index are kept on the stack as `[iter, idx]` for the
     /// whole loop, and each step binds the loop variable to `iter[idx]`. A
-    /// non-array/string iterable is a runtime `TypeError` (from `ArrLength`).
+    /// `Map`/`Set` is normalised to that indexable form first (see
+    /// `builtin::iter_source`); anything else is a runtime `TypeError`
+    /// (from `ArrLength`).
     pub(super) fn compile_for_of(&mut self, s: &ast::ForOfStatement) {
         let span = s.span.start;
         // `for await (… of …)` consumes async iterables, which this dialect
@@ -436,9 +438,16 @@ impl super::Compiler {
         let Some(pat) = self.for_loop_binding_pattern(&s.left, span) else {
             return;
         };
-        // Push the iterable; `compile_index_loop` adds the counter and consumes
-        // both at the end.
+        // Push the iterable, normalised: an array or string is already
+        // indexable, a Map becomes its `[key, value]` pairs and a Set
+        // its values, and anything else passes through to fail on
+        // `GetLength` as before. `compile_index_loop` adds the counter
+        // and consumes both at the end.
         self.compile_expr(&s.right);
+        self.emit(
+            Instr::CallBuiltin(crate::builtin::Builtin::IterSource, 1),
+            span,
+        );
         self.compile_index_loop(pat, &s.body, span);
     }
 

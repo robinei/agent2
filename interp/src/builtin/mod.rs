@@ -567,6 +567,10 @@ builtins! {
     MapSetKeys,    BuiltinKind::Method, "keys",    1, 1, map_set_keys,    false, false, true, true, false, false, false, false, false, false;
     MapSetValues,  BuiltinKind::Method, "values",  1, 1, map_set_values,  false, false, true, true, false, false, false, false, false, false;
     MapSetEntries, BuiltinKind::Method, "entries", 1, 1, map_set_entries, false, false, true, true, false, false, false, false, false, false;
+    // Not reachable as a method: every receiver flag is false, so no
+    // property name resolves to it. The compiler emits it directly, as
+    // the normalising step in front of every `for-of` (see `iter_source`).
+    IterSource,    BuiltinKind::Method, "",        1, 1, iter_source,     false, false, false, false, false, false, false, false, false, false;
 
     // ── Constructors (Step 2a Part 2) ──
     // Callable `Value::Builtin`s keyed by `BuiltinKind::Constructor { type_tag }`.
