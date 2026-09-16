@@ -233,8 +233,16 @@ fn pending_line(
                 unreachable!("resolve() never changes a Post's variant")
             };
             let text = origin.direct().map(|(t, _, _)| t).unwrap_or("");
+            // `post` first, the author in parentheses after it. The
+            // word straight after the id is the row's **label**, which
+            // `remove_history`/`rewrite_history` check as a checksum —
+            // and `[62] from agent 1: …` made the label read as "from
+            // agent 1". A live compaction program on 2026-09-16 did
+            // exactly that and was rejected: "#62 is a `post`, not a
+            // `from agent 1`". It had picked the right row and read the
+            // label off the row, which is the only place it could.
             Some(format!(
-                "[{}] from {}: {}",
+                "[{}] post ({}): {}",
                 event.id.as_u64(),
                 author_label(tree, *from),
                 escape_untrusted(text)
@@ -701,5 +709,61 @@ mod tests {
         );
         interp::compile(&compacted_turn.content)
             .expect("a compacted program's turn is still valid JavaScript");
+    }
+    /// **A row's rendered label is the one its compaction checksum
+    /// expects.** `remove_history(id, label)` and
+    /// `rewrite_history(id, label, value)` check the label against the
+    /// row, and the only place a program can read a label is the row as
+    /// rendered here — so if the two disagree, correct work is rejected
+    /// and the rejection blames the program.
+    ///
+    /// That is not hypothetical: on 2026-09-16 a post rendered as
+    /// `[62] from agent 1: …`, a live compaction program duly called
+    /// `remove_history(62, "from agent 1")`, and the checksum answered
+    /// "#62 is a `post`, not a `from agent 1`". Every test passed; none
+    /// of them compared the two strings.
+    #[test]
+    fn a_rendered_row_carries_the_label_its_checksum_expects() {
+        let mut tree = Tree::new(None);
+        let mut spine = tree.start_agent(None, None, "root", None, "CARD").unwrap();
+        tree.append(
+            &mut spine,
+            EventPayload::Message(Message::Post {
+                from: Author::User,
+                origin: Origin::Direct {
+                    text: "go".into(),
+                    input: serde_json::Value::Null,
+                    expects_reply: false,
+                },
+            }),
+        )
+        .unwrap();
+        tree.append(
+            &mut spine,
+            EventPayload::Note {
+                text: "remembered".into(),
+            },
+        )
+        .unwrap();
+
+        let compacted = tree.compacted_lookup(spine.leaf_id);
+        let mut checked = 0;
+        for ev in tree.path_events(spine.leaf_id) {
+            let Some(line) = pending_line(&tree, spine.leaf_id, ev, &compacted) else {
+                continue;
+            };
+            let Some(after_id) = line.split_once("] ") else {
+                continue;
+            };
+            let rendered = after_id.1.split([':', ' ']).next().unwrap_or("");
+            assert_eq!(
+                rendered,
+                label_of(&ev.payload),
+                "row renders as {rendered:?} but its checksum wants {:?}: {line}",
+                label_of(&ev.payload)
+            );
+            checked += 1;
+        }
+        assert!(checked >= 2, "exercised {checked} rows");
     }
 }
