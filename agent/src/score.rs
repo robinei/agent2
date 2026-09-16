@@ -38,6 +38,16 @@
 //! for a judgement with ending a program — opposite behaviours with
 //! opposite economics.
 //!
+//! **`prompt_bytes`** — what was actually *sent*, summed over the
+//! completions, and the only number that tests the round-trip claim
+//! from the input side. A tool loop re-sends a growing conversation on
+//! every call, so twenty-three calls means twenty-three prompts each
+//! larger than the last; one program means one prompt. Nothing stores
+//! it, because nothing needs to: the document is a fold over the log
+//! (`document::render`) and the system prompt is snapshotted on the
+//! `Agent` event, so what went out is reconstructible exactly from
+//! what came back. Derived, not stored, like everything else here.
+//!
 //! **`silent`** — a run whose programs never reached a person. A root
 //! program that never calls `tell()` is a no-op the log will otherwise
 //! report as a clean completion.
@@ -93,6 +103,16 @@ pub struct Score {
     pub provider_ms: i64,
     /// `span_ms - provider_ms` — the harness, the VM, and the tools.
     pub exec_ms: i64,
+    /// Bytes of prompt sent, summed over every completion — the
+    /// document as it stood when each program was asked for.
+    pub prompt_bytes: usize,
+    /// Bytes of program written, summed.
+    pub source_bytes: usize,
+    /// Bytes of reasoning, summed. Measured 2026-09-16 at five to
+    /// twenty times `source_bytes` on a real task, which is where a
+    /// long run's wall clock actually goes — not into a queue, and not
+    /// into the harness, whose share is `exec_ms`.
+    pub thinking_bytes: usize,
 }
 
 /// Fold a tree into a [`Score`]. One pass, in event-id order, which is
@@ -122,6 +142,9 @@ pub fn score(tree: &Tree) -> Score {
         span_ms: 0,
         provider_ms: 0,
         exec_ms: 0,
+        prompt_bytes: 0,
+        source_bytes: 0,
+        thinking_bytes: 0,
     };
 
     // The same stack `eval::tasks::fold` keeps, and for the same reason:
@@ -139,9 +162,19 @@ pub fn score(tree: &Tree) -> Score {
             EventPayload::Message(Message::Turn {
                 author: Author::Agent(_),
                 source,
-                ..
+                thinking,
             }) => {
                 s.programs += 1;
+                s.source_bytes += source.len();
+                s.thinking_bytes += thinking.as_ref().map_or(0, |t| t.len());
+                // The document as it stood when *this* program was
+                // asked for: the spine ending at the event before it.
+                if let Some(parent) = e.parent_id {
+                    let spine = tree.spine_at(parent);
+                    let doc =
+                        crate::document::render(tree, &spine, crate::host::DEFAULT_DOCUMENT_BUDGET);
+                    s.prompt_bytes += doc.messages.iter().map(|m| m.content.len()).sum::<usize>();
+                }
                 s.program_lengths.push(interp::count_statements(source));
                 // The gap before a program arrived is the completion
                 // that produced it.

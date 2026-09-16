@@ -379,6 +379,13 @@ def aggregate(runs: list) -> dict:
             "programs": med([s["programs"] for s in scores]),
             "handovers": med([s["handovers"] for s in scores]),
             "exec_s": med([s["exec_ms"] / 1000 for s in scores]),
+            # Input scales with *programs*, not with calls: 23 calls in
+            # one program cost 33KB of prompt, 39 calls across four cost
+            # 208KB. That ratio is the round-trip tax, and it is the
+            # thesis stated in bytes.
+            "prompt_kb": med([s["prompt_bytes"] / 1024 for s in scores]),
+            "source_kb": med([s["source_bytes"] / 1024 for s in scores]),
+            "thinking_kb": med([s["thinking_bytes"] / 1024 for s in scores]),
             "provider_s": med([s["provider_ms"] / 1000 for s in scores]),
             "traps": traps,
             "failures": [r["why"] for r in rs if r["pass"] is False],
@@ -395,6 +402,10 @@ def print_summary(summary: dict):
             f"   handovers {s['handovers']}"
         )
         print(f"  exec {s['exec_s']}s   waiting on the provider {s['provider_s']}s")
+        print(
+            f"  prompt {s['prompt_kb']}KB in   program {s['source_kb']}KB out"
+            f"   reasoning {s['thinking_kb']}KB"
+        )
         for trap, n in s["traps"].items():
             print(f"  trap x{n}: {trap}")
         for why in s["failures"]:
@@ -418,7 +429,10 @@ def compare(before: Path, after: Path):
         print(f"  passed          {x['passed']}/{x['runs']}  ->  {y['passed']}/{y['runs']}")
         if x.get("no_run") or y.get("no_run"):
             print(f"  no completion   {x.get('no_run', 0)}  ->  {y.get('no_run', 0)}")
-        for key in ("calls_per_program", "programs", "handovers", "exec_s"):
+        for key in (
+            "calls_per_program", "programs", "handovers", "exec_s",
+            "prompt_kb", "source_kb", "thinking_kb",
+        ):
             print(f"  {key:<15} {x[key]}  ->  {y[key]}")
 
 
