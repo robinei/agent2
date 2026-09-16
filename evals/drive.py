@@ -38,9 +38,15 @@ import threading
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from pi_score import score_pi_session  # noqa: E402
+
 ROOT = Path(__file__).resolve().parent
 REPO = ROOT.parent
 AGENT = REPO / "target" / "debug" / "agent"
+# A writable HOME for `pi`, which locks files under `~/.pi`. Set
+# PI_HOME to a directory holding a copy of the real one.
+PI_HOME = Path(os.environ.get("PI_HOME", Path.home()))
 
 
 class CheckFailed(Exception):
@@ -216,6 +222,38 @@ def sandbox_cmd(sandbox: Path, log: Path, prompt: str, card: Path | None) -> lis
     return argv
 
 
+def pi_cmd(sandbox: Path, sessions: Path, prompt: str, thinking: str) -> list:
+    """`pi` on the same task, in the same confinement, on the same model.
+
+    `opencode-go/deepseek-v4-flash` is exactly what `host::deepseek.rs`
+    defaults to, so the only thing that differs between the two sides is
+    the agent. `--print` is non-interactive and auto-approves its tools,
+    and `--session-dir` puts the record where the scorer can find it.
+
+    `HOME` is redirected because pi takes lock files under `~/.pi`, and
+    the confinement below has the real home read-only — the same reason
+    the agent side binds its own writable paths explicitly.
+    """
+    return [
+        "bwrap",
+        "--ro-bind", "/", "/",
+        "--bind", str(sandbox), str(sandbox),
+        "--bind", str(sessions), str(sessions),
+        "--bind", str(PI_HOME), str(PI_HOME),
+        "--dev", "/dev", "--proc", "/proc",
+        "--unshare-pid", "--unshare-ipc", "--unshare-uts",
+        "--die-with-parent", "--new-session",
+        "--setenv", "HOME", str(PI_HOME),
+        "--chdir", str(sandbox),
+        "pi", "-p",
+        "--provider", "opencode-go",
+        "--model", "deepseek-v4-flash",
+        "--thinking", thinking,
+        "--session-dir", str(sessions),
+        prompt,
+    ]
+
+
 def score_log(log: Path) -> dict:
     out = subprocess.run(
         [str(AGENT), "score", str(log)], capture_output=True, text=True
@@ -225,7 +263,9 @@ def score_log(log: Path) -> dict:
     return json.loads(out.stdout)
 
 
-def run_once(task, card: Path | None, timeout: int, keep: Path | None = None) -> dict:
+def run_once(
+    task, card: Path | None, timeout: int, keep: Path | None = None, agent: str = "code"
+) -> dict:
     """One run, in a throwaway directory — unless `keep` says otherwise.
 
     A failing run is a thing to read, not a number: the log is the whole
@@ -245,7 +285,9 @@ def run_once(task, card: Path | None, timeout: int, keep: Path | None = None) ->
         started = time.time()
         try:
             proc = subprocess.run(
-                sandbox_cmd(sandbox, log, task.PROMPT, card),
+                pi_cmd(sandbox, logdir, task.PROMPT, os.environ.get("PI_THINKING", "high"))
+                if agent == "pi"
+                else sandbox_cmd(sandbox, log, task.PROMPT, card),
                 capture_output=True,
                 text=True,
                 timeout=timeout,
@@ -258,7 +300,13 @@ def run_once(task, card: Path | None, timeout: int, keep: Path | None = None) ->
             timed_out, rc, out = True, None, e.stdout or ""
         wall = time.time() - started
 
-        score = score_log(log) if log.exists() else {"error": "no log written"}
+        if agent == "pi":
+            sessions = sorted(logdir.glob("*.jsonl"))
+            score = (
+                score_pi_session(sessions[-1]) if sessions else {"error": "no session written"}
+            )
+        else:
+            score = score_log(log) if log.exists() else {"error": "no log written"}
 
         # A run that never got a completion is not evidence about
         # anything we changed. The provider stalls: the same task, card
@@ -291,8 +339,8 @@ def run_once(task, card: Path | None, timeout: int, keep: Path | None = None) ->
             kept = keep / f"{task.NAME}-{time.strftime('%H%M%S')}"
             kept.mkdir(parents=True, exist_ok=True)
             shutil.copytree(sandbox, kept / "work", dirs_exist_ok=True)
-            if log.exists():
-                shutil.copy2(log, kept / "run.jsonl")
+            for record in list(logdir.glob("*.jsonl")):
+                shutil.copy2(record, kept / record.name)
             (kept / "verdict.txt").write_text(
                 f"pass={ok}  timed_out={timed_out}  exit={rc}\n{why}\n\nstdout:\n{out[-4000:]}\n"
             )
@@ -386,6 +434,9 @@ def aggregate(runs: list) -> dict:
             "prompt_kb": med([s["prompt_bytes"] / 1024 for s in scores]),
             "source_kb": med([s["source_bytes"] / 1024 for s in scores]),
             "thinking_kb": med([s["thinking_bytes"] / 1024 for s in scores]),
+            "prompt_in": med([s.get("prompt_in", 0) for s in scores]),
+            "cached_in": med([s.get("cached_in", 0) for s in scores]),
+            "completion_out": med([s.get("completion_out", 0) for s in scores]),
             "provider_s": med([s["provider_ms"] / 1000 for s in scores]),
             "traps": traps,
             "failures": [r["why"] for r in rs if r["pass"] is False],
@@ -405,6 +456,10 @@ def print_summary(summary: dict):
         print(
             f"  prompt {s['prompt_kb']}KB in   program {s['source_kb']}KB out"
             f"   reasoning {s['thinking_kb']}KB"
+        )
+        print(
+            f"  tokens: {s['prompt_in']} in ({s['cached_in']} cached)"
+            f"   {s['completion_out']} out"
         )
         for trap, n in s["traps"].items():
             print(f"  trap x{n}: {trap}")
@@ -432,6 +487,7 @@ def compare(before: Path, after: Path):
         for key in (
             "calls_per_program", "programs", "handovers", "exec_s",
             "prompt_kb", "source_kb", "thinking_kb",
+            "prompt_in", "cached_in", "completion_out",
         ):
             print(f"  {key:<15} {x[key]}  ->  {y[key]}")
 
@@ -444,6 +500,12 @@ def main():
         "--jobs", type=int, default=4, help="runs in flight at once (they are network-bound)"
     )
     p.add_argument("--card", type=Path, help="card directory for this variant")
+    p.add_argument(
+        "--agent",
+        choices=("code", "pi"),
+        default="code",
+        help="which agent to drive — `pi` is the tool-loop comparison, same model",
+    )
     p.add_argument("--timeout", type=int, default=900)
     p.add_argument("--out", type=Path, help="write the aggregate here as JSON")
     p.add_argument("--list", action="store_true")
@@ -497,7 +559,9 @@ def main():
             print(f"\nwrote {args.out}")
         return 0
 
-    if "DEEPSEEK_API_KEY" not in os.environ:
+    # Each agent authenticates its own way: ours from the environment,
+    # pi from its own config under PI_HOME.
+    if args.agent == "code" and "DEEPSEEK_API_KEY" not in os.environ:
         print("DEEPSEEK_API_KEY is not set", file=sys.stderr)
         return 2
 
@@ -512,7 +576,7 @@ def main():
 
     def one(item):
         task, i = item
-        r = run_once(task, args.card, args.timeout, args.keep)
+        r = run_once(task, args.card, args.timeout, args.keep, args.agent)
         verdict = (
             "pass"
             if r["pass"]

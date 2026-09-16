@@ -264,6 +264,60 @@ The cost is wall clock per run: 300-420s against 6-40s, and three of
 twelve runs hit the 420s cap. That is a real trade, and it is the trade
 the suite exists to price.
 
+## 25.6b — The pi comparison, and what it costs to think up front
+
+`dead-code-sweep`, n=3 a side, same model
+(`opencode-go/deepseek-v4-flash`), same fixture, same confinement, and
+the same checker judging both — `evals/pi_score.py` folds a pi session
+into the shape `agent score` produces precisely so that correctness,
+the measurement most vulnerable to being eyeballed, is decided by
+identical code.
+
+  pi (tool loop)
+     8 trips   8 calls   in 25,087 (21,504 cached)   out  2,205    19.9s  PASS
+    10 trips  15 calls   in 47,537 (34,560 cached)   out  4,825    56.5s  PASS
+     9 trips  13 calls   in 33,347 (29,440 cached)   out  2,516   121.8s  PASS
+
+  us (code mode)
+     3 programs 40 calls in 32,166 (22,912 cached)   out 65,212   311.0s  FAIL
+     1 program  36 calls in  8,065 ( 7,808 cached)   out 37,068   349.6s  FAIL
+     2 programs 23 calls in 20,081 (15,872 cached)   out 60,059   546.2s  cut off
+
+  median          trips  9 -> 2      in 33,347 -> 20,081
+                  out 2,516 -> 60,059      56.5s -> 349.6s      3/3 -> 0/2
+
+**The mechanism works and the trade is bad.** Round trips fall 4.5x and
+input tokens fall 40%, exactly as claimed — but less than "one program
+instead of nine" suggests, because 86% of what a tool loop re-sends
+comes back from the prefix cache and costs almost nothing. Meanwhile
+output tokens rise **24x**, and output is the expensive half in both
+money and latency, being generated serially.
+
+Almost all of that is reasoning, not program: 206KB of thinking against
+10-27KB of source, versus pi's 5.8KB. So the honest statement of what
+code mode does is not "fewer round trips" — it is **deliberation moved
+from per-step and informed by results, to all up front and
+uninformed**. A tool loop reasons about the next move with the last
+result in hand; a program has to anticipate every branch it might meet,
+including the ones it never reaches.
+
+That reframes the ablation waiting behind this. The question is no
+longer "how much of the card earns its keep for correctness" but
+**"how much of the card is causing the reasoning blowup"** — every
+paragraph about running a control, proving the check can fail, guarding
+a stale offset and handling a broken baseline is another branch the
+model must reason about before writing a line. `plain-question` shows
+the floor is fine at 0.0 calls and 0.6KB of thinking, so the cost is
+specific to planning a whole task in advance.
+
+Caveats worth keeping attached to these numbers: our card is one day
+old and pi is a mature product; one task; and three of our six runs
+across both baselines were cut off by a provider that also gave pi a
+122-second run and a no-completion. The direction of the gap is far
+larger than that noise, but a second task — `skipped-tests`, the same
+shape on another surface — is what would separate "this task" from
+"this design".
+
 ## 25.7 — What the suite still cannot ask
 
 **Nothing answers an `ask()`.** The internal eval module had one fixed
