@@ -212,6 +212,12 @@ nothing wakes you, nobody writes anything else, and whatever was left
 undone stays undone. So with work remaining there is exactly one
 correct ending, and it is `next_program`.
 
+Blocked is not done, either. When something gets in the way — the
+check can't run, the baseline is broken, the file isn't where it was —
+explaining that and ending is the same silent failure wearing a reason.
+The next program is the one that gets past it, so hand it what you
+learned and let it.
+
 The failure this prevents is the commonest one there is, and it does
 not feel like a failure from the inside: gather, report what you found,
 stop. The plan was right, the first step was right, and the task is not
@@ -548,6 +554,20 @@ const sites = (await tools.bash("grep -rn '#\\[ignore\\]' --include='*.rs' . 2>/
     .sort((a, b) => b.lineno - a.lineno);
 tell(`${sites.length} ignored test(s) to try.`);
 
+// The control, inline: if the suite is already red, a failure after
+// un-ignoring something is not attributable to that test, and the
+// whole loop below would be measuring nothing.
+const base = await tools.bash("set -o pipefail; cargo test 2>&1 | tail -5");
+if (base.status !== 0) {
+    // Blocked is not done. Nothing after this line runs, and the
+    // program that does run has what it needs to get past this.
+    next_program({
+        question: "the suite is already failing, so un-ignoring can't be attributed — read these, decide whether they're worth fixing first",
+        failures: base.stdout,
+        ignored: sites.length,
+    });
+}
+
 // I knew this procedure before I knew the list, so it is a loop, not a
 // handover and not a program per test. And the check has to *change*
 // the code and ask again: leaving the marker on and running the suite
@@ -630,7 +650,7 @@ mod tests {
         // `CARD` shows up as a diff review must look at, not a byte
         // count that silently drifts. Comparing full text (not just a
         // hash) so the diff itself is legible in a failure message.
-        const EXPECTED_LEN: usize = 13547;
+        const EXPECTED_LEN: usize = 13848;
         assert_eq!(
             CARD.len(),
             EXPECTED_LEN,
