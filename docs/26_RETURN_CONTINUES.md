@@ -70,6 +70,41 @@ What stays is what the model cannot guess: the response format, the
 verb list, `Edit.*`, the three silent dialect divergences, and the fact
 that a program's return value is what continues.
 
+## The ablation result — over half the cost was ours
+
+`minimal` (5.6KB of card against 17.3KB, every line of engineering
+guidance removed) against the current card, same tasks, n=3:
+
+  dead-code-sweep      current  ->  minimal
+    passed             0/2      ->  1/2
+    reasoning          170.1KB  ->  77.3KB     (-55%)
+    output tokens      51,140   ->  22,214     (-57%)
+    prompt tokens      20,116   ->   9,258     (-54%)
+    calls per program  24.7     ->  20.0
+
+  whole suite          8/9      ->  8/10
+
+**More than half the reasoning blowup was self-inflicted.** Cutting
+two thirds of the card cut the cost roughly in half, improved the pass
+rate on the hardest task, and — the part that matters most — *kept the
+batching*. Calls per program barely moved, so the model still writes
+the loop; it simply stops reasoning at length about controls, stale
+offsets and broken baselines before doing so. Every one of those
+paragraphs was added on 2026-09-16 in response to a single failing run,
+and together they were costing more than they bought.
+
+So the answer to "intrinsic or card-induced" is *both, and mostly
+card*. That moderates this sketch rather than confirming it: the
+current architecture is substantially cheaper than it looked an hour
+ago, and the honest next step is a card cut, not a rewrite.
+
+What survives the moderation is the direction. 77KB of reasoning is
+still thirteen times pi's 5.8KB, and pi was 3/3 at a 56-second median
+against our 1/2 at seven minutes. Halving a 24x gap leaves a 13x gap.
+The short-program instinct still looks right; it is just no longer
+obvious that `return`-continues is the only way to get there, when
+deleting prose got half of it for free.
+
 ## What would refute it
 
 **The ablation, still running.** Two explanations predict opposite

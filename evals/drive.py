@@ -320,11 +320,16 @@ def run_once(
             # by us, which is not a verdict on anything; a run with no
             # completion at all never heard back from the provider.
             wrote = score.get("programs", 0)
-            ok, why = None, (
-                f"cut off at the timeout after {wrote} program(s) — incomplete, not failed"
-                if timed_out and wrote
-                else "no completion ever arrived"
-            )
+            if timed_out and wrote:
+                why = f"cut off at the timeout after {wrote} program(s) — incomplete, not failed"
+            elif timed_out:
+                why = "no completion ever arrived before the timeout"
+            else:
+                # Exited on its own without writing a program: the agent
+                # refused to start, which is a fault in how it was
+                # invoked rather than anything about the run.
+                why = f"agent exited {rc} without writing a program: {(out or '').strip()[-300:]}"
+            ok = None
         else:
             env = Env(task.DIR, sandbox, score)
             try:
@@ -489,7 +494,15 @@ def compare(before: Path, after: Path):
             "prompt_kb", "source_kb", "thinking_kb",
             "prompt_in", "cached_in", "completion_out",
         ):
-            print(f"  {key:<15} {x[key]}  ->  {y[key]}")
+            # A summary written before a metric existed simply lacks it;
+            # say so rather than dropping the row or, worse, raising
+            # halfway down the table and printing a partial comparison
+            # that looks complete.
+            left = x.get(key, "n/a")
+            right = y.get(key, "n/a")
+            if left == "n/a" and right == "n/a":
+                continue
+            print(f"  {key:<17} {left}  ->  {right}")
 
 
 def main():
@@ -518,6 +531,16 @@ def main():
     if args.compare:
         compare(*args.compare)
         return 0
+
+    # The agent runs `--chdir` into the sandbox, so a card path relative
+    # to the repo resolves to nothing there. Twelve runs on 2026-09-16
+    # exited 2 before contacting anything and were reported as twelve
+    # honest "no completion"s, which is true and useless.
+    if args.card:
+        args.card = args.card.resolve()
+        if not (args.card / "card.md").exists():
+            print(f"{args.card}/card.md does not exist", file=sys.stderr)
+            return 2
 
     names = args.tasks.split(",") if args.tasks else None
     tasks = discover(names)
