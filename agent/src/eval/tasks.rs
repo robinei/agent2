@@ -58,7 +58,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::Mutex;
 
 use crate::host;
 use crate::types::{
@@ -300,7 +299,13 @@ pub fn make_sandbox(task: &Task) -> tempfile::TempDir {
 /// `set_current_dir` itself, because the worker threads a session spawns
 /// for its `bash`/`read_file` calls keep reading that directory for as
 /// long as the run is live.
-static SANDBOX_CWD: Mutex<()> = Mutex::new(());
+/// One process has one current directory, so this is
+/// [`host::tools::PROCESS_CWD`] — the same lock the `bash` tests take,
+/// not a second one scoped to this module. It used to be a local
+/// `Mutex` here, which serialised these tests against each other and
+/// against nothing else; see that constant's own doc for the flake that
+/// found it.
+use crate::host::tools::PROCESS_CWD as SANDBOX_CWD;
 
 /// Drive `task` through a real [`host::Session`], inside a real sandbox
 /// directory, and fold the finished log into an [`Outcome`]. `llm` is

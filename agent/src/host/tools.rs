@@ -418,6 +418,25 @@ fn bash_def() -> ToolDef {
     }
 }
 
+/// The process's current directory, as a thing that must be held still.
+///
+/// `bash` inherits the process cwd, and so do the relative paths
+/// `read_file`/`replace_file` resolve. A test (or an eval run) that
+/// points the cwd at a temporary directory is therefore reaching into
+/// global state every other concurrent test shares — and when that
+/// directory is *deleted* while a `bash` subprocess starts in it, the
+/// shell writes
+/// "error retrieving current directory: getcwd: cannot access parent
+/// directories" onto that subprocess's stderr, which is how this was
+/// found: `bash_returns_status_stdout_stderr` failed three runs in four
+/// at full parallelism and passed every time alone.
+///
+/// `eval::tasks` already had a mutex for this, but scoped to itself, so
+/// it serialised the eval tests against each other and not against the
+/// `bash` tests here. One process has one cwd, so the lock belongs
+/// beside the thing that inherits it.
+pub(crate) static PROCESS_CWD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Spawn `bash -c <command>`, enforce the timeout, and shape the outcome
 /// into `{ status, stdout, stderr, truncated? }`. Only the harness-level
 /// failures (spawn failed, timed out) return `Err` — a command that runs
@@ -772,7 +791,12 @@ mod tests {
         }
     }
 
+    /// Every `bash` test goes through here, and every one of them holds
+    /// [`PROCESS_CWD`] for the call: the subprocess inherits the
+    /// process cwd, so a concurrent test moving it (or dropping the
+    /// `TempDir` it moved to) lands in this one's stderr.
     fn bash(args: serde_json::Value) -> Result<serde_json::Value, String> {
+        let _cwd = PROCESS_CWD.lock().unwrap_or_else(|e| e.into_inner());
         (bash_def().handler)(args)
     }
 

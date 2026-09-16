@@ -433,7 +433,7 @@ pub(crate) fn render_with_lookup(
 /// conversation's own first user turn continues the alternation with
 /// no special case.
 fn worked_examples() -> Vec<ChatMessage> {
-    crate::card::SEED_EXEMPLARS
+    crate::card::seed_exemplars()
         .iter()
         .flat_map(|ex| {
             [

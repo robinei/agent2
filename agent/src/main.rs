@@ -84,6 +84,7 @@ fn main() {
             let mut resume: Option<u64> = None;
             let mut fork: Option<u64> = None;
             let mut name: Option<String> = None;
+            let mut card_dir: Option<String> = None;
             let mut rest = args[2..].iter();
             let next_val = |rest: &mut std::slice::Iter<String>, flag: &str| -> String {
                 match rest.next() {
@@ -115,7 +116,28 @@ fn main() {
                     }
                     "--fork" => fork = Some(parse_id(next_val(&mut rest, "--fork"), "--fork")),
                     "--name" => name = Some(next_val(&mut rest, "--name")),
+                    // Installed before the session opens, because the
+                    // system prompt is snapshotted at the agent's root.
+                    "--card" => card_dir = Some(next_val(&mut rest, "--card")),
                     other => log_path = Some(other.to_string()),
+                }
+            }
+            if let Some(dir) = &card_dir {
+                let card = match card::load_from(std::path::Path::new(dir)) {
+                    Ok(card) => card,
+                    Err(e) => {
+                        eprintln!("{e}");
+                        std::process::exit(2);
+                    }
+                };
+                eprintln!(
+                    "agent: card from {dir} ({} bytes, {} exemplar(s))",
+                    card.text.len(),
+                    card.exemplars.len()
+                );
+                if let Err(e) = card::set_active(card) {
+                    eprintln!("{e}");
+                    std::process::exit(2);
                 }
             }
             // The attached TUI is the M1 driving seat: it picks the
