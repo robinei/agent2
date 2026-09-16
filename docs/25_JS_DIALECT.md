@@ -215,6 +215,24 @@ raw wall clock reads as noise.
 Gate: before/after on the task set at n≥3, and a change that fixes one
 task while costing another is not an improvement.
 
+The suite, as built: `dead-code-sweep` (probe loop, Rust/cargo) and
+`skipped-tests` (probe loop, Python/unittest) are the same shape on
+surfaces with nothing in common, so a sentence fitted to one is visibly
+worthless on the other; `plain-question` fails a run that reaches for
+machinery a question does not need, which is the ditch every other task
+and every card sentence pushes toward; `ambiguous-config` fails both
+guessing past an ambiguity and reporting it and stopping.
+
+The variants to measure, in `evals/cards/`: `minimal` (5.6KB of 17.3 —
+the response format, the verbs, `Edit.*`, the three silent divergences,
+and the fact that a program ends when it ends; every line of
+engineering guidance removed) and `no-exemplars` (the full card,
+nothing opening `messages`). Between them they answer what the prose is
+worth and what the examples are worth, and the axis to read is **calls
+per program**, not pass rate: a minimal card will very likely still
+complete tasks, at two or three calls per program, which is a tool loop
+wearing JavaScript and gives the whole advantage back.
+
 ## Not in scope
 
 Card *prose*. This phase adds no engineering-hygiene guidance; the

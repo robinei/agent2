@@ -1,0 +1,11 @@
+[the program you were running has suspended]
+
+  4 | if (a.content === b.content) {
+  5 |     tell("identical — no real conflict, either is fine.");
+  6 | } else {
+  7 |     const keep = await raise("conflicting_backups", { a: a.content, b: b.content });
+    |                              ^ condition `conflicting_backups` raised
+
+payload: {"a":"retries=3\nbackoff=200ms","b":"retries=3\nbackoff=500ms"}
+
+Write a handler program; its `return` value is the restart. `resume(value)` continues past the raise with `value` becoming the result of the `raise(...)` expression; `abandon()` gives up on it. Or do neither and write a program that handles this some other way.
