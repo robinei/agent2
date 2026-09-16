@@ -283,7 +283,25 @@ pub fn compact(
 /// threshold check need. Swap for a real count without changing either
 /// function's shape.
 pub fn rendered_size(doc: &document::Document) -> usize {
-    doc.messages.iter().map(|m| m.content.len()).sum()
+    doc.messages
+        .iter()
+        .map(|m| {
+            // Under `Transport::RunProgram` a program is not in
+            // `content` — it is the `source` of the turn's tool call,
+            // and it is usually the largest thing in the document. Only
+            // counting `content` there would undercount every assistant
+            // turn, so compaction would fire late in one transport and
+            // on time in the other, which would quietly make a
+            // comparison between them a comparison of when they
+            // compacted.
+            m.content.len()
+                + m.tool_calls
+                    .iter()
+                    .flatten()
+                    .map(|c| c.source.len())
+                    .sum::<usize>()
+        })
+        .sum()
 }
 
 /// Fires at a headroom threshold, not at overflow (Part E): the
@@ -545,5 +563,37 @@ mod tests {
             said.contains("fixed"),
             "says what cannot be touched: {said}"
         );
+    }
+    /// A program's bytes count wherever the transport happens to put
+    /// them. Under `RunProgram` they are in the turn's tool call rather
+    /// than its content, and a size that missed them would fire
+    /// compaction late in that mode only — turning any comparison
+    /// between the two transports into a comparison of when each one
+    /// compacted.
+    #[test]
+    fn a_programs_bytes_count_in_either_transport() {
+        use crate::document::{ChatMessage, ChatRole, Document, ToolCall};
+        let program = "tell(\"x\");".repeat(20);
+        let as_text = Document {
+            messages: vec![ChatMessage {
+                role: ChatRole::Assistant,
+                content: program.clone(),
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+        };
+        let as_call = Document {
+            messages: vec![ChatMessage {
+                role: ChatRole::Assistant,
+                content: String::new(),
+                tool_calls: Some(vec![ToolCall {
+                    id: "c1".into(),
+                    source: program.clone(),
+                }]),
+                tool_call_id: None,
+            }],
+        };
+        assert_eq!(rendered_size(&as_text), program.len());
+        assert_eq!(rendered_size(&as_call), rendered_size(&as_text));
     }
 }

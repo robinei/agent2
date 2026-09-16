@@ -35,12 +35,95 @@ pub enum ChatRole {
     System,
     User,
     Assistant,
+    /// `Transport::RunProgram` only: the harness's answer to a
+    /// `run_program` tool call, in the role the wire format requires
+    /// immediately after a tool-calling assistant turn. `render` never
+    /// produces this role under `Transport::Program` — see
+    /// `flush_pending`.
+    Tool,
+}
+
+/// A `run_program` call, as carried on an assistant [`ChatMessage`]
+/// under `Transport::RunProgram`. One call per turn: code mode never
+/// offers a menu of functions to choose from (`host/deepseek.rs`'s own
+/// doc comment), so there is nothing here to disambiguate by name —
+/// `id` exists only to pair this call with the `Tool`-role message that
+/// answers it, the way the wire format requires.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ToolCall {
+    pub id: String,
+    pub source: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ChatMessage {
     pub role: ChatRole,
     pub content: String,
+    /// `Transport::RunProgram` only: the call this assistant turn makes
+    /// instead of sending the program as bare `content`. Always `None`
+    /// under `Transport::Program` and on every non-`Assistant` message,
+    /// so `host/deepseek.rs`'s `message_json` omits the wire field
+    /// entirely and a `Transport::Program` request body is unchanged
+    /// byte-for-byte from before this type grew the field.
+    pub tool_calls: Option<Vec<ToolCall>>,
+    /// `Transport::RunProgram` only: on a `Tool`-role message, the id of
+    /// the call (`tool_calls` above, on the preceding assistant turn)
+    /// this is the result of. `None` everywhere else.
+    pub tool_call_id: Option<String>,
+}
+
+impl ChatMessage {
+    /// A plain message with neither tool field set — every message
+    /// `Transport::Program` ever produces, and most of what
+    /// `Transport::RunProgram` produces too (its `System`/`User`
+    /// messages are identical to `Program`'s; only its assistant turns
+    /// and their tool answers carry the two fields above).
+    fn text(role: ChatRole, content: impl Into<String>) -> Self {
+        ChatMessage {
+            role,
+            content: content.into(),
+            tool_calls: None,
+            tool_call_id: None,
+        }
+    }
+}
+
+/// Which container carries the model's program on the wire.
+/// [`Transport::Program`] (default) sends the model's entire response
+/// text as the program itself — no `tools` array, no function-calling
+/// wrapper, per `host/deepseek.rs`'s own doc comment on why code mode
+/// has neither. [`Transport::RunProgram`] instead advertises a single
+/// `run_program(source)` tool and reads the program back out of the
+/// resulting call, so the same wire round-trip looks like an ordinary
+/// tool-calling completion to anything watching the transport (a proxy,
+/// a provider's own logging) that only understands that shape.
+///
+/// Selected by `AGENT2_TRANSPORT` (`program`/`run_program`), read fresh
+/// on every call rather than cached — the same `AGENT2_*` idiom as
+/// `host/mod.rs`'s `document_budget`/`compaction_headroom`, so a session
+/// can be pointed at either container without a rebuild. The event log
+/// this produces is identical in shape either way: same `Turn`/`Call`/
+/// `Result`/`Condition` payloads, same `Message::Turn.source` — only
+/// this module's rendering and `host/deepseek.rs`'s wire-facing code
+/// branch on it at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Transport {
+    Program,
+    RunProgram,
+}
+
+pub const DEFAULT_TRANSPORT: Transport = Transport::Program;
+
+/// An unset or unrecognized value falls back to [`DEFAULT_TRANSPORT`],
+/// the same "garbage in, quiet default" rule the other `AGENT2_*`
+/// readers use (`llm_concurrency`'s `filter(|n| *n >= 1)`,
+/// `compaction_headroom`'s open-interval filter) rather than a run
+/// failing to start over a typo'd env var.
+pub(crate) fn transport() -> Transport {
+    match std::env::var("AGENT2_TRANSPORT").as_deref() {
+        Ok("run_program") => Transport::RunProgram,
+        _ => DEFAULT_TRANSPORT,
+    }
 }
 
 /// A rendered request, transport-agnostic (Part A: "the document is
@@ -87,10 +170,7 @@ impl Document {
                 m.content.push('\n');
                 m.content.push_str(tail);
             }
-            _ => self.messages.push(ChatMessage {
-                role: ChatRole::User,
-                content: tail.to_owned(),
-            }),
+            _ => self.messages.push(ChatMessage::text(ChatRole::User, tail)),
         }
         self
     }
@@ -352,14 +432,23 @@ pub(crate) fn render_with_lookup(
     budget: usize,
     compacted: &HashMap<EventId, CompactedView>,
 ) -> Document {
-    let mut messages = vec![ChatMessage {
-        role: ChatRole::System,
-        content: card.to_owned(),
-    }];
+    let transport = transport();
+    let mut messages = vec![ChatMessage::text(ChatRole::System, card.to_owned())];
     messages.extend(worked_examples());
     let mut pending: Vec<String> = Vec::new();
     let mut cur_agent: Option<EventId> = None;
     let mut depth: usize = 0;
+    // `Transport::RunProgram` only: the id of the most recent turn's
+    // `run_program` call, still unanswered. `flush_pending` consumes it
+    // whenever the next block closes — the harness's report on what
+    // that turn did becomes the `Tool`-role answer to *this* call, never
+    // an ordinary `User` message, because the wire format requires a
+    // tool-calling assistant turn to be answered before anything else
+    // may follow it. `None` before the first turn (so the very first
+    // block, whatever led up to it, still renders as `User` in both
+    // modes) and again under `Transport::Program`, which never opens a
+    // call at all.
+    let mut open_call: Option<String> = None;
 
     for ev in tree.path_events(leaf) {
         if let EventPayload::Agent { .. } = ev.payload {
@@ -376,15 +465,10 @@ pub(crate) fn render_with_lookup(
                         None => source.clone(),
                         Some(shadow) => compacted_program_comment(ev.id, shadow),
                     };
-                    messages.push(ChatMessage {
-                        role: ChatRole::User,
-                        content: pending.join("\n"),
-                    });
-                    messages.push(ChatMessage {
-                        role: ChatRole::Assistant,
-                        content,
-                    });
-                    pending = Vec::new();
+                    messages.push(flush_pending(&mut pending, transport, &mut open_call));
+                    let (assistant, call_id) = assistant_turn(transport, ev.id, content);
+                    messages.push(assistant);
+                    open_call = call_id;
                 }
                 EventPayload::Return { .. } => {
                     pending.push(crate::report::derive_report(tree, leaf, ev.id, budget));
@@ -405,13 +489,71 @@ pub(crate) fn render_with_lookup(
     }
 
     if !pending.is_empty() {
-        messages.push(ChatMessage {
-            role: ChatRole::User,
-            content: pending.join("\n"),
-        });
+        messages.push(flush_pending(&mut pending, transport, &mut open_call));
     }
 
     Document { messages }
+}
+
+/// The assistant's own turn, in whichever shape `transport` wants.
+/// `Transport::Program` sends bare `content` — the model's whole
+/// response *is* the program, `host/deepseek.rs`'s own substitution
+/// table. `Transport::RunProgram` wraps the same program in a
+/// `run_program` call instead, with empty prose `content`: nothing of
+/// what the model said *alongside* the call was ever stored
+/// (`Message::Turn` has a `source` field and no other), so there is
+/// nothing truthful to replay there.
+///
+/// Returns the id of the call the next pending block should answer —
+/// `Some` only for `RunProgram`, threaded back into `open_call` by the
+/// caller so [`flush_pending`] knows what it is closing.
+fn assistant_turn(
+    transport: Transport,
+    id: EventId,
+    source: String,
+) -> (ChatMessage, Option<String>) {
+    match transport {
+        Transport::Program => (ChatMessage::text(ChatRole::Assistant, source), None),
+        Transport::RunProgram => {
+            let call_id = format!("call_{}", id.as_u64());
+            let message = ChatMessage {
+                role: ChatRole::Assistant,
+                content: String::new(),
+                tool_calls: Some(vec![ToolCall {
+                    id: call_id.clone(),
+                    source,
+                }]),
+                tool_call_id: None,
+            };
+            (message, Some(call_id))
+        }
+    }
+}
+
+/// Close out `pending` into the one message that answers whatever
+/// precedes it, and clear both `pending` and `open_call` for the next
+/// block. The first block ever (before any turn — `open_call` still
+/// `None`) and every block under `Transport::Program` render as an
+/// ordinary `User` message, exactly [`render`]'s pre-`Transport` shape.
+/// A later block under `Transport::RunProgram` instead answers the
+/// still-open call as a `Tool`-role message — see `assistant_turn` and
+/// `open_call`'s own doc comment above.
+fn flush_pending(
+    pending: &mut Vec<String>,
+    transport: Transport,
+    open_call: &mut Option<String>,
+) -> ChatMessage {
+    let content = pending.join("\n");
+    pending.clear();
+    match (transport, open_call.take()) {
+        (Transport::RunProgram, Some(id)) => ChatMessage {
+            role: ChatRole::Tool,
+            content,
+            tool_calls: None,
+            tool_call_id: Some(id),
+        },
+        _ => ChatMessage::text(ChatRole::User, content),
+    }
 }
 
 /// The card's worked examples, as **real alternating turns** ahead of
@@ -440,29 +582,62 @@ pub(crate) fn render_with_lookup(
 /// its own history, and the pairs alternate strictly, so the
 /// conversation's own first user turn continues the alternation with
 /// no special case.
+///
+/// **`Transport::RunProgram` renders three rows per exemplar, not two.**
+/// The wire format requires a tool-calling assistant message to be
+/// followed by a `Tool`-role answer before anything else — the same
+/// rule `flush_pending` enforces for the real conversation — so an
+/// exemplar's `run_program` call needs a stand-in result behind it or
+/// the preamble itself would be malformed under this transport. The
+/// stand-in is a fixed placeholder, never a real report: nothing ran, so
+/// there is nothing truthful to report. `card::seed_exemplars()` itself
+/// — the FILES this reads from — is untouched by which transport is
+/// active; only this rendering is.
 fn worked_examples() -> Vec<ChatMessage> {
+    let transport = transport();
     crate::card::seed_exemplars()
         .iter()
-        .flat_map(|ex| {
-            [
-                ChatMessage {
-                    role: ChatRole::User,
-                    content: format!("[worked example, not this conversation] {}", ex.user),
-                },
-                ChatMessage {
-                    role: ChatRole::Assistant,
-                    // Marked on **both** sides. Only the request used to
-                    // carry the marker, which meant that once a provider's
-                    // chat template flattened these into one token stream,
-                    // the model saw N assistant turns indistinguishable
-                    // from its own prior output — an apparent history of
-                    // programs it had already written, every one of them
-                    // short and single-purpose. That is a demonstration of
-                    // the wrong thing, delivered in the most persuasive
-                    // position available: its own mouth.
-                    content: format!("// [worked example]\n{}", ex.assistant),
-                },
-            ]
+        .enumerate()
+        .flat_map(|(i, ex)| {
+            let request = ChatMessage::text(
+                ChatRole::User,
+                format!("[worked example, not this conversation] {}", ex.user),
+            );
+            // Marked on **both** sides (both the request above and the
+            // program below, whichever wire shape carries it). Only the
+            // request used to carry the marker, which meant that once a
+            // provider's chat template flattened these into one token
+            // stream, the model saw N assistant turns indistinguishable
+            // from its own prior output — an apparent history of
+            // programs it had already written, every one of them short
+            // and single-purpose. That is a demonstration of the wrong
+            // thing, delivered in the most persuasive position
+            // available: its own mouth.
+            let program = format!("// [worked example]\n{}", ex.assistant);
+            match transport {
+                Transport::Program => {
+                    vec![request, ChatMessage::text(ChatRole::Assistant, program)]
+                }
+                Transport::RunProgram => {
+                    let call_id = format!("call_example_{i}");
+                    let assistant = ChatMessage {
+                        role: ChatRole::Assistant,
+                        content: String::new(),
+                        tool_calls: Some(vec![ToolCall {
+                            id: call_id.clone(),
+                            source: program,
+                        }]),
+                        tool_call_id: None,
+                    };
+                    let result = ChatMessage {
+                        role: ChatRole::Tool,
+                        content: "[worked example] ok".to_owned(),
+                        tool_calls: None,
+                        tool_call_id: Some(call_id),
+                    };
+                    vec![request, assistant, result]
+                }
+            }
         })
         .collect()
 }
@@ -765,5 +940,178 @@ mod tests {
             checked += 1;
         }
         assert!(checked >= 2, "exercised {checked} rows");
+    }
+
+    // --- Transport switch ---
+
+    /// Runs `f` with `AGENT2_TRANSPORT` set to `value`, restoring
+    /// whatever was there before (or its absence) once `f` returns — so
+    /// one test flipping the switch can never leak into a sibling's run.
+    /// Relies on this crate's own documented gate
+    /// (`cargo test -p agent -- --test-threads=1`) running the binary
+    /// single-threaded: a per-process env var has no other safe way to
+    /// be scoped to one test.
+    fn with_transport<T>(value: &str, f: impl FnOnce() -> T) -> T {
+        let key = "AGENT2_TRANSPORT";
+        let prev = std::env::var(key).ok();
+        // SAFETY: single-threaded test binary — see doc comment above.
+        unsafe { std::env::set_var(key, value) };
+        let result = f();
+        match prev {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+        result
+    }
+
+    fn sample_document() -> Document {
+        let mut tree = Tree::new(None);
+        let mut spine = tree.start_agent(None, None, "root", None, "CARD").unwrap();
+        tree.append(&mut spine, user_post("hello")).unwrap();
+        tree.append(&mut spine, turn("tell('hi'); return 1;"))
+            .unwrap();
+        tree.append(
+            &mut spine,
+            EventPayload::Return {
+                value: serde_json::json!(1),
+            },
+        )
+        .unwrap();
+        render(&tree, &spine, 64 * 1024)
+    }
+
+    /// Pins today's shape: the model's whole response rides bare in
+    /// `content`, no tool wrapper, and the report that follows it is an
+    /// ordinary `User` message — [`render`]'s behaviour before this
+    /// transport switch existed, and what `Transport::Program` must
+    /// still produce byte-for-byte now that a second mode exists beside
+    /// it.
+    #[test]
+    fn program_mode_renders_an_assistant_turn_as_plain_text() {
+        // `doc.conversation()` recomputes the preamble length from
+        // `worked_examples()` — which itself reads `transport()` fresh
+        // (its own doc comment) — so it has to run inside the same
+        // `with_transport` scope that built `doc`, not after: reading it
+        // back once the guard has restored the env would slice the
+        // preamble at the *other* mode's length.
+        with_transport("program", || {
+            let doc = sample_document();
+            let conv = doc.conversation();
+            assert_eq!(conv[1].role, ChatRole::Assistant);
+            assert_eq!(conv[1].content, "tell('hi'); return 1;");
+            assert!(
+                conv[1].tool_calls.is_none(),
+                "Transport::Program never wraps a turn in a tool call: {conv:?}"
+            );
+            assert_eq!(
+                conv[2].role,
+                ChatRole::User,
+                "the report stays a plain User message under Transport::Program"
+            );
+        });
+    }
+
+    /// `Transport::RunProgram`'s whole point: the same turn now arrives
+    /// as a `run_program` call (its `source` the program, unchanged),
+    /// and the report that follows answers that call in the `Tool` role
+    /// — never a `User` message, per the wire format's own rule that a
+    /// tool-calling assistant turn must be answered before anything else
+    /// follows it.
+    #[test]
+    fn run_program_mode_renders_an_assistant_turn_as_a_tool_call() {
+        with_transport("run_program", || {
+            let doc = sample_document();
+            let conv = doc.conversation();
+            assert_eq!(conv[1].role, ChatRole::Assistant);
+            let calls = conv[1]
+                .tool_calls
+                .as_ref()
+                .expect("Transport::RunProgram wraps the turn in a run_program call");
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].source, "tell('hi'); return 1;");
+            assert_eq!(
+                conv[2].role,
+                ChatRole::Tool,
+                "the report answers the call under Transport::RunProgram: {conv:?}"
+            );
+            assert_eq!(conv[2].tool_call_id.as_deref(), Some(calls[0].id.as_str()));
+        });
+    }
+
+    /// **The point of the exercise.** Two transports, one branch: the
+    /// actual program and report text a model would see must be
+    /// identical whichever container carries it, so a later comparison
+    /// between the two measures the container and nothing else. Strict
+    /// on purpose — this reads the payload back out of whichever field
+    /// each transport put it in (`content` under `Program`, a lone
+    /// `tool_calls[0].source` under `RunProgram`) and demands the two
+    /// sequences match exactly, row for row.
+    #[test]
+    fn both_modes_carry_the_same_content() {
+        fn build() -> (Tree, Spine) {
+            let mut tree = Tree::new(None);
+            let mut spine = tree.start_agent(None, None, "root", None, "CARD").unwrap();
+            tree.append(&mut spine, user_post("hello")).unwrap();
+            tree.append(&mut spine, turn("tell('hi'); return 1;"))
+                .unwrap();
+            tree.append(
+                &mut spine,
+                EventPayload::Return {
+                    value: serde_json::json!(1),
+                },
+            )
+            .unwrap();
+            tree.append(&mut spine, user_post("again")).unwrap();
+            tree.append(&mut spine, turn("return 2;")).unwrap();
+            tree.append(
+                &mut spine,
+                EventPayload::Return {
+                    value: serde_json::json!(2),
+                },
+            )
+            .unwrap();
+            (tree, spine)
+        }
+
+        fn payload(m: &ChatMessage) -> String {
+            match &m.tool_calls {
+                Some(calls) => {
+                    assert_eq!(calls.len(), 1, "run_program is the only tool on offer");
+                    calls[0].source.clone()
+                }
+                None => m.content.clone(),
+            }
+        }
+
+        let (program_tree, program_spine) = build();
+        let (rp_tree, rp_spine) = build();
+        // `.conversation()` has to run inside each transport's own
+        // scope — see `program_mode_renders_an_assistant_turn_as_plain_text`'s
+        // doc comment — so each branch collects its payload before the
+        // guard restores the env.
+        let program_content: Vec<String> = with_transport("program", || {
+            render(&program_tree, &program_spine, 64 * 1024)
+                .conversation()
+                .iter()
+                .map(payload)
+                .collect()
+        });
+        let rp_content: Vec<String> = with_transport("run_program", || {
+            render(&rp_tree, &rp_spine, 64 * 1024)
+                .conversation()
+                .iter()
+                .map(payload)
+                .collect()
+        });
+
+        assert_eq!(
+            program_content.len(),
+            rp_content.len(),
+            "RunProgram must not merge or drop a row to make the text line up by accident"
+        );
+        assert_eq!(
+            program_content, rp_content,
+            "the two transports must carry identical content — only the container differs"
+        );
     }
 }

@@ -3,22 +3,34 @@
 //!
 //! DeepSeek speaks the OpenAI chat-completions format natively, so the
 //! wire mapping is: `Document.messages` → role objects (`System`/
-//! `User`/`Assistant`, one each per `ChatRole`), streamed deltas → the
-//! chunk callback (`reasoning_content` → `Thinking`, `content` → `Text`).
-//! There is no `tools` array in the request under code mode
-//! (23_ONE_AGENT's substitution table: the tool list a request used to
-//! carry on every call is gone; the card is the surface) and no tool-call
-//! argument
-//! accumulation in the response — the model's whole reply is program
-//! text, accumulated the same way `content` always was. The request
-//! builder and SSE parser are pure functions — unit tests run on string
-//! fixtures, never the network.
+//! `User`/`Assistant`/`Tool`, one each per `ChatRole`), streamed deltas →
+//! the chunk callback (`reasoning_content` → `Thinking`, `content` →
+//! `Text`). Under `Transport::Program` there is no `tools` array in the
+//! request at all (23_ONE_AGENT's substitution table: the tool list a
+//! request used to carry on every call is gone; the card is the surface)
+//! and no tool-call argument accumulation in the response — the model's
+//! whole reply is program text, accumulated the same way `content`
+//! always was. Under `Transport::RunProgram` the same program instead
+//! rides a single advertised `run_program` tool: the request grows a
+//! `tools` array (`request_body`) and the response is read back out of
+//! `delta.tool_calls[0].function.arguments` (`parse_sse`) rather than
+//! `delta.content`. Either way the result handed back up is the same
+//! bare `LlmTurn` — this module is the one place the two containers ever
+//! differ; everything above it (`host/mod.rs`, `machine.rs`) sees one
+//! shape. The request builder and SSE parser are pure functions — unit
+//! tests run on string fixtures, never the network.
 
 use std::io::BufRead;
 
-use crate::document::{ChatMessage, ChatRole, Document};
+use crate::document::{ChatMessage, ChatRole, Document, Transport};
 use crate::host::llm::{Cancel, LlmChunk, LlmClient};
 use crate::machine::LlmTurn;
+
+/// The one function `Transport::RunProgram` advertises. Never a menu:
+/// code mode's whole design is that the model has one move per turn
+/// (23_ONE_AGENT), so a second entry here would be a second transport
+/// hiding inside this one.
+const RUN_PROGRAM_TOOL: &str = "run_program";
 
 const DEFAULT_MODEL: &str = "deepseek-v4-flash";
 
@@ -129,7 +141,19 @@ impl LlmClient for DeepSeekClient {
         chunk: &mut dyn FnMut(LlmChunk),
     ) -> Result<LlmTurn, String> {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-        let body = request_body(request, &self.model, self.thinking, self.effort.as_deref());
+        // Read fresh per completion, not cached on `self`: the same
+        // `AGENT2_TRANSPORT` idiom `document::render` reads by, so a
+        // session can be pointed at either container without a rebuild
+        // and the two call sites (this one, `document::render`) can
+        // never drift onto different values mid-session.
+        let transport = crate::document::transport();
+        let body = request_body(
+            request,
+            &self.model,
+            self.thinking,
+            self.effort.as_deref(),
+            transport,
+        );
         let mut response = self
             .agent
             .post(&url)
@@ -147,7 +171,7 @@ impl LlmClient for DeepSeekClient {
             return Err(format!("deepseek http {status}: {text}"));
         }
         let reader = std::io::BufReader::new(response.body_mut().as_reader());
-        parse_sse(reader, cancel, chunk)
+        parse_sse(reader, cancel, chunk, transport)
     }
 }
 
@@ -155,15 +179,25 @@ impl LlmClient for DeepSeekClient {
 /// Assistant `thinking` is never sent back: DeepSeek requires
 /// `reasoning_content` to be excluded from the next-turn context.
 ///
-/// **No `tools` array.** Code mode never offers a function-calling
-/// schema — the model's whole response is the program, not a call into
-/// one of a menu of functions — so there is nothing here to build one
-/// from, unlike the pre-23 wire format this replaced.
+/// **`tools` under `Transport::Program`: absent.** Code mode's default
+/// container never offers a function-calling schema — the model's whole
+/// response is the program, not a call into one of a menu of functions —
+/// so there is nothing here to build one from, unlike the pre-23 wire
+/// format this replaced.
+///
+/// **Under `Transport::RunProgram`: exactly one.** `RUN_PROGRAM_TOOL`,
+/// taking a single required string argument (`source`), with
+/// `tool_choice: "auto"` rather than forcing it — the model still has to
+/// choose to call it on every turn, same as `Program` mode's implicit
+/// choice to reply at all, and a forced call would make a refusal or a
+/// clarifying question (both real, both already handled elsewhere)
+/// impossible to express on the wire.
 fn request_body(
     request: &Document,
     model: &str,
     thinking: bool,
     effort: Option<&str>,
+    transport: Transport,
 ) -> serde_json::Value {
     let messages: Vec<serde_json::Value> = request.messages.iter().map(message_json).collect();
     let mut body = serde_json::json!({
@@ -177,6 +211,20 @@ fn request_body(
         // unavailable from this provider at all.
         "stream_options": { "include_usage": true },
     });
+    if transport == Transport::RunProgram {
+        body["tools"] = serde_json::json!([{
+            "type": "function",
+            "function": {
+                "name": RUN_PROGRAM_TOOL,
+                "parameters": {
+                    "type": "object",
+                    "properties": { "source": { "type": "string" } },
+                    "required": ["source"],
+                },
+            },
+        }]);
+        body["tool_choice"] = serde_json::json!("auto");
+    }
     if !thinking {
         // Exactly what `pi` sends to disable on this provider, so
         // "both off" is the same request on both sides.
@@ -199,17 +247,49 @@ fn request_body(
 /// Each `ChatMessage` maps to exactly one API role **by its `ChatRole`**,
 /// never by a flag. `Document.messages[0]` is always `System` (the
 /// snapshotted card + charter, `document::render`'s own invariant); every
-/// `Assistant` message is one program's bare `source`, no tool-call
-/// wrapper; every `User` message is a post (or the harness's own report,
-/// which renders as one) — there is no `Tool`-role message left to emit,
-/// because there is no separate tool-result channel under code mode.
+/// `User` message is a post (or the harness's own report, when
+/// `Transport::Program` renders one as such).
+///
+/// Under `Transport::Program`, every `Assistant` message is one
+/// program's bare `source`, no tool-call wrapper, and `Tool` never
+/// occurs — there is no separate tool-result channel to emit into.
+/// Under `Transport::RunProgram`, an `Assistant` message's `tool_calls`
+/// (`ChatMessage`'s own doc comment: `None` unless this mode set it)
+/// becomes the wire's `tool_calls` array, and a `Tool` message's
+/// `tool_call_id` rides alongside `content` exactly as the format
+/// requires. Both fields are carried through unconditionally — `None`
+/// simply adds nothing — which is what keeps a `Transport::Program`
+/// body byte-identical to before either field existed.
 fn message_json(message: &ChatMessage) -> serde_json::Value {
     let role = match message.role {
         ChatRole::System => "system",
         ChatRole::User => "user",
         ChatRole::Assistant => "assistant",
+        ChatRole::Tool => "tool",
     };
-    serde_json::json!({ "role": role, "content": message.content })
+    let mut json = serde_json::json!({ "role": role, "content": message.content });
+    if let Some(calls) = &message.tool_calls {
+        json["tool_calls"] = serde_json::json!(
+            calls
+                .iter()
+                .map(|call| serde_json::json!({
+                    "id": call.id,
+                    "type": "function",
+                    "function": {
+                        "name": RUN_PROGRAM_TOOL,
+                        "arguments": serde_json::to_string(
+                            &serde_json::json!({ "source": call.source })
+                        )
+                        .expect("a string/string map always serializes"),
+                    },
+                }))
+                .collect::<Vec<_>>()
+        );
+    }
+    if let Some(id) = &message.tool_call_id {
+        json["tool_call_id"] = serde_json::json!(id);
+    }
+    json
 }
 
 /// What a completion cost, as the provider counted it.
@@ -231,13 +311,23 @@ pub struct Usage {
 
 #[derive(Default)]
 struct Accumulated {
+    /// `Transport::Program`: the whole program, built from `content`
+    /// deltas. `Transport::RunProgram`: unused — `tool_args` below
+    /// carries the program instead, because that transport's `content`
+    /// deltas are prose alongside the call, never the program itself.
     source: String,
     thinking: String,
+    /// `Transport::RunProgram` only: `delta.tool_calls[0].function
+    /// .arguments`, concatenated across chunks the same way `source`
+    /// concatenates `content` deltas — the API streams a tool call's
+    /// arguments as fragments of one JSON string, not one value per
+    /// chunk, so this has to accumulate text before it can be parsed at
+    /// all.
+    tool_args: String,
     /// `"length"` once seen — DeepSeek's own signal that `max_tokens`
     /// was hit before the model stopped on its own. Anything else
-    /// (`"stop"`, `"tool_calls"` — never sent since there is no `tools`
-    /// array to trigger it, a stray if the API sends it anyway) is an
-    /// ordinary, complete turn.
+    /// (`"stop"`, or `"tool_calls"` under `Transport::RunProgram`, once
+    /// the call is complete) is an ordinary, finished turn.
     finish_reason: Option<String>,
     usage: Usage,
 }
@@ -258,10 +348,19 @@ struct Accumulated {
 /// job, all the way up through the session loop to whichever layer logs
 /// `Cause::Truncated` — this parser has no compiler to withhold the text
 /// from.
+///
+/// **`transport` only changes where the program comes from at the very
+/// end.** Every delta still streams through `chunk` live exactly as
+/// before (`Transport::RunProgram`'s `content` deltas are prose, but a
+/// human or UI watching the stream still wants to see them arrive); the
+/// difference is which accumulator the final `LlmTurn.source` is read
+/// out of — `acc.source` under `Program`, the parsed
+/// `acc.tool_args["source"]` under `RunProgram`.
 fn parse_sse(
     reader: impl BufRead,
     cancel: &Cancel,
     chunk: &mut dyn FnMut(LlmChunk),
+    transport: Transport,
 ) -> Result<LlmTurn, String> {
     let mut acc = Accumulated::default();
 
@@ -314,15 +413,48 @@ fn parse_sse(
         if let Some(t) = delta["content"].as_str()
             && !t.is_empty()
         {
-            acc.source.push_str(t);
             chunk(LlmChunk::Text(t.to_owned()));
+            // Under `Transport::RunProgram` this text is prose beside
+            // the call, never the program — accumulating it into
+            // `acc.source` would make `.source` mean two different
+            // things depending on transport, exactly the drift this
+            // switch has to not introduce.
+            if transport == Transport::Program {
+                acc.source.push_str(t);
+            }
+        }
+        if transport == Transport::RunProgram
+            && let Some(args) = delta["tool_calls"][0]["function"]["arguments"].as_str()
+        {
+            acc.tool_args.push_str(args);
         }
     }
 
+    let truncated = acc.finish_reason.as_deref() == Some("length");
+    let source = match transport {
+        Transport::Program => acc.source,
+        // A truncated completion's arguments are likely incomplete
+        // JSON — parsing them would turn a `truncated` turn into a parse
+        // error instead of letting the caller's own truncation path
+        // handle it (`turn.truncated`, checked before `Program`'s
+        // partial `acc.source` is ever allowed near a compiler either).
+        // Best-effort: hand back the raw fragment, same spirit as
+        // `Program`'s own "detection, not suppression."
+        Transport::RunProgram if truncated => acc.tool_args,
+        Transport::RunProgram => {
+            let parsed: serde_json::Value = serde_json::from_str(&acc.tool_args)
+                .map_err(|e| format!("bad run_program arguments: {e}: {}", acc.tool_args))?;
+            parsed["source"]
+                .as_str()
+                .ok_or_else(|| format!("run_program call carried no source: {}", acc.tool_args))?
+                .to_owned()
+        }
+    };
+
     Ok(LlmTurn {
-        source: acc.source,
+        source,
         thinking: (!acc.thinking.is_empty()).then_some(acc.thinking),
-        truncated: acc.finish_reason.as_deref() == Some("length"),
+        truncated,
         usage: (acc.usage != Usage::default()).then_some(acc.usage),
     })
 }
@@ -340,6 +472,8 @@ mod tests {
         ChatMessage {
             role,
             content: content.into(),
+            tool_calls: None,
+            tool_call_id: None,
         }
     }
 
@@ -351,14 +485,14 @@ mod tests {
             msg(ChatRole::Assistant, "return 1;"),
             msg(ChatRole::User, "## program completed"),
         ]);
-        let body = request_body(&request, "deepseek-v4-pro", true, None);
+        let body = request_body(&request, "deepseek-v4-pro", true, None, Transport::Program);
 
         assert_eq!(body["model"], "deepseek-v4-pro");
         assert_eq!(body["stream"], true);
         // Thinking on is the API's own default: no field sent at all.
         assert!(body.get("thinking").is_none());
-        // No function-calling schema under code mode — there is no
-        // longer a `tools` array to send at all.
+        // No function-calling schema under Transport::Program — there is
+        // no `tools` array to send at all.
         assert!(body.get("tools").is_none());
         let messages = body["messages"].as_array().unwrap();
         assert_eq!(messages.len(), 4);
@@ -371,6 +505,34 @@ mod tests {
         assert_eq!(messages[3]["content"], "## program completed");
     }
 
+    /// The other half of the switch: under `Transport::RunProgram` the
+    /// same request grows exactly one tool, shaped so `source` is the
+    /// only thing the model can send back — no `tool_choice: "required"`
+    /// (a refusal or a clarifying question must stay expressible), and
+    /// no second function to pick between (23_ONE_AGENT's one-move-per-
+    /// turn design, `RUN_PROGRAM_TOOL`'s own doc comment).
+    #[test]
+    fn request_body_advertises_run_program_under_that_transport() {
+        let request = doc(vec![msg(ChatRole::System, "card")]);
+        let body = request_body(
+            &request,
+            "deepseek-v4-pro",
+            true,
+            None,
+            Transport::RunProgram,
+        );
+
+        assert_eq!(body["tool_choice"], json!("auto"));
+        let tools = body["tools"].as_array().expect("tools array present");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["type"], "function");
+        assert_eq!(tools[0]["function"]["name"], "run_program");
+        let params = &tools[0]["function"]["parameters"];
+        assert_eq!(params["type"], "object");
+        assert_eq!(params["properties"]["source"]["type"], "string");
+        assert_eq!(params["required"], json!(["source"]));
+    }
+
     #[test]
     fn request_body_pins_reasoning_effort_when_asked() {
         // `pi` sends `reasoning_effort: "<level>"` on this provider, and
@@ -381,23 +543,43 @@ mod tests {
             messages: vec![ChatMessage {
                 role: ChatRole::System,
                 content: "c".into(),
+                tool_calls: None,
+                tool_call_id: None,
             }],
         };
-        let body = request_body(&request, "deepseek-v4-flash", true, Some("medium"));
+        let body = request_body(
+            &request,
+            "deepseek-v4-flash",
+            true,
+            Some("medium"),
+            Transport::Program,
+        );
         assert_eq!(body["reasoning_effort"], json!("medium"));
         // The level needs the enable flag beside it; alone it is a
         // request the API may answer at whatever default it likes.
         assert_eq!(body["thinking"], json!({ "type": "enabled" }));
 
         // Unpinned: no field at all, and the API picks.
-        let body = request_body(&request, "deepseek-v4-flash", true, None);
+        let body = request_body(
+            &request,
+            "deepseek-v4-flash",
+            true,
+            None,
+            Transport::Program,
+        );
         assert!(body.get("reasoning_effort").is_none());
     }
 
     #[test]
     fn request_body_disables_thinking_on_request() {
         let request = doc(vec![]);
-        let body = request_body(&request, "deepseek-v4-flash", false, None);
+        let body = request_body(
+            &request,
+            "deepseek-v4-flash",
+            false,
+            None,
+            Transport::Program,
+        );
         assert_eq!(body["thinking"], json!({ "type": "disabled" }));
     }
 
@@ -422,12 +604,17 @@ mod tests {
             r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
         ]);
         let mut chunks = Vec::new();
-        let turn = parse_sse(stream.as_bytes(), &Cancel::new(), &mut |c| {
-            chunks.push(match c {
-                LlmChunk::Text(t) => format!("T:{t}"),
-                LlmChunk::Thinking(t) => format!("R:{t}"),
-            });
-        })
+        let turn = parse_sse(
+            stream.as_bytes(),
+            &Cancel::new(),
+            &mut |c| {
+                chunks.push(match c {
+                    LlmChunk::Text(t) => format!("T:{t}"),
+                    LlmChunk::Thinking(t) => format!("R:{t}"),
+                });
+            },
+            Transport::Program,
+        )
         .unwrap();
 
         assert_eq!(turn.source, "const x = 42;");
@@ -442,7 +629,13 @@ mod tests {
             r#"{"choices":[{"delta":{"content":"const x = "}}]}"#,
             r#"{"choices":[{"delta":{},"finish_reason":"length"}]}"#,
         ]);
-        let turn = parse_sse(stream.as_bytes(), &Cancel::new(), &mut |_| {}).unwrap();
+        let turn = parse_sse(
+            stream.as_bytes(),
+            &Cancel::new(),
+            &mut |_| {},
+            Transport::Program,
+        )
+        .unwrap();
         assert!(
             turn.truncated,
             "max_tokens was hit before the model stopped"
@@ -458,14 +651,117 @@ mod tests {
             r#"{"choices":[{"delta":{"content":"1;"}}]}"#,
             r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
         ]);
-        let turn = parse_sse(stream.as_bytes(), &Cancel::new(), &mut |_| {}).unwrap();
+        let turn = parse_sse(
+            stream.as_bytes(),
+            &Cancel::new(),
+            &mut |_| {},
+            Transport::Program,
+        )
+        .unwrap();
         assert!(!turn.truncated);
     }
 
     #[test]
     fn parse_sse_surfaces_stream_errors() {
         let stream = "data: {\"error\":{\"message\":\"rate limited\"}}\n\n";
-        let err = parse_sse(stream.as_bytes(), &Cancel::new(), &mut |_| {}).unwrap_err();
+        let err = parse_sse(
+            stream.as_bytes(),
+            &Cancel::new(),
+            &mut |_| {},
+            Transport::Program,
+        )
+        .unwrap_err();
         assert!(err.contains("rate limited"), "{err}");
+    }
+
+    /// Builds an SSE stream from `serde_json::Value` events rather than
+    /// hand-spliced JSON text — `sse`'s `&[&str]` fixtures above read
+    /// well for a one-line delta, but a `tool_calls` fragment nests four
+    /// levels deep with a JSON-string-inside-a-JSON-string argument
+    /// value, where a single misplaced escape produces a fixture that
+    /// silently tests nothing (a parse error the code under test never
+    /// sees, since it's the test's own JSON that's malformed). Values
+    /// let `serde_json` own every brace and escape.
+    fn sse_values(events: &[serde_json::Value]) -> String {
+        let mut out = String::new();
+        for e in events {
+            out.push_str("data: ");
+            out.push_str(&e.to_string());
+            out.push_str("\n\n");
+        }
+        out.push_str("data: [DONE]\n\n");
+        out
+    }
+
+    /// `Transport::RunProgram`'s own accumulation rule: a `tool_calls`
+    /// delta's `function.arguments` fragments concatenate into the
+    /// program (parsed as JSON once the stream ends), while `content`
+    /// deltas — prose beside the call — are forwarded to `chunk` for a
+    /// UI to show live but never join the program text. Mirrors
+    /// `parse_sse_accumulates_text_and_thinking`'s Program-mode fixture
+    /// shape, so the two tests read as a pair.
+    #[test]
+    fn run_program_mode_accumulates_tool_call_arguments_not_content() {
+        let stream = sse_values(&[
+            json!({"choices":[{"delta":{"role":"assistant","content":"On it — "}}]}),
+            // `arguments` streams as fragments of one JSON string —
+            // `{"sou` + `rce":"tell(` + `1);"}` — reassembled only once
+            // the stream ends, exactly like real provider chunking.
+            json!({"choices":[{"delta":{"tool_calls":[
+                {"index":0,"id":"call_1","type":"function",
+                 "function":{"name":"run_program","arguments":"{\"sou"}}
+            ]}}]}),
+            json!({"choices":[{"delta":{"tool_calls":[
+                {"index":0,"function":{"arguments":"rce\":\"tell("}}
+            ]}}]}),
+            json!({"choices":[{"delta":{"content":"running now."}}]}),
+            json!({"choices":[{"delta":{"tool_calls":[
+                {"index":0,"function":{"arguments":"1);\"}"}}
+            ]}}]}),
+            json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}),
+        ]);
+        let mut chunks = Vec::new();
+        let turn = parse_sse(
+            stream.as_bytes(),
+            &Cancel::new(),
+            &mut |c| {
+                if let LlmChunk::Text(t) = c {
+                    chunks.push(t);
+                }
+            },
+            Transport::RunProgram,
+        )
+        .unwrap();
+
+        assert_eq!(turn.source, "tell(1);");
+        assert!(!turn.truncated);
+        // The prose still streamed to the UI, in arrival order, even
+        // though none of it joined `turn.source`.
+        assert_eq!(chunks, ["On it — ", "running now."]);
+    }
+
+    #[test]
+    fn run_program_mode_ignores_content_when_building_the_program() {
+        // A pathological stream where `content` alone, if it were ever
+        // mistaken for the program, would compile to something quite
+        // different from the real `run_program` call's `source` —
+        // making a regression here loud rather than a silent
+        // pass-through.
+        let stream = sse_values(&[
+            json!({"choices":[{"delta":{"content":"return 999;"}}]}),
+            json!({"choices":[{"delta":{"tool_calls":[
+                {"index":0,"id":"call_1","type":"function",
+                 "function":{"name":"run_program","arguments":"{\"source\":\"return 1;\"}"}}
+            ]}}]}),
+            json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}),
+        ]);
+        let turn = parse_sse(
+            stream.as_bytes(),
+            &Cancel::new(),
+            &mut |_| {},
+            Transport::RunProgram,
+        )
+        .unwrap();
+        assert_eq!(turn.source, "return 1;");
     }
 }
