@@ -1259,6 +1259,7 @@ mod tests {
                 author: Author::Agent(EventId::new(1)),
                 source: "noop();".into(),
                 thinking: None,
+                usage: None,
             }),
         )
     }
@@ -1685,6 +1686,7 @@ mod tests {
                 author: Author::Agent(EventId::new(1)),
                 source: "tell(\"user\", \"shared answer\");".into(),
                 thinking: None,
+                usage: None,
             }),
         ));
         chat.apply(&ev_on(
@@ -1783,6 +1785,7 @@ mod tests {
                 author: Author::Agent(EventId::new(1)),
                 source: "tell(\"user\", \"42\");".into(),
                 thinking: Some("let me compute 6*7".into()),
+                usage: None,
             }),
         ));
         chat.apply(&ev(
@@ -1854,6 +1857,7 @@ mod tests {
                 author: Author::Agent(EventId::new(1)),
                 source: "tell(\"user\", \"final answer\");".into(),
                 thinking: Some("done reasoning".into()),
+                usage: None,
             }),
         ));
         let rows = chat.rows(None, 80);

@@ -269,6 +269,7 @@ mod tests {
                     author: Author::Agent(agent),
                     source: "1;".into(),
                     thinking: None,
+                    usage: None,
                 }),
             )
             .unwrap();

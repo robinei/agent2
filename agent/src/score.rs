@@ -113,6 +113,16 @@ pub struct Score {
     /// long run's wall clock actually goes — not into a queue, and not
     /// into the harness, whose share is `exec_ms`.
     pub thinking_bytes: usize,
+    /// Tokens, as the provider counted them, summed over the
+    /// completions that reported any. `cached_in` is the share of
+    /// `prompt_in` served from the prefix cache — without it, "one
+    /// program instead of twenty-three round trips" overstates the
+    /// saving, because most of a re-sent context is cache.
+    /// `reasoning_out` is the part of `completion_out` spent thinking.
+    pub prompt_in: u64,
+    pub cached_in: u64,
+    pub completion_out: u64,
+    pub reasoning_out: u64,
 }
 
 /// Fold a tree into a [`Score`]. One pass, in event-id order, which is
@@ -145,6 +155,10 @@ pub fn score(tree: &Tree) -> Score {
         prompt_bytes: 0,
         source_bytes: 0,
         thinking_bytes: 0,
+        prompt_in: 0,
+        cached_in: 0,
+        completion_out: 0,
+        reasoning_out: 0,
     };
 
     // The same stack `eval::tasks::fold` keeps, and for the same reason:
@@ -163,10 +177,17 @@ pub fn score(tree: &Tree) -> Score {
                 author: Author::Agent(_),
                 source,
                 thinking,
+                usage,
             }) => {
                 s.programs += 1;
                 s.source_bytes += source.len();
                 s.thinking_bytes += thinking.as_ref().map_or(0, |t| t.len());
+                if let Some(u) = usage {
+                    s.prompt_in += u.prompt;
+                    s.cached_in += u.cached;
+                    s.completion_out += u.completion;
+                    s.reasoning_out += u.reasoning;
+                }
                 // The document as it stood when *this* program was
                 // asked for: the spine ending at the event before it.
                 if let Some(parent) = e.parent_id {

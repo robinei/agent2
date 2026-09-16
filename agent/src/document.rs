@@ -563,6 +563,7 @@ mod tests {
             author: Author::Agent(EventId::new(1)),
             source: source.to_owned(),
             thinking: None,
+            usage: None,
         })
     }
 

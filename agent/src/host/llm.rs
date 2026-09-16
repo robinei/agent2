@@ -96,6 +96,7 @@ impl ScriptedLlm {
 /// substitution: the model's whole response *is* `Turn { source }`).
 pub fn scripted_program(source: &str) -> LlmTurn {
     LlmTurn {
+        usage: None,
         source: source.into(),
         thinking: None,
         truncated: false,

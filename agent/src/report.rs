@@ -1171,6 +1171,7 @@ mod tests {
                 author: Author::Agent(crate::types::EventId::new(1)),
                 source: source.to_owned(),
                 thinking: None,
+                usage: None,
             }),
         )
         .unwrap();
@@ -1299,6 +1300,7 @@ mod tests {
                 author: Author::User,
                 source: "answer(#1, \"the second\");".into(),
                 thinking: None,
+                usage: None,
             }),
         )
         .unwrap();
@@ -1356,6 +1358,7 @@ mod tests {
                     author: Author::Agent(EventId::new(1)),
                     source: "return 1;".into(),
                     thinking: None,
+                    usage: None,
                 }),
             )
             .unwrap();

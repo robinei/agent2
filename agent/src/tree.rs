@@ -1164,6 +1164,7 @@ mod tests {
             author: Author::Agent(EventId::new(1)),
             source: source.into(),
             thinking: None,
+            usage: None,
         })
     }
 

@@ -3122,6 +3122,7 @@ mod tests {
             author: Author::Agent(EventId::new(1)),
             source: source.into(),
             thinking: None,
+            usage: None,
         })
     }
 
@@ -3583,6 +3584,7 @@ mod tests {
                 author: Author::Agent(EventId::new(1)),
                 source: "return 42;".into(),
                 thinking: None,
+                usage: None,
             }),
         )
         .unwrap();
@@ -5528,6 +5530,7 @@ mod tests {
                 author: Author::Agent(EventId::new(1)),
                 source: "return await ask(w, \"q\");".into(),
                 thinking: None,
+                usage: None,
             }),
         )
         .unwrap();
@@ -5797,6 +5800,7 @@ mod tests {
                 author: Author::Agent(EventId::new(1)),
                 source: "return 7;".into(),
                 thinking: None,
+                usage: None,
             }),
         )
         .unwrap();
@@ -5861,6 +5865,7 @@ mod tests {
                 source: "await tools.send_email(); return await ask(\"user\", \"which one?\");"
                     .into(),
                 thinking: None,
+                usage: None,
             }),
         )
         .unwrap();
@@ -5956,6 +5961,7 @@ mod tests {
                 author: Author::Agent(EventId::new(5)),
                 source: "return await ask(null, \"which one?\");".into(),
                 thinking: None,
+                usage: None,
             }),
         )
         .unwrap();

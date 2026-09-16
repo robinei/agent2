@@ -170,6 +170,12 @@ fn request_body(
         "model": model,
         "messages": messages,
         "stream": true,
+        // Usage rides the last content chunk, but only if asked for.
+        // Without this the endpoint sends `"usage": null` on every
+        // chunk and nothing at the end — which is how two probes on
+        // 2026-09-16 concluded, wrongly, that token counts were
+        // unavailable from this provider at all.
+        "stream_options": { "include_usage": true },
     });
     if !thinking {
         // Exactly what `pi` sends to disable on this provider, so
@@ -206,6 +212,23 @@ fn message_json(message: &ChatMessage) -> serde_json::Value {
     serde_json::json!({ "role": role, "content": message.content })
 }
 
+/// What a completion cost, as the provider counted it.
+///
+/// `reasoning` is the part of `completion` spent thinking rather than
+/// writing the program, which is the split a long run's wall clock
+/// turns on: a 310-second run measured 131KB of reasoning against 10KB
+/// of program, and this is that same fact in the provider's own units.
+/// `cached` is the share of the prompt served from the prefix cache —
+/// the number that decides how much a re-sent context actually costs,
+/// and therefore how large the round-trip advantage really is.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Usage {
+    pub prompt: u64,
+    pub cached: u64,
+    pub completion: u64,
+    pub reasoning: u64,
+}
+
 #[derive(Default)]
 struct Accumulated {
     source: String,
@@ -216,6 +239,7 @@ struct Accumulated {
     /// array to trigger it, a stray if the API sends it anyway) is an
     /// ordinary, complete turn.
     finish_reason: Option<String>,
+    usage: Usage,
 }
 
 /// Parse a chat-completions SSE stream into the final assistant turn,
@@ -261,6 +285,21 @@ fn parse_sse(
         if let Some(err) = event.get("error") {
             return Err(format!("deepseek stream error: {err}"));
         }
+        // On the last content chunk, not a chunk of its own: read it
+        // before touching `choices`, which is empty on the trailer.
+        if let Some(u) = event.get("usage").filter(|u| !u.is_null()) {
+            acc.usage = Usage {
+                prompt: u["prompt_tokens"].as_u64().unwrap_or(0),
+                cached: u["prompt_cache_hit_tokens"]
+                    .as_u64()
+                    .or_else(|| u["prompt_tokens_details"]["cached_tokens"].as_u64())
+                    .unwrap_or(0),
+                completion: u["completion_tokens"].as_u64().unwrap_or(0),
+                reasoning: u["completion_tokens_details"]["reasoning_tokens"]
+                    .as_u64()
+                    .unwrap_or(0),
+            };
+        }
         let choice = &event["choices"][0];
         if let Some(r) = choice["finish_reason"].as_str() {
             acc.finish_reason = Some(r.to_owned());
@@ -284,6 +323,7 @@ fn parse_sse(
         source: acc.source,
         thinking: (!acc.thinking.is_empty()).then_some(acc.thinking),
         truncated: acc.finish_reason.as_deref() == Some("length"),
+        usage: (acc.usage != Usage::default()).then_some(acc.usage),
     })
 }
 

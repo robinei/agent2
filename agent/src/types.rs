@@ -350,6 +350,12 @@ pub enum Message {
         source: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         thinking: Option<String>,
+        /// What this completion cost, as the provider counted it —
+        /// absent on a turn nobody was billed for (a scripted client,
+        /// a user's own turn) and on logs written before it was
+        /// recorded.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<crate::host::Usage>,
     },
 }
 

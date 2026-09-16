@@ -212,6 +212,9 @@ pub struct LlmTurn {
     /// truncated completion — checked before `interp::compile`, not
     /// after.
     pub truncated: bool,
+    /// What the provider said this completion cost. `None` when the
+    /// transport is scripted, or when an endpoint does not report it.
+    pub usage: Option<crate::host::Usage>,
 }
 
 /// A rendered request's **ephemeral** half only. Under code mode the
@@ -690,7 +693,14 @@ impl Runner {
         match input {
             StepInput::LlmResponse(turn) => {
                 let author = Author::Agent(self.agent_id());
-                self.apply_turn(tree, turn.source, turn.thinking, turn.truncated, author)
+                self.apply_turn(
+                    tree,
+                    turn.source,
+                    turn.thinking,
+                    turn.truncated,
+                    author,
+                    turn.usage,
+                )
             }
             StepInput::ToolResults(batch) => self.on_tool_results(tree, batch),
             StepInput::Tick { fuel } => self.on_tick(tree, fuel),
@@ -803,7 +813,7 @@ impl Runner {
     /// `resume(...)`/`answer(...)` expression (`v` and the answer
     /// gesture), matching `Message::Turn`'s own doc in `types.rs`.
     pub fn take_turn(&mut self, tree: &mut Tree, source: String) -> io::Result<Vec<StepOutput>> {
-        self.apply_turn(tree, source, None, false, Author::User)
+        self.apply_turn(tree, source, None, false, Author::User, None)
     }
 
     /// Log one turn — the whole of what the branch itself just said —
@@ -824,11 +834,13 @@ impl Runner {
         thinking: Option<String>,
         truncated: bool,
         author: Author,
+        usage: Option<crate::host::Usage>,
     ) -> io::Result<Vec<StepOutput>> {
         let message = Message::Turn {
             author,
             source: source.clone(),
             thinking,
+            usage,
         };
         let assistant_id = tree.append(&mut self.spine, EventPayload::Message(message))?;
 
@@ -2566,6 +2578,7 @@ mod tests {
             source: source.into(),
             thinking: None,
             truncated: false,
+            usage: None,
         }
     }
 
