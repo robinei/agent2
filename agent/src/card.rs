@@ -130,6 +130,15 @@ put to a tool that was never going to answer it comes back empty, and
 empty reads as "all fine" — the false negative above, arrived at by a
 command that ran perfectly.
 
+Two more things make a loop like that lie, and both look exactly like
+success. A pipeline's status is its *last* stage's, so `cmd | grep x |
+head` reports 0 when `cmd` never ran — write `set -o pipefail` in front
+of any pipeline whose status you intend to believe, and read `status`
+before you read `stdout`. And a position you measured before you
+started changing things goes stale as you use it: take a line out and
+everything under it renumbers. Get either wrong and the loop reports a
+clean sweep of work it did not do.
+
 The tell is exact: **if you can write down what the next program should
 do, you can write the program.** A handover whose payload says "for
 each of these, do X" spent an inference to hand yourself a to-do list —
@@ -521,7 +530,11 @@ if (build.status === 0) {
         assistant: r#"tell("taking the #[ignore] off each one in turn and running it, so the test runner decides rather than me.");
 const sites = (await tools.bash("grep -rn '#\\[ignore\\]' --include='*.rs' . 2>/dev/null")).stdout
     .split("\n").map(s => s.trim()).filter(Boolean)
-    .map(line => { const [path, lineno] = line.split(":"); return { path, lineno: Number(lineno) }; });
+    .map(line => { const [path, lineno] = line.split(":"); return { path, lineno: Number(lineno) }; })
+    // Bottom of each file upwards: taking a line out renumbers
+    // everything below it, and these numbers were all measured before
+    // any of that. Going up, every number I still hold is still true.
+    .sort((a, b) => b.lineno - a.lineno);
 tell(`${sites.length} ignored test(s) to try.`);
 
 // I knew this procedure before I knew the list, so it is a loop, not a
@@ -539,7 +552,9 @@ for (const site of sites) {
     lines.splice(site.lineno - 1, 1);
     await tools.replace_file(site.path, lines.join("\n"), before.version);
 
-    const run = await tools.bash(`cargo test ${name} -- --exact 2>&1 | tail -5`);
+    // pipefail, or the status is `tail`'s and `tail` always succeeds:
+    // the test could fail to compile at all and this would read as a pass.
+    const run = await tools.bash(`set -o pipefail; cargo test ${name} -- --exact 2>&1 | tail -5`);
     if (run.status === 0) {
         freed.push(name);
     } else {
@@ -599,7 +614,7 @@ mod tests {
         // `CARD` shows up as a diff review must look at, not a byte
         // count that silently drifts. Comparing full text (not just a
         // hash) so the diff itself is legible in a failure message.
-        const EXPECTED_LEN: usize = 12320;
+        const EXPECTED_LEN: usize = 12847;
         assert_eq!(
             CARD.len(),
             EXPECTED_LEN,
