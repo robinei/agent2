@@ -1,0 +1,9 @@
+{
+  "programs": 1,
+  "asks": 1,
+  "handovers": 0,
+  "silent": false,
+  "tells": [
+    "deploy.yaml's request_timeout_seconds is 240 with a note asking whether it should be 30 \u2014 I've asked rather than guess, and left it as it is."
+  ]
+}

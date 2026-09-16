@@ -71,8 +71,21 @@ pub struct Score {
     pub resumes: usize,
     pub spawn_children: usize,
     pub notes: usize,
+    /// `ask()` to a person — a `Send` that expects a reply. Counted
+    /// apart from `sends` because the two are opposite acts: a `tell`
+    /// informs and carries on, an `ask` stops for a judgement only a
+    /// person can give. A task about recognising an ambiguity has
+    /// nothing else to check.
+    pub asks: usize,
     /// A run that never said anything to anyone.
     pub silent: bool,
+    /// What the run actually told a person, in order. A checker often
+    /// turns on this rather than on any file — "did it report the
+    /// count", "did it say which ones it kept" — and a task whose whole
+    /// product is an answer has nothing else to look at. Each is
+    /// clipped: a `tell` carrying a pasted file would otherwise
+    /// dominate the score it is one field of.
+    pub tells: Vec<String>,
     /// First to last event.
     pub span_ms: i64,
     /// Time inside completions: each program's arrival minus the event
@@ -103,7 +116,9 @@ pub fn score(tree: &Tree) -> Score {
         resumes: 0,
         spawn_children: 0,
         notes: 0,
+        asks: 0,
         silent: true,
+        tells: Vec::new(),
         span_ms: 0,
         provider_ms: 0,
         exec_ms: 0,
@@ -135,9 +150,21 @@ pub fn score(tree: &Tree) -> Score {
                 }
             }
             EventPayload::Call(Call::Invoke { .. }) => s.tool_calls += 1,
-            EventPayload::Call(Call::Send { .. }) => {
+            EventPayload::Call(Call::Send {
+                text,
+                expects_reply,
+                ..
+            }) => {
                 s.sends += 1;
+                if *expects_reply {
+                    s.asks += 1;
+                }
                 s.silent = false;
+                const CLIP: usize = 2000;
+                s.tells.push(match text.char_indices().nth(CLIP) {
+                    Some((byte, _)) => format!("{}…", &text[..byte]),
+                    None => text.clone(),
+                });
             }
             EventPayload::Call(Call::Spawn { .. }) => {
                 spawn_calls.insert(e.id);

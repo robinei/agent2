@@ -1,0 +1,9 @@
+{
+  "programs": 1,
+  "asks": 0,
+  "handovers": 0,
+  "silent": false,
+  "tells": [
+    "set request_timeout_seconds to 30."
+  ]
+}

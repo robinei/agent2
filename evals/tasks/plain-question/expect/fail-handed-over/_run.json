@@ -1,0 +1,9 @@
+{
+  "programs": 2,
+  "tool_calls": 0,
+  "handovers": 1,
+  "silent": false,
+  "tells": [
+    "A mutex is owned: whoever locked it is the one who unlocks it, and only one holder exists at a time. A semaphore is a count of permits with no owner \u2014 any thread can release one, and you size it above one when N things may proceed at once."
+  ]
+}

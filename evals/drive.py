@@ -57,6 +57,15 @@ class Env:
         self.task_dir = task_dir
         self.dir = sandbox
         self.score = score
+        # What the run said to a person, in order. A task whose product
+        # is an answer rather than an edit has nothing else to check.
+        self.tells = score.get("tells", [])
+
+    def said(self, *needles: str) -> bool:
+        """Any tell containing all of `needles`, case-insensitively."""
+        return any(
+            all(n.lower() in t.lower() for n in needles) for t in self.tells
+        )
 
     def copy_fixture(self, name: str = "fixture"):
         src = self.task_dir / name
@@ -118,7 +127,15 @@ def discover(names=None):
 # A score standing in for a healthy run, for the fixture verification
 # below: the checker is being asked about the *files*, and its
 # process-level assertions should not be what decides the fixture.
-HEALTHY = {"silent": False, "programs": 1, "tool_calls": 40, "traps": 0}
+HEALTHY = {
+    "silent": False,
+    "programs": 1,
+    "handovers": 0,
+    "tool_calls": 40,
+    "calls_per_program": 40.0,
+    "traps": 0,
+    "tells": [],
+}
 
 
 def verify_checker(task) -> list:
@@ -145,10 +162,18 @@ def verify_checker(task) -> list:
     for fixture in fixtures:
         with tempfile.TemporaryDirectory(prefix="evalfix-") as tmp:
             sandbox = Path(tmp)
+            # `_run.json` is the fixture's stand-in for a finished run:
+            # the score fields and tells a checker reads when its verdict
+            # is about what happened rather than about the files. A task
+            # whose product is an answer is verified entirely this way.
+            score = dict(HEALTHY)
             for item in fixture.iterdir():
+                if item.name == "_run.json":
+                    score.update(json.loads(item.read_text()))
+                    continue
                 dst = sandbox / item.name
                 shutil.copytree(item, dst) if item.is_dir() else shutil.copy2(item, dst)
-            env = Env(task.DIR, sandbox, dict(HEALTHY))
+            env = Env(task.DIR, sandbox, score)
             try:
                 task.check(env)
                 verdict = "pass"

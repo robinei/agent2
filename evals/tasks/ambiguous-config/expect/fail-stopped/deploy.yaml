@@ -1,0 +1,10 @@
+# Production deploy settings.
+service: checkout
+replicas: 3
+
+# Bumped for the Black Friday load test and never put back.
+# TODO: is 240 still right, or did we settle on the old 30?
+request_timeout_seconds: 240
+
+health_check_path: /healthz
+region: eu-west-1
