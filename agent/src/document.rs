@@ -318,36 +318,6 @@ pub fn render(tree: &Tree, spine: &Spine, budget: usize) -> Document {
         .enclosing_agent(leaf)
         .expect("a spine's leaf always has an enclosing Agent — spine_at() built it from one");
     let card = &spine.context().system;
-    // A compaction turn gets an inventory, not the conversation.
-    //
-    // Observed three times on 2026-09-16: handed the whole document
-    // with the request appended, the model read the request and did the
-    // unfinished task instead — "picking up mid-task — card.rs was read
-    // but its summary never came back". It was not disobeying. A
-    // compaction program has no use for the *content* of the rows it is
-    // deciding about; what it needs is which rows exist, how big each
-    // one is, and what kind it is. Sending the content as well puts
-    // sixty kilobytes of unfinished work in front of a program and asks
-    // it to ignore all of it, which is not a thing prose can win.
-    //
-    // It is also the cheapest turn in the system rather than the most
-    // expensive one: an inventory of a hundred rows is a few kilobytes,
-    // where the document it is about might be sixty.
-    if let Some(Event {
-        payload:
-            EventPayload::Condition {
-                cause:
-                    Cause::Compaction {
-                        rendered,
-                        budget: b,
-                    },
-                ..
-            },
-        ..
-    }) = tree.events.get(&leaf)
-    {
-        return compaction_document(tree, agent, leaf, card, *rendered, *b);
-    }
     render_with_lookup(
         tree,
         agent,
@@ -356,78 +326,6 @@ pub fn render(tree: &Tree, spine: &Spine, budget: usize) -> Document {
         budget,
         &tree.compacted_lookup(leaf),
     )
-}
-
-/// The document a compaction program is written from: the card, then an
-/// inventory of the rows it may act on, then the request.
-///
-/// Every row on the branch's path gets one line — `[id] label — N
-/// bytes` — with the largest first, because the largest are what a
-/// compaction has to reach for and a handler reading top-down should
-/// meet them immediately. No content: that is the whole point.
-///
-/// The first line of a row's text is kept as a hint, clipped hard.
-/// Without it an inventory is a list of sizes with nothing to choose
-/// between; with it the handler can tell a tool result it has already
-/// acted on from the task it must not touch, which is exactly the
-/// judgement the request asks for.
-fn compaction_document(
-    tree: &Tree,
-    agent: EventId,
-    leaf: EventId,
-    card: &str,
-    rendered: usize,
-    budget: usize,
-) -> Document {
-    const HINT: usize = 90;
-    let compacted = tree.compacted_lookup(leaf);
-    let mut rows: Vec<(usize, String)> = Vec::new();
-    for ev in tree.path_events(leaf) {
-        if ev.id == agent || ev.id == leaf {
-            continue;
-        }
-        let Some(line) = pending_line(tree, leaf, ev, &compacted) else {
-            continue;
-        };
-        let size = line.len();
-        let hint: String = line
-            .lines()
-            .next()
-            .unwrap_or("")
-            .chars()
-            .take(HINT)
-            .collect();
-        rows.push((
-            size,
-            format!(
-                "[{}] {} — {size} bytes: {hint}",
-                ev.id.as_u64(),
-                label_of(&ev.payload)
-            ),
-        ));
-    }
-    rows.sort_by_key(|(size, _)| std::cmp::Reverse(*size));
-
-    let inventory = rows
-        .into_iter()
-        .map(|(_, line)| line)
-        .collect::<Vec<_>>()
-        .join("\n");
-    Document {
-        messages: vec![
-            ChatMessage {
-                role: ChatRole::System,
-                content: card.to_owned(),
-            },
-            ChatMessage {
-                role: ChatRole::User,
-                content: format!(
-                    "## the conversation so far, by row\n\n{inventory}\n\n{}",
-                    crate::report::compaction_message(rendered, budget)
-                ),
-            },
-        ],
-    }
 }
 
 /// [`render`], but against an explicit compaction lookup instead of one

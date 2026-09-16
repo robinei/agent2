@@ -721,29 +721,44 @@ fn render_handback(h: &Handback<'_>, budget: usize) -> String {
     }
 }
 
-/// [`Cause::Compaction`]'s report: what the next program is being asked
-/// to do, and the two numbers that say how much.
+/// [`Cause::Compaction`]'s report — written to be unmistakable.
 ///
-/// Deliberately does not list the rows. The document *is* the rows —
-/// every one of them is already in front of the model, each with its
-/// own id and label, so restating them here would spend the budget this
-/// condition exists to reclaim. What the handler needs from this
-/// message is the instruction and the size of the problem.
-pub(crate) fn compaction_message(rendered: usize, budget: usize) -> String {
+/// The whole conversation is in front of the model already, and re-
+/// sending it is nearly free: it is the cache prefix, 86-96% of those
+/// prompt tokens are cache hits, and one more completion on the end of
+/// it costs almost nothing. So this does not replace the document or
+/// summarise it. It is the last thing in it, and its only job is to be
+/// impossible to read as a suggestion.
+///
+/// That job is harder than it sounds. Three live runs on 2026-09-16
+/// read a politely-worded version of this and did the unfinished task
+/// instead — the last of them opening with "picking up mid-task —
+/// card.rs was read but its summary never came back". The pull of
+/// visible unfinished work beat a paragraph asking for something else,
+/// which is the same thing that happened to every other paragraph
+/// written this week. So the register here is a stop, not a request:
+/// the run is *blocked*, and the only thing that unblocks it is a
+/// compaction program.
+fn compaction_message(rendered: usize, budget: usize) -> String {
     format!(
-        "This conversation is {rendered} bytes against a {budget}-byte budget, so the next \
-         program is a compaction program: shrink the history above, then return.\n\n\
+        "## STOP — THIS CONVERSATION IS FULL\n\n\
+         {rendered} bytes against a {budget}-byte budget. **The task above is not being \
+         worked on in this program.** No tool call, no answer and no continuation of it will \
+         be accepted from here; the only thing that can happen next is that the history gets \
+         smaller.\n\n\
+         Write a compaction program. Nothing else. It resumes the work by itself once you \
+         return.\n\n\
          `remove_history(id, label)` drops a row's content, keeping its id and label as a \
          stub. `rewrite_history(id, label, value)` replaces the content with something \
-         shorter. Both take the row's own label as a checksum — a wrong id with a wrong \
-         label is rejected rather than compacting the wrong row, and the whole batch is \
-         validated before any of it commits, so a mistake costs a retry and never the log.\n\n\
-         Prefer removing outright and keeping the rest verbatim; rewrite only the rows that \
-         truly need shortening. Tool results that have already been acted on are the usual \
-         first targets, and the task itself is the last. Nothing is deleted: a compacted row \
-         keeps its id, and its artifacts stay fetchable.\n\n\
-         Nothing else happens in this program — do the compaction and return. The work \
-         resumes on its own afterwards."
+         shorter. Each row above carries its `[id]` and its label; both verbs check the label \
+         against the row, so a wrong id is rejected rather than compacting the wrong thing, \
+         and the whole batch is validated before any of it commits — a mistake costs a retry \
+         and never the log.\n\n\
+         Prefer removing outright and keeping the rest verbatim; rewrite only what truly \
+         needs shortening. The largest tool results you have already acted on are the first \
+         targets. The task itself is the last. Nothing is deleted: a compacted row keeps its \
+         id, and its artifacts stay fetchable by it.\n\n\
+         Return when you are done. Do not do anything else."
     )
 }
 
@@ -1298,6 +1313,9 @@ mod tests {
         assert!(text.contains("60555"), "says how big it is: {text}");
         assert!(text.contains("32768"), "and what the budget is: {text}");
         assert!(text.contains("compaction program"), "{text}");
+        // Read as a request rather than a stop, this loses to the pull
+        // of visible unfinished work — measured three times.
+        assert!(text.contains("STOP"), "{text}");
         assert!(text.contains("remove_history"), "names the verbs: {text}");
         assert!(text.contains("rewrite_history"), "{text}");
 

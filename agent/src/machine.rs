@@ -3743,11 +3743,6 @@ mod tests {
             )
             .unwrap();
         drain(&mut state, &mut tree, out);
-        // Before firing: once the leaf is a compaction condition,
-        // `render` returns the inventory, so the conversation has to be
-        // measured while it is still the conversation.
-        let conversation =
-            crate::compaction::rendered_size(&crate::document::render(&tree, &state.spine, budget));
         state.compaction_if_needed(&mut tree, budget, 0.25).unwrap();
         let doc = crate::document::render(&tree, &state.spine, 64 * 1024);
         let text = doc
@@ -3759,29 +3754,16 @@ mod tests {
         assert!(text.contains("compaction program"), "not in the document");
         assert!(text.contains("remove_history"), "the verbs are not there");
 
-        // And it is an *inventory*, not the conversation: the rows are
-        // listed by id, label and size, and their content is not there.
-        // Three live runs were handed the whole document with the
-        // request appended and did the unfinished task instead.
-        assert!(text.contains("the conversation so far, by row"), "{text}");
-        assert!(text.contains("bytes:"), "rows carry their size: {text}");
-        // Each row is one clipped line: enough to tell a tool result
-        // from the task, never the content itself.
-        let longest = text
-            .lines()
-            .filter(|l| l.starts_with('[') && l.contains(" bytes: "))
-            .map(str::len)
-            .max()
-            .expect("inventory rows");
-        assert!(longest < 200, "a row line ran to {longest} bytes");
-
-        // And the whole turn is far smaller than the conversation it is
-        // about — the cheapest turn in the system rather than the
-        // dearest, which is what sending an inventory buys.
+        // The conversation stays: it is the cache prefix, so re-sending
+        // it is nearly free, and a rewrite needs the text it is
+        // shortening. What changes is the register of the request at
+        // the end of it — three live runs read a polite one and did the
+        // unfinished task instead.
+        assert!(text.contains("STOP"), "{text}");
+        assert!(text.contains("not being worked on"), "{text}");
         assert!(
-            text.len() * 2 < conversation,
-            "compaction turn {} bytes vs a {conversation}-byte conversation",
-            text.len()
+            text.contains("filler filler"),
+            "the history itself is still there to compact"
         );
     }
 
