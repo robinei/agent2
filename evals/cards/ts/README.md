@@ -19,7 +19,23 @@ objects, no executor pattern). Everything else JavaScript has either
 works or stops the program and says so, and listing it would be paying
 prose for silence.
 
-**Signatures track the code, not the intent.** The settle-at-dispatch
-verbs still return promises here because they still do in the harness;
-when that changes, this file changes in the same commit, or the card
-lies.
+**Signatures track the code, not the intent**, and writing them down
+found that the verbs are in three groups rather than one:
+
+- `spawn`, `fork`, `done`, `remove_history`, `rewrite_history` — the
+  compiler emits the `Await` itself, so the expression is already the
+  value. Never a promise, today or after.
+- `raise` — `Instr::Raise`, and the host pushes the resumed value
+  straight onto the stack. Also never a promise, though the long card
+  has always written `await raise(...)`.
+- `ask`, `answer`, `append_history`, `fetch_history`, `list_agents` —
+  plain `Invoke`, no `Await`. Genuinely promises **today**; all but
+  `ask` stop being so the moment the settle-at-dispatch change lands,
+  and this file changes in that same commit or the card lies.
+
+Awaiting a plain value is the identity here, so the failure is
+one-sided: a declaration that says `Promise` when it is not costs
+nothing, and one that omits `Promise` when it is would hand the model a
+promise it never unwraps. The prose card, which says nothing either way
+and relies on every example writing `await`, has been getting this for
+free.

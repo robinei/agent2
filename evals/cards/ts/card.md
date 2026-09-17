@@ -26,9 +26,9 @@ declare function answer(question: number, label: string, value: unknown): Promis
 
 /** A new agent with a clean context. Creating is not messaging: it is
  *  idle until you `tell` or `ask` the handle. */
-declare function spawn(charter: string): Promise<Agent>;
+declare function spawn(charter: string): Agent;
 /** A new context inheriting your whole history. Also idle until messaged. */
-declare function fork(): Promise<Agent>;
+declare function fork(): Agent;
 /** Every agent in this subtree, with what each is currently doing. */
 declare function list_agents(): Promise<Array<{ id: number; name: string; status: string }>>;
 
@@ -42,7 +42,7 @@ declare function fetch_history(id: number): Promise<unknown>;
 /** Suspend for a judgement and carry on from this expression with the
  *  answer, every variable still alive. For a verdict you already know
  *  how to act on — not for having something characterised. */
-declare function raise(name: string, payload?: unknown): Promise<unknown>;
+declare function raise(name: string, payload?: unknown): unknown;
 
 /** The task is finished. Nothing is written after this. */
 declare function done(): void;
@@ -92,4 +92,6 @@ otherwise be caught out:
   `Promise.race`, no `Promise.any`. `Promise.all` and `allSettled` work.
 
 `tools.*` below are this session's configured capabilities, and are the
-only way to reach the world. They are all async.
+only way to reach the world. They are all async — as is anything above
+whose type says `Promise`, and nothing else. Awaiting a plain value is
+harmless, so `await` where you are unsure costs nothing.
