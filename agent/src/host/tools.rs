@@ -157,29 +157,19 @@ fn atomic_write(path: &Path, content: &str) -> Result<(), String> {
 fn read_file_def() -> ToolDef {
     ToolDef {
         name: "read_file".into(),
-        description: "Read a UTF-8 text file; returns { content, version }. \
-                      `version` is a content hash — pass it to `replace_file` \
-                      so the write is atomic and fails if the file changed \
-                      since you read it.\n\
-                      \n\
-                      `read_file([path, start_line, end_line])` returns just that \
-                      span, 1-based and inclusive — pair it with `outline`, whose \
-                      entries carry the line numbers. On a large file read the span \
-                      you want rather than the file: the whole thing costs its full \
-                      size wherever you put it. The `version` hash always covers \
-                      the **whole** file, so a span still round-trips safely to \
-                      `replace_file`."
+        description: "Read a UTF-8 text file. `version` is a content hash — hand it to `replace_file` so the write fails if the file moved under you. `from`/`to` are 1-based inclusive lines."
             .into(),
         input_schema: json!({
             "type": "array",
             "items": [
-                { "type": "string", "description": "absolute or cwd-relative path" },
-                { "type": "integer", "description": "first line, 1-based (optional)" },
-                { "type": "integer", "description": "last line, inclusive (optional)" }
+                { "name": "path", "type": "string", "description": "absolute or cwd-relative path" },
+                { "name": "from", "type": "integer", "description": "first line, 1-based (optional)" },
+                { "name": "to", "type": "integer", "description": "last line, inclusive (optional)" }
             ],
             "minItems": 1,
             "maxItems": 3
         }),
+        returns: Some("{ content: string; version: string; truncated?: boolean }".into()),
         handler: Box::new(|args| {
             let path = args
                 .get(0)
@@ -237,19 +227,18 @@ fn read_file_def() -> ToolDef {
 fn create_file_def() -> ToolDef {
     ToolDef {
         name: "create_file".into(),
-        description: "Create a new file atomically — errors if the path already \
-                      exists. Returns { version }. Use for new files; for existing \
-                      files use `replace_file`."
+        description: "Create a new file atomically. Errors if the path exists — for an existing file use `replace_file`."
             .into(),
         input_schema: json!({
             "type": "array",
             "items": [
-                { "type": "string", "description": "absolute or cwd-relative path" },
-                { "type": "string", "description": "UTF-8 content to write" }
+                { "name": "path", "type": "string", "description": "absolute or cwd-relative path" },
+                { "name": "content", "type": "string", "description": "UTF-8 content to write" }
             ],
             "minItems": 2,
             "maxItems": 2
         }),
+        returns: Some("{ version: string }".into()),
         handler: Box::new(|args| {
             let path = args
                 .get(0)
@@ -284,23 +273,19 @@ fn create_file_def() -> ToolDef {
 fn replace_file_def() -> ToolDef {
     ToolDef {
         name: "replace_file".into(),
-        description: "`replace_file(path, content, expected_version)` — writes \
-                      atomically iff the file still matches `expected_version` \
-                      (from `read_file`). Returns { version, diff? }. On mismatch \
-                      errors with the current version and a diff, so you can \
-                      re-read and re-apply. Always requires a version — blind \
-                      overwrite is structurally impossible."
+        description: "Write atomically iff the file still matches `version` (from `read_file`). On mismatch, errors with the current version rather than clobbering."
             .into(),
         input_schema: json!({
             "type": "array",
             "items": [
-                { "type": "string", "description": "absolute or cwd-relative path" },
-                { "type": "string", "description": "new UTF-8 content" },
-                { "type": "string", "description": "expected version (from read_file)" }
+                { "name": "path", "type": "string", "description": "absolute or cwd-relative path" },
+                { "name": "content", "type": "string", "description": "new UTF-8 content" },
+                { "name": "version", "type": "string", "description": "expected version (from read_file)" }
             ],
             "minItems": 3,
             "maxItems": 3
         }),
+        returns: Some("{ version: string }".into()),
         handler: Box::new(|args| {
             let path = args
                 .get(0)
@@ -361,30 +346,19 @@ fn replace_file_def() -> ToolDef {
 fn bash_def() -> ToolDef {
     ToolDef {
         name: "bash".into(),
-        description: "Run one short shell command — a single pipeline, no loops or \
-                      multi-line scripts; do control flow in JS. The command is one \
-                      string: bash(\"mkdir -p /x && ls /x\"). (An argv array is also \
-                      tolerated, joined with spaces.) Resolves to { status, stdout, \
-                      stderr, truncated? } (a non-zero status is a result, not an \
-                      error); times out after 30s; output capped at 4MB/stream. \
-                      Runs with `pipefail`, so a pipeline's `status` is its failing \
-                      stage's and not just the last one's — `cargo test 2>&1 | tail \
-                      -5` reports the test run, not `tail`. (Truncating with `head` \
-                      is still a success.) One consequence worth knowing: `grep` \
-                      exits 1 when it matches nothing, so a grep pipeline that found \
-                      nothing reports a non-zero status. A command that could not be \
-                      run at all (not found, not executable) rejects instead of \
-                      resolving — there is no result to read, and an empty stdout \
-                      would otherwise look like \"nothing to find\"."
+        description: "One short shell command — a single pipeline, no loops; do control flow in JS. Runs with `pipefail`, so the status is the failing stage's, and a `| head` that truncates is still a success. A command that could not be run at all rejects. Non-zero is a result, not an error. 30s timeout, 4MB per stream."
             .into(),
         input_schema: json!({
             "type": "array",
             "items": [
-                { "type": "string", "description": "shell command (kept short)" }
+                { "name": "command", "type": "string", "description": "shell command (kept short)" }
             ],
             "minItems": 1,
             "maxItems": 1
         }),
+        returns: Some(
+            "{ status: number; stdout: string; stderr: string; truncated?: boolean }".into(),
+        ),
         handler: Box::new(|args| {
             // Accept the command as a string, or as an argv array joined
             // with spaces (`bash(["mkdir","-p","/x"])` → "mkdir -p /x") —
@@ -644,24 +618,17 @@ const WAIT_UNTIL_MAX: Duration = Duration::from_secs(15 * 60);
 fn wait_until_def() -> ToolDef {
     ToolDef {
         name: "wait_until".into(),
-        description: "Block until wall-clock time reaches `epoch_ms` (an \
-                      absolute deadline from `Date.now()`), then resolve with \
-                      null; a deadline already past resolves immediately. This \
-                      is how you wait real time out — a polling loop, a \
-                      scheduled check-in — never a busy JS loop (burns fuel, \
-                      time never actually passes) or `bash(\"sleep …\")` (ties \
-                      up a subprocess for the same thing this does directly). \
-                      Capped at 15 minutes per call — for a longer wait, loop \
-                      with several calls instead of one big one."
+        description: "Block until wall-clock `Date.now()` reaches this absolute deadline, then resolve null. A deadline already past resolves at once."
             .into(),
         input_schema: json!({
             "type": "array",
             "items": [
-                { "type": "integer", "description": "epoch milliseconds to wait until" }
+                { "name": "deadlineMs", "type": "integer", "description": "epoch milliseconds to wait until" }
             ],
             "minItems": 1,
             "maxItems": 1
         }),
+        returns: Some("null".into()),
         handler: Box::new(|args| {
             let target_ms = args
                 .get(0)

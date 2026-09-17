@@ -32,6 +32,7 @@ pub fn demo_registry() -> ToolRegistry {
             "type": "array",
             "items": [{ "description": "the value to echo" }]
         }),
+        returns: None,
         handler: Box::new(|args| Ok(args.get(0).cloned().unwrap_or(serde_json::Value::Null))),
     });
     registry

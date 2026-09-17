@@ -58,26 +58,17 @@ pub fn outline_def() -> ToolDef {
         // its top-level definitions") was accurate and said nothing
         // about what is absent, which is what a reader needs in order to
         // pick a different tool.
-        description: "Read a source file and list its top-level definitions: for each, \
-                      { name, kind, start_line, end_line, signature }. Language is \
-                      inferred from the extension. Read-only — no mutation.\n\
-                      \n\
-                      `attributes` carries any attributes/decorators verbatim \
-                      (`#[test]`, `#[allow(dead_code)]`, `@cached`) and `doc` the \
-                      first line of the doc comment.\n\
-                      \n\
-                      NOT included: bodies, call sites, imports, or comment prose \
-                      past that first line. It is an index, not the text — to find \
-                      or match source text, read the file or grep it."
+        description: "Top-level definitions of a source file, language inferred from the extension. Read-only."
             .into(),
         input_schema: json!({
             "type": "array",
             "items": [
-                { "type": "string", "description": "absolute or cwd-relative path" }
+                { "name": "path", "type": "string", "description": "absolute or cwd-relative path" }
             ],
             "minItems": 1,
             "maxItems": 1
         }),
+        returns: Some("{ items: Array<{ name: string; kind: string; line: number }> }".into()),
         handler: Box::new(|args| {
             let path = args
                 .get(0)
@@ -322,30 +313,24 @@ fn signature_first_line(
 pub fn parse_errors_def() -> ToolDef {
     ToolDef {
         name: "parse_errors".into(),
-        description: "Verify syntax: `parse_errors([path])` reads a file and \
-                      checks it; `parse_errors([null, source, lang])` checks \
-                      candidate content the program computed **before writing** — \
-                      no disk touch. Returns { ok, errors: [{ line, col, message }] }; \
-                      a path with no structural parser (e.g. .html, .css) returns \
-                      { ok: null, skipped } so a sweep over mixed files is safe. \
-                      Supported languages: rust, javascript, typescript, python."
+        description: "Check syntax. With a path, reads and checks that file; with `source` and `lang` instead, checks content you computed **before writing it**."
             .into(),
         input_schema: json!({
             "type": "array",
             "items": [
                 {
-                    "oneOf": [
-                        { "type": "string", "description": "absolute or cwd-relative path" },
-                        { "type": "null", "description": "null — use source+lang form" }
-                    ]
+                    "name": "path",
+                    "type": "string",
+                    "description": "path, or null to check `source` instead"
                 },
-                { "type": "string", "description": "source text (required when first arg is null)" },
-                { "type": "string", "description": "language name (required when first arg is null)" }
+                { "name": "source", "type": "string", "description": "content to check, unwritten" },
+                { "name": "lang", "type": "string", "description": "language name, with `source`" }
             ],
             "minItems": 1,
             "maxItems": 3
         }),
 
+        returns: Some("{ ok: boolean; errors: Array<{ line: number; message: string }> }".into()),
         handler: Box::new(|args| {
             let first = args.get(0);
             if first.is_none() || first == Some(&Value::Null) {

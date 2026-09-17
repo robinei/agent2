@@ -2031,6 +2031,7 @@ mod tests {
             name: name.into(),
             description: String::new(),
             input_schema: json!({ "type": "array" }),
+            returns: None,
             handler: Box::new(handler),
         }
     }
@@ -2330,7 +2331,7 @@ mod tests {
         let seen = seen.lock().unwrap();
         let system = &seen.first().expect("a request").messages[0].content;
         assert!(system.starts_with("Programs are written here."));
-        assert!(system.contains("- tools.fetch_page"), "{system}");
+        assert!(system.contains("function fetch_page("), "{system}");
         assert!(
             system.contains("agent prompt here"),
             "agent prompt follows the card"
@@ -2668,7 +2669,7 @@ mod tests {
         };
         assert_eq!(charter, "test agent");
         assert!(
-            system.contains("- tools.fetch_page"),
+            system.contains("function fetch_page("),
             "card present: {system}"
         );
         assert!(

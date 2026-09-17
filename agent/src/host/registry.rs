@@ -15,8 +15,20 @@ pub type ToolHandler = dyn Fn(serde_json::Value) -> Result<serde_json::Value, St
 pub struct ToolDef {
     pub name: String,
     pub description: String,
-    /// JSON schema of the positional argument array.
+    /// JSON schema of the positional argument array. Each item may carry
+    /// a `name`, which is what the TypeScript manifest calls the
+    /// parameter; without one it falls back to a positional `argN`.
     pub input_schema: serde_json::Value,
+    /// The TypeScript type this resolves to, *inside* the promise —
+    /// `"{ status: number; stdout: string }"`, not
+    /// `"Promise<{ … }>"`. `None` renders `unknown`.
+    ///
+    /// A type rather than a sentence because the model already reads
+    /// types: the shape of a result used to be findable only in the
+    /// middle of `description` prose ("Resolves to { status, stdout,
+    /// stderr, truncated? }"), which is a fact stated in the one format
+    /// its reader is *least* practised at.
+    pub returns: Option<String>,
     pub handler: Box<ToolHandler>,
 }
 

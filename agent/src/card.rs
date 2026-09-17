@@ -125,38 +125,86 @@ pub fn active() -> &'static Card {
     ACTIVE.get_or_init(embedded)
 }
 
-/// Per-tool clip for the rendered input schema, carried over unchanged
-/// from the deleted `host/dialect.rs` (22_ONE_VOCABULARY's licensed
-/// step 1: this ~80-line renderer was the one thing `dialect.rs` did
-/// that `card.rs` did not, so it moved here rather than being
-/// reinvented). A schema can run long (nested objects, enums); this
-/// keeps one misbehaving tool from dominating the cache-immutable
-/// prefix the rest of the card sits in front of.
-const SCHEMA_MAX_BYTES: usize = 200;
+/// Per-tool clip for the rendered description. It exists so one
+/// verbose entry cannot dominate the cache-immutable prefix, not as a
+/// budget to write up to — since 27.8 the signature carries the shapes
+/// and the prose says only what a type cannot, so every shipped tool
+/// fits comfortably inside this.
+const DESCRIPTION_MAX_BYTES: usize = 400;
 
-/// The tool manifest appended after [`CARD`]: one line per registered
-/// tool, sorted by name, each with its description and a clipped
-/// preview of its positional-argument schema.
+/// This session's tools, as TypeScript declarations.
 ///
-/// This is the one piece of the system prompt that is a property of
-/// *this session's* registry rather than static text — everything above
-/// it in [`CARD`] is the same for every agent everywhere. Kept as a
-/// separate function (not folded into `CARD` itself) so the immutable
-/// prefix — the part every request shares byte-for-byte, where cache
-/// hits actually pay off — stops at the end of `CARD`, and only the
-/// tail varies per session/allowlist.
+/// **The same format as everything else the model is told.** It used to
+/// be `- tools.bash — <prose> args schema: {"type":"array",…}`, which
+/// states an API in the one notation its reader is least practised at,
+/// and buried the *result* shape in the middle of an English sentence
+/// ("Resolves to { status, stdout, stderr, truncated? }"). A model that
+/// has read a great deal of TypeScript should be handed a `.d.ts`.
+///
+/// Parameter names come from each schema item's `name`, optionality
+/// from its position against `minItems`, and the return type from
+/// `ToolDef::returns`. A tool that supplies neither still renders — as
+/// `argN: unknown` and `Promise<unknown>` — because a manifest that
+/// omits a live tool is worse than one that describes it thinly.
+fn ts_type(schema: &serde_json::Value) -> &'static str {
+    match schema.get("type").and_then(|t| t.as_str()) {
+        Some("string") => "string",
+        Some("integer") | Some("number") => "number",
+        Some("boolean") => "boolean",
+        Some("array") => "unknown[]",
+        Some("object") => "Record<string, unknown>",
+        _ => "unknown",
+    }
+}
+
 pub fn tool_manifest(registry: &crate::host::ToolRegistry) -> String {
     let mut manifest = String::new();
     let mut tools: Vec<_> = registry.iter().collect();
+    if tools.is_empty() {
+        return manifest;
+    }
     tools.sort_by(|a, b| a.name.cmp(&b.name));
+    // A namespace, because that is how they are *called*. Declared bare
+    // they would read as globals beside `spawn` and `ask`, and the one
+    // thing the `tools.` prefix reliably signals — that these are this
+    // session's configured capabilities — would be missing from the
+    // only place the model reads their names.
+    manifest.push_str("\n\ndeclare namespace tools {");
     for def in tools {
+        let items = def
+            .input_schema
+            .get("items")
+            .and_then(|i| i.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let required = def
+            .input_schema
+            .get("minItems")
+            .and_then(|n| n.as_u64())
+            .unwrap_or(items.len() as u64) as usize;
+        let params: Vec<String> = items
+            .iter()
+            .enumerate()
+            .map(|(i, item)| {
+                let name = item
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("arg{i}"));
+                let opt = if i >= required { "?" } else { "" };
+                format!("{name}{opt}: {}", ts_type(item))
+            })
+            .collect();
+        let returns = def.returns.as_deref().unwrap_or("unknown");
         manifest.push_str(&format!(
-            "\n- tools.{} — {} args schema: {}",
+            "\n  /** {} */\n  function {}({}): Promise<{}>;\n",
+            crate::report::clip(&def.description, DESCRIPTION_MAX_BYTES),
             def.name,
-            def.description,
-            crate::report::clip(&def.input_schema.to_string(), SCHEMA_MAX_BYTES),
+            params.join(", "),
+            returns,
         ));
     }
+    manifest.push_str("}\n");
     manifest
 }
 
@@ -210,30 +258,72 @@ mod tests {
         registry.register(ToolDef {
             name: "fetch_page".into(),
             description: "Fetch a URL and return its body text.".into(),
-            input_schema: json!({ "type": "array", "items": [{ "type": "string" }] }),
+            input_schema: json!({
+                "type": "array",
+                "items": [
+                    { "name": "url", "type": "string" },
+                    { "name": "timeoutMs", "type": "integer" }
+                ],
+                "minItems": 1
+            }),
+            returns: Some("{ body: string }".into()),
+            handler: Box::new(|_| Ok(json!(null))),
+        });
+        // A tool that supplies neither names nor a return type, to pin
+        // that the manifest still renders it rather than dropping it.
+        registry.register(ToolDef {
+            name: "bare".into(),
+            description: "No names, no return type.".into(),
+            input_schema: json!({ "type": "array", "items": [{ "type": "object" }] }),
+            returns: None,
             handler: Box::new(|_| Ok(json!(null))),
         });
         registry
     }
 
     /// `dialect.rs`'s own test, ported: the manifest is generated from
-    /// the registry's schemas, not hand-maintained prose.
+    /// the registry's schemas, not hand-maintained prose — and since
+    /// 27.8 it is generated as TypeScript, the notation its reader is
+    /// most practised at, rather than as JSON Schema embedded in an
+    /// English sentence.
     #[test]
     fn tool_manifest_is_generated_from_schemas() {
         let manifest = tool_manifest(&registry_with_tools());
-        let line = manifest
-            .lines()
-            .find(|l| l.starts_with("- tools.fetch_page"))
-            .expect("a fetch_page line");
-        assert!(line.contains("Fetch a URL and return its body text."));
-        assert!(line.contains(r#"{"type":"array","items":[{"type":"string"}]}"#));
+        assert!(
+            manifest.contains(
+                "function fetch_page(url: string, timeoutMs?: number): \
+                 Promise<{ body: string }>;"
+            ),
+            "{manifest}"
+        );
+        // The description becomes the doc comment, where a reader of
+        // declarations looks for it.
+        assert!(
+            manifest.contains("/** Fetch a URL and return its body text. */"),
+            "{manifest}"
+        );
+        // Optionality is read off `minItems`, not guessed.
+        assert!(manifest.contains("timeoutMs?:"), "{manifest}");
+    }
+
+    /// A tool that names no parameters and declares no return type is
+    /// still declared. A manifest that omits a live tool is worse than
+    /// one that describes it thinly, and `argN: unknown` is honest.
+    #[test]
+    fn a_tool_without_names_or_a_return_type_still_renders() {
+        let manifest = tool_manifest(&registry_with_tools());
+        assert!(
+            manifest.contains("function bare(arg0: Record<string, unknown>): Promise<unknown>;"),
+            "{manifest}"
+        );
     }
 
     #[test]
     fn full_card_appends_the_manifest_after_the_card() {
         let full = full_card(&registry_with_tools());
         assert!(full.starts_with(&card()));
-        assert!(full.contains("- tools.fetch_page"));
+        assert!(full.contains("declare namespace tools {"));
+        assert!(full.contains("function fetch_page("));
     }
 
     #[test]
