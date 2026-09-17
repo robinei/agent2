@@ -46,20 +46,13 @@ declare type Decision = unknown;
  * Say something to the person. Nothing else reaches one — and this
  * reaches nothing else.
  *
- * **A `tell` is not how you carry a finding forward.** What you say
- * here is gone when this program ends: the next program cannot see it,
- * cannot search it, and will go and find the same thing again. What it
- * *can* see is what you `return`, and anything you gave
- * `append_history`. If you are about to tell the person something so
- * that you can act on it afterwards, return it instead — and if it is
- * both, do both.
+ * **Not a way to carry a finding forward.** A later program can read
+ * this program's source, so it will see the sentence you wrote — but
+ * not a value you computed into it, and not in any form it can use. If
+ * you are telling the person something so that you can act on it
+ * later, `return` it or `append_history` it as well.
  *
- * `return` happens once, at the end, and is the language's own way of
- * saying what this step produced. `append_history` can be called any
- * number of times, anywhere — so it is where something worth keeping
- * goes when you *find* it, rather than when you finish.
- *
- * So: the first program says what it is about to do, the program that
+ * The first program says what it is about to do, the program that
  * finishes says what the answer was, and the ones in between usually
  * say nothing at all.
  */

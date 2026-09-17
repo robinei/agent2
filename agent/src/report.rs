@@ -519,24 +519,6 @@ pub fn preview(v: &serde_json::Value) -> String {
 /// The byte budget for *one* argument in a menu row's label.
 pub const LABEL_ARG_MAX_BYTES: usize = 48;
 
-/// What a `tell`/`ask`'s own text may occupy in its row — generous,
-/// where every other argument is stingy.
-///
-/// **Because the person can see it.** 27.2 clipped every argument to
-/// [`LABEL_ARG_MAX_BYTES`] so that `replace_file(path, <the whole
-/// file>)` would stop replaying a result; a `tell` is the opposite of
-/// that and got caught by the same net. If the agent says "I'll check
-/// A, then B, then C" and the program after it cannot see that it said
-/// so, the conversation the person is reading and the conversation the
-/// agent is reading have diverged — which is a defect on runs that
-/// *succeed*, never mind the ones where it re-derives what it already
-/// announced.
-///
-/// Bounded anyway, because `tell(f.content)` is a real habit and the
-/// clip is then informative: a tell long enough to be cut is a tell
-/// that was being used as a dumping ground.
-pub const TELL_MAX_BYTES: usize = 512;
-
 /// The budget for a whole label, bounding a call with many arguments.
 pub const LABEL_MAX_BYTES: usize = 160;
 
