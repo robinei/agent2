@@ -112,10 +112,12 @@ declare function abandon(): Decision;
  *  at the end rather than one apiece. Each throws rather than landing
  *  somewhere you did not mean. */
 declare namespace Edit {
-  /** Replace iff `old` occurs exactly once. Keep it as small as it can
-   *  be while still naming one place: the error carries the real count,
-   *  so widen it when it matches several — and do not pad it with
-   *  unchanged lines when it already matches one. */
+  /** Replace iff `old` occurs exactly once. Copy `old` out of the
+   *  content you are editing — not what you remember it saying — and
+   *  keep it as small as it can be while still naming one place: the
+   *  error carries the real count, so widen it when it matches several,
+   *  and do not pad it with unchanged lines when it already matches
+   *  one. */
   function replaceOnce(text: string, old: string, new_: string): string;
   /** Replace every occurrence, and say how many there were. */
   function replaceCount(text: string, old: string, new_: string): { result: string; count: number };

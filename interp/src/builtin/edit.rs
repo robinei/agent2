@@ -19,17 +19,36 @@ use crate::vm::{ErrorKind, RcStr, VM, VMError, Value};
 /// times in one file. Widening the needle to include the line beneath
 /// it is the fix, and nothing said so.
 fn ambiguous(n: usize, needle: &str) -> String {
+    match_count_error("replaceOnce", n, needle)
+}
+
+/// The same message for every needle-based edit, because the two ways
+/// to miss have different remedies and one message cannot carry both.
+///
+/// **Found several** — widen it. That was the 2026-09-16 case.
+///
+/// **Found none** — the needle was *composed* rather than copied.
+/// Observed 2026-09-17 across four `applyEdits` traps, three of them
+/// zero-match: `fn trim()` where the source reads `fn trim(s: &str) ->
+/// &str {`, and an `@unittest.skip` line reconstructed with the wrong
+/// indentation. The text was written from memory of what the file
+/// probably says. `applyEdits` had one message for both counts and so
+/// told a program to widen a needle that was not there at all.
+fn match_count_error(what: &str, n: usize, needle: &str) -> String {
     let mut shown: String = needle.chars().take(50).collect();
     if shown.len() < needle.len() {
         shown.push('…');
     }
     if n == 0 {
         format!(
-            "replaceOnce found no match for `{shown}` — the text has to appear exactly as written, whitespace included"
+            "{what} found no match for `{shown}` — it has to appear exactly as written, \
+             whitespace and all. Copy it out of the content you read rather than writing \
+             out what you expect to be there."
         )
     } else {
         format!(
-            "replaceOnce expected 1 match, found {n} of `{shown}` — widen it with the surrounding text (the line above or below) until it names one place"
+            "{what} expected 1 match, found {n} of `{shown}` — widen it with the \
+             surrounding text (the line above or below) until it names one place"
         )
     }
 }
@@ -534,8 +553,8 @@ pub fn edit_apply_edits(vm: &mut VM, args: Args) -> Result<Value, VMError> {
             return Err(vm.fail(
                 ErrorKind::ValueError,
                 format!(
-                    "applyEdits: edit[{i}] old={old:?} expected 1 match, found {}",
-                    matches.len()
+                    "applyEdits edit[{i}]: {}",
+                    match_count_error("this edit's `old`", matches.len(), old)
                 ),
             ));
         }
@@ -661,6 +680,46 @@ fn as_non_neg_usize(vm: &VM, val: &Value, label: &str) -> Result<usize, VMError>
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod match_count_tests {
+    use super::match_count_error;
+
+    /// **The two ways to miss have different remedies**, and one
+    /// message cannot carry both. Three of four `applyEdits` traps on
+    /// 2026-09-17 were zero-match — a needle composed from memory
+    /// rather than copied — and the message told the program to widen
+    /// something that was not in the file at all.
+    #[test]
+    fn a_missing_needle_and_an_ambiguous_one_advise_differently() {
+        let none = match_count_error("replaceOnce", 0, "fn trim()");
+        assert!(none.contains("found no match"), "{none}");
+        assert!(
+            none.contains("Copy it out of the content you read"),
+            "{none}"
+        );
+        assert!(
+            !none.contains("widen"),
+            "wrong remedy for a missing needle: {none}"
+        );
+
+        let many = match_count_error("replaceOnce", 4, "#[allow(dead_code)]");
+        assert!(many.contains("found 4"), "{many}");
+        assert!(many.contains("widen it"), "{many}");
+        assert!(
+            !many.contains("Copy it out"),
+            "wrong remedy for an ambiguous one: {many}"
+        );
+    }
+
+    /// Long needles are clipped so one trap cannot dominate a report.
+    #[test]
+    fn a_long_needle_is_clipped() {
+        let msg = match_count_error("replaceOnce", 0, &"x".repeat(400));
+        assert!(msg.contains('…'), "{msg}");
+        assert!(msg.len() < 300, "{} bytes", msg.len());
+    }
+}
 
 #[cfg(test)]
 mod tests {
