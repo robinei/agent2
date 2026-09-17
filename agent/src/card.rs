@@ -33,9 +33,12 @@
 /// makes an ablation a command-line argument rather than a branch.
 ///
 /// Editing the files cannot disturb a conversation already underway:
-/// `Agent.system` snapshots the assembled prompt at an agent's root
-/// (see `types::EventPayload`), so the immutable cache prefix belongs
-/// to the conversation, not to whatever the file says today.
+/// `Agent.system` and `Agent.exemplars` snapshot the whole prefix at an
+/// agent's root (see `types::EventPayload`), so it belongs to the
+/// conversation and not to whatever the files say today. Only `system`
+/// did until 27, which meant this sentence was half true and the half
+/// that was false was invisible — the prose came from the log and the
+/// examples from the running process.
 pub struct Card {
     pub text: String,
     pub exemplars: Vec<Exemplar>,
@@ -178,11 +181,7 @@ pub fn full_card(registry: &crate::host::ToolRegistry) -> String {
 /// Why each of the ten exists, and what live failure it answers, is in
 /// the file it lives in: `agent/card/exemplars/NN-name.js` opens with
 /// the comment that used to sit on this constant.
-#[derive(Clone, Debug)]
-pub struct Exemplar {
-    pub user: String,
-    pub assistant: String,
-}
+pub use crate::types::Exemplar;
 
 /// The exemplars of the active card.
 pub fn seed_exemplars() -> &'static [Exemplar] {

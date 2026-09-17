@@ -132,6 +132,18 @@ pub(crate) fn transport() -> Transport {
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct Document {
     pub messages: Vec<ChatMessage>,
+    /// How many leading messages are preamble — the system message plus
+    /// the worked-example turns. Recorded when the document is built,
+    /// because it is a fact about *this* document and nothing else can
+    /// recover it: it depends on the agent's snapshotted exemplars and
+    /// on the transport, and [`conversation`] used to re-derive it by
+    /// calling `worked_examples()` against today's card and today's
+    /// `AGENT2_TRANSPORT`. Slicing with a number computed from the
+    /// wrong card is how a caller silently reads the tail of the
+    /// preamble as the first real turn.
+    ///
+    /// [`conversation`]: Document::conversation
+    pub preamble: usize,
 }
 
 impl Document {
@@ -140,11 +152,12 @@ impl Document {
     /// about *this branch's* history wants, as opposed to what is sent
     /// on the wire.
     ///
-    /// The preamble is a fixed-size prefix that grows when an exemplar
-    /// is added, so positional indexing into `messages` is a latent
-    /// break in anything that means "the first real turn."
+    /// The preamble is a prefix whose length depends on the agent's own
+    /// snapshotted exemplars and on the transport, so it is *recorded*
+    /// rather than recomputed — positional indexing into `messages` is
+    /// a latent break in anything that means "the first real turn."
     pub fn conversation(&self) -> &[ChatMessage] {
-        &self.messages[1 + worked_examples().len()..]
+        &self.messages[self.preamble.min(self.messages.len())..]
     }
 
     /// Append ephemeral, one-request-only content to the open turn
@@ -393,6 +406,14 @@ fn pending_line(
 /// turn, and flush it into an assistant turn every time a depth-0
 /// `Turn` is reached.
 ///
+/// **The system prompt and the worked examples both come from
+/// `spine.context()`, never from a caller or from today's card.** They
+/// are one prefix, and until 27 only half of it was snapshotted: the
+/// exemplars were re-read from `card::seed_exemplars()` on every
+/// render, so a conversation begun under `--card X` came back with X's
+/// prose in front of the embedded examples in any process that had not
+/// been given `--card X` again.
+///
 /// **The system prompt comes from `spine.context().system`, never a
 /// caller-supplied string.** `EventPayload::Agent.system` is snapshotted
 /// once, at the branch's root, precisely so a later card edit or
@@ -444,12 +465,13 @@ pub fn render(tree: &Tree, spine: &Spine, budget: usize) -> Document {
     let agent = tree
         .enclosing_agent(leaf)
         .expect("a spine's leaf always has an enclosing Agent — spine_at() built it from one");
-    let card = &spine.context().system;
+    let context = spine.context();
     render_with_lookup(
         tree,
         agent,
         leaf,
-        card,
+        &context.system,
+        &context.exemplars,
         budget,
         &tree.compacted_lookup(leaf),
     )
@@ -468,12 +490,14 @@ pub(crate) fn render_with_lookup(
     agent: EventId,
     leaf: EventId,
     card: &str,
+    exemplars: &[Exemplar],
     budget: usize,
     compacted: &HashMap<EventId, CompactedView>,
 ) -> Document {
     let transport = transport();
     let mut messages = vec![ChatMessage::text(ChatRole::System, card.to_owned())];
-    messages.extend(worked_examples());
+    messages.extend(worked_examples(exemplars));
+    let preamble = messages.len();
     let mut pending: Vec<String> = Vec::new();
     let mut cur_agent: Option<EventId> = None;
     let mut depth: usize = 0;
@@ -531,7 +555,7 @@ pub(crate) fn render_with_lookup(
         messages.push(flush_pending(&mut pending, transport, &mut open_call));
     }
 
-    Document { messages }
+    Document { messages, preamble }
 }
 
 /// The assistant's own turn, in whichever shape `transport` wants.
@@ -632,9 +656,9 @@ fn flush_pending(
 /// there is nothing truthful to report. `card::seed_exemplars()` itself
 /// — the FILES this reads from — is untouched by which transport is
 /// active; only this rendering is.
-fn worked_examples() -> Vec<ChatMessage> {
+fn worked_examples(exemplars: &[Exemplar]) -> Vec<ChatMessage> {
     let transport = transport();
-    crate::card::seed_exemplars()
+    exemplars
         .iter()
         .enumerate()
         .flat_map(|(i, ex)| {
@@ -725,6 +749,57 @@ pub fn extract_program(raw: &str) -> String {
 mod tests {
     use super::*;
 
+    /// **The whole prefix belongs to the conversation, not to today's
+    /// card.** `Agent.system` was snapshotted for exactly this reason
+    /// and the exemplars beside it were not: they came from
+    /// `card::seed_exemplars()`, the running process's active card. So
+    /// a conversation begun under `--card X` rendered X's prose in
+    /// front of the *embedded* examples in any process that had not
+    /// been handed `--card X` again — `agent document`, `agent score`
+    /// (which rebuilds `prompt_bytes` by re-rendering, so every
+    /// variant's measured prompt size was wrong), and any resume.
+    ///
+    /// This is the shape of that: a tree whose agent snapshotted one
+    /// exemplar, rendered while the *active* card has none.
+    #[test]
+    fn the_exemplars_come_from_the_agents_snapshot_not_todays_card() {
+        let mut tree = Tree::new(None);
+        let snapshotted = vec![Exemplar {
+            user: "the user turn this branch was born with".into(),
+            assistant: "done();".into(),
+        }];
+        let mut spine = tree
+            .start_agent(None, None, "root", None, "CARD OF THE DAY", snapshotted)
+            .unwrap();
+        tree.append(
+            &mut spine,
+            EventPayload::Message(Message::Post {
+                from: Author::User,
+                origin: Origin::Direct {
+                    text: "go".into(),
+                    input: serde_json::Value::Null,
+                    expects_reply: true,
+                },
+            }),
+        )
+        .unwrap();
+
+        let doc = render(&tree, &spine, 4096);
+        let text: String = doc.messages.iter().map(|m| m.content.clone()).collect();
+        assert!(
+            text.contains("the user turn this branch was born with"),
+            "the branch's own exemplar is missing from its prefix"
+        );
+        // `card::active()` here is the embedded card, with ten of its
+        // own — none of which belong to this conversation.
+        assert_eq!(doc.preamble, 1 + 2, "system + one exemplar's two turns");
+        assert_eq!(
+            doc.conversation().len(),
+            doc.messages.len() - doc.preamble,
+            "and the conversation starts exactly after it"
+        );
+    }
+
     // --- extract_program (folded in from the deleted fence.rs) ---
 
     #[test]
@@ -808,7 +883,9 @@ mod tests {
     #[test]
     fn a_completed_program_renders_card_user_assistant_user() {
         let mut tree = Tree::new(None);
-        let mut spine = tree.start_agent(None, None, "root", None, "CARD").unwrap();
+        let mut spine = tree
+            .start_agent(None, None, "root", None, "CARD", Vec::new())
+            .unwrap();
         tree.append(&mut spine, user_post("hello")).unwrap();
         tree.append(&mut spine, turn("tell('hi'); return 1;"))
             .unwrap();
@@ -840,7 +917,9 @@ mod tests {
     #[test]
     fn a_pushed_deliberation_never_enters_the_document() {
         let mut tree = Tree::new(None);
-        let mut spine = tree.start_agent(None, None, "root", None, "CARD").unwrap();
+        let mut spine = tree
+            .start_agent(None, None, "root", None, "CARD", Vec::new())
+            .unwrap();
         tree.append(&mut spine, user_post("go")).unwrap();
         tree.append(&mut spine, turn("raise('x');")).unwrap();
         tree.append(
@@ -892,7 +971,9 @@ mod tests {
     #[test]
     fn a_compacted_program_renders_as_a_comment_only_assistant_turn() {
         let mut tree = Tree::new(None);
-        let mut spine = tree.start_agent(None, None, "root", None, "CARD").unwrap();
+        let mut spine = tree
+            .start_agent(None, None, "root", None, "CARD", Vec::new())
+            .unwrap();
         tree.append(&mut spine, user_post("go")).unwrap();
         let program = tree.append(&mut spine, turn("1 + 1;")).unwrap();
         tree.append(
@@ -939,7 +1020,9 @@ mod tests {
     #[test]
     fn a_rendered_row_carries_the_label_its_checksum_expects() {
         let mut tree = Tree::new(None);
-        let mut spine = tree.start_agent(None, None, "root", None, "CARD").unwrap();
+        let mut spine = tree
+            .start_agent(None, None, "root", None, "CARD", Vec::new())
+            .unwrap();
         tree.append(
             &mut spine,
             EventPayload::Message(Message::Post {
@@ -1005,7 +1088,9 @@ mod tests {
 
     fn sample_document() -> Document {
         let mut tree = Tree::new(None);
-        let mut spine = tree.start_agent(None, None, "root", None, "CARD").unwrap();
+        let mut spine = tree
+            .start_agent(None, None, "root", None, "CARD", Vec::new())
+            .unwrap();
         tree.append(&mut spine, user_post("hello")).unwrap();
         tree.append(&mut spine, turn("tell('hi'); return 1;"))
             .unwrap();
@@ -1089,7 +1174,9 @@ mod tests {
     fn both_modes_carry_the_same_content() {
         fn build() -> (Tree, Spine) {
             let mut tree = Tree::new(None);
-            let mut spine = tree.start_agent(None, None, "root", None, "CARD").unwrap();
+            let mut spine = tree
+                .start_agent(None, None, "root", None, "CARD", Vec::new())
+                .unwrap();
             tree.append(&mut spine, user_post("hello")).unwrap();
             tree.append(&mut spine, turn("tell('hi'); return 1;"))
                 .unwrap();

@@ -459,7 +459,14 @@ impl Runner {
     pub fn new_root(tree: &mut Tree, charter: impl Into<String>, card: &str) -> io::Result<Self> {
         let charter = charter.into();
         let system = assemble_system(card, &charter);
-        let spine = tree.start_agent(None, None, charter, None, system)?;
+        let spine = tree.start_agent(
+            None,
+            None,
+            charter,
+            None,
+            system,
+            crate::card::seed_exemplars().to_vec(),
+        )?;
         let mut state = Self::with_spine(tree, spine);
         state.dialect_card = card.to_owned();
         Ok(state)
@@ -488,7 +495,14 @@ impl Runner {
     ) -> io::Result<Self> {
         let charter = charter.into();
         let system = assemble_system(card, &charter);
-        let spine = tree.start_agent(Some(call_site), name, charter, tools, system)?;
+        let spine = tree.start_agent(
+            Some(call_site),
+            name,
+            charter,
+            tools,
+            system,
+            crate::card::seed_exemplars().to_vec(),
+        )?;
         let mut state = Self::with_spine(tree, spine);
         state.dialect_card = card.to_owned();
         Ok(state)
@@ -1638,9 +1652,14 @@ impl Runner {
                 _ => {
                     let args = {
                         let vm = self.running_vm();
-                        serde_json::Value::Array(
-                            call.args.iter().map(|v| value_json(vm, v)).collect(),
-                        )
+                        match args_as_json(vm, &call) {
+                            Ok(args) => serde_json::Value::Array(args),
+                            Err(why) => {
+                                self.reject_call(call.promise, &why);
+                                progressed = true;
+                                continue;
+                            }
+                        }
                     };
                     let id = self.issue_call(
                         tree,
@@ -2779,9 +2798,62 @@ fn json_arg(vm: &mut VM, json: &serde_json::Value) -> Value {
     vm.json_to_stack_value(json, 0).unwrap_or(Value::Null)
 }
 
+/// A program value as JSON, with a **visible** stand-in when it has no
+/// JSON form.
+///
+/// The fallback used to be `format!("{v:?}")`, the Rust debug
+/// rendering, which is how a live `skipped-tests` run on 2026-09-17
+/// wrote a file whose entire first line was the word `Undefined`:
+/// something in the program evaluated to `undefined`, `replace_file`
+/// was handed the *string* `"Undefined"`, and it wrote it. Python then
+/// said `NameError: name 'Undefined' is not defined`, several steps
+/// away from the mistake.
+///
+/// A value with no JSON form is a defect in the program either way; the
+/// only question is whether it arrives as something a reader can
+/// recognise. `undefined` specifically is common enough — a missing
+/// property, a function with no return — to name outright. Tool
+/// arguments do better still and refuse the call outright
+/// ([`args_as_json`]); this stays for the paths where there is nobody
+/// left to refuse to.
 fn value_json(vm: &VM, v: &Value) -> serde_json::Value {
-    vm.stack_value_to_json(v, 0)
-        .unwrap_or_else(|_| serde_json::Value::String(format!("{v:?}")))
+    vm.stack_value_to_json(v, 0).unwrap_or_else(|_| {
+        serde_json::Value::String(match v {
+            Value::Undefined => "<undefined — this value has no JSON form>".into(),
+            other => format!("<{other:?} — this value has no JSON form>"),
+        })
+    })
+}
+
+/// Every argument of a call, as JSON, or the index of the first one
+/// that has no JSON form.
+///
+/// **A call whose arguments cannot be represented does not happen.**
+/// Passing `undefined` where a tool expects a string is a mistake the
+/// program can fix, but only if it is told; writing the word
+/// `Undefined` into a source file is a mistake it cannot see at all,
+/// and the failure surfaces later, somewhere else, as somebody else's
+/// syntax error.
+fn args_as_json(vm: &VM, call: &InvokeCall) -> Result<Vec<serde_json::Value>, String> {
+    call.args
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            vm.stack_value_to_json(v, 0).map_err(|_| {
+                let what = match v {
+                    Value::Undefined => "is `undefined`".to_string(),
+                    other => format!("has no JSON form ({other:?})"),
+                };
+                format!(
+                    "{}() argument {} {} — nothing was called. A value that cannot \
+                     cross into a tool is a value the program does not have.",
+                    call.name,
+                    i + 1,
+                    what
+                )
+            })
+        })
+        .collect()
 }
 
 fn render_diags(source: &str, diags: &[Diagnostic]) -> String {
@@ -3464,9 +3536,11 @@ mod tests {
         // an earlier turn, read its id off the menu, wrote
         // `ask("#16", ...)`, and was refused.
         let mut tree = Tree::new(None);
-        let root = tree.start_agent(None, None, "root", None, "card").unwrap();
+        let root = tree
+            .start_agent(None, None, "root", None, "card", Vec::new())
+            .unwrap();
         let child = tree
-            .start_agent(Some(root.leaf_id), None, "worker", None, "card")
+            .start_agent(Some(root.leaf_id), None, "worker", None, "card", Vec::new())
             .unwrap();
         let id = child.leaf_id.as_u64();
         let state = Runner::with_spine(&tree, root);
@@ -3491,10 +3565,12 @@ mod tests {
         // a bare number was accepted, so the documented spelling of the
         // documented pattern could not work.
         let mut tree = Tree::new(None);
-        let root = tree.start_agent(None, None, "root", None, "card").unwrap();
+        let root = tree
+            .start_agent(None, None, "root", None, "card", Vec::new())
+            .unwrap();
         let root_agent = root.leaf_id;
         let child = tree
-            .start_agent(Some(root_agent), None, "worker", None, "card")
+            .start_agent(Some(root_agent), None, "worker", None, "card", Vec::new())
             .unwrap();
         let agent_id = child.leaf_id;
         let state = Runner::with_spine(&tree, root);
@@ -3889,6 +3965,47 @@ mod tests {
             .unwrap();
         assert_eq!(returned[0], json!("the parser drops the last field"));
         assert_eq!(returned[1], json!(src));
+    }
+
+    /// **A call whose arguments cannot be represented does not happen.**
+    /// `undefined` used to reach the tool as the *string* `"Undefined"`
+    /// — the Rust debug rendering, via a lossy fallback — and on
+    /// 2026-09-17 a live run wrote a Python file whose entire first
+    /// line was that word. The program could not see it; Python said
+    /// `NameError: name 'Undefined' is not defined` several steps
+    /// later, and the run failed for a reason unrelated to what it got
+    /// wrong.
+    #[test]
+    fn a_call_with_an_unrepresentable_argument_is_refused_not_stringified() {
+        let (mut tree, mut state) = setup();
+        state.kickoff(&mut tree).unwrap();
+        // `parsed.missing` is undefined; the write must not happen.
+        let src = "const parsed = {};\n\
+                   try { await tools.write_file(\"out.py\", parsed.missing); }\n\
+                   catch (e) { tell(`refused: ${e}`); }\n\
+                   done();";
+        let out = state
+            .step(&mut tree, StepInput::LlmResponse(llm_program(src)))
+            .unwrap();
+        let settled = drain(&mut state, &mut tree, out);
+        assert!(
+            !settled
+                .iter()
+                .any(|o| matches!(o, StepOutput::ToolCalls(_))),
+            "the write was issued anyway"
+        );
+        let said: Vec<String> = tree
+            .events
+            .values()
+            .filter_map(|e| match &e.payload {
+                EventPayload::Call(Call::Send { text, .. }) => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            said.iter().any(|t| t.contains("argument 2 is `undefined`")),
+            "the program is told which argument, and that nothing ran: {said:?}"
+        );
     }
 
     #[test]

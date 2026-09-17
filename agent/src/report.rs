@@ -1297,7 +1297,7 @@ mod tests {
     fn fixture(source: &str, outcome: EventPayload) -> (Tree, crate::types::EventId) {
         let mut tree = Tree::new(None);
         let mut spine = tree
-            .start_agent(None, None, "root", None, "SYSTEM")
+            .start_agent(None, None, "root", None, "SYSTEM", Vec::new())
             .unwrap();
         tree.append(
             &mut spine,
@@ -1525,7 +1525,9 @@ mod tests {
     #[test]
     fn reports_partition_the_artifacts_they_list() {
         let mut tree = Tree::new(None);
-        let mut spine = tree.start_agent(None, None, "agent", None, "").unwrap();
+        let mut spine = tree
+            .start_agent(None, None, "agent", None, "", Vec::new())
+            .unwrap();
         let mut ids = Vec::new();
         let mut outcomes = Vec::new();
         // Two handbacks, each with its own call and result.
@@ -1905,7 +1907,7 @@ mod tests {
     fn derived_label_has_no_id_or_author_decoration() {
         let mut tree = Tree::new(None);
         let mut spine = tree
-            .start_agent(None, None, "root", None, "SYSTEM")
+            .start_agent(None, None, "root", None, "SYSTEM", Vec::new())
             .unwrap();
         tree.append(
             &mut spine,

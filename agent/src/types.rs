@@ -84,6 +84,25 @@ pub enum EventPayload {
         tools: Option<Vec<String>>,
         /// The assembled system prompt, snapshotted at creation.
         system: String,
+        /// The worked examples, snapshotted at creation for the same
+        /// reason `system` is — **and they were not, until it turned
+        /// out that half a snapshot protects nothing.**
+        ///
+        /// The cache-immutable prefix is the system message *and* the
+        /// worked-example turns that follow it. `document::render` read
+        /// `system` from here and the exemplars from
+        /// `card::seed_exemplars()` — the *current process's* active
+        /// card — so a conversation started under `--card X` rendered X's
+        /// prose in front of the embedded card's examples the moment
+        /// anything read the log without passing `--card X` again. That
+        /// is `agent document`, `agent score` (which reconstructs
+        /// `prompt_bytes` by re-rendering), and any resume.
+        ///
+        /// `card.rs`'s own header claimed the opposite — "editing the
+        /// files cannot disturb a conversation already underway" — and
+        /// was half right for a year.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        exemplars: Vec<Exemplar>,
     },
 
     /// Structural event; roots a **divergent** branch. Parent: the event
@@ -556,6 +575,16 @@ impl Outcome {
 ///
 /// Bodies here are **resolved**: a `Post` that names its `Send` in the log
 /// carries the body inline once it reaches a `Context`.
+/// One worked example: the user turn that opens it and the program
+/// that answers it. Part of the log vocabulary rather than `card.rs`'s
+/// own type, because an agent's exemplars are snapshotted into its
+/// root `Agent` event — see that variant's `exemplars` field.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Exemplar {
+    pub user: String,
+    pub assistant: String,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Context {
     /// What this agent is for (`Agent.charter`).
@@ -563,6 +592,9 @@ pub struct Context {
     /// The system prompt snapshotted at the agent's root (`Agent.system`),
     /// rebuilt into every request verbatim.
     pub system: String,
+    /// The worked examples snapshotted alongside it — the rest of the
+    /// immutable prefix (`EventPayload::Agent.exemplars`).
+    pub exemplars: Vec<Exemplar>,
     pub messages: Vec<Message>,
     /// Posts open on this branch, oldest first: unanswered, expecting a
     /// reply, and at or after this branch's root. **Agents never close** —

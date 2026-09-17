@@ -3166,7 +3166,9 @@ mod tests {
     /// which is what the tests about owing want.
     fn tree_with_open_root() -> Tree {
         let mut tree = Tree::new(None);
-        let mut spine = tree.start_agent(None, None, "root", None, "").unwrap();
+        let mut spine = tree
+            .start_agent(None, None, "root", None, "", Vec::new())
+            .unwrap();
         tree.append(&mut spine, user("q")).unwrap();
         tree.append(&mut spine, assistant("a1")).unwrap();
         tree
@@ -3604,7 +3606,7 @@ mod tests {
         // outcome).
         let mut tree = Tree::new(None);
         let mut spine = tree
-            .start_agent(None, None, "you are an agent", None, "")
+            .start_agent(None, None, "you are an agent", None, "", Vec::new())
             .unwrap();
         tree.append(
             &mut spine,
@@ -3705,7 +3707,9 @@ mod tests {
     #[test]
     fn a_fully_answered_log_opens_idle() {
         let mut tree = Tree::new(None);
-        let mut spine = tree.start_agent(None, None, "root", None, "").unwrap();
+        let mut spine = tree
+            .start_agent(None, None, "root", None, "", Vec::new())
+            .unwrap();
         let question = tree.append(&mut spine, user("q")).unwrap();
         tree.append(&mut spine, assistant("done")).unwrap();
         tree.append(
@@ -4149,7 +4153,14 @@ mod tests {
         // (C1's command), and what is under test is the projection.
         let mut tree = Tree::new(None);
         let mut root = tree
-            .start_agent(None, Some("root".into()), "test agent", None, "test agent")
+            .start_agent(
+                None,
+                Some("root".into()),
+                "test agent",
+                None,
+                "test agent",
+                Vec::new(),
+            )
             .unwrap();
         let spawn = tree
             .append(
@@ -4163,7 +4174,14 @@ mod tests {
             )
             .unwrap();
         let mut worker = tree
-            .start_agent(Some(spawn), Some("w".into()), "worker", None, "worker")
+            .start_agent(
+                Some(spawn),
+                Some("w".into()),
+                "worker",
+                None,
+                "worker",
+                Vec::new(),
+            )
             .unwrap();
         tree.append(&mut worker, user("first question")).unwrap();
         let fork_point = worker.leaf_id;
@@ -4503,7 +4521,7 @@ mod tests {
     fn ambiguous_agent_id_is_refused() {
         let mut tree = Tree::new(None);
         let mut root = tree
-            .start_agent(None, None, "test agent", None, "test agent")
+            .start_agent(None, None, "test agent", None, "test agent", Vec::new())
             .unwrap();
         let spawn = tree
             .append(
@@ -4517,7 +4535,7 @@ mod tests {
             )
             .unwrap();
         let worker = tree
-            .start_agent(Some(spawn), None, "worker", None, "worker")
+            .start_agent(Some(spawn), None, "worker", None, "worker", Vec::new())
             .unwrap();
         let mut sidebar = tree.fork(worker.leaf_id).unwrap();
         tree.append(&mut sidebar, EventPayload::Fork { name: None })
@@ -5604,7 +5622,9 @@ mod tests {
     /// 9 `Turn` on the worker · 10 `Answer` · 11 `Result` (the answer home)
     fn exchange_log(keep: u64) -> Tree {
         let mut tree = Tree::new(None);
-        let mut root = tree.start_agent(None, None, "root", None, "root").unwrap();
+        let mut root = tree
+            .start_agent(None, None, "root", None, "root", Vec::new())
+            .unwrap();
         let step = |tree: &mut Tree, n: u64| -> bool { tree.id_counter < keep && n <= keep };
         if !step(&mut tree, 2) {
             return tree;
@@ -5646,6 +5666,7 @@ mod tests {
                 "worker",
                 None,
                 "worker",
+                Vec::new(),
             )
             .unwrap();
         if !step(&mut tree, 6) {
@@ -5881,7 +5902,9 @@ mod tests {
     #[test]
     fn crash_after_return_completes_the_run() {
         let mut tree = Tree::new(None);
-        let mut root = tree.start_agent(None, None, "root", None, "root").unwrap();
+        let mut root = tree
+            .start_agent(None, None, "root", None, "root", Vec::new())
+            .unwrap();
         tree.append(&mut root, user("go")).unwrap();
         tree.append(
             &mut root,
@@ -5945,7 +5968,9 @@ mod tests {
     #[test]
     fn user_owed_answer_survives() {
         let mut tree = Tree::new(None);
-        let mut root = tree.start_agent(None, None, "root", None, "root").unwrap();
+        let mut root = tree
+            .start_agent(None, None, "root", None, "root", Vec::new())
+            .unwrap();
         tree.append(&mut root, user("go")).unwrap();
         tree.append(
             &mut root,

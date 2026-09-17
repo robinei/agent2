@@ -491,7 +491,10 @@ mod tests {
     use serde_json::json;
 
     fn doc(messages: Vec<ChatMessage>) -> Document {
-        Document { messages }
+        Document {
+            messages,
+            preamble: 0,
+        }
     }
 
     fn msg(role: ChatRole, content: &str) -> ChatMessage {
@@ -572,6 +575,7 @@ mod tests {
                 tool_calls: None,
                 tool_call_id: None,
             }],
+            preamble: 0,
         };
         let body = request_body(
             &request,

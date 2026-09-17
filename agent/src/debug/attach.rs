@@ -2792,7 +2792,9 @@ mod tests {
     #[test]
     fn a_pending_ask_to_user_shows_above_the_input_as_reply_mode() {
         let mut tree = Tree::new(None);
-        let mut spine = tree.start_agent(None, None, "root", None, "sys").unwrap();
+        let mut spine = tree
+            .start_agent(None, None, "root", None, "sys", Vec::new())
+            .unwrap();
         let send = tree
             .append(
                 &mut spine,

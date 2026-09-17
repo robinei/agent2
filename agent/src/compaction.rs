@@ -238,7 +238,7 @@ pub fn compact(
     let agent = tree
         .enclosing_agent(leaf)
         .expect("a spine's leaf always has an enclosing Agent");
-    let card = &spine.context().system;
+    let context = spine.context();
 
     let path = tree.path_events(leaf);
     let mut lookup = tree.compacted_lookup(leaf);
@@ -270,7 +270,15 @@ pub fn compact(
         );
     }
 
-    let doc = document::render_with_lookup(tree, agent, leaf, card, budget, &lookup);
+    let doc = document::render_with_lookup(
+        tree,
+        agent,
+        leaf,
+        &context.system,
+        &context.exemplars,
+        budget,
+        &lookup,
+    );
     let size = rendered_size(&doc);
     if size >= threshold {
         return Err(CompactionError::StillOverThreshold { size, threshold });
@@ -333,7 +341,9 @@ mod tests {
     /// makes the size checks exercisable.
     fn sample_branch() -> (Tree, Spine, EventId, EventId) {
         let mut tree = Tree::new(None);
-        let mut spine = tree.start_agent(None, None, "root", None, "CARD").unwrap();
+        let mut spine = tree
+            .start_agent(None, None, "root", None, "CARD", Vec::new())
+            .unwrap();
         let agent = spine.leaf_id;
         tree.append(
             &mut spine,
@@ -381,7 +391,9 @@ mod tests {
     /// the document — the shape every real run has.
     fn branch_with_a_report() -> (Tree, Spine, EventId) {
         let mut tree = Tree::new(None);
-        let mut spine = tree.start_agent(None, None, "root", None, "CARD").unwrap();
+        let mut spine = tree
+            .start_agent(None, None, "root", None, "CARD", Vec::new())
+            .unwrap();
         let agent = spine.leaf_id;
         tree.append(
             &mut spine,
@@ -724,6 +736,7 @@ mod tests {
                 tool_calls: None,
                 tool_call_id: None,
             }],
+            preamble: 0,
         };
         let as_call = Document {
             messages: vec![ChatMessage {
@@ -735,6 +748,7 @@ mod tests {
                 }]),
                 tool_call_id: None,
             }],
+            preamble: 0,
         };
         assert_eq!(rendered_size(&as_text), program.len());
         assert_eq!(rendered_size(&as_call), rendered_size(&as_text));

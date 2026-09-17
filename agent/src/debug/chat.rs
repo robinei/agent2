@@ -1309,6 +1309,7 @@ mod tests {
                 charter: "be helpful".into(),
                 tools: None,
                 system: String::new(),
+                exemplars: Vec::new(),
             },
         ));
         chat.apply(&post(2, "hi"));
@@ -1367,6 +1368,7 @@ mod tests {
                 charter: "p".into(),
                 tools: None,
                 system: String::new(),
+                exemplars: Vec::new(),
             },
         ));
         chat.apply(&run_program(2));
@@ -1534,6 +1536,7 @@ mod tests {
                 charter: "p".into(),
                 tools: None,
                 system: String::new(),
+                exemplars: Vec::new(),
             },
         ));
         chat.apply(&run_program(2));
@@ -1564,6 +1567,7 @@ mod tests {
                 charter: "p".into(),
                 tools: None,
                 system: String::new(),
+                exemplars: Vec::new(),
             },
         ));
         chat.apply(&run_program(2));
@@ -1623,6 +1627,7 @@ mod tests {
                 charter: "root".into(),
                 tools: None,
                 system: "ROOT SYSTEM PROMPT".into(),
+                exemplars: Vec::new(),
             },
         ));
         chat.apply(&post(3, "root q"));
@@ -1637,6 +1642,7 @@ mod tests {
                 charter: "child".into(),
                 tools: None,
                 system: "CHILD SYSTEM PROMPT".into(),
+                exemplars: Vec::new(),
             },
         ));
 
@@ -1673,6 +1679,7 @@ mod tests {
                 charter: "root".into(),
                 tools: None,
                 system: "SYS".into(),
+                exemplars: Vec::new(),
             },
         ));
         chat.apply(&post(2, "shared question"));
@@ -1777,6 +1784,7 @@ mod tests {
                 charter: "p".into(),
                 tools: None,
                 system: String::new(),
+                exemplars: Vec::new(),
             },
         ));
         chat.apply(&ev(
@@ -1827,6 +1835,7 @@ mod tests {
                 charter: "p".into(),
                 tools: None,
                 system: String::new(),
+                exemplars: Vec::new(),
             },
         ));
         chat.apply(&SessionEvent::Chunk {
@@ -1885,6 +1894,7 @@ mod tests {
                 charter: "p".into(),
                 tools: None,
                 system: String::new(),
+                exemplars: Vec::new(),
             },
         )
     }
