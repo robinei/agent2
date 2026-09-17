@@ -565,6 +565,94 @@ def print_summary(summary: dict):
             print(f"\n(binary {stamp['before']['binary']}, card {stamp['before']['card']})")
 
 
+def wilson(k: int, n: int) -> tuple:
+    """A 95% interval on a pass rate, so k/n is read as the sample it is.
+
+    Wilson rather than the textbook normal interval because these are
+    small n with rates near the ends, where the normal one runs past 0
+    and 1 and is narrowest exactly where it is least trustworthy.
+    """
+    if n == 0:
+        return (0.0, 1.0)
+    z = 1.96
+    phat = k / n
+    denom = 1 + z * z / n
+    centre = (phat + z * z / (2 * n)) / denom
+    half = z * ((phat * (1 - phat) / n + z * z / (4 * n * n)) ** 0.5) / denom
+    return (max(0.0, centre - half), min(1.0, centre + half))
+
+
+def pool_suites(out, parts: list) -> int:
+    """Sum several suites of the *same* configuration into one rate.
+
+    **Because n=7 per task does not resolve the differences we argue
+    from.** Two suites of the identical configuration -- same commit,
+    same card, hashes matching -- came back 26/28 and 21/28 on
+    2026-09-17. A five-point swing from nothing but sampling, which is
+    larger than most of the changes this driver has been used to
+    justify. One suite is one sample of a noisy process, and reporting
+    it as "the number" is how a run of luck becomes a finding.
+
+    Pass counts add. The per-run medians (calls/program, tokens, wall)
+    are averaged weighted by runs and labelled a mean of medians, rather
+    than dressed up as a median of the pool it is not.
+    """
+    stamps, parsed = set(), []
+    for part in parts:
+        d = json.loads(Path(part).read_text())
+        stamp = d.pop("_measured", None)
+        if stamp and stamp.get("changed_mid_run"):
+            print(f"!! {part} was measured against a tree that changed mid-run")
+        if stamp:
+            stamps.add(json.dumps(stamp.get("before", {}), sort_keys=True))
+        parsed.append(d)
+    if len(stamps) > 1:
+        print(
+            "!! these were not all measured against the same binary and card —\n"
+            "   pooling them averages two different systems, which is the one\n"
+            "   thing pooling must not do."
+        )
+        return 2
+
+    COUNTS = ("runs", "passed", "no_run", "failed_with_gap")
+    pooled = {}
+    for d in parsed:
+        for name, s in d.items():
+            acc = pooled.setdefault(name, {"_traps": {}, "_failures": []})
+            for k, v in s.items():
+                if k in COUNTS:
+                    acc[k] = acc.get(k, 0) + v
+                elif isinstance(v, (int, float)):
+                    acc[k] = acc.get(k, 0) + v * s["runs"]
+            for t, n in s.get("traps", {}).items():
+                acc["_traps"][t] = acc["_traps"].get(t, 0) + n
+            acc["_failures"].extend(s.get("failures", []))
+
+    total_k = total_n = 0
+    for name, acc in sorted(pooled.items()):
+        n = acc["runs"]
+        for k in list(acc):
+            if k not in COUNTS and not k.startswith("_"):
+                acc[k] = round(acc[k] / n, 3) if n else 0
+        acc["traps"] = acc.pop("_traps")
+        acc["failures"] = acc.pop("_failures")
+        lo, hi = wilson(acc["passed"], n)
+        total_k += acc["passed"]
+        total_n += n
+        print(f"\n=== {name}  {acc['passed']}/{n}   95% CI {lo:.0%}-{hi:.0%}")
+        print(
+            f"  mean of per-run medians: calls/program {acc['calls_per_program']}"
+            f"   programs {acc['programs']}   provider {acc['provider_s']}s"
+        )
+        print(f"  tokens: {acc['prompt_in']:.0f} in   {acc['completion_out']:.0f} out")
+    lo, hi = wilson(total_k, total_n)
+    print(f"\nall tasks  {total_k}/{total_n}   95% CI {lo:.0%}-{hi:.0%}  ({len(parts)} suites)")
+    if out:
+        Path(out).write_text(json.dumps(pooled, indent=2))
+        print(f"wrote {out}")
+    return 0
+
+
 def compare(before: Path, after: Path):
     """Before/after on the numbers a change is argued from.
 
@@ -622,9 +710,19 @@ def main():
     p.add_argument("--verify-only", action="store_true", help="check the checkers, run nothing")
     p.add_argument("--keep", type=Path, help="keep each run's sandbox and log under here")
     p.add_argument("--compare", nargs=2, type=Path, metavar=("BEFORE", "AFTER"))
+    p.add_argument(
+        "--pool",
+        nargs="+",
+        metavar="SUMMARY",
+        help="sum several suites of the same configuration into one rate with a "
+        "confidence interval — n=7 per task does not resolve a five-point "
+        "difference, and two identical suites have differed by that much",
+    )
     p.add_argument("--rescore", type=Path, help="re-judge a --keep directory, no completions")
     args = p.parse_args()
 
+    if args.pool:
+        return pool_suites(args.out, args.pool)
     if args.compare:
         compare(*args.compare)
         return 0
