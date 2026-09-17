@@ -140,20 +140,37 @@ pub struct ConditionReport {
 
 impl ConditionReport {
     pub fn render(&self) -> String {
-        let mut out = String::new();
-        out.push_str("## what happened\n");
-        out.push_str(&clip(&self.what, WHAT_MAX_BYTES));
-        out.push_str("\n\n## where\n");
+        let mut sections = vec![format!(
+            "## what happened\n{}",
+            clip(&self.what, WHAT_MAX_BYTES)
+        )];
+        // `## where` earns its place only when it says something the
+        // diagnostic did not. A trap's `what` already carries the
+        // failing line with a caret under it, so a stack of nothing but
+        // `<root>` is a heading, a newline and the word "root" spent to
+        // repeat it — the same empty scaffolding `Cause::Compaction`
+        // was carved out of this report for, four runs ago.
         match &self.whence {
-            Whence::Stack(stack) => out.push_str(&render_stack(stack)),
-            Whence::AnnotatedSource(source) => out.push_str(source),
+            Whence::Stack(stack) if !stack_is_bare(stack) => {
+                sections.push(format!("## where\n{}", render_stack(stack)));
+            }
+            Whence::AnnotatedSource(source) => {
+                sections.push(format!("## where\n{source}"));
+            }
+            Whence::Stack(_) => {}
         }
-        out.push('\n');
-        out.push_str(&render_console(&self.console, self.console_id));
-        out.push_str("\n\n");
-        out.push_str(&render_menu("new rows", &self.artifacts));
-        out
+        sections.extend(render_console(&self.console, self.console_id));
+        let menu: Vec<&Artifact> = self.artifacts.iter().collect();
+        sections.extend(render_menu("new rows", &menu));
+        sections.join("\n\n")
     }
+}
+
+/// A stack that names no frame the model did not already know it was
+/// in: empty, or the single synthetic `<root>` every top-level program
+/// runs in.
+fn stack_is_bare(stack: &[String]) -> bool {
+    stack.is_empty() || stack == ["<root>"]
 }
 
 /// The harness `Post` for a program that finished with a `return`.
@@ -204,18 +221,26 @@ pub struct CompletionReport {
 
 impl CompletionReport {
     pub fn render(&self) -> String {
-        let mut out = String::new();
-        out.push_str("## program completed\n");
         let id = self.result_id();
         let rendered = clip_answer(&self.value.to_string(), RETURN_MAX_BYTES, id);
-        match id {
-            Some(id) => out.push_str(&format!("returned [#{id}]: {rendered}")),
-            None => out.push_str(&format!("returned: {rendered}")),
-        }
-        out.push_str("\n\n");
-        out.push_str(&render_console(&self.console, self.console_id));
-        out.push_str("\n\n");
-        out.push_str(&render_menu("new rows", &self.new_artifacts));
+        let mut sections = vec![match id {
+            Some(id) => format!("## program completed\nreturned [#{id}]: {rendered}"),
+            None => format!("## program completed\nreturned: {rendered}"),
+        }];
+        sections.extend(render_console(&self.console, self.console_id));
+        // The `program result` row is left out of the menu on purpose:
+        // the line above it *is* that row, whole when it fits and
+        // naming its own `fetch_history(id)` when `clip_answer` cuts
+        // it. Listing it again below said "→ ok, 343 bytes" about 343
+        // bytes already printed in full — 129 such rows across the 23
+        // runs measured on 2026-09-17, every one of them redundant.
+        let menu: Vec<&Artifact> = self
+            .new_artifacts
+            .iter()
+            .filter(|a| Some(a.id) != id)
+            .collect();
+        sections.extend(render_menu("new rows", &menu));
+        let mut out = sections.join("\n\n");
 
         if self.failed_calls > 0 {
             out.push_str(&format!(
@@ -305,9 +330,12 @@ fn render_stack(stack: &[String]) -> String {
 /// count: the tail was the one truncation in the system with no way back
 /// to the whole, so when it clips it names its `Console` event and
 /// `fetch_history()` reads that event's lines.
-fn render_console(lines: &[String], event: Option<u64>) -> String {
+fn render_console(lines: &[String], event: Option<u64>) -> Option<String> {
     if lines.is_empty() {
-        return "console: (no output)".into();
+        // Nothing printed is not news. This used to render
+        // `console: (no output)` on every report in the system,
+        // including the ones whose program never called `print`.
+        return None;
     }
     let start = lines.len().saturating_sub(CONSOLE_TAIL_LINES);
     let shown = &lines[start..];
@@ -322,14 +350,16 @@ fn render_console(lines: &[String], event: Option<u64>) -> String {
         out.push('\n');
         out.push_str(&clip(line, CONSOLE_LINE_MAX_BYTES));
     }
-    out
+    Some(out)
 }
 
-fn render_menu(title: &str, artifacts: &[Artifact]) -> String {
+/// The menu of rows this run added. `None` when it added none — a
+/// heading advertising `fetch_history(id)` over the word `(none)` is an
+/// invitation to fetch nothing.
+fn render_menu(title: &str, artifacts: &[&Artifact]) -> Option<String> {
     let mut out = format!("## {title} — fetch any of them with fetch_history(id)");
     if artifacts.is_empty() {
-        out.push_str("\n(none)");
-        return out;
+        return None;
     }
     let start = artifacts.len().saturating_sub(MENU_MAX_ENTRIES);
     if start > 0 {
@@ -370,7 +400,7 @@ fn render_menu(title: &str, artifacts: &[Artifact]) -> String {
         };
         out.push_str(&format!("\n[#{}] {} → {}", a.id, a.label, tail));
     }
-    out
+    Some(out)
 }
 
 /// What a delivered row says about itself: that it arrived, and how
@@ -1229,12 +1259,16 @@ pub fn render_fork(tree: &Tree, leaf: EventId, fork: EventId) -> String {
         .unwrap_or(0);
     let segment: Vec<&Event> = path[start..fork_at].to_vec();
     let artifacts = crate::machine::menu_rows(&segment, 0);
-    format!(
+    let menu: Vec<&Artifact> = artifacts.iter().collect();
+    let head = format!(
         "program {program} is running on branch {branch}, not here. This fork inherited \
          its history and its artifacts; the run itself stayed there, so nothing you do \
-         here disturbs it.\n\n{}",
-        render_menu("rows so far", &artifacts)
-    )
+         here disturbs it."
+    );
+    match render_menu("rows so far", &menu) {
+        Some(m) => format!("{head}\n\n{m}"),
+        None => head,
+    }
 }
 
 #[cfg(test)]
@@ -1581,7 +1615,7 @@ mod tests {
     fn console_tails_with_counts_and_clips_lines() {
         let mut lines: Vec<String> = (0..30).map(|i| format!("line {i}")).collect();
         lines.push("y".repeat(1000));
-        let rendered = render_console(&lines, None);
+        let rendered = render_console(&lines, None).expect("lines present");
         assert!(rendered.starts_with("console (last 20 of 31 lines):"));
         // 31 lines, tail of 20: lines 0–10 dropped, 11–29 + long kept.
         assert!(!rendered.contains("line 0"), "older lines dropped");
@@ -1595,7 +1629,8 @@ mod tests {
         let artifacts: Vec<Artifact> = (1..=25)
             .map(|i| artifact(i, &format!("tool_{i}([])"), json!(i)))
             .collect();
-        let rendered = render_menu("artifacts", &artifacts);
+        let menu: Vec<&Artifact> = artifacts.iter().collect();
+        let rendered = render_menu("artifacts", &menu).expect("25 rows");
         assert!(rendered.contains("(5 older rows omitted; their ids stay fetchable)"));
         assert!(!rendered.contains("[#5]"), "old entries gone");
         assert!(rendered.contains("[#6]") && rendered.contains("[#25]"));
@@ -1606,18 +1641,17 @@ mod tests {
     /// id, while an `Invoke`'s worker died with the process.
     #[test]
     fn pending_rows_say_which_can_be_reattached() {
-        let rendered = render_menu(
-            "artifacts",
-            &[
-                pending(11, "ask(#3, \"which file?\")", ArtifactState::PendingSend),
-                pending(12, "send_email([\"…\"])", ArtifactState::PendingInvoke),
-                pending(
-                    13,
-                    "fetch([\"x\"])",
-                    ArtifactState::Failed("host is down".into()),
-                ),
-            ],
-        );
+        let rows = [
+            pending(11, "ask(#3, \"which file?\")", ArtifactState::PendingSend),
+            pending(12, "send_email([\"…\"])", ArtifactState::PendingInvoke),
+            pending(
+                13,
+                "fetch([\"x\"])",
+                ArtifactState::Failed("host is down".into()),
+            ),
+        ];
+        let menu: Vec<&Artifact> = rows.iter().collect();
+        let rendered = render_menu("artifacts", &menu).expect("three rows");
         assert!(
             rendered.contains("[#11] ask(#3, \"which file?\") → pending — await fetch_history(11)"),
             "{rendered}"

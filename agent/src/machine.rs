@@ -3818,12 +3818,10 @@ mod tests {
         // program parks at its *next* fuel slice, rule B's job, so this
         // drains to let that slice actually run. It settles into
         // `Condition::Posted`, which deliberately produces no
-        // `StepOutput::LlmRequest` of its own (`suspend`'s own doc:
-        // "root programs are rendered; handler programs are not" — a
-        // `Pushed` condition is invisible to the rolling document, and
-        // building the one-shot handler prompt from it is the host's
-        // job); the `Post` this test actually checks is what proves the
-        // interrupt landed.
+        // `StepOutput::LlmRequest` of its own — building the prompt
+        // from a suspension is the host's job (`prompt_suspended`), not
+        // this file's; the `Post` this test actually checks is what
+        // proves the interrupt landed.
         let out = state.interrupt(&mut tree).unwrap();
         drain(&mut state, &mut tree, out);
         let posted = state

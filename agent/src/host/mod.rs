@@ -1127,13 +1127,13 @@ impl Session {
         }
         // A run that just suspended into a `Condition` gets no
         // `StepOutput::LlmRequest` from `machine.rs` — deliberately:
-        // `suspend`'s own doc says a `Pushed` condition is invisible to
-        // the rolling document (nothing renders again until a matching
-        // `Return` brings depth back to 0), and building the one-shot
-        // handler prompt from the condition directly is left to this
-        // file. Without this call a raise/trap/rule-B suspend is a dead
-        // end — the branch sits `Suspended` forever, since nothing else
-        // ever asks it for a decision.
+        // asking for the next turn is this file's job, not the
+        // machine's. The condition's report is a row of the document
+        // now (it used to be an ephemeral tail, back when a `Pushed`
+        // condition rendered as nothing at all), so this only has to
+        // make the request. Without it a raise/trap/rule-B suspend is a
+        // dead end — the branch sits `Suspended` forever, since nothing
+        // else ever asks it for a decision.
         if suspended {
             self.prompt_suspended(branch);
         }
@@ -1154,16 +1154,20 @@ impl Session {
             return;
         };
         let leaf = state.spine.leaf_id;
-        let Some(outcome) = latest_condition(&self.tree, leaf) else {
+        if latest_condition(&self.tree, leaf).is_none() {
             return;
-        };
-        let report = crate::report::derive_report(&self.tree, leaf, outcome, document_budget());
+        }
         let StepOutput::LlmRequest(request) = state.render_request(&self.tree) else {
             unreachable!("render_request always returns an LlmRequest");
         };
-        let mut doc = state
-            .document(&self.tree, document_budget())
-            .with_tail(&report);
+        // The condition's own report used to be folded in here as an
+        // ephemeral tail, because `document::render` dropped every
+        // `Pushed` condition. It no longer does: the report is a row of
+        // the document like any other outcome, so attaching it here
+        // would print it twice in this request — and, worse, printing
+        // it *only* here is what made it vanish from every later one,
+        // leaving the program that died renderable as a blank turn.
+        let mut doc = state.document(&self.tree, document_budget());
         if let Some(tail) = &request.tail {
             doc = doc.with_tail(tail);
         }
@@ -2181,37 +2185,29 @@ mod tests {
         derived_reports(session.tree(), root_leaf(session))
     }
 
-    /// Every report a depth-0 request would actually see, in render
-    /// order, paired with the outcome id it was derived from — a test's
-    /// own version of `document::render`'s fold (`document.rs`'s own
-    /// depth-0 match: a `Return`, or a `Condition` whose `disposition`
-    /// is `Handover`, each produce one report; a `Pushed` condition is a
-    /// handler's own interior and stays invisible at depth 0). Replaces
-    /// the POC-era version that zipped a `Turn`'s `tool_calls` against
+    /// Every report a request would actually see, in render order,
+    /// paired with the outcome id it was derived from — a test's own
+    /// version of `document::render`'s fold, and it has to stay that:
+    /// every `Return` and every `Condition` produces one report. It
+    /// used to filter on handler depth and on `Disposition::Handover`,
+    /// mirroring a `render` that did the same; both dropped the filter
+    /// together when an unhandled trap turned out to be stamped
+    /// `Pushed` and to be silently eating whole programs. Replaces the
+    /// POC-era version that zipped a `Turn`'s `tool_calls` against
     /// `outcomes_of_turn` — code mode has no per-call-id pairing to
     /// assert on any more, one program run has exactly one outcome.
     fn derived_with_ids(tree: &Tree, leaf: EventId) -> Vec<(EventId, String)> {
         let mut out = Vec::new();
-        let mut depth: usize = 0;
         for event in tree.path_events(leaf) {
-            if depth == 0 {
-                match &event.payload {
-                    EventPayload::Return { .. } => out.push((
-                        event.id,
-                        crate::report::derive_report(tree, leaf, event.id, 64 * 1024),
-                    )),
-                    EventPayload::Condition { disposition, .. }
-                        if *disposition == Disposition::Handover =>
-                    {
-                        out.push((
-                            event.id,
-                            crate::report::derive_report(tree, leaf, event.id, 64 * 1024),
-                        ));
-                    }
-                    _ => {}
-                }
+            if matches!(
+                event.payload,
+                EventPayload::Return { .. } | EventPayload::Condition { .. }
+            ) {
+                out.push((
+                    event.id,
+                    crate::report::derive_report(tree, leaf, event.id, 64 * 1024),
+                ));
             }
-            depth = crate::tree::depth_after(depth, &event.payload);
         }
         out
     }
@@ -2397,13 +2393,11 @@ mod tests {
     }
 
     /// The artifact menu a suspended `raise` hands the handler names
-    /// every call so far, `send_email` included — but that menu never
-    /// reaches the log as a stored row: `suspend`'s own doc says a
-    /// `Pushed` condition is invisible to `document::render`'s rolling
-    /// fold, so the report that names the call is built fresh by
-    /// `prompt_suspended` and folded in as an ephemeral tail
-    /// (`CapturingLlm`'s own doc: "only ever observable here, live,
-    /// never in `tool_texts`/the log"). This test used to read
+    /// every call so far, `send_email` included. The report carrying
+    /// that menu is a document row now rather than the ephemeral tail
+    /// `prompt_suspended` used to attach, but this test still reads
+    /// `CapturingLlm` rather than the log, because what it is really
+    /// asserting is that a *request went out* carrying the menu. This test used to read
     /// `tool_texts` instead, which — being log-only — could never see it
     /// (silently vacuous: `tool_texts` returned `[]` and the `.expect()`
     /// on "a report listing the artifact" happened to still fire, for
@@ -2524,14 +2518,16 @@ mod tests {
         assert!(program_result.starts_with("rejected: result too large"));
     }
 
-    /// M2, half of it: `raise` with a payload sends the condition report
-    /// as a one-shot, live-only tail the moment a run suspends
-    /// (`prompt_suspended`) — a `Pushed` condition is invisible to
-    /// `document::render`'s rolling fold, so this prompt is never
-    /// observable in the log itself, only by capturing what crossed the
-    /// LLM trait, which is what this test does. Scoped to exactly that:
-    /// the script has no second turn to answer it, on purpose, so this
-    /// stays a test of the *prompt*, not the round trip.
+    /// M2, half of it: `raise` with a payload prompts the moment a run
+    /// suspends (`prompt_suspended`), carrying the condition's report.
+    /// That report used to be a live-only tail, because a `Pushed`
+    /// condition was invisible to `document::render`'s rolling fold; it
+    /// is an ordinary row of the document now, and this test still
+    /// captures what crossed the LLM trait because that is the only
+    /// place the *prompting* is observable — the row alone would not
+    /// prove a request was made. Scoped to exactly that: the script has
+    /// no second turn to answer it, on purpose, so this stays a test of
+    /// the *prompt*, not the round trip.
     ///
     /// **The other half — a completion answering that prompt actually
     /// being read as a decision and resuming the same VM — used to be

@@ -27,7 +27,7 @@
 
 use std::collections::HashMap;
 
-use crate::tree::{CompactedView, depth_after};
+use crate::tree::CompactedView;
 use crate::types::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -425,18 +425,30 @@ fn pending_line(
 /// yesterday's — this function has no way to tell the difference, so it
 /// does not accept the possibility at all.
 ///
-/// **Depth-derived filtering, not a stored flag.** A `Turn` at handler
-/// depth > 0 — a deliberation, still being decided — contributes
-/// nothing here at all (doc 22: "a deliberating handler never enters
-/// the document"); neither does anything it does while running. Only a
-/// `Condition{disposition: Handover}` or a `Return` reached while depth
-/// is already 0 is this branch's own program truly handing back, which
-/// is when its completion report (`report::derive_report`) is inserted
-/// — a `Pushed` condition at depth 0 means a nested handler is about to
-/// run and produces no report yet, because nothing chat-visible has
-/// happened on *this* branch until that handler resolves. `depth_after`
-/// is the single fold this filter shares with `tree::programs_for`'s
-/// own depth field, by construction rather than by convention.
+/// **Every program on this branch renders, and so does every
+/// condition.** It did not used to: a `Turn` at handler depth > 0 was
+/// filtered out entirely (doc 22: "a deliberating handler never enters
+/// the document"), and only a `Condition{disposition: Handover}` or a
+/// `Return` at depth 0 produced a completion report. That was written
+/// for deliberation the model never saw — a handler decided and popped
+/// between two of its turns. Under automatic continuation (27.1) the
+/// model writes the recovery program itself, on this branch, as an
+/// ordinary next turn, and `machine.rs` stamps `Pushed` on a *trap*
+/// as well as a raise. So an unhandled trap pushed the derived depth
+/// to 1 and every program written before something unwound it
+/// vanished: measured on 2026-09-17, a `dead-code-sweep` run lost two
+/// programs including the one that computed the edit it then believed
+/// it had never made ("But I haven't actually written the files"),
+/// while the trap that started it rendered as a **0-byte user turn**
+/// — `flush_pending` on an empty `pending`, because the condition
+/// that suspended the program produced no line.
+///
+/// A condition's report is therefore a row here rather than the
+/// one-shot ephemeral tail `host::prompt_suspended` used to attach:
+/// the model was prompted with it once, and a document that drops it
+/// afterwards is a document in which the program died of nothing. The
+/// same trap twice in one run — seen in these same logs — is what that
+/// costs.
 ///
 /// `budget` is threaded straight to `report::derive_report` for the
 /// completion-report sections it renders (the answer-into-context
@@ -500,7 +512,6 @@ pub(crate) fn render_with_lookup(
     let preamble = messages.len();
     let mut pending: Vec<String> = Vec::new();
     let mut cur_agent: Option<EventId> = None;
-    let mut depth: usize = 0;
     // `Transport::RunProgram` only: the id of the most recent turn's
     // `run_program` call, still unanswered. `flush_pending` consumes it
     // whenever the next block closes — the harness's report on what
@@ -521,34 +532,26 @@ pub(crate) fn render_with_lookup(
         if cur_agent != Some(agent) {
             continue;
         }
-        if depth == 0 {
-            match &ev.payload {
-                EventPayload::Message(Message::Turn { source, .. }) => {
-                    let content = match compacted.get(&ev.id) {
-                        None => source.clone(),
-                        Some(shadow) => compacted_program_comment(ev.id, shadow),
-                    };
-                    messages.push(flush_pending(&mut pending, transport, &mut open_call));
-                    let (assistant, call_id) = assistant_turn(transport, ev.id, content);
-                    messages.push(assistant);
-                    open_call = call_id;
-                }
-                EventPayload::Return { .. } => {
-                    pending.push(report_line(tree, leaf, ev.id, budget, compacted));
-                }
-                EventPayload::Condition { disposition, .. } => {
-                    if *disposition == Disposition::Handover {
-                        pending.push(report_line(tree, leaf, ev.id, budget, compacted));
-                    }
-                }
-                _ => {
-                    if let Some(line) = pending_line(tree, leaf, ev, compacted) {
-                        pending.push(line);
-                    }
+        match &ev.payload {
+            EventPayload::Message(Message::Turn { source, .. }) => {
+                let content = match compacted.get(&ev.id) {
+                    None => source.clone(),
+                    Some(shadow) => compacted_program_comment(ev.id, shadow),
+                };
+                messages.push(flush_pending(&mut pending, transport, &mut open_call));
+                let (assistant, call_id) = assistant_turn(transport, ev.id, content);
+                messages.push(assistant);
+                open_call = call_id;
+            }
+            EventPayload::Return { .. } | EventPayload::Condition { .. } => {
+                pending.push(report_line(tree, leaf, ev.id, budget, compacted));
+            }
+            _ => {
+                if let Some(line) = pending_line(tree, leaf, ev, compacted) {
+                    pending.push(line);
                 }
             }
         }
-        depth = depth_after(depth, &ev.payload);
     }
 
     if !pending.is_empty() {
@@ -978,13 +981,18 @@ mod tests {
         assert_eq!(conv[2].role, ChatRole::User);
     }
 
-    /// A `Turn` at handler depth > 0 — a deliberation still being
-    /// decided — contributes nothing to the document: not the turn
-    /// itself, not anything it does while running. Only once the
-    /// raising program's own outcome lands (here, its `Return` after
-    /// the nested handler resumed it) does a report appear.
+    /// A handler's deliberation renders like any other program,
+    /// because under automatic continuation it *is* one: the model was
+    /// prompted with the condition report and wrote `return resume(1)`
+    /// as its next turn. This test used to assert the opposite — that
+    /// a `Turn` at handler depth > 0 contributed nothing — and the
+    /// filter it pinned had a second, unintended customer: `machine.rs`
+    /// stamps `Disposition::Pushed` on a **trap** too, so an unhandled
+    /// trap raised the derived depth and silently swallowed every
+    /// program until something unwound it. See [`render_with_lookup`]'s
+    /// own doc for the run that cost.
     #[test]
-    fn a_pushed_deliberation_never_enters_the_document() {
+    fn a_deliberation_renders_like_any_other_program() {
         let mut tree = Tree::new(None);
         let mut spine = tree
             .start_agent(None, None, "root", None, "CARD", Vec::new())
@@ -1023,13 +1031,82 @@ mod tests {
         .unwrap();
 
         let doc = render(&tree, &spine, 64 * 1024);
-        // card, user("go"), assistant("raise('x');"), user(report) —
-        // never the handler's own turn.
-        assert_eq!(doc.conversation().len(), 3);
-        assert_eq!(doc.conversation()[1].content, "raise('x');");
+        let conv = doc.conversation();
+        // user("go") / assistant(raise) / user(the raise's own report,
+        // which is what the model was prompted with) / assistant(the
+        // decision it wrote back) / user(both returns).
+        assert_eq!(conv.len(), 5, "{doc:?}");
+        assert_eq!(conv[1].content, "raise('x');");
+        assert_eq!(conv[3].content, "return resume(1);");
         assert!(
-            !doc.messages.iter().any(|m| m.content.contains("resume(1)")),
-            "the handler's own deliberation must never reach this document: {doc:?}"
+            !conv[2].content.is_empty(),
+            "a condition that suspended the program renders its report, \
+             never an empty turn the model has to infer from: {doc:?}"
+        );
+    }
+
+    /// The bug the depth filter actually had. `machine.rs` stamps
+    /// `Disposition::Pushed` on a **trap**, not just a raise, and
+    /// nothing handles a trap — under automatic continuation the model
+    /// is prompted and writes an ordinary next program. So the filter
+    /// read "a handler is deliberating" off a program that had simply
+    /// died, and hid everything written until something unwound it.
+    ///
+    /// Taken from `keepOff2/dead-code-sweep-151849` (2026-09-17): a
+    /// `ReferenceError` on a variable from the previous program, then
+    /// two programs the document dropped — the second of which computed
+    /// the edit and returned it. The program after that wrote "But I
+    /// haven't actually written the files", correctly, from what it
+    /// could see. The run finished having changed nothing.
+    #[test]
+    fn a_trap_hides_neither_itself_nor_the_programs_after_it() {
+        let mut tree = Tree::new(None);
+        let mut spine = tree
+            .start_agent(None, None, "root", None, "CARD", Vec::new())
+            .unwrap();
+        tree.append(&mut spine, user_post("go")).unwrap();
+        tree.append(&mut spine, turn("Edit.applyEdits(fmt.content, []);"))
+            .unwrap();
+        tree.append(
+            &mut spine,
+            EventPayload::Condition {
+                cause: Cause::Trapped {
+                    kind: "ReferenceError".into(),
+                    message: "fmt is not defined".into(),
+                    resumable: true,
+                },
+                site: 0,
+                stack: vec!["<root>".into()],
+                disposition: Disposition::Pushed,
+            },
+        )
+        .unwrap();
+        tree.append(&mut spine, turn("return recompute();")).unwrap();
+        tree.append(
+            &mut spine,
+            EventPayload::Return {
+                value: serde_json::json!("the edit"),
+            },
+        )
+        .unwrap();
+
+        let doc = render(&tree, &spine, 64 * 1024);
+        let conv = doc.conversation();
+        assert_eq!(
+            conv.iter()
+                .filter(|m| m.role == ChatRole::Assistant)
+                .count(),
+            2,
+            "both programs render; the trap is not a handler push: {doc:?}"
+        );
+        assert!(
+            conv[2].content.contains("fmt is not defined"),
+            "the trap says what happened, rather than rendering as a blank \
+             turn the next program has to guess from: {doc:?}"
+        );
+        assert!(
+            doc.messages.iter().any(|m| m.content.contains("the edit")),
+            "the recovery program's own return survives too: {doc:?}"
         );
     }
 
