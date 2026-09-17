@@ -40,11 +40,18 @@ declare type Decision = unknown;
  *
  * **A `tell` is not how you carry a finding forward.** What you say
  * here is gone when this program ends: the next program cannot see it,
- * cannot search it, and will go and find the same thing again. What the
- * next program sees is what you `return`. What your later turns see is
+ * cannot search it, and will go and find the same thing again. What it
+ * *can* see is what you `return`, and anything you gave
  * `append_history`. If you are about to tell the person something so
  * that you can act on it afterwards, return it instead — and if it is
  * both, do both.
+ *
+ * `return` and `append_history` differ in how long they last, not in
+ * who sees them. When the conversation grows too big to send, returns
+ * are dropped first — they are a program's own report, and every call
+ * in them stays fetchable by id — while a note is nearly the last thing
+ * to go. So `return` what the next program needs, and
+ * `append_history` what you will still want many turns from now.
  *
  * So: the first program says what it is about to do, the program that
  * finishes says what the answer was, and the ones in between usually
