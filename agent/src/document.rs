@@ -1222,7 +1222,10 @@ mod tests {
     fn with_transport<T>(value: &str, f: impl FnOnce() -> T) -> T {
         let key = "AGENT2_TRANSPORT";
         let prev = std::env::var(key).ok();
-        // SAFETY: single-threaded test binary — see doc comment above.
+        // SAFETY: the test binary runs on one thread — enforced by
+        // `RUST_TEST_THREADS = "1"` in `.cargo/config.toml`, which
+        // exists for this. It was previously only asserted here,
+        // while `cargo test` ran one thread per core.
         unsafe { std::env::set_var(key, value) };
         let result = f();
         match prev {

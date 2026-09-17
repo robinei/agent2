@@ -2992,18 +2992,28 @@ pub(crate) fn menu_rows(segment: &[&Event], since: u64) -> Vec<Artifact> {
                 EventPayload::Call(call) => Some(Artifact {
                     id,
                     label: call_label(call),
-                    state: match settlement_of(segment, event.id) {
-                        Some(Outcome::Delivered(v)) => ArtifactState::Delivered(v.clone()),
-                        Some(Outcome::Failed(msg)) => ArtifactState::Failed(msg.clone()),
-                        // Only one pending kind can be re-attached: a
-                        // `Send`'s answer is still coming, while a
-                        // `Spawn`/`Fork`/`Invoke`'s worker died with the
-                        // process.
-                        None => match call {
-                            Call::Send { .. } => ArtifactState::PendingSend,
-                            Call::Spawn { .. } | Call::Fork { .. } | Call::Invoke { .. } => {
-                                ArtifactState::PendingInvoke
-                            }
+                    state: match call {
+                        // A `tell` settles, but nothing about the
+                        // settlement is news: it expects no reply, so
+                        // there is neither an answer to await nor a
+                        // value worth a byte count.
+                        Call::Send {
+                            expects_reply: false,
+                            ..
+                        } => ArtifactState::Told,
+                        _ => match settlement_of(segment, event.id) {
+                            Some(Outcome::Delivered(v)) => ArtifactState::Delivered(v.clone()),
+                            Some(Outcome::Failed(msg)) => ArtifactState::Failed(msg.clone()),
+                            // Only one pending kind can be re-attached:
+                            // an `ask`'s answer is still coming, while a
+                            // `Spawn`/`Fork`/`Invoke`'s worker died with
+                            // the process.
+                            None => match call {
+                                Call::Send { .. } => ArtifactState::PendingSend,
+                                Call::Spawn { .. } | Call::Fork { .. } | Call::Invoke { .. } => {
+                                    ArtifactState::PendingInvoke
+                                }
+                            },
                         },
                     },
                 }),
@@ -3278,7 +3288,10 @@ mod tests {
     fn with_transport<T>(value: &str, f: impl FnOnce() -> T) -> T {
         let key = "AGENT2_TRANSPORT";
         let prev = std::env::var(key).ok();
-        // SAFETY: single-threaded test binary — see doc comment above.
+        // SAFETY: the test binary runs on one thread — enforced by
+        // `RUST_TEST_THREADS = "1"` in `.cargo/config.toml`, which
+        // exists for this. It was previously only asserted here,
+        // while `cargo test` ran one thread per core.
         unsafe { std::env::set_var(key, value) };
         let result = f();
         match prev {

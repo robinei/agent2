@@ -97,6 +97,13 @@ pub enum ArtifactState {
     /// An `Invoke`/`Spawn` with no `Result`: issued, and whether it
     /// happened is not knowable from the log. Not re-attachable.
     PendingInvoke,
+    /// A `Send` that expects no reply — a `tell`. It has no settlement
+    /// worth a row's tail either way: pending, there is no answer
+    /// coming to await, and delivered, the value is a receipt whose
+    /// size ("ok, 13 bytes") describes nothing the model said. The card
+    /// declares `tell(text): void`; a tail reading
+    /// `pending — await fetch_history(8)` contradicts it.
+    Told,
 }
 
 /// The **where** section: where the program stopped.
@@ -397,6 +404,7 @@ fn render_menu(title: &str, artifacts: &[&Artifact]) -> Option<String> {
                 format!("pending — await fetch_history({})", a.id)
             }
             ArtifactState::PendingInvoke => "issued; no result recorded; may have happened".into(),
+            ArtifactState::Told => "sent".into(),
         };
         out.push_str(&format!("\n[#{}] {} → {}", a.id, a.label, tail));
     }
