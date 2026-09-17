@@ -64,7 +64,7 @@ pub const PREVIEW_MAX_BYTES: usize = 256;
 
 /// One artifact-menu entry: a `Call` (settled or still pending) or a
 /// `ProgramResult`, named by its event id and fetchable via
-/// `artifact(id)`.
+/// `fetch_history(id)`.
 pub struct Artifact {
     pub id: u64,
     /// Read from the call variant: `ask(to, "…")` / `tell(to, "…")`,
@@ -140,7 +140,7 @@ impl ConditionReport {
         out.push('\n');
         out.push_str(&render_console(&self.console, self.console_id));
         out.push_str("\n\n");
-        out.push_str(&render_menu("new artifacts", &self.artifacts));
+        out.push_str(&render_menu("new rows", &self.artifacts));
         out
     }
 }
@@ -157,7 +157,7 @@ impl ConditionReport {
 /// no turn boundary in the way. So `value` gets exactly the bounded,
 /// shape-first [`preview`] every other artifact in the menu below gets —
 /// never a full copy, budget or no — with its id named so the whole
-/// value is one `artifact()` away.
+/// value is one `fetch_history()` away.
 pub struct CompletionReport {
     /// The program's top-level return value. Rendered as a bounded
     /// preview only; the full value lives at [`Self::result_id`].
@@ -190,7 +190,7 @@ impl CompletionReport {
         out.push_str("\n\n");
         out.push_str(&render_console(&self.console, self.console_id));
         out.push_str("\n\n");
-        out.push_str(&render_menu("new artifacts", &self.new_artifacts));
+        out.push_str(&render_menu("new rows", &self.new_artifacts));
 
         if self.failed_calls > 0 {
             out.push_str(&format!(
@@ -279,7 +279,7 @@ fn render_stack(stack: &[String]) -> String {
 /// The console tail. **Every clip names a fetchable id**, not just a
 /// count: the tail was the one truncation in the system with no way back
 /// to the whole, so when it clips it names its `Console` event and
-/// `artifact()` reads that event's lines.
+/// `fetch_history()` reads that event's lines.
 fn render_console(lines: &[String], event: Option<u64>) -> String {
     if lines.is_empty() {
         return "console: (no output)".into();
@@ -290,7 +290,7 @@ fn render_console(lines: &[String], event: Option<u64>) -> String {
     // Only a clip names the id — an untruncated tail has nothing behind
     // it to fetch, and the wording stays as it was.
     if let (true, Some(id)) = (start > 0, event) {
-        out.push_str(&format!(" — artifact({id}) for all of them"));
+        out.push_str(&format!(" — fetch_history({id}) for all of them"));
     }
     out.push_str("):");
     for line in shown {
@@ -301,7 +301,7 @@ fn render_console(lines: &[String], event: Option<u64>) -> String {
 }
 
 fn render_menu(title: &str, artifacts: &[Artifact]) -> String {
-    let mut out = format!("## {title} — fetch with artifact(id)");
+    let mut out = format!("## {title} — fetch any of them with fetch_history(id)");
     if artifacts.is_empty() {
         out.push_str("\n(none)");
         return out;
@@ -309,7 +309,7 @@ fn render_menu(title: &str, artifacts: &[Artifact]) -> String {
     let start = artifacts.len().saturating_sub(MENU_MAX_ENTRIES);
     if start > 0 {
         out.push_str(&format!(
-            "\n({start} older artifacts omitted; their ids stay fetchable)"
+            "\n({start} older rows omitted; their ids stay fetchable)"
         ));
     }
     for a in &artifacts[start..] {
@@ -339,7 +339,7 @@ fn render_menu(title: &str, artifacts: &[Artifact]) -> String {
             // not a value.
             ArtifactState::Failed(msg) => format!("failed: {}", clip(msg, PREVIEW_MAX_BYTES)),
             ArtifactState::PendingSend => {
-                format!("pending — await artifact({})", a.id)
+                format!("pending — await fetch_history({})", a.id)
             }
             ArtifactState::PendingInvoke => "issued; no result recorded; may have happened".into(),
         };
@@ -533,7 +533,7 @@ pub fn clip(s: &str, max: usize) -> String {
 
 /// Clip a value to a byte budget. Unlike [`clip`], an over-budget clip's
 /// marker names the fetch id so the full value stays reachable
-/// (`artifact(id)`) when one is known.
+/// (`fetch_history(id)`) when one is known.
 ///
 /// **This step's one open question, not resolved here.** DESIGN.md's "No
 /// exception: nothing enters a context unchosen" retires the mechanism
@@ -558,7 +558,12 @@ pub fn clip_answer(s: &str, max: usize, id: Option<u64>) -> String {
         end -= 1;
     }
     match id {
-        Some(id) => format!("{}… [+{} B — artifact({})]", &s[..end], s.len() - end, id),
+        Some(id) => format!(
+            "{}… [+{} B — fetch_history({})]",
+            &s[..end],
+            s.len() - end,
+            id
+        ),
         None => format!("{}… [truncated; {} bytes total]", &s[..end], s.len()),
     }
 }
@@ -1103,7 +1108,7 @@ pub fn annotate_calls<'a>(
         let note = match settled(call.id) {
             Some(Outcome::Delivered(_)) => format!("#{id} done"),
             Some(Outcome::Failed(_)) => format!("#{id} failed"),
-            None if call.is_send => format!("#{id} pending — await artifact({id})"),
+            None if call.is_send => format!("#{id} pending — await fetch_history({id})"),
             None => format!("#{id} issued; may have happened"),
         };
         let line = line_of(call.site).min(notes.len().saturating_sub(1));
@@ -1238,7 +1243,7 @@ pub fn render_fork(tree: &Tree, leaf: EventId, fork: EventId) -> String {
         "program {program} is running on branch {branch}, not here. This fork inherited \
          its history and its artifacts; the run itself stayed there, so nothing you do \
          here disturbs it.\n\n{}",
-        render_menu("artifacts so far", &artifacts)
+        render_menu("rows so far", &artifacts)
     )
 }
 
@@ -1398,7 +1403,7 @@ mod tests {
         // scaffolding around it ("## where", an empty artifact menu)
         // is noise that framed a directive as a post-mortem.
         assert!(!text.contains("## where"), "{text}");
-        assert!(!text.contains("new artifacts"), "{text}");
+        assert!(!text.contains("new rows"), "{text}");
         assert!(text.contains("remove_history"), "names the verbs: {text}");
         assert!(text.contains("rewrite_history"), "{text}");
 
@@ -1599,7 +1604,7 @@ mod tests {
             .map(|i| artifact(i, &format!("tool_{i}([])"), json!(i)))
             .collect();
         let rendered = render_menu("artifacts", &artifacts);
-        assert!(rendered.contains("(5 older artifacts omitted; their ids stay fetchable)"));
+        assert!(rendered.contains("(5 older rows omitted; their ids stay fetchable)"));
         assert!(!rendered.contains("[#5]"), "old entries gone");
         assert!(rendered.contains("[#6]") && rendered.contains("[#25]"));
     }
@@ -1622,7 +1627,7 @@ mod tests {
             ],
         );
         assert!(
-            rendered.contains("[#11] ask(#3, \"which file?\") → pending — await artifact(11)"),
+            rendered.contains("[#11] ask(#3, \"which file?\") → pending — await fetch_history(11)"),
             "{rendered}"
         );
         assert!(
@@ -1683,7 +1688,7 @@ mod tests {
 
     /// Past the preview bound, the value is clipped like any other
     /// artifact — the marker plus its `program result` id is what keeps
-    /// the full value one `artifact()` away, never a bigger inline
+    /// the full value one `fetch_history()` away, never a bigger inline
     /// copy.
     #[test]
     fn large_return_value_is_previewed_with_fetch_id() {

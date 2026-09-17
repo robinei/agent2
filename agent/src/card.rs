@@ -243,7 +243,7 @@ mod tests {
         // `card()` shows up as a diff review must look at, not a byte
         // count that silently drifts. Comparing full text (not just a
         // hash) so the diff itself is legible in a failure message.
-        const EXPECTED_LEN: usize = 17281;
+        const EXPECTED_LEN: usize = 17283;
         assert_eq!(
             card().len(),
             EXPECTED_LEN,
@@ -279,7 +279,7 @@ mod tests {
             "spawn(",
             "fork(",
             "append_history(",
-            "artifact(",
+            "fetch_history(",
             "raise(",
             "resume(",
             "abandon(",
@@ -545,8 +545,8 @@ mod tests {
             payload.len()
         );
         // And the card's other rule: not to read something back the
-        // same turn. There is no matching artifact()/read of this
+        // same turn. There is no matching fetch_history()/read of this
         // call's own value anywhere in the exemplar.
-        assert!(!ex.assistant.contains("artifact("));
+        assert!(!ex.assistant.contains("fetch_history("));
     }
 }

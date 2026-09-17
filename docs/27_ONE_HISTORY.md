@@ -27,7 +27,8 @@ sees:
   So the one thing a compaction program cannot remove is the largest
   thing in the document.
 - **Its content is unrecoverable once compacted — for the rows that are
-  not calls.** `artifact(id)` serves a `Result`, a settled `Call`, a
+  not calls.** *(fixed in 27.4.)* `artifact(id)` served a `Result`, a
+  settled `Call`, a
   `Return` and a `Console`, and refuses the rest. `compaction.rs`'s
   header promises it "never drops an id — only content", and the
   compaction request tells the model "nothing is deleted … its
@@ -121,13 +122,24 @@ freed bytes are the report's, not "some"), and
 `a_call_is_not_a_row_because_the_report_around_it_is`.
 
 **27.4 — `artifact` becomes `fetch_history`, and reaches every row.**
-The rename is only honest with the extension: fetching a compacted
-`Post` must return its original content, or the promise in 27's opening
-stays false. Wide but mechanical — the verb appears in the card, the
-exemplars, every report header, `machine.rs`'s dispatch, and a number
-of tests. Its own commit.
-Gate: `fetch_history` returns a `Post`'s text; returns a compacted
-row's *original* content; still logs nothing (assert no new events).
+*(done.)* The rename is only honest with the extension: fetching a
+compacted `Post` must return its original content, or the promise in
+27's opening stays false.
+
+The extension needed no compaction-aware code, which is the part worth
+keeping. Compaction never touches its target — it appends a
+`Compacted` event that only the *renderer* consults. The fetch reads
+the log, so it reads the original, for free. The document shrinks; the
+history does not.
+
+The menu's own title went with it: `## new artifacts` named a
+compartment that no longer exists, and it is now `## new rows — fetch
+any of them with fetch_history(id)`, in the vocabulary the compaction
+request already used ("each row above carries its `[id]` and its
+label").
+Gate: `fetch_history_reads_a_compacted_post_back_whole` (the original
+text, and the program's three events with nothing added for the fetch),
+`fetch_history_reads_a_note_and_a_program_back`.
 
 **27.5 — the card states the four channels**, and says plainly that
 `tell` reaches a person and nothing else does.

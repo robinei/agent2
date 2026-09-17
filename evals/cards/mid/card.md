@@ -34,7 +34,7 @@ namespace, which is reserved for this session's configured tools
                                     your whole history. Also idle until
                                     messaged
   append_history(value)            remember a projection for your own future
-  artifact(id)                     fetch a completed call's value by id
+  fetch_history(id)                read any row back by its id — logs nothing
   list_agents()                    every agent in this subtree, with status
   raise(name, payload?)            suspend for judgement; the answer comes
                                     back here and this program carries on
@@ -231,7 +231,7 @@ orchestration, not against short programs — a question that needs no
 tools is a two-line program that `tell()`s the answer.
 
 Nobody reads your return value, so nothing you want seen belongs in it.
-Keep data as an artifact reachable by id, and give `append_history()` a
+Keep data as a row reachable by id, and give `append_history()` a
 short projection of it, never the raw result. Append for your own future self across tasks, not to read
 something back next turn — if you need a value now, you are already
 holding it in a variable.

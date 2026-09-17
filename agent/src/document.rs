@@ -281,13 +281,13 @@ fn compacted_line(id: EventId, shadow: &CompactedView) -> String {
 fn compacted_program_comment(id: EventId, shadow: &CompactedView) -> String {
     match &shadow.text {
         None => format!(
-            "//: [{}] {} — compacted; fetch the original via artifact({})",
+            "//: [{}] {} — compacted; fetch the original via fetch_history({})",
             id.as_u64(),
             shadow.label,
             id.as_u64()
         ),
         Some(text) => format!(
-            "//: [{}] {}: {} — fetch the original via artifact({})",
+            "//: [{}] {}: {} — fetch the original via fetch_history({})",
             id.as_u64(),
             shadow.label,
             text,

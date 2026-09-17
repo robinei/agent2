@@ -36,7 +36,7 @@ namespace, which is reserved for this session's configured tools
                                     your whole history. Also idle until
                                     messaged
   append_history(value)            remember a projection for your own future
-  artifact(id)                     fetch a completed call's value by id
+  fetch_history(id)                read any row back by its id — logs nothing
   list_agents()                    every agent in this subtree, with status
   raise(name, payload?)            suspend for judgement; the answer comes
                                     back here and this program carries on

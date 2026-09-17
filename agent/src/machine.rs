@@ -70,12 +70,26 @@ pub const TOOL_ANSWER: &str = "answer";
 /// chose to remember for its own later turns, never re-derived and
 /// never entering anyone else's context.
 pub const TOOL_APPEND_HISTORY: &str = "append_history";
-/// `artifact(id)` — the renamed `tools.tool_result(id)`: id-addressable
-/// fetch from the log, resolved synchronously without a host round
-/// trip. The **only** survivor of the old budgeted-answer machinery
-/// (DESIGN.md "No exception": the artifact model and id-addressable
-/// fetch stay; only the budgeted copy-into-context goes).
-pub const TOOL_ARTIFACT: &str = "artifact";
+/// `fetch_history(id)` — id-addressable fetch from the log, resolved
+/// synchronously without a host round trip. The **only** survivor of
+/// the old budgeted-answer machinery (DESIGN.md "No exception": the
+/// artifact model and id-addressable fetch stay; only the budgeted
+/// copy-into-context goes).
+///
+/// Named `artifact` until 27.4, which is what it was while the thing
+/// it read was a separate compartment — a menu of call results beside
+/// the conversation. There is one history: the menu is those rows
+/// rendered, `append_history` writes one, `remove_history` and
+/// `rewrite_history` shorten one, and this reads one back. A verb
+/// called `artifact` in that set names a compartment that no longer
+/// exists, and it is the only one of the four that did not say what it
+/// operated on.
+///
+/// **Reading is free.** This logs nothing, which is what lets the menu
+/// be an index rather than a replay: a value reaches the *program*
+/// without entering the *document*, so nothing one program fetched is
+/// inflicted on the program after it.
+pub const TOOL_FETCH_HISTORY: &str = "fetch_history";
 /// `remove_history(id, label)` / `rewrite_history(id, label, value)` —
 /// Part E's compaction verbs. Recognized here so a malformed call gets
 /// a precise rejection rather than a confusing round trip to a host
@@ -128,7 +142,7 @@ const INTERRUPT_NOTICE: &str = "The user interrupted your program. It is paused 
      whatever program you write.";
 
 /// Iteration cap for one `Tick`: each extra round requires a synchronous
-/// artifact fetch (`artifact(id)`) to have unblocked the program, but a
+/// artifact fetch (`fetch_history(id)`) to have unblocked the program, but a
 /// pathological program could chain those forever.
 const MAX_PUMP_ROUNDS: usize = 100;
 
@@ -156,7 +170,7 @@ pub enum StepInput {
 
 /// One settled call. It is named by its **logged `Call` event id** — the
 /// log's own key, which is also what the artifact menu shows and what
-/// `artifact(id)` takes, so there is no second id space to keep in step
+/// `fetch_history(id)` takes, so there is no second id space to keep in step
 /// with it.
 pub struct ToolResult {
     pub call: EventId,
@@ -1179,7 +1193,7 @@ impl Runner {
             // A `tell()`'s `Result` is a delivery receipt, not a value
             // anyone asked for — `expects_reply: false` already says so
             // (`Call::Send`'s own doc). It is logged above like any other
-            // artifact (`artifact(id)` can still fetch it), but Rule C
+            // artifact (`fetch_history(id)` can still fetch it), but Rule C
             // exists to protect a call's *value* from going unseen after
             // a resume, and a `tell` has no value to protect: nothing
             // ever holds a promise for it (`Instr::Notify`,
@@ -1276,7 +1290,7 @@ impl Runner {
         };
         format!(
             "A call you issued has settled with no program awaiting it: [#{}] {label} → \
-             {outcome}. Fetch the whole value with artifact({}). Nothing is owed in reply.",
+             {outcome}. Fetch the whole value with fetch_history({}). Nothing is owed in reply.",
             call.as_u64(),
             call.as_u64(),
         )
@@ -1368,7 +1382,7 @@ impl Runner {
     /// re-attach, routing an answer home — matches on the variant, never
     /// on the string again.
     ///
-    /// `artifact(id)` is answered from the log immediately and logs
+    /// `fetch_history(id)` is answered from the log immediately and logs
     /// nothing (returns true if any were — the program can run again);
     /// `spawn`/`ask`/`tell`/`fork` become logged `Call`s; `answer` and
     /// `append_history` settle synchronously, with no host round trip at
@@ -1392,7 +1406,7 @@ impl Runner {
 
         for call in calls {
             match call.name.as_str() {
-                TOOL_ARTIFACT => {
+                TOOL_FETCH_HISTORY => {
                     // **Re-attach, not re-ask.** A call this session
                     // still has in flight is re-registered against the
                     // *current* run, so a rewritten program awaits the
@@ -1408,7 +1422,7 @@ impl Runner {
                         );
                         continue; // no progress: the program parks on it
                     }
-                    let fetched = self.fetch_artifact(&*tree, &call);
+                    let fetched = self.fetch_history(&*tree, &call);
                     let vm = self.running_vm();
                     match fetched {
                         Ok(json) => {
@@ -1871,7 +1885,7 @@ impl Runner {
         Ok(logged)
     }
 
-    /// The call `artifact(id)` should **re-attach** to rather than read:
+    /// The call `fetch_history(id)` should **re-attach** to rather than read:
     /// one this session still has in flight, on this branch's own path.
     fn reattachable(&self, tree: &Tree, call: &InvokeCall) -> Option<EventId> {
         let Some(Value::PosInt(id)) = call.args.first() else {
@@ -1900,18 +1914,36 @@ impl Runner {
         (is_open_send && !inherited).then_some(id)
     }
 
-    /// Serve `artifact(id)` from the log. Accepts a `Result` id or the id
-    /// of the **call** it settles — the menu names calls, so a program
-    /// reuses exactly the ids it was shown. Ids are scoped to this
-    /// agent's spine segment (decision 3: never ancestor artifacts).
-    fn fetch_artifact(&self, tree: &Tree, call: &InvokeCall) -> Result<serde_json::Value, String> {
+    /// Serve `fetch_history(id)` from the log. Accepts a `Result` id or
+    /// the id of the **call** it settles — the menu names calls, so a
+    /// program reuses exactly the ids it was shown. Ids are scoped to
+    /// this agent's spine segment (decision 3: never ancestor
+    /// artifacts).
+    ///
+    /// **Every row, not just the calls.** Until 27.4 this served a
+    /// `Result`, a settled `Call`, a `Return` and a `Console`, and
+    /// refused everything else — so a `Post`, a `Note` and a program's
+    /// own source were unreachable. That made a promise we had been
+    /// repeating false in exactly the case it mattered: `compaction.rs`
+    /// says it "never drops an id — only content", and the compaction
+    /// request tells the model "nothing is deleted". For a compacted
+    /// `Post` there was nothing to fetch, so removing one *was* a
+    /// deletion.
+    ///
+    /// **A compacted row reads back whole**, and needs no code here to
+    /// do it: compaction never touches its target — it appends a
+    /// `Compacted` event that only the *renderer* consults
+    /// (`document::pending_line`). This reads the log, so it reads the
+    /// original. That asymmetry is the design: the document shrinks,
+    /// the history does not.
+    fn fetch_history(&self, tree: &Tree, call: &InvokeCall) -> Result<serde_json::Value, String> {
         let id = match call.args.first() {
             Some(Value::PosInt(n)) => *n,
-            _ => return Err("artifact needs a numeric id".into()),
+            _ => return Err("fetch_history needs a numeric id".into()),
         };
         let segment = self.agent_segment(tree);
         let Some(event) = segment.iter().find(|e| e.id.as_u64() == id) else {
-            return Err(format!("no artifact #{id} in this agent"));
+            return Err(format!("no row #{id} in this agent"));
         };
         match &event.payload {
             EventPayload::Result { outcome, .. } => outcome_json(outcome),
@@ -1938,7 +1970,29 @@ impl Runner {
                     .map(|l| serde_json::Value::String(l.clone()))
                     .collect(),
             )),
-            _ => Err(format!("event #{id} is not an artifact")),
+            // The conversation's own rows. A `Post` resolves through
+            // the tree first, because its body may live on the `Send`
+            // that produced it rather than inline (`Message::Post`'s
+            // `origin`) — the same `resolve` the renderer calls, so a
+            // fetch and a render can never disagree about what a post
+            // said.
+            EventPayload::Message(msg @ Message::Post { .. }) => match tree.resolve(msg) {
+                Message::Post { origin, .. } => Ok(serde_json::Value::String(
+                    origin.direct().map(|(t, _, _)| t).unwrap_or("").to_owned(),
+                )),
+                _ => unreachable!("resolve() never changes a Post's variant"),
+            },
+            // A program's own source, so a compacted turn can be read
+            // back by the turn that needs to know what it did.
+            EventPayload::Message(Message::Turn { source, .. }) => {
+                Ok(serde_json::Value::String(source.clone()))
+            }
+            EventPayload::Note { text } => Ok(serde_json::Value::String(text.clone())),
+            // Genuinely not a row: the agent's own root, a `Compacted`
+            // event at its own position, structure. `document::label_of`
+            // has no name for these either, and `compaction.rs` refuses
+            // them for the same reason.
+            _ => Err(format!("#{id} is not a row of this conversation")),
         }
     }
 
@@ -2570,7 +2624,7 @@ impl Runner {
             lines.push(format!(
                 "{count} artifacts on this branch, #{first}–#{last}. A report lists only \
                  what is new since the last one; every id above stays fetchable with \
-                 artifact(id)."
+                 fetch_history(id)."
             ));
         }
         lines.push(if self.attached { PRESENT } else { ABSENT }.to_owned());
@@ -2730,7 +2784,7 @@ pub(crate) fn settlement_of<'e>(segment: &[&'e Event], call: EventId) -> Option<
 /// log is the cache and the event id is the key.
 ///
 /// Rows are named by the **call** id, which is what a program reuses:
-/// `artifact(id)` resolves a call id through to its `Result`.
+/// `fetch_history(id)` resolves a call id through to its `Result`.
 pub(crate) fn menu_rows(segment: &[&Event], since: u64) -> Vec<Artifact> {
     segment
         .iter()
@@ -3682,7 +3736,7 @@ mod tests {
 
         let out = state.abandon(&mut tree).unwrap();
         drain(&mut state, &mut tree, out);
-        let rewrite = format!("return await artifact({});", id.as_u64());
+        let rewrite = format!("return await fetch_history({});", id.as_u64());
         let out = state
             .step(&mut tree, StepInput::LlmResponse(llm_program(&rewrite)))
             .unwrap();
@@ -3694,6 +3748,128 @@ mod tests {
             "served from the log, no call re-issued"
         );
         assert!(last_report(&state, &tree).contains("DATA"));
+    }
+
+    /// **A compacted row reads back whole.** `compaction.rs` promises
+    /// it "never drops an id — only content", and the compaction
+    /// request tells the model "nothing is deleted". Until 27.4 that
+    /// was false for a `Post`: the fetch refused anything that was not
+    /// a call, a return or a console, so removing a post's content
+    /// really was deleting it.
+    ///
+    /// Nothing in the fetch knows about compaction and nothing needs
+    /// to: a `Compacted` event shadows its target only for the
+    /// *renderer*, and this reads the log. The document shrinks; the
+    /// history does not.
+    #[test]
+    fn fetch_history_reads_a_compacted_post_back_whole() {
+        let (mut tree, mut state) = setup();
+        let out = user_post(
+            &mut state,
+            &mut tree,
+            "the third column is the one that matters",
+        );
+        drain(&mut state, &mut tree, out);
+        let post = state
+            .agent_segment(&tree)
+            .iter()
+            .rev()
+            .find(|e| matches!(e.payload, EventPayload::Message(Message::Post { .. })))
+            .unwrap()
+            .id;
+
+        tree.append(
+            &mut state.spine,
+            EventPayload::Compacted {
+                of: post,
+                label: "post".into(),
+                text: None,
+            },
+        )
+        .unwrap();
+        // It really is gone from what the model reads.
+        let doc = crate::document::render(&tree, &state.spine, TEST_BUDGET);
+        let rendered: String = doc.messages.iter().map(|m| m.content.clone()).collect();
+        assert!(!rendered.contains("third column"), "still in the document");
+
+        let before = payload_kinds(&state, &tree).len();
+        let src = format!("return await fetch_history({});", post.as_u64());
+        let out = state
+            .step(&mut tree, StepInput::LlmResponse(llm_program(&src)))
+            .unwrap();
+        let settled = drain(&mut state, &mut tree, out);
+        assert!(
+            !settled
+                .iter()
+                .any(|o| matches!(o, StepOutput::ToolCalls(_))),
+            "served from the log, no call issued"
+        );
+        let returned = tree
+            .path_events(state.spine.leaf_id)
+            .iter()
+            .rev()
+            .find_map(|e| match &e.payload {
+                EventPayload::Return { value } => Some(value.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(returned, json!("the third column is the one that matters"));
+
+        // **Reading is free.** The fetch adds nothing of its own: only
+        // the program's own events appear, and none of them is a
+        // `Call`/`Result` pair for the fetch. That is what lets the
+        // menu be an index rather than a replay.
+        assert_eq!(
+            &payload_kinds(&state, &tree)[before..],
+            ["Turn", "Return", "Console"],
+            "the fetch logged something of its own"
+        );
+    }
+
+    /// A `Note` and a program's own source come back too — the three
+    /// row kinds 27.4 added, one test each would be three copies of the
+    /// same walk.
+    #[test]
+    fn fetch_history_reads_a_note_and_a_program_back() {
+        let (mut tree, mut state) = setup();
+        state.kickoff(&mut tree).unwrap();
+        let src = "await append_history(\"the parser drops the last field\"); return 1;";
+        let out = state
+            .step(&mut tree, StepInput::LlmResponse(llm_program(src)))
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+        let segment = state.agent_segment(&tree);
+        let note = segment
+            .iter()
+            .find(|e| matches!(e.payload, EventPayload::Note { .. }))
+            .unwrap()
+            .id;
+        let turn = segment
+            .iter()
+            .find(|e| matches!(e.payload, EventPayload::Message(Message::Turn { .. })))
+            .unwrap()
+            .id;
+
+        let fetch = format!(
+            "return [await fetch_history({}), await fetch_history({})];",
+            note.as_u64(),
+            turn.as_u64()
+        );
+        let out = state
+            .step(&mut tree, StepInput::LlmResponse(llm_program(&fetch)))
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+        let returned = tree
+            .path_events(state.spine.leaf_id)
+            .iter()
+            .rev()
+            .find_map(|e| match &e.payload {
+                EventPayload::Return { value } => Some(value.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(returned[0], json!("the parser drops the last field"));
+        assert_eq!(returned[1], json!(src));
     }
 
     #[test]

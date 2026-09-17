@@ -2682,13 +2682,13 @@ mod tests {
         let mut registry = ToolRegistry::new();
         registry.register(tool("fetch", |_| Ok(json!("DATA"))));
         // Event ids are deterministic: Agent 1, Post 2, Turn 3, the fetch
-        // `Call` 4 — so the rewrite names `artifact(4)`, which is the
+        // `Call` 4 — so the rewrite names `fetch_history(4)`, which is the
         // call id the menu shows and which resolves to its `Result`.
         let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
         let llm = CapturingLlm {
             inner: ScriptedLlm::new([
                 scripted_program(r#"await tools.fetch("expensive"); const v = null; return v.x;"#),
-                scripted_program("return await artifact(4);"),
+                scripted_program("return await fetch_history(4);"),
             ]),
             seen: std::sync::Arc::clone(&seen),
         };
@@ -5409,7 +5409,7 @@ mod tests {
         let tree = session.tree();
 
         // The call and its delivery receipt are both logged — the
-        // physics happened and `artifact(id)` can still find it — but
+        // physics happened and `fetch_history(id)` can still find it — but
         // nothing about it is a `Post`, and the program's own turn is
         // the only one on the branch.
         assert_eq!(
@@ -5536,7 +5536,7 @@ mod tests {
         // renamed with the namespace") — `settled_notice` already emits
         // the new name; this assertion just hadn't been ported.
         assert!(
-            text.contains(&format!("artifact({})", call.as_u64())),
+            text.contains(&format!("fetch_history({})", call.as_u64())),
             "{text}"
         );
         // The branch woke on it — a bare reply, closing nothing
@@ -6076,13 +6076,13 @@ mod tests {
                     )],
                 ),
                 // The child re-attaches to the call it already made,
-                // instead of asking a second time. `artifact(id)` is the
+                // instead of asking a second time. `fetch_history(id)` is the
                 // bare global `tools.tool_result` was renamed into
                 // (namespace dropped, 20_CODE_MODE.md).
                 (
                     "worker",
                     vec![scripted_program(&format!(
-                        "return await artifact({});",
+                        "return await fetch_history({});",
                         send.as_u64()
                     ))],
                 ),

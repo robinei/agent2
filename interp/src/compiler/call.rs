@@ -684,7 +684,7 @@ impl super::Compiler {
                 self.emit(Instr::Invoke(name.into(), argv.len() as u32), span);
                 self.emit(Instr::Await, span);
             }
-            "ask" | "answer" | "append_history" | "artifact" | "list_agents" => {
+            "ask" | "answer" | "append_history" | "fetch_history" | "list_agents" => {
                 // The closed, harness-defined vocabulary (phase 20 doc,
                 // `docs/20_CODE_MODE.md` Step C1) — a fixed global
                 // surface, identical for every agent, known to this

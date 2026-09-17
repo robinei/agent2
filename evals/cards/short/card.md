@@ -80,6 +80,18 @@ saying so — everything else that differs stops the program and tells you:
                                  `{ name, message }`; branch on
                                  `e.name`, not on its type
 
+**Keep each program short.** Two or three calls and a little glue is
+the usual size. You are not trying to finish the task in one program —
+you are doing the next coherent piece of it with the last result in
+hand, and handing what you found to the program after this one. A loop
+still belongs in one program when the same procedure repeats over a
+list; what does not belong is planning branches you have not reached.
+
+`next_program(value)` ends this program and the next one continues,
+with `value` in front of it. That is how the work goes on, and it costs
+one inference — the same as any other step. Use it whenever there is
+more to do.
+
 **There are two ways to stop, and only one of them continues.**
 `next_program(payload)` ends this program and the next one runs. A bare
 `return` — or simply running off the end — ends the *conversation*:

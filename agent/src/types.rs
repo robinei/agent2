@@ -114,7 +114,7 @@ pub enum EventPayload {
     /// **dispatch** (17_BRANCHES A2). Parent: the owning agent's spine,
     /// between the program's `Turn` and its eventual `Return`/`Condition`.
     /// Renders to chat: no — queried for replay, the artifact menu, and
-    /// UI. Addressable via `artifact(id)`, which resolves a call id
+    /// UI. Addressable via `fetch_history(id)`, which resolves a call id
     /// through to its `Result`.
     ///
     /// Logging at issue rather than at resolution is what distinguishes a
@@ -203,7 +203,7 @@ pub enum EventPayload {
     ///
     /// A compacted **program** (a `Turn`) renders as a comment-only
     /// assistant turn — still valid JavaScript, still carrying its own
-    /// id, saying how to fetch the original (`artifact(id)`) — rather
+    /// id, saying how to fetch the original (`fetch_history(id)`) — rather
     /// than as a non-assistant stub. That is what keeps role alternation
     /// intact under compaction with no special case: whatever occupies
     /// the assistant's slot in the rendered transcript is still an

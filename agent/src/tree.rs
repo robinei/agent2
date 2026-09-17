@@ -685,7 +685,7 @@ impl Tree {
     /// *same* depth, a flat sibling rather than a nested child. This is
     /// the deliberate choice for what handler programs look like here:
     /// every one is independently addressable by its own id (an
-    /// `artifact(id)` target, a debugger-pane row of its own), and the
+    /// `fetch_history(id)` target, a debugger-pane row of its own), and the
     /// `depth` field is what lets a caller draw the nesting doc 22's
     /// render-axes table calls a "nested handler block" — a single flat
     /// `Vec` was rejected because collapsing a deliberation into its

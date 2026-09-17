@@ -225,7 +225,7 @@ fn raise_non_literal_name_is_compile_error() {
 // ── phase 20 harness vocabulary: bare-global verbs + decision values
 // (`docs/20_CODE_MODE.md` Step C1/D2) ─────────────────────────────
 //
-// `tell`/`ask`/`answer`/`spawn`/`fork`/`append_history`/`artifact` are
+// `tell`/`ask`/`answer`/`spawn`/`fork`/`append_history`/`fetch_history` are
 // a fixed, closed surface — bare-global, `Invoke`-based, exactly like
 // `tools.*` above but without the namespace, since (unlike `tools.*`)
 // this set never varies per agent. `resume`/`abandon` are pure
@@ -257,7 +257,7 @@ fn awaited_harness_verb_calls_yield_pending_effect() {
             "append_history",
             vec![Value::PosInt(1)],
         ),
-        ("artifact(7)", "artifact", vec![Value::PosInt(7)]),
+        ("fetch_history(7)", "fetch_history", vec![Value::PosInt(7)]),
         (
             "answer(1, 2)",
             "answer",
