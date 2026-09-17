@@ -19,6 +19,14 @@
  * when what to do next depends on reading something, return it and
  * look at it next turn.
  *
+ * **And a call's result is not kept for you.** Afterwards you see that
+ * the call happened and how big its answer was — `bash("grep …") → ok,
+ * 343 bytes` — and not one of those bytes. They reach you only because
+ * you `return` them, or because a later program asks for them by id
+ * with `fetch_history`. A program that finds something and neither
+ * acts on it nor returns it has thrown the finding away, and the
+ * program after it will go and find the same thing again.
+ *
  * When the next step turns on a judgement the data cannot settle —
  * which of these did you mean, is this value still right — stop and
  * get it. `ask("user", …)` if a person has to decide, `raise(…)` if
