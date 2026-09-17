@@ -91,6 +91,16 @@ const COMPACTION_ATTEMPTS: u32 = 2;
 
 pub const TOOL_REMOVE_HISTORY: &str = "remove_history";
 pub const TOOL_REWRITE_HISTORY: &str = "rewrite_history";
+/// `done()` — the only thing that stops the loop. See `finish_program`'s
+/// own comment for the polarity this inverts: completing a program is,
+/// by itself, never enough to rest a branch anymore (on either
+/// transport) — the dominant observed failure across every card variant
+/// and both models is a program that does one step and stops,
+/// abandoning the task, and a *default* rest made that the cheapest
+/// accident to have. Calling `done()` makes stopping an act instead of
+/// an omission: it costs nothing to call correctly, and forgetting it
+/// costs one extra, self-correcting turn rather than an abandoned task.
+pub const TOOL_DONE: &str = "done";
 
 /// Open-post ids named in the request's trailing note before it says
 /// "and N more" — a bounded line, like every other rendered bound.
@@ -402,6 +412,14 @@ pub struct Runner {
     /// document still works, an infinite loop of compaction programs
     /// does not.
     compaction_attempts: u32,
+    /// Whether `done()` (`TOOL_DONE`) was called by the program currently
+    /// running — checked and reset by `finish_program`, which is the
+    /// only reader. A program can call it and keep going (nothing else
+    /// about execution changes), so this has to be recorded at dispatch
+    /// time rather than inferred from anything the completion itself
+    /// carries; `finish_program`'s own comment is where the polarity
+    /// this exists to flip is explained.
+    done: bool,
     /// Runs suspended **beneath** the one currently in `phase`, each
     /// frozen exactly where it stopped, oldest first popped last (a
     /// stack) — see `Phase::Suspended`'s own doc for why this, and not
@@ -481,6 +499,7 @@ impl Runner {
         Runner {
             compacting: None,
             compaction_attempts: 0,
+            done: false,
             spine,
             agent,
             branch,
@@ -1589,6 +1608,19 @@ impl Runner {
                         }
                     }
                 }
+                TOOL_DONE => {
+                    // Not a host call: nothing leaves the process. Recorded
+                    // on the `Runner` rather than resolved-and-forgotten
+                    // because the decision it feeds (rest instead of
+                    // continue) isn't made until the program's return
+                    // value is known, in `finish_program` — a program can
+                    // call `done()` and then keep running (more `tell`s,
+                    // more calls) before actually returning, and the flag
+                    // has to survive to see that.
+                    self.done = true;
+                    self.resolve_call(call.promise, serde_json::Value::Null);
+                    progressed = true;
+                }
                 TOOL_REMOVE_HISTORY | TOOL_REWRITE_HISTORY => {
                     // Not a host call: nothing leaves the process and
                     // nothing settles later. The op joins the batch this
@@ -2123,43 +2155,48 @@ impl Runner {
         // `document.rs::render` derives the completion report straight
         // off this `Return` event on every render (`derive_report`) — no
         // separate "tool result"/harness `Post` for it to answer, and no
-        // subject to force one either. A root program that never calls
-        // `tell()` is a deliberately valid "silent no-op" (card.rs's own
-        // words), so completing must not, on its own, manufacture a
-        // reason to prompt again — that would make a silent no-op cost a
-        // second completion it explicitly doesn't owe, and would leave
-        // `Phase::Idle` unreachable after any ordinary `return` (nothing
-        // else in this file ever routes back to it once a run finishes).
-        // Matches `suspend`'s own depth>0 branch precedent exactly:
-        // `shown` still advances, marking this outcome accounted-for so
-        // `needs_prompt`'s crash-recovery clause doesn't spuriously
-        // re-fire for a completion this file just handled synchronously
-        // (that clause is for a reopened log's genuinely stale `shown`,
-        // not for "immediately after I logged this myself"). Idle is the
-        // resting phase; `prompt_if_needed` is the one door back out of
-        // it, firing only for what is left genuinely unaccounted for — a
-        // post that arrived mid-run and this completion could not have
-        // answered.
+        // subject to force one either.
         //
-        // **Except under `Transport::RunProgram`**, where completing a
-        // program is never the end of the exchange: the return value
-        // just logged is a tool *result*, not a chat reply, and
-        // `document::render` folds it into the next request as the
-        // answer to the still-open `run_program` call rather than
-        // showing it to anyone directly. Advancing `shown` here would
-        // make `needs_prompt`'s own outcome clause — the one thing that
-        // can fire with no unseen `Post` at all — see this outcome as
-        // already accounted for, and `prompt_if_needed` right below
-        // would find nothing to do: the conversation would simply stop,
-        // silently, one round trip after every completed program (the
-        // bug this skip closes). Leaving `shown` where it was costs
-        // nothing extra: `render_request` (called from
-        // `prompt_if_needed`, below) advances it itself the moment a
-        // request actually goes out, exactly as it always has.
-        // `Transport::Program` keeps the unconditional advance, so its
-        // own deliberately valid "silent no-op" stays silent.
-        if crate::document::transport() != crate::document::Transport::RunProgram {
+        // **A program completing continues the conversation by
+        // default, on both transports.** `shown` is what decides that:
+        // left where it was, `needs_prompt`'s outcome clause sees this
+        // `Return` as unshown and `prompt_if_needed` (below) renders the
+        // next request; advanced to the leaf, the branch rests. Before
+        // this it went the other way — `Transport::Program` advanced
+        // unconditionally (rest by default) and only `Transport::
+        // RunProgram` skipped it (97a2622, patching the mirror-image
+        // bug: there, advancing `shown` here made the just-logged
+        // completion read as already accounted for, and the
+        // conversation would simply stop, silently, one round trip
+        // after every completed program). Both readings picked a
+        // default for the same lever; this drops the split and picks
+        // one default for both, because the failure the old default
+        // invited is worse than the one this one invites: the dominant
+        // observed failure across every card variant and both models is
+        // a program that does one step and stops, abandoning the task —
+        // and with rest as the default, the easiest accident (an
+        // ordinary `return` with nothing left to say) causes exactly
+        // that, most expensive, failure. `done()` (`TOOL_DONE`) is the
+        // opt-in the other way: rest happens only when a program
+        // actually said so, so an accidental continuation costs one
+        // visible, self-correcting turn instead.
+        //
+        // Continuing needs nothing else from here: the program's return
+        // value is already rendered into the next request by the
+        // completion report (`document::render`'s own fold), and
+        // `render_request` (called from `prompt_if_needed`, below)
+        // advances `shown` itself the moment that request actually goes
+        // out, exactly as it always has.
+        if self.done {
+            // Matches `suspend`'s own depth>0 branch precedent: `shown`
+            // advances here, marking this outcome accounted-for so
+            // `needs_prompt`'s crash-recovery clause doesn't spuriously
+            // re-fire for a completion this file just handled
+            // synchronously (that clause is for a reopened log's
+            // genuinely stale `shown`, not for "immediately after I
+            // logged this myself").
             self.shown = self.spine.leaf_id.as_u64();
+            self.done = false;
         }
         self.phase = Phase::Idle;
         out.extend(self.prompt_if_needed(tree)?);
@@ -3089,25 +3126,83 @@ mod tests {
         });
     }
 
-    /// The regression guard: the very same scenario, under the default
-    /// transport, must still end the task on completion — a silent no-op
-    /// (this file's own words, `finish_program`) is deliberately valid,
-    /// and `Transport::RunProgram`'s fix above must not leak into it.
+    /// **Superseded by the `done()` change**: this used to pin
+    /// `Transport::Program`'s own regression guard — completing a
+    /// program was a silent no-op by default (this file's old words in
+    /// `finish_program`), and only `Transport::RunProgram` continued.
+    /// That polarity is exactly what this phase inverts (see
+    /// `finish_program`'s current comment): the dominant observed
+    /// failure across every card variant and both models is a program
+    /// that does one step and stops, so completing now continues on
+    /// *both* transports unless the program called `done()`. What was
+    /// this test's assertion is now `done_ends_the_conversation`'s; this
+    /// one instead pins the new default.
     #[test]
-    fn program_mode_still_stops_after_a_program_returns() {
+    fn a_completed_program_continues_by_default() {
         with_transport("program", || {
             let (mut tree, mut state) = setup();
             user_post(&mut state, &mut tree, "go");
             let out = state
-                .step(&mut tree, StepInput::LlmResponse(llm_program("return 1;")))
+                .step(
+                    &mut tree,
+                    StepInput::LlmResponse(llm_program("tell(\"working on it\");")),
+                )
+                .unwrap();
+            let settled = drain(&mut state, &mut tree, out);
+            assert!(
+                settled
+                    .iter()
+                    .any(|o| matches!(o, StepOutput::LlmRequest(_))),
+                "a completed program continues by default now, on both \
+                 transports, unless it called done(): {settled:?}"
+            );
+            assert!(!state.is_idle());
+        });
+    }
+
+    /// `done()` is the one thing that stops the loop (`TOOL_DONE`'s own
+    /// doc): the mirror image of the test above, same shape, only the
+    /// program's text differs.
+    #[test]
+    fn done_ends_the_conversation() {
+        with_transport("program", || {
+            let (mut tree, mut state) = setup();
+            user_post(&mut state, &mut tree, "go");
+            let out = state
+                .step(&mut tree, StepInput::LlmResponse(llm_program("done();")))
                 .unwrap();
             let settled = drain(&mut state, &mut tree, out);
             assert!(
                 !settled
                     .iter()
                     .any(|o| matches!(o, StepOutput::LlmRequest(_))),
-                "Transport::Program's ordinary completion owes no second \
-                 request: {settled:?}"
+                "done() ends the conversation with no further request: {settled:?}"
+            );
+            assert!(state.is_idle());
+        });
+    }
+
+    /// `done()` settles at dispatch (like `spawn`/`fork`), so it is
+    /// recorded on the `Runner` well before the program's own
+    /// completion is known — a call after it in the same program (here,
+    /// a `tell()`) must not un-record it.
+    #[test]
+    fn done_is_recorded_before_the_program_ends() {
+        with_transport("program", || {
+            let (mut tree, mut state) = setup();
+            user_post(&mut state, &mut tree, "go");
+            let out = state
+                .step(
+                    &mut tree,
+                    StepInput::LlmResponse(llm_program("done(); tell(\"wrapping up now\");")),
+                )
+                .unwrap();
+            let settled = drain(&mut state, &mut tree, out);
+            assert!(
+                !settled
+                    .iter()
+                    .any(|o| matches!(o, StepOutput::LlmRequest(_))),
+                "a statement after done() must not cancel it: {settled:?}"
             );
             assert!(state.is_idle());
         });

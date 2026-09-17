@@ -639,6 +639,24 @@ impl super::Compiler {
                 self.emit(Instr::Invoke(name.into(), argv.len() as u32), span);
                 self.emit(Instr::Await, span);
             }
+            "done" => {
+                // The only thing that stops the loop
+                // (`agent/src/machine.rs`'s `TOOL_DONE`): settles at
+                // dispatch exactly like `spawn`/`fork` below, so it
+                // gets the same `Invoke` + `Await` pair rather than
+                // requiring an explicit `await` in the card. Fixed
+                // (zero) arity like `abandon` below — there is no
+                // argument that would mean anything here, so a wrong
+                // count is a clear mistake worth a compile error rather
+                // than silently ignored args.
+                if !argv.is_empty() {
+                    self.error(span, "`done` takes no arguments");
+                    return;
+                }
+                self.compile_args(argv);
+                self.emit(Instr::Invoke(name.into(), argv.len() as u32), span);
+                self.emit(Instr::Await, span);
+            }
             "spawn" | "fork" => {
                 // Creating an agent settles at dispatch: the host appends
                 // an `Agent`/`Fork` event and hands back its id, with no

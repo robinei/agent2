@@ -148,16 +148,25 @@ pub fn scripted_answer(
     ))
 }
 
-/// A scripted turn that only speaks — `tell("user", text)` — and returns
-/// nothing further. Under code mode there is no bare-text assistant
-/// reply any more (`card.rs`: "no prose, no code fence... the whole
-/// response is parsed as JavaScript"); the closest equivalent to the
-/// pre-code-mode "plain reply ends the turn" is a one-line program whose
-/// only act is to tell the user something and fall off the end.
+/// A scripted turn that only speaks — `tell("user", text)` — and ends
+/// the task. Under code mode there is no bare-text assistant reply any
+/// more (`card.rs`: "no prose, no code fence... the whole response is
+/// parsed as JavaScript"); the closest equivalent to the pre-code-mode
+/// "plain reply ends the turn" is a two-line program that tells the user
+/// something and then calls `done()` — completing on its own is no
+/// longer enough to rest a branch (`machine.rs`'s `finish_program`), so
+/// every call site that reached for this helper for exactly that "say
+/// it and stop" shape needs the explicit `done()` to still get it,
+/// rather than a needless extra scripted round trip (or, for a test
+/// double that answers every re-prompt the same way regardless of what
+/// is open, an outright infinite loop — `AutoAnswerLlm`'s own doc).
 #[allow(dead_code)] // used only from test modules, which the non-test
 // build does not compile; not dead.
 pub fn scripted_text(text: &str) -> LlmTurn {
-    scripted_program(&format!("tell(\"user\", {});", serde_json::json!(text)))
+    scripted_program(&format!(
+        "tell(\"user\", {}); done();",
+        serde_json::json!(text)
+    ))
 }
 
 /// A scripted client that answers by **which agent asked**, not by

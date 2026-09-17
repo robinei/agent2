@@ -278,6 +278,7 @@ fn awaited_harness_verb_calls_yield_pending_effect() {
             ],
         ),
         ("list_agents()", "list_agents", vec![]),
+        ("done()", "done", vec![]),
     ] {
         let src = format!("return await {call};");
         let prog = compile(&src).unwrap_or_else(|e| panic!("{call} failed to compile: {e:?}"));
@@ -393,6 +394,15 @@ fn resume_takes_at_most_one_argument() {
 #[test]
 fn abandon_takes_no_arguments() {
     let errs = crate::testutil::compile_errs("abandon(1);");
+    assert!(!errs.is_empty(), "should be a compile error");
+}
+
+#[test]
+fn done_takes_no_arguments() {
+    // Same fixed-arity shape as `abandon` above: `done()` is the only
+    // thing that stops the loop (`agent/src/machine.rs`'s `TOOL_DONE`),
+    // and no argument would mean anything here.
+    let errs = crate::testutil::compile_errs("done(1);");
     assert!(!errs.is_empty(), "should be a compile error");
 }
 

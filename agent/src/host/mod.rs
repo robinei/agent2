@@ -2324,9 +2324,15 @@ mod tests {
             Ok(json!("slow"))
         }));
         registry.register(tool("fast", |_| Ok(json!("fast"))));
+        // `done()` before the `return`: otherwise this completion would
+        // continue by default (`machine.rs`'s `finish_program`) and
+        // consume the leftover `scripted_text("done")` below, whose own
+        // `tell()` logs a third `Result` (its delivery receipt) and
+        // breaks the two-element `order` this test checks.
         let script = vec![
             scripted_program(
-                "const s = tools.slow(); const f = tools.fast(); return [await s, await f];",
+                "const s = tools.slow(); const f = tools.fast(); \
+                 const r = [await s, await f]; done(); return r;",
             ),
             scripted_text("done"),
         ];
@@ -2440,9 +2446,15 @@ mod tests {
         let mut registry = ToolRegistry::new();
         // MAX_RESULT_BYTES is now MB-scale (16 MB); trigger it.
         registry.register(tool("big", |_| Ok(json!("x".repeat(MAX_RESULT_BYTES + 1)))));
+        // `done()` on both paths: otherwise this completion would
+        // continue by default (`machine.rs`'s `finish_program`) and
+        // consume the leftover `scripted_text("done")` below, whose own
+        // `tell()` logs a second `Result` — and the lookup below assumes
+        // there is exactly one.
         let script = vec![
             scripted_program(
-                r#"try { return await tools.big(); } catch (e) { return "rejected: " + e; }"#,
+                r#"try { const r = await tools.big(); done(); return r; }
+                   catch (e) { done(); return "rejected: " + e; }"#,
             ),
             scripted_text("done"),
         ];
@@ -3400,7 +3412,15 @@ mod tests {
         let msgs: Vec<&str> = forked.context().messages.iter().map(|m| m.text()).collect();
         assert_eq!(
             msgs,
-            ["q", "forked follow-up", "tell(\"user\", \"forked done\");"]
+            [
+                "q",
+                "forked follow-up",
+                // `scripted_text` now bakes in `done()` (`machine.rs`'s
+                // `finish_program`: completing no longer rests by
+                // default, so the helper for "say it and stop" has to
+                // say so) — the literal source is what renders here.
+                "tell(\"user\", \"forked done\"); done();"
+            ]
         );
         // The fork's id was announced, and both branches are live.
         let events: Vec<SessionEvent> = rx.try_iter().collect();
@@ -3739,9 +3759,19 @@ mod tests {
                 (
                     "test agent",
                     vec![
+                        // `done()` right before the `return`: without it
+                        // this completion would continue by default
+                        // (`machine.rs`'s `finish_program`) and consume
+                        // the leftover `scripted_text("done")` below as
+                        // its own next turn, which would log a second,
+                        // unrelated `Return` and break `returned()`'s
+                        // "the last one on this path" reading of the
+                        // answer this test actually checks.
                         scripted_program(
                             r#"const w = await spawn("reads files");
-                               return await ask(w.agent, "which file?");"#,
+                               const value = await ask(w.agent, "which file?");
+                               done();
+                               return value;"#,
                         ),
                         scripted_text("done"),
                     ],
@@ -4227,7 +4257,13 @@ mod tests {
                 .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
                 .and_then(|s| s.parse::<u64>().ok())
             else {
-                // Nothing open — a plain reprompt with nothing to answer.
+                // Nothing open — a plain reprompt with nothing to
+                // answer. Relies on `scripted_text`'s own `done()`: a
+                // completed program is no longer, on its own, reason to
+                // rest (`machine.rs`'s `finish_program`), so without it
+                // this fallback would re-fire itself forever — every
+                // "ok" it hands back would just earn another re-prompt,
+                // each hitting this same nothing's-open branch again.
                 return Ok(scripted_text("ok"));
             };
             // An `expect` here used to panic a worker thread when a test
@@ -4243,7 +4279,18 @@ mod tests {
             let Some(value) = values.lock().unwrap().pop_front() else {
                 return Err(format!("no scripted value queued for open post #{id}"));
             };
-            Ok(scripted_answer(EventId::new(id), "answer", json!(value)))
+            // `done()` right after answering — same reasoning as
+            // `scripted_text`'s own doc: without it this worker's
+            // program would continue by default, land back in this
+            // function with nothing open, and earn an extra "ok" turn
+            // no caller here wants (`broadcast_is_promise_all_over_
+            // agents`'s own comment: "one program, not two").
+            Ok(scripted_program(&format!(
+                "answer({}, {}, {}); done();",
+                id,
+                json!("answer"),
+                json!(value)
+            )))
         }
     }
 
@@ -4551,21 +4598,22 @@ mod tests {
             [
                 (
                     "counts things",
-                    // One turn only: `answer(...)` is a bare-global
-                    // `Invoke` like any other, not a tool call the old
-                    // protocol would give the model a fresh turn to
-                    // react to once its result lands — under code mode
-                    // the program that calls it just keeps running (or,
-                    // here, ends), so nothing ever wakes this branch for
-                    // a second completion. A queued `scripted_text`
-                    // second turn used to sit here on the pre-code-mode
-                    // assumption that one would be asked for; deleted
-                    // with it (23_ONE_AGENT.md Pass B).
-                    vec![scripted_answer(
-                        EventId::new(question),
-                        "w1",
+                    // `answer(...)` is a bare-global `Invoke` like any
+                    // other, not a tool call the old protocol would give
+                    // the model a fresh turn to react to once its result
+                    // lands — it does not end the program on its own.
+                    // But completing the program *is*, now, always a
+                    // reason for a fresh request (`machine.rs`'s
+                    // `finish_program`: completing continues by default,
+                    // `done()` is the opt-out) — so the worker's own
+                    // program calls it right after answering, the same
+                    // "one program" shape this test pins, made explicit
+                    // instead of assumed.
+                    vec![scripted_program(&format!(
+                        r#"answer({question}, "w1", {});
+                           done();"#,
                         json!({ "files": 3, "bytes": 1200 }),
-                    )],
+                    ))],
                 ),
                 (
                     "test agent",
@@ -4573,6 +4621,7 @@ mod tests {
                         scripted_program(
                             r#"const w = await spawn("counts things");
                                const v = await ask(w.agent, "how many?");
+                               done();
                                return [typeof v, v.files, v.bytes];"#,
                         ),
                         scripted_text("structured"),
@@ -4603,11 +4652,10 @@ mod tests {
         );
         // `answer(...)` is a bare-global call like any other, settled
         // synchronously with no host round trip (`dispatch_calls`'s
-        // `TOOL_ANSWER` arm) — it does not end the program, and nothing
-        // about it wakes the branch for a second completion the way an
-        // old-protocol tool result would have. The worker's one program
-        // just runs to its own implicit `return` after answering, and
-        // goes idle owing nothing.
+        // `TOOL_ANSWER` arm) — it does not end the program on its own.
+        // The worker's script calls `done()` right after answering, so
+        // it still goes idle owing nothing rather than earning a second,
+        // pointless completion.
         assert_eq!(
             kinds(tree, worker_leaf),
             ["Agent", "Post", "Turn", "Answer", "Return", "Console"]
@@ -4864,8 +4912,17 @@ mod tests {
         // a rule-C notice naming the artifact; since C0b (23_ONE_AGENT.md)
         // a `tell`'s own settlement is never a rule-C surprise, so there
         // is nothing after it.
-        assert_eq!(texts(a), ["q", "to A", "tell(\"user\", \"A answers\");"]);
-        assert_eq!(texts(b), ["q", "to B", "tell(\"user\", \"B answers\");"]);
+        // `scripted_text` now bakes in `done()` (`machine.rs`'s
+        // `finish_program`: completing no longer rests by default), so
+        // the literal source carries it too.
+        assert_eq!(
+            texts(a),
+            ["q", "to A", "tell(\"user\", \"A answers\"); done();"]
+        );
+        assert_eq!(
+            texts(b),
+            ["q", "to B", "tell(\"user\", \"B answers\"); done();"]
+        );
 
         let events: Vec<SessionEvent> = rx.try_iter().collect();
         assert_eq!(opened(&events), [a, b]);
