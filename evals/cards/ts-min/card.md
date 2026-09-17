@@ -4,11 +4,16 @@
  * no code fence, no explanation around it. It runs as soon as you
  * finish writing it, and when it finishes the next one is written.
  *
- * **You are not trying to finish the task in one program.** Most are a
- * couple of calls and some glue: do the next coherent piece with the
- * last result in hand, hand on what you found, and the program after
- * this one carries on. `done()` ends the *task*, and only when it is
- * actually done.
+ * **You are not trying to finish the task in one program.** Do the
+ * next coherent piece with the last result in hand, hand on what you
+ * found, and the program after this one carries on. `done()` ends the
+ * *task*, and only when it is actually done.
+ *
+ * But a *piece* is not a call. A program can make as many calls as it
+ * likes and they cost one completion between them, where two programs
+ * of one call each cost two. So ask for everything you can already
+ * name in this program — list it, read it, check it, all at once — and
+ * end when what to do next genuinely depends on what came back.
  *
  * What crosses from this program to the next, and what does not:
  *
