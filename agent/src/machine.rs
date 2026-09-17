@@ -2719,6 +2719,24 @@ impl Runner {
         })
     }
 
+    /// The directive for the compaction currently outstanding, read
+    /// back off the log rather than stashed on `self`: the `Condition`
+    /// carrying the sizes was appended by `compaction_if_needed` one
+    /// step ago, so the log is already the record and a second copy
+    /// could only disagree with it.
+    fn compaction_directive(&self, tree: &Tree) -> Option<String> {
+        tree.path_events(self.spine.leaf_id)
+            .iter()
+            .rev()
+            .find_map(|e| match &e.payload {
+                EventPayload::Condition {
+                    cause: Cause::Compaction { rendered, budget },
+                    ..
+                } => Some(crate::report::compaction_message(*rendered, *budget)),
+                _ => None,
+            })
+    }
+
     /// The trailing **ephemeral** line: per-request facts, emitted after
     /// the newest message and never logged. Next request it is simply
     /// re-emitted at the new end, so the prefix it followed stays intact —
@@ -2733,6 +2751,18 @@ impl Runner {
     ///   post is open.
     /// - **presence**: whether a client is attached right now.
     fn request_tail(&self, tree: &Tree) -> Option<String> {
+        // While a compaction is outstanding the directive *is* the tail,
+        // and nothing else rides with it — the directive's own words are
+        // "Write a compaction program. Nothing else", and the open-
+        // questions and presence lines are about work that is explicitly
+        // not being done in this program. It lives here rather than in
+        // the document because it instructs rather than reports: see
+        // `document::render_with_lookup`, which skips the row.
+        if self.compacting.is_some() {
+            if let Some(directive) = self.compaction_directive(tree) {
+                return Some(directive);
+            }
+        }
         let mut lines: Vec<String> = Vec::new();
         let open = self.open();
         if !open.is_empty() {
@@ -4577,15 +4607,27 @@ mod tests {
         );
     }
 
-    /// The request has to reach the document the handler is written
-    /// from. Logged `Pushed` it did not: `document::render` hides a
-    /// pushed condition, so two live runs saw only the conversation and
-    /// its unanswered task, and answered the task. Every other test
-    /// here passed throughout — they checked that the condition was
-    /// logged and that its report *renders*, never that the model would
-    /// be shown it.
+    /// The request has to reach what the compaction program is written
+    /// from, and it has to leave again afterwards.
+    ///
+    /// Reaching it was the original bug: logged `Pushed` the directive
+    /// rendered nowhere, and two live runs saw only the conversation
+    /// and its unanswered task, and answered the task. Every other test
+    /// here passed throughout — they checked the condition was logged
+    /// and that its report *renders*, never that the model would be
+    /// shown it.
+    ///
+    /// Leaving again is the other half, and making it a durable row was
+    /// how that got broken: an instruction saying "write a compaction
+    /// program, nothing else" stayed in the history after the episode
+    /// ended, and on 2026-09-17 two expired copies of it — 3,788 bytes
+    /// in a document that had just been compacted for being too large —
+    /// led the model to write a third compaction program unprompted,
+    /// which trapped. So it rides the ephemeral tail: the last thing
+    /// read before the program is written, and gone by the next
+    /// request.
     #[test]
-    fn the_compaction_request_reaches_the_rendered_document() {
+    fn the_compaction_request_reaches_the_model_but_is_not_a_row() {
         let (mut tree, mut state, budget) = crowded();
         // A real conversation has run a program before it is big enough
         // to compact, and the fold inserts a report where a program
@@ -4599,15 +4641,39 @@ mod tests {
             )
             .unwrap();
         drain(&mut state, &mut tree, out);
-        state.compaction_if_needed(&mut tree, budget, 0.25).unwrap();
+        let fired = state
+            .compaction_if_needed(&mut tree, budget, 0.25)
+            .unwrap()
+            .expect("the document is over budget, so compaction fires");
+        let StepOutput::LlmRequest(request) = fired else {
+            panic!("compaction asks for a completion: {fired:?}");
+        };
+        let tail = request.tail.expect("the directive rides the tail");
         let doc = crate::document::render(&tree, &state.spine, 64 * 1024);
-        let text = doc
+
+        // The rolling document carries no trace of the directive — what
+        // survives a compaction episode is its `Compacted` events and
+        // the shortened rows, not the instruction that asked for them.
+        let rows = doc
             .messages
             .iter()
             .map(|m| m.content.as_str())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(text.contains("compaction program"), "not in the document");
+        assert!(
+            !rows.contains("STOP"),
+            "the directive must not be a durable row: {rows}"
+        );
+
+        // What the model is actually sent is the document plus the tail.
+        let text = doc
+            .with_tail(&tail)
+            .messages
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("compaction program"), "not in the request");
         assert!(text.contains("remove_history"), "the verbs are not there");
 
         // The conversation stays: it is the cache prefix, so re-sending

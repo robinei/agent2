@@ -874,7 +874,7 @@ fn render_handback(h: &Handback<'_>, budget: usize) -> String {
 /// written this week. So the register here is a stop, not a request:
 /// the run is *blocked*, and the only thing that unblocks it is a
 /// compaction program.
-fn compaction_message(rendered: usize, budget: usize) -> String {
+pub(crate) fn compaction_message(rendered: usize, budget: usize) -> String {
     format!(
         "## STOP — THIS CONVERSATION IS FULL\n\n\
          {rendered} bytes against a {budget}-byte budget. **The task above is not being \

@@ -2188,7 +2188,9 @@ mod tests {
     /// Every report a request would actually see, in render order,
     /// paired with the outcome id it was derived from — a test's own
     /// version of `document::render`'s fold, and it has to stay that:
-    /// every `Return` and every `Condition` produces one report. It
+    /// every `Return` and every `Condition` produces one report, bar a
+    /// compaction directive, which `render` deliberately keeps out of
+    /// the document (it rides the ephemeral tail instead). It
     /// used to filter on handler depth and on `Disposition::Handover`,
     /// mirroring a `render` that did the same; both dropped the filter
     /// together when an unhandled trap turned out to be stamped
@@ -2202,6 +2204,12 @@ mod tests {
             if matches!(
                 event.payload,
                 EventPayload::Return { .. } | EventPayload::Condition { .. }
+            ) && !matches!(
+                event.payload,
+                EventPayload::Condition {
+                    cause: Cause::Compaction { .. },
+                    ..
+                }
             ) {
                 out.push((
                     event.id,

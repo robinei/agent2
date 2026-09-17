@@ -543,6 +543,23 @@ pub(crate) fn render_with_lookup(
                 messages.push(assistant);
                 open_call = call_id;
             }
+            // A compaction directive is the one condition that does not
+            // belong in the document: it instructs, it does not report.
+            // It rides the ephemeral tail instead (`request_tail`), so
+            // it is the last thing read before the compaction program is
+            // written and is gone by the next request. Left as a row it
+            // was read as a standing instruction — in the run of
+            // 2026-09-17 two expired "STOP — write a compaction program,
+            // nothing else" directives sat in the history, 3,788 bytes
+            // of a document that had just been compacted for being too
+            // large, and the model wrote a third compaction program
+            // nothing had asked for. What survives an episode is its
+            // `Compacted` events and the shortened rows they produce,
+            // which is the trace worth keeping.
+            EventPayload::Condition {
+                cause: Cause::Compaction { .. },
+                ..
+            } => {}
             EventPayload::Return { .. } | EventPayload::Condition { .. } => {
                 pending.push(report_line(tree, leaf, ev.id, budget, compacted));
             }
