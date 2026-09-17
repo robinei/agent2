@@ -1,4 +1,4 @@
 // One step: find them. What to do next depends on what is there, and
 // this program cannot read what it fetches.
-const hits = (await tools.bash("grep -rn '@unittest.skip' .")).stdout.split("\n").filter(Boolean);
-return { question: "un-skip each of these in turn and run it; keep the marker on the ones that still fail", hits };
+const hits = (await tools.bash("grep -rn '@deprecated' src/")).stdout.split("\n").filter(Boolean);
+return { question: "for each of these, check whether anything still calls it and drop the ones nothing does", hits };

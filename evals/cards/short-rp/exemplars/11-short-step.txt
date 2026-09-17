@@ -1,1 +1,1 @@
-some tests here are skipped — which ones pass now?
+some of the helpers in src/ are marked deprecated — are any of them safe to drop?

@@ -81,6 +81,19 @@ saying so — everything else that differs stops the program and tells you:
                                  `{ name, message }`; branch on
                                  `e.name`, not on its type
 
+**When the next step turns on a judgement the data cannot settle, stop
+guessing and get the judgement.** Which verb depends only on who can
+give it. A person has to decide — which of these did you mean, is this
+the one to delete, is this value still right — `await ask("user", …)`,
+and act on the answer in this same program. A judgement that needs
+everything you have read but no new information from outside —
+`raise()`, and the decision comes back mid-program with every variable
+still alive. Neither is a last resort: guessing at a question that has
+a real answer is the failure, and a guess acted on is the expensive one.
+A file that says in plain words it does not know ("is this still right,
+or did we settle on the old value?") has asked you the question; going
+around it and picking one is not resolving it.
+
 **Keep each program short.** Two or three calls and a little glue is
 the usual size. You are not trying to finish the task in one program —
 you are doing the next coherent piece of it with the last result in

@@ -5,7 +5,7 @@ const paths = (await tools.bash("grep -rl '#\\[ignore\\]' --include='*.rs' . 2>/
 // The control, inline: if the suite is already red, a failure after
 // un-ignoring something is not attributable to that test, and the whole
 // loop below would be measuring nothing.
-const base = await tools.bash("set -o pipefail; cargo test 2>&1 | tail -5");
+const base = await tools.bash("cargo test 2>&1 | tail -5");
 if (base.status !== 0) {
     // Blocked is not done. Returning ends this program and starts the
     // next one with this in front of it — which is what gets past the
@@ -36,12 +36,11 @@ for (const path of paths) {
         const stripped = Edit.replaceOnce(file.content, site[0], site[1]);
         const wrote = await tools.replace_file(path, stripped, file.version);
 
-        // pipefail, or the status is `tail`'s and `tail` always succeeds.
-        // And a 0 status is not yet an answer: a filter that matches
-        // nothing exits 0 too, as does a run where the test was still
-        // ignored. Make the runner say it ran one and it passed —
+        // A 0 status is not yet an answer: a run where the test was
+        // still ignored exits 0 too, and so does a filter that selected
+        // nothing. Make the runner say it ran one and it passed —
         // otherwise this check has no way to tell me no.
-        const run = await tools.bash(`set -o pipefail; cargo test ${name} -- --exact 2>&1 | tail -5`);
+        const run = await tools.bash(`cargo test ${name} -- --exact 2>&1 | tail -5`);
         if (run.status === 0 && /1 passed/.test(run.stdout)) {
             freed.push(name);
             file = { content: stripped, version: wrote.version };

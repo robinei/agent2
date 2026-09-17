@@ -1,9 +1,8 @@
 ## program completed
-returned [#18]: null
+returned [#18]: {"question":"for each of these, check whether anything still calls it and drop the ones nothing does","hits":["src/util.js:14:// @deprecated use formatDate","src/util.js:31:// @deprecated use parseHeader","src/util.js:52:// @deprecated"]}
 
-The program handed over: it finished what it could do without a reading, and asked for the next one.
+console: (no output)
 
-Write that program. Nothing is suspended and nothing is waiting on a value — you have the branch, and whatever comes next is yours to write, including another handover when you have gathered more.
-
-what it handed you:
-{"question":"un-skip each of these in turn and run it; keep the marker on the ones that still fail","hits":["tests/test_shipping.py:8","tests/test_shipping.py:17","tests/test_shipping.py:24"]}
+## new rows — fetch any of them with fetch_history(id)
+[#15] tell(user, "finding the deprecated helpers.") → ok
+[#16] bash("grep -rn '@deprecated' src/") → ok, 214 bytes

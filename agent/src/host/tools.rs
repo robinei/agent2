@@ -366,7 +366,15 @@ fn bash_def() -> ToolDef {
                       string: bash(\"mkdir -p /x && ls /x\"). (An argv array is also \
                       tolerated, joined with spaces.) Resolves to { status, stdout, \
                       stderr, truncated? } (a non-zero status is a result, not an \
-                      error); times out after 30s; output capped at 4MB/stream."
+                      error); times out after 30s; output capped at 4MB/stream. \
+                      Runs with `pipefail`, so `status` is the first failing stage's \
+                      and not the last one's — `cargo test | tail -5` reports the \
+                      test run, not `tail`. One consequence worth knowing: `grep` \
+                      exits 1 when it matches nothing, so a grep pipeline that found \
+                      nothing reports a non-zero status. A command that could not be \
+                      run at all (not found, not executable) rejects instead of \
+                      resolving — there is no result to read, and an empty stdout \
+                      would otherwise look like \"nothing to find\"."
             .into(),
         input_schema: json!({
             "type": "array",
@@ -438,10 +446,31 @@ fn bash_def() -> ToolDef {
 #[cfg(test)]
 pub(crate) static PROCESS_CWD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Spawn `bash -c <command>`, enforce the timeout, and shape the outcome
-/// into `{ status, stdout, stderr, truncated? }`. Only the harness-level
-/// failures (spawn failed, timed out) return `Err` — a command that runs
-/// and exits non-zero is a normal result the program branches on.
+/// Spawn `bash -o pipefail -c <command>`, enforce the timeout, and shape
+/// the outcome into `{ status, stdout, stderr, truncated? }`. Only the
+/// harness-level failures (spawn failed, timed out) return `Err` — a
+/// command that runs and exits non-zero is a normal result the program
+/// branches on.
+///
+/// **`pipefail` is on, and that is the point.** A shell pipeline's
+/// status is its *last* stage's, so `cargo test 2>&1 | tail -5` reports
+/// `tail`'s success whatever the tests did, and `cmd | grep x | head`
+/// reports 0 when `cmd` never ran. The card used to carry a paragraph
+/// asking every program to write `set -o pipefail` itself, and a live
+/// `skipped-tests` run on 2026-09-17 shows what that costs when one
+/// forgets: it un-skipped a test, ran `python3 -m unittest … | tail
+/// -15` against a file its own edit had left syntactically broken, read
+/// `tail`'s 0, kept the change, and reported a clean sweep. Every
+/// verdict in that loop was `tail` succeeding.
+///
+/// An instruction the model must remember at every call site is worse
+/// than a fact about the tool it must know once — and this is *our*
+/// bash, with no compatibility contract to keep. The trade is a
+/// different surprise, stated in the tool's own description: `grep`
+/// exits 1 when it matches nothing, so an unmatched grep pipeline now
+/// reports failure. Between a silent false negative ("clean sweep" over
+/// work never done) and a loud false positive, the loud one is the one
+/// a program can see.
 ///
 /// `stdout`/`stderr` are drained on reader threads with a capture ceiling
 /// per stream so a command that out-writes the OS pipe buffer can't
@@ -449,6 +478,8 @@ pub(crate) static PROCESS_CWD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// ceiling the child is killed and the result flags `truncated: true`.
 fn run_bash(command: &str, timeout: Duration) -> Result<serde_json::Value, String> {
     let mut child = Command::new("bash")
+        .arg("-o")
+        .arg("pipefail")
         .arg("-c")
         .arg(command)
         .stdin(Stdio::null())
@@ -498,6 +529,60 @@ fn run_bash(command: &str, timeout: Duration) -> Result<serde_json::Value, Strin
         let _ = child.kill();
         let _ = child.wait();
     }
+
+    // **"It ran and said no" and "it never ran" are different events.**
+    // A non-zero status is a *verdict* for almost everything we run —
+    // `cargo check` failing is the answer a dead-code probe wants,
+    // `npm test` failing is what tells a loop to revert, `grep` exits 1
+    // on no matches — so a non-zero exit resolves like any other result
+    // and the program branches on it. That is why this does not simply
+    // reject: making the common case an exception turns every probe
+    // loop into a try/catch around expected control flow.
+    //
+    // But 126/127 are not verdicts. They are bash reporting that it
+    // could not execute the command at all — not found, not executable
+    // — and the line this function already draws ("only harness-level
+    // failures return Err") puts them on the other side: failing to
+    // spawn *the command* is the same event as failing to spawn bash,
+    // one level down. Resolved, they are the silent false negative the
+    // card has three paragraphs about: `{status: 127, stdout: ""}`, and
+    // a program reading stdout sees nothing and concludes there was
+    // nothing to find.
+    //
+    // Signals stay a verdict deliberately, except when bash itself was
+    // signalled (`code()` is `None`). A child killed by the OOM killer
+    // surfaces as the shell's 137, which is indistinguishable from a
+    // program that chose to exit 137, and guessing wrong there would
+    // reject a real result.
+    let code = status.code();
+    let stderr_text = String::from_utf8_lossy(&stderr);
+    // Truncation is a signal *we* sent: the ceiling was hit, we killed
+    // the child, and the bytes already captured are a real (flagged)
+    // result. So it is settled before the checks below, which are about
+    // deaths nobody here asked for.
+    match code {
+        None if !(out_trunc || err_trunc) => {
+            return Err(format!(
+                "the shell was killed by a signal before the command finished{}",
+                clip_stderr(&stderr_text)
+            ));
+        }
+        Some(127) => {
+            return Err(format!(
+                "command not found — nothing ran, so there is no result to read{}",
+                clip_stderr(&stderr_text)
+            ));
+        }
+        Some(126) => {
+            return Err(format!(
+                "command found but not executable — nothing ran, so there is no \
+                 result to read{}",
+                clip_stderr(&stderr_text)
+            ));
+        }
+        _ => {}
+    }
+
     let mut result = json!({
         "status": status.code(),
         "stdout": String::from_utf8_lossy(&stdout),
@@ -507,6 +592,16 @@ fn run_bash(command: &str, timeout: Duration) -> Result<serde_json::Value, Strin
         result["truncated"] = json!(true);
     }
     Ok(result)
+}
+
+/// bash's own complaint, appended to a rejection so the program is told
+/// *which* command was missing rather than only that one was.
+fn clip_stderr(stderr: &str) -> String {
+    let text = stderr.trim();
+    if text.is_empty() {
+        return String::new();
+    }
+    format!(": {}", crate::report::clip_short(text, 200))
 }
 
 /// Current wall-clock time as epoch milliseconds — matches `Date.now()`,
@@ -813,6 +908,57 @@ mod tests {
     fn bash_nonzero_exit_is_a_result_not_an_error() {
         let result = bash(json!(["exit 3"])).unwrap();
         assert_eq!(result["status"], json!(3));
+    }
+
+    /// **A pipeline's status is the first failing stage's.** The shell's
+    /// default is the *last* stage's, which is how `cargo test 2>&1 |
+    /// tail -5` reports `tail`'s success whatever the tests did. A live
+    /// `skipped-tests` run on 2026-09-17 un-skipped a test, ran the
+    /// suite against a file its own edit had left syntactically broken,
+    /// read `tail`'s 0, kept the change and reported a clean sweep.
+    #[test]
+    fn a_pipelines_status_is_the_first_failing_stage_not_the_last() {
+        let result = bash(json!(["exit 3 | tail -5"])).unwrap();
+        assert_eq!(result["status"], json!(3), "tail's 0 would hide it");
+    }
+
+    /// The other half of that trade, stated in the tool's description
+    /// because it is the one thing `pipefail` makes noisier: an
+    /// unmatched `grep` is a non-zero pipeline now.
+    #[test]
+    fn an_unmatched_grep_pipeline_reports_non_zero() {
+        let result = bash(json!(["echo hello | grep nothing | cat"])).unwrap();
+        assert_ne!(result["status"], json!(0));
+        assert_eq!(result["stdout"], json!(""));
+    }
+
+    /// **"It ran and said no" is a result; "it never ran" is not.** A
+    /// command bash could not execute resolved as `{status: 127,
+    /// stdout: ""}`, and a program reading stdout saw nothing and
+    /// concluded there was nothing to find — the silent false negative
+    /// the card spends three paragraphs on. It rejects now, on the same
+    /// line this function already drew: failing to spawn *the command*
+    /// is the event failing to spawn bash is, one level down.
+    #[test]
+    fn a_command_that_could_not_run_rejects_instead_of_resolving_empty() {
+        let err = bash(json!(["definitely-not-a-real-binary-xyz"])).unwrap_err();
+        assert!(err.contains("command not found"), "{err}");
+        // bash's own complaint comes with it, so the program is told
+        // *which* command was missing.
+        assert!(err.contains("definitely-not-a-real-binary-xyz"), "{err}");
+    }
+
+    /// Ran and failed is still a result — the distinction above is not
+    /// an excuse to reject verdicts. This is the shape every probe loop
+    /// in the card is built on.
+    #[test]
+    fn a_command_that_ran_and_failed_is_still_a_result() {
+        let result = bash(json!(["ls /definitely/not/here"])).unwrap();
+        assert_ne!(result["status"], json!(0));
+        assert!(
+            result["stderr"].as_str().unwrap().contains("No such file"),
+            "{result}"
+        );
     }
 
     #[test]

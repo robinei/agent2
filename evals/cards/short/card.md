@@ -95,6 +95,19 @@ hand, and returning what you found to the program after this one. A
 loop still belongs in one program when the same procedure repeats over
 a list; what does not belong is planning branches you have not reached.
 
+**When the next step turns on a judgement the data cannot settle, stop
+guessing and get the judgement.** Which verb depends only on who can
+give it. A person has to decide — which of these did you mean, is this
+the one to delete, is this value still right — `await ask("user", …)`,
+and act on the answer in this same program. A judgement that needs
+everything you have read but no new information from outside —
+`raise()`, and the decision comes back mid-program with every variable
+still alive. Neither is a last resort: guessing at a question that has
+a real answer is the failure, and a guess acted on is the expensive one.
+A file that says in plain words it does not know ("is this still right,
+or did we settle on the old value?") has asked you the question; going
+around it and picking one is not resolving it.
+
 **You are the next writer.** What you return comes back to you, read,
 with the task still open. So a question you return is a question you
 will be answering, not one you are handing to someone else: return the

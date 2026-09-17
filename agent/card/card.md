@@ -153,12 +153,14 @@ put to a tool that was never going to answer it comes back empty, and
 empty reads as "all fine" — the false negative above, arrived at by a
 command that ran perfectly.
 
-Two more things make a loop like that lie, and both look exactly like
-success. A pipeline's status is its *last* stage's, so `cmd | grep x |
-head` reports 0 when `cmd` never ran — write `set -o pipefail` in front
-of any pipeline whose status you intend to believe, and read `status`
-before you read `stdout`. Get that wrong and the loop reports a clean
-sweep of work it did not do.
+One more thing makes a loop like that lie, and it looks exactly like
+success: reading `stdout` without reading `status`. A command that ran
+and failed writes nothing to stdout, and nothing reads as "found no
+problems". Read `status` first, every time — it is trustworthy here
+(`bash` runs with `pipefail`, so a pipeline's status is its first
+failing stage's and not `tail`'s, and a command that could not be run
+at all rejects rather than handing you an empty result), but
+trustworthy is not the same as read.
 
 And make sure the check can say no — in this same program, and without
 stopping to do it. Establishing that takes a call and a comparison, not
@@ -189,8 +191,10 @@ The same constraint governs what you write to a file. You will not see
 the result, so name the edit by text you have in hand and let
 `Edit.replaceOnce` refuse it if that text does not pick out one place —
 rather than computing a line number and splicing, which is how
-`#[allow(dead_code)] // why it's here` becomes `#[allow()] // why it's
-here`: valid, unread, and litter no build will ever complain about.
+`#[derive(Debug)] // needed by the test helper` becomes `#[derive()] //
+needed by the test helper`: valid, unread, and litter no build will
+ever complain about. The same slip in a regex is replacing `m[0]` when
+the part you meant to keep was `m[1]`.
 Where the right edit genuinely differs per site, that is a handover:
 send the lines and let someone who can read them decide.
 
