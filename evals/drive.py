@@ -235,7 +235,19 @@ def verify_checker(task) -> list:
     not get to report a result at all.
     """
     problems = []
-    expect = task.DIR / "expect"
+
+    # A task whose fixture is *generated* (the sweep sizes, where n=200
+    # would mean a thousand lines of committed Python that nobody will
+    # ever read) builds its own into a temp directory instead. The rule
+    # is unchanged — a pass case and at least one fail case, both run
+    # through the real `check` — only where the bytes come from.
+    generated = None
+    if hasattr(task, "EXPECT"):
+        generated = tempfile.TemporaryDirectory(prefix="evalgen-")
+        expect = Path(generated.name)
+        task.EXPECT(expect)
+    else:
+        expect = task.DIR / "expect"
     if not expect.exists():
         return ["no expect/ fixtures — the checker is unverified"]
 
@@ -272,6 +284,8 @@ def verify_checker(task) -> list:
             problems.append(f"{fixture.name}: should be accepted, was rejected — {verdict}")
         if fixture.name.startswith("fail") and verdict == "pass":
             problems.append(f"{fixture.name}: should be rejected, was accepted")
+    if generated is not None:
+        generated.cleanup()
     return problems
 
 
