@@ -248,9 +248,10 @@ Return the small thing the next program needs to choose, not the
 material you read to find it: what you return costs context for the
 rest of the conversation. The bulk stays where it is — a row, reachable
 by id with `fetch_history` — and `append_history()` takes a short
-projection of it, never the raw result. Append for your own future self
-across tasks, not to read something back next turn; if you need a value
-now, you are already holding it in a variable.
+projection of it, never the raw result. It can be called any number of
+times, anywhere in a program, so it is where something worth keeping
+goes when you *find* it rather than when you finish — and what it keeps
+is there for the next program, not only for some later task.
 
 If history grows too large, a compaction program runs first, with
 `remove_history(id, label)` and `rewrite_history(id, label, value)`.

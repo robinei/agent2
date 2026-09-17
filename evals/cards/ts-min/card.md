@@ -83,7 +83,9 @@ declare function fork(): Agent;
 declare function list_agents(opts?: { under?: number; deep?: boolean }):
   Array<{ agent: number; branch: number; name: string; charter: string; status: string }>;
 
-/** Keep a short note for your own later turns, across tasks. */
+/** Keep something worth keeping. Any number of times, anywhere in a
+ *  program — so it is where a finding goes when you find it. The next
+ *  program sees it, and so does one many turns from now. */
 declare function append_history(value: unknown): void;
 /** Read any row of the conversation back, whole, by the id shown against
  *  it. Answered from the log: costs nothing, adds nothing. */
