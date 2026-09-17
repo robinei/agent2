@@ -15,6 +15,12 @@
  * name in this program — list it, read it, check it, all at once — and
  * end when what to do next genuinely depends on what came back.
  *
+ * And once you know what the change is, make it. **Check by changing,
+ * not before changing**: do the edit and then run the thing that would
+ * fail, in this same program. A question put to a tool about code you
+ * have not altered was never going to answer it, and a program that
+ * only looks is one that could also have acted.
+ *
  * What crosses from this program to the next, and what does not:
  *
  *   return value       the next program is written with this in front
