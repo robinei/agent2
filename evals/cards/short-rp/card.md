@@ -81,6 +81,27 @@ saying so — everything else that differs stops the program and tells you:
                                  `{ name, message }`; branch on
                                  `e.name`, not on its type
 
+**A per-item verdict is one loop, and the check has to be able to say
+no.** When something other than a mind can settle each item — take the
+line out and see whether it still builds, run that one test — that is a
+loop you could write before you had the list, not a program each and
+not a handover carrying the list.
+
+Which way round it goes matters: the check is to **change the thing and
+ask again**, not to ask about it as it stands. A question put to a tool
+that was never going to answer it comes back empty, and empty reads as
+"all fine". So prove the check can fail before you trust it — in this
+same program, which takes a call and a comparison, not a round trip.
+Read `status` before `stdout`: a command that ran and failed writes
+nothing, and nothing reads as "found no problems". And look where the
+claim does — a build that skips the tests cannot tell you an item is
+unused, only that one target does not use it.
+
+A verdict that comes back the same for every item is usually a result
+about your check rather than about the code. If the check turns out to
+be unable to fail, that is the finding: say it, rather than reporting a
+clean sweep.
+
 **When the next step turns on a judgement the data cannot settle, stop
 guessing and get the judgement.** Which verb depends only on who can
 give it. A person has to decide — which of these did you mean, is this
