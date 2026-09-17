@@ -1,35 +1,30 @@
-The card as a `.d.ts` — one sentence of mechanism, the declarations, and
-only the JavaScript we lack that a model would actually reach for.
+The card as a single `.d.ts`: a comment block saying how this works and
+what is expected, the declarations, and only the JavaScript we lack that
+a model would actually reach for.
 
-5.2KB against `short`'s 9.5KB, and no worked examples. The bet is that a
-type declaration with a one-line doc comment is the most familiar
-possible way to hand an API to a model trained on TypeScript, and that
-familiarity is worth more than prose arguing for good judgement — the
-argument being that pi is effective on a system prompt of roughly one
-sentence per tool, and that we spend 14.7KB of reasoning a run against
-its 3.5KB on the identical model at the identical effort.
+5.7KB against `short`'s 9.5KB, and no worked examples.
 
-What is deliberately *not* here: every paragraph of the long card about
-handing over, proving a check can fail, not guessing, reading before
-writing. Those are what this arm is testing the price of.
+**The bet.** pi runs on priors — roughly a sentence per tool and nothing
+else — and is effective. We spend 14.7KB of reasoning a run against its
+3.5KB on the identical model at the identical `reasoning_effort: high`.
+That gap is not configuration; it is 8.7KB of card arguing for
+deliberation and ten exemplars demonstrating careful, commented
+programs. This asks what happens if we override priors only where the
+dialect would silently betray them, and otherwise say nothing.
 
-The dialect section lists only deltas with a measured trap behind them
-(UTF-8 byte length, no cross-type comparison coercion, plain error
-objects, no executor pattern). Everything else JavaScript has either
-works or stops the program and says so, and listing it would be paying
-prose for silence.
+**Why the "missing from JavaScript" list is three items.** Almost
+everything we refuse — `for await`, `BigInt`, private fields,
+`Promise.race`, getters/setters, labelled break — refuses *loudly*, with
+the fix in the message. A card that lists those is paying prose for
+something the error already says at the moment it matters. What earns a
+line is only where the program runs and gives a wrong answer: UTF-8
+`.length`, non-coercing relational operators, and `e instanceof Error`.
+One sentence covers the rest.
 
-**Signatures track the code, not the intent.** Writing them down found
-that the verbs were in three dispatch groups behind one uniform-looking
-table, and that `raise` was never a promise despite every example in the
-long card putting an `await` in front of it.
+**What is deliberately absent**: every paragraph of the long card about
+handing over, proving a check can fail, not guessing, batching the
+experiment. Two of those are measured to matter — asking, and asking
+once for everything a check will answer at once. They are gone here on
+purpose: this arm prices them.
 
-That is settled now: since the settle-at-dispatch change, **`ask` is the
-only verb that returns a promise.** Everything else hands back the
-value. `tools.*` are all async.
-
-The failure here is one-sided, which is why the prose card got away with
-saying nothing: awaiting a plain value is the identity, so declaring
-`Promise` where there is none costs nothing, while omitting it where
-there is one hands the model a promise it never unwraps. Stated in the
-card so a reader can act on it.
+Measured before it is allowed to become the shipped card.
