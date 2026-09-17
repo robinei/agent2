@@ -25,9 +25,12 @@
  *                      anywhere; keep the id, or keep what you
  *                      concluded.
  *
- * So a program that finds something and neither acts on it nor hands
- * it on has thrown the finding away, and the next program will go and
- * find the same thing again. You are writing this one now; what it
+ * Nothing else crosses — least of all your variables. Every name you
+ * bind here goes when this program ends, so a later `ls.stdout` or
+ * `content` is a `ReferenceError`, not a value. A program that finds
+ * something and neither acts on it nor hands it on has thrown the
+ * finding away, and the next program will go and find the same thing
+ * again. You are writing this one now; what it
  * fetches arrives when you are no longer here, and only the program
  * after it can read any of it.
  *
