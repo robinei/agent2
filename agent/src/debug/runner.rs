@@ -176,6 +176,21 @@ impl Runner {
                     self.state = RunState::Waiting;
                 }
             }
+            // The debugger runs a program against stub tools, with no
+            // harness above it: there is no log to fetch a row from and
+            // no tree to spawn into, so every settle-at-dispatch verb
+            // fails at its call site — which, being a throw rather than
+            // a rejection, is exactly what the paused program shows.
+            Ok(StepResult::Settle { call }) => {
+                let msg = interp::Value::String(interp::RcStr::from(
+                    format!(
+                        "`{}` needs a harness; this is the debugger's stub host",
+                        call.name
+                    )
+                    .as_str(),
+                ));
+                let _ = self.vm.settle_throw(msg);
+            }
             Ok(StepResult::Raise { condition, payload }) => {
                 let payload = payload
                     .map(|v| {

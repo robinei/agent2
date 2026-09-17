@@ -490,7 +490,52 @@ pub enum Instr {
     /// host's dispatch code is shared with `Invoke` and expects one —
     /// but nothing in this VM ever constructs a `Value::Promise` from
     /// it, so nothing can ever await it here even by accident.
+    ///
+    /// That promise looks like dead bookkeeping and is not: `Notify`
+    /// puts its call in the outbox, and draining the outbox counts it
+    /// into `inflight`, which only a settlement decrements. Drop the
+    /// promise and a `tell` would leave `inflight` permanently raised,
+    /// and the deadlock check at a blocking `Await` — "nothing ready,
+    /// nothing in the outbox, nothing in flight" — would stop firing.
+    /// The right way out is a `tell` that never enters the outbox at
+    /// all, which is a change to how the host hears about it, not to
+    /// this instruction.
     Notify(RcStr, ArgCount), // any, ... -> undefined
+
+    /// EFFECT: performs the named call **now**, in this frame. Pops N
+    /// arguments (push order: arg 0 deepest), advances `ip` past itself,
+    /// and yields `StepResult::Settle` to the host, which answers with
+    /// `VM::push_settled(value)` — pushing the call's result where the
+    /// arguments were — or `VM::settle_throw(errval)`, which throws it
+    /// into this frame. Execution then continues at the next
+    /// instruction, in the same frame, with nothing suspended.
+    ///
+    /// This is the third point on the line `Invoke` and `Notify` already
+    /// mark. `Invoke` is for a call that may take a while and may fail
+    /// asynchronously, so it hands back a promise. `Notify` is for a
+    /// call that settles at dispatch and has no value, so it hands back
+    /// `undefined`. `Settle` is the missing corner — settles at
+    /// dispatch **and** has a value — and until it existed such a call
+    /// had to borrow `Invoke`'s promise and an `Await` the compiler
+    /// emitted itself, which made `await` appear outside async bodies
+    /// (`names.map(n => spawn(n))` suspended inside a plain arrow) and
+    /// forced `suspend_current_frame` to mint a promise for a frame
+    /// nobody declared async.
+    ///
+    /// Two consequences worth naming. A failure arrives as a **throw in
+    /// this frame**, so an ordinary `try`/`catch` around the call sees
+    /// it and a sync function's caller keeps its own throws — where a
+    /// rejected promise would have belonged to whoever awaited it.
+    /// And the call never enters the outbox, so it is never
+    /// fire-and-forget: there is no unawaited `Settle`.
+    ///
+    /// "Settles at dispatch" is about the **frame**, not the clock: the
+    /// host may take a full event-loop round trip to answer (a `spawn`
+    /// is logged as a `Call` and settled by its `Result` like any
+    /// other), and `step()` meanwhile reports `Pending` with an empty
+    /// batch. What the instruction promises is only that the frame is
+    /// still standing when the answer lands.
+    Settle(RcStr, ArgCount), // any, ... -> any
 
     /// Second half of an **async** function's prologue, emitted right after
     /// `EnterFrame` (and before any code that can throw — a param default,
@@ -521,10 +566,12 @@ pub enum Instr {
     ///    continuation record (zero stack left behind), registered as a
     ///    waiter on the promise; the frame then leaves as any async frame
     ///    does — a frame entered by a call pushes its own promise (the one
-    ///    `AsyncEnter` allocated, or, for a sync frame suspended by a
-    ///    compiler-emitted `Await`, one minted on the spot) to the caller as
-    ///    the call's return value, while a scheduler-resumed frame falls
-    ///    through to the scheduler;
+    ///    `AsyncEnter` allocated) to the caller as the call's return value,
+    ///    while a scheduler-resumed frame falls through to the scheduler.
+    ///    Only an async frame can reach this arm: `await` is confined to
+    ///    async bodies by the parser, and the one emitter that used to put
+    ///    an `Await` in a plain arrow — the settle-at-dispatch verbs —
+    ///    emits `Settle` instead;
     ///  - at top level the root strand parks in place: ready continuations
     ///    run above the parked region, and with nothing ready it yields
     ///    `StepResult::Pending` carrying the drained outbox with ip

@@ -21,9 +21,34 @@ pub use debuginfo::{DebugTable, FnDebug};
 pub use diag::{DiagKind, Diagnostic};
 pub use rc_str::RcStr;
 pub use vm::{
-    ErrorKind, FrameView, Instr, InvokeCall, PromisePtr, PromiseState, ResumeMode, StepResult, VM,
-    VMError, Value,
+    ErrorKind, FrameView, Instr, InvokeCall, PromisePtr, PromiseState, ResumeMode, SettleCall,
+    StepResult, ThrowOutcome, VM, VMError, Value,
 };
+
+/// **The closed harness vocabulary**: every bare global name the
+/// compiler lowers to a host call, rather than to an ordinary function
+/// call or a plain value. It is exported so the harness can assert it
+/// answers all of them — a name in this list with nothing behind it is
+/// a verb the card advertises and the program cannot use, which is
+/// exactly how `list_agents()` shipped for three phases returning
+/// `unknown tool`.
+///
+/// Not in this list, deliberately: `raise` (an effect, not a call),
+/// and `resume`/`abandon` (decision-value constructors that never
+/// reach a host at all).
+pub const HARNESS_VERBS: &[&str] = &[
+    "tell",
+    "ask",
+    "spawn",
+    "fork",
+    "done",
+    "fetch_history",
+    "answer",
+    "append_history",
+    "remove_history",
+    "rewrite_history",
+    "list_agents",
+];
 
 /// Host-seeded read-only consts available to every program by name:
 /// `input` (the frame's caller-provided JSON, `objects[0]`) and

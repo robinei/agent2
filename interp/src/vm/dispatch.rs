@@ -947,6 +947,27 @@ impl VM {
     }
 
     pub(crate) fn dispatch(&mut self, fuel: &mut u64) -> Result<StepResult, VMError> {
+        // An unanswered `Settle` left the stack one value short and `ip`
+        // past the instruction, so there is nothing safe to execute until
+        // the host answers. Report the truth — blocked on the host, with
+        // nothing new to hand over — rather than re-issuing the call or
+        // running against the hole. (`Pending { calls: [] }` already means
+        // exactly this for an `Await` whose calls went out earlier.)
+        if self.settling {
+            return Ok(StepResult::Pending { calls: Vec::new() });
+        }
+        // A settle that failed with nowhere to catch it. Raised here
+        // rather than by `settle_throw` because the host answers a
+        // `Settle` between steps, where there is no `step()` result to
+        // fail — so the error surfaces on the next one, identical to the
+        // one `Instr::Throw` raises for an uncaught program throw.
+        if let Some(value) = self.settle_uncaught.take() {
+            let msg = self.uncaught_message(&value);
+            let mut err = self.fail(ErrorKind::UncaughtException, msg);
+            err.payload = Some(value);
+            return Err(err);
+        }
+
         // ── macros for repetitive instruction shapes ─────────────────
 
         /// Pop one operand, coerce ToNumber (JS), apply f64→f64, push Number.
@@ -2591,6 +2612,37 @@ impl VM {
                     });
                     self.stack.push(Value::Undefined);
                     self.ip += 1;
+                }
+
+                Instr::Settle(name, nargs) => {
+                    // Perform the call now, in this frame: pop the args,
+                    // advance past the instruction, and hand the call to
+                    // the host, which pushes the result into the slot the
+                    // args vacated (`push_settled`) or throws into this
+                    // frame (`settle_throw`).
+                    //
+                    // No promise and no outbox entry: nothing here is
+                    // awaitable, so nothing can be forgotten. `ip` is
+                    // advanced *before* yielding — the `Raise` convention
+                    // — because the host resumes by pushing a value, not
+                    // by re-executing this instruction.
+                    //
+                    // Calls already in the outbox stay there. They are not
+                    // stranded: a `Settle` always gets answered, and the
+                    // next `Await` (or the program's completion) drains
+                    // the outbox as it always did.
+                    let name = name.as_str().to_owned();
+                    let n = *nargs as usize;
+                    if n > self.stack.len() {
+                        return Err(self.fail(ErrorKind::StackUnderflow, "stack underflow"));
+                    }
+                    let args = self.stack.split_off(self.stack.len() - n);
+                    let site = self.spans.get(self.ip as usize).copied().unwrap_or(0);
+                    self.ip += 1;
+                    self.settling = true;
+                    return Ok(StepResult::Settle {
+                        call: SettleCall { name, args, site },
+                    });
                 }
 
                 Instr::Await => {

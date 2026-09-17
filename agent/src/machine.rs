@@ -30,22 +30,32 @@ use std::collections::HashMap;
 use std::io;
 
 use interp::{
-    Diagnostic, InvokeCall, PromisePtr, RcStr, ResumeMode, StepResult, VM, VMError, Value, compile,
+    Diagnostic, InvokeCall, PromisePtr, RcStr, ResumeMode, SettleCall, StepResult, VM, VMError,
+    Value, compile,
 };
 
 use crate::host::ProgramStatus;
 use crate::report::{Artifact, ArtifactState, arg_preview, preview};
 use crate::types::*;
 
-/// The closed, harness-defined verb names `dispatch_calls` recognizes
-/// when the VM yields an `Invoke` effect for one of them — the same
-/// strings `interp`'s compiler emits for a **bare** call (`tell(...)`,
-/// `ask(...)`, `spawn(...)`, ...; `interp/src/compiler/call.rs:575`),
-/// never for a `tools.foo(...)` call, which stays a configured
-/// capability the registry answers. This is "the one place a bare
-/// verb's name becomes a `Call` variant" (17_BRANCHES A2) generalized:
-/// folded in here from the deleted `verbs.rs`, whose job was exactly
-/// this parse, just not yet wired to a live session.
+/// The closed, harness-defined verb names this file recognizes — the
+/// same strings `interp`'s compiler emits for a **bare** call
+/// (`tell(...)`, `ask(...)`, `spawn(...)`, ...; the settle-at-dispatch
+/// arm and the `ask` arm of `interp/src/compiler/call.rs`), never for a
+/// `tools.foo(...)` call, which stays a configured capability the
+/// registry answers. This is "the one place a bare verb's name becomes
+/// a `Call` variant" (17_BRANCHES A2) generalized: folded in here from
+/// the deleted `verbs.rs`, whose job was exactly this parse, just not
+/// yet wired to a live session.
+///
+/// Which dispatcher sees a name depends on how it lowers.
+/// `dispatch_calls` takes the ones that hold a promise — `ask`, `tell`,
+/// and anything unrecognized — from a `StepResult::Pending` batch;
+/// `dispatch_settle` takes the rest, one at a time, from a
+/// `StepResult::Settle`. `interp::HARNESS_VERBS` is the whole list, and
+/// `every_harness_verb_has_an_answerer` checks each one lands in one of
+/// them rather than in the registry, which has no tool by any of these
+/// names.
 ///
 /// `resume`/`abandon` are deliberately **not** among these: they
 /// compile to a plain tagged object (`{ __decision: "resume", value
@@ -115,6 +125,12 @@ pub const TOOL_REWRITE_HISTORY: &str = "rewrite_history";
 /// an omission: it costs nothing to call correctly, and forgetting it
 /// costs one extra, self-correcting turn rather than an abandoned task.
 pub const TOOL_DONE: &str = "done";
+/// `list_agents()` — every agent in this subtree, with status, exactly
+/// as the card has advertised since phase 20. It is served by the
+/// host's `serve_agents` (the one implementation, shared with
+/// `tools.agents(...)`), because the status half is live session state
+/// no single runner can see; `dispatch_settle` routes it there.
+pub const TOOL_LIST_AGENTS: &str = "list_agents";
 
 /// Open-post ids named in the request's trailing note before it says
 /// "and N more" — a bounded line, like every other rendered bound.
@@ -141,9 +157,12 @@ const INTERRUPT_NOTICE: &str = "The user interrupted your program. It is paused 
      is lost, every completed call is already an artifact — and what happens next is \
      whatever program you write.";
 
-/// Iteration cap for one `Tick`: each extra round requires a synchronous
-/// artifact fetch (`fetch_history(id)`) to have unblocked the program, but a
-/// pathological program could chain those forever.
+/// Iteration cap for one `Tick`: each extra round requires a
+/// settle-at-dispatch verb the harness could answer on the spot (a
+/// `fetch_history` off the log, an `append_history`, a compaction edit)
+/// to have unblocked the program, but a pathological program could chain
+/// those forever. Hitting the cap is a slice boundary, not a failure —
+/// the branch re-enqueues and carries on next tick.
 const MAX_PUMP_ROUNDS: usize = 100;
 
 /// A fixed budget for tests calling [`Runner::document`]/
@@ -343,15 +362,36 @@ enum Phase {
 /// The name, args and address live there, not here: the log is the
 /// record, and the session state only has to route the settlement.
 struct PendingCall {
-    /// The program-side promise this call's `Result` resolves or
-    /// rejects. `tools.agent`'s old spawn-then-ask sugar (`Settle`,
-    /// two producers for one promise) is gone from the vocabulary
-    /// (23_ONE_AGENT.md A4: `agent` is not one of the closed verbs) —
-    /// every pending call now has exactly one thing waiting on it.
-    promise: PromisePtr,
+    /// Where the program is waiting for this call — exactly one place,
+    /// always. (`tools.agent`'s old spawn-then-ask sugar, two producers
+    /// for one promise, is gone from the vocabulary: 23_ONE_AGENT.md A4,
+    /// `agent` is not one of the closed verbs.)
+    slot: Slot,
     /// Which run issued it: results from an abandoned run are still
     /// logged as artifacts (the physics happened) but not delivered.
     generation: u64,
+}
+
+/// The two ways a program can be waiting on a call, and the only
+/// difference between them at settlement time.
+enum Slot {
+    /// A promise the program holds (`Instr::Invoke`): settling it wakes
+    /// whoever awaits it, whenever they get round to it, and a failure
+    /// is a rejection they may never look at.
+    Promise(PromisePtr),
+    /// A frame frozen mid-call (`Instr::Settle`): the value goes
+    /// straight onto its stack and it carries on, and a failure is a
+    /// throw at the call site. Nothing else in the VM runs until this
+    /// is answered, so there is at most one of these per runner.
+    ///
+    /// **A settle slot can still outlive a dispatch pass.** `spawn`,
+    /// `fork` and `list_agents` are answered by the host a round trip
+    /// later (it creates the child / reads live branch status, neither
+    /// of which this runner can do), and a `fetch_history` that
+    /// re-attaches waits for a call that is genuinely in flight. What
+    /// `Settle` promises is that the *frame* is still standing when the
+    /// answer lands — not that the answer is instant.
+    Settle,
 }
 
 pub struct Runner {
@@ -1231,18 +1271,28 @@ impl Runner {
                 }
                 continue;
             }
-            let vm = self.settling_vm();
-            match tr.result {
-                Ok(v) => {
-                    let val = json_arg(vm, &v);
-                    vm.resolve_promise(pending.promise, val)
-                        .expect("pending promise is settleable");
+            // Where the program is waiting decides how this lands. A
+            // promise settles and whoever awaits it wakes; a frozen
+            // frame takes the value directly, and takes a failure as a
+            // throw at its call site rather than as a rejection it
+            // could never have caught.
+            match pending.slot {
+                Slot::Promise(promise) => {
+                    let vm = self.settling_vm();
+                    match tr.result {
+                        Ok(v) => {
+                            let val = json_arg(vm, &v);
+                            vm.resolve_promise(promise, val)
+                                .expect("pending promise is settleable");
+                        }
+                        Err(msg) => {
+                            let val = Value::String(RcStr::from(msg.as_str()));
+                            vm.reject_promise(promise, val)
+                                .expect("pending promise is settleable");
+                        }
+                    }
                 }
-                Err(msg) => {
-                    let val = Value::String(RcStr::from(msg.as_str()));
-                    vm.reject_promise(pending.promise, val)
-                        .expect("pending promise is settleable");
-                }
+                Slot::Settle => self.settle(tr.result),
             }
             delivered = true;
         }
@@ -1343,8 +1393,8 @@ impl Runner {
 
     /// Drive the VM until it blocks on the host, suspends, finishes, or
     /// runs out of fuel. Each round runs one `step(fuel)` slice; only a
-    /// synchronous unblock (an artifact fetch answered from the log)
-    /// earns another round.
+    /// synchronous unblock — a call the harness answered on the spot,
+    /// through either dispatcher — earns another round.
     fn pump(&mut self, tree: &mut Tree, fuel: u64) -> io::Result<Vec<StepOutput>> {
         let mut out = Vec::new();
         for _ in 0..MAX_PUMP_ROUNDS {
@@ -1362,6 +1412,17 @@ impl Runner {
                         return Ok(out); // blocked on the host now
                     }
                 }
+                Ok(StepResult::Settle { call }) => {
+                    // One call, answered into the frame that made it.
+                    // `false` is not "failed" here — it is "the answer
+                    // takes a round trip" (a `spawn`'s child, a
+                    // re-attached fetch), and the frame waits, frozen,
+                    // exactly as it would for any other host answer.
+                    let progressed = self.dispatch_settle(tree, call, &mut out)?;
+                    if !progressed {
+                        return Ok(out);
+                    }
+                }
                 Ok(StepResult::Done { value, unstarted }) => {
                     return self.finish_program(tree, value, unstarted, out);
                 }
@@ -1377,23 +1438,28 @@ impl Runner {
         Ok(out)
     }
 
-    /// Classify one `Pending` batch. **This is the one place a bare
-    /// harness verb's name becomes a `Call` variant / log effect**
-    /// (17_BRANCHES A2, folded in here from the deleted `verbs.rs`):
-    /// everything downstream — the artifact menu, reconciliation,
-    /// re-attach, routing an answer home — matches on the variant, never
-    /// on the string again.
+    /// Classify one `Pending` batch — the calls that hold a **promise**
+    /// (`Instr::Invoke`). **This is one of the two places a bare harness
+    /// verb's name becomes a `Call` variant / log effect** (17_BRANCHES
+    /// A2, folded in here from the deleted `verbs.rs`); its sibling is
+    /// `dispatch_settle`, which takes the verbs that answer into a
+    /// standing frame instead. Everything downstream — the artifact
+    /// menu, reconciliation, re-attach, routing an answer home —
+    /// matches on the variant, never on the string again.
     ///
-    /// `fetch_history(id)` is answered from the log immediately and logs
-    /// nothing (returns true if any were — the program can run again);
-    /// `spawn`/`ask`/`tell`/`fork` become logged `Call`s; `answer` and
-    /// `append_history` settle synchronously, with no host round trip at
-    /// all; everything else (`tools.*`, and any bare name this dispatcher
-    /// doesn't recognize, including `list_agents` — served by the host,
-    /// not the registry, but over the same `ToolCalls`/`ToolResults`
-    /// round trip as any other tool) becomes `ToolCalls`. Every call that
-    /// leaves here is logged as a `Call` event *at dispatch*, settled
-    /// later by exactly one `Result`.
+    /// What arrives here: `ask` and `tell` become logged `Call::Send`s,
+    /// and everything else (`tools.*`, plus any bare name this
+    /// dispatcher does not recognize) becomes `ToolCalls`. Every call
+    /// that leaves here is logged as a `Call` event *at dispatch*,
+    /// settled later by exactly one `Result`.
+    ///
+    /// The settle-at-dispatch verbs — `spawn`, `fork`, `list_agents`,
+    /// `done`, `answer`, `append_history`, `fetch_history`,
+    /// `remove_history`, `rewrite_history` — can no longer reach this
+    /// function at all: the compiler lowers them to `Instr::Settle`, so
+    /// they arrive as `StepResult::Settle` and are handled one at a time
+    /// by `dispatch_settle`. Returns true if any call here made progress
+    /// the program can run on.
     fn dispatch_calls(
         &mut self,
         tree: &mut Tree,
@@ -1401,92 +1467,14 @@ impl Runner {
         out: &mut Vec<StepOutput>,
     ) -> io::Result<bool> {
         let mut tool_calls = Vec::new();
-        let mut spawns = Vec::new();
-        let mut forks = Vec::new();
         let mut sends = Vec::new();
         let mut progressed = false;
 
         for call in calls {
             match call.name.as_str() {
-                TOOL_FETCH_HISTORY => {
-                    // **Re-attach, not re-ask.** A call this session
-                    // still has in flight is re-registered against the
-                    // *current* run, so a rewritten program awaits the
-                    // answer the dead VM would have got. Without it,
-                    // "pending" in the menu is amnesia with extra steps.
-                    if let Some(pending) = self.reattachable(&*tree, &call) {
-                        self.pending.insert(
-                            pending,
-                            PendingCall {
-                                promise: call.promise,
-                                generation: self.generation,
-                            },
-                        );
-                        continue; // no progress: the program parks on it
-                    }
-                    let fetched = self.fetch_history(&*tree, &call);
-                    let vm = self.running_vm();
-                    match fetched {
-                        Ok(json) => {
-                            let v = json_arg(vm, &json);
-                            vm.resolve_promise(call.promise, v).expect("fresh promise");
-                        }
-                        Err(msg) => {
-                            let v = Value::String(RcStr::from(msg.as_str()));
-                            vm.reject_promise(call.promise, v).expect("fresh promise");
-                        }
-                    }
-                    progressed = true;
-                }
-                TOOL_SPAWN => {
-                    let args = self.call_args_json(&call);
-                    // `spawn(charter)` — the folded-in verbs.rs
-                    // convention: one positional string, not the old
-                    // `tools.spawn({ charter, name, tools })` options
-                    // object. A name or a tool allowlist is not
-                    // expressible from the bare verb (verbs.rs never
-                    // showed a second argument either); `tools.spawn`
-                    // (a registry-configured capability, if the agent
-                    // has one) is the escape hatch for those.
-                    match args.first().and_then(|v| v.as_str()) {
-                        Some(charter) => {
-                            let spawn = self.issue_call(
-                                tree,
-                                Call::Spawn {
-                                    name: None,
-                                    charter: charter.to_owned(),
-                                    tools: None,
-                                    site: call.site,
-                                },
-                                call.promise,
-                            )?;
-                            spawns.push(spawn);
-                        }
-                        None => {
-                            self.reject_call(call.promise, "spawn(charter) needs a charter string");
-                            progressed = true;
-                        }
-                    }
-                }
-                TOOL_FORK => {
-                    // `fork()` takes nothing: it creates a divergent
-                    // branch and settles with its handle. What the child
-                    // should do is said afterwards, in its own `tell` or
-                    // `ask` — creating is not messaging
-                    // (`22_ONE_VOCABULARY.md`).
-                    let fork = self.issue_call(
-                        tree,
-                        Call::Fork {
-                            name: None,
-                            site: call.site,
-                        },
-                        call.promise,
-                    )?;
-                    forks.push(fork);
-                }
                 TOOL_ASK | TOOL_TELL => {
                     let expects_reply = call.name == TOOL_ASK;
-                    let args = self.call_args_json(&call);
+                    let args = self.call_args_json(&call.args);
                     // `tell(text)` / `tell(to, text)`, always
                     // `ask(who, text)` — positional, not an options
                     // object; `input` alongside the text is no longer
@@ -1510,7 +1498,7 @@ impl Runner {
                                     expects_reply,
                                     site: call.site,
                                 },
-                                call.promise,
+                                Slot::Promise(call.promise),
                             )?;
                             sends.push(send);
                         }
@@ -1531,124 +1519,6 @@ impl Runner {
                         }
                     }
                 }
-                TOOL_ANSWER => {
-                    let args = self.call_args_json(&call);
-                    match args.as_slice() {
-                        [question, _label, value] => {
-                            match question.as_u64().filter(|n| *n > 0).map(EventId::new) {
-                                Some(question) if self.open().contains(&question) => {
-                                    tree.append(
-                                        &mut self.spine,
-                                        EventPayload::Answer {
-                                            question,
-                                            value: value.clone(),
-                                        },
-                                    )?;
-                                    let vm = self.running_vm();
-                                    let v = json_arg(vm, &serde_json::Value::Bool(true));
-                                    vm.resolve_promise(call.promise, v).expect("fresh promise");
-                                    progressed = true;
-                                    out.push(StepOutput::Answered {
-                                        question,
-                                        value: value.clone(),
-                                    });
-                                    // NOTE: the `label` checksum
-                                    // verbs.rs describes (must match the
-                                    // question's own label, the same way
-                                    // `compaction.rs`'s `CompactionOp`
-                                    // checks one) is **not** enforced
-                                    // here — flagged prominently in
-                                    // 23_ONE_AGENT.md A4's report.
-                                    // verbs.rs's own doc said the same:
-                                    // "not implemented at this layer (no
-                                    // log to check against yet)".
-                                }
-                                Some(question) => {
-                                    let msg = match self.owning_branch(tree, question) {
-                                        Some(branch) => format!(
-                                            "#{} belongs to branch #{}; this fork inherited it \
-                                             as history and does not owe it. To make your \
-                                             answer the delivered one, the user can take that \
-                                             branch's turn.",
-                                            question.as_u64(),
-                                            branch.as_u64()
-                                        ),
-                                        None => format!(
-                                            "#{} is not open on this branch — it was already \
-                                             answered, or it is a notice that owes no answer.",
-                                            question.as_u64()
-                                        ),
-                                    };
-                                    self.reject_call(call.promise, &msg);
-                                    progressed = true;
-                                }
-                                None => {
-                                    self.reject_call(
-                                        call.promise,
-                                        "answer's question id must be a positive integer",
-                                    );
-                                    progressed = true;
-                                }
-                            }
-                        }
-                        _ => {
-                            self.reject_call(
-                                call.promise,
-                                "answer(question, label, value) takes exactly three arguments",
-                            );
-                            progressed = true;
-                        }
-                    }
-                }
-                TOOL_APPEND_HISTORY => {
-                    let args = self.call_args_json(&call);
-                    match args.first() {
-                        Some(value) => {
-                            tree.append(
-                                &mut self.spine,
-                                EventPayload::Note {
-                                    text: note_text(value),
-                                },
-                            )?;
-                            let vm = self.running_vm();
-                            let v = json_arg(vm, &serde_json::Value::Null);
-                            vm.resolve_promise(call.promise, v).expect("fresh promise");
-                            progressed = true;
-                        }
-                        None => {
-                            self.reject_call(
-                                call.promise,
-                                "append_history(value) needs one argument",
-                            );
-                            progressed = true;
-                        }
-                    }
-                }
-                TOOL_DONE => {
-                    // Not a host call: nothing leaves the process. Recorded
-                    // on the `Runner` rather than resolved-and-forgotten
-                    // because the decision it feeds (rest instead of
-                    // continue) isn't made until the program's return
-                    // value is known, in `finish_program` — a program can
-                    // call `done()` and then keep running (more `tell`s,
-                    // more calls) before actually returning, and the flag
-                    // has to survive to see that.
-                    self.done = true;
-                    self.resolve_call(call.promise, serde_json::Value::Null);
-                    progressed = true;
-                }
-                TOOL_REMOVE_HISTORY | TOOL_REWRITE_HISTORY => {
-                    // Not a host call: nothing leaves the process and
-                    // nothing settles later. The op joins the batch this
-                    // handler is building and the promise resolves at
-                    // once, so a compaction program reads as ordinary
-                    // straight-line code.
-                    match self.record_compaction(&call) {
-                        Ok(()) => self.resolve_call(call.promise, serde_json::Value::Null),
-                        Err(why) => self.reject_call(call.promise, &why),
-                    }
-                    progressed = true;
-                }
                 _ => {
                     let args = {
                         let vm = self.running_vm();
@@ -1668,7 +1538,7 @@ impl Runner {
                             args: args.clone(),
                             site: call.site,
                         },
-                        call.promise,
+                        Slot::Promise(call.promise),
                     )?;
                     tool_calls.push(OutCall {
                         call: id,
@@ -1681,32 +1551,297 @@ impl Runner {
         if !tool_calls.is_empty() {
             out.push(StepOutput::ToolCalls(tool_calls));
         }
-        if !spawns.is_empty() {
-            out.push(StepOutput::Spawns(spawns));
-        }
-        if !forks.is_empty() {
-            out.push(StepOutput::Forks(forks));
-        }
         if !sends.is_empty() {
             out.push(StepOutput::Sends(sends));
         }
         Ok(progressed)
     }
 
+    /// Serve one settle-at-dispatch call (`Instr::Settle`): the verbs
+    /// that answer **into a frame that is still standing**, rather than
+    /// into a promise the program has to remember to await. The other
+    /// half of `dispatch_calls`, and the reason the compiler no longer
+    /// has to emit an `await` nobody wrote.
+    ///
+    /// Two shapes live here, and the difference is only *when* the
+    /// value is known, never whether the frame survives:
+    ///
+    /// - **Answered here.** `fetch_history` reads a row off the log,
+    ///   `answer` and `append_history` append one, `remove_history` /
+    ///   `rewrite_history` add an edit to the batch the running
+    ///   compaction handler is building, `done` sets the flag that
+    ///   stops the loop. The value is pushed before this function
+    ///   returns and the program runs on in the same pump round
+    ///   (`true`).
+    /// - **Answered a round trip later.** `spawn`, `fork` and
+    ///   `list_agents` need what only the host above this runner has —
+    ///   the registry and card to root a child with, the live per-branch
+    ///   status `list_agents` reports — so they are logged as `Call`s
+    ///   and settled by their `Result` like any other call, through
+    ///   `Slot::Settle`. So is a `fetch_history` that **re-attaches** to
+    ///   a call this session still has in flight. The frame stays frozen
+    ///   meanwhile: `VM::step` reports an empty `Pending` rather than
+    ///   running against a stack with a hole in it.
+    ///
+    /// A failure is `settle_throw`, not a rejection: it lands as a throw
+    /// at the call site, where an ordinary `try`/`catch` can see it and
+    /// where an uncaught one stops the program. That is the second half
+    /// of what this change buys — an unawaited mistake (a wrong
+    /// compaction label, an `answer` to a question this branch does not
+    /// owe) used to settle a promise nobody read, which looked to the
+    /// model exactly like a call that worked.
+    fn dispatch_settle(
+        &mut self,
+        tree: &mut Tree,
+        call: SettleCall,
+        out: &mut Vec<StepOutput>,
+    ) -> io::Result<bool> {
+        match call.name.as_str() {
+            TOOL_FETCH_HISTORY => {
+                // **Re-attach, not re-ask.** A call this session still
+                // has in flight is re-registered against the *current*
+                // run, so a rewritten program is handed the answer the
+                // dead VM would have got. Without it, "pending" in the
+                // menu is amnesia with extra steps.
+                if let Some(pending) = self.reattachable(&*tree, &call.args) {
+                    self.pending.insert(
+                        pending,
+                        PendingCall {
+                            slot: Slot::Settle,
+                            generation: self.generation,
+                        },
+                    );
+                    return Ok(false); // no progress: the frame parks on it
+                }
+                let fetched = self.fetch_history(&*tree, &call.args);
+                self.settle(fetched);
+                Ok(true)
+            }
+            TOOL_SPAWN => {
+                // `spawn(charter)` — the folded-in verbs.rs convention:
+                // one positional string, not the old `tools.spawn({
+                // charter, name, tools })` options object. A name or a
+                // tool allowlist is not expressible from the bare verb
+                // (verbs.rs never showed a second argument either);
+                // `tools.spawn` (a registry-configured capability, if
+                // the agent has one) is the escape hatch for those.
+                let args = self.call_args_json(&call.args);
+                match args.first().and_then(|v| v.as_str()) {
+                    Some(charter) => {
+                        let spawn = self.issue_call(
+                            tree,
+                            Call::Spawn {
+                                name: None,
+                                charter: charter.to_owned(),
+                                tools: None,
+                                site: call.site,
+                            },
+                            Slot::Settle,
+                        )?;
+                        out.push(StepOutput::Spawns(vec![spawn]));
+                        Ok(false)
+                    }
+                    None => {
+                        self.settle_err("spawn(charter) needs a charter string");
+                        Ok(true)
+                    }
+                }
+            }
+            TOOL_FORK => {
+                // `fork()` takes nothing: it creates a divergent branch
+                // and settles with its handle. What the child should do
+                // is said afterwards, in its own `tell` or `ask` —
+                // creating is not messaging (`22_ONE_VOCABULARY.md`).
+                let fork = self.issue_call(
+                    tree,
+                    Call::Fork {
+                        name: None,
+                        site: call.site,
+                    },
+                    Slot::Settle,
+                )?;
+                out.push(StepOutput::Forks(vec![fork]));
+                Ok(false)
+            }
+            TOOL_LIST_AGENTS => {
+                // The card has advertised `list_agents()` since phase 20
+                // and nothing answered it: it fell through to the tool
+                // registry, which has no such tool, so a program that
+                // took the card at its word got `unknown tool
+                // list_agents`. It belongs here, next to `spawn` and
+                // `fork` — spawn creates, fork creates, this one
+                // enumerates, and all three are about agent topology.
+                //
+                // It is logged and dispatched rather than answered on
+                // the spot for one reason: the card promises "with
+                // status", and a branch's status is live session state
+                // (which runner exists, what phase it is in) that this
+                // runner cannot see for anyone but itself. The host's
+                // `serve_agents` — already the sole implementation,
+                // already reached by `tools.agents(...)` — is where that
+                // lives, so this routes there rather than growing a
+                // second, weaker projection that would have to answer
+                // "dormant" for everyone.
+                //
+                // `deep: true` because the card says *subtree*, where
+                // `tools.agents()` defaults to direct children only.
+                let args = serde_json::json!([{ "deep": true }]);
+                let id = self.issue_call(
+                    tree,
+                    Call::Invoke {
+                        name: TOOL_LIST_AGENTS.to_owned(),
+                        args: args.clone(),
+                        site: call.site,
+                    },
+                    Slot::Settle,
+                )?;
+                out.push(StepOutput::ToolCalls(vec![OutCall {
+                    call: id,
+                    name: TOOL_LIST_AGENTS.to_owned(),
+                    args,
+                }]));
+                Ok(false)
+            }
+            TOOL_ANSWER => {
+                let args = self.call_args_json(&call.args);
+                match args.as_slice() {
+                    [question, _label, value] => {
+                        match question.as_u64().filter(|n| *n > 0).map(EventId::new) {
+                            Some(question) if self.open().contains(&question) => {
+                                let value = value.clone();
+                                tree.append(
+                                    &mut self.spine,
+                                    EventPayload::Answer {
+                                        question,
+                                        value: value.clone(),
+                                    },
+                                )?;
+                                self.settle(Ok(serde_json::Value::Bool(true)));
+                                out.push(StepOutput::Answered { question, value });
+                                // NOTE: the `label` checksum verbs.rs
+                                // describes (must match the question's
+                                // own label, the same way
+                                // `compaction.rs`'s `CompactionOp`
+                                // checks one) is **not** enforced here —
+                                // flagged prominently in 23_ONE_AGENT.md
+                                // A4's report. verbs.rs's own doc said
+                                // the same: "not implemented at this
+                                // layer (no log to check against yet)".
+                                Ok(true)
+                            }
+                            Some(question) => {
+                                let msg = match self.owning_branch(tree, question) {
+                                    Some(branch) => format!(
+                                        "#{} belongs to branch #{}; this fork inherited it \
+                                         as history and does not owe it. To make your \
+                                         answer the delivered one, the user can take that \
+                                         branch's turn.",
+                                        question.as_u64(),
+                                        branch.as_u64()
+                                    ),
+                                    None => format!(
+                                        "#{} is not open on this branch — it was already \
+                                         answered, or it is a notice that owes no answer.",
+                                        question.as_u64()
+                                    ),
+                                };
+                                self.settle_err(&msg);
+                                Ok(true)
+                            }
+                            None => {
+                                self.settle_err("answer's question id must be a positive integer");
+                                Ok(true)
+                            }
+                        }
+                    }
+                    _ => {
+                        self.settle_err(
+                            "answer(question, label, value) takes exactly three arguments",
+                        );
+                        Ok(true)
+                    }
+                }
+            }
+            TOOL_APPEND_HISTORY => {
+                let args = self.call_args_json(&call.args);
+                match args.first() {
+                    Some(value) => {
+                        tree.append(
+                            &mut self.spine,
+                            EventPayload::Note {
+                                text: note_text(value),
+                            },
+                        )?;
+                        self.settle(Ok(serde_json::Value::Null));
+                    }
+                    None => self.settle_err("append_history(value) needs one argument"),
+                }
+                Ok(true)
+            }
+            TOOL_DONE => {
+                // Nothing leaves the process. Recorded on the `Runner`
+                // rather than answered-and-forgotten because the
+                // decision it feeds (rest instead of continue) isn't
+                // made until the program's return value is known, in
+                // `finish_program` — a program can call `done()` and
+                // then keep running (more `tell`s, more calls) before
+                // actually returning, and the flag has to survive to see
+                // that.
+                self.done = true;
+                self.settle(Ok(serde_json::Value::Null));
+                Ok(true)
+            }
+            TOOL_REMOVE_HISTORY | TOOL_REWRITE_HISTORY => {
+                // Nothing leaves the process and nothing settles later.
+                // The op joins the batch this handler is building and
+                // the value lands at once, so a compaction program reads
+                // as ordinary straight-line code.
+                let recorded = self
+                    .record_compaction(&call.name, &call.args)
+                    .map(|()| serde_json::Value::Null);
+                self.settle(recorded);
+                Ok(true)
+            }
+            // Unreachable from compiled code — the compiler emits
+            // `Settle` for exactly the names above — but a hand-built
+            // program could get here, and a clear throw beats a panic.
+            other => {
+                let msg = format!("`{other}` is not a settle-at-dispatch verb");
+                self.settle_err(&msg);
+                Ok(true)
+            }
+        }
+    }
+
+    /// Hand a settle-at-dispatch call its outcome: the value onto the
+    /// frame's stack, or the failure as a throw at the call site.
+    fn settle(&mut self, outcome: Result<serde_json::Value, String>) {
+        match outcome {
+            Ok(value) => {
+                let vm = self.settling_vm();
+                let v = vm.json_to_stack_value(&value, 0).expect("plain json");
+                vm.push_settled(v).expect("a Settle is outstanding");
+            }
+            Err(msg) => self.settle_err(&msg),
+        }
+    }
+
+    /// Fail a settle-at-dispatch call: throw into the frame that made
+    /// it. An uncaught throw is left for the VM's next `step`, which
+    /// reports it as the program's own trap — the same road any other
+    /// uncaught throw takes.
+    fn settle_err(&mut self, message: &str) {
+        let vm = self.settling_vm();
+        let v = Value::String(RcStr::from(message));
+        vm.settle_throw(v).expect("a Settle is outstanding");
+    }
+
     /// Every argument of a dispatched call, as JSON — the uniform shape
     /// every bare-verb parser above reads from (folded in from the
     /// deleted `verbs.rs`'s `args_as_json`).
-    fn call_args_json(&mut self, call: &InvokeCall) -> Vec<serde_json::Value> {
+    fn call_args_json(&mut self, args: &[Value]) -> Vec<serde_json::Value> {
         let vm = self.running_vm();
-        call.args.iter().map(|v| value_json(vm, v)).collect()
-    }
-
-    /// Resolve a call that never left the process — the compaction
-    /// verbs, whose answer is known the moment they are made.
-    fn resolve_call(&mut self, promise: PromisePtr, value: serde_json::Value) {
-        let vm = self.running_vm();
-        let v = vm.json_to_stack_value(&value, 0).expect("plain json");
-        vm.resolve_promise(promise, v).expect("fresh promise");
+        args.iter().map(|v| value_json(vm, v)).collect()
     }
 
     /// Add one `remove_history`/`rewrite_history` call to the batch the
@@ -1716,31 +1851,29 @@ impl Runner {
     /// nothing: history is not a thing an ordinary program edits, and a
     /// silently-ignored call would look to the model exactly like one
     /// that worked.
-    fn record_compaction(&mut self, call: &InvokeCall) -> Result<(), String> {
+    fn record_compaction(&mut self, name: &str, args: &[Value]) -> Result<(), String> {
         use crate::compaction::CompactionOp;
         if self.compacting.is_none() {
             return Err(format!(
-                "{} is only available in a compaction program, which the harness asks for \
-                 when the conversation outgrows its budget",
-                call.name
+                "{name} is only available in a compaction program, which the harness asks for \
+                 when the conversation outgrows its budget"
             ));
         }
-        let args = self.call_args_json(call);
+        let args = self.call_args_json(args);
         let id = match args.first().and_then(|v| v.as_u64()) {
             Some(n) if n > 0 => EventId::new(n),
-            _ => return Err(format!("{}(id, label, …) needs the row's id", call.name)),
+            _ => return Err(format!("{name}(id, label, …) needs the row's id")),
         };
         let label = match args.get(1).and_then(|v| v.as_str()) {
             Some(l) => l.to_owned(),
             None => {
                 return Err(format!(
-                    "{}(id, label, …) needs the row's label, which is checked against the \
-                     row itself so a wrong id cannot compact the wrong thing",
-                    call.name
+                    "{name}(id, label, …) needs the row's label, which is checked against the \
+                     row itself so a wrong id cannot compact the wrong thing"
                 ));
             }
         };
-        let op = if call.name == TOOL_REMOVE_HISTORY {
+        let op = if name == TOOL_REMOVE_HISTORY {
             CompactionOp::Remove { id, label }
         } else {
             let Some(text) = args.get(2).and_then(|v| v.as_str()) else {
@@ -1875,17 +2008,12 @@ impl Runner {
     /// Log a `Call` at dispatch and remember how to settle it. Returns the
     /// `Call` event's id — the log's own key, which the host echoes back
     /// with the result and which the artifact menu names.
-    fn issue_call(
-        &mut self,
-        tree: &mut Tree,
-        call: Call,
-        promise: PromisePtr,
-    ) -> io::Result<EventId> {
+    fn issue_call(&mut self, tree: &mut Tree, call: Call, slot: Slot) -> io::Result<EventId> {
         let logged = tree.append(&mut self.spine, EventPayload::Call(call))?;
         self.pending.insert(
             logged,
             PendingCall {
-                promise,
+                slot,
                 generation: self.generation,
             },
         );
@@ -1894,8 +2022,8 @@ impl Runner {
 
     /// The call `fetch_history(id)` should **re-attach** to rather than read:
     /// one this session still has in flight, on this branch's own path.
-    fn reattachable(&self, tree: &Tree, call: &InvokeCall) -> Option<EventId> {
-        let Some(Value::PosInt(id)) = call.args.first() else {
+    fn reattachable(&self, tree: &Tree, args: &[Value]) -> Option<EventId> {
+        let Some(Value::PosInt(id)) = args.first() else {
             return None;
         };
         let id = EventId::new(*id);
@@ -1943,8 +2071,8 @@ impl Runner {
     /// (`document::pending_line`). This reads the log, so it reads the
     /// original. That asymmetry is the design: the document shrinks,
     /// the history does not.
-    fn fetch_history(&self, tree: &Tree, call: &InvokeCall) -> Result<serde_json::Value, String> {
-        let id = match call.args.first() {
+    fn fetch_history(&self, tree: &Tree, args: &[Value]) -> Result<serde_json::Value, String> {
+        let id = match args.first() {
             Some(Value::PosInt(n)) => *n,
             _ => return Err("fetch_history needs a numeric id".into()),
         };
@@ -2021,12 +2149,15 @@ impl Runner {
         mut out: Vec<StepOutput>,
     ) -> io::Result<Vec<StepOutput>> {
         // Fire-and-forget calls the program never awaited: classified
-        // exactly like any other call (`dispatch_calls` — the single
-        // place a bare verb's name becomes a `Call` variant), **while the
-        // VM is still `Running`**, so `tell`/`ask`/`spawn`/`fork` land as
-        // themselves instead of silently demoting to a generic
+        // exactly like any other promise-holding call (`dispatch_calls`),
+        // **while the VM is still `Running`**, so `tell` and `ask` land
+        // as themselves instead of silently demoting to a generic
         // `Call::Invoke` sent to the tool registry (which has no such
-        // tool and answers "unknown tool `tell`"). This used to build
+        // tool and answers "unknown tool `tell`").
+        //
+        // Only those two and `tools.*` can be here at all now: a
+        // settle-at-dispatch verb never enters the outbox, so there is
+        // no such thing as an unstarted `spawn`. This used to build
         // `Call::Invoke` unconditionally for every unstarted call — the
         // bug 23_ONE_AGENT.md's Pass B flagged as a confirmed regression:
         // an unawaited `tell()` reached here, not `dispatch_calls`'s
@@ -3027,6 +3158,100 @@ mod tests {
         let mut child = Runner::new_agent(tree, spawn, None, charter, None, "").unwrap();
         let (_, out) = ask(tree, asker, &mut child, charter, input);
         (child, out)
+    }
+
+    /// **Every verb the card advertises has something that answers
+    /// it.** `card.rs`'s `the_card_names_every_bare_verb` checks the
+    /// card *mentions* each verb, and nothing checked the harness
+    /// *answers* any of them — which is how `list_agents()` shipped
+    /// advertised and unimplemented for three phases, falling past
+    /// `dispatch_calls` into the tool registry and coming back `unknown
+    /// tool \`list_agents\``.
+    ///
+    /// The list is `interp::HARNESS_VERBS`, the compiler's own closed
+    /// vocabulary, so a verb cannot be added to the dialect without
+    /// somewhere here growing an arm for it. What "answers it" means
+    /// depends on how it lowers, and each case is checked against the
+    /// real dispatcher rather than a copy of its match:
+    ///
+    /// - `Settle` — `dispatch_settle` must not fall through to its
+    ///   "not a settle-at-dispatch verb" arm.
+    /// - `Invoke`/`Notify` — `dispatch_calls` must recognise the name
+    ///   rather than shipping it to the registry, *or* the loop must
+    ///   serve it inline (`host::serves_inline`).
+    #[test]
+    fn every_harness_verb_has_an_answerer() {
+        for verb in interp::HARNESS_VERBS {
+            // Enough arguments that the arity-checked verbs compile;
+            // nothing here runs past the first call, and a complaint
+            // about the *arguments* is a real answer for this purpose.
+            let src = if *verb == "done" || *verb == "fork" {
+                format!("{verb}();")
+            } else {
+                format!("{verb}(1, 2, 3);")
+            };
+            let (mut tree, mut state) = setup();
+            let program = compile(&src).unwrap_or_else(|e| panic!("{verb}: {e:?}"));
+            let mut vm = VM::for_program(program, serde_json::Value::Null).unwrap();
+            match vm.step(FUEL).unwrap() {
+                StepResult::Settle { call } => {
+                    state.phase = Phase::Running(Run {
+                        program_id: state.spine.leaf_id,
+                        vm,
+                    });
+                    let mut out = Vec::new();
+                    state.dispatch_settle(&mut tree, call, &mut out).unwrap();
+                    // The fallthrough arm throws this exact sentence;
+                    // any other outcome — a value, or a complaint about
+                    // the arguments — means the verb was recognised.
+                    let vm = state.settling_vm();
+                    let unanswered = vm.stack.iter().any(|v| {
+                        matches!(v, Value::String(s)
+                            if s.as_str().contains("is not a settle-at-dispatch verb"))
+                    });
+                    assert!(
+                        !unanswered,
+                        "`{verb}` reached dispatch_settle's fallthrough"
+                    );
+                    // A settle verb the runner cannot answer itself is
+                    // logged as a tool call and served a round trip
+                    // later. The loop must actually serve it: the
+                    // registry has no tool named after a bare verb, so
+                    // anything else comes back `unknown tool`, which is
+                    // precisely the bug this gate exists for.
+                    for output in &out {
+                        if let StepOutput::ToolCalls(calls) = output {
+                            for c in calls {
+                                assert!(
+                                    crate::host::serves_inline(&c.name),
+                                    "`{verb}` is dispatched as tool `{}`, which nothing serves",
+                                    c.name
+                                );
+                            }
+                        }
+                    }
+                }
+                StepResult::Pending { calls } => {
+                    let name = calls[0].name.as_str();
+                    assert!(
+                        matches!(name, TOOL_ASK | TOOL_TELL) || crate::host::serves_inline(name),
+                        "`{verb}` falls through dispatch_calls to the tool registry, \
+                         which has no such tool"
+                    );
+                }
+                StepResult::Done { unstarted, .. } => {
+                    // `tell` lowers to `Notify`: nothing awaits it, so
+                    // the program ran to the end and the call is in the
+                    // fire-and-forget batch instead.
+                    let name = unstarted[0].name.as_str();
+                    assert!(
+                        matches!(name, TOOL_ASK | TOOL_TELL) || crate::host::serves_inline(name),
+                        "`{verb}` falls through dispatch_calls to the tool registry"
+                    );
+                }
+                other => panic!("`{verb}`: nothing dispatched it ({other:?})"),
+            }
+        }
     }
 
     fn llm_program(source: &str) -> LlmTurn {

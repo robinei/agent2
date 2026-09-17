@@ -588,71 +588,66 @@ impl super::Compiler {
                 self.compile_args(argv);
                 self.emit(Instr::Notify(name.into(), argv.len() as u32), span);
             }
-            "remove_history" | "rewrite_history" => {
-                // Same reasoning as `spawn`/`fork` below: these settle at
-                // dispatch. The harness adds the op to the batch the
-                // running compaction handler is building and answers
-                // immediately — nothing leaves the process, nothing is
-                // pending, and there is no round trip to wait on.
+            "spawn" | "fork" | "list_agents" | "done" | "fetch_history" | "answer"
+            | "append_history" | "remove_history" | "rewrite_history" => {
+                // **The settle-at-dispatch verbs.** None of these leaves
+                // the frame that called it: the host answers each from
+                // the log or the tree it already has — `fetch_history`
+                // reads a row, `answer`/`append_history` append one,
+                // `remove_history`/`rewrite_history` add an edit to the
+                // batch the running compaction handler is building,
+                // `done` sets the flag that stops the loop, and
+                // `spawn`/`fork`/`list_agents` root a child, branch a
+                // context, and read the subtree back. So they lower to
+                // `Settle`, which yields the call and takes the value
+                // straight back onto the stack.
                 //
-                // Emitted with the `Await` rather than requiring one in
-                // the source because a compaction program reads as a
-                // list of edits, and the card writes them that way
-                // (`remove_history(id, label)`). Without this an
-                // unawaited call's rejection — a wrong label, a call
-                // made outside a compaction program — would settle a
-                // promise nobody reads, and the mistake would look to
-                // the model exactly like a call that worked.
-                self.compile_args(argv);
-                self.emit(Instr::Invoke(name.into(), argv.len() as u32), span);
-                self.emit(Instr::Await, span);
-            }
-            "done" => {
-                // The only thing that stops the loop
-                // (`agent/src/machine.rs`'s `TOOL_DONE`): settles at
-                // dispatch exactly like `spawn`/`fork` below, so it
-                // gets the same `Invoke` + `Await` pair rather than
-                // requiring an explicit `await` in the card. Fixed
-                // (zero) arity like `abandon` below — there is no
-                // argument that would mean anything here, so a wrong
+                // "Settles at dispatch" is about the **frame**, not the
+                // clock. The last three cost the harness a round trip
+                // through its own loop — creating a child needs the
+                // registry and a card, and a branch's live status is
+                // session state no single runner can see — but the
+                // frame that called them is still standing when the
+                // answer lands, which is the only property the lowering
+                // depends on.
+                //
+                // They used to lower to `Invoke` + an `Await` emitted
+                // *here* rather than written in the source, so that
+                // `const h = spawn(...)` would be the handle and not a
+                // promise. That worked, and cost more than it looked:
+                // an `Await` the source never wrote put `await` inside
+                // plain arrows (`names.map(n => spawn(n))`), which
+                // suspended a frame nobody declared `async` and forced
+                // `suspend_current_frame` to mint a promise for it.
+                // `Settle` buys the same spelling with none of that —
+                // and, because a failure now arrives as a throw at the
+                // call site instead of a rejection on a promise nobody
+                // holds, an unawaited mistake (a wrong compaction
+                // label, an `answer` to a question this branch does not
+                // owe) stops the program where it happened rather than
+                // looking to the model exactly like a call that worked.
+                //
+                // A source-level `await` in front of any of them still
+                // works and still means the same thing: `Await` passes
+                // a non-promise straight through, and the card and its
+                // exemplars spell several of these with one.
+                //
+                // `done` takes no arguments — the only fixed arity
+                // here. Nothing else would mean anything, so a wrong
                 // count is a clear mistake worth a compile error rather
-                // than silently ignored args.
-                if !argv.is_empty() {
+                // than silently ignored args (same shape as `abandon`).
+                if name == "done" && !argv.is_empty() {
                     self.error(span, "`done` takes no arguments");
                     return;
                 }
+                // `ask` is deliberately NOT in this set: it is the one
+                // call in this vocabulary with a value genuinely coming
+                // back from somewhere else, which may take minutes and
+                // may fail asynchronously. Its promise is honest.
                 self.compile_args(argv);
-                self.emit(Instr::Invoke(name.into(), argv.len() as u32), span);
-                self.emit(Instr::Await, span);
+                self.emit(Instr::Settle(name.into(), argv.len() as u32), span);
             }
-            "spawn" | "fork" => {
-                // Creating an agent settles at dispatch: the host appends
-                // an `Agent`/`Fork` event and hands back its id, with no
-                // inference and no waiting on anyone. So the `await` is
-                // emitted here rather than required in the source, and
-                // `const h = spawn(...)` yields the handle itself.
-                //
-                // It cannot use `Notify` like `tell`: that pushes
-                // `undefined`, and these have a value to return. What it
-                // uses instead is the property `Instr::Await` already
-                // has — it re-executes, peeking while pending and
-                // leaving `ip` unchanged across `StepResult::Pending`, so
-                // the VM yields to the host and resumes with the value in
-                // place. The VM is never on the host's stack; it returns
-                // a `StepResult` and is stepped again.
-                //
-                // A source-level `await spawn(...)` still works: `Await`
-                // passes a non-promise straight through.
-                //
-                // The distinction this encodes (`22_ONE_VOCABULARY.md`,
-                // "Creating is not messaging"): a yield is not a round
-                // trip. This one costs a VM step; `ask` may cost a
-                // completion.
-                self.compile_args(argv);
-                self.emit(Instr::Invoke(name.into(), argv.len() as u32), span);
-                self.emit(Instr::Await, span);
-            }
-            "ask" | "answer" | "append_history" | "fetch_history" | "list_agents" => {
+            "ask" => {
                 // The closed, harness-defined vocabulary (phase 20 doc,
                 // `docs/20_CODE_MODE.md` Step C1) — a fixed global
                 // surface, identical for every agent, known to this
@@ -660,14 +655,18 @@ impl super::Compiler {
                 // `tools.*` (the "tools" arm in `compile_call`) stays
                 // the surface for a specific agent's *configured*
                 // capabilities, which this compiler has no static view
-                // of; these nine never vary per agent, so they get the
-                // same bare-call treatment `tools.foo(...)` gives its
-                // own names — `Invoke`, arity-agnostic here too, left
-                // to the host to accept or refuse at runtime.
-                // `remove_history`/`rewrite_history` are Part E's
-                // compaction verbs — a compaction handler's own
-                // program, not a root program's, but the same fixed
-                // vocabulary either way.
+                // of; these never vary per agent, so they get the same
+                // bare-call treatment `tools.foo(...)` gives its own
+                // names — `Invoke`, arity-agnostic here too, left to
+                // the host to accept or refuse at runtime.
+                //
+                // `ask` is the one the settle-at-dispatch arm above
+                // does **not** take, and the only bare verb left with a
+                // promise. It is a genuine round trip to someone else,
+                // it may take minutes, and it may fail asynchronously:
+                // the promise is the honest shape for it, and the
+                // `await` in front of it in the card is describing
+                // something real.
                 self.compile_args(argv);
                 self.emit(Instr::Invoke(name.into(), argv.len() as u32), span);
             }

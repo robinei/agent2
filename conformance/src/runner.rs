@@ -419,6 +419,15 @@ fn run_work_item(item: WorkItem) -> TestResult {
                 features: item.features,
             }
         }
+        // A settle-at-dispatch verb is harness vocabulary; no test262
+        // case names one, so this is the same "the program used
+        // something outside the language" failure `Pending` is.
+        Ok(StepResult::Settle { .. }) => TestResult {
+            path: item.path,
+            outcome: TestOutcome::Fail,
+            detail: "unexpected settle".to_string(),
+            features: item.features,
+        },
         Ok(StepResult::Pending { .. }) => TestResult {
             path: item.path,
             outcome: TestOutcome::Fail,
