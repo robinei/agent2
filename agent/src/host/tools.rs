@@ -367,9 +367,10 @@ fn bash_def() -> ToolDef {
                       tolerated, joined with spaces.) Resolves to { status, stdout, \
                       stderr, truncated? } (a non-zero status is a result, not an \
                       error); times out after 30s; output capped at 4MB/stream. \
-                      Runs with `pipefail`, so `status` is the first failing stage's \
-                      and not the last one's — `cargo test | tail -5` reports the \
-                      test run, not `tail`. One consequence worth knowing: `grep` \
+                      Runs with `pipefail`, so a pipeline's `status` is its failing \
+                      stage's and not just the last one's — `cargo test 2>&1 | tail \
+                      -5` reports the test run, not `tail`. (Truncating with `head` \
+                      is still a success.) One consequence worth knowing: `grep` \
                       exits 1 when it matches nothing, so a grep pipeline that found \
                       nothing reports a non-zero status. A command that could not be \
                       run at all (not found, not executable) rejects instead of \
@@ -583,8 +584,25 @@ fn run_bash(command: &str, timeout: Duration) -> Result<serde_json::Value, Strin
         _ => {}
     }
 
+    // **SIGPIPE is not a failure of the pipeline; it is how `head`
+    // works.** `pipefail` reports the rightmost non-zero stage, and
+    // `grep … | head -40` that actually truncates leaves `grep` killed
+    // by SIGPIPE — 141 — for doing exactly what was asked. Turning on
+    // `pipefail` without this makes one of the commonest idioms a
+    // program writes report failure on success, which is a worse lie
+    // than the one it fixes.
+    //
+    // Nothing else is hidden by it: `pipefail` takes the *rightmost*
+    // non-zero status, so a stage that failed for a real reason still
+    // wins over an upstream 141, and a missing command still surfaces
+    // as the 127 above.
+    let code = match code {
+        Some(141) => Some(0),
+        other => other,
+    };
+
     let mut result = json!({
-        "status": status.code(),
+        "status": code,
         "stdout": String::from_utf8_lossy(&stdout),
         "stderr": String::from_utf8_lossy(&stderr),
     });
@@ -920,6 +938,33 @@ mod tests {
     fn a_pipelines_status_is_the_first_failing_stage_not_the_last() {
         let result = bash(json!(["exit 3 | tail -5"])).unwrap();
         assert_eq!(result["status"], json!(3), "tail's 0 would hide it");
+    }
+
+    /// **`| head` that truncates is a success.** `pipefail` reports the
+    /// rightmost non-zero stage, and a `grep … | head -40` that
+    /// actually truncates leaves `grep` killed by SIGPIPE — 141 — for
+    /// doing exactly what was asked. Turning `pipefail` on without
+    /// normalising that makes one of the commonest idioms a program
+    /// writes report failure on success: a worse lie than the one
+    /// `pipefail` fixes.
+    #[test]
+    fn a_pipeline_cut_short_by_head_is_not_a_failure() {
+        let result = bash(json!(["seq 1 100000 | head -3"])).unwrap();
+        assert_eq!(result["status"], json!(0), "SIGPIPE is how head works");
+        assert_eq!(result["stdout"], json!("1\n2\n3\n"));
+    }
+
+    /// And it hides nothing: a stage that failed for a real reason is
+    /// to the right of the SIGPIPE'd one, and `pipefail` takes the
+    /// rightmost non-zero.
+    #[test]
+    fn a_real_failure_still_wins_over_an_upstream_sigpipe() {
+        let result = bash(json!(["seq 1 100000 | head -3 | grep nothing"])).unwrap();
+        assert_eq!(
+            result["status"],
+            json!(1),
+            "grep found nothing, and says so"
+        );
     }
 
     /// The other half of that trade, stated in the tool's description
