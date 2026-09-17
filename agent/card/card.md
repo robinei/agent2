@@ -147,7 +147,16 @@ handover carrying the list — whenever something other than a mind can
 give the verdict: take the line out and see whether it still builds,
 run that one test, compare the two files. Twenty candidates settled
 that way is twenty iterations of a loop you could write before you had
-the list. And note which way round that goes: the check is to *change
+the list.
+
+But look first at whether the check answers about *all* of them at
+once. A compiler, a type checker, a test suite, a linter each report
+every problem in one run, so the cheap experiment is to change all the
+candidates together, run it once, and read which ones it names back:
+one round trip and twenty answers, against twenty round trips and
+twenty chances to misread one. Put back only what the run named. The
+loop is for a check that can only answer about one item at a time —
+one that stops at the first failure, or candidates that interact. And note which way round that goes: the check is to *change
 the thing and ask again*, not to ask about it as it stands. A question
 put to a tool that was never going to answer it comes back empty, and
 empty reads as "all fine" — the false negative above, arrived at by a

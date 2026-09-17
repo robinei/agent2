@@ -81,6 +81,16 @@ saying so — everything else that differs stops the program and tells you:
                                  `{ name, message }`; branch on
                                  `e.name`, not on its type
 
+**Ask once for everything the check will answer at once.** A per-item
+loop is the fallback, not the first idea. Most of the tools worth
+asking report *every* problem in one run — a compiler, a type checker,
+a test suite, a linter — so the cheap experiment is to change all the
+candidates at once, run it once, and read which ones it names back.
+One round trip and N answers, against N round trips and N chances to
+misread one of them. Then put back only what the run named. Loop per
+item only when the check can answer about one item at a time: when it
+stops at the first failure, or when the changes interact.
+
 **A per-item verdict is one loop, and the check has to be able to say
 no.** When something other than a mind can settle each item — take the
 line out and see whether it still builds, run that one test — that is a
