@@ -5,12 +5,6 @@ use crate::analyzer::ConstValue;
 use crate::builtin::Builtin;
 use crate::vm::Instr;
 
-/// The condition name `next_program()` lowers to. Reserved: a program
-/// writing `raise("next_program", …)` by hand means the same thing, and
-/// the host reads this one name to tell "give me the next program" from
-/// "answer this and I will carry on".
-pub const NEXT_PROGRAM_CONDITION: &str = "next_program";
-
 impl super::Compiler {
     /// Calls are recognized structurally (the VM has no method objects): a
     /// `namespace.method(...)` static intrinsic, a `recv.method(...)` array/
@@ -593,32 +587,6 @@ impl super::Compiler {
                 // coming back, which `expects_reply` already names.
                 self.compile_args(argv);
                 self.emit(Instr::Notify(name.into(), argv.len() as u32), span);
-            }
-            "next_program" => {
-                // `next_program(payload?)` lowers to a `Raise` under a
-                // reserved condition name. It is not sugar for `raise` at
-                // the surface: `raise` asks a question you come back from
-                // with the answer in hand, and this ends the program and
-                // asks for the next one — the payload is what the writer
-                // of that program gets to see.
-                //
-                // Sharing the instruction is deliberate. Both suspend and
-                // hand a payload to a mind; what differs is what the mind
-                // is asked for, which is a property of the report it
-                // reads, not of the opcode. The host tells them apart by
-                // the condition name.
-                if argv.len() > 1 {
-                    self.error(
-                        span,
-                        "`next_program` takes 0 or 1 arguments: next_program() or next_program(payload)",
-                    );
-                    return;
-                }
-                self.compile_args(argv);
-                self.emit(
-                    Instr::Raise(NEXT_PROGRAM_CONDITION.into(), argv.len() as u32),
-                    span,
-                );
             }
             "remove_history" | "rewrite_history" => {
                 // Same reasoning as `spawn`/`fork` below: these settle at

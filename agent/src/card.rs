@@ -406,15 +406,7 @@ mod tests {
                             .map_err(|e| format!("{e:?}"))?;
                     }
                 }
-                StepResult::Raise { condition, .. } => {
-                    // `next_program` is a raise too, and it ends the
-                    // program rather than resuming into it.
-                    if condition == interp::NEXT_PROGRAM_CONDITION {
-                        return Ok(Ending {
-                            done,
-                            returned: true,
-                        });
-                    }
+                StepResult::Raise { .. } => {
                     let value = vm
                         .json_to_stack_value(&json!("backup-2.txt"), 0)
                         .map_err(|e| format!("{e:?}"))?;

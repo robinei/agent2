@@ -34,10 +34,10 @@ def check(env):
         f"went looking for something: {env.score['tool_calls']} tool call(s) for a "
         "question that needed none",
     )
-    env.require(
-        env.score["handovers"] == 0,
-        "handed itself a to-do list for a question it could already answer",
-    )
+    # Under automatic continuation (27.1) a second program *is* the
+    # handover: the only way to stop is `done()`, so "handed itself a
+    # to-do list" and "took more than one program" became the same
+    # claim, and the separate `handovers` count went with `next_program`.
     env.require(
         env.score["programs"] == 1,
         f"took {env.score['programs']} programs over a question with no work in it",

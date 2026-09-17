@@ -2280,35 +2280,6 @@ impl Runner {
         // and only a live VM can consume one, so the two cannot be the
         // same value.
         let (cause, site, suspension, disposition) = match cause {
-            SuspendCause::Raise { condition, payload }
-                if condition == interp::NEXT_PROGRAM_CONDITION =>
-            {
-                // `next_program(payload)` is a **handover**, not a
-                // deliberation, and the disposition is the whole
-                // difference. `document::render` hides a `Pushed`
-                // condition from the rolling document -- nothing renders
-                // again until a matching `Return` closes the scope -- so
-                // logging this as `Pushed` would put the payload in the
-                // one-shot handler prompt and nowhere else. The program
-                // after next would see none of it and re-read every file,
-                // which is exactly what a live run did.
-                //
-                // `Handover` opens no scope, so the report renders into
-                // the rolling document and **stays there**: the material
-                // one program gathered is in front of every program that
-                // follows, in the stable prefix, read once.
-                let payload = payload.map(|v| value_json(&run.vm, &v));
-                let site = span_at(&run.vm, (run.vm.ip as usize).saturating_sub(1));
-                (
-                    Cause::Raised {
-                        name: condition,
-                        payload,
-                    },
-                    site,
-                    ResumeWith::Raise,
-                    Disposition::Handover,
-                )
-            }
             SuspendCause::Raise { condition, payload } => {
                 let payload = payload.map(|v| value_json(&run.vm, &v));
                 // `step()` advanced `ip` past the `Raise`, so the raise
@@ -2373,8 +2344,8 @@ impl Runner {
             .collect();
         let console = run.vm.console_lines.clone();
         let program_id = run.program_id;
-        // A handover does not park. `next_program` ends its program --
-        // there is nothing to come back to, and nothing will resume it --
+        // A handover does not park: there is nothing to come back to,
+        // and nothing will resume it --
         // so the VM is dropped here rather than left `Suspended` for a
         // decision that is never coming. Two things follow, both wanted:
         // the branch goes `Idle`, so the ordinary "unseen outcome on the
@@ -2543,8 +2514,7 @@ impl Runner {
                 cause: Cause::Compaction { rendered, budget },
                 site: 0,
                 stack: Vec::new(),
-                // `Handover`, not `Pushed`, for the same reason
-                // `next_program` is: `document::render` inserts a
+                // `Handover`, not `Pushed`: `document::render` inserts a
                 // report for a `Handover` and *hides* a `Pushed` one,
                 // because a pushed condition means a nested handler is
                 // about to run and nothing chat-visible has happened
@@ -3464,69 +3434,20 @@ mod tests {
         assert_eq!(state.status(), "idle");
     }
 
-    /// **C0a's routing, driven the way a live completion actually
-    /// arrives** — through `step(LlmResponse)`/`apply_turn`, not a direct
-    /// `resume`/`abandon` call — proving the *recognition* half works,
-    /// not just the mechanism `raise_suspends_with_pushed_disposition_
-    /// and_host_driven_resume_continues` already covers. A handler
-    /// completing with `return resume(41);` re-enters the same raise
-    /// expression; a *second* raise, handled the same way with
-    /// `return abandon();`, discards it instead and leaves the branch
-    /// idle, exactly like a direct `Runner::abandon` call would.
-    #[test]
-    fn next_program_hands_over_and_its_payload_stays_in_the_document() {
-        // The whole point of the verb: what one program gathered is in
-        // front of every program that follows, read once. Logged as
-        // `Handover` rather than `Pushed`, because `document::render`
-        // hides a `Pushed` condition from the rolling document -- a live
-        // run handed over 190KB and the program after next saw none of
-        // it and re-read every file.
-        let mut tree = Tree::new(None);
-        let mut state = Runner::new_root(&mut tree, "root", "card").unwrap();
-        user_post(&mut state, &mut tree, "go");
-        let out = state
-            .step(
-                &mut tree,
-                StepInput::LlmResponse(llm_program("next_program({ found: \"the material\" });")),
-            )
-            .unwrap();
-        let mut queue = out;
-        while !queue.is_empty() {
-            queue = state
-                .step(&mut tree, StepInput::Tick { fuel: FUEL })
-                .unwrap();
-        }
-
-        let cond = tree
-            .events
-            .values()
-            .find_map(|e| match &e.payload {
-                EventPayload::Condition {
-                    cause: Cause::Raised { name, .. },
-                    disposition,
-                    ..
-                } if name == interp::NEXT_PROGRAM_CONDITION => Some(*disposition),
-                _ => None,
-            })
-            .expect("a handover condition");
-        assert_eq!(
-            cond,
-            Disposition::Handover,
-            "a handover opens no scope, so its report stays visible"
-        );
-        // Not parked -- nothing resumes a handover -- and not merely
-        // idle either: it asks for the next program straight away,
-        // through the ordinary trigger rule. A branch that handed over
-        // and then sat idle is the bug this test exists for; the TUI
-        // showed exactly that on 2026-09-15, because `suspend` advanced
-        // `shown` past the outcome and never asked.
-        assert_ne!(state.status(), "suspended", "a handover must not park");
-        assert_eq!(
-            state.status(),
-            "awaiting llm",
-            "a handover asks for the next program immediately"
-        );
-    }
+    /// **Superseded by 27.1 and then deleted with the verb.**
+    /// `next_program_hands_over_and_its_payload_stays_in_the_document`
+    /// pinned that `next_program(payload)` logs `Handover` rather than
+    /// `Pushed`, so its payload reached the rolling document instead of
+    /// only the one-shot handler prompt — a live run had handed over
+    /// 190KB and the program after next saw none of it.
+    ///
+    /// `return payload` does that job now and does it without a
+    /// condition at all: `a_completed_program_continues_by_default`
+    /// covers the continuation, and 27.7's
+    /// `a_return_value_reaches_the_next_program_whole` covers the
+    /// payload arriving intact, which is the property that test was
+    /// really about. The verb is gone (zero uses across 82 live runs
+    /// once no card named it), so there is nothing left to assert.
 
     #[test]
     fn an_id_is_addressable_in_the_form_it_is_displayed() {

@@ -14,7 +14,7 @@ one side's cache and not the other's would flatter whichever side
 cached better, which is the very thing worth measuring.
 
 Two fields have no meaning for a tool-loop agent and are reported as
-zero rather than guessed: `handovers` (nothing ends a turn to write the
+zero rather than guessed: `raises` (nothing ends a turn to write the
 next one — the loop simply continues) and `asks` (nothing suspends for a
 person in `--print` mode).  A checker that turns on those is asking a
 question about code mode, and its task should say so.
@@ -94,7 +94,6 @@ def score_pi_session(path: Path) -> dict:
         "program_lengths": [],
         "raises": 0,
         # No such act in a tool loop: the loop continues on its own.
-        "handovers": 0,
         "traps": 0,
         "trap_messages": [],
         "compile_failures": [],

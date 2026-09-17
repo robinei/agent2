@@ -157,6 +157,14 @@ exactly what it did, and two verbs for one act is the thing to remove,
 not to document. It stays in the interpreter, unmentioned; nothing
 reaches for a verb the card does not name.
 
+`next_program` is gone from the interpreter too, now that a
+measurement has run without it: zero uses across 82 live runs once no
+card named it. With it went its reserved condition name, its `Handover`
+special case in `machine.rs`, its own branch of the completion report,
+and `score`'s `handovers` field — which counted exactly that verb and
+would otherwise have gone on reporting 0 forever. A handover is a
+`Return` the next program reads, and `programs` counts those.
+
 `tell` is stated as the person's channel and nothing else's, with the
 cadence that follows from "rare": the first program says what is about
 to happen, the finishing one says what the answer was, the ones between

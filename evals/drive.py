@@ -183,7 +183,6 @@ def discover(names=None):
 HEALTHY = {
     "silent": False,
     "programs": 1,
-    "handovers": 0,
     "tool_calls": 40,
     "calls_per_program": 40.0,
     "traps": 0,
@@ -475,7 +474,6 @@ def aggregate(runs: list) -> dict:
             "no_run": sum(1 for r in rs if r["pass"] is None),
             "calls_per_program": med([s["calls_per_program"] for s in scores]),
             "programs": med([s["programs"] for s in scores]),
-            "handovers": med([s["handovers"] for s in scores]),
             "exec_s": med([s["exec_ms"] / 1000 for s in scores]),
             # Input scales with *programs*, not with calls: 23 calls in
             # one program cost 33KB of prompt, 39 calls across four cost
@@ -538,7 +536,7 @@ def print_summary(summary: dict):
         print(f"\n=== {name}  {s['passed']}/{s['runs']} passed{no_run}{gap}")
         print(
             f"  calls/program {s['calls_per_program']}   programs {s['programs']}"
-            f"   handovers {s['handovers']}"
+            ""
         )
         print(f"  exec {s['exec_s']}s   waiting on the provider {s['provider_s']}s")
         print(
@@ -675,7 +673,7 @@ def compare(before: Path, after: Path):
         if x.get("no_run") or y.get("no_run"):
             print(f"  no completion   {x.get('no_run', 0)}  ->  {y.get('no_run', 0)}")
         for key in (
-            "calls_per_program", "programs", "handovers", "exec_s",
+            "calls_per_program", "programs", "exec_s",
             "prompt_kb", "source_kb", "thinking_kb",
             "prompt_in", "cached_in", "completion_out",
         ):

@@ -33,11 +33,6 @@
 //! multi-byte UTF-8 character" each cost a run and each named its own
 //! fix. A count would have said only that something went wrong.
 //!
-//! **`handovers`** separated from `raises`. `next_program` lowers to a
-//! raise under a reserved name, so a bare raise count conflates asking
-//! for a judgement with ending a program — opposite behaviours with
-//! opposite economics.
-//!
 //! **`prompt_bytes`** — what was actually *sent*, summed over the
 //! completions, and the only number that tests the round-trip claim
 //! from the input side. A tool loop re-sends a growing conversation on
@@ -69,10 +64,11 @@ pub struct Score {
     /// Statements per program, in order — a program that shrinks over a
     /// run is the transcript shape appearing.
     pub program_lengths: Vec<usize>,
-    /// `raise()` for a judgement, excluding `next_program`.
+    /// `raise()` for a judgement — every one of which is a question
+    /// the program comes back from. There is no second kind since
+    /// `next_program` went: a handover is a `Return` the next program
+    /// reads, and `programs` counts those.
     pub raises: usize,
-    /// `next_program` — ending a program to write the next one.
-    pub handovers: usize,
     pub traps: usize,
     /// Every trap's `kind: message`, deduplicated, in first-seen order.
     pub trap_messages: Vec<String>,
@@ -138,7 +134,6 @@ pub fn score(tree: &Tree) -> Score {
         calls_per_program: 0.0,
         program_lengths: Vec::new(),
         raises: 0,
-        handovers: 0,
         traps: 0,
         trap_messages: Vec::new(),
         compile_failures: Vec::new(),
@@ -239,13 +234,12 @@ pub fn score(tree: &Tree) -> Score {
                 cause, disposition, ..
             } => {
                 match cause {
-                    Cause::Raised { name, .. } => {
-                        if name == interp::NEXT_PROGRAM_CONDITION {
-                            s.handovers += 1;
-                        } else {
-                            s.raises += 1;
-                        }
-                    }
+                    // Every raise is a question the program comes back
+                    // from now. `handovers` counted `next_program`,
+                    // which `return` replaced in 27.1 and which is gone;
+                    // a handover is a `Return` the next program reads,
+                    // and `programs` already counts those.
+                    Cause::Raised { .. } => s.raises += 1,
                     Cause::Trapped { kind, message, .. } => {
                         s.traps += 1;
                         let line = format!("{kind}: {message}");

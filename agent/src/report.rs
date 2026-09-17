@@ -795,7 +795,7 @@ fn render_handback(h: &Handback<'_>, budget: usize) -> String {
             // The message is the whole report.
             Cause::Compaction { rendered, budget } => compaction_message(*rendered, *budget),
             _ => ConditionReport {
-                what: what_happened(h, cause, *site, budget),
+                what: what_happened(h, cause, *site),
                 // A post stopped the program nowhere in particular: the
                 // useful "where" is the whole program with its progress
                 // marked, which is what a rewrite copy-edits.
@@ -925,38 +925,9 @@ fn answer_ack(
 /// menu any more (DESIGN.md "The thesis": a suspension gets a handler
 /// *program*, not a pick off a schema list), so this is simply one more
 /// fact about what happened, stated where the reader is already looking.
-fn what_happened(h: &Handback<'_>, cause: &Cause, site: u32, budget: usize) -> String {
+fn what_happened(h: &Handback<'_>, cause: &Cause, site: u32) -> String {
     let source = &h.source;
     match cause {
-        Cause::Raised { name, payload } if name == interp::NEXT_PROGRAM_CONDITION => {
-            // `next_program(payload)` ends the program and asks for the
-            // next one. Rendering the resume/abandon menu here would be
-            // actively wrong: nothing is waiting to be continued, and the
-            // writer of this report is being asked for a program, not a
-            // decision about one.
-            let mut what = String::from(
-                "The program handed over: it finished what it could do without a \
-                 reading, and asked for the next one.\n\nWrite that program. \
-                 Nothing is suspended and nothing is waiting on a value — you have \
-                 the branch, and whatever comes next is yours to write, including \
-                 another handover when you have gathered more.",
-            );
-            if let Some(p) = payload {
-                what.push_str("\n\nwhat it handed you:\n");
-                // The **answer budget**, not `PAYLOAD_MAX_BYTES`. A
-                // `raise` payload is a preview of a question you are
-                // being asked about; a handover payload *is* the
-                // material the next program is written from, and
-                // clipping it to a kilobyte is discarding the point of
-                // the verb. Observed 2026-09-15: a program handed over
-                // 190,892 bytes of gathered files, 1,024 arrived, and
-                // the next program re-gathered from scratch — the model
-                // carried its findings forward exactly as asked and the
-                // harness threw them away.
-                what.push_str(&clip(&p.to_string(), budget));
-            }
-            what
-        }
         Cause::Raised { name, payload } => {
             let mut what = diagnostic(source, site, &format!("condition `{name}` raised"));
             what.push_str("\npayload: ");
