@@ -1,8 +1,8 @@
 ## program completed
-returned [#18]: {"question":"for each of these, check whether anything still calls it and drop the ones nothing does","hits":["src/util.js:14:// @deprecated use formatDate","src/util.js:31:// @deprecated use parseHeader","src/util.js:52:// @deprecated"]}
+returned [#18]: {"question":"decide which of these still matter and deal with those","hits":["src/a.rs:14:MARKER","src/b.rs:31:MARKER","src/b.rs:52:MARKER"]}
 
 console: (no output)
 
 ## new rows — fetch any of them with fetch_history(id)
-[#15] tell(user, "finding the deprecated helpers.") → ok
-[#16] bash("grep -rn '@deprecated' src/") → ok, 214 bytes
+[#15] tell(user, "finding the marked sites.") → ok
+[#16] bash("grep -rn MARKER .") → ok, 214 bytes

@@ -1,19 +1,14 @@
-// What I returned came back to me as text I have read — not as
-// variables. `hits` was a name in the program before this one and went
-// with its VM, so the three names are written out here, from the report
-// above.
-tell("checking each one for callers, then dropping the ones with none.");
-const names = ["formatLegacyDate", "parseOldHeader", "toCamelDeep"];
+// What the last program returned is a row with an id, so I fetch it
+// rather than re-typing it out of the report — fetching costs nothing
+// and adds nothing, and a name I transcribe by hand is a name I can
+// get wrong.
+const prev = await fetch_history(18);
 const dropped = [], kept = [];
-for (const name of names) {
-    // grep exits 1 when it matches nothing, and nothing is the answer
-    // that makes this one droppable.
-    const callers = await tools.bash(`grep -rln "${name}" src/ test/ | grep -v src/util.js`);
-    if (callers.status === 0) { kept.push(name); continue; }
-    const f = await tools.read_file("src/util.js");
-    const block = Edit.extractBlock(f.content, f.content.indexOf(`export function ${name}`));
-    await tools.replace_file("src/util.js", Edit.replaceLines(f.content, block.start, block.end, ""), f.version);
-    dropped.push(name);
+for (const hit of prev.hits) {
+    const path = hit.split(":")[0];
+    const check = await tools.bash(`make check ${path}`);
+    if (check.status === 0) dropped.push(path);
+    else kept.push(path);
 }
-tell(`dropped ${dropped.length}, kept ${kept.length} that are still called.`);
+tell(`dropped ${dropped.length}, kept ${kept.length}.`);
 done();

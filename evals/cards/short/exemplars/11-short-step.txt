@@ -1,1 +1,1 @@
-some of the helpers in src/ are marked deprecated — are any of them safe to drop?
+some of these are marked and I think most are stale — can you sort it out?

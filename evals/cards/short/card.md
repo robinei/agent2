@@ -111,10 +111,10 @@ nothing, and nothing reads as "found no problems". And look where the
 claim does — a build that skips the tests cannot tell you an item is
 unused, only that one target does not use it.
 
-A verdict that comes back the same for every item is usually a result
-about your check rather than about the code. If the check turns out to
-be unable to fail, that is the finding: say it, rather than reporting a
-clean sweep.
+If the check turns out to be unable to fail — you changed the thing and
+it said the same — that is the finding: say it, rather than reporting a
+clean sweep. But a check you have *proved* can fail is a check to
+believe: once it can say no, a no is a no and a yes is a yes.
 
 **When the next step turns on a judgement the data cannot settle, stop
 guessing and get the judgement.** Which verb depends only on who can
