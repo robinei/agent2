@@ -220,6 +220,63 @@ read, so a question you return is one you will be answering.
 Gate: `a_return_value_reaches_the_next_program_whole`,
 `an_absurd_return_value_is_bounded_and_says_where_the_rest_is`.
 
+## What running it found
+
+Three of the four things in this phase that mattered were not in the
+plan above. They came out of running 27.1–27.5 and reading the
+programs, and they have a shape in common: **each was a rule the card
+asked the model to remember, standing in for a property the harness
+could have had.**
+
+**A truncated channel** (27.7, above). The card could not have fixed
+this one — the model was reading 256 bytes and saying so.
+
+**A pipeline's status was its last stage's.** The card carried a
+paragraph asking every program to write `set -o pipefail`. A
+`skipped-tests` run forgot, ran `python3 -m unittest … | tail -5`
+against a file its own edit had left syntactically broken, read
+`tail`'s 0, kept the change, reverted nothing, and reported a clean
+sweep. Every verdict in that loop was `tail` succeeding. `bash` runs
+with `pipefail` now and the paragraph is gone, along with the ritual
+prefix in eight exemplars. An instruction the model must remember at
+every call site is worse than a fact about the tool it must know once
+— and this is *our* bash, with no compatibility contract to keep.
+
+Turning it on without checking what the statuses actually are would
+have introduced a worse lie: `grep … | head -40` that truncates leaves
+`grep` killed by SIGPIPE, so one of the commonest idioms a program
+writes would have reported failure on success. 141 normalises to 0,
+and nothing is hidden by it, because `pipefail` takes the *rightmost*
+non-zero stage.
+
+**"It ran and said no" and "it never ran" shared a channel.** Asked
+whether `bash` should reject on a non-zero status: no — non-zero is the
+*information* in almost everything we run, and making it an exception
+turns every probe loop into a try/catch around expected control flow.
+But 126/127 are bash saying it could not execute the command at all,
+which is the event "could not spawn bash" is, one level down, and
+`run_bash` already returned `Err` for that. Resolved, they were
+`{status: 127, stdout: ""}` — and a program reading stdout saw nothing
+and concluded there was nothing to find.
+
+### And two about the apparatus, not the agent
+
+`short`'s exemplars 11 and 12 **were** the `skipped-tests` task —
+exemplar 11's user turn read "some tests here are skipped — which ones
+pass now?" against the eval's "Some tests here are skipped. Work out
+which ones actually pass now." Both are rewritten onto a neutral
+surface. `short` scored 3/7 on that task with the answer sitting in its
+own card, which is its own kind of finding.
+
+A suite reads the binary and the card off disk at spawn time, so a
+`cargo build` or a card edit fourteen minutes into an n=7 run silently
+splits it in two and the aggregate averages two systems. That happened
+here and the run was discarded. Runs go from a `git worktree` pinned to
+the commit under test now, so editing cannot reach them; and the driver
+hashes the binary and the card before and after and says so loudly if
+they moved, because a worktree prevents the mistake only while someone
+remembers to use one.
+
 ## What this is measured against
 
 `short` on the four-task set at n=7 — 19/28, 51KB reasoning, 20.8k
