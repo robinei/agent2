@@ -170,6 +170,8 @@ fn read_file_def() -> ToolDef {
             "maxItems": 3
         }),
         guidelines: vec![
+            "Read files with this, not with `cat` or `sed` through bash. The `version` it hands back is what makes a later write atomic; a file read any other way has to be read again before you can safely write it."
+                .into(),
             "Hold onto `version` and hand it to `replace_file`, so a write fails rather than clobbering a file that moved.".into(),
         ],
         example: Some("const f = await tools.read_file(\"src/lib.rs\");".into()),
