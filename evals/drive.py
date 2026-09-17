@@ -298,6 +298,18 @@ def sandbox_cmd(sandbox: Path, log: Path, prompt: str, card: Path | None) -> lis
     argv = [
         "bwrap",
         "--ro-bind", "/", "/",
+        # A writable scratch area, and nowhere else outside the task's
+        # own directory. Three runs on 2026-09-17 tried to put a
+        # throwaway script in `/tmp` and got "Read-only file system":
+        # wanting scratch space is ordinary, and reaching for `/tmp` is
+        # what anyone would do. A fresh tmpfs gives it one that dies
+        # with the run and cannot touch the machine.
+        #
+        # **Before** the binds below, not after: the task directory and
+        # the log both live under `/tmp`, so a tmpfs mounted after them
+        # would hide the very things the run needs. Ordering is the
+        # whole correctness argument here.
+        "--tmpfs", "/tmp",
         "--bind", str(sandbox), str(sandbox),
         "--bind", str(log.parent), str(log.parent),
         "--dev", "/dev", "--proc", "/proc",
