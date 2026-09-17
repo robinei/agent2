@@ -100,6 +100,23 @@ pub fn scripted_program(source: &str) -> LlmTurn {
         source: source.into(),
         thinking: None,
         truncated: false,
+        reply: None,
+    }
+}
+
+/// A scripted `Transport::RunProgram` completion: prose beside a
+/// program (`source` non-empty — the "run it, then keep going" shape),
+/// or prose with no call at all (`source` empty — the "that was the
+/// final answer" shape). `Transport::Program` never sets `LlmTurn.reply`
+/// (its own doc comment), so `scripted_program` above, unchanged, is
+/// still every existing call site's helper; this is the one
+/// `Transport::RunProgram`'s two completion shapes need and
+/// `scripted_program` alone cannot express.
+#[cfg(test)]
+pub fn scripted_reply(reply: &str, source: &str) -> LlmTurn {
+    LlmTurn {
+        reply: Some(reply.to_owned()),
+        ..scripted_program(source)
     }
 }
 

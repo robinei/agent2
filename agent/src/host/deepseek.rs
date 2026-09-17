@@ -324,6 +324,12 @@ struct Accumulated {
     /// chunk, so this has to accumulate text before it can be parsed at
     /// all.
     tool_args: String,
+    /// `Transport::RunProgram` only: `content` deltas, i.e. the model's
+    /// prose — *the message a person reads* in this container
+    /// (`LlmTurn.reply`'s own doc). `Transport::Program`: unused, since
+    /// `content` there already **is** the program and lives in `source`
+    /// above instead.
+    reply: String,
     /// `"length"` once seen — DeepSeek's own signal that `max_tokens`
     /// was hit before the model stopped on its own. Anything else
     /// (`"stop"`, or `"tool_calls"` under `Transport::RunProgram`, once
@@ -418,9 +424,12 @@ fn parse_sse(
             // the call, never the program — accumulating it into
             // `acc.source` would make `.source` mean two different
             // things depending on transport, exactly the drift this
-            // switch has to not introduce.
-            if transport == Transport::Program {
-                acc.source.push_str(t);
+            // switch has to not introduce. It lands in `acc.reply`
+            // instead (gap 1 of the follow-up fix: this text used to
+            // reach no log and no user at all).
+            match transport {
+                Transport::Program => acc.source.push_str(t),
+                Transport::RunProgram => acc.reply.push_str(t),
             }
         }
         if transport == Transport::RunProgram
@@ -441,6 +450,17 @@ fn parse_sse(
         // Best-effort: hand back the raw fragment, same spirit as
         // `Program`'s own "detection, not suppression."
         Transport::RunProgram if truncated => acc.tool_args,
+        // Gap 2b of the follow-up fix: no `tool_calls` delta ever
+        // arrived, so `acc.tool_args` is empty — not incomplete JSON,
+        // simply nothing, because the model never called `run_program`
+        // at all. That is a real, valid completion (its whole answer
+        // rode `acc.reply` above), so this hands back an empty `source`
+        // rather than feeding `""` to the parser below, which would
+        // report a bogus "bad run_program arguments: EOF while parsing
+        // a value" for a turn that made no malformed call — it made
+        // none. `machine.rs::apply_turn` reads an empty `source` as
+        // exactly this shape and skips `interp::compile` accordingly.
+        Transport::RunProgram if acc.tool_args.is_empty() => String::new(),
         Transport::RunProgram => {
             let parsed: serde_json::Value = serde_json::from_str(&acc.tool_args)
                 .map_err(|e| format!("bad run_program arguments: {e}: {}", acc.tool_args))?;
@@ -456,6 +476,12 @@ fn parse_sse(
         thinking: (!acc.thinking.is_empty()).then_some(acc.thinking),
         truncated,
         usage: (acc.usage != Usage::default()).then_some(acc.usage),
+        // `acc.reply` only ever accumulates under `Transport::RunProgram`
+        // (the `content`-delta match above), so this is `None` under
+        // `Transport::Program` unconditionally, matching `LlmTurn.reply`'s
+        // own doc, and `None` under `Transport::RunProgram` too whenever
+        // the model called `run_program` with no prose beside it.
+        reply: (!acc.reply.is_empty()).then_some(acc.reply),
     })
 }
 

@@ -220,6 +220,17 @@ pub struct LlmTurn {
     /// What the provider said this completion cost. `None` when the
     /// transport is scripted, or when an endpoint does not report it.
     pub usage: Option<crate::host::Usage>,
+    /// `Transport::RunProgram` only, and only when the model said
+    /// something beside its `run_program` call (or instead of one) —
+    /// `host/deepseek.rs`'s `content` deltas, which in that container
+    /// are *the message a person reads*, never the program. Always
+    /// `None` under `Transport::Program`, where `content` already **is**
+    /// `source` and there is nothing left over to carry here.
+    /// `apply_turn` dispatches a `Some` value to the user through the
+    /// same `Call::Send` a program's own `tell()` produces, so the log
+    /// cannot tell a prose reply from a `tell` apart (`agent score`'s
+    /// `tells`/`silent` fields have to agree on both transports).
+    pub reply: Option<String>,
 }
 
 /// A rendered request's **ephemeral** half only. Under code mode the
@@ -733,6 +744,7 @@ impl Runner {
                     turn.truncated,
                     author,
                     turn.usage,
+                    turn.reply,
                 )
             }
             StepInput::ToolResults(batch) => self.on_tool_results(tree, batch),
@@ -846,7 +858,7 @@ impl Runner {
     /// `resume(...)`/`answer(...)` expression (`v` and the answer
     /// gesture), matching `Message::Turn`'s own doc in `types.rs`.
     pub fn take_turn(&mut self, tree: &mut Tree, source: String) -> io::Result<Vec<StepOutput>> {
-        self.apply_turn(tree, source, None, false, Author::User, None)
+        self.apply_turn(tree, source, None, false, Author::User, None, None)
     }
 
     /// Log one turn — the whole of what the branch itself just said —
@@ -860,6 +872,7 @@ impl Runner {
     /// they arrive), so the only thing genuinely at risk of being thrown
     /// away is the *VM*, and a program that fails to compile shouldn't
     /// cost you that.
+    #[allow(clippy::too_many_arguments)]
     fn apply_turn(
         &mut self,
         tree: &mut Tree,
@@ -868,6 +881,7 @@ impl Runner {
         truncated: bool,
         author: Author,
         usage: Option<crate::host::Usage>,
+        reply: Option<String>,
     ) -> io::Result<Vec<StepOutput>> {
         let message = Message::Turn {
             author,
@@ -876,6 +890,35 @@ impl Runner {
             usage,
         };
         let assistant_id = tree.append(&mut self.spine, EventPayload::Message(message))?;
+
+        // `Transport::RunProgram`'s prose (`LlmTurn.reply`'s own doc) is
+        // *the message a person reads* in that container, exactly what a
+        // program's own `tell()` is in either container — so it goes out
+        // through the identical `Call::Send { to: Address::User,
+        // expects_reply: false, .. }` `dispatch_calls`'s `TOOL_TELL` arm
+        // logs, via the same `StepOutput::Sends` door, rather than a
+        // second, parallel way for text to reach a person. That is what
+        // makes `agent score`'s `tells`/`silent` fields (folded straight
+        // off `Call::Send` in the log) unable to tell a prose reply from
+        // an ordinary `tell` apart. `site: 0`: no VM ran to have a call
+        // site, the same convention `Cause::CompileFailed`/`Truncated`
+        // below use for the same reason. Dispatched before the
+        // truncated/compile branches below so it goes out regardless of
+        // what (if anything) the turn's program does next.
+        let mut out = Vec::new();
+        if let Some(reply) = reply {
+            let send = tree.append(
+                &mut self.spine,
+                EventPayload::Call(Call::Send {
+                    to: Address::User,
+                    text: reply,
+                    input: serde_json::Value::Null,
+                    expects_reply: false,
+                    site: 0,
+                }),
+            )?;
+            out.push(StepOutput::Sends(vec![send]));
+        }
 
         if truncated {
             // **Never compile a truncated completion** (`Cause::Truncated`'s
@@ -899,7 +942,29 @@ impl Runner {
                 },
             )?;
             self.phase = Phase::AwaitingLlm;
-            return Ok(vec![self.render_request(tree)]);
+            out.push(self.render_request(tree));
+            return Ok(out);
+        }
+
+        // `Transport::RunProgram`'s other completion shape: prose with
+        // **no** call at all — `host/deepseek.rs`'s `parse_sse` hands
+        // back an empty `source` precisely when no `run_program` tool
+        // call ever arrived (never for `Transport::Program`, whose
+        // `source` is the model's whole response text and stays this
+        // module's business regardless of length). That is the model's
+        // final answer, already dispatched above as `reply`, so this
+        // turn does not run — reaching `start_program` with an empty
+        // program would ask `interp::compile` to compile nothing and
+        // manufacture a spurious `Cause::CompileFailed` no repair loop
+        // could ever fix. Gated on the transport, not just on
+        // `source.is_empty()`, so `Transport::Program` — where an empty
+        // response has always fallen through to `start_program` below —
+        // is untouched.
+        if source.is_empty()
+            && crate::document::transport() == crate::document::Transport::RunProgram
+        {
+            self.phase = Phase::Idle;
+            return Ok(out);
         }
 
         match self.start_program(tree, assistant_id, &source) {
@@ -928,7 +993,8 @@ impl Runner {
                 self.generation += 1;
                 self.phase = Phase::Running(run);
                 self.note_status(assistant_id, ProgramStatus::Running);
-                Ok(vec![StepOutput::Working])
+                out.push(StepOutput::Working);
+                Ok(out)
             }
             Err(message) => {
                 // A compile error is an outcome like any other — no VM
@@ -960,7 +1026,8 @@ impl Runner {
                     },
                 )?;
                 self.phase = Phase::AwaitingLlm;
-                Ok(vec![self.render_request(tree)])
+                out.push(self.render_request(tree));
+                Ok(out)
             }
         }
     }
@@ -2073,7 +2140,27 @@ impl Runner {
         // it, firing only for what is left genuinely unaccounted for — a
         // post that arrived mid-run and this completion could not have
         // answered.
-        self.shown = self.spine.leaf_id.as_u64();
+        //
+        // **Except under `Transport::RunProgram`**, where completing a
+        // program is never the end of the exchange: the return value
+        // just logged is a tool *result*, not a chat reply, and
+        // `document::render` folds it into the next request as the
+        // answer to the still-open `run_program` call rather than
+        // showing it to anyone directly. Advancing `shown` here would
+        // make `needs_prompt`'s own outcome clause — the one thing that
+        // can fire with no unseen `Post` at all — see this outcome as
+        // already accounted for, and `prompt_if_needed` right below
+        // would find nothing to do: the conversation would simply stop,
+        // silently, one round trip after every completed program (the
+        // bug this skip closes). Leaving `shown` where it was costs
+        // nothing extra: `render_request` (called from
+        // `prompt_if_needed`, below) advances it itself the moment a
+        // request actually goes out, exactly as it always has.
+        // `Transport::Program` keeps the unconditional advance, so its
+        // own deliberately valid "silent no-op" stays silent.
+        if crate::document::transport() != crate::document::Transport::RunProgram {
+            self.shown = self.spine.leaf_id.as_u64();
+        }
         self.phase = Phase::Idle;
         out.extend(self.prompt_if_needed(tree)?);
         Ok(out)
@@ -2789,7 +2876,29 @@ mod tests {
             thinking: None,
             truncated: false,
             usage: None,
+            reply: None,
         }
+    }
+
+    /// Runs `f` with `AGENT2_TRANSPORT` set to `value`, restoring
+    /// whatever was there before (or its absence) once `f` returns —
+    /// `document.rs`'s own `with_transport` test helper, duplicated here
+    /// because it is `cfg(test)`-private to that module. Relies on this
+    /// crate's documented gate (`cargo test -p agent --
+    /// --test-threads=1`) running the binary single-threaded: a
+    /// per-process env var has no other safe way to be scoped to one
+    /// test.
+    fn with_transport<T>(value: &str, f: impl FnOnce() -> T) -> T {
+        let key = "AGENT2_TRANSPORT";
+        let prev = std::env::var(key).ok();
+        // SAFETY: single-threaded test binary — see doc comment above.
+        unsafe { std::env::set_var(key, value) };
+        let result = f();
+        match prev {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+        result
     }
 
     /// Drive `Tick`s until the machine stops asking for them; collects
@@ -2904,6 +3013,143 @@ mod tests {
             payload_kinds(&state, &tree),
             ["Agent", "Post", "Turn", "Return", "Console"]
         );
+    }
+
+    // ── `Transport::RunProgram`'s two follow-up gaps ────────────────
+    //
+    // Commit 6084a70 added the transport switch but left `RunProgram`
+    // inert: the model's prose reached no log and no user (gap 1), and
+    // the conversation never turned after a program finished (gap 2).
+    // These four pin the fix, one per named acceptance case.
+
+    #[test]
+    fn run_program_prose_reaches_the_user_as_a_send() {
+        with_transport("run_program", || {
+            let (mut tree, mut state) = setup();
+            user_post(&mut state, &mut tree, "go");
+            let out = state
+                .step(
+                    &mut tree,
+                    StepInput::LlmResponse(crate::host::scripted_reply(
+                        "On it — computing now.",
+                        "return 1;",
+                    )),
+                )
+                .unwrap();
+            let settled = drain(&mut state, &mut tree, out);
+            let sends = settled
+                .iter()
+                .find_map(|o| match o {
+                    StepOutput::Sends(s) => Some(s.clone()),
+                    _ => None,
+                })
+                .expect("the reply dispatches as a Sends output, exactly like a tell()");
+            assert_eq!(sends.len(), 1);
+            let EventPayload::Call(Call::Send {
+                to,
+                text,
+                expects_reply,
+                ..
+            }) = &tree.events[&sends[0]].payload
+            else {
+                panic!("expected a Send");
+            };
+            assert_eq!(*to, Address::User);
+            assert_eq!(text, "On it — computing now.");
+            assert!(!expects_reply, "a reply owes no answer, same as a tell()");
+
+            // The log cannot tell a prose reply from a `tell` apart:
+            // `agent score`'s `tells`/`silent` fields see the identical
+            // shape either way.
+            let score = crate::score::score(&tree);
+            assert_eq!(score.tells, ["On it — computing now."]);
+            assert!(!score.silent);
+        });
+    }
+
+    #[test]
+    fn run_program_continues_after_a_program_returns() {
+        with_transport("run_program", || {
+            let (mut tree, mut state) = setup();
+            user_post(&mut state, &mut tree, "go");
+            let out = state
+                .step(&mut tree, StepInput::LlmResponse(llm_program("return 1;")))
+                .unwrap();
+            let settled = drain(&mut state, &mut tree, out);
+            let requests = settled
+                .iter()
+                .filter(|o| matches!(o, StepOutput::LlmRequest(_)))
+                .count();
+            assert_eq!(
+                requests, 1,
+                "a completed program's return value is a tool result under \
+                 Transport::RunProgram, not a chat reply — the conversation \
+                 must continue with a fresh request: {settled:?}"
+            );
+        });
+    }
+
+    /// The regression guard: the very same scenario, under the default
+    /// transport, must still end the task on completion — a silent no-op
+    /// (this file's own words, `finish_program`) is deliberately valid,
+    /// and `Transport::RunProgram`'s fix above must not leak into it.
+    #[test]
+    fn program_mode_still_stops_after_a_program_returns() {
+        with_transport("program", || {
+            let (mut tree, mut state) = setup();
+            user_post(&mut state, &mut tree, "go");
+            let out = state
+                .step(&mut tree, StepInput::LlmResponse(llm_program("return 1;")))
+                .unwrap();
+            let settled = drain(&mut state, &mut tree, out);
+            assert!(
+                !settled
+                    .iter()
+                    .any(|o| matches!(o, StepOutput::LlmRequest(_))),
+                "Transport::Program's ordinary completion owes no second \
+                 request: {settled:?}"
+            );
+            assert!(state.is_idle());
+        });
+    }
+
+    #[test]
+    fn a_reply_with_no_program_ends_the_task() {
+        with_transport("run_program", || {
+            let (mut tree, mut state) = setup();
+            user_post(&mut state, &mut tree, "go");
+            let out = state
+                .step(
+                    &mut tree,
+                    StepInput::LlmResponse(crate::host::scripted_reply(
+                        "All done, nothing left to do.",
+                        "",
+                    )),
+                )
+                .unwrap();
+
+            // No `Working` output at all: an empty `source` must never
+            // reach `start_program`/`interp::compile` and manufacture a
+            // spurious `Cause::CompileFailed`.
+            assert!(
+                !out.iter().any(|o| matches!(o, StepOutput::Working)),
+                "an empty source must not start a program: {out:?}"
+            );
+            assert!(
+                !out.iter().any(|o| matches!(o, StepOutput::LlmRequest(_))),
+                "a final answer owes no further request: {out:?}"
+            );
+            assert!(state.is_idle());
+            assert_eq!(
+                payload_kinds(&state, &tree),
+                ["Agent", "Post", "Turn", "Call"],
+                "no Return, no Condition — nothing ran"
+            );
+
+            let score = crate::score::score(&tree);
+            assert_eq!(score.tells, ["All done, nothing left to do."]);
+            assert_eq!(score.compile_failures, Vec::<String>::new());
+        });
     }
 
     #[test]
