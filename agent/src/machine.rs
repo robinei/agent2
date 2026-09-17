@@ -415,17 +415,6 @@ pub struct Runner {
     /// also what makes the two verbs an error anywhere else: outside a
     /// compaction program there is nothing to add them to.
     compacting: Option<Vec<crate::compaction::CompactionOp>>,
-    /// Compaction attempts since the last one that committed.
-    ///
-    /// A document has a floor no handler can reach: the card and the
-    /// worked examples open every request and are not rows, so a budget
-    /// set near that floor makes every batch fail `StillOverThreshold`,
-    /// and the condition would re-fire on the next prompt, forever.
-    /// After [`COMPACTION_ATTEMPTS`] the branch stops asking and carries
-    /// on over budget, which is the lesser failure: an over-long
-    /// document still works, an infinite loop of compaction programs
-    /// does not.
-    compaction_attempts: u32,
     /// Whether `done()` (`TOOL_DONE`) was called by the program currently
     /// running — checked and reset by `finish_program`, which is the
     /// only reader. A program can call it and keep going (nothing else
@@ -512,7 +501,6 @@ impl Runner {
         let leaf = spine.leaf_id;
         Runner {
             compacting: None,
-            compaction_attempts: 0,
             done: false,
             spine,
             agent,
@@ -2475,6 +2463,41 @@ impl Runner {
     ///
     /// Checked here, at the one door an idle branch re-enters its LLM
     /// through, because that is the only moment the size is both known
+    /// Compaction attempts since the last one that committed — **a fold
+    /// over this branch's path, not a counter.**
+    ///
+    /// A document has a floor no handler can reach: the card and the
+    /// worked examples open every request and are not rows, so a budget
+    /// set near that floor makes every batch fail `StillOverThreshold`,
+    /// and the condition would re-fire on the next prompt, forever.
+    /// After [`COMPACTION_ATTEMPTS`] the branch stops asking and carries
+    /// on over budget, which is the lesser failure: an over-long
+    /// document still works, an infinite loop of compaction programs
+    /// does not.
+    ///
+    /// It was a `u32` on this struct until a live log accumulated seven
+    /// compaction conditions — the bound is per *process*, and the
+    /// branch outlives the process. Reading it off the log instead is
+    /// the same move the reports and the menu already make: the
+    /// evidence for "we have tried twice" is in the log, so nothing
+    /// needs to remember it. A `Compacted` event resets the count for
+    /// the obvious reason — the next time the document grows, that is a
+    /// fresh problem and not the same one again.
+    fn compaction_attempts(&self, tree: &Tree) -> u32 {
+        let mut attempts = 0;
+        for ev in tree.path_events(self.spine.leaf_id) {
+            match &ev.payload {
+                EventPayload::Condition {
+                    cause: Cause::Compaction { .. },
+                    ..
+                } => attempts += 1,
+                EventPayload::Compacted { .. } => attempts = 0,
+                _ => {}
+            }
+        }
+        attempts
+    }
+
     /// and actionable: a document is only ever too large *for a request*,
     /// and this is where requests are made.
     ///
@@ -2487,7 +2510,7 @@ impl Runner {
         budget: usize,
         headroom: f64,
     ) -> io::Result<Option<StepOutput>> {
-        if self.compacting.is_some() || self.compaction_attempts >= COMPACTION_ATTEMPTS {
+        if self.compacting.is_some() || self.compaction_attempts(tree) >= COMPACTION_ATTEMPTS {
             return Ok(None);
         }
         let doc = crate::document::render(tree, &self.spine, budget);
@@ -2516,7 +2539,6 @@ impl Runner {
             },
         )?;
         self.compacting = Some(Vec::new());
-        self.compaction_attempts += 1;
         self.phase = Phase::AwaitingLlm;
         Ok(Some(self.render_request(tree)))
     }
@@ -2544,9 +2566,6 @@ impl Runner {
                 for event in events {
                     tree.append(&mut self.spine, event)?;
                 }
-                // Committed: the next time the document grows, this is a
-                // fresh problem rather than the same one again.
-                self.compaction_attempts = 0;
                 Ok(Ok(n))
             }
             Err(e) => Ok(Err(e.to_string())),
@@ -4242,6 +4261,42 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "past the bound it stops asking"
+        );
+    }
+
+    /// **The bound survives the process.** It was a counter on the
+    /// `Runner` until a live log accumulated seven compaction
+    /// conditions: a restart built a fresh `Runner` over the same
+    /// branch, the count came back 0, and the branch asked again — two
+    /// attempts per process, forever, on a document no handler could
+    /// shrink. This drives the same loop through a *new* `Runner` each
+    /// time, which is what the old counter could not survive.
+    #[test]
+    fn the_compaction_bound_is_read_off_the_log_not_remembered() {
+        let (mut tree, state, _) = crowded();
+        let mut leaf = state.spine.leaf_id;
+        let impossible = 1024;
+        for attempt in 0..COMPACTION_ATTEMPTS {
+            let mut fresh = Runner::with_spine(&tree, tree.spine_at(leaf));
+            assert!(
+                fresh
+                    .compaction_if_needed(&mut tree, impossible, 0.25)
+                    .unwrap()
+                    .is_some(),
+                "attempt {attempt} within the bound still asks"
+            );
+            // The handler returned and its batch was rejected; the
+            // process ends here, taking every field with it. Only the
+            // log carries over — which is the point.
+            leaf = fresh.spine.leaf_id;
+        }
+        let mut fresh = Runner::with_spine(&tree, tree.spine_at(leaf));
+        assert!(
+            fresh
+                .compaction_if_needed(&mut tree, impossible, 0.25)
+                .unwrap()
+                .is_none(),
+            "past the bound it stops asking, even in a process that never asked"
         );
     }
 

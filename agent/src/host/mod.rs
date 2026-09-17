@@ -4694,11 +4694,21 @@ mod tests {
     /// the parent's original `ask(w.agent, "read the plan")` actually
     /// resumes and — once the child (which now explicitly answers #8,
     /// closing the parent's own pending ask) delivers its value —
-    /// settles for real. Completing a program is still not, on its own,
-    /// a reason to reprompt for anything left open
-    /// (`structured_answer_reaches_the_program`'s doc): the child's
-    /// script answers #8 itself rather than relying on a second,
-    /// re-invited turn.
+    /// settles for real.
+    ///
+    /// **One line here went stale in 27.1 and is corrected rather than
+    /// deleted**, because what replaced it is the reason this test
+    /// still passes. It used to say completing a program is not, on its
+    /// own, a reason to reprompt — which was the rule then and is the
+    /// opposite of the rule now: a program that finishes prompts for
+    /// the next one unless it called `done()`. What still holds is the
+    /// *property this test is about*: the child's script answers #8
+    /// itself rather than relying on a second, re-invited turn, so the
+    /// round trip closes on its own terms and not on a continuation
+    /// that happens to arrive. It passes under the new rule because its
+    /// script has nothing left to serve a continuation — which is worth
+    /// knowing, since a script that did would make this test about
+    /// something else.
     #[test]
     fn upward_clarification_does_not_deadlock() {
         // Ids are deterministic: Agent 1, Post 2, Turn 3, Spawn 4,
