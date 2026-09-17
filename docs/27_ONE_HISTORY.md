@@ -337,3 +337,48 @@ The failures that remain are one shape — a probe loop whose check could
 not say no — and `short` turned out not to state that rule at all. Same
 shape as the ask gap: a general rule missing from the variant, losing a
 task, and mistaken for a fact about the harness.
+
+## Card arms measured after the phase, one variable at a time
+
+All at n=14 per task, same binary within each comparison, the card the
+only thing that moved. Pass rate, then per-item credit once the graded
+checkers existed.
+
+| arm | all | ambiguous | dead-code | plain | skipped |
+|---|---|---|---|---|---|
+| baseline (27 complete) | 47/56 | 12/14 | 11/14 | 14/14 | 10/14 |
+| + "the check must be able to say no" | 46/56 | 14/14 | 8/14 | 14/14 | 10/14 |
+| + placeholder exemplars, sentence trimmed | 46/54 | 14/14 | 10/13 | 14/14 | 8/13 |
+| + **"ask once for everything the check will answer at once"** | **49/54** | 13/14 | 11/12 | 14/14 | 11/14 |
+
+**Two of the three did nothing, and both were mine.** The say-no rule
+was a correct-sounding paragraph reasoned from the failures; it bought
+`ambiguous-config` and cost `dead-code-sweep`, net zero. The exemplar
+rewrite was a fix for a problem I had created that morning by making
+three exemplars concrete enough to copy — one run reproduced exemplar
+12 verbatim, invented names and the `// [worked example]` marker and
+all, into a Rust repo that had none of them.
+
+**The one that moved came from reading pi's transcript**, not from
+having an opinion about prose. Its whole strategy is one line of its
+own thinking: *"remove all of them, then run `cargo check` to see which
+warnings appear."* One compile, eight answers. The card had always
+taught the opposite. Calls per program halved on both target tasks (7.6
+→ 4.1, 4.2 → 2.3) and programs per run fell 5 → 3 and 4 → 3, so the
+mechanism is visibly the intended one.
+
+**Half the prediction failed, which is the useful half.** I predicted
+`dead-code-sweep`'s provider time would roughly halve; it went 193.7s →
+**241.5s**. `skipped-tests` did drop (142.2 → 81.5s), so the effect is
+real but not universal: on the larger task the cost is *reasoning*, not
+round trips — 45.7KB of it, essentially unchanged by removing half the
+calls. **The wall-clock gap to pi is a thinking-budget problem, not a
+round-trip problem**, and the whole phase had assumed the opposite.
+
+**And the graded signal earned its keep immediately.** Rescoring both
+arms with the same checkers: `dead-code-sweep` credit 88% → 86%,
+`skipped-tests` 88% → 90%, while the pass rate jumped on both. So the
+rule did not make per-item judgements better — it made failures
+*concentrate*, and runs stopped losing on one stray item. That is a
+different and more honest description of the win than "it got better",
+and one bit per run could never have told us.
