@@ -98,32 +98,70 @@ impl ChatMessage {
 /// tool-calling completion to anything watching the transport (a proxy,
 /// a provider's own logging) that only understands that shape.
 ///
-/// Selected by `AGENT2_TRANSPORT` (`program`/`run_program`), read fresh
-/// on every call rather than cached — the same `AGENT2_*` idiom as
-/// `host/mod.rs`'s `document_budget`/`compaction_headroom`, so a session
-/// can be pointed at either container without a rebuild. The event log
-/// this produces is identical in shape either way: same `Turn`/`Call`/
+/// Chosen once per process from `AGENT2_TRANSPORT`
+/// ([`configured_transport`]) and then **passed as a value** — into
+/// [`render`], recorded on the [`Document`] it produces, and read back
+/// off that document by `host/deepseek.rs`. It is not re-read from the
+/// environment anywhere downstream, which is what makes it impossible
+/// for one request to be *rendered* under one container and *sent*
+/// under the other.
+///
+/// It used to be an ambient `AGENT2_*` lookup on every call, like
+/// `host/mod.rs`'s `document_budget`/`compaction_headroom`. That is a
+/// safe idiom for a value only ever *read*; this one had to vary per
+/// test, and the only way to vary a process-global from a test is to
+/// write the environment variable, which Rust 2024 makes `unsafe`
+/// precisely because it is undefined behaviour once any other thread is
+/// running. `cargo test` runs one thread per core, so those writes
+/// raced every concurrent test that rendered a document — most of the
+/// suite. The visible symptom was
+/// `program_mode_renders_an_assistant_turn_as_plain_text` asserting an
+/// *empty* assistant message, because the other transport had moved the
+/// program into a tool call and left `content` blank.
+///
+/// Threading the value fixes that at the source rather than by
+/// serialising the suite: a test names the transport it means, in an
+/// argument, and nothing global moves.
+///
+/// The event log is identical in shape either way: same `Turn`/`Call`/
 /// `Result`/`Condition` payloads, same `Message::Turn.source` — only
 /// this module's rendering and `host/deepseek.rs`'s wire-facing code
 /// branch on it at all.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Transport {
+    #[default]
     Program,
     RunProgram,
 }
 
 pub const DEFAULT_TRANSPORT: Transport = Transport::Program;
 
+/// The process's transport, read from `AGENT2_TRANSPORT` **once** and
+/// cached. This is the process entry point for the setting: real
+/// callers (`main.rs`, the session loop, `score.rs`) ask here and then
+/// pass the answer down as a value.
+///
+/// Once, not per call, and that is the whole point. A per-call read is
+/// a process-global that anything can observe mid-render, so varying it
+/// in a test meant writing the environment variable underneath every
+/// other running test — UB under threads, and the cause of a real race
+/// across this suite (see [`Transport`]).
+/// A `OnceLock` makes the environment a *start-up* input: it is read
+/// before any document exists, and no later read can disagree with an
+/// earlier one. Tests never come here at all; they name a [`Transport`]
+/// directly.
+///
 /// An unset or unrecognized value falls back to [`DEFAULT_TRANSPORT`],
 /// the same "garbage in, quiet default" rule the other `AGENT2_*`
 /// readers use (`llm_concurrency`'s `filter(|n| *n >= 1)`,
 /// `compaction_headroom`'s open-interval filter) rather than a run
 /// failing to start over a typo'd env var.
-pub(crate) fn transport() -> Transport {
-    match std::env::var("AGENT2_TRANSPORT").as_deref() {
+pub fn configured_transport() -> Transport {
+    static CONFIGURED: std::sync::OnceLock<Transport> = std::sync::OnceLock::new();
+    *CONFIGURED.get_or_init(|| match std::env::var("AGENT2_TRANSPORT").as_deref() {
         Ok("run_program") => Transport::RunProgram,
         _ => DEFAULT_TRANSPORT,
-    }
+    })
 }
 
 /// A rendered request, transport-agnostic (Part A: "the document is
@@ -137,13 +175,27 @@ pub struct Document {
     /// because it is a fact about *this* document and nothing else can
     /// recover it: it depends on the agent's snapshotted exemplars and
     /// on the transport, and [`conversation`] used to re-derive it by
-    /// calling `worked_examples()` against today's card and today's
-    /// `AGENT2_TRANSPORT`. Slicing with a number computed from the
-    /// wrong card is how a caller silently reads the tail of the
+    /// calling `worked_examples()` against today's card and whatever
+    /// transport happened to be configured when it was asked. Slicing
+    /// with a number computed from the wrong card — or the wrong
+    /// container — is how a caller silently reads the tail of the
     /// preamble as the first real turn.
     ///
     /// [`conversation`]: Document::conversation
     pub preamble: usize,
+    /// Which container this document was rendered for. Recorded for the
+    /// same reason as `preamble`, and in fact it is *why* `preamble`
+    /// varies: a `RunProgram` exemplar renders three rows where a
+    /// `Program` one renders two.
+    ///
+    /// `host/deepseek.rs` reads it here rather than asking the
+    /// environment again on its way to the wire. Those were once two
+    /// independent reads of one global, held in agreement only by a
+    /// comment promising they "can never drift onto different values
+    /// mid-session" — a promise nothing enforced. Carrying the value on
+    /// the document makes the request and the wire format it is sent
+    /// under the same fact, so there is nothing left to keep in sync.
+    pub transport: Transport,
 }
 
 impl Document {
@@ -472,7 +524,7 @@ fn pending_line(
 /// for it — every depth-0 program's own outcome auto-populates the
 /// pending turn before the next `Turn` can appear, by construction of
 /// this fold, so "two programs adjacent" is no longer representable.
-pub fn render(tree: &Tree, spine: &Spine, budget: usize) -> Document {
+pub fn render(tree: &Tree, spine: &Spine, budget: usize, transport: Transport) -> Document {
     let leaf = spine.leaf_id;
     let agent = tree
         .enclosing_agent(leaf)
@@ -482,10 +534,10 @@ pub fn render(tree: &Tree, spine: &Spine, budget: usize) -> Document {
         tree,
         agent,
         leaf,
-        &context.system,
-        &context.exemplars,
+        context,
         budget,
         &tree.compacted_lookup(leaf),
+        transport,
     )
 }
 
@@ -497,18 +549,26 @@ pub fn render(tree: &Tree, spine: &Spine, budget: usize) -> Document {
 /// actually logged) and stays the public entry point; this is the one
 /// fold underneath both of them, so a compaction dry-run and a real
 /// request can never silently diverge on how a row renders.
+///
+/// `context` arrives whole rather than as its `system` and `exemplars`
+/// separately: both callers already hold one and pull the pair out of
+/// it, and passing the halves let a caller combine a card from one
+/// agent's snapshot with another's exemplars — a preamble no agent ever
+/// had. `transport` is a parameter for the reason [`Transport`] gives:
+/// it is the one input here that a test must vary, and it was a
+/// process-global read mid-fold until that turned out to be a data
+/// race.
 pub(crate) fn render_with_lookup(
     tree: &Tree,
     agent: EventId,
     leaf: EventId,
-    card: &str,
-    exemplars: &[Exemplar],
+    context: &Context,
     budget: usize,
     compacted: &HashMap<EventId, CompactedView>,
+    transport: Transport,
 ) -> Document {
-    let transport = transport();
-    let mut messages = vec![ChatMessage::text(ChatRole::System, card.to_owned())];
-    messages.extend(worked_examples(exemplars));
+    let mut messages = vec![ChatMessage::text(ChatRole::System, context.system.clone())];
+    messages.extend(worked_examples(&context.exemplars, transport));
     let preamble = messages.len();
     let mut pending: Vec<String> = Vec::new();
     let mut cur_agent: Option<EventId> = None;
@@ -575,7 +635,11 @@ pub(crate) fn render_with_lookup(
         messages.push(flush_pending(&mut pending, transport, &mut open_call));
     }
 
-    Document { messages, preamble }
+    Document {
+        messages,
+        preamble,
+        transport,
+    }
 }
 
 /// The assistant's own turn, in whichever shape `transport` wants.
@@ -676,8 +740,7 @@ fn flush_pending(
 /// there is nothing truthful to report. `card::seed_exemplars()` itself
 /// — the FILES this reads from — is untouched by which transport is
 /// active; only this rendering is.
-fn worked_examples(exemplars: &[Exemplar]) -> Vec<ChatMessage> {
-    let transport = transport();
+fn worked_examples(exemplars: &[Exemplar], transport: Transport) -> Vec<ChatMessage> {
     exemplars
         .iter()
         .enumerate()
@@ -847,7 +910,7 @@ mod tests {
         )
         .unwrap();
 
-        let doc = render(&tree, &spine, 4096);
+        let doc = render(&tree, &spine, 4096, Transport::Program);
         let text: String = doc.messages.iter().map(|m| m.content.clone()).collect();
         assert!(
             text.contains("the user turn this branch was born with"),
@@ -986,7 +1049,7 @@ mod tests {
         )
         .unwrap();
 
-        let doc = render(&tree, &spine, 64 * 1024);
+        let doc = render(&tree, &spine, 64 * 1024, Transport::Program);
         assert_eq!(doc.messages[0].role, ChatRole::System);
         assert_eq!(doc.messages[0].content, "CARD");
         let conv = doc.conversation();
@@ -1047,7 +1110,7 @@ mod tests {
         )
         .unwrap();
 
-        let doc = render(&tree, &spine, 64 * 1024);
+        let doc = render(&tree, &spine, 64 * 1024, Transport::Program);
         let conv = doc.conversation();
         // user("go") / assistant(raise) / user(the raise's own report,
         // which is what the model was prompted with) / assistant(the
@@ -1098,7 +1161,8 @@ mod tests {
             },
         )
         .unwrap();
-        tree.append(&mut spine, turn("return recompute();")).unwrap();
+        tree.append(&mut spine, turn("return recompute();"))
+            .unwrap();
         tree.append(
             &mut spine,
             EventPayload::Return {
@@ -1107,7 +1171,7 @@ mod tests {
         )
         .unwrap();
 
-        let doc = render(&tree, &spine, 64 * 1024);
+        let doc = render(&tree, &spine, 64 * 1024, Transport::Program);
         let conv = doc.conversation();
         assert_eq!(
             conv.iter()
@@ -1156,7 +1220,7 @@ mod tests {
         )
         .unwrap();
 
-        let doc = render(&tree, &spine, 64 * 1024);
+        let doc = render(&tree, &spine, 64 * 1024, Transport::Program);
         let compacted_turn = &doc.conversation()[1];
         assert_eq!(compacted_turn.role, ChatRole::Assistant);
         assert!(compacted_turn.content.starts_with("//:"));
@@ -1229,30 +1293,12 @@ mod tests {
 
     // --- Transport switch ---
 
-    /// Runs `f` with `AGENT2_TRANSPORT` set to `value`, restoring
-    /// whatever was there before (or its absence) once `f` returns — so
-    /// one test flipping the switch can never leak into a sibling's run.
-    /// Relies on this crate's own documented gate
-    /// (`cargo test -p agent -- --test-threads=1`) running the binary
-    /// single-threaded: a per-process env var has no other safe way to
-    /// be scoped to one test.
-    fn with_transport<T>(value: &str, f: impl FnOnce() -> T) -> T {
-        let key = "AGENT2_TRANSPORT";
-        let prev = std::env::var(key).ok();
-        // SAFETY: the test binary runs on one thread — enforced by
-        // `RUST_TEST_THREADS = "1"` in `.cargo/config.toml`, which
-        // exists for this. It was previously only asserted here,
-        // while `cargo test` ran one thread per core.
-        unsafe { std::env::set_var(key, value) };
-        let result = f();
-        match prev {
-            Some(v) => unsafe { std::env::set_var(key, v) },
-            None => unsafe { std::env::remove_var(key) },
-        }
-        result
-    }
-
-    fn sample_document() -> Document {
+    /// The same small branch rendered under whichever container the
+    /// caller names. There is no ambient switch to flip and nothing to
+    /// restore: the transport is an argument, so two of these tests can
+    /// run side by side on different threads and neither can see the
+    /// other's choice.
+    fn sample_document(transport: Transport) -> Document {
         let mut tree = Tree::new(None);
         let mut spine = tree
             .start_agent(None, None, "root", None, "CARD", Vec::new())
@@ -1267,7 +1313,7 @@ mod tests {
             },
         )
         .unwrap();
-        render(&tree, &spine, 64 * 1024)
+        render(&tree, &spine, 64 * 1024, transport)
     }
 
     /// Pins today's shape: the model's whole response rides bare in
@@ -1278,27 +1324,26 @@ mod tests {
     /// it.
     #[test]
     fn program_mode_renders_an_assistant_turn_as_plain_text() {
-        // `doc.conversation()` recomputes the preamble length from
-        // `worked_examples()` — which itself reads `transport()` fresh
-        // (its own doc comment) — so it has to run inside the same
-        // `with_transport` scope that built `doc`, not after: reading it
-        // back once the guard has restored the env would slice the
-        // preamble at the *other* mode's length.
-        with_transport("program", || {
-            let doc = sample_document();
-            let conv = doc.conversation();
-            assert_eq!(conv[1].role, ChatRole::Assistant);
-            assert_eq!(conv[1].content, "tell('hi'); return 1;");
-            assert!(
-                conv[1].tool_calls.is_none(),
-                "Transport::Program never wraps a turn in a tool call: {conv:?}"
-            );
-            assert_eq!(
-                conv[2].role,
-                ChatRole::User,
-                "the report stays a plain User message under Transport::Program"
-            );
-        });
+        // `conversation()` slices at the preamble length this document
+        // recorded when it was built, and that length is transport-
+        // dependent (a `RunProgram` exemplar renders three rows, a
+        // `Program` one two). It is read off `doc` itself, so there is
+        // no window in which it could be sliced at the other mode's
+        // length — which is exactly what an ambient transport used to
+        // make possible.
+        let doc = sample_document(Transport::Program);
+        let conv = doc.conversation();
+        assert_eq!(conv[1].role, ChatRole::Assistant);
+        assert_eq!(conv[1].content, "tell('hi'); return 1;");
+        assert!(
+            conv[1].tool_calls.is_none(),
+            "Transport::Program never wraps a turn in a tool call: {conv:?}"
+        );
+        assert_eq!(
+            conv[2].role,
+            ChatRole::User,
+            "the report stays a plain User message under Transport::Program"
+        );
     }
 
     /// `Transport::RunProgram`'s whole point: the same turn now arrives
@@ -1309,23 +1354,21 @@ mod tests {
     /// follows it.
     #[test]
     fn run_program_mode_renders_an_assistant_turn_as_a_tool_call() {
-        with_transport("run_program", || {
-            let doc = sample_document();
-            let conv = doc.conversation();
-            assert_eq!(conv[1].role, ChatRole::Assistant);
-            let calls = conv[1]
-                .tool_calls
-                .as_ref()
-                .expect("Transport::RunProgram wraps the turn in a run_program call");
-            assert_eq!(calls.len(), 1);
-            assert_eq!(calls[0].source, "tell('hi'); return 1;");
-            assert_eq!(
-                conv[2].role,
-                ChatRole::Tool,
-                "the report answers the call under Transport::RunProgram: {conv:?}"
-            );
-            assert_eq!(conv[2].tool_call_id.as_deref(), Some(calls[0].id.as_str()));
-        });
+        let doc = sample_document(Transport::RunProgram);
+        let conv = doc.conversation();
+        assert_eq!(conv[1].role, ChatRole::Assistant);
+        let calls = conv[1]
+            .tool_calls
+            .as_ref()
+            .expect("Transport::RunProgram wraps the turn in a run_program call");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].source, "tell('hi'); return 1;");
+        assert_eq!(
+            conv[2].role,
+            ChatRole::Tool,
+            "the report answers the call under Transport::RunProgram: {conv:?}"
+        );
+        assert_eq!(conv[2].tool_call_id.as_deref(), Some(calls[0].id.as_str()));
     }
 
     /// **The point of the exercise.** Two transports, one branch: the
@@ -1377,24 +1420,20 @@ mod tests {
 
         let (program_tree, program_spine) = build();
         let (rp_tree, rp_spine) = build();
-        // `.conversation()` has to run inside each transport's own
-        // scope — see `program_mode_renders_an_assistant_turn_as_plain_text`'s
-        // doc comment — so each branch collects its payload before the
-        // guard restores the env.
-        let program_content: Vec<String> = with_transport("program", || {
-            render(&program_tree, &program_spine, 64 * 1024)
+        // Each document carries the transport it was rendered under, so
+        // `.conversation()` slices each at its own preamble length and
+        // the two can simply be built one after the other.
+        let program_content: Vec<String> =
+            render(&program_tree, &program_spine, 64 * 1024, Transport::Program)
                 .conversation()
                 .iter()
                 .map(payload)
-                .collect()
-        });
-        let rp_content: Vec<String> = with_transport("run_program", || {
-            render(&rp_tree, &rp_spine, 64 * 1024)
-                .conversation()
-                .iter()
-                .map(payload)
-                .collect()
-        });
+                .collect();
+        let rp_content: Vec<String> = render(&rp_tree, &rp_spine, 64 * 1024, Transport::RunProgram)
+            .conversation()
+            .iter()
+            .map(payload)
+            .collect();
 
         assert_eq!(
             program_content.len(),

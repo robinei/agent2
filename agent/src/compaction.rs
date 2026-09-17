@@ -210,7 +210,18 @@ pub fn should_fire(current_size: usize, budget: usize, headroom_fraction: f64) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::document::render;
+    use crate::document::{Document, Transport};
+
+    /// These tests are about *sizes and ops* — what compaction removes
+    /// and when it fires — not about wire containers, so they render
+    /// under one transport throughout and say so once here rather than
+    /// at every call site. The one size question that *is* transport-
+    /// sensitive has its own test,
+    /// `a_programs_bytes_count_in_either_transport`, which builds both
+    /// shapes by hand.
+    fn render(tree: &Tree, spine: &Spine, budget: usize) -> Document {
+        crate::document::render(tree, spine, budget, Transport::Program)
+    }
 
     /// A small real branch: a user post, a completed program, and a
     /// `Note` — three ids to target, and a card/budget combination that
@@ -601,6 +612,7 @@ mod tests {
                 tool_call_id: None,
             }],
             preamble: 0,
+            transport: Transport::Program,
         };
         let as_call = Document {
             messages: vec![ChatMessage {
@@ -613,6 +625,7 @@ mod tests {
                 tool_call_id: None,
             }],
             preamble: 0,
+            transport: Transport::Program,
         };
         assert_eq!(rendered_size(&as_text), program.len());
         assert_eq!(rendered_size(&as_call), rendered_size(&as_text));

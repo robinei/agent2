@@ -421,6 +421,33 @@ pub struct Runner {
     /// one step — a rewrite abandoning the old run as a new one starts —
     /// both surface, and so the sans-io output set is untouched.
     status_transitions: Vec<(EventId, ProgramStatus)>,
+    /// Which wire container this branch's requests are rendered for.
+    ///
+    /// Session configuration, not branch state: it is the same for every
+    /// runner in a session, and nothing ever logs it. It lives here
+    /// because two places need it and neither can reach the other's —
+    /// `document()` renders with it, and `apply_turn` needs it to read an
+    /// *empty* completion correctly (under `RunProgram` an empty `source`
+    /// means "no `run_program` call arrived", i.e. the model's final
+    /// prose; under `Program` it is just an empty program).
+    ///
+    /// Defaulted at construction to `document::configured_transport()`
+    /// — the process's one start-up read — and overridable through
+    /// [`set_transport`]. Defaulted rather than passed in because there
+    /// are six construction sites across the session loop and a seventh
+    /// that forgot to set it would silently render every request under
+    /// the wrong container; the env var would simply stop working, with
+    /// nothing failing to say so. A test names the transport it means
+    /// through [`set_transport`], the way it does `dialect_card` and
+    /// `attached`.
+    ///
+    /// It was an `AGENT2_TRANSPORT` lookup on every *use* until that
+    /// global's per-test mutation turned out to be a data race — see
+    /// `document::Transport`. Reading it once at construction is the
+    /// same value with none of the exposure.
+    ///
+    /// [`set_transport`]: Runner::set_transport
+    transport: crate::document::Transport,
     /// Whether a client is attached to the session right now.
     ///
     /// Presence is a **per-request fact**, never branch state that
@@ -565,6 +592,7 @@ impl Runner {
             dialect_card: String::new(),
             last_vm: None,
             status_transitions: Vec::new(),
+            transport: crate::document::configured_transport(),
             attached: false,
             // A branch handed to a fresh `Runner` has said nothing to
             // *this* session's LLM and is owed no prompt for its
@@ -581,6 +609,13 @@ impl Runner {
     /// prompt is the snapshot and never re-derived.
     pub fn set_dialect_card(&mut self, card: String) {
         self.dialect_card = card;
+    }
+
+    /// Point this branch at a wire container. The session sets it from
+    /// `document::configured_transport()` when it opens a branch; tests
+    /// name one directly.
+    pub fn set_transport(&mut self, transport: crate::document::Transport) {
+        self.transport = transport;
     }
 
     /// This branch's agent — the innermost `Agent` root on its path.
@@ -1035,9 +1070,7 @@ impl Runner {
         // `source.is_empty()`, so `Transport::Program` — where an empty
         // response has always fallen through to `start_program` below —
         // is untouched.
-        if source.is_empty()
-            && crate::document::transport() == crate::document::Transport::RunProgram
-        {
+        if source.is_empty() && self.transport == crate::document::Transport::RunProgram {
             self.phase = Phase::Idle;
             return Ok(out);
         }
@@ -2623,7 +2656,7 @@ impl Runner {
         if self.compacting.is_some() || self.compaction_attempts(tree) >= COMPACTION_ATTEMPTS {
             return Ok(None);
         }
-        let doc = crate::document::render(tree, &self.spine, budget);
+        let doc = crate::document::render(tree, &self.spine, budget, self.transport);
         let rendered = crate::compaction::rendered_size(&doc);
         if !crate::compaction::should_fire(rendered, budget, headroom) {
             return Ok(None);
@@ -2814,7 +2847,7 @@ impl Runner {
     /// So the host calls this with whatever it tracks, then applies the
     /// tail itself: `runner.document(tree, budget).with_tail(&tail)`.
     pub fn document(&self, tree: &Tree, budget: usize) -> crate::document::Document {
-        crate::document::render(tree, &self.spine, budget)
+        crate::document::render(tree, &self.spine, budget, self.transport)
     }
 
     /// One request's ephemeral half, for tests that inspect the tail.
@@ -3103,8 +3136,18 @@ mod tests {
     const FUEL: u64 = 100_000;
 
     fn setup() -> (Tree, Runner) {
+        setup_under(crate::document::Transport::Program)
+    }
+
+    /// `setup`, but for the tests that are *about* the wire container.
+    /// The transport is set on the runner rather than in the process
+    /// environment, so these tests say which container they mean and two
+    /// of them can run at once on different threads — the env-var helper
+    /// this replaced could not manage either (see `document::Transport`).
+    fn setup_under(transport: crate::document::Transport) -> (Tree, Runner) {
         let mut tree = Tree::new(None);
-        let state = Runner::new_root(&mut tree, "you are a test agent", "").unwrap();
+        let mut state = Runner::new_root(&mut tree, "you are a test agent", "").unwrap();
+        state.set_transport(transport);
         (tree, state)
     }
 
@@ -3283,30 +3326,6 @@ mod tests {
         }
     }
 
-    /// Runs `f` with `AGENT2_TRANSPORT` set to `value`, restoring
-    /// whatever was there before (or its absence) once `f` returns —
-    /// `document.rs`'s own `with_transport` test helper, duplicated here
-    /// because it is `cfg(test)`-private to that module. Relies on this
-    /// crate's documented gate (`cargo test -p agent --
-    /// --test-threads=1`) running the binary single-threaded: a
-    /// per-process env var has no other safe way to be scoped to one
-    /// test.
-    fn with_transport<T>(value: &str, f: impl FnOnce() -> T) -> T {
-        let key = "AGENT2_TRANSPORT";
-        let prev = std::env::var(key).ok();
-        // SAFETY: the test binary runs on one thread — enforced by
-        // `RUST_TEST_THREADS = "1"` in `.cargo/config.toml`, which
-        // exists for this. It was previously only asserted here,
-        // while `cargo test` ran one thread per core.
-        unsafe { std::env::set_var(key, value) };
-        let result = f();
-        match prev {
-            Some(v) => unsafe { std::env::set_var(key, v) },
-            None => unsafe { std::env::remove_var(key) },
-        }
-        result
-    }
-
     /// Drive `Tick`s until the machine stops asking for them; collects
     /// every non-`Working` output.
     fn drain(state: &mut Runner, tree: &mut Tree, outputs: Vec<StepOutput>) -> Vec<StepOutput> {
@@ -3430,69 +3449,65 @@ mod tests {
 
     #[test]
     fn run_program_prose_reaches_the_user_as_a_send() {
-        with_transport("run_program", || {
-            let (mut tree, mut state) = setup();
-            user_post(&mut state, &mut tree, "go");
-            let out = state
-                .step(
-                    &mut tree,
-                    StepInput::LlmResponse(crate::host::scripted_reply(
-                        "On it — computing now.",
-                        "return 1;",
-                    )),
-                )
-                .unwrap();
-            let settled = drain(&mut state, &mut tree, out);
-            let sends = settled
-                .iter()
-                .find_map(|o| match o {
-                    StepOutput::Sends(s) => Some(s.clone()),
-                    _ => None,
-                })
-                .expect("the reply dispatches as a Sends output, exactly like a tell()");
-            assert_eq!(sends.len(), 1);
-            let EventPayload::Call(Call::Send {
-                to,
-                text,
-                expects_reply,
-                ..
-            }) = &tree.events[&sends[0]].payload
-            else {
-                panic!("expected a Send");
-            };
-            assert_eq!(*to, Address::User);
-            assert_eq!(text, "On it — computing now.");
-            assert!(!expects_reply, "a reply owes no answer, same as a tell()");
+        let (mut tree, mut state) = setup_under(crate::document::Transport::RunProgram);
+        user_post(&mut state, &mut tree, "go");
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(crate::host::scripted_reply(
+                    "On it — computing now.",
+                    "return 1;",
+                )),
+            )
+            .unwrap();
+        let settled = drain(&mut state, &mut tree, out);
+        let sends = settled
+            .iter()
+            .find_map(|o| match o {
+                StepOutput::Sends(s) => Some(s.clone()),
+                _ => None,
+            })
+            .expect("the reply dispatches as a Sends output, exactly like a tell()");
+        assert_eq!(sends.len(), 1);
+        let EventPayload::Call(Call::Send {
+            to,
+            text,
+            expects_reply,
+            ..
+        }) = &tree.events[&sends[0]].payload
+        else {
+            panic!("expected a Send");
+        };
+        assert_eq!(*to, Address::User);
+        assert_eq!(text, "On it — computing now.");
+        assert!(!expects_reply, "a reply owes no answer, same as a tell()");
 
-            // The log cannot tell a prose reply from a `tell` apart:
-            // `agent score`'s `tells`/`silent` fields see the identical
-            // shape either way.
-            let score = crate::score::score(&tree);
-            assert_eq!(score.tells, ["On it — computing now."]);
-            assert!(!score.silent);
-        });
+        // The log cannot tell a prose reply from a `tell` apart:
+        // `agent score`'s `tells`/`silent` fields see the identical
+        // shape either way.
+        let score = crate::score::score(&tree);
+        assert_eq!(score.tells, ["On it — computing now."]);
+        assert!(!score.silent);
     }
 
     #[test]
     fn run_program_continues_after_a_program_returns() {
-        with_transport("run_program", || {
-            let (mut tree, mut state) = setup();
-            user_post(&mut state, &mut tree, "go");
-            let out = state
-                .step(&mut tree, StepInput::LlmResponse(llm_program("return 1;")))
-                .unwrap();
-            let settled = drain(&mut state, &mut tree, out);
-            let requests = settled
-                .iter()
-                .filter(|o| matches!(o, StepOutput::LlmRequest(_)))
-                .count();
-            assert_eq!(
-                requests, 1,
-                "a completed program's return value is a tool result under \
-                 Transport::RunProgram, not a chat reply — the conversation \
-                 must continue with a fresh request: {settled:?}"
-            );
-        });
+        let (mut tree, mut state) = setup_under(crate::document::Transport::RunProgram);
+        user_post(&mut state, &mut tree, "go");
+        let out = state
+            .step(&mut tree, StepInput::LlmResponse(llm_program("return 1;")))
+            .unwrap();
+        let settled = drain(&mut state, &mut tree, out);
+        let requests = settled
+            .iter()
+            .filter(|o| matches!(o, StepOutput::LlmRequest(_)))
+            .count();
+        assert_eq!(
+            requests, 1,
+            "a completed program's return value is a tool result under \
+             Transport::RunProgram, not a chat reply — the conversation \
+             must continue with a fresh request: {settled:?}"
+        );
     }
 
     /// **Superseded by the `done()` change**: this used to pin
@@ -3508,25 +3523,23 @@ mod tests {
     /// one instead pins the new default.
     #[test]
     fn a_completed_program_continues_by_default() {
-        with_transport("program", || {
-            let (mut tree, mut state) = setup();
-            user_post(&mut state, &mut tree, "go");
-            let out = state
-                .step(
-                    &mut tree,
-                    StepInput::LlmResponse(llm_program("tell(\"working on it\");")),
-                )
-                .unwrap();
-            let settled = drain(&mut state, &mut tree, out);
-            assert!(
-                settled
-                    .iter()
-                    .any(|o| matches!(o, StepOutput::LlmRequest(_))),
-                "a completed program continues by default now, on both \
-                 transports, unless it called done(): {settled:?}"
-            );
-            assert!(!state.is_idle());
-        });
+        let (mut tree, mut state) = setup_under(crate::document::Transport::Program);
+        user_post(&mut state, &mut tree, "go");
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(llm_program("tell(\"working on it\");")),
+            )
+            .unwrap();
+        let settled = drain(&mut state, &mut tree, out);
+        assert!(
+            settled
+                .iter()
+                .any(|o| matches!(o, StepOutput::LlmRequest(_))),
+            "a completed program continues by default now, on both \
+             transports, unless it called done(): {settled:?}"
+        );
+        assert!(!state.is_idle());
     }
 
     /// `done()` is the one thing that stops the loop (`TOOL_DONE`'s own
@@ -3534,21 +3547,19 @@ mod tests {
     /// program's text differs.
     #[test]
     fn done_ends_the_conversation() {
-        with_transport("program", || {
-            let (mut tree, mut state) = setup();
-            user_post(&mut state, &mut tree, "go");
-            let out = state
-                .step(&mut tree, StepInput::LlmResponse(llm_program("done();")))
-                .unwrap();
-            let settled = drain(&mut state, &mut tree, out);
-            assert!(
-                !settled
-                    .iter()
-                    .any(|o| matches!(o, StepOutput::LlmRequest(_))),
-                "done() ends the conversation with no further request: {settled:?}"
-            );
-            assert!(state.is_idle());
-        });
+        let (mut tree, mut state) = setup_under(crate::document::Transport::Program);
+        user_post(&mut state, &mut tree, "go");
+        let out = state
+            .step(&mut tree, StepInput::LlmResponse(llm_program("done();")))
+            .unwrap();
+        let settled = drain(&mut state, &mut tree, out);
+        assert!(
+            !settled
+                .iter()
+                .any(|o| matches!(o, StepOutput::LlmRequest(_))),
+            "done() ends the conversation with no further request: {settled:?}"
+        );
+        assert!(state.is_idle());
     }
 
     /// `done()` settles at dispatch (like `spawn`/`fork`), so it is
@@ -3557,63 +3568,59 @@ mod tests {
     /// a `tell()`) must not un-record it.
     #[test]
     fn done_is_recorded_before_the_program_ends() {
-        with_transport("program", || {
-            let (mut tree, mut state) = setup();
-            user_post(&mut state, &mut tree, "go");
-            let out = state
-                .step(
-                    &mut tree,
-                    StepInput::LlmResponse(llm_program("done(); tell(\"wrapping up now\");")),
-                )
-                .unwrap();
-            let settled = drain(&mut state, &mut tree, out);
-            assert!(
-                !settled
-                    .iter()
-                    .any(|o| matches!(o, StepOutput::LlmRequest(_))),
-                "a statement after done() must not cancel it: {settled:?}"
-            );
-            assert!(state.is_idle());
-        });
+        let (mut tree, mut state) = setup_under(crate::document::Transport::Program);
+        user_post(&mut state, &mut tree, "go");
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(llm_program("done(); tell(\"wrapping up now\");")),
+            )
+            .unwrap();
+        let settled = drain(&mut state, &mut tree, out);
+        assert!(
+            !settled
+                .iter()
+                .any(|o| matches!(o, StepOutput::LlmRequest(_))),
+            "a statement after done() must not cancel it: {settled:?}"
+        );
+        assert!(state.is_idle());
     }
 
     #[test]
     fn a_reply_with_no_program_ends_the_task() {
-        with_transport("run_program", || {
-            let (mut tree, mut state) = setup();
-            user_post(&mut state, &mut tree, "go");
-            let out = state
-                .step(
-                    &mut tree,
-                    StepInput::LlmResponse(crate::host::scripted_reply(
-                        "All done, nothing left to do.",
-                        "",
-                    )),
-                )
-                .unwrap();
+        let (mut tree, mut state) = setup_under(crate::document::Transport::RunProgram);
+        user_post(&mut state, &mut tree, "go");
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(crate::host::scripted_reply(
+                    "All done, nothing left to do.",
+                    "",
+                )),
+            )
+            .unwrap();
 
-            // No `Working` output at all: an empty `source` must never
-            // reach `start_program`/`interp::compile` and manufacture a
-            // spurious `Cause::CompileFailed`.
-            assert!(
-                !out.iter().any(|o| matches!(o, StepOutput::Working)),
-                "an empty source must not start a program: {out:?}"
-            );
-            assert!(
-                !out.iter().any(|o| matches!(o, StepOutput::LlmRequest(_))),
-                "a final answer owes no further request: {out:?}"
-            );
-            assert!(state.is_idle());
-            assert_eq!(
-                payload_kinds(&state, &tree),
-                ["Agent", "Post", "Turn", "Call"],
-                "no Return, no Condition — nothing ran"
-            );
+        // No `Working` output at all: an empty `source` must never
+        // reach `start_program`/`interp::compile` and manufacture a
+        // spurious `Cause::CompileFailed`.
+        assert!(
+            !out.iter().any(|o| matches!(o, StepOutput::Working)),
+            "an empty source must not start a program: {out:?}"
+        );
+        assert!(
+            !out.iter().any(|o| matches!(o, StepOutput::LlmRequest(_))),
+            "a final answer owes no further request: {out:?}"
+        );
+        assert!(state.is_idle());
+        assert_eq!(
+            payload_kinds(&state, &tree),
+            ["Agent", "Post", "Turn", "Call"],
+            "no Return, no Condition — nothing ran"
+        );
 
-            let score = crate::score::score(&tree);
-            assert_eq!(score.tells, ["All done, nothing left to do."]);
-            assert_eq!(score.compile_failures, Vec::<String>::new());
-        });
+        let score = crate::score::score(&tree);
+        assert_eq!(score.tells, ["All done, nothing left to do."]);
+        assert_eq!(score.compile_failures, Vec::<String>::new());
     }
 
     #[test]
@@ -4049,7 +4056,7 @@ mod tests {
         )
         .unwrap();
         // It really is gone from what the model reads.
-        let doc = crate::document::render(&tree, &state.spine, TEST_BUDGET);
+        let doc = crate::document::render(&tree, &state.spine, TEST_BUDGET, state.transport);
         let rendered: String = doc.messages.iter().map(|m| m.content.clone()).collect();
         assert!(!rendered.contains("third column"), "still in the document");
 
@@ -4466,6 +4473,7 @@ mod tests {
             &tree,
             &state.spine,
             64 * 1024,
+            state.transport,
         ));
         (tree, state, size / 2)
     }
@@ -4625,7 +4633,7 @@ mod tests {
             panic!("compaction asks for a completion: {fired:?}");
         };
         let tail = request.tail.expect("the directive rides the tail");
-        let doc = crate::document::render(&tree, &state.spine, 64 * 1024);
+        let doc = crate::document::render(&tree, &state.spine, 64 * 1024, state.transport);
 
         // The rolling document carries no trace of the directive — what
         // survives a compaction episode is its `Compacted` events and
