@@ -289,3 +289,43 @@ all premature stops, so automatic continuation should move it toward
 `mid`'s 7/7 without giving back throughput. The prediction 27.2 makes:
 input tokens fall further, because 27% of every document stops being
 replay.
+
+## What it measured — and the correction that came with it
+
+**n=7 per task does not resolve what we argue from.** Two suites of the
+identical configuration — same commit, same card, provenance hashes
+matching — came back **26/28 and 21/28**. A five-point swing from
+nothing but sampling, and larger than most of the changes this
+apparatus has been used to justify. The first of those was reported as
+"the number" before the second existed. `drive.py --pool` exists now:
+it sums suites of one configuration, prints a Wilson interval, and
+refuses to pool suites whose stamps disagree.
+
+Pooled over two suites at the same commit:
+
+| | all four | the three pi can attempt |
+|---|---|---|
+| `short` + 27 | **47/56, 84%** (72–91%) | 35/42, 83% (69–92%) |
+| pi | 21/28, 75% (57–87%) | **21/21, 100%** (85–100%) |
+| `short`, pre-27 | 19/28, 68% (49–82%) | 16/21, 76% (55–89%) |
+
+Per task, ours against pi: `ambiguous-config` **12/14 vs 0/7**,
+`plain-question` 14/14 vs 7/7, `dead-code-sweep` 11/14 vs 7/7,
+`skipped-tests` 10/14 vs 7/7.
+
+**So the whole-set lead is entirely the task pi cannot attempt.** On
+the work both can do, the tool loop is still ahead, and saying "26/28
+beats 21/28" hides that. What 27 actually bought is `ambiguous-config`
+3/7 → 12/14 and `skipped-tests` 3/7 → 10/14; what it has not bought is
+parity on per-item probe loops, where pi's many small checked steps
+still beat our few large ones.
+
+Cost, per run, ours against pi: 61s against 19s of provider time, 13.0k
+input tokens against 18.9k, 4.2k output against 1.8k, 14.7KB of
+reasoning against 3.5KB. We are cheaper to feed and three times slower
+to finish.
+
+The failures that remain are one shape — a probe loop whose check could
+not say no — and `short` turned out not to state that rule at all. Same
+shape as the ask gap: a general rule missing from the variant, losing a
+task, and mistaken for a fact about the harness.
