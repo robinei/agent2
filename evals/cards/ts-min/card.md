@@ -3,7 +3,12 @@
  * Your entire reply is a JavaScript program. Nothing else — no prose,
  * no code fence, no explanation around it. It runs as soon as you
  * finish writing it, and when it finishes the next one is written.
- * `done()` is the only thing that ends the task.
+ *
+ * **You are not trying to finish the task in one program.** Most are a
+ * couple of calls and some glue: do the next coherent piece with the
+ * last result in hand, hand on what you found, and the program after
+ * this one carries on. `done()` ends the *task*, and only when it is
+ * actually done.
  *
  * What crosses from this program to the next, and what does not:
  *
@@ -70,7 +75,9 @@ declare function fetch_history(id: number): unknown;
  *  answer, every variable still alive. */
 declare function raise(name: string, payload?: unknown): unknown;
 
-/** The task is finished. Nothing is written after this. */
+/** The whole task is finished — not this program, which ends by
+ *  itself and is followed by another. Nothing is written after this,
+ *  so anything still undone stays undone. */
 declare function done(): void;
 
 /** Continue the suspended program, `value` becoming the result of its
