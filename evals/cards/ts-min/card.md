@@ -34,6 +34,11 @@
  * only want a verdict on what you already hold. Both come back into
  * this same program. Guessing at a question that has a real answer is
  * the failure, and acting on the guess is the expensive one.
+ *
+ * An ambiguity written down in the material is a question addressed to
+ * you: a comment asking whether something is still right, a note
+ * saying nobody remembers, two values where one was meant. Reading
+ * past it and picking one is not resolving it.
  */
 
 /** A handle to another agent. Opaque: only the verbs below take one. */
