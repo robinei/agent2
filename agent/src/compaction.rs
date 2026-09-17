@@ -129,14 +129,34 @@ pub enum CompactionError {
     /// `remove_history(1, "system")`, aiming at the card, which is not
     /// a row and cannot be made smaller this way.
     ///
-    /// A `Call` and a `Result` land here too, and that is the right
-    /// answer rather than a gap in `label_of`: they have no line of
-    /// their own anywhere, because they are rendered *inside* the
-    /// completion report of the `Return` that closed their program.
-    /// Removing that `return` takes the whole menu with it, which is
-    /// what `compacting_a_return_removes_the_report_rendered_around_it`
-    /// pins.
     NotARow(EventId),
+    /// A `Call` or a `Result`: real conversation content, unlike
+    /// [`NotARow`], but with no line of its own — it is rendered
+    /// *inside* the completion report of the `Return` that closed its
+    /// program, as a menu row. Removing that `return` takes the whole
+    /// menu with it, which is what
+    /// `compacting_a_return_removes_the_report_rendered_around_it`
+    /// pins, so that is what this says to do.
+    ///
+    /// It used to share `NotARow`'s message, which told the model the
+    /// id was "structural, and the card and the worked examples above
+    /// it are fixed". That is false of a call and it misleads
+    /// precisely: the menu advertises `[#4] bash("pwd && ls -la") → ok,
+    /// 298 bytes` and the directive says "each row above carries its
+    /// `[id]` and its label", so reaching for `remove_history(4,
+    /// "bash")` is the reading the document invites. In the run of
+    /// 2026-09-17 it was refused with that message, the model
+    /// concluded low ids were preamble, retried from `#17` — another
+    /// call — and was refused again. Both batches were atomic, so
+    /// roughly twenty valid removals died with the one bad id and the
+    /// session compacted nothing at all.
+    InsideAReport {
+        id: EventId,
+        /// The `Return` whose report renders it, when one exists — the
+        /// program may still be running, in which case there is no
+        /// report to name yet.
+        report: Option<EventId>,
+    },
     /// The batch, once applied, is still at or above the threshold —
     /// the real advantage of program-based compaction over
     /// regenerative summarization: this is checkable before commit,
@@ -187,6 +207,25 @@ impl std::fmt::Display for CompactionError {
                  compacted. Nothing was changed.",
                 id.as_u64()
             ),
+            CompactionError::InsideAReport { id, report } => match report {
+                Some(r) => write!(
+                    f,
+                    "#{} is a call, which has no row of its own — it is listed inside the \
+                     report of program #{}. Compact that instead: remove_history({}, \
+                     \"return\") takes the whole menu with it, this call included. Nothing \
+                     was changed.",
+                    id.as_u64(),
+                    r.as_u64(),
+                    r.as_u64()
+                ),
+                None => write!(
+                    f,
+                    "#{} is a call, which has no row of its own — it is listed inside the \
+                     report of the program that made it, and that program has not finished \
+                     yet, so there is no report to compact. Nothing was changed.",
+                    id.as_u64()
+                ),
+            },
             CompactionError::StillOverThreshold { size, threshold } => write!(
                 f,
                 "that batch would leave {size} bytes against a {threshold}-byte threshold, so \
@@ -248,6 +287,22 @@ pub fn compact(
         };
         let expected = label_of(&target.payload);
         if expected == "event" {
+            if matches!(
+                target.payload,
+                EventPayload::Call(_) | EventPayload::Result { .. }
+            ) {
+                // The enclosing report is the first `Return` after it on
+                // this path — the one whose menu lists this call.
+                let report = path
+                    .iter()
+                    .skip_while(|e| e.id != op.id())
+                    .find(|e| matches!(e.payload, EventPayload::Return { .. }))
+                    .map(|e| e.id);
+                return Err(CompactionError::InsideAReport {
+                    id: op.id(),
+                    report,
+                });
+            }
             return Err(CompactionError::NotARow(op.id()));
         }
         if expected != op.label() {
@@ -519,7 +574,10 @@ mod tests {
                 4096,
                 10_000,
             ),
-            Err(CompactionError::NotARow(call))
+            Err(CompactionError::InsideAReport {
+                id: call,
+                report: Some(ret),
+            })
         );
     }
 
