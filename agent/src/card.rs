@@ -243,7 +243,38 @@ pub fn tool_manifest(registry: &crate::host::ToolRegistry) -> String {
 /// immutable cache prefix, and a later card edit or registry change must
 /// not alter an existing conversation's prompt out from under it.
 pub fn full_card(registry: &crate::host::ToolRegistry) -> String {
-    format!("{}{}", active().text, tool_manifest(registry))
+    format!(
+        "{}{}{}",
+        active().text,
+        tool_manifest(registry),
+        working_directory()
+    )
+}
+
+/// Where the program will run, stated once.
+///
+/// **Because we never told it.** The tool descriptions say "absolute or
+/// cwd-relative path" and nothing says what the cwd *is*, so the first
+/// program of nearly every run is spent working that out — `ls -a`,
+/// `pwd`, `cat package.json` — and one run on 2026-09-17 ran `find . ~
+/// -maxdepth 5`, searching the home directory, because it genuinely did
+/// not know where it was. A tool loop pays two calls inside one turn
+/// for that orientation; here it costs a whole program, which is a
+/// whole completion.
+///
+/// `pi`'s system prompt ends with exactly this line, which is how the
+/// omission was noticed at all.
+///
+/// Snapshotted with the rest of the prompt at the agent's root, like
+/// `system` and `exemplars`: a session that changes directory later
+/// must not silently rewrite what an existing conversation was told.
+fn working_directory() -> String {
+    match std::env::current_dir() {
+        Ok(dir) => format!("\n\nCurrent working directory: {}", dir.display()),
+        // Not worth failing a session over, and a wrong answer would be
+        // worse than none.
+        Err(_) => String::new(),
+    }
 }
 
 /// A worked exemplar: a real user/assistant pair opening `messages`,
@@ -391,6 +422,9 @@ mod tests {
     fn full_card_appends_the_manifest_after_the_card() {
         let full = full_card(&registry_with_tools());
         assert!(full.starts_with(&card()));
+        // And says where the program will run — the thing every first
+        // program was otherwise spending itself discovering.
+        assert!(full.contains("Current working directory: "), "{full}");
         assert!(full.contains("declare namespace tools {"));
         assert!(full.contains("function fetch_page("));
     }
