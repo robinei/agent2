@@ -3030,16 +3030,18 @@ pub(crate) fn menu_rows(segment: &[&Event], since: u64) -> Vec<Artifact> {
 /// fetchable whole under its id.
 fn call_label(call: &Call) -> String {
     match call {
+        // The one argument that is not clipped hard: what this agent
+        // said. See `report::TELL_MAX_BYTES`.
         Call::Send {
             to,
             text,
             expects_reply,
             ..
         } => format!(
-            "{}({}, {})",
+            "{}({}, {:?})",
             if *expects_reply { "ask" } else { "tell" },
             address_label(to),
-            arg_preview(&serde_json::Value::String(text.clone()))
+            crate::report::clip_short(text, crate::report::TELL_MAX_BYTES)
         ),
         Call::Spawn { name, .. } => format!("spawn({})", name.as_deref().unwrap_or("<unnamed>")),
         Call::Fork { name, .. } => {
@@ -4717,8 +4719,11 @@ mod tests {
         );
         assert!(label.len() < crate::report::LABEL_MAX_BYTES + 32, "{label}");
 
-        // A `tell` is the same shape: the person already read the text,
-        // and the row is here so a later program can find the call.
+        // **A `tell` is the exception**, and deliberately so: the person
+        // can see what this agent said, so the program after it must be
+        // able to see it too, or the two conversations diverge. Bounded
+        // all the same — a tell long enough to be cut was being used as
+        // a dumping ground, and the cut says so.
         let label = call_label(&Call::Send {
             to: Address::User,
             text: "y".repeat(8_000),
@@ -4726,7 +4731,27 @@ mod tests {
             expects_reply: false,
             site: 0,
         });
-        assert!(label.starts_with("tell(user, "), "{label}");
-        assert!(label.len() < crate::report::LABEL_MAX_BYTES + 32, "{label}");
+        assert!(label.starts_with("tell(user, "), "{}", &label[..40]);
+        assert!(
+            label.len() > crate::report::LABEL_MAX_BYTES,
+            "a tell is not held to the argument budget"
+        );
+        assert!(
+            label.len() < crate::report::TELL_MAX_BYTES + 64,
+            "{} bytes",
+            label.len()
+        );
+
+        // An ordinary tell — a sentence or three — survives whole.
+        let said = "Removed 4 attributes that no longer suppress anything; \
+                    the other 3 are still doing work and stay.";
+        let label = call_label(&Call::Send {
+            to: Address::User,
+            text: said.into(),
+            input: serde_json::Value::Null,
+            expects_reply: false,
+            site: 0,
+        });
+        assert!(label.contains(said), "clipped an ordinary tell: {label}");
     }
 }
