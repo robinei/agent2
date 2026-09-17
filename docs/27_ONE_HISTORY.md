@@ -182,14 +182,27 @@ real VM run rather than grepping for the word, and asserts *not both*
 exists to test exemplars-as-shape and its programs deliberately do not
 run.
 
-**27.6 — compaction prefers by lifetime.** *(done, with 27.3.)* Folded
-in there because once the report became reachable the old sentence —
-"the largest tool results you have already acted on are the first
-targets" — was pointing at things that are not rows. The order the
-request now states: `return` first (a whole program's report, whose
-calls stay fetchable by their own ids), then `turn`, then `note` and
-`post`, and never the task. A sort key in the compaction request, not
-a mechanism.
+**27.6 — compaction prefers by lifetime.** *(done with 27.3, then
+**undone**.)* The ordering went in because a `return`'s calls stayed
+fetchable by id afterwards, so dropping one lost less than dropping a
+note. **27.4 removed that asymmetry in the same phase and I did not
+notice**: `fetch_history` reaches every row, compaction never touches
+the original event, and a compacted `post` reads back whole — there is
+a test. Once nothing is lost either way, the ordering is taste, and it
+is taste imposed on the one reader who has actually read the
+conversation.
+
+So the request no longer prescribes an order. It says what is true —
+nothing is lost, every shortened row stays readable by its id — and
+leaves the choice to the program making it. The card says nothing about
+compaction at all.
+
+What `return` and `append_history` actually differ by is mechanical, and
+smaller than any of the three stories I told about it (audience, then
+lifetime, then purpose): **`return` happens once, at the end, and is
+the language's own outlet for what a step produced; `append_history`
+can be called any number of times, anywhere.** One is for what you have
+when you finish, the other for what you notice on the way.
 
 **27.7 — the return value arrives whole.** *(done. Found by running
 27.1–27.5 and reading the programs, not by planning.)*
