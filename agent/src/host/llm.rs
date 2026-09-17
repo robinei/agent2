@@ -188,6 +188,24 @@ pub fn scripted_text(text: &str) -> LlmTurn {
 #[cfg(test)]
 pub struct RoutedLlm {
     rules: Vec<(String, Mutex<VecDeque<LlmTurn>>)>,
+    route: Route,
+}
+
+/// Which part of the request a rule's needle is matched against.
+#[cfg(test)]
+enum Route {
+    /// The tail of the system prompt — an agent's charter. The right key
+    /// when the branches that think at once belong to *different*
+    /// agents.
+    CharterTail,
+    /// Anywhere in the conversation proper (everything after the
+    /// preamble). The right key when two branches of the **same** agent
+    /// think at once: they share a charter, so nothing in the system
+    /// prompt can tell them apart, and only what was said on each branch
+    /// can. The preamble is excluded for the same reason `CharterTail`
+    /// matches only the tail — the card's own prose would otherwise
+    /// match needles meant for the conversation.
+    Conversation,
 }
 
 #[cfg(test)]
@@ -195,7 +213,22 @@ impl RoutedLlm {
     /// Rules are tried in order, first match wins, so list the most
     /// specific charter first when one is a suffix of another.
     pub fn new(rules: impl IntoIterator<Item = (&'static str, Vec<LlmTurn>)>) -> Self {
+        Self::with_route(Route::CharterTail, rules)
+    }
+
+    /// [`RoutedLlm`], keyed on what the branch has *said* rather than on
+    /// whose charter it is — the only key available when two forks of one
+    /// agent think at once.
+    pub fn by_conversation(rules: impl IntoIterator<Item = (&'static str, Vec<LlmTurn>)>) -> Self {
+        Self::with_route(Route::Conversation, rules)
+    }
+
+    fn with_route(
+        route: Route,
+        rules: impl IntoIterator<Item = (&'static str, Vec<LlmTurn>)>,
+    ) -> Self {
         RoutedLlm {
+            route,
             rules: rules
                 .into_iter()
                 .map(|(needle, turns)| (needle.to_owned(), Mutex::new(turns.into())))
@@ -220,8 +253,25 @@ impl LlmClient for RoutedLlm {
             .first()
             .map(|m| m.content.as_str())
             .unwrap_or_default();
+        // Content *and* any tool-call source: under
+        // `Transport::RunProgram` a turn's program rides in the call, not
+        // in `content`, and a rule keyed on what a branch said must not
+        // depend on which container carried it.
+        let conversation: String = request
+            .conversation()
+            .iter()
+            .flat_map(|m| {
+                std::iter::once(m.content.clone())
+                    .chain(m.tool_calls.iter().flatten().map(|c| c.source.clone()))
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
         for (charter, queue) in &self.rules {
-            if !system.ends_with(charter.as_str()) {
+            let matched = match self.route {
+                Route::CharterTail => system.ends_with(charter.as_str()),
+                Route::Conversation => conversation.contains(charter.as_str()),
+            };
+            if !matched {
                 continue;
             }
             let Some(turn) = queue.lock().unwrap().pop_front() else {
@@ -235,11 +285,18 @@ impl LlmClient for RoutedLlm {
             }
             return Ok(turn);
         }
-        let tail = system.len().saturating_sub(80);
-        Err(format!(
-            "no scripted rule matches this branch's charter: …{}",
-            &system[tail..]
-        ))
+        Err(match self.route {
+            Route::CharterTail => {
+                let tail = system.len().saturating_sub(80);
+                format!(
+                    "no scripted rule matches this branch's charter: …{}",
+                    &system[tail..]
+                )
+            }
+            Route::Conversation => {
+                format!("no scripted rule matches this branch's conversation: {conversation:?}")
+            }
+        })
     }
 }
 

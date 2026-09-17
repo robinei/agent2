@@ -3300,6 +3300,25 @@ mod tests {
         (session, rx)
     }
 
+    /// `open_routed`, keyed on what a branch has said rather than on its
+    /// charter — for two branches of the **same** agent, where the
+    /// charter is identical and only the conversation differs.
+    fn open_routed_by_text(
+        tree: Tree,
+        rules: impl IntoIterator<Item = (&'static str, Vec<LlmTurn>)>,
+    ) -> (Session, Receiver<SessionEvent>) {
+        let (tx, rx) = channel();
+        let session = Session::new(
+            tree,
+            "ignored on resume",
+            ToolRegistry::new(),
+            Box::new(RoutedLlm::by_conversation(rules)),
+            tx,
+        )
+        .unwrap();
+        (session, rx)
+    }
+
     fn drain(mut session: Session) -> Session {
         while session.pump_one() {}
         session
@@ -3527,12 +3546,25 @@ mod tests {
     fn resume_opens_a_branch_and_rejects_only_the_unknown() {
         // Open root (#3) plus a real second branch, forked off #2, that
         // has answered — under the old rules that spine was sealed.
+        //
+        // The fork carries **nothing unanswered**, and that is load-
+        // bearing rather than incidental. A post owed a reply makes the
+        // branch wake the moment the log is opened, which spawns a
+        // completion this test scripts no answer for; the scripted client
+        // then errors, and whether that error beats the `Shutdown` below
+        // through the inbox is a race between a worker thread and the
+        // loop. The fixture used to have such a post, and this test duly
+        // failed about one run in two hundred — alone, single-threaded,
+        // on an idle machine — on `errs.len()`. Nothing here is about
+        // waking, so the fix is to not ask for it. `open_routed`'s doc
+        // records the same hazard from the other side: more than one
+        // branch to wake and one scripted queue is already known to pop
+        // in whatever order the threads win.
         let mut tree = tree_with_answered_root();
         let mut branch = tree.fork(EventId::new(2)).unwrap();
         let fork = tree
             .append(&mut branch, EventPayload::Fork { name: None })
             .unwrap();
-        tree.append(&mut branch, user("other")).unwrap();
         let answered_leaf = tree
             .append(
                 &mut branch,
@@ -5032,9 +5064,20 @@ mod tests {
     /// leaf they forked from is untouched.
     #[test]
     fn two_forks_of_one_agent_run_concurrently() {
-        let (session, rx) = open(
+        // Routed on what each fork was *told*, not on a shared queue.
+        // Both forks are of one agent, so they have the same charter and
+        // the same system prompt — `open_routed` cannot tell them apart,
+        // and a single `ScriptedLlm` queue hands its first turn to
+        // whichever worker thread wins. That is the race `RoutedLlm`'s
+        // own doc describes, and with both forks woken in the same step
+        // it bit here: the suite failed about one run in sixty with A
+        // holding B's answer.
+        let (session, rx) = open_routed_by_text(
             tree_with_answered_root(),
-            vec![scripted_text("A answers"), scripted_text("B answers")],
+            [
+                ("to A", vec![scripted_text("A answers")]),
+                ("to B", vec![scripted_text("B answers")]),
+            ],
         );
         let h = session.handle();
         // Two forks off the same point (#2). Their ids are the next two
