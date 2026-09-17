@@ -796,6 +796,15 @@ impl super::Compiler {
                 return self.compile_hof(recv, argv, span, optional, "__findLastIndex", 1);
             }
             "sort" => return self.compile_sort(recv, argv, span, optional),
+            // The promise combinators. `await` inside `try`/`catch` is
+            // what the card teaches and what composes best here, but
+            // reaching for `.catch` is ordinary JavaScript and trapping
+            // on it spends a round trip to make a point about style —
+            // the prelude helpers await and then call the handler, so
+            // `p.then(f).catch(g)` chains as it reads.
+            "then" => return self.compile_promise_then(recv, argv, span, optional),
+            "catch" => return self.compile_hof(recv, argv, span, optional, "__pcatch", 1),
+            "finally" => return self.compile_hof(recv, argv, span, optional, "__pfinally", 1),
             // `f.call`/`f.apply` are invocation forwarders, not builtins: lower
             // them to the existing `has_this` dispatch (`dispatch_call(f, this =
             // thisArg, args)`). See `compile_invoke_forward`.
@@ -995,6 +1004,29 @@ impl super::Compiler {
             return;
         }
         self.emit_prelude_call(helper, recv, argv, span, optional);
+    }
+
+    /// `p.then(onValue)` / `p.then(onValue, onError)` — JS's two forms,
+    /// both lowering to `__pthen(p, f, g)`. The one-argument form
+    /// passes two arguments and lets `g` arrive `undefined`, which the
+    /// helper tests for, rather than needing a second helper the way
+    /// `sort`/`sortDefault` and `reduce`/`reduce1` do: those differ in
+    /// *behaviour* without their second argument, this one does not.
+    pub(super) fn compile_promise_then(
+        &mut self,
+        recv: &ast::Expression,
+        argv: &[&ast::Expression],
+        span: u32,
+        optional: bool,
+    ) {
+        if argv.is_empty() || argv.len() > 2 {
+            self.error(
+                span,
+                format!("`then` expects 1 or 2 arguments, got {}", argv.len()),
+            );
+            return;
+        }
+        self.emit_prelude_call("__pthen", recv, argv, span, optional);
     }
 
     /// `arr.reduce(cb[, init])`. The two JS forms map to two helpers: with an

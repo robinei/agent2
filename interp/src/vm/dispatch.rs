@@ -12,25 +12,19 @@ fn await_hint(v: &Value) -> &'static str {
     }
 }
 
-/// Reading a property off a promise. Three of the names are the
-/// combinator methods this dialect does not have, and for those the
-/// generic "did you forget `await`?" is actively unhelpful: the fix for
-/// `p.field` is to await `p`, but the fix for `p.catch(f)` is not
-/// `await p.catch(f)` — it is `try { await p } catch (e) { … }`, a
-/// different shape.
-///
-/// A live run on 2026-09-17 hit this and the trap classified as a
-/// `gap`, correctly: reaching for `.catch` on a promise is ordinary
-/// JavaScript, and if the dialect will not have it, the error is where
-/// the dialect has to say so. Naming the replacement costs one line and
-/// is what a program needs in order to write the next one.
+/// Reading a property off a promise. `.then`/`.catch`/`.finally` are
+/// *calls* and never reach here — the compiler lowers them to prelude
+/// helpers — so anything else is the missing-`await` misuse this hint
+/// was written for (`tools.f(x).field` instead of `(await
+/// tools.f(x)).field`).
 fn promise_property_error(name: &str) -> String {
     match name {
+        // Reachable only by taking the method without calling it:
+        // `const c = p.catch;`. Rare, and the answer is the same.
         "then" | "catch" | "finally" => format!(
-            "promises here have no `.{name}` — `await` is the only way to settle one. \
-             Write `try {{ const v = await p; … }} catch (e) {{ … }}` instead of \
-             `p.{name}(…)`; the whole sequence runs at the top level, so there is \
-             nothing to chain onto."
+            "`.{name}` on a promise is a call, not a value — write `p.{name}(f)`, or \
+             better, `await` the promise inside `try`/`catch`, which is what the rest \
+             of this dialect is shaped for."
         ),
         other => format!("cannot read property '{other}' on promise (did you forget `await`?)?"),
     }

@@ -105,6 +105,28 @@ const PROMISE_ALL: &str = "async function __all(ps) {\n  const r = [];\n  for (l
 /// JS result shape. Never rejects; a non-promise element settles fulfilled.
 const PROMISE_ALL_SETTLED: &str = "async function __allSettled(ps) {\n  const r = [];\n  for (let i = 0; i < ps.length; i++) {\n    try { r.push({ status: \"fulfilled\", value: await ps[i] }); }\n    catch (e) { r.push({ status: \"rejected\", reason: e }); }\n  }\n  return r;\n}";
 
+/// `p.then(f[, g])`, `p.catch(g)` and `p.finally(f)` lower to these.
+///
+/// **Awaiting is the only way this VM settles a promise**, so each is
+/// an `async function` that awaits and then calls the handler — which
+/// is also what makes them compose: an `async function` returns a
+/// promise, so `p.then(f).catch(g)` chains exactly as it reads, and
+/// `await p.catch(g)` is the value.
+///
+/// Supported, not recommended. The card teaches `await` inside
+/// `try`/`catch` and will go on doing so — it is straight-line, it
+/// composes with every other statement, and there is nothing to chain
+/// onto when the whole program is top-level. But reaching for `.catch`
+/// is ordinary JavaScript, a live run did it on 2026-09-17, and the
+/// trap classified as a `gap`: our fault, by our own table. A dialect
+/// that could have answered and chose to trap instead is spending the
+/// model's round trip to make a point about style.
+const PROMISE_THEN: &str = "async function __pthen(p, f, g) {\n  let v;\n  try { v = await p; }\n  catch (e) { if (g) { return g(e); } throw e; }\n  return f ? f(v) : v;\n}";
+const PROMISE_CATCH: &str =
+    "async function __pcatch(p, g) {\n  try { return await p; }\n  catch (e) { return g(e); }\n}";
+const PROMISE_FINALLY: &str =
+    "async function __pfinally(p, f) {\n  try { return await p; }\n  finally { f(); }\n}";
+
 /// `str.replace(pat, rep)` lowers to `__replace(s, pat, rep)`. A *string*
 /// replacer is handed to the `__replaceStr` builtin (the optimized Rust path
 /// with `$1`/`$&`/`$<name>` token expansion); a *function* replacer is
@@ -203,6 +225,19 @@ pub fn assemble(user_source: &str) -> String {
         out.push('\n');
         out.push_str(PROMISE_ALL_SETTLED);
         out.push('\n');
+    }
+    // The promise combinator *methods*, which are receiver calls like
+    // the HOFs above rather than namespace calls like `Promise.all`.
+    for (method, source) in [
+        ("then", PROMISE_THEN),
+        ("catch", PROMISE_CATCH),
+        ("finally", PROMISE_FINALLY),
+    ] {
+        if uses_method(user_source, method) {
+            out.push('\n');
+            out.push_str(source);
+            out.push('\n');
+        }
     }
     // `.replace` / `.replaceAll` (the boundary check keeps `.replace` from
     // matching `.replaceAll`, like `all`/`allSettled`).

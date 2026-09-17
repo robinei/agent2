@@ -454,3 +454,94 @@ fn spread_takes_a_set_and_a_string() {
     assert_eq!(eval_str("[...'abc'].join('-')"), "a-b-c");
     assert_eq!(eval_str("[...new Set(['a']), ...['b']].join(',')"), "a,b");
 }
+
+/// **The promise combinators work rather than trapping.** `await`
+/// inside `try`/`catch` is what the card teaches and what composes best
+/// here — straight-line, and there is nothing to chain onto when the
+/// whole program is top-level statements. But reaching for `.catch` is
+/// ordinary JavaScript, a live run did it on 2026-09-17, and the trap
+/// classified as a `gap`: ours, by our own table. A dialect that could
+/// have answered and trapped instead spends the model's round trip to
+/// make a point about style.
+#[test]
+fn promise_combinators_run() {
+    // A plain value passes through `await`, so these exercise the
+    // helpers' own control flow without needing a host to settle
+    // anything — which is the part that could be wrong.
+    assert_eq!(eval_str("String(await (7).then((v) => v + 1))"), "8");
+    assert_eq!(
+        eval_str("String(await (7).then((v) => v + 1, (e) => 0))"),
+        "8"
+    );
+    assert_eq!(eval_str("String(await (7).catch((e) => 0))"), "7");
+    assert_eq!(eval_str("String(await (7).finally(() => 1))"), "7");
+
+    // A handler that *throws* is not routed to the next link, because
+    // an async body that throws escapes rather than rejecting in this
+    // VM — pinned by `an_async_body_that_throws_escapes_instead_of_
+    // rejecting`, which predates these helpers and is not caused by
+    // them. A rejected *call* does reach `.catch`, which is the case
+    // that actually happens: `a_rejected_call_reaches_dot_catch`.
+}
+
+/// Chaining composes because each helper is an `async function`, so it
+/// returns a promise like the real thing.
+#[test]
+fn promise_combinators_chain() {
+    compile("p.then(f).catch(g).finally(h);").expect("chains");
+    compile("const v = await p.catch(g);").expect("awaitable");
+}
+
+/// The arities JS has, and a clear refusal past them.
+#[test]
+fn then_takes_one_or_two_handlers() {
+    compile("p.then();").expect_err("no handler is a mistake");
+    compile("p.then(f, g, h);").expect_err("three is a mistake");
+}
+
+/// **A rejected tool call reaches `.catch`** — the case that actually
+/// happens, and the one the combinators exist for. The plain-value
+/// tests above exercise the helpers' control flow; this drives a real
+/// host rejection through the whole path.
+#[test]
+fn a_rejected_call_reaches_dot_catch() {
+    let prog = compile("return await tools.fetch(\"x\").catch((e) => `handled: ${e}`);")
+        .expect("compiles");
+    let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
+    let id = match vm.step(u64::MAX).unwrap() {
+        StepResult::Pending { calls } => calls[0].promise,
+        other => panic!("expected Pending, got {other:?}"),
+    };
+    vm.reject_promise(id, Value::String("host is down".into()))
+        .unwrap();
+    match vm.step(u64::MAX).unwrap() {
+        StepResult::Done { value, .. } => {
+            assert_eq!(value, Value::String("handled: host is down".into()));
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+}
+
+/// **A known gap, pinned rather than papered over.** An `async`
+/// function whose body throws does not reject its promise in this VM —
+/// the throw escapes synchronously to whoever called it, even when the
+/// caller stores the promise and awaits it later inside a `try`. It
+/// predates the combinators and is not caused by them (the third case
+/// here uses no combinator at all), but it is why `p.then(f)` does not
+/// route a throw from `f` into a following `.catch`.
+///
+/// Recorded as a test so the day it is fixed, this fails and says so.
+#[test]
+fn an_async_body_that_throws_escapes_instead_of_rejecting() {
+    let src = "function t() { throw new Error(\"x\"); }\n\
+               async function b() { await 1; return t(); }\n\
+               const p = b();\n\
+               try { await p; } catch (e) { return \"caught\"; }\n\
+               return \"no throw\";";
+    let prog = compile(src).expect("compiles");
+    let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
+    let err = vm
+        .step(u64::MAX)
+        .expect_err("escapes rather than rejecting");
+    assert_eq!(err.kind, crate::vm::ErrorKind::UncaughtException, "{err:?}");
+}

@@ -1650,15 +1650,12 @@ fn invoke_pushes_promise_and_continues() {
     assert!(matches!(vm.promises[0], PromiseState::Pending { .. }));
 }
 
-/// **The combinator methods name their replacement.** `p.field` is
-/// fixed by awaiting `p`; `p.catch(f)` is not — it is
-/// `try { await p } catch`, a different shape — so the generic
-/// missing-`await` hint sends a program the wrong way. A live run on
-/// 2026-09-17 reached for `.catch` and the trap classified as a `gap`,
-/// correctly: it is ordinary JavaScript, and a dialect that will not
-/// have it has to say so where it is reached for.
+/// The combinators are *calls* the compiler lowers, so this path is
+/// reached only by taking one without calling it — `const c = p.catch;`
+/// — where the answer is different from the generic missing-`await`
+/// hint and worth saying.
 #[test]
-fn promise_combinator_methods_say_what_to_write_instead() {
+fn a_promise_combinator_taken_as_a_value_says_it_is_a_call() {
     for name in ["then", "catch", "finally"] {
         let err = run_err(vec![
             PushFloat(1.0),
@@ -1666,14 +1663,9 @@ fn promise_combinator_methods_say_what_to_write_instead() {
             PushStr(name.into()),
             IndexGet,
         ]);
-        assert!(err.message.contains(&format!("no `.{name}`")), "{err:?}");
-        assert!(err.message.contains("try {"), "{err:?}");
-        assert!(
-            !err.message.contains("did you forget"),
-            "the generic hint points the wrong way here: {err:?}"
-        );
+        assert!(err.message.contains("is a call, not a value"), "{err:?}");
     }
-    // Everything else keeps it, because there the hint is right.
+    // Everything else keeps the hint, because there it is right.
     let err = run_err(vec![
         PushFloat(1.0),
         Invoke("my_tool".into(), 1),
