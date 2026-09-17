@@ -2332,7 +2332,11 @@ mod tests {
 
         let seen = seen.lock().unwrap();
         let system = &seen.first().expect("a request").messages[0].content;
-        assert!(system.starts_with("Programs are written here."));
+        assert!(
+            system.starts_with("/**"),
+            "the card opens as a .d.ts: {}",
+            &system[..40]
+        );
         assert!(system.contains("function fetch_page("), "{system}");
         assert!(
             system.contains("agent prompt here"),

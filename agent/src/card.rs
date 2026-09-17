@@ -57,18 +57,7 @@ pub fn embedded() -> Card {
     }
     Card {
         text: include_str!("../card/card.md").to_owned(),
-        exemplars: vec![
-            exemplar!("01-do-the-tests-pass"),
-            exemplar!("02-fix-a-value-that-needs-asking"),
-            exemplar!("03-judge-two-logs"),
-            exemplar!("04-raise-a-conflict"),
-            exemplar!("05-handle-a-raised-condition"),
-            exemplar!("06-fan-out-to-a-helper"),
-            exemplar!("07-recon-then-hand-over"),
-            exemplar!("08-recurring-cleanup"),
-            exemplar!("09-rename-and-build"),
-            exemplar!("10-probe-loop"),
-        ],
+        exemplars: vec![exemplar!("01-finish"), exemplar!("02-continue")],
     }
 }
 
@@ -435,7 +424,7 @@ mod tests {
         // `card()` shows up as a diff review must look at, not a byte
         // count that silently drifts. Comparing full text (not just a
         // hash) so the diff itself is legible in a failure message.
-        const EXPECTED_LEN: usize = 18809;
+        const EXPECTED_LEN: usize = 8398;
         assert_eq!(
             card().len(),
             EXPECTED_LEN,
@@ -475,19 +464,42 @@ mod tests {
             "raise(",
             "resume(",
             "abandon(",
-            "remove_history(",
-            "rewrite_history(",
             "list_agents(",
         ] {
             assert!(card().contains(verb), "card is missing {verb}");
         }
+        // **`remove_history` and `rewrite_history` are deliberately
+        // absent.** They are only callable inside a compaction handler
+        // — `machine.rs` refuses them anywhere else — and the
+        // compaction request introduces them at the moment it asks for
+        // that handler, with the labels and the batch rule alongside.
+        // Declaring them in the card would advertise two verbs that
+        // fail everywhere the model would first try them.
+        for verb in ["remove_history", "rewrite_history"] {
+            assert!(
+                !card().contains(verb),
+                "{verb} is introduced by the compaction request, not the card"
+            );
+        }
     }
 
     #[test]
-    fn the_card_states_the_no_fence_rule_and_the_no_op_rule() {
-        assert!(card().contains("no code fence"));
-        assert!(card().contains("parsed as JavaScript"));
-        assert!(card().contains("silent no-op"));
+    fn the_card_states_the_response_rule_and_the_ending_rule() {
+        // What the whole reply is, and that nothing may surround it.
+        assert!(card().contains("no code fence"), "{}", card());
+        assert!(
+            card().contains("entire reply is a JavaScript program"),
+            "{}",
+            card()
+        );
+        // And the two halves of the ending, which 27.1 inverted: a
+        // program finishing is not the task finishing.
+        assert!(card().contains("done()"), "{}", card());
+        assert!(
+            card().contains("not trying to finish the task in one program"),
+            "{}",
+            card()
+        );
     }
 
     #[test]
@@ -722,6 +734,48 @@ mod tests {
         );
     }
 
+    /// **Five positional exemplar tests lived here** — the second
+    /// demonstrates `ask` inline, the fourth calls `raise`, the fifth
+    /// uses `append_history` as a short projection, and every one opens
+    /// with a `tell`. They pinned a ten-exemplar card whose job was to
+    /// teach the API by demonstration.
+    ///
+    /// The card teaches the API by *declaration* now, and the two
+    /// exemplars that remain exist for the one thing a declaration
+    /// cannot show: what a finished assistant turn looks like. Asserting
+    /// that the fourth one calls `raise` is meaningless when there is no
+    /// fourth one, and adding exemplars back to satisfy the test would
+    /// be the test choosing the design.
+    ///
+    /// What replaced them is below and is stricter about the thing that
+    /// now matters: both exemplars parse, both run to completion against
+    /// stub tools, and both end on purpose.
+    #[test]
+    fn the_exemplars_demonstrate_the_two_endings_and_nothing_else() {
+        let ex = exemplars();
+        assert_eq!(ex.len(), 2, "two, and each earns its place");
+        assert!(
+            ex[0].assistant.contains("done()") && !ex[0].assistant.contains("return"),
+            "the first ends a finished task: {}",
+            ex[0].assistant
+        );
+        assert!(
+            ex[1].assistant.contains("return") && !ex[1].assistant.contains("done()"),
+            "the second hands on and does not stop: {}",
+            ex[1].assistant
+        );
+        // Short enough to be a shape rather than a technique to copy —
+        // a live run on 2026-09-17 reproduced a long exemplar verbatim,
+        // invented names and all, into a repo that had none of them.
+        for e in &ex {
+            assert!(
+                e.assistant.len() < 400,
+                "an exemplar long enough to copy: {} bytes",
+                e.assistant.len()
+            );
+        }
+    }
+
     #[test]
     fn the_exemplars_assistant_turn_has_no_entry_header_and_no_fence() {
         // Step B1: an assistant turn is bare source, nothing else —
@@ -731,142 +785,5 @@ mod tests {
             assert!(!ex.assistant.starts_with("```"));
             assert!(!ex.assistant.starts_with('['));
         }
-    }
-
-    #[test]
-    fn the_exemplars_open_with_a_tell() {
-        // Narration used to be a special leading-comment convention
-        // that nothing ever streamed to anyone (there was no
-        // extraction code anywhere in the harness); it's replaced by
-        // an ordinary `tell()` call, which actually reaches the user.
-        // `tell()` has no placement rule the old convention claimed to
-        // (a live watcher never existed to have one for) — it can
-        // appear anywhere in the program — but each exemplar still
-        // opens by saying what it's about to do, which is the
-        // property this checks. Leading `//` comments are skipped:
-        // a comment is not a statement, and the handler exemplar
-        // opens by explaining the judgement it is about to make
-        // before announcing it.
-        for ex in &exemplars() {
-            let first_statement = ex
-                .assistant
-                .lines()
-                .find(|l| !l.trim().is_empty() && !l.trim_start().starts_with("//"))
-                .unwrap_or("");
-            assert!(
-                first_statement.trim_start().starts_with("tell("),
-                "exemplar for {:?} opens with {first_statement:?}, not a tell()",
-                ex.user
-            );
-        }
-    }
-
-    #[test]
-    fn the_second_exemplar_demonstrates_ask_inline_then_acting_on_it() {
-        // Card prose alone ("ask() is a normal await, not a reason to
-        // end early") wasn't enough to stop a live run from splitting
-        // an ordinary read-then-ask into two programs (2026-09-10) —
-        // this exemplar is the demonstration, so hold it to actually
-        // being one: `ask(` appears, and something runs after it in
-        // the same program (not the program's last line).
-        let all = exemplars();
-        let ex = &all[1];
-        let ask_at = ex
-            .assistant
-            .find("await ask(")
-            .expect("second exemplar should demonstrate ask()");
-        let after = &ex.assistant[ask_at..];
-        assert!(
-            after.lines().count() > 2,
-            "ask() should not be the last meaningful line of the exemplar"
-        );
-    }
-
-    #[test]
-    fn the_third_exemplar_finishes_the_judgment_in_the_same_program() {
-        // Card prose alone ("ending a program... has quietly failed to
-        // do the task") wasn't enough either — two independent live
-        // runs (2026-09-14) each wrote a genuinely well-reasoned
-        // recon-only program whose own closing comment planned a "next
-        // program," which nothing then ran. This exemplar is the
-        // demonstration: both reads happen, then the judgment (a
-        // tell() call comparing what was actually read) happens in the
-        // same program, not a planned-but-absent one.
-        let all = exemplars();
-        let ex = &all[2];
-        let last_read = ex
-            .assistant
-            .rfind("tools.read_file(")
-            .expect("third exemplar should read more than one thing");
-        let after = &ex.assistant[last_read..];
-        assert!(
-            after.contains("tell("),
-            "the judgement must be reported in the same program as the reads, \
-             not deferred to an implied next one"
-        );
-        // The specific failure this exemplar answers: a program ending
-        // on a forward-looking comment instead of doing the work.
-        assert!(!ex.assistant.to_lowercase().contains("next program"));
-    }
-
-    #[test]
-    fn the_fourth_exemplar_actually_calls_raise() {
-        // raise() had prose in three places and no worked example
-        // anywhere — live 2026-09-14 found a program that read two
-        // genuinely conflicting, data-side-irresolvable numbers,
-        // correctly recognized it couldn't decide, and then just
-        // stopped instead of calling raise() — recognizing the
-        // moment isn't the same as acting on it, the same gap a
-        // worked example (not another sentence) closed for ask() and
-        // for finishing a judgement inline.
-        let all = exemplars();
-        let ex = &all[3];
-        assert!(
-            ex.assistant.contains("await raise("),
-            "the fourth exemplar exists specifically to demonstrate raise() \
-             actually being called, not just described"
-        );
-        // And it must not be the program's last line — same
-        // "reported, not just decided" standard the ask()-inline
-        // exemplar is held to.
-        let raise_at = ex.assistant.find("await raise(").unwrap();
-        assert!(ex.assistant[raise_at..].lines().count() > 1);
-    }
-
-    #[test]
-    fn the_fifth_exemplar_uses_append_history_as_a_short_projection() {
-        // append_history's payoff isn't wired anywhere yet (see the
-        // doc comment on exemplars()) — this exemplar tests only
-        // whether the model reaches for the verb appropriately once
-        // shown how, not whether anything downstream uses it.
-        // Found by what it demonstrates, not by position — an exemplar
-        // added ahead of it must not silently retarget this test at a
-        // different one.
-        let all = exemplars();
-        let ex = all
-            .iter()
-            .find(|e| e.assistant.contains("append_history("))
-            .expect("an exemplar demonstrating append_history");
-        assert!(
-            ex.assistant.contains("append_history("),
-            "the fifth exemplar exists to demonstrate append_history actually \
-             being called, not just described"
-        );
-        // The card's own rule: "never the raw result." The appended
-        // string must be short — a projection, not a dump of the
-        // count() call's own output.
-        let call_start = ex.assistant.find("append_history(").unwrap();
-        let call_end = ex.assistant[call_start..].find(");").unwrap() + call_start;
-        let payload = &ex.assistant[call_start..call_end];
-        assert!(
-            payload.len() < 200,
-            "append_history's payload should be a short projection, not a \
-             dump: {} bytes",
-            payload.len()
-        );
-        // And the card's other rule: not to read something back the
-        // same turn. There is no matching fetch_history()/read of this
-        // call's own value anywhere in the exemplar.
-        assert!(!ex.assistant.contains("fetch_history("));
     }
 }
