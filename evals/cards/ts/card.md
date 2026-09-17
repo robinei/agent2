@@ -22,7 +22,7 @@ declare function ask(who: "user" | Agent, text: string): Promise<string>;
 
 /** Discharge an `ask()` another program is blocked on, by that
  *  question's own id. Not for ordinary messages — that is `tell`. */
-declare function answer(question: number, label: string, value: unknown): Promise<void>;
+declare function answer(question: number, label: string, value: unknown): void;
 
 /** A new agent with a clean context. Creating is not messaging: it is
  *  idle until you `tell` or `ask` the handle. */
@@ -30,14 +30,14 @@ declare function spawn(charter: string): Agent;
 /** A new context inheriting your whole history. Also idle until messaged. */
 declare function fork(): Agent;
 /** Every agent in this subtree, with what each is currently doing. */
-declare function list_agents(): Promise<Array<{ id: number; name: string; status: string }>>;
+declare function list_agents(): Array<{ id: number; name: string; status: string }>;
 
 /** Keep a short projection for your own later turns, across tasks.
  *  Not for reading back next turn — you still hold that in a variable. */
-declare function append_history(value: unknown): Promise<void>;
+declare function append_history(value: unknown): void;
 /** Read any row of the conversation back, whole, by the id shown
  *  against it. Answered from the log: costs nothing and adds nothing. */
-declare function fetch_history(id: number): Promise<unknown>;
+declare function fetch_history(id: number): unknown;
 
 /** Suspend for a judgement and carry on from this expression with the
  *  answer, every variable still alive. For a verdict you already know
@@ -92,6 +92,6 @@ otherwise be caught out:
   `Promise.race`, no `Promise.any`. `Promise.all` and `allSettled` work.
 
 `tools.*` below are this session's configured capabilities, and are the
-only way to reach the world. They are all async — as is anything above
-whose type says `Promise`, and nothing else. Awaiting a plain value is
-harmless, so `await` where you are unsure costs nothing.
+only way to reach the world. They are all async. `ask` is the only verb
+above that is — everything else hands you the value. Awaiting a plain
+value is harmless, so an `await` you did not need costs nothing.

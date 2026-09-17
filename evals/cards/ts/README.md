@@ -19,23 +19,17 @@ objects, no executor pattern). Everything else JavaScript has either
 works or stops the program and says so, and listing it would be paying
 prose for silence.
 
-**Signatures track the code, not the intent**, and writing them down
-found that the verbs are in three groups rather than one:
+**Signatures track the code, not the intent.** Writing them down found
+that the verbs were in three dispatch groups behind one uniform-looking
+table, and that `raise` was never a promise despite every example in the
+long card putting an `await` in front of it.
 
-- `spawn`, `fork`, `done`, `remove_history`, `rewrite_history` — the
-  compiler emits the `Await` itself, so the expression is already the
-  value. Never a promise, today or after.
-- `raise` — `Instr::Raise`, and the host pushes the resumed value
-  straight onto the stack. Also never a promise, though the long card
-  has always written `await raise(...)`.
-- `ask`, `answer`, `append_history`, `fetch_history`, `list_agents` —
-  plain `Invoke`, no `Await`. Genuinely promises **today**; all but
-  `ask` stop being so the moment the settle-at-dispatch change lands,
-  and this file changes in that same commit or the card lies.
+That is settled now: since the settle-at-dispatch change, **`ask` is the
+only verb that returns a promise.** Everything else hands back the
+value. `tools.*` are all async.
 
-Awaiting a plain value is the identity here, so the failure is
-one-sided: a declaration that says `Promise` when it is not costs
-nothing, and one that omits `Promise` when it is would hand the model a
-promise it never unwraps. The prose card, which says nothing either way
-and relies on every example writing `await`, has been getting this for
-free.
+The failure here is one-sided, which is why the prose card got away with
+saying nothing: awaiting a plain value is the identity, so declaring
+`Promise` where there is none costs nothing, while omitting it where
+there is one hands the model a promise it never unwraps. Stated in the
+card so a reader can act on it.
