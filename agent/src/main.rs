@@ -574,9 +574,10 @@ fn print_session_event(event: &SessionEvent) {
                     println!("{head} console: {} lines", lines.len());
                 }
                 EventPayload::Note { text } => println!("{head} note: {text}"),
-                EventPayload::Compacted { of, label, .. } => {
-                    println!("{head} compacted #{}: {label}", of.as_u64());
-                }
+                EventPayload::Compacted { of, text } => match text {
+                    Some(t) => println!("{head} compacted #{}: {t}", of.as_u64()),
+                    None => println!("{head} compacted #{}: removed", of.as_u64()),
+                },
             }
         }
     }

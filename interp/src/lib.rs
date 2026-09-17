@@ -46,7 +46,7 @@ pub const HARNESS_VERBS: &[&str] = &[
     "answer",
     "append_history",
     "remove_history",
-    "rewrite_history",
+    "replace_history",
     "list_agents",
 ];
 

@@ -300,8 +300,8 @@ fn settle_at_dispatch_verbs_yield_settle_with_or_without_await() {
             vec![Value::PosInt(4), Value::String("note".into())],
         ),
         (
-            "rewrite_history(4, \"note\", \"shorter\")",
-            "rewrite_history",
+            "replace_history(4, \"note\", \"shorter\")",
+            "replace_history",
             vec![
                 Value::PosInt(4),
                 Value::String("note".into()),

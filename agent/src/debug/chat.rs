@@ -516,10 +516,10 @@ impl ChatState {
             // Never its own row — it replaces its target's rendering in
             // place, per its own doc in `types.rs` ("never removes the
             // target row... a renderer consults [a lookup] instead").
-            EventPayload::Compacted { of, label, text } => {
+            EventPayload::Compacted { of, text } => {
                 let marker = match text {
-                    Some(t) => format!("[compacted: {label}] {t}"),
-                    None => format!("[compacted: {label}]"),
+                    Some(t) => format!("[compacted] {t}"),
+                    None => "[removed]".to_owned(),
                 };
                 if let Some(&row) = self.entry_index.get(of) {
                     match self.entries.get_mut(row) {

@@ -424,7 +424,7 @@ mod tests {
         // `card()` shows up as a diff review must look at, not a byte
         // count that silently drifts. Comparing full text (not just a
         // hash) so the diff itself is legible in a failure message.
-        const EXPECTED_LEN: usize = 9063;
+        const EXPECTED_LEN: usize = 9919;
         assert_eq!(
             card().len(),
             EXPECTED_LEN,
@@ -459,8 +459,7 @@ mod tests {
             "answer(",
             "spawn(",
             "fork(",
-            "append_history(",
-            "fetch_history(",
+            "namespace history",
             "raise(",
             "resume(",
             "abandon(",
@@ -468,19 +467,26 @@ mod tests {
         ] {
             assert!(card().contains(verb), "card is missing {verb}");
         }
-        // **`remove_history` and `rewrite_history` are deliberately
-        // absent.** They are only callable inside a compaction handler
-        // — `machine.rs` refuses them anywhere else — and the
-        // compaction request introduces them at the moment it asks for
-        // that handler, with the labels and the batch rule alongside.
-        // Declaring them in the card would advertise two verbs that
-        // fail everywhere the model would first try them.
-        for verb in ["remove_history", "rewrite_history"] {
+        // `history.remove`/`history.replace` are named here too now.
+        // They used to be withheld, because they were refused outside a
+        // compaction program and advertising them would have pointed
+        // the model at two verbs that fail where it would first try
+        // them. They are not refused any more: a program that has
+        // finished with an entry may say so when it knows, which is
+        // usually the program that made it rather than a compaction
+        // program later with less to go on.
+        for member in [
+            "function append(",
+            "function fetch(",
+            "function remove(",
+            "function replace(",
+        ] {
             assert!(
-                !card().contains(verb),
-                "{verb} is introduced by the compaction request, not the card"
+                card().contains(member),
+                "the history namespace is missing {member}"
             );
         }
+
     }
 
     #[test]

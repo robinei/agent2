@@ -883,21 +883,22 @@ pub(crate) fn compaction_message(rendered: usize, budget: usize) -> String {
          smaller.\n\n\
          Write a compaction program. Nothing else. It resumes the work by itself once you \
          return.\n\n\
-         `remove_history(id, label)` drops a row's content, keeping its id and label as a \
-         stub. `rewrite_history(id, label, value)` replaces the content with something \
-         shorter. Each row above carries its `[id]` and its label; both verbs check the label \
-         against the row, so a wrong id is rejected rather than compacting the wrong thing, \
-         and the whole batch is validated before any of it commits — a mistake costs a retry \
-         and never the log.\n\n\
-         Only the numbered rows above can be compacted — this card and the worked examples \
-         before the conversation are fixed, and nothing addresses them.\n\n\
-         Prefer removing outright and keeping the rest verbatim; rewrite only what truly \
-         needs shortening.\n\n\
-         **Nothing is lost by this.** A compacted row keeps its id and its content stays \
-         readable through `fetch_history(id)` — a shortened `post` reads back whole, the \
-         same as a shortened `return`. So shorten whatever you judge least useful to have \
-         in front of you from here, which is a judgement only you can make: you are the \
-         one who has read this conversation. The task itself is never a target.\n\n\
+         `history.remove(id)` shows nothing for that entry from here on, and \
+         `history.remove(from, to)` does the same for every entry in an inclusive range. \
+         `history.replace(id, text)` shows `text` in its place instead. Everything carrying \
+         an `[id]` above can be named — a program, a report, a note, a post, or any single \
+         line of a report's menu. Anything else you name is simply skipped, and everything \
+         you name that does exist still applies.\n\n\
+         This card and the worked examples before the conversation carry no id, so they \
+         cannot be named and are not yours to shrink.\n\n\
+         Prefer removing outright and keeping the rest verbatim; replace only what is worth \
+         keeping a shorter version of, and spend the words on what you concluded rather \
+         than on saying something was removed.\n\n\
+         **Nothing is lost by this.** Removing an entry takes it out of what you are shown, \
+         never off the log: `history.fetch(id)` still returns it whole, so an id you keep \
+         is an id you can still read. So drop whatever you judge least useful to have in \
+         front of you from here, which is a judgement only you can make: you are the one \
+         who has read this conversation. The task itself is never a target.\n\n\
          Return when you are done. Do not do anything else."
     )
 }
@@ -1436,8 +1437,8 @@ mod tests {
         // is noise that framed a directive as a post-mortem.
         assert!(!text.contains("## where"), "{text}");
         assert!(!text.contains("new rows"), "{text}");
-        assert!(text.contains("remove_history"), "names the verbs: {text}");
-        assert!(text.contains("rewrite_history"), "{text}");
+        assert!(text.contains("history.remove"), "names the verbs: {text}");
+        assert!(text.contains("history.replace"), "{text}");
 
         // Compile error: the diagnostic alone — no VM was built, so this
         // run has no console and no artifacts.

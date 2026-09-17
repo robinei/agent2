@@ -162,9 +162,8 @@ pub fn depth_after(depth: usize, payload: &EventPayload) -> usize {
 /// is never actually removed from the log.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompactedView {
-    pub label: String,
-    /// `None` ⇒ the target row is removed (renders as a stub carrying
-    /// only its id and label); `Some` ⇒ rewritten to this shorter text.
+    /// `None` ⇒ the entry renders nothing at all; `Some` ⇒ this is shown
+    /// in its place.
     pub text: Option<String>,
 }
 
@@ -830,14 +829,8 @@ impl Tree {
     pub fn compacted_lookup(&self, leaf: EventId) -> HashMap<EventId, CompactedView> {
         let mut lookup = HashMap::new();
         for event in self.path_events(leaf) {
-            if let EventPayload::Compacted { of, label, text } = &event.payload {
-                lookup.insert(
-                    *of,
-                    CompactedView {
-                        label: label.clone(),
-                        text: text.clone(),
-                    },
-                );
+            if let EventPayload::Compacted { of, text } = &event.payload {
+                lookup.insert(*of, CompactedView { text: text.clone() });
             }
         }
         lookup

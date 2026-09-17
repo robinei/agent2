@@ -295,28 +295,6 @@ fn author_label(tree: &Tree, from: Author) -> String {
     }
 }
 
-/// The short, stable checksum a compaction op's `label` is checked
-/// against (`compaction.rs`'s `CompactionOp::label`) — the event's own
-/// *kind*, not anything derived from its content. Kept here, beside the
-/// rendering that consults the same rows, rather than duplicated in
-/// `compaction.rs`.
-///
-/// The `"event"` fallback means *this kind has no row*, which is why
-/// `compaction.rs` turns it into a refusal. `Call` and `Result` are
-/// deliberately left in it: what a reader sees of them is the menu
-/// inside a `Return`'s completion report, so the row that holds them —
-/// and the one that compacts them — is that `return`.
-pub(crate) fn label_of(payload: &EventPayload) -> &'static str {
-    match payload {
-        EventPayload::Message(Message::Turn { .. }) => "turn",
-        EventPayload::Message(Message::Post { .. }) => "post",
-        EventPayload::Note { .. } => "note",
-        EventPayload::Fork { .. } => "fork",
-        EventPayload::Return { .. } => "return",
-        EventPayload::Condition { .. } => "condition",
-        _ => "event",
-    }
-}
 
 /// A compacted row's rendered line: `[id] label: text`, `text` falling
 /// back to [`crate::compaction::REMOVED_MARKER`] when the op was a bare
@@ -324,16 +302,11 @@ pub(crate) fn label_of(payload: &EventPayload) -> &'static str {
 /// compacted row is lossy, not distinguished-looking, which is the
 /// point: nothing about its rendering tells the model it is missing
 /// anything it is entitled to ask for by id.
-fn compacted_line(id: EventId, shadow: &CompactedView) -> String {
-    format!(
-        "[{}] {}: {}",
-        id.as_u64(),
-        shadow.label,
-        shadow
-            .text
-            .as_deref()
-            .unwrap_or(crate::compaction::REMOVED_MARKER)
-    )
+fn compacted_line(id: EventId, shadow: &CompactedView) -> Option<String> {
+    shadow
+        .text
+        .as_deref()
+        .map(|text| format!("[{}] {}", id.as_u64(), text))
 }
 
 /// A compacted **program**'s rendered turn: still valid JavaScript,
@@ -343,22 +316,11 @@ fn compacted_line(id: EventId, shadow: &CompactedView) -> String {
 /// `types.rs` doc comment): whatever occupies the assistant's slot in
 /// the rendered transcript is still an assistant turn, just one whose
 /// entire body is a comment.
-fn compacted_program_comment(id: EventId, shadow: &CompactedView) -> String {
-    match &shadow.text {
-        None => format!(
-            "//: [{}] {} — compacted; fetch the original via fetch_history({})",
-            id.as_u64(),
-            shadow.label,
-            id.as_u64()
-        ),
-        Some(text) => format!(
-            "//: [{}] {}: {} — fetch the original via fetch_history({})",
-            id.as_u64(),
-            shadow.label,
-            text,
-            id.as_u64()
-        ),
-    }
+fn compacted_program_comment(id: EventId, shadow: &CompactedView) -> Option<String> {
+    shadow
+        .text
+        .as_deref()
+        .map(|text| format!("//: [{}] {}", id.as_u64(), text))
 }
 
 /// A completion report's line — the rendering of a `Return` or a
@@ -387,9 +349,9 @@ fn report_line(
     id: EventId,
     budget: usize,
     compacted: &HashMap<EventId, CompactedView>,
-) -> String {
+) -> Option<String> {
     match compacted.get(&id) {
-        None => crate::report::derive_report(tree, leaf, id, budget),
+        None => Some(crate::report::derive_report(tree, leaf, id, budget)),
         Some(shadow) => compacted_line(id, shadow),
     }
 }
@@ -408,7 +370,7 @@ fn pending_line(
     compacted: &HashMap<EventId, CompactedView>,
 ) -> Option<String> {
     if let Some(shadow) = compacted.get(&event.id) {
-        return Some(compacted_line(event.id, shadow));
+        return compacted_line(event.id, shadow);
     }
     match &event.payload {
         EventPayload::Message(msg @ Message::Post { from, .. }) => {
@@ -595,13 +557,19 @@ pub(crate) fn render_with_lookup(
         match &ev.payload {
             EventPayload::Message(Message::Turn { source, .. }) => {
                 let content = match compacted.get(&ev.id) {
-                    None => source.clone(),
+                    None => Some(source.clone()),
                     Some(shadow) => compacted_program_comment(ev.id, shadow),
                 };
-                messages.push(flush_pending(&mut pending, transport, &mut open_call));
-                let (assistant, call_id) = assistant_turn(transport, ev.id, content);
-                messages.push(assistant);
-                open_call = call_id;
+                // A removed program occupies no slot at all. Because a
+                // flush only happens here, the pending lines from either
+                // side of it merge into one user message — no empty
+                // message, and never two assistant turns in a row.
+                if let Some(content) = content {
+                    messages.push(flush_pending(&mut pending, transport, &mut open_call));
+                    let (assistant, call_id) = assistant_turn(transport, ev.id, content);
+                    messages.push(assistant);
+                    open_call = call_id;
+                }
             }
             // A compaction directive is the one condition that does not
             // belong in the document: it instructs, it does not report.
@@ -621,7 +589,9 @@ pub(crate) fn render_with_lookup(
                 ..
             } => {}
             EventPayload::Return { .. } | EventPayload::Condition { .. } => {
-                pending.push(report_line(tree, leaf, ev.id, budget, compacted));
+                if let Some(line) = report_line(tree, leaf, ev.id, budget, compacted) {
+                    pending.push(line);
+                }
             }
             _ => {
                 if let Some(line) = pending_line(tree, leaf, ev, compacted) {
@@ -1191,104 +1161,72 @@ mod tests {
         );
     }
 
-    /// A compacted program renders as a comment-only assistant turn —
-    /// still valid JavaScript, still carrying its own id — never as a
-    /// non-assistant stub, which is what keeps role alternation intact
-    /// under compaction with no special case.
-    #[test]
-    fn a_compacted_program_renders_as_a_comment_only_assistant_turn() {
-        let mut tree = Tree::new(None);
-        let mut spine = tree
-            .start_agent(None, None, "root", None, "CARD", Vec::new())
-            .unwrap();
-        tree.append(&mut spine, user_post("go")).unwrap();
-        let program = tree.append(&mut spine, turn("1 + 1;")).unwrap();
-        tree.append(
-            &mut spine,
-            EventPayload::Return {
-                value: serde_json::json!(2),
-            },
-        )
-        .unwrap();
-        tree.append(
-            &mut spine,
-            EventPayload::Compacted {
-                of: program,
-                label: "turn".into(),
-                text: None,
-            },
-        )
-        .unwrap();
-
-        let doc = render(&tree, &spine, 64 * 1024, Transport::Program);
-        let compacted_turn = &doc.conversation()[1];
-        assert_eq!(compacted_turn.role, ChatRole::Assistant);
-        assert!(compacted_turn.content.starts_with("//:"));
-        assert!(
-            compacted_turn
-                .content
-                .contains(&program.as_u64().to_string())
-        );
-        interp::compile(&compacted_turn.content)
-            .expect("a compacted program's turn is still valid JavaScript");
-    }
-    /// **A row's rendered label is the one its compaction checksum
-    /// expects.** `remove_history(id, label)` and
-    /// `rewrite_history(id, label, value)` check the label against the
-    /// row, and the only place a program can read a label is the row as
-    /// rendered here — so if the two disagree, correct work is rejected
-    /// and the rejection blames the program.
+    /// A **replaced** program still occupies the assistant's slot, as a
+    /// comment-only turn — valid JavaScript, carrying its own id — so
+    /// role alternation survives with no special case.
     ///
-    /// That is not hypothetical: on 2026-09-16 a post rendered as
-    /// `[62] from agent 1: …`, a live compaction program duly called
-    /// `remove_history(62, "from agent 1")`, and the checksum answered
-    /// "#62 is a `post`, not a `from agent 1`". Every test passed; none
-    /// of them compared the two strings.
+    /// A **removed** one occupies no slot at all, and that also needs no
+    /// special case: `render` flushes the pending user lines only when
+    /// it meets a turn, so a turn that renders nothing lets the lines on
+    /// either side of it merge into one user message. No empty message,
+    /// and never two assistant turns in a row — which is what the stub
+    /// used to be for, at 62 bytes apiece of permanent floor.
     #[test]
-    fn a_rendered_row_carries_the_label_its_checksum_expects() {
-        let mut tree = Tree::new(None);
-        let mut spine = tree
-            .start_agent(None, None, "root", None, "CARD", Vec::new())
-            .unwrap();
-        tree.append(
-            &mut spine,
-            EventPayload::Message(Message::Post {
-                from: Author::User,
-                origin: Origin::Direct {
-                    text: "go".into(),
-                    input: serde_json::Value::Null,
-                    expects_reply: false,
+    fn a_replaced_program_keeps_the_assistant_slot_and_a_removed_one_vacates_it() {
+        let build = |text: Option<String>| {
+            let mut tree = Tree::new(None);
+            let mut spine = tree
+                .start_agent(None, None, "root", None, "CARD", Vec::new())
+                .unwrap();
+            tree.append(&mut spine, user_post("go")).unwrap();
+            let program = tree.append(&mut spine, turn("1 + 1;")).unwrap();
+            tree.append(
+                &mut spine,
+                EventPayload::Return {
+                    value: serde_json::json!(2),
                 },
-            }),
-        )
-        .unwrap();
-        tree.append(
-            &mut spine,
-            EventPayload::Note {
-                text: "remembered".into(),
-            },
-        )
-        .unwrap();
+            )
+            .unwrap();
+            tree.append(
+                &mut spine,
+                EventPayload::Compacted { of: program, text },
+            )
+            .unwrap();
+            render(&tree, &spine, 64 * 1024, Transport::Program)
+        };
 
-        let compacted = tree.compacted_lookup(spine.leaf_id);
-        let mut checked = 0;
-        for ev in tree.path_events(spine.leaf_id) {
-            let Some(line) = pending_line(&tree, spine.leaf_id, ev, &compacted) else {
-                continue;
-            };
-            let Some(after_id) = line.split_once("] ") else {
-                continue;
-            };
-            let rendered = after_id.1.split([':', ' ']).next().unwrap_or("");
-            assert_eq!(
-                rendered,
-                label_of(&ev.payload),
-                "row renders as {rendered:?} but its checksum wants {:?}: {line}",
-                label_of(&ev.payload)
-            );
-            checked += 1;
-        }
-        assert!(checked >= 2, "exercised {checked} rows");
+        let replaced = build(Some("did the arithmetic".into()));
+        let conv = replaced.conversation();
+        let assistant: Vec<&ChatMessage> = conv
+            .iter()
+            .filter(|m| m.role == ChatRole::Assistant)
+            .collect();
+        assert_eq!(assistant.len(), 1, "{conv:?}");
+        assert!(
+            assistant[0].content.starts_with("//:"),
+            "still a program, and still a comment: {:?}",
+            assistant[0].content
+        );
+        assert!(
+            !assistant[0].content.contains("1 + 1"),
+            "the original is gone: {:?}",
+            assistant[0].content
+        );
+
+        let removed = build(None);
+        let conv = removed.conversation();
+        assert!(
+            !conv.iter().any(|m| m.role == ChatRole::Assistant),
+            "a removed program occupies no slot: {conv:?}"
+        );
+        assert!(
+            !conv.iter().any(|m| m.content.is_empty()),
+            "and leaves no empty message behind: {conv:?}"
+        );
+        assert!(
+            conv.windows(2).all(|w| w[0].role != w[1].role),
+            "roles still alternate: {conv:?}"
+        );
     }
 
     // --- Transport switch ---

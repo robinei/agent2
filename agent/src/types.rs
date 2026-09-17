@@ -4,7 +4,7 @@ use std::num::NonZeroU64;
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
-#[derive(Serialize, Deserialize, Copy, Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Serialize, Deserialize, Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct EventId(NonZeroU64);
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -209,9 +209,27 @@ pub enum EventPayload {
 
     /// Structural event; one per compaction operation. Parent: the owning
     /// agent's spine. Renders to chat: replaces its target's row — `of`
-    /// names the event being compacted, `label` is the short marker shown
-    /// in its place, `text` is `None` when the target row is *removed*
-    /// and `Some` when it is *rewritten* to shorter text.
+    /// names the event being compacted, `text` is what is shown in its
+    /// place, and `None` means **nothing is shown**: the entry stops
+    /// contributing to the document entirely.
+    ///
+    /// `None` used to mean a short stub, `[19] note: (removed)`, and a
+    /// compacted program a 62-byte comment. Those were a *floor*:
+    /// unremovable by construction, one per compacted entry, rising
+    /// monotonically for the life of a session. At the default 64 KB
+    /// budget with a 12.7 KB card that floor reaches the compaction
+    /// threshold after a few hundred programs, and a session that
+    /// arrives there can never get under budget again however well it
+    /// compacts — it stops producing `Compacted` events, so
+    /// `COMPACTION_ATTEMPTS` is never reset and compaction stops firing.
+    /// Nothing recovers from that state.
+    ///
+    /// Removing the stub costs only the reminder: the id is no longer
+    /// advertised anywhere. Nothing is *lost* — the event is still in
+    /// the log and `history.fetch(id)` still answers for it, so a
+    /// program that noted the id elsewhere can still read it back. A
+    /// program that wants the reminder kept asks for it, with
+    /// `history.replace(id, "…")`.
     ///
     /// **Never removes the target row from the log.** Replay builds a
     /// lookup (target id → this event) that the renderer consults instead
@@ -220,16 +238,17 @@ pub enum EventPayload {
     /// the original event exactly as it was, because nothing was ever
     /// deleted, only shadowed for later renders.
     ///
-    /// A compacted **program** (a `Turn`) renders as a comment-only
-    /// assistant turn — still valid JavaScript, still carrying its own
-    /// id, saying how to fetch the original (`fetch_history(id)`) — rather
-    /// than as a non-assistant stub. That is what keeps role alternation
-    /// intact under compaction with no special case: whatever occupies
-    /// the assistant's slot in the rendered transcript is still an
-    /// assistant turn.
+    /// A **replaced** program (a `Turn` with `Some` text) still renders
+    /// as a comment-only assistant turn — valid JavaScript, carrying its
+    /// own id — so whatever occupies the assistant's slot is still an
+    /// assistant turn. A **removed** program occupies no slot at all,
+    /// which the fold handles without a special case: `render` only
+    /// flushes the pending user lines when it meets a `Turn`, so a turn
+    /// that renders nothing simply lets the lines before and after it
+    /// merge into one user message. No empty message, and no two
+    /// assistant turns in a row.
     Compacted {
         of: EventId,
-        label: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         text: Option<String>,
     },

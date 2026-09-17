@@ -36,74 +36,71 @@
 //! The `#![allow(dead_code)]` this module carried while its caller was
 //! unwritten is gone with it.
 
-use crate::document::{self, label_of};
+use crate::document::{self};
 use crate::types::*;
 
-/// A compaction handler's request via `remove_history(id, label)` or
-/// `rewrite_history(id, label, value)`.
+/// One edit a compaction program asked for.
 ///
-/// `label` is the redundant checksum every id-bearing verb call
-/// carries (Part B): it must match the target event's own
-/// [`document::label_of`], or the whole batch is rejected. With a dense
-/// integer keyspace every wrong id is a *valid* id, so a mistake would
-/// otherwise silently compact the wrong row — the label turns that
-/// into a rejected call instead.
-#[derive(Clone, Debug, PartialEq)]
+/// Neither op carries a label. It used to: the label was a checksum
+/// against a mistyped id compacting the wrong entry. Measured on the
+/// skipped-tests run of 2026-09-17 it would have caught 80% of
+/// near-miss ids — but the model made no id mistakes at all there (11
+/// of 11 correct) and every one of its labels was refused, because the
+/// menu shows a call's *tool name* (`bash`, `tell`) while the checksum
+/// wanted `label_of`'s vocabulary, which has no word for a call.
+///
+/// The asymmetry is what settles it. Naming the wrong id drops the
+/// wrong entry out of context — the event is still in the log, still
+/// answers `fetch`, and the next document visibly differs. Naming the
+/// wrong label, now that compaction is best effort and reports
+/// nothing, does nothing at all and says nothing: the model believes it
+/// compacted and the document does not shrink. The guard's own failure
+/// was worse than the failure it guarded against.
+///
+/// What actually protects the fixed parts of the prompt was never the
+/// label: the card and the worked examples carry no id anywhere in the
+/// document, so they cannot be named.
+#[derive(Debug, Clone, PartialEq)]
 pub enum CompactionOp {
-    /// Drop this event's content entirely, keeping only its id and
-    /// label — the cheap, preferred operation (the card's guidance:
-    /// "prefer removal and verbatim retention; rewrite only rows that
-    /// genuinely need it").
-    Remove { id: EventId, label: String },
-    /// Replace this event's rendered content with a shorter summary,
-    /// keeping its id and label. Costs output tokens proportional to
-    /// `text`, unlike `Remove` — the more expensive operation, for the
-    /// rows that actually need rephrasing rather than dropping.
-    Rewrite {
-        id: EventId,
-        label: String,
-        text: String,
-    },
+    /// Show nothing for these entries — an inclusive id range, `to`
+    /// equal to `from` for a single one. The events stay in the log and
+    /// `fetch` still answers for them; they simply stop being rendered,
+    /// and stop costing anything.
+    Remove { from: EventId, to: EventId },
+    /// Show `text` in place of this entry's content.
+    Replace { id: EventId, text: String },
 }
 
 impl CompactionOp {
-    fn id(&self) -> EventId {
+    /// The `EventPayload::Compacted` events this op becomes — one per
+    /// entry, so a range is expanded by the caller against the ids that
+    /// actually exist rather than stored as a span that would have to
+    /// be re-resolved every render.
+    fn into_payloads(self, present: &[EventId]) -> Vec<EventPayload> {
         match self {
-            CompactionOp::Remove { id, .. } => *id,
-            CompactionOp::Rewrite { id, .. } => *id,
-        }
-    }
-
-    fn label(&self) -> &str {
-        match self {
-            CompactionOp::Remove { label, .. } => label,
-            CompactionOp::Rewrite { label, .. } => label,
-        }
-    }
-
-    /// The `EventPayload::Compacted` this op becomes once it has
-    /// cleared validation — the thing a caller actually appends.
-    fn into_payload(self) -> EventPayload {
-        match self {
-            CompactionOp::Remove { id, label } => EventPayload::Compacted {
-                of: id,
-                label,
-                text: None,
-            },
-            CompactionOp::Rewrite { id, label, text } => EventPayload::Compacted {
-                of: id,
-                label,
-                text: Some(text),
-            },
+            CompactionOp::Remove { from, to } => present
+                .iter()
+                // Whichever way round it was written: the model reading
+                // ids off the document should not have to care which end
+                // it named first.
+                .filter(|id| **id >= from.min(to) && **id <= from.max(to))
+                .map(|id| EventPayload::Compacted {
+                    of: *id,
+                    text: None,
+                })
+                .collect(),
+            CompactionOp::Replace { id, text } => present
+                .iter()
+                .filter(|p| **p == id)
+                .map(|id| EventPayload::Compacted {
+                    of: *id,
+                    text: Some(text.clone()),
+                })
+                .collect(),
         }
     }
 }
 
-
-/// The fixed marker a bare `remove_history` leaves in place of
-/// content — never empty, so "no row silently emptied" holds by
-/// construction rather than needing every caller to remember it.
-pub const REMOVED_MARKER: &str = "(removed)";
 
 /// The `EventPayload::Compacted` events a caller should append for
 /// `ops`, in `ops`' own order — **best effort**: an op naming something
@@ -135,36 +132,60 @@ pub const REMOVED_MARKER: &str = "(removed)";
 /// appends no `Compacted` event, so the attempt counter is not reset
 /// and the cap bites.
 pub fn compact(tree: &Tree, spine: &Spine, ops: &[CompactionOp]) -> Vec<EventPayload> {
-    let path = tree.path_events(spine.leaf_id);
-    let mut seen = std::collections::HashSet::new();
+    // Every entry on this path that renders something of its own, and so
+    // has something to remove. A `Result` is excluded not as a refusal
+    // but as a fact: it has no line, it is the `→ ok, 210 bytes` on its
+    // call's menu row, so there is nothing for an op to act on. A `Call`
+    // *is* included, and that is the change — its line is its menu row.
+    // It used to be refused as "not a row of the conversation", which
+    // sent the model looking for ids that do not exist while the ones
+    // in front of it were the right ones all along.
+    let present: Vec<EventId> = tree
+        .path_events(spine.leaf_id)
+        .iter()
+        .filter(|e| renders_a_line(&e.payload))
+        .map(|e| e.id)
+        .collect();
 
-    ops.iter()
-        .filter(|op| {
-            // Each op stands or falls on its own — and it is checked
-            // *before* the one-op-per-row rule, so an op that was never
-            // going to apply does not consume its row's slot and take a
-            // good op on the same row down with it.
-            if let CompactionOp::Rewrite { text, .. } = op
-                && text.is_empty()
-            {
-                return false;
-            }
-            let Some(target) = path.iter().find(|e| e.id == op.id()) else {
-                return false;
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for op in ops {
+        if let CompactionOp::Replace { text, .. } = op
+            && text.is_empty()
+        {
+            // An empty replacement is a removal spelled the long way
+            // round, and an ambiguous one — `remove` says it outright.
+            continue;
+        }
+        for payload in op.clone().into_payloads(&present) {
+            let EventPayload::Compacted { of, .. } = &payload else {
+                unreachable!("into_payloads only builds Compacted")
             };
-            // "event" is `label_of`'s "no name for this kind of row":
-            // the card, a worked example, an `Agent`, or a `Call`
-            // rendered inside some `Return`'s report rather than as a
-            // line of its own. None can be made smaller this way.
-            let expected = label_of(&target.payload);
-            if expected == "event" || expected != op.label() {
-                return false;
+            // One op per entry: a later op on an entry an earlier op
+            // already claimed is dropped, so a range and a replacement
+            // that overlap resolve in the order they were written.
+            if seen.insert(*of) {
+                out.push(payload);
             }
-            seen.insert(op.id())
-        })
-        .cloned()
-        .map(CompactionOp::into_payload)
-        .collect()
+        }
+    }
+    out
+}
+
+/// Whether this event puts a line of its own into the document — the
+/// only question an op has to answer, now that there is no label to
+/// check. An `Agent` (the card and the worked examples it carries), a
+/// `Result` and a `Console` render inside something else or not at all,
+/// so naming one is a no-op rather than an error.
+fn renders_a_line(payload: &EventPayload) -> bool {
+    matches!(
+        payload,
+        EventPayload::Message(_)
+            | EventPayload::Note { .. }
+            | EventPayload::Return { .. }
+            | EventPayload::Call(_)
+            | EventPayload::Fork { .. }
+    )
 }
 
 /// Total content bytes across a rendered [`document::Document`] — a
@@ -347,10 +368,7 @@ mod tests {
     fn compacting_a_return_removes_the_report_rendered_around_it() {
         let (tree, spine, ret) = branch_with_a_report();
         let before = rendered_size(&render(&tree, &spine, 4096));
-        let ops = [CompactionOp::Remove {
-            id: ret,
-            label: "return".into(),
-        }];
+        let ops = [CompactionOp::Remove { from: ret, to: ret }];
         let events = compact(&tree, &spine, &ops);
         assert_eq!(events.len(), 1);
 
@@ -381,12 +399,43 @@ mod tests {
         );
     }
 
-    /// A `Call` has no line of its own to remove — it is *inside* the
-    /// report, and goes when the report goes (the test above). So it is
-    /// skipped. What this really pins is that skipping it costs nothing
-    /// else in the batch: the `return` named beside it still applies.
+    /// The two ways an op can still be bad — an id that is not on this
+    /// path, and an empty replacement — each paired with a good one:
+    /// the bad op is dropped in silence and the good one still applies.
+    /// Atomicity used to mean the good one died too, twenty at a time.
     #[test]
-    fn a_call_is_skipped_but_the_rest_of_the_batch_applies() {
+    fn a_bad_op_is_skipped_and_never_takes_a_good_one_with_it() {
+        let cases: Vec<(&str, fn() -> CompactionOp)> = vec![
+            ("an id that is not on this path", || CompactionOp::Remove {
+                from: EventId::new(9999),
+                to: EventId::new(9999),
+            }),
+            ("a replacement with no text", || CompactionOp::Replace {
+                id: EventId::new(9999),
+                text: String::new(),
+            }),
+        ];
+        for (what, bad) in cases {
+            let (tree, spine, _program, note) = sample_branch();
+            let good = CompactionOp::Remove {
+                from: note,
+                to: note,
+            };
+            let payloads = compact(&tree, &spine, &[bad(), good]);
+            assert_eq!(payloads.len(), 1, "{what}: {payloads:?}");
+            assert!(
+                matches!(&payloads[0], EventPayload::Compacted { of, .. } if *of == note),
+                "{what}: {payloads:?}"
+            );
+        }
+    }
+
+    /// A call *is* addressable now — its line is its menu row. It used
+    /// to be refused as "not a row of the conversation", which sent the
+    /// model hunting for ids that do not exist while the ones the menu
+    /// showed it were the right ones all along.
+    #[test]
+    fn a_call_is_addressable_because_its_line_is_its_menu_row() {
         let (tree, spine, ret) = branch_with_a_report();
         let call = tree
             .path_events(spine.leaf_id)
@@ -398,62 +447,43 @@ mod tests {
         let payloads = compact(
             &tree,
             &spine,
-            &[
-                CompactionOp::Remove {
-                    id: call,
-                    label: "call".into(),
-                },
-                CompactionOp::Remove {
-                    id: ret,
-                    label: "return".into(),
-                },
-            ],
+            &[CompactionOp::Remove {
+                from: call,
+                to: call,
+            }],
         );
-        assert_eq!(payloads.len(), 1, "only the call is dropped: {payloads:?}");
+        assert_eq!(payloads.len(), 1, "{payloads:?}");
         assert!(
-            matches!(&payloads[0], EventPayload::Compacted { of, .. } if *of == ret),
+            matches!(&payloads[0], EventPayload::Compacted { of, .. } if *of == call),
             "{payloads:?}"
         );
     }
 
-    /// Every way a single op can be bad, each paired with a good one:
-    /// the bad op is dropped in silence and the good one still applies.
-    /// Atomicity used to mean the good one died too — twenty of them at
-    /// a time, in the run that prompted this.
+    /// A range names every addressable entry between its ends, and runs
+    /// whichever way round it was written.
     #[test]
-    fn a_bad_op_is_skipped_and_never_takes_a_good_one_with_it() {
-        let good = |note| CompactionOp::Remove {
-            id: note,
-            label: "note".into(),
-        };
-        let cases: Vec<(&str, fn(EventId) -> CompactionOp)> = vec![
-            ("an id that is not on this path", |_| CompactionOp::Remove {
-                id: EventId::new(9999),
-                label: "note".into(),
-            }),
-            ("a real id under the wrong label", |note| {
-                CompactionOp::Remove {
-                    id: note,
-                    label: "turn".into(),
-                }
-            }),
-            ("a rewrite that would empty the row", |note| {
-                CompactionOp::Rewrite {
-                    id: note,
-                    label: "note".into(),
-                    text: String::new(),
-                }
-            }),
-        ];
-        for (what, bad) in cases {
-            let (tree, spine, _program, note) = sample_branch();
-            let payloads = compact(&tree, &spine, &[bad(note), good(note)]);
-            assert_eq!(payloads.len(), 1, "{what}: {payloads:?}");
-            assert!(
-                matches!(&payloads[0], EventPayload::Compacted { of, .. } if *of == note),
-                "{what}: {payloads:?}"
-            );
-        }
+    fn a_range_covers_the_entries_between_its_ends() {
+        let (tree, spine, _program, note) = sample_branch();
+        let ids: Vec<EventId> = tree
+            .path_events(spine.leaf_id)
+            .iter()
+            .map(|e| e.id)
+            .collect();
+        let lo = *ids.first().unwrap();
+        let hi = *ids.last().unwrap();
+        let forwards = compact(&tree, &spine, &[CompactionOp::Remove { from: lo, to: hi }]);
+        let backwards = compact(&tree, &spine, &[CompactionOp::Remove { from: hi, to: lo }]);
+        assert!(
+            forwards.len() > 1,
+            "a range spanning the branch covers more than one entry: {forwards:?}"
+        );
+        assert_eq!(forwards, backwards, "a range is not order-sensitive");
+        assert!(
+            forwards
+                .iter()
+                .any(|p| matches!(p, EventPayload::Compacted { of, .. } if *of == note)),
+            "the note is inside the range: {forwards:?}"
+        );
     }
 
     /// One op per row still holds — the second op on an id is dropped
@@ -466,15 +496,8 @@ mod tests {
             &tree,
             &spine,
             &[
-                CompactionOp::Remove {
-                    id: note,
-                    label: "note".into(),
-                },
-                CompactionOp::Rewrite {
-                    id: note,
-                    label: "note".into(),
-                    text: "second op on the same id".into(),
-                },
+                CompactionOp::Remove { from: note, to: note },
+                CompactionOp::Replace { id: note, text: "second op on the same id".into() },
             ],
         );
         assert_eq!(payloads.len(), 1, "{payloads:?}");
@@ -487,17 +510,13 @@ mod tests {
     #[test]
     fn a_valid_batch_returns_compacted_events_that_shadow_every_target() {
         let (tree, spine, _program, note) = sample_branch();
-        let ops = [CompactionOp::Remove {
-            id: note,
-            label: "note".into(),
-        }];
+        let ops = [CompactionOp::Remove { from: note, to: note }];
         let payloads = compact(&tree, &spine, &ops);
         assert_eq!(payloads.len(), 1);
         assert_eq!(
             payloads[0],
             EventPayload::Compacted {
                 of: note,
-                label: "note".into(),
                 text: None,
             }
         );
@@ -506,17 +525,12 @@ mod tests {
     #[test]
     fn rewrite_carries_its_text_into_the_compacted_event() {
         let (tree, spine, _program, note) = sample_branch();
-        let ops = [CompactionOp::Rewrite {
-            id: note,
-            label: "note".into(),
-            text: "note was long".into(),
-        }];
+        let ops = [CompactionOp::Replace { id: note, text: "note was long".into() }];
         let payloads = compact(&tree, &spine, &ops);
         assert_eq!(
             payloads[0],
             EventPayload::Compacted {
                 of: note,
-                label: "note".into(),
                 text: Some("note was long".into()),
             }
         );
@@ -527,12 +541,9 @@ mod tests {
     /// resolves — as a stub, not a hole — and the branch keeps
     /// rendering.
     #[test]
-    fn appending_the_proposed_event_leaves_the_id_resolvable_as_a_stub() {
+    fn a_removed_entry_leaves_the_document_but_not_the_log() {
         let (mut tree, mut spine, _program, note) = sample_branch();
-        let ops = [CompactionOp::Remove {
-            id: note,
-            label: "note".into(),
-        }];
+        let ops = [CompactionOp::Remove { from: note, to: note }];
         let payloads = compact(&tree, &spine, &ops);
         for payload in payloads {
             tree.append(&mut spine, payload).unwrap();
@@ -545,12 +556,24 @@ mod tests {
             .map(|m| m.content.as_str())
             .collect::<Vec<_>>()
             .join("\n");
-        let marker = format!("[{}]", note.as_u64());
-        assert!(rendered.contains(&marker), "the id must still round-trip");
-        assert!(rendered.contains(REMOVED_MARKER));
         assert!(
             !rendered.contains("a long note that takes up a lot of space"),
-            "the content is gone, only the id and label remain"
+            "the content is gone: {rendered}"
+        );
+        // The id is gone from the document too — that is the change. It
+        // used to be kept as a stub, which was a per-entry floor that
+        // could never be compacted away. Nothing is *lost*: the event is
+        // still on the log, so a program holding the id can still fetch
+        // it, and a program that wants the reminder asks for one with
+        // `history.replace`.
+        let marker = format!("[{}]", note.as_u64());
+        assert!(
+            !rendered.contains(&marker),
+            "a removed entry costs nothing at all: {rendered}"
+        );
+        assert!(
+            tree.events.contains_key(&note),
+            "but the log still has it, so fetch still answers"
         );
     }
 
@@ -578,14 +601,8 @@ mod tests {
             &tree,
             &spine,
             &[
-                CompactionOp::Remove {
-                    id: agent,
-                    label: "event".into(),
-                },
-                CompactionOp::Remove {
-                    id: note,
-                    label: "note".into(),
-                },
+                CompactionOp::Remove { from: agent, to: agent },
+                CompactionOp::Remove { from: note, to: note },
             ],
         );
         assert_eq!(payloads.len(), 1, "the card is not compactable: {payloads:?}");

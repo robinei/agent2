@@ -114,7 +114,7 @@ pub const TOOL_FETCH_HISTORY: &str = "fetch_history";
 const COMPACTION_ATTEMPTS: u32 = 2;
 
 pub const TOOL_REMOVE_HISTORY: &str = "remove_history";
-pub const TOOL_REWRITE_HISTORY: &str = "rewrite_history";
+pub const TOOL_REPLACE_HISTORY: &str = "replace_history";
 /// `done()` — the only thing that stops the loop. See `finish_program`'s
 /// own comment for the polarity this inverts: completing a program is,
 /// by itself, never enough to rest a branch anymore (on either
@@ -478,10 +478,28 @@ pub struct Runner {
     /// to be wrong, and the log is append-only, so the batch is the unit
     /// that either commits or does not.
     ///
-    /// `Some` exactly while a compaction handler is running, which is
-    /// also what makes the two verbs an error anywhere else: outside a
-    /// compaction program there is nothing to add them to.
-    compacting: Option<Vec<crate::compaction::CompactionOp>>,
+    /// True exactly while a compaction program is the thing being asked
+    /// for. It no longer gates `history.remove`/`history.replace`: this
+    /// tracks only *whether the harness asked*, so `compaction_if_needed`
+    /// does not ask twice and `request_tail` knows to carry the
+    /// directive.
+    compaction_requested: bool,
+    /// History edits this program has queued, applied when it finishes.
+    ///
+    /// Any program may queue them, not only a compaction program. The
+    /// verbs used to be refused outside one, on the reasoning that
+    /// history is not a thing an ordinary program edits — but a program
+    /// that has just read a 40 KB file and pulled one number out of it
+    /// knows, right then, that the entry is not worth carrying, and it
+    /// knows it better than a compaction program will later, with less
+    /// to go on. Deferring that to a compaction it has to be asked for
+    /// is the same recon-then-stop shape the card argues against
+    /// everywhere else.
+    ///
+    /// Applied at the end of the program that queued them, never
+    /// mid-run, so a program that traps or is abandoned halfway leaves
+    /// the log exactly as it found it.
+    pending_edits: Vec<crate::compaction::CompactionOp>,
     /// Whether `done()` (`TOOL_DONE`) was called by the program currently
     /// running — checked and reset by `finish_program`, which is the
     /// only reader. A program can call it and keep going (nothing else
@@ -581,7 +599,8 @@ impl Runner {
         let branch = tree.branch_of(spine.leaf_id).unwrap_or(spine.leaf_id);
         let leaf = spine.leaf_id;
         Runner {
-            compacting: None,
+            compaction_requested: false,
+            pending_edits: Vec::new(),
             done: false,
             spine,
             agent,
@@ -1827,7 +1846,7 @@ impl Runner {
                 self.settle(Ok(serde_json::Value::Null));
                 Ok(true)
             }
-            TOOL_REMOVE_HISTORY | TOOL_REWRITE_HISTORY => {
+            TOOL_REMOVE_HISTORY | TOOL_REPLACE_HISTORY => {
                 // Nothing leaves the process and nothing settles later.
                 // The op joins the batch this handler is building and
                 // the value lands at once, so a compaction program reads
@@ -1880,52 +1899,51 @@ impl Runner {
         args.iter().map(|v| value_json(vm, v)).collect()
     }
 
-    /// Add one `remove_history`/`rewrite_history` call to the batch the
-    /// running compaction handler is building.
+    /// Add one history edit to the batch the running compaction program
+    /// is building.
     ///
     /// Refuses outside a compaction program rather than quietly doing
     /// nothing: history is not a thing an ordinary program edits, and a
     /// silently-ignored call would look to the model exactly like one
     /// that worked.
+    ///
+    /// No label argument. See `CompactionOp` for why the checksum went.
     fn record_compaction(&mut self, name: &str, args: &[Value]) -> Result<(), String> {
         use crate::compaction::CompactionOp;
-        if self.compacting.is_none() {
-            return Err(format!(
-                "{name} is only available in a compaction program, which the harness asks for \
-                 when the conversation outgrows its budget"
-            ));
-        }
         let args = self.call_args_json(args);
-        let id = match args.first().and_then(|v| v.as_u64()) {
-            Some(n) if n > 0 => EventId::new(n),
-            _ => return Err(format!("{name}(id, label, …) needs the row's id")),
+        let id_at = |n: usize| -> Option<EventId> {
+            args.get(n)
+                .and_then(|v| v.as_u64())
+                .filter(|n| *n > 0)
+                .map(EventId::new)
         };
-        let label = match args.get(1).and_then(|v| v.as_str()) {
-            Some(l) => l.to_owned(),
-            None => {
-                return Err(format!(
-                    "{name}(id, label, …) needs the row's label, which is checked against the \
-                     row itself so a wrong id cannot compact the wrong thing"
-                ));
-            }
+        let Some(first) = id_at(0) else {
+            return Err(format!("{name} needs the id of an entry"));
         };
         let op = if name == TOOL_REMOVE_HISTORY {
-            CompactionOp::Remove { id, label }
+            // `remove(id)` is `remove(id, id)`. A range runs whichever
+            // way it was written — the model reading ids off the
+            // document should not have to care which end it named first.
+            let last = id_at(1).unwrap_or(first);
+            CompactionOp::Remove {
+                from: first.min(last),
+                to: first.max(last),
+            }
         } else {
-            let Some(text) = args.get(2).and_then(|v| v.as_str()) else {
+            let Some(text) = args.get(1).and_then(|v| v.as_str()) else {
                 return Err(format!(
-                    "{TOOL_REWRITE_HISTORY}(id, label, value) needs the replacement text"
+                    "{TOOL_REPLACE_HISTORY}(id, text) needs the text to show in its place"
                 ));
             };
-            CompactionOp::Rewrite {
-                id,
-                label,
+            CompactionOp::Replace {
+                id: first,
                 text: text.to_owned(),
             }
         };
-        self.compacting.as_mut().expect("checked above").push(op);
+        self.pending_edits.push(op);
         Ok(())
     }
+
 
     /// Reject a malformed call in place. Nothing is logged: the call was
     /// never dispatched, so it has no `Call` event and owes no `Result` —
@@ -2211,15 +2229,13 @@ impl Runner {
         // Nothing about the ops is applied before this point, so a
         // handler that traps or is abandoned halfway leaves the log
         // exactly as it found it.
-        if self.compacting.is_some() {
-            // Best effort, and nothing is reported back: the ops that
-            // name a real row apply, the rest are dropped, and whether
-            // the document actually got smaller is something the next
-            // request answers by being smaller. If it is still over
-            // budget, `compaction_if_needed` notices that on its own
-            // terms rather than on the strength of a refusal.
-            self.finish_compaction(tree)?;
-        }
+        // Best effort, and nothing is reported back: the ops that name a
+        // real entry apply, the rest are dropped, and whether the
+        // document actually got smaller is something the next request
+        // answers by being smaller. If it is still over budget,
+        // `compaction_if_needed` notices that on its own terms rather
+        // than on the strength of a refusal.
+        self.apply_history_edits(tree)?;
 
         let Phase::Running(run) = std::mem::replace(&mut self.phase, Phase::Idle) else {
             unreachable!()
@@ -2653,7 +2669,7 @@ impl Runner {
         budget: usize,
         headroom: f64,
     ) -> io::Result<Option<StepOutput>> {
-        if self.compacting.is_some() || self.compaction_attempts(tree) >= COMPACTION_ATTEMPTS {
+        if self.compaction_requested || self.compaction_attempts(tree) >= COMPACTION_ATTEMPTS {
             return Ok(None);
         }
         let doc = crate::document::render(tree, &self.spine, budget, self.transport);
@@ -2680,7 +2696,7 @@ impl Runner {
                 disposition: Disposition::Handover,
             },
         )?;
-        self.compacting = Some(Vec::new());
+        self.compaction_requested = true;
         self.phase = Phase::AwaitingLlm;
         Ok(Some(self.render_request(tree)))
     }
@@ -2692,10 +2708,12 @@ impl Runner {
     /// `Compacted` event or none of them. A rejection is returned as a
     /// string for the caller to hand back to the model, which is a
     /// retry rather than a failure: the log is untouched either way.
-    fn finish_compaction(&mut self, tree: &mut Tree) -> io::Result<usize> {
-        let Some(ops) = self.compacting.take() else {
+    fn apply_history_edits(&mut self, tree: &mut Tree) -> io::Result<usize> {
+        let ops = std::mem::take(&mut self.pending_edits);
+        self.compaction_requested = false;
+        if ops.is_empty() {
             return Ok(0);
-        };
+        }
         let events = crate::compaction::compact(tree, &self.spine, &ops);
         let n = events.len();
         for event in events {
@@ -2767,7 +2785,7 @@ impl Runner {
         // not being done in this program. It lives here rather than in
         // the document because it instructs rather than reports: see
         // `document::render_with_lookup`, which skips the row.
-        if self.compacting.is_some()
+        if self.compaction_requested
             && let Some(directive) = self.compaction_directive(tree)
         {
             return Some(directive);
@@ -4050,7 +4068,6 @@ mod tests {
             &mut state.spine,
             EventPayload::Compacted {
                 of: post,
-                label: "post".into(),
                 text: None,
             },
         )
@@ -4487,7 +4504,7 @@ mod tests {
             .compaction_if_needed(&mut tree, 1024 * 1024, 0.25)
             .unwrap();
         assert!(fired.is_none());
-        assert!(state.compacting.is_none());
+        assert!(!state.compaction_requested);
         assert!(
             !tree
                 .events
@@ -4503,7 +4520,7 @@ mod tests {
         let (mut tree, mut state, budget) = crowded();
         let fired = state.compaction_if_needed(&mut tree, budget, 0.25).unwrap();
         assert!(matches!(fired, Some(StepOutput::LlmRequest(_))));
-        assert!(state.compacting.is_some(), "the batch is open");
+        assert!(state.compaction_requested, "a compaction was asked for");
 
         let logged = tree
             .events
@@ -4544,7 +4561,7 @@ mod tests {
                     .is_some(),
                 "each attempt within the bound still asks"
             );
-            state.compacting = None; // the handler returned, batch rejected
+            state.compaction_requested = false; // the program returned
         }
         assert!(
             state
@@ -4658,7 +4675,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(text.contains("compaction program"), "not in the request");
-        assert!(text.contains("remove_history"), "the verbs are not there");
+        assert!(text.contains("history.remove"), "the verbs are not there");
 
         // The conversation stays: it is the cache prefix, so re-sending
         // it is nearly free, and a rewrite needs the text it is
@@ -4709,7 +4726,7 @@ mod tests {
             )
             .unwrap();
         drain(&mut state, &mut tree, out);
-        assert!(state.compacting.is_none(), "the batch closed");
+        assert!(!state.compaction_requested, "the request is closed");
         let compacted: Vec<_> = tree
             .events
             .values()
@@ -4725,24 +4742,38 @@ mod tests {
         );
     }
 
-    /// Outside a compaction program the verbs are refused rather than
-    /// quietly doing nothing — history is not something an ordinary
-    /// program edits, and a silently-ignored call looks exactly like one
-    /// that worked.
+    /// The history verbs work in any program, not only a compaction
+    /// one, and the edit lands when that program finishes.
+    ///
+    /// They used to be refused outside a compaction program, on the
+    /// reasoning that history is not a thing an ordinary program edits.
+    /// But the program that made an entry is the one that knows what it
+    /// was worth: having read a listing and picked four paths out of
+    /// it, it knows right then that the listing is not worth carrying,
+    /// and knows it better than a compaction program will later with
+    /// less to go on.
     #[test]
-    fn history_verbs_are_refused_outside_a_compaction_program() {
+    fn a_history_edit_applies_from_any_program() {
         let (mut tree, mut state) = setup();
         user_post(&mut state, &mut tree, "go");
+        let post = tree
+            .events
+            .values()
+            .filter(|e| matches!(e.payload, EventPayload::Message(Message::Post { .. })))
+            .map(|e| e.id)
+            .min()
+            .expect("a post to remove");
         let out = state
             .step(
                 &mut tree,
-                StepInput::LlmResponse(llm_program(
-                    "try { remove_history(1, \"post\"); tell(\"no trap\"); } \
-                     catch (e) { tell(`refused: ${e}`); }",
-                )),
+                StepInput::LlmResponse(llm_program(&format!(
+                    "history.remove({}); tell(\"done\");",
+                    post.as_u64()
+                ))),
             )
             .unwrap();
         drain(&mut state, &mut tree, out);
+
         let said: Vec<String> = tree
             .events
             .values()
@@ -4752,12 +4783,18 @@ mod tests {
             })
             .collect();
         assert!(
-            said.iter()
-                .any(|t| t.contains("refused")
-                    && t.contains("only available in a compaction program")),
-            "{said:?}"
+            said.iter().any(|t| t == "done"),
+            "no refusal, the program ran straight through: {said:?}"
+        );
+        assert!(
+            tree.events.values().any(|e| matches!(
+                &e.payload,
+                EventPayload::Compacted { of, text: None } if *of == post
+            )),
+            "and the edit landed when the program finished"
         );
     }
+
 
     /// A label indexes a call; it does not replay its arguments. The
     /// argument that *identifies* the call survives a huge one standing

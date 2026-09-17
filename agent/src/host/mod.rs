@@ -2046,9 +2046,10 @@ fn leaf_summary(tree: &Tree, leaf: EventId) -> String {
         EventPayload::Rename { name } => format!("Rename: {name}"),
         EventPayload::Console { lines } => format!("Console: {} lines", lines.len()),
         EventPayload::Note { text } => format!("Note: {text}"),
-        EventPayload::Compacted { of, label, .. } => {
-            format!("Compacted #{}: {label}", of.as_u64())
-        }
+        EventPayload::Compacted { of, text } => match text {
+            Some(t) => format!("Compacted #{}: {t}", of.as_u64()),
+            None => format!("Compacted #{}: removed", of.as_u64()),
+        },
     };
     crate::report::clip(&s, crate::report::PREVIEW_MAX_BYTES)
 }
