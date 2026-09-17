@@ -17,6 +17,13 @@
  * when what to do next depends on reading something, return it and
  * look at it next turn.
  *
+ * When the next step turns on a judgement the data cannot settle —
+ * which of these did you mean, is this value still right — stop and
+ * get it. `ask("user", …)` if a person has to decide, `raise(…)` if
+ * you have everything you need and only want the verdict. Both come
+ * back into this same program. Guessing at a question with a real
+ * answer is the failure, and acting on the guess is the expensive one.
+ *
  * `tell()` is the only thing a person ever sees.
  */
 
