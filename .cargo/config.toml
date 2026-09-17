@@ -1,0 +1,17 @@
+# The test binaries set `AGENT2_TRANSPORT` with `std::env::set_var` to
+# render a document both ways (`with_transport`, in document.rs and
+# machine.rs). Both call sites carry the same SAFETY note — "single-
+# threaded test binary" — and it was not true: `cargo test` defaults to
+# one thread per core, so those writes raced every other test that
+# renders a document and reads the variable back, which is most of them.
+#
+# The symptom was not a clean failure. It was `program_mode_renders_an_
+# assistant_turn_as_plain_text` reporting an *empty* assistant message
+# (the other transport wraps the program in a tool call, leaving
+# `content` blank), plus intermittent hangs of the whole run — the
+# reason day-to-day work here had drifted to `-- --test-threads=1`.
+#
+# This makes the invariant those SAFETY comments already depend on the
+# actual default. It costs nothing: the suite is 2.9s serial.
+[env]
+RUST_TEST_THREADS = "1"
