@@ -612,7 +612,24 @@ def fingerprint(card: Path | None) -> dict:
         if f.is_file():
             h.update(f.relative_to(card).as_posix().encode())
             h.update(f.read_bytes())
-    return {"binary": binary, "card": h.hexdigest()[:12]}
+    # **The environment is part of what was measured.** The knobs that
+    # change a run's behaviour without changing a byte of the binary or
+    # the card live here — the reasoning level above all, which is the
+    # whole variable in a thinking-level sweep. Three arms that differ
+    # only by `DEEPSEEK_REASONING_EFFORT` would otherwise stamp
+    # identically, and a mislabelled JSON would be indistinguishable
+    # from a real result.
+    knobs = {
+        k: os.environ[k]
+        for k in (
+            "DEEPSEEK_MODEL",
+            "DEEPSEEK_REASONING_EFFORT",
+            "DEEPSEEK_NO_THINKING",
+            "AGENT2_TRANSPORT",
+        )
+        if k in os.environ
+    }
+    return {"binary": binary, "card": h.hexdigest()[:12], "env": knobs}
 
 
 def print_summary(summary: dict):
@@ -652,7 +669,14 @@ def print_summary(summary: dict):
                 "   Re-run from a clean checkout before believing the number."
             )
         else:
-            print(f"\n(binary {stamp['before']['binary']}, card {stamp['before']['card']})")
+            b = stamp["before"]
+            env = b.get("env") or {}
+            shown = "  ".join(f"{k}={v}" for k, v in sorted(env.items()))
+            print(
+                f"\n(binary {b['binary']}, card {b['card']}"
+                + (f", {shown}" if shown else ", default reasoning")
+                + ")"
+            )
 
 
 def wilson(k: int, n: int) -> tuple:
