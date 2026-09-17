@@ -41,6 +41,7 @@ namespace, which is reserved for this session's configured tools
   list_agents()                    every agent in this subtree, with status
   raise(name, payload?)            suspend for judgement; the answer comes
                                     back here and this program carries on
+  done()                           the task is finished; stop for good
   return <value>                   end this program; the value comes
                                     back to you and you go again
 
@@ -92,8 +93,10 @@ in hand. That is how the work goes on: do the next piece, return what
 you found, read it, do the next. You do not have to finish in one
 program and you should not try.
 
-The task is over when you reply **without** running a program. So say
-the answer in a reply and stop; anything else is another step.
+The task is over when a program calls `done()`. Nothing else ends it —
+finishing a program, returning, replying — so with work remaining, just
+return what you found and go again; call `done()` only when there is
+nothing left to do.
 
 Await at the top level directly — this dialect permits it.
 

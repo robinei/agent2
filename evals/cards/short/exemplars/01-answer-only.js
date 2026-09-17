@@ -1,1 +1,2 @@
 tell("A mutex is owned — whoever locks it unlocks it. A semaphore is a count of permits with no owner.");
+done();

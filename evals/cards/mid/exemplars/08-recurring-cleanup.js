@@ -8,9 +8,11 @@ if (count === 0) {
     await tools.bash("find /tmp/build-cache -type f -mtime +1 -delete");
     tell(`removed ${count} stale file(s).`);
     if (count > 200) {
-        // a short projection for whoever runs this next — not read
-        // back by me, I'm done; this run's own count is already in
-        // the variable I just used
+        // A short projection for whoever runs this job next week — a
+        // different audience from both `tell` and `return`: not the
+        // person waiting now, and not the next program, which does not
+        // exist because this task is finished.
         append_history(`/tmp/build-cache had ${count} stale files tonight — well above the usual handful; worth checking what's writing there if it keeps climbing.`);
     }
 }
+done();

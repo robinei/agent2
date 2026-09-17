@@ -15,3 +15,4 @@ for (const name of names) {
 }
 
 tell(names.map((n, i) => `${n}: ${summaries[i]}`).join("\n"));
+done();

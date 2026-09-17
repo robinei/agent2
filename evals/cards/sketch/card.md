@@ -40,9 +40,7 @@ namespace, which is reserved for this session's configured tools
   list_agents()                    every agent in this subtree, with status
   raise(name, payload?)            suspend for judgement; the answer comes
                                     back here and this program carries on
-  next_program(payload?)           end here and write the next program with
-                                    `payload` in view. Nothing resumes — the
-                                    next program is the continuation
+  done()                           the task is finished; stop for good
 
 Editing text is `Edit.*` — pure functions over strings, not tools, so a
 whole batch of edits costs one write at the end rather than one apiece.
@@ -80,12 +78,12 @@ saying so — everything else that differs stops the program and tells you:
                                  `{ name, message }`; branch on
                                  `e.name`, not on its type
 
-**There are two ways to stop, and only one of them continues.**
-`next_program(payload)` ends this program and the next one runs. A bare
-`return` — or simply running off the end — ends the *conversation*:
-nothing wakes you, nobody writes anything else, and whatever was left
-undone stays undone. So with work remaining there is exactly one
-correct ending, and it is `next_program`.
+**Finishing continues; only `done()` stops.** Returning — or simply
+running off the end — ends this program and starts the next one, with
+your value in front of it. `done()` ends the *task*: nothing wakes you,
+nobody writes anything else, and whatever was left undone stays undone.
+So with work remaining, just return what you found; call `done()` only
+when there is nothing left to do.
 
 Await at the top level directly — this dialect permits it.
 

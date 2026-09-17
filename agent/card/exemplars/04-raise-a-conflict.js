@@ -14,3 +14,4 @@ if (a.content === b.content) {
     const keep = await raise("conflicting_backups", { a: a.content, b: b.content });
     tell(`keeping ${keep}.`);
 }
+done();

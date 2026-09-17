@@ -1,19 +1,19 @@
 tell("taking the #[ignore] off each one in turn and running it, so the test runner decides rather than me.");
 const paths = (await tools.bash("grep -rl '#\\[ignore\\]' --include='*.rs' . 2>/dev/null")).stdout
     .split("\n").map(s => s.trim()).filter(Boolean);
-tell(`${paths.length} file(s) carry ignored tests.`);
 
 // The control, inline: if the suite is already red, a failure after
 // un-ignoring something is not attributable to that test, and the whole
 // loop below would be measuring nothing.
 const base = await tools.bash("set -o pipefail; cargo test 2>&1 | tail -5");
 if (base.status !== 0) {
-    // Blocked is not done. Nothing after this line runs, and the
-    // program that does run has what it needs to get past this.
-    next_program({
+    // Blocked is not done. Returning ends this program and starts the
+    // next one with this in front of it — which is what gets past the
+    // obstacle. Stopping here would leave the task undone.
+    return {
         question: "the suite is already failing, so un-ignoring can't be attributed — read these, decide whether they're worth fixing first",
         failures: base.stdout,
-    });
+    };
 }
 
 // I knew this procedure before I knew the list, so it is a loop, not a
@@ -58,3 +58,4 @@ for (const path of paths) {
 tell(freed.length
     ? `un-ignored ${freed.length}: ${freed.join(", ")}. ${kept.length} still fail and keep the marker.`
     : `none of the ${kept.length} pass yet — every marker stays.`);
+done();

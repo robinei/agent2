@@ -17,3 +17,4 @@ for (const site of sites) {
     else { await tools.replace_file(path, f.content, w.version); kept.push(site); }
 }
 tell(`un-ignored ${freed.length}, kept ${kept.length}.`);
+done();

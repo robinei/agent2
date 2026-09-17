@@ -141,8 +141,38 @@ Gate: `fetch_history_reads_a_compacted_post_back_whole` (the original
 text, and the program's three events with nothing added for the fetch),
 `fetch_history_reads_a_note_and_a_program_back`.
 
-**27.5 — the card states the four channels**, and says plainly that
-`tell` reaches a person and nothing else does.
+**27.5 — the card states the four channels.** *(done.)* This was
+listed as a wording change and is not one: after 27.1 the shipped card
+taught the opposite of what the code does. It said "a bare `return` —
+or simply running off the end — ends the *conversation*", listed
+`next_program` as the one correct ending, and told the model "a root
+program's return value is read by nobody". Every one of those is now
+false, and the last two are false in the direction that causes the
+failure 27.1 exists to prevent.
+
+The card now opens on the four channels, and the sentence before them
+is the one that matters: **a program finishing is not the task
+ending.** `next_program` is gone from every card — `return value` does
+exactly what it did, and two verbs for one act is the thing to remove,
+not to document. It stays in the interpreter, unmentioned; nothing
+reaches for a verb the card does not name.
+
+`tell` is stated as the person's channel and nothing else's, with the
+cadence that follows from "rare": the first program says what is about
+to happen, the finishing one says what the answer was, the ones between
+usually say nothing. The old card asked for a `tell` "as things
+actually happen", which is where `tell(f.content)` came from.
+
+Every exemplar was rewritten to end on purpose — `done()` where the
+task finishes, `return` where it hands on — in the shipped card and in
+all five eval variants, since a variant that teaches falling off the
+end now measures the accident rather than the card.
+Gate: `every_exemplar_ends_on_purpose`, which reads the ending off a
+real VM run rather than grepping for the word, and asserts *not both*
+(a value returned beside `done()` is read by nobody);
+`every_eval_card_variant_ends_on_purpose`, textual, because `sketch`
+exists to test exemplars-as-shape and its programs deliberately do not
+run.
 
 **27.6 — compaction prefers by lifetime.** *(done, with 27.3.)* Folded
 in there because once the report became reachable the old sentence —

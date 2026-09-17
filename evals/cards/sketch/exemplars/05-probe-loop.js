@@ -9,3 +9,4 @@ for (const site of sites) {
     else { await tools.replace_file(path(site), f.content, w.version); kept.push(site); }
 }
 tell(`removed ${gone.length}, kept ${kept.length}.`);
+done();

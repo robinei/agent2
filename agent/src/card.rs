@@ -243,7 +243,7 @@ mod tests {
         // `card()` shows up as a diff review must look at, not a byte
         // count that silently drifts. Comparing full text (not just a
         // hash) so the diff itself is legible in a failure message.
-        const EXPECTED_LEN: usize = 17283;
+        const EXPECTED_LEN: usize = 17684;
         assert_eq!(
             card().len(),
             EXPECTED_LEN,
@@ -362,20 +362,43 @@ mod tests {
         }
     }
 
+    /// How an exemplar ended — the thing 27.1 made a decision rather
+    /// than an omission, so it is worth reading back off a real run
+    /// instead of grepping the source for the word.
+    struct Ending {
+        /// `done()` was called: the task is over.
+        done: bool,
+        /// The program returned something for the next one to read.
+        /// `Value::Undefined` when it ran off the end.
+        returned: bool,
+    }
+
     /// Drive one program on a bare VM: every call answered by
     /// [`stub_result`], every `raise` resumed with a plausible answer.
     /// Deliberately not the real machine — this checks the program
     /// against its tools, and wants no conversation around it.
-    fn run_against_stubs(src: &str) -> Result<(), String> {
-        use interp::{StepResult, VM};
+    fn run_against_stubs(src: &str) -> Result<Ending, String> {
+        use interp::{StepResult, VM, Value};
         let program = interp::compile(src).map_err(|e| format!("{e:?}"))?;
         let mut vm = VM::for_program(program, serde_json::Value::Null)
             .map_err(|e| format!("could not start: {e:?}"))?;
+        let mut done = false;
         loop {
             match vm.step(u64::MAX).map_err(|e| format!("{e:?}"))? {
-                StepResult::Done { .. } => return Ok(()),
+                StepResult::Done { value, .. } => {
+                    return Ok(Ending {
+                        done,
+                        returned: !matches!(value, Value::Undefined),
+                    });
+                }
                 StepResult::Pending { calls } => {
                     for call in calls {
+                        // `done()` settles at dispatch in the real
+                        // machine and never leaves the process; here it
+                        // is just a call whose name is worth noting.
+                        if call.name == crate::machine::TOOL_DONE {
+                            done = true;
+                        }
                         let result = stub_result(&call.name, &call.args);
                         let value = vm
                             .json_to_stack_value(&result, 0)
@@ -388,7 +411,10 @@ mod tests {
                     // `next_program` is a raise too, and it ends the
                     // program rather than resuming into it.
                     if condition == interp::NEXT_PROGRAM_CONDITION {
-                        return Ok(());
+                        return Ok(Ending {
+                            done,
+                            returned: true,
+                        });
                     }
                     let value = vm
                         .json_to_stack_value(&json!("backup-2.txt"), 0)
@@ -400,6 +426,108 @@ mod tests {
                 StepResult::OutOfFuel => {}
             }
         }
+    }
+
+    /// **Every exemplar ends on purpose.** Since 27.1 a program that
+    /// runs off the end does not stop — the next one is written — so
+    /// falling off the end is no longer an ending at all, and an
+    /// exemplar that did it would be teaching the accident the whole
+    /// change exists to prevent. Each one either calls `done()`,
+    /// because its task is finished, or returns the thing the next
+    /// program continues from.
+    ///
+    /// Not both: `done()` rests the branch, so a value returned beside
+    /// it is read by nobody, and writing one says the author expected
+    /// something to come next.
+    #[test]
+    fn every_exemplar_ends_on_purpose() {
+        for ex in &exemplars() {
+            let ending = run_against_stubs(&ex.assistant)
+                .unwrap_or_else(|e| panic!("exemplar for {:?} trapped: {e}", ex.user));
+            assert!(
+                ending.done || ending.returned,
+                "exemplar for {:?} runs off the end — under automatic \
+                 continuation that is not an ending",
+                ex.user
+            );
+            assert!(
+                !(ending.done && ending.returned),
+                "exemplar for {:?} calls done() *and* returns a value — \
+                 nothing will read the value",
+                ex.user
+            );
+        }
+    }
+
+    /// **The eval card variants end on purpose too.** They are inputs
+    /// to measurements, and a broken one does not fail loudly — it
+    /// produces a *worse number*, which is indistinguishable from a
+    /// real finding until someone reads the logs. Two exemplars have
+    /// already shipped teaching a field the tools do not return; that
+    /// cost a day of attributing the result to the card's prose.
+    ///
+    /// The check is textual and deliberately coarse — does an ending
+    /// appear in the source at all — because these are not compiled
+    /// against a real machine here and a stricter reading would start
+    /// asserting things about control flow that only a run can settle.
+    /// It catches the one shape that is now simply wrong: an exemplar
+    /// with no ending anywhere in it.
+    ///
+    /// Only the ending is checked, not runnability: `sketch` exists to
+    /// test the opposite hypothesis — exemplars as *shape*, with
+    /// `path(site)` and `needleFor(site)` deliberately undefined — so
+    /// running these against stubs would be asserting the very thing
+    /// that variant is there to question. The shipped exemplars are
+    /// held to both (`every_exemplar_ends_on_purpose`); these to the
+    /// one that is about the card's claims rather than its code.
+    ///
+    /// Skipped silently when `evals/` is not beside the crate (a
+    /// published tarball, a sparse checkout): its absence is not a
+    /// defect in the agent.
+    #[test]
+    fn every_eval_card_variant_ends_on_purpose() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("evals/cards");
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            return;
+        };
+        let mut checked = 0;
+        for entry in entries.filter_map(|e| e.ok()) {
+            let dir = entry.path();
+            if !dir.join("card.md").is_file() {
+                continue;
+            }
+            let card = load_from(&dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
+            for ex in &card.exemplars {
+                interp::compile(&ex.assistant).unwrap_or_else(|e| {
+                    panic!(
+                        "{} exemplar for {:?} does not parse: {e:?}",
+                        dir.display(),
+                        ex.user
+                    )
+                });
+                let ends = ex.assistant.contains("done()")
+                    || ex
+                        .assistant
+                        .lines()
+                        .any(|l| l.trim_start().starts_with("return"));
+                assert!(
+                    ends,
+                    "{} exemplar for {:?} has no ending in it at all — \
+                     under automatic continuation, running off the end \
+                     is not one",
+                    dir.display(),
+                    ex.user
+                );
+            }
+            checked += 1;
+        }
+        assert!(
+            checked >= 2,
+            "found only {checked} card variants under {root:?}"
+        );
     }
 
     #[test]

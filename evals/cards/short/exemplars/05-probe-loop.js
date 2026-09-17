@@ -9,4 +9,4 @@ for (const site of sites) {
     if (ok.status === 0) gone.push(site);
     else { await tools.replace_file(path(site), f.content, w.version); kept.push(site); }
 }
-next_program({ question: "the sweep is done — check the tree still builds and report", gone, kept });
+return { question: "the sweep is done — check the tree still builds and report", gone, kept };

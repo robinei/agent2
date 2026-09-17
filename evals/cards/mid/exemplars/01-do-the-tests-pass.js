@@ -5,3 +5,6 @@ if (result.status === 0) {
 } else {
     tell(`tests failed:\n${result.stdout}`);
 }
+// The question is answered, so the task is over. Without this, the
+// next program is written and finds nothing left to do.
+done();
