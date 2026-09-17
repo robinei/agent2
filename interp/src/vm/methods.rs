@@ -516,7 +516,8 @@ impl VM {
     }
 
     /// Allocate a fresh `Pending` promise. Used by `Instr::Invoke` (leaf tool
-    /// promises) and by first suspension of an async call (Tier 2).
+    /// promises) and by `Instr::AsyncEnter` (an async call's own promise,
+    /// Tier 2).
     pub(super) fn alloc_promise(&mut self) -> PromisePtr {
         let id = self.promises.len() as PromisePtr;
         self.promises.push(PromiseState::Pending {
@@ -568,35 +569,113 @@ impl VM {
 
     // ── Tier 2: suspend / resume / schedule ──────────────────────────
 
-    /// Whether execution is currently inside a scheduler-resumed strand.
-    /// Resumed frames are only ever pushed while the root frame alone is
-    /// live, so a strand's base — when one exists — is `callstack[1]`.
+    /// Callstack index of the innermost async frame: the base of the strand
+    /// a throw would escape into, and the owner of the promise that throw
+    /// rejects. Everything at or above `base` is that call's own execution
+    /// (the async frame plus any sync calls it made); everything below
+    /// belongs to someone else — the parked root, or a caller that already
+    /// took the call's promise and moved on.
+    ///
+    /// Scanning from the top, rather than asking whether `callstack[1]` is a
+    /// resumed frame, is what makes a *directly called* async function a
+    /// strand at all: it sits at whatever depth its caller happens to be at,
+    /// and a body that throws before it ever suspends never becomes a
+    /// scheduler-resumed frame. With the narrower test, such a throw escaped
+    /// to the caller instead of rejecting.
+    pub(super) fn strand_base(&self) -> Option<usize> {
+        self.callstack
+            .iter()
+            .rposition(|f| f.completion.promise().is_some())
+    }
+
+    /// Whether execution is inside an async call's own frames — i.e. whether
+    /// there is a promise for an escaping throw to reject.
     pub(super) fn in_strand(&self) -> bool {
-        self.callstack.len() > 1
-            && matches!(self.callstack[1].completion, Completion::ResolvePromise(_))
+        self.strand_base().is_some()
     }
 
     /// Whether the innermost `try` handler may catch a throw from the
-    /// current position. Inside a resumed strand, the parked root strand's
-    /// handlers (entries pushed at top level, `callstack_len == 1`) are
-    /// walled off: a throw escaping the strand rejects its promise instead
-    /// of unwinding into code that isn't executing.
+    /// current position. Handlers belonging to frames *below* the innermost
+    /// async frame are walled off: a throw escaping an async call rejects
+    /// that call's promise, and must not unwind into the code below, which
+    /// is either parked (a resumed strand sits above the root's own region)
+    /// or has already moved past the call holding its promise. So
+    /// `try { b(); } catch` around a call to an async `b` whose body throws
+    /// catches nothing — in JS it catches nothing either, because the call
+    /// returned a rejected promise instead of throwing.
+    ///
+    /// A `TryEnter` in frame `k` records `callstack_len == k + 1`, so "at or
+    /// above the strand base `k`" is exactly `callstack_len > k`.
     pub(super) fn reachable_handler(&self) -> bool {
-        match self.handlers.last() {
-            None => false,
-            Some(h) => !self.in_strand() || h.callstack_len > 1,
+        match (self.handlers.last(), self.strand_base()) {
+            (None, _) => false,
+            (Some(_), None) => true,
+            (Some(h), Some(base)) => h.callstack_len > base,
+        }
+    }
+
+    /// The last step of every async-frame exit — `Return`, suspension, and
+    /// rejection alike: the frame's region (and the caller's call group under
+    /// it) is already off the stack, and the promise it settled now goes to
+    /// whoever is waiting for it. A frame entered by a call hands the promise
+    /// back as the call's value; a scheduler-resumed frame has nobody below
+    /// it and falls through to the scheduler. Keeping the three exits on one
+    /// rule is why a throw and a `return` leave an async call in the same
+    /// shape.
+    pub(super) fn leave_async_frame(
+        &mut self,
+        completion: Completion,
+        return_addr: CodeAddr,
+    ) -> Result<(), VMError> {
+        match completion {
+            Completion::AsyncCall(pid) => {
+                self.stack.push(Value::Promise(pid));
+                self.ip = return_addr;
+                Ok(())
+            }
+            Completion::Resumed(_) => self.schedule(),
+            Completion::Normal => Err(self.fail_not_resumable(
+                ErrorKind::BadReturn,
+                "async exit from a frame that owns no promise",
+            )),
         }
     }
 
     /// Tier 2 suspension: at a pending `await` in an async function frame,
     /// copy the frame (stack region + metadata + its own handler entries)
     /// into a continuation record registered as a waiter on `awaiting`, and
-    /// pop the frame, reusing the `Return` machinery. On *first* suspension
-    /// (frame entered by a direct call) a fresh promise is pushed onto the
-    /// caller's stack as the call's return value — the caller, sync or
-    /// async, just continues. On *re-suspension* (frame entered by scheduler
-    /// resume) control falls through to the scheduler.
+    /// pop the frame, reusing the `Return` machinery. The frame leaves the
+    /// way any async frame leaves (`leave_async_frame`): its promise —
+    /// unsettled here, since the call has not finished — goes to the caller
+    /// as the call's value, or, for a frame the scheduler resumed, control
+    /// falls through to the scheduler.
     pub(super) fn suspend_current_frame(&mut self, awaiting: PromisePtr) -> Result<(), VMError> {
+        // An async body has owned its promise since its `AsyncEnter`
+        // prologue. A *sync* frame can suspend too, though, and that one
+        // mints its promise here: the settle-at-dispatch verbs (`spawn`,
+        // `fork`, `done`, `remove_history`, `rewrite_history` — see
+        // `compiler/call.rs`) emit their `Await` themselves rather than
+        // requiring one in the source, so `names.map(n => spawn(n))` awaits
+        // inside a plain arrow. Suspending is the first moment such a call
+        // owes its caller a value, and a promise is the only thing that value
+        // can be — while before it, a throw still belongs to the caller,
+        // which is exactly right for a function nobody declared `async`.
+        // (For an async body the same late minting was wrong, and was the
+        // bug: a body that threw before ever suspending had nothing to
+        // reject, so the throw escaped to the caller.)
+        //
+        // Read before anything is torn down — past this point the frame is in
+        // pieces and there is no coherent state to fail from.
+        let Some(entered_as) = self.callstack.last().map(|f| f.completion) else {
+            return Err(self.fail(ErrorKind::BadReturn, "suspend without a frame"));
+        };
+        let (promise, exit_as) = match entered_as {
+            Completion::Normal => {
+                let pid = self.alloc_promise();
+                (pid, Completion::AsyncCall(pid))
+            }
+            Completion::AsyncCall(pid) | Completion::Resumed(pid) => (pid, entered_as),
+        };
         // The Await consumes its operand: the promise leaves the stack now;
         // resume pushes the settled value in its place and continues past
         // the Await.
@@ -635,10 +714,6 @@ impl VM {
         // like `Return` — that promise must land at `fp - reclaim_below`.
         self.stack
             .truncate(self.stack.len() - frame.reclaim_below as usize);
-        let (promise, first_suspension) = match frame.completion {
-            Completion::Normal => (self.alloc_promise(), true),
-            Completion::ResolvePromise(pid) => (pid, false),
-        };
         let cont_id = self.continuations.len() as u32;
         self.continuations.push(Some(Continuation {
             resume_ip,
@@ -659,13 +734,7 @@ impl VM {
                 );
             }
         }
-        if first_suspension {
-            self.stack.push(Value::Promise(promise));
-            self.ip = frame.return_addr;
-        } else {
-            self.schedule()?;
-        }
-        Ok(())
+        self.leave_async_frame(exit_as, frame.return_addr)
     }
 
     /// The scheduler: resume the next woken continuation (deterministic
@@ -733,8 +802,8 @@ impl VM {
     }
 
     /// Resume = re-push and jump: re-create the suspended frame at the
-    /// current stack top in `ResolvePromise` completion mode (a resumed
-    /// frame has no caller below it), re-base its saved handler entries,
+    /// current stack top in `Resumed` completion mode (it keeps the same
+    /// promise, but has no caller below it now), re-base its handler entries,
     /// then push the resolved value and jump past the await — or unwind a
     /// rejection to the innermost re-based handler. No `EnterFrame` runs.
     fn resume_continuation(&mut self, cont: Continuation, payload: ResumePayload) {
@@ -750,7 +819,7 @@ impl VM {
             this_val: Value::Undefined,
             new_obj: None,
             reclaim_below: 0,
-            completion: Completion::ResolvePromise(cont.promise),
+            completion: Completion::Resumed(cont.promise),
         });
         self.fp = new_fp;
         self.cur_local_count = cont.local_count;
@@ -777,32 +846,47 @@ impl VM {
         }
     }
 
-    /// An uncaught throw / rejection / catchable VM error escaping a
-    /// resumed strand: reject the strand's promise (waking waiters),
-    /// discard the strand's frames and handler entries, and fall through
-    /// to the scheduler. The parked root region below is untouched.
+    /// An uncaught throw / rejection / catchable VM error escaping an async
+    /// call: reject that call's promise (waking waiters), discard the call's
+    /// own frames and handler entries, and leave the frame exactly as a
+    /// `Return` would — the caller gets the (rejected) promise as the call's
+    /// value, or a resumed strand falls through to the scheduler. Everything
+    /// below the strand base is untouched: it is either the parked root
+    /// region or a caller this throw must not reach.
     pub(super) fn reject_strand(&mut self, errval: Value) -> Result<(), VMError> {
-        let Completion::ResolvePromise(pid) = self.callstack[1].completion else {
+        let Some(base) = self.strand_base() else {
             return Err(
                 self.fail_not_resumable(ErrorKind::BadReturn, "reject_strand outside a strand")
             );
         };
+        let (completion, return_addr, prev_fp, reclaim_below) = {
+            let f = &self.callstack[base];
+            (f.completion, f.return_addr, f.prev_fp, f.reclaim_below)
+        };
+        let Some(pid) = completion.promise() else {
+            unreachable!("strand_base only ever names a frame that owns a promise");
+        };
         // The strand base frame's fp: the current fp when no sync frames
         // sit above it, else the first such frame's saved prev_fp.
-        let strand_fp = if self.callstack.len() > 2 {
-            self.callstack[2].prev_fp
+        let base_fp = if self.callstack.len() > base + 1 {
+            self.callstack[base + 1].prev_fp
         } else {
             self.fp
         };
-        self.stack.truncate(strand_fp as usize);
-        self.fp = self.callstack[1].prev_fp;
-        self.callstack.truncate(1);
+        // Drop the frame's region *and* the call group the caller left under
+        // it (callee/receiver), like `Return`'s `keep_below`: the promise
+        // `leave_async_frame` pushes has to land where the call's value goes.
+        // A resumed frame reclaims nothing — it has no call group.
+        self.stack
+            .truncate(base_fp as usize - reclaim_below as usize);
+        self.fp = prev_fp;
+        self.callstack.truncate(base);
         self.cur_local_count = self.callstack.last().map_or(0, |f| f.local_count);
-        while self.handlers.last().is_some_and(|h| h.callstack_len > 1) {
+        while self.handlers.last().is_some_and(|h| h.callstack_len > base) {
             self.handlers.pop();
         }
         self.settle_and_wake(pid, PromiseState::Rejected(errval))?;
-        self.schedule()
+        self.leave_async_frame(completion, return_addr)
     }
 
     /// The dedicated deadlock error (commitment 4's payoff: promises only

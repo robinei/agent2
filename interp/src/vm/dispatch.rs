@@ -1406,10 +1406,13 @@ impl VM {
                     if self.stack.len() < keep_below + n {
                         return Err(self.fail(ErrorKind::StackUnderflow, "stack underflow"));
                     }
-                    if let Completion::ResolvePromise(pid) = frame.completion {
-                        // A scheduler-resumed async frame has no caller below:
-                        // resolve its promise with the return value (waking
-                        // waiters) and fall through to the scheduler.
+                    if let Some(pid) = frame.completion.promise() {
+                        // An async frame returns its *promise*, not its value:
+                        // resolve the promise its `AsyncEnter` allocated (waking
+                        // waiters, who run at the next await point — no
+                        // preemption) and hand it to the caller below, or, for a
+                        // scheduler-resumed frame with no caller, fall through to
+                        // the scheduler.
                         let value = if n == 0 {
                             Value::Undefined
                         } else {
@@ -1419,7 +1422,7 @@ impl VM {
                         self.fp = frame.prev_fp;
                         self.cur_local_count = self.callstack.last().map_or(0, |f| f.local_count);
                         self.settle_and_wake(pid, PromiseState::Resolved(value))?;
-                        self.schedule()?;
+                        self.leave_async_frame(frame.completion, frame.return_addr)?;
                         continue;
                     }
                     let ret_start = self.stack.len() - n;
@@ -1568,6 +1571,22 @@ impl VM {
                     let total = nparams as u32 + k + local_kinds.len() as u32;
                     self.callstack.last_mut().unwrap().local_count = total;
                     self.cur_local_count = total;
+                    self.ip += 1;
+                }
+
+                Instr::AsyncEnter => {
+                    // The second half of an async prologue: this call owns a
+                    // promise from here on, and every exit settles it — `Return`
+                    // resolves it, an escaping throw rejects it, a pending
+                    // `await` suspends into it. It reaches the caller as the
+                    // call's return value whenever the frame leaves, which is
+                    // also the first moment anything could observe it: until
+                    // then this frame sits on top of the caller's stack.
+                    let pid = self.alloc_promise();
+                    let Some(frame) = self.callstack.last_mut() else {
+                        return Err(self.fail(ErrorKind::BadCall, "AsyncEnter without a frame"));
+                    };
+                    frame.completion = Completion::AsyncCall(pid);
                     self.ip += 1;
                 }
 

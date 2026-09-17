@@ -1198,7 +1198,8 @@ returns). A new `Completion` variant handles the discarding:
 ```rust
 pub(super) enum Completion {
     Normal,
-    ResolvePromise(PromisePtr),
+    AsyncCall(PromisePtr),
+    Resumed(PromisePtr),
     /// Setter call: when Return fires, discard the setter's return value and
     /// push `result_val` instead (the assigned value for the ObjSet result).
     SetterReturn(Value),

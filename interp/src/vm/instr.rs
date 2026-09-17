@@ -492,21 +492,39 @@ pub enum Instr {
     /// it, so nothing can ever await it here even by accident.
     Notify(RcStr, ArgCount), // any, ... -> undefined
 
+    /// Second half of an **async** function's prologue, emitted right after
+    /// `EnterFrame` (and before any code that can throw — a param default,
+    /// say): allocate this call's promise and record it on the frame, so the
+    /// frame knows from its first instruction what it settles on the way out.
+    /// Every exit goes through that one promise: `Return` resolves it, an
+    /// uncaught throw rejects it, a pending `await` suspends into it. The
+    /// promise reaches the caller when the frame leaves — as the call's
+    /// return value — which is the only moment it could be observed anyway,
+    /// since the callee's frame sits on top of the caller until then.
+    ///
+    /// Allocating here rather than at the first suspension is what makes a
+    /// throw before any `await` reject instead of escaping to the caller: a
+    /// body that never suspends still has a promise to reject.
+    /// Stack: () -> ()
+    AsyncEnter,
+
     /// Await the top of stack. A non-promise passes through unchanged (JS
     /// `await x` on a plain value). A Resolved promise is replaced by its
     /// value (a promise resolved with a promise is adopted: the Await
     /// re-executes on the innermost one; a cycle is the JS "chaining cycle"
     /// TypeError). A Rejected one consumes the promise and unwinds to a
-    /// reachable `try` handler, rejects the enclosing strand's promise
-    /// (inside a resumed continuation), or escalates the rejection value as
-    /// a resumable error (Phase 3 path — the host may substitute a value).
+    /// reachable `try` handler, rejects the enclosing async call's promise
+    /// (anywhere inside one), or escalates the rejection value as a
+    /// resumable error (Phase 3 path — the host may substitute a value).
     /// A Pending promise depends on where the Await sits (7_ASYNC Tier 2):
-    ///  - below top level it is inside an async function's own frame (the
-    ///    parser confines `await` there) — that one frame is suspended into
-    ///    a continuation record (zero stack left behind) and registered as
-    ///    a waiter; a first suspension pushes a fresh promise to the caller
-    ///    as the call's return value, a re-suspension falls through to the
-    ///    scheduler;
+    ///  - below top level it suspends exactly that one frame into a
+    ///    continuation record (zero stack left behind), registered as a
+    ///    waiter on the promise; the frame then leaves as any async frame
+    ///    does — a frame entered by a call pushes its own promise (the one
+    ///    `AsyncEnter` allocated, or, for a sync frame suspended by a
+    ///    compiler-emitted `Await`, one minted on the spot) to the caller as
+    ///    the call's return value, while a scheduler-resumed frame falls
+    ///    through to the scheduler;
     ///  - at top level the root strand parks in place: ready continuations
     ///    run above the parked region, and with nothing ready it yields
     ///    `StepResult::Pending` carrying the drained outbox with ip

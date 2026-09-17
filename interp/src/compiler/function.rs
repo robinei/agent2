@@ -243,6 +243,7 @@ impl super::Compiler {
             captures,
             this_slot,
             js_length,
+            is_async,
         ) = {
             let analysis = self.analysis.as_ref().expect("analysis present");
             let scope = &analysis.scopes[scope_id];
@@ -257,6 +258,7 @@ impl super::Compiler {
                 scope.captures.clone(),
                 scope.this_slot,
                 scope.js_length(),
+                scope.is_async,
             )
         };
         let nparams = params_info.len() as u32;
@@ -318,6 +320,13 @@ impl super::Compiler {
             Instr::EnterFrame(nparams as u16, uses_arguments, local_kinds.into()),
             span,
         );
+        // An async body allocates its promise here, before anything that can
+        // throw (a param default is the first such thing), so that every way
+        // out of this frame settles the same promise — including a throw that
+        // happens before the body ever suspends.
+        if is_async {
+            self.emit(Instr::AsyncEnter, span);
+        }
 
         // Reify `this` for arrow capture: copy frame.this_val into a captured
         // Boxed local so nested arrows can capture it through the standard upval

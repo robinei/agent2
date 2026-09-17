@@ -137,6 +137,12 @@ pub(crate) struct FuncScope {
     pub(crate) slot_kinds: Vec<SlotKind>,
     /// Whether this function scope is an arrow function (no own `this`).
     pub(crate) is_arrow: bool,
+    /// Whether this function scope is `async`. The prologue of an async body
+    /// emits `AsyncEnter`, which allocates the call's promise at frame setup
+    /// (7_ASYNC Tier 2) — the promise has to exist before the first
+    /// instruction that can throw, or a body that throws before ever
+    /// suspending would have nothing to reject.
+    pub(crate) is_async: bool,
     /// If this non-arrow scope reifies `this` for arrow capture, the own-local
     /// slot index that holds the reified `this` value. `None` otherwise.
     pub(crate) this_slot: Option<u32>,
@@ -198,6 +204,7 @@ impl FuncScope {
             uses_arguments: false,
             slot_kinds: Vec::new(),
             is_arrow: false,
+            is_async: false,
             this_slot: None,
             needs_this_reify: false,
         }
@@ -315,6 +322,7 @@ impl Analyzer {
             self_name,
             is_declaration,
         );
+        scope.is_async = func.r#async;
         if func.params.rest.is_some() {
             scope.uses_arguments = true;
         }
@@ -346,6 +354,7 @@ impl Analyzer {
             false,
         );
         scope.is_arrow = true;
+        scope.is_async = arrow.r#async;
         if arrow.params.rest.is_some() {
             scope.uses_arguments = true;
         }
