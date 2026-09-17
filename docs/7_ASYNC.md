@@ -20,6 +20,18 @@
 > - A rejection delivered to a continuation with no handler around its
 >   await propagates to that call's own promise without materializing the
 >   frame at all.
+> - **The call's promise is allocated at frame entry, not at first
+>   suspension** (2026-09-17). An async body's prologue is `EnterFrame` +
+>   `AsyncEnter`, and that second instruction allocates the promise and
+>   records it on the frame, so every exit — `Return`, suspension, uncaught
+>   throw — settles the same promise and hands it to the caller as the
+>   call's value. This removed both accepted divergences below: an async
+>   call now always returns a promise, and a body that throws before it
+>   ever suspends rejects instead of escaping to the caller. Allocating it
+>   at the first suspension meant a body that never suspended had nothing
+>   to reject, so the throw escaped synchronously — `try { await p }` in
+>   the caller could not catch it, and a throwing `.then` handler was not
+>   routed to a following `.catch`.
 > - The await-chain diagnostic renders in the `Deadlock` error message
 >   (the one place a suspended chain produces an error with no stack).
 >
@@ -153,10 +165,17 @@ and moved on. Exactly one frame ever needs saving.
    handler-stack entries belonging to this frame) into a **continuation
    record** `(resume_ip, saved_region, frame_meta, await_span)`; register
    it as a waiter on the promise; pop the frame, reusing the `Return`
-   machinery. On **first** suspension (frame entered by direct call), push
-   a fresh promise onto the caller's stack as the return value — the
-   caller, sync or async, just continues. On a **re-suspension** (frame
-   entered by scheduler resume), fall through to the scheduler.
+   machinery. The frame then leaves the way every async frame leaves: a
+   frame entered by a **direct call** pushes its promise — allocated by its
+   `AsyncEnter` prologue, so already in hand — onto the caller's stack as
+   the call's return value, and the caller, sync or async, just continues;
+   a frame entered by **scheduler resume** has no caller below and falls
+   through to the scheduler. (One frame can suspend without an `AsyncEnter`
+   promise: the settle-at-dispatch verbs `spawn`/`fork`/`done`/
+   `remove_history`/`rewrite_history` emit their own `Await`, so a *sync*
+   function can suspend. That frame mints its promise at the suspension —
+   which for a sync function is right: suspending is the first moment it
+   owes its caller a value, and until then a throw belongs to the caller.)
 2. **Resume = re-push and jump.** Push the saved region at the current
    stack top, recompute `fp` (everything is fp-relative — `Local`/`Pick`/
    `Dig` survive relocation; no instruction stores absolute stack
@@ -164,27 +183,36 @@ and moved on. Exactly one frame ever needs saving.
    resolved value, jump to `resume_ip`. No `EnterFrame` runs on resume.
    A rejected promise instead dispatches to the re-based handler (6B) or
    rejects this frame's own promise (propagation).
-3. **Completion modes on the frame.** A resumed frame has no caller below
-   it: `CallFrame` gains `completion: Normal | ResolvePromise(PromiseId)`.
-   `Return` in `ResolvePromise` mode resolves the promise with the return
-   value (waking waiters) and falls through to the scheduler; an uncaught
-   throw rejects it.
+3. **Completion modes on the frame.** `CallFrame` gains
+   `completion: Normal | AsyncCall(PromiseId) | Resumed(PromiseId)`. Both
+   async modes own the same promise; they differ only in who is waiting for
+   it. `Return` settles it with the return value (waking waiters) and then
+   hands it to the caller below (`AsyncCall`) or falls through to the
+   scheduler (`Resumed`, which has no caller below it); an uncaught throw
+   rejects it and leaves by the same two routes. The innermost frame with a
+   promise is the **strand base**: a throw escaping it rejects that promise,
+   and handlers belonging to frames *below* the base are walled off — they
+   are either parked (the root, under a resumed strand) or already past the
+   call, holding its promise.
 
 The **root strand** parks in place: top-level await leaves the root region
 (locals + temps) where it is, and ready continuations execute above it —
 the invariant guarantees they leave nothing behind, so the root's `Await`
 re-executes against an intact region.
 
-Accepted divergences (document in the divergence list): an async function
-that completes without ever suspending returns its plain value, not a
-wrapped promise (`await` passes non-promises through and `await` is the
-only promise consumer in this dialect — observationally invisible,
-including to the `__all` prelude); a throw before the first suspension
-propagates synchronously to the caller instead of rejecting.
+Both of this section's original divergences are gone, retired by the
+call-time allocation above (2026-09-17): an async call returns a promise
+whether or not it ever suspends, and a throw anywhere in an async body —
+before the first suspension included — rejects that promise instead of
+propagating synchronously to the caller. What remains of the old note is
+its reasoning: `await` passes non-promises through and is the only promise
+consumer in this dialect, which is why the first divergence was invisible
+for as long as it lasted.
 
 Resulting work split: compiler ≈ accept `async` flags + emit `Await` +
-prelude/method-table rows (small); analyzer untouched (existing capture
-analysis already boxes exactly what closures share); optimizer ≈ classify
+prelude/method-table rows (small); analyzer ≈ one flag (`FuncScope::is_async`,
+so the prologue knows to emit `AsyncEnter` — the rest untouched, since the
+existing capture analysis already boxes exactly what closures share); optimizer ≈ classify
 `Await` as an effect barrier like `Invoke`; **the VM carries the feature**
 (promise heap, outbox, suspend/resume copy, completion modes, scheduler,
 deadlock detection, host resolve API). Suspension cost is one copy of one
@@ -214,9 +242,12 @@ tools.fetch at 12:9, awaited by __all at 3:14, awaited at top level 3:1").
 
 Note: the "run synchronously until the first pending await" optimization
 falls out of this design for free — an async call IS an ordinary call on
-the caller's stack, and nothing is heap-materialized unless it actually
+the caller's stack, and no *frame* is heap-materialized unless it actually
 suspends. The common case (async fn whose awaits all hit already-resolved
-promises) allocates nothing.
+promises) costs one promise slot, allocated by the prologue so that a body
+that throws before suspending has something to reject; the promise heap
+grows monotonically like the others, so a hot loop over async calls pays
+for it in slots.
 
 Tests: the canonical chain pattern
 (`Promise.all(items.map(async it => tools.g(await tools.f(it))))` resolves

@@ -476,12 +476,22 @@ fn promise_combinators_run() {
     assert_eq!(eval_str("String(await (7).catch((e) => 0))"), "7");
     assert_eq!(eval_str("String(await (7).finally(() => 1))"), "7");
 
-    // A handler that *throws* is not routed to the next link, because
-    // an async body that throws escapes rather than rejecting in this
-    // VM — pinned by `an_async_body_that_throws_escapes_instead_of_
-    // rejecting`, which predates these helpers and is not caused by
-    // them. A rejected *call* does reach `.catch`, which is the case
-    // that actually happens: `a_rejected_call_reaches_dot_catch`.
+    // A handler that *throws* is routed to the next link, because the
+    // helper is an async function and an async body that throws rejects
+    // its promise (`an_async_body_that_throws_rejects_its_promise`).
+    // These two assertions were dropped while that was still broken;
+    // they are the reason `.then(f).catch(g)` is worth having at all.
+    assert_eq!(
+        eval_str("await (1).then(() => { throw new Error(\"boom\"); }).catch((e) => e.message)"),
+        "boom"
+    );
+    assert_eq!(
+        eval_str(
+            "await (1).then(() => { throw new Error(\"boom\"); }, (e) => \"unused\")\
+             .catch((e) => e.message)"
+        ),
+        "boom"
+    );
 }
 
 /// Chaining composes because each helper is an `async function`, so it
@@ -522,17 +532,19 @@ fn a_rejected_call_reaches_dot_catch() {
     }
 }
 
-/// **A known gap, pinned rather than papered over.** An `async`
-/// function whose body throws does not reject its promise in this VM —
-/// the throw escapes synchronously to whoever called it, even when the
-/// caller stores the promise and awaits it later inside a `try`. It
-/// predates the combinators and is not caused by them (the third case
-/// here uses no combinator at all), but it is why `p.then(f)` does not
-/// route a throw from `f` into a following `.catch`.
+/// **The gap this used to pin is closed.** An `async` function whose
+/// body throws rejects its promise, so a caller that holds the promise
+/// and awaits it later inside a `try` catches the error, instead of the
+/// throw escaping synchronously to whoever made the call.
 ///
-/// Recorded as a test so the day it is fixed, this fails and says so.
+/// What changed: the call's promise is allocated by the prologue
+/// (`AsyncEnter`) rather than at the first suspension, so a body that
+/// throws before it ever suspends still has a promise to reject — and
+/// this body suspends nowhere, since `await 1` on a non-promise passes
+/// straight through. It is also why a throw from inside `p.then(f)` now
+/// reaches a following `.catch` (`promise_combinators_run`).
 #[test]
-fn an_async_body_that_throws_escapes_instead_of_rejecting() {
+fn an_async_body_that_throws_rejects_its_promise() {
     let src = "function t() { throw new Error(\"x\"); }\n\
                async function b() { await 1; return t(); }\n\
                const p = b();\n\
@@ -540,8 +552,10 @@ fn an_async_body_that_throws_escapes_instead_of_rejecting() {
                return \"no throw\";";
     let prog = compile(src).expect("compiles");
     let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
-    let err = vm
-        .step(u64::MAX)
-        .expect_err("escapes rather than rejecting");
-    assert_eq!(err.kind, crate::vm::ErrorKind::UncaughtException, "{err:?}");
+    match vm.step(u64::MAX).expect("rejects rather than escaping") {
+        StepResult::Done { value, .. } => {
+            assert_eq!(value, Value::String("caught".into()));
+        }
+        other => panic!("expected Done, got {other:?}"),
+    }
 }

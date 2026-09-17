@@ -451,18 +451,20 @@ fn await_in_loop_head_resumes_repeatedly() {
 }
 
 #[test]
-fn async_fn_without_suspension_returns_plain_value() {
-    // Accepted divergence: completing without ever suspending returns the
-    // plain value, not a wrapped promise — observationally invisible since
-    // `await` passes non-promises through and is the only promise consumer.
+fn async_fn_without_suspension_still_returns_a_promise() {
+    // The promise is allocated in the prologue (`AsyncEnter`), not at the
+    // first suspension, so *every* async call returns one — a body that runs
+    // straight through included. This used to be an accepted divergence (the
+    // plain value came back instead); it went when the promise had to exist
+    // early enough for a throw before any `await` to reject it.
     let result = run_ret(
         r#"
         async function id(x) { return x; }
         const v = id(5);
-        return [typeof v, v, await id(6)];
+        return [typeof v, await v, await id(6)];
         "#,
     );
-    assert_eq!(result, serde_json::json!(["number", 5, 6]));
+    assert_eq!(result, serde_json::json!(["object", 5, 6]));
 }
 
 #[test]
@@ -563,25 +565,30 @@ fn suspended_handler_does_not_leak_into_root() {
 }
 
 #[test]
-fn throw_before_first_suspension_propagates_synchronously() {
-    // Accepted divergence: until its first suspension an async body runs on
-    // the caller's stack, so an early throw reaches the caller's `try`
-    // directly (JS would reject the promise instead).
+fn throw_before_first_suspension_rejects_like_any_other() {
+    // The other half of the divergence that went with call-time promise
+    // allocation: a body that throws before it ever suspends rejects its
+    // promise rather than escaping to the caller. So the `try` around the
+    // *call* catches nothing — the call returns a (rejected) promise, it
+    // does not throw, exactly as in JS — and the `try` around the `await`
+    // is what sees the error.
     let result = run_ret(
         r#"
         async function boom() { throw "sync"; }
-        try { boom(); } catch (e) { return "caught:" + e; }
-        return "uncaught";
+        let seen = "call-did-not-throw";
+        try { boom(); } catch (e) { seen = "wrongly caught at the call"; }
+        try { await boom(); } catch (e) { seen = seen + "|awaited:" + e; }
+        return seen;
         "#,
     );
-    assert_eq!(result, serde_json::json!("caught:sync"));
+    assert_eq!(result, serde_json::json!("call-did-not-throw|awaited:sync"));
 }
 
 #[test]
 fn throw_after_suspension_rejects_promise() {
-    // After the first suspension the frame belongs to a strand: an uncaught
-    // throw rejects the call's promise (JS semantics) instead of unwinding
-    // into the parked root — even though the root has a `try` active.
+    // The throw happens in the resumed frame, which has no caller below it:
+    // it rejects the call's promise (JS semantics) instead of unwinding into
+    // the parked root — even though the root has a `try` active.
     let src = r#"
         async function boom() { await tools.f(); throw "late"; }
         const p = boom();
@@ -592,6 +599,121 @@ fn throw_after_suspension_rejects_promise() {
     let calls = expect_pending(&mut vm);
     vm.resolve_promise(calls[0].promise, Value::Null).unwrap();
     assert_eq!(expect_done_json(&mut vm), serde_json::json!("caught:late"));
+}
+
+#[test]
+fn a_throw_from_a_nested_sync_call_rejects_the_promise() {
+    // The throw starts two frames above the async one (`b` calls `t`), and
+    // the async call had not suspended — its promise exists anyway, from the
+    // prologue on, so the rejection has somewhere to go. The `try` around the
+    // *call* deliberately catches nothing: the call returns a promise, and
+    // awaiting it is what raises the error, exactly as in JS.
+    let result = run_ret(
+        r#"
+        function t() { throw "deep"; }
+        function mid() { return t(); }
+        async function b() { return mid(); }
+        let seen = "call-did-not-throw";
+        try { const p = b(); seen = seen + "|" + typeof p; await p; }
+        catch (e) { seen = seen + "|awaited:" + e; }
+        return seen;
+        "#,
+    );
+    assert_eq!(
+        result,
+        serde_json::json!("call-did-not-throw|object|awaited:deep")
+    );
+}
+
+#[test]
+fn a_throw_crosses_two_nested_async_frames() {
+    // `inner` rejects its promise; `outer` awaits it with no handler of its
+    // own, so the rejection rejects *outer's* promise in turn; the top-level
+    // `await` inside a `try` is the first handler that may run. Neither call
+    // ever suspends — nothing here is pending — so the whole chain is the
+    // call-time promises propagating, not the scheduler.
+    let result = run_ret(
+        r#"
+        async function inner() { throw "boom"; }
+        async function outer() { return await inner(); }
+        try { await outer(); } catch (e) { return "caught:" + e; }
+        return "no throw";
+        "#,
+    );
+    assert_eq!(result, serde_json::json!("caught:boom"));
+}
+
+#[test]
+fn a_throw_after_a_real_suspension_reaches_the_awaiting_frame() {
+    // The same rejection path, but through a genuine suspension: `worker`
+    // parks on a host promise, and the throw happens in the resumed
+    // continuation — a `Completion::Resumed` frame with no caller below,
+    // which settles the same promise `AsyncEnter` allocated before the
+    // suspension. `boss` is awaiting it inside a `try` and catches.
+    let src = r#"
+        async function worker() { await tools.f(); throw "late"; }
+        async function boss() {
+            try { return await worker(); } catch (e) { return "boss caught:" + e; }
+        }
+        return await boss();
+    "#;
+    let prog = compile_ok(src);
+    let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
+    let calls = expect_pending(&mut vm);
+    assert_eq!(calls.len(), 1, "one pending tool call");
+    vm.resolve_promise(calls[0].promise, Value::Null).unwrap();
+    assert_eq!(
+        expect_done_json(&mut vm),
+        serde_json::json!("boss caught:late")
+    );
+}
+
+#[test]
+fn a_rejection_nobody_awaits_neither_crashes_nor_leaks_a_handler() {
+    // An unhandled rejection is not an error: the promise is simply left
+    // rejected (JS logs it; this VM has nowhere to log). The program must run
+    // on, and the handler stack must come out of it unchanged — the root's
+    // own `try`, entered afterwards, still catches its own throw.
+    let src = r#"
+        async function boom() { throw "nobody is waiting"; }
+        boom();
+        try { throw "mine"; } catch (e) { return "root still catches:" + e; }
+    "#;
+    let vm = run_vm(src);
+    assert_eq!(
+        vm.stack.last(),
+        Some(&Value::String("root still catches:mine".into()))
+    );
+    assert!(
+        vm.promises
+            .iter()
+            .any(|p| matches!(p, crate::vm::PromiseState::Rejected(_))),
+        "the abandoned call's promise is rejected, not pending: {:?}",
+        vm.promises
+    );
+}
+
+#[test]
+fn every_async_function_form_rejects_its_own_promise() {
+    // `AsyncEnter` has to reach every syntactic form that can be `async`, and
+    // has to run before the parameter defaults — those are the first code in
+    // the frame that can throw, and in JS a default that throws rejects the
+    // call's promise rather than the caller. A form the analyzer forgot to
+    // mark would throw straight past the `await` here.
+    let result = run_ret(
+        r#"
+        function boom(where) { throw where; }
+        async function decl(x = boom("default")) { return x; }
+        const arrow = async () => boom("arrow");
+        class C { async method() { return boom("method"); } }
+        const out = [];
+        for (const f of [decl, arrow, () => new C().method()]) {
+            try { await f(); out.push("no throw"); } catch (e) { out.push(e); }
+        }
+        return out;
+        "#,
+    );
+    assert_eq!(result, serde_json::json!(["default", "arrow", "method"]));
 }
 
 #[test]

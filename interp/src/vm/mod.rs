@@ -197,17 +197,15 @@ The remaining intentional divergences from JS — deferred or accepted, NOT bugs
     identity-only `===`, "object" under `typeof`, no JSON form (reaching the
     persistence boundary errors with a missing-`await` hint, as does property
     access on a promise).
-  • Async functions are real (7_ASYNC Tier 2): a pending `await` inside an
-    async function suspends just that call (frame snapshot, zero stack), the
-    caller receives a promise and continues, and settled promises wake
-    suspended calls through a deterministic FIFO ready queue drained at
-    await points only. Two accepted divergences from JS: an async function
-    that completes without ever suspending returns its plain value, not a
-    wrapped promise (observationally invisible — `await` passes non-promises
-    through and is the only promise consumer in this dialect); and a throw
-    before the first suspension propagates synchronously to the caller
-    instead of rejecting. After the first suspension, an uncaught
-    throw/rejection rejects the call's promise, exactly as in JS. Circular
+  • Async functions are real (7_ASYNC Tier 2): an async call's promise is
+    allocated by its prologue, so the call always returns one; a pending
+    `await` inside an async function suspends just that call (frame
+    snapshot, zero stack) and hands that promise to the caller, which
+    continues; and settled promises wake suspended calls through a
+    deterministic FIFO ready queue drained at await points only. An uncaught
+    throw or rejection anywhere in an async body rejects the call's promise,
+    exactly as in JS — so a `try` around the *call* catches nothing, and a
+    `try` around an `await` of its promise is what sees the error. Circular
     awaits are detected and reported as a dedicated `Deadlock` error naming
     the await chain.
   • `instanceof` walks the `[[Prototype]]` chain for all RHS types (Step
@@ -522,22 +520,46 @@ pub struct CallFrame {
     /// for the post-return fixup (if the constructor returns a non-object the
     /// instance is used instead). `None` for non-new calls.
     pub(super) new_obj: Option<ObjectPtr>,
-    /// How this frame completes (7_ASYNC Tier 2). Direct calls are `Normal`;
-    /// a scheduler-resumed async frame is `ResolvePromise` — it has no
-    /// caller below it on the stack.
+    /// How this frame completes (7_ASYNC Tier 2). A sync call is `Normal`;
+    /// an async call owns a promise from its prologue (`AsyncEnter`) on, and
+    /// the variant says who is waiting for it — the caller below (`AsyncCall`)
+    /// or nobody (`Resumed`, a frame the scheduler re-created above the
+    /// parked root).
     completion: Completion,
 }
 
-/// How a frame's `Return` completes (7_ASYNC Tier 2).
+/// How a frame leaves — by `Return`, by an uncaught throw, or by suspending
+/// (7_ASYNC Tier 2). The two async variants differ only in where the frame's
+/// promise goes when the frame leaves; both settle the same promise.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) enum Completion {
     /// Ordinary call: the return value lands on the caller's stack at `fp`
     /// and execution continues at `return_addr`.
     Normal,
-    /// Scheduler-resumed async frame: `Return` resolves this promise with
-    /// the return value (waking waiters) and falls through to the scheduler;
-    /// an uncaught throw rejects it instead.
-    ResolvePromise(PromisePtr),
+    /// Async frame entered by an ordinary call, its promise allocated by the
+    /// prologue's `AsyncEnter`. The caller's frame sits below, waiting for
+    /// this call's value — which is the promise: `Return` resolves it, an
+    /// uncaught throw rejects it, a pending `await` suspends into it, and all
+    /// three then hand the promise to the caller and continue at
+    /// `return_addr`.
+    AsyncCall(PromisePtr),
+    /// The same async call after a suspension, re-created by the scheduler
+    /// above the parked root region: the caller took the promise long ago and
+    /// nothing sits below this frame, so every exit settles the promise and
+    /// falls through to the scheduler instead of returning anywhere.
+    Resumed(PromisePtr),
+}
+
+impl Completion {
+    /// The promise this frame settles when it leaves — `None` for a sync
+    /// frame. The predicate behind `strand_base`: an async frame is one that
+    /// owns a promise, whichever way it was entered.
+    pub(super) fn promise(self) -> Option<PromisePtr> {
+        match self {
+            Completion::Normal => None,
+            Completion::AsyncCall(pid) | Completion::Resumed(pid) => Some(pid),
+        }
+    }
 }
 
 /// A suspended async function call (7_ASYNC Tier 2): everything needed to
@@ -563,9 +585,10 @@ pub(super) struct Continuation {
     /// frames keep executing); dropping an unresumed continuation drops its
     /// saved handlers with it — nothing leaks.
     saved_handlers: Vec<SavedHandler>,
-    /// The promise this call settles when it completes — created at first
-    /// suspension (the caller received it as the call's return value) and
-    /// carried through re-suspensions via `Completion::ResolvePromise`.
+    /// The promise this call settles when it completes — created by the
+    /// call's `AsyncEnter` prologue (or, for a sync frame that a
+    /// compiler-emitted `Await` suspends, at that suspension) and carried
+    /// across every further suspension via `Completion::Resumed`.
     promise: PromisePtr,
     /// The promise this continuation waits on (await-chain rendering).
     awaiting: PromisePtr,
