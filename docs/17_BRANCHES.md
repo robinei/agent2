@@ -135,7 +135,7 @@ live, so you never spend a turn on it.
 | A subagent delivers, the parent is notified, I keep talking there | an answer is an event, not a terminator; agents never close |
 | Ask a subagent many questions; spawn = create + first question | `Send`/`Post` pairs with ids; `Agent` carries only name + charter |
 | Ad-hoc orchestration: as many workers as needed; one, some, or all; over hours | `spawn` / `ask` / `agents` as tools; **composition is JS** (`Promise.all`, loops), not more tools |
-| Workers outlive the program that made them | `tools.agents()` re-discovers the subtree with status, so the next program picks up where the last left off |
+| Workers outlive the program that made them | `list_agents()` re-discovers the subtree with status, so the next program picks up where the last left off |
 | Upward questions for clarification | the same exchange, the other way; no topology rule needed |
 | Structured replies | `Answer.value` / `Result.value` are JSON; `answer(question, value)` is a restart |
 | Graceful Ctrl-C / resume | every exchange recorded on both ends; recovery is reconciliation |
@@ -806,7 +806,7 @@ The whole model-facing surface for running a tree of workers:
 | `tools.spawn({ name?, charter, tools? }) → { agent }` | a new agent under you; `tools` narrows the child's allowlist (default: yours) |
 | `tools.ask({ to?, text, input? }) → value` | one question, one answer; `to` omitted = whoever asked you |
 | `tools.tell({ to?, text, input? }) → { post }` | inform without asking; resolves with a delivery receipt as soon as the post lands |
-| `tools.agents({ under?, deep? }) → [{ agent, branch, name, charter, parent, status, open, last_answer }]` | **discovery** — your subagents (or the whole subtree), one row per branch, with live status (`idle` / `thinking` / `running` / `suspended` / `dormant`), open-question count, and each one's last answer id |
+| `list_agents({ under?, deep? }) → [{ agent, branch, name, charter, parent, status, open, last_answer }]` | **discovery** — your subagents (or the whole subtree), one row per branch, with live status (`idle` / `thinking` / `running` / `suspended` / `dormant`), open-question count, and each one's last answer id |
 | `tools.tool_result(id)` | reuse: a done result, or re-attach to a pending one |
 | `tools.agent({ prompt, input, budget? })` | sugar: spawn + ask, unchanged |
 
@@ -835,7 +835,7 @@ know the shape to use it well:
 > repeatedly — `await tools.ask({ to: w.agent, text, input })` — and it
 > keeps its context between questions. Fan out with `Promise.all`.
 > Workers outlive your programs: in a later program, `await
-> tools.agents()` lists them (`{ deep: true }` for the whole subtree) with
+> list_agents()` lists them (`{ deep: false }` to stop at direct children) with
 > status and open questions, so you can pick up where you left off. To
 > inform a worker without needing an answer, `tools.tell` it. A worker
 > that is stuck asks *you*: `await tools.ask({ text })` with no
@@ -1365,7 +1365,7 @@ events per step.
       unambiguous agent id (an ambiguous one rejects the call naming the
       live branches); `tools.agent(...)` desugars to both in
       `dispatch_calls`, schema and card line verbatim.
-- [x] `tools.agents({ under?, deep? })` served from tree + session state:
+- [x] `list_agents({ under?, deep? })` served from tree + session state:
       direct children by default, the subtree with `deep`, one row per
       branch with `agent`/`branch`/`name`/`charter`/`parent`/`status`/
       `open`/`last_answer`. Tests: a program spawns three workers and a
@@ -2085,3 +2085,19 @@ just narrowed to the one place still wanting it.
   question one layer down; `spawn({ name })` already covers the moment
   that matters.
 - **Eviction cap** — see "does not add."
+
+
+## Amended 2026-09-17: one name, not two
+
+`tools.agents(options)` and `list_agents()` reached the same
+implementation and were not synonyms. `deep` defaulted the other way, so
+the two spellings answered different questions; after the
+settle-at-dispatch change one returned a promise and the other a value.
+And `tools.agents` wore a prefix it had no claim to — in no registry,
+intercepted before `check_allowlist`, so neither configured nor
+refusable, which is a counterexample to all three things the `tools.`
+prefix is supposed to signal.
+
+Collapsed into `list_agents(opts?)`, keeping the options and defaulting
+`deep` to **true**, because that is what the card has always promised
+the verb returns.

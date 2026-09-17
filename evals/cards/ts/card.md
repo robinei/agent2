@@ -29,8 +29,11 @@ declare function answer(question: number, label: string, value: unknown): void;
 declare function spawn(charter: string): Agent;
 /** A new context inheriting your whole history. Also idle until messaged. */
 declare function fork(): Agent;
-/** Every agent in this subtree, with what each is currently doing. */
-declare function list_agents(): Array<{ id: number; name: string; status: string }>;
+/** Every agent in this subtree, with what each is currently doing.
+ *  `under` starts somewhere other than you; `deep: false` stops at
+ *  direct children. */
+declare function list_agents(opts?: { under?: number; deep?: boolean }):
+  Array<{ agent: number; branch: number; name: string; charter: string; status: string }>;
 
 /** Keep a short projection for your own later turns, across tasks.
  *  Not for reading back next turn — you still hold that in a variable. */

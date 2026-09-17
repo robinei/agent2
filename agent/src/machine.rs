@@ -128,7 +128,7 @@ pub const TOOL_DONE: &str = "done";
 /// `list_agents()` — every agent in this subtree, with status, exactly
 /// as the card has advertised since phase 20. It is served by the
 /// host's `serve_agents` (the one implementation, shared with
-/// `tools.agents(...)`), because the status half is live session state
+/// ), because the status half is live session state
 /// no single runner can see; `dispatch_settle` routes it there.
 pub const TOOL_LIST_AGENTS: &str = "list_agents";
 
@@ -1677,15 +1677,18 @@ impl Runner {
                 // status", and a branch's status is live session state
                 // (which runner exists, what phase it is in) that this
                 // runner cannot see for anyone but itself. The host's
-                // `serve_agents` — already the sole implementation,
-                // already reached by `tools.agents(...)` — is where that
-                // lives, so this routes there rather than growing a
+                // `serve_agents` — the sole implementation — is where
+                // that lives, so this routes there rather than growing a
                 // second, weaker projection that would have to answer
                 // "dormant" for everyone.
                 //
-                // `deep: true` because the card says *subtree*, where
-                // `tools.agents()` defaults to direct children only.
-                let args = serde_json::json!([{ "deep": true }]);
+                // The program's own options ride through — `list_agents()`
+                // and `list_agents({ under, deep })` are the same verb,
+                // which is what collapsing the old `tools.agents`
+                // spelling into this one left behind. `deep` defaults to
+                // true in `serve_agents`, because the card promises
+                // *subtree*.
+                let args = serde_json::Value::Array(self.call_args_json(&call.args));
                 let id = self.issue_call(
                     tree,
                     Call::Invoke {

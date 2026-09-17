@@ -38,7 +38,8 @@ namespace, which is reserved for this session's configured tools
                                     messaged
   append_history(value)            remember a projection for your own future
   fetch_history(id)                read any row back by its id — logs nothing
-  list_agents()                    every agent in this subtree, with status
+  list_agents(opts?)               every agent in this subtree, with status
+                                    ({ under, deep }) narrows it
   raise(name, payload?)            suspend for judgement; the answer comes
                                     back here and this program carries on
   done()                           the task is finished; stop for good

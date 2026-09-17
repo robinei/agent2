@@ -1338,12 +1338,8 @@ impl Session {
         let agent = self.agent_of(branch);
         for call in calls {
             // Answered inline, on the loop thread — it reads memory
-            // (`serves_inline`'s own doc for why nothing else can).
-            // These are the tool names the host itself must know:
-            // `TOOL_AGENTS` lived in `machine.rs` only as part of the
-            // deleted `ToolSpec` surface (23_ONE_AGENT A4); the string
-            // itself is not a deleted concept, `tools.agents(...)` is
-            // very much live, so it stays inline here.
+            // (`serves_inline`'s own doc for why nothing else can, and
+            // for why there is one name here rather than two).
             if serves_inline(&call.name) {
                 let _ = self.tx.send(LoopMsg::ToolDone {
                     branch,
@@ -1730,7 +1726,7 @@ impl Session {
         Ok(())
     }
 
-    /// Serve `tools.agents({ under?, deep? })`: **discovery**, the one
+    /// Serve `list_agents({ under?, deep? })`: **discovery**, the one
     /// addition that makes long-running orchestration possible. Agents
     /// outlive programs but a program's handles to them do not, so the
     /// next program re-discovers its workers by query rather than by
@@ -1754,7 +1750,12 @@ impl Session {
                 .ok_or_else(|| format!("`under` must be an agent id; got {v}"))?,
             None => caller,
         };
-        let deep = arg.get("deep").and_then(|v| v.as_bool()).unwrap_or(false);
+        // Defaults to the whole subtree, because that is what the card
+        // promises `list_agents()` returns. The old `tools.agents`
+        // spelling defaulted to direct children, which is how one
+        // implementation came to answer two different questions
+        // depending on which name you reached it by.
+        let deep = arg.get("deep").and_then(|v| v.as_bool()).unwrap_or(true);
         let mut rows = Vec::new();
         for (branch, leaf) in self.tree.branches() {
             let Some(agent) = self.tree.enclosing_agent(branch) else {
@@ -1881,13 +1882,21 @@ fn pick_resume_leaf(tree: &Tree) -> io::Result<EventId> {
 /// session state** (a branch's status), which no `ToolHandler` can see,
 /// so there is nowhere else for it to live.
 ///
-/// Two spellings, one implementation: `tools.agents(options)` is the
-/// configurable form, `list_agents()` the bare verb the card
-/// advertises. Named as a function rather than inlined in
-/// `spawn_tools` so `every_harness_verb_has_an_answerer` can ask the
-/// question without running a session.
+/// **One name.** There used to be two — `tools.agents(options)` and the
+/// bare `list_agents()` — reaching this same implementation, and they
+/// were not synonyms: `deep` defaulted the other way, so the two
+/// spellings answered differently, and after the settle-at-dispatch
+/// change one returned a promise and the other a value. `tools.agents`
+/// also wore a prefix it had no right to, being in no registry and
+/// intercepted here *before* `check_allowlist`, so it was neither
+/// configured nor refusable — a counterexample to everything the
+/// `tools.` prefix is supposed to signal.
+///
+/// Named as a function rather than inlined in `spawn_tools` so
+/// `every_harness_verb_has_an_answerer` can ask the question without
+/// running a session.
 pub(crate) fn serves_inline(name: &str) -> bool {
-    name == "agents" || name == crate::machine::TOOL_LIST_AGENTS
+    name == crate::machine::TOOL_LIST_AGENTS
 }
 
 /// The most recent `Condition` on `leaf`'s path — a just-suspended run's
@@ -4007,7 +4016,7 @@ mod tests {
                     ),
                     // A different program, a fresh VM: the handles above
                     // are gone, and the workers are found by query.
-                    scripted_program("return await tools.agents();"),
+                    scripted_program("return list_agents({ deep: false });"),
                 ],
             )],
         );
@@ -4089,7 +4098,7 @@ mod tests {
                     // `return` in the same program instead — root's own
                     // `ask(w.agent, "make a helper")` needs *something*
                     // to settle it, or root never gets past its first
-                    // `await` to reach the `tools.agents()` calls this
+                    // `await` to reach the `list_agents()` calls this
                     // test is actually about.
                     vec![scripted_program(
                         r#"const g = await spawn("helper");
@@ -4102,15 +4111,15 @@ mod tests {
                     // One turn, not two, same reasoning as the worker's
                     // above: `await ask(...)` resolving is a value the
                     // *same* program keeps running with, not a reason
-                    // for a fresh completion — so the `tools.agents()`
+                    // for a fresh completion — so the `list_agents()`
                     // checks this test is actually about sit right after
                     // the `ask`, in the program that awaited it, instead
                     // of a second queued turn nothing would ever prompt.
                     vec![scripted_program(
                         r#"const w = await spawn("worker");
                            await ask(w.agent, "make a helper");
-                           return { direct: await tools.agents(),
-                                     deep: await tools.agents({ deep: true }) };"#,
+                           return { direct: list_agents({ deep: false }),
+                                     deep: list_agents() };"#,
                     )],
                 ),
             ],
@@ -4332,9 +4341,9 @@ mod tests {
     ///
     /// It is a settle-at-dispatch verb like `spawn` and `fork`, so it is
     /// spelled here **without** `await` — the rows come straight back
-    /// onto the frame's stack. And `deep: true`: the card says subtree,
-    /// where `tools.agents()` defaults to direct children only, so the
-    /// grandchild the worker makes must show up too.
+    /// onto the frame's stack. No `deep` argument either: the card says
+    /// subtree and that is now the default, so the grandchild the worker
+    /// makes shows up without asking.
     ///
     /// Two turns, because the subtree has to exist before it can be
     /// listed: the first rests after telling the worker to go, the
@@ -4421,7 +4430,7 @@ mod tests {
             inner: ScriptedLlm::new([scripted_program(
                 r#"await Promise.all(["a", "b", "c"].map(n =>
                      spawn("worker " + n)));
-                   const rows = await tools.agents();
+                   const rows = list_agents();
                    return await Promise.all(
                      rows.map(r => ask(r.branch, "status?")));"#,
             )]),
