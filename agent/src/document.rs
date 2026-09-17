@@ -296,17 +296,30 @@ fn author_label(tree: &Tree, from: Author) -> String {
 }
 
 
-/// A compacted row's rendered line: `[id] label: text`, `text` falling
-/// back to [`crate::compaction::REMOVED_MARKER`] when the op was a bare
-/// removal. The same shape an ordinary `Note`/`Post` line has — a
-/// compacted row is lossy, not distinguished-looking, which is the
-/// point: nothing about its rendering tells the model it is missing
-/// anything it is entitled to ask for by id.
+/// A replaced entry's line, `[id] … text`. `None` for a removed one,
+/// which renders nothing at all.
+///
+/// **The `…` says this entry stands in for something longer**, and it
+/// is the whole reason the marker exists: without it a replacement is
+/// presented exactly like a short original, so a later program cannot
+/// tell that shortening it again means summarising a summary. On the
+/// skipped-tests run of 2026-09-17 one entry was replaced four times,
+/// each pass rewriting the pass before it, and the constraint that
+/// mattered — that the project runs `unittest`, not `pytest` — was
+/// three generations gone by the time a program needed it. The run
+/// failed on a regex written for the wrong test framework.
+///
+/// One character, and only on replacements: the run's 150 ops were 143
+/// removals and 7 replacements, so this is charged against the few
+/// entries that already carry text someone chose to spend words on.
+/// What to *do* about it — fetch the original and summarise from that
+/// — is stated once, in the compaction directive, rather than repeated
+/// on every line that carries the mark.
 fn compacted_line(id: EventId, shadow: &CompactedView) -> Option<String> {
     shadow
         .text
         .as_deref()
-        .map(|text| format!("[{}] {}", id.as_u64(), text))
+        .map(|text| format!("[{}] … {}", id.as_u64(), text))
 }
 
 /// A compacted **program**'s rendered turn: still valid JavaScript,
@@ -320,7 +333,7 @@ fn compacted_program_comment(id: EventId, shadow: &CompactedView) -> Option<Stri
     shadow
         .text
         .as_deref()
-        .map(|text| format!("//: [{}] {}", id.as_u64(), text))
+        .map(|text| format!("//: [{}] … {}", id.as_u64(), text))
 }
 
 /// A completion report's line — the rendering of a `Return` or a
@@ -1158,6 +1171,50 @@ mod tests {
         assert!(
             doc.messages.iter().any(|m| m.content.contains("the edit")),
             "the recovery program's own return survives too: {doc:?}"
+        );
+    }
+
+    /// A replacement is marked; an original is not. Without the mark a
+    /// replacement is presented exactly like a short original, and a
+    /// later program cannot tell that shortening it again means
+    /// summarising a summary — which is how one entry got rewritten
+    /// four times on 2026-09-17, losing the constraint that mattered.
+    #[test]
+    fn a_replaced_entry_is_marked_as_standing_in_for_more() {
+        let mut tree = Tree::new(None);
+        let mut spine = tree
+            .start_agent(None, None, "root", None, "CARD", Vec::new())
+            .unwrap();
+        tree.append(&mut spine, user_post("go")).unwrap();
+        let note = tree
+            .append(
+                &mut spine,
+                EventPayload::Note {
+                    text: "a long finding worth several lines".into(),
+                },
+            )
+            .unwrap();
+        tree.append(&mut spine, turn("1;")).unwrap();
+        let doc = render(&tree, &spine, 64 * 1024, Transport::Program);
+        let before: String = doc.messages.iter().map(|m| m.content.clone()).collect();
+        assert!(
+            !before.contains('…'),
+            "an original carries no mark: {before}"
+        );
+
+        tree.append(
+            &mut spine,
+            EventPayload::Compacted {
+                of: note,
+                text: Some("the finding, in one line".into()),
+            },
+        )
+        .unwrap();
+        let doc = render(&tree, &spine, 64 * 1024, Transport::Program);
+        let after: String = doc.messages.iter().map(|m| m.content.clone()).collect();
+        assert!(
+            after.contains(&format!("[{}] … the finding", note.as_u64())),
+            "a replacement says it stands in for more: {after}"
         );
     }
 

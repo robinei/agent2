@@ -114,7 +114,12 @@ declare namespace history {
   function remove(from: number, to?: number): void;
   /** Show `text` in place of that entry — for when the entry is worth
    *  something in one line but not in eighty. Spend the words on what
-   *  you concluded, not on saying something was removed. */
+   *  you concluded, not on saying something was removed.
+   *
+   *  An entry already showing as `[id] … text` is standing in for
+   *  something longer. Replacing that one summarises a summary, and the
+   *  detail that made it useful is what goes: `fetch` the original and
+   *  write from that instead. */
   function replace(id: number, text: string): void;
 }
 

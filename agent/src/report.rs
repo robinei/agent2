@@ -891,6 +891,12 @@ pub(crate) fn compaction_message(rendered: usize, budget: usize) -> String {
          you name that does exist still applies.\n\n\
          This card and the worked examples before the conversation carry no id, so they \
          cannot be named and are not yours to shrink.\n\n\
+         An entry shown as `[id] … text` is already standing in for something longer. \
+         Shortening *that* summarises a summary, and what goes first is the detail that \
+         made it useful — a run on 2026-09-17 did it four times over and lost the one fact \
+         that told it which test framework the project used. If such an entry still needs \
+         shortening, `history.fetch(id)` returns what it replaced: write the new version \
+         from the original, not from the summary. Otherwise leave it alone.\n\n\
          Prefer removing outright and keeping the rest verbatim; replace only what is worth \
          keeping a shorter version of, and spend the words on what you concluded rather \
          than on saying something was removed.\n\n\
