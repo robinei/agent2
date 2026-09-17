@@ -110,6 +110,8 @@ class Env:
         self.task_dir = task_dir
         self.dir = sandbox
         self.score = score
+        # Graded credit, recorded alongside the pass/fail verdict.
+        self.credits = []
         # What the run said to a person, in order. A task whose product
         # is an answer rather than an edit has nothing else to check.
         self.tells = score.get("tells", [])
@@ -153,6 +155,38 @@ class Env:
     def require(self, condition, message: str):
         if not condition:
             raise CheckFailed(message)
+
+    def credit(self, earned: int, possible: int, label: str):
+        """Record a graded part of the verdict: `earned` of `possible`.
+
+        **Pass/fail throws away nearly all the signal.**
+        `dead-code-sweep` contains eight independent judgements and used
+        to record one bit, so a run that got seven right scored the same
+        as one that got none. That is most of why ranking two cards has
+        needed suites nobody can afford: at n=14 a five-point swing is
+        indistinguishable from sampling, and two identical
+        configurations produced exactly that on 2026-09-17.
+
+        Credit is independent of `pass`, deliberately. A run that trips
+        a hard gate and still judged six of eight sites correctly scores
+        0.75 here and `False` there, and both are true. Record credit
+        *before* the `require` calls that could raise, or it is lost
+        with the exception.
+        """
+        self.credits.append((earned, possible, label))
+
+
+def grade(env, ok) -> float:
+    """A run's credit in [0, 1] — the graded signal, or the bit.
+
+    A task that records no credits falls back to its pass/fail verdict,
+    so a checker gains resolution by opting in and nothing breaks while
+    they are converted one at a time.
+    """
+    possible = sum(n for _, n, _ in env.credits)
+    if not possible:
+        return 1.0 if ok else 0.0
+    return round(sum(k for k, _, _ in env.credits) / possible, 4)
 
 
 def load_task(task_dir: Path):
@@ -374,6 +408,7 @@ def run_once(
                 # invoked rather than anything about the run.
                 why = f"agent exited {rc} without writing a program: {(out or '').strip()[-300:]}"
             ok = None
+            credit = 0.0
         else:
             env = Env(task.DIR, sandbox, score)
             try:
@@ -383,6 +418,7 @@ def run_once(
                 ok, why = False, str(e)
             except Exception as e:
                 ok, why = False, f"checker raised {e!r}"
+            credit = grade(env, ok)
 
         if keep is not None:
             kept = keep / f"{task.NAME}-{time.strftime('%H%M%S')}"
@@ -398,6 +434,7 @@ def run_once(
         "task": task.NAME,
         "kept": str(kept) if keep is not None else None,
         "pass": ok,
+        "credit": credit,
         "why": why,
         "timed_out": timed_out,
         "exit": rc,
@@ -435,7 +472,7 @@ def rescore(keep_dir: Path, tasks: list) -> list:
         log = run_dir / "run.jsonl"
         score = score_log(log) if log.exists() else {"error": "no log kept"}
         if score.get("programs", 0) == 0:
-            runs.append({"task": name, "pass": None, "why": "no completion", "kept": str(run_dir), "score": score})
+            runs.append({"task": name, "pass": None, "credit": 0.0, "why": "no completion", "kept": str(run_dir), "score": score})
             continue
         env = Env(task.DIR, run_dir / "work", score)
         try:
@@ -445,8 +482,9 @@ def rescore(keep_dir: Path, tasks: list) -> list:
             ok, why = False, str(e)
         except Exception as e:
             ok, why = False, f"checker raised {e!r}"
+        credit = grade(env, ok)
         print(f"  {run_dir.name}: {'pass' if ok else 'FAIL: ' + why}")
-        runs.append({"task": name, "pass": ok, "why": why, "kept": str(run_dir), "score": score})
+        runs.append({"task": name, "pass": ok, "credit": credit, "why": why, "kept": str(run_dir), "score": score})
     return runs
 
 
@@ -472,6 +510,14 @@ def aggregate(runs: list) -> dict:
             "runs": sum(1 for r in rs if r["pass"] is not None),
             "passed": sum(1 for r in rs if r["pass"] is True),
             "no_run": sum(1 for r in rs if r["pass"] is None),
+            # The graded verdict, averaged over the runs that produced
+            # one. Far lower variance than `passed`, because a task with
+            # eight judgements in it reports eight of them.
+            "credit": round(
+                sum(r.get("credit", 0.0) for r in rs if r["pass"] is not None)
+                / max(1, sum(1 for r in rs if r["pass"] is not None)),
+                3,
+            ),
             "calls_per_program": med([s["calls_per_program"] for s in scores]),
             "programs": med([s["programs"] for s in scores]),
             "exec_s": med([s["exec_ms"] / 1000 for s in scores]),
@@ -533,7 +579,8 @@ def print_summary(summary: dict):
             if s.get("failed_with_gap")
             else ""
         )
-        print(f"\n=== {name}  {s['passed']}/{s['runs']} passed{no_run}{gap}")
+        credit = f"   credit {s['credit']:.0%}" if "credit" in s else ""
+        print(f"\n=== {name}  {s['passed']}/{s['runs']} passed{no_run}{gap}{credit}")
         print(
             f"  calls/program {s['calls_per_program']}   programs {s['programs']}"
             ""
@@ -637,14 +684,25 @@ def pool_suites(out, parts: list) -> int:
         lo, hi = wilson(acc["passed"], n)
         total_k += acc["passed"]
         total_n += n
-        print(f"\n=== {name}  {acc['passed']}/{n}   95% CI {lo:.0%}-{hi:.0%}")
+        credit = f"   credit {acc['credit']:.0%}" if "credit" in acc else ""
+        print(f"\n=== {name}  {acc['passed']}/{n}   95% CI {lo:.0%}-{hi:.0%}{credit}")
         print(
             f"  mean of per-run medians: calls/program {acc['calls_per_program']}"
             f"   programs {acc['programs']}   provider {acc['provider_s']}s"
         )
         print(f"  tokens: {acc['prompt_in']:.0f} in   {acc['completion_out']:.0f} out")
     lo, hi = wilson(total_k, total_n)
-    print(f"\nall tasks  {total_k}/{total_n}   95% CI {lo:.0%}-{hi:.0%}  ({len(parts)} suites)")
+    overall = [acc for acc in pooled.values() if "credit" in acc]
+    mean_credit = (
+        sum(a["credit"] * a["runs"] for a in overall) / sum(a["runs"] for a in overall)
+        if overall
+        else None
+    )
+    credit = f"   credit {mean_credit:.0%}" if mean_credit is not None else ""
+    print(
+        f"\nall tasks  {total_k}/{total_n}   95% CI {lo:.0%}-{hi:.0%}{credit}"
+        f"  ({len(parts)} suites)"
+    )
     if out:
         Path(out).write_text(json.dumps(pooled, indent=2))
         print(f"wrote {out}")
@@ -673,7 +731,7 @@ def compare(before: Path, after: Path):
         if x.get("no_run") or y.get("no_run"):
             print(f"  no completion   {x.get('no_run', 0)}  ->  {y.get('no_run', 0)}")
         for key in (
-            "calls_per_program", "programs", "exec_s",
+            "credit", "calls_per_program", "programs", "exec_s",
             "prompt_kb", "source_kb", "thinking_kb",
             "prompt_in", "cached_in", "completion_out",
         ):

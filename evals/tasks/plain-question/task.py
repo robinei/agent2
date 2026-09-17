@@ -28,6 +28,19 @@ def setup(env):
 
 
 def check(env):
+    # Graded before the gates: spoke, needed no tools, took one program.
+    env.credit(
+        sum(
+            [
+                not env.score["silent"],
+                env.score["tool_calls"] == 0,
+                env.score["programs"] == 1,
+            ]
+        ),
+        3,
+        "spoke / no tools / one program",
+    )
+
     env.require(not env.score["silent"], "the run never said anything to anyone")
     env.require(
         env.score["tool_calls"] == 0,

@@ -39,6 +39,21 @@ def setup(env):
 def check(env):
     env.require(not env.score["silent"], "the run never said anything to anyone")
 
+    # **Graded first, because every gate below can raise.** Five
+    # independent per-test verdicts, recorded as five, not as one bit —
+    # a run that gets four right and one wrong is four-fifths of the way
+    # there and the number should say so.
+    right, wrong = 0, []
+    for name, still_failing in STILL_FAILING.items():
+        marked = bool(
+            env.grep(rf"@unittest\.skip\([^\n]*\)\s*\n\s*def {name}\b", "**/*.py")
+        )
+        if marked == still_failing:
+            right += 1
+        else:
+            wrong.append((name, still_failing))
+    env.credit(right, len(STILL_FAILING), "per-test verdicts")
+
     run = env.run("python3 -m unittest test_shipping 2>&1")
     env.require(
         run.returncode == 0,
@@ -51,11 +66,7 @@ def check(env):
         "was removed instead of its line",
     )
 
-    for name, still_failing in STILL_FAILING.items():
-        marked = bool(
-            env.grep(rf"@unittest\.skip\([^\n]*\)\s*\n\s*def {name}\b", "**/*.py")
-        )
+    for name, still_failing in wrong:
         if still_failing:
-            env.require(marked, f"{name} still fails and must keep its skip marker")
-        else:
-            env.require(not marked, f"{name} passes now and should have been un-skipped")
+            env.require(False, f"{name} still fails and must keep its skip marker")
+        env.require(False, f"{name} passes now and should have been un-skipped")

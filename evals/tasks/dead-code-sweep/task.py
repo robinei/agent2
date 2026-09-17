@@ -64,9 +64,24 @@ def check(env):
         "removed instead of its line",
     )
 
+    # **Graded before the gates, because the gates raise.** This task
+    # holds eight independent judgements and used to report one bit, so
+    # a run that got seven right scored the same as one that got none.
+    # That is most of why ranking two cards has taken suites nobody can
+    # afford: at n=14 a five-point swing is indistinguishable from
+    # sampling, and two identical configurations produced exactly that
+    # on 2026-09-17.
+    right = 0
+    wrong = []
     for item, suppressing in SUPPRESSING.items():
         has = bool(env.grep(rf"#\[allow\(dead_code[^)]*\)\][^\n]*\n[^\n]*fn {item}\b"))
-        if suppressing:
-            env.require(has, f"{item}'s attribute was still needed and is gone")
+        if has == suppressing:
+            right += 1
         else:
-            env.require(not has, f"{item}'s attribute suppresses nothing and is still there")
+            wrong.append(item)
+    env.credit(right, len(SUPPRESSING), "per-attribute verdicts")
+
+    for item in wrong:
+        if SUPPRESSING[item]:
+            env.require(False, f"{item}'s attribute was still needed and is gone")
+        env.require(False, f"{item}'s attribute suppresses nothing and is still there")
