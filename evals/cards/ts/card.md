@@ -25,7 +25,12 @@
  *
  *   return value       the next program is written with this in front
  *                      of it. Once, at the end.
- *   append_history(v)  the same, any number of times, from anywhere.
+ *   append_history(v)  the same, any number of times, from anywhere —
+ *                      for something you conclude in the middle and
+ *                      would otherwise carry to the end just to hand
+ *                      it on. Not alongside the return, though:
+ *                      appending what you are about to return writes
+ *                      it into the same turn twice.
  *   tell(text)         reaches the person, and only the person.
  *   a call's result    is not in front of the next program, but it is
  *                      not gone: you see that the call happened and
