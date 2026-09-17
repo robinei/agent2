@@ -12,6 +12,30 @@ fn await_hint(v: &Value) -> &'static str {
     }
 }
 
+/// Reading a property off a promise. Three of the names are the
+/// combinator methods this dialect does not have, and for those the
+/// generic "did you forget `await`?" is actively unhelpful: the fix for
+/// `p.field` is to await `p`, but the fix for `p.catch(f)` is not
+/// `await p.catch(f)` — it is `try { await p } catch (e) { … }`, a
+/// different shape.
+///
+/// A live run on 2026-09-17 hit this and the trap classified as a
+/// `gap`, correctly: reaching for `.catch` on a promise is ordinary
+/// JavaScript, and if the dialect will not have it, the error is where
+/// the dialect has to say so. Naming the replacement costs one line and
+/// is what a program needs in order to write the next one.
+fn promise_property_error(name: &str) -> String {
+    match name {
+        "then" | "catch" | "finally" => format!(
+            "promises here have no `.{name}` — `await` is the only way to settle one. \
+             Write `try {{ const v = await p; … }} catch (e) {{ … }}` instead of \
+             `p.{name}(…)`; the whole sequence runs at the top level, so there is \
+             nothing to chain onto."
+        ),
+        other => format!("cannot read property '{other}' on promise (did you forget `await`?)?"),
+    }
+}
+
 /// Indefinite-article phrase for a type name in a type/value-error message,
 /// e.g. "a string", "an object". `null`/`undefined` take no article
 /// ("cannot increment null", not "an null").
@@ -118,14 +142,7 @@ impl VM {
             }
             Value::Promise(_) => {
                 let name = self.to_js_string(key, 0);
-                return Err(self.fail(
-                    ErrorKind::TypeError,
-                    format!(
-                        "cannot read property '{}' on promise{}",
-                        name.as_str(),
-                        await_hint(receiver)
-                    ),
-                ));
+                return Err(self.fail(ErrorKind::TypeError, promise_property_error(name.as_str())));
             }
             _ => {}
         }
