@@ -94,12 +94,31 @@ Gate: a report for a run with N calls is under a fixed small bound
 regardless of how large those calls' results were; a failed call's
 error text still appears; `artifact(id)` still fetches the full value.
 
-**27.3 — menu rows are history rows.** `label_of` gains `call` and
-`result`, so `remove_history(#19, "call")` works and `NotARow` goes
-back to meaning *structural* rather than *anything unnamed*.
-Gate: a compaction batch naming a `Call` commits; the rendered label
-for such a row equals `label_of` for it (the invariant from `b96537f`,
-which already caught one mismatch).
+**27.3 — the completion report is a row.** *(done, and not what this
+step said.)* The plan here was to give `label_of` a `call` and a
+`result` so a menu row could be compacted under its own id. Reading the
+renderer says that is the wrong shape: a `Call` has no line anywhere.
+It is rendered *inside* the completion report that `derive_report`
+builds around the `Return` closing its program, and that report is one
+row, already named `return`.
+
+What was actually broken was worse, and one arm away. `render_with_
+lookup` consulted the compaction lookup for `Turn`s and for everything
+`pending_line` handles — but **not** for `Return` or `Condition`, whose
+arms called `derive_report` unconditionally. So the checksum accepted
+`remove_history(id, "return")`, the dry run re-rendered the report in
+full, the batch came back the same size, and it was refused for freeing
+nothing. Two live compaction programs on 2026-09-16 did correct work
+and were told "compact more of it and return again"; the same shape as
+the label-mismatch bug, and found the same way.
+
+Both arms now go through one `report_line`, which checks the shadow
+first exactly as `pending_line` does. `Call` and `Result` keep the
+`"event"` fallback and stay `NotARow` — the honest answer once the row
+that contains them is reachable.
+Gate: `compacting_a_return_removes_the_report_rendered_around_it` (the
+freed bytes are the report's, not "some"), and
+`a_call_is_not_a_row_because_the_report_around_it_is`.
 
 **27.4 — `artifact` becomes `fetch_history`, and reaches every row.**
 The rename is only honest with the extension: fetching a compacted
@@ -113,10 +132,14 @@ row's *original* content; still logs nothing (assert no new events).
 **27.5 — the card states the four channels**, and says plainly that
 `tell` reaches a person and nothing else does.
 
-**27.6 — compaction prefers by lifetime.** With every tier finally
-reachable: call/result rows first (pure replay, fetchable), returns
-next (consumed by the program after them), notes last (deliberately
-kept). A sort key in the compaction request, not a mechanism.
+**27.6 — compaction prefers by lifetime.** *(done, with 27.3.)* Folded
+in there because once the report became reachable the old sentence —
+"the largest tool results you have already acted on are the first
+targets" — was pointing at things that are not rows. The order the
+request now states: `return` first (a whole program's report, whose
+calls stay fetchable by their own ids), then `turn`, then `note` and
+`post`, and never the task. A sort key in the compaction request, not
+a mechanism.
 
 ## What this is measured against
 

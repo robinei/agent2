@@ -128,6 +128,14 @@ pub enum CompactionError {
     /// compaction program on 2026-09-16 opened with
     /// `remove_history(1, "system")`, aiming at the card, which is not
     /// a row and cannot be made smaller this way.
+    ///
+    /// A `Call` and a `Result` land here too, and that is the right
+    /// answer rather than a gap in `label_of`: they have no line of
+    /// their own anywhere, because they are rendered *inside* the
+    /// completion report of the `Return` that closed their program.
+    /// Removing that `return` takes the whole menu with it, which is
+    /// what `compacting_a_return_removes_the_report_rendered_around_it`
+    /// pins.
     NotARow(EventId),
     /// The batch, once applied, is still at or above the threshold —
     /// the real advantage of program-based compaction over
@@ -366,6 +374,141 @@ mod tests {
             )
             .unwrap();
         (tree, spine, program, note)
+    }
+
+    /// A branch whose program made one call with a big result, so the
+    /// completion report around its `Return` is the largest thing in
+    /// the document — the shape every real run has.
+    fn branch_with_a_report() -> (Tree, Spine, EventId) {
+        let mut tree = Tree::new(None);
+        let mut spine = tree.start_agent(None, None, "root", None, "CARD").unwrap();
+        let agent = spine.leaf_id;
+        tree.append(
+            &mut spine,
+            EventPayload::Message(Message::Post {
+                from: Author::User,
+                origin: Origin::Direct {
+                    text: "go".into(),
+                    input: serde_json::Value::Null,
+                    expects_reply: true,
+                },
+            }),
+        )
+        .unwrap();
+        tree.append(
+            &mut spine,
+            EventPayload::Message(Message::Turn {
+                author: Author::Agent(agent),
+                source: "await tools.bash('cargo check');".into(),
+                thinking: None,
+                usage: None,
+            }),
+        )
+        .unwrap();
+        let call = tree
+            .append(
+                &mut spine,
+                EventPayload::Call(Call::Invoke {
+                    name: "bash".into(),
+                    args: serde_json::json!(["cargo check --all-targets 2>&1"]),
+                    site: 0,
+                }),
+            )
+            .unwrap();
+        tree.append(
+            &mut spine,
+            EventPayload::Result {
+                call,
+                outcome: Outcome::Delivered(serde_json::json!({
+                    "status": 0,
+                    "stdout": "warning: unused\n".repeat(200),
+                })),
+            },
+        )
+        .unwrap();
+        let ret = tree
+            .append(
+                &mut spine,
+                EventPayload::Return {
+                    value: serde_json::json!("checked"),
+                },
+            )
+            .unwrap();
+        (tree, spine, ret)
+    }
+
+    /// **The completion report is a row.** Until 27.3 this arm of
+    /// `render_with_lookup` called `derive_report` unconditionally, so
+    /// the return preview, the console and the artifact menu were the
+    /// one part of a conversation compaction could not reach: the
+    /// checksum accepted `remove_history(id, "return")`, the dry run
+    /// came back the same size, and the batch was refused for freeing
+    /// nothing. Two live compaction programs hit exactly that.
+    #[test]
+    fn compacting_a_return_removes_the_report_rendered_around_it() {
+        let (tree, spine, ret) = branch_with_a_report();
+        let before = rendered_size(&render(&tree, &spine, 4096));
+        let ops = [CompactionOp::Remove {
+            id: ret,
+            label: "return".into(),
+        }];
+        let events = compact(&tree, &spine, &ops, 4096, before).unwrap();
+        assert_eq!(events.len(), 1);
+
+        // Apply it and render again — the report's own words are gone
+        // and the document is materially smaller.
+        let (mut tree, mut spine, _) = branch_with_a_report();
+        for payload in events {
+            tree.append(&mut spine, payload).unwrap();
+        }
+        let doc = render(&tree, &spine, 4096);
+        let after = rendered_size(&doc);
+        let text: String = doc.messages.iter().map(|m| m.content.clone()).collect();
+        assert!(!text.contains("warning: unused"), "result replayed");
+        assert!(!text.contains("cargo check --all-targets"), "menu kept");
+
+        // What it freed is the whole report bar the stub that replaces
+        // it — not "some bytes", which a rounding change could satisfy.
+        // The report is small here *because of 27.2*: a menu row no
+        // longer replays its result, so the 3 KB of stdout above was
+        // already an `ok, N bytes`. On a real run the menu is the bulk.
+        let (fresh, fresh_spine, fresh_ret) = branch_with_a_report();
+        let report = crate::report::derive_report(&fresh, fresh_spine.leaf_id, fresh_ret, 4096);
+        assert!(
+            before - after >= report.len() - 64,
+            "freed {} of a {}-byte report",
+            before - after,
+            report.len()
+        );
+    }
+
+    /// A `Call` has no line of its own to remove — it is *inside* the
+    /// report, and goes when the report goes (the test above). So the
+    /// `"event"` fallback refusing it is the honest answer, not a gap:
+    /// compacting one would look like a success and free nothing.
+    #[test]
+    fn a_call_is_not_a_row_because_the_report_around_it_is() {
+        let (tree, spine, ret) = branch_with_a_report();
+        let call = tree
+            .path_events(spine.leaf_id)
+            .iter()
+            .find(|e| matches!(e.payload, EventPayload::Call(_)))
+            .unwrap()
+            .id;
+        assert_ne!(call, ret);
+        assert_eq!(
+            compact(
+                &tree,
+                &spine,
+                &[CompactionOp::Remove {
+                    id: call,
+                    label: "call".into(),
+                }],
+                4096,
+                10_000,
+            ),
+            Err(CompactionError::NotARow(call))
+        );
     }
 
     #[test]

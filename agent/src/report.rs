@@ -828,9 +828,14 @@ fn compaction_message(rendered: usize, budget: usize) -> String {
          Only the numbered rows above can be compacted — this card and the worked examples \
          before the conversation are fixed, and nothing addresses them.\n\n\
          Prefer removing outright and keeping the rest verbatim; rewrite only what truly \
-         needs shortening. The largest tool results you have already acted on are the first \
-         targets. The task itself is the last. Nothing is deleted: a compacted row keeps its \
-         id, and its artifacts stay fetchable by it.\n\n\
+         needs shortening.\n\n\
+         Take them in this order. A `return` row is a whole program's report — what it \
+         returned, what it printed, and the index of every call it made; those calls are \
+         still fetchable by their own ids afterwards, so these are the cheapest bytes in \
+         the conversation and the first to go. A `turn` row is a program you have already \
+         run; keep the ones whose shape you still need. A `note` was kept on purpose and a \
+         `post` is someone speaking, so those are last, and the task itself is never a \
+         target. Nothing is deleted: a compacted row keeps its id.\n\n\
          Return when you are done. Do not do anything else."
     )
 }

@@ -235,6 +235,12 @@ fn author_label(tree: &Tree, from: Author) -> String {
 /// *kind*, not anything derived from its content. Kept here, beside the
 /// rendering that consults the same rows, rather than duplicated in
 /// `compaction.rs`.
+///
+/// The `"event"` fallback means *this kind has no row*, which is why
+/// `compaction.rs` turns it into a refusal. `Call` and `Result` are
+/// deliberately left in it: what a reader sees of them is the menu
+/// inside a `Return`'s completion report, so the row that holds them —
+/// and the one that compacts them — is that `return`.
 pub(crate) fn label_of(payload: &EventPayload) -> &'static str {
     match payload {
         EventPayload::Message(Message::Turn { .. }) => "turn",
@@ -287,6 +293,39 @@ fn compacted_program_comment(id: EventId, shadow: &CompactedView) -> String {
             text,
             id.as_u64()
         ),
+    }
+}
+
+/// A completion report's line — the rendering of a `Return` or a
+/// handing-back `Condition` — with its compacted shadow taking
+/// precedence, exactly as [`pending_line`] does for the rows it
+/// handles.
+///
+/// **The report is a row.** It did not used to be: this arm called
+/// `derive_report` unconditionally, so the return preview, the console
+/// and the artifact menu — measured on 2026-09-17 as the largest thing
+/// in a document after the card — were the one part of a conversation
+/// compaction could not reach. `label_of` said `"return"` for the
+/// event, so `remove_history(#19, "return")` passed the checksum and
+/// was then applied to a rendering that ignored it: the dry run came
+/// back the same size and the batch was refused for freeing nothing.
+/// Live compaction programs hit exactly that, twice, and were told
+/// "compact more of it and return again" for work that was correct.
+///
+/// This is also why `Call` and `Result` keep [`label_of`]'s `"event"`
+/// fallback and stay [`crate::compaction::CompactionError::NotARow`]:
+/// they have no line of their own to remove: they are *inside* this
+/// one, and go when it goes.
+fn report_line(
+    tree: &Tree,
+    leaf: EventId,
+    id: EventId,
+    budget: usize,
+    compacted: &HashMap<EventId, CompactedView>,
+) -> String {
+    match compacted.get(&id) {
+        None => crate::report::derive_report(tree, leaf, id, budget),
+        Some(shadow) => compacted_line(id, shadow),
     }
 }
 
@@ -471,11 +510,11 @@ pub(crate) fn render_with_lookup(
                     open_call = call_id;
                 }
                 EventPayload::Return { .. } => {
-                    pending.push(crate::report::derive_report(tree, leaf, ev.id, budget));
+                    pending.push(report_line(tree, leaf, ev.id, budget, compacted));
                 }
                 EventPayload::Condition { disposition, .. } => {
                     if *disposition == Disposition::Handover {
-                        pending.push(crate::report::derive_report(tree, leaf, ev.id, budget));
+                        pending.push(report_line(tree, leaf, ev.id, budget, compacted));
                     }
                 }
                 _ => {
