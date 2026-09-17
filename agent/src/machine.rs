@@ -34,7 +34,7 @@ use interp::{
 };
 
 use crate::host::ProgramStatus;
-use crate::report::{Artifact, ArtifactState, preview};
+use crate::report::{Artifact, ArtifactState, arg_preview, preview};
 use crate::types::*;
 
 /// The closed, harness-defined verb names `dispatch_calls` recognizes
@@ -2772,6 +2772,13 @@ pub(crate) fn menu_rows(segment: &[&Event], since: u64) -> Vec<Artifact> {
 /// A menu row's label, read from the call variant — never by re-parsing a
 /// tool name. `ask` versus `tell` is `expects_reply`, the one place the
 /// difference is visible.
+///
+/// Arguments go through [`arg_preview`], which is deliberately stingy.
+/// A label is how a reader decides whether to spend a fetch, and the
+/// whole argument is never the thing that decides it: an id and
+/// `bash("cargo check 2>&1")` is a decision, `bash(<4 KB of script>)`
+/// is the script itself arriving unasked. The call's arguments stay
+/// fetchable whole under its id.
 fn call_label(call: &Call) -> String {
     match call {
         Call::Send {
@@ -2783,13 +2790,13 @@ fn call_label(call: &Call) -> String {
             "{}({}, {})",
             if *expects_reply { "ask" } else { "tell" },
             address_label(to),
-            preview(&serde_json::Value::String(text.clone()))
+            arg_preview(&serde_json::Value::String(text.clone()))
         ),
         Call::Spawn { name, .. } => format!("spawn({})", name.as_deref().unwrap_or("<unnamed>")),
         Call::Fork { name, .. } => {
             format!("fork({})", name.as_deref().unwrap_or(""))
         }
-        Call::Invoke { name, args, .. } => format!("{}({})", name, preview(args)),
+        Call::Invoke { name, args, .. } => format!("{}({})", name, arg_preview(args)),
     }
 }
 
@@ -4192,5 +4199,37 @@ mod tests {
                     && t.contains("only available in a compaction program")),
             "{said:?}"
         );
+    }
+
+    /// A label indexes a call; it does not replay its arguments. The
+    /// argument that *identifies* the call survives a huge one standing
+    /// beside it, which is the whole reason each is clipped on its own
+    /// rather than the joined string being clipped once.
+    #[test]
+    fn a_label_indexes_a_call_instead_of_replaying_its_arguments() {
+        let whole_file = "x".repeat(100_000);
+        let label = call_label(&Call::Invoke {
+            name: "replace_file".into(),
+            args: json!(["src/lib.rs", whole_file]),
+            site: 0,
+        });
+        assert!(label.contains("src/lib.rs"), "{label}");
+        assert!(
+            !label.contains(&"x".repeat(100)),
+            "payload replayed: {label}"
+        );
+        assert!(label.len() < crate::report::LABEL_MAX_BYTES + 32, "{label}");
+
+        // A `tell` is the same shape: the person already read the text,
+        // and the row is here so a later program can find the call.
+        let label = call_label(&Call::Send {
+            to: Address::User,
+            text: "y".repeat(8_000),
+            input: serde_json::Value::Null,
+            expects_reply: false,
+            site: 0,
+        });
+        assert!(label.starts_with("tell(user, "), "{label}");
+        assert!(label.len() < crate::report::LABEL_MAX_BYTES + 32, "{label}");
     }
 }

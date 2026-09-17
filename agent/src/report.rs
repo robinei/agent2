@@ -441,9 +441,7 @@ pub fn derived_branch_label(tree: &Tree, branch: EventId, leaf: EventId) -> Opti
 /// Byte-bounded truncation with a bare ellipsis — for a display label,
 /// where [`clip`]'s "[truncated; N bytes total]" marker would be most of
 /// the label.
-#[allow(dead_code)] // caller returns in Pass D: only `debug/` used this,
-// and the TUI is cut from the build for Passes A-C.
-fn clip_short(s: &str, max: usize) -> String {
+pub fn clip_short(s: &str, max: usize) -> String {
     if s.len() <= max {
         return s.to_owned();
     }
@@ -491,6 +489,33 @@ pub fn input_preview(v: &serde_json::Value) -> String {
 /// [`PREVIEW_MAX_BYTES`].
 pub fn preview(v: &serde_json::Value) -> String {
     clip(&v.to_string(), PREVIEW_MAX_BYTES)
+}
+
+/// The byte budget for *one* argument in a menu row's label.
+pub const LABEL_ARG_MAX_BYTES: usize = 48;
+
+/// The budget for a whole label, bounding a call with many arguments.
+pub const LABEL_MAX_BYTES: usize = 160;
+
+/// A call's arguments as a menu row shows them.
+///
+/// Each argument is clipped on its own, so the one that *identifies*
+/// the call survives a huge one standing beside it:
+/// `replace_file("src/lib.rs", "pub fn …")` still says which file, where
+/// clipping the joined string would have spent the whole budget on the
+/// path and lost the rest. The budgets are small on purpose — a label
+/// is an index entry, and `replace_file(["src/lib.rs", "<the whole
+/// file>"])` is a result in all but name (see [`render_menu`]).
+pub fn arg_preview(args: &serde_json::Value) -> String {
+    let joined = match args {
+        serde_json::Value::Array(items) => items
+            .iter()
+            .map(|v| clip_short(&v.to_string(), LABEL_ARG_MAX_BYTES))
+            .collect::<Vec<_>>()
+            .join(", "),
+        other => clip_short(&other.to_string(), LABEL_ARG_MAX_BYTES),
+    };
+    clip_short(&joined, LABEL_MAX_BYTES)
 }
 
 /// Byte-bounded truncation with an explicit marker; respects char
