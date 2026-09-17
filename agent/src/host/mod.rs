@@ -225,6 +225,15 @@ pub(crate) enum LoopMsg {
     Continue {
         branch: BranchId,
     },
+    /// **A worker thread's last act**, sent immediately after its
+    /// result. It carries nothing: consuming it is the whole point,
+    /// because that is when the loop decrements `in_flight`.
+    ///
+    /// The channel is FIFO, so this can only be taken off the inbox
+    /// after the result it follows — which is exactly the guarantee
+    /// `in_flight` needs and could not have while the worker decremented
+    /// the counter itself. See `Session::in_flight`.
+    WorkerDone,
     /// Terminal input for the embedding TUI; opaque to the loop.
     #[allow(dead_code)] // caller returns in Pass D: only `debug/` used this,
     // and the TUI is cut from the build for Passes A-C.
@@ -282,26 +291,47 @@ pub struct Session {
     llm_epoch: HashMap<BranchId, u64>,
     /// The cancellation token of each in-flight generation.
     cancels: HashMap<BranchId, Cancel>,
-    /// Worker threads that have not yet sent their result. Read **before**
-    /// draining the inbox and decremented **after** the send, so zero
-    /// means every send already landed — which is what makes `quiet()`
-    /// race-free without a second channel.
+    /// Worker threads whose result the loop has not consumed yet.
+    /// Incremented on the loop thread at spawn, and decremented **on the
+    /// loop thread** when it takes that worker's trailing
+    /// [`LoopMsg::WorkerDone`] off the inbox — never by the worker
+    /// itself.
     ///
-    /// **This counter is the loop's only liveness guarantee, so every
-    /// spawned worker must eventually send.** A non-zero count is what
-    /// licenses `pump_one` to block in `rx.recv()` with no deadline: the
-    /// promise is that something is still coming. A worker that never
-    /// returns therefore does not merely lose its own result — it wedges
-    /// the whole loop, silently and forever, because `quiet()` can never
-    /// go true again.
+    /// **The invariant is "non-zero means a message is still coming",
+    /// and only the consumer can maintain it.** `pump_one` blocks in an
+    /// undeadlined `rx.recv()` on the strength of a non-zero count, so a
+    /// count that can outlive its message is a permanent hang.
     ///
-    /// No deadline is added here on purpose. A real completion can take
-    /// minutes, and a loop that gave up on one would end live sessions
-    /// mid-answer; "the client hung" is a client bug, and the honest
-    /// place to bound it is the client's own timeout. The one thing that
-    /// ever broke this invariant was a *test* client parking on a
-    /// cancellation that never came — see `host/llm.rs`'s `HoldingLlm`,
-    /// which hung the whole test binary that way.
+    /// It used to be decremented by the worker, on the worker, right
+    /// after its send — "after the send, never before", so that zero
+    /// would always mean "already in the inbox". That direction was
+    /// sound; the other one was not. Between a worker's `send` returning
+    /// and its `fetch_sub` landing there is a window in which the loop
+    /// can receive that very message, handle it, come back round, read
+    /// the still-stale count as work in flight, find the inbox empty —
+    /// and block forever on a message it had already consumed.
+    ///
+    /// That window is small and purely a matter of scheduling, which is
+    /// why it read as a flake: a different test hung each time, always
+    /// passing on retry, at any `--test-threads` setting. It was caught
+    /// by counting completed worker sends against terminal messages the
+    /// loop had consumed, and finding `consumed` *ahead of* `sent` at the
+    /// moment a wedged `pump_one` chose to block — a worker mid-window,
+    /// its message already delivered and handled.
+    ///
+    /// Routing the decrement through the inbox closes it: the channel is
+    /// FIFO, so `WorkerDone` cannot be consumed before the result it
+    /// follows, and the count is only lowered by the thread that does the
+    /// consuming. Zero now means every worker's result has been handled,
+    /// not merely queued — a stronger statement than the old ordering
+    /// could make, and one that needs no reasoning about instruction
+    /// interleaving to check.
+    ///
+    /// A worker that never sends at all still holds the count up, and
+    /// still wedges the loop — that is unchanged, and deliberate. No
+    /// deadline belongs here: a real completion can take minutes, and a
+    /// loop that gave up on one would end live sessions mid-answer.
+    /// "The client hung" is a client bug, bounded in the client.
     in_flight: Arc<AtomicUsize>,
     /// Whether a client is attached. A per-request fact, pushed into each
     /// runner's trailing line and stored nowhere else.
@@ -602,6 +632,9 @@ impl Session {
     /// It is deliberately *not* derived from phases alone: a worker
     /// thread that has produced its answer but not yet been drained is
     /// still work in flight, which `in_flight` counts and no phase shows.
+    /// What makes that count trustworthy — rather than a hang waiting to
+    /// happen — is that only this thread lowers it, and only once it has
+    /// consumed the worker's result. See [`Session::in_flight`].
     pub fn quiet(&self) -> bool {
         self.in_flight.load(Ordering::SeqCst) == 0
             && !self.states.values().any(|s| s.status() == "awaiting llm")
@@ -613,9 +646,10 @@ impl Session {
         if self.done {
             return false;
         }
-        // Sampled **before** the drain, and decremented **after** each
-        // worker's send: zero here means every send already landed, so an
-        // empty inbox now is genuinely empty.
+        // Sampled **before** the drain. `in_flight` is lowered by this
+        // thread only, as it consumes each worker's `WorkerDone`, so a
+        // zero here cannot be stale: every worker's result has already
+        // been handled, and an empty inbox now is genuinely empty.
         let quiet = self.quiet();
         match self.rx.try_recv() {
             Ok(msg) => {
@@ -832,6 +866,10 @@ impl Session {
                 branch,
                 StepInput::ToolResults(vec![ToolResult { call, result }]),
             ),
+            LoopMsg::WorkerDone => {
+                self.in_flight.fetch_sub(1, Ordering::SeqCst);
+                Ok(())
+            }
             LoopMsg::Continue { branch } => {
                 if self.paused.contains(&branch) {
                     // Park the slice; `set_paused(false)` re-enqueues it.
@@ -1322,8 +1360,7 @@ impl Session {
         let llm = Arc::clone(&self.llm);
         let permits = Arc::clone(&self.llm_permits);
         let tx = self.tx.clone();
-        let in_flight = Arc::clone(&self.in_flight);
-        in_flight.fetch_add(1, Ordering::SeqCst);
+        self.in_flight.fetch_add(1, Ordering::SeqCst);
         thread::spawn(move || {
             // Block off-loop until a completion slot is free; the permit
             // is held only for this `complete()` call and released on drop.
@@ -1345,9 +1382,9 @@ impl Session {
                 epoch,
                 result,
             });
-            // After the send, never before: `quiet()` reads this counter
-            // and then drains, so zero must mean "already in the inbox".
-            in_flight.fetch_sub(1, Ordering::SeqCst);
+            // The loop decrements `in_flight` when it consumes this,
+            // never this thread after the send — see `Session::in_flight`.
+            let _ = tx.send(LoopMsg::WorkerDone);
         });
     }
 
@@ -1380,8 +1417,7 @@ impl Session {
                 Some(def) => {
                     let def = Arc::clone(def);
                     let tx = self.tx.clone();
-                    let in_flight = Arc::clone(&self.in_flight);
-                    in_flight.fetch_add(1, Ordering::SeqCst);
+                    self.in_flight.fetch_add(1, Ordering::SeqCst);
                     thread::spawn(move || {
                         let result = guard_size((def.handler)(call.args));
                         let _ = tx.send(LoopMsg::ToolDone {
@@ -1389,7 +1425,7 @@ impl Session {
                             call: call.call,
                             result,
                         });
-                        in_flight.fetch_sub(1, Ordering::SeqCst);
+                        let _ = tx.send(LoopMsg::WorkerDone);
                     });
                 }
                 None => {
