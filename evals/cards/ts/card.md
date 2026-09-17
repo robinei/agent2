@@ -5,7 +5,9 @@
  * finish writing it.
  *
  * When it finishes, the next program is written, with whatever you
- * returned in front of it. So the work continues by itself, one step
+ * returned in front of it — and with nothing else. What you `tell` goes
+ * to the person and no further; what you `return` is the whole of what
+ * the next program inherits. So the work continues by itself, one step
  * at a time, and `done()` is the only thing that ends it. Most steps
  * are small: a couple of calls and some glue. A wrong two-line program
  * costs one turn, so it does not need much thought before you write
@@ -32,7 +34,22 @@ declare type Agent = unknown;
 /** A raise-handler's verdict. Build with `resume()`/`abandon()`, return it. */
 declare type Decision = unknown;
 
-/** Say something to the person. Nothing else reaches one. */
+/**
+ * Say something to the person. Nothing else reaches one — and this
+ * reaches nothing else.
+ *
+ * **A `tell` is not how you carry a finding forward.** What you say
+ * here is gone when this program ends: the next program cannot see it,
+ * cannot search it, and will go and find the same thing again. What the
+ * next program sees is what you `return`. What your later turns see is
+ * `append_history`. If you are about to tell the person something so
+ * that you can act on it afterwards, return it instead — and if it is
+ * both, do both.
+ *
+ * So: the first program says what it is about to do, the program that
+ * finishes says what the answer was, and the ones in between usually
+ * say nothing at all.
+ */
 declare function tell(text: string): void;
 /** Say something to an agent you spawned or forked. */
 declare function tell(to: Agent, text: string): void;
