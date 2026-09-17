@@ -329,6 +329,14 @@ def sandbox_cmd(sandbox: Path, log: Path, prompt: str, card: Path | None) -> lis
         # would hide the very things the run needs. Ordering is the
         # whole correctness argument here.
         "--tmpfs", "/tmp",
+        # The binary, explicitly. It usually sits in the checkout, but a
+        # worktree under `/tmp` — which is how arms are run, so an edit
+        # cannot reach a suite in flight — puts it behind the tmpfs
+        # above, and it vanishes: exec fails, the agent exits 1 in 0.0s
+        # with no output, and twelve runs come back "agent exited 1
+        # without writing a program". A sandbox should bind what it
+        # needs rather than assume the rest of `/` survived.
+        "--ro-bind", str(AGENT), str(AGENT),
         "--bind", str(sandbox), str(sandbox),
         "--bind", str(log.parent), str(log.parent),
         "--dev", "/dev", "--proc", "/proc",
