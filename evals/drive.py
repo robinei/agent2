@@ -19,8 +19,27 @@ what a variant is, and whether a checker can be trusted.
 
     evals/drive.py --list
     evals/drive.py --tasks dead-code-sweep --repeat 3
-    evals/drive.py --card ../cards/minimal --repeat 3 --out minimal.json
+    evals/drive.py --card cards/short --repeat 5 --out short.json
+    evals/drive.py --pool a.json b.json
     evals/drive.py --compare before.json after.json
+
+**Run it from a git worktree pinned to the commit under test.**  A
+suite takes tens of minutes and reads the binary and the card off disk
+at spawn time, so an edit or a `cargo build` while one is in flight
+splits the run in two and the aggregate averages two systems.  That
+happened on 2026-09-17 and the run was discarded.
+
+    git worktree add /tmp/evalwt <commit>
+    cd /tmp/evalwt && cargo build -p agent --bin agent && cd evals
+    python3 drive.py --repeat 5 --card cards/short --out /tmp/arm.json
+
+The fingerprint below catches contamination afterwards; the worktree is
+what stops it happening.  And hold `--jobs` constant across any arms
+compared on wall clock — provider queuing inflates per-run time, and
+one task took 900s at `--jobs 6` against 115s at `--jobs 2`.
+
+No `--card` runs the shipped card, which is what every variant under
+`cards/` is measured against.
 """
 
 import argparse
