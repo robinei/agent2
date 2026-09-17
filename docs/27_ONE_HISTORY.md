@@ -183,6 +183,43 @@ calls stay fetchable by their own ids), then `turn`, then `note` and
 `post`, and never the task. A sort key in the compaction request, not
 a mechanism.
 
+**27.7 — the return value arrives whole.** *(done. Found by running
+27.1–27.5 and reading the programs, not by planning.)*
+`CompletionReport::render` gave the return value the same 256-byte
+preview a menu row gets, on the rule that nothing enters a context
+unchosen. That was sound while a `return` was read by nobody — it was
+then just another artifact. 27.1 made it the channel the whole design
+runs on, and nothing re-read the rendering.
+
+What it looked like in a live `ambiguous-config` run: program 1 reads
+`deploy.yaml` and returns `{question, content: <the file>}`. Program 2
+sees 256 bytes of it, says *"Reading the whole file — the last look was
+cut off"*, and reads the file again. So does program 3. Program 4
+finally acts — by then over the task's 3-program cap, and it guessed
+rather than asking. Four programs, three of them re-fetching what the
+first had already handed them, each behaving reasonably given what it
+could see.
+
+The "unchosen" rule is not violated by rendering it whole and never
+was: the author of the value and the reader of the report are the same
+mind one turn apart, and the author picked it deliberately over
+everything else it was holding. That is what chosen means. The document
+now has **exactly one generous channel and it is the chosen one** — the
+menu is an index, a call's arguments are clipped, a result is a size,
+and the thing a program deliberately addressed to its successor arrives
+intact. `RETURN_MAX_BYTES` (8 KB) bounds the pathological case and
+`clip_answer` names the id, so the remainder is a `fetch_history` away
+rather than lost.
+
+The other half of that run was the card's, not the renderer's: the
+model returned *the question* instead of answering it, because the card
+described the next program as somebody else ("the next writer", "the
+program after this one"). It is not somebody else. Every card now says
+so: **you are the next writer**, what you return comes back to you
+read, so a question you return is one you will be answering.
+Gate: `a_return_value_reaches_the_next_program_whole`,
+`an_absurd_return_value_is_bounded_and_says_where_the_rest_is`.
+
 ## What this is measured against
 
 `short` on the four-task set at n=7 — 19/28, 51KB reasoning, 20.8k

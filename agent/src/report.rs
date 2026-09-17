@@ -62,6 +62,17 @@ pub const ANNOTATIONS_PER_LINE: usize = 6;
 /// Per-entry preview bytes in the artifact menu.
 pub const PREVIEW_MAX_BYTES: usize = 256;
 
+/// What a `return` value may occupy in the completion report that
+/// carries it to the next program — the document's one generous
+/// channel, and generous on purpose (see [`CompletionReport`]).
+///
+/// Large enough for the things a program actually hands on — a file, a
+/// list of sites, a set of findings — and small enough that a program
+/// returning something absurd costs one turn's worth of document rather
+/// than the conversation. Past it, [`clip_answer`] names the id, so the
+/// remainder is one `fetch_history` away instead of lost.
+pub const RETURN_MAX_BYTES: usize = 8192;
+
 /// One artifact-menu entry: a `Call` (settled or still pending) or a
 /// `ProgramResult`, named by its event id and fetchable via
 /// `fetch_history(id)`.
@@ -147,17 +158,29 @@ impl ConditionReport {
 
 /// The harness `Post` for a program that finished with a `return`.
 ///
-/// **No exception, not even for the return value** (DESIGN.md "No
-/// exception: nothing enters a context unchosen"). Earlier designs
-/// rendered the return generously — up to a per-agent answer budget,
-/// delivered whole when it fit — as the one deliberate channel for
-/// machine-bound data to cross into a context. Code mode dissolves the
-/// problem it was solving instead of widening the channel: a program
-/// that wants to hand its result to someone calls `tell()` itself, with
-/// no turn boundary in the way. So `value` gets exactly the bounded,
-/// shape-first [`preview`] every other artifact in the menu below gets —
-/// never a full copy, budget or no — with its id named so the whole
-/// value is one `fetch_history()` away.
+/// **The return value is rendered whole, and it is the only thing here
+/// that is** (27.7). This used to get the same 256-byte [`preview`] a
+/// menu row gets, on the rule that nothing enters a context unchosen
+/// (DESIGN.md "No exception") — sound while a `return` was read by
+/// nobody, because it was then just another artifact. 27.1 made it the
+/// channel the whole design runs on: a program returns, the next one is
+/// written, and that value is what it is written from.
+///
+/// Measured 2026-09-17, before this. On `ambiguous-config`, a program
+/// returned `{question, content: <the file>}`; the next one saw 256
+/// bytes of it, said *"Reading the whole file — the last look was cut
+/// off"*, and read the file again. So did the one after that. Three
+/// programs re-fetching what the first had already handed them, each
+/// one behaving perfectly reasonably given what it could see.
+///
+/// The "unchosen" rule is not violated by this and never was: the
+/// author of the value and the reader of the report are the same mind
+/// one turn apart, and the author picked it deliberately over
+/// everything else it was holding. That is the definition of chosen.
+/// The document now has exactly one generous channel and it is that
+/// one — the menu is an index (27.2), a call's arguments are clipped,
+/// a result is a size. [`RETURN_MAX_BYTES`] bounds the pathological
+/// case, and [`clip_answer`] names the id so the rest stays reachable.
 pub struct CompletionReport {
     /// The program's top-level return value. Rendered as a bounded
     /// preview only; the full value lives at [`Self::result_id`].
@@ -183,9 +206,11 @@ impl CompletionReport {
     pub fn render(&self) -> String {
         let mut out = String::new();
         out.push_str("## program completed\n");
-        match self.result_id() {
-            Some(id) => out.push_str(&format!("returned [#{id}]: {}", preview(&self.value))),
-            None => out.push_str(&format!("returned: {}", preview(&self.value))),
+        let id = self.result_id();
+        let rendered = clip_answer(&self.value.to_string(), RETURN_MAX_BYTES, id);
+        match id {
+            Some(id) => out.push_str(&format!("returned [#{id}]: {rendered}")),
+            None => out.push_str(&format!("returned: {rendered}")),
         }
         out.push_str("\n\n");
         out.push_str(&render_console(&self.console, self.console_id));
@@ -535,20 +560,16 @@ pub fn clip(s: &str, max: usize) -> String {
 /// marker names the fetch id so the full value stays reachable
 /// (`fetch_history(id)`) when one is known.
 ///
-/// **This step's one open question, not resolved here.** DESIGN.md's "No
-/// exception: nothing enters a context unchosen" retires the mechanism
-/// this existed for — a program's `return` rendered budgeted-and-generous
-/// into a completion report (12_ANSWERS) — and [`CompletionReport`] no
-/// longer calls this (see its own doc). The only caller left *in this
-/// file* is [`answer_ack`], echoing back a value the answering program
-/// just wrote itself — not the retired exception, so kept using this.
-/// But `machine.rs` (a different agent's file, mid-edit alongside this
-/// one) still calls `crate::report::clip_answer` directly, from its
-/// `answer_budget`/`DEFAULT_ANSWER_BUDGET` machinery, which DESIGN.md
-/// says goes in Pass B — so this function is **not actually orphaned
-/// yet**, and deleting it here would break a caller outside this file's
-/// scope. Left in place; finishing its removal (and `answer_budget`'s)
-/// is Pass B's job, coordinated with whoever owns `machine.rs` then.
+/// **Nearly deleted once, and now the shape the design turns on.** This
+/// was written for the retired budgeted-answer machinery (12_ANSWERS)
+/// and a long note here recorded that it was one caller away from being
+/// orphaned. 27.7 made [`CompletionReport`] a caller again, for the
+/// opposite of the retired reason: a `return` is not foreign data
+/// arriving unchosen, it is what the previous program picked out of
+/// everything it was holding, addressed to the program reading this.
+/// Generous-with-the-id-named is exactly right for that, and wrong for
+/// everything else in the report — which is why nothing else here uses
+/// it.
 pub fn clip_answer(s: &str, max: usize, id: Option<u64>) -> String {
     if s.len() <= max {
         return s.to_owned();
@@ -1686,25 +1707,58 @@ mod tests {
         assert_eq!(line, r#"returned [#9]: "hello""#, "{line}");
     }
 
-    /// Past the preview bound, the value is clipped like any other
-    /// artifact — the marker plus its `program result` id is what keeps
-    /// the full value one `fetch_history()` away, never a bigger inline
-    /// copy.
+    /// **The return value arrives whole.** It is the one generous thing
+    /// in a document whose menu is an index, because it is the one
+    /// thing the previous program chose for this one — and 5,000 bytes
+    /// of it is an ordinary handover, not a pathology.
+    ///
+    /// Before 27.7 this asserted the opposite, and a live run showed
+    /// what that cost: a program returned `{question, content}`, the
+    /// next saw 256 bytes of it, said "the last look was cut off", and
+    /// read the file again. Three programs did that in a row.
     #[test]
-    fn large_return_value_is_previewed_with_fetch_id() {
+    fn a_return_value_reaches_the_next_program_whole() {
+        let value = json!("z".repeat(5_000));
         let report = CompletionReport {
-            value: json!("z".repeat(5_000)),
+            value: value.clone(),
             console: Vec::new(),
             console_id: None,
-            new_artifacts: vec![artifact(9, "program result", json!("z".repeat(5_000)))],
+            new_artifacts: vec![artifact(9, "program result", value)],
             failed_calls: 0,
         };
         let rendered = report.render();
         let line = rendered.lines().nth(1).unwrap();
-        assert!(line.starts_with("returned [#9]: "), "{line}");
-        assert!(line.len() < PREVIEW_MAX_BYTES + 100, "{line}");
-        assert!(!line.contains(&"z".repeat(5_000)), "not copied whole");
-        assert!(line.contains("[truncated;"), "{line}");
+        assert!(line.starts_with("returned [#9]: "), "{}", &line[..60]);
+        assert!(
+            line.contains(&"z".repeat(5_000)),
+            "clipped: {}",
+            &line[..80]
+        );
+    }
+
+    /// Generous is not unbounded. Past [`RETURN_MAX_BYTES`] the id is
+    /// named, so the remainder is one `fetch_history` away rather than
+    /// lost — the marker says so in the line itself, because a reader
+    /// that cannot tell it was clipped is the reader that re-fetches
+    /// blind.
+    #[test]
+    fn an_absurd_return_value_is_bounded_and_says_where_the_rest_is() {
+        let value = json!("z".repeat(60_000));
+        let report = CompletionReport {
+            value: value.clone(),
+            console: Vec::new(),
+            console_id: None,
+            new_artifacts: vec![artifact(9, "program result", value)],
+            failed_calls: 0,
+        };
+        let rendered = report.render();
+        let line = rendered.lines().nth(1).unwrap();
+        assert!(line.len() < RETURN_MAX_BYTES + 100, "{}", line.len());
+        assert!(
+            line.contains("fetch_history(9)"),
+            "{}",
+            &line[line.len() - 60..]
+        );
     }
 
     /// A menu row says a call arrived and how big its value is — never

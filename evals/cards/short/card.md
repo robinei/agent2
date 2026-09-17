@@ -95,6 +95,13 @@ hand, and returning what you found to the program after this one. A
 loop still belongs in one program when the same procedure repeats over
 a list; what does not belong is planning branches you have not reached.
 
+**You are the next writer.** What you return comes back to you, read,
+with the task still open. So a question you return is a question you
+will be answering, not one you are handing to someone else: return the
+material, and answer it next turn. Returning the *question* is a program
+that reads a file, asks what it means, and comes back to read the same
+file again.
+
 **Finishing continues; only `done()` stops.** Returning — or simply
 running off the end — ends this program and starts the next one, with
 your value in front of it. `done()` ends the *task*: nothing wakes you,

@@ -123,11 +123,13 @@ Reading ten files to answer one question, and passing all ten on, is
 the shape to avoid: it is a guess about relevance, made by code that
 cannot read them, paid for in full.
 
-So: fetch the *cheap* thing, hand it over, and let the next program —
-written by someone who has read it — fetch the few things that matter. The
-program after this one is written by someone who has *read* what you
-gathered, and can say what it means in a sentence rather than parsing
-for it. If what you gathered turns out to be thin — a manifest with no
+So: fetch the *cheap* thing, return it, and pick up next turn — having
+read it — with the few things that matter. **You are that next writer.**
+What you return comes back to you, read, with the task still open. So a
+question you return is a question you will be answering, not one you are
+handing to someone else: return the material, and answer it next turn.
+Returning the *question* is a program that reads a file, asks what it
+means, and comes back to read the same file again. If what you gathered turns out to be thin — a manifest with no
 README, the wrong directory — that writer looks further and hands over
 again. Gather, hand over, read, gather again, answer. **One program is
 not your whole budget.** Each pass costs exactly one inference, spent
