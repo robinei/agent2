@@ -286,6 +286,22 @@ pub struct Session {
     /// draining the inbox and decremented **after** the send, so zero
     /// means every send already landed — which is what makes `quiet()`
     /// race-free without a second channel.
+    ///
+    /// **This counter is the loop's only liveness guarantee, so every
+    /// spawned worker must eventually send.** A non-zero count is what
+    /// licenses `pump_one` to block in `rx.recv()` with no deadline: the
+    /// promise is that something is still coming. A worker that never
+    /// returns therefore does not merely lose its own result — it wedges
+    /// the whole loop, silently and forever, because `quiet()` can never
+    /// go true again.
+    ///
+    /// No deadline is added here on purpose. A real completion can take
+    /// minutes, and a loop that gave up on one would end live sessions
+    /// mid-answer; "the client hung" is a client bug, and the honest
+    /// place to bound it is the client's own timeout. The one thing that
+    /// ever broke this invariant was a *test* client parking on a
+    /// cancellation that never came — see `host/llm.rs`'s `HoldingLlm`,
+    /// which hung the whole test binary that way.
     in_flight: Arc<AtomicUsize>,
     /// Whether a client is attached. A per-request fact, pushed into each
     /// runner's trailing line and stored nowhere else.
@@ -5166,8 +5182,14 @@ mod tests {
             text: "think hard".into(),
             expects_reply: true,
         });
-        session.pump_one(); // the request goes out and the worker holds
+        session.pump_one(); // the request goes out
         assert_eq!(session.state(branch).unwrap().status(), "awaiting llm");
+        // That status only says the *loop* spawned the worker. Wait for
+        // the worker to actually park before speaking again, or the two
+        // generations' threads race for `HoldingLlm`'s single hold slot
+        // and the post-interrupt one — whose token nothing ever cancels
+        // — can win it and wedge the loop forever (see `HoldingLlm`).
+        llm.wait_until_held(1);
 
         // Speak again while it thinks: logged on arrival, unseen.
         h.send(SessionCommand::UserTurn {

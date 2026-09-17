@@ -277,20 +277,81 @@ impl LlmClient for ScriptedLlm {
 /// It also counts the cancellations it observed, so a test can assert
 /// the token reached the worker rather than only that the session
 /// dropped the answer.
+///
+/// **A hold slot is claimed by whichever worker thread reaches
+/// `complete` first, which is not necessarily the generation the test
+/// meant to hold** — and that is a deadlock, not a flake, because the
+/// session only ever cancels the generation it has *superseded*. The
+/// last generation's token is never cancelled by anyone, so a worker
+/// that holds *it* spins forever; `Session::in_flight` never returns to
+/// zero, `quiet()` is therefore permanently false, and the loop's
+/// `pump_one` blocks in `rx.recv()` for good.
+///
+/// That is exactly how `host::tests::interrupt_cancels_generation` hung
+/// the whole test binary. `spawn_llm` starts a worker and returns; the
+/// loop thread then processes the next queued command and starts a
+/// second worker, so two generations' threads race to enter `complete`.
+/// On an idle machine the first wins and the test passes — it passed 30
+/// runs in a row alone. Under load (20 test threads, or 24 spinners and
+/// `--test-threads=1`) the second wins often, and an instrumented run
+/// correlated the two outcomes perfectly across 25 attempts: every run
+/// whose held request was the pre-interrupt document passed, and every
+/// run whose held request was the post-interrupt one hung.
+///
+/// So the claim is *observable*: [`wait_until_held`] blocks until `n`
+/// completions have actually taken a hold slot, which lets a test send
+/// the interrupting turn only once the generation it means to interrupt
+/// is genuinely parked. Asserting the branch's status is not enough —
+/// that only proves the loop spawned the worker, not that the worker
+/// ran.
+///
+/// [`wait_until_held`]: HoldingLlm::wait_until_held
 #[cfg(test)]
 pub struct HoldingLlm {
-    held: Mutex<usize>,
+    holds: Mutex<Holds>,
+    /// Signalled when a completion claims a hold slot.
+    claimed: std::sync::Condvar,
     observed: std::sync::atomic::AtomicUsize,
     inner: ScriptedLlm,
+}
+
+/// Hold slots, as a pair rather than one counter: `left` is what
+/// `complete` decrements, `claimed` is what `wait_until_held` waits on.
+/// One counter cannot serve both — a test cannot tell "not claimed yet"
+/// from "claimed and released" by watching a number go down.
+#[cfg(test)]
+struct Holds {
+    left: usize,
+    claimed: usize,
 }
 
 #[cfg(test)]
 impl HoldingLlm {
     pub fn new(hold: usize, responses: impl IntoIterator<Item = LlmTurn>) -> Self {
         HoldingLlm {
-            held: Mutex::new(hold),
+            holds: Mutex::new(Holds {
+                left: hold,
+                claimed: 0,
+            }),
+            claimed: std::sync::Condvar::new(),
             observed: std::sync::atomic::AtomicUsize::new(0),
             inner: ScriptedLlm::new(responses),
+        }
+    }
+
+    /// Block until `n` completions have claimed a hold slot. Call it
+    /// before doing anything that starts a *second* generation: once the
+    /// slot is taken, the later worker cannot take it, so which
+    /// generation is parked stops depending on thread start order.
+    ///
+    /// Waits unconditionally rather than with a deadline: the worker is
+    /// already spawned when a test gets here, so this returns as soon as
+    /// it is scheduled, and a timeout would only trade a diagnosable
+    /// hang for a flaky assertion on a loaded machine.
+    pub fn wait_until_held(&self, n: usize) {
+        let mut holds = self.holds.lock().unwrap();
+        while holds.claimed < n {
+            holds = self.claimed.wait(holds).unwrap();
         }
     }
 
@@ -322,9 +383,13 @@ impl LlmClient for HoldingLlm {
         chunk: &mut dyn FnMut(LlmChunk),
     ) -> Result<LlmTurn, String> {
         let hold = {
-            let mut left = self.held.lock().unwrap();
-            let hold = *left > 0;
-            *left = left.saturating_sub(1);
+            let mut holds = self.holds.lock().unwrap();
+            let hold = holds.left > 0;
+            if hold {
+                holds.left -= 1;
+                holds.claimed += 1;
+                self.claimed.notify_all();
+            }
             hold
         };
         if hold {
