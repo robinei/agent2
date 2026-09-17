@@ -314,7 +314,29 @@ fn render_menu(title: &str, artifacts: &[Artifact]) -> String {
     }
     for a in &artifacts[start..] {
         let tail = match &a.state {
-            ArtifactState::Delivered(v) => preview(v),
+            // **A delivered value is never shown here.** This menu is an
+            // index of history rows, not a replay of them: the row's
+            // label says what the call was, its id fetches the value
+            // whole, and fetching logs nothing — so a program reads what
+            // it wants without inflicting it on the program after it.
+            //
+            // Measured 2026-09-17, before this: one `dead-code-sweep`
+            // run's menu was 9,901 bytes of a 36,821-byte document, the
+            // largest thing in it after the card, and not one byte of it
+            // had been chosen by anybody. A return value did not replace
+            // it either — `CompletionReport::render` emits the value and
+            // then the menu regardless — so a program that distilled its
+            // findings handed the next writer the distillation *and* the
+            // firehose, with the firehose winning on volume.
+            //
+            // The size stays, because it is what a reader needs in order
+            // to decide whether the fetch is worth a round trip.
+            ArtifactState::Delivered(v) => delivered_tail(v),
+            // A failure keeps its text. It is exactly the thing nobody
+            // chose and everybody needs: the only place the reason
+            // appears, and unlike a result it is not fetchable under its
+            // own id — `outcome_json` turns a `Failed` into a rejection,
+            // not a value.
             ArtifactState::Failed(msg) => format!("failed: {}", clip(msg, PREVIEW_MAX_BYTES)),
             ArtifactState::PendingSend => {
                 format!("pending — await artifact({})", a.id)
@@ -324,6 +346,22 @@ fn render_menu(title: &str, artifacts: &[Artifact]) -> String {
         out.push_str(&format!("\n[#{}] {} → {}", a.id, a.label, tail));
     }
     out
+}
+
+/// What a delivered row says about itself: that it arrived, and how
+/// big it is. Never what it contains — see [`render_menu`].
+///
+/// A scalar is the exception, and only because it is smaller than any
+/// description of it: `→ 0` costs less than `→ ok, 1 byte` and tells a
+/// reader strictly more. The rule is about not replaying *payloads*,
+/// not about withholding numbers.
+fn delivered_tail(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::Null => "ok".into(),
+        serde_json::Value::Bool(_) | serde_json::Value::Number(_) => v.to_string(),
+        serde_json::Value::String(s) if s.len() <= 24 => format!("{s:?}"),
+        other => format!("ok, {} bytes", other.to_string().len()),
+    }
 }
 
 // ── rendered messages ───────────────────────────────────────────────
@@ -1634,8 +1672,12 @@ mod tests {
         assert!(line.contains("[truncated;"), "{line}");
     }
 
+    /// A menu row says a call arrived and how big its value is — never
+    /// what the value was. Bounded is not enough: a bounded preview of
+    /// every call is still a replay nobody asked for, and on one live
+    /// run it was 27% of the document.
     #[test]
-    fn artifact_previews_are_bounded() {
+    fn a_menu_row_indexes_a_value_instead_of_replaying_it() {
         let report = ConditionReport {
             what: "boom".into(),
             whence: Whence::Stack(vec!["<root>".into()]),
@@ -1645,8 +1687,46 @@ mod tests {
         };
         let rendered = report.render();
         let menu_line = rendered.lines().find(|l| l.starts_with("[#7]")).unwrap();
-        assert!(menu_line.len() < PREVIEW_MAX_BYTES + 100, "{menu_line}");
-        assert!(menu_line.contains("[truncated; 9002 bytes total]"));
+        assert!(!menu_line.contains("bbbb"), "value replayed: {menu_line}");
+        assert!(
+            menu_line.contains("9002 bytes"),
+            "size is kept: {menu_line}"
+        );
+        assert!(menu_line.len() < 120, "{menu_line}");
+    }
+
+    /// A failure keeps its text: it is the one thing nobody chose and
+    /// everybody needs, and unlike a delivered value it cannot be
+    /// fetched back — `outcome_json` turns it into a rejection.
+    #[test]
+    fn a_failed_row_still_carries_its_reason() {
+        let report = ConditionReport {
+            what: "boom".into(),
+            whence: Whence::Stack(vec!["<root>".into()]),
+            console: Vec::new(),
+            console_id: None,
+            artifacts: vec![pending(
+                7,
+                "bash([\"build\"])",
+                ArtifactState::Failed("no such file or directory".into()),
+            )],
+        };
+        let line = report
+            .render()
+            .lines()
+            .find(|l| l.starts_with("[#7]"))
+            .unwrap()
+            .to_owned();
+        assert!(line.contains("no such file or directory"), "{line}");
+    }
+
+    /// A scalar is smaller than any description of it, so it is shown.
+    #[test]
+    fn a_small_delivered_scalar_is_shown_whole() {
+        assert_eq!(delivered_tail(&json!(0)), "0");
+        assert_eq!(delivered_tail(&json!(null)), "ok");
+        assert_eq!(delivered_tail(&json!("v2")), "\"v2\"");
+        assert!(delivered_tail(&json!("x".repeat(400))).starts_with("ok, "));
     }
 
     #[test]
