@@ -46,12 +46,14 @@ declare type Decision = unknown;
  * that you can act on it afterwards, return it instead — and if it is
  * both, do both.
  *
- * `return` and `append_history` differ in how long they last, not in
- * who sees them. When the conversation grows too big to send, returns
- * are dropped first — they are a program's own report, and every call
- * in them stays fetchable by id — while a note is nearly the last thing
- * to go. So `return` what the next program needs, and
- * `append_history` what you will still want many turns from now.
+ * `return` and `append_history` differ in what they are for, not in
+ * who sees them. A `return` is this step's handoff: what the next
+ * program is written from. `append_history` is a row you keep
+ * deliberately, for something you will still want much later. When the
+ * conversation grows too big to send, a program is written to shorten
+ * it, and that program is asked to drop finished reports before it
+ * touches anything kept on purpose — but it is a program making a
+ * judgement, not a rule, so what survives is up to it.
  *
  * So: the first program says what it is about to do, the program that
  * finishes says what the answer was, and the ones in between usually
