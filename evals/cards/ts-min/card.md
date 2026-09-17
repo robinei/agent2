@@ -16,11 +16,14 @@
  *                      of it. Once, at the end.
  *   append_history(v)  the same, any number of times, from anywhere.
  *   tell(text)         reaches the person, and only the person.
- *   a call's result    does not cross. Afterwards you see that the
- *                      call happened and how big its answer was —
- *                      bash("grep …") → ok, 343 bytes — and none of
- *                      those bytes, unless a later program asks for
- *                      them by id with fetch_history.
+ *   a call's result    is not in front of the next program, but it is
+ *                      not gone: you see that the call happened and
+ *                      how big its answer was — bash("grep …") → ok,
+ *                      343 bytes — and `fetch_history(id)` hands back
+ *                      the bytes themselves, whole and for nothing. So
+ *                      there is never a reason to copy a result
+ *                      anywhere; keep the id, or keep what you
+ *                      concluded.
  *
  * So a program that finds something and neither acts on it nor hands
  * it on has thrown the finding away, and the next program will go and
@@ -69,8 +72,14 @@ declare function fork(): Agent;
 declare function list_agents(opts?: { under?: number; deep?: boolean }):
   Array<{ agent: number; branch: number; name: string; charter: string; status: string }>;
 
-/** Keep something worth keeping — where a finding goes when you find
- *  it, rather than when you finish. */
+/** Keep a conclusion worth keeping — where a finding goes when you
+ *  find it, rather than when you finish.
+ *
+ *  Not a copy of a result. The result is already kept: its row is in
+ *  the conversation and `fetch_history(id)` returns it whole, for
+ *  nothing. What belongs here is what you worked out *from* it — the
+ *  four paths that matter out of the two hundred you listed — never
+ *  the two hundred. */
 declare function append_history(value: unknown): void;
 /** Read any row of the conversation back, whole, by the id shown against
  *  it. Answered from the log: costs nothing, adds nothing. */

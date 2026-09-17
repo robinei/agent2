@@ -723,7 +723,50 @@ fn worked_examples(exemplars: &[Exemplar]) -> Vec<ChatMessage> {
 /// (```javascript, ```js, or bare ```) and requires a matching closing
 /// ``` as the last non-blank line, so a program that legitimately
 /// contains a ``` in a string or comment is not mis-stripped.
+/// A provider's own control tokens, arriving as *text* in the
+/// completion and then compiled as if the model had written them.
+///
+/// Observed 2026-09-17: a run died on `compile error: 1:1: Unexpected
+/// token` with `<｜｜DSML｜｜ calls>` as the offending source — DeepSeek's
+/// tool-call delimiter, leaked into the content stream. The model did
+/// not write it, the program was otherwise fine, and the whole run was
+/// lost to a trap it could not have avoided or understood.
+///
+/// Stripped rather than handled further up because this is the one
+/// place that decides what counts as the program's source, and because
+/// the alternative — teaching the card about a provider's framing — is
+/// exactly the sort of thing the model should never have to know.
+///
+/// Deliberately narrow: only tokens delimited by the full-width bars
+/// `｜` (U+FF5C), which no ordinary program contains and which are how
+/// this family of tokens is spelled. A broad "strip anything in angle
+/// brackets" rule would eat `a < b && c > d`.
+fn strip_control_tokens(raw: &str) -> String {
+    if !raw.contains('\u{ff5c}') {
+        return raw.to_owned();
+    }
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(start) = rest.find('<') {
+        let Some(end_rel) = rest[start..].find('>') else {
+            break;
+        };
+        let end = start + end_rel + 1;
+        if rest[start..end].contains('\u{ff5c}') {
+            out.push_str(&rest[..start]);
+            rest = &rest[end..];
+        } else {
+            out.push_str(&rest[..end]);
+            rest = &rest[end..];
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 pub fn extract_program(raw: &str) -> String {
+    let raw = strip_control_tokens(raw);
+    let raw = raw.as_str();
     let trimmed = raw.trim();
     let Some(after_open) = trimmed.strip_prefix("```") else {
         return raw.to_owned();
@@ -801,6 +844,32 @@ mod tests {
     }
 
     // --- extract_program (folded in from the deleted fence.rs) ---
+
+    /// **A provider's control token is not the model's program.** A run
+    /// on 2026-09-17 was lost to `compile error: 1:1: Unexpected token`
+    /// whose source was `<｜｜DSML｜｜ calls>` — DeepSeek's tool-call
+    /// delimiter arriving as content. Nothing the model could have
+    /// avoided, and nothing it should have to know about.
+    #[test]
+    fn a_leaked_control_token_is_not_compiled_as_source() {
+        assert_eq!(
+            extract_program("<｜｜DSML｜｜ calls>tell(\"hi\");"),
+            "tell(\"hi\");"
+        );
+        assert_eq!(
+            extract_program("tell(\"hi\");<｜tool▁calls▁end｜>"),
+            "tell(\"hi\");"
+        );
+    }
+
+    /// Narrow on purpose: a comparison is not a control token.
+    #[test]
+    fn ordinary_angle_brackets_survive() {
+        let src = "if (a < b && c > d) { tell(\"x\"); }";
+        assert_eq!(extract_program(src), src);
+        let generic = "const xs = [1, 2]; if (xs.length < 3) done();";
+        assert_eq!(extract_program(generic), generic);
+    }
 
     #[test]
     fn no_fence_is_returned_unchanged() {
