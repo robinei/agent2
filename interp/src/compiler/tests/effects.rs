@@ -4,7 +4,7 @@
 
 use crate::compiler::compile;
 use crate::testutil::{eval, eval_str};
-use crate::vm::{StepResult, VM, Value};
+use crate::vm::{Instr, StepResult, VM, Value};
 
 // ── effects (tools / raise) ───────────────────────────────────────
 
@@ -225,43 +225,74 @@ fn raise_non_literal_name_is_compile_error() {
 // ── phase 20 harness vocabulary: bare-global verbs + decision values
 // (`docs/20_CODE_MODE.md` Step C1/D2) ─────────────────────────────
 //
-// `tell`/`ask`/`answer`/`spawn`/`fork`/`append_history`/`fetch_history` are
-// a fixed, closed surface — bare-global, `Invoke`-based, exactly like
+// The bare-global verbs are a fixed, closed surface, exactly like
 // `tools.*` above but without the namespace, since (unlike `tools.*`)
-// this set never varies per agent. `resume`/`abandon` are pure
-// decision-value constructors (Step D2): no `Invoke`, no promise —
-// the same shape `TypeError(...)` already builds, just tagged
-// `__decision` instead of `name`. `tell` is the one exception to
-// "`Invoke`-based": it lowers to `Notify` instead (23_ONE_AGENT.md
-// C0b), covered separately below rather than in this loop, because it
-// never yields `Pending` even when awaited.
+// this set never varies per agent. They lower three ways, and which
+// one a verb gets says what kind of call it is:
+//
+//   `Invoke`  — `ask`, and nothing else: a promise, because the
+//               value comes from someone else and may take minutes.
+//   `Notify`  — `tell`: settles at dispatch and has no value, so it
+//               pushes `undefined` (23_ONE_AGENT.md C0b). Covered
+//               separately below, because it never yields `Pending`
+//               even when awaited.
+//   `Settle`  — everything else: settles into the standing frame and
+//               hands back a value, with no promise and no `Await`.
+//
+// `resume`/`abandon` are pure decision-value constructors (Step D2):
+// no call at all — the same shape `TypeError(...)` already builds,
+// just tagged `__decision` instead of `name`.
 
 #[test]
 fn awaited_harness_verb_calls_yield_pending_effect() {
-    // One representative per verb: each is bare (no `tools.` prefix)
-    // and produces the same `Invoke` effect `tools.*` does.
+    // `ask` is the last bare verb with a promise, and the only one
+    // that should have had one all along: a genuine round trip to
+    // someone else, which may take minutes and may fail
+    // asynchronously. Everything else in the vocabulary now settles
+    // into the calling frame.
+    let src = "return await ask(\"who\", \"q\");";
+    let prog = compile(src).expect("compiles");
+    let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
+    match vm.step(u64::MAX).unwrap() {
+        StepResult::Pending { calls } => {
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].name, "ask");
+            assert_eq!(
+                calls[0].args,
+                vec![Value::String("who".into()), Value::String("q".into())]
+            );
+        }
+        other => panic!("expected Pending, got {other:?}"),
+    }
+}
+
+#[test]
+fn settle_at_dispatch_verbs_yield_settle_with_or_without_await() {
+    // Every verb the harness answers into the calling frame. Each is
+    // checked **both** spellings: the card and its exemplars write
+    // `await` in front of several of these and a model that copies them
+    // must keep working, while a model that leaves it off must get the
+    // value and not a promise. `Await` passing a non-promise straight
+    // through is what makes the two identical.
     for (call, expected_name, expected_args) in [
-        (
-            "ask(\"who\", \"q\")",
-            "ask",
-            vec![Value::String("who".into()), Value::String("q".into())],
-        ),
         (
             "spawn(\"reviewer\")",
             "spawn",
             vec![Value::String("reviewer".into())],
         ),
         ("fork()", "fork", vec![]),
+        ("list_agents()", "list_agents", vec![]),
+        ("done()", "done", vec![]),
+        ("fetch_history(7)", "fetch_history", vec![Value::PosInt(7)]),
         (
             "append_history(1)",
             "append_history",
             vec![Value::PosInt(1)],
         ),
-        ("fetch_history(7)", "fetch_history", vec![Value::PosInt(7)]),
         (
-            "answer(1, 2)",
+            "answer(1, 2, 3)",
             "answer",
-            vec![Value::PosInt(1), Value::PosInt(2)],
+            vec![Value::PosInt(1), Value::PosInt(2), Value::PosInt(3)],
         ),
         (
             "remove_history(4, \"note\")",
@@ -277,20 +308,50 @@ fn awaited_harness_verb_calls_yield_pending_effect() {
                 Value::String("shorter".into()),
             ],
         ),
-        ("list_agents()", "list_agents", vec![]),
-        ("done()", "done", vec![]),
     ] {
-        let src = format!("return await {call};");
-        let prog = compile(&src).unwrap_or_else(|e| panic!("{call} failed to compile: {e:?}"));
-        let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
-        match vm.step(u64::MAX).unwrap() {
-            StepResult::Pending { calls } => {
-                assert_eq!(calls.len(), 1, "{call}");
-                assert_eq!(calls[0].name, expected_name, "{call}");
-                assert_eq!(calls[0].args, expected_args, "{call}");
+        for src in [format!("return {call};"), format!("return await {call};")] {
+            let prog = compile(&src).unwrap_or_else(|e| panic!("{src} failed to compile: {e:?}"));
+            let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
+            match vm.step(u64::MAX).unwrap() {
+                StepResult::Settle { call: settle } => {
+                    assert_eq!(settle.name, expected_name, "{src}");
+                    assert_eq!(settle.args, expected_args, "{src}");
+                }
+                other => panic!("{src}: expected Settle, got {other:?}"),
             }
-            other => panic!("{call}: expected Pending, got {other:?}"),
+            vm.push_settled(Value::Float(7.0)).expect("outstanding");
+            match vm.step(u64::MAX).unwrap() {
+                StepResult::Done { value, .. } => {
+                    assert_eq!(value, Value::Float(7.0), "{src}: the value itself");
+                }
+                other => panic!("{src}: expected completion, got {other:?}"),
+            }
         }
+    }
+}
+
+#[test]
+fn a_settle_is_not_re_issued_while_it_waits() {
+    // The host need not answer in the same dispatch pass — `spawn`
+    // takes a round trip through the real harness — so a host that
+    // ticks the VM meanwhile must get "blocked, nothing new" rather
+    // than the same call a second time.
+    let prog = compile("return spawn(\"c\");").expect("compiles");
+    let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
+    assert!(matches!(
+        vm.step(u64::MAX).unwrap(),
+        StepResult::Settle { .. }
+    ));
+    for _ in 0..3 {
+        match vm.step(u64::MAX).unwrap() {
+            StepResult::Pending { calls } => assert!(calls.is_empty(), "nothing new to hand over"),
+            other => panic!("expected an empty Pending while waiting, got {other:?}"),
+        }
+    }
+    vm.push_settled(Value::Float(2.0)).expect("outstanding");
+    match vm.step(u64::MAX).unwrap() {
+        StepResult::Done { value, .. } => assert_eq!(value, Value::Float(2.0)),
+        other => panic!("expected completion, got {other:?}"),
     }
 }
 
@@ -425,18 +486,15 @@ fn spawn_yields_its_handle_without_a_source_level_await() {
     // The card and its exemplars spell it without `await`, and a model
     // that copies them and passes `h` as an address must not be handing
     // over a promise -- two live traps came from exactly that. Creating
-    // settles at dispatch, so the compiler emits the await itself.
+    // settles at dispatch, so the value comes straight back onto the
+    // frame's stack.
     let prog = compile("const h = spawn(\"charter\"); return h;").expect("compiles");
     let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
-    let id = match vm.step(u64::MAX).unwrap() {
-        StepResult::Pending { calls } => {
-            assert_eq!(calls.len(), 1, "one spawn call");
-            assert_eq!(calls[0].name.as_str(), "spawn");
-            calls[0].promise
-        }
+    match vm.step(u64::MAX).unwrap() {
+        StepResult::Settle { call } => assert_eq!(call.name.as_str(), "spawn"),
         other => panic!("expected the spawn to yield, got {other:?}"),
-    };
-    vm.resolve_promise(id, Value::Float(7.0)).unwrap();
+    }
+    vm.push_settled(Value::Float(7.0)).unwrap();
     match vm.step(u64::MAX).unwrap() {
         StepResult::Done { value, .. } => {
             assert_eq!(value, Value::Float(7.0), "the handle itself, not a promise");
@@ -555,6 +613,212 @@ fn an_async_body_that_throws_rejects_its_promise() {
     match vm.step(u64::MAX).expect("rejects rather than escaping") {
         StepResult::Done { value, .. } => {
             assert_eq!(value, Value::String("caught".into()));
+        }
+        other => panic!("expected Done, got {other:?}"),
+    }
+}
+
+// ── settling in a plain frame (`Instr::Settle`) ───────────────────
+//
+// The three properties the `Invoke` + compiler-emitted-`Await`
+// lowering could not have. Each is about the *frame*: it never leaves,
+// so nothing has to be invented to represent it while it is away.
+
+/// **A settle-at-dispatch verb inside a plain arrow does not suspend.**
+/// This is the shape that forced the old design's hand:
+/// `names.map(n => spawn(n))` put an `await` — one the source never
+/// wrote — inside a function nobody declared `async`, so the arrow's
+/// frame suspended and `suspend_current_frame` had to mint a promise
+/// to hand back in its place. With `Settle` the arrow just returns the
+/// value, and there is no continuation, no strand, and no promise
+/// anywhere in the VM.
+#[test]
+fn a_settle_in_a_plain_arrow_makes_no_strand() {
+    let src = "const made = [\"a\", \"b\"].map(n => spawn(n));\n\
+               return made;";
+    let prog = compile(src).expect("compiles");
+    let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
+    let mut handles = 0.0;
+    loop {
+        match vm.step(u64::MAX).expect("no trap") {
+            StepResult::Settle { call } => {
+                assert_eq!(call.name.as_str(), "spawn");
+                handles += 1.0;
+                vm.push_settled(Value::Float(handles)).expect("outstanding");
+            }
+            StepResult::Done { value, .. } => {
+                let rows = vm.stack_value_to_json(&value, 0).expect("json");
+                assert_eq!(rows, serde_json::json!([1, 2]), "the handles themselves");
+                break;
+            }
+            other => panic!("expected only settles and completion, got {other:?}"),
+        }
+    }
+    assert_eq!(handles, 2.0, "one settle per element");
+    // The point of the exercise: nothing was suspended and nothing was
+    // promised. A single stray promise here would mean the arrow's
+    // frame had left, which is the whole thing this replaces.
+    assert!(vm.promise_count() == 0, "no promise was ever allocated");
+    assert!(vm.continuation_count() == 0, "no frame was ever suspended");
+}
+
+/// **A throw after a settle-at-dispatch call, in a sync function, is
+/// the caller's.** The old lowering suspended the frame at the call,
+/// which meant everything after it belonged to a promise — so this
+/// `throw` would have rejected a promise the `try` below never held.
+/// A function nobody declared `async` must keep throwing to its caller.
+#[test]
+fn a_throw_after_a_settle_belongs_to_the_caller() {
+    let src = "function make(n) { const h = spawn(n); throw \"after \" + h; }\n\
+               try { make(\"a\"); } catch (e) { return e; }\n\
+               return \"not caught\";";
+    let prog = compile(src).expect("compiles");
+    let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
+    match vm.step(u64::MAX).expect("no trap") {
+        StepResult::Settle { call } => assert_eq!(call.name.as_str(), "spawn"),
+        other => panic!("expected a settle, got {other:?}"),
+    }
+    vm.push_settled(Value::String("h1".into()))
+        .expect("outstanding");
+    match vm.step(u64::MAX).expect("no trap") {
+        StepResult::Done { value, .. } => {
+            assert_eq!(
+                value,
+                Value::String("after h1".into()),
+                "the caller caught it"
+            );
+        }
+        other => panic!("expected Done, got {other:?}"),
+    }
+}
+
+/// **A failed settle throws at the call site**, so an ordinary
+/// `try`/`catch` around the call — in a plain function — sees it. A
+/// rejected promise could not do this: the rejection belonged to
+/// whoever awaited it, and a sync caller never did.
+#[test]
+fn a_failed_settle_throws_where_it_was_called() {
+    let src = "function make() { try { return spawn(1); } catch (e) { return \"caught \" + e; } }\n\
+               return make();";
+    let prog = compile(src).expect("compiles");
+    let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
+    assert!(matches!(
+        vm.step(u64::MAX).unwrap(),
+        StepResult::Settle { .. }
+    ));
+    let outcome = vm
+        .settle_throw(Value::String("needs a charter".into()))
+        .expect("outstanding");
+    assert!(
+        matches!(outcome, crate::vm::ThrowOutcome::Caught),
+        "the try saw it"
+    );
+    match vm.step(u64::MAX).expect("no trap") {
+        StepResult::Done { value, .. } => {
+            assert_eq!(value, Value::String("caught needs a charter".into()));
+        }
+        other => panic!("expected Done, got {other:?}"),
+    }
+}
+
+/// `Promise.all` over settle-at-dispatch calls still works, because
+/// there are no promises in it to combine: they are plain values, and
+/// `Promise.all` passes a non-thenable through. The card, the
+/// exemplars and several harness tests spell it exactly this way.
+#[test]
+fn promise_all_over_settles_is_the_values() {
+    let src = "return await Promise.all([\"a\", \"b\"].map(n => spawn(n)));";
+    let prog = compile(src).expect("compiles");
+    let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
+    let mut n = 0.0;
+    loop {
+        match vm.step(u64::MAX).expect("no trap") {
+            StepResult::Settle { .. } => {
+                n += 1.0;
+                vm.push_settled(Value::Float(n)).expect("outstanding");
+            }
+            StepResult::Done { value, .. } => {
+                let rows = vm.stack_value_to_json(&value, 0).expect("json");
+                assert_eq!(rows, serde_json::json!([1, 2]));
+                break;
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+}
+
+/// **Every name in the exported vocabulary lowers to a host call.** The
+/// list is what `agent`'s own gate iterates to check the harness answers
+/// them; if a name drifted out of the compiler's arms it would lower to
+/// an ordinary call to an undefined global, and the harness gate would
+/// then be checking nothing.
+#[test]
+fn every_harness_verb_lowers_to_a_host_call() {
+    for verb in crate::HARNESS_VERBS {
+        // Enough arguments for the arity-checked ones; the rest ignore
+        // the extras, and none of this runs past the first call.
+        let src = if *verb == "done" || *verb == "fork" {
+            format!("{verb}();")
+        } else {
+            format!("{verb}(1, 2, 3);")
+        };
+        let prog = compile(&src).unwrap_or_else(|e| panic!("{verb} failed to compile: {e:?}"));
+        let emitted = prog.code.iter().any(|i| {
+            matches!(i, Instr::Invoke(n, _) | Instr::Notify(n, _) | Instr::Settle(n, _)
+                if n.as_str() == *verb)
+        });
+        assert!(emitted, "`{verb}` does not lower to a host call");
+    }
+}
+
+/// **A settle that fails with nowhere to catch it traps the program.**
+/// The host answers a `Settle` between steps, so there is no `step()`
+/// result for `settle_throw` to fail — it records the value and the
+/// next `step` raises exactly the error an uncaught `throw` raises,
+/// payload and all. Without this the VM would carry on past the call
+/// with a hole where its value should have been.
+#[test]
+fn an_uncaught_settle_failure_traps_on_the_next_step() {
+    let prog = compile("const h = spawn(1); return h;").expect("compiles");
+    let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
+    assert!(matches!(
+        vm.step(u64::MAX).unwrap(),
+        StepResult::Settle { .. }
+    ));
+    let outcome = vm
+        .settle_throw(Value::String("needs a charter".into()))
+        .expect("outstanding");
+    assert!(
+        matches!(outcome, crate::vm::ThrowOutcome::Uncaught(_)),
+        "nothing could catch it"
+    );
+    let err = vm.step(u64::MAX).expect_err("the program traps");
+    assert_eq!(err.kind, crate::vm::ErrorKind::UncaughtException);
+    assert_eq!(
+        err.payload,
+        Some(Value::String("needs a charter".into())),
+        "the harness's own message reaches the report structurally"
+    );
+}
+
+/// A settle inside an **async** call rejects that call's promise, the
+/// same as any other throw there: the failure belongs to whoever awaits
+/// the call, not to the parked code underneath it.
+#[test]
+fn a_settle_failure_inside_an_async_call_rejects_its_promise() {
+    let src = "async function make() { return spawn(1); }\n\
+               try { return await make(); } catch (e) { return \"caught \" + e; }";
+    let prog = compile(src).expect("compiles");
+    let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
+    assert!(matches!(
+        vm.step(u64::MAX).unwrap(),
+        StepResult::Settle { .. }
+    ));
+    vm.settle_throw(Value::String("no charter".into()))
+        .expect("outstanding");
+    match vm.step(u64::MAX).expect("no trap") {
+        StepResult::Done { value, .. } => {
+            assert_eq!(value, Value::String("caught no charter".into()));
         }
         other => panic!("expected Done, got {other:?}"),
     }

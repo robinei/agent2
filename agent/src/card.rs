@@ -392,12 +392,6 @@ mod tests {
                 }
                 StepResult::Pending { calls } => {
                     for call in calls {
-                        // `done()` settles at dispatch in the real
-                        // machine and never leaves the process; here it
-                        // is just a call whose name is worth noting.
-                        if call.name == crate::machine::TOOL_DONE {
-                            done = true;
-                        }
                         let result = stub_result(&call.name, &call.args);
                         let value = vm
                             .json_to_stack_value(&result, 0)
@@ -405,6 +399,20 @@ mod tests {
                         vm.resolve_promise(call.promise, value)
                             .map_err(|e| format!("{e:?}"))?;
                     }
+                }
+                // The settle-at-dispatch verbs — `done()` among them —
+                // come back here instead of through the outbox: they
+                // answer into the frame that called them, so the stub
+                // pushes the value rather than settling a promise.
+                StepResult::Settle { call } => {
+                    if call.name == crate::machine::TOOL_DONE {
+                        done = true;
+                    }
+                    let result = stub_result(&call.name, &call.args);
+                    let value = vm
+                        .json_to_stack_value(&result, 0)
+                        .map_err(|e| format!("{e:?}"))?;
+                    vm.push_settled(value).map_err(|e| format!("{e:?}"))?;
                 }
                 StepResult::Raise { .. } => {
                     let value = vm

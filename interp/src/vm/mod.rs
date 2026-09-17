@@ -399,6 +399,22 @@ pub struct VM {
     /// with the ready queue, outbox, AND this all empty, no settlement can
     /// ever arrive: deadlock (only reachable via circular awaits).
     inflight: usize,
+    /// A `Settle` call is outstanding: its arguments are consumed, `ip`
+    /// has advanced past it, and the stack is one value short until the
+    /// host answers with `push_settled` / `settle_throw`. `step()`
+    /// refuses to execute in that state (it reports `Pending` with an
+    /// empty batch) so a host that ticks the VM before answering cannot
+    /// run instructions against a stack with a hole in it — nor see the
+    /// same call issued twice.
+    settling: bool,
+    /// A settle failure with nowhere to go: no reachable handler and no
+    /// enclosing async call to reject. The next `dispatch` turns it into
+    /// the program's own uncaught-throw trap — the same error
+    /// `Instr::Throw` raises — so a failed call escalates down exactly
+    /// one road no matter who noticed it first. Held rather than
+    /// returned to the host because the host answers a `Settle` between
+    /// steps, where there is no `step()` result to fail.
+    settle_uncaught: Option<Value>,
     /// Active `try` handlers, innermost last (see [`Instr::TryEnter`]). A
     /// throw — or a catchable runtime error — unwinds to the top entry;
     /// `TryExit` pops it on the normal path. The compiler guarantees entries
@@ -717,6 +733,19 @@ pub enum StepResult {
     /// a hot program can't starve the loop, debuggers single-step with
     /// `fuel = 1`. Never observable by the program — no `try` can trap it.
     OutOfFuel,
+    /// A settle-at-dispatch call (`Instr::Settle`) is waiting for its
+    /// value. The arguments are already consumed and `ip` has advanced
+    /// past the instruction, exactly as for `Raise`: the host answers
+    /// with `VM::push_settled(value)` or `VM::settle_throw(errval)` and
+    /// calls `step()` again, and execution resumes at the next
+    /// instruction **in the same frame** — nothing was suspended and no
+    /// promise exists for this call.
+    ///
+    /// The host need not answer within the same dispatch pass. Until it
+    /// does, `step()` reports `Pending { calls: [] }` — blocked on the
+    /// host with nothing new to hand over — rather than re-issuing the
+    /// call.
+    Settle { call: SettleCall },
     /// A condition was raised; host (LLM) decides how to proceed.
     /// The payload (if any) is the value passed to `raise("name", expr)`.
     /// ip has already advanced past the Raise instruction; the host may
@@ -730,6 +759,20 @@ pub enum StepResult {
         condition: String,
         payload: Option<Value>,
     },
+}
+
+/// A settle-at-dispatch call (`Instr::Settle`): the same name/args/site
+/// an `InvokeCall` carries, minus the promise — there is none, because
+/// the frame that made the call is still standing and takes the value
+/// directly. One is outstanding at a time per VM, so it needs no id.
+#[derive(Debug)]
+pub struct SettleCall {
+    pub name: String,
+    /// Arguments in call order (`args[0]` is the first argument).
+    pub args: Vec<Value>,
+    /// Source byte offset of the `Settle` instruction that issued this
+    /// call, like `InvokeCall::site`.
+    pub site: u32,
 }
 
 /// A single tool/function call requested by the program.

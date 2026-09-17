@@ -1337,16 +1337,14 @@ impl Session {
     fn spawn_tools(&self, branch: BranchId, calls: Vec<OutCall>) {
         let agent = self.agent_of(branch);
         for call in calls {
-            // `agents` is the one tool the registry cannot serve: its
-            // answer is a projection over the tree **plus live session
-            // state** (a branch's status), which no `ToolHandler` can
-            // see. Answered inline, on the loop thread — it reads memory.
-            // `agents` is the one tool name the host itself must know —
+            // Answered inline, on the loop thread — it reads memory
+            // (`serves_inline`'s own doc for why nothing else can).
+            // These are the tool names the host itself must know:
             // `TOOL_AGENTS` lived in `machine.rs` only as part of the
             // deleted `ToolSpec` surface (23_ONE_AGENT A4); the string
             // itself is not a deleted concept, `tools.agents(...)` is
             // very much live, so it stays inline here.
-            if call.name == "agents" {
+            if serves_inline(&call.name) {
                 let _ = self.tx.send(LoopMsg::ToolDone {
                     branch,
                     call: call.call,
@@ -1876,6 +1874,20 @@ fn pick_resume_leaf(tree: &Tree) -> io::Result<EventId> {
         .find(|id| owes_work(tree, *id))
         .or_else(|| leaves.first().copied())
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "log has no leaves"))
+}
+
+/// Tool names the loop answers itself instead of handing to the
+/// registry. The answer is a projection over the tree **plus live
+/// session state** (a branch's status), which no `ToolHandler` can see,
+/// so there is nowhere else for it to live.
+///
+/// Two spellings, one implementation: `tools.agents(options)` is the
+/// configurable form, `list_agents()` the bare verb the card
+/// advertises. Named as a function rather than inlined in
+/// `spawn_tools` so `every_harness_verb_has_an_answerer` can ask the
+/// question without running a session.
+pub(crate) fn serves_inline(name: &str) -> bool {
+    name == "agents" || name == crate::machine::TOOL_LIST_AGENTS
 }
 
 /// The most recent `Condition` on `leaf`'s path — a just-suspended run's
@@ -4309,6 +4321,82 @@ mod tests {
                 json!("answer"),
                 json!(value)
             )))
+        }
+    }
+
+    /// **`list_agents()` answers.** The card has advertised it since
+    /// phase 20 — "every agent in this subtree, with status" — and
+    /// nothing implemented it: the name fell past `dispatch_calls` into
+    /// the tool registry, which has no such tool, so a program that took
+    /// the card at its word got `unknown tool ` + the verb's own name.
+    ///
+    /// It is a settle-at-dispatch verb like `spawn` and `fork`, so it is
+    /// spelled here **without** `await` — the rows come straight back
+    /// onto the frame's stack. And `deep: true`: the card says subtree,
+    /// where `tools.agents()` defaults to direct children only, so the
+    /// grandchild the worker makes must show up too.
+    ///
+    /// Two turns, because the subtree has to exist before it can be
+    /// listed: the first rests after telling the worker to go, the
+    /// worker builds its own child, and the second — independently
+    /// prompted — asks who is there (the same shape
+    /// `agents_survive_across_programs` uses, and for the same reason).
+    #[test]
+    fn list_agents_answers_with_the_subtree_and_its_status() {
+        let (session, _rx) = open_routed(
+            Tree::new(None),
+            [
+                (
+                    "ignored on resume",
+                    vec![
+                        scripted_program(
+                            r#"const child = spawn("worker");
+                               tell(child, "make one of your own");
+                               done();"#,
+                        ),
+                        scripted_program("return list_agents();"),
+                    ],
+                ),
+                (
+                    "worker",
+                    vec![scripted_program("spawn(\"grandchild\"); done();")],
+                ),
+                ("grandchild", vec![scripted_program("done();")]),
+            ],
+        );
+        let h = session.handle();
+        let branch = session.conversation_branch();
+        h.send(SessionCommand::UserTurn {
+            branch,
+            text: "hire someone".into(),
+            expects_reply: true,
+        });
+        let session = drain(session);
+        h.send(SessionCommand::UserTurn {
+            branch,
+            text: "who works for me?".into(),
+            expects_reply: true,
+        });
+        let session = drain(session);
+        let tree = session.tree();
+        let rows = returned(tree, root_leaf(&session));
+        let rows = rows.as_array().expect("an array of rows");
+        let mut charters: Vec<&str> = rows
+            .iter()
+            .map(|r| r["charter"].as_str().expect("a charter"))
+            .collect();
+        charters.sort();
+        assert_eq!(
+            charters,
+            ["grandchild", "worker"],
+            "the whole subtree, not just direct children: {rows:?}"
+        );
+        for row in rows {
+            assert!(row["agent"].is_u64(), "an id per row: {row}");
+            assert!(
+                row["status"].as_str().is_some_and(|s| !s.is_empty()),
+                "a status per row, which is the half only the loop can see: {row}"
+            );
         }
     }
 

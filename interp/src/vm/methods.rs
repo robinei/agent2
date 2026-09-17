@@ -48,6 +48,8 @@ impl VM {
             ready: VecDeque::new(),
             root_ip: 0,
             inflight: 0,
+            settling: false,
+            settle_uncaught: None,
             handlers: Vec::new(),
             stack: Vec::new(),
             // Root frame so that Local is valid from the start.
@@ -139,6 +141,67 @@ impl VM {
     /// already advanced past the Raise by `step()`).
     pub fn resume_raise(&mut self, value: Value) {
         self.stack.push(value);
+    }
+
+    /// Answer the outstanding `StepResult::Settle` with its value: push it
+    /// where the call's arguments were (ip was already advanced past the
+    /// `Settle` by `step()`) and let the frame carry on. The mirror of
+    /// `resume_raise`, and the whole point of `Instr::Settle` — the call
+    /// returns a value without ever having been a promise.
+    ///
+    /// A `Settle` is answered exactly once; answering when none is
+    /// outstanding is host misuse and errors without touching the stack,
+    /// because pushing there would corrupt the frame it landed in.
+    pub fn push_settled(&mut self, value: Value) -> Result<(), VMError> {
+        if !self.settling {
+            return Err(self.fail_not_resumable(
+                ErrorKind::BadArg,
+                "push_settled without an outstanding Settle",
+            ));
+        }
+        self.settling = false;
+        self.stack.push(value);
+        Ok(())
+    }
+
+    /// Fail the outstanding `StepResult::Settle`: throw `errval` into the
+    /// frame that made the call, at the call site. Unlike a rejected
+    /// promise — which belongs to whoever awaits it, and which a *sync*
+    /// caller could never catch — this is an ordinary throw, so a
+    /// `try`/`catch` around the call sees it and an uncaught one escapes
+    /// to the caller the way any other failed call in a sync function
+    /// does.
+    ///
+    /// The three destinations are `Instr::Throw`'s own, in its order,
+    /// because a failed call is a throw and should not get a second set
+    /// of rules: a reachable handler catches it; failing that, an
+    /// enclosing async call's promise rejects (the failure belongs to
+    /// whoever awaits that call, not to the parked code below it); and
+    /// failing that it is uncaught, recorded for the next `step` to
+    /// raise as the program's trap.
+    ///
+    /// The value slot the call owed the stack is never filled, and never
+    /// needs to be: unwinding truncates the stack to the handler's
+    /// snapshot, rejecting a strand discards its frames, and an uncaught
+    /// throw ends the program before another instruction runs.
+    pub fn settle_throw(&mut self, errval: Value) -> Result<ThrowOutcome, VMError> {
+        if !self.settling {
+            return Err(self.fail_not_resumable(
+                ErrorKind::BadArg,
+                "settle_throw without an outstanding Settle",
+            ));
+        }
+        self.settling = false;
+        if self.reachable_handler() {
+            self.unwind_to_handler(errval);
+            return Ok(ThrowOutcome::Caught);
+        }
+        if self.in_strand() {
+            self.reject_strand(errval.clone())?;
+            return Ok(ThrowOutcome::Caught);
+        }
+        self.settle_uncaught = Some(errval.clone());
+        Ok(ThrowOutcome::Uncaught(errval))
     }
 
     /// Unwind to the innermost `try` handler with `value` as the thrown
@@ -515,6 +578,20 @@ impl VM {
         Ok(())
     }
 
+    /// How many continuation records this VM has ever created — i.e.
+    /// how many times a frame has been suspended. Zero is the property
+    /// the settle-at-dispatch verbs are supposed to have: the frame
+    /// that made the call is still the one that receives the value.
+    pub fn continuation_count(&self) -> usize {
+        self.continuations.len()
+    }
+
+    /// How many promises this VM has ever allocated. A settle-at-dispatch
+    /// call allocates none — that is the whole claim.
+    pub fn promise_count(&self) -> usize {
+        self.promises.len()
+    }
+
     /// Allocate a fresh `Pending` promise. Used by `Instr::Invoke` (leaf tool
     /// promises) and by `Instr::AsyncEnter` (an async call's own promise,
     /// Tier 2).
@@ -650,19 +727,15 @@ impl VM {
     /// as the call's value, or, for a frame the scheduler resumed, control
     /// falls through to the scheduler.
     pub(super) fn suspend_current_frame(&mut self, awaiting: PromisePtr) -> Result<(), VMError> {
-        // An async body has owned its promise since its `AsyncEnter`
-        // prologue. A *sync* frame can suspend too, though, and that one
-        // mints its promise here: the settle-at-dispatch verbs (`spawn`,
-        // `fork`, `done`, `remove_history`, `rewrite_history` — see
-        // `compiler/call.rs`) emit their `Await` themselves rather than
-        // requiring one in the source, so `names.map(n => spawn(n))` awaits
-        // inside a plain arrow. Suspending is the first moment such a call
-        // owes its caller a value, and a promise is the only thing that value
-        // can be — while before it, a throw still belongs to the caller,
-        // which is exactly right for a function nobody declared `async`.
-        // (For an async body the same late minting was wrong, and was the
-        // bug: a body that threw before ever suspending had nothing to
-        // reject, so the throw escaped to the caller.)
+        // **Only an async frame can get here.** The frame has owned its
+        // promise since its `AsyncEnter` prologue, so there is nothing to
+        // mint: `await` is confined to async bodies by the parser, and the
+        // one emitter that used to put an `Await` in a plain arrow — the
+        // settle-at-dispatch verbs — emits `Settle` instead, which does not
+        // suspend anything. A sync frame reaching here is a compiler bug,
+        // not a case to handle: minting a promise for it would be inventing
+        // a value the source never asked for, and would silently move a
+        // throw that belongs to the caller onto a promise nobody awaits.
         //
         // Read before anything is torn down — past this point the frame is in
         // pieces and there is no coherent state to fail from.
@@ -671,8 +744,10 @@ impl VM {
         };
         let (promise, exit_as) = match entered_as {
             Completion::Normal => {
-                let pid = self.alloc_promise();
-                (pid, Completion::AsyncCall(pid))
+                return Err(self.fail_not_resumable(
+                    ErrorKind::BadReturn,
+                    "cannot suspend a frame that is not async",
+                ));
             }
             Completion::AsyncCall(pid) | Completion::Resumed(pid) => (pid, entered_as),
         };
