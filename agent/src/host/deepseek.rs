@@ -141,12 +141,12 @@ impl LlmClient for DeepSeekClient {
         chunk: &mut dyn FnMut(LlmChunk),
     ) -> Result<LlmTurn, String> {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-        // Read fresh per completion, not cached on `self`: the same
-        // `AGENT2_TRANSPORT` idiom `document::render` reads by, so a
-        // session can be pointed at either container without a rebuild
-        // and the two call sites (this one, `document::render`) can
-        // never drift onto different values mid-session.
-        let transport = crate::document::transport();
+        // Taken off the request, not looked up again: this is the
+        // container the document in hand was actually *rendered* for, so
+        // the body we build and the SSE shape we expect back cannot
+        // disagree with it. Both used to read `AGENT2_TRANSPORT`
+        // independently and were kept in agreement only by a comment.
+        let transport = request.transport;
         let body = request_body(
             request,
             &self.model,
@@ -494,6 +494,7 @@ mod tests {
         Document {
             messages,
             preamble: 0,
+            transport: Transport::Program,
         }
     }
 
@@ -576,6 +577,7 @@ mod tests {
                 tool_call_id: None,
             }],
             preamble: 0,
+            transport: Transport::Program,
         };
         let body = request_body(
             &request,

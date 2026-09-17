@@ -221,6 +221,7 @@ pub fn compact(
     ops: &[CompactionOp],
     budget: usize,
     threshold: usize,
+    transport: document::Transport,
 ) -> Result<Vec<EventPayload>, CompactionError> {
     let mut seen = std::collections::HashSet::new();
     for op in ops {
@@ -270,15 +271,7 @@ pub fn compact(
         );
     }
 
-    let doc = document::render_with_lookup(
-        tree,
-        agent,
-        leaf,
-        &context.system,
-        &context.exemplars,
-        budget,
-        &lookup,
-    );
+    let doc = document::render_with_lookup(tree, agent, leaf, context, budget, &lookup, transport);
     let size = rendered_size(&doc);
     if size >= threshold {
         return Err(CompactionError::StillOverThreshold { size, threshold });
@@ -334,7 +327,28 @@ pub fn should_fire(current_size: usize, budget: usize, headroom_fraction: f64) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::document::render;
+    use crate::document::{Document, Transport};
+
+    /// These tests are about *sizes and ops* — what compaction removes
+    /// and when it fires — not about wire containers, so they render
+    /// under one transport throughout and say so once here rather than
+    /// at thirty call sites. The one size question that *is* transport-
+    /// sensitive has its own test,
+    /// `a_programs_bytes_count_in_either_transport`, which builds both
+    /// shapes by hand.
+    fn render(tree: &Tree, spine: &Spine, budget: usize) -> Document {
+        crate::document::render(tree, spine, budget, Transport::Program)
+    }
+
+    fn compact(
+        tree: &Tree,
+        spine: &Spine,
+        ops: &[CompactionOp],
+        budget: usize,
+        threshold: usize,
+    ) -> Result<Vec<EventPayload>, CompactionError> {
+        super::compact(tree, spine, ops, budget, threshold, Transport::Program)
+    }
 
     /// A small real branch: a user post, a completed program, and a
     /// `Note` — three ids to target, and a card/budget combination that
@@ -727,7 +741,7 @@ mod tests {
     /// compacted.
     #[test]
     fn a_programs_bytes_count_in_either_transport() {
-        use crate::document::{ChatMessage, ChatRole, Document, ToolCall};
+        use crate::document::{ChatMessage, ChatRole, ToolCall};
         let program = "tell(\"x\");".repeat(20);
         let as_text = Document {
             messages: vec![ChatMessage {
@@ -737,6 +751,7 @@ mod tests {
                 tool_call_id: None,
             }],
             preamble: 0,
+            transport: Transport::Program,
         };
         let as_call = Document {
             messages: vec![ChatMessage {
@@ -749,6 +764,7 @@ mod tests {
                 tool_call_id: None,
             }],
             preamble: 0,
+            transport: Transport::RunProgram,
         };
         assert_eq!(rendered_size(&as_text), program.len());
         assert_eq!(rendered_size(&as_call), rendered_size(&as_text));

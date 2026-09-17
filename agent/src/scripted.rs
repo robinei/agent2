@@ -1280,7 +1280,15 @@ fn multi_turn_continuity_check(outcome: &Outcome, _dir: &Path) -> Result<(), Str
     // request that produced this completion — over the branch's own
     // log, not a guess about what it must have contained.
     let spine = tree.spine_at(before_second);
-    let doc = crate::document::render(tree, &spine, host::DEFAULT_DOCUMENT_BUDGET);
+    // The transport the run itself used: this reconstructs a document a
+    // real session already rendered, so it has to fold under the same
+    // container that session did.
+    let doc = crate::document::render(
+        tree,
+        &spine,
+        host::DEFAULT_DOCUMENT_BUDGET,
+        crate::document::configured_transport(),
+    );
     let seen = doc
         .messages
         .iter()

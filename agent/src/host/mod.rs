@@ -5131,7 +5131,12 @@ mod tests {
         let session = drain(session);
 
         let state = session.state(EventId::new(5)).unwrap();
-        let doc = crate::document::render(session.tree(), &state.spine, DEFAULT_DOCUMENT_BUDGET);
+        let doc = crate::document::render(
+            session.tree(),
+            &state.spine,
+            DEFAULT_DOCUMENT_BUDGET,
+            crate::document::Transport::Program,
+        );
         assert_eq!(
             doc.messages.last(),
             Some(&crate::document::ChatMessage {

@@ -201,7 +201,12 @@ fn print_document(log: Option<&str>) -> Result<(), String> {
         .keys()
         .max_by_key(|id| id.as_u64())
         .ok_or("the log is empty")?;
-    let doc = document::render(&tree, &tree.spine_at(leaf), 64 * 1024);
+    let doc = document::render(
+        &tree,
+        &tree.spine_at(leaf),
+        64 * 1024,
+        document::configured_transport(),
+    );
 
     let total: usize = doc.messages.iter().map(|m| m.content.len()).sum();
     println!("{} messages, {total} bytes\n", doc.messages.len());
