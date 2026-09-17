@@ -19,6 +19,23 @@ pub struct ToolDef {
     /// a `name`, which is what the TypeScript manifest calls the
     /// parameter; without one it falls back to a positional `argN`.
     pub input_schema: serde_json::Value,
+    /// How to use it well: the handful of behavioural rules that are
+    /// about *this* tool and that no signature can express — "read
+    /// `status` before `stdout`", "name the edit by text you have in
+    /// hand". Rendered as bullets inside the declaration's doc comment.
+    ///
+    /// **Separate from `description` on purpose.** A rule attached to
+    /// the declaration it constrains is read at the moment it applies;
+    /// the same rule in a free-floating essay has to be remembered.
+    /// That is the structure `pi` uses — a one-line snippet plus a
+    /// `promptGuidelines[]` per tool, assembled only for the tools
+    /// actually enabled — and two of its densest guidelines are rules
+    /// we spent a day rediscovering by measurement.
+    pub guidelines: Vec<String>,
+    /// One line of idiomatic use, rendered as TSDoc `@example`. The
+    /// format a model trained on TypeScript is most practised at
+    /// reading, and the cheapest thing an exemplar was ever doing.
+    pub example: Option<String>,
     /// The TypeScript type this resolves to, *inside* the promise —
     /// `"{ status: number; stdout: string }"`, not
     /// `"Promise<{ … }>"`. `None` renders `unknown`.

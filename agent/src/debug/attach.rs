@@ -4224,6 +4224,8 @@ mod tests {
             name: "slow".into(),
             description: String::new(),
             input_schema: json!({}),
+            guidelines: Vec::new(),
+            example: None,
             returns: None,
             handler: Box::new(|_| {
                 std::thread::sleep(std::time::Duration::from_millis(100));

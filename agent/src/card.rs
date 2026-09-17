@@ -157,6 +157,34 @@ fn ts_type(schema: &serde_json::Value) -> &'static str {
     }
 }
 
+/// A tool's TSDoc, synthesised from its fields rather than stored as
+/// one blob: the description is the summary, each guideline a bullet,
+/// the example an `@example`. Kept apart in [`ToolDef`] so a rule can
+/// be added to one tool without rewriting its prose, and so the
+/// rendering — not the author — decides the shape.
+///
+/// Collapses to a single `/** … */` line when there is nothing but a
+/// description, because most tools have nothing more to say and a
+/// four-line comment around one sentence is noise.
+fn doc_comment(def: &crate::host::ToolDef) -> String {
+    let summary = crate::report::clip(&def.description, DESCRIPTION_MAX_BYTES);
+    if def.guidelines.is_empty() && def.example.is_none() {
+        return format!("\n  /** {summary} */\n");
+    }
+    let mut out = format!("\n  /**\n   * {summary}\n");
+    if !def.guidelines.is_empty() {
+        out.push_str("   *\n");
+        for g in &def.guidelines {
+            out.push_str(&format!("   * - {g}\n"));
+        }
+    }
+    if let Some(example) = &def.example {
+        out.push_str(&format!("   *\n   * @example {example}\n"));
+    }
+    out.push_str("   */\n");
+    out
+}
+
 pub fn tool_manifest(registry: &crate::host::ToolRegistry) -> String {
     let mut manifest = String::new();
     let mut tools: Vec<_> = registry.iter().collect();
@@ -196,9 +224,9 @@ pub fn tool_manifest(registry: &crate::host::ToolRegistry) -> String {
             })
             .collect();
         let returns = def.returns.as_deref().unwrap_or("unknown");
+        manifest.push_str(&doc_comment(def));
         manifest.push_str(&format!(
-            "\n  /** {} */\n  function {}({}): Promise<{}>;\n",
-            crate::report::clip(&def.description, DESCRIPTION_MAX_BYTES),
+            "  function {}({}): Promise<{}>;\n",
             def.name,
             params.join(", "),
             returns,
@@ -266,6 +294,8 @@ mod tests {
                 ],
                 "minItems": 1
             }),
+            guidelines: Vec::new(),
+            example: None,
             returns: Some("{ body: string }".into()),
             handler: Box::new(|_| Ok(json!(null))),
         });
@@ -275,6 +305,8 @@ mod tests {
             name: "bare".into(),
             description: "No names, no return type.".into(),
             input_schema: json!({ "type": "array", "items": [{ "type": "object" }] }),
+            guidelines: Vec::new(),
+            example: None,
             returns: None,
             handler: Box::new(|_| Ok(json!(null))),
         });
@@ -304,6 +336,43 @@ mod tests {
         );
         // Optionality is read off `minItems`, not guessed.
         assert!(manifest.contains("timeoutMs?:"), "{manifest}");
+    }
+
+    /// **The doc comment is synthesised from fields, not stored.** A
+    /// behavioural rule belongs on the declaration it constrains — read
+    /// where it applies rather than remembered from an essay — and
+    /// keeping it in its own field means a rule can be added to one
+    /// tool without rewriting that tool's prose.
+    #[test]
+    fn a_tools_doc_comment_is_built_from_its_parts() {
+        let mut registry = ToolRegistry::new();
+        registry.register(ToolDef {
+            name: "dig".into(),
+            description: "Dig a hole.".into(),
+            input_schema: json!({ "type": "array", "items": [{ "name": "depth", "type": "integer" }] }),
+            guidelines: vec!["Mind the cables.".into(), "Backfill when done.".into()],
+            example: Some("await tools.dig(2);".into()),
+            returns: Some("{ depth: number }".into()),
+            handler: Box::new(|_| Ok(json!(null))),
+        });
+        let m = tool_manifest(&registry);
+        assert!(m.contains("   * Dig a hole."), "{m}");
+        assert!(m.contains("   * - Mind the cables."), "{m}");
+        assert!(m.contains("   * - Backfill when done."), "{m}");
+        assert!(m.contains("   * @example await tools.dig(2);"), "{m}");
+        assert!(
+            m.contains("  function dig(depth: number): Promise<{ depth: number }>;"),
+            "{m}"
+        );
+    }
+
+    /// With nothing but a description it collapses to one line, because
+    /// most tools have nothing more to say and four lines of comment
+    /// around one sentence is noise.
+    #[test]
+    fn a_tool_with_only_a_description_gets_a_one_line_comment() {
+        let m = tool_manifest(&registry_with_tools());
+        assert!(m.contains("  /** No names, no return type. */"), "{m}");
     }
 
     /// A tool that names no parameters and declares no return type is

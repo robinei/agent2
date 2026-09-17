@@ -68,6 +68,8 @@ pub fn outline_def() -> ToolDef {
             "minItems": 1,
             "maxItems": 1
         }),
+        guidelines: Vec::new(),
+        example: Some("const { items } = await tools.outline(\"src/lib.rs\");".into()),
         returns: Some("{ items: Array<{ name: string; kind: string; line: number }> }".into()),
         handler: Box::new(|args| {
             let path = args
@@ -330,6 +332,10 @@ pub fn parse_errors_def() -> ToolDef {
             "maxItems": 3
         }),
 
+        guidelines: vec![
+            "Check content *before* writing it: pass `source` and `lang` with no path, and nothing touches disk.".into(),
+        ],
+        example: Some("const { ok } = await tools.parse_errors(null, candidate, \"rust\");".into()),
         returns: Some("{ ok: boolean; errors: Array<{ line: number; message: string }> }".into()),
         handler: Box::new(|args| {
             let first = args.get(0);

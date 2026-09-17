@@ -169,6 +169,10 @@ fn read_file_def() -> ToolDef {
             "minItems": 1,
             "maxItems": 3
         }),
+        guidelines: vec![
+            "Hold onto `version` and hand it to `replace_file`, so a write fails rather than clobbering a file that moved.".into(),
+        ],
+        example: Some("const f = await tools.read_file(\"src/lib.rs\");".into()),
         returns: Some("{ content: string; version: string; truncated?: boolean }".into()),
         handler: Box::new(|args| {
             let path = args
@@ -238,6 +242,8 @@ fn create_file_def() -> ToolDef {
             "minItems": 2,
             "maxItems": 2
         }),
+        guidelines: Vec::new(),
+        example: Some("await tools.create_file(\"notes.md\", body);".into()),
         returns: Some("{ version: string }".into()),
         handler: Box::new(|args| {
             let path = args
@@ -285,6 +291,11 @@ fn replace_file_def() -> ToolDef {
             "minItems": 3,
             "maxItems": 3
         }),
+        guidelines: vec![
+            "Name the edit by text you have in hand — `Edit.replaceOnce` refuses an ambiguous one — rather than computing a line number and splicing.".into(),
+            "You will not see the result, so verify in this same program: read it back, or run the thing that would fail.".into(),
+        ],
+        example: Some("await tools.replace_file(p, Edit.replaceOnce(f.content, old, new), f.version);".into()),
         returns: Some("{ version: string }".into()),
         handler: Box::new(|args| {
             let path = args
@@ -356,6 +367,11 @@ fn bash_def() -> ToolDef {
             "minItems": 1,
             "maxItems": 1
         }),
+        guidelines: vec![
+            "Read `status` before `stdout`. A command that ran and failed writes nothing, and nothing reads as \"found no problems\".".into(),
+            "Ask once for everything it will answer at once: change all the candidates, run it once, and read which ones it names back. A per-item loop is the fallback.".into(),
+        ],
+        example: Some("const r = await tools.bash(\"cargo check --all-targets 2>&1\");".into()),
         returns: Some(
             "{ status: number; stdout: string; stderr: string; truncated?: boolean }".into(),
         ),
@@ -628,6 +644,8 @@ fn wait_until_def() -> ToolDef {
             "minItems": 1,
             "maxItems": 1
         }),
+        guidelines: Vec::new(),
+        example: Some("await tools.wait_until(Date.now() + 5000);".into()),
         returns: Some("null".into()),
         handler: Box::new(|args| {
             let target_ms = args

@@ -2031,6 +2031,8 @@ mod tests {
             name: name.into(),
             description: String::new(),
             input_schema: json!({ "type": "array" }),
+            guidelines: Vec::new(),
+            example: None,
             returns: None,
             handler: Box::new(handler),
         }
