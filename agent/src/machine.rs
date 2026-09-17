@@ -2179,27 +2179,13 @@ impl Runner {
         // handler that traps or is abandoned halfway leaves the log
         // exactly as it found it.
         if self.compacting.is_some() {
-            let budget = crate::host::document_budget();
-            let headroom = crate::host::compaction_headroom();
-            match self.finish_compaction(tree, budget, headroom)? {
-                Ok(_) => {}
-                Err(why) => {
-                    // Not a failure: the log is untouched, so the
-                    // condition simply fires again with the reason in
-                    // front of the next program.
-                    tree.append(
-                        &mut self.spine,
-                        EventPayload::Message(Message::Post {
-                            from: Author::Harness,
-                            origin: Origin::Direct {
-                                text: why,
-                                input: serde_json::Value::Null,
-                                expects_reply: false,
-                            },
-                        }),
-                    )?;
-                }
-            }
+            // Best effort, and nothing is reported back: the ops that
+            // name a real row apply, the rest are dropped, and whether
+            // the document actually got smaller is something the next
+            // request answers by being smaller. If it is still over
+            // budget, `compaction_if_needed` notices that on its own
+            // terms rather than on the strength of a refusal.
+            self.finish_compaction(tree)?;
         }
 
         let Phase::Running(run) = std::mem::replace(&mut self.phase, Phase::Idle) else {
@@ -2673,26 +2659,16 @@ impl Runner {
     /// `Compacted` event or none of them. A rejection is returned as a
     /// string for the caller to hand back to the model, which is a
     /// retry rather than a failure: the log is untouched either way.
-    fn finish_compaction(
-        &mut self,
-        tree: &mut Tree,
-        budget: usize,
-        headroom: f64,
-    ) -> io::Result<Result<usize, String>> {
+    fn finish_compaction(&mut self, tree: &mut Tree) -> io::Result<usize> {
         let Some(ops) = self.compacting.take() else {
-            return Ok(Ok(0));
+            return Ok(0);
         };
-        let threshold = (budget as f64 * (1.0 - headroom)) as usize;
-        match crate::compaction::compact(tree, &self.spine, &ops, budget, threshold) {
-            Ok(events) => {
-                let n = events.len();
-                for event in events {
-                    tree.append(&mut self.spine, event)?;
-                }
-                Ok(Ok(n))
-            }
-            Err(e) => Ok(Err(e.to_string())),
+        let events = crate::compaction::compact(tree, &self.spine, &ops);
+        let n = events.len();
+        for event in events {
+            tree.append(&mut self.spine, event)?;
         }
+        Ok(n)
     }
 
     // ── rendering ───────────────────────────────────────────────────
@@ -2758,10 +2734,10 @@ impl Runner {
         // not being done in this program. It lives here rather than in
         // the document because it instructs rather than reports: see
         // `document::render_with_lookup`, which skips the row.
-        if self.compacting.is_some() {
-            if let Some(directive) = self.compaction_directive(tree) {
-                return Some(directive);
-            }
+        if self.compacting.is_some()
+            && let Some(directive) = self.compaction_directive(tree)
+        {
+            return Some(directive);
         }
         let mut lines: Vec<String> = Vec::new();
         let open = self.open();
