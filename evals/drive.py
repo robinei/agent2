@@ -35,6 +35,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import hashlib
 import time
 from pathlib import Path
 
@@ -499,7 +500,34 @@ def aggregate(runs: list) -> dict:
     return summary
 
 
+def fingerprint(card: Path | None) -> dict:
+    """What this suite is actually measuring: the binary and the card.
+
+    A suite takes tens of minutes, and everything it runs is read off
+    disk at spawn time — `target/debug/agent` per run, the card dir per
+    run.  So an edit or a `cargo build` while it is in flight silently
+    splits the run in two, and the aggregate at the end averages two
+    different systems.  That happened on 2026-09-17: a `cargo build`
+    partway through an n=7 suite meant the later runs measured a change
+    the earlier ones did not have, and nothing in the output said so.
+
+    Cheap to prevent by hashing what matters before and after.  It does
+    not stop the mistake, but it makes a contaminated number impossible
+    to mistake for a clean one, which is the part that costs a day.
+    """
+    h = hashlib.sha256()
+    h.update(AGENT.read_bytes() if AGENT.exists() else b"")
+    binary = h.hexdigest()[:12]
+    h = hashlib.sha256()
+    for f in sorted((card or Path("/nonexistent")).rglob("*")):
+        if f.is_file():
+            h.update(f.relative_to(card).as_posix().encode())
+            h.update(f.read_bytes())
+    return {"binary": binary, "card": h.hexdigest()[:12]}
+
+
 def print_summary(summary: dict):
+    stamp = summary.pop("_measured", None)
     for name, s in summary.items():
         no_run = f"   ({s['no_run']} never got a completion)" if s["no_run"] else ""
         gap = (
@@ -525,6 +553,16 @@ def print_summary(summary: dict):
             print(f"  trap [{classify_trap(trap)}] x{n}: {trap}")
         for why in s["failures"]:
             print(f"  FAIL: {why}")
+    if stamp:
+        summary["_measured"] = stamp
+        if stamp.get("changed_mid_run"):
+            print(
+                "\n!! THE TREE CHANGED WHILE THIS RAN — the runs above did not all\n"
+                f"   measure the same thing: {stamp['before']} -> {stamp['after']}.\n"
+                "   Re-run from a clean checkout before believing the number."
+            )
+        else:
+            print(f"\n(binary {stamp['before']['binary']}, card {stamp['before']['card']})")
 
 
 def compare(before: Path, after: Path):
@@ -535,6 +573,10 @@ def compare(before: Path, after: Path):
     """
     a = json.loads(before.read_text())
     b = json.loads(after.read_text())
+    for side, d in (("before", a), ("after", b)):
+        stamp = d.pop("_measured", None)
+        if stamp and stamp.get("changed_mid_run"):
+            print(f"!! {side} was measured against a tree that changed mid-run")
     for name in sorted(set(a) | set(b)):
         x, y = a.get(name), b.get(name)
         if not x or not y:
@@ -655,6 +697,7 @@ def main():
     # program with the CPU idle — so they overlap. Serial, the suite is
     # paced by the slowest queue in the provider rather than by anything
     # being measured.
+    before = fingerprint(args.card)
     work = [(task, i) for task in usable for i in range(args.repeat)]
     printing = threading.Lock()
     runs = []
@@ -684,7 +727,13 @@ def main():
         with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
             runs = list(pool.map(one, work))
 
+    after = fingerprint(args.card)
     summary = aggregate(runs)
+    summary["_measured"] = {
+        "before": before,
+        "after": after,
+        "changed_mid_run": before != after,
+    }
     print_summary(summary)
     if args.out:
         args.out.write_text(json.dumps(summary, indent=2))
