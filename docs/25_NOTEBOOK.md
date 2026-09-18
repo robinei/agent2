@@ -486,10 +486,36 @@ span-keyed, so it accumulates without collision; the compiler appends to
 its own `code`/`spans`, so label ids backpatch against the same vector
 they were emitted into and addresses come out absolute by construction.
 
-One pass must be scoped to the newly appended range: **backpatch**,
-which runs from the cell's first instruction onward. Cell 0's jumps hold
-resolved addresses by now, not label ids, and a pass that cannot tell
-the two apart would corrupt them.
+Six things need handling that a one-shot compile never faces. The first
+was in the original draft; the rest were found while building 25.2 and
+are recorded so they are costed rather than discovered:
+
+1. **Backpatch, scoped to the appended range.** Cell 0's jumps hold
+   resolved addresses by now, not label ids, and a pass that cannot tell
+   the two apart would corrupt them.
+2. **The optimizer too, and more urgently.** `optimizer::finalize` is
+   `optimize` + `backpatch`, and `optimize` deletes and reorders
+   instructions to a fixpoint. Over a shared vector it would move
+   already-executed code out from under a live `ip` and invalidate every
+   `Fn`/`Closure` address. Scope it the same way, or skip it on the
+   incremental path — these programs are I/O-bound and would not notice.
+3. **Labels must persist across fragments.** Backpatch strips `Label`
+   markers, so a `function f(){}` declared in cell 0 and called in cell 1
+   emits a static `Call(label_of_f)` against a marker that is already
+   gone. A label→address table has to survive alongside the scope
+   tables. "Addresses come out absolute by construction" is true and
+   does not cover this.
+4. **The prelude needs its own growing region.** `compile_with` appends
+   tree-shaken HOF helpers to the source; appending per fragment either
+   redeclares `__map` or collides spans with the previous fragment's
+   prelude. It needs a monotonically growing area past the buffer.
+5. **Scope ordering.** `resolve_captures` requires children to have
+   lower ids than parents, and the root is pushed *last* today — so a
+   second fragment's child scopes would land above the root and break
+   the invariant.
+6. **`Program::source` is the markdown, not the parse buffer.** D2's
+   buffer is blanked outside the live cell; a closure from cell 0 that
+   errors during cell 2 must not render its diagnostic against spaces.
 
 **A cell must not end the way a program does.** `compile_program` emits
 a trailing `Instr::Return(0)` — "Root frame ends with `Return(0)` →
@@ -578,6 +604,74 @@ after each cell and comparing against the previous result yields exactly
 the slots that flipped. Those get a `FreshCell` at this cell's start.
 There is no "is this the first capture of an earlier name" logic to
 write.
+
+#### Correction: the root frame must be pinned, because the store can be absent
+
+**D12 as first written was unsound, and its own gate test was the
+counterexample.** The premise — "slot *indices* are stable, slot
+*representation* is not" — is wrong on both halves against this code.
+Verified by compiling the cases, not by reading:
+
+```
+let x = 5; console.log(x);
+  0 EnterFrame(0, false, [Plain])
+  1 PushPosInt(5)                  <- no SetLocal; slot 0 is never written
+```
+```
+let x = 5; console.log(x); const f = () => x + 1; f();
+  0 EnterFrame(0, false, [Boxed, Plain])
+  2 SetLocal(0)                    <- the store exists only once something captures
+```
+
+`immutable = is_const || (!reassigned && !captured)`, so while nothing
+captures `x` it is effectively const, constant propagation folds `5` into
+the instruction stream and **drops the store**. A `FreshCell(0)` at the
+next cell's start would box `Undefined`, and `() => x + 1` returns `NaN`.
+Silently. `let x = 5` in one cell and `x` in the next is ordinary
+notebook code.
+
+The flaw is in the premise, not the argument: the old representation is
+not "Plain in the frame" but **no representation at all**. `FreshCell`
+moves a value out of a slot; it cannot conjure one that was never in it.
+
+**And slot indices are not stable either.** `analyzer/const_fns.rs`'s
+`compact_const_fn_slots` reclaims const-function slots and renumbers the
+survivors down, and const-function-ness is a fixpoint over the whole
+accumulation, so a later cell can flip it:
+
+```
+function f(){return 1;} let x = 5;          -> EnterFrame(.., [Plain])
+function f(){return 1;} let x = 5; f = 2;   -> EnterFrame(.., [Plain, Plain])
+```
+
+`f` stops being a const function when a later cell assigns to it, takes
+a slot, and every declaration after it shifts.
+
+**The fix: pin the root frame, on the incremental path only.** At the
+root scope, and only when compiling incrementally:
+
+- every declaration gets a real slot and a real store — constant
+  propagation may still fold *uses*, but may not elide the write;
+- no const-function slot elimination;
+- no slot compaction.
+
+Nested function scopes keep every optimization. The cost is top-level
+constant folding at the root of a program that is a few dozen statements
+dominated by I/O, which is nothing, and the one-shot path is untouched.
+
+With that, "allocated in declaration order and stable" becomes literally
+true, the slot always holds the value, and the `FreshCell` diff above is
+soundly repairing the *only* property left that a later cell can flip.
+
+This is D12's rejected draft 2 generalized. That draft was rejected on a
+cost basis — "`FreshCell` already moves a slot, so the common case need
+not pay" — which assumed the store existed. It does not.
+
+**Scopes freeze when compiled.** Re-finalization may add new scopes and
+may flip a root slot `Plain -> Boxed`; it may not change anything else
+about a scope whose code has already been emitted. That is the general
+form of the rule above, and it is what makes the diff safe rather than
+merely usually-safe.
 
 **Why promotion is sound.** A flip can only be caused by a *new* closure
 in the cell being compiled: if any closure in an earlier cell had
