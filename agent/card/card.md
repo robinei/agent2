@@ -27,10 +27,10 @@ What crosses from this program to the next, and what does not:
                      hundred items belongs here, not in the two above.
   tell(text)         reaches the person — and lands on the record
                      whole, as its own row, so you see it again too.
-                     That is not a reason to tell yourself things:
-                     what you say here is read by someone, and
-                     `console.log` is the one that costs them
-                     nothing.
+                     Not a way to talk to yourself: what you say here
+                     is read by someone, and `console.log` costs them
+                     nothing. But the program that finishes owes them
+                     the answer — say it, then `done()`.
   a call's result    is not in front of the next program, but it is
                      not gone: you see that the call happened and
                      how big its answer was — bash("grep …") → ok,

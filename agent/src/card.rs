@@ -430,7 +430,7 @@ mod tests {
         // `card()` shows up as a diff review must look at, not a byte
         // count that silently drifts. Comparing full text (not just a
         // hash) so the diff itself is legible in a failure message.
-        const EXPECTED_LEN: usize = 12188;
+        const EXPECTED_LEN: usize = 12235;
         assert_eq!(
             card().len(),
             EXPECTED_LEN,
@@ -845,6 +845,23 @@ mod tests {
             "the first edits and then runs the thing that would fail: {}",
             ex[0].assistant
         );
+        // **Whatever finishes, speaks.** Every exemplar that calls
+        // `done()` tells the person first, and the two that hand on
+        // instead do neither — which is the rule, demonstrated rather
+        // than stated. Pinned because the demonstration lost once: a
+        // crossing-table line arguing `console.log` over `tell` moved
+        // tells from 75% of programs to 22% and took the legitimate
+        // ones with them, and runs ending without a word to anybody
+        // went from 1 in 12 to 4 in 12 across four arms. Three
+        // exemplars showing the opposite did not hold it.
+        for e in &ex {
+            assert_eq!(
+                e.assistant.contains("done()"),
+                e.assistant.contains("tell("),
+                "an exemplar finishes without speaking, or speaks without finishing: {}",
+                e.assistant
+            );
+        }
         // Short enough to be a shape rather than a technique to copy —
         // a live run on 2026-09-17 reproduced a long exemplar verbatim,
         // invented names and all, into a repo that had none of them.

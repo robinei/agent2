@@ -348,6 +348,18 @@ def sandbox_cmd(sandbox: Path, log: Path, prompt: str, card: Path | None) -> lis
         "--turn", prompt,
     ]
     if card:
+        # **Absolute, and bound explicitly.** Two things bite here, and
+        # each costs a whole arm of runs that fail identically with
+        # nothing to say why. The sandbox `--chdir`s into the task
+        # directory, so a relative `--card cards/ts` resolves against
+        # the wrong place and the agent exits 2 having read no card.
+        # And a card under `/tmp` — which is where a pinned worktree
+        # lives, and arms are meant to be run from a worktree — is
+        # behind the `--tmpfs /tmp` above unless it is bound back —
+        # *after* that tmpfs, for the reason its own comment gives, and
+        # the same reason the binary is bound there.
+        card = card.resolve()
+        argv[6:6] = ["--ro-bind", str(card), str(card)]
         argv[-2:-2] = ["--card", str(card)]
     argv.append(str(log))
     return argv
