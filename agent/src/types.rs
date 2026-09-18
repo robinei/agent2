@@ -89,6 +89,27 @@ pub enum EventPayload {
         /// already *is* the completion and nothing is lost.
         #[serde(default, skip_serializing_if = "String::is_empty")]
         text: String,
+        /// **What the model reasoned before writing the reply**, when the
+        /// provider returns it (`reasoning_content`).
+        ///
+        /// Here for the same reason `usage` is: it belongs to the
+        /// *completion*, and under `Transport::Notebook` there is no
+        /// `Turn` left to carry it. Every cell `Turn` is written before
+        /// its cell runs — while the completion is still streaming — so by
+        /// the time the reasoning has finished arriving they are all on an
+        /// append-only log.
+        ///
+        /// Dropping it was not cosmetic. `score.rs` reads `thinking_bytes`
+        /// off this, and a run that reasoned for 55KB reported 0.0 —
+        /// which reads as "the model did not think" rather than "the
+        /// harness did not keep it", and invalidated a 56-run comparison.
+        ///
+        /// Never sent back to the provider (`host/deepseek.rs`: DeepSeek
+        /// requires `reasoning_content` to be excluded from the next
+        /// turn's context), so this is for the log, the metrics and the
+        /// reader — not for the document.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thinking: Option<String>,
     },
 
     /// Chat event. Parent: the previous event on the owning agent's

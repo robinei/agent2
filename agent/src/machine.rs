@@ -919,9 +919,12 @@ impl Runner {
                 // A notebook fed in as it streamed has already logged every
                 // piece of this reply; the final message only says the
                 // completion is over (and whether it was cut off).
-                if let Some(out) =
-                    self.notebook_stream_end(tree, turn.truncated, turn.usage.clone())?
-                {
+                if let Some(out) = self.notebook_stream_end(
+                    tree,
+                    turn.truncated,
+                    turn.usage.clone(),
+                    turn.thinking.clone(),
+                )? {
                     return Ok(out);
                 }
                 let author = Author::Agent(self.agent_id());
@@ -1087,12 +1090,13 @@ impl Runner {
             // Same reasoning as the streaming path: this reply's `Turn`s
             // are written by the driver, one per cell, so the cost of
             // the completion is logged on its own.
-            if usage.is_some() || !source.is_empty() {
+            if usage.is_some() || !source.is_empty() || thinking.is_some() {
                 tree.append(
                     &mut self.spine,
                     EventPayload::Completion {
                         usage: usage.clone().unwrap_or_default(),
                         text: source.clone(),
+                        thinking: thinking.clone(),
                     },
                 )?;
             }
@@ -3613,6 +3617,7 @@ impl Runner {
         tree: &mut Tree,
         truncated: bool,
         usage: Option<crate::host::Usage>,
+        thinking: Option<String>,
     ) -> io::Result<Option<Vec<StepOutput>>> {
         if !self.streaming_notebook {
             return Ok(None);
@@ -3641,12 +3646,13 @@ impl Runner {
         // still produced a reply, and that reply is what the model is
         // shown as its own past turn. Gating this on usage left those
         // runs rendering their turns as bare cells again.
-        if usage.is_some() || !text.is_empty() {
+        if usage.is_some() || !text.is_empty() || thinking.is_some() {
             tree.append(
                 &mut self.spine,
                 EventPayload::Completion {
                     usage: usage.unwrap_or_default(),
                     text,
+                    thinking,
                 },
             )?;
         }
@@ -6791,5 +6797,140 @@ mod tests {
             assistant[0]
         );
         assert!(!assistant[0].contains("```"), "no fences invented");
+    }
+
+    /// A scripted completion that reasoned before answering.
+    fn llm_program_thinking(source: &str, thinking: &str, reasoning: u64) -> LlmTurn {
+        LlmTurn {
+            source: source.into(),
+            thinking: Some(thinking.into()),
+            truncated: false,
+            usage: Some(crate::host::Usage {
+                prompt: 100,
+                cached: 40,
+                completion: 200,
+                reasoning,
+            }),
+            reply: None,
+        }
+    }
+
+    fn recorded_thinking(state: &Runner, tree: &Tree) -> Vec<String> {
+        state
+            .agent_segment(tree)
+            .iter()
+            .filter_map(|e| match &e.payload {
+                EventPayload::Completion { thinking, .. } => thinking.clone(),
+                EventPayload::Message(Message::Turn { thinking, .. }) => thinking.clone(),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// **The model's reasoning is kept, once per completion.**
+    ///
+    /// It used to be dropped entirely on this transport: the streaming
+    /// path takes the completion at `LlmDone` and discarded everything
+    /// but `truncated` and `usage`, and every cell `Turn` is written with
+    /// `thinking: None` because the reasoning has not finished arriving
+    /// when the cell runs. A run that reasoned for 55KB scored 0.0 — which
+    /// reads as "the model did not think" rather than "the harness did
+    /// not keep it", and cost a 56-run comparison.
+    #[test]
+    fn a_notebook_reply_records_its_reasoning_exactly_once() {
+        let (mut tree, mut state) = setup_under(crate::document::Transport::Notebook);
+        user_post(&mut state, &mut tree, "go");
+        let reply = "```js\nlet n = 1;\n```\n\n```js\nconsole.log(n);\n```\n";
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(llm_program_thinking(reply, "weighing the options", 900)),
+            )
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+
+        assert_eq!(
+            recorded_thinking(&state, &tree),
+            vec!["weighing the options"],
+            "two cells, one completion, one reasoning record"
+        );
+    }
+
+    /// And through the streaming door, which is the one a real session
+    /// uses and the one the reasoning fell through.
+    #[test]
+    fn a_streamed_notebook_reply_records_its_reasoning() {
+        let (mut tree, mut state) = setup_under(crate::document::Transport::Notebook);
+        user_post(&mut state, &mut tree, "go");
+        state.phase = Phase::AwaitingLlm;
+
+        stream_chunks(
+            &mut state,
+            &mut tree,
+            &["Looking.\n\n```js\ntell(\"done\");\n```\n"],
+        );
+        // The reasoning arrives with the completion, after every cell
+        // `Turn` is already on the log.
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(llm_program_thinking("", "the long way round", 900)),
+            )
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+
+        assert_eq!(
+            recorded_thinking(&state, &tree),
+            vec!["the long way round"]
+        );
+    }
+
+    /// **`agent score` reads it**, which is the number the comparison
+    /// turns on — and the provider's own reasoning-token count comes
+    /// through the same event, so both halves of the symptom are one
+    /// cause.
+    #[test]
+    fn score_reads_a_notebook_replys_reasoning() {
+        let (mut tree, mut state) = setup_under(crate::document::Transport::Notebook);
+        user_post(&mut state, &mut tree, "go");
+        let reply = "```js\nconsole.log(\"a\");\n```\n";
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(llm_program_thinking(reply, "a lot of thinking", 1234)),
+            )
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+
+        let score = crate::score::score(&tree);
+        assert_eq!(
+            score.thinking_bytes,
+            "a lot of thinking".len(),
+            "the reasoning text is counted"
+        );
+        assert_eq!(
+            score.reasoning_out, 1234,
+            "and so is the provider's own token count"
+        );
+    }
+
+    /// The program transport is unmoved: its reasoning still rides on the
+    /// `Turn`, where it always did.
+    #[test]
+    fn the_program_transport_still_keeps_reasoning_on_the_turn() {
+        let (mut tree, mut state) = setup();
+        user_post(&mut state, &mut tree, "go");
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(llm_program_thinking("done();", "still thinking", 55)),
+            )
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+
+        assert_eq!(recorded_thinking(&state, &tree), vec!["still thinking"]);
+        let score = crate::score::score(&tree);
+        assert_eq!(score.thinking_bytes, "still thinking".len());
+        assert_eq!(score.reasoning_out, 55);
     }
 }
