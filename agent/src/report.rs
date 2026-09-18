@@ -1161,7 +1161,22 @@ fn menu_since(h: &Handback<'_>, since: u64) -> Vec<Artifact> {
         .rposition(|e| matches!(e.payload, EventPayload::Agent { .. }))
         .unwrap_or(0);
     let segment: Vec<&Event> = h.path[start..=h.outcome_at].to_vec();
-    crate::machine::menu_rows(&segment, since)
+    // The whole path, not the segment: a row is compacted *after* it is
+    // logged, so the `Compacted` event that removes it routinely sits
+    // past `outcome_at`.
+    crate::machine::menu_rows(&segment, since, &removed_rows(&h.path))
+}
+
+/// Rows a `Compacted` event removed outright — `text: None`, which
+/// `document.rs` renders as nothing at all. A `replace` is absent here
+/// on purpose: that row still exists and is still worth an index entry.
+fn removed_rows(path: &[&Event]) -> std::collections::HashSet<EventId> {
+    path.iter()
+        .filter_map(|e| match &e.payload {
+            EventPayload::Compacted { of, text } if text.is_none() => Some(*of),
+            _ => None,
+        })
+        .collect()
 }
 
 /// One call's dispatch site and whether it is a `Send` (re-awaitable by
@@ -1334,7 +1349,7 @@ pub fn render_fork(tree: &Tree, leaf: EventId, fork: EventId) -> String {
         .rposition(|e| matches!(e.payload, EventPayload::Agent { .. }))
         .unwrap_or(0);
     let segment: Vec<&Event> = path[start..fork_at].to_vec();
-    let artifacts = crate::machine::menu_rows(&segment, 0);
+    let artifacts = crate::machine::menu_rows(&segment, 0, &removed_rows(&path));
     let menu: Vec<&Artifact> = artifacts.iter().collect();
     let head = format!(
         "program {program} is running on branch {branch}, not here. This fork inherited \
@@ -2015,6 +2030,61 @@ mod tests {
     /// author decoration. `render_post` adds both (so the model can
     /// resolve `answer(question, value)`'s `question`), but a navigator
     /// label is for a human's eye, not a restart target.
+    /// **A removed row leaves the menu too.** `document.rs` drops a
+    /// compacted row from the history log through its `CompactedView`
+    /// shadow, but `menu_rows` had no compaction awareness at all — so a
+    /// row deleted with `history.remove` vanished from the log and went
+    /// on being advertised in the index printed directly beneath it.
+    ///
+    /// Found on 2026-09-18 in a kept eval log, not by a test: the
+    /// existing menu tests all call `render_menu` with synthetic
+    /// artifacts and never exercise `menu_rows`, which is the function
+    /// that decides *which* rows exist. A `replace` is deliberately not
+    /// filtered — that row still exists and is still worth fetching.
+    #[test]
+    fn a_removed_row_is_dropped_from_the_menu_not_only_from_the_log() {
+        fn ev(id: u64, payload: EventPayload) -> Event {
+            Event {
+                id: EventId::new(id),
+                parent_id: None,
+                timestamp: jiff::Timestamp::UNIX_EPOCH,
+                payload,
+            }
+        }
+        let call = |id: u64, name: &str| {
+            ev(
+                id,
+                EventPayload::Call(Call::Invoke {
+                    name: name.into(),
+                    args: json!([]),
+                    site: 0,
+                }),
+            )
+        };
+        let owned = vec![
+            call(5, "outline"),
+            call(6, "read_file"),
+            call(7, "grep"),
+            ev(8, EventPayload::Compacted { of: EventId::new(5), text: None }),
+            ev(
+                9,
+                EventPayload::Compacted {
+                    of: EventId::new(6),
+                    text: Some("kept, shortened".into()),
+                },
+            ),
+        ];
+        let path: Vec<&Event> = owned.iter().collect();
+        let removed = removed_rows(&path);
+        assert_eq!(removed.len(), 1, "a replace is not a removal: {removed:?}");
+
+        let rows = crate::machine::menu_rows(&path, 0, &removed);
+        let ids: Vec<u64> = rows.iter().map(|a| a.id).collect();
+        assert!(!ids.contains(&5), "the removed row is gone: {ids:?}");
+        assert!(ids.contains(&6), "a replaced row stays fetchable: {ids:?}");
+        assert!(ids.contains(&7), "an untouched row stays: {ids:?}");
+    }
+
     #[test]
     fn derived_label_has_no_id_or_author_decoration() {
         let mut tree = Tree::new(None);

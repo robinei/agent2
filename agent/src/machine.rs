@@ -3373,10 +3373,23 @@ pub(crate) fn settlement_of<'e>(segment: &[&'e Event], call: EventId) -> Option<
 ///
 /// Rows are named by the **call** id, which is what a program reuses:
 /// `fetch_history(id)` resolves a call id through to its `Result`.
-pub(crate) fn menu_rows(segment: &[&Event], since: u64) -> Vec<Artifact> {
+pub(crate) fn menu_rows(
+    segment: &[&Event],
+    since: u64,
+    removed: &std::collections::HashSet<EventId>,
+) -> Vec<Artifact> {
     segment
         .iter()
         .filter(|e| e.id.as_u64() > since)
+        // **A removed row is removed here too.** `document.rs` drops a
+        // compacted row from the history log via its `CompactedView`
+        // shadow, but this menu had no compaction awareness at all — so
+        // a row the model deleted with `history.remove` vanished from
+        // the log and went on being advertised in the index beside it,
+        // which is the one place the card promises removal means
+        // removal. Only a *removal* is filtered: a `replace` leaves a
+        // row that still exists and is still worth fetching.
+        .filter(|e| !removed.contains(&e.id))
         .filter_map(|event| {
             let id = event.id.as_u64();
             match &event.payload {
