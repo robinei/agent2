@@ -40,6 +40,9 @@ use crate::types::{
     Address, Author, Call, Disposition, Event, EventId, EventPayload, Message, Outcome,
 };
 
+/// How many lines of a cell's source show while it is collapsed (D13).
+pub const CELL_COLLAPSED_LINES: usize = 5;
+
 /// What a transcript row is, for styling by the renderer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ChatKind {
@@ -133,6 +136,14 @@ enum Entry {
         /// is substituted (`Compacted`'s own doc: "never removes the
         /// target row") — so the program stays fetchable by its id.
         compacted: Option<String>,
+        /// The `Turn`'s own source.
+        ///
+        /// Rendered beneath the header only under `Transport::Notebook`
+        /// (`show_cells`), where a `Turn` is one **cell** and its code is
+        /// part of what the person is reading. Under every other transport
+        /// the program's source belongs to the source pane, and inlining it
+        /// here would bury the transcript in it.
+        source: String,
     },
 }
 
@@ -147,6 +158,18 @@ type LineCache = std::cell::RefCell<Vec<Option<(usize, Vec<(ChatKind, String)>)>
 #[derive(Default)]
 pub struct ChatState {
     entries: Vec<Entry>,
+    /// `Transport::Notebook`: render each cell's source under its header.
+    show_cells: bool,
+    /// Cells the person has opened. **Collapsed is the default** (D13):
+    /// after a cell has run, what matters is its *effects* — the calls it
+    /// made, what they returned — and those are rows this pane already
+    /// draws. The source is how it got there, and the least interesting
+    /// thing on screen for the person who asked a question.
+    ///
+    /// Keyed by the cell's `Turn` id, deliberately not an extension of the
+    /// navigator's per-branch `collapsed: HashSet<BranchId>`: one bit per
+    /// branch cannot express several cells in one reply.
+    expanded_cells: std::collections::HashSet<EventId>,
     /// Accumulating streamed text per branch, shown until the logged
     /// assistant message replaces it.
     streaming: Vec<(BranchId, String)>,
@@ -217,6 +240,30 @@ pub struct ChatState {
 }
 
 impl ChatState {
+    /// Render each `Turn`'s source beneath its header, semi-collapsed —
+    /// the notebook reading experience (D13). Off by default, because under
+    /// every other transport a `Turn` is a whole program whose source
+    /// belongs to the source pane.
+    pub fn set_show_cells(&mut self, on: bool) {
+        self.show_cells = on;
+    }
+
+    /// Toggle one cell open or shut. Keyed by the cell's `Turn` id, **not**
+    /// by branch: a single reply holds several cells, so the per-branch
+    /// `collapsed` set the navigator uses cannot express this.
+    pub fn toggle_cell(&mut self, program: EventId) {
+        if !self.expanded_cells.remove(&program) {
+            self.expanded_cells.insert(program);
+        }
+    }
+
+    /// Whether `program`'s cell is showing its whole source.
+    #[allow(dead_code)] // read from test modules, which the non-test
+    // build does not compile; the renderer reads `expanded_cells` directly.
+    pub fn cell_expanded(&self, program: EventId) -> bool {
+        self.expanded_cells.contains(&program)
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -370,7 +417,10 @@ impl ChatState {
                 });
             }
             EventPayload::Message(Message::Turn {
-                author, thinking, ..
+                author,
+                thinking,
+                source,
+                ..
             }) => {
                 self.streaming.retain(|(b, _)| *b != branch);
                 self.thinking_streaming.retain(|(b, _)| *b != branch);
@@ -400,6 +450,7 @@ impl ChatState {
                     depth,
                     by_user,
                     compacted: None,
+                    source: source.clone(),
                 });
                 self.program_stack.entry(branch).or_default().push(id);
             }
@@ -586,6 +637,56 @@ impl ChatState {
         self.rows_impl(branch, true, width)
     }
 
+    /// A cell's source, as rows beneath its header (D13).
+    ///
+    /// **Semi-collapsed by default**: five lines and a count of the rest.
+    /// Five is a starting value, meant to be tuned against real replies
+    /// rather than argued about — what it is for is making "a user must
+    /// never have to read the generated JavaScript to know what is
+    /// happening" true in practice and not only in principle.
+    ///
+    /// Empty under every transport but the notebook, where a `Turn`'s
+    /// source is a whole program that belongs to the source pane.
+    fn cell_rows(
+        &self,
+        program: EventId,
+        source: &str,
+        indent: &str,
+    ) -> Vec<(ChatKind, String, RowDetail, EventId)> {
+        if !self.show_cells || source.trim().is_empty() {
+            return Vec::new();
+        }
+        let lines: Vec<&str> = source.trim_end().lines().collect();
+        let expanded = self.expanded_cells.contains(&program);
+        let shown = if expanded {
+            lines.len()
+        } else {
+            CELL_COLLAPSED_LINES.min(lines.len())
+        };
+        let mut out: Vec<(ChatKind, String, RowDetail, EventId)> = lines[..shown]
+            .iter()
+            .map(|line| {
+                (
+                    ChatKind::Code,
+                    format!("{indent}{line}"),
+                    RowDetail::Program(program),
+                    program,
+                )
+            })
+            .collect();
+        if shown < lines.len() {
+            let rest = lines.len() - shown;
+            let plural = if rest == 1 { "" } else { "s" };
+            out.push((
+                ChatKind::Code,
+                format!("{indent}… {rest} more line{plural}"),
+                RowDetail::Program(program),
+                program,
+            ));
+        }
+        out
+    }
+
     /// Same rows, but with markdown block/inline classification skipped
     /// entirely — the stored `Entry::Line.text` is always the untouched
     /// original, so this is a re-derivation, never a lossy fallback: what
@@ -630,6 +731,7 @@ impl ChatState {
                     depth,
                     by_user,
                     compacted,
+                    source,
                 } if visible(*branch, *program) => {
                     let indent = "  ".repeat(*depth);
                     if let Some(marker) = compacted {
@@ -661,6 +763,7 @@ impl ChatState {
                         RowDetail::Program(*program),
                         *program,
                     ));
+                    out.extend(self.cell_rows(*program, source, &indent));
                 }
                 Entry::Line {
                     branch,
@@ -2698,5 +2801,153 @@ mod tests {
             rows.iter()
                 .any(|(k, t, _, _)| *k == ChatKind::Code && t.contains("|---|---|"))
         );
+    }
+
+    // ── notebook cells in the transcript (D13, 25.6) ────────────────
+
+    /// A `Turn` whose source is a cell's JavaScript.
+    fn cell(id: u64, source: &str) -> SessionEvent {
+        ev(
+            id,
+            EventPayload::Message(Message::Turn {
+                author: Author::Agent(EventId::new(1)),
+                source: source.into(),
+                thinking: None,
+                usage: None,
+            }),
+        )
+    }
+
+    fn code_rows(chat: &ChatState) -> Vec<String> {
+        chat.rows(None, 80)
+            .into_iter()
+            .filter(|(k, ..)| *k == ChatKind::Code)
+            .map(|(_, text, ..)| text)
+            .collect()
+    }
+
+    /// Under every transport but the notebook, a `Turn`'s source stays out
+    /// of the transcript — it is a whole program, and the source pane is
+    /// where it belongs. This is what keeps the existing render unchanged.
+    #[test]
+    fn a_turns_source_is_not_inlined_unless_cells_are_shown() {
+        let mut chat = ChatState::new();
+        chat.apply(&agent_event());
+        chat.apply(&cell(2, "let a = 1;\nlet b = 2;"));
+        assert!(code_rows(&chat).is_empty());
+    }
+
+    /// **Collapsed by default**: five lines and a count of the rest (D13).
+    #[test]
+    fn a_cell_shows_five_lines_and_a_count_when_collapsed() {
+        let mut chat = ChatState::new();
+        chat.apply(&agent_event());
+        chat.set_show_cells(true);
+        let source = (1..=8)
+            .map(|n| format!("line{n}();"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        chat.apply(&cell(2, &source));
+
+        let rows = code_rows(&chat);
+        assert_eq!(rows.len(), CELL_COLLAPSED_LINES + 1, "five lines and a count");
+        assert_eq!(rows[0], "line1();");
+        assert_eq!(rows[CELL_COLLAPSED_LINES - 1], "line5();");
+        assert_eq!(rows[CELL_COLLAPSED_LINES], "… 3 more lines");
+    }
+
+    /// A cell shorter than the cap shows whole, with no count row.
+    #[test]
+    fn a_short_cell_shows_whole_with_no_count() {
+        let mut chat = ChatState::new();
+        chat.apply(&agent_event());
+        chat.set_show_cells(true);
+        chat.apply(&cell(2, "tell(\"hi\");\ndone();"));
+        assert_eq!(code_rows(&chat), vec!["tell(\"hi\");", "done();"]);
+    }
+
+    /// Expanding shows the rest.
+    #[test]
+    fn expanding_a_cell_shows_its_whole_source() {
+        let mut chat = ChatState::new();
+        chat.apply(&agent_event());
+        chat.set_show_cells(true);
+        let source = (1..=8)
+            .map(|n| format!("line{n}();"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        chat.apply(&cell(2, &source));
+        chat.toggle_cell(EventId::new(2));
+        assert!(chat.cell_expanded(EventId::new(2)));
+        assert_eq!(code_rows(&chat).len(), 8, "every line, no count row");
+        chat.toggle_cell(EventId::new(2));
+        assert_eq!(code_rows(&chat).len(), CELL_COLLAPSED_LINES + 1);
+    }
+
+    /// **A reply with two cells collapses them independently** — the gate's
+    /// own case, and the reason the state is keyed by `Turn` id rather than
+    /// being one bit per branch.
+    #[test]
+    fn two_cells_in_one_reply_collapse_independently() {
+        let mut chat = ChatState::new();
+        chat.apply(&agent_event());
+        chat.set_show_cells(true);
+        let long = |tag: &str| {
+            (1..=8)
+                .map(|n| format!("{tag}{n}();"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        chat.apply(&cell(2, &long("a")));
+        chat.apply(&cell(3, &long("b")));
+
+        // Both collapsed: five lines and a count each.
+        assert_eq!(code_rows(&chat).len(), 2 * (CELL_COLLAPSED_LINES + 1));
+
+        // Open only the first.
+        chat.toggle_cell(EventId::new(2));
+        assert!(chat.cell_expanded(EventId::new(2)));
+        assert!(
+            !chat.cell_expanded(EventId::new(3)),
+            "the other cell is untouched"
+        );
+        let rows = code_rows(&chat);
+        assert_eq!(rows.len(), 8 + (CELL_COLLAPSED_LINES + 1));
+        assert!(rows.contains(&"a8();".to_string()), "the first is open");
+        assert!(!rows.contains(&"b8();".to_string()), "the second is not");
+    }
+
+    /// Every cell row carries its own `Turn` id, so a click on one row can
+    /// name the cell it belongs to and nothing else.
+    #[test]
+    fn a_cell_row_names_its_own_turn() {
+        let mut chat = ChatState::new();
+        chat.apply(&agent_event());
+        chat.set_show_cells(true);
+        chat.apply(&cell(2, "first();"));
+        chat.apply(&cell(3, "second();"));
+        let owners: Vec<(String, RowDetail)> = chat
+            .rows(None, 80)
+            .into_iter()
+            .filter(|(k, ..)| *k == ChatKind::Code)
+            .map(|(_, text, detail, _)| (text, detail))
+            .collect();
+        assert_eq!(
+            owners,
+            vec![
+                ("first();".to_string(), RowDetail::Program(EventId::new(2))),
+                ("second();".to_string(), RowDetail::Program(EventId::new(3))),
+            ]
+        );
+    }
+
+    /// An empty cell adds no rows at all — there is nothing to fold.
+    #[test]
+    fn an_empty_cell_adds_no_rows() {
+        let mut chat = ChatState::new();
+        chat.apply(&agent_event());
+        chat.set_show_cells(true);
+        chat.apply(&cell(2, "   \n\n"));
+        assert!(code_rows(&chat).is_empty());
     }
 }
