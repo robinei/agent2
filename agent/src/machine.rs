@@ -470,10 +470,28 @@ pub struct Runner {
     ///
     /// [`set_transport`]: Runner::set_transport
     transport: crate::document::Transport,
-    /// `Transport::Notebook` only: a reply is being fed in as it streams, so
-    /// the run in `phase` belongs to a completion that has not finished
-    /// arriving. Cleared when the completion ends, however it ends.
-    streaming_notebook: bool,
+    /// `Transport::Notebook` only: **which generation** the run in `phase`
+    /// is assembling, by the host's own `llm_epoch` for this branch.
+    /// `None` between replies.
+    ///
+    /// Deliberately an identity and not a flag. It was a `bool` with one
+    /// set site and one clear site, and the clear site was on the single
+    /// happy path — the `LlmResponse` a *successful* generation produces.
+    /// Four other ways a generation ends leave no `LlmResponse` at all:
+    /// the epoch moves and `LlmDone` is dropped (which is exactly what
+    /// D11's cancel-on-trap does), the provider errors, the user
+    /// interrupts, or a handler abandons. Each left the flag set with a
+    /// stale `Run`, and the next reply was fed into the *previous*
+    /// reply's VM — so D10's "nothing survives to the next notebook"
+    /// stopped being true at runtime. A model that wrote `const files` in
+    /// two consecutive replies, which is ordinary and legal, got
+    /// `files is already declared` and lost the run.
+    ///
+    /// An epoch cannot be forgotten the way a flag can: a chunk from a
+    /// generation this is not assembling starts a fresh reply by
+    /// construction, on every path at once — including the ones nobody
+    /// remembered to add a reset to.
+    streaming_epoch: Option<u64>,
     /// Whether a client is attached to the session right now.
     ///
     /// Presence is a **per-request fact**, never branch state that
@@ -657,7 +675,7 @@ impl Runner {
             last_vm: None,
             status_transitions: Vec::new(),
             transport: crate::document::configured_transport(),
-            streaming_notebook: false,
+            streaming_epoch: None,
             attached: false,
             // A branch handed to a fresh `Runner` has said nothing to
             // *this* session's LLM and is owed no prompt for its
@@ -1075,33 +1093,26 @@ impl Runner {
         usage: Option<crate::host::Usage>,
         reply: Option<String>,
     ) -> io::Result<Vec<StepOutput>> {
-        let notebook = self.transport == crate::document::Transport::Notebook;
-        // **Under `Transport::Notebook` the reply is not one `Turn`** (D15).
-        // It decomposes, in source order, into prose segments logged as
-        // `Call::Send { to: User }` and cells logged as their own `Turn`s —
-        // each written by the driver as it reaches that piece, so a cell's
-        // `Turn` lands immediately before that cell runs and the calls it
-        // dispatches land after it. Nothing here logs the completion whole.
+        // **One implementation, and it is the streaming one.** A reply
+        // that arrives whole — a user taking the branch's turn, a client
+        // that does not stream — is fed through the same door as one that
+        // arrives in chunks, and ends the same way.
         //
-        // What is given up: the reply is recoverable in content and order,
-        // but not byte-for-byte — the fences and the whitespace between
-        // pieces are stored nowhere. Nothing downstream needs them.
-        let assistant_id = if notebook {
-            // Same reasoning as the streaming path: this reply's `Turn`s
-            // are written by the driver, one per cell, so the cost of
-            // the completion is logged on its own.
-            if usage.is_some() || !source.is_empty() || thinking.is_some() {
-                tree.append(
-                    &mut self.spine,
-                    EventPayload::Completion {
-                        usage: usage.clone().unwrap_or_default(),
-                        text: source.clone(),
-                        thinking: thinking.clone(),
-                    },
-                )?;
+        // There used to be two: this function built its own `Run`, its
+        // own `Notebook` and its own zero-cell rule, while production
+        // only ever went through `notebook_stream`. They agreed on the
+        // happy path and diverged on every other, and because the unit
+        // tests drove *this* one, five bugs reached a live run through a
+        // green suite.
+        if self.transport == crate::document::Transport::Notebook {
+            self.open_notebook_reply(tree, None)?;
+            let mut out = self.notebook_stream_chunk(tree, &source)?;
+            if let Some(more) = self.notebook_stream_end(tree, truncated, usage, thinking)? {
+                out.extend(more);
             }
-            self.spine.leaf_id
-        } else {
+            return Ok(out);
+        }
+        let assistant_id = {
             let message = Message::Turn {
                 author,
                 source: source.clone(),
@@ -1146,16 +1157,7 @@ impl Runner {
             out.push(StepOutput::Sends(vec![send]));
         }
 
-        // **Truncation is partial progress here, not a discarded reply**
-        // (D11). Under every other transport a completion cut off mid-program
-        // is never compiled, because half a program the model never finished
-        // emitting is worse than a clean compile failure. A notebook has a
-        // finer grain to offer: the cells whose fences closed are whole, they
-        // run, and what they did stands — only the half-written cell after
-        // them is dropped, by the splitter, for being unterminated. The
-        // reply is still reported as truncated, so the next completion knows
-        // it was cut off.
-        if truncated && !notebook {
+        if truncated {
             // **Never compile a truncated completion** (`Cause::Truncated`'s
             // own doc in `types.rs`): cut off wherever the token budget ran
             // out, it may still parse and run — half-written, on a program
@@ -1200,54 +1202,7 @@ impl Runner {
             return Ok(out);
         }
 
-        // **A reply with no cells rests the branch** (D4), and needs no rule
-        // of its own — this is only the "there is nothing to run" gate the
-        // `RunProgram` case above already is. The model spoke and stopped:
-        // that is a complete turn, not a failure. Nothing is refused and
-        // nothing is re-asked.
-        //
-        // Resting is not a state. With no `Turn` outcome logged,
-        // `last_turn_outcome` finds no `Return`/`Condition` after the newest
-        // `Turn` and returns `None`, so `needs_prompt`'s outcome clause is
-        // false; with no `Post`, its other clause is false too. That is
-        // bit-for-bit the state `done()` produces by advancing `shown`.
-        //
-        // The share of replies that land here is the chat-mode-drift metric
-        // 25.8 wants, and it is free to count. It is a metric, not a gate:
-        // requiring a cell never prevented drift — a drifting model writes
-        // `done();` in a cell and drifts identically — it only ever prevented
-        // the *silent* variant, and a reply that speaks and rests is not
-        // silent.
-        if notebook && crate::notebook::split_cells(&source).is_empty() {
-            // The prose still reaches the person — that is the whole of
-            // "the model spoke and stopped". It goes out as the same
-            // `Call::Send { to: User }` a cell's prose does, so nothing
-            // downstream has a second shape to learn.
-            let mut stream = crate::notebook::Stream::new();
-            for piece in stream.finish(&source) {
-                let crate::notebook::Piece::Prose(text) = piece else {
-                    unreachable!("no cells, so no cell pieces");
-                };
-                let send = tree.append(
-                    &mut self.spine,
-                    EventPayload::Call(Call::Send {
-                        to: Address::User,
-                        prose: true,
-                        text,
-                        input: serde_json::Value::Null,
-                        options: Vec::new(),
-                        expects_reply: false,
-                        site: 0,
-                        site_end: 0,
-                    }),
-                )?;
-                out.push(StepOutput::Sends(vec![send]));
-            }
-            self.phase = Phase::Idle;
-            return Ok(out);
-        }
-
-        match self.start_program(tree, assistant_id, &source, truncated) {
+        match self.start_program(tree, assistant_id, &source) {
             Ok(run) => {
                 if let Phase::Suspended(old, resume_with) =
                     std::mem::replace(&mut self.phase, Phase::Idle)
@@ -1588,11 +1543,7 @@ impl Runner {
         tree: &Tree,
         program_id: EventId,
         source: &str,
-        truncated: bool,
     ) -> Result<Run, String> {
-        if self.transport == crate::document::Transport::Notebook {
-            return self.start_notebook(tree, program_id, source, truncated);
-        }
         let program = compile(source).map_err(|diags| render_diags(source, &diags))?;
         // The whole `input` reaches the program even though the context
         // saw only a bounded preview of it.
@@ -1602,42 +1553,6 @@ impl Runner {
             program_id,
             vm,
             notebook: None,
-        })
-    }
-
-    /// `Transport::Notebook`'s half of [`start_program`](Self::start_program):
-    /// build the VM, prime the prelude, and hand the reply over as one piece.
-    ///
-    /// **The batch entry point**, used when a whole completion arrives at once
-    /// (a scripted turn, or the user taking the branch's turn by hand). The
-    /// streaming path — [`notebook_chunk`](Self::notebook_chunk) — feeds the
-    /// same driver in pieces instead; both end at the same place, because the
-    /// splitter does not care how the text arrived.
-    ///
-    /// Only the first cell is compiled here. The rest arrive through `pump`'s
-    /// `Paused` arm as the VM reaches each cell's `Instr::Pause`, which is
-    /// what makes the cells one compilation that pauses rather than a series
-    /// of programs.
-    fn start_notebook(
-        &mut self,
-        tree: &Tree,
-        program_id: EventId,
-        source: &str,
-        truncated: bool,
-    ) -> Result<Run, String> {
-        let mut vm = VM::for_incremental(self.spine.context().input(tree), serde_json::Value::Null)
-            .map_err(|e| format!("program setup failed: {}", e.message))?;
-        let mut notebook = crate::notebook::Notebook::new(&mut vm)?;
-        notebook.push_text(source);
-        notebook.end_truncated(truncated);
-        // Nothing is fed here. Priming left the VM parked at the prelude
-        // fragment's own `Pause`, so the pump's first step reports `Paused`
-        // and every cell — the first included — arrives through the one
-        // door, with its `Turn` logged immediately before it runs.
-        Ok(Run {
-            program_id,
-            vm,
-            notebook: Some(notebook),
         })
     }
 
@@ -3590,13 +3505,31 @@ impl Runner {
     /// Cells still run strictly in sequence (D11): a fence can close while
     /// the previous cell is suspended on an await, and the cell then waits in
     /// the queue rather than jumping ahead of it.
-    pub fn notebook_stream(&mut self, tree: &mut Tree, text: &str) -> io::Result<Vec<StepOutput>> {
+    pub fn notebook_stream(
+        &mut self,
+        tree: &mut Tree,
+        epoch: u64,
+        text: &str,
+    ) -> io::Result<Vec<StepOutput>> {
         if self.transport != crate::document::Transport::Notebook {
             return Ok(Vec::new());
         }
-        if !self.begin_streaming_notebook(tree)? {
-            return Ok(Vec::new());
+        if self.streaming_epoch != Some(epoch) {
+            // A different generation: whatever was being assembled is
+            // over, however it ended.
+            self.open_notebook_reply(tree, Some(epoch))?;
         }
+        self.notebook_stream_chunk(tree, text)
+    }
+
+    /// Append text to the reply already open, and run whatever that
+    /// completes. The one place a notebook reply grows, whether the text
+    /// arrived as a chunk or whole.
+    fn notebook_stream_chunk(
+        &mut self,
+        tree: &mut Tree,
+        text: &str,
+    ) -> io::Result<Vec<StepOutput>> {
         let Phase::Running(run) = &mut self.phase else {
             return Ok(Vec::new());
         };
@@ -3619,52 +3552,34 @@ impl Runner {
         usage: Option<crate::host::Usage>,
         thinking: Option<String>,
     ) -> io::Result<Option<Vec<StepOutput>>> {
-        if !self.streaming_notebook {
+        if self.streaming_epoch.is_none() {
             return Ok(None);
         }
-        self.streaming_notebook = false;
-        // **What the completion cost, logged the moment it is known.**
-        // Every `Turn` this reply produced is already on the log — each
-        // was written before its cell ran, which is while this
-        // completion was still streaming (D15) — and the log is
-        // append-only, so there is no `Turn` left to hang the figure on.
-        // It goes on its own, exactly once, which is also what makes a
-        // reply countable as one turn rather than as its cells.
-        // The reply as it actually arrived. Taken from the notebook
-        // rather than from the final `LlmTurn`, whose `source` the
-        // streaming path never fills — the text came in as chunks.
-        let text = match &self.phase {
-            Phase::Running(run) => run
-                .notebook
-                .as_ref()
-                .map(|nb| nb.reply().to_string())
-                .unwrap_or_default(),
-            _ => String::new(),
-        };
-        // **Logged for the text, not only for the cost.** A client that
-        // reports no usage — a scripted one, a provider that omits it —
-        // still produced a reply, and that reply is what the model is
-        // shown as its own past turn. Gating this on usage left those
-        // runs rendering their turns as bare cells again.
-        if usage.is_some() || !text.is_empty() || thinking.is_some() {
-            tree.append(
-                &mut self.spine,
-                EventPayload::Completion {
-                    usage: usage.unwrap_or_default(),
-                    text,
-                    thinking,
-                },
-            )?;
+        // **What the completion cost and said, recorded once.** Every
+        // `Turn` this reply produced is already on the log — each was
+        // written before its cell ran, which is while this completion was
+        // still streaming (D15) — and the log is append-only, so there is
+        // no `Turn` left to hang the figures on.
+        self.finish_notebook_generation(tree, usage, thinking)?;
+        // **Mark the reply ended wherever its run is**, suspended
+        // included. A raise or a trap in an early cell parks the run, and
+        // this used to return before marking it — so the notebook stayed
+        // open, and when a handler resumed it the remaining cells waited
+        // for a fence that was never coming. The reply is over either
+        // way; whether its run can proceed is a separate question,
+        // answered below.
+        match &mut self.phase {
+            Phase::Running(run) | Phase::Suspended(run, _) => {
+                if let Some(notebook) = run.notebook.as_mut() {
+                    notebook.end_truncated(truncated);
+                }
+            }
+            _ => return Ok(Some(Vec::new())),
         }
-        let Phase::Running(run) = &mut self.phase else {
-            // The run already ended — a trap or a raise in an earlier cell
-            // suspended it, and the rest of the reply is moot.
+        if !matches!(self.phase, Phase::Running(_)) {
+            // Parked. The cells that are left run when a handler decides.
             return Ok(Some(Vec::new()));
-        };
-        let Some(notebook) = run.notebook.as_mut() else {
-            return Ok(Some(Vec::new()));
-        };
-        notebook.end_truncated(truncated);
+        }
         Ok(Some(self.drive_notebook(tree)?))
     }
 
@@ -3704,15 +3619,23 @@ impl Runner {
 
     /// Start the streaming run if it has not started, returning whether there
     /// is one to feed.
-    fn begin_streaming_notebook(&mut self, tree: &mut Tree) -> io::Result<bool> {
-        if self.streaming_notebook {
-            return Ok(matches!(self.phase, Phase::Running(_)));
-        }
-        if !matches!(self.phase, Phase::AwaitingLlm) {
-            // A chunk arriving outside a turn this branch is waiting on:
-            // nothing to attach it to.
-            return Ok(false);
-        }
+    /// Close out whatever reply was being assembled and open a fresh one.
+    ///
+    /// `epoch` names the generation this reply belongs to, or `None` for a
+    /// reply that arrived whole rather than as chunks — a user taking the
+    /// branch's turn by hand, or a client that does not stream.
+    ///
+    /// **No phase guard.** It used to refuse anything but `AwaitingLlm`,
+    /// which made the `Phase::Suspended` arm below unreachable — so a
+    /// *handler's* reply, which by definition streams while the branch is
+    /// suspended, had every chunk dropped in silence and a `raise` was
+    /// never answered on this transport. Every phase this can be reached
+    /// in is a phase a reply can legitimately arrive in, so each is
+    /// handled rather than refused: a suspended run is parked on
+    /// `beneath` for its handler to decide, and a still-running one is
+    /// discarded the way `apply_turn` discards it.
+    fn open_notebook_reply(&mut self, tree: &mut Tree, epoch: Option<u64>) -> io::Result<bool> {
+        self.finish_notebook_generation(tree, None, None)?;
         let mut vm =
             match VM::for_incremental(self.spine.context().input(tree), serde_json::Value::Null) {
                 Ok(vm) => vm,
@@ -3732,8 +3655,58 @@ impl Runner {
             vm,
             notebook: Some(notebook),
         });
-        self.streaming_notebook = true;
+        self.streaming_epoch = epoch.or(Some(u64::MAX));
         Ok(true)
+    }
+
+    /// Record what the generation being assembled cost and said, and stop
+    /// assembling it. Idempotent: a reply already closed out closes again
+    /// for nothing.
+    ///
+    /// **Called from every path that ends a generation**, and — because
+    /// that list has been wrong twice — also from
+    /// [`open_notebook_reply`](Self::open_notebook_reply), so a path
+    /// nobody thought of still cannot leave a reply half-open.
+    fn finish_notebook_generation(
+        &mut self,
+        tree: &mut Tree,
+        usage: Option<crate::host::Usage>,
+        thinking: Option<String>,
+    ) -> io::Result<()> {
+        if self.streaming_epoch.take().is_none() {
+            return Ok(());
+        }
+        // The reply as it actually arrived, taken from the notebook
+        // rather than from the final `LlmTurn`, whose `source` the
+        // streaming path never fills — the text came in as chunks.
+        let text = match &self.phase {
+            Phase::Running(run) | Phase::Suspended(run, _) => run
+                .notebook
+                .as_ref()
+                .map(|nb| nb.reply().to_string())
+                .unwrap_or_default(),
+            _ => String::new(),
+        };
+        // **Logged even when there is nothing to report.** A cancelled
+        // generation has no usage, but "no event" and "no usage" must not
+        // be the same state: that is what made a third of the arm's
+        // completions invisible, and every per-reply metric was divided
+        // by the wrong number.
+        tree.append(
+            &mut self.spine,
+            EventPayload::Completion {
+                usage: usage.unwrap_or_default(),
+                text,
+                thinking,
+            },
+        )?;
+        Ok(())
+    }
+
+    /// The generation ended some way other than a completion arriving —
+    /// cancelled, superseded, errored, interrupted. The reply is over.
+    pub fn notebook_generation_ended(&mut self, tree: &mut Tree) -> io::Result<()> {
+        self.finish_notebook_generation(tree, None, None)
     }
 
     /// Whether a suspension or completion should cancel the generation still
@@ -3746,7 +3719,7 @@ impl Runner {
     /// often the answer the person asked for, so cutting it off would truncate
     /// the reply mid-sentence.
     pub fn notebook_cancels_generation(&self) -> bool {
-        self.streaming_notebook && matches!(self.phase, Phase::Suspended(..))
+        self.streaming_epoch.is_some() && matches!(self.phase, Phase::Suspended(..))
     }
 }
 
@@ -5775,18 +5748,21 @@ mod tests {
             payload_kinds(&state, &tree),
             [
                 "Agent",
-                "Post",       //
-                "Completion", // the reply's own bytes, once
+                "Post", //
                 "Call",
                 "Turn", // "Reading the two files first." + cell 0
                 "Call",
                 "Turn", // "Now the adjustment."          + cell 1
                 "Call",
                 "Turn", // "And the answer."              + cell 2
+                // The reply's own bytes and cost, once, when the
+                // generation ends — which is after its cells have run,
+                // because every reply now takes the streaming path.
+                "Completion",
                 "Return",
                 "Console",
             ],
-            "three cells, three Turns, one Return"
+            "three cells, three Turns, one Completion, one Return"
         );
 
         // And they really shared a scope.
@@ -6095,10 +6071,13 @@ mod tests {
         );
         assert_eq!(
             payload_kinds(&state, &tree),
-            // The reply's own bytes are logged first — a cell-less
-            // reply is still a completion, and it is still what the
-            // model must be shown as its own past turn.
-            ["Agent", "Post", "Completion", "Call"],
+            // A cell-less reply is still a completion, and still what
+            // the model must be shown as its own past turn. It runs an
+            // empty program — there is no separate "nothing to run" path
+            // any more — so it closes with an outcome like any other
+            // reply, and rests because no `Turn` of its own was ever
+            // logged for `last_turn_outcome` to find.
+            ["Agent", "Post", "Completion", "Call", "Return", "Console"],
             "the prose is delivered and nothing ran"
         );
         let said = state
@@ -6205,11 +6184,23 @@ mod tests {
     // ── streaming: execute as the fences close (D11, D15, 25.5) ────
 
     /// Push `reply` through the streaming door in chunks, the way the
-    /// session loop does, without ending the completion.
+    /// session loop does, without ending the completion. All one
+    /// generation, so they assemble into one reply.
+    const TEST_EPOCH: u64 = 1;
+
     fn stream_chunks(state: &mut Runner, tree: &mut Tree, chunks: &[&str]) -> Vec<StepOutput> {
+        stream_chunks_at(state, tree, TEST_EPOCH, chunks)
+    }
+
+    fn stream_chunks_at(
+        state: &mut Runner,
+        tree: &mut Tree,
+        epoch: u64,
+        chunks: &[&str],
+    ) -> Vec<StepOutput> {
         let mut out = Vec::new();
         for chunk in chunks {
-            let produced = state.notebook_stream(tree, chunk).unwrap();
+            let produced = state.notebook_stream(tree, epoch, chunk).unwrap();
             out.extend(drain(state, tree, produced));
         }
         out
@@ -6879,10 +6870,7 @@ mod tests {
             .unwrap();
         drain(&mut state, &mut tree, out);
 
-        assert_eq!(
-            recorded_thinking(&state, &tree),
-            vec!["the long way round"]
-        );
+        assert_eq!(recorded_thinking(&state, &tree), vec!["the long way round"]);
     }
 
     /// **`agent score` reads it**, which is the number the comparison
@@ -6932,5 +6920,192 @@ mod tests {
         let score = crate::score::score(&tree);
         assert_eq!(score.thinking_bytes, "still thinking".len());
         assert_eq!(score.reasoning_out, 55);
+    }
+
+    // ── one lifecycle, closed on every path (D10) ───────────────────
+    //
+    // `streaming_notebook` was a `bool` with one clear site, on the one
+    // path a *successful* generation takes. Four others end a generation
+    // without producing an `LlmResponse` at all, and each left the flag
+    // set with a stale `Run` — so the next reply was fed into the
+    // previous reply's VM and D10's "nothing survives to the next
+    // notebook" stopped being true. These drive the reply through the
+    // streaming door, which is the one production uses.
+
+    /// Feed a whole reply as one generation and end it, the way the
+    /// session loop does.
+    fn stream_reply(state: &mut Runner, tree: &mut Tree, epoch: u64, reply: &str) {
+        state.phase = Phase::AwaitingLlm;
+        stream_chunks_at(state, tree, epoch, &[reply]);
+        let out = state
+            .step(&mut *tree, StepInput::LlmResponse(llm_program("")))
+            .unwrap();
+        drain(state, tree, out);
+    }
+
+    /// Whether the branch's most recent reply trapped on a name the
+    /// *previous* reply declared — which is what a leaked VM looks like.
+    fn leaked_binding(state: &Runner, tree: &Tree) -> bool {
+        state.agent_segment(tree).iter().any(|e| {
+            matches!(&e.payload, EventPayload::Condition { cause, .. }
+                if format!("{cause:?}").contains("already declared"))
+        })
+    }
+
+    /// **A trap in reply N leaves reply N+1 a fresh VM** — the case the
+    /// live arm died on: two consecutive replies each opening with
+    /// `const files`, which is ordinary and legal, and the second getting
+    /// `files is already declared` because it ran in the first one's
+    /// frame.
+    #[test]
+    fn a_trap_does_not_leak_its_vm_into_the_next_reply() {
+        let (mut tree, mut state) = setup_under(crate::document::Transport::Notebook);
+        user_post(&mut state, &mut tree, "go");
+
+        // Reply 1 declares `files` and then traps.
+        stream_reply(
+            &mut state,
+            &mut tree,
+            1,
+            "```js\nconst files = 1;\nundefined_thing_here();\n```\n",
+        );
+        assert!(matches!(state.phase, Phase::Suspended(..)), "it trapped");
+
+        // Reply 2 declares the same name. A fresh VM has never heard of it.
+        stream_reply(
+            &mut state,
+            &mut tree,
+            2,
+            "```js\nconst files = 2;\nconsole.log(\"second reply ran\");\n```\n",
+        );
+        assert!(!leaked_binding(&state, &tree), "reply 2 got a fresh VM");
+        assert!(
+            state.agent_segment(&tree).iter().any(|e| {
+                matches!(&e.payload, EventPayload::Message(Message::Turn { source, .. })
+                    if source.contains("second reply ran"))
+            }),
+            "and its chunks were not dropped"
+        );
+    }
+
+    /// The same for a generation that ends without any `LlmResponse` at
+    /// all — a provider error, an interrupt, a cancelled generation. The
+    /// next reply's chunks simply carry a different epoch, and that alone
+    /// is what starts a fresh reply: nothing had to remember to reset.
+    #[test]
+    fn a_generation_that_never_completes_does_not_leak_its_vm() {
+        let (mut tree, mut state) = setup_under(crate::document::Transport::Notebook);
+        user_post(&mut state, &mut tree, "go");
+
+        // Reply 1 streams and is never completed — no `LlmResponse` ever
+        // arrives for it.
+        state.phase = Phase::AwaitingLlm;
+        stream_chunks_at(
+            &mut state,
+            &mut tree,
+            1,
+            &["```js\nconst files = 1;\n```\n"],
+        );
+
+        // Reply 2 arrives under the next generation.
+        stream_reply(
+            &mut state,
+            &mut tree,
+            2,
+            "```js\nconst files = 2;\nconsole.log(\"still fine\");\n```\n",
+        );
+        assert!(!leaked_binding(&state, &tree), "reply 2 got a fresh VM");
+    }
+
+    /// **Every reply logs exactly one `Completion`**, including one whose
+    /// generation was abandoned. "No event" and "no usage" are different
+    /// states: a third of the live arm's completions went unlogged, and
+    /// every per-reply metric was divided by the wrong number.
+    #[test]
+    fn every_reply_logs_exactly_one_completion() {
+        let (mut tree, mut state) = setup_under(crate::document::Transport::Notebook);
+        user_post(&mut state, &mut tree, "go");
+
+        // One abandoned generation, one that traps, one that finishes.
+        state.phase = Phase::AwaitingLlm;
+        stream_chunks_at(&mut state, &mut tree, 1, &["```js\nlet a = 1;\n```\n"]);
+        stream_reply(&mut state, &mut tree, 2, "```js\nboom_undefined();\n```\n");
+        stream_reply(
+            &mut state,
+            &mut tree,
+            3,
+            "```js\nconsole.log(\"ok\");\n```\n",
+        );
+
+        let completions = state
+            .agent_segment(&tree)
+            .iter()
+            .filter(|e| matches!(e.payload, EventPayload::Completion { .. }))
+            .count();
+        assert_eq!(completions, 3, "three replies, three completions");
+        assert_eq!(
+            crate::score::score(&tree).programs,
+            3,
+            "and `agent score` counts three round trips"
+        );
+    }
+
+    /// A reply that arrives whole rather than in chunks — a user taking
+    /// the branch's turn, a client that does not stream — goes through
+    /// the same door and lands in the same place. There is no second
+    /// implementation for it to diverge from.
+    #[test]
+    fn a_whole_reply_and_a_streamed_one_land_identically() {
+        let reply = "Looking.\n\n```js\nlet n = 1;\n```\n\n```js\nconsole.log(n + 41);\n```\n";
+
+        let whole = {
+            let (mut tree, mut state) = setup_under(crate::document::Transport::Notebook);
+            user_post(&mut state, &mut tree, "go");
+            let out = state
+                .step(&mut tree, StepInput::LlmResponse(llm_program(reply)))
+                .unwrap();
+            drain(&mut state, &mut tree, out);
+            payload_kinds(&state, &tree)
+        };
+        let streamed = {
+            let (mut tree, mut state) = setup_under(crate::document::Transport::Notebook);
+            user_post(&mut state, &mut tree, "go");
+            stream_reply(&mut state, &mut tree, 1, reply);
+            payload_kinds(&state, &tree)
+        };
+        assert_eq!(whole, streamed);
+    }
+
+    /// **A handler's reply runs.** It streams while the branch is
+    /// `Suspended`, which the old phase guard refused outright — so every
+    /// chunk was dropped in silence and a `raise` was never answered on
+    /// this transport.
+    #[test]
+    fn a_handlers_reply_is_not_dropped_while_suspended() {
+        let (mut tree, mut state) = setup_under(crate::document::Transport::Notebook);
+        user_post(&mut state, &mut tree, "go");
+        stream_reply(
+            &mut state,
+            &mut tree,
+            1,
+            "```js\nconst pick = raise(\"which\");\nconsole.log(`picked ${pick}`);\n```\n",
+        );
+        assert!(matches!(state.phase, Phase::Suspended(..)), "it raised");
+
+        // The handler's own reply arrives while the branch is still
+        // suspended — which is the only time a handler's reply ever
+        // arrives.
+        let out = state
+            .notebook_stream(&mut tree, 2, "```js\nconsole.log(\"handler ran\");\n```\n")
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+
+        assert!(
+            state.agent_segment(&tree).iter().any(|e| {
+                matches!(&e.payload, EventPayload::Message(Message::Turn { source, .. })
+                    if source.contains("handler ran"))
+            }),
+            "the handler's cell was compiled and logged, not dropped"
+        );
     }
 }
