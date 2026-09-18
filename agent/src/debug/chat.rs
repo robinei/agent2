@@ -1680,6 +1680,7 @@ mod tests {
         chat.apply(&ev(
             3,
             EventPayload::Call(Call::Send {
+                prose: false,
                 to: Address::User,
                 text: "hello 👋".into(),
                 input: serde_json::Value::Null,
@@ -1692,6 +1693,7 @@ mod tests {
         chat.apply(&ev(
             4,
             EventPayload::Call(Call::Send {
+                prose: false,
                 to: Address::User,
                 text: "what's your name?".into(),
                 input: serde_json::Value::Null,
@@ -1811,6 +1813,7 @@ mod tests {
             4,
             Some(3),
             EventPayload::Call(Call::Send {
+                prose: false,
                 to: Address::User,
                 text: "shared answer".into(),
                 input: serde_json::Value::Null,
@@ -1912,6 +1915,7 @@ mod tests {
         chat.apply(&ev(
             3,
             EventPayload::Call(Call::Send {
+                prose: false,
                 to: Address::User,
                 text: "42".into(),
                 input: serde_json::Value::Null,
@@ -2023,6 +2027,7 @@ mod tests {
         ev(
             id,
             EventPayload::Call(Call::Send {
+                prose: false,
                 to: Address::User,
                 text: text.into(),
                 input: serde_json::Value::Null,
@@ -2852,7 +2857,11 @@ mod tests {
         chat.apply(&cell(2, &source));
 
         let rows = code_rows(&chat);
-        assert_eq!(rows.len(), CELL_COLLAPSED_LINES + 1, "five lines and a count");
+        assert_eq!(
+            rows.len(),
+            CELL_COLLAPSED_LINES + 1,
+            "five lines and a count"
+        );
         assert_eq!(rows[0], "line1();");
         assert_eq!(rows[CELL_COLLAPSED_LINES - 1], "line5();");
         assert_eq!(rows[CELL_COLLAPSED_LINES], "… 3 more lines");

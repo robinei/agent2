@@ -1750,6 +1750,7 @@ mod tests {
         let send = tree.append(
             &mut caller,
             EventPayload::Call(Call::Send {
+                prose: false,
                 to: Address::Branch(EventId::new(1)),
                 text: plan.clone(),
                 input: json!({ "big": plan.clone() }),

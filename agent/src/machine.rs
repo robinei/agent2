@@ -1087,8 +1087,14 @@ impl Runner {
             // Same reasoning as the streaming path: this reply's `Turn`s
             // are written by the driver, one per cell, so the cost of
             // the completion is logged on its own.
-            if let Some(usage) = usage.clone() {
-                tree.append(&mut self.spine, EventPayload::Completion { usage })?;
+            if usage.is_some() || !source.is_empty() {
+                tree.append(
+                    &mut self.spine,
+                    EventPayload::Completion {
+                        usage: usage.clone().unwrap_or_default(),
+                        text: source.clone(),
+                    },
+                )?;
             }
             self.spine.leaf_id
         } else {
@@ -1121,6 +1127,10 @@ impl Runner {
                 &mut self.spine,
                 EventPayload::Call(Call::Send {
                     to: Address::User,
+                    // Prose, but `RunProgram` stores it nowhere else —
+                    // its assistant message is empty by construction —
+                    // so the row is the only place it appears.
+                    prose: false,
                     text: reply,
                     input: serde_json::Value::Null,
                     options: Vec::new(),
@@ -1218,6 +1228,7 @@ impl Runner {
                     &mut self.spine,
                     EventPayload::Call(Call::Send {
                         to: Address::User,
+                        prose: true,
                         text,
                         input: serde_json::Value::Null,
                         options: Vec::new(),
@@ -1700,8 +1711,11 @@ impl Runner {
                         // the next piece wakes it.
                         NotebookStep::Waiting => return Ok(out),
                         NotebookStep::Failed(report) => {
-                            return self
-                                .suspend(tree, SuspendCause::CellCompileFailed(report), out);
+                            return self.suspend(
+                                tree,
+                                SuspendCause::CellCompileFailed(report),
+                                out,
+                            );
                         }
                         NotebookStep::Truncated => {
                             return self.suspend(tree, SuspendCause::Truncated, out);
@@ -1766,16 +1780,14 @@ impl Runner {
                     // to (`resolve_address`).
                     let (to, text, options) = match (call.name.as_str(), args.as_slice()) {
                         (TOOL_TELL, [text]) => (None, coerce_text(text), Vec::new()),
-                        (TOOL_CHOOSE, [to, text, options]) => {
-                            match read_options(options) {
-                                Ok(options) => (Some(to.clone()), coerce_text(text), options),
-                                Err(msg) => {
-                                    self.reject_call(call.promise, &msg);
-                                    progressed = true;
-                                    continue;
-                                }
+                        (TOOL_CHOOSE, [to, text, options]) => match read_options(options) {
+                            Ok(options) => (Some(to.clone()), coerce_text(text), options),
+                            Err(msg) => {
+                                self.reject_call(call.promise, &msg);
+                                progressed = true;
+                                continue;
                             }
-                        }
+                        },
                         (TOOL_CHOOSE, _) => (None, None, Vec::new()),
                         (_, [to, text]) => (Some(to.clone()), coerce_text(text), Vec::new()),
                         _ => (None, None, Vec::new()),
@@ -1786,6 +1798,7 @@ impl Runner {
                                 tree,
                                 Call::Send {
                                     to,
+                                    prose: false,
                                     text,
                                     input: serde_json::Value::Null,
                                     options,
@@ -2227,7 +2240,6 @@ impl Runner {
         self.pending_edits.push(op);
         Ok(())
     }
-
 
     /// Reject a malformed call in place. Nothing is logged: the call was
     /// never dispatched, so it has no `Call` event and owes no `Result` —
@@ -3273,14 +3285,14 @@ fn read_options(v: &serde_json::Value) -> Result<Vec<String>, String> {
             serde_json::Value::String(_) => {
                 return Err("choose: an option is empty; every option needs text a \
                             person can pick by"
-                    .to_owned())
+                    .to_owned());
             }
             other => {
                 return Err(format!(
                     "choose: options must be strings; got {}. A person picks by reading \
                      them, so each one has to say what it means.",
                     crate::report::input_preview(other)
-                ))
+                ));
             }
         }
     }
@@ -3321,10 +3333,7 @@ pub(crate) fn pick_option(reply: &str, options: &[String]) -> Option<String> {
         return Some(hit.clone());
     }
     let folded = reply.trim().to_lowercase();
-    if let Some(hit) = options
-        .iter()
-        .find(|o| o.trim().to_lowercase() == folded)
-    {
+    if let Some(hit) = options.iter().find(|o| o.trim().to_lowercase() == folded) {
         return Some(hit.clone());
     }
     folded
@@ -3577,11 +3586,7 @@ impl Runner {
     /// Cells still run strictly in sequence (D11): a fence can close while
     /// the previous cell is suspended on an await, and the cell then waits in
     /// the queue rather than jumping ahead of it.
-    pub fn notebook_stream(
-        &mut self,
-        tree: &mut Tree,
-        text: &str,
-    ) -> io::Result<Vec<StepOutput>> {
+    pub fn notebook_stream(&mut self, tree: &mut Tree, text: &str) -> io::Result<Vec<StepOutput>> {
         if self.transport != crate::document::Transport::Notebook {
             return Ok(Vec::new());
         }
@@ -3620,8 +3625,30 @@ impl Runner {
         // append-only, so there is no `Turn` left to hang the figure on.
         // It goes on its own, exactly once, which is also what makes a
         // reply countable as one turn rather than as its cells.
-        if let Some(usage) = usage {
-            tree.append(&mut self.spine, EventPayload::Completion { usage })?;
+        // The reply as it actually arrived. Taken from the notebook
+        // rather than from the final `LlmTurn`, whose `source` the
+        // streaming path never fills — the text came in as chunks.
+        let text = match &self.phase {
+            Phase::Running(run) => run
+                .notebook
+                .as_ref()
+                .map(|nb| nb.reply().to_string())
+                .unwrap_or_default(),
+            _ => String::new(),
+        };
+        // **Logged for the text, not only for the cost.** A client that
+        // reports no usage — a scripted one, a provider that omits it —
+        // still produced a reply, and that reply is what the model is
+        // shown as its own past turn. Gating this on usage left those
+        // runs rendering their turns as bare cells again.
+        if usage.is_some() || !text.is_empty() {
+            tree.append(
+                &mut self.spine,
+                EventPayload::Completion {
+                    usage: usage.unwrap_or_default(),
+                    text,
+                },
+            )?;
         }
         let Phase::Running(run) = &mut self.phase else {
             // The run already ended — a trap or a raise in an earlier cell
@@ -3680,18 +3707,17 @@ impl Runner {
             // nothing to attach it to.
             return Ok(false);
         }
-        let mut vm = match VM::for_incremental(
-            self.spine.context().input(tree),
-            serde_json::Value::Null,
-        ) {
-            Ok(vm) => vm,
-            Err(_) => return Ok(false),
-        };
+        let mut vm =
+            match VM::for_incremental(self.spine.context().input(tree), serde_json::Value::Null) {
+                Ok(vm) => vm,
+                Err(_) => return Ok(false),
+            };
         let notebook = match crate::notebook::Notebook::new(&mut vm) {
             Ok(nb) => nb,
             Err(_) => return Ok(false),
         };
-        if let Phase::Suspended(old, resume_with) = std::mem::replace(&mut self.phase, Phase::Idle) {
+        if let Phase::Suspended(old, resume_with) = std::mem::replace(&mut self.phase, Phase::Idle)
+        {
             self.beneath.push((old, resume_with, self.generation));
         }
         self.generation += 1;
@@ -3744,10 +3770,9 @@ impl Runner {
     /// offset, and no other transport is touched.
     fn rebase_site(&self, raw: u32) -> u32 {
         match &self.phase {
-            Phase::Running(run) | Phase::Suspended(run, _) => run
-                .notebook
-                .as_ref()
-                .map_or(raw, |nb| nb.rebase_site(raw)),
+            Phase::Running(run) | Phase::Suspended(run, _) => {
+                run.notebook.as_ref().map_or(raw, |nb| nb.rebase_site(raw))
+            }
             _ => raw,
         }
     }
@@ -3784,6 +3809,7 @@ impl Runner {
                         &mut self.spine,
                         EventPayload::Call(Call::Send {
                             to: Address::User,
+                            prose: true,
                             text,
                             input: serde_json::Value::Null,
                             options: Vec::new(),
@@ -3912,6 +3938,7 @@ mod tests {
             .append(
                 &mut asker.spine,
                 EventPayload::Call(Call::Send {
+                    prose: false,
                     to,
                     text: text.into(),
                     input,
@@ -4026,7 +4053,8 @@ mod tests {
                 StepResult::Pending { calls } => {
                     let name = calls[0].name.as_str();
                     assert!(
-                        matches!(name, TOOL_ASK | TOOL_CHOOSE | TOOL_TELL) || crate::host::serves_inline(name),
+                        matches!(name, TOOL_ASK | TOOL_CHOOSE | TOOL_TELL)
+                            || crate::host::serves_inline(name),
                         "`{verb}` falls through dispatch_calls to the tool registry, \
                          which has no such tool"
                     );
@@ -4037,7 +4065,8 @@ mod tests {
                     // fire-and-forget batch instead.
                     let name = unstarted[0].name.as_str();
                     assert!(
-                        matches!(name, TOOL_ASK | TOOL_CHOOSE | TOOL_TELL) || crate::host::serves_inline(name),
+                        matches!(name, TOOL_ASK | TOOL_CHOOSE | TOOL_TELL)
+                            || crate::host::serves_inline(name),
                         "`{verb}` falls through dispatch_calls to the tool registry"
                     );
                 }
@@ -4174,9 +4203,7 @@ mod tests {
             })
             .expect("tell() dispatches as a Sends output");
         assert_eq!(sends.len(), 1);
-        let EventPayload::Call(Call::Send {
-            site, site_end, ..
-        }) = &tree.events[&sends[0]].payload
+        let EventPayload::Call(Call::Send { site, site_end, .. }) = &tree.events[&sends[0]].payload
         else {
             panic!("expected a Send");
         };
@@ -4272,13 +4299,18 @@ mod tests {
             program.contains("String(1)") && program.contains(") /* history["),
             "the computed one keeps its construction and takes a reference: {program}"
         );
-        let all: String = doc.conversation().iter().map(|m| m.content.clone()).collect();
+        let all: String = doc
+            .conversation()
+            .iter()
+            .map(|m| m.content.clone())
+            .collect();
         assert!(
-            all.contains("you told user: checked every file and the build is green after the rename"),
+            all.contains(
+                "you told user: checked every file and the build is green after the rename"
+            ),
             "and the row carries the text: {all}"
         );
     }
-
 
     #[test]
     fn program_completion_logs_a_harness_report_and_the_branch_goes_idle() {
@@ -5640,7 +5672,6 @@ mod tests {
         );
     }
 
-
     /// A label indexes a call; it does not replay its arguments. The
     /// argument that *identifies* the call survives a huge one standing
     /// beside it, which is the whole reason each is clipped on its own
@@ -5663,6 +5694,7 @@ mod tests {
         // A `tell` is the same shape: the person already read the text,
         // and the row is here so a later program can find the call.
         let label = call_label(&Call::Send {
+            prose: false,
             to: Address::User,
             text: "y".repeat(8_000),
             input: serde_json::Value::Null,
@@ -5736,11 +5768,17 @@ mod tests {
         assert_eq!(
             payload_kinds(&state, &tree),
             [
-                "Agent", "Post", //
-                "Call", "Turn", // "Reading the two files first." + cell 0
-                "Call", "Turn", // "Now the adjustment."          + cell 1
-                "Call", "Turn", // "And the answer."              + cell 2
-                "Return", "Console",
+                "Agent",
+                "Post",       //
+                "Completion", // the reply's own bytes, once
+                "Call",
+                "Turn", // "Reading the two files first." + cell 0
+                "Call",
+                "Turn", // "Now the adjustment."          + cell 1
+                "Call",
+                "Turn", // "And the answer."              + cell 2
+                "Return",
+                "Console",
             ],
             "three cells, three Turns, one Return"
         );
@@ -6051,7 +6089,10 @@ mod tests {
         );
         assert_eq!(
             payload_kinds(&state, &tree),
-            ["Agent", "Post", "Call"],
+            // The reply's own bytes are logged first — a cell-less
+            // reply is still a completion, and it is still what the
+            // model must be shown as its own past turn.
+            ["Agent", "Post", "Completion", "Call"],
             "the prose is delivered and nothing ran"
         );
         let said = state
@@ -6129,7 +6170,10 @@ mod tests {
 
         let report = last_report(&state, &tree);
         assert!(report.contains("still ran"), "{report}");
-        assert!(!state.needs_prompt(&tree), "`done()` still rests the branch");
+        assert!(
+            !state.needs_prompt(&tree),
+            "`done()` still rests the branch"
+        );
     }
 
     /// The existing transport is untouched: a plain program under
@@ -6303,13 +6347,15 @@ mod tests {
             .unwrap();
         drain(&mut state, &mut tree, out);
 
-        let said = state
-            .agent_segment(&tree)
-            .iter()
-            .any(|e| matches!(&e.payload, EventPayload::Call(Call::Send { text, .. })
-                if text == "after done"));
+        let said = state.agent_segment(&tree).iter().any(|e| {
+            matches!(&e.payload, EventPayload::Call(Call::Send { text, .. })
+                if text == "after done")
+        });
         assert!(said, "the cell after `done()` still ran");
-        assert!(!state.needs_prompt(&tree), "`done()` still rests the branch");
+        assert!(
+            !state.needs_prompt(&tree),
+            "`done()` still rests the branch"
+        );
     }
 
     /// **Truncation becomes partial progress** (D11). The cell that
@@ -6325,9 +6371,7 @@ mod tests {
         stream_chunks(
             &mut state,
             &mut tree,
-            &[
-                "```js\ntell(\"cell 0 ran\");\n```\n\nNext I will\n\n```js\nawait tools.read_fi",
-            ],
+            &["```js\ntell(\"cell 0 ran\");\n```\n\nNext I will\n\n```js\nawait tools.read_fi"],
         );
         // The token budget ran out here.
         let out = state
@@ -6344,11 +6388,10 @@ mod tests {
             .unwrap();
         drain(&mut state, &mut tree, out);
 
-        let said = state
-            .agent_segment(&tree)
-            .iter()
-            .any(|e| matches!(&e.payload, EventPayload::Call(Call::Send { text, .. })
-                if text == "cell 0 ran"));
+        let said = state.agent_segment(&tree).iter().any(|e| {
+            matches!(&e.payload, EventPayload::Call(Call::Send { text, .. })
+                if text == "cell 0 ran")
+        });
         assert!(said, "cell 0's effects stand");
         let causes: Vec<&Cause> = state
             .agent_segment(&tree)
@@ -6444,7 +6487,7 @@ mod tests {
             .agent_segment(&tree)
             .iter()
             .filter_map(|e| match &e.payload {
-                EventPayload::Completion { usage } => Some(usage.completion),
+                EventPayload::Completion { usage, .. } => Some(usage.completion),
                 _ => None,
             })
             .collect();
@@ -6488,17 +6531,16 @@ mod tests {
             .agent_segment(&tree)
             .iter()
             .filter_map(|e| match &e.payload {
-                EventPayload::Completion { usage } => Some(usage.completion),
+                EventPayload::Completion { usage, .. } => Some(usage.completion),
                 _ => None,
             })
             .collect();
         assert_eq!(costs, vec![654], "one completion, one cost");
         assert!(
-            state
-                .agent_segment(&tree)
-                .iter()
-                .any(|e| matches!(&e.payload, EventPayload::Call(Call::Send { text, .. })
-                    if text == "n is 42")),
+            state.agent_segment(&tree).iter().any(
+                |e| matches!(&e.payload, EventPayload::Call(Call::Send { text, .. })
+                    if text == "n is 42")
+            ),
             "and the reply really ran"
         );
     }
@@ -6542,5 +6584,212 @@ mod tests {
         let score = crate::score::score(&tree);
         assert_eq!(score.programs, 1);
         assert_eq!(score.completion_out, 0, "nobody was billed");
+    }
+
+    // ── a reply reads back as what it was (25.8 follow-up) ──────────
+
+    /// Render the conversation of a scripted notebook reply.
+    fn notebook_conversation(reply: &str) -> Vec<(crate::document::ChatRole, String)> {
+        let (mut tree, mut state) = setup_under(crate::document::Transport::Notebook);
+        user_post(&mut state, &mut tree, "go");
+        let out = state
+            .step(&mut tree, StepInput::LlmResponse(llm_program(reply)))
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+        let doc = crate::document::render(
+            &tree,
+            &state.spine,
+            100_000,
+            crate::document::Transport::Notebook,
+        );
+        doc.conversation()
+            .iter()
+            .map(|m| (m.role, m.content.clone()))
+            .collect()
+    }
+
+    /// **The model's own past turn is what it generated.** Not rebuilt
+    /// from pieces, not re-fenced, not reassembled — the completion
+    /// verbatim, with only the documented annotate-and-snip pass on top.
+    ///
+    /// It used to be rendered from the pieces: one assistant message per
+    /// *cell*, each bare JavaScript, with the prose showing up in the
+    /// user-role history as `[3] you told user: …`. So every turn the
+    /// model was given a card saying "your reply is markdown and the code
+    /// blocks in it run", worked examples in markdown, and then its own
+    /// history as a series of bare programs. Its context taught it the
+    /// opposite of its card.
+    #[test]
+    fn a_reply_reads_back_as_the_markdown_it_was() {
+        let reply = "Reading it first.\n\n\
+                     ```js\nlet n = 1;\n```\n\n\
+                     Now the sum.\n\n\
+                     ```js\nconsole.log(n + 41);\n```\n\n\
+                     That is it.\n";
+        let rows = notebook_conversation(reply);
+        let assistant: Vec<&String> = rows
+            .iter()
+            .filter(|(r, _)| *r == crate::document::ChatRole::Assistant)
+            .map(|(_, c)| c)
+            .collect();
+
+        assert_eq!(assistant.len(), 1, "one message per reply, not per cell");
+        assert_eq!(
+            assistant[0], reply,
+            "byte-identical to what the model generated"
+        );
+    }
+
+    /// The prose is in the assistant turn, so it does not also appear as
+    /// a history row — it would be the same words twice, in the other
+    /// voice. A `tell` keeps its row: it is not in the reply's text, only
+    /// its call is.
+    #[test]
+    fn prose_leaves_no_row_but_a_tell_still_does() {
+        let reply = "Some narration here.\n\n```js\ntell(\"the finding\");\n```\n";
+        let rows = notebook_conversation(reply);
+        let user: String = rows
+            .iter()
+            .filter(|(r, _)| *r == crate::document::ChatRole::User)
+            .map(|(_, c)| c.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            !user.contains("Some narration here"),
+            "the prose is in the assistant turn already:\n{user}"
+        );
+        assert!(
+            user.contains("you told user: the finding"),
+            "a tell keeps its row:\n{user}"
+        );
+    }
+
+    /// **The gate case: a long literal in the *second* cell.**
+    ///
+    /// A `Call::site` is cell-local (D1) — the cell's offset is
+    /// subtracted at log time — so those offsets do not index the whole
+    /// reply. Rendering the reply without adding the offset back cut at
+    /// bytes that happen to work for cell 0 and land anywhere for cell 1.
+    /// The offset is derived from the stored text by the same splitter
+    /// that produced the cells, so it is a fact about the bytes rather
+    /// than a field anyone has to keep in step.
+    #[test]
+    fn a_long_literal_in_the_second_cell_snips_at_the_right_bytes() {
+        let filler = "x".repeat(400);
+        let reply = format!(
+            "First, something short.\n\n\
+             ```js\ntell(\"short one\");\n```\n\n\
+             Now the long one.\n\n\
+             ```js\ntell(\"{filler}\");\n```\n"
+        );
+        let rows = notebook_conversation(&reply);
+        let assistant: Vec<&String> = rows
+            .iter()
+            .filter(|(r, _)| *r == crate::document::ChatRole::Assistant)
+            .map(|(_, c)| c)
+            .collect();
+        assert_eq!(assistant.len(), 1);
+        let shown = assistant[0];
+
+        // The long literal is gone, replaced by its row reference — and
+        // the *second* cell is where the replacement happened.
+        assert!(
+            !shown.contains(&filler),
+            "the long literal should have been snipped:\n{shown}"
+        );
+        assert!(
+            shown.contains("snipped - history["),
+            "and replaced by its row:\n{shown}"
+        );
+        // Everything around it is intact: the prose, both fences, and
+        // the short tell that must *not* have been cut.
+        assert!(shown.contains("First, something short."), "{shown}");
+        assert!(shown.contains("Now the long one."), "{shown}");
+        assert!(
+            shown.contains("tell(\"short one\")"),
+            "cell 0's own literal is short and stays:\n{shown}"
+        );
+        assert_eq!(
+            shown.matches("```js").count(),
+            2,
+            "both fences kept:\n{shown}"
+        );
+    }
+
+    /// A reply that never reported a completion — truncated mid-stream,
+    /// or a log written before the text was stored — still renders. The
+    /// cells are all that is left, so they render as themselves, which
+    /// is the behaviour this replaced.
+    #[test]
+    fn a_reply_with_no_stored_text_falls_back_to_its_cells() {
+        let (mut tree, mut state) = setup_under(crate::document::Transport::Notebook);
+        user_post(&mut state, &mut tree, "go");
+        // A truncated reply logs its cells and no completion text.
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(LlmTurn {
+                    source: "```js\nconsole.log(\"ran\");\n```\n".into(),
+                    thinking: None,
+                    truncated: true,
+                    usage: None,
+                    reply: None,
+                }),
+            )
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+        let doc = crate::document::render(
+            &tree,
+            &state.spine,
+            100_000,
+            crate::document::Transport::Notebook,
+        );
+        let assistant: Vec<&String> = doc
+            .conversation()
+            .iter()
+            .filter(|m| m.role == crate::document::ChatRole::Assistant)
+            .map(|m| &m.content)
+            .collect();
+        assert_eq!(assistant.len(), 1);
+        assert!(
+            assistant[0].contains("console.log(\"ran\")"),
+            "the cell still renders: {:?}",
+            assistant[0]
+        );
+    }
+
+    /// The program transport is untouched by any of this: its `Turn` is
+    /// the completion, and it renders as it always did.
+    #[test]
+    fn the_program_transport_renders_its_turn_unchanged() {
+        let (mut tree, mut state) = setup();
+        user_post(&mut state, &mut tree, "go");
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(llm_program("tell(\"hi\");\ndone();")),
+            )
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+        let doc = crate::document::render(
+            &tree,
+            &state.spine,
+            100_000,
+            crate::document::Transport::Program,
+        );
+        let assistant: Vec<&String> = doc
+            .conversation()
+            .iter()
+            .filter(|m| m.role == crate::document::ChatRole::Assistant)
+            .map(|m| &m.content)
+            .collect();
+        assert_eq!(assistant.len(), 1);
+        assert!(
+            assistant[0].starts_with("tell(\"hi\")"),
+            "{:?}",
+            assistant[0]
+        );
+        assert!(!assistant[0].contains("```"), "no fences invented");
     }
 }

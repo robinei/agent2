@@ -574,7 +574,7 @@ fn print_session_event(event: &SessionEvent) {
                 EventPayload::Console { lines } => {
                     println!("{head} console: {} lines", lines.len());
                 }
-                EventPayload::Completion { usage } => {
+                EventPayload::Completion { usage, .. } => {
                     println!(
                         "{head} completion: {} in ({} cached), {} out ({} reasoning)",
                         usage.prompt, usage.cached, usage.completion, usage.reasoning
