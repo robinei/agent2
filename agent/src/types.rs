@@ -67,6 +67,28 @@ pub enum EventPayload {
     /// would report a three-cell reply as three turns of drift.
     Completion {
         usage: crate::host::Usage,
+        /// **The completion verbatim**, exactly as the provider sent it.
+        ///
+        /// This is what the model is shown as its own past turn, and
+        /// that is the whole reason it is stored. A reply under
+        /// `Transport::Notebook` is prose and fenced code together; its
+        /// cells reach the log as `Turn`s holding bare JavaScript, and
+        /// its prose as `Send`s. Rendering a turn *back* from those
+        /// pieces showed the model a series of bare programs — its
+        /// context teaching it the opposite of the card that had just
+        /// told it to write markdown.
+        ///
+        /// D1 said the reply was "recoverable in content and order, but
+        /// not byte-for-byte... Nothing downstream needs them". The last
+        /// clause was false: the model downstream needs them, because
+        /// what it is shown as its own past turn is what it imitates.
+        /// So the bytes are kept, and the renderer replays them rather
+        /// than reassembling anything.
+        ///
+        /// Empty under `Transport::Program`, where `Message::Turn.source`
+        /// already *is* the completion and nothing is lost.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        text: String,
     },
 
     /// Chat event. Parent: the previous event on the owning agent's
@@ -576,6 +598,22 @@ pub enum Call {
     /// delivery instead of settling a program's await — the same path an
     /// unawaited `tell` already takes.
     Send {
+        /// **This send is a prose segment of the model's own reply**, not
+        /// a call a program made (`Transport::Notebook`, D15).
+        ///
+        /// Marked rather than inferred. The only other way to tell the
+        /// two apart is the synthetic zero-width `site`/`site_end`, and a
+        /// `tell` written as the first thing in a cell has `site: 0` too
+        /// — so the discriminator would be `site_end`, which is a
+        /// coincidence of layout standing in for a fact about origin.
+        ///
+        /// What it decides: a prose send leaves **no history row**,
+        /// because the reply it belongs to is already rendered whole as
+        /// the assistant turn and a row would print it twice. A `tell`
+        /// keeps its row; it is not in the reply's text, only its call
+        /// is.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        prose: bool,
         to: Address,
         text: String,
         #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]

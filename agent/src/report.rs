@@ -1708,7 +1708,9 @@ mod tests {
 
         // Past the budget, the oldest of the tail goes rather than every
         // line losing its end.
-        let fat: Vec<String> = (0..10).map(|i| format!("{i}") + &"z".repeat(1000)).collect();
+        let fat: Vec<String> = (0..10)
+            .map(|i| format!("{i}") + &"z".repeat(1000))
+            .collect();
         let rendered = render_console(&fat, None).expect("lines present");
         let kept = rendered.lines().count() - 1;
         assert!(

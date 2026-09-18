@@ -373,8 +373,7 @@ fn prose_between(reply: &str, start: usize, end: usize) -> Option<String> {
 /// Under this transport `return` did two things and something else already
 /// does each: falling off the last cell ends the run, `done()` rests the
 /// branch, and `history.append` is what leaves a row the next turn reads.
-pub const NO_TOP_LEVEL_RETURN: &str =
-    "a cell cannot `return`: use `history.append(...)` to leave a row the next \
+pub const NO_TOP_LEVEL_RETURN: &str = "a cell cannot `return`: use `history.append(...)` to leave a row the next \
      turn reads, and `done()` to rest once the work is finished";
 
 /// One executable cell, as a byte range into the markdown it came from.
@@ -829,7 +828,11 @@ three\n";
     #[test]
     fn a_cell_lands_as_soon_as_its_closing_fence_arrives() {
         let mut stream = Stream::new();
-        assert!(stream.advance("Some prose first.\n\n```js\nconst a = 1;").is_empty());
+        assert!(
+            stream
+                .advance("Some prose first.\n\n```js\nconst a = 1;")
+                .is_empty()
+        );
         // The closing fence completes both the prose before it and the cell.
         let pieces = stream.advance("Some prose first.\n\n```js\nconst a = 1;\n```\n");
         assert_eq!(
@@ -872,10 +875,7 @@ three\n";
     fn nothing_but_whitespace_between_cells_is_not_a_message() {
         let reply = "```js\nlet a = 1;\n```\n\n```js\na = 2;\n```\n";
         let mut stream = Stream::new();
-        assert_eq!(
-            stream.finish(reply),
-            vec![Piece::Cell(0), Piece::Cell(1)]
-        );
+        assert_eq!(stream.finish(reply), vec![Piece::Cell(0), Piece::Cell(1)]);
     }
 
     /// A reply with no cells is all prose, delivered when it ends (D4).
@@ -886,7 +886,9 @@ three\n";
         assert!(stream.advance(reply).is_empty());
         assert_eq!(
             stream.finish(reply),
-            vec![Piece::Prose("The retry policy already lives in `retry.rs`.".into())]
+            vec![Piece::Prose(
+                "The retry policy already lives in `retry.rs`.".into()
+            )]
         );
     }
 
@@ -894,7 +896,8 @@ three\n";
     /// one after it is not a cell at all (D11's partial progress).
     #[test]
     fn a_truncated_reply_keeps_the_cells_that_closed() {
-        let reply = "```js\nconsole.log(\"ran\");\n```\n\nNext I will\n\n```js\nawait tools.read_fi";
+        let reply =
+            "```js\nconsole.log(\"ran\");\n```\n\nNext I will\n\n```js\nawait tools.read_fi";
         let mut stream = Stream::new();
         let pieces = stream.finish(reply);
         assert_eq!(
@@ -959,8 +962,7 @@ three\n";
         assert_eq!(cells.len(), 2);
 
         let mut pb = ParseBuffer::new(md);
-        let mut repl =
-            interp::Repl::new(serde_json::Value::Null, serde_json::Value::Null).unwrap();
+        let mut repl = interp::Repl::new(serde_json::Value::Null, serde_json::Value::Null).unwrap();
         repl.reject_top_level_return(NO_TOP_LEVEL_RETURN);
 
         repl.push(pb.focus(cells[0]))

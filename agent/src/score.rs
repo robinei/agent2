@@ -195,8 +195,7 @@ pub fn score(tree: &Tree) -> Score {
     // not from whatever event happens to sit immediately before a
     // `Turn`: under `Transport::Notebook` that is the reply's own
     // opening prose, logged mid-generation, and the gap to it is nil.
-    let mut last_outcome_ms: Option<i64> =
-        events.first().map(|e| e.timestamp.as_millisecond());
+    let mut last_outcome_ms: Option<i64> = events.first().map(|e| e.timestamp.as_millisecond());
     // Whether a `Turn` has been seen since that outcome, so only the
     // first one of a reply charges the wait.
     let mut turn_since_outcome = false;
@@ -236,14 +235,12 @@ pub fn score(tree: &Tree) -> Score {
                 // completion that produced it. A later cell's `Turn`
                 // charges nothing: it was generated inside that same
                 // wait, which is what D11 bought.
-                if !turn_since_outcome
-                    && let Some(prev) = last_outcome_ms
-                {
+                if !turn_since_outcome && let Some(prev) = last_outcome_ms {
                     s.provider_ms += ms - prev;
                 }
                 turn_since_outcome = true;
             }
-            EventPayload::Completion { usage } => {
+            EventPayload::Completion { usage, .. } => {
                 completions += 1;
                 s.prompt_in += usage.prompt;
                 s.cached_in += usage.cached;
@@ -397,12 +394,27 @@ mod tests {
         // outcome land in quick succession.
         let log = synthetic_log(&[
             (0, r#"{"Agent":{"charter":"c","system":"s"}}"#),
-            (10, r#"{"Message":{"Post":{"from":"User","origin":{"Direct":{"text":"go","input":null,"options":[],"expects_reply":true}}}}}"#),
+            (
+                10,
+                r#"{"Message":{"Post":{"from":"User","origin":{"Direct":{"text":"go","input":null,"options":[],"expects_reply":true}}}}}"#,
+            ),
             // Five seconds of generation, invisible in the log.
-            (5_010, r#"{"Call":{"Send":{"to":"User","text":"Looking now.","input":null,"options":[],"expects_reply":false,"site":0,"site_end":0}}}"#),
-            (5_020, r#"{"Message":{"Turn":{"author":{"Agent":1},"source":"tell(\"hi\");"}}}"#),
-            (5_030, r#"{"Message":{"Turn":{"author":{"Agent":1},"source":"done();"}}}"#),
-            (5_040, r#"{"Completion":{"usage":{"prompt":10,"cached":0,"completion":20,"reasoning":0}}}"#),
+            (
+                5_010,
+                r#"{"Call":{"Send":{"to":"User","text":"Looking now.","input":null,"options":[],"expects_reply":false,"site":0,"site_end":0}}}"#,
+            ),
+            (
+                5_020,
+                r#"{"Message":{"Turn":{"author":{"Agent":1},"source":"tell(\"hi\");"}}}"#,
+            ),
+            (
+                5_030,
+                r#"{"Message":{"Turn":{"author":{"Agent":1},"source":"done();"}}}"#,
+            ),
+            (
+                5_040,
+                r#"{"Completion":{"usage":{"prompt":10,"cached":0,"completion":20,"reasoning":0}}}"#,
+            ),
             (5_050, r#"{"Return":{"value":null}}"#),
         ]);
         let tree = crate::open_tree_read_only(log.path().to_str().unwrap()).unwrap();
@@ -430,11 +442,20 @@ mod tests {
     fn the_program_transports_wait_is_unchanged() {
         let log = synthetic_log(&[
             (0, r#"{"Agent":{"charter":"c","system":"s"}}"#),
-            (10, r#"{"Message":{"Post":{"from":"User","origin":{"Direct":{"text":"go","input":null,"options":[],"expects_reply":true}}}}}"#),
-            (3_010, r#"{"Message":{"Turn":{"author":{"Agent":1},"source":"return 1;","usage":{"prompt":10,"cached":0,"completion":20,"reasoning":0}}}}"#),
+            (
+                10,
+                r#"{"Message":{"Post":{"from":"User","origin":{"Direct":{"text":"go","input":null,"options":[],"expects_reply":true}}}}}"#,
+            ),
+            (
+                3_010,
+                r#"{"Message":{"Turn":{"author":{"Agent":1},"source":"return 1;","usage":{"prompt":10,"cached":0,"completion":20,"reasoning":0}}}}"#,
+            ),
             (3_020, r#"{"Return":{"value":1}}"#),
             // A second completion, two seconds of it.
-            (5_020, r#"{"Message":{"Turn":{"author":{"Agent":1},"source":"done();","usage":{"prompt":10,"cached":0,"completion":5,"reasoning":0}}}}"#),
+            (
+                5_020,
+                r#"{"Message":{"Turn":{"author":{"Agent":1},"source":"done();","usage":{"prompt":10,"cached":0,"completion":5,"reasoning":0}}}}"#,
+            ),
             (5_030, r#"{"Return":{"value":null}}"#),
         ]);
         let tree = crate::open_tree_read_only(log.path().to_str().unwrap()).unwrap();

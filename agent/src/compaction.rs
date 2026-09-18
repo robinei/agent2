@@ -101,7 +101,6 @@ impl CompactionOp {
     }
 }
 
-
 /// The `EventPayload::Compacted` events a caller should append for
 /// `ops`, in `ops`' own order — **best effort**: an op naming something
 /// it cannot compact is dropped and the rest apply. Applies nothing
@@ -500,8 +499,14 @@ mod tests {
             &tree,
             &spine,
             &[
-                CompactionOp::Remove { from: note, to: note },
-                CompactionOp::Replace { id: note, text: "second op on the same id".into() },
+                CompactionOp::Remove {
+                    from: note,
+                    to: note,
+                },
+                CompactionOp::Replace {
+                    id: note,
+                    text: "second op on the same id".into(),
+                },
             ],
         );
         assert_eq!(payloads.len(), 1, "{payloads:?}");
@@ -514,7 +519,10 @@ mod tests {
     #[test]
     fn a_valid_batch_returns_compacted_events_that_shadow_every_target() {
         let (tree, spine, _program, note) = sample_branch();
-        let ops = [CompactionOp::Remove { from: note, to: note }];
+        let ops = [CompactionOp::Remove {
+            from: note,
+            to: note,
+        }];
         let payloads = compact(&tree, &spine, &ops);
         assert_eq!(payloads.len(), 1);
         assert_eq!(
@@ -529,7 +537,10 @@ mod tests {
     #[test]
     fn rewrite_carries_its_text_into_the_compacted_event() {
         let (tree, spine, _program, note) = sample_branch();
-        let ops = [CompactionOp::Replace { id: note, text: "note was long".into() }];
+        let ops = [CompactionOp::Replace {
+            id: note,
+            text: "note was long".into(),
+        }];
         let payloads = compact(&tree, &spine, &ops);
         assert_eq!(
             payloads[0],
@@ -547,7 +558,10 @@ mod tests {
     #[test]
     fn a_removed_entry_leaves_the_document_but_not_the_log() {
         let (mut tree, mut spine, _program, note) = sample_branch();
-        let ops = [CompactionOp::Remove { from: note, to: note }];
+        let ops = [CompactionOp::Remove {
+            from: note,
+            to: note,
+        }];
         let payloads = compact(&tree, &spine, &ops);
         for payload in payloads {
             tree.append(&mut spine, payload).unwrap();
@@ -605,11 +619,21 @@ mod tests {
             &tree,
             &spine,
             &[
-                CompactionOp::Remove { from: agent, to: agent },
-                CompactionOp::Remove { from: note, to: note },
+                CompactionOp::Remove {
+                    from: agent,
+                    to: agent,
+                },
+                CompactionOp::Remove {
+                    from: note,
+                    to: note,
+                },
             ],
         );
-        assert_eq!(payloads.len(), 1, "the card is not compactable: {payloads:?}");
+        assert_eq!(
+            payloads.len(),
+            1,
+            "the card is not compactable: {payloads:?}"
+        );
         assert!(
             matches!(&payloads[0], EventPayload::Compacted { of, .. } if *of == note),
             "{payloads:?}"

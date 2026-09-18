@@ -2900,6 +2900,7 @@ mod tests {
             .append(
                 &mut spine,
                 EventPayload::Call(crate::types::Call::Send {
+                    prose: false,
                     to: crate::types::Address::User,
                     text: "which file?".into(),
                     input: json!(null),

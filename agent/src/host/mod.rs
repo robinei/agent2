@@ -1765,7 +1765,10 @@ impl Session {
         // only `on_tool_results` clears it) — so the suspended `await
         // ask(...)` just sat there forever, ticking on nothing that
         // could ever advance it.
-        self.step_branch(branch, StepInput::ToolResults(vec![ToolResult { call, result }]))
+        self.step_branch(
+            branch,
+            StepInput::ToolResults(vec![ToolResult { call, result }]),
+        )
     }
 
     /// The exchanges `branch` still owes: `(asker, send)` for every open
@@ -2103,7 +2106,7 @@ fn leaf_summary(tree: &Tree, leaf: EventId) -> String {
         EventPayload::Condition { cause, .. } => format!("Condition: {}", cause_label(cause)),
         EventPayload::Rename { name } => format!("Rename: {name}"),
         EventPayload::Console { lines } => format!("Console: {} lines", lines.len()),
-        EventPayload::Completion { usage } => {
+        EventPayload::Completion { usage, .. } => {
             format!("Completion: {} out", usage.completion)
         }
         EventPayload::Note { text, .. } => format!("Note: {text}"),
@@ -2244,7 +2247,9 @@ mod tests {
             .collect();
         assert_eq!(sources.len(), 2, "one Turn per cell: {sources:?}");
         assert!(
-            sources.iter().all(|s| !s.contains("```") && !s.contains("Opening the file")),
+            sources
+                .iter()
+                .all(|s| !s.contains("```") && !s.contains("Opening the file")),
             "a Turn holds JavaScript, not markdown: {sources:?}"
         );
 
@@ -3025,6 +3030,7 @@ mod tests {
             .append(
                 &mut spine,
                 EventPayload::Call(Call::Send {
+                    prose: false,
                     to: Address::User,
                     text: "which file?".into(),
                     input: json!(null),
@@ -3155,10 +3161,14 @@ mod tests {
         });
         let session = session.run();
 
-        let returned = session.tree().events.values().find_map(|e| match &e.payload {
-            EventPayload::Return { value } => Some(value.clone()),
-            _ => None,
-        });
+        let returned = session
+            .tree()
+            .events
+            .values()
+            .find_map(|e| match &e.payload {
+                EventPayload::Return { value } => Some(value.clone()),
+                _ => None,
+            });
         assert_eq!(
             returned,
             Some(json!("picked: B")),
@@ -3231,10 +3241,14 @@ mod tests {
             "and what was offered, so the handler can map onto it: {message}"
         );
 
-        let returned = session.tree().events.values().find_map(|e| match &e.payload {
-            EventPayload::Return { value } => Some(value.clone()),
-            _ => None,
-        });
+        let returned = session
+            .tree()
+            .events
+            .values()
+            .find_map(|e| match &e.payload {
+                EventPayload::Return { value } => Some(value.clone()),
+                _ => None,
+            });
         assert_eq!(
             returned,
             Some(json!("picked: B")),
@@ -5143,11 +5157,9 @@ mod tests {
         // The question the worker read carried the options with it.
         let rendered = match &tree.events[&EventId::new(question)].payload {
             EventPayload::Message(msg) => match tree.resolve(msg) {
-                Message::Post { origin, from } => crate::report::render_post(
-                    EventId::new(question),
-                    from,
-                    &origin,
-                ),
+                Message::Post { origin, from } => {
+                    crate::report::render_post(EventId::new(question), from, &origin)
+                }
                 _ => panic!("not a post"),
             },
             other => panic!("not a message: {other:?}"),
@@ -6281,6 +6293,7 @@ mod tests {
         tree.append(
             &mut root,
             EventPayload::Call(Call::Send {
+                prose: false,
                 to: Address::Branch(EventId::new(5)),
                 text: "q".into(),
                 input: json!(null),
@@ -6594,6 +6607,7 @@ mod tests {
             .append(
                 &mut root,
                 EventPayload::Call(Call::Send {
+                    prose: false,
                     to: Address::User,
                     text: "which one?".into(),
                     input: json!(null),
@@ -6683,6 +6697,7 @@ mod tests {
             .append(
                 &mut worker,
                 EventPayload::Call(Call::Send {
+                    prose: false,
                     to: Address::Branch(EventId::new(1)),
                     text: "which one?".into(),
                     input: json!(null),

@@ -25,7 +25,7 @@
 //! module calls into it rather than re-deriving effects a second,
 //! incompatible way.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::tree::CompactedView;
 use crate::types::*;
@@ -301,7 +301,6 @@ fn author_label(tree: &Tree, from: Author) -> String {
     }
 }
 
-
 /// Where each program's literal `tell`/`ask` calls sit in its own
 /// source, keyed by the turn that wrote them.
 ///
@@ -310,11 +309,7 @@ fn author_label(tree: &Tree, from: Author) -> String {
 /// scanning every event on the path matched one agent's call site
 /// against another agent's source, which is how a broadcast test found
 /// a 239-byte offset into a 238-byte program.
-fn told_literal_cuts(
-    tree: &Tree,
-    agent: EventId,
-    leaf: EventId,
-) -> HashMap<EventId, Vec<Cut>> {
+fn told_literal_cuts(tree: &Tree, agent: EventId, leaf: EventId) -> HashMap<EventId, Vec<Cut>> {
     let mut out: HashMap<EventId, Vec<Cut>> = HashMap::new();
     let mut cur_agent: Option<EventId> = None;
     let mut turn: Option<(EventId, String)> = None;
@@ -355,6 +350,157 @@ fn told_literal_cuts(
     out
 }
 
+/// A reply reconstructed for rendering: the completion verbatim, plus the
+/// cuts of all its cells shifted into that text's coordinates.
+struct ReplyRender {
+    text: String,
+    cuts: Vec<Cut>,
+}
+
+/// **Group a notebook run's `Turn`s into the replies they came from**, and
+/// pair each reply with the completion text that produced it.
+///
+/// A reply is N cells and one completion (D7, D15). Its cells reach the log
+/// as `Turn`s holding bare JavaScript and its prose as `Send`s, so rendering
+/// the turn back from those pieces showed the model a series of bare
+/// programs — its own context teaching it the opposite of the card that had
+/// just told it to write markdown. `EventPayload::Completion` carries the
+/// bytes; this puts them back where the reply was.
+///
+/// Returns the render keyed by the reply's **first** `Turn` (where the
+/// assistant message goes) and the set of later `Turn`s it already covers
+/// (which render nothing of their own).
+///
+/// Three cases are deliberately left to the per-`Turn` path instead:
+///
+/// - **A reply with no `Completion`.** Truncated mid-stream, killed, or a
+///   log written before the text was stored. The cells are still there and
+///   still render; nothing is lost, and the fallback is the behaviour this
+///   whole function replaces.
+/// - **A reply any of whose cells is compacted.** Compaction shortens a
+///   `Turn`'s row, and replaying the full reply text over it would undo
+///   exactly what it was for.
+/// - **Cells that ran after their reply's `Completion`** — the tail of a
+///   reply resumed from a `raise`. They arrive in a later group, so they
+///   render as themselves rather than being folded into a reply already
+///   drawn above them.
+#[allow(clippy::type_complexity)]
+fn notebook_replies(
+    tree: &Tree,
+    leaf: EventId,
+    agent: EventId,
+    cuts: &HashMap<EventId, Vec<Cut>>,
+    compacted: &HashMap<EventId, CompactedView>,
+) -> (HashMap<EventId, ReplyRender>, HashSet<EventId>) {
+    let mut replies: HashMap<EventId, ReplyRender> = HashMap::new();
+    let mut covered: HashSet<EventId> = HashSet::new();
+    let mut cur_agent: Option<EventId> = None;
+    // The reply being assembled: its cell `Turn`s in order, and its text
+    // once seen.
+    //
+    // **The two are not in a fixed order.** A streamed reply logs its
+    // cells as their fences close and its `Completion` at the end; a
+    // batched one knows the whole text before a single cell runs and
+    // logs it first. Both are the same reply, so this claims `Turn`s
+    // either side of the text rather than assuming one arrangement.
+    let mut group: Vec<EventId> = Vec::new();
+    let mut group_text: Option<String> = None;
+
+    // A reply is finished when its text and its cells have both been
+    // seen; that is where it is recorded.
+    macro_rules! flush {
+        () => {
+            if let Some(text) = group_text.take() {
+                let turns = std::mem::take(&mut group);
+                record_reply(&mut replies, &mut covered, &turns, &text, cuts, compacted);
+            }
+        };
+    }
+
+    for ev in tree.path_events(leaf) {
+        if let EventPayload::Agent { .. } = ev.payload {
+            cur_agent = Some(ev.id);
+            continue;
+        }
+        if cur_agent != Some(agent) {
+            continue;
+        }
+        match &ev.payload {
+            EventPayload::Message(Message::Turn { .. }) => group.push(ev.id),
+            // The run's terminal ends a reply — but only once its text
+            // has arrived. A `raise` suspends mid-reply and logs its
+            // `Condition` *before* the completion ends, so a group with
+            // no text yet keeps waiting rather than falling back.
+            EventPayload::Return { .. } | EventPayload::Condition { .. } => flush!(),
+            EventPayload::Completion { text, .. } => {
+                if text.is_empty() {
+                    continue;
+                }
+                group_text = Some(text.clone());
+                // Cells already logged: this completion is theirs.
+                // Cells still to come (a batched reply): wait for the
+                // terminal.
+                if !group.is_empty() {
+                    flush!();
+                }
+            }
+            _ => {}
+        }
+    }
+    flush!();
+    (replies, covered)
+}
+
+/// Record one reply: its text keyed by its first cell's `Turn`, and its
+/// later cells marked as already drawn.
+fn record_reply(
+    replies: &mut HashMap<EventId, ReplyRender>,
+    covered: &mut HashSet<EventId>,
+    turns: &[EventId],
+    text: &str,
+    cuts: &HashMap<EventId, Vec<Cut>>,
+    compacted: &HashMap<EventId, CompactedView>,
+) {
+    if turns.is_empty() {
+        return;
+    }
+    if turns.iter().any(|id| compacted.contains_key(id)) {
+        return;
+    }
+    // The cells of this reply, in the same order the driver
+    // fed them — the same splitter, on the same bytes, so
+    // the k-th `Turn` is the k-th cell.
+    let cells = crate::notebook::split_cells(text);
+    let mut shifted: Vec<Cut> = Vec::new();
+    for (k, id) in turns.iter().enumerate() {
+        let Some(cell) = cells.get(k) else { break };
+        // **A `Call::site` is cell-local** (D1): the cell's
+        // offset is subtracted at log time, so a site
+        // indexes its own `Turn.source`. Rendering the whole
+        // reply means those offsets no longer index what is
+        // being shown, and a snip would cut at the wrong
+        // bytes — so the offset is added back here. It is
+        // derived rather than stored: the reply's text is on
+        // the log and the splitter is deterministic, so
+        // where cell k starts is a fact about the bytes.
+        if let Some(cell_cuts) = cuts.get(id) {
+            shifted.extend(cell_cuts.iter().map(|c| Cut {
+                start: c.start + cell.start,
+                end: c.end + cell.start,
+                row: c.row,
+                literal: c.literal,
+            }));
+        }
+    }
+    replies.insert(
+        turns[0],
+        ReplyRender {
+            text: text.to_owned(),
+            cuts: shifted,
+        },
+    );
+    covered.extend(turns.iter().skip(1).copied());
+}
 /// One call's span recorded against the turn that wrote it, if the span
 /// is usable at all. Overlapping spans are dropped: an `ask` nested
 /// inside a `tell` is one call's range inside another's, and editing
@@ -576,11 +722,12 @@ fn pending_line(
         // `ask` was addressed to.
         EventPayload::Result { call, outcome } => {
             let Some(Event {
-                payload: EventPayload::Call(Call::Send {
-                    to,
-                    expects_reply: true,
-                    ..
-                }),
+                payload:
+                    EventPayload::Call(Call::Send {
+                        to,
+                        expects_reply: true,
+                        ..
+                    }),
                 ..
             }) = tree.events.get(call)
             else {
@@ -669,6 +816,11 @@ fn pending_line(
             question.as_u64(),
             escape_untrusted(&value.to_string())
         )),
+        // **A prose segment leaves no row.** It is not something the
+        // branch *did* — it is part of what the branch *said*, and the
+        // assistant turn above already carries it verbatim. A row would
+        // print the same words a second time, in the other voice.
+        EventPayload::Call(Call::Send { prose: true, .. }) => None,
         EventPayload::Call(Call::Send {
             to,
             text,
@@ -821,6 +973,16 @@ pub(crate) fn render_with_lookup(
     messages.extend(worked_examples(&context.exemplars, transport));
     let preamble = messages.len();
     let cuts = told_literal_cuts(tree, agent, leaf);
+    // Under `Transport::Notebook` a reply is N cell `Turn`s and one
+    // completion; this pairs each reply with the bytes the model
+    // actually generated, so the assistant turn replays them rather
+    // than being rebuilt out of its pieces. Empty on every other
+    // transport, where a `Turn` already *is* the completion.
+    let (replies, covered) = if transport == Transport::Notebook {
+        notebook_replies(tree, leaf, agent, &cuts, compacted)
+    } else {
+        (HashMap::new(), HashSet::new())
+    };
     let mut pending: Vec<String> = Vec::new();
     let mut cur_agent: Option<EventId> = None;
     // `Transport::RunProgram` only: the id of the most recent turn's
@@ -845,9 +1007,23 @@ pub(crate) fn render_with_lookup(
         }
         match &ev.payload {
             EventPayload::Message(Message::Turn { source, .. }) => {
-                let content = match compacted.get(&ev.id) {
-                    None => Some(annotate_history_calls(source, cuts.get(&ev.id))),
-                    Some(shadow) => compacted_program_comment(ev.id, shadow),
+                // A later cell of a reply already drawn above: its
+                // JavaScript is inside that reply's text.
+                if covered.contains(&ev.id) {
+                    continue;
+                }
+                let content = match (replies.get(&ev.id), compacted.get(&ev.id)) {
+                    // **The reply, verbatim.** Only the documented
+                    // annotate-and-snip pass is applied on top; no
+                    // re-fencing, no re-assembly, no normalisation. What
+                    // the model is shown as its own turn is what it
+                    // wrote, because that is what it imitates.
+                    (Some(reply), _) => Some(annotate_history_calls(
+                        &reply.text,
+                        Some(&reply.cuts).filter(|c| !c.is_empty()),
+                    )),
+                    (None, None) => Some(annotate_history_calls(source, cuts.get(&ev.id))),
+                    (None, Some(shadow)) => compacted_program_comment(ev.id, shadow),
                 };
                 // A removed program occupies no slot at all. Because a
                 // flush only happens here, the pending lines from either
@@ -1477,10 +1653,13 @@ mod tests {
     fn a_literal_tell_becomes_a_reference_and_a_computed_one_does_not() {
         const LONG_TELL: &str = "checked every file and the build is green after the rename";
         let src = "tell(\"checked every file and the build is green after the rename\");\ntell(\"x \" + y);\n";
-        let lit = src.find("tell(\"checked every file and the build is green after the rename\")").unwrap();
+        let lit = src
+            .find("tell(\"checked every file and the build is green after the rename\")")
+            .unwrap();
         let comp = src.find("tell(\"x \" + y)").unwrap();
         let send = |text: &str, a: usize, b: usize| {
             EventPayload::Call(Call::Send {
+                prose: false,
                 to: Address::User,
                 text: text.into(),
                 input: serde_json::Value::Null,
@@ -1498,11 +1677,22 @@ mod tests {
         tree.append(&mut spine, user_post("go")).unwrap();
         tree.append(&mut spine, turn(src)).unwrap();
         let a = tree
-            .append(&mut spine, send("checked every file and the build is green after the rename", lit, lit + "tell(\"checked every file and the build is green after the rename\")".len()))
+            .append(
+                &mut spine,
+                send(
+                    "checked every file and the build is green after the rename",
+                    lit,
+                    lit + "tell(\"checked every file and the build is green after the rename\")"
+                        .len(),
+                ),
+            )
             .unwrap();
         // Computed: the text never appears inside its own call.
-        tree.append(&mut spine, send("x 1", comp, comp + "tell(\"x \" + y)".len()))
-            .unwrap();
+        tree.append(
+            &mut spine,
+            send("x 1", comp, comp + "tell(\"x \" + y)".len()),
+        )
+        .unwrap();
 
         let doc = render(&tree, &spine, 64 * 1024, Transport::Program);
         let program = doc
@@ -1541,6 +1731,7 @@ mod tests {
         tree.append(
             &mut spine,
             EventPayload::Call(Call::Send {
+                prose: false,
                 to: Address::User,
                 text: "ok".into(),
                 input: serde_json::Value::Null,
@@ -1596,6 +1787,7 @@ mod tests {
             .append(
                 &mut spine,
                 EventPayload::Call(Call::Send {
+                    prose: false,
                     to: Address::User,
                     text: "30 or 240?".into(),
                     input: serde_json::Value::Null,
@@ -1643,6 +1835,7 @@ mod tests {
             .append(
                 &mut spine,
                 EventPayload::Call(Call::Send {
+                    prose: false,
                     to: Address::User,
                     text: "is 240 still right for request_timeout_seconds, or did we settle on the old 30?".into(),
                     input: serde_json::Value::Null,
@@ -1741,11 +1934,8 @@ mod tests {
                 },
             )
             .unwrap();
-            tree.append(
-                &mut spine,
-                EventPayload::Compacted { of: program, text },
-            )
-            .unwrap();
+            tree.append(&mut spine, EventPayload::Compacted { of: program, text })
+                .unwrap();
             render(&tree, &spine, 64 * 1024, Transport::Program)
         };
 

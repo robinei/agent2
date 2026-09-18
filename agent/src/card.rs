@@ -492,7 +492,6 @@ mod tests {
                 "the history namespace is missing {member}"
             );
         }
-
     }
 
     #[test]
@@ -964,7 +963,10 @@ mod tests {
             for (i, cell) in cells.iter().enumerate() {
                 let src = cell.slice(&ex.assistant);
                 interp::compile(src).unwrap_or_else(|e| {
-                    panic!("exemplar for {:?} cell {i} does not compile: {e:?}", ex.user)
+                    panic!(
+                        "exemplar for {:?} cell {i} does not compile: {e:?}",
+                        ex.user
+                    )
                 });
             }
         }
@@ -1107,9 +1109,8 @@ mod tests {
         use interp::{StepResult, VM};
         let cells = crate::notebook::split_cells(markdown);
         let mut buffer = crate::notebook::ParseBuffer::new(markdown);
-        let mut vm =
-            VM::for_incremental(serde_json::Value::Null, serde_json::Value::Null)
-                .map_err(|e| format!("{e:?}"))?;
+        let mut vm = VM::for_incremental(serde_json::Value::Null, serde_json::Value::Null)
+            .map_err(|e| format!("{e:?}"))?;
         let mut core = interp::ReplCore::new();
         core.reject_top_level_return(crate::notebook::NO_TOP_LEVEL_RETURN);
 
