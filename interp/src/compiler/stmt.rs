@@ -1,6 +1,7 @@
 use oxc_ast::ast;
 use oxc_span::GetSpan;
 
+use crate::span::Span;
 use crate::vm::{Instr, LocalIndex};
 
 impl super::Compiler {
@@ -24,12 +25,16 @@ impl super::Compiler {
         let root_slot_count = root.slot_kinds.len() as u32;
         let emitted_enter_frame = !root.slot_kinds.is_empty() || root.uses_arguments;
         let root_this_slot = root.this_slot;
+        // Synthetic prologue instructions: no single source expression of
+        // their own, so the span is a point at the program's start rather
+        // than an invented range.
+        let prologue_span = Span::point(program.span.start);
         if emitted_enter_frame {
             let kinds = root.slot_kinds.clone();
             let uses_arguments = root.uses_arguments;
             self.emit(
                 Instr::EnterFrame(0, uses_arguments, kinds.into()),
-                program.span.start,
+                prologue_span,
             );
         }
         self.return_spill = Some(super::ReturnSpill {
@@ -46,8 +51,8 @@ impl super::Compiler {
         // `this_val` (undefined) into a captured Boxed local so top-level arrows
         // can capture it through the standard upval path.
         if let Some(ts) = root_this_slot {
-            self.emit(Instr::LoadThis, program.span.start);
-            self.emit(Instr::SetLocal(ts as LocalIndex), program.span.start);
+            self.emit(Instr::LoadThis, prologue_span);
+            self.emit(Instr::SetLocal(ts as LocalIndex), prologue_span);
         }
 
         // Hoist function declarations into the prologue (emit their bindings).
@@ -58,10 +63,12 @@ impl super::Compiler {
             self.compile_stmt(stmt);
         }
 
-        // Root frame ends with Return(0) → StepResult::Done.
-        self.emit(Instr::Return(0), program.span.end);
+        // Root frame ends with Return(0) → StepResult::Done. Also synthetic
+        // (no source statement produced it), so a point span — at the
+        // program's end, matching where execution falls off the end.
+        self.emit(Instr::Return(0), Span::point(program.span.end));
         if let Some(spill) = self.return_spill.take() {
-            self.finalize_return_spill(spill, program.span.start);
+            self.finalize_return_spill(spill, prologue_span);
         }
     }
 
@@ -80,7 +87,7 @@ impl super::Compiler {
                 }
                 _ => {
                     self.compile_expr(&es.expression);
-                    self.emit(Instr::Pop(1), es.span.start);
+                    self.emit(Instr::Pop(1), es.span.into());
                 }
             },
             ast::Statement::VariableDeclaration(decl) => self.compile_var_decl(decl),
@@ -116,9 +123,9 @@ impl super::Compiler {
                 let _is_top_level = analysis.scopes[self.current_scope].parent == usize::MAX;
                 match &r.argument {
                     Some(expr) => self.compile_expr(expr),
-                    None => self.emit(Instr::PushUndefined, r.span.start),
+                    None => self.emit(Instr::PushUndefined, r.span.into()),
                 }
-                self.emit_return(r.span.start);
+                self.emit_return(r.span.into());
             }
 
             ast::Statement::ForOfStatement(s) => self.compile_for_of(s),
@@ -129,7 +136,7 @@ impl super::Compiler {
             // ── Phase 6B: exceptions ──────────────────────────────────
             ast::Statement::ThrowStatement(s) => {
                 self.compile_expr(&s.argument);
-                self.emit(Instr::Throw, s.span.start);
+                self.emit(Instr::Throw, s.span.into());
             }
             ast::Statement::TryStatement(s) => self.compile_try(s),
 
@@ -138,9 +145,9 @@ impl super::Compiler {
 
             // Out of scope — informative errors.
             ast::Statement::LabeledStatement(s) => {
-                self.error(s.span.start, "labeled statements are not supported")
+                self.error(s.span.into(), "labeled statements are not supported")
             }
-            other => self.error(other.span().start, "unsupported statement"),
+            other => self.error(other.span().into(), "unsupported statement"),
         }
     }
 
@@ -153,7 +160,7 @@ impl super::Compiler {
         use ast::VariableDeclarationKind as Kind;
         let is_var = decl.kind == Kind::Var;
         if matches!(decl.kind, Kind::Using | Kind::AwaitUsing) {
-            self.error(decl.span.start, "`using` declarations are not supported");
+            self.error(decl.span.into(), "`using` declarations are not supported");
             return;
         }
         for d in &decl.declarations {
@@ -205,8 +212,8 @@ impl super::Compiler {
                                 // closures capture per-iteration copies. The new
                                 // cell's seed value is irrelevant here — this
                                 // SetLocal overwrites it with the initializer.
-                                self.fresh_cell_if_needed(slot, d.span.start);
-                                self.emit(Instr::SetLocal(slot as LocalIndex), d.span.start);
+                                self.fresh_cell_if_needed(slot, d.span.into());
+                                self.emit(Instr::SetLocal(slot as LocalIndex), d.span.into());
                             }
                         }
                         (None, Some(slot))
@@ -217,9 +224,9 @@ impl super::Compiler {
                             // so skip the redundant Push+SetLocal.
                             && !self.loops.is_empty() =>
                         {
-                            self.fresh_cell_if_needed(slot, d.span.start);
-                            self.emit(Instr::PushUndefined, d.span.start);
-                            self.emit(Instr::SetLocal(slot as LocalIndex), d.span.start);
+                            self.fresh_cell_if_needed(slot, d.span.into());
+                            self.emit(Instr::PushUndefined, d.span.into());
+                            self.emit(Instr::SetLocal(slot as LocalIndex), d.span.into());
                         }
                         _ => {}
                     }
@@ -229,10 +236,10 @@ impl super::Compiler {
                         // Evaluate the source once, then destructure it (the
                         // helper consumes the source value).
                         self.compile_expr(init);
-                        self.destructure_binding(pattern, d.span.start);
+                        self.destructure_binding(pattern, d.span.into());
                     }
                     None => self.error(
-                        d.span.start,
+                        d.span.into(),
                         "destructuring declaration requires an initializer",
                     ),
                 },

@@ -1,4 +1,5 @@
 use crate::analyzer::{ConstValue, RefSlot};
+use crate::span::Span;
 use crate::vm::{Instr, LocalIndex, Value};
 
 impl super::Compiler {
@@ -108,7 +109,7 @@ impl super::Compiler {
     /// is dead-eliminated, so the slot is never written — a `Local` load
     /// would read an uninitialized (undefined) slot. Every consumer of a
     /// `RefSlot` read must go through here.
-    pub(super) fn emit_slot_read(&mut self, r: &RefSlot, span: u32) {
+    pub(super) fn emit_slot_read(&mut self, r: &RefSlot, span: Span) {
         if r.immutable
             && let Some(push) = self.const_env.get(&r.slot)
         {
@@ -148,7 +149,7 @@ impl super::Compiler {
     /// clause before the loop context is pushed) is excluded — `compile_for`
     /// re-boxes the head explicitly. Captured `var` bindings are function-scoped,
     /// never in `fresh_owns`, so they are correctly left shared.
-    pub(super) fn fresh_cell_if_needed(&mut self, slot: u32, span: u32) {
+    pub(super) fn fresh_cell_if_needed(&mut self, slot: u32, span: Span) {
         if !self.loops.is_empty() && self.slot_needs_fresh(slot) {
             self.emit(Instr::FreshCell(slot as LocalIndex), span);
         }

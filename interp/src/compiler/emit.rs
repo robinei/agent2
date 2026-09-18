@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::diag::{DiagKind, Diagnostic};
+use crate::span::Span;
 use crate::vm::{Instr, RcStr};
 
 impl super::Compiler {
@@ -27,8 +28,8 @@ impl super::Compiler {
         id
     }
 
-    /// Append an instruction with its source span (byte offset).
-    pub(super) fn emit(&mut self, instr: Instr, span: u32) {
+    /// Append an instruction with its source span (byte range).
+    pub(super) fn emit(&mut self, instr: Instr, span: Span) {
         self.code.push(instr);
         self.spans.push(span);
     }
@@ -48,7 +49,7 @@ impl super::Compiler {
 
     /// Record a semantic diagnostic; aborts the compile before a `Program` is
     /// produced.
-    pub(super) fn error(&mut self, span: u32, message: impl Into<String>) {
+    pub(super) fn error(&mut self, span: Span, message: impl Into<String>) {
         self.diagnostics.push(Diagnostic {
             span,
             message: message.into(),
@@ -57,7 +58,7 @@ impl super::Compiler {
     }
 
     /// Record a parse diagnostic (from `oxc_parser`).
-    pub(super) fn parse_error(&mut self, span: u32, message: impl Into<String>) {
+    pub(super) fn parse_error(&mut self, span: Span, message: impl Into<String>) {
         self.diagnostics.push(Diagnostic {
             span,
             message: message.into(),

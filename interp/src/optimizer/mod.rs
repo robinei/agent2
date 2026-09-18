@@ -21,14 +21,15 @@
 //! bare `Jump` exposes threading for cfg; cfg pruning exposes adjacencies for
 //! peephole), so [`optimize`] iterates the trio to a fixpoint.
 
+use crate::span::Span;
 use crate::vm::{Instr, StepResult, VM, Value};
 
 /// Compiler entry point: optimize the label-form code, then resolve labels.
 pub(crate) fn finalize(
     code: Vec<Instr>,
-    spans: Vec<u32>,
+    spans: Vec<Span>,
     next_label: u32,
-) -> (Vec<Instr>, Vec<u32>) {
+) -> (Vec<Instr>, Vec<Span>) {
     let (code, spans) = optimize(code, spans, next_label);
     backpatch(code, spans, next_label)
 }
@@ -81,7 +82,7 @@ fn label_is_next(code: &[Instr], from: usize, l: u32) -> bool {
 /// false-arm body between them is empty); otherwise the inversion would change
 /// where the not-taken arm lands. Commonly arises once peephole empties the
 /// then-branch of an `if (c) {} else { … }`.
-fn invert_branches(code: Vec<Instr>, spans: Vec<u32>) -> (Vec<Instr>, Vec<u32>) {
+fn invert_branches(code: Vec<Instr>, spans: Vec<Span>) -> (Vec<Instr>, Vec<Span>) {
     let n = code.len();
     let mut out_code = Vec::with_capacity(n);
     let mut out_spans = Vec::with_capacity(n);
@@ -133,7 +134,7 @@ fn invert_branches(code: Vec<Instr>, spans: Vec<u32>) -> (Vec<Instr>, Vec<u32>) 
 /// fixpoint rebuild: reachability prunes dead labeled blocks a linear "after an
 /// unconditional transfer" scan would keep. Surviving `Label`s are stripped by
 /// [`backpatch`]; `Call`/`PushFn`/`MakeClosure` operands are never threaded.
-fn simplify_cfg(code: Vec<Instr>, spans: Vec<u32>, next_label: u32) -> (Vec<Instr>, Vec<u32>) {
+fn simplify_cfg(code: Vec<Instr>, spans: Vec<Span>, next_label: u32) -> (Vec<Instr>, Vec<Span>) {
     let n = code.len();
     if n == 0 {
         return (code, spans);
@@ -198,7 +199,7 @@ fn simplify_cfg(code: Vec<Instr>, spans: Vec<u32>, next_label: u32) -> (Vec<Inst
 
     // Emit reachable instructions, threading jump operands.
     let mut kept: Vec<Instr> = Vec::with_capacity(n);
-    let mut kept_spans: Vec<u32> = Vec::with_capacity(n);
+    let mut kept_spans: Vec<Span> = Vec::with_capacity(n);
     for i in 0..n {
         if !visited[i] {
             continue;
@@ -529,9 +530,9 @@ fn pe_reduce(a: &Instr, b: &Instr) -> Reduction {
 /// `(1+2)*3`, `Pop;Pop;Pop`).
 ///
 /// Composed with the CFG passes under a fixpoint loop (see [`optimize`]).
-fn peephole(code: Vec<Instr>, spans: Vec<u32>) -> (Vec<Instr>, Vec<u32>) {
+fn peephole(code: Vec<Instr>, spans: Vec<Span>) -> (Vec<Instr>, Vec<Span>) {
     let mut out: Vec<Instr> = Vec::with_capacity(code.len());
-    let mut out_spans: Vec<u32> = Vec::with_capacity(code.len());
+    let mut out_spans: Vec<Span> = Vec::with_capacity(code.len());
     for (instr, span) in code.into_iter().zip(spans) {
         // `Pop(0)` is a no-op — drop it outright (and let its neighbours, now
         // adjacent, reduce). Safe even at a jump target: control just proceeds.
@@ -583,7 +584,7 @@ fn peephole(code: Vec<Instr>, spans: Vec<u32>) -> (Vec<Instr>, Vec<u32>) {
 /// changing. Instruction count is monotonically non-increasing (every transform
 /// removes/fuses or is an idempotent operand rewrite), so this terminates well
 /// before the safety cap.
-fn optimize(mut code: Vec<Instr>, mut spans: Vec<u32>, next_label: u32) -> (Vec<Instr>, Vec<u32>) {
+fn optimize(mut code: Vec<Instr>, mut spans: Vec<Span>, next_label: u32) -> (Vec<Instr>, Vec<Span>) {
     for _ in 0..32 {
         let prev = code.clone();
         let (c, s) = invert_branches(code, spans);
@@ -602,7 +603,7 @@ fn optimize(mut code: Vec<Instr>, mut spans: Vec<u32>, next_label: u32) -> (Vec<
 /// offset, copying spans in lockstep so the table stays aligned with the
 /// compacted code. A first scan records each label's offset; a second emits the
 /// rewritten stream.
-fn backpatch(code: Vec<Instr>, spans: Vec<u32>, next_label: u32) -> (Vec<Instr>, Vec<u32>) {
+fn backpatch(code: Vec<Instr>, spans: Vec<Span>, next_label: u32) -> (Vec<Instr>, Vec<Span>) {
     // First scan: the offset of each label is the count of non-Label
     // instructions preceding it.
     let mut label_offset = vec![0u32; next_label as usize];

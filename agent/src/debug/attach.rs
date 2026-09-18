@@ -2804,6 +2804,7 @@ mod tests {
                     input: json!(null),
                     expects_reply: true,
                     site: 0,
+                    site_end: 0,
                 }),
             )
             .unwrap();

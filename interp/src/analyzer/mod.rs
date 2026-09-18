@@ -17,6 +17,7 @@ use indexmap::IndexMap;
 use oxc_ast::ast;
 
 use crate::diag::Diagnostic;
+use crate::span::Span;
 
 use captures::finalize_tables;
 use const_fns::resolve_const_functions;
@@ -85,10 +86,14 @@ impl Analyzer {
         id
     }
 
-    /// Record a semantic diagnostic from the analyzer.
+    /// Record a semantic diagnostic from the analyzer. `span` here is a
+    /// binding/reference *key* (an identifier's start offset, used to look
+    /// up its resolved slot elsewhere in this pass), not a range — so the
+    /// diagnostic gets a zero-width span, a single caret rather than an
+    /// underline.
     pub(super) fn error(&mut self, span: u32, message: impl Into<String>) {
         self.diagnostics.push(Diagnostic {
-            span,
+            span: Span::point(span),
             message: message.into(),
             kind: super::diag::DiagKind::Semantic,
         });

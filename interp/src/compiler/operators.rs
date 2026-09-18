@@ -1,11 +1,12 @@
 use oxc_ast::ast;
 
+use crate::span::Span;
 use crate::vm::{Instr, Value};
 
 impl super::Compiler {
     pub(super) fn compile_binary(&mut self, bin: &ast::BinaryExpression) {
         use ast::BinaryOperator as Op;
-        let span = bin.span.start;
+        let span = bin.span.into();
 
         // `key in obj` lowers to ObjHas, which pops the (string) key then the
         // object. Evaluate left (key) then right (obj) to keep JS eval order,
@@ -68,7 +69,7 @@ impl super::Compiler {
         &mut self,
         lhs: &ast::Expression,
         rhs: &ast::Expression,
-        span: u32,
+        span: Span,
     ) {
         self.compile_expr(lhs);
         self.compile_expr(rhs);
@@ -77,7 +78,7 @@ impl super::Compiler {
 
     pub(super) fn compile_unary(&mut self, un: &ast::UnaryExpression) {
         use ast::UnaryOperator as Op;
-        let span = un.span.start;
+        let span = un.span.into();
         match un.operator {
             Op::UnaryNegation => {
                 // Fold `-<numeric literal>` to a canonical NegInt/Number at
@@ -152,13 +153,13 @@ impl super::Compiler {
     /// `delete obj.foo` / `delete obj[k]` lower to `ObjDelete` (which pops the
     /// string key then the object and pushes whether it existed). A non-property
     /// delete is an error.
-    pub(super) fn compile_delete(&mut self, arg: &ast::Expression, span: u32) {
+    pub(super) fn compile_delete(&mut self, arg: &ast::Expression, span: Span) {
         match arg {
             ast::Expression::StaticMemberExpression(m) => {
                 self.compile_expr(&m.object);
                 self.emit(
                     Instr::PushStr(m.property.name.as_str().into()),
-                    m.property.span.start,
+                    m.property.span.into(),
                 );
                 self.emit(Instr::ObjDelete, span);
             }
@@ -176,13 +177,13 @@ impl super::Compiler {
         }
     }
 
-    pub(super) fn compile_delete_chain(&mut self, el: &ast::ChainElement, span: u32) {
+    pub(super) fn compile_delete_chain(&mut self, el: &ast::ChainElement, span: Span) {
         match el {
             ast::ChainElement::StaticMemberExpression(m) => {
                 self.compile_expr(&m.object);
                 self.emit(
                     Instr::PushStr(m.property.name.as_str().into()),
-                    m.property.span.start,
+                    m.property.span.into(),
                 );
                 self.emit(Instr::ObjDelete, span);
             }
@@ -200,7 +201,7 @@ impl super::Compiler {
     /// instructions, which evaluate both operands and so cannot short-circuit).
     pub(super) fn compile_logical(&mut self, log: &ast::LogicalExpression) {
         use ast::LogicalOperator as Op;
-        let span = log.span.start;
+        let span = log.span.into();
         self.compile_expr(&log.left);
         match log.operator {
             Op::And => {
@@ -233,7 +234,7 @@ impl super::Compiler {
     }
 
     pub(super) fn compile_conditional(&mut self, cond: &ast::ConditionalExpression) {
-        let span = cond.span.start;
+        let span = cond.span.into();
         let els = self.new_label();
         let end = self.new_label();
         self.compile_expr(&cond.test);

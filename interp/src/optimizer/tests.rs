@@ -1,10 +1,11 @@
 use super::*;
 use crate::builtin::Builtin;
+use crate::span::Span;
 use crate::vm::RcStr;
 use thin_vec::ThinVec;
 
-fn s0(n: usize) -> Vec<u32> {
-    vec![0u32; n]
+fn s0(n: usize) -> Vec<Span> {
+    vec![Span::default(); n]
 }
 
 // ── peephole: adjacent-pair rules ────────────────────────────────

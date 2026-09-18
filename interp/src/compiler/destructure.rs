@@ -2,6 +2,7 @@ use oxc_ast::ast;
 use oxc_span::GetSpan;
 
 use crate::builtin::Builtin;
+use crate::span::Span;
 use crate::vm::{Instr, LocalIndex, RcStr};
 
 impl super::Compiler {
@@ -9,7 +10,7 @@ impl super::Compiler {
     /// if it is `undefined`, replace it with the default expression's value;
     /// otherwise leave it. (JS applies defaults only for `undefined`, not
     /// `null`.) Leaves exactly one value either way.
-    pub(super) fn emit_default(&mut self, default: &ast::Expression, span: u32) {
+    pub(super) fn emit_default(&mut self, default: &ast::Expression, span: Span) {
         let have = self.new_label();
         self.emit(Instr::Pick(0), span);
         self.emit(Instr::PushUndefined, span);
@@ -28,7 +29,7 @@ impl super::Compiler {
         &mut self,
         key: &ast::PropertyKey,
         computed: bool,
-        span: u32,
+        span: Span,
     ) {
         if computed && let Some(expr) = key.as_expression() {
             self.compile_expr(expr);
@@ -45,7 +46,7 @@ impl super::Compiler {
                     self.emit(Instr::IndexGet, span);
                     return;
                 }
-                self.error(key.span().start, "unsupported destructuring key");
+                self.error(key.span().into(), "unsupported destructuring key");
                 return;
             }
         };
@@ -59,7 +60,7 @@ impl super::Compiler {
         &mut self,
         key: &ast::PropertyKey,
         computed: bool,
-        span: u32,
+        span: Span,
     ) {
         if computed && let Some(expr) = key.as_expression() {
             self.compile_expr(expr);
@@ -76,7 +77,7 @@ impl super::Compiler {
                     self.emit(Instr::ToStr, span);
                     return;
                 }
-                self.error(key.span().start, "unsupported destructuring key");
+                self.error(key.span().into(), "unsupported destructuring key");
                 return;
             }
         };
@@ -87,7 +88,7 @@ impl super::Compiler {
     /// string), delete `key` from the `rest` copy and read `src[key]`, leaving
     /// `[src, rest, value]`. The key is consumed by both uses via one `Pick`,
     /// so its expression never re-evaluates.
-    pub(super) fn emit_rest_excluded_key_access(&mut self, span: u32) {
+    pub(super) fn emit_rest_excluded_key_access(&mut self, span: Span) {
         self.emit(Instr::Pick(0), span); //   [src, rest, src, key, key]
         self.emit(Instr::Pick(3), span); //   [src, rest, src, key, key, rest]
         self.emit(Instr::Dig(1), span); //    [src, rest, src, key, rest, key]
@@ -99,7 +100,7 @@ impl super::Compiler {
     /// Destructure the source value already on top of the stack into a binding
     /// pattern, **consuming** that value. Used by declarations; every leaf is a
     /// binding identifier whose slot comes from analysis (`binding_slot`).
-    pub(super) fn destructure_binding(&mut self, pat: &ast::BindingPattern, span: u32) {
+    pub(super) fn destructure_binding(&mut self, pat: &ast::BindingPattern, span: Span) {
         match pat {
             ast::BindingPattern::BindingIdentifier(id) => {
                 match self.binding_slot(id.span.start) {
@@ -162,7 +163,7 @@ impl super::Compiler {
     /// Emit `FreshCell` for every captured binding in a loop-head pattern, so
     /// in-loop closures capture per-iteration copies (the single-identifier
     /// form does the same inline in `compile_index_loop`).
-    pub(super) fn emit_pattern_fresh_cells(&mut self, pat: &ast::BindingPattern, span: u32) {
+    pub(super) fn emit_pattern_fresh_cells(&mut self, pat: &ast::BindingPattern, span: Span) {
         match pat {
             ast::BindingPattern::BindingIdentifier(id) => {
                 if let Some(slot) = self.binding_slot(id.span.start)

@@ -29,7 +29,7 @@ pub fn current_line(vm: &VM) -> Option<usize> {
     if vm.source.is_empty() {
         return None;
     }
-    let (line, _, _) = interp::diag::line_col(&vm.source, span);
+    let (line, _, _) = interp::diag::line_col(&vm.source, span.start);
     Some(line)
 }
 
@@ -66,7 +66,7 @@ pub fn disasm_window(vm: &VM, height: usize, scroll_top: Option<usize>) -> Vec<A
             if vm.source.is_empty() {
                 None
             } else {
-                Some(interp::diag::line_col(&vm.source, sp).0)
+                Some(interp::diag::line_col(&vm.source, sp.start).0)
             }
         });
         rows.push(AsmRow::Instr {

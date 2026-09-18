@@ -1,10 +1,11 @@
 use oxc_ast::ast;
 
+use crate::span::Span;
 use crate::vm::{Instr, LocalIndex};
 
 impl super::Compiler {
     pub(super) fn compile_if(&mut self, s: &ast::IfStatement) {
-        let span = s.span.start;
+        let span = s.span.into();
         self.compile_expr(&s.test);
         match &s.alternate {
             Some(alt) => {
@@ -27,7 +28,7 @@ impl super::Compiler {
     }
 
     pub(super) fn compile_while(&mut self, s: &ast::WhileStatement) {
-        let span = s.span.start;
+        let span = s.span.into();
         let top = self.new_label();
         let end = self.new_label();
         self.emit(Instr::Label(top), span);
@@ -45,7 +46,7 @@ impl super::Compiler {
     }
 
     pub(super) fn compile_do_while(&mut self, s: &ast::DoWhileStatement) {
-        let span = s.span.start;
+        let span = s.span.into();
         let top = self.new_label();
         let cont = self.new_label();
         let end = self.new_label();
@@ -65,7 +66,7 @@ impl super::Compiler {
     }
 
     pub(super) fn compile_for(&mut self, s: &ast::ForStatement) {
-        let span = s.span.start;
+        let span = s.span.into();
         // Captured head bindings need a fresh cell per iteration so closures
         // created in the body capture per-iteration copies. The init declaration
         // runs once (outside the loop), so its bindings are NOT handled by
@@ -132,7 +133,7 @@ impl super::Compiler {
 
     pub(super) fn compile_break(&mut self, s: &ast::BreakStatement) {
         if s.label.is_some() {
-            self.error(s.span.start, "labeled `break` is not supported");
+            self.error(s.span.into(), "labeled `break` is not supported");
             return;
         }
         match self.loops.last() {
@@ -141,15 +142,15 @@ impl super::Compiler {
                     target: ctx.break_label,
                     floor: ctx.floor,
                 };
-                self.emit_exit(kind, s.span.start);
+                self.emit_exit(kind, s.span.into());
             }
-            None => self.error(s.span.start, "`break` outside a loop"),
+            None => self.error(s.span.into(), "`break` outside a loop"),
         }
     }
 
     pub(super) fn compile_continue(&mut self, s: &ast::ContinueStatement) {
         if s.label.is_some() {
-            self.error(s.span.start, "labeled `continue` is not supported");
+            self.error(s.span.into(), "labeled `continue` is not supported");
             return;
         }
         // `continue` targets the innermost *loop* — break-only `switch` entries
@@ -162,9 +163,9 @@ impl super::Compiler {
             .find_map(|ctx| ctx.continue_label.map(|l| (l, ctx.floor)));
         match target {
             Some((target, floor)) => {
-                self.emit_exit(super::ExitKind::Jump { target, floor }, s.span.start);
+                self.emit_exit(super::ExitKind::Jump { target, floor }, s.span.into());
             }
-            None => self.error(s.span.start, "`continue` outside a loop"),
+            None => self.error(s.span.into(), "`continue` outside a loop"),
         }
     }
 
@@ -183,7 +184,7 @@ impl super::Compiler {
     /// handler entered above it has been `TryExit`ed; a handler entered
     /// while a residue is open snapshots a stack that includes the residue
     /// slots, so popping them any earlier would desynchronize the snapshot.
-    pub(super) fn emit_exit(&mut self, kind: super::ExitKind, span: u32) {
+    pub(super) fn emit_exit(&mut self, kind: super::ExitKind, span: Span) {
         let floor = match kind {
             super::ExitKind::Jump { floor, .. } => floor,
             super::ExitKind::Return => 0,
@@ -243,7 +244,7 @@ impl super::Compiler {
     /// `Return(1)` — the value rides the stack, byte-for-byte the pre-B2
     /// codegen. Crossing a finalizer: spill the value to the return slot
     /// and take the exit walk through the finally stubs.
-    pub(super) fn emit_return(&mut self, span: u32) {
+    pub(super) fn emit_return(&mut self, span: Span) {
         let crosses_finalizer = self.barriers.iter().any(|b| {
             matches!(
                 b,
@@ -275,7 +276,7 @@ impl super::Compiler {
     /// Post-body half of the spill-slot protocol (see [`ReturnSpill`]):
     /// materialize the slot by patching (or, for a root frame that skipped
     /// it, inserting) the `EnterFrame`, only if some `return` used it.
-    pub(super) fn finalize_return_spill(&mut self, spill: super::ReturnSpill, span: u32) {
+    pub(super) fn finalize_return_spill(&mut self, spill: super::ReturnSpill, span: Span) {
         if !spill.used {
             return;
         }
@@ -299,7 +300,7 @@ impl super::Compiler {
     }
 
     pub(super) fn compile_try(&mut self, s: &ast::TryStatement) {
-        let span = s.span.start;
+        let span = s.span.into();
         match &s.finalizer {
             None => {
                 let Some(handler) = &s.handler else {
@@ -332,13 +333,13 @@ impl super::Compiler {
                 self.emit(Instr::TryExit, span);
                 self.compile_finally_copy(fin, 0); // normal-path copy
                 self.emit(Instr::Jump(end), span);
-                self.emit(Instr::Label(fin_label), fin.span.start);
+                self.emit(Instr::Label(fin_label), fin.span.into());
                 self.compile_finally_copy(fin, 1); // unwind-path copy
-                self.emit(Instr::Throw, fin.span.start); // rethrow
+                self.emit(Instr::Throw, fin.span.into()); // rethrow
                 for (kind, stub) in stubs {
-                    self.emit(Instr::Label(stub), fin.span.start);
+                    self.emit(Instr::Label(stub), fin.span.into());
                     self.compile_finally_copy(fin, 0); // exit-path copy
-                    self.emit_exit(kind, fin.span.start); // continue outward
+                    self.emit_exit(kind, fin.span.into()); // continue outward
                 }
                 self.emit(Instr::Label(end), span);
             }
@@ -368,7 +369,7 @@ impl super::Compiler {
         &mut self,
         block: &ast::BlockStatement,
         handler: &ast::CatchClause,
-        span: u32,
+        span: Span,
     ) {
         let catch_label = self.new_label();
         let end = self.new_label();
@@ -385,7 +386,7 @@ impl super::Compiler {
         self.emit(Instr::Jump(end), span);
 
         // Catch: the unwinder pushed the thrown value; bind or discard it.
-        let hspan = handler.span.start;
+        let hspan = handler.span.into();
         self.emit(Instr::Label(catch_label), hspan);
         match &handler.param {
             Some(param) => match &param.pattern {
@@ -424,7 +425,7 @@ impl super::Compiler {
     /// `builtin::iter_source`); anything else is a runtime `TypeError`
     /// (from `ArrLength`).
     pub(super) fn compile_for_of(&mut self, s: &ast::ForOfStatement) {
-        let span = s.span.start;
+        let span = s.span.into();
         // `for await (… of …)` consumes async iterables, which this dialect
         // has no source of (tool calls return plain promises; arrays are the
         // only iterable). Await the elements in the body instead.
@@ -456,7 +457,7 @@ impl super::Compiler {
     /// by the same index loop as `for-of`, binding the loop variable to each
     /// key. Over `state` this enumerates the blessed object's keys.
     pub(super) fn compile_for_in(&mut self, s: &ast::ForInStatement) {
-        let span = s.span.start;
+        let span = s.span.into();
         let Some(pat) = self.for_loop_binding_pattern(&s.left, span) else {
             return;
         };
@@ -480,7 +481,7 @@ impl super::Compiler {
         &mut self,
         pat: &ast::BindingPattern,
         body: &ast::Statement,
-        span: u32,
+        span: Span,
     ) {
         self.emit(Instr::PushPosInt(0), span); // [cont, idx]
         let top = self.new_label();
@@ -537,7 +538,7 @@ impl super::Compiler {
     pub(super) fn for_loop_binding_pattern<'b>(
         &mut self,
         left: &'b ast::ForStatementLeft<'b>,
-        span: u32,
+        span: Span,
     ) -> Option<&'b ast::BindingPattern<'b>> {
         let decl = match left {
             ast::ForStatementLeft::VariableDeclaration(decl) => decl,
@@ -571,7 +572,7 @@ impl super::Compiler {
     /// `break` jumps to the switch end (via a break-only loop-context entry);
     /// `continue` is not bound here and escapes to any enclosing loop.
     pub(super) fn compile_switch(&mut self, s: &ast::SwitchStatement) {
-        let span = s.span.start;
+        let span = s.span.into();
         self.compile_expr(&s.discriminant); // [disc]
         let end = self.new_label();
         // One body label per case (including `default`).

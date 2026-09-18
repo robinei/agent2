@@ -341,7 +341,10 @@ impl VM {
         }
     }
 
-    /// Render an error against the VM's source (when available). Falls back
+    /// Render an error against the VM's source (when available): `spans[ip]`
+    /// is a byte range, so this underlines the whole offending expression
+    /// rather than just caret its first byte (a zero-width span still
+    /// renders as a single caret — see [`Diagnostic::render`]). Falls back
     /// to a plain "at instruction {ip}" format when spans/source are empty
     /// (hand-assembled code via `VM::new`).
     pub fn render_error(&self, e: &VMError) -> String {
@@ -467,7 +470,9 @@ impl VM {
     /// `spans[ip]`. `None` without debug info (`VM::new` programs).
     pub fn function_at(&self, ip: CodeAddr) -> Option<(usize, &crate::debuginfo::FnDebug)> {
         let span = *self.spans.get(ip as usize)?;
-        let idx = self.debug.function_at_span(span)?;
+        // Containment is checked against the instruction's start — the debug
+        // table's function ranges are keyed the same way (by node start).
+        let idx = self.debug.function_at_span(span.start)?;
         Some((idx, &self.debug.functions[idx]))
     }
 
@@ -543,7 +548,7 @@ impl VM {
         };
         match self.spans.get(ip as usize) {
             Some(&sp) if !self.source.is_empty() => {
-                let (line, _, _) = crate::diag::line_col(&self.source, sp);
+                let (line, _, _) = crate::diag::line_col(&self.source, sp.start);
                 format!("{ip:>5}  {instr:<32} @{line}")
             }
             _ => format!("{ip:>5}  {instr}"),
@@ -756,7 +761,13 @@ impl VM {
         // the Await.
         self.stack.pop();
         let resume_ip = self.ip + 1;
-        let await_span = self.spans.get(self.ip as usize).copied().unwrap_or(0);
+        // `await_span` feeds `span_pos` (a line:col point, for await-chain
+        // rendering) — only the start is meaningful there.
+        let await_span = self
+            .spans
+            .get(self.ip as usize)
+            .map(|s| s.start)
+            .unwrap_or(0);
         // Split off this frame's own handler entries (a `TryEnter` in this
         // frame snapshots `callstack_len` == the current depth), storing
         // `stack_len` fp-relative so resume can re-base them.
