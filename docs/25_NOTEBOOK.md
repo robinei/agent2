@@ -584,17 +584,54 @@ should accumulate safely, since the analysis table simply keeps it and
 later cells fold it identically. Loop-declared `FreshCell` slots do not
 arise at cell top level.
 
-### D13 — The TUI collapses cells
+### D13 — The TUI: streaming markdown, highlighted cells, collapsed by default
 
-A code block renders semi-collapsed by default — a few lines and a count
-— and expands on a keystroke.
+The reading experience this phase exists for. Four parts, three of which
+already have machinery that must be reused rather than rebuilt.
 
-After a cell has run, what matters is its *effects*: the calls it made,
-what they returned, what it logged. Those are rows the TUI already
-renders. The source is how it got there, and it is the least interesting
-thing on screen for the person who asked a question. Collapsing is what
-makes "never have to read the generated JavaScript" true in practice
-rather than only in principle.
+**Prose renders as markdown while it streams.** This already works:
+`chat.rs` accumulates `SessionEvent::Chunk` into a per-branch buffer and
+runs `classify_markdown_lines` over it live, with
+`streaming_fence_content_is_code_kinded_before_the_turn_logs` pinning
+exactly that. Under this transport it stops being incidental and becomes
+the main path — the report the person asked for arrives as rendered
+markdown, line by line, with no extraction and no scanner (the "Why"
+above). What changes is not the mechanism but what flows through it.
+
+**Cells are syntax-highlighted.** `debug/highlight.rs` is already a
+hand-rolled JS highlighter, and `ui.rs:209` already drives it with
+`highlight::tokenize(src)` — for the *source pane*. The work is wiring
+it into chat rows of a code kind, not writing a highlighter.
+
+**Cells are semi-collapsed by default.** Five lines and a count of the
+rest, as a starting value worth tuning against real replies rather than
+argued about here. After a cell has run, what matters is its *effects*
+— the calls it made, what they returned, what it logged — and those are
+rows the TUI already renders. The source is how it got there, and it is
+the least interesting thing on screen for the person who asked a
+question. Collapsing is what makes "a user must never have to read the
+generated JavaScript to know what is happening" (phase 24) true in
+practice rather than only in principle.
+
+**Click toggles a cell.** Mouse capture is already on (`debug/mod.rs`
+enables it), but `app.rs`'s `on_mouse` handles `ScrollUp`/`ScrollDown`
+and nothing else — so `MouseEventKind::Down`, a hit test from row to
+cell, and a toggle are new. A keyboard equivalent comes with it, and it
+needs a gesture of its own: `c` is taken by the navigator's
+branch-collapse, and this is a different thing with a different scope.
+
+That scope difference is the one trap here. The existing `collapsed` is
+a `HashSet<BranchId>` — one bit per branch. Cell collapse is one bit per
+*cell*, of which a single reply can hold several, so it needs its own
+state keyed by the cell's `Turn` id rather than an extension of that
+set.
+
+**One choice left, and it is a taste call**: whether a cell is collapsed
+while it is still streaming, or only once complete. Collapsed from the
+start is the position consistent with everything above — the prose is
+the narration, and the JS is not what the person is reading — and the
+cell's effects appear beneath it as it runs, so nothing looks stalled.
+Worth revisiting the first time it feels wrong to watch.
 
 ### D14 — `Message::Turn`'s doc comment becomes false
 
@@ -968,9 +1005,20 @@ dropped) while a `done()` in cell 0 does **not** — later cells still run
 and the reply finishes (D8, D11); and that a mid-stream truncation
 leaves cell 0's effects standing with the turn reported as partial.
 
-**25.6 — TUI (D13).** Semi-collapsed cells, expand on a keystroke,
-effects rendered beneath each cell as they land. Gate: manual, plus the
-existing `chat.rs` render tests still green.
+**25.6 — TUI (D13).** Wire `debug/highlight.rs` into chat rows of a code
+kind; per-cell collapse state keyed by `Turn` id (*not* an extension of
+`attach.rs`'s per-branch `collapsed: HashSet<BranchId>`); five lines and
+a count when collapsed; `MouseEventKind::Down` in `app.rs`'s `on_mouse`
+alongside the scroll arms it already has, with a hit test from row to
+cell and a keyboard equivalent on a gesture that is not `c`. Streaming
+markdown needs nothing — `classify_markdown_lines` already runs on the
+live buffer.
+
+Gate: the existing `chat.rs` render tests still green, including
+`streaming_fence_content_is_code_kinded_before_the_turn_logs`; a reply
+with two cells collapses them independently; and a click on a collapsed
+cell expands only that one. Highlighting and the collapsed line count
+are judged by eye.
 
 **25.7 — Card, exemplars, and the doc corrections (D14).** The
 prose/`tell()` split as the sentence above; cells are one scope; no
