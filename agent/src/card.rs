@@ -57,7 +57,11 @@ pub fn embedded() -> Card {
     }
     Card {
         text: include_str!("../card/card.md").to_owned(),
-        exemplars: vec![exemplar!("01-finish"), exemplar!("02-continue")],
+        exemplars: vec![
+            exemplar!("01-finish"),
+            exemplar!("02-continue"),
+            exemplar!("03-ask"),
+        ],
     }
 }
 
@@ -561,8 +565,14 @@ mod tests {
             "read_file" if path.ends_with(".json") => {
                 json!({ "content": "{\"retries\": 3}", "version": "v1" })
             }
+            // Carries the placeholder tokens the exemplars edit against
+            // (`OLD`) as well as a realistic-looking marker, so an
+            // exemplar can demonstrate `Edit.replaceOnce` without
+            // putting a real-looking literal on the card — a live run on
+            // 2026-09-17 copied an exemplar's literals verbatim into a
+            // repo that had none of them.
             "read_file" => json!({
-                "content": "// one\n#[ignore]\nfn thing() {}\n",
+                "content": "// one\nOLD\n#[ignore]\nfn thing() {}\n",
                 "version": "v1",
             }),
             "replace_file" | "write_file" | "create_file" => json!({ "version": "v2" }),
@@ -757,9 +767,9 @@ mod tests {
     /// now matters: both exemplars parse, both run to completion against
     /// stub tools, and both end on purpose.
     #[test]
-    fn the_exemplars_demonstrate_the_two_endings_and_nothing_else() {
+    fn the_exemplars_demonstrate_the_endings_and_the_shapes() {
         let ex = exemplars();
-        assert_eq!(ex.len(), 2, "two, and each earns its place");
+        assert_eq!(ex.len(), 3, "three, and each earns its place");
         assert!(
             ex[0].assistant.contains("done()") && !ex[0].assistant.contains("return"),
             "the first ends a finished task: {}",
@@ -769,6 +779,25 @@ mod tests {
             ex[1].assistant.contains("return") && !ex[1].assistant.contains("done()"),
             "the second hands on and does not stop: {}",
             ex[1].assistant
+        );
+        assert!(
+            ex[2].assistant.contains("await ask(") && ex[2].assistant.contains("done()"),
+            "the third asks mid-program and acts on the answer: {}",
+            ex[2].assistant
+        );
+        // **The finishing one changes something and checks it.** It used
+        // to be `bash("make check")` → `tell` → `done()`, against the
+        // prompt "is the build green?" — right for that prompt, and
+        // structurally identical to the dominant failure: measured on
+        // 2026-09-17, 45% of programs read something, wrote nothing,
+        // carried nothing forward and did not finish, 140 of those 155
+        // ending by telling the user. The exemplars are two turns of a
+        // 10 KB card and the only place the model sees the work done
+        // rather than described, so one of them does the work.
+        assert!(
+            ex[0].assistant.contains("replace_file") && ex[0].assistant.contains("bash"),
+            "the first edits and then runs the thing that would fail: {}",
+            ex[0].assistant
         );
         // Short enough to be a shape rather than a technique to copy —
         // a live run on 2026-09-17 reproduced a long exemplar verbatim,
