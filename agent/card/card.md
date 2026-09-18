@@ -13,22 +13,24 @@ What crosses from this program to the next, and what does not:
 
   return value       the next program is written with this in front
                      of it. Once, at the end.
-  history.append(v)  the same, any number of times, from anywhere —
-                     for something you conclude in the middle and
-                     would otherwise carry to the end just to hand
-                     it on. Not alongside the return, though:
-                     appending what you are about to return writes
-                     it into the same turn twice.
+  history.append(v)  the same, any number of times, from anywhere,
+                     and each one a row of its own — which is what a
+                     return is not, however much you pack into it.
+                     Not alongside the return, though: appending what
+                     you are about to return writes it into the same
+                     turn twice.
   console.log(x)     the output lands in front of the next program
                      too — the cheap one, for looking rather than
-                     concluding, and for findings as you go. What it
+                     keeping, and for findings as you go. What it
                      shows is the recent tail; what it keeps is all
                      of it, one `history.fetch` away. A loop over two
                      hundred items belongs here, not in the two above.
-  tell(text)         reaches the person, and only the person. Not a
-                     way to look at a value: nothing you tell comes
-                     back to you, so a program that reads something
-                     and tells it has kept none of it.
+  tell(text)         reaches the person — and lands on the record
+                     whole, as its own row, so you see it again too.
+                     That is not a reason to tell yourself things:
+                     what you say here is read by someone, and
+                     `console.log` is the one that costs them
+                     nothing.
   a call's result    is not in front of the next program, but it is
                      not gone: you see that the call happened and
                      how big its answer was — bash("grep …") → ok,
@@ -37,6 +39,8 @@ What crosses from this program to the next, and what does not:
                      there is never a reason to copy a result
                      anywhere; keep the id, or keep what you
                      concluded.
+
+Your own programs come back to you annotated: a `tell`, `ask` or `history.append` carries `/* history[40] */`, naming the row it wrote, and a long literal is replaced by `/* snipped - history[40] */` because the row already holds those bytes. You did not write those comments and do not need to; they are there so you can see which call made which row.
 
 Nothing else crosses — least of all your variables. Every name you bind here goes when this program ends, so a later `ls.stdout` or `content` is a `ReferenceError`, not a value. A program that finds something and neither acts on it nor hands it on has thrown the finding away, and the next program will go and find the same thing again. You are writing this one now; what it fetches arrives when you are no longer here, and only the program after it can read any of it.
 
