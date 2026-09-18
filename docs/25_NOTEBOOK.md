@@ -2,7 +2,8 @@
 
 The model's reply stops being a bare JavaScript program and becomes
 **markdown containing executable code blocks**. Prose is prose, reaching
-the person as it streams; the code blocks are one program.
+the person as it streams; the code blocks are one *run* — separate
+compilations sharing one frame, one scope and one outcome.
 
 ## Why
 
@@ -49,14 +50,14 @@ done();
 ````
 
 One completion. One `Turn` whose `source` is the whole markdown, byte
-for byte. Two cells sharing one scope — `a` is visible in the second
-cell because **the cells are one program**.
+for byte. Two cells sharing one frame — `a` is visible in the second
+cell because the compiler carries cell 0's scope table into cell 1 and
+both run against the same locals (D12).
 
 Note what cell 0 does *not* do: end with `return`. That is the habit
-exemplar 02 teaches, and under this transport it would end the notebook
-before cell 1 ran — see D5, which makes it a compile error rather than a
-silent one. A cell keeps what is worth keeping with `history.append`;
-the sole `return` belongs in the last cell, if anywhere.
+exemplar 02 teaches, and there is no `return` here at all (D5) — a cell
+keeps what is worth keeping with `history.append`, and the run ends by
+running out of cells or by `done()`.
 
 ## Decisions
 
@@ -67,9 +68,10 @@ reply. Cells are byte spans within it, numbered from zero.
 
 This keeps the property phase 24 was careful about: `Call::site` is an
 offset into the stored source, so a report can annotate a program per
-call site from the log alone. If cells were sliced out and stored
-separately, every offset would need rebasing, and `Turn.source` would
-stop being what the model actually wrote.
+call site from the log alone. Cells are *compiled* from their own text
+(D2), but they are never *stored* that way — the log holds the markdown
+and offsets into it, so `Turn.source` stays what the model wrote and no
+consumer has to know cells exist.
 
 ### D2 — Compile the cell's own substring, then rebase its spans
 
@@ -123,6 +125,15 @@ the person to *read* rather than run is tagged as anything else
 (```text, ```rust, or a 4-backtick fence around it — the notebook prior
 already handles this: quoted code lives in the markdown, not in a code
 cell).
+
+A **bare** ` ``` ` fence with no info string does *not* execute. That is
+narrower than today's `extract_program`, which strips a bare fence along
+with ```js and ```javascript, so it gives up some leniency against a
+habit the model demonstrably has. It is the right trade here because a
+bare fence is also how prose quotes anything at all, and the failure is
+caught rather than silent: a reply whose only code sits in a bare fence
+has no executable cell, which D4 makes a compile failure and the repair
+loop re-asks.
 
 This is the decision most likely to be wrong, and it is cheap to
 reverse: it is one predicate over the fence's info string.
@@ -179,9 +190,11 @@ logged by the calls it makes.
 
 ### D7 — Exactly one terminal per notebook
 
-`Return`'s doc states the invariant: *a run must have exactly one
-log-visible terminal, or nothing downstream can be derived from the log
-alone.* Cells must not break it.
+`Cause::Abandoned`'s doc states the invariant: *a run must have exactly
+one log-visible terminal, or nothing downstream can be derived from the
+log alone* — and `Return`'s states the completing half of it, that a
+program ending without a `return` still logs `Return { value: null }`.
+Cells must not break either.
 
 The notebook — not the cell — logs exactly one `Return` or `Condition`.
 Cutting the `return` *statement* (D5) does not cut the `Return`
@@ -198,9 +211,9 @@ inverted.
 ### D8 — `done()` ends the notebook
 
 Unchanged in meaning: it is the only thing that rests a branch. It
-therefore also stops the notebook — remaining cells do not run, the same
-way code after `return` in a function does not. The card says so once;
-cells after `done()` are dead code and read as such.
+therefore also stops the notebook — the cell driver stops, and later
+cells are never compiled or run. The card says so once; cells after
+`done()` are dead code and read as such.
 
 ### D9 — A raise or a trap suspends the notebook mid-cell
 
@@ -208,10 +221,17 @@ Also unchanged. `raise(...)` suspends with a handler frame; a trap
 suspends resumably or not. Remaining cells do not run, because the VM is
 parked inside cell *k*.
 
-`resume(v)` then continues **from that instruction**, falls out of cell
-*k*, and runs cells *k+1…* normally. This needs no new machinery — it is
-exactly what `resume` already does, and it matches the notebook prior
-(an erroring cell stops a Run All).
+`resume(v)` then continues **from that instruction** and falls out of
+cell *k*. The VM half of that is exactly what `resume` already does and
+needs nothing new; what *is* new is that falling out of a cell returns
+to the **cell driver** rather than ending the run, so the driver must
+resume its walk at cell *k+1* rather than treating the handback as a
+completed program. That is the same integration point D7 names, and it
+is where the `finish_program`-renders-unconditionally behaviour has to
+learn the difference between a cell ending and a notebook ending.
+
+The semantics match the notebook prior: an erroring cell stops a Run
+All.
 
 ### D10 — The kernel lives for one turn
 
@@ -245,10 +265,19 @@ Three consequences, and the second is the reason to do it:
   to know what is happening* — met by the format.
 - **Early stop cancels the completion.** A `done()`, a trap or a
   `raise` in cell 0 makes every later cell moot, and the harness can
-  cancel the generation still in flight. `llm_epoch` and `cancels`
-  already do this for `Interrupt`, and `LlmDone` already drops a
-  response whose epoch has moved. **This saves output tokens, not just
-  latency**, and concatenation cannot capture it at all.
+  cancel the generation still in flight. The machinery exists:
+  `llm_epoch` and `cancels` already do this for `Interrupt`, `LlmDone`
+  already drops a response whose epoch has moved, and `deepseek.rs`'s
+  `parse_sse` checks the token **between SSE lines** — "so an
+  interrupted generation stops streaming within a chunk rather than at
+  the end of a completion that may run for minutes."
+
+  What that buys for certain is that the harness stops reading and
+  closes the connection. Whether the *provider* then halts generation
+  and stops billing is provider behaviour on disconnect, not something
+  this repo can assert — usually yes for streaming, but **25.5 should
+  measure it rather than claim it**. Either way concatenation cannot
+  capture it at all.
 - **Truncation becomes partial progress.** Today a truncated completion
   is never compiled and the whole thing is re-asked. Here the cells that
   ran stand, and the next completion continues with their results in
@@ -315,6 +344,34 @@ cell actually closes over it, and then it costs one instruction, once.
 
 An earlier draft boxed every top-level slot unconditionally to pin the
 representation before any cell ran. Unnecessary, given the above.
+
+**How a later cell's code gets into the running VM.** This is the part
+the phrase "compile incrementally" was hiding, and it is the mechanism
+behind "feed more source into a VM".
+
+`Program` is `{ code, spans, source, debug }` — no separate constant
+pool, so there is no pool to merge. Appending cell *k*'s compilation
+into the live VM is therefore: extend `code` and `spans`, merge the
+debug function table, and set `ip` to the append point.
+
+The one thing that must not be naive is **jump targets**. Labels resolve
+to absolute addresses at the end of codegen, so a cell compiled
+standalone emits jumps relative to its own zero. The fix is a base
+address threaded into label resolution, so cell *k* resolves labels at
+`base + local`. The compiler already has the shape for this:
+`Analysis { next_label }` exists precisely so "codegen continues the
+same allocation" across a unit.
+
+So what the compiler carries between cells is four things, not one: the
+**scope table** (name → slot and `SlotKind`), the **frame's local
+count**, the **label counter**, and the **base address**.
+
+One detail for 25.1b: `Program::source` is what diagnostics render
+against, and under this transport it should be the markdown, not the
+cell — that is what makes a rebased span resolve. While the reply is
+still streaming the markdown is a prefix, which is harmless (it always
+contains every cell that has run) but means the VM's `source` grows
+between cells rather than being set once.
 
 **Why promotion is sound.** If an earlier cell's analysis said `Plain`,
 then no closure in that cell referenced the name — a reference from a
@@ -390,15 +447,17 @@ call's own text, and that no prelude instruction carries a span landing
 in prose.
 
 **25.2 — Incremental cell compilation (D12).** Re-enterable compiler
-carrying the scope table (name → slot *and* `SlotKind`); growable frame
-locals; `FreshCell` emitted at a cell's start for each earlier-declared
+carrying four things — scope table (name → slot *and* `SlotKind`), frame
+local count, label counter, base address — so a cell's `code`/`spans`
+append into the live VM with jump targets already absolute; growable
+frame locals; `FreshCell` emitted at a cell's start for each earlier-declared
 name it is the first to capture. Gate: `cargo test -p interp` green, plus tests that a `const`
 in cell 0 is readable in cell 1, that an undeclared name is a *compile*
 error naming it, that a redeclaration across cells is caught, that a
 function declared in cell 0 and called in cell 1 resolves a top-level
-name, and — the case that forced the boxing policy — that a closure in
-cell 1 capturing a variable cell 0 declared and already wrote sees the
-current value, not a stale copy.
+name, and — the case that forced promotion — that a closure in cell 1
+capturing a variable cell 0 declared and already wrote sees the current
+value through the promoted cell, not a stale copy.
 
 **25.3 — The `return` diagnostic (D5).** A top-level `return` in any
 cell is a compile error naming `history.append` and `done()`. Gate: a
