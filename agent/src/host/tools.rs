@@ -33,11 +33,35 @@ pub const READ_FILE_MAX_BYTES: usize = 16 * 1024 * 1024;
 /// threads stop accumulating past this and the child is killed.
 const BASH_OUTPUT_MAX_BYTES: usize = 4 * 1024 * 1024;
 
-/// Command-length cap. The point of `bash` is *short* commands — a
-/// single pipeline — with control flow living in the JS program. This
-/// is the mechanical backstop for the card's instruction; long scripts
-/// are rejected (as a repairable condition) rather than run.
-const BASH_COMMAND_MAX_BYTES: usize = 1024;
+/// Sanity ceiling on a command, against a runaway generation rather
+/// than against style. It used to be 1 KB, and it *rejected*.
+///
+/// The rule it was enforcing — "one short pipeline, control flow in the
+/// JS program" — is real, and the tool's own description states it. But
+/// it is a preference about where logic reads best, not where the
+/// design's advantage comes from: a program that batches two hundred
+/// items through one heredoc costs exactly the same single completion
+/// as one that loops in JS. Refusing spent a whole completion to
+/// enforce a style rule, and the objective the style serves is
+/// completions.
+///
+/// Measured on `sweep-200`, 2026-09-17: the model wrote a 2,204-byte
+/// Python AST analysis into `bash`, was refused, and its next program
+/// re-did the work as regex `matchAll` over Python source. It passed —
+/// but it traded a correct approach for a fragile one and paid a
+/// completion for the privilege, in the one task where completions are
+/// the whole measurement.
+///
+/// So the length is reported now (`CompletionReport`'s note, at
+/// [`BASH_COMMAND_LONG_BYTES`]) rather than refused: the work happens,
+/// and the nudge arrives at the moment that earned it. There are still
+/// good reasons to prefer JS — values stay in variables usable across
+/// calls, a trap names a line instead of opaque shell output, and the
+/// 30s/4MB ceilings apply to the whole script — and the note says so.
+const BASH_COMMAND_MAX_BYTES: usize = 64 * 1024;
+/// Where a command stops being "one short pipeline" and the completion
+/// report says so. **A note, not a refusal** — see the cap above.
+pub const BASH_COMMAND_LONG_BYTES: usize = 1024;
 
 /// Wall-clock cap on a single command. `bash` is the first tool that
 /// can hang indefinitely; a timeout turns that into a condition.
@@ -359,7 +383,7 @@ fn replace_file_def() -> ToolDef {
 fn bash_def() -> ToolDef {
     ToolDef {
         name: "bash".into(),
-        description: "One short shell command — a single pipeline, no loops; do control flow in JS. Runs with `pipefail`, so the status is the failing stage's, and a `| head` that truncates is still a success. A command that could not be run at all rejects. Non-zero is a result, not an error. 30s timeout, 4MB per stream."
+        description: "A shell command. A single pipeline is what it is best at, and loops or multi-step logic usually read better in the JS program — but a script here is allowed when it is the right tool. Runs with `pipefail`, so the status is the failing stage's, and a `| head` that truncates is still a success. A command that could not be run at all rejects. Non-zero is a result, not an error. 30s timeout, 4MB per stream."
             .into(),
         input_schema: json!({
             "type": "array",
@@ -372,6 +396,7 @@ fn bash_def() -> ToolDef {
         guidelines: vec![
             "Read `status` before `stdout`. A command that ran and failed writes nothing, and nothing reads as \"found no problems\".".into(),
             "Ask once for everything it will answer at once: change all the candidates, run it once, and read which ones it names back. A per-item loop is the fallback.".into(),
+            "Prefer looping in the program rather than in the command: the values stay in variables you can use in the next call and return at the end, and a mistake stops at a line instead of somewhere inside a heredoc. When a script really is the right tool — a parser, something with no JS equivalent — write the script.".into(),
         ],
         example: Some("const r = await tools.bash(\"cargo check --all-targets 2>&1\");".into()),
         returns: Some(
@@ -408,9 +433,8 @@ fn bash_def() -> ToolDef {
             };
             if command.len() > BASH_COMMAND_MAX_BYTES {
                 return Err(format!(
-                    "command is {} bytes (limit {BASH_COMMAND_MAX_BYTES}): keep bash to \
-                     one short pipeline and move loops/conditionals/multi-step logic \
-                     into the JS program",
+                    "command is {} bytes, past the {BASH_COMMAND_MAX_BYTES}-byte ceiling \
+                     — that is a runaway, not a script",
                     command.len()
                 ));
             }
@@ -1055,11 +1079,21 @@ mod tests {
     }
 
     #[test]
-    fn bash_rejects_overlong_commands() {
-        let long = format!("echo {}", "x".repeat(BASH_COMMAND_MAX_BYTES));
-        let err = bash(json!([long])).unwrap_err();
-        assert!(err.contains("limit"), "{err}");
-        assert!(err.contains("JS program"), "{err}");
+    fn bash_runs_a_script_and_refuses_only_a_runaway() {
+        // Past the sanity ceiling: still refused, and the message says
+        // what that ceiling is about.
+        let runaway = format!("echo {}", "x".repeat(BASH_COMMAND_MAX_BYTES));
+        let err = bash(json!([runaway])).unwrap_err();
+        assert!(err.contains("runaway"), "{err}");
+
+        // A script — well past the old 1 KB limit, nowhere near the
+        // ceiling — runs. It used to be refused, which cost a whole
+        // completion to enforce a preference about where logic reads
+        // best; the completion report notes the length instead.
+        let script = format!("true # {}", "x".repeat(BASH_COMMAND_LONG_BYTES * 3));
+        assert!(script.len() > BASH_COMMAND_LONG_BYTES);
+        let out = bash(json!([script])).expect("a long command runs");
+        assert_eq!(out["status"], 0, "{out}");
     }
 
     // ── wait_until ───────────────────────────────────────────────────

@@ -227,6 +227,11 @@ pub struct CompletionReport {
     /// success. The fix belongs in the report, not in a new event — so
     /// the report counts them and says so.
     pub failed_calls: usize,
+    /// Bytes of the longest `bash` command this run issued, when it was
+    /// long enough to be a script rather than a pipeline. Zero
+    /// otherwise. See `host::tools`'s command ceiling for why this is a
+    /// note and no longer a refusal.
+    pub long_bash: usize,
 }
 
 impl CompletionReport {
@@ -259,6 +264,19 @@ impl CompletionReport {
                  is not the success it looks like. Each failure's reason is fetchable by \
                  id from the menu above.",
                 self.failed_calls
+            ));
+        }
+
+        if self.long_bash > 0 {
+            out.push_str(&format!(
+                "\n\n## note\n\nThat was a {}-byte `bash` command — a script rather \
+                 than a pipeline. It ran, and if it was the right tool then it was the \
+                 right tool. Worth knowing for next time: the same logic written in the \
+                 program keeps its values in variables you can use in the later calls \
+                 and return at the end, and a mistake in it stops at a line rather than \
+                 somewhere inside a heredoc. The 30s and 4MB limits apply to the whole \
+                 script either way.",
+                self.long_bash
             ));
         }
 
@@ -810,6 +828,19 @@ fn render_handback(h: &Handback<'_>, budget: usize) -> String {
             console: h.console.clone(),
             console_id: h.console_id,
             new_artifacts: menu_since(h, h.previous_outcome),
+            long_bash: h.path[h.turn_at + 1..=h.outcome_at]
+                .iter()
+                .filter_map(|e| match &e.payload {
+                    EventPayload::Call(crate::types::Call::Invoke { name, args, .. })
+                        if name == "bash" =>
+                    {
+                        args.get(0).and_then(|a| a.as_str()).map(str::len)
+                    }
+                    _ => None,
+                })
+                .filter(|n| *n > crate::host::tools::BASH_COMMAND_LONG_BYTES)
+                .max()
+                .unwrap_or(0),
             failed_calls: h.path[h.turn_at + 1..=h.outcome_at]
                 .iter()
                 .filter(|e| {
@@ -1757,6 +1788,7 @@ mod tests {
             console_id: None,
             new_artifacts: vec![artifact(9, "program result", json!("hello"))],
             failed_calls: 0,
+            long_bash: 0,
         };
         let rendered = report.render();
         let line = rendered.lines().nth(1).unwrap();
@@ -1781,6 +1813,7 @@ mod tests {
             console_id: None,
             new_artifacts: vec![artifact(9, "program result", value)],
             failed_calls: 0,
+            long_bash: 0,
         };
         let rendered = report.render();
         let line = rendered.lines().nth(1).unwrap();
@@ -1806,6 +1839,7 @@ mod tests {
             console_id: None,
             new_artifacts: vec![artifact(9, "program result", value)],
             failed_calls: 0,
+            long_bash: 0,
         };
         let rendered = report.render();
         let line = rendered.lines().nth(1).unwrap();
@@ -1894,6 +1928,7 @@ mod tests {
             console_id: None,
             new_artifacts: artifacts,
             failed_calls: 0,
+            long_bash: 0,
         }
         .render()
     }
