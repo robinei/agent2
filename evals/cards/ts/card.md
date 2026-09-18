@@ -30,7 +30,14 @@
  *                      it on. Not alongside the return, though:
  *                      appending what you are about to return writes
  *                      it into the same turn twice.
- *   tell(text)         reaches the person, and only the person.
+ *   console.log(x)     the output lands in front of the next program
+ *                      too — the one that costs nothing and commits to
+ *                      nothing, for looking at a thing rather than
+ *                      concluding something about it.
+ *   tell(text)         reaches the person, and only the person. Not a
+ *                      way to look at a value: nothing you tell comes
+ *                      back to you, so a program that reads something
+ *                      and tells it has kept none of it.
  *   a call's result    is not in front of the next program, but it is
  *                      not gone: you see that the call happened and
  *                      how big its answer was — bash("grep …") → ok,
@@ -66,6 +73,11 @@
 declare type Agent = unknown;
 /** A raise-handler's verdict. Build with `resume()`/`abandon()`, return it. */
 declare type Decision = unknown;
+
+/** Print, for your own benefit. The lines land in the next program's
+ *  report — so this is how you look at something without returning it
+ *  or concluding anything about it. */
+declare const console: { log(...args: unknown[]): void };
 
 /** Say something to the person. The first program says what it is
  *  about to do, the program that finishes says what the answer was,

@@ -49,8 +49,18 @@ pub const CONSOLE_TAIL_LINES: usize = 20;
 pub const CONSOLE_MAX_LINES: usize = 2_000;
 /// Bytes a logged `Console` keeps, across all its lines.
 pub const CONSOLE_MAX_BYTES: usize = 256 * 1024;
-/// Per-line clip for quoted console output.
-pub const CONSOLE_LINE_MAX_BYTES: usize = 200;
+/// Bytes the quoted console tail may occupy in a report, across all
+/// its lines.
+///
+/// It was a flat 200-byte clip **per line**, which made the channel
+/// useless for the thing programs actually reach for it to do: a
+/// `console.log` of a 463-byte file came back cut at 200. The model
+/// then used `tell` to look at content instead — where nothing comes
+/// back at all — and re-read the same files next program. Half the
+/// return value's budget, spent from the newest line backwards, so the
+/// most recent output survives whole and an older chatty loop is what
+/// gets dropped.
+pub const CONSOLE_SECTION_MAX_BYTES: usize = RETURN_MAX_BYTES / 2;
 /// Artifact-menu entries shown (most recent kept; older ids stay valid).
 pub const MENU_MAX_ENTRIES: usize = 20;
 /// Max bytes of one arriving post quoted in a post-condition report.
@@ -97,13 +107,6 @@ pub enum ArtifactState {
     /// An `Invoke`/`Spawn` with no `Result`: issued, and whether it
     /// happened is not knowable from the log. Not re-attachable.
     PendingInvoke,
-    /// A `Send` that expects no reply — a `tell`. It has no settlement
-    /// worth a row's tail either way: pending, there is no answer
-    /// coming to await, and delivered, the value is a receipt whose
-    /// size ("ok, 13 bytes") describes nothing the model said. The card
-    /// declares `tell(text): void`; a tail reading
-    /// `pending — await fetch_history(8)` contradicts it.
-    Told,
 }
 
 /// The **where** section: where the program stopped.
@@ -344,8 +347,17 @@ fn render_console(lines: &[String], event: Option<u64>) -> Option<String> {
         // including the ones whose program never called `print`.
         return None;
     }
-    let start = lines.len().saturating_sub(CONSOLE_TAIL_LINES);
-    let shown = &lines[start..];
+    // Newest-first until the budget runs out, then back into order.
+    let mut start = lines.len().saturating_sub(CONSOLE_TAIL_LINES);
+    let mut used = 0usize;
+    for (i, line) in lines.iter().enumerate().skip(start).rev() {
+        used += line.len() + 1;
+        if used > CONSOLE_SECTION_MAX_BYTES {
+            start = i + 1;
+            break;
+        }
+    }
+    let shown = &lines[start.min(lines.len())..];
     let mut out = format!("console (last {} of {} lines", shown.len(), lines.len());
     // Only a clip names the id — an untruncated tail has nothing behind
     // it to fetch, and the wording stays as it was.
@@ -355,7 +367,7 @@ fn render_console(lines: &[String], event: Option<u64>) -> Option<String> {
     out.push_str("):");
     for line in shown {
         out.push('\n');
-        out.push_str(&clip(line, CONSOLE_LINE_MAX_BYTES));
+        out.push_str(&clip(line, CONSOLE_SECTION_MAX_BYTES));
     }
     Some(out)
 }
@@ -404,7 +416,6 @@ fn render_menu(title: &str, artifacts: &[&Artifact]) -> Option<String> {
                 format!("pending — await fetch_history({})", a.id)
             }
             ArtifactState::PendingInvoke => "issued; no result recorded; may have happened".into(),
-            ArtifactState::Told => "sent".into(),
         };
         out.push_str(&format!("\n[#{}] {} → {}", a.id, a.label, tail));
     }
@@ -1626,17 +1637,42 @@ mod tests {
         assert!(c.contains("[truncated;"));
     }
 
+    /// The tail is bounded in **total** bytes, not by a flat per-line
+    /// clip. A `console.log` of a file used to come back cut at 200
+    /// bytes, which made the one channel that shows a value to the next
+    /// program useless for the thing programs reach for it to do.
     #[test]
-    fn console_tails_with_counts_and_clips_lines() {
+    fn console_keeps_recent_output_whole_within_a_total_budget() {
         let mut lines: Vec<String> = (0..30).map(|i| format!("line {i}")).collect();
         lines.push("y".repeat(1000));
         let rendered = render_console(&lines, None).expect("lines present");
         assert!(rendered.starts_with("console (last 20 of 31 lines):"));
-        // 31 lines, tail of 20: lines 0–10 dropped, 11–29 + long kept.
         assert!(!rendered.contains("line 0"), "older lines dropped");
-        assert!(!rendered.contains("line 10\n"), "older lines dropped");
         assert!(rendered.contains("line 11"), "tail kept");
-        assert!(rendered.contains("[truncated; 1000 bytes total]"));
+        assert!(
+            rendered.contains(&"y".repeat(1000)),
+            "a 1000-byte line is well inside the budget and survives whole"
+        );
+
+        // Past the budget, the oldest of the tail goes rather than every
+        // line losing its end.
+        let fat: Vec<String> = (0..10).map(|i| format!("{i}") + &"z".repeat(1000)).collect();
+        let rendered = render_console(&fat, None).expect("lines present");
+        let kept = rendered.lines().count() - 1;
+        assert!(
+            kept < fat.len(),
+            "the budget drops whole lines: kept {kept} of {}",
+            fat.len()
+        );
+        assert!(
+            rendered.len() <= CONSOLE_SECTION_MAX_BYTES + 200,
+            "and stays inside it: {} bytes",
+            rendered.len()
+        );
+        assert!(
+            rendered.contains(&("9".to_owned() + &"z".repeat(1000))),
+            "the newest line is the one guaranteed to survive"
+        );
     }
 
     #[test]

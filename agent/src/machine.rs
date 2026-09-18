@@ -3044,33 +3044,47 @@ pub(crate) fn menu_rows(segment: &[&Event], since: u64) -> Vec<Artifact> {
         .filter_map(|event| {
             let id = event.id.as_u64();
             match &event.payload {
+                // **A `tell` gets no row.** Its text is already in the
+                // document, verbatim, in the `tell(...)` call of the
+                // program that made it — a menu row could only repeat
+                // it, and the preview it repeated taught the opposite
+                // of the card: the card says `tell` reaches "the
+                // person, and only the person", while the row showed
+                // the first fifty characters of exactly the content the
+                // program had wanted to look at, sitting in the
+                // conversation. That reads as "it is here, merely
+                // truncated", and the next program reformats the same
+                // `tell` rather than concluding the channel was wrong.
+                // Measured 2026-09-17: 45% of programs read something,
+                // wrote nothing, carried nothing forward and did not
+                // finish; 140 of those 155 ended by telling the user.
+                // One run repeated a read-and-tell program five times,
+                // commenting "show them for context", then "show full
+                // contents for inspection".
+                //
+                // An `ask` keeps its row: it is a question a person is
+                // going to answer, and the row is how it is awaited.
+                EventPayload::Call(Call::Send {
+                    expects_reply: false,
+                    ..
+                }) => None,
                 // A row's label comes from the call *variant*; its value
                 // (or its absence) from the `Result`.
                 EventPayload::Call(call) => Some(Artifact {
                     id,
                     label: call_label(call),
-                    state: match call {
-                        // A `tell` settles, but nothing about the
-                        // settlement is news: it expects no reply, so
-                        // there is neither an answer to await nor a
-                        // value worth a byte count.
-                        Call::Send {
-                            expects_reply: false,
-                            ..
-                        } => ArtifactState::Told,
-                        _ => match settlement_of(segment, event.id) {
-                            Some(Outcome::Delivered(v)) => ArtifactState::Delivered(v.clone()),
-                            Some(Outcome::Failed(msg)) => ArtifactState::Failed(msg.clone()),
-                            // Only one pending kind can be re-attached:
-                            // an `ask`'s answer is still coming, while a
-                            // `Spawn`/`Fork`/`Invoke`'s worker died with
-                            // the process.
-                            None => match call {
-                                Call::Send { .. } => ArtifactState::PendingSend,
-                                Call::Spawn { .. } | Call::Fork { .. } | Call::Invoke { .. } => {
-                                    ArtifactState::PendingInvoke
-                                }
-                            },
+                    state: match settlement_of(segment, event.id) {
+                        Some(Outcome::Delivered(v)) => ArtifactState::Delivered(v.clone()),
+                        Some(Outcome::Failed(msg)) => ArtifactState::Failed(msg.clone()),
+                        // Only one pending kind can be re-attached: an
+                        // `ask`'s answer is still coming, while a
+                        // `Spawn`/`Fork`/`Invoke`'s worker died with the
+                        // process.
+                        None => match call {
+                            Call::Send { .. } => ArtifactState::PendingSend,
+                            Call::Spawn { .. } | Call::Fork { .. } | Call::Invoke { .. } => {
+                                ArtifactState::PendingInvoke
+                            }
                         },
                     },
                 }),
@@ -3102,12 +3116,14 @@ fn call_label(call: &Call) -> String {
             text,
             expects_reply,
             ..
-        } => format!(
-            "{}({}, {})",
-            if *expects_reply { "ask" } else { "tell" },
-            address_label(to),
-            arg_preview(&serde_json::Value::String(text.clone()))
-        ),
+        } => {
+            format!(
+                "{}({}, {})",
+                if *expects_reply { "ask" } else { "tell" },
+                address_label(to),
+                arg_preview(&serde_json::Value::String(text.clone()))
+            )
+        }
         Call::Spawn { name, .. } => format!("spawn({})", name.as_deref().unwrap_or("<unnamed>")),
         Call::Fork { name, .. } => {
             format!("fork({})", name.as_deref().unwrap_or(""))
