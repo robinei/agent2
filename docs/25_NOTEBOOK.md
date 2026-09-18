@@ -982,6 +982,41 @@ wastes stack on every frame. **Re-running a patched `EnterFrame`** would
 re-initialize cell 0's locals. **A heap scope object** is the scope map
 D12 already rejected.
 
+#### Three things 25.2 settled that this doc had wrong or unsaid
+
+**An undeclared name is a runtime `ReferenceError`, not a compile
+error.** An earlier gate here asked for a compile error naming it. The
+compiler structurally cannot give one: a reference absent from
+`ref_resolution` *is* the global fallback (`Instr::PushName` — "the
+reflective fallback for bare identifiers the compiler does not
+statically recognize… everything else resolves to a `ReferenceError`"),
+and that is how `console`, `Math`, `tools` and every harness verb
+resolve. `compile("console.log(mystery);")` succeeds today. Incremental
+evaluation changes nothing about it.
+
+**Top-level `this` is refused with a diagnostic.** Capture resolution's
+reify pass appends a synthetic `<this>` slot at `own_local_count`, and
+since analysis is re-derived from pristine scopes each fragment, that
+slot would land where the next fragment's first declaration also
+claims — and somewhere else again after that. Top-level `this` is
+`undefined` in this dialect, so refusing it costs nothing real and is far
+cheaper than making the slot stable. The one place in this phase where a
+diagnostic was chosen over machinery.
+
+**`EnterFrame` belongs to fragment 0 by index, not by "has one been
+emitted".** Keying off whether a prologue exists makes a first fragment
+that declares nothing hand `EnterFrame` to fragment 1 — which happens to
+work, but `EnterFrame` truncates the stack to `fp + nparams` and so must
+never run against a frame that could already hold locals. The rule is
+positional: fragment 0 enters, everyone else extends, and a unit whose
+first fragment declares nothing emits no `EnterFrame` at all.
+
+Requirement 2 above was resolved by **skipping the optimizer entirely**
+on the incremental path rather than range-scoping it: `simplify_cfg`
+does a reachability DFS over a label→index marker table, and a fragment
+referencing an earlier fragment's label has no marker for it, so clean
+scoping was not on offer.
+
 #### Yes, it is an instruction: `ExtendFrame(local_kinds)`
 
 Mirroring `EnterFrame(nparams, build_args, local_kinds)`. The first
@@ -1086,8 +1121,7 @@ harness. **Name everything for incremental evaluation, not for cells
 caller of it.
 
 Gate: `cargo test -p interp` green, plus tests that a `const` in cell 0
-is readable in cell 1; that an undeclared name is a *compile* error
-naming it; that a redeclaration across cells is caught; that a function
+is readable in cell 1; that a redeclaration across cells is caught; that a function
 declared in cell 0 and called in cell 1 resolves a top-level name; that
 a call in cell 2 logs a `site` slicing `Turn.source` to that call's own
 text; and — the case that forced promotion — that a closure in cell 1
