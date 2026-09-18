@@ -3064,12 +3064,10 @@ pub(crate) fn menu_rows(segment: &[&Event], since: u64) -> Vec<Artifact> {
                 // commenting "show them for context", then "show full
                 // contents for inspection".
                 //
-                // An `ask` keeps its row: it is a question a person is
-                // going to answer, and the row is how it is awaited.
-                EventPayload::Call(Call::Send {
-                    expects_reply: false,
-                    ..
-                }) => None,
+                // An `ask` has no row here either: it renders whole as a
+                // row of its own, and which questions are still open is
+                // what `request_tail` says on every request.
+                EventPayload::Call(Call::Send { .. }) => None,
                 // A row's label comes from the call *variant*; its value
                 // (or its absence) from the `Result`.
                 EventPayload::Call(call) => Some(Artifact {

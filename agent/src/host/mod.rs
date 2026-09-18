@@ -5231,8 +5231,12 @@ mod tests {
             Some(&crate::document::ChatMessage {
                 role: crate::document::ChatRole::User,
                 content:
-                    "history log:\n[harness] fork of branch #1 at #4 — questions before this \
-                 line are being handled there; do not redo its work unless asked."
+                    // The `answer` row above it is new: an `answer`
+                    // renders whole now, the same as a `tell` or an
+                    // `ask`, rather than not at all.
+                    "history log:\n[4] you answered #2: \"a1\"\n[harness] fork of branch #1 at \
+                 #4 — questions before this line are being handled there; do not redo its \
+                 work unless asked."
                         .to_owned(),
                 tool_calls: None,
                 tool_call_id: None,

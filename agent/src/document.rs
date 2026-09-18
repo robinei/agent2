@@ -296,69 +296,108 @@ fn author_label(tree: &Tree, from: Author) -> String {
 }
 
 
-/// A program's source with each `tell` of a **literal** string replaced
-/// by a reference to the row that now carries it.
+/// Where each program's literal `tell`/`ask` calls sit in its own
+/// source, keyed by the turn that wrote them.
 ///
-/// `tell` renders whole, as its own row, so a literal one is in the
-/// document twice: once as the row and once inside the `tell(...)` that
-/// produced it. Measured across every run kept on 2026-09-17, 1011 of
-/// 3344 tells (30%) had their text verbatim in their own program.
-///
-/// **Only when the text is verbatim inside the call's own span.** A
-/// computed `tell("--- " + f.content)` is not duplication — the row has
-/// the bytes, the source has the *construction*, and the construction
-/// is program logic worth reading. 87% of tells are computed, and this
-/// leaves every one of them alone.
-///
-/// Not `ask`, and not `answer`, though both put text in the source: an
-/// `ask` renders at most an elided preview in the menu and `answer`
-/// renders nothing at all, so for those the program *is* the only copy
-/// and snipping would delete the question rather than de-duplicate it.
-///
-/// The span comes from the parser (`interp::Span`, logged as
-/// `site`/`site_end` on `Call::Send`), not from matching brackets here:
-/// a scan would have to get string literals right, and gets them wrong
-/// on the first `tell(")")` it meets. Rows written before those fields
-/// existed have `site_end` 0 and are left exactly as they were.
-fn snip_told_literals(tree: &Tree, leaf: EventId, turn: EventId, source: &str) -> String {
-    let mut cuts: Vec<(usize, usize, u64)> = Vec::new();
-    let mut seen_turn = false;
+/// Built in one pass with the same agent filter the fold uses, because
+/// a span is only meaningful against the program it was compiled from:
+/// scanning every event on the path matched one agent's call site
+/// against another agent's source, which is how a broadcast test found
+/// a 239-byte offset into a 238-byte program.
+fn told_literal_cuts(
+    tree: &Tree,
+    agent: EventId,
+    leaf: EventId,
+) -> HashMap<EventId, Vec<(usize, usize, u64, &'static str)>> {
+    let mut out: HashMap<EventId, Vec<(usize, usize, u64, &'static str)>> = HashMap::new();
+    let mut cur_agent: Option<EventId> = None;
+    let mut turn: Option<(EventId, String)> = None;
     for ev in tree.path_events(leaf) {
-        if ev.id == turn {
-            seen_turn = true;
+        if let EventPayload::Agent { .. } = ev.payload {
+            cur_agent = Some(ev.id);
             continue;
         }
-        if !seen_turn {
+        if cur_agent != Some(agent) {
             continue;
         }
         match &ev.payload {
-            // The next turn ends this program's calls.
-            EventPayload::Message(Message::Turn { .. }) => break,
+            EventPayload::Message(Message::Turn { source, .. }) => {
+                turn = Some((ev.id, source.clone()));
+            }
             EventPayload::Call(Call::Send {
                 text,
-                expects_reply: false,
                 site,
                 site_end,
+                expects_reply,
                 ..
             }) => {
+                let Some((id, src)) = &turn else { continue };
                 let (a, b) = (*site as usize, *site_end as usize);
-                if b > a && b <= source.len() && source.is_char_boundary(a) && source.is_char_boundary(b)
-                    && source[a..b].contains(text.as_str())
+                if b <= a
+                    || b > src.len()
+                    || !src.is_char_boundary(a)
+                    || !src.is_char_boundary(b)
+                    || !src[a..b].contains(text.as_str())
                 {
-                    cuts.push((a, b, ev.id.as_u64()));
+                    continue;
                 }
+                let cuts = out.entry(*id).or_default();
+                // Never two cuts over the same bytes: an `ask` nested
+                // inside a `tell` is one call's span inside another's,
+                // and replacing the outer leaves the inner pointing
+                // past the end of a string that just got shorter.
+                if cuts.iter().any(|(x, y, _, _)| a < *y && *x < b) {
+                    continue;
+                }
+                // The verb stays, so the call still reads as a call —
+                // `const answer = await ask(/* [7] above */);` keeps its
+                // shape where a bare comment would not.
+                let verb = if *expects_reply { "ask" } else { "tell" };
+                cuts.push((a, b, ev.id.as_u64(), verb));
             }
             _ => {}
         }
     }
-    if cuts.is_empty() {
+    out
+}
+
+/// A program's source with each literal `tell`/`ask` replaced by a
+/// reference to the row that now carries it.
+///
+/// Those render whole, as rows of their own, so a literal one is in the
+/// document twice: once as the row and once inside the call that
+/// produced it. Across every run kept on 2026-09-17, 1011 of 3344
+/// tells (30%) and 121 of 196 asks (61%) had their text verbatim in
+/// their own program.
+///
+/// **Only when the text is verbatim inside the call's own span.** A
+/// computed `tell("--- " + f.content)` is not duplication — the row has
+/// the bytes, the source has the *construction*, and that is program
+/// logic worth reading. 87% of tells are computed and every one of them
+/// is left alone.
+///
+/// An `answer` is not snipped for want of an end offset, not for want
+/// of a reason: it is a settle-at-dispatch verb, and `SettleCall`
+/// records only a start.
+///
+/// The span is the parser's own (`interp::Span`, logged as `site` and
+/// `site_end` on `Call::Send`), not brackets matched here — a scan
+/// would have to get string literals right and would get them wrong on
+/// the first `tell(")")` it met. Rows written before those fields
+/// existed carry `site_end` 0 and render exactly as they did.
+fn snip_told_literals(
+    source: &str,
+    cuts: Option<&Vec<(usize, usize, u64, &'static str)>>,
+) -> String {
+    let Some(cuts) = cuts else {
         return source.to_owned();
-    }
+    };
+    let mut cuts = cuts.clone();
     // Right to left, so no earlier offset goes stale.
-    cuts.sort_by_key(|(a, _, _)| std::cmp::Reverse(*a));
+    cuts.sort_by_key(|(a, _, _, _)| std::cmp::Reverse(*a));
     let mut out = source.to_owned();
-    for (a, b, id) in cuts {
-        out.replace_range(a..b, &format!("tell(/* [{id}] above */)"));
+    for (a, b, id, verb) in cuts {
+        out.replace_range(a..b, &format!("{verb}(/* [{id}] above */)"));
     }
     out
 }
@@ -504,6 +543,30 @@ fn pending_line(
         // a sentence to a person become a file dump; paying for it in
         // the same context that reads it is the only feedback the model
         // gets, and `history.remove` is how it settles the bill.
+        // An `ask` is a `tell` that expects an answer back, and an
+        // `answer` is the reply to one. All three are the same act —
+        // words crossing between this branch and someone else — so all
+        // three render the same way: whole, as a row of their own. An
+        // `ask` used to render as an elided menu preview and an
+        // `answer` as nothing at all, which left the program that made
+        // it holding the only full copy.
+        EventPayload::Call(Call::Send {
+            to,
+            text,
+            expects_reply: true,
+            ..
+        }) => Some(format!(
+            "[{}] you asked {}: {}",
+            event.id.as_u64(),
+            crate::machine::address_label(to),
+            escape_untrusted(text)
+        )),
+        EventPayload::Answer { question, value } => Some(format!(
+            "[{}] you answered #{}: {}",
+            event.id.as_u64(),
+            question.as_u64(),
+            escape_untrusted(&value.to_string())
+        )),
         EventPayload::Call(Call::Send {
             to,
             text,
@@ -655,6 +718,7 @@ pub(crate) fn render_with_lookup(
     let mut messages = vec![ChatMessage::text(ChatRole::System, context.system.clone())];
     messages.extend(worked_examples(&context.exemplars, transport));
     let preamble = messages.len();
+    let cuts = told_literal_cuts(tree, agent, leaf);
     let mut pending: Vec<String> = Vec::new();
     let mut cur_agent: Option<EventId> = None;
     // `Transport::RunProgram` only: the id of the most recent turn's
@@ -680,7 +744,7 @@ pub(crate) fn render_with_lookup(
         match &ev.payload {
             EventPayload::Message(Message::Turn { source, .. }) => {
                 let content = match compacted.get(&ev.id) {
-                    None => Some(snip_told_literals(tree, leaf, ev.id, source)),
+                    None => Some(snip_told_literals(source, cuts.get(&ev.id))),
                     Some(shadow) => compacted_program_comment(ev.id, shadow),
                 };
                 // A removed program occupies no slot at all. Because a
@@ -1348,6 +1412,46 @@ mod tests {
         assert!(
             !program.contains("\"hello\""),
             "and the duplicated bytes are gone: {program}"
+        );
+    }
+
+    /// An `ask` is snipped on the same terms, and keeps its verb so the
+    /// call still reads as a call — `await ask(/* [7] above */)` has a
+    /// shape where a bare comment would not.
+    #[test]
+    fn a_literal_ask_is_snipped_and_keeps_its_verb() {
+        let src = "const a = await ask(\"user\", \"which one?\");\n";
+        let at = src.find("ask(").unwrap();
+        let end = src.find(");").unwrap() + 1;
+        let mut tree = Tree::new(None);
+        let mut spine = tree
+            .start_agent(None, None, "root", None, "CARD", Vec::new())
+            .unwrap();
+        tree.append(&mut spine, user_post("go")).unwrap();
+        tree.append(&mut spine, turn(src)).unwrap();
+        let q = tree
+            .append(
+                &mut spine,
+                EventPayload::Call(Call::Send {
+                    to: Address::User,
+                    text: "which one?".into(),
+                    input: serde_json::Value::Null,
+                    expects_reply: true,
+                    site: at as u32,
+                    site_end: end as u32,
+                }),
+            )
+            .unwrap();
+
+        let doc = render(&tree, &spine, 64 * 1024, Transport::Program);
+        let all: String = doc.messages.iter().map(|m| m.content.clone()).collect();
+        assert!(
+            all.contains(&format!("const a = await ask(/* [{}] above */)", q.as_u64())),
+            "{all}"
+        );
+        assert!(
+            all.contains(&format!("[{}] you asked user: which one?", q.as_u64())),
+            "and the question itself renders whole, as its own row: {all}"
         );
     }
 
