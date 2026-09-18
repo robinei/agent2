@@ -68,6 +68,11 @@ impl super::Compiler {
         c
     }
 
+    /// Make a top-level `return` a compile error carrying `message`.
+    pub(crate) fn set_no_top_level_return(&mut self, message: Option<String>) {
+        self.no_top_level_return = message;
+    }
+
     /// Install the fragment's re-resolved analysis and continue the shared
     /// label numbering.
     pub(crate) fn begin_fragment(

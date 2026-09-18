@@ -19,6 +19,7 @@ impl super::Compiler {
             interned: HashSet::new(),
             const_env: HashMap::new(),
             pin_root: false,
+            no_top_level_return: None,
         }
     }
 

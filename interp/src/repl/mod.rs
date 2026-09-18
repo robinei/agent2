@@ -110,6 +110,24 @@ impl Repl {
         })
     }
 
+    /// Reject a top-level `return` in every fragment, with `message`.
+    ///
+    /// **The rule is here; the wording is the caller's** (D16). A top-level
+    /// `return` is meaningless in an incremental unit — the root frame outlives
+    /// each fragment, and returning from it would end the run partway through —
+    /// but what a program should have written *instead* is the embedding
+    /// harness's vocabulary, not the language's. So `interp` carries the flag,
+    /// the inverse of `oxc`'s `allow_return_outside_function`, and the caller
+    /// supplies the sentence.
+    ///
+    /// A `return` inside a function *in* a fragment is untouched: it is an
+    /// ordinary function return, and the root scope is the only one this
+    /// applies to.
+    pub fn reject_top_level_return(&mut self, message: impl Into<String>) {
+        self.compiler
+            .set_no_top_level_return(Some(message.into()));
+    }
+
     /// Feed one fragment, appending its instructions after the ones already
     /// compiled. The VM is left standing at the first of them.
     ///

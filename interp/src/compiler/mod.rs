@@ -364,6 +364,16 @@ pub(crate) struct Compiler {
     /// compiled whole within one fragment and keep every optimization, and the
     /// one-shot path leaves this `false`.
     pin_root: bool,
+    /// When set, a top-level `return` is a compile error carrying **this
+    /// message**, supplied by the caller.
+    ///
+    /// The inverse of `oxc`'s `allow_return_outside_function`, and deliberately
+    /// the same shape: a flag, not a policy. `interp` decides *where* a
+    /// top-level `return` is detected; it does not decide what a program should
+    /// have written instead, because the alternatives are the embedding
+    /// harness's vocabulary and not the language's. Left `None` on the one-shot
+    /// path, where top-level `return` is the program's own result.
+    no_top_level_return: Option<String>,
 }
 
 // ── impl blocks live in the sub-modules above ────────────────────────

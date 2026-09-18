@@ -614,6 +614,54 @@ fn an_empty_unit_closes_cleanly() {
     }
 }
 
+// ── the top-level `return` flag (25.3) ────────────────────────────────
+
+/// Off by default: `interp` does not decide that a top-level `return` is
+/// wrong, it only offers to enforce that a caller thinks so.
+#[test]
+fn a_top_level_return_is_allowed_unless_the_caller_rejects_it() {
+    let unit = Unit::new(&["return 1;"]);
+    let mut repl = Repl::new(serde_json::Value::Null, serde_json::Value::Null).unwrap();
+    assert!(repl.push(&unit.buffer(0)).is_ok());
+}
+
+/// And when the caller rejects it, the caller's own sentence is what comes
+/// back — `interp` supplies no wording of its own.
+#[test]
+fn a_rejected_top_level_return_carries_the_callers_message() {
+    let unit = Unit::new(&["let a = 1;", "return { a };"]);
+    let mut repl = Repl::new(serde_json::Value::Null, serde_json::Value::Null).unwrap();
+    repl.reject_top_level_return("use `history.append` and `done()` instead");
+    repl.push(&unit.buffer(0)).unwrap();
+    repl.vm.step(u64::MAX).unwrap();
+    let errs = repl.push(&unit.buffer(1)).expect_err("the fragment is refused");
+    let rendered: Vec<String> = errs.iter().map(|d| d.render(&unit.buffer(1))).collect();
+    assert!(
+        rendered
+            .iter()
+            .any(|e| e.contains("use `history.append` and `done()` instead")),
+        "{rendered:?}"
+    );
+}
+
+/// The gate's second half: a `return` *inside a function* in a fragment is an
+/// ordinary function return and is left alone.
+#[test]
+fn a_return_inside_a_function_in_a_fragment_is_left_alone() {
+    let unit = Unit::new(&[
+        "function pick(xs) { for (const x of xs) { if (x > 2) { return x; } } return -1; }",
+        "const arrow = (n) => { if (n) { return \"yes\"; } return \"no\"; };",
+        "console.log(pick([1, 2, 3]), arrow(1));",
+    ]);
+    let mut repl = Repl::new(serde_json::Value::Null, serde_json::Value::Null).unwrap();
+    repl.reject_top_level_return("use `history.append` and `done()` instead");
+    for i in 0..unit.len() {
+        repl.push(&unit.buffer(i)).expect("a function may return");
+        repl.vm.step(u64::MAX).unwrap();
+    }
+    assert_eq!(console(&repl), vec!["3 yes"]);
+}
+
 /// Top-level `this` capture is refused rather than silently misplacing a slot
 /// on the fragment after it (see the diagnostic's own note).
 #[test]

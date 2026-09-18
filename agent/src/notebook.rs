@@ -30,6 +30,24 @@
 #![allow(dead_code)] // wired into the compile path in 25.4; until then
 // the only callers are this module's own tests.
 
+/// What a cell should write instead of a top-level `return` (D5, 25.3).
+///
+/// **The rule lives in `interp`; this sentence lives here** (D16). `interp`
+/// carries a flag — the inverse of `oxc`'s `allow_return_outside_function` —
+/// and `Repl::reject_top_level_return` takes the message from whoever set it,
+/// because `history.append` and `done()` are this harness's vocabulary and not
+/// the language's.
+///
+/// **The diagnostic matters more than the rule**, because ending a program
+/// with `return {…}` is the *trained* habit — exemplar 02 teaches it — so this
+/// has to say what to write instead rather than merely that it is disallowed.
+/// Under this transport `return` did two things and something else already
+/// does each: falling off the last cell ends the run, `done()` rests the
+/// branch, and `history.append` is what leaves a row the next turn reads.
+pub const NO_TOP_LEVEL_RETURN: &str =
+    "a cell cannot `return`: use `history.append(...)` to leave a row the next \
+     turn reads, and `done()` to rest once the work is finished";
+
 /// One executable cell, as a byte range into the markdown it came from.
 ///
 /// The range covers the cell's *content* — everything between the
@@ -424,6 +442,57 @@ three\n";
     fn a_closing_fence_at_eof_without_a_newline_closes() {
         let md = "```js\ndone();\n```";
         assert_eq!(cells_of(md), vec!["done();\n"]);
+    }
+
+    // --- the `return` diagnostic (D5, 25.3) ---
+
+    /// The gate: the message names both replacements, because a model that is
+    /// only told `return` is disallowed has nowhere to go. It is carried into
+    /// `interp` by `Repl::reject_top_level_return`, which supplies no wording
+    /// of its own.
+    #[test]
+    fn the_return_diagnostic_names_what_to_use_instead() {
+        assert!(
+            NO_TOP_LEVEL_RETURN.contains("history.append"),
+            "the message must name what leaves a row for the next turn"
+        );
+        assert!(
+            NO_TOP_LEVEL_RETURN.contains("done()"),
+            "the message must name what rests the branch"
+        );
+        assert!(
+            NO_TOP_LEVEL_RETURN.contains("return"),
+            "and it must name the thing being refused"
+        );
+    }
+
+    /// End to end through the REPL: a cell's top-level `return` is refused
+    /// with this harness's sentence, while a `return` inside a function in a
+    /// cell is left alone.
+    #[test]
+    fn a_cell_cannot_return_but_a_function_in_one_can() {
+        let md = "```js\nfunction f() { return 1; }\nconsole.log(f());\n```\n\n\
+                  ```js\nreturn { done: true };\n```\n";
+        let cells = split_cells(md);
+        assert_eq!(cells.len(), 2);
+
+        let mut pb = ParseBuffer::new(md);
+        let mut repl =
+            interp::Repl::new(serde_json::Value::Null, serde_json::Value::Null).unwrap();
+        repl.reject_top_level_return(NO_TOP_LEVEL_RETURN);
+
+        repl.push(pb.focus(cells[0]))
+            .expect("a function inside a cell may return");
+        repl.vm.step(u64::MAX).unwrap();
+        assert_eq!(repl.vm.console_lines, vec!["1"]);
+
+        let errs = repl
+            .push(pb.focus(cells[1]))
+            .expect_err("the cell's own `return` is refused");
+        assert!(
+            errs.iter().any(|d| d.message == NO_TOP_LEVEL_RETURN),
+            "expected this harness's message, got {errs:?}"
+        );
     }
 
     // --- the parse buffer (D2) ---
