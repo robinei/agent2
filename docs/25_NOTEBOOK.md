@@ -2,8 +2,9 @@
 
 The model's reply stops being a bare JavaScript program and becomes
 **markdown containing executable code blocks**. Prose is prose, reaching
-the person as it streams; the code blocks are one *run* — separate
-compilations sharing one frame, one scope and one outcome.
+the person as it streams; the code blocks are one *run* — one
+compilation that pauses at each block, sharing a frame, a scope and a
+single outcome.
 
 ## Why
 
@@ -50,9 +51,8 @@ done();
 ````
 
 One completion. One `Turn` whose `source` is the whole markdown, byte
-for byte. Two cells sharing one frame — `a` is visible in the second
-cell because the compiler carries cell 0's scope table into cell 1 and
-both run against the same locals (D12).
+for byte. Two cells sharing one frame — `a` is visible in the second cell because
+the analyzer and compiler never stopped between them (D12).
 
 Note what cell 0 does *not* do: end with `return`. That is the habit
 exemplar 02 teaches, and there is no `return` here at all (D5) — a cell
@@ -68,10 +68,11 @@ reply. Cells are byte spans within it, numbered from zero.
 
 This keeps the property phase 24 was careful about: `Call::site` is an
 offset into the stored source, so a report can annotate a program per
-call site from the log alone. Cells are *compiled* from their own text
-(D2), but they are never *stored* that way — the log holds the markdown
-and offsets into it, so `Turn.source` stays what the model wrote and no
-consumer has to know cells exist.
+call site from the log alone. A cell is *isolated* while it compiles —
+it is the only live region of the shared buffer (D2) — but it is never
+*stored* that way. The log holds the markdown and offsets into it, so
+`Turn.source` stays what the model wrote and no consumer downstream has
+to know cells exist at all.
 
 ### D2 — One coordinate system: the markdown's own offsets
 
@@ -320,27 +321,32 @@ whole program is written blind too, so this is not a regression — but
 the failure is now visible mid-stream, which is new, and cancellation
 bounds the waste rather than removing it.
 
-### D12 — Cells compile incrementally; capture promotes with `FreshCell`
+### D12 — One compilation that pauses
 
-Each cell compiles once, with the compiler re-entered carrying the prior
-scope table. Cell 0's instructions are never regenerated, so nothing a
-later cell does can change them. Slot indices are allocated in
-declaration order and stay put: cell 1 resolves `a` to the slot cell 0
-gave it, and allocates its own names above.
+The `Analyzer`, its growing `ProgramAnalysis`, the `Compiler` and the VM
+all stay alive for the whole reply and are fed each cell in turn through
+the shared buffer (D2). **Nothing is carried between cells, because
+nothing is rebuilt.** A cell boundary is not a compilation boundary — it
+is a point at which the instructions emitted so far happen to be run.
 
-**An earlier draft of this doc got the obstacle wrong.** It argued that
-appending is unsafe because the whole-program analysis could change
-codegen for code that already ran, and proposed moving top-level names
-into a run-lived scope map with runtime name resolution. That objection
-applies to *recompiling the prefix*, which nothing here does. Incremental
-compilation has no such problem, and the scope map would have bought
-nothing for a hash lookup per access and a lost compile-time resolution.
+That works because spans arrive absolute. The analysis table is
+span-keyed, so it accumulates without collision; the compiler appends to
+its own `code`/`spans`, so label ids backpatch against the same vector
+they were emitted into and addresses come out absolute by construction.
 
-The real obstacle is narrower, and it is not the slot index but the slot
-*representation*. `analyzer/captures.rs` assigns each own-local a
-`SlotKind` from whole-unit capture analysis: a slot captured by a
-descendant closure is `Boxed` — one eager cell shared by reference —
-and everything else is `Plain`, a raw value in the frame. So:
+One pass must be scoped to the newly appended range: **backpatch**,
+which runs from the cell's first instruction onward. Cell 0's jumps hold
+resolved addresses by now, not label ids, and a pass that cannot tell
+the two apart would corrupt them.
+
+#### Capture across cells, and the one thing that must move
+
+Slot *indices* are stable — allocated in declaration order, so cell 1
+resolves `a` to the slot cell 0 gave it and allocates its own names
+above. Slot *representation* is not. `analyzer/captures.rs` assigns each
+own-local a `SlotKind` from capture analysis: a slot captured by a
+descendant closure is `Boxed`, one eager cell shared by reference, and
+everything else is `Plain`, a raw value in the frame.
 
 ```js
 // cell 0
@@ -352,81 +358,64 @@ console.log(x);          // nothing captures x → Plain, a raw value
 const f = () => x + 1;   // x is captured now → this code expects a Box
 ```
 
-Cell 0 has run and written a raw value into the slot that cell 1's
-closure expects to be a cell. The index agreed; the representation did
-not. Boxing is a property of the binding decided by uses that may not
-have been written yet, which is the one thing a widening window cannot
-settle after the fact.
+Cell 0 wrote a raw value into a slot cell 1's closure expects to be a
+cell. Boxing is a property of the binding decided by uses that may not
+have been written yet — the one thing a widening window cannot settle
+after the fact.
 
-**The promotion primitive already exists**: `Instr::FreshCell(slot)`.
-Its doc comment describes it as re-boxing a captured loop local per
-iteration, but the implementation is general — it reads the slot,
-dereferencing an `Upval` if there is one and otherwise taking the raw
-value, allocates a cell seeded with it, and stores `Value::Upval(idx)`
-back. On a `Plain` slot that is exactly a value-preserving
-`Plain → Boxed` promotion.
+**The primitive for moving it already exists**: `Instr::FreshCell(slot)`.
+Its doc comment describes re-boxing a captured loop local per iteration,
+but the implementation is general — it reads the slot, dereferencing an
+`Upval` if there is one and otherwise taking the raw value, allocates a
+cell seeded with it, and stores `Value::Upval(idx)` back. On a `Plain`
+slot that is exactly a value-preserving `Plain → Boxed` promotion.
 
-So slots stay `Plain` by default. When cell *k*'s analysis finds it
-captures a name an earlier cell declared `Plain`, the compiler emits
-`FreshCell(slot)` at the top of cell *k* and flips that name to `Boxed`
-in the carried scope table. Nothing pays an indirection unless a later
-cell actually closes over it, and then it costs one instruction, once.
+**And the promotion set is a diff, not a rule.** `finalize_tables`
+recomputes `slot_kinds` over the accumulated scopes, so re-finalizing
+after each cell and comparing against the previous result yields exactly
+the slots that flipped. Those get a `FreshCell` at this cell's start.
+There is no "is this the first capture of an earlier name" logic to
+write.
 
-An earlier draft boxed every top-level slot unconditionally to pin the
-representation before any cell ran. Unnecessary, given the above.
+**Why promotion is sound.** A flip can only be caused by a *new* closure
+in the cell being compiled: if any closure in an earlier cell had
+referenced the name, that reference was itself a capture and the slot
+was `Boxed` from the start. So every instruction compiled against the
+`Plain` representation is straight-line code in a cell that has already
+run to completion, and nothing that could observe the old
+representation survives the boundary.
 
-**Nothing is carried, because nothing is rebuilt.** The `Analyzer`, its
-growing `ProgramAnalysis`, the `Compiler` and the VM all stay alive for
-the whole reply and are fed each cell in turn. This is not incremental
-compilation with state threaded between calls — it is **one compilation
-that pauses**, and a cell boundary is a point where the instructions
-emitted so far happen to be run.
+The ordering invariant it rests on: promotion is emitted at cell
+*start*, and cells run strictly sequentially (D11). A fence can close
+while the previous cell is still suspended on an await, so a cell may
+**compile** early — but its first instruction does not **execute** until
+the previous cell has finished, so that cell's post-await tail never
+reads a slot promoted underneath it.
 
-That works only because of D2. Spans arrive absolute, so the analysis
-table — keyed by span — accumulates without collision, and the compiler
-appends to its own `code`/`spans` so label ids backpatch against the
-same vector they were emitted into. Addresses come out absolute by
-construction.
+#### Drafts that were wrong, and why
 
-Two earlier drafts each invented machinery to fix a problem they had
-themselves created: compiling each cell standalone and appending its
-`Program` afterwards (which made jump targets cell-relative, "solved" by
-threading a base address through label resolution), and seeding a fresh
-analyzer per cell with a hand-carried scope table (which existed only
-because unpadded cells produced colliding spans). Neither is needed.
+Three, each inventing machinery to fix a problem the previous one had
+created. Recorded because the errors are the useful part.
 
-What *does* have to be scoped to the newly appended range is the
-backpatch pass: cell 0's jumps hold resolved addresses by now, not label
-ids, and a pass that cannot tell the two apart would corrupt them. It
-runs from the cell's first instruction onward.
+1. **A run-lived scope map with runtime name resolution**, on the
+   grounds that whole-program analysis could change codegen for code
+   that already ran. That objection applies to *recompiling the prefix*,
+   which nothing here does. It would have cost a hash lookup per access
+   and compile-time name resolution to solve a problem that was absent.
+2. **Boxing every top-level slot unconditionally**, to pin the
+   representation before any cell ran. The right problem, but
+   `FreshCell` already moves a slot, so the common case need not pay.
+3. **Compiling each cell standalone and appending its `Program`**, which
+   made jump targets cell-relative and needed a base address threaded
+   through label resolution — and left the span collision untouched, so
+   the analyzer still had to be seeded by hand. Emitting into the shared
+   buffers in the first place means neither problem arises.
 
-**The promotion set is a diff, not a rule.** `finalize_tables`
-recomputes `slot_kinds` over all accumulated scopes. Re-finalize after
-each cell and compare against the previous result: every slot that
-flipped `Plain → Boxed` is exactly the set needing a `FreshCell` at this
-cell's start. There is no bespoke "is this the first capture of an
-earlier name" logic to write — it is a diff of two tables the analyzer
-already produces.
-
-**Why promotion is sound.** If an earlier cell's analysis said `Plain`,
-then no closure in that cell referenced the name — a reference from a
-nested function *is* a capture, which would have forced `Boxed` there.
-So the only code compiled against the `Plain` representation is
-straight-line code in cells that have already run to completion, and
-nothing that could observe the old representation survives the boundary.
-
-The ordering invariant this rests on: promotion is emitted at cell
-*start*, and cells run strictly sequentially (D11). A cell's fence can
-close while the previous cell is still suspended on an await, so cell
-*k+1* may **compile** early — but its first instruction does not
-**execute** until cell *k* has finished, so cell *k*'s post-await tail
-never reads a slot promoted underneath it.
-
-Worth checking during 25.2 rather than assuming: `NameRes::Const` —
-a const binding folded at compile time that "never reaches the frame" —
-appears to carry over safely, since a carried scope table folds it
-identically in later cells. Loop-declared `FreshCell` slots do not arise
-at cell top level.
+Worth checking during 25.2 rather than assuming: `NameRes::Const` — a
+const binding folded at compile time that "never reaches the frame" —
+should accumulate safely, since the analysis table simply keeps it and
+later cells fold it identically. Loop-declared `FreshCell` slots do not
+arise at cell top level.
 
 ### D13 — The TUI collapses cells
 
@@ -479,9 +468,10 @@ every span slices the markdown back to exactly the cell's text.
 
 **25.2 — One paused compilation (D12).** Analyzer, `ProgramAnalysis`,
 `Compiler` and VM all live for the whole reply and are fed each cell in
-turn through the shared buffer (D2); backpatch scoped to the appended range; growable frame
-locals; `FreshCell` emitted for the `Plain → Boxed` diff across
-re-finalization.
+turn through the shared buffer (D2); backpatch scoped to the appended
+range; growable frame locals; `FreshCell` emitted for the
+`Plain → Boxed` diff across re-finalization. `interp`-level only — no
+transport, no events, cells driven by a test harness.
 
 Gate: `cargo test -p interp` green, plus tests that a `const` in cell 0
 is readable in cell 1; that an undeclared name is a *compile* error
@@ -497,13 +487,28 @@ cell is a compile error naming `history.append` and `done()`. Gate: a
 test asserting the message names both, and that a `return` inside a
 function *in* a cell is left alone.
 
-**25.4 — `Transport::Notebook`, batch first.** Wire the split into the
-compile path beside `extract_program`, executing cells in sequence
-*after* the completion ends. No streaming yet — this isolates the
-transport from the scheduling change. Gate: a scripted session test
-asserting `Turn.source` is byte-identical to the completion, exactly one
-`Return`/`Condition` per turn, one report, one next completion, and
-every `Call::site` resolving to the right span in the markdown.
+**25.4 — `Transport::Notebook`, batch first, and the cell driver.**
+Wire the split into the compile path beside `extract_program`, executing
+cells in sequence *after* the completion ends. No streaming yet — this
+isolates the transport from the scheduling change.
+
+**This step owns the seam D7 and D9 both point at, and it is the
+riskiest thing in the phase.** `finish_program` renders
+unconditionally today, on the premise that a program running out is a
+turn running out. Under a notebook those come apart: a cell ending means
+*walk to the next cell*, and only the notebook ending means *one report,
+one next completion*. The same fork governs a handback — `resume(v)`
+falls out of cell *k* into the driver, which must continue at *k+1*
+rather than treat the run as complete. Every other step here is local;
+this one changes a control-flow premise the harness has held since the
+loop was written, and it is the only part of this design not traced
+against the code.
+
+Gate: a scripted session test asserting `Turn.source` is byte-identical
+to the completion, exactly one `Return`/`Condition` per turn, one report
+and one next completion for a three-cell reply (**not three**), that a
+`raise` in cell 0 resumed by a handler runs cells 1 and 2 afterwards,
+and every `Call::site` resolving to the right span in the markdown.
 
 **25.5 — Execute as the fences close (D11).** Dispatch on fence close;
 cancel the in-flight completion on `done()`, trap or raise. Gate: tests
@@ -520,8 +525,15 @@ existing `chat.rs` render tests still green.
 above; cells are one scope; no `return`; `done()` ends the notebook;
 ```js runs. Gate: every exemplar parses and runs against stub tools.
 
-**25.8 — Measure before adopting.** `drive.py --card` with a notebook
-arm against the current one, on the existing tasks. Gate: report
-**programs/run** and **output tokens** explicitly — those are where
-chat-mode drift would show, and they are the reason to keep this behind
-a transport rather than switching to it.
+**25.8 — Measure before adopting.** Two arms on the existing tasks,
+differing only by `AGENT2_TRANSPORT`. The plumbing is already there:
+`Transport` is read from that variable in `document.rs`, and `drive.py`
+already lists it among the provenance knobs, so the two arms stamp
+distinguishably rather than producing two JSONs that cannot be told
+apart.
+
+Gate: report **programs/run** and **output tokens** explicitly — those
+are where chat-mode drift would show, and they are the reason to keep
+this behind a transport rather than switching to it. Also report whether
+cancelling an in-flight completion actually reduced output tokens
+(D11), which is asserted nowhere and assumed in one place.
