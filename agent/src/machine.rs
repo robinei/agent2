@@ -315,6 +315,16 @@ struct Run {
     /// to the same block across a continuation.
     program_id: EventId,
     vm: VM,
+    /// `Transport::Notebook` only: the reply's remaining cells and the paused
+    /// compilation feeding them into `vm`.
+    ///
+    /// **A reply is one run** (D7), so this is not a second run beside the
+    /// first — it is the compile half of *this* one. `vm` stays where it always
+    /// was and is stepped exactly as it always was; the only new thing is that
+    /// on `StepResult::Paused` there is somewhere to go for more code.
+    /// `None` under every other transport, which is what keeps those paths
+    /// byte-for-byte what they were.
+    notebook: Option<crate::notebook::Notebook>,
 }
 
 /// How `Runner::resume` re-enters a suspended run — the *live* half of a
@@ -544,6 +554,17 @@ enum SuspendCause {
     Trapped(VMError),
     /// Someone spoke to the running program.
     Posted(Vec<EventId>),
+    /// `Transport::Notebook` only: a cell after the first did not compile.
+    ///
+    /// Distinct from the `CompileFailed` handback in `apply_turn`, which is
+    /// the case where *no VM was ever built*. Here one was, and earlier cells
+    /// have already run — their calls made, their rows appended. So this
+    /// suspends the run that is under way rather than refusing a turn that
+    /// never started, and the effects that happened stay in the log. The
+    /// cause is still `Cause::CompileFailed`: what went wrong is that the
+    /// model wrote a cell that does not compile, and that is what the repair
+    /// loop needs to see.
+    CellCompileFailed(String),
 }
 
 impl Runner {
@@ -1106,6 +1127,31 @@ impl Runner {
             return Ok(out);
         }
 
+        // **A reply with no cells rests the branch** (D4), and needs no rule
+        // of its own — this is only the "there is nothing to run" gate the
+        // `RunProgram` case above already is. The model spoke and stopped:
+        // that is a complete turn, not a failure. Nothing is refused and
+        // nothing is re-asked.
+        //
+        // Resting is not a state. With no `Turn` outcome logged,
+        // `last_turn_outcome` finds no `Return`/`Condition` after the newest
+        // `Turn` and returns `None`, so `needs_prompt`'s outcome clause is
+        // false; with no `Post`, its other clause is false too. That is
+        // bit-for-bit the state `done()` produces by advancing `shown`.
+        //
+        // The share of replies that land here is the chat-mode-drift metric
+        // 25.8 wants, and it is free to count. It is a metric, not a gate:
+        // requiring a cell never prevented drift — a drifting model writes
+        // `done();` in a cell and drifts identically — it only ever prevented
+        // the *silent* variant, and a reply that speaks and rests is not
+        // silent.
+        if self.transport == crate::document::Transport::Notebook
+            && crate::notebook::split_cells(&source).is_empty()
+        {
+            self.phase = Phase::Idle;
+            return Ok(out);
+        }
+
         match self.start_program(tree, assistant_id, &source) {
             Ok(run) => {
                 if let Phase::Suspended(old, resume_with) =
@@ -1448,12 +1494,48 @@ impl Runner {
         program_id: EventId,
         source: &str,
     ) -> Result<Run, String> {
+        if self.transport == crate::document::Transport::Notebook {
+            return self.start_notebook(tree, program_id, source);
+        }
         let program = compile(source).map_err(|diags| render_diags(source, &diags))?;
         // The whole `input` reaches the program even though the context
         // saw only a bounded preview of it.
         let vm = VM::for_program(program, self.spine.context().input(tree))
             .map_err(|e| format!("program setup failed: {}", e.message))?;
-        Ok(Run { program_id, vm })
+        Ok(Run {
+            program_id,
+            vm,
+            notebook: None,
+        })
+    }
+
+    /// `Transport::Notebook`'s half of [`start_program`](Self::start_program):
+    /// split the reply into cells and compile the **first** one.
+    ///
+    /// Only the first. The rest arrive through `pump`'s `Paused` arm as the VM
+    /// reaches each cell's `Instr::Pause`, which is what makes the cells one
+    /// compilation that pauses rather than a series of programs.
+    ///
+    /// A cell that does not compile is reported exactly as a program that does
+    /// not compile: the caller turns it into `Cause::CompileFailed` and the
+    /// repair loop sees it. Under D15 (25.5) a later cell failing will leave
+    /// the earlier ones' effects standing; batching here means the first
+    /// failure costs the whole reply, which is what today's transport does too.
+    fn start_notebook(
+        &mut self,
+        tree: &Tree,
+        program_id: EventId,
+        source: &str,
+    ) -> Result<Run, String> {
+        let mut notebook = crate::notebook::Notebook::new(source);
+        let mut vm = VM::for_incremental(self.spine.context().input(tree), serde_json::Value::Null)
+            .map_err(|e| format!("program setup failed: {}", e.message))?;
+        notebook.feed_next(&mut vm)?;
+        Ok(Run {
+            program_id,
+            vm,
+            notebook: Some(notebook),
+        })
     }
 
     /// Drive the VM until it blocks on the host, suspends, finishes, or
@@ -1491,13 +1573,30 @@ impl Runner {
                 Ok(StepResult::Done { value, unstarted }) => {
                     return self.finish_program(tree, value, unstarted, out);
                 }
-                // A fragment of an incremental evaluation ended. Only the
-                // notebook transport compiles fragments, and its driver
-                // (25.4) owns this arm; nothing on the program transport
-                // ever emits `Instr::Pause`, so reaching it here would mean
-                // a program was compiled one way and run another.
+                // **A cell ended — the run did not** (D7). The frame is
+                // still standing with every binding the cell declared, so
+                // there is nothing to log and nothing to report: feed the
+                // next cell in and keep stepping. When the cells run out,
+                // the epilogue appended here is the ordinary root
+                // `Return(0)`, so the very next step reports `Done` and
+                // reaches `finish_program` on the one path every program
+                // takes. That is why `finish_program` needs no notebook
+                // case: a cell boundary never arrives there.
                 Ok(StepResult::Paused) => {
-                    unreachable!("Paused outside the incremental driver")
+                    let Some(notebook) = run.notebook.as_mut() else {
+                        unreachable!("Paused with no notebook driving it")
+                    };
+                    // Borrow the VM out of the same `run` the notebook
+                    // lives on: the compile half and the VM are two fields
+                    // of one run, not two runs.
+                    let (vm, notebook) = (&mut run.vm, notebook);
+                    if let Err(report) = notebook.feed_next(vm) {
+                        // A later cell that does not compile stops the run
+                        // that is already under way — earlier cells have
+                        // run, and what they did stays in the log.
+                        return self
+                            .suspend(tree, SuspendCause::CellCompileFailed(report), out);
+                    }
                 }
                 Ok(StepResult::Raise { condition, payload }) => {
                     return self.suspend(tree, SuspendCause::Raise { condition, payload }, out);
@@ -2563,6 +2662,21 @@ impl Runner {
                 // the two cases aren't confused when this is read later.
                 (cause, site, ResumeWith::Trapped(e), Disposition::Pushed)
             }
+            SuspendCause::CellCompileFailed(report) => {
+                // `ip` is parked on the failed cell's append position, which
+                // has no instruction yet — so there is no span to point at,
+                // and a zero-width site is the convention for exactly that.
+                (
+                    Cause::CompileFailed { message: report },
+                    0,
+                    // Nothing to resume *into*: the cell that would have
+                    // continued the run does not exist. The next completion
+                    // starts a fresh reply, as it does for any other
+                    // compile failure.
+                    ResumeWith::Continue,
+                    Disposition::Pushed,
+                )
+            }
             SuspendCause::Posted(ids) => {
                 let site = span_at(&run.vm, run.vm.ip as usize);
                 // A post arriving is never a tail call — there is no
@@ -3470,6 +3584,7 @@ mod tests {
                     state.phase = Phase::Running(Run {
                         program_id: state.spine.leaf_id,
                         vm,
+                        notebook: None,
                     });
                     let mut out = Vec::new();
                     state.dispatch_settle(&mut tree, call, &mut out).unwrap();
@@ -5152,5 +5267,288 @@ mod tests {
         });
         assert!(label.starts_with("tell(user, "), "{label}");
         assert!(label.len() < crate::report::LABEL_MAX_BYTES + 32, "{label}");
+    }
+
+    // ── `Transport::Notebook` (phase 25, step 25.4) ────────────────
+    //
+    // Batch first: the reply is split into cells and they run in
+    // sequence *after* the completion ends. **A reply is one run**
+    // (D7) — the cells share a frame that is never unwound between
+    // them, so a cell boundary never reaches `finish_program` and the
+    // reply's own `Return(0)` does, once.
+
+    /// A three-cell reply. The gate, most of it in one place: the
+    /// `Turn` holds the completion byte-for-byte, exactly one outcome
+    /// is logged, and the cells share a scope — cell 2 reads what cell
+    /// 0 declared and cell 1 changed.
+    #[test]
+    fn a_three_cell_reply_is_one_turn_one_run_and_one_outcome() {
+        let (mut tree, mut state) = setup_under(crate::document::Transport::Notebook);
+        user_post(&mut state, &mut tree, "go");
+        let reply = "Reading the two files first.\n\n\
+             ```js\n\
+             let total = 1;\n\
+             ```\n\n\
+             Now the adjustment.\n\n\
+             ```js\n\
+             total = total + 41;\n\
+             ```\n\n\
+             And the answer.\n\n\
+             ```js\n\
+             console.log(`total is ${total}`);\n\
+             ```\n";
+        let out = state
+            .step(&mut tree, StepInput::LlmResponse(llm_program(reply)))
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+
+        // `Turn.source` is the completion, byte for byte.
+        let sources: Vec<&str> = state
+            .agent_segment(&tree)
+            .iter()
+            .filter_map(|e| match &e.payload {
+                EventPayload::Message(Message::Turn { source, .. }) => Some(source.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sources, vec![reply]);
+
+        // One run, one terminal — not one per cell.
+        assert_eq!(
+            payload_kinds(&state, &tree),
+            ["Agent", "Post", "Turn", "Return", "Console"],
+            "three cells, one Turn and one Return"
+        );
+
+        // And they really shared a scope.
+        let report = last_report(&state, &tree);
+        assert!(report.contains("total is 42"), "{report}");
+    }
+
+    /// One report and one next completion for a three-cell reply, not
+    /// three. The branch prompts exactly once, when the *reply* ends.
+    #[test]
+    fn a_three_cell_reply_prompts_once() {
+        let (mut tree, mut state) = setup_under(crate::document::Transport::Notebook);
+        user_post(&mut state, &mut tree, "go");
+        let reply = "```js\nconsole.log(\"a\");\n```\n\n\
+                     ```js\nconsole.log(\"b\");\n```\n\n\
+                     ```js\nconsole.log(\"c\");\n```\n";
+        let out = state
+            .step(&mut tree, StepInput::LlmResponse(llm_program(reply)))
+            .unwrap();
+        let outs = drain(&mut state, &mut tree, out);
+
+        let requests = outs
+            .iter()
+            .filter(|o| matches!(o, StepOutput::LlmRequest(_)))
+            .count();
+        assert_eq!(requests, 1, "one next completion, not one per cell");
+        let outcomes = state
+            .agent_segment(&tree)
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.payload,
+                    EventPayload::Return { .. } | EventPayload::Condition { .. }
+                )
+            })
+            .count();
+        assert_eq!(outcomes, 1, "one report, not one per cell");
+    }
+
+    /// **A raise in cell 0, resumed, runs cells 1 and 2.** The VM is
+    /// parked *inside* cell 0; resuming continues from that instruction
+    /// and falls out of the cell into the driver, which walks on to the
+    /// next one rather than treating the handback as a finished run
+    /// (D9).
+    #[test]
+    fn a_raise_in_cell_0_resumes_into_the_later_cells() {
+        let (mut tree, mut state) = setup_under(crate::document::Transport::Notebook);
+        user_post(&mut state, &mut tree, "go");
+        let reply = "```js\nconst pick = raise(\"which\", { of: [1, 2] });\n```\n\n\
+                     ```js\nconsole.log(`picked ${pick}`);\n```\n\n\
+                     ```js\nconsole.log(\"and the last cell ran\");\n```\n";
+        let out = state
+            .step(&mut tree, StepInput::LlmResponse(llm_program(reply)))
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+
+        // Parked mid-cell-0, with a condition logged.
+        assert!(
+            matches!(state.phase, Phase::Suspended(..)),
+            "a raise suspends the run"
+        );
+        let out = state.resume(&mut tree, json!("the second one")).unwrap();
+        drain(&mut state, &mut tree, out);
+
+        let consoles: Vec<String> = state
+            .agent_segment(&tree)
+            .iter()
+            .filter_map(|e| match &e.payload {
+                EventPayload::Console { lines } => Some(lines.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert_eq!(
+            consoles,
+            vec!["picked the second one", "and the last cell ran"],
+            "the cells after the raise run on resume"
+        );
+    }
+
+    /// Every `Call::site` is an offset into the markdown, resolving to
+    /// that call's own text — the point of D2's one coordinate system.
+    /// With one `Turn` holding the whole reply, no rebasing is needed:
+    /// the span the compiler emitted is already the right one.
+    #[test]
+    fn every_call_site_resolves_into_the_markdown() {
+        let (mut tree, mut state) = setup_under(crate::document::Transport::Notebook);
+        user_post(&mut state, &mut tree, "go");
+        let reply = "First I speak.\n\n\
+                     ```js\ntell(\"from the first cell\");\n```\n\n\
+                     Then again, further down.\n\n\
+                     ```js\ntell(\"from the second cell\");\n```\n";
+        let out = state
+            .step(&mut tree, StepInput::LlmResponse(llm_program(reply)))
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+
+        let sites: Vec<(u32, u32)> = state
+            .agent_segment(&tree)
+            .iter()
+            .filter_map(|e| match &e.payload {
+                EventPayload::Call(Call::Send { site, site_end, .. }) => Some((*site, *site_end)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sites.len(), 2, "two tells, two sites");
+        for (start, end) in sites {
+            let sliced = &reply[start as usize..end as usize];
+            assert!(
+                sliced.starts_with("tell(") && sliced.contains("cell"),
+                "site sliced {sliced:?}, which is not the call's own text"
+            );
+        }
+        // And the second really is further into the markdown than the
+        // first, rather than both rebased to their own cell.
+        let first = reply.find("tell(\"from the first").unwrap();
+        let second = reply.find("tell(\"from the second").unwrap();
+        assert!(second > first);
+    }
+
+    /// **A reply with no cells rests the branch** (D4), and nothing was
+    /// implemented to make it: with no outcome logged, `needs_prompt`'s
+    /// outcome clause is false and the branch simply sits `Idle`. That
+    /// is bit-for-bit what `done()` produces.
+    #[test]
+    fn a_reply_with_no_cells_rests_the_branch() {
+        let (mut tree, mut state) = setup_under(crate::document::Transport::Notebook);
+        user_post(&mut state, &mut tree, "go");
+        let reply = "The retry policy already lives in `retry.rs`, so there is \
+                     nothing to change.\n\n```text\njust a quote, not a cell\n```\n";
+        let out = state
+            .step(&mut tree, StepInput::LlmResponse(llm_program(reply)))
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+
+        assert!(matches!(state.phase, Phase::Idle));
+        assert!(
+            !state.needs_prompt(&tree),
+            "the model spoke and stopped: that is a finished turn"
+        );
+        assert_eq!(
+            payload_kinds(&state, &tree),
+            ["Agent", "Post", "Turn"],
+            "the reply is logged and nothing ran"
+        );
+    }
+
+    /// A cell that does not compile stops the run — but the cells
+    /// before it have already run, and what they did stays in the log.
+    #[test]
+    fn a_later_cell_that_does_not_compile_leaves_the_earlier_ones_standing() {
+        let (mut tree, mut state) = setup_under(crate::document::Transport::Notebook);
+        user_post(&mut state, &mut tree, "go");
+        let reply = "```js\nconsole.log(\"the first cell ran\");\n```\n\n\
+                     ```js\nthis is not javascript\n```\n";
+        let out = state
+            .step(&mut tree, StepInput::LlmResponse(llm_program(reply)))
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+
+        let kinds = payload_kinds(&state, &tree);
+        assert!(
+            kinds.contains(&"Console"),
+            "cell 0's effect stands: {kinds:?}"
+        );
+        assert!(
+            kinds.contains(&"Condition"),
+            "and the run has an outcome: {kinds:?}"
+        );
+        // The effects stand in the *log* — that is what "partial
+        // progress" means. The report renders the compile failure,
+        // because that is what the repair loop has to act on.
+        let report = last_report(&state, &tree);
+        assert!(
+            report.contains("Expected a semicolon") || report.contains("compile"),
+            "the report names the failure: {report}"
+        );
+    }
+
+    /// A top-level `return` in a cell is refused, with the message that
+    /// says what to write instead (D5, 25.3) — carried end to end.
+    #[test]
+    fn a_cell_that_returns_is_refused_with_the_harness_message() {
+        let (mut tree, mut state) = setup_under(crate::document::Transport::Notebook);
+        user_post(&mut state, &mut tree, "go");
+        let reply = "```js\nreturn { done: true };\n```\n";
+        let out = state
+            .step(&mut tree, StepInput::LlmResponse(llm_program(reply)))
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+
+        let report = last_report(&state, &tree);
+        assert!(report.contains("history.append"), "{report}");
+        assert!(report.contains("done()"), "{report}");
+    }
+
+    /// `done()` does not stop anything (D8): the cells after it still
+    /// run, exactly as statements after it do today.
+    #[test]
+    fn done_in_cell_0_does_not_stop_the_later_cells() {
+        let (mut tree, mut state) = setup_under(crate::document::Transport::Notebook);
+        user_post(&mut state, &mut tree, "go");
+        let reply = "```js\ndone();\n```\n\n\
+                     ```js\nconsole.log(\"still ran\");\n```\n";
+        let out = state
+            .step(&mut tree, StepInput::LlmResponse(llm_program(reply)))
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+
+        let report = last_report(&state, &tree);
+        assert!(report.contains("still ran"), "{report}");
+        assert!(!state.needs_prompt(&tree), "`done()` still rests the branch");
+    }
+
+    /// The existing transport is untouched: a plain program under
+    /// `Transport::Program` is compiled as one program, as it always
+    /// was.
+    #[test]
+    fn the_program_transport_still_compiles_the_whole_completion() {
+        let (mut tree, mut state) = setup();
+        user_post(&mut state, &mut tree, "go");
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(llm_program("console.log(\"plain program\");")),
+            )
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+        assert_eq!(
+            payload_kinds(&state, &tree),
+            ["Agent", "Post", "Turn", "Return", "Console"]
+        );
     }
 }

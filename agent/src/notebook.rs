@@ -30,6 +30,106 @@
 #![allow(dead_code)] // wired into the compile path in 25.4; until then
 // the only callers are this module's own tests.
 
+/// The cell driver: a reply's cells, fed to one paused compilation in turn
+/// (25.4).
+///
+/// **A reply is one run** (D7). The cells share a frame that is never unwound
+/// between them, so the driver's whole job is: feed a cell, let the VM run it
+/// to its `Pause`, feed the next — and when they run out, close the unit so the
+/// ordinary root `Return(0)` ends the run on exactly the path a one-shot
+/// program takes. No cell boundary ever reaches `finish_program`; the reply's
+/// end does, once.
+///
+/// It holds the compile half of the evaluation ([`interp::ReplCore`]) rather
+/// than a whole [`interp::Repl`], because the host already keeps the VM in its
+/// own run state and one VM in two places is one too many.
+pub struct Notebook {
+    core: interp::ReplCore,
+    buffer: ParseBuffer,
+    cells: Vec<CellSpan>,
+    /// The next cell to feed. Equal to `cells.len()` once they are exhausted
+    /// and only the epilogue is left.
+    next: usize,
+}
+
+/// What [`Notebook::feed_next`] did.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Fed {
+    /// A cell's instructions were appended; step the VM to run them.
+    Cell(usize),
+    /// The cells ran out and the run's epilogue was appended; the next step
+    /// reports `Done`.
+    Closed,
+}
+
+impl Notebook {
+    /// Split `markdown` into cells and prepare to feed them.
+    ///
+    /// Nothing is compiled here — a notebook with no cells is a perfectly good
+    /// notebook that simply has nothing to run (D4), and the caller decides
+    /// what that means before any VM exists.
+    pub fn new(markdown: &str) -> Self {
+        let mut core = interp::ReplCore::new();
+        core.reject_top_level_return(NO_TOP_LEVEL_RETURN);
+        Self {
+            cells: split_cells(markdown),
+            buffer: ParseBuffer::new(markdown),
+            core,
+            next: 0,
+        }
+    }
+
+    /// How many executable cells the reply held. Zero is the cell-less reply
+    /// D4 is about, and the drift metric 25.8 counts.
+    pub fn cell_count(&self) -> usize {
+        self.cells.len()
+    }
+
+    /// The cell at `i`, as a range into the markdown.
+    pub fn cell(&self, i: usize) -> CellSpan {
+        self.cells[i]
+    }
+
+    /// Compile the next cell into `vm` — or, once they are exhausted, the
+    /// run's `Return(0)` epilogue.
+    ///
+    /// Each cell is compiled from the shared buffer with only its own bytes
+    /// live (D2), so the spans it emits are offsets into the markdown and the
+    /// analysis tables accumulate across cells instead of colliding.
+    pub fn feed_next(&mut self, vm: &mut interp::VM) -> Result<Fed, String> {
+        if self.next < self.cells.len() {
+            let i = self.next;
+            let live = self.buffer.focus(self.cells[i]);
+            self.core
+                .push(vm, live)
+                .map_err(|diags| render_cell_diags(live, &diags))?;
+            self.next += 1;
+            Ok(Fed::Cell(i))
+        } else {
+            // Nothing live: the epilogue is the compiler's own, with no
+            // source of its own to point at.
+            let blank = self.buffer.clear();
+            self.core
+                .close(vm, blank)
+                .map_err(|diags| render_cell_diags(blank, &diags))?;
+            Ok(Fed::Closed)
+        }
+    }
+}
+
+/// Render a cell's diagnostics against the parse buffer.
+///
+/// The buffer, not the raw markdown, because that is the coordinate system the
+/// spans were taken in — and outside the live cell it is blank, which is
+/// exactly right: a diagnostic points into the cell that failed.
+fn render_cell_diags(buffer: &str, diags: &[interp::Diagnostic]) -> String {
+    diags
+        .iter()
+        .map(|d| d.render(buffer))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// What a cell should write instead of a top-level `return` (D5, 25.3).
 ///
 /// **The rule lives in `interp`; this sentence lives here** (D16). `interp`

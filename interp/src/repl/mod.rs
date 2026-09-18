@@ -58,14 +58,17 @@ use crate::diag::Diagnostic;
 use crate::span::Span;
 use crate::vm::{CodeAddr, Instr, SlotKind, VM, VMError};
 
-/// A live incremental evaluation.
-pub struct Repl {
+/// The compile side of a live incremental evaluation: everything that
+/// accumulates across fragments **except** the VM.
+///
+/// Split out from [`Repl`] because a host that already holds a `VM` in its own
+/// run state — the way `agent`'s `Run` does — needs the compiler half beside
+/// it rather than a second, nested copy of the VM. Every method therefore takes
+/// the VM it is appending into. [`Repl`] is this plus the VM, for callers with
+/// nothing else to keep.
+pub struct ReplCore {
     analyzer: IncrementalAnalyzer,
     compiler: Compiler,
-    /// The VM, with the shared root frame standing from the first fragment to
-    /// the last. Public so a driver can `step` it, inspect it, settle promises
-    /// and resume conditions exactly as it would any other VM.
-    pub vm: VM,
     /// Label id -> resolved code address, for the life of the unit.
     /// `u32::MAX` means "not yet defined".
     label_addr: Vec<CodeAddr>,
@@ -89,16 +92,19 @@ pub struct Repl {
     closed: bool,
 }
 
-impl Repl {
-    /// A new unit with the host-seeded consts in place and no code.
-    pub fn new(
-        input: serde_json::Value,
-        attachments: serde_json::Value,
-    ) -> Result<Self, VMError> {
-        Ok(Self {
+impl Default for ReplCore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ReplCore {
+    /// A new unit with no code compiled yet. Pair it with a VM built by
+    /// [`VM::for_incremental`].
+    pub fn new() -> Self {
+        Self {
             analyzer: IncrementalAnalyzer::new(),
             compiler: Compiler::new_incremental(),
-            vm: VM::for_incremental(input, attachments)?,
             label_addr: Vec::new(),
             const_fn_closures: HashMap::new(),
             prev_slot_kinds: Vec::new(),
@@ -107,7 +113,7 @@ impl Repl {
             prelude_base: 0,
             fragments: 0,
             closed: false,
-        })
+        }
     }
 
     /// Reject a top-level `return` in every fragment, with `message`.
@@ -134,8 +140,8 @@ impl Repl {
     /// `buffer` is as long as the whole unit with only this fragment's text
     /// live — see the module docs. Nothing is executed here; the caller steps
     /// the VM.
-    pub fn push(&mut self, buffer: &str) -> Result<(), Vec<Diagnostic>> {
-        self.compile_and_append(buffer, false)
+    pub fn push(&mut self, vm: &mut VM, buffer: &str) -> Result<(), Vec<Diagnostic>> {
+        self.compile_and_append(vm, buffer, false)
     }
 
     /// End the unit: emit the ordinary root `Return(0)`, so the next `step`
@@ -145,8 +151,13 @@ impl Repl {
     /// `buffer` may be a final fragment or an empty unit-length buffer when
     /// there is nothing left to compile. A run is one run however many
     /// fragments it took, so this is the only terminator it ever has.
-    pub fn close(&mut self, buffer: &str) -> Result<(), Vec<Diagnostic>> {
-        self.compile_and_append(buffer, true)
+    pub fn close(&mut self, vm: &mut VM, buffer: &str) -> Result<(), Vec<Diagnostic>> {
+        self.compile_and_append(vm, buffer, true)
+    }
+
+    /// Whether the run's `Return(0)` epilogue has been emitted.
+    pub fn is_closed(&self) -> bool {
+        self.closed
     }
 
     /// The unit's source so far, as the diagnostics render against it.
@@ -156,6 +167,7 @@ impl Repl {
 
     fn compile_and_append(
         &mut self,
+        vm: &mut VM,
         buffer: &str,
         close: bool,
     ) -> Result<(), Vec<Diagnostic>> {
@@ -255,15 +267,14 @@ impl Repl {
 
         // ── backpatch the appended range, and append it ──
         let (code, spans) = self.compiler.take_fragment();
-        let base = self.vm.code.len() as CodeAddr;
+        let base = vm.code.len() as CodeAddr;
         let (code, spans) = self.backpatch(code, spans, base);
 
-        let from = self.vm.code.len();
-        self.vm.code.extend(code);
-        self.vm.spans.extend(spans);
-        self.vm
-            .install_const_fn_closures(from, &mut self.const_fn_closures);
-        self.vm.source = Arc::from(self.source.as_str());
+        let from = vm.code.len();
+        vm.code.extend(code);
+        vm.spans.extend(spans);
+        vm.install_const_fn_closures(from, &mut self.const_fn_closures);
+        vm.source = Arc::from(self.source.as_str());
 
         self.fragments += 1;
         self.prev_slot_kinds = slot_kinds;
@@ -386,6 +397,43 @@ impl Repl {
         }
         self.source = String::from_utf8(merged)
             .expect("the unit's source stays UTF-8: fills are ASCII and fragments are aligned");
+    }
+}
+
+/// A [`ReplCore`] and the VM it feeds, for callers with nothing else to hold.
+///
+/// A host that already keeps a `VM` in its own run state should hold a
+/// `ReplCore` beside it instead, and pass the VM in.
+pub struct Repl {
+    pub core: ReplCore,
+    /// The VM, with the shared root frame standing from the first fragment to
+    /// the last. Public so a driver can `step` it, inspect it, settle promises
+    /// and resume conditions exactly as it would any other VM.
+    pub vm: VM,
+}
+
+impl Repl {
+    pub fn new(input: serde_json::Value, attachments: serde_json::Value) -> Result<Self, VMError> {
+        Ok(Self {
+            core: ReplCore::new(),
+            vm: VM::for_incremental(input, attachments)?,
+        })
+    }
+
+    pub fn reject_top_level_return(&mut self, message: impl Into<String>) {
+        self.core.reject_top_level_return(message);
+    }
+
+    pub fn push(&mut self, buffer: &str) -> Result<(), Vec<Diagnostic>> {
+        self.core.push(&mut self.vm, buffer)
+    }
+
+    pub fn close(&mut self, buffer: &str) -> Result<(), Vec<Diagnostic>> {
+        self.core.close(&mut self.vm, buffer)
+    }
+
+    pub fn source(&self) -> &str {
+        self.core.source()
     }
 }
 

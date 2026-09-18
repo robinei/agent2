@@ -22,7 +22,7 @@ pub use compiler::{Program, compile, compile_for_test262, count_statements};
 pub use debuginfo::{DebugTable, FnDebug};
 pub use diag::{DiagKind, Diagnostic};
 pub use rc_str::RcStr;
-pub use repl::Repl;
+pub use repl::{Repl, ReplCore};
 pub use span::Span;
 pub use vm::{
     ErrorKind, FrameView, Instr, InvokeCall, PromisePtr, PromiseState, ResumeMode, SettleCall,

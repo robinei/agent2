@@ -428,7 +428,7 @@ fn parse_sse(
             // instead (gap 1 of the follow-up fix: this text used to
             // reach no log and no user at all).
             match transport {
-                Transport::Program => acc.source.push_str(t),
+                Transport::Program | Transport::Notebook => acc.source.push_str(t),
                 Transport::RunProgram => acc.reply.push_str(t),
             }
         }
@@ -441,7 +441,7 @@ fn parse_sse(
 
     let truncated = acc.finish_reason.as_deref() == Some("length");
     let source = match transport {
-        Transport::Program => acc.source,
+        Transport::Program | Transport::Notebook => acc.source,
         // A truncated completion's arguments are likely incomplete
         // JSON — parsing them would turn a `truncated` turn into a parse
         // error instead of letting the caller's own truncation path
