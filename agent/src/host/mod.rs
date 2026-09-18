@@ -2103,6 +2103,9 @@ fn leaf_summary(tree: &Tree, leaf: EventId) -> String {
         EventPayload::Condition { cause, .. } => format!("Condition: {}", cause_label(cause)),
         EventPayload::Rename { name } => format!("Rename: {name}"),
         EventPayload::Console { lines } => format!("Console: {} lines", lines.len()),
+        EventPayload::Completion { usage } => {
+            format!("Completion: {} out", usage.completion)
+        }
         EventPayload::Note { text, .. } => format!("Note: {text}"),
         EventPayload::Compacted { of, text } => match text {
             Some(t) => format!("Compacted #{}: {t}", of.as_u64()),
@@ -2348,6 +2351,7 @@ mod tests {
                 EventPayload::Return { .. } => "Return",
                 EventPayload::Condition { .. } => "Condition",
                 EventPayload::Console { .. } => "Console",
+                EventPayload::Completion { .. } => "Completion",
                 EventPayload::Rename { .. } => "Rename",
                 EventPayload::Note { .. } => "Note",
                 EventPayload::Compacted { .. } => "Compacted",

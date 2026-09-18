@@ -52,7 +52,17 @@ use crate::types::{Author, Call, Cause, Event, EventPayload, Message, Tree};
 /// One finished log, reduced to the numbers a change is argued from.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Score {
-    /// Completions, i.e. round trips — one per program the model wrote.
+    /// **Completions, i.e. round trips** — which is not the same as
+    /// `Turn`s any more.
+    ///
+    /// Under `Transport::Program` it is: one `Turn` per completion. Under
+    /// `Transport::Notebook` a reply is N `Turn`s, one per cell, and one
+    /// completion — so counting `Turn`s there would report a three-cell
+    /// reply as three round trips and make the arm look like it drifted
+    /// when nothing drifted. `EventPayload::Completion` is logged exactly
+    /// once per completion, so where any exist they are what is counted;
+    /// a log with none is a scripted or hand-driven run nobody was billed
+    /// for, where every `Turn` really is its own turn.
     pub programs: usize,
     /// `Call::Invoke` — tool calls. With `programs`, the ratio below.
     pub tool_calls: usize,
@@ -94,8 +104,21 @@ pub struct Score {
     pub tells: Vec<String>,
     /// First to last event.
     pub span_ms: i64,
-    /// Time inside completions: each program's arrival minus the event
-    /// before it. The provider's share, not ours.
+    /// Time inside completions: each reply's first `Turn` minus the
+    /// **previous reply's outcome**. The provider's share, not ours.
+    ///
+    /// Measured from the outcome rather than from whatever event happens
+    /// to precede the `Turn`, because under `Transport::Notebook` that
+    /// is the reply's own opening prose — logged while the completion is
+    /// still streaming — and the gap to it is nil. The generation wait
+    /// is real on both transports and lands here on both.
+    ///
+    /// It does **not** partition wall clock under the notebook the way
+    /// it does under the program transport. Cells run while later ones
+    /// are still being generated (D11), so part of what this counts is
+    /// also counted by `exec_ms`, and the two no longer sum to
+    /// `span_ms`. That overlap is the point of the transport, not an
+    /// error in the measurement.
     pub provider_ms: i64,
     /// `span_ms - provider_ms` — the harness, the VM, and the tools.
     pub exec_ms: i64,
@@ -163,7 +186,20 @@ pub fn score(tree: &Tree) -> Score {
     // as neither.
     let mut open_scopes = 0usize;
     let mut spawn_calls = std::collections::HashSet::new();
-    let mut prev_ms: Option<i64> = None;
+    // `Turn`s seen, and completions seen. They differ under
+    // `Transport::Notebook`; see `Score::programs`.
+    let mut turns = 0usize;
+    let mut completions = 0usize;
+    // The end of the last reply — an outcome, or, for the first one,
+    // the log's own start. The generation wait is measured from here,
+    // not from whatever event happens to sit immediately before a
+    // `Turn`: under `Transport::Notebook` that is the reply's own
+    // opening prose, logged mid-generation, and the gap to it is nil.
+    let mut last_outcome_ms: Option<i64> =
+        events.first().map(|e| e.timestamp.as_millisecond());
+    // Whether a `Turn` has been seen since that outcome, so only the
+    // first one of a reply charges the wait.
+    let mut turn_since_outcome = false;
 
     for e in &events {
         let ms = e.timestamp.as_millisecond();
@@ -174,7 +210,7 @@ pub fn score(tree: &Tree) -> Score {
                 thinking,
                 usage,
             }) => {
-                s.programs += 1;
+                turns += 1;
                 s.source_bytes += source.len();
                 s.thinking_bytes += thinking.as_ref().map_or(0, |t| t.len());
                 if let Some(u) = usage {
@@ -196,11 +232,23 @@ pub fn score(tree: &Tree) -> Score {
                     s.prompt_bytes += doc.messages.iter().map(|m| m.content.len()).sum::<usize>();
                 }
                 s.program_lengths.push(interp::count_statements(source));
-                // The gap before a program arrived is the completion
-                // that produced it.
-                if let Some(prev) = prev_ms {
+                // The gap before a reply's *first* `Turn` is the
+                // completion that produced it. A later cell's `Turn`
+                // charges nothing: it was generated inside that same
+                // wait, which is what D11 bought.
+                if !turn_since_outcome
+                    && let Some(prev) = last_outcome_ms
+                {
                     s.provider_ms += ms - prev;
                 }
+                turn_since_outcome = true;
+            }
+            EventPayload::Completion { usage } => {
+                completions += 1;
+                s.prompt_in += usage.prompt;
+                s.cached_in += usage.cached;
+                s.completion_out += usage.completion;
+                s.reasoning_out += usage.reasoning;
             }
             EventPayload::Call(Call::Invoke { .. }) => s.tool_calls += 1,
             EventPayload::Call(Call::Send {
@@ -229,6 +277,8 @@ pub fn score(tree: &Tree) -> Score {
             }
             EventPayload::Note { .. } => s.notes += 1,
             EventPayload::Return { .. } => {
+                last_outcome_ms = Some(ms);
+                turn_since_outcome = false;
                 if open_scopes > 0 {
                     open_scopes -= 1;
                     s.resumes += 1;
@@ -237,6 +287,8 @@ pub fn score(tree: &Tree) -> Score {
             EventPayload::Condition {
                 cause, disposition, ..
             } => {
+                last_outcome_ms = Some(ms);
+                turn_since_outcome = false;
                 match cause {
                     // Every raise is a question the program comes back
                     // from now. `handovers` counted `next_program`,
@@ -265,12 +317,14 @@ pub fn score(tree: &Tree) -> Score {
             }
             _ => {}
         }
-        prev_ms = Some(ms);
     }
 
     if let (Some(first), Some(last)) = (events.first(), events.last()) {
         s.span_ms = last.timestamp.as_millisecond() - first.timestamp.as_millisecond();
     }
+    // See `Score::programs`: a log that records completions is counted
+    // by them, because a `Turn` there may be one cell of several.
+    s.programs = if completions > 0 { completions } else { turns };
     s.exec_ms = s.span_ms - s.provider_ms;
     s.calls_per_program = s.tool_calls as f64 / s.programs.max(1) as f64;
     s
@@ -321,5 +375,96 @@ mod tests {
         assert_eq!(s.resumes, outcome.resume_count);
         assert!(!s.silent, "the program told the user something");
         drop(sandbox);
+    }
+
+    /// **The generation wait is measured from the previous reply's
+    /// outcome, not from the event before the `Turn`** — and under
+    /// `Transport::Notebook` those are very different things.
+    ///
+    /// A notebook reply's first logged event is its own opening prose,
+    /// written while the completion is still streaming. Anchoring on
+    /// "the event before the `Turn`" therefore measured the gap from
+    /// that prose to the cell below it — microseconds — and reported a
+    /// six-second run as `waiting on the provider 0.0s`, with the whole
+    /// wall clock attributed to execution.
+    ///
+    /// Built from a log with chosen timestamps, because that is the only
+    /// way to assert a duration rather than assume one.
+    #[test]
+    fn the_provider_wait_is_measured_from_the_previous_outcome() {
+        // t=0 the branch opens; the request goes out; the provider
+        // takes five seconds; then the reply's prose, its cell, and its
+        // outcome land in quick succession.
+        let log = synthetic_log(&[
+            (0, r#"{"Agent":{"charter":"c","system":"s"}}"#),
+            (10, r#"{"Message":{"Post":{"from":"User","origin":{"Direct":{"text":"go","input":null,"options":[],"expects_reply":true}}}}}"#),
+            // Five seconds of generation, invisible in the log.
+            (5_010, r#"{"Call":{"Send":{"to":"User","text":"Looking now.","input":null,"options":[],"expects_reply":false,"site":0,"site_end":0}}}"#),
+            (5_020, r#"{"Message":{"Turn":{"author":{"Agent":1},"source":"tell(\"hi\");"}}}"#),
+            (5_030, r#"{"Message":{"Turn":{"author":{"Agent":1},"source":"done();"}}}"#),
+            (5_040, r#"{"Completion":{"usage":{"prompt":10,"cached":0,"completion":20,"reasoning":0}}}"#),
+            (5_050, r#"{"Return":{"value":null}}"#),
+        ]);
+        let tree = crate::open_tree_read_only(log.path().to_str().unwrap()).unwrap();
+        let s = score(&tree);
+
+        assert_eq!(s.programs, 1, "two cells, one round trip");
+        assert_eq!(s.completion_out, 20);
+        // The five seconds are the provider's, and they are charged
+        // once — not once per cell, and not lost to the prose.
+        assert_eq!(
+            s.provider_ms, 5_020,
+            "the wait runs from the log's start to the reply's first Turn"
+        );
+        assert!(
+            s.exec_ms < 100,
+            "and the rest is execution, not the whole run: {}",
+            s.exec_ms
+        );
+    }
+
+    /// The program transport is unmoved by the same change: its `Turn`
+    /// *is* the first event of its reply, so anchoring on the previous
+    /// outcome measures what anchoring on the previous event did.
+    #[test]
+    fn the_program_transports_wait_is_unchanged() {
+        let log = synthetic_log(&[
+            (0, r#"{"Agent":{"charter":"c","system":"s"}}"#),
+            (10, r#"{"Message":{"Post":{"from":"User","origin":{"Direct":{"text":"go","input":null,"options":[],"expects_reply":true}}}}}"#),
+            (3_010, r#"{"Message":{"Turn":{"author":{"Agent":1},"source":"return 1;","usage":{"prompt":10,"cached":0,"completion":20,"reasoning":0}}}}"#),
+            (3_020, r#"{"Return":{"value":1}}"#),
+            // A second completion, two seconds of it.
+            (5_020, r#"{"Message":{"Turn":{"author":{"Agent":1},"source":"done();","usage":{"prompt":10,"cached":0,"completion":5,"reasoning":0}}}}"#),
+            (5_030, r#"{"Return":{"value":null}}"#),
+        ]);
+        let tree = crate::open_tree_read_only(log.path().to_str().unwrap()).unwrap();
+        let s = score(&tree);
+
+        assert_eq!(s.programs, 2, "two Turns, two round trips");
+        assert_eq!(s.completion_out, 25, "usage still rides on the Turn here");
+        // 3010 from the start, plus 2000 from the first outcome.
+        assert_eq!(s.provider_ms, 5_010);
+    }
+
+    /// Write a log with chosen timestamps and hand back the file.
+    fn synthetic_log(rows: &[(i64, &str)]) -> tempfile::NamedTempFile {
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(f, r#"{{"version":{}}}"#, crate::tree::LOG_VERSION).unwrap();
+        for (i, (ms, payload)) in rows.iter().enumerate() {
+            let id = i + 1;
+            let parent = if i == 0 {
+                "null".to_string()
+            } else {
+                id.saturating_sub(1).to_string()
+            };
+            writeln!(
+                f,
+                r#"{{"id":{id},"parent_id":{parent},"timestamp":{ms},"payload":{payload}}}"#
+            )
+            .unwrap();
+        }
+        f.flush().unwrap();
+        f
     }
 }

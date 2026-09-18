@@ -39,6 +39,36 @@ pub enum EventPayload {
     /// `Author::Harness`, not as a distinguished reply kind of its own.
     Message(Message),
 
+    /// **What one completion cost**, as the provider counted it.
+    /// Parent: the owning agent's spine. Renders to chat: no — it is
+    /// accounting, not conversation.
+    ///
+    /// Logged once per completion, when the provider reports the
+    /// figure, and only where [`Message::Turn`]'s own `usage` cannot
+    /// carry it. Under `Transport::Program` it still does, because
+    /// there is one `Turn` per completion and it is written when the
+    /// completion lands.
+    ///
+    /// **Under `Transport::Notebook` it cannot** (`docs/25_NOTEBOOK.md`
+    /// D15). A reply is N `Turn`s, one per cell, and each is logged
+    /// *before its cell runs* — which is while the completion is still
+    /// streaming. By the time the provider says what the completion
+    /// cost, every `Turn` that could have carried it is already on an
+    /// append-only log. So the figure is logged on its own instead, at
+    /// the moment it arrives.
+    ///
+    /// This is the one place D1's "the log schema does not change"
+    /// stopped holding, and it stopped holding because D15 changed when
+    /// a `Turn` is written, not because of anything D1 got wrong.
+    ///
+    /// **Exactly one per completion**, which is what makes it countable:
+    /// `score.rs` reads `programs` off these where they exist, because
+    /// under this transport a `Turn` is a *cell* and counting cells
+    /// would report a three-cell reply as three turns of drift.
+    Completion {
+        usage: crate::host::Usage,
+    },
+
     /// Chat event. Parent: the previous event on the owning agent's
     /// spine. Renders to chat: yes — as a marker in the branch's own
     /// history, nothing more.

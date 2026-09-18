@@ -586,6 +586,8 @@ impl ChatState {
             // is read from the log projection's `ProgramView.console`
             // (`tree.rs`), never this incremental model.
             EventPayload::Console { .. } => {}
+            // What the completion cost is accounting, never transcript.
+            EventPayload::Completion { .. } => {}
             // A rename is a record: it changes the navigator, never the
             // transcript, and never wakes the branch.
             EventPayload::Rename { .. } => {}

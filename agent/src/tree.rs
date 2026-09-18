@@ -489,6 +489,8 @@ impl Tree {
             | EventPayload::Return { .. }
             | EventPayload::Condition { .. }
             | EventPayload::Console { .. }
+            // Accounting: it changes nothing a later turn can see.
+            | EventPayload::Completion { .. }
             | EventPayload::Rename { .. }
             | EventPayload::Note { .. }
             | EventPayload::Compacted { .. } => {}
