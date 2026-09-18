@@ -716,7 +716,18 @@ fn flush_pending(
     transport: Transport,
     open_call: &mut Option<String>,
 ) -> ChatMessage {
-    let content = pending.join("\n");
+    // **Named, because the role does not name it.** A message in the
+    // user role holds whatever the log gained since the last program:
+    // a person's words, the model's own `tell`s rendered whole, its
+    // notes, its program's report. Read without a label, a kilobyte of
+    // the model's own prose arriving in the user role looks like
+    // somebody saying it. Two words, once per turn, against a card
+    // sentence 13 KB earlier that says the same thing in general.
+    let content = if pending.is_empty() {
+        String::new()
+    } else {
+        format!("history log:\n{}", pending.join("\n"))
+    };
     pending.clear();
     match (transport, open_call.take()) {
         (Transport::RunProgram, Some(id)) => ChatMessage {

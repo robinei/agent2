@@ -5230,8 +5230,8 @@ mod tests {
             Some(&crate::document::ChatMessage {
                 role: crate::document::ChatRole::User,
                 content:
-                    "[harness] fork of branch #1 at #4 — questions before this line are being \
-                 handled there; do not redo its work unless asked."
+                    "history log:\n[harness] fork of branch #1 at #4 — questions before this \
+                 line are being handled there; do not redo its work unless asked."
                         .to_owned(),
                 tool_calls: None,
                 tool_call_id: None,
