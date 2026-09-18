@@ -215,9 +215,19 @@ rows compact independently; one fat value does not).
 Between cells the data channel is the shared scope. What belongs in the
 log goes there by the verb that means it.
 
-There is consequently no `EventPayload::Cell`. Cells leave no events of
-their own — they are spans in a `Turn`, and everything a cell does is
-logged by the calls it makes.
+There is consequently no `EventPayload::Cell`. **A cell runs purely for
+side effect.** It has no value — D5 removed the only statement that
+could produce one — so there is nothing about "a cell ran" worth a row
+that its own actions do not already say. Everything that matters is
+logged as it happens, by the cell's own doing: a `Call` at dispatch, its
+`Result`, a `Note` for `history.append`, a `Console` for `console.log`.
+A cell is a region of instructions and nothing more.
+
+The notebook's single `Return`/`Condition` (D7) is not an exception to
+this. It records no value either — it records *how the run ended*, which
+is what `Cause::Abandoned`'s invariant is about: a branch that suspended
+and a branch that finished must be distinguishable on reload. Per-run
+bookkeeping, not per-cell data.
 
 ### D7 — Exactly one terminal per notebook
 
@@ -315,11 +325,43 @@ Three consequences, and the second is the reason to do it:
   hand. This retires `Cause::Truncated`'s current guarantee, and the
   card must stop implying it.
 
-The cost to accept honestly: while cell 0 runs and fails, the model is
-still writing cells 1–3 on the assumption that it succeeded. Today the
-whole program is written blind too, so this is not a regression — but
-the failure is now visible mid-stream, which is new, and cancellation
-bounds the waste rather than removing it.
+Two costs to accept honestly.
+
+**Cells written on a false premise.** While cell 0 runs and fails, the
+model is still writing cells 1–3 assuming it succeeded. Today the whole
+program is written blind too, so this is not a regression — but the
+failure is now visible mid-stream, which is new, and cancellation bounds
+the waste rather than removing it.
+
+**A call can outrun its own `Turn`, and this is not yet solved.**
+`Call`'s doc pins its placement: "Parent: the owning agent's spine,
+**between the program's `Turn` and its eventual `Return`/`Condition`**."
+But a cell dispatches calls before the completion ends, and the `Turn`
+cannot be logged before then — its `source` is the whole markdown, and
+the markdown is not finished. So cell 0's calls land *before* the Turn,
+and their `site` points into a Turn that does not exist yet.
+
+The durability half is fine, and deliberately so: the same doc explains
+that logging at dispatch rather than at resolution is what keeps "a
+`send_email` issued a millisecond before `kill -9`" from being invisible
+in the log. The side effect is recorded either way. What breaks is the
+ordering invariant and site resolution.
+
+This is **the one unsolved problem in this design**, and it belongs to
+25.5 alone — batch execution (25.4) has no such gap, which is what makes
+the batch-first sequencing load-bearing rather than merely cautious. The
+shape of the answer is a fork not taken here:
+
+- **Buffer a cell's events and append them after the `Turn`.** Keeps
+  every invariant and the log's order, at the price of the log briefly
+  disagreeing with reality — and of the crash window the dispatch-time
+  logging rule exists to close.
+- **Log the reply as it arrives**, prose and cells as separate events in
+  source order, rather than one `Turn` at the end. Matches reality and
+  needs no buffering, but gives up "one completion, one `Turn`" — which
+  the trigger rule, `shown`, and the repair loop all lean on.
+
+Deciding between these is a gate *of* 25.5, not a detail inside it.
 
 ### D12 — One compilation that pauses
 
@@ -510,8 +552,15 @@ and one next completion for a three-cell reply (**not three**), that a
 `raise` in cell 0 resumed by a handler runs cells 1 and 2 afterwards,
 and every `Call::site` resolving to the right span in the markdown.
 
-**25.5 — Execute as the fences close (D11).** Dispatch on fence close;
-cancel the in-flight completion on `done()`, trap or raise. Gate: tests
+**25.5 — Execute as the fences close (D11).** **Decide the Turn-ordering
+fork first** — a cell dispatches calls before the completion ends, so
+before its `Turn` can be logged, and `Call`'s documented placement is
+between the `Turn` and its terminal. Buffer the events, or log the reply
+as it arrives and give up one-completion-one-`Turn`. Nothing else in
+this step is safe to build until that is settled.
+
+Then: dispatch on fence close; cancel the in-flight completion on
+`done()`, trap or raise. Gate: tests
 that a two-cell notebook runs cell 0 before cell 1's fence arrives, that
 `done()` in cell 0 cancels the completion (epoch moved, `LlmDone`
 dropped), and that a mid-stream truncation leaves cell 0's effects
