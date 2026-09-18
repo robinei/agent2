@@ -73,48 +73,71 @@ call site from the log alone. Cells are *compiled* from their own text
 and offsets into it, so `Turn.source` stays what the model wrote and no
 consumer has to know cells exist.
 
-### D2 — Pad each cell to its offset, then parse it
+### D2 — One coordinate system: the markdown's own offsets
 
-A cell's parse source is `" ".repeat(cell.start) + cell_text`. oxc then
-emits **absolute spans into the markdown** directly, and nothing
-downstream has to rebase anything.
+There is a single buffer, byte-for-byte as long as the reply and with
+the same newlines, in which **only the cell being compiled is live**.
+Every other byte is a space, except `\n`, which is kept. The parser is
+handed that buffer, so the spans it emits are already offsets into the
+markdown.
 
-This is not cosmetic. Both the analysis and the debug table are
-*span-keyed*: `analyzer/mod.rs` "resolves every binding and identifier
-reference to a frame slot — keyed by source span", and `debuginfo.rs`
-identifies a function as "the innermost function whose *source* span
-contains the instruction's span". Parse two cells from their own
-substrings and both start at zero, so their bindings and their function
-extents collide. Padding is what lets the analyzer simply *accumulate*
-across cells (D12) instead of being handed a carried table.
+`oxc_parser` has no offset option — `Parser::new` takes only the source
+text, and `ParseOptions` carries nothing for it (checked against
+0.134.0) — so spans are relative to whatever `&str` it is given. The
+only alternatives are to line the bytes up, or to walk the AST
+afterwards adding an offset to every node's span, which costs a
+`VisitMut` over every node type and a full tree walk to recover what
+lining up gives for free.
 
-Absolute spans also mean `Call::site`, `Condition::site`, `report.rs`'s
-per-call-site annotation and its line-and-caret diagnostic all keep
-working untouched against `Turn.source` — the whole markdown, byte for
-byte — and a caret lands in the model's own reply with its prose around
-it.
+**Newlines are preserved in the fill, not just byte count.** Byte-exact
+alone would satisfy every consumer that goes through a span, but line
+and column are computed from a source, and this way the parse buffer
+answers those identically to the markdown too. Filling is byte-wise, so
+a multi-byte character in the prose becomes that many spaces and the
+length is exact; the fill is never read as text, only skipped.
 
-Three drafts of this section, recorded because the middle one was wrong
-in an instructive way:
+It is one buffer, not one per cell. After a cell compiles, its bytes are
+blanked by the same rule, and the next cell's text is written at its own
+offset when its fence closes. One allocation amortized, and O(cell) of
+filling per cell.
 
-- **Blank the whole markdown except this cell**, and compile that. Gives
-  absolute spans, but parses a full-length copy of the reply once per
-  cell. Padding is this idea's good half: the *suffix* was the waste,
-  the *prefix* was the point.
+The cost is that the parser re-lexes the whitespace prefix each time, so
+lexing is quadratic over the reply. This is the trade phase 24 already
+accepted in writing — "re-parsing the accumulated prefix from scratch on
+each chunk is quadratic over a few KB against a parser that runs at
+MB/s, which is not measurable."
+
+Why this matters beyond tidiness: both the analysis and the debug table
+are *span-keyed*. `analyzer/mod.rs` resolves bindings "keyed by source
+span", and `debuginfo.rs` identifies a function as "the innermost
+function whose *source* span contains the instruction's span". Parse two
+cells from their own substrings and both start at zero, so their
+bindings and their function extents collide. Absolute spans are what let
+the analyzer simply *accumulate* across cells (D12) rather than being
+rebuilt and handed a carried table.
+
+They also mean `Call::site`, `Condition::site`, `report.rs`'s
+per-call-site annotation and its line-and-caret diagnostic keep working
+untouched against `Turn.source` — the whole markdown, byte for byte —
+and a caret lands in the model's own reply with its prose around it.
+
+Rejected along the way, recorded because the middle one was wrong in an
+instructive way:
+
+- **Blank the whole markdown except this cell**, allocating a fresh
+  full-length copy per cell. The right idea with two wasteful details,
+  both fixed above: reuse the buffer, and keep the newlines.
 - **Compile the bare substring and rebase spans afterwards** — add
   `cell.start` across `Program::spans` and the debug table. Looks
-  cheaper and is not: it needs a pass per cell, it has to special-case
-  the appended prelude (whose spans sit past the user's text and would
-  otherwise land in the following prose), and it does nothing about the
-  span collision above, so the analyzer still has to be seeded by hand.
+  cheaper and is not: a pass per cell, a special case for the appended
+  prelude (whose spans sit past the user's text and would otherwise land
+  in the following prose), and it does nothing about the span collision
+  above, so the analyzer still has to be seeded by hand.
 - **Cell-local spans**, as a notebook's line numbers are. Rejected
   because `site` is not only for error text: it is logged on
   `Call::Send` and `Condition` and read back to annotate a program per
   call site. Going relative would put a cell index on every
   span-carrying event in the log and teach every consumer to resolve it.
-
-The prelude keeps its own spans past the end of the cell's text, as it
-does today — harmless, because nothing rebases them onto prose.
 
 ### D3 — ```js executes; quoting is the marked case
 
@@ -445,15 +468,18 @@ evidence exists, and that is the failure mode to watch for.
 
 ## Steps
 
-**25.1 — The split.** `notebook.rs`: markdown in, `Vec<CellSpan>` out.
-Pure, no IO, no JS parsing. Gate: `cargo test -p agent notebook` covers
+**25.1 — The split and the buffer.** `notebook.rs`: markdown in,
+`Vec<CellSpan>` out, plus the shared parse buffer of D2 — same length,
+same newlines, one cell live at a time. Pure, no IO, no JS parsing.
+Gate: the buffer's length and every newline position match the markdown
+for each cell in turn, and `cargo test -p agent notebook` covers
 ```js, ```javascript, a non-executable tag, an unterminated final fence,
 a 4-backtick fence wrapping a 3-backtick one, and zero cells; asserts
 every span slices the markdown back to exactly the cell's text.
 
 **25.2 — One paused compilation (D12).** Analyzer, `ProgramAnalysis`,
-`Compiler` and VM all live for the whole reply and are fed each padded
-cell in turn; backpatch scoped to the appended range; growable frame
+`Compiler` and VM all live for the whole reply and are fed each cell in
+turn through the shared buffer (D2); backpatch scoped to the appended range; growable frame
 locals; `FreshCell` emitted for the `Plain → Boxed` diff across
 re-finalization.
 
