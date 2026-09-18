@@ -59,8 +59,9 @@ stopped between them (D12).
 
 Note what cell 0 does *not* do: end with `return`. That is the habit
 exemplar 02 teaches, and there is no `return` here at all (D5) — a cell
-keeps what is worth keeping with `history.append`, and the run ends by
-running out of cells or by `done()`.
+keeps what is worth keeping with `history.append`. The run ends by
+running out of cells — `done()` does not end it (D8), it only decides
+that the branch rests once it has.
 
 ## Decisions
 
@@ -189,13 +190,38 @@ reverse: it is one predicate over the fence's info string.
 
 ### D4 — A reply with no executable cell is a compile failure
 
-It goes to the repair loop like any other unusable completion.
-
 Without this rule the format makes "reply with prose and do nothing"
 expressible, which is chat mode — and chat mode is what the code-mode
 thesis measured its way out of (programs/run 8.9 → 3.5, read-tell-stop
 60% → 0%). A turn that only wants to speak still writes one cell:
 `done();`.
+
+**The unresolved part: what "goes to the repair loop" means once prose
+has already been delivered.** An earlier draft said simply "it goes to
+the repair loop like any other unusable completion", which was true when
+a completion was one indivisible thing. D15 broke that: by the time the
+harness can know there is no executable cell — the end of the reply —
+the prose has been logged and shown. Three cases, and only the first is
+settled:
+
+- **A cell that fails to compile, with earlier cells already run.** Not
+  a repair case at all. Log `Condition { CompileFailed }` for that cell;
+  the reply ends there; the next completion sees the earlier cells'
+  outcomes and the diagnostic. This is D15's partial-progress gain, and
+  it is an ordinary continuation rather than a re-ask.
+- **A cell 0 that fails to compile, nothing run.** Today's repair case,
+  unchanged in substance. Any prose before it has been said, which is
+  acceptable — it was the model talking, and it is not retracted by the
+  code after it failing.
+- **No executable cell at all.** This is the one to decide. A re-ask
+  risks the person hearing the same prose twice. Not re-asking is worse:
+  a pure-prose reply logs `Send`s and no `Turn`, so there is no outcome
+  and no unseen `Post` — `needs_prompt` is false on both clauses and the
+  branch **goes quiet**. That is the silence failure this project has
+  measured before, reachable here by a new route.
+
+Whatever the answer, it cannot be "nothing", and it is the last thing in
+this phase that is asserted rather than designed.
 
 ### D5 — There is no `return`
 
@@ -688,12 +714,12 @@ untouched.
 So the direction is generalization. Three rules keep it that way, and
 they are easy to violate by accident:
 
-**Instruction names carry no notebook concepts.** Two additions look
-likely: a way to stop without unwinding, and a way to extend the current
-frame (see below). Both are REPL primitives. An `Instr::CellBoundary`
-would put a markdown word into the instruction set of a JavaScript VM —
-a further argument for the stop-at-ip bound in D12, which needs no
-instruction at all.
+**Instruction names carry no notebook concepts.** Two are added, and
+both are named for incremental evaluation: `ExtendFrame(local_kinds)`,
+which pairs with `EnterFrame`, and `Pause`, which stops without
+unwinding and pairs with `OutOfFuel`. An `Instr::CellBoundary` would
+have put a markdown word into the instruction set of a JavaScript VM;
+neither of these does, and both are what any REPL needs.
 
 **The top-level-`return` rule is a flag, not a policy.** D5 is the one
 genuinely notebook-shaped thing heading for the compiler, and its
@@ -888,6 +914,11 @@ test asserting the message names both, and that a `return` inside a
 function *in* a cell is left alone.
 
 **25.4 — `Transport::Notebook`, batch first, and the cell driver.**
+**Settle D4's third case first** — a reply with no executable cell must
+not leave the branch quiet, and the choice between re-asking (the person
+may hear the prose twice) and something else is a design decision, not
+an implementation detail.
+
 Wire the split into the compile path beside `extract_program`, executing
 cells in sequence *after* the completion ends. No streaming yet — this
 isolates the transport from the scheduling change.
@@ -918,10 +949,11 @@ then dispatch on fence close, and cancel the in-flight completion on
 for the prose case (D15). Gate: a prose send has exactly one `Result`
 and no dangling promise; a multi-paragraph report renders legibly
 through the `you told user:` row; and tests
-that a two-cell notebook runs cell 0 before cell 1's fence arrives, that
-`done()` in cell 0 cancels the completion (epoch moved, `LlmDone`
-dropped), and that a mid-stream truncation leaves cell 0's effects
-standing with the turn reported as partial.
+that a two-cell notebook runs cell 0 before cell 1's fence arrives; that
+a **trap** in cell 0 cancels the completion (epoch moved, `LlmDone`
+dropped) while a `done()` in cell 0 does **not** — later cells still run
+and the reply finishes (D8, D11); and that a mid-stream truncation
+leaves cell 0's effects standing with the turn reported as partial.
 
 **25.6 — TUI (D13).** Semi-collapsed cells, expand on a keystroke,
 effects rendered beneath each cell as they land. Gate: manual, plus the
@@ -929,7 +961,10 @@ existing `chat.rs` render tests still green.
 
 **25.7 — Card, exemplars, and the doc corrections (D14).** The
 prose/`tell()` split as the sentence above; cells are one scope; no
-`return`; `done()` ends the notebook; ```js runs. Plus the three false
+`return`; ```js runs; and — the line that must be there because the
+natural reading is wrong and an exemplar written during this design got
+it wrong — that `done()` does not stop anything, so a branch you mean to
+skip is guarded with `else`, not with `done()` (D8). Plus the three false
 clauses of `Message::Turn`'s doc rewritten, and
 `compacted_program_comment` narrowed to cells — a compacted *prose*
 segment is a `Send` and needs no comment wrapper. No field rename: D15
