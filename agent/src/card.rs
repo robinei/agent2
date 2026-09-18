@@ -430,7 +430,7 @@ mod tests {
         // `card()` shows up as a diff review must look at, not a byte
         // count that silently drifts. Comparing full text (not just a
         // hash) so the diff itself is legible in a failure message.
-        const EXPECTED_LEN: usize = 11684;
+        const EXPECTED_LEN: usize = 11742;
         assert_eq!(
             card().len(),
             EXPECTED_LEN,
@@ -787,14 +787,16 @@ mod tests {
             "the third asks mid-program and acts on the answer: {}",
             ex[2].assistant
         );
-        // **The fifth keeps what it will keep thinking with.** A
-        // `return` is one per program and it is that program's result,
-        // so pinning the README would cost the finding — which is the
-        // case that has no other verb. `history.append` fell from 6% of
-        // programs to 0% once `console.log` was documented, because the
-        // framing it had ("a conclusion reached in the middle") is the
-        // case `console.log` now serves better. This is the one it
-        // does not. A `return`
+        // **The fifth appends twice, and that is the point.** A return
+        // is one row however much is packed into it, so a later
+        // compaction takes all of it or rewrites all of it; two appends
+        // are two rows, and the one finished with can go while the
+        // other stays exact. Two weaker arguments were tried and
+        // dropped: that a program "only gets one return" (it can return
+        // an object holding everything) and that a return "only reaches
+        // the next program" (every past return still renders). What is
+        // left is granularity, and landing before the program ends. A
+        // `return`
         // is a promise the program has to live to keep; `history.append`
         // is already on the log the moment it is called, and survives
         // the program's own trap — verified on a real run, where note
@@ -804,8 +806,8 @@ mod tests {
         // correctly which attributes were pointless, trapped on
         // `fmt is not defined`, and lost the whole analysis.
         assert!(
-            ex[4].assistant.contains("history.append") && ex[4].assistant.contains("return"),
-            "the fifth keeps reference material and still returns its finding: {}",
+            ex[4].assistant.matches("history.append").count() == 2,
+            "the fifth appends separately, a row each: {}",
             ex[4].assistant
         );
         // Per-item findings belong in `console.log`, not `append`: 200
