@@ -62,6 +62,7 @@ pub fn embedded() -> Card {
             exemplar!("02-continue"),
             exemplar!("03-ask"),
             exemplar!("04-many"),
+            exemplar!("05-bank"),
         ],
     }
 }
@@ -429,7 +430,7 @@ mod tests {
         // `card()` shows up as a diff review must look at, not a byte
         // count that silently drifts. Comparing full text (not just a
         // hash) so the diff itself is legible in a failure message.
-        const EXPECTED_LEN: usize = 11264;
+        const EXPECTED_LEN: usize = 11675;
         assert_eq!(
             card().len(),
             EXPECTED_LEN,
@@ -770,7 +771,7 @@ mod tests {
     #[test]
     fn the_exemplars_demonstrate_the_endings_and_the_shapes() {
         let ex = exemplars();
-        assert_eq!(ex.len(), 4, "four, and each earns its place");
+        assert_eq!(ex.len(), 5, "five, and each earns its place");
         assert!(
             ex[0].assistant.contains("done()") && !ex[0].assistant.contains("return"),
             "the first ends a finished task: {}",
@@ -785,6 +786,29 @@ mod tests {
             ex[2].assistant.contains("await ask(") && ex[2].assistant.contains("done()"),
             "the third asks mid-program and acts on the answer: {}",
             ex[2].assistant
+        );
+        // **The fifth banks a conclusion before risking it.** A `return`
+        // is a promise the program has to live to keep; `history.append`
+        // is already on the log the moment it is called, and survives
+        // the program's own trap — verified on a real run, where note
+        // #551 outlived the exception that killed the program holding
+        // it. That is the case the card never made, and the failure it
+        // describes is one we watched: a dead-code run worked out
+        // correctly which attributes were pointless, trapped on
+        // `fmt is not defined`, and lost the whole analysis.
+        assert!(
+            ex[4].assistant.contains("history.append"),
+            "the fifth banks a finding before the risky part: {}",
+            ex[4].assistant
+        );
+        // Per-item findings belong in `console.log`, not `append`: 200
+        // appends would be 200 permanent rows, which is the firehose
+        // the card warns about, while the console's display is bounded
+        // and its record stays whole and fetchable.
+        assert!(
+            ex[3].assistant.contains("console.log") && !ex[3].assistant.contains("history.append"),
+            "the loop prints per item rather than appending: {}",
+            ex[3].assistant
         );
         // **The fourth is the whole structural argument for code mode**
         // — N items in one completion, where a tool loop spends N round

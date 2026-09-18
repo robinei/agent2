@@ -38,9 +38,11 @@
  *                      appending what you are about to return writes
  *                      it into the same turn twice.
  *   console.log(x)     the output lands in front of the next program
- *                      too — the one that costs nothing and commits to
- *                      nothing, for looking at a thing rather than
- *                      concluding something about it.
+ *                      too — the cheap one, for looking rather than
+ *                      concluding, and for findings as you go. What it
+ *                      shows is the recent tail; what it keeps is all
+ *                      of it, one `history.fetch` away. A loop over two
+ *                      hundred items belongs here, not in the two above.
  *   tell(text)         reaches the person, and only the person. Not a
  *                      way to look at a value: nothing you tell comes
  *                      back to you, so a program that reads something
@@ -112,14 +114,18 @@ declare function list_agents(opts?: { under?: number; deep?: boolean }):
 /** The conversation itself, by the `[id]` shown against each entry.
  *  Answered from the log: costs nothing, adds nothing. */
 declare namespace history {
-  /** Keep a conclusion worth keeping — where a finding goes when you
-   *  find it, rather than when you finish.
+  /** Keep one conclusion, as its own row, now.
    *
    *  Not a copy of a result. The result is already kept: its entry is
    *  in the conversation and `history.fetch(id)` returns it whole, for
    *  nothing. What belongs here is what you worked out *from* it — the
    *  four paths that matter out of the two hundred you listed — never
-   *  the two hundred. */
+   *  the two hundred, which is what `console.log` is for.
+   *
+   *  Reach for it when the working-out was the expensive part and the
+   *  rest of the program might not survive: this is on the log the
+   *  moment you call it, where a `return` is a promise the program has
+   *  to live to keep. A trap loses the return and keeps this. */
   function append(value: unknown): void;
   /** Read any entry back, whole, by its id. Works for entries that no
    *  longer show in the conversation, too: `remove` takes them out of
