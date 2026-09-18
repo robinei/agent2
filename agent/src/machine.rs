@@ -492,6 +492,19 @@ pub struct Runner {
     /// construction, on every path at once — including the ones nobody
     /// remembered to add a reset to.
     streaming_epoch: Option<u64>,
+    /// The reply this generation has produced so far, verbatim.
+    ///
+    /// **Kept here rather than read off the run**, because the run does
+    /// not outlive the generation: a reply whose cells all finish before
+    /// its completion ends leaves `Phase::Running` first, and the text
+    /// went with it. Measured 2026-09-18 — 12 of 44 completions logged
+    /// an empty `text`, and every one of the twelve had its outcome
+    /// logged immediately before, which is exactly that race. An empty
+    /// `text` makes `document::render` fall back to per-`Turn` grouping,
+    /// so the model saw bare cell source with its prose and fences
+    /// stripped — the bug this field exists to stop, on a quarter of
+    /// replies.
+    streaming_reply: String,
     /// Whether a client is attached to the session right now.
     ///
     /// Presence is a **per-request fact**, never branch state that
@@ -676,6 +689,7 @@ impl Runner {
             status_transitions: Vec::new(),
             transport: crate::document::configured_transport(),
             streaming_epoch: None,
+            streaming_reply: String::new(),
             attached: false,
             // A branch handed to a fresh `Runner` has said nothing to
             // *this* session's LLM and is owed no prompt for its
@@ -3550,6 +3564,7 @@ impl Runner {
             return Ok(Vec::new());
         };
         notebook.push_text(text);
+        self.streaming_reply.push_str(text);
         self.drive_notebook(tree)
     }
 
@@ -3692,14 +3707,7 @@ impl Runner {
         // The reply as it actually arrived, taken from the notebook
         // rather than from the final `LlmTurn`, whose `source` the
         // streaming path never fills — the text came in as chunks.
-        let text = match &self.phase {
-            Phase::Running(run) | Phase::Suspended(run, _) => run
-                .notebook
-                .as_ref()
-                .map(|nb| nb.reply().to_string())
-                .unwrap_or_default(),
-            _ => String::new(),
-        };
+        let text = std::mem::take(&mut self.streaming_reply);
         // **Logged even when there is nothing to report.** A cancelled
         // generation has no usage, but "no event" and "no usage" must not
         // be the same state: that is what made a third of the arm's
@@ -6318,6 +6326,46 @@ mod tests {
     }
 
     /// A `raise` is the same: the run is parked until a handler decides.
+    /// **The reply's text survives its own run.** A reply whose cells
+    /// all finish before the completion ends leaves `Phase::Running`
+    /// first, and the text used to be read off the run at that point —
+    /// so it came back empty. `document::render` treats an empty
+    /// `Completion.text` as "no verbatim reply" and falls back to
+    /// grouping the `Turn`s, which shows the model bare cell source
+    /// with its prose and fences stripped: the very thing the verbatim
+    /// rendering exists to prevent. Measured 2026-09-18: empty on 12 of
+    /// 44 completions, and all twelve had their outcome logged
+    /// immediately before.
+    #[test]
+    fn a_completed_reply_still_records_its_text() {
+        let (mut tree, mut state) = setup_under(crate::document::Transport::Notebook);
+        user_post(&mut state, &mut tree, "go");
+        state.phase = Phase::AwaitingLlm;
+
+        let reply = "Here is the answer.\n\n```js\ndone();\n```\n";
+        stream_chunks(&mut state, &mut tree, &[reply]);
+        // Stand in for the run having already ended, which is what the
+        // real ordering does — every one of the twelve empty-text
+        // completions logged `Return, Console, Completion`, so the run
+        // was gone by the time the text was wanted. Forcing the phase
+        // here pins the invariant (the text outlives the run) without
+        // depending on the upstream ordering that produces it.
+        state.phase = Phase::Idle;
+        state
+            .notebook_stream_end(&mut tree, false, None, None)
+            .unwrap();
+
+        let text = tree
+            .events
+            .values()
+            .find_map(|e| match &e.payload {
+                EventPayload::Completion { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .expect("the completion was logged");
+        assert_eq!(text, reply, "verbatim, prose and fences included");
+    }
+
     #[test]
     fn a_raise_in_a_cell_asks_for_the_generation_to_be_cancelled() {
         let (mut tree, mut state) = setup_under(crate::document::Transport::Notebook);
