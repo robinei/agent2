@@ -759,7 +759,6 @@ mod tests {
         assert_eq!(out, json!("hello earth"));
     }
 
-    #[test]
     /// The message names the mistake, not the call that tripped over
     /// it. `replaceOnce` returns the new text and `replaceCount`
     /// returns `{ result, count }`, so a `.result` on the former is
