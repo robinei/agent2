@@ -586,8 +586,25 @@ impl ChatState {
             // is read from the log projection's `ProgramView.console`
             // (`tree.rs`), never this incremental model.
             EventPayload::Console { .. } => {}
-            // What the completion cost is accounting, never transcript.
-            EventPayload::Completion { .. } => {}
+            // What the completion cost is accounting, never transcript
+            // — but what it *reasoned* is transcript, and is the only
+            // place a reloaded log has it. Live, it arrives as
+            // `SessionEvent::Chunk { thinking: true }`; on reload that
+            // buffer is gone and this is what is left.
+            EventPayload::Completion { thinking, .. } => {
+                self.thinking_streaming.retain(|(b, _)| *b != branch);
+                if let Some(thinking) = thinking
+                    && !thinking.is_empty()
+                {
+                    self.push_entry(Entry::Line {
+                        branch,
+                        id,
+                        kind: ChatKind::Thinking,
+                        text: thinking.clone(),
+                        program: None,
+                    });
+                }
+            }
             // A rename is a record: it changes the navigator, never the
             // transcript, and never wakes the branch.
             EventPayload::Rename { .. } => {}

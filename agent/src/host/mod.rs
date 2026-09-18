@@ -2217,7 +2217,16 @@ mod tests {
             Tree::new(None),
             "test agent",
             ToolRegistry::new(),
-            Box::new(ScriptedLlm::new(vec![scripted_program(reply)])),
+            Box::new(ScriptedLlm::new(vec![LlmTurn {
+                thinking: Some("weighing it up".into()),
+                usage: Some(crate::host::Usage {
+                    prompt: 10,
+                    cached: 0,
+                    completion: 20,
+                    reasoning: 700,
+                }),
+                ..scripted_program(reply)
+            }])),
             tx,
         )
         .unwrap();
@@ -2271,6 +2280,24 @@ mod tests {
             said.iter().any(|t| t == "n is 42"),
             "the second cell ran with the first cell's binding: {said:?}"
         );
+
+        // **The reasoning is kept, once.** It arrives with the
+        // completion, after every cell `Turn` is already on the log, so
+        // this is the layer it used to fall through: 28/28 kept runs
+        // stored none of it, and the arm scored as though the model had
+        // not thought at all.
+        let reasoned: Vec<String> = tree
+            .events
+            .values()
+            .filter_map(|e| match &e.payload {
+                EventPayload::Completion { thinking, .. } => thinking.clone(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reasoned, vec!["weighing it up"], "one completion, one record");
+        let score = crate::score::score(tree);
+        assert_eq!(score.thinking_bytes, "weighing it up".len());
+        assert_eq!(score.reasoning_out, 700, "and the provider's token count");
 
         // One run: exactly one terminal for the whole reply (D7).
         let terminals = tree

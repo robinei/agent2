@@ -608,6 +608,11 @@ def aggregate(runs: list) -> dict:
             "source_kb": med([s["source_bytes"] / 1024 for s in scores]),
             "thinking_kb": med([s["thinking_bytes"] / 1024 for s in scores]),
             "prompt_in": med([s.get("prompt_in", 0) for s in scores]),
+            # Printed alongside the others because its absence is how a
+            # dropped-reasoning bug stayed invisible: the summary showed
+            # `reasoning 0.0KB` from the *text* bytes and never showed
+            # the provider's own count, so one symptom read as two.
+            "reasoning_out": med([s.get("reasoning_out", 0) for s in scores]),
             "cached_in": med([s.get("cached_in", 0) for s in scores]),
             "completion_out": med([s.get("completion_out", 0) for s in scores]),
             "provider_s": med([s["provider_ms"] / 1000 for s in scores]),
@@ -688,7 +693,7 @@ def print_summary(summary: dict):
         )
         print(
             f"  tokens: {s['prompt_in']} in ({s['cached_in']} cached)"
-            f"   {s['completion_out']} out"
+            f"   {s['completion_out']} out ({s['reasoning_out']} reasoning)"
         )
         for trap, n in s["traps"].items():
             print(f"  trap [{classify_trap(trap)}] x{n}: {trap}")
@@ -836,7 +841,7 @@ def compare(before: Path, after: Path):
         for key in (
             "credit", "calls_per_program", "programs", "exec_s",
             "prompt_kb", "source_kb", "thinking_kb",
-            "prompt_in", "cached_in", "completion_out",
+            "prompt_in", "cached_in", "completion_out", "reasoning_out",
         ):
             # A summary written before a metric existed simply lacks it;
             # say so rather than dropping the row or, worse, raising

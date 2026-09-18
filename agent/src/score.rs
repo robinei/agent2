@@ -240,12 +240,19 @@ pub fn score(tree: &Tree) -> Score {
                 }
                 turn_since_outcome = true;
             }
-            EventPayload::Completion { usage, .. } => {
+            EventPayload::Completion {
+                usage, thinking, ..
+            } => {
                 completions += 1;
                 s.prompt_in += usage.prompt;
                 s.cached_in += usage.cached;
                 s.completion_out += usage.completion;
                 s.reasoning_out += usage.reasoning;
+                // Counted here as well as off `Message::Turn`, because
+                // under `Transport::Notebook` that is where the
+                // reasoning lives — a reply's `Turn`s are its cells and
+                // are all written before the completion ends.
+                s.thinking_bytes += thinking.as_ref().map_or(0, |t| t.len());
             }
             EventPayload::Call(Call::Invoke { .. }) => s.tool_calls += 1,
             EventPayload::Call(Call::Send {
