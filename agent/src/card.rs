@@ -61,6 +61,7 @@ pub fn embedded() -> Card {
             exemplar!("01-finish"),
             exemplar!("02-continue"),
             exemplar!("03-ask"),
+            exemplar!("04-many"),
         ],
     }
 }
@@ -769,7 +770,7 @@ mod tests {
     #[test]
     fn the_exemplars_demonstrate_the_endings_and_the_shapes() {
         let ex = exemplars();
-        assert_eq!(ex.len(), 3, "three, and each earns its place");
+        assert_eq!(ex.len(), 4, "four, and each earns its place");
         assert!(
             ex[0].assistant.contains("done()") && !ex[0].assistant.contains("return"),
             "the first ends a finished task: {}",
@@ -784,6 +785,18 @@ mod tests {
             ex[2].assistant.contains("await ask(") && ex[2].assistant.contains("done()"),
             "the third asks mid-program and acts on the answer: {}",
             ex[2].assistant
+        );
+        // **The fourth is the whole structural argument for code mode**
+        // — N items in one completion, where a tool loop spends N round
+        // trips — and nothing showed it. Measured across 3,071 programs
+        // on 2026-09-17: 15% contain a loop at all and 5% make parallel
+        // calls, so the shape the design exists for is the shape the
+        // model almost never reaches for. It carries both in one
+        // program: enumerate, read in parallel, edit each, verify once.
+        assert!(
+            ex[3].assistant.contains("Promise.all") && ex[3].assistant.contains("for ("),
+            "the fourth does many at once: {}",
+            ex[3].assistant
         );
         // **The finishing one changes something and checks it.** It used
         // to be `bash("make check")` → `tell` → `done()`, against the
