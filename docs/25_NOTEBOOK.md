@@ -71,18 +71,41 @@ call site from the log alone. If cells were sliced out and stored
 separately, every offset would need rebasing, and `Turn.source` would
 stop being what the model actually wrote.
 
-### D2 — Blank outside the cell, compile the cell alone
+### D2 — Compile the cell's own substring, then rebase its spans
 
-Each cell compiles on its own, from a source built by **overwriting
-every byte outside that cell with spaces**. Blanking preserves length,
-so every `Call::site` still points into the markdown the model wrote,
-and `Turn.source` stays byte-exact. That is phase 24's trick, per cell.
+A cell is compiled from its own text. Afterwards, `cell.start` is added
+to every span the compilation produced — `Program::spans` (one `Span`
+per instruction, a flat array), each debug function's
+`span_start`/`span_end`, and any diagnostic's span.
 
-An earlier draft blanked everything outside *all* fences and compiled
-one program, which gave shared scope for free because the cells were
-literally one source. D11 gives up that freebie deliberately: cells must
-execute as they arrive, and a cell cannot be part of a program whose
-later half has not been written yet.
+The result is what matters downstream: **every offset is absolute into
+`Turn.source`**, which is the whole markdown, byte for byte. So
+`Call::site`, `Condition::site`, `report.rs`'s per-call-site annotation
+and its line-and-caret diagnostic all keep working untouched, and a
+caret lands in the model's own reply with its prose around it.
+
+Two rejected alternatives:
+
+- **Blanking** — overwrite every byte outside the cell with spaces and
+  compile that, so offsets come out absolute with no rebase. This is
+  what phase 24 did for a leading `tell()`, and an earlier draft of this
+  doc adopted it. With per-cell compilation it is strictly worse: it
+  allocates and parses a full-length copy of the markdown once per cell
+  to save two loops over arrays that already exist.
+- **Cell-local spans** — accept that an offset means "byte 40 of cell 2",
+  as a notebook's line numbers do. Rejected because `site` is not only
+  for error text: it is logged on `Call::Send` and `Condition`, and
+  read back to annotate a program per call site. Going relative would
+  put a cell index on every span-carrying event in the log and teach
+  every consumer to resolve it — schema churn to avoid an addition.
+
+**The prelude is the trap here.** `compile_with` *appends* the
+higher-order-method helpers to the source ("appended, so user spans are
+unchanged"), so prelude instructions carry spans past the end of the
+user's text. Harmless today; after rebasing, cell 0's prelude spans
+would land inside the prose that follows it, and a report could annotate
+a paragraph with a call result. A span starting at or beyond the cell's
+own length is therefore made zero-width synthetic rather than shifted.
 
 ### D3 — ```js executes; quoting is the marked case
 
@@ -353,12 +376,18 @@ evidence exists, and that is the failure mode to watch for.
 
 ## Steps
 
-**25.1 — The split.** `notebook.rs`: markdown in, `Vec<CellSpan>` out,
-plus a blanking helper producing one compilable source per cell. Pure,
-no IO, no JS parsing. Gate: `cargo test -p agent notebook` covers ```js,
-```javascript, a non-executable tag, an unterminated final fence, a
-4-backtick fence wrapping a 3-backtick one, and zero cells; asserts the
-blanked source is the same length as the markdown in every case.
+**25.1 — The split.** `notebook.rs`: markdown in, `Vec<CellSpan>` out.
+Pure, no IO, no JS parsing. Gate: `cargo test -p agent notebook` covers
+```js, ```javascript, a non-executable tag, an unterminated final fence,
+a 4-backtick fence wrapping a 3-backtick one, and zero cells; asserts
+every span slices the markdown back to exactly the cell's text.
+
+**25.1b — Span rebasing.** Compile a cell's substring, add `cell.start`
+across `Program::spans` and the debug function table, zero-width any
+span at or beyond the cell's length (the appended prelude). Gate: a test
+that a call in cell 2 logs a `site` which slices `Turn.source` to that
+call's own text, and that no prelude instruction carries a span landing
+in prose.
 
 **25.2 — Incremental cell compilation (D12).** Re-enterable compiler
 carrying the scope table (name → slot *and* `SlotKind`); growable frame
