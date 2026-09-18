@@ -667,6 +667,46 @@ This is D12's rejected draft 2 generalized. That draft was rejected on a
 cost basis — "`FreshCell` already moves a slot, so the common case need
 not pay" — which assumed the store existed. It does not.
 
+**Pinning is a blunt instrument, and there is a sharper one if it ever
+matters.** Constant elision is not inherently unsafe under incremental
+evaluation — it is unsafe only because nothing *resurrects* the binding
+when a later fragment turns out to need it. Let a later fragment
+materialize the slot in its own prologue and the optimization can stay.
+
+It composes with the machinery already here, because the trigger is the
+same re-finalization diff that drives promotion. One transition becomes
+two:
+
+| transition | prologue emits |
+|---|---|
+| `Plain -> Boxed` | `FreshCell(slot)` |
+| elided -> materialized | push the constant, `SetLocal(slot)` |
+
+And it is **always** constructible: `ConstValue` is `Null`, `Bool`,
+`Num`, `Str` and `Fn { label, arity, js_length }`, each a single push,
+with `Fn`'s label already persisting across fragments (requirement 3).
+There is no case where the compiler knows a binding is constant and
+cannot rebuild it.
+
+What makes it sound is the `!captured` clause: a function in an earlier
+fragment that referenced the binding would have *captured* it, so it was
+never folded, so no already-emitted code can hold a stale fold. The only
+readers of a folded constant are straight-line statements in fragments
+that have already run, and they read it correctly at the time. The
+resurrected slot goes at the **end** of the frame rather than in
+declaration order — earlier slots cannot shift, and slot indices are
+internal anyway.
+
+The case needing real care is const-function demotion:
+`function f(){ return z; }` followed later by `let z = 9;` both demotes
+`f` and gives it a closure cell the earlier fragment never emitted. Also
+constructible, but more than one push.
+
+**Not built, deliberately.** It recovers constant folding at the root of
+programs that are a few dozen statements dominated by file reads and
+network calls, so it buys nothing measurable. Recorded because it is the
+right shape if the cost of pinning ever shows up in a measurement.
+
 **Scopes freeze when compiled.** Re-finalization may add new scopes and
 may flip a root slot `Plain -> Boxed`; it may not change anything else
 about a scope whose code has already been emitted. That is the general
