@@ -430,7 +430,7 @@ mod tests {
         // `card()` shows up as a diff review must look at, not a byte
         // count that silently drifts. Comparing full text (not just a
         // hash) so the diff itself is legible in a failure message.
-        const EXPECTED_LEN: usize = 12957;
+        const EXPECTED_LEN: usize = 13676;
         assert_eq!(
             card().len(),
             EXPECTED_LEN,
@@ -782,9 +782,21 @@ mod tests {
             "the second hands on and does not stop: {}",
             ex[1].assistant
         );
+        // **`choose`, not `ask`.** The awaited value is the whole point
+        // of the third exemplar: a free-form `ask` answered in prose
+        // cannot be compared with `===` or written into a file, and an
+        // exemplar that does so teaches the one mistake this pair of
+        // verbs exists to prevent. `choose` promises one of the offered
+        // strings, so the `await`, the `===` and the edit are all
+        // honest — and the case where the person answers outside the
+        // set does not appear here because the program does not handle
+        // it: it arrives as a resumable condition, and the program
+        // written *then* is the one that judges their words.
         assert!(
-            ex[2].assistant.contains("await ask(") && ex[2].assistant.contains("done()"),
-            "the third asks mid-program and acts on the answer: {}",
+            ex[2].assistant.contains("await choose(")
+                && ex[2].assistant.contains("===")
+                && ex[2].assistant.contains("done()"),
+            "the third offers a bounded choice and acts on the answer: {}",
             ex[2].assistant
         );
         // **The fifth appends twice, and that is the point.** A return

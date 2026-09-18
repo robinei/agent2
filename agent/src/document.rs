@@ -632,12 +632,30 @@ fn pending_line(
             to,
             text,
             expects_reply: true,
+            options,
             ..
         }) => Some(format!(
-            "[{}] you asked {}: {}",
+            "[{}] you asked {}: {}{}",
             event.id.as_u64(),
             crate::machine::address_label(to),
-            escape_untrusted(text)
+            escape_untrusted(text),
+            // A `choose`'s options belong on its own row. When the
+            // answer arrives it is one of these strings and nothing
+            // else, and a row reading `you asked user: 30s` two lines
+            // above `user answered #12: 5m` is unreadable without them
+            // — the reader cannot tell a picked option from prose.
+            if options.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " — pick one of: {}",
+                    options
+                        .iter()
+                        .map(|o| escape_untrusted(o))
+                        .collect::<Vec<_>>()
+                        .join(" / ")
+                )
+            }
         )),
         EventPayload::Answer { question, value } => Some(format!(
             "[{}] you answered #{}: {}",
@@ -1150,6 +1168,7 @@ mod tests {
                 origin: Origin::Direct {
                     text: "go".into(),
                     input: serde_json::Value::Null,
+                    options: Vec::new(),
                     expects_reply: true,
                 },
             }),
@@ -1268,6 +1287,7 @@ mod tests {
             origin: Origin::Direct {
                 text: text.to_owned(),
                 input: serde_json::Value::Null,
+                options: Vec::new(),
                 expects_reply: true,
             },
         })
@@ -1453,6 +1473,7 @@ mod tests {
                 to: Address::User,
                 text: text.into(),
                 input: serde_json::Value::Null,
+                options: Vec::new(),
                 expects_reply: false,
                 site: a as u32,
                 site_end: b as u32,
@@ -1512,6 +1533,7 @@ mod tests {
                 to: Address::User,
                 text: "ok".into(),
                 input: serde_json::Value::Null,
+                options: Vec::new(),
                 expects_reply: false,
                 site: 0,
                 site_end: "tell(\"ok\")".len() as u32,
@@ -1551,6 +1573,7 @@ mod tests {
                 origin: Origin::Direct {
                     text: "which one?".into(),
                     input: serde_json::Value::Null,
+                    options: Vec::new(),
                     expects_reply: true,
                 },
             }),
@@ -1565,6 +1588,7 @@ mod tests {
                     to: Address::User,
                     text: "30 or 240?".into(),
                     input: serde_json::Value::Null,
+                    options: Vec::new(),
                     expects_reply: true,
                     site: 0,
                     site_end: 0,
@@ -1611,6 +1635,7 @@ mod tests {
                     to: Address::User,
                     text: "is 240 still right for request_timeout_seconds, or did we settle on the old 30?".into(),
                     input: serde_json::Value::Null,
+                    options: Vec::new(),
                     expects_reply: true,
                     site: at as u32,
                     site_end: end as u32,

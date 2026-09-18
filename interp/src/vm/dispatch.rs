@@ -2,6 +2,13 @@ use super::*;
 use crate::builtin::{Builtin, BuiltinKind};
 use smallvec::SmallVec;
 
+/// How much of a string rejection survives into the error a program's
+/// handler reads. Generous because the string is the whole message — a
+/// tool's failure explained in the words it chose — and stingy only
+/// against a program that rejects with a megabyte of its own data,
+/// which would otherwise land in the log and every later context.
+const REJECTION_MESSAGE_MAX_BYTES: usize = 4096;
+
 /// The missing-`await` hint, appended to property/index access errors when
 /// the receiver is a promise — the misuse LLMs actually commit under this
 /// dialect (`tools.f(x).field` instead of `(await tools.f(x)).field`).
@@ -2732,11 +2739,35 @@ impl VM {
                             // first (pop-first invariant), then fail resumably —
                             // the host may substitute a value for the rejection
                             // (`PushValueThenContinue`).
-                            let msg = format!(
-                                "awaited promise rejected with {} ({})",
-                                errval.type_name(),
-                                self.preview(errval)
-                            );
+                            // A string rejection **is** the message. Every
+                            // host tool that fails rejects with one, written
+                            // to be read by the model, and `preview` cuts
+                            // strings at 42 bytes for use inside a larger
+                            // sentence — so `read_file` on a missing path
+                            // used to arrive as `awaited promise rejected
+                            // with string ("/nonexistent/deeply/nested/pa…")`,
+                            // the reason gone entirely and the path cut in
+                            // half. Anything else has no text of its own and
+                            // still gets the type-and-preview form.
+                            let msg = match errval {
+                                Value::String(s) => {
+                                    let s = s.as_str();
+                                    if s.len() <= REJECTION_MESSAGE_MAX_BYTES {
+                                        s.to_owned()
+                                    } else {
+                                        let mut end = REJECTION_MESSAGE_MAX_BYTES;
+                                        while !s.is_char_boundary(end) {
+                                            end -= 1;
+                                        }
+                                        format!("{}…", &s[..end])
+                                    }
+                                }
+                                _ => format!(
+                                    "awaited promise rejected with {} ({})",
+                                    errval.type_name(),
+                                    self.preview(errval)
+                                ),
+                            };
                             self.stack.pop();
                             return Err(self.fail(ErrorKind::ValueError, msg));
                         }

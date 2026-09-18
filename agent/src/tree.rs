@@ -1119,10 +1119,12 @@ fn resolve_message(events: &HashMap<EventId, Event>, msg: &Message) -> Message {
             text,
             input,
             expects_reply,
+            options,
             ..
         })) => Origin::Direct {
             text: text.clone(),
             input: input.clone(),
+            options: options.clone(),
             expects_reply: *expects_reply,
         },
         // The `Send` is not in this tree (or is not a `Send`): keep the
@@ -1149,6 +1151,7 @@ mod tests {
             origin: Origin::Direct {
                 text: text.into(),
                 input: json!(null),
+                options: Vec::new(),
                 expects_reply: true,
             },
         })
@@ -1427,6 +1430,7 @@ mod tests {
                 origin: Origin::Direct {
                     text: "fyi".into(),
                     input: json!(null),
+                    options: Vec::new(),
                     expects_reply: false,
                 },
             }),
@@ -1540,6 +1544,7 @@ mod tests {
                 origin: Origin::Direct {
                     text: "child prompt".into(),
                     input: json!({"task": 1}),
+                    options: Vec::new(),
                     expects_reply: true,
                 },
             }),
@@ -1746,6 +1751,7 @@ mod tests {
                 to: Address::Branch(EventId::new(1)),
                 text: plan.clone(),
                 input: json!({ "big": plan.clone() }),
+                options: Vec::new(),
                 expects_reply: true,
                 site: 0,
                 site_end: 0,
@@ -1808,6 +1814,7 @@ mod tests {
                     origin: Origin::Direct {
                         text: "read PLAN.md".into(),
                         input: json!({ "n": 7 }),
+                        options: Vec::new(),
                         expects_reply: true,
                     },
                 }),

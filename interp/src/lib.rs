@@ -41,6 +41,7 @@ pub use vm::{
 pub const HARNESS_VERBS: &[&str] = &[
     "tell",
     "ask",
+    "choose",
     "spawn",
     "fork",
     "done",

@@ -488,6 +488,20 @@ pub fn render_post(id: EventId, from: Author, origin: &Origin) -> String {
         Author::Agent(id) => out.push_str(&format!("[agent {}] ", id.as_u64())),
     }
     out.push_str(text);
+    // A `choose` asked of an agent: the options are part of the
+    // question. Without them the recipient is being asked to pick from
+    // a set it cannot see, and every `answer` it tries is refused.
+    let options = origin.options();
+    if !options.is_empty() {
+        out.push_str("\n\npick one, and answer with it exactly: ");
+        out.push_str(
+            &options
+                .iter()
+                .map(|o| format!("{o:?}"))
+                .collect::<Vec<_>>()
+                .join(" / "),
+        );
+    }
     if !input.is_null() {
         out.push_str("\n\ninput: ");
         out.push_str(&input_preview(input));
@@ -1371,6 +1385,7 @@ mod tests {
                 origin: Origin::Direct {
                     text: "go".into(),
                     input: json!(null),
+                    options: Vec::new(),
                     expects_reply: true,
                 },
             }),
@@ -1532,6 +1547,7 @@ mod tests {
                     origin: Origin::Direct {
                         text: "which one?".into(),
                         input: serde_json::Value::Null,
+                        options: Vec::new(),
                         expects_reply: true,
                     },
                 }),
@@ -2010,6 +2026,7 @@ mod tests {
                 origin: Origin::Direct {
                     text: "read the config and summarize it".into(),
                     input: json!(null),
+                    options: Vec::new(),
                     expects_reply: true,
                 },
             }),

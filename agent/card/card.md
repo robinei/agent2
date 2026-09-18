@@ -44,7 +44,7 @@ Your own programs come back to you annotated: a `tell`, `ask` or `history.append
 
 Nothing else crosses — least of all your variables. Every name you bind here goes when this program ends, so a later `ls.stdout` or `content` is a `ReferenceError`, not a value. A program that finds something and neither acts on it nor hands it on has thrown the finding away, and the next program will go and find the same thing again. You are writing this one now; what it fetches arrives when you are no longer here, and only the program after it can read any of it.
 
-When the next step turns on a judgement the data cannot settle — which of these did you mean, is this value still right — stop and get it: `ask("user", …)` if a person must decide, `raise(…)` if you only want a verdict on what you already hold. Both come back into this same program. Guessing at a question that has a real answer is the failure, and acting on the guess is the expensive one.
+When the next step turns on a judgement the data cannot settle — which of these did you mean, is this value still right — stop and get it: `choose("user", …, [ … ])` if a person must decide between things you can name, `ask("user", …)` if the question is open, `raise(…)` if you only want a verdict on what you already hold. Both come back into this same program. Guessing at a question that has a real answer is the failure, and acting on the guess is the expensive one.
 
 An ambiguity written down in the material is a question addressed to you: a comment asking whether something is still right, a note saying nobody remembers, two values where one was meant. Reading past it and picking one is not resolving it.
  */
@@ -62,10 +62,13 @@ declare function tell(text: string): void;
 /** Say something to an agent you spawned or forked. */
 declare function tell(to: Agent, text: string): void;
 
-/** Ask, and wait for the answer in the middle of this program. `"user"` is the person. The only verb here that returns a promise. */
+/** Ask an open question and wait for the answer in the middle of this program. `"user"` is the person. The answer is whatever they write, so it is text to read, not a value to compute with. */
 declare function ask(who: "user" | Agent, text: string): Promise<string>;
 
-/** Discharge an `ask()` another program is blocked on, by its id. */
+/** Ask which of a few named things they want. Resolves to one of `options`, exactly — safe to compare with `===` and to use as a value. If they answer with something else instead, this call fails with their words, and the program you write next decides what they meant: `resume(<one of the options>)` puts a value back in place of this call and runs on from here, or handle it some other way. */
+declare function choose(who: "user" | Agent, text: string, options: string[]): Promise<string>;
+
+/** Discharge an `ask()` or `choose()` another program is blocked on, by its id. A `choose` takes one of the options it offered and nothing else. */
 declare function answer(question: number, label: string, value: unknown): void;
 
 /** A new agent with a clean context. Creating is not messaging — it is idle until you `tell` or `ask` the handle. */

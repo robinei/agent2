@@ -1694,7 +1694,7 @@ fn await_rejected_escalates_resumably() {
     vm.reject_promise(id, Value::String("boom".into())).unwrap();
     let err = vm.step(u64::MAX).unwrap_err();
     assert_eq!(err.kind, ErrorKind::ValueError);
-    assert!(err.message.contains("rejected"), "got: {}", err.message);
+    assert_eq!(err.message, "boom", "got: {}", err.message);
     assert!(matches!(err.resume, ResumeMode::PushValueThenContinue));
     vm.resume_with(&err, n(7.0)).unwrap();
     match vm.step(u64::MAX).unwrap() {

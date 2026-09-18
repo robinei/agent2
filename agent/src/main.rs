@@ -590,14 +590,24 @@ fn describe_call(call: &Call) -> String {
             to,
             text,
             expects_reply,
+            options,
             ..
         } => {
-            let verb = if *expects_reply { "ask" } else { "tell" };
+            let verb = match (*expects_reply, options.is_empty()) {
+                (false, _) => "tell",
+                (true, true) => "ask",
+                (true, false) => "choose",
+            };
             let to = match to {
                 Address::User => "user".to_owned(),
                 Address::Branch(id) => format!("#{}", id.as_u64()),
             };
-            format!("{verb} {to}: {text}")
+            let offered = if options.is_empty() {
+                String::new()
+            } else {
+                format!(" [{}]", options.join(" / "))
+            };
+            format!("{verb} {to}: {text}{offered}")
         }
         Call::Spawn { name, charter, .. } => {
             format!(

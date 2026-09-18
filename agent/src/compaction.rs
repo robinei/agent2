@@ -260,6 +260,7 @@ mod tests {
                 origin: Origin::Direct {
                     text: "go".into(),
                     input: serde_json::Value::Null,
+                    options: Vec::new(),
                     expects_reply: true,
                 },
             }),
@@ -312,6 +313,7 @@ mod tests {
                 origin: Origin::Direct {
                     text: "go".into(),
                     input: serde_json::Value::Null,
+                    options: Vec::new(),
                     expects_reply: true,
                 },
             }),

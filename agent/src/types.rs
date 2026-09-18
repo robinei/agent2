@@ -454,6 +454,12 @@ pub enum Origin {
         #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
         input: serde_json::Value,
         expects_reply: bool,
+        /// The offered options, when the `Send` behind this was a
+        /// `choose` — the recipient cannot answer within a set it
+        /// cannot see, so the body carries them the same way it carries
+        /// the text.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        options: Vec<String>,
     },
 }
 
@@ -466,8 +472,17 @@ impl Origin {
                 text,
                 input,
                 expects_reply,
+                ..
             } => Some((text, input, *expects_reply)),
             Origin::Sent(_) => None,
+        }
+    }
+
+    /// The options a `choose` offered, empty for everything else.
+    pub fn options(&self) -> &[String] {
+        match self {
+            Origin::Direct { options, .. } => options,
+            Origin::Sent(_) => &[],
         }
     }
 }
@@ -512,6 +527,24 @@ pub enum Call {
         #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
         input: serde_json::Value,
         expects_reply: bool,
+        /// `choose(who, question, options)`'s options — empty for every
+        /// `tell` and every free-form `ask`.
+        ///
+        /// Non-empty is the whole difference between the two asking
+        /// verbs, and it is a **promise to the asking program**: the
+        /// value that settles this call is one of these strings, `===`
+        /// -equal, so `await choose(...)` is safe to compare and switch
+        /// on. Nothing else in this vocabulary hands a program a value
+        /// with a shape it can rely on without checking.
+        ///
+        /// The promise is kept by refusing replies rather than by
+        /// coercing them: `Runner::pick_option` normalises a human's
+        /// "2" or "leave IT" onto the canonical spelling, and anything
+        /// it cannot place leaves the call open (`Host::cmd_reply`) or
+        /// rejects the `answer` (`machine.rs`'s `TOOL_ANSWER`). A
+        /// settled `choose` therefore never carries prose.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        options: Vec<String>,
         site: u32,
         /// End of the `tools.ask`/`tools.tell` call's source span
         /// (`site` is its start), so a host can log/underline the whole
@@ -669,6 +702,20 @@ impl Context {
                 .map(|(_, input, _)| input.clone())
                 .unwrap_or(serde_json::Value::Null),
             _ => serde_json::Value::Null,
+        }
+    }
+
+    /// The options a still-open post offered, when it came from a
+    /// `choose` — empty for every `ask`. What `answer(question, …)` is
+    /// held to, and what a recipient reads off the rendered post.
+    pub fn options(tree: &Tree, question: EventId) -> Vec<String> {
+        let Some(EventPayload::Message(msg)) = tree.events.get(&question).map(|e| &e.payload)
+        else {
+            return Vec::new();
+        };
+        match tree.resolve(msg) {
+            Message::Post { origin, .. } => origin.options().to_vec(),
+            _ => Vec::new(),
         }
     }
 }

@@ -110,11 +110,11 @@ fn rejected_await_escalates_and_is_resumable() {
         .unwrap();
     let err = vm.step(u64::MAX).unwrap_err();
     assert_eq!(err.kind, ErrorKind::ValueError);
-    assert!(
-        err.message.contains("rejected") && err.message.contains("tool exploded"),
-        "got: {}",
-        err.message
-    );
+    // The rejection string reaches the handler as itself: a tool's
+    // failure is explained in the tool's own words, and wrapping it in
+    // `rejected with string (…)` cost the end of every message longer
+    // than 42 bytes.
+    assert_eq!(err.message, "tool exploded", "got: {}", err.message);
     // Phase 3 path: the host substitutes a value and execution continues.
     assert!(matches!(err.resume, ResumeMode::PushValueThenContinue));
     vm.resume_with(&err, Value::PosInt(0)).unwrap();

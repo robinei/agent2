@@ -771,6 +771,7 @@ impl Session {
                     Origin::Direct {
                         text,
                         input: serde_json::Value::Null,
+                        options: Vec::new(),
                         expects_reply,
                     },
                 )
@@ -1069,6 +1070,7 @@ impl Session {
                 Origin::Direct {
                     text,
                     input: serde_json::Value::Null,
+                    options: Vec::new(),
                     expects_reply: true,
                 },
             )?;
@@ -1677,21 +1679,41 @@ impl Session {
         if !self.open_branch(branch) {
             return self.unaddressable(branch);
         }
-        let pending = matches!(
-            self.tree.events.get(&call).map(|e| &e.payload),
-            Some(EventPayload::Call(Call::Send {
-                to: Address::User,
-                expects_reply: true,
-                ..
-            }))
-        );
-        if !pending {
+        let Some(EventPayload::Call(Call::Send {
+            to: Address::User,
+            expects_reply: true,
+            options,
+            ..
+        })) = self.tree.events.get(&call).map(|e| &e.payload)
+        else {
             self.emit(SessionEvent::Error {
                 branch: Some(branch),
                 message: format!("#{} is not a question to you", call.as_u64()),
             });
             return Ok(());
-        }
+        };
+        // A `choose` promised its asking program one of the offered
+        // strings. The promise is kept here, and it is kept by *not*
+        // coercing: a reply that lands on an option settles the call
+        // with that option's canonical spelling, and one that doesn't
+        // rejects it — which `Await` escalates as a resumable condition,
+        // handing the person's actual words to a program that can judge
+        // them. The person is never told to answer again; the machine
+        // that can read prose is the one that reads it.
+        let result = match (options.as_slice(), value.as_str()) {
+            ([], _) => Ok(value),
+            (options, Some(reply)) => match crate::machine::pick_option(reply, options) {
+                Some(picked) => Ok(serde_json::Value::String(picked)),
+                None => Err(crate::machine::off_menu("the user", reply, options)),
+            },
+            (options, None) => {
+                let rendered = value.to_string();
+                match crate::machine::pick_option(&rendered, options) {
+                    Some(picked) => Ok(serde_json::Value::String(picked)),
+                    None => Err(crate::machine::off_menu("the user", &rendered, options)),
+                }
+            }
+        };
         // Settle through the same door every other tool result uses
         // (`on_tool_results`, via `StepInput::ToolResults`): it logs the
         // `Result` itself *and* resolves the VM's waiting promise. The
@@ -1701,13 +1723,7 @@ impl Session {
         // only `on_tool_results` clears it) — so the suspended `await
         // ask(...)` just sat there forever, ticking on nothing that
         // could ever advance it.
-        self.step_branch(
-            branch,
-            StepInput::ToolResults(vec![ToolResult {
-                call,
-                result: Ok(value),
-            }]),
-        )
+        self.step_branch(branch, StepInput::ToolResults(vec![ToolResult { call, result }]))
     }
 
     /// The exchanges `branch` still owes: `(asker, send)` for every open
@@ -2883,6 +2899,7 @@ mod tests {
                     to: Address::User,
                     text: "which file?".into(),
                     input: json!(null),
+                    options: Vec::new(),
                     expects_reply: true,
                     site: 0,
                     site_end: 0,
@@ -2976,6 +2993,160 @@ mod tests {
             returned,
             Some(json!("got: yes")),
             "the same VM resumed and finished the program, not just logged an unread Result"
+        );
+    }
+
+    /// `choose` keeps its promise on the ordinary path: the value the
+    /// program awaits is one of the options it offered, spelled the way
+    /// it offered it, however the person typed it. Here they answer
+    /// `"b"` to an option named `"B"` — a reply that means exactly one
+    /// thing and would be a bug to hand back verbatim, because the
+    /// program compares it with `===`.
+    #[test]
+    fn choose_settles_with_the_offered_spelling_not_the_typed_one() {
+        let (session, _events) = run_session(
+            ToolRegistry::new(),
+            vec![scripted_program(
+                r#"const p = await choose("user", "which?", ["A", "B"]);
+                   return "picked: " + p;"#,
+            )],
+            "go",
+        );
+        let branch = session.conversation_branch();
+        let call = session
+            .branch_infos()
+            .into_iter()
+            .find(|b| b.branch == branch)
+            .and_then(|b| b.asking_user)
+            .expect("parked on the choice");
+        session.handle().send(SessionCommand::Reply {
+            branch,
+            call,
+            value: json!("b"),
+        });
+        let session = session.run();
+
+        let returned = session.tree().events.values().find_map(|e| match &e.payload {
+            EventPayload::Return { value } => Some(value.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            returned,
+            Some(json!("picked: B")),
+            "the awaited value is the option as offered"
+        );
+    }
+
+    /// **The A/B/C/Other path, end to end.** A person who answers
+    /// outside the set is never told to answer again — their words are
+    /// not the problem, they are the information. The call fails with
+    /// them, `Await` escalates that as a *resumable* error, and the next
+    /// program is a handler that reads what they actually said and
+    /// decides: `resume(v)` stands in for the `choose` and the original
+    /// program runs on from that instruction with `v` in hand.
+    ///
+    /// This is the whole reason `choose` needed no new machinery — every
+    /// piece below already existed for trapped errors.
+    #[test]
+    fn an_answer_outside_the_options_becomes_a_resumable_condition() {
+        let (session, _events) = run_session(
+            ToolRegistry::new(),
+            vec![
+                scripted_program(
+                    r#"const p = await choose("user", "which?", ["A", "B"]);
+                       return "picked: " + p;"#,
+                ),
+                // The handler. It sees the words in its condition
+                // report and maps them onto an option itself — the
+                // judgement the harness deliberately refused to make.
+                scripted_program(r#"return resume("B");"#),
+            ],
+            "go",
+        );
+        let branch = session.conversation_branch();
+        let call = session
+            .branch_infos()
+            .into_iter()
+            .find(|b| b.branch == branch)
+            .and_then(|b| b.asking_user)
+            .expect("parked on the choice");
+        session.handle().send(SessionCommand::Reply {
+            branch,
+            call,
+            value: json!("whichever one is cheaper"),
+        });
+        let session = session.run();
+
+        let condition = session
+            .tree()
+            .events
+            .values()
+            .find_map(|e| match &e.payload {
+                EventPayload::Condition { cause, .. } => Some(cause.clone()),
+                _ => None,
+            })
+            .expect("the off-menu reply raised a condition");
+        let Cause::Trapped {
+            message, resumable, ..
+        } = condition
+        else {
+            panic!("expected a trapped condition, got {condition:?}");
+        };
+        assert!(resumable, "the handler must be able to stand a value in");
+        assert!(
+            message.contains("whichever one is cheaper"),
+            "the person's own words reach the handler: {message}"
+        );
+        assert!(
+            message.contains("\"A\"") && message.contains("\"B\""),
+            "and what was offered, so the handler can map onto it: {message}"
+        );
+
+        let returned = session.tree().events.values().find_map(|e| match &e.payload {
+            EventPayload::Return { value } => Some(value.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            returned,
+            Some(json!("picked: B")),
+            "resume() stood in for the choose and the original program finished"
+        );
+    }
+
+    /// **A failing tool has to say why.** A tool that fails rejects its
+    /// promise with a string written for the model to read, and an
+    /// unhandled rejection escalates through `Await` as a resumable
+    /// error carrying that string. It was arriving through `preview`,
+    /// which cuts strings at 42 bytes for use *inside* a larger
+    /// sentence — so this exact call used to reach the model as
+    /// `awaited promise rejected with string ("/nonexistent/deeply/…")`,
+    /// the path cut in half and the reason missing altogether, leaving
+    /// nothing to act on but the fact that something went wrong.
+    #[test]
+    fn a_failing_tool_reaches_the_program_with_its_reason_intact() {
+        let (session, _e) = run_session(
+            crate::host::tools::real_registry(),
+            vec![scripted_program(
+                r#"const x = await tools.read_file("/nonexistent/deeply/nested/path/that/is/not/there.txt"); return x;"#,
+            )],
+            "go",
+        );
+        let session = session.run();
+        let message = session
+            .tree()
+            .events
+            .values()
+            .find_map(|e| match &e.payload {
+                EventPayload::Condition {
+                    cause: Cause::Trapped { message, .. },
+                    ..
+                } => Some(message.clone()),
+                _ => None,
+            })
+            .expect("the failed read trapped");
+        assert!(
+            message.contains("not/there.txt") && message.contains("No such file"),
+            "the whole path and the reason both survive: {message}"
         );
     }
 
@@ -3226,6 +3397,7 @@ mod tests {
             origin: Origin::Direct {
                 text: text.into(),
                 input: json!(null),
+                options: Vec::new(),
                 expects_reply: true,
             },
         })
@@ -3733,6 +3905,7 @@ mod tests {
                 origin: Origin::Direct {
                     text: "do something".into(),
                     input: json!(null),
+                    options: Vec::new(),
                     expects_reply: true,
                 },
             }),
@@ -4796,6 +4969,79 @@ mod tests {
     // ── B2: structured answers ──────────────────────────────────────
 
     /// `Answer.value` is JSON: a structured answer reaches the asking
+    /// A `choose` aimed at an agent, both halves. The recipient can
+    /// only answer within a set it can see, so the options travel with
+    /// the question into its post; and it is *held* to them, because
+    /// the asking program was promised one of them. An agent answering
+    /// off-menu is corrected on the spot rather than escalated to the
+    /// asker: unlike a person's prose, this is a program's mistake, and
+    /// the program that made it is still running and can fix it — which
+    /// is what the first of these two scripts does.
+    #[test]
+    fn an_agent_answering_a_choose_is_held_to_the_options() {
+        let question = 8;
+        let (session, _) = run_routed(
+            ToolRegistry::new(),
+            [
+                (
+                    "counts things",
+                    vec![
+                        scripted_program(&format!(r#"answer({question}, "w1", "maybe");"#)),
+                        scripted_program(&format!(
+                            r#"answer({question}, "w1", "big");
+                               done();"#
+                        )),
+                    ],
+                ),
+                (
+                    "test agent",
+                    vec![
+                        scripted_program(
+                            r#"const w = await spawn("counts things");
+                               const v = await choose(w.agent, "how many?", ["small", "big"]);
+                               done();
+                               return v;"#,
+                        ),
+                        scripted_text("done"),
+                    ],
+                ),
+            ],
+            "count them",
+        );
+        let tree = session.tree();
+        let worker = agent_by_charter(tree, "counts things");
+
+        // The question the worker read carried the options with it.
+        let rendered = match &tree.events[&EventId::new(question)].payload {
+            EventPayload::Message(msg) => match tree.resolve(msg) {
+                Message::Post { origin, from } => crate::report::render_post(
+                    EventId::new(question),
+                    from,
+                    &origin,
+                ),
+                _ => panic!("not a post"),
+            },
+            other => panic!("not a message: {other:?}"),
+        };
+        assert!(
+            rendered.contains("\"small\"") && rendered.contains("\"big\""),
+            "the recipient sees what it may answer: {rendered}"
+        );
+
+        // Its first, off-menu answer was refused: `"maybe"` logged no
+        // `Answer` at all, the post stayed open, and the refusal
+        // trapped — which is what got the worker another program to put
+        // it right, rather than the asker a value it was promised would
+        // be one of two strings and wasn't.
+        let worker_leaf = session.state(worker).unwrap().spine.leaf_id;
+        let answers: Vec<_> = kinds(tree, worker_leaf)
+            .into_iter()
+            .filter(|k| *k == "Answer")
+            .collect();
+        assert_eq!(answers.len(), 1, "{:?}", kinds(tree, worker_leaf));
+        assert_eq!(returned(tree, root_leaf(&session)), json!("big"));
+    }
+
     /// **program** as an object, not as prose it would have to parse.
     /// 8_HARNESS decision 3 said a subagent's result is a JSON value and
     /// `finish_frame` could only produce a string. Closed.
@@ -5909,6 +6155,7 @@ mod tests {
                 to: Address::Branch(EventId::new(5)),
                 text: "q".into(),
                 input: json!(null),
+                options: Vec::new(),
                 expects_reply: true,
                 site: 0,
                 site_end: 0,
@@ -6221,6 +6468,7 @@ mod tests {
                     to: Address::User,
                     text: "which one?".into(),
                     input: json!(null),
+                    options: Vec::new(),
                     expects_reply: true,
                     site: 47,
                     site_end: 47,
@@ -6286,6 +6534,7 @@ mod tests {
                 origin: Origin::Direct {
                     text: "do the thing".into(),
                     input: json!(null),
+                    options: Vec::new(),
                     expects_reply: true,
                 },
             }),
@@ -6308,6 +6557,7 @@ mod tests {
                     to: Address::Branch(EventId::new(1)),
                     text: "which one?".into(),
                     input: json!(null),
+                    options: Vec::new(),
                     expects_reply: true,
                     site: 0,
                     site_end: 0,

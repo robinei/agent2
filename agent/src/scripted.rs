@@ -209,10 +209,25 @@ impl Outcome {
                     text,
                     input,
                     expects_reply,
+                    options,
                     ..
                 }) => Some(LoggedCall {
-                    name: if *expects_reply { "ask" } else { "tell" }.to_owned(),
-                    args: serde_json::json!([text, input]),
+                    // Three verbs, three names: a checker asking "did it
+                    // stop and ask?" and one asking "did it offer the
+                    // choice?" are different questions, and collapsing
+                    // `choose` into `ask` here would make the second
+                    // unanswerable from the log.
+                    name: match (*expects_reply, options.is_empty()) {
+                        (false, _) => "tell",
+                        (true, true) => "ask",
+                        (true, false) => "choose",
+                    }
+                    .to_owned(),
+                    args: if options.is_empty() {
+                        serde_json::json!([text, input])
+                    } else {
+                        serde_json::json!([text, options])
+                    },
                 }),
                 _ => None,
             })

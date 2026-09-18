@@ -65,6 +65,15 @@ use crate::types::*;
 /// likewise absent: it is its own `Instr::Raise`, handled in `pump`.
 pub const TOOL_SPAWN: &str = "spawn";
 pub const TOOL_ASK: &str = "ask";
+/// `choose(who, question, options)` — `ask`'s constrained sibling. The
+/// value it settles with is one of `options`, `===`-equal, so the
+/// asking program can compare and switch on it without checking; a
+/// person who answers outside the set rejects the call instead, which
+/// `Await` escalates as a *resumable* condition, so their actual words
+/// reach a program that can judge them and `resume(...)` stands in for
+/// the value. Nothing here is new machinery — that is what a rejected
+/// await has always done. See [`Call::Send::options`].
+pub const TOOL_CHOOSE: &str = "choose";
 pub const TOOL_TELL: &str = "tell";
 /// `fork()` — a divergent branch inheriting this agent's history,
 /// settled with the fork's handle exactly as `spawn` is (types.rs
@@ -968,6 +977,7 @@ impl Runner {
                 let origin = Origin::Direct {
                     text: INTERRUPT_NOTICE.to_owned(),
                     input: serde_json::Value::Null,
+                    options: Vec::new(),
                     expects_reply: false,
                 };
                 let (_, out) = self.deliver(tree, Author::Harness, origin)?;
@@ -1042,6 +1052,7 @@ impl Runner {
                     to: Address::User,
                     text: reply,
                     input: serde_json::Value::Null,
+                    options: Vec::new(),
                     expects_reply: false,
                     site: 0,
                     site_end: 0,
@@ -1360,6 +1371,7 @@ impl Runner {
             let origin = Origin::Direct {
                 text: self.settled_notice(tree, call, result),
                 input: serde_json::Value::Null,
+                options: Vec::new(),
                 expects_reply: false,
             };
             let (_, delivered) = self.deliver(tree, Author::Harness, origin)?;
@@ -1525,8 +1537,8 @@ impl Runner {
 
         for call in calls {
             match call.name.as_str() {
-                TOOL_ASK | TOOL_TELL => {
-                    let expects_reply = call.name == TOOL_ASK;
+                TOOL_ASK | TOOL_CHOOSE | TOOL_TELL => {
+                    let expects_reply = call.name != TOOL_TELL;
                     let args = self.call_args_json(&call.args);
                     // `tell(text)` / `tell(to, text)`, always
                     // `ask(who, text)` — positional, not an options
@@ -1535,10 +1547,21 @@ impl Runner {
                     // carried one either). Omitted `to`/`who` resolves
                     // to whoever this branch owes its oldest open post
                     // to (`resolve_address`).
-                    let (to, text) = match (call.name.as_str(), args.as_slice()) {
-                        (TOOL_TELL, [text]) => (None, coerce_text(text)),
-                        (_, [to, text]) => (Some(to.clone()), coerce_text(text)),
-                        _ => (None, None),
+                    let (to, text, options) = match (call.name.as_str(), args.as_slice()) {
+                        (TOOL_TELL, [text]) => (None, coerce_text(text), Vec::new()),
+                        (TOOL_CHOOSE, [to, text, options]) => {
+                            match read_options(options) {
+                                Ok(options) => (Some(to.clone()), coerce_text(text), options),
+                                Err(msg) => {
+                                    self.reject_call(call.promise, &msg);
+                                    progressed = true;
+                                    continue;
+                                }
+                            }
+                        }
+                        (TOOL_CHOOSE, _) => (None, None, Vec::new()),
+                        (_, [to, text]) => (Some(to.clone()), coerce_text(text), Vec::new()),
+                        _ => (None, None, Vec::new()),
                     };
                     match (text, self.resolve_address(tree, to.as_ref())) {
                         (Some(text), Ok(to)) => {
@@ -1548,6 +1571,7 @@ impl Runner {
                                     to,
                                     text,
                                     input: serde_json::Value::Null,
+                                    options,
                                     expects_reply,
                                     site: call.site,
                                     site_end: call.site_end,
@@ -1560,9 +1584,14 @@ impl Runner {
                             self.reject_call(
                                 call.promise,
                                 &format!(
-                                    "{}({}text) needs a text argument",
+                                    "{}({}text{}) needs a text argument",
                                     call.name,
-                                    if expects_reply { "who, " } else { "[to, ]" }
+                                    if expects_reply { "who, " } else { "[to, ]" },
+                                    if call.name == TOOL_CHOOSE {
+                                        ", options"
+                                    } else {
+                                        ""
+                                    }
                                 ),
                             );
                             progressed = true;
@@ -1765,7 +1794,39 @@ impl Runner {
                     [question, _label, value] => {
                         match question.as_u64().filter(|n| *n > 0).map(EventId::new) {
                             Some(question) if self.open().contains(&question) => {
-                                let value = value.clone();
+                                // A `choose` promised its asker one of
+                                // the offered strings. An agent that
+                                // answers outside the set is corrected
+                                // here rather than escalated to the
+                                // asker: unlike a person's prose, this
+                                // is a program's mistake, and the
+                                // program that made it is the one still
+                                // running and able to fix it.
+                                let options = Context::options(tree, question);
+                                let value = if options.is_empty() {
+                                    value.clone()
+                                } else {
+                                    let reply = match value.as_str() {
+                                        Some(s) => s.to_owned(),
+                                        None => value.to_string(),
+                                    };
+                                    match pick_option(&reply, &options) {
+                                        Some(picked) => serde_json::Value::String(picked),
+                                        None => {
+                                            let offered = options
+                                                .iter()
+                                                .map(|o| format!("{o:?}"))
+                                                .collect::<Vec<_>>()
+                                                .join(", ");
+                                            self.settle_err(&format!(
+                                                "#{} offered a choice; answer it with one of \
+                                                 [{offered}], not {reply:?}",
+                                                question.as_u64()
+                                            ));
+                                            return Ok(true);
+                                        }
+                                    }
+                                };
                                 tree.append(
                                     &mut self.spine,
                                     EventPayload::Answer {
@@ -2948,6 +3009,106 @@ fn coerce_text(v: &serde_json::Value) -> Option<String> {
     }
 }
 
+/// Read `choose`'s third argument: the offered options.
+///
+/// Strict, and deliberately so — a malformed `choose` is a program bug
+/// the model should see named, not a round trip to a person who is then
+/// asked to pick from one option or from `[object Object]`. Two is the
+/// floor because a one-option choice is a `tell`, and duplicates are
+/// refused because the whole promise of this verb is that the value
+/// coming back identifies *which* option was picked.
+fn read_options(v: &serde_json::Value) -> Result<Vec<String>, String> {
+    let serde_json::Value::Array(items) = v else {
+        return Err("choose(who, question, options) needs an array of option \
+                    strings as its third argument"
+            .to_owned());
+    };
+    let mut options = Vec::with_capacity(items.len());
+    for item in items {
+        match item {
+            serde_json::Value::String(s) if !s.trim().is_empty() => options.push(s.clone()),
+            serde_json::Value::String(_) => {
+                return Err("choose: an option is empty; every option needs text a \
+                            person can pick by"
+                    .to_owned())
+            }
+            other => {
+                return Err(format!(
+                    "choose: options must be strings; got {}. A person picks by reading \
+                     them, so each one has to say what it means.",
+                    crate::report::input_preview(other)
+                ))
+            }
+        }
+    }
+    if options.len() < 2 {
+        return Err(format!(
+            "choose: {} option{} is not a choice — offer at least two, or say it with \
+             tell() and ask() if there is nothing to pick between",
+            options.len(),
+            if options.len() == 1 { "" } else { "s" }
+        ));
+    }
+    for (i, a) in options.iter().enumerate() {
+        if let Some(j) = options[..i].iter().position(|b| b.trim() == a.trim()) {
+            return Err(format!(
+                "choose: options {} and {} are the same ({a:?}); the answer could not \
+                 say which was picked",
+                j + 1,
+                i + 1
+            ));
+        }
+    }
+    Ok(options)
+}
+
+/// Place a reply onto one of the offered options, or `None` if it does
+/// not land on one.
+///
+/// Strict on purpose. A looser matcher (unique prefixes, substrings)
+/// would buy nothing here and could guess wrong silently, because
+/// *failing* to place a reply is not an error in this design: it hands
+/// the person's actual words to a program that can read them. Being
+/// strict costs one condition; being clever costs a wrong answer nobody
+/// sees. Exact first, then case/whitespace, then the 1-based ordinal a
+/// person naturally types when reading a numbered list — the ordinal
+/// last so a literal option `"2"` still wins its own name.
+pub(crate) fn pick_option(reply: &str, options: &[String]) -> Option<String> {
+    if let Some(hit) = options.iter().find(|o| *o == reply) {
+        return Some(hit.clone());
+    }
+    let folded = reply.trim().to_lowercase();
+    if let Some(hit) = options
+        .iter()
+        .find(|o| o.trim().to_lowercase() == folded)
+    {
+        return Some(hit.clone());
+    }
+    folded
+        .parse::<usize>()
+        .ok()
+        .filter(|n| *n >= 1 && *n <= options.len())
+        .map(|n| options[n - 1].clone())
+}
+
+/// What a `choose` settles with when the reply did not land on an
+/// option: a rejection carrying the words themselves.
+///
+/// `Await` escalates a rejected promise as a resumable error, so this
+/// string is what the next program reads in its condition report, and
+/// `resume(value)` stands in for the call. It therefore has to carry
+/// everything that judgement needs — what was offered and what was
+/// actually said — because the suspended program's own source is the
+/// only other thing in view.
+pub(crate) fn off_menu(who: &str, reply: &str, options: &[String]) -> String {
+    let offered = options
+        .iter()
+        .map(|o| format!("{o:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("choose: {who} answered outside the offered set [{offered}], saying: {reply}")
+}
+
 /// `append_history(value)` takes any JSON value, but `EventPayload::Note`
 /// stores rendered text: a JSON string is used verbatim, anything else is
 /// serialized. The card's own guidance is to append a short projection
@@ -3195,6 +3356,7 @@ mod tests {
         Origin::Direct {
             text: text.into(),
             input: serde_json::Value::Null,
+            options: Vec::new(),
             expects_reply,
         }
     }
@@ -3226,6 +3388,7 @@ mod tests {
                     to,
                     text: text.into(),
                     input,
+                    options: Vec::new(),
                     expects_reply: true,
                     site: 0,
                     site_end: 0,
@@ -3335,7 +3498,7 @@ mod tests {
                 StepResult::Pending { calls } => {
                     let name = calls[0].name.as_str();
                     assert!(
-                        matches!(name, TOOL_ASK | TOOL_TELL) || crate::host::serves_inline(name),
+                        matches!(name, TOOL_ASK | TOOL_CHOOSE | TOOL_TELL) || crate::host::serves_inline(name),
                         "`{verb}` falls through dispatch_calls to the tool registry, \
                          which has no such tool"
                     );
@@ -3346,7 +3509,7 @@ mod tests {
                     // fire-and-forget batch instead.
                     let name = unstarted[0].name.as_str();
                     assert!(
-                        matches!(name, TOOL_ASK | TOOL_TELL) || crate::host::serves_inline(name),
+                        matches!(name, TOOL_ASK | TOOL_CHOOSE | TOOL_TELL) || crate::host::serves_inline(name),
                         "`{verb}` falls through dispatch_calls to the tool registry"
                     );
                 }
@@ -4552,6 +4715,7 @@ mod tests {
                 Origin::Direct {
                     text: "one".into(),
                     input: json!({ "n": 1 }),
+                    options: Vec::new(),
                     expects_reply: true,
                 },
             )
@@ -4563,6 +4727,7 @@ mod tests {
                 Origin::Direct {
                     text: "two".into(),
                     input: json!({ "n": 2 }),
+                    options: Vec::new(),
                     expects_reply: true,
                 },
             )
@@ -4972,6 +5137,7 @@ mod tests {
             to: Address::User,
             text: "y".repeat(8_000),
             input: serde_json::Value::Null,
+            options: Vec::new(),
             expects_reply: false,
             site: 0,
             site_end: 0,

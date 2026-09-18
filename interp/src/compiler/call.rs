@@ -673,7 +673,7 @@ impl super::Compiler {
                 self.compile_args(argv);
                 self.emit(Instr::Settle(name.into(), argv.len() as u32), span);
             }
-            "ask" => {
+            "ask" | "choose" => {
                 // The closed, harness-defined vocabulary (phase 20 doc,
                 // `docs/20_CODE_MODE.md` Step C1) — a fixed global
                 // surface, identical for every agent, known to this
@@ -686,13 +686,23 @@ impl super::Compiler {
                 // names — `Invoke`, arity-agnostic here too, left to
                 // the host to accept or refuse at runtime.
                 //
-                // `ask` is the one the settle-at-dispatch arm above
-                // does **not** take, and the only bare verb left with a
-                // promise. It is a genuine round trip to someone else,
-                // it may take minutes, and it may fail asynchronously:
-                // the promise is the honest shape for it, and the
-                // `await` in front of it in the card is describing
-                // something real.
+                // `ask` and `choose` are the ones the settle-at-dispatch
+                // arm above does **not** take, and the only bare verbs
+                // left with a promise. They are a genuine round trip to
+                // someone else, they may take minutes, and they may fail
+                // asynchronously: the promise is the honest shape for
+                // them, and the `await` in front of them in the card is
+                // describing something real.
+                //
+                // `choose(who, question, options)` differs from `ask`
+                // only in what it promises about the value: one of the
+                // offered strings, or — when the person answers outside
+                // the set — a rejection, which `Await` escalates as a
+                // resumable error so the next program decides with their
+                // actual words in view and `resume(...)` stands in for
+                // the call. That is the A/B/C/Other shape, and it needed
+                // no new mechanism: a rejected await was already a
+                // resumable condition.
                 self.compile_args(argv);
                 self.emit(Instr::Invoke(name.into(), argv.len() as u32), span);
             }

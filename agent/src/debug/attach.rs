@@ -1875,6 +1875,21 @@ fn asking_question_text(session: &Session, branch: BranchId) -> Option<String> {
         .find(|info| info.branch == branch)?
         .asking_user?;
     match session.tree().events.get(&call).map(|e| &e.payload) {
+        // A `choose` is not answerable without seeing what is on offer:
+        // the options are numbered because typing `2` is what a person
+        // does when reading a numbered list, and `pick_option` takes the
+        // ordinal for exactly that reason. Anything else typed here is
+        // still accepted — it reaches the agent as a condition to think
+        // about rather than being refused at the input line.
+        Some(EventPayload::Call(Call::Send { text, options, .. })) if !options.is_empty() => {
+            let listed = options
+                .iter()
+                .enumerate()
+                .map(|(i, o)| format!("  {}. {o}", i + 1))
+                .collect::<Vec<_>>()
+                .join("\n");
+            Some(format!("{text}\n{listed}"))
+        }
         Some(EventPayload::Call(Call::Send { text, .. })) => Some(text.clone()),
         _ => None,
     }
@@ -2802,6 +2817,7 @@ mod tests {
                     to: crate::types::Address::User,
                     text: "which file?".into(),
                     input: json!(null),
+                    options: Vec::new(),
                     expects_reply: true,
                     site: 0,
                     site_end: 0,

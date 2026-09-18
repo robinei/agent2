@@ -428,7 +428,7 @@ fn await_rejection_without_try_escalates_unchanged() {
     let err = vm.step(u64::MAX).unwrap_err();
     assert_eq!(err.kind, ErrorKind::ValueError);
     assert!(matches!(err.resume, ResumeMode::PushValueThenContinue));
-    assert!(err.message.contains("rejected"), "got: {}", err.message);
+    assert_eq!(err.message, "down", "got: {}", err.message);
 }
 
 #[test]
