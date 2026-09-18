@@ -1516,7 +1516,7 @@ impl Runner {
             _ => String::new(),
         };
         format!(
-            "A call you issued has settled with no program awaiting it: [#{}] {label} → \
+            "A call you issued has settled with no program awaiting it: [{}] {label} → \
              {outcome}. Fetch the whole value with history.fetch({}). Nothing is owed in reply.",
             call.as_u64(),
             call.as_u64(),
@@ -2249,7 +2249,13 @@ impl Runner {
         // display teaches the spelling; the parser should accept it.
         let id = to.as_u64().or_else(|| {
             to.as_str()
-                .map(|s| s.trim().trim_start_matches('#'))
+                // **Whatever form the id was displayed in.** A model
+                // writes back what it read, and it reads ids off the
+                // menu, the rows and the reports. `#16` was accepted in
+                // 2026-09-16 after a live run wrote `ask("#16", …)` and
+                // was refused; the bracketed form is what those places
+                // render now, so it has to address the same branch too.
+                .map(|s| s.trim().trim_matches(|c| c == '#' || c == '[' || c == ']'))
                 .and_then(|s| s.parse::<u64>().ok())
         });
         let Some(id) = id.filter(|n| *n > 0).map(EventId::new) else {
@@ -4616,6 +4622,7 @@ mod tests {
         for form in [
             serde_json::json!(id),
             serde_json::json!(format!("{id}")),
+            serde_json::json!(format!("[{id}]")),
             serde_json::json!(format!("#{id}")),
         ] {
             assert!(

@@ -249,7 +249,7 @@ impl CompletionReport {
         // reader to skip the block it heads.
         let mut sections = vec![match (id, self.value.is_null()) {
             (_, true) => "## program completed".to_owned(),
-            (Some(id), false) => format!("## program completed\nreturned [#{id}]: {rendered}"),
+            (Some(id), false) => format!("## program completed\nreturned [{id}]: {rendered}"),
             (None, false) => format!("## program completed\nreturned: {rendered}"),
         }];
         sections.extend(render_console(&self.console, self.console_id));
@@ -457,7 +457,7 @@ fn render_menu(title: &str, artifacts: &[&Artifact]) -> Option<String> {
             }
             ArtifactState::PendingInvoke => "issued; no result recorded; may have happened".into(),
         };
-        out.push_str(&format!("\n[#{}] {} → {}", a.id, a.label, tail));
+        out.push_str(&format!("\n[{}] {} → {}", a.id, a.label, tail));
     }
     Some(out)
 }
@@ -503,7 +503,7 @@ pub fn render_post(id: EventId, from: Author, origin: &Origin) -> String {
         // `Context` materialises bodies. Say so rather than render a lie.
         return "(message body unavailable)".to_owned();
     };
-    let mut out = format!("[#{}] ", id.as_u64());
+    let mut out = format!("[{}] ", id.as_u64());
     match from {
         Author::User => {}
         Author::Harness => out.push_str("[harness] "),
@@ -1467,7 +1467,7 @@ mod tests {
         let text = derive_report(&tree, leaf, o, 64 * 1024);
         assert!(text.starts_with("## program completed"), "{text}");
         assert!(
-            text.contains(&format!("returned [#{}]: 1", o.as_u64())),
+            text.contains(&format!("returned [{}]: 1", o.as_u64())),
             "{text}"
         );
 
@@ -1774,8 +1774,8 @@ mod tests {
         let menu: Vec<&Artifact> = artifacts.iter().collect();
         let rendered = render_menu("artifacts", &menu).expect("25 rows");
         assert!(rendered.contains("(5 older rows omitted; their ids stay fetchable)"));
-        assert!(!rendered.contains("[#5]"), "old entries gone");
-        assert!(rendered.contains("[#6]") && rendered.contains("[#25]"));
+        assert!(!rendered.contains("[5]"), "old entries gone");
+        assert!(rendered.contains("[6]") && rendered.contains("[25]"));
     }
 
     /// The two pending kinds render differently because only one can be
@@ -1795,17 +1795,17 @@ mod tests {
         let menu: Vec<&Artifact> = rows.iter().collect();
         let rendered = render_menu("artifacts", &menu).expect("three rows");
         assert!(
-            rendered.contains("[#11] ask(#3, \"which file?\") → pending — await history.fetch(11)"),
+            rendered.contains("[11] ask(#3, \"which file?\") → pending — await history.fetch(11)"),
             "{rendered}"
         );
         assert!(
             rendered.contains(
-                "[#12] send_email([\"…\"]) → issued; no result recorded; may have happened"
+                "[12] send_email([\"…\"]) → issued; no result recorded; may have happened"
             ),
             "{rendered}"
         );
         assert!(
-            rendered.contains("[#13] fetch([\"x\"]) → failed: host is down"),
+            rendered.contains("[13] fetch([\"x\"]) → failed: host is down"),
             "{rendered}"
         );
     }
@@ -1852,7 +1852,7 @@ mod tests {
         };
         let rendered = report.render();
         let line = rendered.lines().nth(1).unwrap();
-        assert_eq!(line, r#"returned [#9]: "hello""#, "{line}");
+        assert_eq!(line, r#"returned [9]: "hello""#, "{line}");
     }
 
     /// **The return value arrives whole.** It is the one generous thing
@@ -1877,7 +1877,7 @@ mod tests {
         };
         let rendered = report.render();
         let line = rendered.lines().nth(1).unwrap();
-        assert!(line.starts_with("returned [#9]: "), "{}", &line[..60]);
+        assert!(line.starts_with("returned [9]: "), "{}", &line[..60]);
         assert!(
             line.contains(&"z".repeat(5_000)),
             "clipped: {}",
@@ -1925,7 +1925,7 @@ mod tests {
             artifacts: vec![artifact(7, "fetch([\"big\"])", json!("b".repeat(9000)))],
         };
         let rendered = report.render();
-        let menu_line = rendered.lines().find(|l| l.starts_with("[#7]")).unwrap();
+        let menu_line = rendered.lines().find(|l| l.starts_with("[7]")).unwrap();
         assert!(!menu_line.contains("bbbb"), "value replayed: {menu_line}");
         assert!(
             menu_line.contains("9002 bytes"),
@@ -1953,7 +1953,7 @@ mod tests {
         let line = report
             .render()
             .lines()
-            .find(|l| l.starts_with("[#7]"))
+            .find(|l| l.starts_with("[7]"))
             .unwrap()
             .to_owned();
         assert!(line.contains("no such file or directory"), "{line}");

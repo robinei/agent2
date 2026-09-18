@@ -3081,7 +3081,7 @@ mod tests {
             .map(|doc| doc.messages.last().unwrap().content.clone())
             .collect();
         assert!(
-            reports[1].contains("[#4]") && reports[1].contains("fetch"),
+            reports[1].contains("[4]") && reports[1].contains("fetch"),
             "{}",
             reports[1]
         );
@@ -6688,7 +6688,7 @@ mod tests {
         assert!(
             reports
                 .iter()
-                .any(|t| t.contains("program completed") && t.contains("returned [#4]: 7")),
+                .any(|t| t.contains("program completed") && t.contains("returned [4]: 7")),
             "{reports:?}"
         );
         assert_eq!(
