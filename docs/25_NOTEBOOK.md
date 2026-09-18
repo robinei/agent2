@@ -388,6 +388,29 @@ which runs from the cell's first instruction onward. Cell 0's jumps hold
 resolved addresses by now, not label ids, and a pass that cannot tell
 the two apart would corrupt them.
 
+**A cell must not end the way a program does.** `compile_program` emits
+a trailing `Instr::Return(0)` — "Root frame ends with `Return(0)` →
+`StepResult::Done`" (`compiler/stmt.rs`). Sent down that path, cell 0
+would unwind the root frame on its way out and take every top-level
+local with it, so cell 1 would find no `a`. That is the shared scope
+this whole decision rests on, destroyed by the first thing anyone would
+write.
+
+So a cell's compilation omits the trailing `Return(0)`, and the VM stops
+at the end of the appended range **without unwinding**. Two ways, and
+this is the one open mechanical choice in the phase:
+
+- **A boundary instruction** that yields to the driver and leaves the
+  frame standing. Explicit, but it is a new `Instr` — the only one this
+  design needs, against a doc that otherwise claims none.
+- **A stop-at-ip bound on the step loop**, beside the fuel bound it
+  already takes. No new instruction, but the VM gains a second reason to
+  stop and every caller has to mean the right one.
+
+Either way the *event* terminal (D7) is written by the driver when
+execution reaches that point, not by an instruction. Only the reply
+ending — or `done()` — unwinds the frame.
+
 #### Capture across cells, and the one thing that must move
 
 Slot *indices* are stable — allocated in declaration order, so cell 1
@@ -629,6 +652,15 @@ evidence exists, and that is the failure mode to watch for.
 **25.1 — The split and the buffer.** `notebook.rs`: markdown in,
 `Vec<CellSpan>` out, plus the shared parse buffer of D2 — same length,
 same newlines, one cell live at a time. Pure, no IO, no JS parsing.
+
+Recognition is **strict, and deliberately so**: a fence is three or more
+backticks at column 0, the info string is exactly `js` or `javascript`
+in lower case, and the closing fence is at least as long as the opening
+one. No tildes, no indented fences, nothing inside a list item or a
+block quote. CommonMark permits all of those; a strict subset is safe
+here because a missed cell is not silent — D4 turns a reply with no
+executable cell into a repair-loop retry, so the model is told and tries
+again. A *wrongly* recognised cell has no such backstop.
 Gate: the buffer's length and every newline position match the markdown
 for each cell in turn, and `cargo test -p agent notebook` covers
 ```js, ```javascript, a non-executable tag, an unterminated final fence,
