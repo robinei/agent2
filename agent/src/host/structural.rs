@@ -68,7 +68,9 @@ pub fn outline_def() -> ToolDef {
             "minItems": 1,
             "maxItems": 1
         }),
-        guidelines: Vec::new(),
+        guidelines: vec![
+            "The `line` is an edit anchor, not just a fact: `Edit.replaceLines(text, line, line, …)` names one place exactly, where a string that looks distinctive often is not. `#[allow(dead_code)]` appears seven times in a small file; `label` appears once, and outline says which line it is on.".into(),
+        ],
         example: Some("const { items } = await tools.outline(\"src/lib.rs\");".into()),
         returns: Some("{ items: Array<{ name: string; kind: string; line: number }> }".into()),
         handler: Box::new(|args| {
