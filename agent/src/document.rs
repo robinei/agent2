@@ -412,6 +412,42 @@ fn pending_line(
             event.id.as_u64(),
             escape_untrusted(text)
         )),
+        // **A `tell` renders whole, and it is the same bytes the person
+        // read.** Not a menu row with a preview: that showed the first
+        // fifty characters of what the program had said and nothing
+        // more, which is the one rendering guaranteed to mislead — the
+        // card promises `tell` reaches "the person, and only the
+        // person", while a truncated echo of it sits in the
+        // conversation looking like it half-arrived. A run on
+        // 2026-09-17 repeated a read-and-tell program five times
+        // against that preview, commenting "show them for context",
+        // then "show full contents for inspection".
+        //
+        // Whole rather than clipped, on `CompletionReport`'s own rule
+        // for the return value (27.7): the author of the text and the
+        // reader of the report are the same mind one turn apart, and
+        // the author picked these words deliberately. It also has to be
+        // whole to be *true* — 87% of the 503 tells measured that day
+        // were computed, so the source shows `tell("--- " + f.content)`
+        // and not one byte of what was actually said.
+        //
+        // This is the expensive choice and deliberately so: those 503
+        // tells were 491 KB against 142 KB of program text, a mean of
+        // 976 bytes each. A tell that costs nothing to make is what let
+        // a sentence to a person become a file dump; paying for it in
+        // the same context that reads it is the only feedback the model
+        // gets, and `history.remove` is how it settles the bill.
+        EventPayload::Call(Call::Send {
+            to,
+            text,
+            expects_reply: false,
+            ..
+        }) => Some(format!(
+            "[{}] tell ({}): {}",
+            event.id.as_u64(),
+            crate::machine::address_label(to),
+            escape_untrusted(text)
+        )),
         // Renders to chat as a harness line (`types.rs`'s own doc
         // comment on `Fork`) — `report::render_fork` already carries the
         // real logic (settled vs. mid-program fork point, which branch

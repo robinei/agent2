@@ -3132,7 +3132,7 @@ fn call_label(call: &Call) -> String {
     }
 }
 
-fn address_label(to: &Address) -> String {
+pub(crate) fn address_label(to: &Address) -> String {
     match to {
         Address::User => "user".into(),
         Address::Branch(id) => format!("#{}", id.as_u64()),
