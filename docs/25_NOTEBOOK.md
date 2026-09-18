@@ -61,18 +61,25 @@ running out of cells or by `done()`.
 
 ## Decisions
 
-### D1 — A cell is a span, not an event
+### D1 — A reply is a run of events, in source order
 
-One completion is one `Turn`, and `Turn.source` is the entire markdown
-reply. Cells are byte spans within it, numbered from zero.
+**One completion is not one `Turn`** (see D15, which decided this). A
+reply decomposes, as it streams, into its pieces in source order: each
+prose segment is a `Call::Send { to: User }` — prose *is* a message to
+the person — and each cell is a `Turn` whose `source` is that cell's
+JavaScript.
 
-This keeps the property phase 24 was careful about: `Call::site` is an
-offset into the stored source, so a report can annotate a program per
-call site from the log alone. A cell is *isolated* while it compiles —
-it is the only live region of the shared buffer (D2) — but it is never
-*stored* that way. The log holds the markdown and offsets into it, so
-`Turn.source` stays what the model wrote and no consumer downstream has
-to know cells exist at all.
+`Call::site` stays an offset a report can annotate from the log alone,
+but it now resolves into the cell's own `Turn` rather than into a whole
+markdown reply. Each cell-`Turn` therefore records its **offset within
+the reply**, so an absolute span (D2) maps back to the text that
+produced it.
+
+What is given up: the reply is recoverable in content and order, but not
+byte-for-byte. The fences and the whitespace between pieces are not
+stored anywhere. Nothing downstream needs them — sites resolve per cell,
+and the document renders the pieces in order — but a log no longer
+reproduces the exact bytes the provider returned.
 
 ### D2 — One coordinate system: the markdown's own offsets
 
@@ -237,17 +244,28 @@ log alone* — and `Return`'s states the completing half of it, that a
 program ending without a `return` still logs `Return { value: null }`.
 Cells must not break either.
 
-The notebook — not the cell — logs exactly one `Return` or `Condition`.
-Cutting the `return` *statement* (D5) does not cut the `Return`
-*event*: its own doc already says a program that ends without a `return`
-still logs `Return { value: null }`, which is now simply the only case.
+Under D15 a cell *is* a run, so each cell logs exactly one `Return` or
+`Condition` and the invariant holds per cell. Cutting the `return`
+*statement* (D5) does not cut the `Return` *event*: its own doc already
+says a program that ends without a `return` still logs
+`Return { value: null }`, which is now simply the only case.
 
-Had cells logged outcomes of their own, the trigger rule ("the newest
-`Turn`'s run has an outcome that has not been shown yet") would fire per
-cell and prompt a fresh completion after each one — the thesis exactly
-inverted.
+**What must not multiply is the prompting, not the events.** A reply
+with three cells is still **one report and one next completion**, and
+two things keep it that way:
 
-**One notebook, one report, one next completion.**
+- `needs_prompt` already returns false unless the branch is
+  `Phase::Idle` — "Awaiting an LLM: a request is already out, and
+  everything logged since will ride the next one." Outcomes logged while
+  the reply is still streaming therefore cannot trigger anything.
+- The gap is the *unconditional* path: `finish_program` and `suspend`
+  render "bypassing this rule entirely", on the premise that a program
+  running out is a turn running out. Under a notebook those come apart,
+  and that path has to learn the difference between a cell ending — walk
+  to the next one — and the reply ending.
+
+That second point is owed by 25.4 whichever way D15 had gone; it is a
+cost of notebooks, not of logging as you stream.
 
 ### D8 — `done()` ends the notebook
 
@@ -333,35 +351,13 @@ program is written blind too, so this is not a regression — but the
 failure is now visible mid-stream, which is new, and cancellation bounds
 the waste rather than removing it.
 
-**A call can outrun its own `Turn`, and this is not yet solved.**
-`Call`'s doc pins its placement: "Parent: the owning agent's spine,
-**between the program's `Turn` and its eventual `Return`/`Condition`**."
-But a cell dispatches calls before the completion ends, and the `Turn`
-cannot be logged before then — its `source` is the whole markdown, and
-the markdown is not finished. So cell 0's calls land *before* the Turn,
-and their `site` points into a Turn that does not exist yet.
-
-The durability half is fine, and deliberately so: the same doc explains
-that logging at dispatch rather than at resolution is what keeps "a
-`send_email` issued a millisecond before `kill -9`" from being invisible
-in the log. The side effect is recorded either way. What breaks is the
-ordering invariant and site resolution.
-
-This is **the one unsolved problem in this design**, and it belongs to
-25.5 alone — batch execution (25.4) has no such gap, which is what makes
-the batch-first sequencing load-bearing rather than merely cautious. The
-shape of the answer is a fork not taken here:
-
-- **Buffer a cell's events and append them after the `Turn`.** Keeps
-  every invariant and the log's order, at the price of the log briefly
-  disagreeing with reality — and of the crash window the dispatch-time
-  logging rule exists to close.
-- **Log the reply as it arrives**, prose and cells as separate events in
-  source order, rather than one `Turn` at the end. Matches reality and
-  needs no buffering, but gives up "one completion, one `Turn`" — which
-  the trigger rule, `shown`, and the repair loop all lean on.
-
-Deciding between these is a gate *of* 25.5, not a detail inside it.
+**A call would outrun its own `Turn`.** `Call`'s doc pins its
+placement: "Parent: the owning agent's spine, **between the program's
+`Turn` and its eventual `Return`/`Condition`**." A cell dispatches calls
+before the completion ends, so a single `Turn` holding the whole reply
+could not be logged before them. **Decided in D15: the reply is logged
+as it arrives**, so each cell's `Turn` lands before that cell runs and
+the placement holds.
 
 ### D12 — One compilation that pauses
 
@@ -459,28 +455,21 @@ should accumulate safely, since the analysis table simply keeps it and
 later cells fold it identically. Loop-declared `FreshCell` slots do not
 arise at cell top level.
 
-### D14 — `Turn.source` is a misnomer, and its doc comment becomes false
+### D14 — `Message::Turn`'s doc comment becomes false
 
-The event type is fine. `Message::{Post, Turn}` splits incoming from
-"this context's own output (assistant role)", and under this transport
-the reply genuinely *is* the branch's own message — prose addressed to
-the person, with executable regions in it. `Turn` gets **more** apt, not
-less: today a program squats in the assistant slot, which is why its doc
-comment spends a paragraph explaining the squatting.
+The type is well named, and D15 keeps it that way. `Message::{Post,
+Turn}` splits incoming from "this context's own output (assistant
+role)", and under D15 a cell-`Turn`'s `source` holds JavaScript exactly
+as it does today — so the rename this decision originally called for
+(`source` → `text`, because it would have held mostly prose) is **not
+needed**. Logging the reply as it arrives keeps the field honest.
 
-The **field** is what goes wrong. `source` holds "the complete
-JavaScript text the model emitted"; here it holds markdown, of which
-only the fenced regions are source. `Call::site`'s "a source byte
-offset" inherits it — an offset into a reply that is mostly prose.
-Renaming to `text` is the honest fix and is mechanical; it is listed in
-25.7 rather than given a step, because it touches every consumer and
-nothing depends on the order.
-
-Three clauses of `Message::Turn`'s doc go from explanatory to false and
-must be rewritten in the same pass:
+Three clauses of its doc comment still go from explanatory to false, and
+must be rewritten:
 
 - "there is no separate prose channel and no tool-call wrapper around
-  it" — there is now: the reply itself.
+  it" — there is now: the prose segments of the reply, logged as
+  `Call::Send { to: User }`.
 - "A program that wants to speak calls `tell()`/`ask()` from inside
   itself" — no longer the only way, and no longer the usual way.
 - "it never returns prose alongside a list of calls, because there is no
@@ -492,10 +481,11 @@ program still lands here as a comment-only `source`, which is what keeps
 role alternation intact under compaction with no special case", and
 `document.rs`'s `compacted_program_comment` wraps the replacement text
 as `//: [17] … text`. That wrapper exists **only** because the assistant
-slot had to hold valid JavaScript. Here it does not — a compacted turn
-is simply prose, and role alternation holds with no wrapper at all. The
-`//:` marker leaves this design for the second time, and this time
-nothing replaces it.
+slot had to hold valid JavaScript. Under D15 a compacted *prose* segment
+is just prose in a `Send`, and a compacted *cell* keeps the comment form
+it already has. The `//:` marker survives for cells and disappears for
+prose, which is the first time in this design it has had a coherent
+scope.
 
 One thing to be careful of while doing it: D4 makes a reply with no
 executable cell a *compile failure*, and a compacted turn is exactly
@@ -514,6 +504,56 @@ renders. The source is how it got there, and it is the least interesting
 thing on screen for the person who asked a question. Collapsing is what
 makes "never have to read the generated JavaScript" true in practice
 rather than only in principle.
+
+### D15 — The reply is logged as it arrives
+
+The fork D11 opened, decided. **A reply is logged piece by piece as it
+streams**, not as one `Turn` at the end: each prose segment a
+`Call::Send { to: User }`, each cell a `Turn` logged before that cell
+runs. "One completion, one `Turn`" is given up.
+
+The alternative was to **buffer a cell's events and append them after a
+single `Turn`** at the end of the completion. Rejected, and not on
+balance — it gives back a property the design explicitly bought.
+`Call`'s doc: logging at dispatch rather than at resolution is what
+distinguishes a call that "definitively did not work" from one that was
+"in flight when the process died — a `send_email` issued a millisecond
+before `kill -9` used to be invisible in the log." Buffering reopens
+exactly that window, for the 10–25s of generation still to come, over
+file edits already made and messages already on a person's screen.
+
+What made the choice cheaper than it looked:
+
+- **The trigger rule mostly already handles it.** `needs_prompt`
+  returns false unless the branch is `Phase::Idle` — "Awaiting an LLM: a
+  request is already out, and everything logged since will ride the next
+  one." Outcomes logged mid-stream cannot prompt.
+- **The part that does need work is owed anyway.** `finish_program`
+  renders unconditionally, and teaching it that a cell ending is not a
+  reply ending is a cost of notebooks under either option (D7, 25.4).
+
+What it gains beyond correctness:
+
+- **Compile failure becomes partial progress**, the way D11 already made
+  truncation partial progress. A cell 2 that does not compile leaves
+  cells 0 and 1 standing instead of discarding the reply.
+- **`Call::site` resolves into its own cell's `Turn`** — local, and
+  never pointing into something not yet written.
+- **`Turn.source` stays honest.** With prose in its own events, a
+  cell-`Turn` holds JavaScript, so the rename D14 called for is not
+  needed.
+
+Prose as `Call::Send { to: User }` is not a workaround. A prose segment
+*is* a message to the person, it renders in history exactly as a `tell`
+does, and the model therefore re-reads its own reply in a shape it
+already knows. The one adjustment: these sends are logged at generation
+time rather than execution time, which is the distinction the card
+already has to draw between prose and `tell()`.
+
+**The cost, stated plainly.** The reply is recoverable in content and
+order but not byte-for-byte — fences and the whitespace between pieces
+are stored nowhere. Nothing downstream needs them, but a log no longer
+reproduces the exact bytes the provider returned.
 
 ## What this deletes
 
@@ -596,15 +636,10 @@ and one next completion for a three-cell reply (**not three**), that a
 `raise` in cell 0 resumed by a handler runs cells 1 and 2 afterwards,
 and every `Call::site` resolving to the right span in the markdown.
 
-**25.5 — Execute as the fences close (D11).** **Decide the Turn-ordering
-fork first** — a cell dispatches calls before the completion ends, so
-before its `Turn` can be logged, and `Call`'s documented placement is
-between the `Turn` and its terminal. Buffer the events, or log the reply
-as it arrives and give up one-completion-one-`Turn`. Nothing else in
-this step is safe to build until that is settled.
-
-Then: dispatch on fence close; cancel the in-flight completion on
-`done()`, trap or raise. Gate: tests
+**25.5 — Execute as the fences close (D11, D15).** Log each piece as it
+arrives — prose as a `Call::Send { to: User }`, each cell as a `Turn`
+before it runs — then dispatch on fence close, and cancel the in-flight
+completion on `done()`, trap or raise. Gate: tests
 that a two-cell notebook runs cell 0 before cell 1's fence arrives, that
 `done()` in cell 0 cancels the completion (epoch moved, `LlmDone`
 dropped), and that a mid-stream truncation leaves cell 0's effects
@@ -614,13 +649,16 @@ standing with the turn reported as partial.
 effects rendered beneath each cell as they land. Gate: manual, plus the
 existing `chat.rs` render tests still green.
 
-**25.7 — Card, exemplars, and the renaming (D14).** The prose/`tell()`
-split as the sentence above; cells are one scope; no `return`; `done()`
-ends the notebook; ```js runs. Plus `Turn.source` → `Turn.text`, the
-three false clauses of `Message::Turn`'s doc rewritten, and
-`compacted_program_comment`'s `//:` wrapper deleted. Gate: every
-exemplar parses and runs against stub tools; a compacted turn renders as
-plain prose with no marker and role alternation still holds.
+**25.7 — Card, exemplars, and the doc corrections (D14).** The
+prose/`tell()` split as the sentence above; cells are one scope; no
+`return`; `done()` ends the notebook; ```js runs. Plus the three false
+clauses of `Message::Turn`'s doc rewritten, and
+`compacted_program_comment` narrowed to cells — a compacted *prose*
+segment is a `Send` and needs no comment wrapper. No field rename: D15
+leaves `Turn.source` holding JavaScript. Gate: every exemplar parses and
+runs against stub tools; a compacted prose segment renders as plain
+prose with no marker, a compacted cell keeps its comment form, and role
+alternation holds in both.
 
 **25.8 — Measure before adopting.** Two arms on the existing tasks,
 differing only by `AGENT2_TRANSPORT`. The plumbing is already there:
