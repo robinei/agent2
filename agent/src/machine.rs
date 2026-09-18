@@ -315,7 +315,20 @@ struct Run {
     /// to the same block across a continuation.
     program_id: EventId,
     vm: VM,
+    /// `Transport::Notebook` only: the reply's remaining cells and the paused
+    /// compilation feeding them into `vm`.
+    ///
+    /// **A reply is one run** (D7), so this is not a second run beside the
+    /// first — it is the compile half of *this* one. `vm` stays where it always
+    /// was and is stepped exactly as it always was; the only new thing is that
+    /// on `StepResult::Paused` there is somewhere to go for more code.
+    /// `None` under every other transport, which is what keeps those paths
+    /// byte-for-byte what they were.
+    notebook: Option<crate::notebook::Notebook>,
 }
+
+/// Fuel for a slice driven by an arriving chunk rather than a `Tick`.
+const TICK_FUEL: u64 = 100_000;
 
 /// How `Runner::resume` re-enters a suspended run — the *live* half of a
 /// suspension, kept beside the phase.
@@ -457,6 +470,10 @@ pub struct Runner {
     ///
     /// [`set_transport`]: Runner::set_transport
     transport: crate::document::Transport,
+    /// `Transport::Notebook` only: a reply is being fed in as it streams, so
+    /// the run in `phase` belongs to a completion that has not finished
+    /// arriving. Cleared when the completion ends, however it ends.
+    streaming_notebook: bool,
     /// Whether a client is attached to the session right now.
     ///
     /// Presence is a **per-request fact**, never branch state that
@@ -544,6 +561,25 @@ enum SuspendCause {
     Trapped(VMError),
     /// Someone spoke to the running program.
     Posted(Vec<EventId>),
+    /// `Transport::Notebook` only: a cell after the first did not compile.
+    ///
+    /// Distinct from the `CompileFailed` handback in `apply_turn`, which is
+    /// the case where *no VM was ever built*. Here one was, and earlier cells
+    /// have already run — their calls made, their rows appended. So this
+    /// suspends the run that is under way rather than refusing a turn that
+    /// never started, and the effects that happened stay in the log. The
+    /// cause is still `Cause::CompileFailed`: what went wrong is that the
+    /// model wrote a cell that does not compile, and that is what the repair
+    /// loop needs to see.
+    CellCompileFailed(String),
+    /// `Transport::Notebook` only: the completion was cut off by the token
+    /// budget, after some cells had already run.
+    ///
+    /// The run ends here rather than with its `Return(0)`, so it has exactly
+    /// one terminal and that terminal says what happened. The effects of the
+    /// cells that closed stay in the log — which is the whole of D11's
+    /// "truncation becomes partial progress".
+    Truncated,
 }
 
 impl Runner {
@@ -621,6 +657,7 @@ impl Runner {
             last_vm: None,
             status_transitions: Vec::new(),
             transport: crate::document::configured_transport(),
+            streaming_notebook: false,
             attached: false,
             // A branch handed to a fresh `Runner` has said nothing to
             // *this* session's LLM and is owed no prompt for its
@@ -644,6 +681,11 @@ impl Runner {
     /// name one directly.
     pub fn set_transport(&mut self, transport: crate::document::Transport) {
         self.transport = transport;
+    }
+
+    /// The wire container this branch's turns use.
+    pub fn transport(&self) -> crate::document::Transport {
+        self.transport
     }
 
     /// This branch's agent — the innermost `Agent` root on its path.
@@ -874,6 +916,12 @@ impl Runner {
     pub fn step(&mut self, tree: &mut Tree, input: StepInput) -> io::Result<Vec<StepOutput>> {
         match input {
             StepInput::LlmResponse(turn) => {
+                // A notebook fed in as it streamed has already logged every
+                // piece of this reply; the final message only says the
+                // completion is over (and whether it was cut off).
+                if let Some(out) = self.notebook_stream_end(tree, turn.truncated)? {
+                    return Ok(out);
+                }
                 let author = Author::Agent(self.agent_id());
                 self.apply_turn(
                     tree,
@@ -1022,13 +1070,28 @@ impl Runner {
         usage: Option<crate::host::Usage>,
         reply: Option<String>,
     ) -> io::Result<Vec<StepOutput>> {
-        let message = Message::Turn {
-            author,
-            source: source.clone(),
-            thinking,
-            usage,
+        let notebook = self.transport == crate::document::Transport::Notebook;
+        // **Under `Transport::Notebook` the reply is not one `Turn`** (D15).
+        // It decomposes, in source order, into prose segments logged as
+        // `Call::Send { to: User }` and cells logged as their own `Turn`s —
+        // each written by the driver as it reaches that piece, so a cell's
+        // `Turn` lands immediately before that cell runs and the calls it
+        // dispatches land after it. Nothing here logs the completion whole.
+        //
+        // What is given up: the reply is recoverable in content and order,
+        // but not byte-for-byte — the fences and the whitespace between
+        // pieces are stored nowhere. Nothing downstream needs them.
+        let assistant_id = if notebook {
+            self.spine.leaf_id
+        } else {
+            let message = Message::Turn {
+                author,
+                source: source.clone(),
+                thinking,
+                usage,
+            };
+            tree.append(&mut self.spine, EventPayload::Message(message))?
         };
-        let assistant_id = tree.append(&mut self.spine, EventPayload::Message(message))?;
 
         // `Transport::RunProgram`'s prose (`LlmTurn.reply`'s own doc) is
         // *the message a person reads* in that container, exactly what a
@@ -1061,7 +1124,16 @@ impl Runner {
             out.push(StepOutput::Sends(vec![send]));
         }
 
-        if truncated {
+        // **Truncation is partial progress here, not a discarded reply**
+        // (D11). Under every other transport a completion cut off mid-program
+        // is never compiled, because half a program the model never finished
+        // emitting is worse than a clean compile failure. A notebook has a
+        // finer grain to offer: the cells whose fences closed are whole, they
+        // run, and what they did stands — only the half-written cell after
+        // them is dropped, by the splitter, for being unterminated. The
+        // reply is still reported as truncated, so the next completion knows
+        // it was cut off.
+        if truncated && !notebook {
             // **Never compile a truncated completion** (`Cause::Truncated`'s
             // own doc in `types.rs`): cut off wherever the token budget ran
             // out, it may still parse and run — half-written, on a program
@@ -1106,7 +1178,53 @@ impl Runner {
             return Ok(out);
         }
 
-        match self.start_program(tree, assistant_id, &source) {
+        // **A reply with no cells rests the branch** (D4), and needs no rule
+        // of its own — this is only the "there is nothing to run" gate the
+        // `RunProgram` case above already is. The model spoke and stopped:
+        // that is a complete turn, not a failure. Nothing is refused and
+        // nothing is re-asked.
+        //
+        // Resting is not a state. With no `Turn` outcome logged,
+        // `last_turn_outcome` finds no `Return`/`Condition` after the newest
+        // `Turn` and returns `None`, so `needs_prompt`'s outcome clause is
+        // false; with no `Post`, its other clause is false too. That is
+        // bit-for-bit the state `done()` produces by advancing `shown`.
+        //
+        // The share of replies that land here is the chat-mode-drift metric
+        // 25.8 wants, and it is free to count. It is a metric, not a gate:
+        // requiring a cell never prevented drift — a drifting model writes
+        // `done();` in a cell and drifts identically — it only ever prevented
+        // the *silent* variant, and a reply that speaks and rests is not
+        // silent.
+        if notebook && crate::notebook::split_cells(&source).is_empty() {
+            // The prose still reaches the person — that is the whole of
+            // "the model spoke and stopped". It goes out as the same
+            // `Call::Send { to: User }` a cell's prose does, so nothing
+            // downstream has a second shape to learn.
+            let mut stream = crate::notebook::Stream::new();
+            for piece in stream.finish(&source) {
+                let crate::notebook::Piece::Prose(text) = piece else {
+                    unreachable!("no cells, so no cell pieces");
+                };
+                let send = tree.append(
+                    &mut self.spine,
+                    EventPayload::Call(Call::Send {
+                        to: Address::User,
+                        text,
+                        input: serde_json::Value::Null,
+                        options: Vec::new(),
+                        expects_reply: false,
+                        site: 0,
+                        site_end: 0,
+                    }),
+                )?;
+                out.push(StepOutput::Sends(vec![send]));
+            }
+            self.phase = Phase::Idle;
+            return Ok(out);
+        }
+
+        match self.start_program(tree, assistant_id, &source, truncated) {
             Ok(run) => {
                 if let Phase::Suspended(old, resume_with) =
                     std::mem::replace(&mut self.phase, Phase::Idle)
@@ -1447,13 +1565,57 @@ impl Runner {
         tree: &Tree,
         program_id: EventId,
         source: &str,
+        truncated: bool,
     ) -> Result<Run, String> {
+        if self.transport == crate::document::Transport::Notebook {
+            return self.start_notebook(tree, program_id, source, truncated);
+        }
         let program = compile(source).map_err(|diags| render_diags(source, &diags))?;
         // The whole `input` reaches the program even though the context
         // saw only a bounded preview of it.
         let vm = VM::for_program(program, self.spine.context().input(tree))
             .map_err(|e| format!("program setup failed: {}", e.message))?;
-        Ok(Run { program_id, vm })
+        Ok(Run {
+            program_id,
+            vm,
+            notebook: None,
+        })
+    }
+
+    /// `Transport::Notebook`'s half of [`start_program`](Self::start_program):
+    /// build the VM, prime the prelude, and hand the reply over as one piece.
+    ///
+    /// **The batch entry point**, used when a whole completion arrives at once
+    /// (a scripted turn, or the user taking the branch's turn by hand). The
+    /// streaming path — [`notebook_chunk`](Self::notebook_chunk) — feeds the
+    /// same driver in pieces instead; both end at the same place, because the
+    /// splitter does not care how the text arrived.
+    ///
+    /// Only the first cell is compiled here. The rest arrive through `pump`'s
+    /// `Paused` arm as the VM reaches each cell's `Instr::Pause`, which is
+    /// what makes the cells one compilation that pauses rather than a series
+    /// of programs.
+    fn start_notebook(
+        &mut self,
+        tree: &Tree,
+        program_id: EventId,
+        source: &str,
+        truncated: bool,
+    ) -> Result<Run, String> {
+        let mut vm = VM::for_incremental(self.spine.context().input(tree), serde_json::Value::Null)
+            .map_err(|e| format!("program setup failed: {}", e.message))?;
+        let mut notebook = crate::notebook::Notebook::new(&mut vm)?;
+        notebook.push_text(source);
+        notebook.end_truncated(truncated);
+        // Nothing is fed here. Priming left the VM parked at the prelude
+        // fragment's own `Pause`, so the pump's first step reports `Paused`
+        // and every cell — the first included — arrives through the one
+        // door, with its `Turn` logged immediately before it runs.
+        Ok(Run {
+            program_id,
+            vm,
+            notebook: Some(notebook),
+        })
     }
 
     /// Drive the VM until it blocks on the host, suspends, finishes, or
@@ -1491,13 +1653,52 @@ impl Runner {
                 Ok(StepResult::Done { value, unstarted }) => {
                     return self.finish_program(tree, value, unstarted, out);
                 }
-                // A fragment of an incremental evaluation ended. Only the
-                // notebook transport compiles fragments, and its driver
-                // (25.4) owns this arm; nothing on the program transport
-                // ever emits `Instr::Pause`, so reaching it here would mean
-                // a program was compiled one way and run another.
-                Ok(StepResult::Paused) => {
-                    unreachable!("Paused outside the incremental driver")
+                // **A cell ended — the run did not** (D7). The frame is
+                // still standing with every binding the cell declared, so
+                // there is nothing to log and nothing to report: feed the
+                // next cell in and keep stepping. When the cells run out,
+                // the epilogue appended here is the ordinary root
+                // `Return(0)`, so the very next step reports `Done` and
+                // reaches `finish_program` on the one path every program
+                // takes. That is why `finish_program` needs no notebook
+                // case: a cell boundary never arrives there.
+                Ok(StepResult::Paused { unstarted }) => {
+                    // **A cell ended — the run did not** (D7). The frame is
+                    // still standing with every binding the cell declared, so
+                    // there is nothing terminal to log: walk the reply's
+                    // pieces until the next cell, or close the run once they
+                    // run out.
+                    //
+                    // Pieces are consumed here, in source order, rather than
+                    // logged the moment the splitter recognises them. That is
+                    // what keeps the log readable as the reply reads: a
+                    // paragraph written between two cells lands after the
+                    // first cell's calls, and each cell's `Turn` lands
+                    // immediately before its own instructions execute, so
+                    // `Call`'s placement holds (D15).
+                    //
+                    // The cell's own unawaited calls go out **first**, before
+                    // the next piece is touched. A `tell()` a cell never
+                    // awaited sits in the VM's outbox, which only drains when
+                    // the program blocks or ends — so without this its `Call`
+                    // would be logged after the *next* cell's `Turn`, and
+                    // `Call`'s placement rule ("between the program's `Turn`
+                    // and its eventual `Return`") would be false of it.
+                    self.dispatch_calls(tree, unstarted, &mut out)?;
+                    match self.advance_notebook(tree, &mut out)? {
+                        NotebookStep::Ran => {}
+                        // The next fence has not closed yet. The VM parks at
+                        // its `Pause` while the completion keeps arriving;
+                        // the next piece wakes it.
+                        NotebookStep::Waiting => return Ok(out),
+                        NotebookStep::Failed(report) => {
+                            return self
+                                .suspend(tree, SuspendCause::CellCompileFailed(report), out);
+                        }
+                        NotebookStep::Truncated => {
+                            return self.suspend(tree, SuspendCause::Truncated, out);
+                        }
+                    }
                 }
                 Ok(StepResult::Raise { condition, payload }) => {
                     return self.suspend(tree, SuspendCause::Raise { condition, payload }, out);
@@ -1581,8 +1782,8 @@ impl Runner {
                                     input: serde_json::Value::Null,
                                     options,
                                     expects_reply,
-                                    site: call.site,
-                                    site_end: call.site_end,
+                                    site: self.rebase_site(call.site),
+                                    site_end: self.rebase_site(call.site_end),
                                 },
                                 Slot::Promise(call.promise),
                             )?;
@@ -1627,7 +1828,7 @@ impl Runner {
                         Call::Invoke {
                             name: call.name.clone(),
                             args: args.clone(),
-                            site: call.site,
+                            site: self.rebase_site(call.site),
                         },
                         Slot::Promise(call.promise),
                     )?;
@@ -1725,7 +1926,7 @@ impl Runner {
                                 name: None,
                                 charter: charter.to_owned(),
                                 tools: None,
-                                site: call.site,
+                                site: self.rebase_site(call.site),
                             },
                             Slot::Settle,
                         )?;
@@ -1747,7 +1948,7 @@ impl Runner {
                     tree,
                     Call::Fork {
                         name: None,
-                        site: call.site,
+                        site: self.rebase_site(call.site),
                     },
                     Slot::Settle,
                 )?;
@@ -1785,7 +1986,7 @@ impl Runner {
                     Call::Invoke {
                         name: TOOL_LIST_AGENTS.to_owned(),
                         args: args.clone(),
-                        site: call.site,
+                        site: self.rebase_site(call.site),
                     },
                     Slot::Settle,
                 )?;
@@ -1892,12 +2093,14 @@ impl Runner {
                 let args = self.call_args_json(&call.args);
                 match args.first() {
                     Some(value) => {
+                        let (site, site_end) =
+                            (self.rebase_site(call.site), self.rebase_site(call.site_end));
                         tree.append(
                             &mut self.spine,
                             EventPayload::Note {
                                 text: note_text(value),
-                                site: call.site,
-                                site_end: call.site_end,
+                                site,
+                                site_end,
                             },
                         )?;
                         self.settle(Ok(serde_json::Value::Null));
@@ -2562,6 +2765,30 @@ impl Runner {
                 // unknown answer — it is simply correct. Noted anyway so
                 // the two cases aren't confused when this is read later.
                 (cause, site, ResumeWith::Trapped(e), Disposition::Pushed)
+            }
+            SuspendCause::Truncated => (
+                Cause::Truncated,
+                0,
+                // Nothing to resume into: the rest of the reply was never
+                // written. The next completion continues with the results
+                // of the cells that did run already in hand.
+                ResumeWith::Continue,
+                Disposition::Pushed,
+            ),
+            SuspendCause::CellCompileFailed(report) => {
+                // `ip` is parked on the failed cell's append position, which
+                // has no instruction yet — so there is no span to point at,
+                // and a zero-width site is the convention for exactly that.
+                (
+                    Cause::CompileFailed { message: report },
+                    0,
+                    // Nothing to resume *into*: the cell that would have
+                    // continued the run does not exist. The next completion
+                    // starts a fresh reply, as it does for any other
+                    // compile failure.
+                    ResumeWith::Continue,
+                    Disposition::Pushed,
+                )
             }
             SuspendCause::Posted(ids) => {
                 let site = span_at(&run.vm, run.vm.ip as usize);
@@ -3323,6 +3550,279 @@ fn outcome_json(outcome: &Outcome) -> Result<serde_json::Value, String> {
 /// records so its report can point a caret without a live VM. `spans[ip]`
 /// is a `(start, end)` range; `Condition::site` is a single point (a caret,
 /// not an underline), so only `start` survives here.
+
+impl Runner {
+    /// **Feed streamed completion text to a notebook turn** (D11, 25.5).
+    ///
+    /// The reply is split as it arrives and each piece acted on the moment it
+    /// is complete: prose logged as a `Send`, a cell compiled and run the
+    /// moment its closing fence lands. A closing fence is decidable at the
+    /// line level with no parsing, which is the property phase 24 could never
+    /// get from a JS expression.
+    ///
+    /// The run is created on the first chunk, so the branch is `Running` with
+    /// a generation still in flight — a state nothing else produces, and one
+    /// nothing objects to: `needs_prompt` is false for both reasons at once.
+    /// Until the first fence closes the VM simply parks at the prelude
+    /// fragment's `Pause`.
+    ///
+    /// Cells still run strictly in sequence (D11): a fence can close while
+    /// the previous cell is suspended on an await, and the cell then waits in
+    /// the queue rather than jumping ahead of it.
+    pub fn notebook_stream(
+        &mut self,
+        tree: &mut Tree,
+        text: &str,
+    ) -> io::Result<Vec<StepOutput>> {
+        if self.transport != crate::document::Transport::Notebook {
+            return Ok(Vec::new());
+        }
+        if !self.begin_streaming_notebook(tree)? {
+            return Ok(Vec::new());
+        }
+        let Phase::Running(run) = &mut self.phase else {
+            return Ok(Vec::new());
+        };
+        let Some(notebook) = run.notebook.as_mut() else {
+            return Ok(Vec::new());
+        };
+        notebook.push_text(text);
+        self.drive_notebook(tree)
+    }
+
+    /// The completion has finished arriving: hand over the trailing prose and
+    /// let the run close.
+    ///
+    /// Returns `false` when no streaming notebook turn was under way, so the
+    /// caller falls back to the batch path.
+    pub fn notebook_stream_end(
+        &mut self,
+        tree: &mut Tree,
+        truncated: bool,
+    ) -> io::Result<Option<Vec<StepOutput>>> {
+        if !self.streaming_notebook {
+            return Ok(None);
+        }
+        self.streaming_notebook = false;
+        let Phase::Running(run) = &mut self.phase else {
+            // The run already ended — a trap or a raise in an earlier cell
+            // suspended it, and the rest of the reply is moot.
+            return Ok(Some(Vec::new()));
+        };
+        let Some(notebook) = run.notebook.as_mut() else {
+            return Ok(Some(Vec::new()));
+        };
+        notebook.end_truncated(truncated);
+        Ok(Some(self.drive_notebook(tree)?))
+    }
+
+    /// Run whatever the notebook now has to run.
+    ///
+    /// **The VM must not be stepped when there is nothing to step.** A cell
+    /// ends with `Pause`, which leaves `ip` at the append position — one past
+    /// the last instruction — and stepping there runs off the end of the code
+    /// and reports `Done`, ending the run before the next cell has even been
+    /// written. So a VM parked at the end is advanced by *compiling* first,
+    /// not by stepping: the code vector grows in front of it, and only then is
+    /// there anything to execute.
+    fn drive_notebook(&mut self, tree: &mut Tree) -> io::Result<Vec<StepOutput>> {
+        let parked = match &self.phase {
+            Phase::Running(run) => run.vm.ip as usize >= run.vm.code.len(),
+            _ => return Ok(Vec::new()),
+        };
+        if !parked {
+            // Mid-cell — suspended on an await, most likely. The pump will
+            // reach the new pieces when this cell finishes.
+            return self.pump(tree, TICK_FUEL);
+        }
+        let mut out = Vec::new();
+        match self.advance_notebook(tree, &mut out)? {
+            NotebookStep::Ran => {
+                let more = self.pump(tree, TICK_FUEL)?;
+                out.extend(more);
+                Ok(out)
+            }
+            NotebookStep::Waiting => Ok(out),
+            NotebookStep::Failed(report) => {
+                self.suspend(tree, SuspendCause::CellCompileFailed(report), out)
+            }
+            NotebookStep::Truncated => self.suspend(tree, SuspendCause::Truncated, out),
+        }
+    }
+
+    /// Start the streaming run if it has not started, returning whether there
+    /// is one to feed.
+    fn begin_streaming_notebook(&mut self, tree: &mut Tree) -> io::Result<bool> {
+        if self.streaming_notebook {
+            return Ok(matches!(self.phase, Phase::Running(_)));
+        }
+        if !matches!(self.phase, Phase::AwaitingLlm) {
+            // A chunk arriving outside a turn this branch is waiting on:
+            // nothing to attach it to.
+            return Ok(false);
+        }
+        let mut vm = match VM::for_incremental(
+            self.spine.context().input(tree),
+            serde_json::Value::Null,
+        ) {
+            Ok(vm) => vm,
+            Err(_) => return Ok(false),
+        };
+        let notebook = match crate::notebook::Notebook::new(&mut vm) {
+            Ok(nb) => nb,
+            Err(_) => return Ok(false),
+        };
+        if let Phase::Suspended(old, resume_with) = std::mem::replace(&mut self.phase, Phase::Idle) {
+            self.beneath.push((old, resume_with, self.generation));
+        }
+        self.generation += 1;
+        self.phase = Phase::Running(Run {
+            program_id: self.spine.leaf_id,
+            vm,
+            notebook: Some(notebook),
+        });
+        self.streaming_notebook = true;
+        Ok(true)
+    }
+
+    /// Whether a suspension or completion should cancel the generation still
+    /// in flight (D11).
+    ///
+    /// **A trap or a `raise` should; `done()` should not.** A suspension parks
+    /// the VM, so no later cell can run until a handler resumes it — every
+    /// token still being generated is waste. `done()` stops nothing (D8): the
+    /// later cells still run, and the prose the model is still writing is very
+    /// often the answer the person asked for, so cutting it off would truncate
+    /// the reply mid-sentence.
+    pub fn notebook_cancels_generation(&self) -> bool {
+        self.streaming_notebook && matches!(self.phase, Phase::Suspended(..))
+    }
+}
+
+/// What one turn of the notebook driver did.
+enum NotebookStep {
+    /// A cell was compiled (or the run's epilogue was), so there is code to
+    /// step into.
+    Ran,
+    /// Nothing complete to act on and the reply is still arriving.
+    Waiting,
+    /// A cell did not compile; the report is the repair loop's.
+    Failed(String),
+    /// The reply was cut off. The cells that ran stand; the run ends as
+    /// truncated rather than completed.
+    Truncated,
+}
+
+impl Runner {
+    /// Turn a raw instruction span into the `site` a `Call` is logged with.
+    ///
+    /// `Call::site` means "an offset into the owning `Turn`'s `source`", and
+    /// that meaning is kept exactly (D1). Under `Transport::Notebook` the
+    /// owning `Turn` is one cell, while the spans the compiler emitted are
+    /// offsets into the whole unit — absolute so the analyzer's span-keyed
+    /// tables do not collide across cells (D2) — so the cell's own origin is
+    /// subtracted here, at log time. Nothing downstream sees an absolute
+    /// offset, and no other transport is touched.
+    fn rebase_site(&self, raw: u32) -> u32 {
+        match &self.phase {
+            Phase::Running(run) | Phase::Suspended(run, _) => run
+                .notebook
+                .as_ref()
+                .map_or(raw, |nb| nb.rebase_site(raw)),
+            _ => raw,
+        }
+    }
+
+    /// Walk the reply's pieces until something is compiled, logging each as
+    /// it is acted on.
+    ///
+    /// Prose is a `Call::Send { to: User }` — a prose segment *is* a message
+    /// to the person, and it renders in history exactly as a `tell` does, so
+    /// the model re-reads its own reply in a shape it already knows (D15).
+    /// It is logged and handed to the host through the same `Sends` door an
+    /// unawaited `tell` uses, which is also what settles it: there is no VM
+    /// promise behind it, and `on_tool_results` already treats a `None`
+    /// pending lookup as the ordinary unwaited case.
+    ///
+    /// A cell is a `Turn` whose `source` is that cell's JavaScript, logged
+    /// immediately before the cell's instructions run.
+    fn advance_notebook(
+        &mut self,
+        tree: &mut Tree,
+        out: &mut Vec<StepOutput>,
+    ) -> io::Result<NotebookStep> {
+        let agent = self.agent_id();
+        loop {
+            let Phase::Running(run) = &mut self.phase else {
+                unreachable!("advance_notebook outside Running");
+            };
+            let Some(notebook) = run.notebook.as_mut() else {
+                unreachable!("advance_notebook with no notebook");
+            };
+            match notebook.take_piece() {
+                Some(crate::notebook::Piece::Prose(text)) => {
+                    let send = tree.append(
+                        &mut self.spine,
+                        EventPayload::Call(Call::Send {
+                            to: Address::User,
+                            text,
+                            input: serde_json::Value::Null,
+                            options: Vec::new(),
+                            expects_reply: false,
+                            // Synthetic: no instruction issued this, so
+                            // there is no source expression to point at.
+                            // Zero width is the convention `span.rs`
+                            // already names for exactly that.
+                            site: 0,
+                            site_end: 0,
+                        }),
+                    )?;
+                    out.push(StepOutput::Sends(vec![send]));
+                }
+                Some(crate::notebook::Piece::Cell(i)) => {
+                    // The `Turn` goes in **before** the cell is compiled,
+                    // not merely before it runs. A cell that does not
+                    // compile has to leave its source in the log too, or the
+                    // repair loop is handed a diagnostic with nothing to
+                    // read it against — and the report, which anchors on the
+                    // newest `Turn`, would have nothing to anchor to.
+                    let source = notebook.cell_source(i);
+                    let turn = tree.append(
+                        &mut self.spine,
+                        EventPayload::Message(Message::Turn {
+                            author: Author::Agent(agent),
+                            source,
+                            thinking: None,
+                            usage: None,
+                        }),
+                    )?;
+                    let Phase::Running(run) = &mut self.phase else {
+                        unreachable!()
+                    };
+                    run.program_id = turn;
+                    let notebook = run.notebook.as_mut().expect("a notebook");
+                    if let Err(report) = notebook.feed_cell(&mut run.vm, i) {
+                        return Ok(NotebookStep::Failed(report));
+                    }
+                    self.note_status(turn, ProgramStatus::Running);
+                    return Ok(NotebookStep::Ran);
+                }
+                None => {
+                    if !notebook.is_ended() {
+                        return Ok(NotebookStep::Waiting);
+                    }
+                    if notebook.was_truncated() {
+                        return Ok(NotebookStep::Truncated);
+                    }
+                    if let Err(report) = notebook.close(&mut run.vm) {
+                        return Ok(NotebookStep::Failed(report));
+                    }
+                    return Ok(NotebookStep::Ran);
+                }
+            }
+        }
+    }
+}
 fn span_at(vm: &VM, ip: usize) -> u32 {
     vm.spans.get(ip).map(|s| s.start).unwrap_or(0)
 }
@@ -3470,6 +3970,7 @@ mod tests {
                     state.phase = Phase::Running(Run {
                         program_id: state.spine.leaf_id,
                         vm,
+                        notebook: None,
                     });
                     let mut out = Vec::new();
                     state.dispatch_settle(&mut tree, call, &mut out).unwrap();
@@ -5152,5 +5653,730 @@ mod tests {
         });
         assert!(label.starts_with("tell(user, "), "{label}");
         assert!(label.len() < crate::report::LABEL_MAX_BYTES + 32, "{label}");
+    }
+
+    // ── `Transport::Notebook` (phase 25, step 25.4) ────────────────
+    //
+    // Batch first: the reply is split into cells and they run in
+    // sequence *after* the completion ends. **A reply is one run**
+    // (D7) — the cells share a frame that is never unwound between
+    // them, so a cell boundary never reaches `finish_program` and the
+    // reply's own `Return(0)` does, once.
+
+    /// A three-cell reply, decomposed. **One completion is not one
+    /// `Turn`** (D15): the reply becomes its pieces in source order —
+    /// a `Send` for each prose segment, a `Turn` holding each cell's
+    /// own JavaScript — and it is still **one run** with one terminal
+    /// (D7), because the cells share a frame nothing unwinds between
+    /// them.
+    #[test]
+    fn a_three_cell_reply_is_three_turns_one_run_and_one_outcome() {
+        let (mut tree, mut state) = setup_under(crate::document::Transport::Notebook);
+        user_post(&mut state, &mut tree, "go");
+        let reply = "Reading the two files first.\n\n\
+             ```js\n\
+             let total = 1;\n\
+             ```\n\n\
+             Now the adjustment.\n\n\
+             ```js\n\
+             total = total + 41;\n\
+             ```\n\n\
+             And the answer.\n\n\
+             ```js\n\
+             console.log(`total is ${total}`);\n\
+             ```\n";
+        let out = state
+            .step(&mut tree, StepInput::LlmResponse(llm_program(reply)))
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+
+        // Each cell's `Turn` holds that cell's JavaScript — which is
+        // what keeps `Turn.source` honest under this transport, and why
+        // D14's rename turned out not to be needed.
+        let sources: Vec<&str> = state
+            .agent_segment(&tree)
+            .iter()
+            .filter_map(|e| match &e.payload {
+                EventPayload::Message(Message::Turn { source, .. }) => Some(source.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            sources,
+            vec![
+                "let total = 1;\n",
+                "total = total + 41;\n",
+                "console.log(`total is ${total}`);\n",
+            ]
+        );
+
+        // Prose and cells interleave in source order: a paragraph, a
+        // cell, a paragraph, a cell, a paragraph, a cell — and one
+        // `Return` at the end, for the one run.
+        assert_eq!(
+            payload_kinds(&state, &tree),
+            [
+                "Agent", "Post", //
+                "Call", "Turn", // "Reading the two files first." + cell 0
+                "Call", "Turn", // "Now the adjustment."          + cell 1
+                "Call", "Turn", // "And the answer."              + cell 2
+                "Return", "Console",
+            ],
+            "three cells, three Turns, one Return"
+        );
+
+        // And they really shared a scope.
+        let report = last_report(&state, &tree);
+        assert!(report.contains("total is 42"), "{report}");
+    }
+
+    /// The prose reaches the person as a `Call::Send { to: User }` —
+    /// the same shape a `tell` takes, so the model re-reads its own
+    /// reply in a form it already knows (D15).
+    #[test]
+    fn prose_segments_are_sends_to_the_user_in_source_order() {
+        let (mut tree, mut state) = setup_under(crate::document::Transport::Notebook);
+        user_post(&mut state, &mut tree, "go");
+        let reply = "First I look.\n\n```js\nlet a = 1;\n```\n\n\
+                     Then I decide.\n\n```js\na = 2;\n```\n\nThat is all.\n";
+        let out = state
+            .step(&mut tree, StepInput::LlmResponse(llm_program(reply)))
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+
+        let sends: Vec<(String, u32, u32)> = state
+            .agent_segment(&tree)
+            .iter()
+            .filter_map(|e| match &e.payload {
+                EventPayload::Call(Call::Send {
+                    to: Address::User,
+                    text,
+                    expects_reply: false,
+                    site,
+                    site_end,
+                    ..
+                }) => Some((text.clone(), *site, *site_end)),
+                _ => None,
+            })
+            .collect();
+        let texts: Vec<&str> = sends.iter().map(|(t, _, _)| t.as_str()).collect();
+        assert_eq!(texts, ["First I look.", "Then I decide.", "That is all."]);
+
+        // **Synthetic sites.** No instruction issued these, so there is
+        // no source expression to point at; zero width is the
+        // convention `span.rs` already names for exactly that.
+        for (text, site, site_end) in &sends {
+            assert_eq!((*site, *site_end), (0, 0), "prose {text:?} has a real site");
+        }
+    }
+
+    /// **A prose send gets exactly one `Result` and leaves no dangling
+    /// promise.** It has no VM promise behind it — nothing awaited it,
+    /// nothing can — so it settles through the same unwaited-`tell`
+    /// path the host already has rather than a second mechanism.
+    #[test]
+    fn a_prose_send_settles_exactly_once() {
+        let (mut tree, mut state) = setup_under(crate::document::Transport::Notebook);
+        user_post(&mut state, &mut tree, "go");
+        let reply = "Just a sentence.\n\n```js\ndone();\n```\n";
+        let out = state
+            .step(&mut tree, StepInput::LlmResponse(llm_program(reply)))
+            .unwrap();
+        let outs = drain(&mut state, &mut tree, out);
+
+        // The host is handed the send to deliver, exactly once.
+        let delivered: Vec<EventId> = outs
+            .iter()
+            .filter_map(|o| match o {
+                StepOutput::Sends(ids) => Some(ids.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert_eq!(delivered.len(), 1, "one prose segment, one delivery");
+
+        // Settle it the way the host does, and it takes exactly one
+        // `Result` — with no program awaiting it and no complaint.
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::ToolResults(vec![ToolResult {
+                    call: delivered[0],
+                    result: Ok(serde_json::Value::Null),
+                }]),
+            )
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+        let results = state
+            .agent_segment(&tree)
+            .iter()
+            .filter(|e| matches!(e.payload, EventPayload::Result { .. }))
+            .count();
+        assert_eq!(results, 1, "exactly one Result for the prose send");
+    }
+
+    /// A multi-paragraph report — the case this whole phase exists for —
+    /// arrives as one message with its structure intact, rather than
+    /// one send per line.
+    #[test]
+    fn a_multi_paragraph_report_is_one_send() {
+        let (mut tree, mut state) = setup_under(crate::document::Transport::Notebook);
+        user_post(&mut state, &mut tree, "go");
+        let reply = "# What I found\n\n\
+                     The retry policy lives in two places.\n\n\
+                     - `client.rs` sets the ceiling\n\
+                     - `retry.rs` sets the backoff\n\n\
+                     I would keep the second.\n";
+        let out = state
+            .step(&mut tree, StepInput::LlmResponse(llm_program(reply)))
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+
+        let texts: Vec<String> = state
+            .agent_segment(&tree)
+            .iter()
+            .filter_map(|e| match &e.payload {
+                EventPayload::Call(Call::Send { text, .. }) => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts.len(), 1, "one report, one message");
+        assert!(texts[0].starts_with("# What I found"));
+        assert!(texts[0].contains("- `client.rs` sets the ceiling\n- `retry.rs`"));
+        assert!(texts[0].ends_with("I would keep the second."));
+    }
+
+    /// One report and one next completion for a three-cell reply, not
+    /// three. The branch prompts exactly once, when the *reply* ends.
+    #[test]
+    fn a_three_cell_reply_prompts_once() {
+        let (mut tree, mut state) = setup_under(crate::document::Transport::Notebook);
+        user_post(&mut state, &mut tree, "go");
+        let reply = "```js\nconsole.log(\"a\");\n```\n\n\
+                     ```js\nconsole.log(\"b\");\n```\n\n\
+                     ```js\nconsole.log(\"c\");\n```\n";
+        let out = state
+            .step(&mut tree, StepInput::LlmResponse(llm_program(reply)))
+            .unwrap();
+        let outs = drain(&mut state, &mut tree, out);
+
+        let requests = outs
+            .iter()
+            .filter(|o| matches!(o, StepOutput::LlmRequest(_)))
+            .count();
+        assert_eq!(requests, 1, "one next completion, not one per cell");
+        let outcomes = state
+            .agent_segment(&tree)
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.payload,
+                    EventPayload::Return { .. } | EventPayload::Condition { .. }
+                )
+            })
+            .count();
+        assert_eq!(outcomes, 1, "one report, not one per cell");
+    }
+
+    /// **A raise in cell 0, resumed, runs cells 1 and 2.** The VM is
+    /// parked *inside* cell 0; resuming continues from that instruction
+    /// and falls out of the cell into the driver, which walks on to the
+    /// next one rather than treating the handback as a finished run
+    /// (D9).
+    #[test]
+    fn a_raise_in_cell_0_resumes_into_the_later_cells() {
+        let (mut tree, mut state) = setup_under(crate::document::Transport::Notebook);
+        user_post(&mut state, &mut tree, "go");
+        let reply = "```js\nconst pick = raise(\"which\", { of: [1, 2] });\n```\n\n\
+                     ```js\nconsole.log(`picked ${pick}`);\n```\n\n\
+                     ```js\nconsole.log(\"and the last cell ran\");\n```\n";
+        let out = state
+            .step(&mut tree, StepInput::LlmResponse(llm_program(reply)))
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+
+        // Parked mid-cell-0, with a condition logged.
+        assert!(
+            matches!(state.phase, Phase::Suspended(..)),
+            "a raise suspends the run"
+        );
+        let out = state.resume(&mut tree, json!("the second one")).unwrap();
+        drain(&mut state, &mut tree, out);
+
+        let consoles: Vec<String> = state
+            .agent_segment(&tree)
+            .iter()
+            .filter_map(|e| match &e.payload {
+                EventPayload::Console { lines } => Some(lines.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert_eq!(
+            consoles,
+            vec!["picked the second one", "and the last cell ran"],
+            "the cells after the raise run on resume"
+        );
+    }
+
+    /// **`Call::site` keeps its meaning exactly** (D1): an offset into
+    /// the owning `Turn`'s `source`. The owning `Turn` is now one cell,
+    /// so the absolute span the compiler emitted — absolute so the
+    /// analyzer's span-keyed tables do not collide across cells (D2) —
+    /// is rebased against that cell at log time. Nothing downstream
+    /// sees an absolute offset.
+    #[test]
+    fn every_call_site_resolves_into_its_own_cell() {
+        let (mut tree, mut state) = setup_under(crate::document::Transport::Notebook);
+        user_post(&mut state, &mut tree, "go");
+        let reply = "First I speak.\n\n\
+                     ```js\ntell(\"from the first cell\");\n```\n\n\
+                     Then again, further down.\n\n\
+                     ```js\nconst x = 1;\ntell(\"from the second cell\");\n```\n";
+        let out = state
+            .step(&mut tree, StepInput::LlmResponse(llm_program(reply)))
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+
+        // Walk the log keeping each `Turn`'s source beside the sends
+        // that follow it, which is exactly how a site is meant to be
+        // resolved.
+        let mut current: Option<String> = None;
+        let mut checked = 0;
+        for event in state.agent_segment(&tree) {
+            match &event.payload {
+                EventPayload::Message(Message::Turn { source, .. }) => {
+                    current = Some(source.clone());
+                }
+                EventPayload::Call(Call::Send { site, site_end, .. }) => {
+                    let Some(source) = current.as_deref() else {
+                        // The reply's opening prose, logged before any
+                        // cell: synthetic, zero-width.
+                        assert_eq!((*site, *site_end), (0, 0));
+                        continue;
+                    };
+                    if (*site, *site_end) == (0, 0) {
+                        continue; // a prose segment between cells
+                    }
+                    let sliced = &source[*site as usize..*site_end as usize];
+                    assert!(
+                        sliced.starts_with("tell(") && sliced.contains("cell"),
+                        "site sliced {sliced:?} out of {source:?}"
+                    );
+                    checked += 1;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(checked, 2, "two tells, two sites resolved");
+    }
+
+    /// And the rebasing is real work, not a no-op: the second cell's
+    /// `tell` sits well into the markdown but near the start of its own
+    /// cell, and the site is the latter.
+    #[test]
+    fn a_site_is_cell_local_not_reply_absolute() {
+        let (mut tree, mut state) = setup_under(crate::document::Transport::Notebook);
+        user_post(&mut state, &mut tree, "go");
+        let reply = "A fairly long opening paragraph, so the offsets differ.\n\n\
+                     ```js\nlet a = 1;\n```\n\n\
+                     More prose here as well.\n\n\
+                     ```js\ntell(\"second\");\n```\n";
+        let out = state
+            .step(&mut tree, StepInput::LlmResponse(llm_program(reply)))
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+
+        let site = state
+            .agent_segment(&tree)
+            .iter()
+            .filter_map(|e| match &e.payload {
+                EventPayload::Call(Call::Send { site, site_end, .. }) if *site_end > 0 => {
+                    Some(*site)
+                }
+                _ => None,
+            })
+            .next()
+            .expect("the tell");
+        assert_eq!(site, 0, "the tell is the first thing in its own cell");
+        assert!(
+            reply.find("tell(\"second\")").unwrap() > 60,
+            "but it is far into the reply, so this was a real rebase"
+        );
+    }
+
+    /// **A reply with no cells rests the branch** (D4), and nothing was
+    /// implemented to make it: with no `Turn` and no outcome logged,
+    /// `last_turn_outcome` finds nothing and `needs_prompt` is false on
+    /// both clauses — a `Send` is not a `Post`. That is bit-for-bit the
+    /// state `done()` produces.
+    ///
+    /// The model still **speaks**: silence is a branch that produces
+    /// nothing, and this one produced an answer.
+    #[test]
+    fn a_reply_with_no_cells_speaks_and_rests_the_branch() {
+        let (mut tree, mut state) = setup_under(crate::document::Transport::Notebook);
+        user_post(&mut state, &mut tree, "go");
+        let reply = "The retry policy already lives in `retry.rs`, so there is \
+                     nothing to change.\n\n```text\njust a quote, not a cell\n```\n";
+        let out = state
+            .step(&mut tree, StepInput::LlmResponse(llm_program(reply)))
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+
+        assert!(matches!(state.phase, Phase::Idle));
+        assert!(
+            !state.needs_prompt(&tree),
+            "the model spoke and stopped: that is a finished turn"
+        );
+        assert_eq!(
+            payload_kinds(&state, &tree),
+            ["Agent", "Post", "Call"],
+            "the prose is delivered and nothing ran"
+        );
+        let said = state
+            .agent_segment(&tree)
+            .iter()
+            .find_map(|e| match &e.payload {
+                EventPayload::Call(Call::Send { text, .. }) => Some(text.clone()),
+                _ => None,
+            })
+            .expect("the person hears it");
+        assert!(said.contains("already lives in `retry.rs`"), "{said}");
+    }
+
+    /// A cell that does not compile stops the run — but the cells
+    /// before it have already run, and what they did stays in the log.
+    #[test]
+    fn a_later_cell_that_does_not_compile_leaves_the_earlier_ones_standing() {
+        let (mut tree, mut state) = setup_under(crate::document::Transport::Notebook);
+        user_post(&mut state, &mut tree, "go");
+        let reply = "```js\nconsole.log(\"the first cell ran\");\n```\n\n\
+                     ```js\nthis is not javascript\n```\n";
+        let out = state
+            .step(&mut tree, StepInput::LlmResponse(llm_program(reply)))
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+
+        let kinds = payload_kinds(&state, &tree);
+        assert!(
+            kinds.contains(&"Console"),
+            "cell 0's effect stands: {kinds:?}"
+        );
+        assert!(
+            kinds.contains(&"Condition"),
+            "and the run has an outcome: {kinds:?}"
+        );
+        // The effects stand in the *log* — that is what "partial
+        // progress" means. The report renders the compile failure,
+        // because that is what the repair loop has to act on.
+        let report = last_report(&state, &tree);
+        assert!(
+            report.contains("Expected a semicolon") || report.contains("compile"),
+            "the report names the failure: {report}"
+        );
+    }
+
+    /// A top-level `return` in a cell is refused, with the message that
+    /// says what to write instead (D5, 25.3) — carried end to end.
+    #[test]
+    fn a_cell_that_returns_is_refused_with_the_harness_message() {
+        let (mut tree, mut state) = setup_under(crate::document::Transport::Notebook);
+        user_post(&mut state, &mut tree, "go");
+        let reply = "```js\nreturn { done: true };\n```\n";
+        let out = state
+            .step(&mut tree, StepInput::LlmResponse(llm_program(reply)))
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+
+        let report = last_report(&state, &tree);
+        assert!(report.contains("history.append"), "{report}");
+        assert!(report.contains("done()"), "{report}");
+    }
+
+    /// `done()` does not stop anything (D8): the cells after it still
+    /// run, exactly as statements after it do today.
+    #[test]
+    fn done_in_cell_0_does_not_stop_the_later_cells() {
+        let (mut tree, mut state) = setup_under(crate::document::Transport::Notebook);
+        user_post(&mut state, &mut tree, "go");
+        let reply = "```js\ndone();\n```\n\n\
+                     ```js\nconsole.log(\"still ran\");\n```\n";
+        let out = state
+            .step(&mut tree, StepInput::LlmResponse(llm_program(reply)))
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+
+        let report = last_report(&state, &tree);
+        assert!(report.contains("still ran"), "{report}");
+        assert!(!state.needs_prompt(&tree), "`done()` still rests the branch");
+    }
+
+    /// The existing transport is untouched: a plain program under
+    /// `Transport::Program` is compiled as one program, as it always
+    /// was.
+    #[test]
+    fn the_program_transport_still_compiles_the_whole_completion() {
+        let (mut tree, mut state) = setup();
+        user_post(&mut state, &mut tree, "go");
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(llm_program("console.log(\"plain program\");")),
+            )
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+        assert_eq!(
+            payload_kinds(&state, &tree),
+            ["Agent", "Post", "Turn", "Return", "Console"]
+        );
+    }
+
+    // ── streaming: execute as the fences close (D11, D15, 25.5) ────
+
+    /// Push `reply` through the streaming door in chunks, the way the
+    /// session loop does, without ending the completion.
+    fn stream_chunks(state: &mut Runner, tree: &mut Tree, chunks: &[&str]) -> Vec<StepOutput> {
+        let mut out = Vec::new();
+        for chunk in chunks {
+            let produced = state.notebook_stream(tree, chunk).unwrap();
+            out.extend(drain(state, tree, produced));
+        }
+        out
+    }
+
+    /// **A cell runs the moment its fence closes**, with the completion
+    /// still arriving (D11). Cell 0's effect is in the log before cell
+    /// 1's text has been written at all.
+    #[test]
+    fn a_cell_runs_before_the_next_ones_fence_arrives() {
+        let (mut tree, mut state) = setup_under(crate::document::Transport::Notebook);
+        user_post(&mut state, &mut tree, "go");
+        state.phase = Phase::AwaitingLlm;
+
+        stream_chunks(
+            &mut state,
+            &mut tree,
+            &["Looking now.\n\n```js\ntell(\"cell 0 ran\");\n```\n"],
+        );
+
+        // Cell 0 has run, and nothing of cell 1 exists yet. A `tell` is
+        // logged at dispatch, so it is the effect that shows mid-reply;
+        // the console is a diagnostic stream drained at the run's end.
+        let kinds = payload_kinds(&state, &tree);
+        assert_eq!(
+            kinds,
+            ["Agent", "Post", "Call", "Turn", "Call"],
+            "cell 0 ran while the reply was still open"
+        );
+        assert!(
+            !kinds.contains(&"Return"),
+            "but the run has not ended: {kinds:?}"
+        );
+        assert!(matches!(state.phase, Phase::Running(_)));
+
+        // Now the rest arrives.
+        stream_chunks(
+            &mut state,
+            &mut tree,
+            &["\nAnd the second.\n\n```js\ntell(\"cell 1 ran\");\n```\n"],
+        );
+        let out = state
+            .step(&mut tree, StepInput::LlmResponse(llm_program("")))
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+
+        let said: Vec<String> = state
+            .agent_segment(&tree)
+            .iter()
+            .filter_map(|e| match &e.payload {
+                EventPayload::Call(Call::Send { text, site_end, .. }) if *site_end > 0 => {
+                    Some(text.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(said, vec!["cell 0 ran", "cell 1 ran"]);
+    }
+
+    /// Prose lands as its own `Send` as the reply streams, so the person
+    /// reads the narration beside the effects rather than after them.
+    #[test]
+    fn streamed_prose_is_delivered_before_the_cell_below_it_runs() {
+        let (mut tree, mut state) = setup_under(crate::document::Transport::Notebook);
+        user_post(&mut state, &mut tree, "go");
+        state.phase = Phase::AwaitingLlm;
+
+        stream_chunks(
+            &mut state,
+            &mut tree,
+            &["I will read both files.\n\n```js\ntell(\"read\");\n```\n"],
+        );
+        assert_eq!(
+            payload_kinds(&state, &tree),
+            ["Agent", "Post", "Call", "Turn", "Call"],
+            "the paragraph is delivered, then the cell runs and speaks"
+        );
+    }
+
+    /// **A trap cancels the generation still in flight** (D11): the VM is
+    /// parked, so no later cell can run until a handler resumes it, and
+    /// every token still being generated is waste.
+    #[test]
+    fn a_trap_in_a_cell_asks_for_the_generation_to_be_cancelled() {
+        let (mut tree, mut state) = setup_under(crate::document::Transport::Notebook);
+        user_post(&mut state, &mut tree, "go");
+        state.phase = Phase::AwaitingLlm;
+
+        stream_chunks(
+            &mut state,
+            &mut tree,
+            &["```js\nundefined_thing_here();\n```\n"],
+        );
+        assert!(
+            matches!(state.phase, Phase::Suspended(..)),
+            "the trap parked the run"
+        );
+        assert!(
+            state.notebook_cancels_generation(),
+            "so the harness stops reading the completion"
+        );
+    }
+
+    /// A `raise` is the same: the run is parked until a handler decides.
+    #[test]
+    fn a_raise_in_a_cell_asks_for_the_generation_to_be_cancelled() {
+        let (mut tree, mut state) = setup_under(crate::document::Transport::Notebook);
+        user_post(&mut state, &mut tree, "go");
+        state.phase = Phase::AwaitingLlm;
+
+        stream_chunks(&mut state, &mut tree, &["```js\nraise(\"which\");\n```\n"]);
+        assert!(matches!(state.phase, Phase::Suspended(..)));
+        assert!(state.notebook_cancels_generation());
+    }
+
+    /// **But `done()` does not** (D8, D11). It stops nothing: the later
+    /// cells still run, and the prose the model is still writing is very
+    /// often the answer the person asked for — cancelling would cut the
+    /// reply off mid-sentence.
+    #[test]
+    fn done_in_a_cell_does_not_cancel_the_generation() {
+        let (mut tree, mut state) = setup_under(crate::document::Transport::Notebook);
+        user_post(&mut state, &mut tree, "go");
+        state.phase = Phase::AwaitingLlm;
+
+        stream_chunks(&mut state, &mut tree, &["```js\ndone();\n```\n"]);
+        assert!(
+            !state.notebook_cancels_generation(),
+            "`done()` stops nothing, so the reply keeps arriving"
+        );
+        assert!(matches!(state.phase, Phase::Running(_)));
+
+        // And the rest of the reply really does run and finish.
+        stream_chunks(
+            &mut state,
+            &mut tree,
+            &["\n```js\ntell(\"after done\");\n```\n"],
+        );
+        let out = state
+            .step(&mut tree, StepInput::LlmResponse(llm_program("")))
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+
+        let said = state
+            .agent_segment(&tree)
+            .iter()
+            .any(|e| matches!(&e.payload, EventPayload::Call(Call::Send { text, .. })
+                if text == "after done"));
+        assert!(said, "the cell after `done()` still ran");
+        assert!(!state.needs_prompt(&tree), "`done()` still rests the branch");
+    }
+
+    /// **Truncation becomes partial progress** (D11). The cell that
+    /// closed ran and its effects stand; the half-written one after it
+    /// was never a cell at all, and the turn is reported as truncated so
+    /// the next completion knows it was cut off.
+    #[test]
+    fn a_mid_stream_truncation_keeps_what_ran_and_reports_partial() {
+        let (mut tree, mut state) = setup_under(crate::document::Transport::Notebook);
+        user_post(&mut state, &mut tree, "go");
+        state.phase = Phase::AwaitingLlm;
+
+        stream_chunks(
+            &mut state,
+            &mut tree,
+            &[
+                "```js\ntell(\"cell 0 ran\");\n```\n\nNext I will\n\n```js\nawait tools.read_fi",
+            ],
+        );
+        // The token budget ran out here.
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(LlmTurn {
+                    source: String::new(),
+                    thinking: None,
+                    truncated: true,
+                    usage: None,
+                    reply: None,
+                }),
+            )
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+
+        let said = state
+            .agent_segment(&tree)
+            .iter()
+            .any(|e| matches!(&e.payload, EventPayload::Call(Call::Send { text, .. })
+                if text == "cell 0 ran"));
+        assert!(said, "cell 0's effects stand");
+        let causes: Vec<&Cause> = state
+            .agent_segment(&tree)
+            .iter()
+            .filter_map(|e| match &e.payload {
+                EventPayload::Condition { cause, .. } => Some(cause),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            causes.len(),
+            1,
+            "one run, one terminal, even truncated: {causes:?}"
+        );
+        assert!(
+            matches!(causes[0], Cause::Truncated),
+            "reported as partial, not completed: {causes:?}"
+        );
+    }
+
+    /// The whole reply arriving in one chunk is the same as arriving in
+    /// many: the splitter does not care where the chunk boundaries fell.
+    #[test]
+    fn chunk_boundaries_do_not_change_the_log() {
+        let reply = "One.\n\n```js\nlet a = 1;\n```\n\nTwo.\n\n```js\na = 2;\n```\n\nThree.\n";
+        let whole = {
+            let (mut tree, mut state) = setup_under(crate::document::Transport::Notebook);
+            user_post(&mut state, &mut tree, "go");
+            state.phase = Phase::AwaitingLlm;
+            stream_chunks(&mut state, &mut tree, &[reply]);
+            let out = state
+                .step(&mut tree, StepInput::LlmResponse(llm_program("")))
+                .unwrap();
+            drain(&mut state, &mut tree, out);
+            payload_kinds(&state, &tree)
+        };
+        let split = {
+            let (mut tree, mut state) = setup_under(crate::document::Transport::Notebook);
+            user_post(&mut state, &mut tree, "go");
+            state.phase = Phase::AwaitingLlm;
+            let chunks: Vec<&str> = reply.split_inclusive('\n').collect();
+            stream_chunks(&mut state, &mut tree, &chunks);
+            let out = state
+                .step(&mut tree, StepInput::LlmResponse(llm_program("")))
+                .unwrap();
+            drain(&mut state, &mut tree, out);
+            payload_kinds(&state, &tree)
+        };
+        assert_eq!(whole, split);
     }
 }

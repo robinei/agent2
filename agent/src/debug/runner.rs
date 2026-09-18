@@ -162,7 +162,7 @@ impl Runner {
             // `Instr::Pause` is ever in its stream. (Unrelated to this
             // runner's own `RunState::Paused`, which is the debugger being
             // stopped at a breakpoint.)
-            Ok(StepResult::Paused) => {
+            Ok(StepResult::Paused { .. }) => {
                 unreachable!("the debugger does not compile incrementally")
             }
             Ok(StepResult::Done { value, .. }) => {

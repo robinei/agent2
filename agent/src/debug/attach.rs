@@ -251,8 +251,15 @@ pub struct AttachedApp {
 
 impl AttachedApp {
     pub fn new(root: BranchId) -> Self {
+        let mut chat = ChatState::new();
+        // A `Turn` is a **cell** only under this transport; under the
+        // others it is a whole program, whose source belongs to the
+        // source pane rather than inline in the transcript (D13).
+        chat.set_show_cells(
+            crate::document::configured_transport() == crate::document::Transport::Notebook,
+        );
         AttachedApp {
-            chat: ChatState::new(),
+            chat,
             view: View::Chat,
             prev_view: View::Chat,
             focus: Focus::Input,
@@ -467,6 +474,18 @@ impl AttachedApp {
                         {
                             self.collapsed.insert(branch);
                         }
+                        return;
+                    }
+                    // **Click toggles a cell** (D13) — clicking the *code*,
+                    // which is the thing you want more or less of. The
+                    // header keeps selecting the program, so folding and
+                    // selecting stay separate gestures on separate rows.
+                    // One cell at a time: the state is keyed by `Turn` id,
+                    // so a reply's other cells are untouched.
+                    if *kind == ChatKind::Code
+                        && let RowDetail::Program(pid) = detail
+                    {
+                        self.chat.toggle_cell(*pid);
                         return;
                     }
                     match detail {
@@ -913,6 +932,16 @@ impl AttachedApp {
             KeyCode::Char('c') if self.view == View::Chat => {
                 self.view = View::Running;
                 self.focus = Focus::Input;
+                KeyAction::None
+            }
+            // The keyboard equivalent of clicking a cell's code (D13).
+            // **Not `c`**: that is the pane-collapse gesture, one bit per
+            // *branch*, and this is one bit per *cell* — a different thing
+            // at a different scope, which is exactly the trap D13 names.
+            KeyCode::Char('z') if self.view != View::FullDebug => {
+                if let Some(pid) = self.selected_program {
+                    self.chat.toggle_cell(pid);
+                }
                 KeyAction::None
             }
             KeyCode::Char(' ') => KeyAction::TogglePause,
@@ -1711,6 +1740,48 @@ fn footer_hint(
     }
 }
 
+/// One line of JavaScript as colored spans, over `base`.
+///
+/// Reuses `debug/highlight.rs` — already a hand-rolled JS highlighter, and
+/// already what `ui.rs` drives for the source pane — so a cell and the
+/// source pane cannot drift in how they color the same token.
+fn js_spans(text: &str, base: Style) -> Vec<Span<'static>> {
+    let mut out: Vec<Span<'static>> = Vec::new();
+    let mut pos = 0usize;
+    for tok in super::highlight::tokenize(text) {
+        if tok.start > pos {
+            out.push(Span::styled(text[pos..tok.start].to_string(), base));
+        }
+        let style = match token_color(tok.kind) {
+            Some(color) => base.fg(color),
+            None => base,
+        };
+        out.push(Span::styled(text[tok.start..tok.end].to_string(), style));
+        pos = tok.end;
+    }
+    if pos < text.len() {
+        out.push(Span::styled(text[pos..].to_string(), base));
+    }
+    if out.is_empty() {
+        out.push(Span::styled(text.to_string(), base));
+    }
+    out
+}
+
+/// The transcript's colors for a highlighted token. Deliberately muted
+/// against the source pane's: a cell sits inside a conversation, and the
+/// prose around it must stay the thing the eye lands on first.
+fn token_color(kind: super::highlight::Kind) -> Option<Color> {
+    use super::highlight::Kind;
+    match kind {
+        Kind::Keyword => Some(Color::Rgb(197, 134, 192)),
+        Kind::Str => Some(Color::Rgb(206, 145, 120)),
+        Kind::Number => Some(Color::Rgb(181, 206, 168)),
+        Kind::Comment => Some(Color::Rgb(106, 153, 85)),
+        Kind::Ident | Kind::Punct => None,
+    }
+}
+
 fn chat_style(kind: ChatKind, even: bool) -> Style {
     let dim = |r, g, b| Color::Rgb((r * 3 / 4) as u8, (g * 3 / 4) as u8, (b * 3 / 4) as u8);
     match kind {
@@ -2059,6 +2130,21 @@ fn render_chat(
         {
             let spans = markdown::inline_spans(text, style);
             lines.extend(markdown::wrap_spans(&spans, style, wrap_width));
+        } else if *kind == ChatKind::Code
+            && matches!(detail, RowDetail::Program(_))
+            && text.chars().count() <= wrap_width
+        {
+            // **A cell's source is syntax-highlighted** (D13), through the
+            // highlighter the source pane already drives — the work here is
+            // routing, not a second tokenizer. Scoped to a cell's own rows
+            // (`RowDetail::Program`), so a fenced block quoted in *prose*
+            // stays literal, which is what a quote is for.
+            //
+            // Only when it fits unwrapped: a wrapped line would have to
+            // re-tokenize per fragment to keep the colors right, and an
+            // overlong line falls back to the plain wrap below rather than
+            // to mis-colored code.
+            lines.push(Line::from(js_spans(text, style)));
         } else if matches!(kind, ChatKind::TableHeader | ChatKind::TableRow)
             && text.chars().count() <= wrap_width
         {
@@ -4325,5 +4411,51 @@ mod tests {
         // root's final answer on its branch.
         while session.pump_one() {}
         assert!(session.quiet());
+    }
+
+    /// **The cell-fold gesture is not `c`** (D13). `c` is the pane-collapse
+    /// key — one bit per *branch*, a different thing at a different scope —
+    /// and it keeps doing exactly that.
+    #[test]
+    fn the_cell_fold_key_is_not_the_pane_collapse_key() {
+        let mut app = AttachedApp::new(fid(1));
+        app.chat.set_show_cells(true);
+        app.selected_program = Some(EventId::new(7));
+        app.focus = Focus::Debug;
+
+        // `c` still folds the panes, and folds no cell.
+        app.view = View::Running;
+        app.on_debug_key(KeyCode::Char('c'), &[], None);
+        assert_eq!(app.view, View::Chat);
+        assert!(!app.chat.cell_expanded(EventId::new(7)));
+
+        // `z` folds the cell, and leaves the panes alone.
+        let view = app.view;
+        app.on_debug_key(KeyCode::Char('z'), &[], None);
+        assert!(app.chat.cell_expanded(EventId::new(7)));
+        assert_eq!(app.view, view, "the panes are untouched");
+
+        // And it toggles back.
+        app.on_debug_key(KeyCode::Char('z'), &[], None);
+        assert!(!app.chat.cell_expanded(EventId::new(7)));
+    }
+
+    /// One cell at a time: the fold key names the selected program, so a
+    /// reply's other cells are untouched.
+    #[test]
+    fn folding_one_cell_leaves_the_others_alone() {
+        let mut app = AttachedApp::new(fid(1));
+        app.chat.set_show_cells(true);
+        app.focus = Focus::Debug;
+
+        app.selected_program = Some(EventId::new(2));
+        app.on_debug_key(KeyCode::Char('z'), &[], None);
+        assert!(app.chat.cell_expanded(EventId::new(2)));
+        assert!(!app.chat.cell_expanded(EventId::new(3)));
+
+        app.selected_program = Some(EventId::new(3));
+        app.on_debug_key(KeyCode::Char('z'), &[], None);
+        assert!(app.chat.cell_expanded(EventId::new(2)), "still open");
+        assert!(app.chat.cell_expanded(EventId::new(3)));
     }
 }

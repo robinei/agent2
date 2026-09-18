@@ -262,6 +262,46 @@ pub fn assemble(user_source: &str) -> String {
     concat(needed_parts(user_source).into_iter().map(|(_, src)| src))
 }
 
+/// **Every** helper, in the fixed order, for a caller that would rather
+/// compile them all once than append them as fragments turn out to need them.
+///
+/// Incremental evaluation over a source that is still *growing* has no other
+/// option. A prelude appended after fragment k's text lands at offsets that
+/// fragment k+1's own text will occupy once more of it arrives, and since the
+/// analysis tables are span-keyed, the two would collide. Compiling the whole
+/// prelude *first* puts it below every fragment instead of between two of
+/// them, after which the source region can grow without bound.
+///
+/// The cost is the helpers a unit never uses. That is a few dozen small
+/// functions compiled once per unit, against a turn that is dominated by I/O.
+pub fn all() -> String {
+    concat(every_part().into_iter().map(|(_, src)| src))
+}
+
+/// Mark every helper as already compiled, so [`assemble_new`] appends nothing
+/// more. Pairs with [`all`].
+pub fn mark_all_emitted(emitted: &mut std::collections::HashSet<&'static str>) {
+    for (key, _) in every_part() {
+        emitted.insert(key);
+    }
+}
+
+/// Every helper there is, keyed, in the order [`needed_parts`] would emit them.
+fn every_part() -> Vec<(&'static str, &'static str)> {
+    let mut out: Vec<(&'static str, &'static str)> = Vec::new();
+    for hof in HOFS {
+        out.push((hof.method, hof.source));
+    }
+    out.push(("Promise.all", PROMISE_ALL));
+    out.push(("Promise.allSettled", PROMISE_ALL_SETTLED));
+    out.push(("then", PROMISE_THEN));
+    out.push(("catch", PROMISE_CATCH));
+    out.push(("finally", PROMISE_FINALLY));
+    out.push(("replace", REPLACE));
+    out.push(("replaceAll", REPLACE_ALL));
+    out
+}
+
 /// The incremental form: the helpers this fragment needs that have **not
 /// already been compiled into the unit**, recording them in `emitted` as it
 /// goes.

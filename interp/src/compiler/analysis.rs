@@ -64,6 +64,16 @@ impl super::Compiler {
                 .is_some_and(|a| a.root == self.current_scope)
     }
 
+    /// Whether the function at `scope_id` names itself in its own body, so
+    /// its self-reference slot is live (see `FuncScope::uses_self_name`).
+    pub(super) fn scope_uses_self_name(&self, scope_id: usize) -> bool {
+        self.analysis
+            .as_ref()
+            .expect("analysis present")
+            .scopes[scope_id]
+            .uses_self_name()
+    }
+
     /// Whether the function scope `scope_id` is a constant function (Phase F):
     /// non-capturing and non-reassigned, so its binding store is dead.
     pub(super) fn is_const_fn_scope(&self, scope_id: usize) -> bool {

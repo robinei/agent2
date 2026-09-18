@@ -132,6 +132,11 @@ pub enum Transport {
     #[default]
     Program,
     RunProgram,
+    /// Phase 25: the completion is **markdown containing executable code
+    /// blocks**. Prose is prose and reaches the person as it streams; the
+    /// ```js cells are one compilation that pauses at each block, sharing a
+    /// frame and a scope (`docs/25_NOTEBOOK.md`).
+    Notebook,
 }
 
 pub const DEFAULT_TRANSPORT: Transport = Transport::Program;
@@ -160,6 +165,7 @@ pub fn configured_transport() -> Transport {
     static CONFIGURED: std::sync::OnceLock<Transport> = std::sync::OnceLock::new();
     *CONFIGURED.get_or_init(|| match std::env::var("AGENT2_TRANSPORT").as_deref() {
         Ok("run_program") => Transport::RunProgram,
+        Ok("notebook") => Transport::Notebook,
         _ => DEFAULT_TRANSPORT,
     })
 }
@@ -913,7 +919,12 @@ fn assistant_turn(
     source: String,
 ) -> (ChatMessage, Option<String>) {
     match transport {
-        Transport::Program => (ChatMessage::text(ChatRole::Assistant, source), None),
+        // Notebook's completion is the model's whole response text, as
+        // Program's is — markdown rather than bare JS, but the same plain
+        // assistant message either way.
+        Transport::Program | Transport::Notebook => {
+            (ChatMessage::text(ChatRole::Assistant, source), None)
+        }
         Transport::RunProgram => {
             let call_id = format!("call_{}", id.as_u64());
             let message = ChatMessage {
@@ -1025,7 +1036,7 @@ fn worked_examples(exemplars: &[Exemplar], transport: Transport) -> Vec<ChatMess
             // available: its own mouth.
             let program = format!("// [worked example]\n{}", ex.assistant);
             match transport {
-                Transport::Program => {
+                Transport::Program | Transport::Notebook => {
                     vec![request, ChatMessage::text(ChatRole::Assistant, program)]
                 }
                 Transport::RunProgram => {

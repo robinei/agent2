@@ -648,7 +648,7 @@ mod tests {
                 StepResult::OutOfFuel => {}
                 // An exemplar is one whole program compiled one-shot, so
                 // no `Instr::Pause` is ever in its stream.
-                StepResult::Paused => {
+                StepResult::Paused { .. } => {
                     return Err("an exemplar paused: it was not compiled one-shot".into());
                 }
             }

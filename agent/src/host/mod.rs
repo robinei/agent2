@@ -816,8 +816,34 @@ impl Session {
                     agent,
                     branch,
                     thinking,
-                    text,
+                    text: text.clone(),
                 });
+                // **Execute as the fences close** (D11). Under
+                // `Transport::Notebook` the reply is not waited for: each
+                // piece is acted on as it completes, so a cell's effects
+                // appear beneath it while the model is still writing the
+                // prose that follows. Thinking is not part of the reply.
+                if !thinking {
+                    let outputs = match self.states.get_mut(&branch) {
+                        Some(state) => state.notebook_stream(&mut self.tree, &text)?,
+                        None => Vec::new(),
+                    };
+                    if !outputs.is_empty() {
+                        self.after_step(branch, outputs)?;
+                    }
+                    // A trap or a raise parks the VM, so no later cell can
+                    // run until a handler resumes it — every token still
+                    // being generated is waste, and the harness stops
+                    // reading. **Not on `done()`**, which stops nothing
+                    // (D8) and whose reply is usually the answer itself.
+                    if self
+                        .states
+                        .get(&branch)
+                        .is_some_and(|s| s.notebook_cancels_generation())
+                    {
+                        self.cancel_generation(branch);
+                    }
+                }
                 Ok(())
             }
             LoopMsg::LlmDone {
@@ -1312,8 +1338,24 @@ impl Session {
         // gets logged all see the same real program — and the log holds
         // the program rather than a fenced wrapper around it. Unfenced
         // source passes through untouched.
-        message.source = crate::document::extract_program(&message.source);
-        if !message.truncated
+        // **Neither of these applies to a notebook.** Under
+        // `Transport::Notebook` the completion is markdown, so stripping a
+        // ```js fence off the front of it would eat the first cell's opening
+        // fence, and pre-checking the whole reply with `interp::compile`
+        // would fail on the prose and send every turn into the repair loop.
+        // A notebook's cells are compiled one at a time, by the driver, and
+        // a cell that does not compile is reported as itself.
+        let notebook = self
+            .states
+            .get(&branch)
+            .map(|s| s.transport())
+            .unwrap_or_default()
+            == crate::document::Transport::Notebook;
+        if !notebook {
+            message.source = crate::document::extract_program(&message.source);
+        }
+        if !notebook
+            && !message.truncated
             && let Err(diagnostics) = interp::compile(&message.source)
         {
             let attempts = self.repair_attempts.entry(branch).or_insert(0);
@@ -2151,6 +2193,89 @@ mod tests {
         let session = session.run();
         let events = rx.try_iter().collect();
         (session, events)
+    }
+
+    /// **A notebook reply through the real session loop.** Every other
+    /// notebook test drives `Runner::step` directly with an
+    /// `LlmResponse`, which is exactly how a latent `on_llm_response`
+    /// bug survived 25.4's gate: it applied `extract_program` (eating
+    /// the opening fence) and a whole-reply `interp::compile` pre-check
+    /// (which fails on prose, sending every turn to the repair loop).
+    /// This one goes through `Session`, the client's chunk callback and
+    /// `on_llm_response`, so that layer is covered by something.
+    #[test]
+    fn a_notebook_reply_survives_the_real_session_loop() {
+        let reply = "Opening the file.\n\n```js\nlet n = 1;\n```\n\nNow the sum.\n\n```js\ntell(`n is ${n + 41}`);\ndone();\n```\n";
+        let (tx, rx) = channel();
+        let mut session = Session::new(
+            Tree::new(None),
+            "test agent",
+            ToolRegistry::new(),
+            Box::new(ScriptedLlm::new(vec![scripted_program(reply)])),
+            tx,
+        )
+        .unwrap();
+        let branch = session.conversation_branch();
+        session
+            .states
+            .get_mut(&branch)
+            .expect("conversation branch")
+            .set_transport(crate::document::Transport::Notebook);
+        session.handle().send(SessionCommand::UserTurn {
+            branch,
+            text: "go".into(),
+            expects_reply: true,
+        });
+        let session = session.run();
+        let _: Vec<SessionEvent> = rx.try_iter().collect();
+        let tree = session.tree();
+
+        // Two cells: two `Turn`s, each holding only its own JavaScript.
+        let sources: Vec<String> = tree
+            .events
+            .values()
+            .filter_map(|e| match &e.payload {
+                EventPayload::Message(Message::Turn { source, .. }) => Some(source.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sources.len(), 2, "one Turn per cell: {sources:?}");
+        assert!(
+            sources.iter().all(|s| !s.contains("```") && !s.contains("Opening the file")),
+            "a Turn holds JavaScript, not markdown: {sources:?}"
+        );
+
+        // Prose reached the person, and the cell's `tell` ran — so the
+        // fence was not eaten and the reply was not sent to repair.
+        let said: Vec<String> = tree
+            .events
+            .values()
+            .filter_map(|e| match &e.payload {
+                EventPayload::Call(Call::Send { text, .. }) => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            said.iter().any(|t| t.contains("Opening the file")),
+            "the opening prose is a send: {said:?}"
+        );
+        assert!(
+            said.iter().any(|t| t == "n is 42"),
+            "the second cell ran with the first cell's binding: {said:?}"
+        );
+
+        // One run: exactly one terminal for the whole reply (D7).
+        let terminals = tree
+            .events
+            .values()
+            .filter(|e| {
+                matches!(
+                    e.payload,
+                    EventPayload::Return { .. } | EventPayload::Condition { .. }
+                )
+            })
+            .count();
+        assert_eq!(terminals, 1, "a reply is one run, however many cells");
     }
 
     /// Build a session, send one user turn, and run it to **quiet**.

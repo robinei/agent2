@@ -243,7 +243,7 @@ impl super::Compiler {
             label,
             slot_kinds,
             params_info,
-            self_name,
+            _self_name,
             upval_count,
             own_local_count,
             uses_arguments,
@@ -309,9 +309,13 @@ impl super::Compiler {
         // their kinds. `slot_kinds[..nparams]` are the params (handled below);
         // `slot_kinds[nparams..]` are the declared locals.
         let mut local_kinds: Vec<SlotKind> = slot_kinds[nparams as usize..].to_vec();
-        // The self-reference slot — except for a constant function, which refers
-        // to itself by its `Fn` constant, so the slot would be dead.
-        if self_name.is_some() && !self.is_const_fn_scope(scope_id) {
+        // The self-reference slot — but only when the body actually names
+        // itself. A constant function (Phase F) refers to itself by its `Fn`
+        // constant, so the slot would be dead; and a function that never
+        // mentions its own name has no use for it either, which matters
+        // because a pinned root makes *every* root function non-constant.
+        let needs_self_slot = self.scope_uses_self_name(scope_id);
+        if needs_self_slot && !self.is_const_fn_scope(scope_id) {
             local_kinds.push(SlotKind::Plain);
         }
         // The return spill slot would land just past everything; the
@@ -422,7 +426,7 @@ impl super::Compiler {
         // slot was allocated by EnterFrame above; fill it with the bare `Fn`.
         // A constant function (Phase F) refers to itself by its `Fn` constant
         // (static self-recursion), so the self-slot is dead — skip the setup.
-        if self_name.is_some() && !self.is_const_fn_scope(scope_id) {
+        if needs_self_slot && !self.is_const_fn_scope(scope_id) {
             let self_slot = frame_abs(own_local_count, nparams, upval_count);
             self.emit(
                 Instr::ClosureNew(label, js_length, thin_vec::ThinVec::new()),

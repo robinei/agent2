@@ -169,6 +169,23 @@ pub(crate) struct SlotInfo {
 }
 
 impl FuncScope {
+    /// Whether this function's body ever names **itself** — directly, or
+    /// from a nested scope that propagated the name up here.
+    ///
+    /// Only then does the self-reference slot earn its place. A named
+    /// function that never mentions its own name has a dead slot and a dead
+    /// `ClosureNew` of itself in its own prologue, paid on every call.
+    /// Ordinarily that is rare, because a plain declaration is a constant
+    /// function (Phase F) and refers to itself by its `Fn` constant — but
+    /// under a pinned root (incremental evaluation) no root function is a
+    /// constant function, so without this check *every* one of them pays.
+    pub(crate) fn uses_self_name(&self) -> bool {
+        let Some(name) = self.self_name.as_deref() else {
+            return false;
+        };
+        self.free_refs.iter().any(|(_, n)| n == name) || self.free_vars.contains(name)
+    }
+
     pub(crate) fn new(
         parent: usize,
         label: u32,

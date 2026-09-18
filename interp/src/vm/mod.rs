@@ -748,7 +748,14 @@ pub enum StepResult {
     /// driver appends the next fragment's instructions and calls `step()`
     /// again with nothing to reposition. `OutOfFuel` is the nearest neighbour:
     /// a resumable stop with the frame intact, minus the budget.
-    Paused,
+    ///
+    /// `unstarted` is the drained outbox — calls this fragment issued and
+    /// never awaited — handed over for the same reason `Done` hands its own
+    /// over: the fragment is finished, so they are *its* effects and belong
+    /// beside it. Unlike `Done`'s, these are not log-only. The run continues,
+    /// so a later fragment may well `await` one of the promises they settle;
+    /// holding them back until the run ends would strand exactly that.
+    Paused { unstarted: Vec<InvokeCall> },
     /// A settle-at-dispatch call (`Instr::Settle`) is waiting for its
     /// value. The arguments are already consumed and `ip` has advanced
     /// past the instruction, exactly as for `Raise`: the host answers
