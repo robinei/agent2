@@ -797,6 +797,52 @@ mod tests {
     /// What replaced them is below and is stricter about the thing that
     /// now matters: both exemplars parse, both run to completion against
     /// stub tools, and both end on purpose.
+    /// **One name per thing, across the card and everything the harness
+    /// prints.** The model is taught a vocabulary by the card and then
+    /// reads the harness's own text every turn; where the two disagree
+    /// it has to hold two names for one idea. Two had drifted apart by
+    /// 2026-09-18: the report advertised `fetch_history(id)` (37 times
+    /// in a single session) while the card taught the `history.*`
+    /// namespace that commit 235f823 made the surface, and the request
+    /// tail still called history rows "artifacts" — the name from the
+    /// artifact/menu machinery that phase deleted.
+    #[test]
+    fn the_harness_and_the_card_use_one_vocabulary() {
+        // Only the shipping half of each file: a `#[cfg(test)]` module
+        // builds scripted programs whose text is input to the harness,
+        // not output from it.
+        let harness: String = [include_str!("report.rs"), include_str!("machine.rs")]
+            .iter()
+            .map(|f| match f.find("\n#[cfg(test)]") {
+                Some(at) => &f[..at],
+                None => f,
+            })
+            .collect::<Vec<_>>()
+            .concat();
+        // Only what the model reads: quoted strings, not identifiers,
+        // doc comments, or the constants the lowering is named by.
+        let model_facing: Vec<&str> = harness
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && !t.starts_with("///") && l.contains('"')
+            })
+            .collect();
+        for (stale, instead) in [
+            ("fetch_history(", "history.fetch("),
+            ("artifacts on this branch", "rows on this branch"),
+        ] {
+            let offenders: Vec<&&str> = model_facing
+                .iter()
+                .filter(|l| l.contains(stale) && !l.contains("TOOL_"))
+                .collect();
+            assert!(
+                offenders.is_empty(),
+                "the model is shown {stale:?} but taught {instead:?}: {offenders:?}"
+            );
+        }
+    }
+
     #[test]
     fn the_exemplars_demonstrate_the_endings_and_the_shapes() {
         let ex = exemplars();

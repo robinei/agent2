@@ -6291,12 +6291,16 @@ mod tests {
             unreachable!()
         };
         let (text, _, _) = origin.direct().unwrap();
-        // `tools.tool_result` was renamed `artifact` with the namespace
-        // dropped (20_CODE_MODE.md: "DESIGN.md's `tools.tool_result`,
-        // renamed with the namespace") — `settled_notice` already emits
-        // the new name; this assertion just hadn't been ported.
+        // The third spelling this assertion has carried. It was
+        // `tools.tool_result`, then `artifact` with the namespace
+        // dropped, and now `history.fetch` — the namespace commit
+        // 235f823 settled on and the card has taught since. Each time
+        // `settled_notice` moved first and the assertion trailed, which
+        // is why `card::tests::the_harness_and_the_card_use_one_vocabulary`
+        // now checks the harness's model-facing strings as a set rather
+        // than one call site at a time.
         assert!(
-            text.contains(&format!("fetch_history({})", call.as_u64())),
+            text.contains(&format!("history.fetch({})", call.as_u64())),
             "{text}"
         );
         // The branch woke on it — a bare reply, closing nothing

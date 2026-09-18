@@ -1503,7 +1503,7 @@ impl Runner {
         };
         format!(
             "A call you issued has settled with no program awaiting it: [#{}] {label} → \
-             {outcome}. Fetch the whole value with fetch_history({}). Nothing is owed in reply.",
+             {outcome}. Fetch the whole value with history.fetch({}). Nothing is owed in reply.",
             call.as_u64(),
             call.as_u64(),
         )
@@ -3060,9 +3060,9 @@ impl Runner {
         }
         if let Some((count, first, last)) = self.artifact_span(tree) {
             lines.push(format!(
-                "{count} artifacts on this branch, #{first}–#{last}. A report lists only \
+                "{count} rows on this branch, #{first}–#{last}. A report lists only \
                  what is new since the last one; every id above stays fetchable with \
-                 fetch_history(id)."
+                 history.fetch(id)."
             ));
         }
         lines.push(if self.attached { PRESENT } else { ABSENT }.to_owned());
