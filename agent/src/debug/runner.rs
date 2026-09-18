@@ -158,6 +158,13 @@ impl Runner {
     fn handle(&mut self, res: Result<StepResult, interp::VMError>) {
         match res {
             Ok(StepResult::OutOfFuel) => {}
+            // The standalone debugger compiles one program one-shot, so no
+            // `Instr::Pause` is ever in its stream. (Unrelated to this
+            // runner's own `RunState::Paused`, which is the debugger being
+            // stopped at a breakpoint.)
+            Ok(StepResult::Paused) => {
+                unreachable!("the debugger does not compile incrementally")
+            }
             Ok(StepResult::Done { value, .. }) => {
                 let rendered = self
                     .vm

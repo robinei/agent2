@@ -404,6 +404,71 @@ pub enum Instr {
     ///     copy or local-allocation step.
     EnterFrame(LocalCount, bool, ThinVec<SlotKind>),
 
+    /// Grow the current frame's locals region by `local_kinds`, allocating each
+    /// exactly as [`Instr::EnterFrame`] does — `Plain` pushes `Undefined`,
+    /// `Boxed` allocates a `cells` entry and pushes an `Upval` marker.
+    ///
+    /// The second half of incremental evaluation's prologue, and the pair to
+    /// `EnterFrame`: the first fragment fed to a live VM emits `EnterFrame`,
+    /// every later one emits `ExtendFrame` carrying only its own new slots.
+    /// `EnterFrame` bakes the frame's local count into an instruction that has
+    /// already run by the time a later fragment declares a local, and patching
+    /// an emitted instruction does not grow a live frame.
+    ///
+    /// **Extending is a push, not an insert, and only because the frame is
+    /// quiescent.** Locals sit at the bottom of the frame with expression
+    /// temporaries above them, so growing the locals region would normally mean
+    /// shifting everything above it. At a fragment boundary there is nothing
+    /// above it: a fragment is a run of complete statements, so the operand
+    /// stack is balanced and `sp` is exactly the top of the locals. That is
+    /// asserted rather than assumed (`debug_assert`), because it is the whole
+    /// reason this instruction can exist.
+    ///
+    /// Emitted only at a fragment's start, where that invariant holds — never
+    /// mid-fragment, where temporaries are live. A fragment that declares no new
+    /// locals elides it rather than emitting an empty one, and a fragment
+    /// extending a root frame that never emitted an `EnterFrame` at all (no
+    /// locals in the first fragment) simply extends from zero.
+    ///
+    /// Disjoint from [`Instr::FreshCell`], so their order does not matter: a
+    /// *new* slot captured by a closure in its own fragment is allocated `Boxed`
+    /// here directly, while `FreshCell` only promotes *pre-existing* `Plain`
+    /// slots. Stack: () -> ()
+    ExtendFrame(ThinVec<SlotKind>),
+
+    /// Stop the VM **without unwinding the frame**, reporting
+    /// [`StepResult::Paused`]. The terminator of one fragment of an incremental
+    /// evaluation.
+    ///
+    /// The pair to `Return(0)`, and deliberately not it. A root frame's
+    /// `Return(0)` ends the run — it unwinds, taking every top-level local with
+    /// it — which is exactly wrong between two fragments that share a scope: the
+    /// next fragment would find none of the previous one's bindings. `Pause`
+    /// leaves the frame standing, so the bindings stay live and the next
+    /// fragment's instructions can simply be appended.
+    ///
+    /// **Nothing sets `ip`.** A fragment stops by running to the end of what
+    /// existed, so `ip` is left pointing at the append position; appending the
+    /// next fragment puts its first instruction exactly where the VM is already
+    /// standing. The code vector grows in front of a VM that is already there,
+    /// which is why the driver never needs to know an instruction offset.
+    ///
+    /// [`StepResult::OutOfFuel`] is the precedent for the shape — "nothing was
+    /// consumed; call `step` again to continue" — minus the budget. An
+    /// instruction rather than a stop-at-`ip` bound on `step` because every
+    /// semantic effect in this VM is already an instruction (`Settle`, `Raise`,
+    /// `FreshCell`, `EnterFrame`); the one non-instruction pause is
+    /// `OutOfFuel`, and that is a scheduling artifact, not a semantic one.
+    /// A fragment boundary is semantic — it is where the compiler decided one
+    /// ends — and its prologue (`ExtendFrame`) is already in the stream, so an
+    /// epilogue living in driver state would be asymmetric.
+    ///
+    /// Named for incremental evaluation, not for any one caller's vocabulary:
+    /// not `Yield` (which reads as generator semantics to anyone who knows JS,
+    /// though this VM has no generators) and not `Suspend` (taken by conditions
+    /// and `Phase::Suspended`). Stack: () -> ()
+    Pause,
+
     /// Push the `arguments` array for the current frame: a fresh heap array of
     /// all `arg_count` arguments (arg 0 first). Built lazily and cached per
     /// frame (`CallFrame::arguments_cache`), so repeated references reuse the

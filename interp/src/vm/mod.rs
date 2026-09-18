@@ -734,6 +734,21 @@ pub enum StepResult {
     /// a hot program can't starve the loop, debuggers single-step with
     /// `fuel = 1`. Never observable by the program — no `try` can trap it.
     OutOfFuel,
+    /// `Instr::Pause` ran: one fragment of an incremental evaluation ended
+    /// **without unwinding its frame**, so every binding it declared is still
+    /// live and the next fragment can be appended and stepped into.
+    ///
+    /// This is not a completion. Nothing is returned, the root frame is still
+    /// standing, and the run is not over — a driver seeing `Paused` logs no
+    /// terminal and simply waits for more code. The run ends the ordinary way,
+    /// with the root frame's `Return(0)` reporting `Done`, once the last
+    /// fragment has been fed in.
+    ///
+    /// `ip` is at the append position (the `Pause` itself is consumed), so a
+    /// driver appends the next fragment's instructions and calls `step()`
+    /// again with nothing to reposition. `OutOfFuel` is the nearest neighbour:
+    /// a resumable stop with the frame intact, minus the budget.
+    Paused,
     /// A settle-at-dispatch call (`Instr::Settle`) is waiting for its
     /// value. The arguments are already consumed and `ip` has advanced
     /// past the instruction, exactly as for `Raise`: the host answers

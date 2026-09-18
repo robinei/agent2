@@ -25,7 +25,13 @@ pub(crate) struct ParamInfo {
 /// program). The analysis pass walks all nested functions, detects free
 /// variables, and determines which slots must be `Boxed` because they are
 /// captured by a nested function (conservative: all captured slots are boxed).
-#[derive(Debug)]
+/// `Clone` is what makes incremental evaluation's re-resolution well defined.
+/// `resolve_const_functions` and `resolve_captures` mutate scopes destructively
+/// — clearing and refilling capture state, and renumbering slots — so feeding a
+/// growing scope set through them repeatedly only works if each round starts
+/// from the pristine, never-resolved walk output. The incremental analyzer
+/// keeps that pristine copy and clones it per fragment.
+#[derive(Debug, Clone)]
 pub(crate) struct FuncScope {
     /// Unique id (index into the `ProgramAnalysis::scopes` vec).
     pub(crate) id: usize,

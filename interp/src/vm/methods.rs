@@ -381,68 +381,108 @@ impl VM {
         attachments: serde_json::Value,
     ) -> Result<Self, VMError> {
         let mut vm = VM::new(program.code);
-        // Allocate one canonical `Closure` per unique `PushFn` code address.
-        // `PushFn` is emitted only for **const-fns** (Step 2e), which are
-        // single-identity: a `function F(){}` declaration is one function
-        // object, so every value-reference must resolve to the same `ptr`
-        // (baked into the instruction here; no runtime addr→ptr map). This is
-        // what keeps `F === F`, a shared `.prototype`, and `new F() instanceof
-        // F` correct. Genuine per-evaluation function values (expressions,
-        // non-const declarations, capturing closures) use `ClosureNew`, which
-        // allocates a fresh entry each time for JS per-instance identity.
-        {
-            let mut canonical: std::collections::HashMap<CodeAddr, ClosurePtr> =
-                std::collections::HashMap::new();
-            for instr in &mut vm.code {
-                if let Instr::PushFn(addr, ptr, arity) = instr {
-                    let cptr = *canonical.entry(*addr).or_insert_with(|| {
-                        let idx = vm.closures.len() as ClosurePtr;
-                        vm.closures.push(Closure {
-                            upvals: ThinVec::new(),
-                            prototype: None,
-                            arity: *arity,
-                            props: None,
-                        });
-                        idx
+        vm.install_const_fn_closures(0, &mut std::collections::HashMap::new());
+        vm.spans = program.spans;
+        vm.source = program.source;
+        vm.debug = program.debug;
+        vm.seed_host_consts(input, attachments)?;
+        Ok(vm)
+    }
+
+    /// A VM with **no code**, ready to be fed fragments by an incremental
+    /// evaluator. The host-seeded consts are in place, so `input` and
+    /// `attachments` resolve from the first fragment onward; `code`, `spans`
+    /// and `source` grow as fragments are appended.
+    ///
+    /// The root frame `VM::new` installs is the frame every fragment shares —
+    /// it is never unwound between them, which is the whole point.
+    pub fn for_incremental(
+        input: serde_json::Value,
+        attachments: serde_json::Value,
+    ) -> Result<Self, VMError> {
+        let mut vm = VM::new(Vec::new());
+        vm.seed_host_consts(input, attachments)?;
+        Ok(vm)
+    }
+
+    /// Allocate one canonical `Closure` per unique `PushFn` code address in
+    /// `code[from..]`, recording the mapping in `canonical`.
+    ///
+    /// `PushFn` is emitted only for **const-fns** (Step 2e), which are
+    /// single-identity: a `function F(){}` declaration is one function
+    /// object, so every value-reference must resolve to the same `ptr`
+    /// (baked into the instruction here; no runtime addr→ptr map). This is
+    /// what keeps `F === F`, a shared `.prototype`, and `new F() instanceof
+    /// F` correct. Genuine per-evaluation function values (expressions,
+    /// non-const declarations, capturing closures) use `ClosureNew`, which
+    /// allocates a fresh entry each time for JS per-instance identity.
+    ///
+    /// `from` and a caller-owned `canonical` are what let this run again over
+    /// appended code: an incremental evaluator keeps the map alive across
+    /// fragments, so a `PushFn` in a later fragment naming a const-fn from an
+    /// earlier one resolves to the closure already allocated for it.
+    pub(crate) fn install_const_fn_closures(
+        &mut self,
+        from: usize,
+        canonical: &mut std::collections::HashMap<CodeAddr, ClosurePtr>,
+    ) {
+        for i in from..self.code.len() {
+            if let Instr::PushFn(addr, _, arity) = self.code[i] {
+                let cptr = *canonical.entry(addr).or_insert_with(|| {
+                    let idx = self.closures.len() as ClosurePtr;
+                    self.closures.push(Closure {
+                        upvals: ThinVec::new(),
+                        prototype: None,
+                        arity,
+                        props: None,
                     });
+                    idx
+                });
+                if let Instr::PushFn(_, ptr, _) = &mut self.code[i] {
                     *ptr = cptr;
                 }
             }
         }
-        vm.spans = program.spans;
-        vm.source = program.source;
-        vm.debug = program.debug;
+    }
+
+    /// Install `input` (`objects[0]`) and `attachments` (`objects[1]`), the
+    /// two host-seeded read-only consts every program sees by name.
+    fn seed_host_consts(
+        &mut self,
+        input: serde_json::Value,
+        attachments: serde_json::Value,
+    ) -> Result<(), VMError> {
         // Reserve the two fixed slots before seeding either's nested values.
-        vm.objects.push(ObjData {
+        self.objects.push(ObjData {
             proto: None,
             map: IndexMap::new(),
             ..Default::default()
         }); // objects[0] = input
-        vm.objects.push(ObjData {
+        self.objects.push(ObjData {
             proto: None,
             map: IndexMap::new(),
             ..Default::default()
         }); // objects[1] = attachments
-        let input_entries = vm.seed_const_object(input)?;
-        let attachment_entries = vm.seed_const_object(attachments)?;
+        let input_entries = self.seed_const_object(input)?;
+        let attachment_entries = self.seed_const_object(attachments)?;
         // Step 2b: chain the host-seeded objects to `Object.prototype`,
         // matching JS (`Object.getPrototypeOf(input) === Object.prototype`
         // for a parsed JSON object). The prototype is allocated after
         // seeding (so it lands at a stable index beyond the nested values),
         // and the fixed `Object(0)`/`Object(1)` references are untouched —
         // only the `proto` field is set.
-        let object_proto = vm.prototype_for(crate::vm::instr::TypeTag::Object)?;
-        vm.objects[0] = ObjData {
+        let object_proto = self.prototype_for(crate::vm::instr::TypeTag::Object)?;
+        self.objects[0] = ObjData {
             proto: Some(object_proto),
             map: input_entries,
             ..Default::default()
         };
-        vm.objects[1] = ObjData {
+        self.objects[1] = ObjData {
             proto: Some(object_proto),
             map: attachment_entries,
             ..Default::default()
         };
-        Ok(vm)
+        Ok(())
     }
 
     /// Build the entry map for a host-seeded const from a JSON object;

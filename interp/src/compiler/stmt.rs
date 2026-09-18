@@ -44,6 +44,7 @@ impl super::Compiler {
             } else {
                 Err(enter_frame_at)
             },
+            prologue: super::PrologueKind::Enter,
             used: false,
         });
 
@@ -118,9 +119,17 @@ impl super::Compiler {
                     .analysis
                     .as_ref()
                     .expect("analysis present during codegen");
-                // Top-level `return` is allowed (8_HARNESS Step 0); the root
-                // frame's Return pops it and yields Done { value }.
-                let _is_top_level = analysis.scopes[self.current_scope].parent == usize::MAX;
+                // Top-level `return` is allowed by default (8_HARNESS Step 0);
+                // the root frame's Return pops it and yields Done { value }.
+                // A caller that has no use for it — an incremental evaluator,
+                // where the root frame outlives the fragment and returning from
+                // it would end the run mid-way — sets `no_top_level_return` to
+                // the message it wants instead. The rule is a flag here; the
+                // wording belongs to whoever set it.
+                let is_top_level = analysis.scopes[self.current_scope].parent == usize::MAX;
+                if is_top_level && let Some(message) = self.no_top_level_return.clone() {
+                    self.error(r.span.into(), message);
+                }
                 match &r.argument {
                     Some(expr) => self.compile_expr(expr),
                     None => self.emit(Instr::PushUndefined, r.span.into()),
@@ -203,7 +212,10 @@ impl super::Compiler {
                             // is dead. `const_eval` succeeding guarantees the init
                             // is pure const-pushes/ops (no labels/effects), so we
                             // can drop the emitted init wholesale.
-                            if recorded && !self.binding_captured(id.span.start) {
+                            if recorded
+                                && !self.binding_captured(id.span.start)
+                                && !self.root_is_pinned()
+                            {
                                 self.code.truncate(init_start);
                                 self.spans.truncate(init_start);
                             } else {

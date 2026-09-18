@@ -11,6 +11,7 @@ pub mod diag;
 pub mod optimizer;
 pub mod prelude;
 pub mod rc_str;
+pub mod repl;
 pub mod span;
 pub mod vm;
 
@@ -21,6 +22,7 @@ pub use compiler::{Program, compile, compile_for_test262, count_statements};
 pub use debuginfo::{DebugTable, FnDebug};
 pub use diag::{DiagKind, Diagnostic};
 pub use rc_str::RcStr;
+pub use repl::Repl;
 pub use span::Span;
 pub use vm::{
     ErrorKind, FrameView, Instr, InvokeCall, PromisePtr, PromiseState, ResumeMode, SettleCall,

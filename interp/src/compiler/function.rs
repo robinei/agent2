@@ -321,6 +321,7 @@ impl super::Compiler {
         self.return_spill = Some(super::ReturnSpill {
             slot: nparams + upval_count + local_kinds.len() as u32,
             enter_frame: Ok(enter_frame_at),
+            prologue: super::PrologueKind::Enter,
             used: false,
         });
         self.emit(
