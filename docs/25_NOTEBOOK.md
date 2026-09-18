@@ -660,24 +660,61 @@ sits.
 buffer, cell spans: all `agent/src/notebook.rs`. `interp` receives a
 `&str` and knows nothing about fences. 25.1 is already scoped this way.
 
-#### The frame must grow, and that is the second new primitive
+#### The frame must grow, and a cell boundary is the only place it can
 
 `EnterFrame(nparams, build_args, local_kinds)` bakes the frame's local
 count *and* every slot's kind into one instruction, executed once at
-frame entry. Cell 0's `EnterFrame` has already run by the time cell 1
-declares a local, and patching the emitted instruction does not grow a
-live frame.
+frame entry. Cell 0's has already run by the time cell 1 declares a
+local, and patching the emitted instruction does not grow a live frame.
 
-So a cell's prologue needs a runtime "extend the current frame by these
-slot kinds" operation — almost certainly an instruction, since it must
-run between cells rather than being driven from outside the VM. Named
-generically it is a REPL primitive like any other; named for cells it is
-the leak this decision exists to prevent.
+The stack layout makes this look worse than it is:
 
-It pairs with the `FreshCell` promotions (D12), which also run at a
-cell's start: **extend for the new slots, promote the ones a new closure
-just captured.** Those two plus the stop mechanism are the whole of the
-VM-side surface.
+```
+    │  expr temporaries    │  <- sp
+    ├──────────────────────┤
+    │  declared locals     │  fp + nparams + K ..
+    │  upvals (K)          │
+    │  params (= args)     │
+```
+
+Locals sit at the *bottom* of the frame with temporaries above them, so
+extending the locals region would normally mean shifting everything
+above it. **At a cell boundary there is nothing above it.** A cell is a
+run of complete statements, so the operand stack is balanced between
+them and `sp` is exactly the top of the locals. Extending is a push, not
+an insert:
+
+1. Assert `sp == fp + nparams + K + cur_local_count` — the frame's
+   temporaries are empty.
+2. For each new slot, what `EnterFrame` already does: `Plain` pushes
+   `Undefined`, `Boxed` allocates a `cells` entry and pushes
+   `Upval(idx)`. This is `EnterFrame`'s own allocation loop applied to a
+   suffix, so factor it out rather than writing it twice.
+3. Bump `cur_local_count` **and** `callstack.last_mut().local_count`.
+   The cached copy is re-derived from the frame (`methods.rs:222`), so
+   bumping only the cache is undone by the next frame change.
+
+**That invariant is why the prologue is the only place this can happen**
+— mid-cell, temporaries are live and extending would mean shifting them
+— and it is cheap to assert rather than assume.
+
+It also puts weight on D11's sequential rule for a reason beyond data
+dependencies: continuations snapshot `local_count` (`methods.rs:911`),
+so a cell suspended on a top-level await must finish before the next
+cell extends the frame, or a parked continuation resumes into a frame
+that grew underneath it.
+
+Three alternatives, all worse. **Over-allocating** at `EnterFrame`
+cannot work: the reply is still streaming when cell 0's frame is built,
+so any reserve is a guess that can be exceeded, and a generous one
+wastes stack on every frame. **Re-running a patched `EnterFrame`** would
+re-initialize cell 0's locals. **A heap scope object** is the scope map
+D12 already rejected.
+
+So the cell prologue is two operations, both at the one point where the
+frame is quiescent: **extend for the new slots, then `FreshCell` the
+ones a new closure just captured** (D12). With the stop mechanism, that
+is the entire VM-side surface of this phase.
 
 ## What this deletes
 
