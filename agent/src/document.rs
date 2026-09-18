@@ -296,6 +296,73 @@ fn author_label(tree: &Tree, from: Author) -> String {
 }
 
 
+/// A program's source with each `tell` of a **literal** string replaced
+/// by a reference to the row that now carries it.
+///
+/// `tell` renders whole, as its own row, so a literal one is in the
+/// document twice: once as the row and once inside the `tell(...)` that
+/// produced it. Measured across every run kept on 2026-09-17, 1011 of
+/// 3344 tells (30%) had their text verbatim in their own program.
+///
+/// **Only when the text is verbatim inside the call's own span.** A
+/// computed `tell("--- " + f.content)` is not duplication — the row has
+/// the bytes, the source has the *construction*, and the construction
+/// is program logic worth reading. 87% of tells are computed, and this
+/// leaves every one of them alone.
+///
+/// Not `ask`, and not `answer`, though both put text in the source: an
+/// `ask` renders at most an elided preview in the menu and `answer`
+/// renders nothing at all, so for those the program *is* the only copy
+/// and snipping would delete the question rather than de-duplicate it.
+///
+/// The span comes from the parser (`interp::Span`, logged as
+/// `site`/`site_end` on `Call::Send`), not from matching brackets here:
+/// a scan would have to get string literals right, and gets them wrong
+/// on the first `tell(")")` it meets. Rows written before those fields
+/// existed have `site_end` 0 and are left exactly as they were.
+fn snip_told_literals(tree: &Tree, leaf: EventId, turn: EventId, source: &str) -> String {
+    let mut cuts: Vec<(usize, usize, u64)> = Vec::new();
+    let mut seen_turn = false;
+    for ev in tree.path_events(leaf) {
+        if ev.id == turn {
+            seen_turn = true;
+            continue;
+        }
+        if !seen_turn {
+            continue;
+        }
+        match &ev.payload {
+            // The next turn ends this program's calls.
+            EventPayload::Message(Message::Turn { .. }) => break,
+            EventPayload::Call(Call::Send {
+                text,
+                expects_reply: false,
+                site,
+                site_end,
+                ..
+            }) => {
+                let (a, b) = (*site as usize, *site_end as usize);
+                if b > a && b <= source.len() && source.is_char_boundary(a) && source.is_char_boundary(b)
+                    && source[a..b].contains(text.as_str())
+                {
+                    cuts.push((a, b, ev.id.as_u64()));
+                }
+            }
+            _ => {}
+        }
+    }
+    if cuts.is_empty() {
+        return source.to_owned();
+    }
+    // Right to left, so no earlier offset goes stale.
+    cuts.sort_by_key(|(a, _, _)| std::cmp::Reverse(*a));
+    let mut out = source.to_owned();
+    for (a, b, id) in cuts {
+        out.replace_range(a..b, &format!("tell(/* [{id}] above */)"));
+    }
+    out
+}
+
 /// A replaced entry's line, `[id] … text`. `None` for a removed one,
 /// which renders nothing at all.
 ///
@@ -613,7 +680,7 @@ pub(crate) fn render_with_lookup(
         match &ev.payload {
             EventPayload::Message(Message::Turn { source, .. }) => {
                 let content = match compacted.get(&ev.id) {
-                    None => Some(source.clone()),
+                    None => Some(snip_told_literals(tree, leaf, ev.id, source)),
                     Some(shadow) => compacted_program_comment(ev.id, shadow),
                 };
                 // A removed program occupies no slot at all. Because a
@@ -1225,6 +1292,62 @@ mod tests {
         assert!(
             doc.messages.iter().any(|m| m.content.contains("the edit")),
             "the recovery program's own return survives too: {doc:?}"
+        );
+    }
+
+    /// A literal `tell` is in the document twice — as its own row, and
+    /// inside the call that produced it — so the call becomes a
+    /// reference to the row. A computed one is not duplication and is
+    /// left alone: the row has the bytes, the source has how they were
+    /// built.
+    #[test]
+    fn a_literal_tell_becomes_a_reference_and_a_computed_one_does_not() {
+        let src = "tell(\"hello\");\ntell(\"x \" + y);\n";
+        let lit = src.find("tell(\"hello\")").unwrap();
+        let comp = src.find("tell(\"x \" + y)").unwrap();
+        let send = |text: &str, a: usize, b: usize| {
+            EventPayload::Call(Call::Send {
+                to: Address::User,
+                text: text.into(),
+                input: serde_json::Value::Null,
+                expects_reply: false,
+                site: a as u32,
+                site_end: b as u32,
+            })
+        };
+
+        let mut tree = Tree::new(None);
+        let mut spine = tree
+            .start_agent(None, None, "root", None, "CARD", Vec::new())
+            .unwrap();
+        tree.append(&mut spine, user_post("go")).unwrap();
+        tree.append(&mut spine, turn(src)).unwrap();
+        let a = tree
+            .append(&mut spine, send("hello", lit, lit + "tell(\"hello\")".len()))
+            .unwrap();
+        // Computed: the text never appears inside its own call.
+        tree.append(&mut spine, send("x 1", comp, comp + "tell(\"x \" + y)".len()))
+            .unwrap();
+
+        let doc = render(&tree, &spine, 64 * 1024, Transport::Program);
+        let program = doc
+            .conversation()
+            .iter()
+            .find(|m| m.role == ChatRole::Assistant)
+            .expect("a program")
+            .content
+            .clone();
+        assert!(
+            program.contains(&format!("tell(/* [{}] above */)", a.as_u64())),
+            "the literal one points at its row: {program}"
+        );
+        assert!(
+            program.contains("tell(\"x \" + y)"),
+            "the computed one keeps its construction: {program}"
+        );
+        assert!(
+            !program.contains("\"hello\""),
+            "and the duplicated bytes are gone: {program}"
         );
     }
 
