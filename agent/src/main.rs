@@ -574,6 +574,12 @@ fn print_session_event(event: &SessionEvent) {
                 EventPayload::Console { lines } => {
                     println!("{head} console: {} lines", lines.len());
                 }
+                EventPayload::Completion { usage } => {
+                    println!(
+                        "{head} completion: {} in ({} cached), {} out ({} reasoning)",
+                        usage.prompt, usage.cached, usage.completion, usage.reasoning
+                    );
+                }
                 EventPayload::Note { text, .. } => println!("{head} note: {text}"),
                 EventPayload::Compacted { of, text } => match text {
                     Some(t) => println!("{head} compacted #{}: {t}", of.as_u64()),

@@ -919,7 +919,9 @@ impl Runner {
                 // A notebook fed in as it streamed has already logged every
                 // piece of this reply; the final message only says the
                 // completion is over (and whether it was cut off).
-                if let Some(out) = self.notebook_stream_end(tree, turn.truncated)? {
+                if let Some(out) =
+                    self.notebook_stream_end(tree, turn.truncated, turn.usage.clone())?
+                {
                     return Ok(out);
                 }
                 let author = Author::Agent(self.agent_id());
@@ -1082,6 +1084,12 @@ impl Runner {
         // but not byte-for-byte — the fences and the whitespace between
         // pieces are stored nowhere. Nothing downstream needs them.
         let assistant_id = if notebook {
+            // Same reasoning as the streaming path: this reply's `Turn`s
+            // are written by the driver, one per cell, so the cost of
+            // the completion is logged on its own.
+            if let Some(usage) = usage.clone() {
+                tree.append(&mut self.spine, EventPayload::Completion { usage })?;
+            }
             self.spine.leaf_id
         } else {
             let message = Message::Turn {
@@ -3599,11 +3607,22 @@ impl Runner {
         &mut self,
         tree: &mut Tree,
         truncated: bool,
+        usage: Option<crate::host::Usage>,
     ) -> io::Result<Option<Vec<StepOutput>>> {
         if !self.streaming_notebook {
             return Ok(None);
         }
         self.streaming_notebook = false;
+        // **What the completion cost, logged the moment it is known.**
+        // Every `Turn` this reply produced is already on the log — each
+        // was written before its cell ran, which is while this
+        // completion was still streaming (D15) — and the log is
+        // append-only, so there is no `Turn` left to hang the figure on.
+        // It goes on its own, exactly once, which is also what makes a
+        // reply countable as one turn rather than as its cells.
+        if let Some(usage) = usage {
+            tree.append(&mut self.spine, EventPayload::Completion { usage })?;
+        }
         let Phase::Running(run) = &mut self.phase else {
             // The run already ended — a trap or a raise in an earlier cell
             // suspended it, and the rest of the reply is moot.
@@ -4093,6 +4112,7 @@ mod tests {
                 EventPayload::Return { .. } => "Return",
                 EventPayload::Condition { .. } => "Condition",
                 EventPayload::Console { .. } => "Console",
+                EventPayload::Completion { .. } => "Completion",
                 EventPayload::Rename { .. } => "Rename",
                 EventPayload::Note { .. } => "Note",
                 EventPayload::Compacted { .. } => "Compacted",
@@ -6378,5 +6398,149 @@ mod tests {
             payload_kinds(&state, &tree)
         };
         assert_eq!(whole, split);
+    }
+
+    /// One `LlmTurn` carrying usage, for the transports that read it.
+    fn llm_program_with_usage(source: &str, completion: u64) -> LlmTurn {
+        LlmTurn {
+            source: source.into(),
+            thinking: None,
+            truncated: false,
+            usage: Some(crate::host::Usage {
+                prompt: 100,
+                cached: 40,
+                completion,
+                reasoning: 7,
+            }),
+            reply: None,
+        }
+    }
+
+    /// **A reply's cost is recorded exactly once, however many cells it
+    /// held.** The usage belongs to the *completion*, not to any one
+    /// cell, and a three-cell reply is one completion.
+    ///
+    /// It cannot live on a `Turn` here: every one of this reply's `Turn`s
+    /// is written before its cell runs — while the completion is still
+    /// streaming — and the log is append-only, so by the time the
+    /// provider says what the completion cost there is no `Turn` left to
+    /// put it on.
+    #[test]
+    fn a_three_cell_reply_records_its_usage_exactly_once() {
+        let (mut tree, mut state) = setup_under(crate::document::Transport::Notebook);
+        user_post(&mut state, &mut tree, "go");
+        let reply = "```js\nconsole.log(\"a\");\n```\n\n\
+                     ```js\nconsole.log(\"b\");\n```\n\n\
+                     ```js\nconsole.log(\"c\");\n```\n";
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(llm_program_with_usage(reply, 321)),
+            )
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+
+        let costs: Vec<u64> = state
+            .agent_segment(&tree)
+            .iter()
+            .filter_map(|e| match &e.payload {
+                EventPayload::Completion { usage } => Some(usage.completion),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(costs, vec![321], "one completion, one cost");
+
+        let turns = state
+            .agent_segment(&tree)
+            .iter()
+            .filter(|e| matches!(e.payload, EventPayload::Message(Message::Turn { .. })))
+            .count();
+        assert_eq!(turns, 3, "three cells, three Turns — and still one cost");
+    }
+
+    /// The same through the *streaming* door, which is the one a real
+    /// session uses and the one the figure used to fall through.
+    #[test]
+    fn a_streamed_reply_records_its_usage_exactly_once() {
+        let (mut tree, mut state) = setup_under(crate::document::Transport::Notebook);
+        user_post(&mut state, &mut tree, "go");
+        state.phase = Phase::AwaitingLlm;
+
+        stream_chunks(
+            &mut state,
+            &mut tree,
+            &[
+                "Reading it.\n\n```js\nlet n = 1;\n```\n",
+                "\nNow the sum.\n\n```js\ntell(`n is ${n + 41}`);\n```\n",
+            ],
+        );
+        // Every cell has already run, so there is no `Turn` left for the
+        // figure to ride in on.
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(llm_program_with_usage("", 654)),
+            )
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+
+        let costs: Vec<u64> = state
+            .agent_segment(&tree)
+            .iter()
+            .filter_map(|e| match &e.payload {
+                EventPayload::Completion { usage } => Some(usage.completion),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(costs, vec![654], "one completion, one cost");
+        assert!(
+            state
+                .agent_segment(&tree)
+                .iter()
+                .any(|e| matches!(&e.payload, EventPayload::Call(Call::Send { text, .. })
+                    if text == "n is 42")),
+            "and the reply really ran"
+        );
+    }
+
+    /// **`programs` counts round trips, not cells.** This is the other
+    /// number 25.8 compares, and counting `Turn`s would report a
+    /// three-cell reply as three turns of chat-mode drift when nothing
+    /// drifted.
+    #[test]
+    fn a_three_cell_reply_scores_as_one_program() {
+        let (mut tree, mut state) = setup_under(crate::document::Transport::Notebook);
+        user_post(&mut state, &mut tree, "go");
+        let reply = "```js\nconsole.log(\"a\");\n```\n\n\
+                     ```js\nconsole.log(\"b\");\n```\n\n\
+                     ```js\nconsole.log(\"c\");\n```\n";
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(llm_program_with_usage(reply, 321)),
+            )
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+
+        let score = crate::score::score(&tree);
+        assert_eq!(score.programs, 1, "one completion, one program");
+        assert_eq!(score.completion_out, 321, "and its cost is summed");
+    }
+
+    /// And a log that records no completions at all — a scripted run
+    /// nobody was billed for — still counts its turns, because there
+    /// every `Turn` really is its own round trip.
+    #[test]
+    fn a_log_with_no_recorded_cost_still_counts_its_turns() {
+        let (mut tree, mut state) = setup();
+        user_post(&mut state, &mut tree, "go");
+        let out = state
+            .step(&mut tree, StepInput::LlmResponse(llm_program("done();")))
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+
+        let score = crate::score::score(&tree);
+        assert_eq!(score.programs, 1);
+        assert_eq!(score.completion_out, 0, "nobody was billed");
     }
 }
