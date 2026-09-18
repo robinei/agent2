@@ -90,6 +90,9 @@ pub struct ReplCore {
     fragments: usize,
     /// Set once [`close`](Self::close) has emitted the run's `Return(0)`.
     closed: bool,
+    /// Where a primed unit's own source starts — past the prelude. Zero
+    /// for a unit that was never primed.
+    source_base: usize,
 }
 
 impl Default for ReplCore {
@@ -113,6 +116,7 @@ impl ReplCore {
             prelude_base: 0,
             fragments: 0,
             closed: false,
+            source_base: 0,
         }
     }
 
@@ -132,6 +136,36 @@ impl ReplCore {
     pub fn reject_top_level_return(&mut self, message: impl Into<String>) {
         self.compiler
             .set_no_top_level_return(Some(message.into()));
+    }
+
+    /// Compile the **whole** prelude as this unit's first fragment, and stop
+    /// appending helpers to later ones.
+    ///
+    /// For a unit whose source is still *growing* — an evaluator fed a
+    /// completion as it streams — this is the only workable order. A prelude
+    /// appended after fragment k's text occupies offsets that fragment k+1's
+    /// own text will take once more of it arrives, and the analysis tables are
+    /// span-keyed, so the two would collide. Compiling it first puts it
+    /// *below* every fragment rather than between two of them, after which the
+    /// source region can grow as far as it likes.
+    ///
+    /// Callers that prime must then place their own source above the prelude:
+    /// `source_base()` says where. Callers whose source is complete before the
+    /// first fragment need none of this and should not prime — they get the
+    /// tree-shaken per-fragment prelude instead.
+    pub fn prime_prelude(&mut self, vm: &mut VM) -> Result<(), Vec<Diagnostic>> {
+        assert_eq!(self.fragments, 0, "prime the prelude before any fragment");
+        let helpers = crate::prelude::all();
+        crate::prelude::mark_all_emitted(&mut self.emitted_helpers);
+        self.compile_and_append(vm, &helpers, false)?;
+        self.source_base = self.source.len();
+        Ok(())
+    }
+
+    /// The offset every later fragment's own text must start at, once
+    /// [`prime_prelude`](Self::prime_prelude) has run. Zero when it has not.
+    pub fn source_base(&self) -> usize {
+        self.source_base
     }
 
     /// Feed one fragment, appending its instructions after the ones already

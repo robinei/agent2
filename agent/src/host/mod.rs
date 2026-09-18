@@ -816,8 +816,34 @@ impl Session {
                     agent,
                     branch,
                     thinking,
-                    text,
+                    text: text.clone(),
                 });
+                // **Execute as the fences close** (D11). Under
+                // `Transport::Notebook` the reply is not waited for: each
+                // piece is acted on as it completes, so a cell's effects
+                // appear beneath it while the model is still writing the
+                // prose that follows. Thinking is not part of the reply.
+                if !thinking {
+                    let outputs = match self.states.get_mut(&branch) {
+                        Some(state) => state.notebook_stream(&mut self.tree, &text)?,
+                        None => Vec::new(),
+                    };
+                    if !outputs.is_empty() {
+                        self.after_step(branch, outputs)?;
+                    }
+                    // A trap or a raise parks the VM, so no later cell can
+                    // run until a handler resumes it — every token still
+                    // being generated is waste, and the harness stops
+                    // reading. **Not on `done()`**, which stops nothing
+                    // (D8) and whose reply is usually the answer itself.
+                    if self
+                        .states
+                        .get(&branch)
+                        .is_some_and(|s| s.notebook_cancels_generation())
+                    {
+                        self.cancel_generation(branch);
+                    }
+                }
                 Ok(())
             }
             LoopMsg::LlmDone {
@@ -1312,8 +1338,24 @@ impl Session {
         // gets logged all see the same real program — and the log holds
         // the program rather than a fenced wrapper around it. Unfenced
         // source passes through untouched.
-        message.source = crate::document::extract_program(&message.source);
-        if !message.truncated
+        // **Neither of these applies to a notebook.** Under
+        // `Transport::Notebook` the completion is markdown, so stripping a
+        // ```js fence off the front of it would eat the first cell's opening
+        // fence, and pre-checking the whole reply with `interp::compile`
+        // would fail on the prose and send every turn into the repair loop.
+        // A notebook's cells are compiled one at a time, by the driver, and
+        // a cell that does not compile is reported as itself.
+        let notebook = self
+            .states
+            .get(&branch)
+            .map(|s| s.transport())
+            .unwrap_or_default()
+            == crate::document::Transport::Notebook;
+        if !notebook {
+            message.source = crate::document::extract_program(&message.source);
+        }
+        if !notebook
+            && !message.truncated
             && let Err(diagnostics) = interp::compile(&message.source)
         {
             let attempts = self.repair_attempts.entry(branch).or_insert(0);

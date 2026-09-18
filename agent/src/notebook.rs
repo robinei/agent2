@@ -30,90 +30,206 @@
 #![allow(dead_code)] // wired into the compile path in 25.4; until then
 // the only callers are this module's own tests.
 
-/// The cell driver: a reply's cells, fed to one paused compilation in turn
-/// (25.4).
+/// The cell driver: a reply's pieces, split as they arrive and its cells fed
+/// to one paused compilation in turn (25.4, 25.5).
 ///
 /// **A reply is one run** (D7). The cells share a frame that is never unwound
 /// between them, so the driver's whole job is: feed a cell, let the VM run it
-/// to its `Pause`, feed the next — and when they run out, close the unit so the
-/// ordinary root `Return(0)` ends the run on exactly the path a one-shot
+/// to its `Pause`, feed the next — and when the reply ends, close the unit so
+/// the ordinary root `Return(0)` ends the run on exactly the path a one-shot
 /// program takes. No cell boundary ever reaches `finish_program`; the reply's
 /// end does, once.
+///
+/// **The reply grows underneath it** (D11): a cell runs the moment its fence
+/// closes, with the completion still streaming. That is why the prelude is
+/// compiled *first* rather than appended per cell — see
+/// [`interp::ReplCore::prime_prelude`] — and why every cell's parse buffer is
+/// rebuilt over the reply as it stands, with the earlier cells' offsets
+/// unchanged beneath it.
 ///
 /// It holds the compile half of the evaluation ([`interp::ReplCore`]) rather
 /// than a whole [`interp::Repl`], because the host already keeps the VM in its
 /// own run state and one VM in two places is one too many.
 pub struct Notebook {
     core: interp::ReplCore,
-    buffer: ParseBuffer,
-    cells: Vec<CellSpan>,
-    /// The next cell to feed. Equal to `cells.len()` once they are exhausted
-    /// and only the epilogue is left.
-    next: usize,
-}
-
-/// What [`Notebook::feed_next`] did.
-#[derive(Debug, PartialEq, Eq)]
-pub enum Fed {
-    /// A cell's instructions were appended; step the VM to run them.
-    Cell(usize),
-    /// The cells ran out and the run's epilogue was appended; the next step
-    /// reports `Done`.
-    Closed,
+    /// Where the reply's own coordinates start: past the primed prelude.
+    /// Every cell span the compiler emits is `base + markdown offset`.
+    base: usize,
+    /// The prelude region, blanked — spaces except newlines — so a cell's
+    /// parse buffer keeps the same line structure the unit's source has.
+    base_blank: String,
+    /// The completion so far.
+    reply: String,
+    stream: Stream,
+    /// Pieces that are complete but not yet acted on, in source order.
+    ///
+    /// A cell can close while the previous one is still suspended on an
+    /// await, so it waits here until the VM reaches the previous cell's
+    /// `Pause` (D11's sequential rule). Prose waits in the same queue rather
+    /// than being logged the moment it is recognised, because the log has to
+    /// read in source order: a paragraph written between two cells belongs
+    /// after the first cell's calls, not before them.
+    queued: std::collections::VecDeque<Piece>,
+    /// Whether the completion has ended, so the run can be closed once the
+    /// queue drains.
+    ended: bool,
+    /// The completion was cut off by the token budget. The cells that closed
+    /// still ran (D11's partial progress); the run is reported as truncated
+    /// rather than completed, so the next completion knows.
+    truncated: bool,
 }
 
 impl Notebook {
-    /// Split `markdown` into cells and prepare to feed them.
-    ///
-    /// Nothing is compiled here — a notebook with no cells is a perfectly good
-    /// notebook that simply has nothing to run (D4), and the caller decides
-    /// what that means before any VM exists.
-    pub fn new(markdown: &str) -> Self {
+    /// Begin a reply. Compiles the prelude into `vm` as the unit's first
+    /// fragment, which is what lets the reply's own region grow afterwards.
+    pub fn new(vm: &mut interp::VM) -> Result<Self, String> {
         let mut core = interp::ReplCore::new();
         core.reject_top_level_return(NO_TOP_LEVEL_RETURN);
-        Self {
-            cells: split_cells(markdown),
-            buffer: ParseBuffer::new(markdown),
+        core.prime_prelude(vm)
+            .map_err(|diags| render_cell_diags("", &diags))?;
+        let base = core.source_base();
+        let base_blank = core.source()[..base]
+            .bytes()
+            .map(|b| if b == b'\n' { '\n' } else { ' ' })
+            .collect();
+        Ok(Self {
             core,
-            next: 0,
-        }
+            base,
+            base_blank,
+            reply: String::new(),
+            stream: Stream::new(),
+            queued: std::collections::VecDeque::new(),
+            ended: false,
+            truncated: false,
+        })
     }
 
-    /// How many executable cells the reply held. Zero is the cell-less reply
-    /// D4 is about, and the drift metric 25.8 counts.
+    /// Append streamed text and hand back whatever pieces are now complete.
+    /// Cells named by the returned pieces are queued for compilation.
+    pub fn push_text(&mut self, text: &str) -> Vec<Piece> {
+        self.reply.push_str(text);
+        let pieces = self.stream.advance(&self.reply);
+        self.queue(&pieces);
+        pieces
+    }
+
+    /// The completion is over: hand back the trailing prose, and let the run
+    /// close once the queue drains.
+    pub fn end(&mut self) -> Vec<Piece> {
+        self.end_truncated(false)
+    }
+
+    /// The completion is over because the token budget ran out. The cells
+    /// that closed stand; the half-written one after them was never a cell.
+    pub fn end_truncated(&mut self, truncated: bool) -> Vec<Piece> {
+        let pieces = self.stream.finish(&self.reply);
+        self.queue(&pieces);
+        self.ended = true;
+        self.truncated = truncated;
+        pieces
+    }
+
+    /// Whether the completion was cut off.
+    pub fn was_truncated(&self) -> bool {
+        self.truncated
+    }
+
+    fn queue(&mut self, pieces: &[Piece]) {
+        self.queued.extend(pieces.iter().cloned());
+    }
+
+    /// The next piece to act on, in source order. `None` means the queue has
+    /// drained — which is "wait for more" while the reply is still arriving
+    /// ([`is_ended`](Self::is_ended) says which).
+    pub fn take_piece(&mut self) -> Option<Piece> {
+        self.queued.pop_front()
+    }
+
+    /// Whether the completion has finished arriving.
+    pub fn is_ended(&self) -> bool {
+        self.ended
+    }
+
+    /// The completion so far.
+    pub fn reply(&self) -> &str {
+        &self.reply
+    }
+
+    /// How many executable cells the reply has held so far. Zero at the end
+    /// is the cell-less reply D4 is about, and the drift metric 25.8 counts.
     pub fn cell_count(&self) -> usize {
-        self.cells.len()
+        self.stream.cells().len()
     }
 
-    /// The cell at `i`, as a range into the markdown.
-    pub fn cell(&self, i: usize) -> CellSpan {
-        self.cells[i]
+    /// The source of cell `i` — what its `Turn` records (D15).
+    pub fn cell_source(&self, i: usize) -> String {
+        self.stream.cells()[i].slice(&self.reply).to_string()
     }
 
-    /// Compile the next cell into `vm` — or, once they are exhausted, the
-    /// run's `Return(0)` epilogue.
+    /// Rebase a raw instruction span into the cell that contains it, so a
+    /// logged `site` is an offset into that cell's own `Turn.source` (D1).
     ///
-    /// Each cell is compiled from the shared buffer with only its own bytes
-    /// live (D2), so the spans it emits are offsets into the markdown and the
-    /// analysis tables accumulate across cells instead of colliding.
-    pub fn feed_next(&mut self, vm: &mut interp::VM) -> Result<Fed, String> {
-        if self.next < self.cells.len() {
-            let i = self.next;
-            let live = self.buffer.focus(self.cells[i]);
-            self.core
-                .push(vm, live)
-                .map_err(|diags| render_cell_diags(live, &diags))?;
-            self.next += 1;
-            Ok(Fed::Cell(i))
-        } else {
-            // Nothing live: the epilogue is the compiler's own, with no
-            // source of its own to point at.
-            let blank = self.buffer.clear();
-            self.core
-                .close(vm, blank)
-                .map_err(|diags| render_cell_diags(blank, &diags))?;
-            Ok(Fed::Closed)
-        }
+    /// The lookup is by *containment* rather than by "whichever cell was fed
+    /// last", because an await can leave an earlier cell still executing while
+    /// a later one has already been compiled. A span in the prelude or outside
+    /// every cell has no call site of its own and gets the zero-width
+    /// convention.
+    pub fn rebase_site(&self, raw: u32) -> u32 {
+        let Some(offset) = (raw as usize).checked_sub(self.base) else {
+            return 0;
+        };
+        self.stream
+            .cells()
+            .iter()
+            .find(|c| (c.start..c.end).contains(&offset))
+            .map(|c| (offset - c.start) as u32)
+            .unwrap_or(0)
+    }
+
+    /// Compile cell `i` into `vm`.
+    ///
+    /// Each cell is compiled from a buffer as long as the reply so far, with
+    /// only its own bytes live (D2), so the spans it emits are offsets into
+    /// the unit and the analysis tables accumulate across cells instead of
+    /// colliding.
+    pub fn feed_cell(&mut self, vm: &mut interp::VM, i: usize) -> Result<(), String> {
+        let buffer = self.buffer_for(self.stream.cells()[i]);
+        self.core
+            .push(vm, &buffer)
+            .map_err(|diags| render_cell_diags(&buffer, &diags))
+    }
+
+    /// Append the run's `Return(0)` epilogue: the reply is over, so the next
+    /// step unwinds the frame and reports `Done` on exactly the path a
+    /// one-shot program takes.
+    pub fn close(&mut self, vm: &mut interp::VM) -> Result<(), String> {
+        let buffer = self.blank_buffer();
+        self.core
+            .close(vm, &buffer)
+            .map_err(|diags| render_cell_diags(&buffer, &diags))
+    }
+
+    /// The parse buffer with `cell` live: the prelude region blanked, the
+    /// reply blanked but for this cell, and every newline in place.
+    fn buffer_for(&self, cell: CellSpan) -> String {
+        let mut buf = self.blank_buffer();
+        buf.replace_range(
+            self.base + cell.start..self.base + cell.end,
+            cell.slice(&self.reply),
+        );
+        buf
+    }
+
+    /// The same buffer with nothing live at all.
+    fn blank_buffer(&self) -> String {
+        let mut buf = String::with_capacity(self.base + self.reply.len());
+        buf.push_str(&self.base_blank);
+        buf.extend(
+            self.reply
+                .bytes()
+                .map(|b| if b == b'\n' { '\n' } else { ' ' }),
+        );
+        buf
     }
 }
 
@@ -128,6 +244,119 @@ fn render_cell_diags(buffer: &str, diags: &[interp::Diagnostic]) -> String {
         .map(|d| d.render(buffer))
         .collect::<Vec<_>>()
         .join("\n")
+}
+/// One piece of a reply, in source order (D1).
+///
+/// A reply decomposes into prose segments and cells. Each prose segment is a
+/// message to the person; each cell is JavaScript to run. The fences between
+/// them belong to neither and are stored nowhere.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Piece {
+    /// Text to send the person, trimmed of the blank lines that separated it
+    /// from the fences around it. Never empty — an empty segment is dropped
+    /// rather than logged as a message with nothing in it.
+    Prose(String),
+    /// An executable cell, by index into the reply's cells.
+    Cell(usize),
+}
+
+/// The streaming splitter: hands back each piece of a reply **the moment it
+/// is complete** (D11).
+///
+/// A cell is complete when its closing fence arrives, which is decidable at
+/// the line level with no parsing — three or more backticks at column 0. That
+/// is the property phase 24 could never get from a JS expression, where
+/// `tell("a")` might still become `tell("a").then(...)`.
+///
+/// A prose segment is complete when the cell after it opens, or when the reply
+/// ends. So prose is delivered a little behind the person's reading — it lands
+/// when the model starts the next code block — while the *rendering* of it is
+/// already live through the TUI's own chunk buffer. What this produces is the
+/// log, not the screen.
+///
+/// Re-scanning the accumulated reply on each advance is quadratic over the
+/// whole completion. That is the trade phase 24 already accepted in writing:
+/// a few KB against a scanner that does no parsing at all.
+pub struct Stream {
+    /// Bytes of the reply already handed out as pieces.
+    consumed: usize,
+    /// Cells already handed out.
+    emitted_cells: usize,
+    /// Every cell seen so far, refreshed on each advance.
+    cells: Vec<CellSpan>,
+}
+
+impl Default for Stream {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Stream {
+    pub fn new() -> Self {
+        Self {
+            consumed: 0,
+            emitted_cells: 0,
+            cells: Vec::new(),
+        }
+    }
+
+    /// Every cell recognised in the reply so far.
+    pub fn cells(&self) -> &[CellSpan] {
+        &self.cells
+    }
+
+    /// Pieces that have become complete since the last call, given the reply
+    /// as it stands now.
+    ///
+    /// `reply` must be the accumulated completion from the start, not just the
+    /// newest chunk: a fence can straddle a chunk boundary, and the only way
+    /// to be sure of a piece is to look at the whole thing.
+    pub fn advance(&mut self, reply: &str) -> Vec<Piece> {
+        self.cells = split_cells(reply);
+        let mut out = Vec::new();
+        while self.emitted_cells < self.cells.len() {
+            let cell = self.cells[self.emitted_cells];
+            // The prose between wherever we stopped and this cell's
+            // opening fence.
+            if let Some(text) = prose_between(reply, self.consumed, cell.outer_start) {
+                out.push(Piece::Prose(text));
+            }
+            out.push(Piece::Cell(self.emitted_cells));
+            self.consumed = cell.outer_end;
+            self.emitted_cells += 1;
+        }
+        out
+    }
+
+    /// The reply is over: hand back the trailing prose, if any.
+    ///
+    /// Separate from [`advance`](Self::advance) because a trailing segment is
+    /// only known to be complete once the completion ends — until then the
+    /// model may still be part-way through a sentence, or about to open
+    /// another fence.
+    pub fn finish(&mut self, reply: &str) -> Vec<Piece> {
+        let mut out = self.advance(reply);
+        if let Some(text) = prose_between(reply, self.consumed, reply.len()) {
+            out.push(Piece::Prose(text));
+        }
+        self.consumed = reply.len();
+        out
+    }
+}
+
+/// The prose in `reply[start..end]`, or `None` when there is nothing but
+/// whitespace there.
+///
+/// Trimmed, because the blank line separating a paragraph from the fence below
+/// it is markdown punctuation rather than part of the message. An all-blank
+/// gap between two adjacent cells is not a message at all.
+fn prose_between(reply: &str, start: usize, end: usize) -> Option<String> {
+    if start >= end {
+        return None;
+    }
+    let text = reply[start..end].trim();
+    (!text.is_empty()).then(|| text.to_string())
 }
 
 /// What a cell should write instead of a top-level `return` (D5, 25.3).
@@ -166,6 +395,17 @@ pub const NO_TOP_LEVEL_RETURN: &str =
 pub struct CellSpan {
     pub start: usize,
     pub end: usize,
+    /// Start of the opening fence *line*, and one past the end of the
+    /// closing fence line (including its newline, when it has one).
+    ///
+    /// The cell's outer extent, which is what the prose around it is
+    /// measured against: a prose segment runs from one cell's
+    /// `outer_end` to the next one's `outer_start`. The fences
+    /// themselves belong to neither piece and are stored nowhere — the
+    /// reply is recoverable in content and order, not byte-for-byte
+    /// (D1).
+    pub outer_start: usize,
+    pub outer_end: usize,
 }
 
 impl CellSpan {
@@ -195,6 +435,8 @@ struct OpenFence {
     executable: bool,
     /// Byte offset just past the opening fence line's newline.
     content_start: usize,
+    /// Byte offset of the opening fence line's first character.
+    outer_start: usize,
 }
 
 /// Is this info string one that executes? Exactly `js` or
@@ -238,6 +480,8 @@ pub fn split_cells(markdown: &str) -> Vec<CellSpan> {
                         cells.push(CellSpan {
                             start: fence.content_start,
                             end: line_start,
+                            outer_start: fence.outer_start,
+                            outer_end: offset,
                         });
                     }
                     open = None;
@@ -260,6 +504,7 @@ pub fn split_cells(markdown: &str) -> Vec<CellSpan> {
                     ticks,
                     executable: executes(info),
                     content_start: offset,
+                    outer_start: line_start,
                 });
             }
         }
@@ -542,6 +787,143 @@ three\n";
     fn a_closing_fence_at_eof_without_a_newline_closes() {
         let md = "```js\ndone();\n```";
         assert_eq!(cells_of(md), vec!["done();\n"]);
+    }
+
+    // --- the streaming splitter (D11, D15) ---
+
+    /// Feed a reply one byte at a time and collect the pieces, which is the
+    /// worst case a real stream can produce: every fence straddles a chunk.
+    fn pieces_byte_by_byte(reply: &str) -> Vec<Piece> {
+        let mut stream = Stream::new();
+        let mut out = Vec::new();
+        for (i, _) in reply.char_indices() {
+            out.extend(stream.advance(&reply[..i]));
+        }
+        out.extend(stream.finish(reply));
+        out
+    }
+
+    /// The shape from the doc: prose, cell, prose, cell — in source order.
+    #[test]
+    fn a_reply_decomposes_into_its_pieces_in_source_order() {
+        let reply = "Both files claim to own the retry policy.\n\n\
+                     ```js\nconst a = 1;\n```\n\n\
+                     `retry.rs` is the newer of the two.\n\n\
+                     ```js\ndone();\n```\n";
+        let mut stream = Stream::new();
+        let pieces = stream.finish(reply);
+        assert_eq!(
+            pieces,
+            vec![
+                Piece::Prose("Both files claim to own the retry policy.".into()),
+                Piece::Cell(0),
+                Piece::Prose("`retry.rs` is the newer of the two.".into()),
+                Piece::Cell(1),
+            ]
+        );
+    }
+
+    /// **A cell is complete the moment its fence closes**, not when the
+    /// completion ends (D11) — so it comes back from `advance`, with the
+    /// reply still arriving.
+    #[test]
+    fn a_cell_lands_as_soon_as_its_closing_fence_arrives() {
+        let mut stream = Stream::new();
+        assert!(stream.advance("Some prose first.\n\n```js\nconst a = 1;").is_empty());
+        // The closing fence completes both the prose before it and the cell.
+        let pieces = stream.advance("Some prose first.\n\n```js\nconst a = 1;\n```\n");
+        assert_eq!(
+            pieces,
+            vec![Piece::Prose("Some prose first.".into()), Piece::Cell(0)]
+        );
+        // And it is not handed out a second time.
+        assert!(
+            stream
+                .advance("Some prose first.\n\n```js\nconst a = 1;\n```\n\nmore")
+                .is_empty()
+        );
+    }
+
+    /// Trailing prose is only complete when the reply is: until then the
+    /// model may still be mid-sentence, or about to open another fence.
+    #[test]
+    fn trailing_prose_waits_for_the_end_of_the_reply() {
+        let reply = "```js\ndone();\n```\n\nThat is everything.\n";
+        let mut stream = Stream::new();
+        assert_eq!(stream.advance(reply), vec![Piece::Cell(0)]);
+        assert_eq!(
+            stream.finish(reply),
+            vec![Piece::Prose("That is everything.".into())]
+        );
+    }
+
+    /// A fence straddling chunk boundaries is still recognised exactly once,
+    /// which is why `advance` takes the whole accumulated reply.
+    #[test]
+    fn pieces_are_the_same_however_the_chunks_fall() {
+        let reply = "One.\n\n```js\nlet a = 1;\n```\n\nTwo.\n\n```js\na = 2;\n```\n\nThree.\n";
+        let mut whole = Stream::new();
+        assert_eq!(pieces_byte_by_byte(reply), whole.finish(reply));
+    }
+
+    /// Two adjacent cells with only blank space between them produce no
+    /// prose piece: an empty message is not a message.
+    #[test]
+    fn nothing_but_whitespace_between_cells_is_not_a_message() {
+        let reply = "```js\nlet a = 1;\n```\n\n```js\na = 2;\n```\n";
+        let mut stream = Stream::new();
+        assert_eq!(
+            stream.finish(reply),
+            vec![Piece::Cell(0), Piece::Cell(1)]
+        );
+    }
+
+    /// A reply with no cells is all prose, delivered when it ends (D4).
+    #[test]
+    fn a_cell_less_reply_is_one_prose_piece() {
+        let reply = "The retry policy already lives in `retry.rs`.\n";
+        let mut stream = Stream::new();
+        assert!(stream.advance(reply).is_empty());
+        assert_eq!(
+            stream.finish(reply),
+            vec![Piece::Prose("The retry policy already lives in `retry.rs`.".into())]
+        );
+    }
+
+    /// A truncated reply: the cell that closed stands, and the half-written
+    /// one after it is not a cell at all (D11's partial progress).
+    #[test]
+    fn a_truncated_reply_keeps_the_cells_that_closed() {
+        let reply = "```js\nconsole.log(\"ran\");\n```\n\nNext I will\n\n```js\nawait tools.read_fi";
+        let mut stream = Stream::new();
+        let pieces = stream.finish(reply);
+        assert_eq!(
+            pieces,
+            vec![
+                Piece::Cell(0),
+                // The prose after the closed cell still lands; the
+                // unterminated fence and its contents do not.
+                Piece::Prose("Next I will\n\n```js\nawait tools.read_fi".into()),
+            ]
+        );
+        assert_eq!(stream.cells().len(), 1);
+    }
+
+    /// A multi-paragraph report comes back as one message, with its internal
+    /// blank lines intact — this is the case the whole phase exists for.
+    #[test]
+    fn a_multi_paragraph_report_is_one_prose_piece() {
+        let reply = "# Findings\n\nThe first thing I noticed.\n\n\
+                     - one\n- two\n\nAnd the conclusion.\n";
+        let mut stream = Stream::new();
+        let pieces = stream.finish(reply);
+        let Piece::Prose(text) = &pieces[0] else {
+            panic!("expected prose, got {pieces:?}");
+        };
+        assert!(text.starts_with("# Findings"));
+        assert!(text.contains("\n\n- one\n- two\n\n"));
+        assert!(text.ends_with("And the conclusion."));
+        assert_eq!(pieces.len(), 1);
     }
 
     // --- the `return` diagnostic (D5, 25.3) ---

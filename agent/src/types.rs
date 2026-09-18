@@ -515,12 +515,36 @@ impl Message {
 /// `site_end` (`InvokeCall::site_end`), the end of that same call's source
 /// span, so a host can underline the whole `tools.ask`/`tools.tell` call
 /// rather than caret its first byte.
+///
+/// **One `Call` per call a program issues, logged at dispatch — with one
+/// exception.** Under `Transport::Notebook` a *prose* segment of the model's
+/// reply is logged as a `Send` too (`25_NOTEBOOK.md` D15), and no program
+/// issued it: it is text the model wrote beside its code, logged as the
+/// reply streams rather than at execution time. Such a send carries a
+/// synthetic zero-width `site`/`site_end`, because there is no instruction
+/// and no source expression behind it, and the reply's *opening* prose is
+/// logged before any `Turn` exists at all — so the placement rule ("between
+/// the program's `Turn` and its eventual `Return`") describes program-issued
+/// calls and no longer describes every `Call` on the spine.
+///
+/// Using `Send` anyway is deliberate. A prose segment *is* a message to the
+/// person: it renders in history exactly as a `tell` does, so the model
+/// re-reads its own reply in a shape it already knows, and `agent score`'s
+/// `tells`/`silent` fields fold off it without learning a second payload.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub enum Call {
     /// This branch's program messaged an agent or the user — the mirror of
     /// `Post`. `tools.ask` and `tools.tell` both log one, differing only in
     /// `expects_reply`; the body lives here and the `Post` names it, so it
     /// is never copied.
+    ///
+    /// **Or this branch's model wrote prose** (`Transport::Notebook`, D15):
+    /// the reply's own text, addressed to the user with
+    /// `expects_reply: false` and a synthetic site. See [`Call`]'s own
+    /// comment for why that case shares this variant rather than adding one.
+    /// It has no VM promise behind it, so the host writes its `Result` at
+    /// delivery instead of settling a program's await — the same path an
+    /// unawaited `tell` already takes.
     Send {
         to: Address,
         text: String,

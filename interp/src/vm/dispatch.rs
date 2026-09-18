@@ -1652,7 +1652,9 @@ impl VM {
                     // will be written. The frame is left standing: no unwind,
                     // no return value, nothing logged.
                     self.ip += 1;
-                    return Ok(StepResult::Paused);
+                    return Ok(StepResult::Paused {
+                        unstarted: std::mem::take(&mut self.outbox),
+                    });
                 }
 
                 Instr::AsyncEnter => {

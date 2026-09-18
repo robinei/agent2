@@ -451,7 +451,7 @@ fn run_work_item(item: WorkItem) -> TestResult {
         // is a `Fail` rather than a panic for the same reason the arms
         // above are: a conformance run classifies surprises, it does not
         // die on them.
-        Ok(StepResult::Paused) => TestResult {
+        Ok(StepResult::Paused { .. }) => TestResult {
             path: item.path,
             outcome: TestOutcome::Fail,
             detail: "unexpected pause".to_string(),

@@ -81,7 +81,7 @@ fn run_all(fragments: &[&str]) -> Repl {
             panic!("fragment {i} failed to compile:\n{}", rendered.join("\n"));
         }
         match repl.vm.step(u64::MAX).unwrap() {
-            StepResult::Paused => {}
+            StepResult::Paused { .. } => {}
             other => panic!("fragment {i} did not pause: {other:?}"),
         }
     }
@@ -401,7 +401,7 @@ fn a_fragment_ends_with_pause_and_the_unit_ends_with_return() {
     assert_eq!(repl.vm.code.last(), Some(&Instr::Pause));
     assert!(matches!(
         repl.vm.step(u64::MAX).unwrap(),
-        StepResult::Paused
+        StepResult::Paused { .. }
     ));
     // The frame is still standing, with the binding in it.
     assert_eq!(repl.vm.stack.len(), 1);
@@ -460,7 +460,7 @@ fn a_first_fragment_with_no_locals_emits_no_enter_frame() {
     );
     assert!(matches!(
         repl.vm.step(u64::MAX).unwrap(),
-        StepResult::Paused
+        StepResult::Paused { .. }
     ));
     assert_eq!(repl.vm.stack.len(), 1, "the frame grew by one slot");
 }
