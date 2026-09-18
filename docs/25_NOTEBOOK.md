@@ -182,46 +182,62 @@ with ```js and ```javascript, so it gives up some leniency against a
 habit the model demonstrably has. It is the right trade here because a
 bare fence is also how prose quotes anything at all, and the failure is
 caught rather than silent: a reply whose only code sits in a bare fence
-has no executable cell, which D4 makes a compile failure and the repair
-loop re-asks.
+has no executable cell, so the turn simply rests (D4) and the person's
+next message gets it moving again.
 
 This is the decision most likely to be wrong, and it is cheap to
 reverse: it is one predicate over the fence's info string.
 
-### D4 — A reply with no executable cell is a compile failure
+### D4 — A reply with no cells rests the branch, and needs no rule
 
-Without this rule the format makes "reply with prose and do nothing"
-expressible, which is chat mode — and chat mode is what the code-mode
-thesis measured its way out of (programs/run 8.9 → 3.5, read-tell-stop
-60% → 0%). A turn that only wants to speak still writes one cell:
-`done();`.
+It is a complete turn: the model spoke and stopped. Nothing is refused,
+nothing is re-asked.
 
-**The unresolved part: what "goes to the repair loop" means once prose
-has already been delivered.** An earlier draft said simply "it goes to
-the repair loop like any other unusable completion", which was true when
-a completion was one indivisible thing. D15 broke that: by the time the
-harness can know there is no executable cell — the end of the reply —
-the prose has been logged and shown. Three cases, and only the first is
-settled:
+**This is not a rule being added — it is what the harness already does.**
+`finish_program` shows that resting is not a state:
 
-- **A cell that fails to compile, with earlier cells already run.** Not
-  a repair case at all. Log `Condition { CompileFailed }` for that cell;
-  the reply ends there; the next completion sees the earlier cells'
-  outcomes and the diagnostic. This is D15's partial-progress gain, and
-  it is an ordinary continuation rather than a re-ask.
-- **A cell 0 that fails to compile, nothing run.** Today's repair case,
-  unchanged in substance. Any prose before it has been said, which is
-  acceptable — it was the model talking, and it is not retracted by the
-  code after it failing.
-- **No executable cell at all.** This is the one to decide. A re-ask
-  risks the person hearing the same prose twice. Not re-asking is worse:
-  a pure-prose reply logs `Send`s and no `Turn`, so there is no outcome
-  and no unseen `Post` — `needs_prompt` is false on both clauses and the
-  branch **goes quiet**. That is the silence failure this project has
-  measured before, reachable here by a new route.
+```rust
+if self.done {
+    self.shown = self.spine.leaf_id.as_u64();
+    self.done = false;
+}
+self.phase = Phase::Idle;
+out.extend(self.prompt_if_needed(tree)?);
+```
 
-Whatever the answer, it cannot be "nothing", and it is the last thing in
-this phase that is asserted rather than designed.
+`done()` works *entirely* by advancing `shown` so `needs_prompt`'s
+outcome clause goes false. Resting **is** "shown has caught up".
+
+A cell-less reply reaches the same place by a different road. It logs
+`Send`s and no `Turn`, so `unseen_posts` is empty — sends are not posts
+— and `last_turn_outcome > shown` is false, because the newest `Turn` is
+the previous reply's and was shown already. `needs_prompt` is false on
+both clauses and the branch sits `Idle`. That is bit-for-bit the state
+`done()` produces. **A reply with no cells is an implicit `done()`,
+without anything being implemented.**
+
+Two earlier drafts of this decision were wrong, in opposite directions:
+
+- **"It goes to the repair loop like any other unusable completion."**
+  Fighting the harness to refuse a turn it handles correctly — and, once
+  D15 lands, re-asking after the prose has already been delivered, so
+  the person may hear it twice.
+- **"Not re-asking is worse: the branch goes quiet."** Quiet is what a
+  finished turn looks like. Silence, the failure this project has
+  measured, is a branch that produces *nothing*; a cell-less reply
+  speaks and then rests, which is `tell(); done();` with the ceremony
+  removed.
+
+**And the original rationale overclaimed.** It cited the chat-drift
+numbers (programs/run 8.9 → 3.5, read-tell-stop 60% → 0%) as though
+requiring a cell prevented drift. It never could: a drifting model would
+write `done();` in a cell and drift identically. Forcing a cell only
+ever prevented the *silent* variant, and there is no silent variant.
+
+What remains is a **metric, not a gate**. The share of replies with no
+cells is exactly the chat-mode-drift measurement 25.8 wants, and it is
+free to count. The actual guards against drift are the card and the
+exemplars, which is where they always were.
 
 ### D5 — There is no `return`
 
@@ -612,11 +628,10 @@ it already has. The `//:` marker survives for cells and disappears for
 prose, which is the first time in this design it has had a coherent
 scope.
 
-One thing to be careful of while doing it: D4 makes a reply with no
-executable cell a *compile failure*, and a compacted turn is exactly
-such a reply. D4 governs an arriving completion, never a stored one —
-the check belongs on the completion path, not on anything that renders
-history.
+A caveat this decision used to carry has dissolved: while D4 made a
+cell-less reply a compile failure, a compacted turn — which is exactly
+such a reply — needed the check confined to the completion path. D4 no
+longer rejects anything, so there is nothing to confine.
 
 ### D15 — The reply is logged as it arrives
 
@@ -872,9 +887,11 @@ backticks at column 0, the info string is exactly `js` or `javascript`
 in lower case, and the closing fence is at least as long as the opening
 one. No tildes, no indented fences, nothing inside a list item or a
 block quote. CommonMark permits all of those; a strict subset is safe
-here because a missed cell is not silent — D4 turns a reply with no
-executable cell into a repair-loop retry, so the model is told and tries
-again. A *wrongly* recognised cell has no such backstop.
+here because a missed cell is not silent: the reply still speaks, the
+turn rests (D4), and the person's next message gets it moving again — so
+a missed cell costs one exchange and nothing else. A *wrongly*
+recognised cell runs code the model did not mean to run, and has no such
+backstop.
 Gate: the buffer's length and every newline position match the markdown
 for each cell in turn, and `cargo test -p agent notebook` covers
 ```js, ```javascript, a non-executable tag, an unterminated final fence,
@@ -914,10 +931,6 @@ test asserting the message names both, and that a `return` inside a
 function *in* a cell is left alone.
 
 **25.4 — `Transport::Notebook`, batch first, and the cell driver.**
-**Settle D4's third case first** — a reply with no executable cell must
-not leave the branch quiet, and the choice between re-asking (the person
-may hear the prose twice) and something else is a design decision, not
-an implementation detail.
 
 Wire the split into the compile path beside `extract_program`, executing
 cells in sequence *after* the completion ends. No streaming yet — this
