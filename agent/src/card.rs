@@ -62,7 +62,7 @@ pub fn embedded() -> Card {
             exemplar!("02-continue"),
             exemplar!("03-ask"),
             exemplar!("04-many"),
-            exemplar!("05-bank"),
+            exemplar!("05-keep"),
         ],
     }
 }
@@ -430,7 +430,7 @@ mod tests {
         // `card()` shows up as a diff review must look at, not a byte
         // count that silently drifts. Comparing full text (not just a
         // hash) so the diff itself is legible in a failure message.
-        const EXPECTED_LEN: usize = 11193;
+        const EXPECTED_LEN: usize = 11684;
         assert_eq!(
             card().len(),
             EXPECTED_LEN,
@@ -787,7 +787,14 @@ mod tests {
             "the third asks mid-program and acts on the answer: {}",
             ex[2].assistant
         );
-        // **The fifth banks a conclusion before risking it.** A `return`
+        // **The fifth keeps what it will keep thinking with.** A
+        // `return` is one per program and it is that program's result,
+        // so pinning the README would cost the finding — which is the
+        // case that has no other verb. `history.append` fell from 6% of
+        // programs to 0% once `console.log` was documented, because the
+        // framing it had ("a conclusion reached in the middle") is the
+        // case `console.log` now serves better. This is the one it
+        // does not. A `return`
         // is a promise the program has to live to keep; `history.append`
         // is already on the log the moment it is called, and survives
         // the program's own trap — verified on a real run, where note
@@ -797,8 +804,8 @@ mod tests {
         // correctly which attributes were pointless, trapped on
         // `fmt is not defined`, and lost the whole analysis.
         assert!(
-            ex[4].assistant.contains("history.append"),
-            "the fifth banks a finding before the risky part: {}",
+            ex[4].assistant.contains("history.append") && ex[4].assistant.contains("return"),
+            "the fifth keeps reference material and still returns its finding: {}",
             ex[4].assistant
         );
         // Per-item findings belong in `console.log`, not `append`: 200

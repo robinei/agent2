@@ -74,11 +74,13 @@ declare function list_agents(opts?: { under?: number; deep?: boolean }):
 
 /** The conversation itself, by the `[id]` shown against each entry. Answered from the log: costs nothing, adds nothing. */
 declare namespace history {
-  /** Keep one conclusion, as its own row, now.
+  /** Put something on the record, as a row of its own, now.
 
-  Not a copy of a result. The result is already kept: its entry is in the conversation and `history.fetch(id)` returns it whole, for nothing. What belongs here is what you worked out *from* it — the four paths that matter out of the two hundred you listed — never the two hundred, which is what `console.log` is for.
+  Two things want that. A conclusion you reached — the four paths that matter out of the two hundred you listed, never the two hundred, which is what `console.log` is for. And the material you are going to keep thinking *with*: the README, the design notes, the one file the whole task turns on. Reading a file costs nothing and never fills this up, but what you read is only in front of you if it is on the record, and you write the next program out of what is in front of you.
 
-  Reach for it when the working-out was the expensive part and the rest of the program might not survive: this is on the log the moment you call it, where a `return` is a promise the program has to live to keep. A trap loses the return and keeps this. */
+  Not a copy of a result, though. A result is already kept — its row is in the conversation and `history.fetch(id)` returns it whole, for nothing — so copy an id, or a conclusion, not the bytes.
+
+  Why a verb of its own, when a program could return the same thing: a program gets one `return` and it is that program's *result*. Keeping the design notes should not cost you the ability to hand on what you actually found. And this lands the moment you call it, where a `return` only arrives if the program lives to the end — a trap loses the return and keeps this. */
   function append(value: unknown): void;
   /** Read any entry back, whole, by its id. Works for entries that no longer show in the conversation, too: `remove` takes them out of what you are shown, never off the log. */
   function fetch(id: number): unknown;
