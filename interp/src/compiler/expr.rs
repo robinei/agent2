@@ -2,6 +2,7 @@ use oxc_ast::ast;
 use oxc_span::GetSpan;
 
 use crate::builtin::Builtin;
+use crate::span::Span;
 use crate::vm::{Instr, RcStr, Value};
 
 impl super::Compiler {
@@ -14,25 +15,25 @@ impl super::Compiler {
             // ── literals ──────────────────────────────────────────────
             ast::Expression::NumericLiteral(lit) => match super::number_literal_to_value(lit.value)
             {
-                Value::PosInt(v) => self.emit(Instr::PushPosInt(v), lit.span.start),
-                Value::Float(v) => self.emit(Instr::PushFloat(v), lit.span.start),
+                Value::PosInt(v) => self.emit(Instr::PushPosInt(v), lit.span.into()),
+                Value::Float(v) => self.emit(Instr::PushFloat(v), lit.span.into()),
                 _ => unreachable!(),
             },
             ast::Expression::StringLiteral(lit) => {
                 let s = self.intern_string(lit.value.as_str());
-                self.emit(Instr::PushStr(s), lit.span.start);
+                self.emit(Instr::PushStr(s), lit.span.into());
             }
             ast::Expression::BooleanLiteral(lit) => {
-                self.emit(Instr::PushBool(lit.value), lit.span.start);
+                self.emit(Instr::PushBool(lit.value), lit.span.into());
             }
             ast::Expression::NullLiteral(lit) => {
-                self.emit(Instr::PushNull, lit.span.start);
+                self.emit(Instr::PushNull, lit.span.into());
             }
             ast::Expression::TemplateLiteral(tl) => self.compile_template(tl),
 
             // ── identifiers ───────────────────────────────────────────
             ast::Expression::Identifier(id) => {
-                self.compile_identifier(id.name.as_str(), id.span.start)
+                self.compile_identifier(id.name.as_str(), id.span.into())
             }
 
             // ── composite literals ────────────────────────────────────
@@ -51,7 +52,7 @@ impl super::Compiler {
                 for (i, e) in seq.expressions.iter().enumerate() {
                     self.compile_expr(e);
                     if i != last {
-                        self.emit(Instr::Pop(1), e.span().start);
+                        self.emit(Instr::Pop(1), e.span().into());
                     }
                 }
             }
@@ -76,23 +77,23 @@ impl super::Compiler {
             // (module mode), which Tier 2's suspension story relies on.
             ast::Expression::AwaitExpression(a) => {
                 self.compile_expr(&a.argument);
-                self.emit(Instr::Await, a.span.start);
+                self.emit(Instr::Await, a.span.into());
             }
 
             // ── Phase 3: function expressions / arrows ────────────────
             ast::Expression::FunctionExpression(f) => {
-                self.compile_function_expr(f, f.span.start);
+                self.compile_function_expr(f, f.span.into());
             }
             ast::Expression::ArrowFunctionExpression(f) => {
-                self.compile_arrow_expr(f, f.span.start);
+                self.compile_arrow_expr(f, f.span.into());
             }
 
             // ── informative errors for out-of-scope nodes ─────────────
             ast::Expression::BigIntLiteral(b) => {
-                self.error(b.span.start, "BigInt is not supported")
+                self.error(b.span.into(), "BigInt is not supported")
             }
             ast::Expression::RegExpLiteral(r) => {
-                let span = r.span.start;
+                let span = r.span.into();
                 let pattern = self.intern_string(r.regex.pattern.text.as_str());
                 let flags_str = super::regexp_flags_to_str(r.regex.flags);
                 let flags = self.intern_string(&flags_str);
@@ -111,9 +112,9 @@ impl super::Compiler {
                 // non-arrow function has no slot resolution and falls through
                 // to LoadThis.
                 if let Some(r) = self.ref_slot(t.span.start) {
-                    self.emit_slot_read(&r, t.span.start);
+                    self.emit_slot_read(&r, t.span.into());
                 } else {
-                    self.emit(Instr::LoadThis, t.span.start);
+                    self.emit(Instr::LoadThis, t.span.into());
                 }
             }
             ast::Expression::NewExpression(n) => {
@@ -138,7 +139,7 @@ impl super::Compiler {
                 // so all promises provably settle.
                 if matches!(&n.callee, ast::Expression::Identifier(id) if id.name == "Promise") {
                     self.error(
-                        n.span.start,
+                        n.span.into(),
                         "`new Promise` is not supported: promises come only from `tools.*` calls \
                          and async functions (there is no executor pattern)",
                     )
@@ -146,13 +147,13 @@ impl super::Compiler {
                     self.compile_new_call(n);
                 }
             }
-            ast::Expression::ClassExpression(c) => self.compile_class_expr(c, c.span.start),
+            ast::Expression::ClassExpression(c) => self.compile_class_expr(c, c.span.into()),
             ast::Expression::Super(s) => self.error(
-                s.span.start,
+                s.span.into(),
                 "`super` is only valid as `super(...)` or `super.method(...)` \
                  inside a derived class",
             ),
-            other => self.error(other.span().start, "unsupported expression"),
+            other => self.error(other.span().into(), "unsupported expression"),
         }
     }
 
@@ -160,7 +161,7 @@ impl super::Compiler {
     /// message }` error object. The message coerces with ToString at
     /// construction (`new Error(123)` → `"123"`, as in JS); absent → `""`.
     pub(super) fn compile_error_ctor(&mut self, name: &str, n: &ast::NewExpression) {
-        let span = n.span.start;
+        let span = n.span.into();
         if n.arguments.len() > 1 {
             // JS's `{ cause }` options bag is out of scope; stay strict.
             self.error(
@@ -208,7 +209,7 @@ impl super::Compiler {
     /// `PushBuiltin(constructor)`, and `Instr::New`'s builtin-constructor arm
     /// dispatches the native construction (`VM::construct_builtin`).
     fn compile_new_call(&mut self, n: &ast::NewExpression) {
-        let span = n.span.start;
+        let span = n.span.into();
         // Push the callee (a Closure value)
         self.compile_expr(&n.callee);
         let nargs = n.arguments.len() as u32;
@@ -231,19 +232,21 @@ impl super::Compiler {
     /// a compile error. (Local variables arrive in Phase 2/3; namespace names
     /// like `Math`/`Object` are recognized structurally as call/member
     /// receivers, never as bare values.)
-    pub(super) fn compile_identifier(&mut self, name: &str, span: u32) {
+    pub(super) fn compile_identifier(&mut self, name: &str, span: Span) {
         // A local/param/captured variable resolves to its frame slot (resolved
-        // by analysis, keyed by this reference's span); `Local` dereferences a
-        // boxed slot transparently.
+        // by analysis, keyed by this reference's start offset — `key` below);
+        // `Local` dereferences a boxed slot transparently. `span` (the whole
+        // identifier's range) is only for the instructions this emits.
+        let key = span.start;
         // An eliminated `const x = <literal>` binding (Phase E): no slot — the
         // reference is the literal itself (resolved intra- or cross-function by
         // analysis). Composes with const-folding like any other push.
-        if let Some(value) = self.const_ref(span) {
+        if let Some(value) = self.const_ref(key) {
             let push = self.const_value_push(&value);
             self.emit(push, span);
             return;
         }
-        if let Some(r) = self.ref_slot(span) {
+        if let Some(r) = self.ref_slot(key) {
             self.emit_slot_read(&r, span);
             return;
         }

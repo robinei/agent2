@@ -17,6 +17,7 @@ use oxc_span::SourceType;
 
 use crate::analyzer::{self, ProgramAnalysis};
 use crate::diag::Diagnostic;
+use crate::span::Span;
 use crate::vm::RcStr;
 use crate::vm::{Instr, Value};
 
@@ -35,13 +36,14 @@ mod operators;
 mod stmt;
 
 /// A compiled program: the flat instruction stream, a parallel span table
-/// (`spans[ip]` = source byte offset of the instruction at `ip`), the
-/// source it was compiled from (for rendering runtime diagnostics), and
-/// the debug table (function names, source ranges, slot names — 9_TUI).
+/// (`spans[ip]` = source byte range of the instruction at `ip`, `(start,
+/// end)`), the source it was compiled from (for rendering runtime
+/// diagnostics), and the debug table (function names, source ranges, slot
+/// names — 9_TUI).
 #[derive(Debug)]
 pub struct Program {
     pub code: Vec<Instr>,
-    pub spans: Vec<u32>,
+    pub spans: Vec<Span>,
     pub source: Arc<str>,
     pub debug: crate::debuginfo::DebugTable,
 }
@@ -115,14 +117,19 @@ fn compile_with(source: &str, source_type: SourceType) -> Result<Program, Vec<Di
 
     let mut compiler = Compiler::new();
 
-    // Convert oxc's own syntax errors into our Diagnostic shape.
+    // Convert oxc's own syntax errors into our Diagnostic shape. A miette
+    // `LabeledSpan` carries both an offset and a length, so the underline
+    // covers the whole offending token/production, not just its first byte.
     for err in &ret.errors {
         let span = err
             .labels
             .as_ref()
             .and_then(|labels| labels.first())
-            .map(|l| l.offset() as u32)
-            .unwrap_or(0);
+            .map(|l| {
+                let start = l.offset() as u32;
+                Span::new(start, start + l.len() as u32)
+            })
+            .unwrap_or_default();
         compiler.parse_error(span, err.message.to_string());
     }
 
@@ -284,8 +291,8 @@ struct Compiler {
     /// Instructions with `Label` markers; addresses in `Jump`/`JFalse`/`Call`/
     /// `MakeClosure`/`Push(Fn)` are label ids until the backpatch pass.
     code: Vec<Instr>,
-    /// `spans[i]` = source byte offset of `code[i]`; kept in lockstep.
-    spans: Vec<u32>,
+    /// `spans[i]` = source byte range of `code[i]`; kept in lockstep.
+    spans: Vec<Span>,
     /// Monotonic label-id allocator.
     next_label: u32,
     /// Loop-context stack for `break`/`continue` (innermost loop last).

@@ -2885,6 +2885,7 @@ mod tests {
                     input: json!(null),
                     expects_reply: true,
                     site: 0,
+                    site_end: 0,
                 }),
             )
             .unwrap();
@@ -5906,6 +5907,7 @@ mod tests {
                 input: json!(null),
                 expects_reply: true,
                 site: 0,
+                site_end: 0,
             }),
         )
         .unwrap();
@@ -6217,6 +6219,7 @@ mod tests {
                     input: json!(null),
                     expects_reply: true,
                     site: 47,
+                    site_end: 47,
                 }),
             )
             .unwrap();
@@ -6303,6 +6306,7 @@ mod tests {
                     input: json!(null),
                     expects_reply: true,
                     site: 0,
+                    site_end: 0,
                 }),
             )
             .unwrap();

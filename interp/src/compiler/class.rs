@@ -2,13 +2,17 @@ use oxc_ast::ast;
 use oxc_span::GetSpan;
 
 use crate::builtin::Builtin;
+use crate::span::Span;
 use crate::vm::{Instr, LocalIndex, RcStr, SetMode};
 
 /// One instance method to install on `C.prototype`.
 struct Method<'a> {
     name: RcStr,
     func: &'a ast::Function<'a>,
-    span: u32,
+    /// Scope lookup key (`scope_by_span`) — the method function's start
+    /// offset. Kept separate from `span` below.
+    key: u32,
+    span: Span,
 }
 
 impl super::Compiler {
@@ -24,17 +28,17 @@ impl super::Compiler {
         if let Some(id) = &class.id
             && let Some(slot) = self.binding_slot(id.span.start)
         {
-            self.emit(Instr::SetLocal(slot as LocalIndex), class.span.start);
+            self.emit(Instr::SetLocal(slot as LocalIndex), class.span.into());
             return;
         }
         // No binding (shouldn't happen for a declaration) — discard the value to
         // keep the stack balanced.
-        self.emit(Instr::Pop(1), class.span.start);
+        self.emit(Instr::Pop(1), class.span.into());
     }
 
     /// `const X = class { … }` / `(class { … })` expression form: leaves the
     /// constructor closure value on the stack.
-    pub(super) fn compile_class_expr(&mut self, class: &ast::Class, span: u32) {
+    pub(super) fn compile_class_expr(&mut self, class: &ast::Class, span: Span) {
         if !self.compile_class_value(class) {
             // Keep the stack balanced for the surrounding expression even on a
             // rejected class (the diagnostic already failed the compile).
@@ -47,7 +51,7 @@ impl super::Compiler {
     /// diagnostic) if the class uses an unsupported feature, in which case
     /// nothing is left on the stack.
     fn compile_class_value(&mut self, class: &ast::Class) -> bool {
-        let span = class.span.start;
+        let span = class.span.into();
         // `extends <ident>` (Step 7b): the superclass must be a plain identifier
         // resolvable to a constructor value (the MVP rejects an expression
         // superclass, matching the static-callee restriction on `new`).
@@ -55,7 +59,7 @@ impl super::Compiler {
             Some(ast::Expression::Identifier(_)) => class.super_class.as_ref(),
             Some(other) => {
                 self.error(
-                    other.span().start,
+                    other.span().into(),
                     "`extends` requires a class/constructor name (an expression \
                      superclass is not supported)",
                 );
@@ -79,7 +83,7 @@ impl super::Compiler {
             match el {
                 ast::ClassElement::MethodDefinition(m) => {
                     if m.r#static {
-                        self.error(m.span.start, "`static` class members are not supported");
+                        self.error(m.span.into(), "`static` class members are not supported");
                         return false;
                     }
                     match m.kind {
@@ -91,12 +95,13 @@ impl super::Compiler {
                             methods.push(Method {
                                 name,
                                 func: &m.value,
-                                span: m.value.span.start,
+                                key: m.value.span.start,
+                                span: m.value.span.into(),
                             });
                         }
                         ast::MethodDefinitionKind::Get | ast::MethodDefinitionKind::Set => {
                             self.error(
-                                m.span.start,
+                                m.span.into(),
                                 "getters/setters are not supported (use a plain method)",
                             );
                             return false;
@@ -105,7 +110,7 @@ impl super::Compiler {
                 }
                 ast::ClassElement::PropertyDefinition(p) => {
                     if p.r#static {
-                        self.error(p.span.start, "`static` class fields are not supported");
+                        self.error(p.span.into(), "`static` class fields are not supported");
                         return false;
                     }
                     let Some(name) = self.class_key_name(&p.key, p.computed) else {
@@ -115,7 +120,7 @@ impl super::Compiler {
                 }
                 other => {
                     self.error(
-                        other.span().start,
+                        other.span().into(),
                         "unsupported class element (static blocks, accessors, and index \
                          signatures are not supported)",
                     );
@@ -142,8 +147,8 @@ impl super::Compiler {
         // class node's span. Field initializers are prepended to its body — or,
         // for a derived class, emitted right after `super(...)` returns
         // (`defer_fields_after_super`), so they observe parent-set values.
-        let ctor_span = ctor.map_or(span, |f| f.span.start);
-        let Some(ctor_scope) = self.scope_for_node(ctor_span) else {
+        let ctor_key = ctor.map_or(span.start, |f| f.span.start);
+        let Some(ctor_scope) = self.scope_for_node(ctor_key) else {
             self.error(
                 span,
                 "internal error: class constructor not found in analysis",
@@ -174,7 +179,7 @@ impl super::Compiler {
             self.emit(Instr::Pick(0), span); // dup C
             self.emit(Instr::ObjGet(RcStr::from("prototype")), span); // C.prototype (lazy-alloc)
             for m in &methods {
-                let Some(m_scope) = self.scope_for_node(m.span) else {
+                let Some(m_scope) = self.scope_for_node(m.key) else {
                     self.error(m.span, "internal error: class method not found in analysis");
                     return false;
                 };
@@ -222,7 +227,7 @@ impl super::Compiler {
     fn class_key_name(&mut self, key: &ast::PropertyKey, computed: bool) -> Option<RcStr> {
         if computed {
             self.error(
-                key.span().start,
+                key.span().into(),
                 "computed class member names (`[expr]`) are not supported",
             );
             return None;
@@ -235,13 +240,13 @@ impl super::Compiler {
             }
             ast::PropertyKey::PrivateIdentifier(_) => {
                 self.error(
-                    key.span().start,
+                    key.span().into(),
                     "private class members (`#name`) are not supported",
                 );
                 None
             }
             _ => {
-                self.error(key.span().start, "unsupported class member name");
+                self.error(key.span().into(), "unsupported class member name");
                 None
             }
         }

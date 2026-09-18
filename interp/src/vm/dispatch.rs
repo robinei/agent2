@@ -2577,12 +2577,13 @@ impl VM {
                     let id = self.alloc_promise();
                     // `ip` still points at this `Invoke`, so `spans[ip]` is
                     // the call site the harness annotates its report with.
-                    let site = self.spans.get(self.ip as usize).copied().unwrap_or(0);
+                    let span = self.spans.get(self.ip as usize).copied().unwrap_or_default();
                     self.outbox.push(InvokeCall {
                         promise: id,
                         name,
                         args,
-                        site,
+                        site: span.start,
+                        site_end: span.end,
                     });
                     self.stack.push(Value::Promise(id));
                     self.ip += 1;
@@ -2603,12 +2604,13 @@ impl VM {
                     }
                     let args = self.stack.split_off(self.stack.len() - n);
                     let id = self.alloc_promise();
-                    let site = self.spans.get(self.ip as usize).copied().unwrap_or(0);
+                    let span = self.spans.get(self.ip as usize).copied().unwrap_or_default();
                     self.outbox.push(InvokeCall {
                         promise: id,
                         name,
                         args,
-                        site,
+                        site: span.start,
+                        site_end: span.end,
                     });
                     self.stack.push(Value::Undefined);
                     self.ip += 1;
@@ -2637,7 +2639,14 @@ impl VM {
                         return Err(self.fail(ErrorKind::StackUnderflow, "stack underflow"));
                     }
                     let args = self.stack.split_off(self.stack.len() - n);
-                    let site = self.spans.get(self.ip as usize).copied().unwrap_or(0);
+                    // Only the start travels into `SettleCall::site` (see its
+                    // own doc) — no settle-at-dispatch verb logs a `Call`
+                    // variant with an end today.
+                    let site = self
+                        .spans
+                        .get(self.ip as usize)
+                        .map(|s| s.start)
+                        .unwrap_or(0);
                     self.ip += 1;
                     self.settling = true;
                     return Ok(StepResult::Settle {

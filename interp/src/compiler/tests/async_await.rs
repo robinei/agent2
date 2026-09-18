@@ -843,11 +843,12 @@ fn chaining_cycle_is_type_error() {
 
 // ── call sites ─────────────────────────────────────────────────────
 
-/// Every `InvokeCall` carries `site` — the source byte offset of its
-/// `Invoke` instruction — so the harness can annotate a program's source
-/// per call site from the log alone, with no live VM (17_BRANCHES A2).
-/// Asserted through a *nested* call (inside an arrow inside `map`) to pin
-/// that the site is the call's own instruction, not the top-level one.
+/// Every `InvokeCall` carries `site`/`site_end` — the `[start, end)` source
+/// byte range of its `Invoke` instruction — so the harness can annotate a
+/// program's source per call site from the log alone, with no live VM
+/// (17_BRANCHES A2). Asserted through a *nested* call (inside an arrow
+/// inside `map`) to pin that the site is the call's own instruction, not
+/// the top-level one.
 #[test]
 fn invoke_call_carries_its_source_site() {
     let src = r#"const outer = tools.first("x");
@@ -859,7 +860,9 @@ return [await outer, await Promise.all(inner)];
     let calls = expect_pending(&mut vm);
     assert_eq!(calls.len(), 2);
 
-    // Each site points at its own `tools.<name>(` in the source.
+    // Each site points at its own `tools.<name>(` in the source, and
+    // `site_end` closes exactly at the call's own `)` — not the outer
+    // expression's (`await tools.first("x")`, `["a"].map(…)`, …).
     for call in &calls {
         let at = &src[call.site as usize..];
         assert!(
@@ -867,6 +870,17 @@ return [await outer, await Promise.all(inner)];
             "site for `{}` landed at {:?}",
             call.name,
             &at[..at.len().min(30)]
+        );
+        let text = &src[call.site as usize..call.site_end as usize];
+        assert_eq!(
+            text,
+            format!(
+                "tools.{}({})",
+                call.name,
+                if call.name == "first" { "\"x\"" } else { "u" }
+            ),
+            "site..site_end for `{}` should be exactly its own call expression",
+            call.name
         );
     }
     // The nested call's site is on line 2, the top-level one's on line 1 —

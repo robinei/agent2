@@ -1,6 +1,7 @@
 use oxc_ast::ast;
 
 use crate::builtin::Builtin;
+use crate::span::Span;
 use crate::vm::Instr;
 
 impl super::Compiler {
@@ -16,7 +17,7 @@ impl super::Compiler {
             if let Some(val) =
                 super::namespace_constant(obj.name.as_str(), m.property.name.as_str())
             {
-                let span = m.span.start;
+                let span = m.span.into();
                 match val {
                     super::ConstVal::Float(f) => self.emit(Instr::PushFloat(f), span),
                     super::ConstVal::PosInt(n) => self.emit(Instr::PushPosInt(n), span),
@@ -28,15 +29,15 @@ impl super::Compiler {
             if let Some(builtin) =
                 Builtin::for_namespace(obj.name.as_str(), m.property.name.as_str())
             {
-                self.emit(Instr::PushBuiltin(builtin), m.span.start);
+                self.emit(Instr::PushBuiltin(builtin), m.span.into());
                 return;
             }
         }
         self.compile_expr(&m.object);
         if m.optional {
-            let end = self.begin_optional(m.span.start);
+            let end = self.begin_optional(m.span.into());
             self.emit_static_access(m);
-            self.emit(Instr::Label(end), m.span.start);
+            self.emit(Instr::Label(end), m.span.into());
         } else {
             self.emit_static_access(m);
         }
@@ -44,7 +45,7 @@ impl super::Compiler {
 
     pub(super) fn emit_static_access(&mut self, m: &ast::StaticMemberExpression) {
         let name = m.property.name.as_str();
-        let span = m.property.span.start;
+        let span = m.property.span.into();
         if name == "length" {
             self.emit(Instr::GetLength, span);
         } else if name == "size" {
@@ -64,13 +65,13 @@ impl super::Compiler {
     pub(super) fn compile_computed_member(&mut self, m: &ast::ComputedMemberExpression) {
         self.compile_expr(&m.object);
         if m.optional {
-            let end = self.begin_optional(m.span.start);
+            let end = self.begin_optional(m.span.into());
             self.compile_expr(&m.expression);
-            self.emit(Instr::IndexGet, m.span.start);
-            self.emit(Instr::Label(end), m.span.start);
+            self.emit(Instr::IndexGet, m.span.into());
+            self.emit(Instr::Label(end), m.span.into());
         } else {
             self.compile_expr(&m.expression);
-            self.emit(Instr::IndexGet, m.span.start);
+            self.emit(Instr::IndexGet, m.span.into());
         }
     }
 
@@ -86,7 +87,7 @@ impl super::Compiler {
     /// Per-link: a fully-`?.` chain (`a?.b?.c`) short-circuits correctly because
     /// each link re-checks; mixing `?.` then a plain `.` on a nullish base
     /// (`a?.b.c`) is an accepted divergence (runtime TypeError, not `undefined`).
-    pub(super) fn begin_optional(&mut self, span: u32) -> u32 {
+    pub(super) fn begin_optional(&mut self, span: Span) -> u32 {
         let cont = self.new_label();
         let end = self.new_label();
         self.emit(Instr::JNotNullish(cont), span);
@@ -102,10 +103,10 @@ impl super::Compiler {
             ast::ChainElement::StaticMemberExpression(m) => self.compile_static_member(m),
             ast::ChainElement::ComputedMemberExpression(m) => self.compile_computed_member(m),
             ast::ChainElement::PrivateFieldExpression(m) => {
-                self.error(m.span.start, "private fields are not supported")
+                self.error(m.span.into(), "private fields are not supported")
             }
             ast::ChainElement::TSNonNullExpression(e) => self.error(
-                e.span.start,
+                e.span.into(),
                 "TypeScript non-null assertions are not supported",
             ),
         }

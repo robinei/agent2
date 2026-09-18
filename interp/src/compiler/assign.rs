@@ -2,6 +2,7 @@ use oxc_ast::ast;
 use oxc_span::GetSpan;
 
 use crate::builtin::Builtin;
+use crate::span::Span;
 use crate::vm::{Instr, LocalIndex, RcStr, SetMode};
 
 impl super::Compiler {
@@ -13,7 +14,7 @@ impl super::Compiler {
     /// lowering. Array/object destructuring targets are handled separately.
     pub(super) fn compile_assignment(&mut self, a: &ast::AssignmentExpression, value_needed: bool) {
         use ast::AssignmentOperator as Op;
-        let span = a.span.start;
+        let span = a.span.into();
 
         // Destructuring assignment (`[a, b] = …`, `({a} = …)`). These leave the
         // RHS value as the expression result, so keep an extra copy.
@@ -78,7 +79,7 @@ impl super::Compiler {
     pub(super) fn compound_binary_instr(
         &mut self,
         op: ast::AssignmentOperator,
-        _span: u32,
+        _span: Span,
     ) -> Option<Instr> {
         use ast::AssignmentOperator as Op;
         Some(match op {
@@ -110,7 +111,7 @@ impl super::Compiler {
         lv: &super::LValue<'_, '_>,
         op: ast::AssignmentOperator,
         rhs: &ast::Expression,
-        span: u32,
+        span: Span,
         value_needed: bool,
     ) {
         use ast::AssignmentOperator as Op;
@@ -164,7 +165,7 @@ impl super::Compiler {
     /// handles prefix/postfix in one instruction. For non-locals, `ObjSet`/
     /// `IndexSet` in `SetMode::Old` preserves the exact old value.
     pub(super) fn compile_update(&mut self, u: &ast::UpdateExpression, value_needed: bool) {
-        let span = u.span.start;
+        let span = u.span.into();
         let lv = match self.lvalue_from_simple_target(&u.argument) {
             Some(lv) => lv,
             None => return,
@@ -228,7 +229,7 @@ impl super::Compiler {
     ) -> Option<super::LValue<'r, 'a>> {
         match target {
             ast::AssignmentTarget::AssignmentTargetIdentifier(id) => {
-                self.lvalue_for_identifier(id.name.as_str(), id.span.start)
+                self.lvalue_for_identifier(id.name.as_str(), id.span.into())
             }
             ast::AssignmentTarget::StaticMemberExpression(m) => Some(super::LValue::Member(
                 &m.object,
@@ -238,7 +239,7 @@ impl super::Compiler {
                 Some(super::LValue::Index(&m.object, &m.expression))
             }
             other => {
-                self.error(other.span().start, "unsupported assignment target");
+                self.error(other.span().into(), "unsupported assignment target");
                 None
             }
         }
@@ -252,7 +253,7 @@ impl super::Compiler {
     ) -> Option<super::LValue<'r, 'a>> {
         match target {
             ast::SimpleAssignmentTarget::AssignmentTargetIdentifier(id) => {
-                self.lvalue_for_identifier(id.name.as_str(), id.span.start)
+                self.lvalue_for_identifier(id.name.as_str(), id.span.into())
             }
             ast::SimpleAssignmentTarget::StaticMemberExpression(m) => Some(super::LValue::Member(
                 &m.object,
@@ -262,7 +263,7 @@ impl super::Compiler {
                 Some(super::LValue::Index(&m.object, &m.expression))
             }
             other => {
-                self.error(other.span().start, "unsupported assignment target");
+                self.error(other.span().into(), "unsupported assignment target");
                 None
             }
         }
@@ -273,15 +274,18 @@ impl super::Compiler {
     pub(super) fn lvalue_for_identifier<'r, 'a>(
         &mut self,
         name: &str,
-        span: u32,
+        span: Span,
     ) -> Option<super::LValue<'r, 'a>> {
+        // `const_ref`/`ref_slot` are keyed by the identifier's start offset;
+        // `span` (the whole identifier) is what the diagnostics underline.
+        let key = span.start;
         // An eliminated `const` (Phase E) has no slot; a write to it is still a
         // constant reassignment error.
-        if self.const_ref(span).is_some() {
+        if self.const_ref(key).is_some() {
             self.error(span, format!("assignment to constant `{name}`"));
             return None;
         }
-        match self.ref_slot(span) {
+        match self.ref_slot(key) {
             Some(r) => {
                 if r.is_const {
                     self.error(span, format!("assignment to constant `{name}`"));
@@ -314,7 +318,7 @@ impl super::Compiler {
 
     /// Push the lvalue's address operands (the object, and key for an index) in
     /// JS evaluation order. A local has no address.
-    pub(super) fn lvalue_emit_addr(&mut self, lv: &super::LValue<'_, '_>, _span: u32) {
+    pub(super) fn lvalue_emit_addr(&mut self, lv: &super::LValue<'_, '_>, _span: Span) {
         match lv {
             super::LValue::Local(_) => {}
             super::LValue::Member(obj, _) => self.compile_expr(obj),
@@ -328,7 +332,7 @@ impl super::Compiler {
     /// With the address already on the stack, push the lvalue's current value
     /// **without** consuming the address (so a store can follow). Uses `Pick` to
     /// copy the buried object/key for the read.
-    pub(super) fn lvalue_emit_load(&mut self, lv: &super::LValue<'_, '_>, span: u32) {
+    pub(super) fn lvalue_emit_load(&mut self, lv: &super::LValue<'_, '_>, span: Span) {
         match lv {
             super::LValue::Local(slot) => self.emit(Instr::GetLocal(*slot as LocalIndex), span),
             super::LValue::Member(_, field) => {
@@ -346,7 +350,7 @@ impl super::Compiler {
     /// With `[address…, value]` on the stack, store `value` into the lvalue and
     /// leave it on the stack (assignment is an expression). For locals, uses
     /// `TeeLocal` (the one-instruction equivalent of `Pick(0); SetLocal`, formerly `Dup; SetLocal`).
-    pub(super) fn lvalue_emit_store(&mut self, lv: &super::LValue<'_, '_>, span: u32) {
+    pub(super) fn lvalue_emit_store(&mut self, lv: &super::LValue<'_, '_>, span: Span) {
         match lv {
             super::LValue::Local(slot) => {
                 self.emit(Instr::TeeLocal(*slot as LocalIndex), span);
@@ -363,7 +367,7 @@ impl super::Compiler {
     /// need the resulting value). For locals, uses plain `SetLocal` (consumes
     /// the value, pushing nothing). For non-locals, `ObjSet`/`IndexSet` always
     /// leave the value — emit a `Pop(1)` to discard it.
-    pub(super) fn lvalue_emit_store_void(&mut self, lv: &super::LValue<'_, '_>, span: u32) {
+    pub(super) fn lvalue_emit_store_void(&mut self, lv: &super::LValue<'_, '_>, span: Span) {
         match lv {
             super::LValue::Local(slot) => {
                 self.emit(Instr::SetLocal(*slot as LocalIndex), span);
@@ -385,7 +389,7 @@ impl super::Compiler {
     /// Remove `n` values sitting directly below the top of the stack, leaving the
     /// top in place. Uses `Nip(n)` (one instruction) rather than `Dig(1)`+`Pop` (formerly `Swap`+`Pop`)
     /// pairs.
-    pub(super) fn emit_drop_below_top(&mut self, n: usize, span: u32) {
+    pub(super) fn emit_drop_below_top(&mut self, n: usize, span: Span) {
         if n > 0 {
             self.emit(Instr::Nip(n), span);
         }
@@ -396,7 +400,7 @@ impl super::Compiler {
     /// Destructure the source value on top of the stack into an assignment
     /// pattern, **consuming** it. Leaves are existing assignment targets; Phase 2
     /// supports identifier leaves (member/index leaves and rest are errors).
-    pub(super) fn destructure_assign(&mut self, target: &ast::AssignmentTarget, span: u32) {
+    pub(super) fn destructure_assign(&mut self, target: &ast::AssignmentTarget, span: Span) {
         match target {
             ast::AssignmentTarget::ArrayAssignmentTarget(arr) => {
                 for (i, el) in arr.elements.iter().enumerate() {
@@ -435,7 +439,7 @@ impl super::Compiler {
                                 }
                                 self.assign_to_identifier(
                                     p.binding.name.as_str(),
-                                    p.binding.span.start,
+                                    p.binding.span.into(),
                                     span,
                                 );
                             }
@@ -462,7 +466,7 @@ impl super::Compiler {
                                 }
                                 self.assign_to_identifier(
                                     p.binding.name.as_str(),
-                                    p.binding.span.start,
+                                    p.binding.span.into(),
                                     span,
                                 );
                             }
@@ -476,7 +480,7 @@ impl super::Compiler {
                 }
                 self.emit(Instr::Pop(1), span);
             }
-            other => self.error(other.span().start, "unsupported destructuring target"),
+            other => self.error(other.span().into(), "unsupported destructuring target"),
         }
     }
 
@@ -485,7 +489,7 @@ impl super::Compiler {
     pub(super) fn assign_maybe_default(
         &mut self,
         m: &ast::AssignmentTargetMaybeDefault,
-        span: u32,
+        span: Span,
     ) {
         match m {
             ast::AssignmentTargetMaybeDefault::AssignmentTargetWithDefault(wd) => {
@@ -497,7 +501,7 @@ impl super::Compiler {
                 if let Some(t) = other.as_assignment_target() {
                     self.assign_target_leaf(t, span);
                 } else {
-                    self.error(other.span().start, "unsupported destructuring target");
+                    self.error(other.span().into(), "unsupported destructuring target");
                 }
             }
         }
@@ -506,31 +510,35 @@ impl super::Compiler {
     /// Store the value on top of the stack into a destructuring leaf, consuming
     /// it. Identifier leaves lower to `SetLocal`; nested patterns recurse;
     /// member/index leaves are not supported in Phase 2.
-    pub(super) fn assign_target_leaf(&mut self, target: &ast::AssignmentTarget, span: u32) {
+    pub(super) fn assign_target_leaf(&mut self, target: &ast::AssignmentTarget, span: Span) {
         match target {
             ast::AssignmentTarget::AssignmentTargetIdentifier(id) => {
-                self.assign_to_identifier(id.name.as_str(), id.span.start, span)
+                self.assign_to_identifier(id.name.as_str(), id.span.into(), span)
             }
             ast::AssignmentTarget::ArrayAssignmentTarget(_)
             | ast::AssignmentTarget::ObjectAssignmentTarget(_) => {
                 self.destructure_assign(target, span)
             }
             other => self.error(
-                other.span().start,
+                other.span().into(),
                 "only variable targets are supported inside destructuring assignment",
             ),
         }
     }
 
     /// Store the value on top of the stack into a named local, consuming it.
-    pub(super) fn assign_to_identifier(&mut self, name: &str, id_span: u32, span: u32) {
+    pub(super) fn assign_to_identifier(&mut self, name: &str, id_span: Span, span: Span) {
+        // `const_ref`/`ref_slot` are keyed by the identifier's start offset;
+        // `id_span` itself (the whole identifier) is what the diagnostics
+        // below underline.
+        let id_key = id_span.start;
         // An eliminated `const` (Phase E) has no slot; reassigning it is an error.
-        if self.const_ref(id_span).is_some() {
+        if self.const_ref(id_key).is_some() {
             self.error(id_span, format!("assignment to constant `{name}`"));
             self.emit(Instr::Pop(1), span);
             return;
         }
-        match self.ref_slot(id_span) {
+        match self.ref_slot(id_key) {
             Some(r) => {
                 if r.is_const {
                     self.error(id_span, format!("assignment to constant `{name}`"));

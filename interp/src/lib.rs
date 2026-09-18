@@ -11,6 +11,7 @@ pub mod diag;
 pub mod optimizer;
 pub mod prelude;
 pub mod rc_str;
+pub mod span;
 pub mod vm;
 
 #[cfg(test)]
@@ -20,6 +21,7 @@ pub use compiler::{Program, compile, compile_for_test262, count_statements};
 pub use debuginfo::{DebugTable, FnDebug};
 pub use diag::{DiagKind, Diagnostic};
 pub use rc_str::RcStr;
+pub use span::Span;
 pub use vm::{
     ErrorKind, FrameView, Instr, InvokeCall, PromisePtr, PromiseState, ResumeMode, SettleCall,
     StepResult, ThrowOutcome, VM, VMError, Value,

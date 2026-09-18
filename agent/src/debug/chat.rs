@@ -1579,6 +1579,7 @@ mod tests {
                 input: serde_json::Value::Null,
                 expects_reply: false,
                 site: 0,
+                site_end: 0,
             }),
         ));
         chat.apply(&ev(
@@ -1589,6 +1590,7 @@ mod tests {
                 input: serde_json::Value::Null,
                 expects_reply: true,
                 site: 0,
+                site_end: 0,
             }),
         ));
 
@@ -1706,6 +1708,7 @@ mod tests {
                 input: serde_json::Value::Null,
                 expects_reply: false,
                 site: 0,
+                site_end: 0,
             }),
         ));
         // Fork at #4: branch id 10, rooted with parent_id = 4.
@@ -1804,6 +1807,7 @@ mod tests {
                 input: serde_json::Value::Null,
                 expects_reply: false,
                 site: 0,
+                site_end: 0,
             }),
         ));
 
@@ -1913,6 +1917,7 @@ mod tests {
                 input: serde_json::Value::Null,
                 expects_reply: false,
                 site: 0,
+                site_end: 0,
             }),
         )
     }

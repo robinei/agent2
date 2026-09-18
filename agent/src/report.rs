@@ -1114,14 +1114,19 @@ pub(crate) fn author_label(from: Author) -> String {
 }
 
 /// `line:col: message` with the source line and a caret, or the bare
-/// message when there is no source to point into.
+/// message when there is no source to point into. `site` (a `Condition`'s
+/// recorded point, not a range — see `machine::span_at`) renders as a
+/// single caret rather than an underline: underlining the whole offending
+/// expression would need `Condition` to carry an end too, which nothing
+/// here asks for yet — only `Call::Send` gained one (`site_end`, for a
+/// host to log the whole call), so this stays a caret.
 fn diagnostic(source: &str, site: u32, message: &str) -> String {
     if source.is_empty() {
         return message.to_owned();
     }
     interp::Diagnostic {
         kind: interp::DiagKind::Semantic,
-        span: site,
+        span: interp::Span::point(site),
         message: message.to_owned(),
     }
     .render(source)

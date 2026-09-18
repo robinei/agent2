@@ -22,6 +22,7 @@ use indexmap::{IndexMap, IndexSet};
 use thin_vec::ThinVec;
 
 use crate::compiler::Program;
+use crate::span::Span;
 
 /*
 
@@ -433,10 +434,10 @@ pub struct VM {
     /// (→ the restored caller frame's count). `local_count` only changes at
     /// those four sites, so the mirror is always current.
     cur_local_count: u32,
-    /// Source byte offset per instruction (`spans[ip]`), populated by
+    /// Source byte range per instruction (`spans[ip]`), populated by
     /// `for_program` from `Program::spans`. Empty when constructed via
     /// `VM::new` (hand-assembled instructions used by tests).
-    pub spans: Vec<u32>,
+    pub spans: Vec<Span>,
     /// Source text the `spans` refer into, populated by `for_program` from
     /// `Program::source`. Empty for `VM::new` programs, where error
     /// rendering degrades gracefully to "at instruction N".
@@ -770,8 +771,11 @@ pub struct SettleCall {
     pub name: String,
     /// Arguments in call order (`args[0]` is the first argument).
     pub args: Vec<Value>,
-    /// Source byte offset of the `Settle` instruction that issued this
-    /// call, like `InvokeCall::site`.
+    /// Start of the source byte range (`spans[ip].start`) of the `Settle`
+    /// instruction that issued this call, like `InvokeCall::site`. Only the
+    /// start travels here: none of today's settle-at-dispatch verbs
+    /// (`spawn`/`fork`/`list_agents`/…) log a `Call` variant that carries an
+    /// end — unlike `InvokeCall::site_end`, which `Call::Send` does use.
     pub site: u32,
 }
 
@@ -784,12 +788,15 @@ pub struct InvokeCall {
     pub name: String,
     /// Arguments in call order (`args[0]` is the first argument).
     pub args: Vec<Value>,
-    /// Source byte offset of the `Invoke` instruction that issued this
-    /// call — `spans[ip]` at the call site. The harness logs it on the
-    /// call event so a report can annotate the program source per call
-    /// site without a live VM (17_BRANCHES). `0` for hand-assembled
-    /// programs, which carry no spans.
+    /// Source byte range of the `Invoke` instruction that issued this
+    /// call — `spans[ip]` at the call site, split into its two ends. The
+    /// harness logs both on the call event so a report can annotate the
+    /// program source per call site without a live VM (17_BRANCHES), and
+    /// (for `tools.ask`/`tools.tell`) underline the whole call rather than
+    /// caret its first byte. Both `0` for hand-assembled programs, which
+    /// carry no spans.
     pub site: u32,
+    pub site_end: u32,
 }
 
 #[derive(Debug, PartialEq)]

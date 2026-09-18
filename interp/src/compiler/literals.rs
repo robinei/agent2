@@ -5,7 +5,7 @@ use crate::vm::{Instr, RcStr, SetMode};
 
 impl super::Compiler {
     pub(super) fn compile_array(&mut self, arr: &ast::ArrayExpression) {
-        let span = arr.span.start;
+        let span = arr.span.into();
         // Fast path: no spread elements (byte-for-byte unchanged from before)
         let has_spread = arr
             .elements
@@ -20,7 +20,7 @@ impl super::Compiler {
                         n += 1;
                     }
                     None => {
-                        self.error(el.span().start, "array holes are not supported");
+                        self.error(el.span().into(), "array holes are not supported");
                         return;
                     }
                 }
@@ -40,7 +40,7 @@ impl super::Compiler {
                         self.compile_expr(e);
                         leading += 1;
                     } else {
-                        self.error(el.span().start, "array holes are not supported");
+                        self.error(el.span().into(), "array holes are not supported");
                         return;
                     }
                 }
@@ -60,7 +60,7 @@ impl super::Compiler {
                         self.compile_expr(e);
                         self.emit(Instr::ArrPush, span);
                     } else {
-                        self.error(el.span().start, "array holes are not supported");
+                        self.error(el.span().into(), "array holes are not supported");
                         return;
                     }
                 }
@@ -74,7 +74,7 @@ impl super::Compiler {
     /// `None` without error — the caller falls through to the IndexSet path).
     pub(super) fn static_property_name(&mut self, p: &ast::ObjectProperty) -> Option<RcStr> {
         if p.kind != ast::PropertyKind::Init {
-            self.error(p.span.start, "getters/setters are not supported");
+            self.error(p.span.into(), "getters/setters are not supported");
             return None;
         }
         // Method shorthand `{ run(x) { … } }` is not rejected — the value is a
@@ -90,14 +90,14 @@ impl super::Compiler {
                 Some(RcStr::from(super::number_key_to_string(num.value).as_str()))
             }
             _ => {
-                self.error(p.key.span().start, "unsupported object key");
+                self.error(p.key.span().into(), "unsupported object key");
                 None
             }
         }
     }
 
     pub(super) fn compile_object(&mut self, obj: &ast::ObjectExpression) {
-        let span = obj.span.start;
+        let span = obj.span.into();
         // Fast path: no spread, no computed keys (byte-for-byte unchanged)
         let needs_slow = obj.properties.iter().any(|prop| {
             matches!(prop, ast::ObjectPropertyKind::SpreadProperty(_))
@@ -183,7 +183,7 @@ impl super::Compiler {
     }
 
     pub(super) fn compile_template(&mut self, tl: &ast::TemplateLiteral) {
-        let span = tl.span.start;
+        let span = tl.span.into();
         // result = quasi0 + expr0 + quasi1 + expr1 + … . The accumulator starts
         // as a string (interned constant) and stays one, so every `Add` takes
         // the concat path and ToString-coerces each interpolated value, as JS does.

@@ -1,5 +1,7 @@
 //! Compile/run-time diagnostics shared by the analyzer and codegen.
 
+use crate::span::Span;
+
 /// Which pass produced a [`Diagnostic`]. Lets the conformance runner bucket
 /// failures honestly (oxc parse errors vs. our own semantic rejections),
 /// instead of folding every compile error into one "parse error" bucket.
@@ -13,11 +15,14 @@ pub enum DiagKind {
     Semantic,
 }
 
-/// A compile- or run-time diagnostic anchored at a source byte offset.
+/// A compile- or run-time diagnostic anchored at a source byte range.
+/// `render` underlines the whole range when it's wider than one byte,
+/// and falls back to a single caret when `span.start == span.end` (a
+/// synthetic site with no expression of its own to underline).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Diagnostic {
-    /// Source byte offset the diagnostic points at.
-    pub span: u32,
+    /// Source byte range the diagnostic points at.
+    pub span: Span,
     pub message: String,
     /// Which pass produced this diagnostic.
     pub kind: DiagKind,
@@ -42,17 +47,23 @@ pub fn line_col(source: &str, span: u32) -> (usize, usize, usize) {
 }
 
 impl Diagnostic {
-    /// Render as `line:col: message` followed by the offending source line and
-    /// a caret under the offending column.
+    /// Render as `line:col: message` followed by the offending source line
+    /// and an underline beneath it: a single caret for a zero-width span
+    /// (`start == end`), or a run of `^` under the whole `[start, end)` when
+    /// the span carries real width — clipped to the line, since an
+    /// underline never wraps.
     pub fn render(&self, source: &str) -> String {
-        let offset = (self.span as usize).min(source.len());
-        let (line, col, line_start) = line_col(source, self.span);
+        let start = (self.span.start as usize).min(source.len());
+        let end = (self.span.end as usize).min(source.len()).max(start);
+        let (line, col, line_start) = line_col(source, self.span.start);
         let line_end = source[line_start..]
             .find('\n')
             .map(|p| line_start + p)
             .unwrap_or(source.len());
         let src_line = &source[line_start..line_end];
-        let caret = format!("{}^", " ".repeat(offset - line_start));
+        let underline_end = end.min(line_end);
+        let width = underline_end.saturating_sub(start).max(1);
+        let caret = format!("{}{}", " ".repeat(start - line_start), "^".repeat(width));
         format!("{line}:{col}: {}\n{src_line}\n{caret}", self.message)
     }
 }

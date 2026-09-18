@@ -3,6 +3,7 @@ use oxc_span::GetSpan;
 
 use crate::analyzer::ConstValue;
 use crate::builtin::Builtin;
+use crate::span::Span;
 use crate::vm::Instr;
 
 impl super::Compiler {
@@ -12,7 +13,7 @@ impl super::Compiler {
     /// dedicated instruction; user functions, `tools.*`, and `raise` arrive in
     /// later phases.
     pub(super) fn compile_call(&mut self, call: &ast::CallExpression) {
-        let span = call.span.start;
+        let span = call.span.into();
         // Check for spread arguments — if present, use `CallSpread` path.
         let has_spread = call
             .arguments
@@ -67,14 +68,14 @@ impl super::Compiler {
             // `super(args)` (Step 7b): invoke the parent constructor with the
             // current instance as `this` — not the `new` path (no fresh object).
             ast::Expression::Super(s) => {
-                self.compile_super_call(s.span.start, &argv, span);
+                self.compile_super_call(s.span.into(), &argv, span);
             }
             ast::Expression::StaticMemberExpression(m) => {
                 let method = m.property.name.as_str();
                 // `super.m(args)` (Step 7b): resolve `m` on the *parent prototype*
                 // (so an override on `C` is skipped) and call it with `this`.
                 if let ast::Expression::Super(s) = &m.object {
-                    self.compile_super_method_call(s.span.start, method, &argv, span);
+                    self.compile_super_method_call(s.span.into(), method, &argv, span);
                     return;
                 }
                 // A leading identifier matching a reserved namespace is a static
@@ -154,7 +155,7 @@ impl super::Compiler {
 
     /// Compile a call with spread arguments: lower to callee expression +
     /// array of args + [`CallSpread`].
-    pub(super) fn compile_call_spread(&mut self, call: &ast::CallExpression, span: u32) {
+    pub(super) fn compile_call_spread(&mut self, call: &ast::CallExpression, span: Span) {
         // `tools.foo(...args)` can't take the value path: `tools` is only
         // valid structurally as an `Invoke` receiver (compiling it as an
         // expression would give a misleading undeclared-variable error), and
@@ -172,7 +173,7 @@ impl super::Compiler {
         // for `CallSpread`. Receiver is always `this`.
         if let ast::Expression::Super(s) = &call.callee {
             self.emit(Instr::LoadThis, span);
-            self.emit_super_class_ref(s.span.start);
+            self.emit_super_class_ref(s.span.into());
             self.compile_call_args_array(&call.arguments, span);
             self.emit(Instr::CallSpread(true), span);
             return;
@@ -181,7 +182,7 @@ impl super::Compiler {
             && let ast::Expression::Super(s) = &m.object
         {
             self.emit(Instr::LoadThis, span);
-            self.emit_super_class_ref(s.span.start);
+            self.emit_super_class_ref(s.span.into());
             self.emit(Instr::ObjGet(crate::vm::RcStr::from("prototype")), span);
             self.emit(Instr::ObjGet(m.property.name.as_str().into()), span);
             self.compile_call_args_array(&call.arguments, span);
@@ -284,7 +285,7 @@ impl super::Compiler {
     /// Compile call arguments into an array on the stack.  Supports spread
     /// elements: leading static args + `ArrNew`, then `ArrExtend` for each
     /// spread and `ArrPush` for each trailing static argument.
-    pub(super) fn compile_call_args_array(&mut self, args: &[ast::Argument<'_>], span: u32) {
+    pub(super) fn compile_call_args_array(&mut self, args: &[ast::Argument<'_>], span: Span) {
         // Count leading non-spread arguments.
         let leading_count = args
             .iter()
@@ -328,7 +329,7 @@ impl super::Compiler {
         &mut self,
         argv: &[&ast::Expression],
         want: usize,
-        span: u32,
+        span: Span,
         name: &str,
     ) -> bool {
         if argv.len() == want {
@@ -360,7 +361,7 @@ impl super::Compiler {
         builtin: Builtin,
         recv: Option<&ast::Expression>,
         argv: &[&ast::Expression],
-        span: u32,
+        span: Span,
         optional: bool,
     ) {
         let base = recv.is_some() as u32; // the receiver occupies one arity slot
@@ -428,7 +429,7 @@ impl super::Compiler {
         ns: &str,
         method: &str,
         argv: &[&ast::Expression],
-        span: u32,
+        span: Span,
     ) {
         match Builtin::for_namespace(ns, method) {
             Some(builtin) => self.compile_builtin_call(builtin, None, argv, span, false),
@@ -446,7 +447,7 @@ impl super::Compiler {
         &mut self,
         method: &str,
         argv: &[&ast::Expression],
-        span: u32,
+        span: Span,
     ) {
         match method {
             "all" | "allSettled" => {
@@ -484,7 +485,7 @@ impl super::Compiler {
     }
 
     /// Global function calls recognized structurally.
-    pub(super) fn compile_global_call(&mut self, name: &str, argv: &[&ast::Expression], span: u32) {
+    pub(super) fn compile_global_call(&mut self, name: &str, argv: &[&ast::Expression], span: Span) {
         match name {
             // Step 2a Part 2: constructor names called as plain functions.
             // `String(x)`/`Number(x)`/`Boolean(x)` keep their dedicated
@@ -583,7 +584,7 @@ impl super::Compiler {
                     ast::Expression::StringLiteral(lit) => lit.value.as_str().into(),
                     other => {
                         self.error(
-                            other.span().start,
+                            other.span().into(),
                             "`raise` condition name must be a string literal",
                         );
                         return;
@@ -801,7 +802,7 @@ impl super::Compiler {
         recv: &ast::Expression,
         method: &str,
         argv: &[&ast::Expression],
-        span: u32,
+        span: Span,
         optional: bool,
     ) {
         // ── higher-order array methods (prelude helpers) ──────────
@@ -875,7 +876,7 @@ impl super::Compiler {
         &mut self,
         recv: &ast::Expression, // the function being invoked
         argv: &[&ast::Expression],
-        span: u32,
+        span: Span,
         optional: bool,
         spread: bool,
     ) {
@@ -922,9 +923,9 @@ impl super::Compiler {
     /// captured superclass binding (resolved at this `super` node's span).
     pub(super) fn compile_super_call(
         &mut self,
-        super_span: u32,
+        super_span: Span,
         argv: &[&ast::Expression],
-        span: u32,
+        span: Span,
     ) {
         self.emit(Instr::LoadThis, span); // receiver = the instance
         self.emit_super_class_ref(super_span); // callee = parent constructor
@@ -937,10 +938,10 @@ impl super::Compiler {
     /// Layout `[this, Parent.prototype.m, args…]` + `CallDyn(has_this=true)`.
     pub(super) fn compile_super_method_call(
         &mut self,
-        super_span: u32,
+        super_span: Span,
         method: &str,
         argv: &[&ast::Expression],
-        span: u32,
+        span: Span,
     ) {
         self.emit(Instr::LoadThis, span); // receiver = the instance
         self.emit_super_class_ref(super_span); // parent constructor
@@ -953,11 +954,15 @@ impl super::Compiler {
     /// Read the captured superclass (parent constructor) value at a `super` use
     /// site. The analyzer registered this `super` node's span as a reference to
     /// the `extends` identifier, so it resolves like any captured binding.
-    pub(super) fn emit_super_class_ref(&mut self, super_span: u32) {
-        if let Some(value) = self.const_ref(super_span) {
+    pub(super) fn emit_super_class_ref(&mut self, super_span: Span) {
+        // `const_ref`/`ref_slot` are keyed by the `super` node's start offset
+        // (like any captured binding); `super_span` itself is only for the
+        // instructions this emits.
+        let key = super_span.start;
+        if let Some(value) = self.const_ref(key) {
             let push = self.const_value_push(&value);
             self.emit(push, super_span);
-        } else if let Some(r) = self.ref_slot(super_span) {
+        } else if let Some(r) = self.ref_slot(key) {
             self.emit_slot_read(&r, super_span);
         } else {
             self.error(
@@ -975,7 +980,7 @@ impl super::Compiler {
         recv: &ast::Expression,
         method: &str,
         argv: &[&ast::Expression],
-        span: u32,
+        span: Span,
         optional: bool,
     ) {
         // Evaluate the receiver.
@@ -1011,7 +1016,7 @@ impl super::Compiler {
         &mut self,
         recv: &ast::Expression,
         argv: &[&ast::Expression],
-        span: u32,
+        span: Span,
         optional: bool,
         helper: &str,
         want_cb: usize,
@@ -1040,7 +1045,7 @@ impl super::Compiler {
         &mut self,
         recv: &ast::Expression,
         argv: &[&ast::Expression],
-        span: u32,
+        span: Span,
         optional: bool,
     ) {
         if argv.is_empty() || argv.len() > 2 {
@@ -1060,7 +1065,7 @@ impl super::Compiler {
         &mut self,
         recv: &ast::Expression,
         argv: &[&ast::Expression],
-        span: u32,
+        span: Span,
         optional: bool,
     ) {
         match argv.len() {
@@ -1079,7 +1084,7 @@ impl super::Compiler {
         &mut self,
         recv: &ast::Expression,
         argv: &[&ast::Expression],
-        span: u32,
+        span: Span,
         optional: bool,
     ) {
         match argv.len() {
@@ -1099,7 +1104,7 @@ impl super::Compiler {
         helper: &str,
         recv: &ast::Expression,
         argv: &[&ast::Expression],
-        span: u32,
+        span: Span,
         optional: bool,
     ) {
         let Some(label) = self.find_root_callee_label(helper) else {
@@ -1149,7 +1154,7 @@ impl super::Compiler {
         name: &str,
         callee_span: u32,
         argv: &[&ast::Expression],
-        span: u32,
+        span: Span,
     ) {
         // A constant function (Phase F): no slot — call its label statically.
         // Pad missing args to the declared arity (as the slotted path does).

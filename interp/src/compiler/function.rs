@@ -5,6 +5,7 @@ use oxc_span::GetSpan;
 
 use crate::analyzer::frame_abs;
 use crate::builtin::Builtin;
+use crate::span::Span;
 use crate::vm::{Instr, LocalIndex, RcStr, SetMode, SlotKind};
 
 impl super::Compiler {
@@ -37,7 +38,7 @@ impl super::Compiler {
                 if let Some(id) = &f.id
                     && let Some(slot) = self.binding_slot(id.span.start)
                 {
-                    let span = f.span.start;
+                    let span = f.span.into();
                     self.emit(
                         Instr::ClosureNew(
                             label,
@@ -87,7 +88,7 @@ impl super::Compiler {
     pub(super) fn compile_function_decl_body(&mut self, f: &ast::Function) {
         let Some(scope_id) = self.scope_for_node(f.span.start) else {
             self.error(
-                f.span.start,
+                f.span.into(),
                 "internal error: function declaration not found in analysis",
             );
             return;
@@ -98,7 +99,7 @@ impl super::Compiler {
                 &body.statements,
                 Some(&f.params),
                 &[],
-                f.span.start,
+                f.span.into(),
                 false,
                 false,
             );
@@ -106,7 +107,7 @@ impl super::Compiler {
     }
 
     /// Compile a function expression: emit the function value, then its body.
-    pub(super) fn compile_function_expr(&mut self, func: &ast::Function, span: u32) {
+    pub(super) fn compile_function_expr(&mut self, func: &ast::Function, span: Span) {
         let Some(scope_id) = self.scope_for_node(func.span.start) else {
             self.error(
                 span,
@@ -129,7 +130,11 @@ impl super::Compiler {
     }
 
     /// Compile an arrow function expression.
-    pub(super) fn compile_arrow_expr(&mut self, arrow: &ast::ArrowFunctionExpression, span: u32) {
+    pub(super) fn compile_arrow_expr(
+        &mut self,
+        arrow: &ast::ArrowFunctionExpression,
+        span: Span,
+    ) {
         let Some(scope_id) = self.scope_for_node(arrow.span.start) else {
             self.error(span, "internal error: arrow function not found in analysis");
             return;
@@ -152,12 +157,14 @@ impl super::Compiler {
     /// emit only its body (the jump-over guards it) — no value push, no store,
     /// since references resolve to its `Fn` constant — and return `true`.
     pub(super) fn emit_const_fn_expr_body(&mut self, init: &ast::Expression) -> bool {
-        let span = match init {
+        // Scope lookup key (identifier into `scope_by_span`, start offset
+        // only), kept separate from the instruction span built per-arm below.
+        let key = match init {
             ast::Expression::ArrowFunctionExpression(a) => a.span.start,
             ast::Expression::FunctionExpression(f) => f.span.start,
             _ => return false,
         };
-        let Some(scope_id) = self.scope_for_node(span) else {
+        let Some(scope_id) = self.scope_for_node(key) else {
             return false;
         };
         if !self.is_const_fn_scope(scope_id) {
@@ -170,7 +177,7 @@ impl super::Compiler {
                     &a.body.statements,
                     Some(&a.params),
                     &[],
-                    span,
+                    a.span.into(),
                     a.expression,
                     false,
                 );
@@ -182,7 +189,7 @@ impl super::Compiler {
                         &body.statements,
                         Some(&f.params),
                         &[],
-                        span,
+                        f.span.into(),
                         false,
                         false,
                     );
@@ -198,7 +205,7 @@ impl super::Compiler {
     /// non-capturing case). Step 2e: each evaluation allocates a fresh
     /// closure at runtime, giving JS per-instance identity (`PushFn`, the
     /// former zero-alloc canonical-closure special case, is folded away).
-    pub(super) fn emit_closure_value(&mut self, scope_id: usize, span: u32) {
+    pub(super) fn emit_closure_value(&mut self, scope_id: usize, span: Span) {
         let (label, captures, js_length) = {
             let analysis = self.analysis.as_ref().expect("analysis present");
             let child = &analysis.scopes[scope_id];
@@ -228,7 +235,7 @@ impl super::Compiler {
         body_stmts: &[ast::Statement],
         params: Option<&ast::FormalParameters>,
         field_inits: &[(RcStr, Option<&ast::Expression>)],
-        span: u32,
+        span: Span,
         is_expression_body: bool,
         defer_fields_after_super: bool,
     ) {
@@ -367,7 +374,7 @@ impl super::Compiler {
                     // pattern lowering into the leaf bindings (own locals; captured
                     // ones got their cells from `EnterFrame`, and `SetLocal`
                     // writes through cells).
-                    let pat_span = item.span.start;
+                    let pat_span = item.span.into();
                     self.emit(Instr::GetLocal(slot as LocalIndex), pat_span);
                     if let Some(default) = &item.initializer {
                         self.emit_default(default, pat_span);
@@ -405,7 +412,7 @@ impl super::Compiler {
                 } else {
                     // Pattern rest (`...[a, b]`): destructure the freshly built
                     // array directly; the anonymous rest slot stays undefined.
-                    self.destructure_binding(rest_pat, rest_pat.span().start);
+                    self.destructure_binding(rest_pat, rest_pat.span().into());
                 }
             }
         }
@@ -472,7 +479,7 @@ impl super::Compiler {
     /// Emit a class constructor's instance-field initializers: `this.<name> =
     /// <init>` for each, in declaration order. `ObjSet` leaves the value, so it
     /// is discarded. A field with no initializer stores `undefined`.
-    fn emit_field_inits(&mut self, field_inits: &[(RcStr, Option<&ast::Expression>)], span: u32) {
+    fn emit_field_inits(&mut self, field_inits: &[(RcStr, Option<&ast::Expression>)], span: Span) {
         for (name, init) in field_inits {
             self.emit(Instr::LoadThis, span);
             match init {
@@ -519,7 +526,7 @@ impl super::Compiler {
         needs_box: bool,
         has_default: bool,
         default_expr: Option<&ast::Expression>,
-        span: u32,
+        span: Span,
     ) {
         if has_default && let Some(default) = default_expr {
             // if Local(slot) === undefined { slot = default }

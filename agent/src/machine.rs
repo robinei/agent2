@@ -1044,6 +1044,7 @@ impl Runner {
                     input: serde_json::Value::Null,
                     expects_reply: false,
                     site: 0,
+                    site_end: 0,
                 }),
             )?;
             out.push(StepOutput::Sends(vec![send]));
@@ -1549,6 +1550,7 @@ impl Runner {
                                     input: serde_json::Value::Null,
                                     expects_reply,
                                     site: call.site,
+                                    site_end: call.site_end,
                                 },
                                 Slot::Promise(call.promise),
                             )?;
@@ -3149,9 +3151,11 @@ fn outcome_json(outcome: &Outcome) -> Result<serde_json::Value, String> {
 }
 
 /// The source byte offset of instruction `ip` — what a `Condition`
-/// records so its report can point a caret without a live VM.
+/// records so its report can point a caret without a live VM. `spans[ip]`
+/// is a `(start, end)` range; `Condition::site` is a single point (a caret,
+/// not an underline), so only `start` survives here.
 fn span_at(vm: &VM, ip: usize) -> u32 {
-    vm.spans.get(ip).copied().unwrap_or(0)
+    vm.spans.get(ip).map(|s| s.start).unwrap_or(0)
 }
 
 /// Who authored the post `question` — the author an answer is owed to.
@@ -3224,6 +3228,7 @@ mod tests {
                     input,
                     expects_reply: true,
                     site: 0,
+                    site_end: 0,
                 }),
             )
             .unwrap();
@@ -3451,6 +3456,40 @@ mod tests {
         let out = user_post(&mut state, &mut tree, "compute 6*7");
         let req = expect_request(&out);
         assert!(req.tail.as_deref().unwrap_or("").contains("attached"));
+    }
+
+    /// Gate: `Call::Send::site_end` is the call's own end, not a copy of
+    /// `site` and not the enclosing statement's end. Compiles and runs a
+    /// program containing `tell("hello")`, finds the logged `Call::Send`,
+    /// and asserts `source[site..site_end]` is exactly `tell("hello")` —
+    /// which only holds if `site` is the call's start and `site_end` its
+    /// real end (a bug either off-by-one, or reusing `site` for both,
+    /// would show up as extra/missing characters here).
+    #[test]
+    fn call_send_site_end_bounds_the_whole_call_expression() {
+        let (mut tree, mut state) = setup();
+        user_post(&mut state, &mut tree, "go");
+        let source = "tell(\"hello\");";
+        let out = state
+            .step(&mut tree, StepInput::LlmResponse(llm_program(source)))
+            .unwrap();
+        let settled = drain(&mut state, &mut tree, out);
+        let sends = settled
+            .iter()
+            .find_map(|o| match o {
+                StepOutput::Sends(s) => Some(s.clone()),
+                _ => None,
+            })
+            .expect("tell() dispatches as a Sends output");
+        assert_eq!(sends.len(), 1);
+        let EventPayload::Call(Call::Send {
+            site, site_end, ..
+        }) = &tree.events[&sends[0]].payload
+        else {
+            panic!("expected a Send");
+        };
+        let (site, site_end) = (*site as usize, *site_end as usize);
+        assert_eq!(&source[site..site_end], r#"tell("hello")"#);
     }
 
     #[test]
@@ -4839,6 +4878,7 @@ mod tests {
             input: serde_json::Value::Null,
             expects_reply: false,
             site: 0,
+            site_end: 0,
         });
         assert!(label.starts_with("tell(user, "), "{label}");
         assert!(label.len() < crate::report::LABEL_MAX_BYTES + 32, "{label}");

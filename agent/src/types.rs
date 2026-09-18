@@ -486,7 +486,10 @@ impl Message {
 ///
 /// Every variant carries `site`, the source byte offset of its `Invoke`
 /// instruction, so a report can annotate the program source per call site
-/// from the log alone (`InvokeCall::site`).
+/// from the log alone (`InvokeCall::site`). `Send` additionally carries
+/// `site_end` (`InvokeCall::site_end`), the end of that same call's source
+/// span, so a host can underline the whole `tools.ask`/`tools.tell` call
+/// rather than caret its first byte.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub enum Call {
     /// This branch's program messaged an agent or the user — the mirror of
@@ -500,6 +503,14 @@ pub enum Call {
         input: serde_json::Value,
         expects_reply: bool,
         site: u32,
+        /// End of the `tools.ask`/`tools.tell` call's source span
+        /// (`site` is its start), so a host can log/underline the whole
+        /// call rather than caret its first byte. `#[serde(default)]`:
+        /// logs written before this field existed carry none, and this
+        /// repo never migrates logs — an old log just defaults it to `0`
+        /// rather than refusing to load.
+        #[serde(default)]
+        site_end: u32,
     },
     /// This branch's program created an agent. Settled with the agent
     /// handle; the `Agent` event it roots is a child of this `Spawn`.
