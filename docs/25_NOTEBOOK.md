@@ -283,42 +283,76 @@ logged as it happens, by the cell's own doing: a `Call` at dispatch, its
 `Result`, a `Note` for `history.append`, a `Console` for `console.log`.
 A cell is a region of instructions and nothing more.
 
-A cell's `Return`/`Condition` (D7) is not an exception to this. It
-records no value either — it records *how that run ended*, which is what
+A cell does not even have a terminal of its own: a reply is **one run**
+and carries one `Return`/`Condition` at its end (D7). That terminal
+records no value either — it records *how the run ended*, which is what
 `Cause::Abandoned`'s invariant is about: a branch that suspended and a
 branch that finished must be distinguishable on reload. Bookkeeping, not
-data. `Return { value: null }` is now the only shape it takes.
+data, and `Return { value: null }` is now the only shape it takes.
 
-### D7 — One terminal per cell, one report per reply
+### D7 — One run, one terminal, however many cells
 
 `Cause::Abandoned`'s doc states the invariant: *a run must have exactly
 one log-visible terminal, or nothing downstream can be derived from the
-log alone* — and `Return`'s states the completing half of it, that a
-program ending without a `return` still logs `Return { value: null }`.
-Cells must not break either.
+log alone* — and `Return`'s states the completing half, that a program
+ending without a `return` still logs `Return { value: null }`.
 
-Under D15 a cell *is* a run, so each cell logs exactly one `Return` or
-`Condition` and the invariant holds per cell. Cutting the `return`
-*statement* (D5) does not cut the `Return` *event*: its own doc already
-says a program that ends without a `return` still logs
-`Return { value: null }`, which is now simply the only case.
+**A reply is one run.** A run is a frame's lifetime, and D12 has every
+cell sharing one frame that is never unwound between them. So a reply
+is N `Turn`s (D15), one run, and **one** terminal — not one per cell.
 
-**What must not multiply is the prompting, not the events.** A reply
-with three cells is still **one report and one next completion**, and
-two things keep it that way:
+An earlier draft of this decision said "a cell *is* a run, so each cell
+logs exactly one `Return` or `Condition`". That contradicted D12 and was
+the source of the only thing in this phase ever labelled untraceable.
+Corrected here, and the correction removes the problem rather than
+moving it.
 
-- `needs_prompt` already returns false unless the branch is
-  `Phase::Idle` — "Awaiting an LLM: a request is already out, and
-  everything logged since will ride the next one." Outcomes logged while
-  the reply is still streaming therefore cannot trigger anything.
-- The gap is the *unconditional* path: `finish_program` and `suspend`
-  render "bypassing this rule entirely", on the premise that a program
-  running out is a turn running out. Under a notebook those come apart,
-  and that path has to learn the difference between a cell ending — walk
-  to the next one — and the reply ending.
+#### How a run ends, and why `finish_program` needs no changes
 
-That second point is owed by 25.4 whichever way D15 had gone; it is a
-cost of notebooks, not of logging as you stream.
+`finish_program` is reached on `StepResult::Done` — the root frame
+returning. Under D12 a cell ends with `Pause`, so **a cell boundary
+never reaches it**. The driver sees `Paused`, logs nothing terminal, and
+waits for more code.
+
+When the reply ends, the compiler emits the epilogue it already emits
+for every program — `Instr::Return(0)`, `compiler/stmt.rs`'s "Root frame
+ends with `Return(0)` → `StepResult::Done`" — and the VM resumes into
+it, unwinds, and reaches `finish_program` on exactly the path it takes
+today. Everything there works unchanged: the compaction batch commit,
+`apply_history_edits`, the `done` flag, the `resume`/`abandon` decision
+handling, `note_status`, `last_vm`.
+
+So D5's "a cell omits the trailing `Return(0)`" is precise rather than
+absolute: **a cell** omits it; the **reply** still ends with it. The
+epilogue moves from per-fragment to once, at close.
+
+`suspend` needs nothing either. A `raise` or trap in cell 1 is an
+ordinary suspension of the one run, and `resume(v)` continues from that
+instruction and falls through into cell 2 (D8).
+
+An earlier draft of this decision claimed the opposite — that
+`finish_program` and `suspend` "render unconditionally, on the premise
+that a program running out is a turn running out", and that notebooks
+break that premise. They do not. The premise holds exactly: the run ends
+when the reply ends. That paragraph existed only because a cell had been
+miscast as a run.
+
+#### What the prompting does
+
+A reply with three cells is still **one report and one next
+completion**, and now trivially so: there is one outcome, logged once,
+at the end. `needs_prompt` also returns false unless the branch is
+`Phase::Idle` — "Awaiting an LLM: a request is already out, and
+everything logged since will ride the next one" — so nothing logged
+mid-stream could have prompted anyway.
+
+Intermediate `Turn`s carry no outcome of their own. Nothing requires
+them to: `last_turn_outcome` consults only the newest, and
+`document::render` derives the report straight off the
+`Return`/`Condition` event. A crash mid-reply leaves `Turn`s with no
+terminal, which is precisely what reconciliation's `Cause::Interrupted`
+is for — "written by reconciliation so an interrupted run has an outcome
+like any other".
 
 ### D8 — `done()` does not stop anything, here or today
 
@@ -355,14 +389,12 @@ Also unchanged. `raise(...)` suspends with a handler frame; a trap
 suspends resumably or not. Remaining cells do not run, because the VM is
 parked inside cell *k*.
 
-`resume(v)` then continues **from that instruction** and falls out of
-cell *k*. The VM half of that is exactly what `resume` already does and
-needs nothing new; what *is* new is that falling out of a cell returns
-to the **cell driver** rather than ending the run, so the driver must
-resume its walk at cell *k+1* rather than treating the handback as a
-completed program. That is the same integration point D7 names, and it
-is where the `finish_program`-renders-unconditionally behaviour has to
-learn the difference between a cell ending and a notebook ending.
+`resume(v)` then continues **from that instruction**, falls out of cell
+*k* through its `Pause`, and the driver walks on to cell *k+1*. Nothing
+here is new: `resume` already does the VM half, and the driver already
+handles `Paused` that way for every cell boundary (D7). The run itself
+was never completed — a suspension suspends the one run, and only the
+reply's epilogue ends it.
 
 The semantics match the notebook prior: an erroring cell stops a Run
 All.
@@ -467,9 +499,12 @@ local with it, so cell 1 would find no `a`. That is the shared scope
 this whole decision rests on, destroyed by the first thing anyone would
 write.
 
-So a cell's compilation omits the trailing `Return(0)` and ends with
-`Instr::Pause` instead, which stops the VM **without unwinding** and
-reports `StepResult::Paused`.
+So a **cell's** compilation omits the trailing `Return(0)` and ends
+with `Instr::Pause` instead, which stops the VM **without unwinding**
+and reports `StepResult::Paused`. The **reply** still ends with
+`Return(0)`, emitted once when it closes — that is what unwinds the
+frame and carries the run into `finish_program` on its ordinary path
+(D7).
 
 **Nothing sets `ip`.** A cell stops by running to the end of what
 existed, so `ip` already points at the append position; appending the
@@ -973,17 +1008,14 @@ Wire the split into the compile path beside `extract_program`, executing
 cells in sequence *after* the completion ends. No streaming yet — this
 isolates the transport from the scheduling change.
 
-**This step owns the seam D7 and D9 both point at, and it is the
-riskiest thing in the phase.** `finish_program` renders
-unconditionally today, on the premise that a program running out is a
-turn running out. Under a notebook those come apart: a cell ending means
-*walk to the next cell*, and only the notebook ending means *one report,
-one next completion*. The same fork governs a handback — `resume(v)`
-falls out of cell *k* into the driver, which must continue at *k+1*
-rather than treat the run as complete. Every other step here is local;
-this one changes a control-flow premise the harness has held since the
-loop was written, and it is the only part of this design not traced
-against the code.
+**This step owns the driver, which is smaller than an earlier draft of
+this doc claimed.** That draft called it the riskiest thing in the phase
+on the grounds that `finish_program` renders unconditionally, on a
+premise notebooks break. They do not break it (D7, corrected): a cell
+ends with `Pause` and never reaches `finish_program`, and the reply ends
+with the ordinary `Return(0)` epilogue that does. The driver's job is
+therefore: feed each cell, handle `Paused` by waiting for more code, and
+close the run by emitting the epilogue when the reply ends.
 
 Gate: a scripted session test asserting `Turn.source` is byte-identical
 to the completion, exactly one `Return`/`Condition` per turn, one report
