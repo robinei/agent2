@@ -486,8 +486,22 @@ def run_once(
             credit = grade(env, ok)
 
         if keep is not None:
-            kept = keep / f"{task.NAME}-{time.strftime('%H%M%S')}"
-            kept.mkdir(parents=True, exist_ok=True)
+            # `exist_ok` plus a second-resolution name is how two runs of
+            # the same task under `--jobs` quietly became one: the second
+            # copytree landed on top of the first and the evidence for a
+            # whole run was gone, with nothing in the output saying so.
+            # The suffix runs until a name is free, so N runs leave N
+            # directories or the run fails loudly.
+            stamp = time.strftime("%H%M%S")
+            for n in range(100):
+                kept = keep / (f"{task.NAME}-{stamp}" if n == 0 else f"{task.NAME}-{stamp}-{n}")
+                try:
+                    kept.mkdir(parents=True)
+                    break
+                except FileExistsError:
+                    continue
+            else:
+                raise RuntimeError(f"no free --keep directory for {task.NAME}-{stamp}")
             shutil.copytree(sandbox, kept / "work", dirs_exist_ok=True)
             for record in list(logdir.glob("*.jsonl")):
                 shutil.copy2(record, kept / record.name)
