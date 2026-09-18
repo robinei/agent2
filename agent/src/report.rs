@@ -238,9 +238,19 @@ impl CompletionReport {
     pub fn render(&self) -> String {
         let id = self.result_id();
         let rendered = clip_answer(&self.value.to_string(), RETURN_MAX_BYTES, id);
-        let mut sections = vec![match id {
-            Some(id) => format!("## program completed\nreturned [#{id}]: {rendered}"),
-            None => format!("## program completed\nreturned: {rendered}"),
+        // **A program that returned nothing says so by saying nothing.**
+        // `returned: null` is not news: the heading already reports that
+        // the program completed, and null is what completing without a
+        // `return` logs (`Return`'s own doc). Measured 2026-09-18 across
+        // two eval arms: 24 of 38 completions under `Transport::Program`
+        // and **38 of 38** under `Transport::Notebook`, where `return`
+        // does not exist at all (D5) so the line could never say
+        // anything else. A line that is always the same teaches the
+        // reader to skip the block it heads.
+        let mut sections = vec![match (id, self.value.is_null()) {
+            (_, true) => "## program completed".to_owned(),
+            (Some(id), false) => format!("## program completed\nreturned [#{id}]: {rendered}"),
+            (None, false) => format!("## program completed\nreturned: {rendered}"),
         }];
         sections.extend(render_console(&self.console, self.console_id));
         // The `program result` row is left out of the menu on purpose:
@@ -2030,6 +2040,38 @@ mod tests {
     /// author decoration. `render_post` adds both (so the model can
     /// resolve `answer(question, value)`'s `question`), but a navigator
     /// label is for a human's eye, not a restart target.
+    /// A completion that returned nothing prints no `returned` line —
+    /// the heading already said it completed, and `null` is what a
+    /// program without a `return` logs. Under `Transport::Notebook`
+    /// there is no `return` statement at all (D5), so that line was
+    /// identical on every one of 38 completions in a 2026-09-18 eval
+    /// arm; it was null on 24 of 38 under `Transport::Program` too.
+    #[test]
+    fn a_null_return_prints_no_returned_line() {
+        let report = |value: serde_json::Value| CompletionReport {
+            value,
+            console: Vec::new(),
+            console_id: None,
+            new_artifacts: Vec::new(),
+            failed_calls: 0,
+            long_bash: 0,
+        };
+        let with_value = report(json!(7));
+        let rendered = with_value.render();
+        assert!(rendered.contains("returned"), "a real value still shows: {rendered}");
+
+        let empty = report(json!(null));
+        let rendered = empty.render();
+        assert!(
+            rendered.starts_with("## program completed"),
+            "still says it completed: {rendered}"
+        );
+        assert!(
+            !rendered.contains("returned"),
+            "but says nothing about a value it does not have: {rendered}"
+        );
+    }
+
     /// **A removed row leaves the menu too.** `document.rs` drops a
     /// compacted row from the history log through its `CompactedView`
     /// shadow, but `menu_rows` had no compaction awareness at all — so a
