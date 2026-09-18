@@ -2,9 +2,10 @@
 
 The model's reply stops being a bare JavaScript program and becomes
 **markdown containing executable code blocks**. Prose is prose, reaching
-the person as it streams; the code blocks are one *run* — one
-compilation that pauses at each block, sharing a frame, a scope and a
-single outcome.
+the person as it streams; the code blocks are one *compilation that
+pauses at each block*, sharing a frame and a scope. The reply is logged
+piece by piece as it arrives (D15), and prompts exactly one next
+completion however many blocks it held.
 
 ## Why
 
@@ -50,9 +51,11 @@ done();
 ```
 ````
 
-One completion. One `Turn` whose `source` is the whole markdown, byte
-for byte. Two cells sharing one frame — `a` is visible in the second cell because
-the analyzer and compiler never stopped between them (D12).
+One completion, logged as four events in this order: a `Send` carrying
+the opening prose, a `Turn` holding cell 0, a `Send` for the middle
+prose, a `Turn` holding cell 1 (D1, D15). Two cells sharing one frame —
+`a` is visible in the second because the analyzer and compiler never
+stopped between them (D12).
 
 Note what cell 0 does *not* do: end with `return`. That is the habit
 exemplar 02 teaches, and there is no `return` here at all (D5) — a cell
@@ -69,11 +72,18 @@ prose segment is a `Call::Send { to: User }` — prose *is* a message to
 the person — and each cell is a `Turn` whose `source` is that cell's
 JavaScript.
 
-`Call::site` stays an offset a report can annotate from the log alone,
-but it now resolves into the cell's own `Turn` rather than into a whole
-markdown reply. Each cell-`Turn` therefore records its **offset within
-the reply**, so an absolute span (D2) maps back to the text that
-produced it.
+`Call::site` keeps its meaning exactly — an offset into the owning
+`Turn`'s `source` — because the cell's offset is **subtracted when the
+call is logged**. D2's absolute spans exist so the *analyzer's* in-memory
+tables do not collide across cells; nothing requires them to survive
+into the log, and the reply is not stored whole for them to index. So
+`Message::Turn` gains no field and the log schema does not change.
+
+An earlier draft had each cell-`Turn` record its offset within the
+reply. Unnecessary: the only consumers of a site — `report.rs`'s
+per-call-site annotation, the caret diagnostic, the TUI's program pane —
+all want a position within the program they are showing, which is the
+cell.
 
 What is given up: the reply is recoverable in content and order, but not
 byte-for-byte. The fences and the whitespace between pieces are not
@@ -124,10 +134,11 @@ bindings and their function extents collide. Absolute spans are what let
 the analyzer simply *accumulate* across cells (D12) rather than being
 rebuilt and handed a carried table.
 
-They also mean `Call::site`, `Condition::site`, `report.rs`'s
-per-call-site annotation and its line-and-caret diagnostic keep working
-untouched against `Turn.source` — the whole markdown, byte for byte —
-and a caret lands in the model's own reply with its prose around it.
+Note that these absolute spans are a *compile-time* device. They keep
+the analyzer's tables from colliding; they are not what gets logged.
+`Call::site` and `Condition::site` are written cell-local, by
+subtracting the cell's offset at log time, so both keep the meaning they
+have today — an offset into the owning `Turn`'s `source` (D1).
 
 Rejected along the way, recorded because the middle one was wrong in an
 instructive way:
@@ -230,13 +241,13 @@ logged as it happens, by the cell's own doing: a `Call` at dispatch, its
 `Result`, a `Note` for `history.append`, a `Console` for `console.log`.
 A cell is a region of instructions and nothing more.
 
-The notebook's single `Return`/`Condition` (D7) is not an exception to
-this. It records no value either — it records *how the run ended*, which
-is what `Cause::Abandoned`'s invariant is about: a branch that suspended
-and a branch that finished must be distinguishable on reload. Per-run
-bookkeeping, not per-cell data.
+A cell's `Return`/`Condition` (D7) is not an exception to this. It
+records no value either — it records *how that run ended*, which is what
+`Cause::Abandoned`'s invariant is about: a branch that suspended and a
+branch that finished must be distinguishable on reload. Bookkeeping, not
+data. `Return { value: null }` is now the only shape it takes.
 
-### D7 — Exactly one terminal per notebook
+### D7 — One terminal per cell, one report per reply
 
 `Cause::Abandoned`'s doc states the invariant: *a run must have exactly
 one log-visible terminal, or nothing downstream can be derived from the
@@ -455,6 +466,18 @@ should accumulate safely, since the analysis table simply keeps it and
 later cells fold it identically. Loop-declared `FreshCell` slots do not
 arise at cell top level.
 
+### D13 — The TUI collapses cells
+
+A code block renders semi-collapsed by default — a few lines and a count
+— and expands on a keystroke.
+
+After a cell has run, what matters is its *effects*: the calls it made,
+what they returned, what it logged. Those are rows the TUI already
+renders. The source is how it got there, and it is the least interesting
+thing on screen for the person who asked a question. Collapsing is what
+makes "never have to read the generated JavaScript" true in practice
+rather than only in principle.
+
 ### D14 — `Message::Turn`'s doc comment becomes false
 
 The type is well named, and D15 keeps it that way. `Message::{Post,
@@ -492,18 +515,6 @@ executable cell a *compile failure*, and a compacted turn is exactly
 such a reply. D4 governs an arriving completion, never a stored one —
 the check belongs on the completion path, not on anything that renders
 history.
-
-### D13 — The TUI collapses cells
-
-A code block renders semi-collapsed by default — a few lines and a count
-— and expands on a keystroke.
-
-After a cell has run, what matters is its *effects*: the calls it made,
-what they returned, what it logged. Those are rows the TUI already
-renders. The source is how it got there, and it is the least interesting
-thing on screen for the person who asked a question. Collapsing is what
-makes "never have to read the generated JavaScript" true in practice
-rather than only in principle.
 
 ### D15 — The reply is logged as it arrives
 
@@ -549,6 +560,38 @@ does, and the model therefore re-reads its own reply in a shape it
 already knows. The one adjustment: these sends are logged at generation
 time rather than execution time, which is the distinction the card
 already has to draw between prose and `tell()`.
+
+**A prose `Send` is a new shape, and owes four things.** `Call::Send` is
+documented as "**This branch's program** messaged an agent or the user",
+and `Call` as "one per call **a program issues**, logged at dispatch.
+Parent: the owning agent's spine, **between the program's `Turn` and its
+eventual `Return`/`Condition`**." A prose segment satisfies none of
+that: no program issued it, and the reply's *opening* prose is logged
+before any `Turn` exists at all. Using `Call::Send` anyway is still the
+right call — it renders in history exactly as a `tell` does, so the
+model re-reads its own reply in a shape it already knows, and a new
+payload would need its own rendering, compaction and menu handling — but
+the relaxations must be deliberate, not discovered:
+
+1. **It settles immediately, and the `Result` is written directly.**
+   "Every call gets exactly one `Result`" is `Result`'s own invariant.
+   A prose send has no VM promise behind it, so it cannot settle through
+   `ToolDone`/`on_tool_results` the way `deliver_send` settles a `tell`
+   — the host writes the `Result` itself at delivery.
+2. **`site`/`site_end` are synthetic.** No instruction issued it. Zero
+   width, the convention `span.rs` already names for "an instruction
+   with no source expression of its own".
+3. **`Call::Send`'s and `Call`'s doc comments must say so.** Both assert
+   a program as the issuer; after this, prose is the exception and the
+   comments name it.
+4. **Its position is before the first `Turn`, not between.** `Call`'s
+   placement rule holds for program-issued calls and no longer describes
+   every `Call` on the spine.
+
+Worth checking during 25.5: whether a multi-paragraph report reads
+correctly through the `you told user:` row rendering, which was built
+for one-line tells and escapes untrusted text. A report is the case this
+whole phase exists for, so it is the case that must render well.
 
 **The cost, stated plainly.** The reply is recoverable in content and
 order but not byte-for-byte — fences and the whitespace between pieces
@@ -637,9 +680,13 @@ and one next completion for a three-cell reply (**not three**), that a
 and every `Call::site` resolving to the right span in the markdown.
 
 **25.5 — Execute as the fences close (D11, D15).** Log each piece as it
-arrives — prose as a `Call::Send { to: User }`, each cell as a `Turn`
-before it runs — then dispatch on fence close, and cancel the in-flight
-completion on `done()`, trap or raise. Gate: tests
+arrives — prose as a `Call::Send { to: User }`, settled immediately by
+the host with a synthetic site, each cell as a `Turn` before it runs —
+then dispatch on fence close, and cancel the in-flight completion on
+`done()`, trap or raise. Update `Call`'s and `Call::Send`'s doc comments
+for the prose case (D15). Gate: a prose send has exactly one `Result`
+and no dangling promise; a multi-paragraph report renders legibly
+through the `you told user:` row; and tests
 that a two-cell notebook runs cell 0 before cell 1's fence arrives, that
 `done()` in cell 0 cancels the completion (epoch moved, `LlmDone`
 dropped), and that a mid-stream truncation leaves cell 0's effects
