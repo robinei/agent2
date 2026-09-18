@@ -386,13 +386,25 @@ fn render_console(lines: &[String], event: Option<u64>) -> Option<String> {
         }
     }
     let shown = &lines[start.min(lines.len())..];
-    let mut out = format!("console (last {} of {} lines", shown.len(), lines.len());
-    // Only a clip names the id — an untruncated tail has nothing behind
-    // it to fetch, and the wording stays as it was.
-    if let (true, Some(id)) = (start > 0, event) {
-        out.push_str(&format!(" — history.fetch({id}) for all of them"));
-    }
-    out.push_str("):");
+    // **Count the lines only when some were dropped.** "last 3 of 3
+    // lines" announces a clip that did not happen, and it was every
+    // single one: measured 2026-09-18, 31 of 31 console sections under
+    // `Transport::Notebook` and 28 of 28 under `Transport::Program` read
+    // "N of N". A heading that always says the same thing is one the
+    // reader learns to skip, and this one heads the output the program
+    // just produced.
+    let mut out = if shown.len() == lines.len() {
+        "console:".to_owned()
+    } else {
+        let mut out = format!("console (last {} of {} lines", shown.len(), lines.len());
+        // Only a clip names the id — an untruncated tail has nothing
+        // behind it to fetch.
+        if let Some(id) = event {
+            out.push_str(&format!(" — history.fetch({id}) for all of them"));
+        }
+        out.push_str("):");
+        out
+    };
     for line in shown {
         out.push('\n');
         out.push_str(&clip(line, CONSOLE_SECTION_MAX_BYTES));
@@ -2040,6 +2052,30 @@ mod tests {
     /// author decoration. `render_post` adds both (so the model can
     /// resolve `answer(question, value)`'s `question`), but a navigator
     /// label is for a human's eye, not a restart target.
+    /// The line count appears only when lines were actually dropped.
+    /// "last 3 of 3 lines" announces a clip that did not happen, and it
+    /// was every one: 31 of 31 console sections under the notebook
+    /// transport and 28 of 28 under the program transport read "N of N"
+    /// on 2026-09-18. Same principle as the `(no output)` line removed
+    /// just above — a heading that never varies is one the reader skips.
+    #[test]
+    fn the_console_counts_lines_only_when_it_dropped_some() {
+        let short: Vec<String> = vec!["one".into(), "two".into()];
+        let rendered = render_console(&short, Some(9)).expect("two lines");
+        assert!(rendered.starts_with("console:"), "{rendered}");
+        assert!(!rendered.contains("of 2 lines"), "no phantom clip: {rendered}");
+        assert!(!rendered.contains("history.fetch"), "nothing behind it: {rendered}");
+
+        // Enough bytes to force a drop.
+        let long: Vec<String> = (0..400).map(|i| format!("line {i} {}", "x".repeat(200))).collect();
+        let rendered = render_console(&long, Some(9)).expect("many lines");
+        assert!(rendered.contains("of 400 lines"), "a real clip counts: {rendered}");
+        assert!(
+            rendered.contains("history.fetch(9)"),
+            "and names where the rest is: {rendered}"
+        );
+    }
+
     /// A completion that returned nothing prints no `returned` line —
     /// the heading already said it completed, and `null` is what a
     /// program without a `return` logs. Under `Transport::Notebook`
