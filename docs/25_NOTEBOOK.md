@@ -1057,6 +1057,40 @@ does a reachability DFS over a label→index marker table, and a fragment
 referencing an earlier fragment's label has no marker for it, so clean
 scoping was not on offer.
 
+**What that costs, measured rather than assumed.** Against the one-shot
+path on the same source:
+
+```
+const DEBUG = false; if (DEBUG) { … } console.log('b');
+  one-shot     4 instrs   the branch is gone
+  incremental  9 instrs   PushBool(false), JFalse(5), … the branch survives
+
+const n = 5; console.log(n + 1);
+  one-shot     4 instrs   PushFloat(6.0)
+  incremental  6 instrs   PushPosInt(5), PushPosInt(1), Add
+```
+
+Dead-branch elimination and constant folding are both lost, and they are
+lost to the *skipped optimizer*, not to pinning (D12) — pinning costs
+only static dispatch for root-level functions. This is worth separating
+because the two have different fixes: resurrect-on-demand recovers what
+pinning gave up, and nothing about it touches the optimizer.
+
+**And the reason to care is diagnosability more than speed.** These
+programs wait on file reads and network calls; nobody will measure the
+`Add`. But the incremental path is the newest and least-trodden code in
+the tree, so it is the code most likely to need reading when something
+goes wrong — and it is currently the code whose output is hardest to
+read. The self-hoisting defect found on 2026-09-18 (every function's own
+frame carrying a redundant local and a `ClosureNew` of itself) was
+caught by diffing instruction listings, where 13 against 27 for two
+trivial functions was visible at a glance. Noise hides the next one.
+
+So the order, if this is revisited: fix emitted-code defects first, then
+`simplify_cfg`'s cross-fragment labels (which recovers both losses
+above), and only then resurrect-on-demand. Each is independent and each
+is measurable against the others.
+
 #### Yes, it is an instruction: `ExtendFrame(local_kinds)`
 
 Mirroring `EnterFrame(nparams, build_args, local_kinds)`. The first
