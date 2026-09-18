@@ -390,7 +390,7 @@ fn render_console(lines: &[String], event: Option<u64>) -> Option<String> {
     // Only a clip names the id — an untruncated tail has nothing behind
     // it to fetch, and the wording stays as it was.
     if let (true, Some(id)) = (start > 0, event) {
-        out.push_str(&format!(" — fetch_history({id}) for all of them"));
+        out.push_str(&format!(" — history.fetch({id}) for all of them"));
     }
     out.push_str("):");
     for line in shown {
@@ -404,7 +404,7 @@ fn render_console(lines: &[String], event: Option<u64>) -> Option<String> {
 /// heading advertising `fetch_history(id)` over the word `(none)` is an
 /// invitation to fetch nothing.
 fn render_menu(title: &str, artifacts: &[&Artifact]) -> Option<String> {
-    let mut out = format!("## {title} — fetch any of them with fetch_history(id)");
+    let mut out = format!("## {title} — fetch any of them with history.fetch(id)");
     if artifacts.is_empty() {
         return None;
     }
@@ -441,7 +441,7 @@ fn render_menu(title: &str, artifacts: &[&Artifact]) -> Option<String> {
             // not a value.
             ArtifactState::Failed(msg) => format!("failed: {}", clip(msg, PREVIEW_MAX_BYTES)),
             ArtifactState::PendingSend => {
-                format!("pending — await fetch_history({})", a.id)
+                format!("pending — await history.fetch({})", a.id)
             }
             ArtifactState::PendingInvoke => "issued; no result recorded; may have happened".into(),
         };
@@ -671,7 +671,7 @@ pub fn clip_answer(s: &str, max: usize, id: Option<u64>) -> String {
     }
     match id {
         Some(id) => format!(
-            "{}… [+{} B — fetch_history({})]",
+            "{}… [+{} B — history.fetch({})]",
             &s[..end],
             s.len() - end,
             id
@@ -1229,7 +1229,7 @@ pub fn annotate_calls<'a>(
         let note = match settled(call.id) {
             Some(Outcome::Delivered(_)) => format!("#{id} done"),
             Some(Outcome::Failed(_)) => format!("#{id} failed"),
-            None if call.is_send => format!("#{id} pending — await fetch_history({id})"),
+            None if call.is_send => format!("#{id} pending — await history.fetch({id})"),
             None => format!("#{id} issued; may have happened"),
         };
         let line = line_of(call.site).min(notes.len().saturating_sub(1));
@@ -1783,7 +1783,7 @@ mod tests {
         let menu: Vec<&Artifact> = rows.iter().collect();
         let rendered = render_menu("artifacts", &menu).expect("three rows");
         assert!(
-            rendered.contains("[#11] ask(#3, \"which file?\") → pending — await fetch_history(11)"),
+            rendered.contains("[#11] ask(#3, \"which file?\") → pending — await history.fetch(11)"),
             "{rendered}"
         );
         assert!(
@@ -1893,7 +1893,7 @@ mod tests {
         let line = rendered.lines().nth(1).unwrap();
         assert!(line.len() < RETURN_MAX_BYTES + 100, "{}", line.len());
         assert!(
-            line.contains("fetch_history(9)"),
+            line.contains("history.fetch(9)"),
             "{}",
             &line[line.len() - 60..]
         );

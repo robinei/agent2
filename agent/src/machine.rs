@@ -2343,7 +2343,7 @@ impl Runner {
     fn fetch_history(&self, tree: &Tree, args: &[Value]) -> Result<serde_json::Value, String> {
         let id = match args.first() {
             Some(Value::PosInt(n)) => *n,
-            _ => return Err("fetch_history needs a numeric id".into()),
+            _ => return Err("history.fetch needs a numeric id".into()),
         };
         let segment = self.agent_segment(tree);
         let Some(event) = segment.iter().find(|e| e.id.as_u64() == id) else {
