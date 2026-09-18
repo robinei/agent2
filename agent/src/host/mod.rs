@@ -841,9 +841,20 @@ impl Session {
                         Some(state) => state.notebook_stream(&mut self.tree, epoch, &text)?,
                         None => Vec::new(),
                     };
-                    if !outputs.is_empty() {
-                        self.after_step(branch, outputs)?;
-                    }
+                    // **Unconditionally, even with nothing to process.**
+                    // A cell that traps or raises parks the run and
+                    // deliberately emits no `StepOutput` — `suspend`'s
+                    // own comment: "it is the host's job to build
+                    // whatever one-shot handler-triggering prompt it
+                    // needs". That prompt is `after_step`'s
+                    // `prompt_suspended`, and status transitions travel
+                    // beside the outputs rather than inside them, so
+                    // skipping the call on an empty batch threw the
+                    // suspension away. The branch then sat parked with
+                    // its generation cancelled and nothing left to wake
+                    // it: `sweep-200-201526` (2026-09-18) trapped, logged
+                    // nothing further, and left its task undone without
+                    // ever timing out.
                     // A trap or a raise parks the VM, so no later cell can
                     // run until a handler resumes it — every token still
                     // being generated is waste, and the harness stops
@@ -856,6 +867,7 @@ impl Session {
                     {
                         self.cancel_generation(branch);
                     }
+                    self.after_step(branch, outputs)?;
                 }
                 Ok(())
             }
@@ -2336,6 +2348,67 @@ mod tests {
             })
             .count();
         assert_eq!(terminals, 1, "a reply is one run, however many cells");
+    }
+
+    /// **A trapped cell must get a handler.** `suspend` deliberately
+    /// emits no `StepOutput` — its own comment says building the
+    /// handler-triggering prompt "is the host's job" — and the host does
+    /// it in `after_step`'s `prompt_suspended`. The notebook chunk arm
+    /// called `after_step` only when the batch was non-empty, so a trap,
+    /// which produces nothing, threw the suspension away: the branch
+    /// parked, its generation was cancelled, and nothing was left to
+    /// wake it. Seen in `sweep-200-201526` (2026-09-18), which trapped,
+    /// logged nothing further and left its task undone without timing
+    /// out.
+    #[test]
+    fn a_trapped_cell_gets_a_handler() {
+        let (tx, rx) = channel();
+        let mut session = Session::new(
+            Tree::new(None),
+            "test agent",
+            ToolRegistry::new(),
+            Box::new(ScriptedLlm::new(vec![
+                scripted_program("Working on it.\n\n```js\nundefined_thing_here();\n```\n"),
+                scripted_program("Recovering.\n\n```js\ntell(\"done\");\ndone();\n```\n"),
+            ])),
+            tx,
+        )
+        .unwrap();
+        let branch = session.conversation_branch();
+        session
+            .states
+            .get_mut(&branch)
+            .expect("conversation branch")
+            .set_transport(crate::document::Transport::Notebook);
+        session.handle().send(SessionCommand::UserTurn {
+            branch,
+            text: "go".into(),
+            expects_reply: true,
+        });
+        let session = session.run();
+        let _: Vec<SessionEvent> = rx.try_iter().collect();
+        let tree = session.tree();
+
+        let trapped = tree.events.values().any(|e| {
+            matches!(
+                &e.payload,
+                EventPayload::Condition { cause: Cause::Trapped { .. }, .. }
+            )
+        });
+        assert!(trapped, "the cell trapped");
+
+        let said: Vec<String> = tree
+            .events
+            .values()
+            .filter_map(|e| match &e.payload {
+                EventPayload::Call(Call::Send { text, .. }) => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            said.iter().any(|t| t.contains("Recovering") || t == "done"),
+            "the handler ran, so the branch was woken: {said:?}"
+        );
     }
 
     /// Build a session, send one user turn, and run it to **quiet**.
