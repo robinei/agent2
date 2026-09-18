@@ -762,11 +762,22 @@ model re-reads its own reply in a shape it already knows, and a new
 payload would need its own rendering, compaction and menu handling — but
 the relaxations must be deliberate, not discovered:
 
-1. **It settles immediately, and the `Result` is written directly.**
-   "Every call gets exactly one `Result`" is `Result`'s own invariant.
-   A prose send has no VM promise behind it, so it cannot settle through
-   `ToolDone`/`on_tool_results` the way `deliver_send` settles a `tell`
-   — the host writes the `Result` itself at delivery.
+1. **It settles immediately, through the ordinary path — which already
+   handles it.** "Every call gets exactly one `Result`" is `Result`'s own
+   invariant. A prose send has no VM promise behind it, but
+   `on_tool_results` already covers that case: `self.pending.remove()`
+   returning `None` is expected ("the run that issued them has been
+   rewritten away, or the branch holds no VM at all"), and the `Result`
+   is logged anyway provided `settleable` holds.
+
+   The part that would have hurt is already handled too. A settled call
+   with nothing awaiting it normally produces a harness post — "a call
+   you issued has settled with no program awaiting it" — which per prose
+   paragraph would be intolerable. But `machine.rs` computes
+   `is_unwaited_tell` as `Call::Send { expects_reply: false, .. }` and
+   skips the notice for exactly that shape, which is exactly what a
+   prose send is. **No new code; settle it like a `tell` and the
+   existing guard covers it.**
 2. **`site`/`site_end` are synthetic.** No instruction issued it. Zero
    width, the convention `span.rs` already names for "an instruction
    with no source expression of its own".
