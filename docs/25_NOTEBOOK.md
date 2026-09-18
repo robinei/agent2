@@ -278,12 +278,34 @@ two things keep it that way:
 That second point is owed by 25.4 whichever way D15 had gone; it is a
 cost of notebooks, not of logging as you stream.
 
-### D8 — `done()` ends the notebook
+### D8 — `done()` does not stop anything, here or today
 
-Unchanged in meaning: it is the only thing that rests a branch. It
-therefore also stops the notebook — the cell driver stops, and later
-cells are never compiled or run. The card says so once; cells after
-`done()` are dead code and read as such.
+An earlier draft of this decision said `done()` ends the notebook and
+later cells never run. That is not what `done()` does. `machine.rs`'s
+`TOOL_DONE` arm is explicit: the flag is "recorded on the `Runner`
+rather than answered-and-forgotten because the decision it feeds (rest
+instead of continue) isn't made until the program's return value is
+known, in `finish_program` — a program can call `done()` and then keep
+running (more `tell`s, more calls) before actually returning".
+
+So `done()` keeps its meaning exactly: a flag consulted when the run
+ends, deciding rest rather than continue. **Cells after it still run**,
+the same way statements after it still run today. Nothing changes and
+nothing needs to.
+
+This is also why cells need no terminating `Return` (D12): there is no
+case where falling from one cell into the next is wrong. Normal
+sequence *is* that fall-through — cell 1 is appended at exactly the ip
+cell 0 stopped at. `resume(v)` after a condition falls out of cell *k*
+into *k+1*, which is what D9 specifies. A closure from cell 0 called in
+cell 2 enters the function's own body, not cell 0's top level. And
+nothing spans cells, so no loop or `try` can jump backwards into an
+earlier one.
+
+The card must say what `done()` does *not* do, because the natural
+reading is wrong and an exemplar written during this design got it
+wrong: `if (bail) { tell("left it alone"); done(); }` followed by the
+edit it meant to skip. Guard with `else`, not with `done()`.
 
 ### D9 — A raise or a trap suspends the notebook mid-cell
 
@@ -333,9 +355,16 @@ Three consequences, and the second is the reason to do it:
   then the next prose. The Jupyter reading experience, and the phase 24
   requirement — *a user must never have to read the generated JavaScript
   to know what is happening* — met by the format.
-- **Early stop cancels the completion.** A `done()`, a trap or a
-  `raise` in cell 0 makes every later cell moot, and the harness can
-  cancel the generation still in flight. The machinery exists:
+- **A suspension cancels the completion.** A trap or a `raise` in cell
+  0 parks the VM, so no later cell can run until a handler resumes it —
+  generating them is waste, and the harness can cancel the generation
+  still in flight.
+
+  **Not `done()`**, though an earlier draft said so. `done()` does not
+  stop execution (D8), so later cells still run; cancelling on it would
+  cut off the reply mid-sentence, and `tell` *then* `done()` is the
+  taught shape — the prose the model is still writing is the answer the
+  person asked for. The machinery exists:
   `llm_epoch` and `cancels` already do this for `Interrupt`, `LlmDone`
   already drops a response whose epoch has moved, and `deepseek.rs`'s
   `parse_sse` checks the token **between SSE lines** — "so an
