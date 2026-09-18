@@ -711,10 +711,50 @@ wastes stack on every frame. **Re-running a patched `EnterFrame`** would
 re-initialize cell 0's locals. **A heap scope object** is the scope map
 D12 already rejected.
 
-So the cell prologue is two operations, both at the one point where the
-frame is quiescent: **extend for the new slots, then `FreshCell` the
-ones a new closure just captured** (D12). With the stop mechanism, that
-is the entire VM-side surface of this phase.
+#### Yes, it is an instruction: `ExtendFrame(local_kinds)`
+
+Mirroring `EnterFrame(nparams, build_args, local_kinds)`. The first
+fragment emits `EnterFrame` as today; every later one emits
+`ExtendFrame` carrying only its own new slots.
+
+An instruction rather than a call the driver makes between `step`s,
+because the slot kinds are *compiler* knowledge — the analyzer computed
+them — and routing them through the driver means carrying compiler
+output to the VM by hand, which the instruction stream already does. It
+is also the same shape as `FreshCell`: an instruction that adjusts frame
+state at a point the compiler chose. Doing one half of the prologue
+through a side channel and the other half through the stream would be
+two mechanisms for one operation.
+
+It stays general (D16): `ExtendFrame` pairs with `EnterFrame`, is what
+any incremental evaluator needs, and carries no notebook vocabulary.
+
+**It does not subsume `FreshCell`; they touch disjoint slots.** A *new*
+slot that a closure in this same cell captures is allocated `Boxed` by
+`ExtendFrame` directly. `FreshCell` is only for *pre-existing* `Plain`
+slots being promoted (D12's diff). Order between them is therefore
+irrelevant.
+
+**The emit-then-patch idiom already exists.** `ReturnSpill`'s doc
+describes materializing a slot "by patching the already-emitted
+`EnterFrame`" — the compiler emits the prologue before compiling the
+body and patches the final `local_kinds` in afterwards. `ExtendFrame`
+follows exactly that: emitted at the cell's start, patched when the cell
+finishes compiling.
+
+Two edge cases, both from the same doc comment:
+
+- "`Err(i)`: no `EnterFrame` was emitted (a root frame with no locals)"
+  — so a first cell that declares nothing leaves no prologue at all, and
+  a later `ExtendFrame` must extend from zero with no `EnterFrame`
+  before it.
+- A cell that declares no new locals elides `ExtendFrame` rather than
+  emitting an empty one.
+
+So the cell prologue is two instructions at the one point where the
+frame is quiescent: **`ExtendFrame` for the new slots, then `FreshCell`
+for the ones a new closure just captured** (D12). With the stop
+mechanism, that is the entire VM-side surface of this phase.
 
 ## What this deletes
 
@@ -765,7 +805,7 @@ every span slices the markdown back to exactly the cell's text.
 **25.2 — One paused compilation (D12, D16).** Analyzer,
 `ProgramAnalysis`, `Compiler` and VM all live across fragments and are
 fed each in turn; backpatch scoped to the appended range; a cell
-prologue that extends the frame and emits `FreshCell` for the
+prologue of `ExtendFrame(local_kinds)` plus `FreshCell` for the
 `Plain → Boxed` diff; a stop that does not unwind. `interp`-level only —
 no transport, no events, no markdown, fragments driven by a test
 harness. **Name everything for incremental evaluation, not for cells
@@ -780,6 +820,14 @@ a call in cell 2 logs a `site` slicing `Turn.source` to that call's own
 text; and — the case that forced promotion — that a closure in cell 1
 capturing a variable cell 0 declared and already wrote sees the current
 value through the promoted cell, not a stale copy.
+
+Plus the two `ExtendFrame` edge cases: a first fragment declaring no
+locals (no `EnterFrame` is emitted at all, so a later `ExtendFrame`
+extends from zero), and a fragment declaring no new locals (no
+`ExtendFrame` emitted). And a debug assertion that the frame is
+quiescent — `sp == fp + nparams + K + cur_local_count` — at every
+prologue, since that invariant is what makes extending a push instead of
+a shift.
 
 **25.3 — The `return` diagnostic (D5).** A top-level `return` in any
 cell is a compile error naming `history.append` and `done()`. Gate: a
