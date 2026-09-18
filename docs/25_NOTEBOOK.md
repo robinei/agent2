@@ -238,33 +238,61 @@ whole program is written blind too, so this is not a regression — but
 the failure is now visible mid-stream, which is new, and cancellation
 bounds the waste rather than removing it.
 
-### D12 — Top-level names live in a scope map, not in slots
+### D12 — Cells compile incrementally; top-level slots are always boxed
 
-This is what D11 costs, and it is the only real work in the phase.
+Each cell compiles once, with the compiler re-entered carrying the prior
+scope table. Cell 0's instructions are never regenerated, so nothing a
+later cell does can change them. Slot indices are allocated in
+declaration order and stay put: cell 1 resolves `a` to the slot cell 0
+gave it, and allocates its own names above.
 
-Top-level variables lower to `GetLocal(LocalIndex)`/`SetLocal(LocalIndex)`,
-resolved by a **whole-program** analysis (`analysis.scopes`,
-`const_fn_scopes`). So "append the next cell's instructions to the
-running program" is not safe: recompiling a longer prefix can change
-codegen for code that already ran — a name const-folded across cells 0–1
-stops being foldable when cell 2 reassigns it, and the live frame no
-longer matches its own instructions. Appending would need an incremental
-analyzer with a slot-stability guarantee.
+**An earlier draft of this doc got the obstacle wrong.** It argued that
+appending is unsafe because the whole-program analysis could change
+codegen for code that already ran, and proposed moving top-level names
+into a run-lived scope map with runtime name resolution. That objection
+applies to *recompiling the prefix*, which nothing here does. Incremental
+compilation has no such problem, and the scope map would have bought
+nothing for a hash lookup per access and a lost compile-time resolution.
 
-Instead, **in notebook mode only**, a top-level declaration reads and
-writes a notebook scope map that lives for the run. The compiler carries
-the set of declared names across cells, so an undeclared reference is
-still a compile-time error and a redeclaration is still caught. Each
-cell is then an ordinary independent compilation unit: no appending, no
-frame growth, no analyzer change, no slot-stability invariant.
+The real obstacle is narrower, and it is not the slot index but the slot
+*representation*. `analyzer/captures.rs` assigns each own-local a
+`SlotKind` from whole-unit capture analysis: a slot captured by a
+descendant closure is `Boxed` — one eager cell shared by reference —
+and everything else is `Plain`, a raw value in the frame. So:
 
-`Instr::PushName(RcStr)` is already this shape — a name resolved at
-runtime against a registry, `ReferenceError` when unknown — so the
-mechanism is an extension of something present, not a new one.
+```js
+// cell 0
+let x = 5;
+console.log(x);          // nothing captures x → Plain, a raw value
+```
+```js
+// cell 1
+const f = () => x + 1;   // x is captured now → this code expects a Box
+```
 
-The cost is a hash lookup instead of an array index for top-level names.
-For programs of a few dozen statements dominated by I/O, it is not
-measurable. Function scopes are untouched and keep their slots.
+Cell 0 has run and written a raw value into the slot that cell 1's
+closure expects to be a cell. The index agreed; the representation did
+not. Boxing is a property of the binding decided by uses that may not
+have been written yet, which is the one thing a widening window cannot
+settle after the fact.
+
+**So in notebook mode every top-level slot is `Boxed`, unconditionally.**
+The representation is pinned before any cell runs and no later cell can
+invalidate it. The cost is one indirection per top-level access. Nothing
+else in the pipeline changes: slots stay compile-time resolved,
+diagnostics stay compile-time, no new instructions, function scopes
+untouched.
+
+Two smaller requirements come with it: the compiler must be re-enterable
+with a prior scope table (it currently builds a fresh `Compiler` per
+call), and the frame's locals must grow between cells rather than being
+sized once.
+
+Worth checking during 25.2 rather than assuming: `NameRes::Const` —
+a const binding folded at compile time that "never reaches the frame" —
+appears to carry over safely, since a carried scope table folds it
+identically in later cells. Loop-declared `FreshCell` slots do not arise
+at cell top level.
 
 ### D13 — The TUI collapses cells
 
@@ -313,13 +341,15 @@ no IO, no JS parsing. Gate: `cargo test -p agent notebook` covers ```js,
 4-backtick fence wrapping a 3-backtick one, and zero cells; asserts the
 blanked source is the same length as the markdown in every case.
 
-**25.2 — The notebook scope (D12).** Top-level declarations compile
-against a run-lived scope map; the compiler carries the declared-name
-set between cells. Gate: `cargo test -p interp` green, plus tests that a
-`const` in cell 0 is readable in cell 1, that an undeclared name is a
-*compile* error naming it, that a redeclaration across cells is caught,
-and that a function declared in cell 0 and called in cell 1 resolves a
-top-level name correctly.
+**25.2 — Incremental cell compilation (D12).** Re-enterable compiler
+carrying the scope table; growable frame locals; all top-level slots
+`Boxed`. Gate: `cargo test -p interp` green, plus tests that a `const`
+in cell 0 is readable in cell 1, that an undeclared name is a *compile*
+error naming it, that a redeclaration across cells is caught, that a
+function declared in cell 0 and called in cell 1 resolves a top-level
+name, and — the case that forced the boxing policy — that a closure in
+cell 1 capturing a variable cell 0 declared and already wrote sees the
+current value, not a stale copy.
 
 **25.3 — The `return` diagnostic (D5).** A top-level `return` in any
 cell is a compile error naming `history.append` and `done()`. Gate: a
