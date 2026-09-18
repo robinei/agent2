@@ -3489,6 +3489,55 @@ mod tests {
         let (site, site_end) = (*site as usize, *site_end as usize);
         assert_eq!(&source[site..site_end], r#"tell("hello")"#);
     }
+    /// End to end: the compiler's spans and the renderer's snip, on a
+    /// real program run through the machine.
+    ///
+    /// The two halves were tested apart — that `source[site..site_end]`
+    /// is the whole call, and that a hand-built span renders as a
+    /// reference — and apart is where an off-by-one lives. This is the
+    /// only test that fails if either side drifts.
+    #[test]
+    fn a_literal_tell_snips_against_the_compiler_s_own_spans() {
+        let (mut tree, mut state) = setup();
+        user_post(&mut state, &mut tree, "go");
+        let source = "tell(\"hello\");\ntell(\"x \" + String(1));";
+        let out = state
+            .step(&mut tree, StepInput::LlmResponse(llm_program(source)))
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+
+        let doc = crate::document::render(
+            &tree,
+            &state.spine,
+            64 * 1024,
+            crate::document::Transport::Program,
+        );
+        let program = doc
+            .conversation()
+            .iter()
+            .find(|m| m.role == crate::document::ChatRole::Assistant)
+            .expect("the program renders")
+            .content
+            .clone();
+        assert!(
+            program.contains("tell(/* [") && program.contains("] above */)"),
+            "the literal tell became a reference: {program}"
+        );
+        assert!(
+            !program.contains("\"hello\""),
+            "and its bytes are not in the document twice: {program}"
+        );
+        assert!(
+            program.contains("String(1)"),
+            "the computed one keeps its construction: {program}"
+        );
+        let all: String = doc.conversation().iter().map(|m| m.content.clone()).collect();
+        assert!(
+            all.contains("you told user: hello"),
+            "and the row carries the text: {all}"
+        );
+    }
+
 
     #[test]
     fn program_completion_logs_a_harness_report_and_the_branch_goes_idle() {
