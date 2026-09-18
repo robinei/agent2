@@ -204,6 +204,12 @@ pub(crate) enum LoopMsg {
     Command(SessionCommand),
     LlmChunk {
         branch: BranchId,
+        /// The generation this chunk belongs to. A chunk whose epoch has
+        /// moved is from a generation already cancelled or superseded and
+        /// is dropped, exactly as `LlmDone` is — without it, a cancelled
+        /// generation's remaining chunks were still appended to the reply
+        /// and still executed.
+        epoch: u64,
         thinking: bool,
         text: String,
     },
@@ -808,9 +814,16 @@ impl Session {
             LoopMsg::Command(SessionCommand::Resume(leaf)) => self.cmd_resume(leaf),
             LoopMsg::LlmChunk {
                 branch,
+                epoch,
                 thinking,
                 text,
             } => {
+                // Same rule `LlmDone` applies: a generation whose epoch
+                // has moved never happened as far as this branch is
+                // concerned.
+                if self.llm_epoch.get(&branch).copied() != Some(epoch) {
+                    return Ok(());
+                }
                 let agent = self.agent_of(branch);
                 self.emit(SessionEvent::Chunk {
                     agent,
@@ -825,7 +838,7 @@ impl Session {
                 // prose that follows. Thinking is not part of the reply.
                 if !thinking {
                     let outputs = match self.states.get_mut(&branch) {
-                        Some(state) => state.notebook_stream(&mut self.tree, &text)?,
+                        Some(state) => state.notebook_stream(&mut self.tree, epoch, &text)?,
                         None => Vec::new(),
                     };
                     if !outputs.is_empty() {
@@ -1060,6 +1073,13 @@ impl Session {
         *self.llm_epoch.entry(branch).or_default() += 1;
         if let Some(cancel) = self.cancels.remove(&branch) {
             cancel.cancel();
+        }
+        // The reply that generation was carrying is over. Closing it here
+        // records what it cost and said; the epoch bump above is what
+        // makes the *state* right either way, so this is about the log
+        // rather than about correctness.
+        if let Some(state) = self.states.get_mut(&branch) {
+            let _ = state.notebook_generation_ended(&mut self.tree);
         }
     }
 
@@ -1416,6 +1436,7 @@ impl Session {
                 };
                 let _ = tx.send(LoopMsg::LlmChunk {
                     branch,
+                    epoch,
                     thinking,
                     text,
                 });
@@ -2294,7 +2315,11 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(reasoned, vec!["weighing it up"], "one completion, one record");
+        assert_eq!(
+            reasoned,
+            vec!["weighing it up"],
+            "one completion, one record"
+        );
         let score = crate::score::score(tree);
         assert_eq!(score.thinking_bytes, "weighing it up".len());
         assert_eq!(score.reasoning_out, 700, "and the provider's token count");
