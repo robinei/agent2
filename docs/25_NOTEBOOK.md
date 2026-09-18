@@ -459,6 +459,50 @@ should accumulate safely, since the analysis table simply keeps it and
 later cells fold it identically. Loop-declared `FreshCell` slots do not
 arise at cell top level.
 
+### D14 — `Turn.source` is a misnomer, and its doc comment becomes false
+
+The event type is fine. `Message::{Post, Turn}` splits incoming from
+"this context's own output (assistant role)", and under this transport
+the reply genuinely *is* the branch's own message — prose addressed to
+the person, with executable regions in it. `Turn` gets **more** apt, not
+less: today a program squats in the assistant slot, which is why its doc
+comment spends a paragraph explaining the squatting.
+
+The **field** is what goes wrong. `source` holds "the complete
+JavaScript text the model emitted"; here it holds markdown, of which
+only the fenced regions are source. `Call::site`'s "a source byte
+offset" inherits it — an offset into a reply that is mostly prose.
+Renaming to `text` is the honest fix and is mechanical; it is listed in
+25.7 rather than given a step, because it touches every consumer and
+nothing depends on the order.
+
+Three clauses of `Message::Turn`'s doc go from explanatory to false and
+must be rewritten in the same pass:
+
+- "there is no separate prose channel and no tool-call wrapper around
+  it" — there is now: the reply itself.
+- "A program that wants to speak calls `tell()`/`ask()` from inside
+  itself" — no longer the only way, and no longer the usual way.
+- "it never returns prose alongside a list of calls, because there is no
+  second channel for the prose to live in" — that second channel is
+  precisely what this phase adds.
+
+**And a deletion falls out.** The same comment ends: "A compacted
+program still lands here as a comment-only `source`, which is what keeps
+role alternation intact under compaction with no special case", and
+`document.rs`'s `compacted_program_comment` wraps the replacement text
+as `//: [17] … text`. That wrapper exists **only** because the assistant
+slot had to hold valid JavaScript. Here it does not — a compacted turn
+is simply prose, and role alternation holds with no wrapper at all. The
+`//:` marker leaves this design for the second time, and this time
+nothing replaces it.
+
+One thing to be careful of while doing it: D4 makes a reply with no
+executable cell a *compile failure*, and a compacted turn is exactly
+such a reply. D4 governs an arriving completion, never a stored one —
+the check belongs on the completion path, not on anything that renders
+history.
+
 ### D13 — The TUI collapses cells
 
 A code block renders semi-collapsed by default — a few lines and a count
@@ -570,9 +614,13 @@ standing with the turn reported as partial.
 effects rendered beneath each cell as they land. Gate: manual, plus the
 existing `chat.rs` render tests still green.
 
-**25.7 — Card and exemplars.** The prose/`tell()` split as the sentence
-above; cells are one scope; no `return`; `done()` ends the notebook;
-```js runs. Gate: every exemplar parses and runs against stub tools.
+**25.7 — Card, exemplars, and the renaming (D14).** The prose/`tell()`
+split as the sentence above; cells are one scope; no `return`; `done()`
+ends the notebook; ```js runs. Plus `Turn.source` → `Turn.text`, the
+three false clauses of `Message::Turn`'s doc rewritten, and
+`compacted_program_comment`'s `//:` wrapper deleted. Gate: every
+exemplar parses and runs against stub tools; a compacted turn renders as
+plain prose with no marker and role alternation still holds.
 
 **25.8 — Measure before adopting.** Two arms on the existing tasks,
 differing only by `AGENT2_TRANSPORT`. The plumbing is already there:
