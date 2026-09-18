@@ -288,6 +288,8 @@ mod tests {
                 &mut spine,
                 EventPayload::Note {
                     text: "a long note that takes up a lot of space in the record".into(),
+                    site: 0,
+                    site_end: 0,
                 },
             )
             .unwrap();

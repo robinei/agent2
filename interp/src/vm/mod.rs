@@ -771,12 +771,12 @@ pub struct SettleCall {
     pub name: String,
     /// Arguments in call order (`args[0]` is the first argument).
     pub args: Vec<Value>,
-    /// Start of the source byte range (`spans[ip].start`) of the `Settle`
-    /// instruction that issued this call, like `InvokeCall::site`. Only the
-    /// start travels here: none of today's settle-at-dispatch verbs
-    /// (`spawn`/`fork`/`list_agents`/…) log a `Call` variant that carries an
-    /// end — unlike `InvokeCall::site_end`, which `Call::Send` does use.
+    /// Source byte range of the `Settle` instruction that issued this
+    /// call, like `InvokeCall::site`/`site_end`. `append_history` is why
+    /// the end travels: its `Note` gets a row of its own, and the
+    /// document annotates the call that wrote it with that row's id.
     pub site: u32,
+    pub site_end: u32,
 }
 
 /// A single tool/function call requested by the program.

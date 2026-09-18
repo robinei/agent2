@@ -2640,17 +2640,19 @@ impl VM {
                     }
                     let args = self.stack.split_off(self.stack.len() - n);
                     // Only the start travels into `SettleCall::site` (see its
-                    // own doc) — no settle-at-dispatch verb logs a `Call`
-                    // variant with an end today.
-                    let site = self
-                        .spans
-                        .get(self.ip as usize)
-                        .map(|s| s.start)
-                        .unwrap_or(0);
+                    // own doc). The end travels too now: `append_history`
+                    // logs a `Note`, whose row the document cross-
+                    // references back to the call that wrote it.
+                    let span = self.spans.get(self.ip as usize).copied().unwrap_or_default();
                     self.ip += 1;
                     self.settling = true;
                     return Ok(StepResult::Settle {
-                        call: SettleCall { name, args, site },
+                        call: SettleCall {
+                            name,
+                            args,
+                            site: span.start,
+                            site_end: span.end,
+                        },
                     });
                 }
 

@@ -53,7 +53,17 @@ pub enum EventPayload {
     /// a variable this run's VM is about to drop — not to read something
     /// back later in the *same* turn, since if you need the value now
     /// you are already holding it.
-    Note { text: String },
+    Note {
+        text: String,
+        /// Source byte range of the `history.append(...)` that wrote it,
+        /// so the document can point the call at the row it produced.
+        /// Zero for notes written before this existed, and for any the
+        /// harness itself appends.
+        #[serde(default)]
+        site: u32,
+        #[serde(default)]
+        site_end: u32,
+    },
 
     /// Structural event; roots an agent's first branch. Parent: the
     /// call-site event on the caller's spine (`None` for the tree

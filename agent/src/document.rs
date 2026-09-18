@@ -308,8 +308,8 @@ fn told_literal_cuts(
     tree: &Tree,
     agent: EventId,
     leaf: EventId,
-) -> HashMap<EventId, Vec<(usize, usize, u64, &'static str)>> {
-    let mut out: HashMap<EventId, Vec<(usize, usize, u64, &'static str)>> = HashMap::new();
+) -> HashMap<EventId, Vec<Cut>> {
+    let mut out: HashMap<EventId, Vec<Cut>> = HashMap::new();
     let mut cur_agent: Option<EventId> = None;
     let mut turn: Option<(EventId, String)> = None;
     for ev in tree.path_events(leaf) {
@@ -324,6 +324,14 @@ fn told_literal_cuts(
             EventPayload::Message(Message::Turn { source, .. }) => {
                 turn = Some((ev.id, source.clone()));
             }
+            EventPayload::Note {
+                text,
+                site,
+                site_end,
+            } => {
+                let Some((id, src)) = &turn else { continue };
+                push_cut(&mut out, *id, src, *site, *site_end, text, ev.id.as_u64());
+            }
             EventPayload::Call(Call::Send {
                 text,
                 site,
@@ -331,29 +339,9 @@ fn told_literal_cuts(
                 expects_reply,
                 ..
             }) => {
+                let _ = expects_reply;
                 let Some((id, src)) = &turn else { continue };
-                let (a, b) = (*site as usize, *site_end as usize);
-                if b <= a
-                    || b > src.len()
-                    || !src.is_char_boundary(a)
-                    || !src.is_char_boundary(b)
-                    || !src[a..b].contains(text.as_str())
-                {
-                    continue;
-                }
-                let cuts = out.entry(*id).or_default();
-                // Never two cuts over the same bytes: an `ask` nested
-                // inside a `tell` is one call's span inside another's,
-                // and replacing the outer leaves the inner pointing
-                // past the end of a string that just got shorter.
-                if cuts.iter().any(|(x, y, _, _)| a < *y && *x < b) {
-                    continue;
-                }
-                // The verb stays, so the call still reads as a call —
-                // `const answer = await ask(/* [7] above */);` keeps its
-                // shape where a bare comment would not.
-                let verb = if *expects_reply { "ask" } else { "tell" };
-                cuts.push((a, b, ev.id.as_u64(), verb));
+                push_cut(&mut out, *id, src, *site, *site_end, text, ev.id.as_u64());
             }
             _ => {}
         }
@@ -361,51 +349,98 @@ fn told_literal_cuts(
     out
 }
 
-/// A program's source with each literal `tell`/`ask` replaced by a
-/// reference to the row that now carries it.
+/// One call's span recorded against the turn that wrote it, if the span
+/// is usable at all. Overlapping spans are dropped: an `ask` nested
+/// inside a `tell` is one call's range inside another's, and editing
+/// the outer leaves the inner pointing past the end of a string that
+/// just got shorter.
+fn push_cut(
+    out: &mut HashMap<EventId, Vec<Cut>>,
+    turn: EventId,
+    src: &str,
+    site: u32,
+    site_end: u32,
+    text: &str,
+    row: u64,
+) {
+    let (a, b) = (site as usize, site_end as usize);
+    if b <= a || b > src.len() || !src.is_char_boundary(a) || !src.is_char_boundary(b) {
+        return;
+    }
+    let cuts = out.entry(turn).or_default();
+    if cuts.iter().any(|c| a < c.end && c.start < b) {
+        return;
+    }
+    cuts.push(Cut {
+        start: a,
+        end: b,
+        row,
+        // Only a literal can be replaced: the row already holds those
+        // bytes. A computed argument is not duplication — the row has
+        // the text and the source has how it was built — so it keeps
+        // its construction and takes the reference alongside.
+        literal: src[a..b].contains(text),
+    });
+}
+
+/// A call in a program's source and the history row it produced.
+#[derive(Clone)]
+struct Cut {
+    start: usize,
+    end: usize,
+    row: u64,
+    literal: bool,
+}
+
+/// A program's source, cross-referenced to the history rows its calls
+/// produced — and with a literal argument replaced by that reference
+/// when doing so is shorter than keeping it.
 ///
-/// Those render whole, as rows of their own, so a literal one is in the
-/// document twice: once as the row and once inside the call that
-/// produced it. Across every run kept on 2026-09-17, 1011 of 3344
-/// tells (30%) and 121 of 196 asks (61%) had their text verbatim in
-/// their own program.
+/// **Every `tell`, `ask` and `history.append` is annotated**, whether
+/// or not its text is duplicated. The row says `[40] you told user: …`
+/// and the call says `/* history[40] */`, and neither on its own says
+/// that *this* call produced *that* row. With several computed calls
+/// in one program the link is otherwise only inferable from order.
 ///
-/// **Only when it saves bytes**, and only when the text is verbatim
-/// inside the call's own span. A
-/// computed `tell("--- " + f.content)` is not duplication — the row has
-/// the bytes, the source has the *construction*, and that is program
-/// logic worth reading. 87% of tells are computed and every one of them
-/// is left alone.
+/// **Replaced only when the argument is a literal and the reference is
+/// shorter.** A literal is in the document twice — once as the row,
+/// once inside the call — and across every run kept on 2026-09-17 that
+/// was 1011 of 3344 tells and 121 of 196 asks. A computed
+/// `tell("--- " + f.content)` is not duplication: the row has the
+/// bytes, the source has the construction, and 87% of tells are
+/// computed. And `tell("ok")` is shorter than any reference to it, so
+/// it stays as written — 6% of literal calls were.
 ///
-/// An `answer` is not snipped for want of an end offset, not for want
-/// of a reason: it is a settle-at-dispatch verb, and `SettleCall`
-/// records only a start.
+/// An `answer` is not in this: it renders whole as a row, but
+/// `EventPayload::Answer` records no span to anchor a reference to.
 ///
-/// The span is the parser's own (`interp::Span`, logged as `site` and
-/// `site_end` on `Call::Send`), not brackets matched here — a scan
-/// would have to get string literals right and would get them wrong on
-/// the first `tell(")")` it met. Rows written before those fields
-/// existed carry `site_end` 0 and render exactly as they did.
-fn snip_told_literals(
-    source: &str,
-    cuts: Option<&Vec<(usize, usize, u64, &'static str)>>,
-) -> String {
+/// Spans are the parser's own (`interp::Span`), not brackets matched
+/// here — a scan would have to get string literals right and would get
+/// them wrong on the first `tell(")")`. Rows written before those
+/// fields existed carry zero and are left exactly as they were.
+fn annotate_history_calls(source: &str, cuts: Option<&Vec<Cut>>) -> String {
     let Some(cuts) = cuts else {
         return source.to_owned();
     };
     let mut cuts = cuts.clone();
     // Right to left, so no earlier offset goes stale.
-    cuts.sort_by_key(|(a, _, _, _)| std::cmp::Reverse(*a));
+    cuts.sort_by_key(|c| std::cmp::Reverse(c.start));
     let mut out = source.to_owned();
-    for (a, b, id, verb) in cuts {
-        let marker = format!("{verb}(/* [{id}] above */)");
-        // Never grow the document to de-duplicate it. A `tell("ok")` is
-        // ten bytes and the marker is twenty-four; 6% of the literal
-        // calls measured on 2026-09-17 were shorter than the thing that
-        // would replace them, and those read better as themselves
-        // anyway.
-        if marker.len() < b - a {
-            out.replace_range(a..b, &marker);
+    for c in cuts {
+        let snipped = format!("/* snipped - history[{}] */", c.row);
+        let marked = format!(" /* history[{}] */", c.row);
+        if c.literal && snipped.len() < c.end - c.start {
+            // Keep the callee, so the call still reads as a call:
+            // `const a = await ask(/* snipped - history[7] */)` has a
+            // shape that a bare comment would not.
+            let callee = out[c.start..c.end]
+                .find('(')
+                .map(|i| &out[c.start..c.start + i])
+                .unwrap_or("")
+                .to_owned();
+            out.replace_range(c.start..c.end, &format!("{callee}({snipped})"));
+        } else {
+            out.insert_str(c.end, &marked);
         }
     }
     out
@@ -556,7 +591,7 @@ fn pending_line(
                 escape_untrusted(&value.to_string())
             ))
         }
-        EventPayload::Note { text } => Some(format!(
+        EventPayload::Note { text, .. } => Some(format!(
             "[{}] note: {}",
             event.id.as_u64(),
             escape_untrusted(text)
@@ -787,7 +822,7 @@ pub(crate) fn render_with_lookup(
         match &ev.payload {
             EventPayload::Message(Message::Turn { source, .. }) => {
                 let content = match compacted.get(&ev.id) {
-                    None => Some(snip_told_literals(source, cuts.get(&ev.id))),
+                    None => Some(annotate_history_calls(source, cuts.get(&ev.id))),
                     Some(shadow) => compacted_program_comment(ev.id, shadow),
                 };
                 // A removed program occupies no slot at all. Because a
@@ -1446,12 +1481,12 @@ mod tests {
             .content
             .clone();
         assert!(
-            program.contains(&format!("tell(/* [{}] above */)", a.as_u64())),
-            "the literal one points at its row: {program}"
+            program.contains(&format!("tell(/* snipped - history[{}] */)", a.as_u64())),
+            "the long literal is replaced by its row: {program}"
         );
         assert!(
-            program.contains("tell(\"x \" + y)"),
-            "the computed one keeps its construction: {program}"
+            program.contains("tell(\"x \" + y) /* history["),
+            "the computed one keeps its construction and takes a reference: {program}"
         );
         assert!(
             !program.contains(LONG_TELL),
@@ -1459,11 +1494,11 @@ mod tests {
         );
     }
 
-    /// A call shorter than the marker is left alone: de-duplicating is
-    /// not worth spending more bytes than it saves, and a short literal
-    /// reads better as itself.
+    /// A call shorter than the reference keeps its text — de-duplicating
+    /// is not worth spending more bytes than it saves — but still takes
+    /// the reference, because the link from call to row is the point.
     #[test]
-    fn a_tell_shorter_than_its_marker_is_left_alone() {
+    fn a_short_call_keeps_its_text_and_still_takes_the_reference() {
         let src = "tell(\"ok\");\n";
         let mut tree = Tree::new(None);
         let mut spine = tree
@@ -1491,7 +1526,10 @@ mod tests {
             .expect("a program")
             .content
             .clone();
-        assert_eq!(program, src, "left exactly as written: {program}");
+        assert!(
+            program.starts_with("tell(\"ok\") /* history["),
+            "text kept, reference added: {program}"
+        );
     }
 
     /// Both directions read the same way. A row never makes the reader
@@ -1557,7 +1595,7 @@ mod tests {
     /// shape where a bare comment would not.
     #[test]
     fn a_literal_ask_is_snipped_and_keeps_its_verb() {
-        let src = "const a = await ask(\"user\", \"which one?\");\n";
+        let src = "const a = await ask(\"user\", \"is 240 still right for request_timeout_seconds, or did we settle on the old 30?\");\n";
         let at = src.find("ask(").unwrap();
         let end = src.find(");").unwrap() + 1;
         let mut tree = Tree::new(None);
@@ -1571,7 +1609,7 @@ mod tests {
                 &mut spine,
                 EventPayload::Call(Call::Send {
                     to: Address::User,
-                    text: "which one?".into(),
+                    text: "is 240 still right for request_timeout_seconds, or did we settle on the old 30?".into(),
                     input: serde_json::Value::Null,
                     expects_reply: true,
                     site: at as u32,
@@ -1583,11 +1621,14 @@ mod tests {
         let doc = render(&tree, &spine, 64 * 1024, Transport::Program);
         let all: String = doc.messages.iter().map(|m| m.content.clone()).collect();
         assert!(
-            all.contains(&format!("const a = await ask(/* [{}] above */)", q.as_u64())),
+            all.contains(&format!(
+                "const a = await ask(/* snipped - history[{}] */)",
+                q.as_u64()
+            )),
             "{all}"
         );
         assert!(
-            all.contains(&format!("[{}] you asked user: which one?", q.as_u64())),
+            all.contains(&format!("[{}] you asked user: is 240 still right for request_timeout_seconds, or did we settle on the old 30?", q.as_u64())),
             "and the question itself renders whole, as its own row: {all}"
         );
     }
@@ -1609,6 +1650,8 @@ mod tests {
                 &mut spine,
                 EventPayload::Note {
                     text: "a long finding worth several lines".into(),
+                    site: 0,
+                    site_end: 0,
                 },
             )
             .unwrap();

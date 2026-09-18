@@ -1827,6 +1827,8 @@ impl Runner {
                             &mut self.spine,
                             EventPayload::Note {
                                 text: note_text(value),
+                                site: call.site,
+                                site_end: call.site_end,
                             },
                         )?;
                         self.settle(Ok(serde_json::Value::Null));
@@ -2178,7 +2180,7 @@ impl Runner {
             EventPayload::Message(Message::Turn { source, .. }) => {
                 Ok(serde_json::Value::String(source.clone()))
             }
-            EventPayload::Note { text } => Ok(serde_json::Value::String(text.clone())),
+            EventPayload::Note { text, .. } => Ok(serde_json::Value::String(text.clone())),
             // Genuinely not a row: the agent's own root, a `Compacted`
             // event at its own position, structure. `document::label_of`
             // has no name for these either, and `compaction.rs` refuses
@@ -3489,6 +3491,53 @@ mod tests {
         let (site, site_end) = (*site as usize, *site_end as usize);
         assert_eq!(&source[site..site_end], r#"tell("hello")"#);
     }
+    /// `history.append` is a settle-at-dispatch verb, so its span comes
+    /// through `SettleCall` rather than `InvokeCall` — a path that
+    /// carried no end offset until the note needed one. End to end
+    /// because that plumbing is the part with nothing else watching it.
+    #[test]
+    fn an_append_is_cross_referenced_to_the_note_it_wrote() {
+        let (mut tree, mut state) = setup();
+        user_post(&mut state, &mut tree, "go");
+        let source = "history.append({ found: 3 });";
+        let out = state
+            .step(&mut tree, StepInput::LlmResponse(llm_program(source)))
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+
+        let note = tree
+            .events
+            .values()
+            .find(|e| matches!(e.payload, EventPayload::Note { .. }))
+            .expect("append writes a note");
+        let EventPayload::Note { site, site_end, .. } = &note.payload else {
+            unreachable!()
+        };
+        assert_eq!(
+            &source[*site as usize..*site_end as usize],
+            "history.append({ found: 3 })",
+            "the span is the whole call"
+        );
+
+        let doc = crate::document::render(
+            &tree,
+            &state.spine,
+            64 * 1024,
+            crate::document::Transport::Program,
+        );
+        let program = doc
+            .conversation()
+            .iter()
+            .find(|m| m.role == crate::document::ChatRole::Assistant)
+            .expect("the program renders")
+            .content
+            .clone();
+        assert!(
+            program.contains(&format!("/* history[{}] */", note.id.as_u64())),
+            "and the call points at the row it wrote: {program}"
+        );
+    }
+
     /// End to end: the compiler's spans and the renderer's snip, on a
     /// real program run through the machine.
     ///
@@ -3520,16 +3569,16 @@ mod tests {
             .content
             .clone();
         assert!(
-            program.contains("tell(/* [") && program.contains("] above */)"),
-            "the literal tell became a reference: {program}"
+            program.contains("tell(/* snipped - history["),
+            "the long literal tell became a reference: {program}"
         );
         assert!(
             !program.contains("green after the rename\""),
             "and its bytes are not in the document twice: {program}"
         );
         assert!(
-            program.contains("String(1)"),
-            "the computed one keeps its construction: {program}"
+            program.contains("String(1)") && program.contains(") /* history["),
+            "the computed one keeps its construction and takes a reference: {program}"
         );
         let all: String = doc.conversation().iter().map(|m| m.content.clone()).collect();
         assert!(
@@ -4095,7 +4144,7 @@ mod tests {
             .agent_segment(&tree)
             .iter()
             .find_map(|e| match &e.payload {
-                EventPayload::Note { text } => Some(text.clone()),
+                EventPayload::Note { text, .. } => Some(text.clone()),
                 _ => None,
             });
         assert_eq!(note.as_deref(), Some("figured out the bug is in parsing"));

@@ -518,7 +518,7 @@ fn fold(session: host::Session, errors: Vec<String>) -> Outcome {
                     resume_count += 1;
                 }
             }
-            EventPayload::Note { text } => appended.push(text.clone()),
+            EventPayload::Note { text, .. } => appended.push(text.clone()),
             EventPayload::Message(Message::Turn {
                 author: Author::Agent(_),
                 ..

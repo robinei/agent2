@@ -504,7 +504,7 @@ impl ChatState {
             // A note is heard by no one but the branch's own future self
             // — a marker in its own history, same as `append_history`'s
             // own doc in `types.rs` describes.
-            EventPayload::Note { text } => {
+            EventPayload::Note { text, .. } => {
                 self.push_entry(Entry::Line {
                     branch,
                     id,
