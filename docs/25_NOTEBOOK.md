@@ -345,26 +345,36 @@ cell actually closes over it, and then it costs one instruction, once.
 An earlier draft boxed every top-level slot unconditionally to pin the
 representation before any cell ran. Unnecessary, given the above.
 
-**How a later cell's code gets into the running VM.** This is the part
-the phrase "compile incrementally" was hiding, and it is the mechanism
-behind "feed more source into a VM".
+**How a later cell's code gets into the running VM.** The same
+`Compiler` instance keeps emitting. Its buffers are its own fields —
+`code: Vec<Instr>`, `spans: Vec<Span>`, `next_label` — so cell 1's
+instructions are appended to the buffer cell 0 filled, and the backpatch
+pass resolves label ids to indices into that same vector. **Addresses
+come out absolute by construction; there is nothing to rebase.**
 
-`Program` is `{ code, spans, source, debug }` — no separate constant
-pool, so there is no pool to merge. Appending cell *k*'s compilation
-into the live VM is therefore: extend `code` and `spans`, merge the
-debug function table, and set `ip` to the append point.
+An earlier draft of this doc had each cell compiled standalone and its
+`Program` appended afterwards, which created a jump-rebasing problem and
+a `base_addr` parameter to solve it. Both were self-inflicted: compiling
+into the shared buffer in the first place means the problem never
+arises.
 
-The one thing that must not be naive is **jump targets**. Labels resolve
-to absolute addresses at the end of codegen, so a cell compiled
-standalone emits jumps relative to its own zero. The fix is a base
-address threaded into label resolution, so cell *k* resolves labels at
-`base + local`. The compiler already has the shape for this:
-`Analysis { next_label }` exists precisely so "codegen continues the
-same allocation" across a unit.
+What the appending *does* require is that each pass run over the **newly
+appended range**, not the whole buffer:
 
-So what the compiler carries between cells is four things, not one: the
-**scope table** (name → slot and `SlotKind`), the **frame's local
-count**, the **label counter**, and the **base address**.
+- **Backpatch** from the cell's first instruction onward. Cell 0's jumps
+  hold resolved addresses by now, not label ids, and a pass that cannot
+  tell the two apart would corrupt them.
+- **Span rebasing** over the same range. A cell is parsed from its own
+  substring (D2), so its spans arrive cell-relative and `cell.start` is
+  added as they are appended.
+
+**The real plumbing is in the analyzer, not the compiler.** Scope and
+capture analysis is a separate pass over the cell's AST, and it
+allocates slots from zero for each unit it sees. It has to be seeded
+with the prior scope table and the frame's current local count, or cell
+1 gives `let y` slot 0 and stomps cell 0's `x`. That seeding is the one
+genuinely new piece; everything else on this list is free once the
+compiler instance simply stays alive.
 
 One detail for 25.1b: `Program::source` is what diagnostics render
 against, and under this transport it should be the markdown, not the
@@ -446,10 +456,11 @@ that a call in cell 2 logs a `site` which slices `Turn.source` to that
 call's own text, and that no prelude instruction carries a span landing
 in prose.
 
-**25.2 — Incremental cell compilation (D12).** Re-enterable compiler
-carrying four things — scope table (name → slot *and* `SlotKind`), frame
-local count, label counter, base address — so a cell's `code`/`spans`
-append into the live VM with jump targets already absolute; growable
+**25.2 — Incremental cell compilation (D12).** One `Compiler` instance
+emitting every cell into its own buffers, so addresses stay absolute
+with no rebasing; backpatch and span-rebase scoped to each cell's
+appended range; the analyzer seeded with the prior scope table (name →
+slot *and* `SlotKind`) and the frame's current local count; growable
 frame locals; `FreshCell` emitted at a cell's start for each earlier-declared
 name it is the first to capture. Gate: `cargo test -p interp` green, plus tests that a `const`
 in cell 0 is readable in cell 1, that an undeclared name is a *compile*
