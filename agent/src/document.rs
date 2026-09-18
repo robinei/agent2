@@ -443,7 +443,14 @@ fn pending_line(
             expects_reply: false,
             ..
         }) => Some(format!(
-            "[{}] tell ({}): {}",
+            // `to`, with an arrow, because the parenthesis a `post` uses
+            // names its *author* — `[2] post (user): …` is the person
+            // speaking — and `[6] tell (user): …` in the next row meant
+            // the opposite, the person being spoken to. Two rows, the
+            // same punctuation, reversed direction, in a message that is
+            // itself in the user role: the one thing a reader has to get
+            // right here is who said it.
+            "[{}] you told {}: {}",
             event.id.as_u64(),
             crate::machine::address_label(to),
             escape_untrusted(text)

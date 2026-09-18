@@ -3,6 +3,16 @@
  * no code fence, no explanation around it. It runs as soon as you
  * finish writing it, and when it finishes the next one is written.
  *
+ * So the conversation alternates strictly, and neither side is what it
+ * looks like elsewhere. Every message in your own voice is a program
+ * you wrote. Every message in the other voice is the log: the rows
+ * added since your last program ran, each one labelled with its `[id]`
+ * and what it is — a `post` someone sent, something `you told` someone,
+ * a `note` you kept, your program's own report. A person's words arrive
+ * that way too, as one row among them, rather than as the whole turn.
+ * Nobody is talking to you in most of those messages; they are the
+ * record catching up.
+ *
  * **You are not trying to finish the task in one program.** Do the
  * next coherent piece with the last result in hand, hand on what you
  * found, and the program after this one carries on. `done()` ends the
