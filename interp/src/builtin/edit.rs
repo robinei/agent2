@@ -6,6 +6,30 @@ use crate::vm::{ErrorKind, RcStr, VM, VMError, Value};
 
 // ── Edit.replaceOnce ──────────────────────────────────────────────────────────
 
+/// The `text` every `Edit.*` takes first, with an error that names the
+/// mistake instead of its symptom.
+///
+/// `vm.string_from` says only "type error", and the value that reaches
+/// it is usually `undefined` produced two lines earlier: `replaceOnce`
+/// returns the new string directly while `replaceCount` returns
+/// `{ result, count }`, so a `.result` on the wrong one is `undefined`
+/// and the *next* call is what fails. Eight traps across the runs of
+/// 2026-09-18 said `in \`replaceOnce\`: type error` while naming a call
+/// that was not the error, which is the least useful thing a message
+/// can do.
+fn edit_text(vm: &mut VM, args: &Args, who: &str) -> Result<RcStr, VMError> {
+    let v = args.get(vm, 0);
+    if matches!(v, Value::Undefined) {
+        let msg = format!(
+            "{who}(text, …): `text` is undefined. `replaceOnce` and `applyEdits` return the \
+             new text itself — only `replaceCount` returns `{{ result, count }}` — so a \
+             `.result` on the wrong one gives undefined, and this is the next call along."
+        );
+        return Err(vm.fail(ErrorKind::TypeError, msg));
+    }
+    vm.string_from(v)
+}
+
 /// `Edit.replaceOnce(text, old, new)` → string.
 /// Replace `old` (string or RegExp) with `new` iff `old` matches exactly once
 /// in `text`. Errors with the actual match count on ambiguity.
@@ -54,7 +78,7 @@ fn match_count_error(what: &str, n: usize, needle: &str) -> String {
 }
 
 pub fn edit_replace_once(vm: &mut VM, args: Args) -> Result<Value, VMError> {
-    let text_s = vm.string_from(args.get(vm, 0))?;
+    let text_s = edit_text(vm, &args, "replaceOnce")?;
     let text = text_s.as_str();
     let replacement = vm.to_js_string(args.get(vm, 2), 0);
     let old_val = args.get(vm, 1);
@@ -101,7 +125,7 @@ pub fn edit_replace_once(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 /// Replace every occurrence of `old` (string or RegExp) with `new` and
 /// return the result string plus the match count.
 pub fn edit_replace_count(vm: &mut VM, args: Args) -> Result<Value, VMError> {
-    let text_s = vm.string_from(args.get(vm, 0))?;
+    let text_s = edit_text(vm, &args, "replaceCount")?;
     let text = text_s.as_str();
     let replacement = vm.to_js_string(args.get(vm, 2), 0);
     let old_val = args.get(vm, 1);
@@ -531,7 +555,7 @@ pub fn edit_insert_at(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 /// Edits are applied right-to-left so offsets stay stable.  Errors with
 /// the index and content of the offending edit on ambiguity.
 pub fn edit_apply_edits(vm: &mut VM, args: Args) -> Result<Value, VMError> {
-    let text_s = vm.string_from(args.get(vm, 0))?;
+    let text_s = edit_text(vm, &args, "applyEdits")?;
     let text = text_s.as_str();
 
     let edits_val = args.get(vm, 1);
@@ -733,6 +757,21 @@ mod tests {
     fn replace_once_success() {
         let out = testutil::run_ret("return Edit.replaceOnce('hello world', 'world', 'earth');");
         assert_eq!(out, json!("hello earth"));
+    }
+
+    #[test]
+    /// The message names the mistake, not the call that tripped over
+    /// it. `replaceOnce` returns the new text and `replaceCount`
+    /// returns `{ result, count }`, so a `.result` on the former is
+    /// `undefined` and the *next* `Edit` call is where it surfaces.
+    #[test]
+    fn undefined_text_says_which_verb_returns_what() {
+        let e = testutil::run_runtime_err(
+            "return Edit.replaceOnce(Edit.replaceOnce('a', 'a', 'b').result, 'x', 'y');",
+        )
+        .message;
+        assert!(e.contains("`text` is undefined"), "{e}");
+        assert!(e.contains("replaceCount"), "names the sibling that does return an object: {e}");
     }
 
     #[test]
