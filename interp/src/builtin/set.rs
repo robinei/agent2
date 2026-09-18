@@ -134,4 +134,93 @@ mod tests {
         let out = testutil::run_ret("const m = new Map([['a', 1], ['b', 2]]); return m.size;");
         assert_eq!(out, serde_json::json!(2));
     }
+
+    // ── new Set(iterable) — sweep-200 2026-09-17: only `Array` worked ──
+
+    #[test]
+    fn set_construct_from_string() {
+        // `new Set("abc")` iterates characters, like real JS — not just
+        // `new Set(Array)`.
+        let out = testutil::run_ret("return new Set('abc').size;");
+        assert_eq!(out, serde_json::json!(3));
+    }
+
+    #[test]
+    fn set_construct_from_string_dedupes() {
+        let out = testutil::run_ret("return new Set('aab').size;");
+        assert_eq!(out, serde_json::json!(2));
+    }
+
+    #[test]
+    fn set_construct_from_other_set() {
+        let out = testutil::run_ret(
+            "const a = new Set([1, 2, 3]); const b = new Set(a); return [b.size, b.has(2)];",
+        );
+        assert_eq!(out, serde_json::json!([3, true]));
+    }
+
+    #[test]
+    fn set_construct_from_map_keys() {
+        let out = testutil::run_ret(
+            "const m = new Map([['a', 1], ['b', 2]]); \
+             const s = new Set(m.keys()); return [s.size, s.has('a'), s.has('b')];",
+        );
+        assert_eq!(out, serde_json::json!([2, true, true]));
+    }
+
+    #[test]
+    fn set_construct_from_map_yields_entries() {
+        // Iterating a `Map` directly (not `.keys()`) yields `[key, value]`
+        // entries, same as real JS.
+        let out = testutil::run_ret(
+            "const m = new Map([['a', 1]]); const s = new Set(m); \
+             return [s.size, s.values()[0]];",
+        );
+        assert_eq!(out, serde_json::json!([1, ["a", 1]]));
+    }
+
+    #[test]
+    fn set_construct_non_iterable_still_throws() {
+        use crate::testutil::run_err_kind;
+        use crate::vm::ErrorKind;
+        // A plain number is not one of this dialect's iterables.
+        assert_eq!(run_err_kind("return new Set(5);"), ErrorKind::TypeError);
+    }
+
+    #[test]
+    fn set_construct_plain_object_still_throws() {
+        use crate::testutil::run_err_kind;
+        use crate::vm::ErrorKind;
+        assert_eq!(
+            run_err_kind("return new Set({a: 1});"),
+            ErrorKind::TypeError
+        );
+    }
+
+    // ── new Map(iterable) — same gap, same fix ─────────────────────────
+
+    #[test]
+    fn map_construct_from_other_map() {
+        let out = testutil::run_ret(
+            "const a = new Map([['a', 1], ['b', 2]]); const b = new Map(a); \
+             return [b.size, b.get('a'), b.get('b')];",
+        );
+        assert_eq!(out, serde_json::json!([2, 1, 2]));
+    }
+
+    #[test]
+    fn map_construct_from_set_of_pairs() {
+        let out = testutil::run_ret(
+            "const s = new Set([['a', 1], ['b', 2]]); const m = new Map(s); \
+             return [m.get('a'), m.get('b')];",
+        );
+        assert_eq!(out, serde_json::json!([1, 2]));
+    }
+
+    #[test]
+    fn map_construct_non_iterable_still_throws() {
+        use crate::testutil::run_err_kind;
+        use crate::vm::ErrorKind;
+        assert_eq!(run_err_kind("return new Map(5);"), ErrorKind::TypeError);
+    }
 }

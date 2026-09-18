@@ -11,8 +11,25 @@ pub fn json_parse(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     vm.json_to_stack_value(&json, 0)
 }
 
-/// `JSON.stringify(value[, replacer[, space]])` → str.
+/// `JSON.stringify(value[, replacer[, space]])` → str, or the value
+/// `undefined` when `value` itself has no JSON form (JS: `SerializeJSONProperty`
+/// on the root returns `undefined` in that case, and `JSON.stringify` passes
+/// that straight through — it does not throw). `undefined` nested in an
+/// array (→ `null`) or an object (key omitted) is already handled inside
+/// [`VM::stack_value_to_json`]; this is only the root, which previously fell
+/// through to that same function and failed with a bare "value error" —
+/// hit by the 2026-09-17 `sweep-200` eval on `JSON.stringify(outline.items,
+/// null, 2)` where `items` was `undefined`. Matching JS here (rather than
+/// just improving the error text) is deliberate: this dialect's contract is
+/// to diverge from JS in exactly three named, documented ways and otherwise
+/// behave like it — an `undefined` root was never one of the three, so the
+/// throw was a gap, not a divergence worth keeping. Other root values with
+/// no JSON form (a function, a promise, a `RegExp`, …) still throw via
+/// `stack_value_to_json` below, unchanged.
 pub fn json_stringify(vm: &mut VM, args: Args) -> Result<Value, VMError> {
+    if matches!(args.get(vm, 0), Value::Undefined) {
+        return Ok(Value::Undefined);
+    }
     let json = vm.stack_value_to_json(args.get(vm, 0), 0)?;
     // Check replacer: only null/undefined are accepted.
     if args.argc >= 2 {
@@ -169,6 +186,60 @@ mod tests {
         assert_eq!(
             run_err_kind("return JSON.stringify({a:1}, x => x, 2);"),
             ErrorKind::TypeError
+        );
+    }
+
+    // ── JSON.stringify(undefined) — sweep-200 2026-09-17: threw ────────
+
+    #[test]
+    fn json_stringify_root_undefined_returns_undefined_value() {
+        // Real JS: `JSON.stringify(undefined)` is the *value* `undefined`,
+        // not a string and not a throw. This dialect used to throw a bare
+        // "value error" here (`outline.items` being `undefined` in
+        // `JSON.stringify(outline.items, null, 2)` was the eval hit).
+        let v = testutil::run_val("return JSON.stringify(undefined);");
+        assert_eq!(v, Value::Undefined);
+    }
+
+    #[test]
+    fn json_stringify_root_undefined_with_space_still_returns_undefined() {
+        // The `space` argument only shapes a produced string; there is
+        // none here, so it must not change the outcome.
+        let v = testutil::run_val("return JSON.stringify(undefined, null, 2);");
+        assert_eq!(v, Value::Undefined);
+    }
+
+    #[test]
+    fn json_stringify_undefined_in_array_is_null() {
+        // Already correct going in (stack_value_to_json's array arm), but
+        // pinned here alongside the root-undefined fix so the three cases
+        // the eval's outline.items call cares about are covered together.
+        let v = testutil::run_val("return JSON.stringify([1, undefined, 3]);");
+        match v {
+            Value::String(s) => assert_eq!(s.as_str(), "[1,null,3]"),
+            other => panic!("expected string, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn json_stringify_undefined_in_object_omits_key() {
+        // Same: already correct (stack_value_to_json's object arm), pinned
+        // here for the same reason.
+        let v = testutil::run_val("return JSON.stringify({a: 1, b: undefined, c: 3});");
+        match v {
+            Value::String(s) => assert_eq!(s.as_str(), "{\"a\":1,\"c\":3}"),
+            other => panic!("expected string, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn json_stringify_non_serializable_root_still_throws() {
+        // A function still has no JSON form at the root — only `undefined`
+        // gets the JS "return undefined, don't throw" treatment here.
+        use crate::testutil::run_err_kind;
+        assert_eq!(
+            run_err_kind("return JSON.stringify(function() {});"),
+            ErrorKind::ValueError
         );
     }
 }

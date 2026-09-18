@@ -1507,20 +1507,106 @@ impl VM {
         }
     }
 
+    /// Materialize the element sequence of a value this dialect treats as
+    /// "iterable" for `new Map(..)`/`new Set(..)`. There is still no general
+    /// iterator protocol — but `for-of`/spread no longer need one either:
+    /// they normalize through `builtin::iter_source` (added 2026-09-16,
+    /// itself a fix for the same *kind* of gap — `Map`/`Set` not iterating),
+    /// which turns a `Map` into its `[key, value]` pairs and a `Set` into
+    /// its values before the existing array/string index loop runs. This
+    /// helper can't call `iter_source` directly (it takes stack-based
+    /// `Args`, and `map_construct`/`set_construct` run outside the
+    /// compiled-bytecode path that supplies those), so it reimplements the
+    /// same two normalizations by hand, plus `String` (which `iter_source`
+    /// leaves alone, since native byte-indexing already makes a string
+    /// loop-indexable — but a constructor needs actual *members*, not just
+    /// something indexable). Recognizes:
+    /// - `Array`: its elements, as-is.
+    /// - `String`: one `Value::String` per Unicode scalar value (so
+    ///   `"abc"` yields three one-character strings). Note this is *not*
+    ///   the dialect's usual "strings are UTF-8 bytes" indexing rule —
+    ///   walking raw byte offsets would split multi-byte characters into
+    ///   fragments that are not valid `RcStr`s on their own, so member-
+    ///   ship in the resulting `Set`/`Map` would be nonsensical for
+    ///   anything outside ASCII. `chars()` is the one sane reading of
+    ///   "iterate a string" here; ASCII input (the tested case) is
+    ///   identical either way.
+    /// - `Set`: its values, in insertion order (same values `iter_source`
+    ///   would produce for a `for-of`).
+    /// - `Map`: its entries, in insertion order, each freshly boxed as a
+    ///   `[key, value]` 2-element array — mirroring real JS, where iterating
+    ///   a `Map` (`for (const [k, v] of someMap)`, or spreading one) yields
+    ///   entries, not bare keys (again, matching `iter_source`).
+    ///
+    /// Found by the 2026-09-17 `sweep-200` eval: `new Set(x)` rejected every
+    /// argument except a plain `Array` while claiming to require "an
+    /// iterable" — rejecting `new Set("abc")`, `new Set(otherSet)`, and
+    /// `new Set(map.keys())` (itself a plain `Array` — this dialect's
+    /// `Map`/`Set` accessor methods already materialize eagerly — so that
+    /// last case worked by accident once `Array` did, but the other two
+    /// didn't). Returns `Ok(None)` when `arg` is none of these; the caller
+    /// turns that into a `TypeError` naming the constructor.
+    fn iterable_elements(&mut self, arg: &Value) -> Result<Option<Vec<Value>>, VMError> {
+        match arg {
+            Value::Array(p) => {
+                let arr = self
+                    .arrays
+                    .get(*p as usize)
+                    .ok_or_else(|| self.fail(ErrorKind::ValueError, "value error"))?;
+                Ok(Some(arr.iter().cloned().collect()))
+            }
+            Value::String(s) => Ok(Some(
+                s.as_str()
+                    .chars()
+                    .map(|c| Value::String(RcStr::from(c.to_string())))
+                    .collect(),
+            )),
+            Value::Set(p) => {
+                let set = self
+                    .sets
+                    .get(*p as usize)
+                    .ok_or_else(|| self.fail(ErrorKind::ValueError, "value error"))?;
+                Ok(Some(set.iter().map(|k| k.0.clone()).collect()))
+            }
+            Value::Map(p) => {
+                let pairs: Vec<(Value, Value)> = {
+                    let map = self
+                        .maps
+                        .get(*p as usize)
+                        .ok_or_else(|| self.fail(ErrorKind::ValueError, "value error"))?;
+                    map.iter().map(|(k, v)| (k.0.clone(), v.clone())).collect()
+                };
+                let mut out = Vec::with_capacity(pairs.len());
+                for (k, v) in pairs {
+                    let pair: ThinVec<Value> = vec![k, v].into();
+                    out.push(self.alloc_array(pair));
+                }
+                Ok(Some(out))
+            }
+            _ => Ok(None),
+        }
+    }
+
     /// Construct a `Value::Map` from an optional iterable of `[key, value]`
     /// pairs. The **one** native Map construction body (Step 2a Part 3 item C):
     /// `new Map(entries)` and any other entry point share this. `arg` is
-    /// `Value::Undefined` for the no-arg case (`new Map()`).
+    /// `Value::Undefined` for the no-arg case (`new Map()`). Any value
+    /// [`iterable_elements`] recognizes is accepted; each yielded element must
+    /// still itself be an `[key, value]`-shaped `Array` (a `String`'s
+    /// characters, e.g., are not, so `new Map("ab")` still throws, matching
+    /// real JS).
     pub(crate) fn map_construct(&mut self, arg: Value) -> Result<Value, VMError> {
         let mut map: IndexMap<MapKey, Value> = IndexMap::new();
-        if let Value::Array(p) = arg {
-            let entries = self
-                .arrays
-                .get(p as usize)
-                .ok_or_else(|| self.fail(ErrorKind::ValueError, "value error"))?;
-            for entry in entries.iter() {
+        if !matches!(arg, Value::Undefined) {
+            let Some(entries) = self.iterable_elements(&arg)? else {
+                return Err(self.fail(
+                    ErrorKind::TypeError,
+                    "Map argument must be an iterable of [key, value] pairs",
+                ));
+            };
+            for entry in entries {
                 let pair_ptr = match entry {
-                    Value::Array(p) => *p,
+                    Value::Array(p) => p,
                     _ => {
                         return Err(self.fail(ErrorKind::TypeError, "type error"));
                     }
@@ -1534,11 +1620,6 @@ impl VM {
                 }
                 map.insert(MapKey(pair[0].clone()), pair[1].clone());
             }
-        } else if !matches!(arg, Value::Undefined) {
-            return Err(self.fail(
-                ErrorKind::TypeError,
-                "Map argument must be an iterable of [key, value] pairs",
-            ));
         }
         let addr = self.maps.len() as MapPtr;
         self.maps.push(map);
@@ -1548,19 +1629,18 @@ impl VM {
     /// Construct a `Value::Set` from an optional iterable of values. The
     /// **one** native Set construction body (Step 2a Part 3 item C):
     /// `new Set(iterable)` and any other entry point share this. `arg` is
-    /// `Value::Undefined` for the no-arg case (`new Set()`).
+    /// `Value::Undefined` for the no-arg case (`new Set()`). Any value
+    /// [`iterable_elements`] recognizes is accepted — see that doc comment
+    /// for the full list and the eval finding that drove it.
     pub(crate) fn set_construct(&mut self, arg: Value) -> Result<Value, VMError> {
         let mut set: IndexSet<MapKey> = IndexSet::new();
-        if let Value::Array(p) = arg {
-            let arr = self
-                .arrays
-                .get(p as usize)
-                .ok_or_else(|| self.fail(ErrorKind::ValueError, "value error"))?;
-            for v in arr.iter() {
-                set.insert(MapKey(v.clone()));
+        if !matches!(arg, Value::Undefined) {
+            let Some(elements) = self.iterable_elements(&arg)? else {
+                return Err(self.fail(ErrorKind::TypeError, "Set argument must be an iterable"));
+            };
+            for v in elements {
+                set.insert(MapKey(v));
             }
-        } else if !matches!(arg, Value::Undefined) {
-            return Err(self.fail(ErrorKind::TypeError, "Set argument must be an iterable"));
         }
         let addr = self.sets.len() as SetPtr;
         self.sets.push(set);
