@@ -621,6 +621,64 @@ order but not byte-for-byte — fences and the whitespace between pieces
 are stored nowhere. Nothing downstream needs them, but a log no longer
 reproduces the exact bytes the provider returned.
 
+### D16 — What `interp` gains is a REPL, not a notebook
+
+The changes this phase asks of `interp` are all one capability:
+**incremental evaluation** — feed successive fragments into a live VM
+that shares a frame and a scope. That is what a REPL is, and it is what
+an interactive shell, an eval loop, or a debugger evaluating an
+expression against a live frame would each want. Today's
+`compile(src) -> Program` plus a fresh VM becomes the degenerate case:
+one fragment, then done. Nothing is removed and the one-shot path is
+untouched.
+
+So the direction is generalization. Three rules keep it that way, and
+they are easy to violate by accident:
+
+**Instruction names carry no notebook concepts.** Two additions look
+likely: a way to stop without unwinding, and a way to extend the current
+frame (see below). Both are REPL primitives. An `Instr::CellBoundary`
+would put a markdown word into the instruction set of a JavaScript VM —
+a further argument for the stop-at-ip bound in D12, which needs no
+instruction at all.
+
+**The top-level-`return` rule is a flag, not a policy.** D5 is the one
+genuinely notebook-shaped thing heading for the compiler, and its
+message names `history.append` and `done()` — harness verbs. `interp`
+already has `allow_return_outside_function`; this is enforcing its
+inverse and belongs in the same place, with the harness-vocabulary
+message supplied at the boundary rather than hardcoded.
+
+The caveat, stated so nobody argues it later: `interp` is *already*
+dialect-aware — `HARNESS_VERBS` in `interp/src/lib.rs` names `tell`,
+`ask`, `done`, `history`. This is not new contamination in kind. But
+there is a difference between `interp` knowing the dialect's *names* and
+`interp` knowing the *notebook's rules*, and the flag is where that line
+sits.
+
+**Markdown never enters `interp`.** Fence recognition, the shared
+buffer, cell spans: all `agent/src/notebook.rs`. `interp` receives a
+`&str` and knows nothing about fences. 25.1 is already scoped this way.
+
+#### The frame must grow, and that is the second new primitive
+
+`EnterFrame(nparams, build_args, local_kinds)` bakes the frame's local
+count *and* every slot's kind into one instruction, executed once at
+frame entry. Cell 0's `EnterFrame` has already run by the time cell 1
+declares a local, and patching the emitted instruction does not grow a
+live frame.
+
+So a cell's prologue needs a runtime "extend the current frame by these
+slot kinds" operation — almost certainly an instruction, since it must
+run between cells rather than being driven from outside the VM. Named
+generically it is a REPL primitive like any other; named for cells it is
+the leak this decision exists to prevent.
+
+It pairs with the `FreshCell` promotions (D12), which also run at a
+cell's start: **extend for the new slots, promote the ones a new closure
+just captured.** Those two plus the stop mechanism are the whole of the
+VM-side surface.
+
 ## What this deletes
 
 - `//: ` narration, and the question of which marker it should use.
@@ -667,12 +725,15 @@ for each cell in turn, and `cargo test -p agent notebook` covers
 a 4-backtick fence wrapping a 3-backtick one, and zero cells; asserts
 every span slices the markdown back to exactly the cell's text.
 
-**25.2 — One paused compilation (D12).** Analyzer, `ProgramAnalysis`,
-`Compiler` and VM all live for the whole reply and are fed each cell in
-turn through the shared buffer (D2); backpatch scoped to the appended
-range; growable frame locals; `FreshCell` emitted for the
-`Plain → Boxed` diff across re-finalization. `interp`-level only — no
-transport, no events, cells driven by a test harness.
+**25.2 — One paused compilation (D12, D16).** Analyzer,
+`ProgramAnalysis`, `Compiler` and VM all live across fragments and are
+fed each in turn; backpatch scoped to the appended range; a cell
+prologue that extends the frame and emits `FreshCell` for the
+`Plain → Boxed` diff; a stop that does not unwind. `interp`-level only —
+no transport, no events, no markdown, fragments driven by a test
+harness. **Name everything for incremental evaluation, not for cells
+(D16)**: what is being built here is a REPL, and the notebook is one
+caller of it.
 
 Gate: `cargo test -p interp` green, plus tests that a `const` in cell 0
 is readable in cell 1; that an undeclared name is a *compile* error
