@@ -52,6 +52,18 @@ impl super::Compiler {
             .cloned()
     }
 
+    /// Whether the binding being compiled sits in a **pinned root frame** — an
+    /// incremental unit's root scope, where a store may not be elided however
+    /// dead it looks from here (see `Compiler::pin_root`). False everywhere on
+    /// the one-shot path, and false inside nested functions either way.
+    pub(super) fn root_is_pinned(&self) -> bool {
+        self.pin_root
+            && self
+                .analysis
+                .as_ref()
+                .is_some_and(|a| a.root == self.current_scope)
+    }
+
     /// Whether the function scope `scope_id` is a constant function (Phase F):
     /// non-capturing and non-reassigned, so its binding store is dead.
     pub(super) fn is_const_fn_scope(&self, scope_id: usize) -> bool {

@@ -44,6 +44,7 @@ impl super::Compiler {
             } else {
                 Err(enter_frame_at)
             },
+            prologue: super::PrologueKind::Enter,
             used: false,
         });
 
@@ -203,7 +204,10 @@ impl super::Compiler {
                             // is dead. `const_eval` succeeding guarantees the init
                             // is pure const-pushes/ops (no labels/effects), so we
                             // can drop the emitted init wholesale.
-                            if recorded && !self.binding_captured(id.span.start) {
+                            if recorded
+                                && !self.binding_captured(id.span.start)
+                                && !self.root_is_pinned()
+                            {
                                 self.code.truncate(init_start);
                                 self.spans.truncate(init_start);
                             } else {

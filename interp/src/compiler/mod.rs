@@ -29,6 +29,7 @@ mod control_flow;
 mod destructure;
 mod emit;
 mod expr;
+pub(crate) mod fragment;
 mod function;
 mod literals;
 mod member;
@@ -241,12 +242,23 @@ enum ExitKind {
 struct ReturnSpill {
     /// Absolute frame slot index.
     slot: u32,
-    /// `Ok(i)`: `code[i]` is this frame's `EnterFrame`, patch its kinds.
-    /// `Err(i)`: no `EnterFrame` was emitted (a root frame with no locals);
-    /// insert one at `i` if the slot is used (safe pre-backpatch: labels
-    /// are positional markers, jumps carry label ids).
+    /// `Ok(i)`: `code[i]` is this frame's prologue instruction, patch its
+    /// kinds. `Err(i)`: no prologue was emitted (a root frame with no
+    /// locals); insert one at `i` if the slot is used (safe pre-backpatch:
+    /// labels are positional markers, jumps carry label ids).
     enter_frame: Result<usize, usize>,
+    /// Which prologue instruction to patch or insert. A fragment of an
+    /// incremental unit grows an already-live frame, so its prologue is
+    /// `ExtendFrame`; everything else sets up a fresh frame with
+    /// `EnterFrame`.
+    prologue: PrologueKind,
     used: bool,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum PrologueKind {
+    Enter,
+    Extend,
 }
 
 /// One entry of the compile-time barrier stack: everything an early exit
@@ -287,7 +299,7 @@ enum LValue<'r, 'a> {
 }
 
 /// Codegen state for one compilation unit.
-struct Compiler {
+pub(crate) struct Compiler {
     /// Instructions with `Label` markers; addresses in `Jump`/`JFalse`/`Call`/
     /// `MakeClosure`/`Push(Fn)` are label ids until the backpatch pass.
     code: Vec<Instr>,
@@ -333,6 +345,25 @@ struct Compiler {
     /// reset per function body in `emit_function_def` (slot numbers are
     /// frame-relative, so a callee's slots must not see the caller's constants).
     const_env: HashMap<u32, Instr>,
+    /// **Root-frame pinning** (incremental evaluation only): at the root
+    /// scope, a binding's initializer store is emitted even when every read of
+    /// it was propagated.
+    ///
+    /// Dead-store elimination is sound for a whole program — if no read
+    /// survives, nothing can observe the slot. It is not sound for a *fragment*
+    /// of one, because a later fragment can add a read, and by then the store
+    /// is long gone: the slot holds `Undefined` and the value exists only as an
+    /// immediate inside instructions that have already run. `Instr::FreshCell`
+    /// can move a value out of a slot but cannot conjure one that was never put
+    /// there.
+    ///
+    /// So the root frame is pinned: every declaration gets a real slot and a
+    /// real store. Uses may still fold — `emit_slot_read` keeps propagating,
+    /// and a later fragment that reassigns the binding simply stops being
+    /// eligible — it is only the *write* that must survive. Nested scopes are
+    /// compiled whole within one fragment and keep every optimization, and the
+    /// one-shot path leaves this `false`.
+    pin_root: bool,
 }
 
 // ── impl blocks live in the sub-modules above ────────────────────────

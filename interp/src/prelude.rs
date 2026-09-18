@@ -200,16 +200,15 @@ const REPLACE_ALL: &str = r#"function __replaceAll(s, pat, rep) {
   return out + s.slice(last);
 }"#;
 
-/// Build the prelude source to append to `user_source`: the concatenated source
-/// of every helper whose method the program uses. Returns an empty string when
-/// the program uses no higher-order methods (so it compiles unchanged).
-pub fn assemble(user_source: &str) -> String {
-    let mut out = String::new();
+/// Every helper `user_source` needs, in a fixed order, each keyed by the
+/// method that pulls it in. The key names the helper, not the call site, so
+/// it is a stable identity for "this helper is already compiled" — which is
+/// what incremental evaluation needs and a one-shot compile does not.
+fn needed_parts(user_source: &str) -> Vec<(&'static str, &'static str)> {
+    let mut out: Vec<(&'static str, &'static str)> = Vec::new();
     for hof in HOFS {
         if uses_method(user_source, hof.method) {
-            out.push('\n');
-            out.push_str(hof.source);
-            out.push('\n');
+            out.push((hof.method, hof.source));
         }
     }
     // `Promise.all`/`Promise.allSettled` are namespace calls, not methods on
@@ -217,14 +216,10 @@ pub fn assemble(user_source: &str) -> String {
     // `.allSettled` does not match the `all` token (boundary check), so each
     // pulls in exactly its own helper.
     if uses_method(user_source, "all") && user_source.contains("Promise.all") {
-        out.push('\n');
-        out.push_str(PROMISE_ALL);
-        out.push('\n');
+        out.push(("Promise.all", PROMISE_ALL));
     }
     if uses_method(user_source, "allSettled") && user_source.contains("Promise.allSettled") {
-        out.push('\n');
-        out.push_str(PROMISE_ALL_SETTLED);
-        out.push('\n');
+        out.push(("Promise.allSettled", PROMISE_ALL_SETTLED));
     }
     // The promise combinator *methods*, which are receiver calls like
     // the HOFs above rather than namespace calls like `Promise.all`.
@@ -234,24 +229,60 @@ pub fn assemble(user_source: &str) -> String {
         ("finally", PROMISE_FINALLY),
     ] {
         if uses_method(user_source, method) {
-            out.push('\n');
-            out.push_str(source);
-            out.push('\n');
+            out.push((method, source));
         }
     }
     // `.replace` / `.replaceAll` (the boundary check keeps `.replace` from
     // matching `.replaceAll`, like `all`/`allSettled`).
     if uses_method(user_source, "replace") {
-        out.push('\n');
-        out.push_str(REPLACE);
-        out.push('\n');
+        out.push(("replace", REPLACE));
     }
     if uses_method(user_source, "replaceAll") {
+        out.push(("replaceAll", REPLACE_ALL));
+    }
+    out
+}
+
+/// Concatenate helper sources the way the compiler appends them: each on its
+/// own lines, so a helper's spans never share a line with the user's code.
+fn concat(parts: impl IntoIterator<Item = &'static str>) -> String {
+    let mut out = String::new();
+    for source in parts {
         out.push('\n');
-        out.push_str(REPLACE_ALL);
+        out.push_str(source);
         out.push('\n');
     }
     out
+}
+
+/// Build the prelude source to append to `user_source`: the concatenated source
+/// of every helper whose method the program uses. Returns an empty string when
+/// the program uses no higher-order methods (so it compiles unchanged).
+pub fn assemble(user_source: &str) -> String {
+    concat(needed_parts(user_source).into_iter().map(|(_, src)| src))
+}
+
+/// The incremental form: the helpers this fragment needs that have **not
+/// already been compiled into the unit**, recording them in `emitted` as it
+/// goes.
+///
+/// Incremental evaluation feeds fragments into one live compilation, so a
+/// helper appended twice would be a redeclaration — and appending each
+/// fragment's full prelude at its own offset would collide spans with the
+/// previous fragment's. Tracking what has been emitted turns the prelude into
+/// a monotonically growing region: each fragment contributes only what is new,
+/// past everything written before it, and a fragment needing nothing new
+/// contributes an empty string.
+pub fn assemble_new(
+    user_source: &str,
+    emitted: &mut std::collections::HashSet<&'static str>,
+) -> String {
+    let fresh: Vec<&'static str> = needed_parts(user_source)
+        .into_iter()
+        .filter(|(key, _)| emitted.insert(key))
+        .map(|(_, src)| src)
+        .collect();
+    concat(fresh)
 }
 
 /// Whether `source` contains a method call `recv.<method>(…)`.

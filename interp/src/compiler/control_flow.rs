@@ -281,19 +281,29 @@ impl super::Compiler {
             return;
         }
         match spill.enter_frame {
-            Ok(i) => {
-                let Instr::EnterFrame(nparams, build_args, kinds) = &self.code[i] else {
-                    unreachable!("ReturnSpill::enter_frame must point at an EnterFrame");
-                };
-                let mut kinds: Vec<crate::vm::SlotKind> = kinds.iter().copied().collect();
-                kinds.push(crate::vm::SlotKind::Plain);
-                self.code[i] = Instr::EnterFrame(*nparams, *build_args, kinds.into());
-            }
+            Ok(i) => match &self.code[i] {
+                Instr::EnterFrame(nparams, build_args, kinds) => {
+                    let mut kinds: Vec<crate::vm::SlotKind> = kinds.iter().copied().collect();
+                    kinds.push(crate::vm::SlotKind::Plain);
+                    self.code[i] = Instr::EnterFrame(*nparams, *build_args, kinds.into());
+                }
+                Instr::ExtendFrame(kinds) => {
+                    let mut kinds: Vec<crate::vm::SlotKind> = kinds.iter().copied().collect();
+                    kinds.push(crate::vm::SlotKind::Plain);
+                    self.code[i] = Instr::ExtendFrame(kinds.into());
+                }
+                _ => unreachable!("ReturnSpill::enter_frame must point at a frame prologue"),
+            },
             Err(i) => {
-                self.code.insert(
-                    i,
-                    Instr::EnterFrame(0, false, vec![crate::vm::SlotKind::Plain].into()),
-                );
+                let instr = match spill.prologue {
+                    super::PrologueKind::Enter => {
+                        Instr::EnterFrame(0, false, vec![crate::vm::SlotKind::Plain].into())
+                    }
+                    super::PrologueKind::Extend => {
+                        Instr::ExtendFrame(vec![crate::vm::SlotKind::Plain].into())
+                    }
+                };
+                self.code.insert(i, instr);
                 self.spans.insert(i, span);
             }
         }

@@ -5,6 +5,7 @@
 
 pub(crate) mod captures;
 pub(crate) mod const_fns;
+pub(crate) mod incremental;
 pub(crate) mod scope;
 pub(crate) mod walk;
 
@@ -117,7 +118,9 @@ impl Analyzer {
         // resolution) and leave `scopes` capture-resolved with them registered,
         // so their references resolve to `Fn` values rather than captures —
         // breaking self/mutual-recursion captures.
-        let const_fns = resolve_const_functions(&mut scopes);
+        // `None`: the one-shot path sees the whole program at once, so no
+        // later fragment can flip a const function out of the set.
+        let const_fns = resolve_const_functions(&mut scopes, None);
         let (
             binding_slot,
             ref_resolution,

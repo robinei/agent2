@@ -446,6 +446,17 @@ fn run_work_item(item: WorkItem) -> TestResult {
             detail: "out of fuel".to_string(),
             features: item.features,
         },
+        // `Instr::Pause` is emitted only by incremental evaluation, and a
+        // test262 case is compiled one-shot, so this cannot arise — but it
+        // is a `Fail` rather than a panic for the same reason the arms
+        // above are: a conformance run classifies surprises, it does not
+        // die on them.
+        Ok(StepResult::Paused) => TestResult {
+            path: item.path,
+            outcome: TestOutcome::Fail,
+            detail: "unexpected pause".to_string(),
+            features: item.features,
+        },
         Err(e) => {
             let error_name = format!("{:?}", e.kind);
             if let Some(neg) = &item.negative {

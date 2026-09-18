@@ -64,7 +64,28 @@ pub(crate) fn literal_const_value(expr: &ast::Expression) -> Option<ConstValue> 
 /// `resolve_captures`; **demote** any that still ended up with a real capture;
 /// repeat until stable. Monotone (demote-only) ⇒ converges. The final iteration
 /// leaves `scopes` with the correct captures/upvals for `finalize_tables`.
-pub(crate) fn resolve_const_functions(scopes: &mut [FuncScope]) -> HashSet<usize> {
+/// `pinned_root`: when `Some(root)`, no function whose enclosing scope is
+/// `root` may become a constant function. This is root-frame **pinning**, and
+/// it exists because const-function-ness is a fixpoint over the *whole* scope
+/// set: under incremental evaluation a later fragment can flip an earlier
+/// fragment's function out of the set — by assigning to it, or by declaring a
+/// name its body referenced — and the flip both reclaims a slot (renumbering
+/// every declaration after it, via `compact_const_fn_slots`) and reinstates a
+/// binding store the earlier fragment never emitted. Neither is repairable
+/// after the fact.
+///
+/// Excluding root-parented functions removes both: they keep a real slot in
+/// declaration order and a real store, so nothing a later fragment learns can
+/// move them. Nested scopes are untouched — they are compiled whole within one
+/// fragment — and the one-shot path passes `None`, so it is unaffected.
+///
+/// Note this costs nothing at the call sites that matter: `find_callee_label`
+/// resolves a static `Call` from the scope tree, not from this set, so prelude
+/// helpers and cross-fragment function calls still lower to direct calls.
+pub(crate) fn resolve_const_functions(
+    scopes: &mut [FuncScope],
+    pinned_root: Option<usize>,
+) -> HashSet<usize> {
     // `resolve_captures` mutates `free_vars` (propagation) and the derived
     // capture fields; snapshot the inputs so each iteration starts clean.
     let direct_free: Vec<IndexSet<String>> = scopes.iter().map(|s| s.free_vars.clone()).collect();
@@ -78,6 +99,12 @@ pub(crate) fn resolve_const_functions(scopes: &mut [FuncScope]) -> HashSet<usize
     let mut const_fns: HashSet<usize> = HashSet::new();
     for (id, s) in scopes.iter().enumerate() {
         if s.parent == usize::MAX {
+            continue;
+        }
+        // Root-frame pinning: a function declared at the root of an
+        // incremental unit keeps its slot and its store, whatever a later
+        // fragment turns out to say about it.
+        if pinned_root == Some(s.parent) {
             continue;
         }
         // The external binding: a declaration's own name, or a function

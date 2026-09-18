@@ -18,6 +18,7 @@ impl super::Compiler {
             current_scope: 0,
             interned: HashSet::new(),
             const_env: HashMap::new(),
+            pin_root: false,
         }
     }
 
@@ -58,7 +59,7 @@ impl super::Compiler {
     }
 
     /// Record a parse diagnostic (from `oxc_parser`).
-    pub(super) fn parse_error(&mut self, span: Span, message: impl Into<String>) {
+    pub(crate) fn parse_error(&mut self, span: Span, message: impl Into<String>) {
         self.diagnostics.push(Diagnostic {
             span,
             message: message.into(),

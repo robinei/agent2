@@ -928,6 +928,28 @@ impl VM {
 }
 
 impl VM {
+    /// Allocate a run of declared local slots on top of the frame, the one way
+    /// this VM ever does it: `Plain` pushes `Undefined`, `Boxed` allocates a
+    /// `cells` entry and pushes the `Upval` marker addressing it.
+    ///
+    /// Shared by [`Instr::EnterFrame`], which applies it to a whole frame's
+    /// locals, and [`Instr::ExtendFrame`], which applies it to a suffix. One
+    /// loop rather than two so the two instructions cannot drift in how a slot
+    /// comes into existence.
+    fn alloc_local_slots(&mut self, local_kinds: &[SlotKind]) {
+        for kind in local_kinds {
+            let slot = match kind {
+                SlotKind::Plain => Value::Undefined,
+                SlotKind::Boxed => {
+                    let idx = self.cells.len() as CellIndex;
+                    self.cells.push(Value::Undefined);
+                    Value::Upval(idx)
+                }
+            };
+            self.stack.push(slot);
+        }
+    }
+
     /// JS `Function.prototype.length` for any callable value (Step 6):
     /// `Closure` → the declared param count before the first default/rest
     /// (stored on the `Closure` heap entry); `Builtin` → `min_args` minus 1
@@ -1585,21 +1607,52 @@ impl VM {
                     }
                     // 4. Allocate the declared (non-param) own locals + self-ref
                     // slot (Boxed → fresh cell + Upval).
-                    for kind in &local_kinds {
-                        let slot = match kind {
-                            SlotKind::Plain => Value::Undefined,
-                            SlotKind::Boxed => {
-                                let idx = self.cells.len() as CellIndex;
-                                self.cells.push(Value::Undefined);
-                                Value::Upval(idx)
-                            }
-                        };
-                        self.stack.push(slot);
-                    }
+                    self.alloc_local_slots(&local_kinds);
                     let total = nparams as u32 + k + local_kinds.len() as u32;
                     self.callstack.last_mut().unwrap().local_count = total;
                     self.cur_local_count = total;
                     self.ip += 1;
+                }
+
+                Instr::ExtendFrame(local_kinds) => {
+                    // Same stack-allocated collect as `EnterFrame`: the kinds
+                    // are borrowed out of `self.code`, which the allocation
+                    // loop mutates through `self`.
+                    let local_kinds: SmallVec<[SlotKind; 32]> =
+                        local_kinds.iter().copied().collect();
+                    // **The invariant that makes this a push rather than an
+                    // insert.** A fragment is a run of complete statements, so
+                    // between two of them the operand stack is balanced and
+                    // `sp` is exactly the top of the locals region. Note that
+                    // `cur_local_count` is the frame's *total* — params, upvals
+                    // and declared locals — so the layout formula
+                    // `fp + nparams + K + locals` is just `fp + local_count`
+                    // here. Debug-only: a violation is a compiler bug, and the
+                    // check is worth its cost in the builds that hunt those.
+                    debug_assert_eq!(
+                        self.stack.len(),
+                        self.fp as usize + self.cur_local_count as usize,
+                        "ExtendFrame with a non-quiescent frame: expression \
+                         temporaries are live above the locals, so extending \
+                         would have to shift them rather than push"
+                    );
+                    self.alloc_local_slots(&local_kinds);
+                    let total = self.cur_local_count + local_kinds.len() as u32;
+                    // Both, deliberately: the cached copy is re-derived from
+                    // the frame on the next frame change, so bumping only the
+                    // mirror would be silently undone.
+                    self.callstack.last_mut().unwrap().local_count = total;
+                    self.cur_local_count = total;
+                    self.ip += 1;
+                }
+
+                Instr::Pause => {
+                    // Consume the instruction, so `ip` lands on the append
+                    // position — where the next fragment's first instruction
+                    // will be written. The frame is left standing: no unwind,
+                    // no return value, nothing logged.
+                    self.ip += 1;
+                    return Ok(StepResult::Paused);
                 }
 
                 Instr::AsyncEnter => {

@@ -1491,6 +1491,14 @@ impl Runner {
                 Ok(StepResult::Done { value, unstarted }) => {
                     return self.finish_program(tree, value, unstarted, out);
                 }
+                // A fragment of an incremental evaluation ended. Only the
+                // notebook transport compiles fragments, and its driver
+                // (25.4) owns this arm; nothing on the program transport
+                // ever emits `Instr::Pause`, so reaching it here would mean
+                // a program was compiled one way and run another.
+                Ok(StepResult::Paused) => {
+                    unreachable!("Paused outside the incremental driver")
+                }
                 Ok(StepResult::Raise { condition, payload }) => {
                     return self.suspend(tree, SuspendCause::Raise { condition, payload }, out);
                 }

@@ -646,6 +646,11 @@ mod tests {
                 // Unreachable with `u64::MAX` fuel, and there is
                 // nothing to do about it but step again.
                 StepResult::OutOfFuel => {}
+                // An exemplar is one whole program compiled one-shot, so
+                // no `Instr::Pause` is ever in its stream.
+                StepResult::Paused => {
+                    return Err("an exemplar paused: it was not compiled one-shot".into());
+                }
             }
         }
     }
