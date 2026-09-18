@@ -492,25 +492,59 @@ fn pending_line(
         return compacted_line(event.id, shadow);
     }
     match &event.payload {
+        // **Symmetric with the outgoing rows.** `[2] user told you: …`
+        // against `[4] you told user: …`, and the same for asking, so a
+        // reader never has to work out which way a row points from the
+        // punctuation around an author's name. It used to render as
+        // `post (user): …`, with `post` leading because that word was
+        // the row's label and compaction checked it as a checksum. The
+        // checksum is gone — an op names an id and nothing else — so
+        // the word is free to say what happened instead of what kind of
+        // event it was.
         EventPayload::Message(msg @ Message::Post { from, .. }) => {
             let resolved = tree.resolve(msg);
             let Message::Post { origin, .. } = &resolved else {
                 unreachable!("resolve() never changes a Post's variant")
             };
-            let text = origin.direct().map(|(t, _, _)| t).unwrap_or("");
-            // `post` first, the author in parentheses after it. The
-            // word straight after the id is the row's **label**, which
-            // `remove_history`/`rewrite_history` check as a checksum —
-            // and `[62] from agent 1: …` made the label read as "from
-            // agent 1". A live compaction program on 2026-09-16 did
-            // exactly that and was rejected: "#62 is a `post`, not a
-            // `from agent 1`". It had picked the right row and read the
-            // label off the row, which is the only place it could.
+            let (text, wants_reply) = origin
+                .direct()
+                .map(|(t, _, r)| (t, r))
+                .unwrap_or(("", false));
             Some(format!(
-                "[{}] post ({}): {}",
+                "[{}] {} {} you: {}",
                 event.id.as_u64(),
                 author_label(tree, *from),
+                if wants_reply { "asked" } else { "told" },
                 escape_untrusted(text)
+            ))
+        }
+        // The answer to a question this branch asked. Before this it
+        // rendered as a menu row's `→ ok, 14 bytes` and, once `ask`
+        // left the menu, as nothing at all — so a value the program had
+        // suspended itself to obtain was invisible to the program after
+        // it. The asker is named rather than assumed: it is whoever the
+        // `ask` was addressed to.
+        EventPayload::Result { call, outcome } => {
+            let Some(Event {
+                payload: EventPayload::Call(Call::Send {
+                    to,
+                    expects_reply: true,
+                    ..
+                }),
+                ..
+            }) = tree.events.get(call)
+            else {
+                return None;
+            };
+            let Outcome::Delivered(value) = outcome else {
+                return None;
+            };
+            Some(format!(
+                "[{}] {} answered #{}: {}",
+                event.id.as_u64(),
+                crate::machine::address_label(to),
+                call.as_u64(),
+                escape_untrusted(&value.to_string())
             ))
         }
         EventPayload::Note { text } => Some(format!(
@@ -1412,6 +1446,64 @@ mod tests {
         assert!(
             !program.contains("\"hello\""),
             "and the duplicated bytes are gone: {program}"
+        );
+    }
+
+    /// Both directions read the same way. A row never makes the reader
+    /// work out which way it points from the punctuation around a name:
+    /// `user told you` against `you told user`, `user asked you`
+    /// against `you asked user`, and the answer to a question this
+    /// branch asked named by the question it answers.
+    #[test]
+    fn incoming_and_outgoing_rows_are_symmetric() {
+        let mut tree = Tree::new(None);
+        let mut spine = tree
+            .start_agent(None, None, "root", None, "CARD", Vec::new())
+            .unwrap();
+        // Incoming, expecting a reply.
+        tree.append(
+            &mut spine,
+            EventPayload::Message(Message::Post {
+                from: Author::User,
+                origin: Origin::Direct {
+                    text: "which one?".into(),
+                    input: serde_json::Value::Null,
+                    expects_reply: true,
+                },
+            }),
+        )
+        .unwrap();
+        tree.append(&mut spine, turn("1;")).unwrap();
+        // Outgoing question, and the answer that settles it.
+        let q = tree
+            .append(
+                &mut spine,
+                EventPayload::Call(Call::Send {
+                    to: Address::User,
+                    text: "30 or 240?".into(),
+                    input: serde_json::Value::Null,
+                    expects_reply: true,
+                    site: 0,
+                    site_end: 0,
+                }),
+            )
+            .unwrap();
+        tree.append(
+            &mut spine,
+            EventPayload::Result {
+                call: q,
+                outcome: Outcome::Delivered(serde_json::json!("30")),
+            },
+        )
+        .unwrap();
+
+        let doc = render(&tree, &spine, 64 * 1024, Transport::Program);
+        let all: String = doc.messages.iter().map(|m| m.content.clone()).collect();
+        assert!(all.contains("user asked you: which one?"), "{all}");
+        assert!(all.contains("you asked user: 30 or 240?"), "{all}");
+        assert!(
+            all.contains(&format!("user answered #{}: \"30\"", q.as_u64())),
+            "the answer names the question it settles: {all}"
         );
     }
 
