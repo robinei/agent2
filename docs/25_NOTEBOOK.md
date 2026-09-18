@@ -238,7 +238,7 @@ whole program is written blind too, so this is not a regression — but
 the failure is now visible mid-stream, which is new, and cancellation
 bounds the waste rather than removing it.
 
-### D12 — Cells compile incrementally; top-level slots are always boxed
+### D12 — Cells compile incrementally; capture promotes with `FreshCell`
 
 Each cell compiles once, with the compiler re-entered carrying the prior
 scope table. Cell 0's instructions are never regenerated, so nothing a
@@ -276,17 +276,36 @@ not. Boxing is a property of the binding decided by uses that may not
 have been written yet, which is the one thing a widening window cannot
 settle after the fact.
 
-**So in notebook mode every top-level slot is `Boxed`, unconditionally.**
-The representation is pinned before any cell runs and no later cell can
-invalidate it. The cost is one indirection per top-level access. Nothing
-else in the pipeline changes: slots stay compile-time resolved,
-diagnostics stay compile-time, no new instructions, function scopes
-untouched.
+**The promotion primitive already exists**: `Instr::FreshCell(slot)`.
+Its doc comment describes it as re-boxing a captured loop local per
+iteration, but the implementation is general — it reads the slot,
+dereferencing an `Upval` if there is one and otherwise taking the raw
+value, allocates a cell seeded with it, and stores `Value::Upval(idx)`
+back. On a `Plain` slot that is exactly a value-preserving
+`Plain → Boxed` promotion.
 
-Two smaller requirements come with it: the compiler must be re-enterable
-with a prior scope table (it currently builds a fresh `Compiler` per
-call), and the frame's locals must grow between cells rather than being
-sized once.
+So slots stay `Plain` by default. When cell *k*'s analysis finds it
+captures a name an earlier cell declared `Plain`, the compiler emits
+`FreshCell(slot)` at the top of cell *k* and flips that name to `Boxed`
+in the carried scope table. Nothing pays an indirection unless a later
+cell actually closes over it, and then it costs one instruction, once.
+
+An earlier draft boxed every top-level slot unconditionally to pin the
+representation before any cell ran. Unnecessary, given the above.
+
+**Why promotion is sound.** If an earlier cell's analysis said `Plain`,
+then no closure in that cell referenced the name — a reference from a
+nested function *is* a capture, which would have forced `Boxed` there.
+So the only code compiled against the `Plain` representation is
+straight-line code in cells that have already run to completion, and
+nothing that could observe the old representation survives the boundary.
+
+The ordering invariant this rests on: promotion is emitted at cell
+*start*, and cells run strictly sequentially (D11). A cell's fence can
+close while the previous cell is still suspended on an await, so cell
+*k+1* may **compile** early — but its first instruction does not
+**execute** until cell *k* has finished, so cell *k*'s post-await tail
+never reads a slot promoted underneath it.
 
 Worth checking during 25.2 rather than assuming: `NameRes::Const` —
 a const binding folded at compile time that "never reaches the frame" —
@@ -342,8 +361,9 @@ no IO, no JS parsing. Gate: `cargo test -p agent notebook` covers ```js,
 blanked source is the same length as the markdown in every case.
 
 **25.2 — Incremental cell compilation (D12).** Re-enterable compiler
-carrying the scope table; growable frame locals; all top-level slots
-`Boxed`. Gate: `cargo test -p interp` green, plus tests that a `const`
+carrying the scope table (name → slot *and* `SlotKind`); growable frame
+locals; `FreshCell` emitted at a cell's start for each earlier-declared
+name it is the first to capture. Gate: `cargo test -p interp` green, plus tests that a `const`
 in cell 0 is readable in cell 1, that an undeclared name is a *compile*
 error naming it, that a redeclaration across cells is caught, that a
 function declared in cell 0 and called in cell 1 resolves a top-level
