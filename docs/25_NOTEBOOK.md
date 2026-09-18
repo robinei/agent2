@@ -425,20 +425,44 @@ local with it, so cell 1 would find no `a`. That is the shared scope
 this whole decision rests on, destroyed by the first thing anyone would
 write.
 
-So a cell's compilation omits the trailing `Return(0)`, and the VM stops
-at the end of the appended range **without unwinding**. Two ways, and
-this is the one open mechanical choice in the phase:
+So a cell's compilation omits the trailing `Return(0)` and ends with
+`Instr::Pause` instead, which stops the VM **without unwinding** and
+reports `StepResult::Paused`.
 
-- **A boundary instruction** that yields to the driver and leaves the
-  frame standing. Explicit, but it is a new `Instr` — the only one this
-  design needs, against a doc that otherwise claims none.
-- **A stop-at-ip bound on the step loop**, beside the fuel bound it
-  already takes. No new instruction, but the VM gains a second reason to
-  stop and every caller has to mean the right one.
+**Nothing sets `ip`.** A cell stops by running to the end of what
+existed, so `ip` already points at the append position; appending the
+next cell puts its first instruction exactly where the VM is standing.
+The code vector grows in front of a VM that is already there. That is
+what "one compilation that pauses" means mechanically, and it is why
+the driver never needs to know an instruction offset at all.
 
-Either way the *event* terminal (D7) is written by the driver when
-execution reaches that point, not by an instruction. Only the reply
-ending — or `done()` — unwinds the frame.
+An instruction rather than a stop-at-ip bound on `step`, for a reason
+particular to this VM: **every semantic effect here is already an
+instruction** — `Settle`, `Raise`, `FreshCell`, `EnterFrame`. The one
+non-instruction pause is `OutOfFuel`, and that is a scheduling artifact,
+not a semantic one. A fragment boundary is semantic, it is where the
+compiler decided one ends, and the prologue is already in the stream
+(`ExtendFrame`): a prologue of instructions with an epilogue living in
+driver state would be asymmetric, and a bug in the driver's bound would
+be invisible in a disassembly.
+
+`OutOfFuel` is the precedent for the shape — "Nothing was consumed
+(`ip` is at the next unexecuted instruction); call `step` again to
+continue." `Paused` is that, minus the budget.
+
+It also covers resume-after-condition with no special case: a trap in
+cell 2 resumes, runs out the rest of cell 2, hits its `Pause`, and the
+driver logs cell 2's terminal without reconstructing which cell it was
+in.
+
+Named `Pause`, not `Yield` (which reads as generator semantics to anyone
+who knows JS, even though this VM has no generators) and not `Suspend`
+(taken by conditions, `Phase::Suspended`). Per D16 it is named for
+incremental evaluation, not for cells.
+
+The *event* terminal (D7) is written by the driver on seeing `Paused`,
+not by an instruction. Only the reply ending unwinds the frame — and
+not `done()`, which stops nothing (D8).
 
 #### Capture across cells, and the one thing that must move
 
@@ -835,7 +859,7 @@ every span slices the markdown back to exactly the cell's text.
 `ProgramAnalysis`, `Compiler` and VM all live across fragments and are
 fed each in turn; backpatch scoped to the appended range; a cell
 prologue of `ExtendFrame(local_kinds)` plus `FreshCell` for the
-`Plain → Boxed` diff; a stop that does not unwind. `interp`-level only —
+`Plain → Boxed` diff; an epilogue of `Instr::Pause` reporting `StepResult::Paused`. `interp`-level only —
 no transport, no events, no markdown, fragments driven by a test
 harness. **Name everything for incremental evaluation, not for cells
 (D16)**: what is being built here is a REPL, and the notebook is one
