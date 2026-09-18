@@ -99,7 +99,9 @@ declare namespace history {
 /** Suspend for a judgement and carry on from this expression with the answer, every variable still alive. */
 declare function raise(name: string, payload?: unknown): unknown;
 
-/** The whole task is finished — not this program, which ends by itself and is followed by another. Nothing is written after this, so anything still undone stays undone, and a check you ran and watched fail is something undone. Reporting a failure is not the same as finishing: say what is wrong by all means, then keep going and fix it. Stop here when the work is right, or when only a person can settle what to do next — and then it is `ask` you want, not this. */
+/** The whole task is finished — not this program, which ends by itself and is followed by another. Nothing is written after this, so anything still undone stays undone, and a check you ran and watched fail is something undone. Reporting a failure is not the same as finishing: say what is wrong by all means, then keep going and fix it.
+
+  Stopping short is allowed and sometimes right — the task turns out to be the wrong thing to attempt, or you asked and were told to leave it. What is not allowed is stopping short quietly. Say plainly what you did not do and why, so nobody has to find out later. If what you need is a decision rather than an ending, `ask` first; this is for after the answer. */
 declare function done(): void;
 
 /** Continue the suspended program, `value` becoming the result of its `raise(...)`. Returning it is the decision; calling it is not. */
