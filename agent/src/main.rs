@@ -3,6 +3,7 @@ mod compaction;
 mod document;
 mod host;
 mod machine;
+mod notebook;
 mod report;
 // Fixtures and scripted end-to-end runs: test-only, and compiled only
 // for `cargo test` now that no binary path reaches them.
