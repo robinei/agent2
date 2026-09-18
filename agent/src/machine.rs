@@ -3500,7 +3500,7 @@ mod tests {
     fn a_literal_tell_snips_against_the_compiler_s_own_spans() {
         let (mut tree, mut state) = setup();
         user_post(&mut state, &mut tree, "go");
-        let source = "tell(\"hello\");\ntell(\"x \" + String(1));";
+        let source = "tell(\"checked every file and the build is green after the rename\");\ntell(\"x \" + String(1));";
         let out = state
             .step(&mut tree, StepInput::LlmResponse(llm_program(source)))
             .unwrap();
@@ -3524,7 +3524,7 @@ mod tests {
             "the literal tell became a reference: {program}"
         );
         assert!(
-            !program.contains("\"hello\""),
+            !program.contains("green after the rename\""),
             "and its bytes are not in the document twice: {program}"
         );
         assert!(
@@ -3533,7 +3533,7 @@ mod tests {
         );
         let all: String = doc.conversation().iter().map(|m| m.content.clone()).collect();
         assert!(
-            all.contains("you told user: hello"),
+            all.contains("you told user: checked every file and the build is green after the rename"),
             "and the row carries the text: {all}"
         );
     }

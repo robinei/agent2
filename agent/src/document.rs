@@ -370,7 +370,8 @@ fn told_literal_cuts(
 /// tells (30%) and 121 of 196 asks (61%) had their text verbatim in
 /// their own program.
 ///
-/// **Only when the text is verbatim inside the call's own span.** A
+/// **Only when it saves bytes**, and only when the text is verbatim
+/// inside the call's own span. A
 /// computed `tell("--- " + f.content)` is not duplication — the row has
 /// the bytes, the source has the *construction*, and that is program
 /// logic worth reading. 87% of tells are computed and every one of them
@@ -397,7 +398,15 @@ fn snip_told_literals(
     cuts.sort_by_key(|(a, _, _, _)| std::cmp::Reverse(*a));
     let mut out = source.to_owned();
     for (a, b, id, verb) in cuts {
-        out.replace_range(a..b, &format!("{verb}(/* [{id}] above */)"));
+        let marker = format!("{verb}(/* [{id}] above */)");
+        // Never grow the document to de-duplicate it. A `tell("ok")` is
+        // ten bytes and the marker is twenty-four; 6% of the literal
+        // calls measured on 2026-09-17 were shorter than the thing that
+        // would replace them, and those read better as themselves
+        // anyway.
+        if marker.len() < b - a {
+            out.replace_range(a..b, &marker);
+        }
     }
     out
 }
@@ -1400,8 +1409,9 @@ mod tests {
     /// built.
     #[test]
     fn a_literal_tell_becomes_a_reference_and_a_computed_one_does_not() {
-        let src = "tell(\"hello\");\ntell(\"x \" + y);\n";
-        let lit = src.find("tell(\"hello\")").unwrap();
+        const LONG_TELL: &str = "checked every file and the build is green after the rename";
+        let src = "tell(\"checked every file and the build is green after the rename\");\ntell(\"x \" + y);\n";
+        let lit = src.find("tell(\"checked every file and the build is green after the rename\")").unwrap();
         let comp = src.find("tell(\"x \" + y)").unwrap();
         let send = |text: &str, a: usize, b: usize| {
             EventPayload::Call(Call::Send {
@@ -1421,7 +1431,7 @@ mod tests {
         tree.append(&mut spine, user_post("go")).unwrap();
         tree.append(&mut spine, turn(src)).unwrap();
         let a = tree
-            .append(&mut spine, send("hello", lit, lit + "tell(\"hello\")".len()))
+            .append(&mut spine, send("checked every file and the build is green after the rename", lit, lit + "tell(\"checked every file and the build is green after the rename\")".len()))
             .unwrap();
         // Computed: the text never appears inside its own call.
         tree.append(&mut spine, send("x 1", comp, comp + "tell(\"x \" + y)".len()))
@@ -1444,9 +1454,44 @@ mod tests {
             "the computed one keeps its construction: {program}"
         );
         assert!(
-            !program.contains("\"hello\""),
+            !program.contains(LONG_TELL),
             "and the duplicated bytes are gone: {program}"
         );
+    }
+
+    /// A call shorter than the marker is left alone: de-duplicating is
+    /// not worth spending more bytes than it saves, and a short literal
+    /// reads better as itself.
+    #[test]
+    fn a_tell_shorter_than_its_marker_is_left_alone() {
+        let src = "tell(\"ok\");\n";
+        let mut tree = Tree::new(None);
+        let mut spine = tree
+            .start_agent(None, None, "root", None, "CARD", Vec::new())
+            .unwrap();
+        tree.append(&mut spine, user_post("go")).unwrap();
+        tree.append(&mut spine, turn(src)).unwrap();
+        tree.append(
+            &mut spine,
+            EventPayload::Call(Call::Send {
+                to: Address::User,
+                text: "ok".into(),
+                input: serde_json::Value::Null,
+                expects_reply: false,
+                site: 0,
+                site_end: "tell(\"ok\")".len() as u32,
+            }),
+        )
+        .unwrap();
+        let doc = render(&tree, &spine, 64 * 1024, Transport::Program);
+        let program = doc
+            .conversation()
+            .iter()
+            .find(|m| m.role == ChatRole::Assistant)
+            .expect("a program")
+            .content
+            .clone();
+        assert_eq!(program, src, "left exactly as written: {program}");
     }
 
     /// Both directions read the same way. A row never makes the reader
