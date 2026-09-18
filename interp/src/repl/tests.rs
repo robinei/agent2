@@ -696,3 +696,87 @@ fn the_unsound_cases_that_forced_root_pinning() {
     ]);
     assert_eq!(console(&repl), vec!["5", "2"], "x must not have shifted");
 }
+
+// ── a function's own frame (regression) ───────────────────────────────
+
+/// **A function declaration binds its name in the *enclosing* scope, and
+/// nowhere else.** Its own frame declares no local for itself.
+///
+/// The incremental path once hoisted every root declaration into each nested
+/// scope as well, so every function's frame carried a redundant slot and a
+/// `ClosureNew` of itself — doubling the code and allocating a closure on
+/// every call. The values still came out right, which is exactly why this
+/// pins the *shape* rather than the behaviour.
+#[test]
+fn a_functions_own_frame_declares_no_local_for_itself() {
+    let unit = Unit::new(&[
+        "function outer() { return 1; }\nfunction two() { return 2; }\nlet r = outer() + two();",
+    ]);
+    let mut repl = Repl::new(serde_json::Value::Null, serde_json::Value::Null).unwrap();
+    repl.push(&unit.buffer(0)).unwrap();
+
+    // Walk each function body — everything after the root's prologue —
+    // and check no frame re-binds a name the root already owns.
+    let entries: Vec<usize> = repl
+        .vm
+        .code
+        .iter()
+        .enumerate()
+        .skip(1)
+        .filter(|(_, i)| matches!(i, Instr::EnterFrame(..)))
+        .map(|(at, _)| at)
+        .collect();
+    assert_eq!(entries.len(), 2, "two functions, two frames");
+    for at in entries {
+        let Instr::EnterFrame(_, _, kinds) = &repl.vm.code[at] else {
+            unreachable!()
+        };
+        assert!(
+            kinds.is_empty(),
+            "a function whose body declares nothing needs no locals, got {kinds:?} at {at}"
+        );
+        assert!(
+            !matches!(repl.vm.code[at + 1], Instr::ClosureNew(..)),
+            "a function must not build a closure of itself in its own frame: {:?}",
+            &repl.vm.code[at..at + 3]
+        );
+    }
+}
+
+/// The other half of the invariant: a function that *does* name itself keeps
+/// its self-reference slot, and self-recursion works across fragments.
+#[test]
+fn a_self_recursive_function_keeps_its_self_slot() {
+    let repl = run_all(&[
+        "function fact(n) { return n <= 1 ? 1 : n * fact(n - 1); }",
+        "console.log(fact(5));",
+    ]);
+    assert_eq!(console(&repl), vec!["120"]);
+    assert!(
+        repl.vm
+            .code
+            .iter()
+            .any(|i| matches!(i, Instr::EnterFrame(1, _, kinds) if !kinds.is_empty())),
+        "a self-recursive function allocates its self slot"
+    );
+}
+
+/// And the saving is real: a unit of plain functions costs no more code than
+/// their bodies need.
+#[test]
+fn functions_that_never_name_themselves_cost_no_prologue_closure() {
+    let unit = Unit::new(&[
+        "function a() { return 1; }\nfunction b() { return 2; }\nfunction c() { return 3; }\n",
+    ]);
+    let mut repl = Repl::new(serde_json::Value::Null, serde_json::Value::Null).unwrap();
+    repl.push(&unit.buffer(0)).unwrap();
+    // Three root bindings, three bodies. The only `ClosureNew`s are the
+    // three that bind the names in the *root* frame.
+    let closures = repl
+        .vm
+        .code
+        .iter()
+        .filter(|i| matches!(i, Instr::ClosureNew(..)))
+        .count();
+    assert_eq!(closures, 3, "one per binding, none inside a body");
+}
