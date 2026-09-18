@@ -73,41 +73,48 @@ call site from the log alone. Cells are *compiled* from their own text
 and offsets into it, so `Turn.source` stays what the model wrote and no
 consumer has to know cells exist.
 
-### D2 — Compile the cell's own substring, then rebase its spans
+### D2 — Pad each cell to its offset, then parse it
 
-A cell is compiled from its own text. Afterwards, `cell.start` is added
-to every span the compilation produced — `Program::spans` (one `Span`
-per instruction, a flat array), each debug function's
-`span_start`/`span_end`, and any diagnostic's span.
+A cell's parse source is `" ".repeat(cell.start) + cell_text`. oxc then
+emits **absolute spans into the markdown** directly, and nothing
+downstream has to rebase anything.
 
-The result is what matters downstream: **every offset is absolute into
-`Turn.source`**, which is the whole markdown, byte for byte. So
-`Call::site`, `Condition::site`, `report.rs`'s per-call-site annotation
-and its line-and-caret diagnostic all keep working untouched, and a
-caret lands in the model's own reply with its prose around it.
+This is not cosmetic. Both the analysis and the debug table are
+*span-keyed*: `analyzer/mod.rs` "resolves every binding and identifier
+reference to a frame slot — keyed by source span", and `debuginfo.rs`
+identifies a function as "the innermost function whose *source* span
+contains the instruction's span". Parse two cells from their own
+substrings and both start at zero, so their bindings and their function
+extents collide. Padding is what lets the analyzer simply *accumulate*
+across cells (D12) instead of being handed a carried table.
 
-Two rejected alternatives:
+Absolute spans also mean `Call::site`, `Condition::site`, `report.rs`'s
+per-call-site annotation and its line-and-caret diagnostic all keep
+working untouched against `Turn.source` — the whole markdown, byte for
+byte — and a caret lands in the model's own reply with its prose around
+it.
 
-- **Blanking** — overwrite every byte outside the cell with spaces and
-  compile that, so offsets come out absolute with no rebase. This is
-  what phase 24 did for a leading `tell()`, and an earlier draft of this
-  doc adopted it. With per-cell compilation it is strictly worse: it
-  allocates and parses a full-length copy of the markdown once per cell
-  to save two loops over arrays that already exist.
-- **Cell-local spans** — accept that an offset means "byte 40 of cell 2",
-  as a notebook's line numbers do. Rejected because `site` is not only
-  for error text: it is logged on `Call::Send` and `Condition`, and
-  read back to annotate a program per call site. Going relative would
-  put a cell index on every span-carrying event in the log and teach
-  every consumer to resolve it — schema churn to avoid an addition.
+Three drafts of this section, recorded because the middle one was wrong
+in an instructive way:
 
-**The prelude is the trap here.** `compile_with` *appends* the
-higher-order-method helpers to the source ("appended, so user spans are
-unchanged"), so prelude instructions carry spans past the end of the
-user's text. Harmless today; after rebasing, cell 0's prelude spans
-would land inside the prose that follows it, and a report could annotate
-a paragraph with a call result. A span starting at or beyond the cell's
-own length is therefore made zero-width synthetic rather than shifted.
+- **Blank the whole markdown except this cell**, and compile that. Gives
+  absolute spans, but parses a full-length copy of the reply once per
+  cell. Padding is this idea's good half: the *suffix* was the waste,
+  the *prefix* was the point.
+- **Compile the bare substring and rebase spans afterwards** — add
+  `cell.start` across `Program::spans` and the debug table. Looks
+  cheaper and is not: it needs a pass per cell, it has to special-case
+  the appended prelude (whose spans sit past the user's text and would
+  otherwise land in the following prose), and it does nothing about the
+  span collision above, so the analyzer still has to be seeded by hand.
+- **Cell-local spans**, as a notebook's line numbers are. Rejected
+  because `site` is not only for error text: it is logged on
+  `Call::Send` and `Condition` and read back to annotate a program per
+  call site. Going relative would put a cell index on every
+  span-carrying event in the log and teach every consumer to resolve it.
+
+The prelude keeps its own spans past the end of the cell's text, as it
+does today — harmless, because nothing rebases them onto prose.
 
 ### D3 — ```js executes; quoting is the marked case
 
@@ -345,43 +352,38 @@ cell actually closes over it, and then it costs one instruction, once.
 An earlier draft boxed every top-level slot unconditionally to pin the
 representation before any cell ran. Unnecessary, given the above.
 
-**How a later cell's code gets into the running VM.** The same
-`Compiler` instance keeps emitting. Its buffers are its own fields —
-`code: Vec<Instr>`, `spans: Vec<Span>`, `next_label` — so cell 1's
-instructions are appended to the buffer cell 0 filled, and the backpatch
-pass resolves label ids to indices into that same vector. **Addresses
-come out absolute by construction; there is nothing to rebase.**
+**Nothing is carried, because nothing is rebuilt.** The `Analyzer`, its
+growing `ProgramAnalysis`, the `Compiler` and the VM all stay alive for
+the whole reply and are fed each cell in turn. This is not incremental
+compilation with state threaded between calls — it is **one compilation
+that pauses**, and a cell boundary is a point where the instructions
+emitted so far happen to be run.
 
-An earlier draft of this doc had each cell compiled standalone and its
-`Program` appended afterwards, which created a jump-rebasing problem and
-a `base_addr` parameter to solve it. Both were self-inflicted: compiling
-into the shared buffer in the first place means the problem never
-arises.
+That works only because of D2. Spans arrive absolute, so the analysis
+table — keyed by span — accumulates without collision, and the compiler
+appends to its own `code`/`spans` so label ids backpatch against the
+same vector they were emitted into. Addresses come out absolute by
+construction.
 
-What the appending *does* require is that each pass run over the **newly
-appended range**, not the whole buffer:
+Two earlier drafts each invented machinery to fix a problem they had
+themselves created: compiling each cell standalone and appending its
+`Program` afterwards (which made jump targets cell-relative, "solved" by
+threading a base address through label resolution), and seeding a fresh
+analyzer per cell with a hand-carried scope table (which existed only
+because unpadded cells produced colliding spans). Neither is needed.
 
-- **Backpatch** from the cell's first instruction onward. Cell 0's jumps
-  hold resolved addresses by now, not label ids, and a pass that cannot
-  tell the two apart would corrupt them.
-- **Span rebasing** over the same range. A cell is parsed from its own
-  substring (D2), so its spans arrive cell-relative and `cell.start` is
-  added as they are appended.
+What *does* have to be scoped to the newly appended range is the
+backpatch pass: cell 0's jumps hold resolved addresses by now, not label
+ids, and a pass that cannot tell the two apart would corrupt them. It
+runs from the cell's first instruction onward.
 
-**The real plumbing is in the analyzer, not the compiler.** Scope and
-capture analysis is a separate pass over the cell's AST, and it
-allocates slots from zero for each unit it sees. It has to be seeded
-with the prior scope table and the frame's current local count, or cell
-1 gives `let y` slot 0 and stomps cell 0's `x`. That seeding is the one
-genuinely new piece; everything else on this list is free once the
-compiler instance simply stays alive.
-
-One detail for 25.1b: `Program::source` is what diagnostics render
-against, and under this transport it should be the markdown, not the
-cell — that is what makes a rebased span resolve. While the reply is
-still streaming the markdown is a prefix, which is harmless (it always
-contains every cell that has run) but means the VM's `source` grows
-between cells rather than being set once.
+**The promotion set is a diff, not a rule.** `finalize_tables`
+recomputes `slot_kinds` over all accumulated scopes. Re-finalize after
+each cell and compare against the previous result: every slot that
+flipped `Plain → Boxed` is exactly the set needing a `FreshCell` at this
+cell's start. There is no bespoke "is this the first capture of an
+earlier name" logic to write — it is a diff of two tables the analyzer
+already produces.
 
 **Why promotion is sound.** If an earlier cell's analysis said `Plain`,
 then no closure in that cell referenced the name — a reference from a
@@ -449,24 +451,18 @@ Pure, no IO, no JS parsing. Gate: `cargo test -p agent notebook` covers
 a 4-backtick fence wrapping a 3-backtick one, and zero cells; asserts
 every span slices the markdown back to exactly the cell's text.
 
-**25.1b — Span rebasing.** Compile a cell's substring, add `cell.start`
-across `Program::spans` and the debug function table, zero-width any
-span at or beyond the cell's length (the appended prelude). Gate: a test
-that a call in cell 2 logs a `site` which slices `Turn.source` to that
-call's own text, and that no prelude instruction carries a span landing
-in prose.
+**25.2 — One paused compilation (D12).** Analyzer, `ProgramAnalysis`,
+`Compiler` and VM all live for the whole reply and are fed each padded
+cell in turn; backpatch scoped to the appended range; growable frame
+locals; `FreshCell` emitted for the `Plain → Boxed` diff across
+re-finalization.
 
-**25.2 — Incremental cell compilation (D12).** One `Compiler` instance
-emitting every cell into its own buffers, so addresses stay absolute
-with no rebasing; backpatch and span-rebase scoped to each cell's
-appended range; the analyzer seeded with the prior scope table (name →
-slot *and* `SlotKind`) and the frame's current local count; growable
-frame locals; `FreshCell` emitted at a cell's start for each earlier-declared
-name it is the first to capture. Gate: `cargo test -p interp` green, plus tests that a `const`
-in cell 0 is readable in cell 1, that an undeclared name is a *compile*
-error naming it, that a redeclaration across cells is caught, that a
-function declared in cell 0 and called in cell 1 resolves a top-level
-name, and — the case that forced promotion — that a closure in cell 1
+Gate: `cargo test -p interp` green, plus tests that a `const` in cell 0
+is readable in cell 1; that an undeclared name is a *compile* error
+naming it; that a redeclaration across cells is caught; that a function
+declared in cell 0 and called in cell 1 resolves a top-level name; that
+a call in cell 2 logs a `site` slicing `Turn.source` to that call's own
+text; and — the case that forced promotion — that a closure in cell 1
 capturing a variable cell 0 declared and already wrote sees the current
 value through the promoted cell, not a stale copy.
 
