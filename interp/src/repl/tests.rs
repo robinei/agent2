@@ -672,3 +672,27 @@ fn capturing_this_at_the_top_level_is_refused() {
         "{errs:?}"
     );
 }
+
+/// **The two cases that made phase 25's first design unsound**, end to
+/// end rather than by inspecting instructions. Before root-frame
+/// pinning, `immutable = is_const || (!reassigned && !captured)` let
+/// constant propagation fold `5` into the stream and drop the store, so
+/// a later fragment's `FreshCell` boxed `Undefined` and the closure
+/// returned `NaN`. And `compact_const_fn_slots` renumbered survivors
+/// when a later fragment demoted a const function, moving a binding an
+/// earlier fragment had already written.
+#[test]
+fn the_unsound_cases_that_forced_root_pinning() {
+    let repl = run_all(&[
+        "let x = 5; console.log(x);",
+        "const f = () => x + 1; console.log(f());",
+    ]);
+    assert_eq!(console(&repl), vec!["5", "6"], "NaN here is the old bug");
+
+    // And the slot-renumbering half.
+    let repl = run_all(&[
+        "function f(){ return 1; }\nlet x = 5;",
+        "f = 2;\nconsole.log(x);\nconsole.log(f);",
+    ]);
+    assert_eq!(console(&repl), vec!["5", "2"], "x must not have shifted");
+}
