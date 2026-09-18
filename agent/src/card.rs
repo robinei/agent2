@@ -728,14 +728,39 @@ mod tests {
             }
             let card = load_from(&dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
             for ex in &card.exemplars {
-                interp::compile(&ex.assistant).unwrap_or_else(|e| {
-                    panic!(
-                        "{} exemplar for {:?} does not parse: {e:?}",
-                        dir.display(),
-                        ex.user
-                    )
-                });
+                // **What "the assistant turn" *is* depends on the
+                // transport the variant is for.** Under
+                // `Transport::Notebook` it is markdown whose ```js blocks
+                // are the program, so compiling the whole thing as
+                // JavaScript would fail on the prose. A variant that
+                // contains a cell is read the way that transport reads
+                // it: split first, then compile each cell.
+                let cells = crate::notebook::split_cells(&ex.assistant);
+                if cells.is_empty() {
+                    interp::compile(&ex.assistant).unwrap_or_else(|e| {
+                        panic!(
+                            "{} exemplar for {:?} does not parse: {e:?}",
+                            dir.display(),
+                            ex.user
+                        )
+                    });
+                } else {
+                    for (i, cell) in cells.iter().enumerate() {
+                        let src = cell.slice(&ex.assistant);
+                        interp::compile(src).unwrap_or_else(|e| {
+                            panic!(
+                                "{} exemplar for {:?} cell {i} does not parse: {e:?}",
+                                dir.display(),
+                                ex.user
+                            )
+                        });
+                    }
+                }
+                // And what counts as an *ending* depends on it too. A
+                // notebook cell cannot `return` at all (D5), so the verb
+                // that hands work to the next reply is `history.append`.
                 let ends = ex.assistant.contains("done()")
+                    || ex.assistant.contains("history.append")
                     || ex
                         .assistant
                         .lines()
@@ -899,6 +924,239 @@ mod tests {
         for ex in &exemplars() {
             assert!(!ex.assistant.starts_with("```"));
             assert!(!ex.assistant.starts_with('['));
+        }
+    }
+
+    /// **The notebook card's exemplars are notebooks.** They are not under
+    /// `the_exemplars_*` above, which cover the built-in card — the control
+    /// arm for 25.8, which must not move — so the job those tests do is
+    /// done here for the variant instead.
+    ///
+    /// Three things, and the first is the one a `Transport::Program` reader
+    /// would miss: an exemplar whose fences are wrong, or tagged something
+    /// other than ```js, splits into **no cells at all**. It would still
+    /// parse as prose, still look right in a diff, and teach the model a
+    /// reply that does nothing — and a broken eval input does not fail
+    /// loudly, it produces a worse number, which is indistinguishable from
+    /// a real finding until someone reads the logs.
+    #[test]
+    fn the_notebook_cards_exemplars_split_into_cells_that_compile() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("evals/cards/notebook");
+        // Skipped silently when `evals/` is not beside the crate (a
+        // published tarball, a sparse checkout), like its neighbour above.
+        if !dir.join("card.md").is_file() {
+            return;
+        }
+        let card = load_from(&dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
+        assert_eq!(card.exemplars.len(), 5, "five, each keeping its own job");
+
+        for ex in &card.exemplars {
+            let cells = crate::notebook::split_cells(&ex.assistant);
+            assert!(
+                !cells.is_empty(),
+                "exemplar for {:?} has no executable cell — it would run \
+                 nothing and rest the branch",
+                ex.user
+            );
+            for (i, cell) in cells.iter().enumerate() {
+                let src = cell.slice(&ex.assistant);
+                interp::compile(src).unwrap_or_else(|e| {
+                    panic!("exemplar for {:?} cell {i} does not compile: {e:?}", ex.user)
+                });
+            }
+        }
+    }
+
+    /// And they run — as one paused compilation, the way the transport runs
+    /// them, not as N separate programs.
+    ///
+    /// This is the check that catches what a per-cell compile cannot: a
+    /// second cell naming something the first never bound, or redeclaring
+    /// something it did. Each cell compiles alone either way; only feeding
+    /// them to one `Repl` in order can tell.
+    #[test]
+    fn the_notebook_cards_exemplars_run_as_one_paused_compilation() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("evals/cards/notebook");
+        if !dir.join("card.md").is_file() {
+            return;
+        }
+        let card = load_from(&dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
+        for ex in &card.exemplars {
+            run_notebook_against_stubs(&ex.assistant)
+                .unwrap_or_else(|e| panic!("notebook exemplar for {:?}: {e}", ex.user));
+        }
+    }
+
+    /// **Every notebook exemplar ends on purpose too**, and under this
+    /// transport there are only two ways to: `done()`, because the task is
+    /// finished, or `history.append`, because something is being handed to
+    /// the next reply. `return` is not one — a cell cannot (D5) — so the
+    /// third option the shipped exemplars have is simply gone.
+    #[test]
+    fn every_notebook_exemplar_ends_on_purpose() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("evals/cards/notebook");
+        if !dir.join("card.md").is_file() {
+            return;
+        }
+        let card = load_from(&dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
+        for ex in &card.exemplars {
+            let finishes = ex.assistant.contains("done()");
+            let hands_on = ex.assistant.contains("history.append");
+            assert!(
+                finishes || hands_on,
+                "notebook exemplar for {:?} neither finishes nor hands on",
+                ex.user
+            );
+            assert!(
+                !ex.assistant
+                    .lines()
+                    .any(|l| l.trim_start().starts_with("return ")),
+                "notebook exemplar for {:?} has a top-level `return`, which \
+                 a cell cannot do",
+                ex.user
+            );
+        }
+    }
+
+    /// The jobs the five exemplars do, kept from the shipped card — the
+    /// reasoning in `the_exemplars_demonstrate_the_endings_and_the_shapes`
+    /// is the part worth preserving, and porting a form without its purpose
+    /// would lose it.
+    #[test]
+    fn the_notebook_exemplars_keep_the_jobs_they_had() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("evals/cards/notebook");
+        if !dir.join("card.md").is_file() {
+            return;
+        }
+        let ex = load_from(&dir).unwrap().exemplars;
+
+        // The first finishes a task it actually changed, and checks the
+        // change by running the thing that would fail.
+        assert!(
+            ex[0].assistant.contains("done()") && ex[0].assistant.contains("tools.replace_file"),
+            "the first changes something and finishes: {}",
+            ex[0].assistant
+        );
+        // The second hands on without stopping — which is now `append`,
+        // there being no `return`.
+        assert!(
+            ex[1].assistant.contains("history.append") && !ex[1].assistant.contains("done()"),
+            "the second hands on and does not stop: {}",
+            ex[1].assistant
+        );
+        // The third offers a *bounded* choice and acts on the answer. The
+        // awaited value is the point: a free-form `ask` answered in prose
+        // could not be compared with `===`. And it guards the skip with
+        // `else` — which under this transport is not merely tidy: `done()`
+        // stops nothing, so a guard that used it would write the file it
+        // meant to leave alone (D8).
+        assert!(
+            ex[2].assistant.contains("await choose(")
+                && ex[2].assistant.contains("===")
+                && ex[2].assistant.contains("} else {")
+                && ex[2].assistant.contains("done()"),
+            "the third offers a bounded choice and guards with else: {}",
+            ex[2].assistant
+        );
+        // The fourth does many at once — the structural argument for code
+        // mode — and prints per item rather than appending 200 rows.
+        assert!(
+            ex[3].assistant.contains("Promise.all")
+                && ex[3].assistant.contains("for (")
+                && ex[3].assistant.contains("console.log")
+                && !ex[3].assistant.contains("history.append"),
+            "the fourth does many at once and prints per item: {}",
+            ex[3].assistant
+        );
+        // It is also the one that demonstrates the shared scope: it binds
+        // in one cell and uses the binding in the next, which is the thing
+        // about this transport a declaration cannot show.
+        let cells = crate::notebook::split_cells(&ex[3].assistant);
+        assert!(cells.len() >= 2, "the fourth spans two cells");
+        assert!(
+            cells[0].slice(&ex[3].assistant).contains("const hits")
+                && cells[1].slice(&ex[3].assistant).contains("hits.length"),
+            "the fourth binds in one cell and reads it in the next"
+        );
+        // The fifth keeps two rows rather than one fat value, so a later
+        // compaction can drop one and leave the other exact.
+        assert!(
+            ex[4].assistant.matches("history.append").count() >= 2,
+            "the fifth appends separately, a row each: {}",
+            ex[4].assistant
+        );
+    }
+
+    /// Drive a whole notebook reply the way the transport does: one
+    /// `ReplCore` fed each cell in turn, every call answered by
+    /// [`stub_result`], every `raise` resumed. A cell ends at a `Pause`;
+    /// the reply ends with the run's own `Return(0)`.
+    fn run_notebook_against_stubs(markdown: &str) -> Result<(), String> {
+        use interp::{StepResult, VM};
+        let cells = crate::notebook::split_cells(markdown);
+        let mut buffer = crate::notebook::ParseBuffer::new(markdown);
+        let mut vm =
+            VM::for_incremental(serde_json::Value::Null, serde_json::Value::Null)
+                .map_err(|e| format!("{e:?}"))?;
+        let mut core = interp::ReplCore::new();
+        core.reject_top_level_return(crate::notebook::NO_TOP_LEVEL_RETURN);
+
+        let mut fed = 0usize;
+        loop {
+            match vm.step(u64::MAX).map_err(|e| format!("{e:?}"))? {
+                StepResult::Done { .. } => return Ok(()),
+                StepResult::Paused { .. } => {
+                    if fed < cells.len() {
+                        let live = buffer.focus(cells[fed]);
+                        core.push(&mut vm, live).map_err(|d| {
+                            d.iter()
+                                .map(|x| x.render(live))
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        })?;
+                        fed += 1;
+                    } else {
+                        let blank = buffer.clear();
+                        core.close(&mut vm, blank).map_err(|d| format!("{d:?}"))?;
+                    }
+                }
+                StepResult::Pending { calls } => {
+                    for call in calls {
+                        let result = stub_result(&call.name, &call.args);
+                        let value = vm
+                            .json_to_stack_value(&result, 0)
+                            .map_err(|e| format!("{e:?}"))?;
+                        vm.resolve_promise(call.promise, value)
+                            .map_err(|e| format!("{e:?}"))?;
+                    }
+                }
+                StepResult::Settle { call } => {
+                    let result = stub_result(&call.name, &call.args);
+                    let value = vm
+                        .json_to_stack_value(&result, 0)
+                        .map_err(|e| format!("{e:?}"))?;
+                    vm.push_settled(value).map_err(|e| format!("{e:?}"))?;
+                }
+                StepResult::Raise { .. } => {
+                    let value = vm
+                        .json_to_stack_value(&json!("backup-2.txt"), 0)
+                        .map_err(|e| format!("{e:?}"))?;
+                    vm.resume_raise(value);
+                }
+                StepResult::OutOfFuel => {}
+            }
         }
     }
 }
