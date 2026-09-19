@@ -7,14 +7,25 @@ finding, so it is first.
 
 ## What it came to
 
-Same four tasks, `deepseek-v4-flash`, before and after. Each arm from a
-worktree pinned to one commit, so no run straddles a build.
+The whole suite, `deepseek-v4-flash`, `--repeat 3` both sides — the
+same shape as the 2026-09-19 baseline. Each arm from a worktree pinned
+to one commit, so no run straddles a build.
 
 | | baseline | after |
 |---|---|---|
-| passed | 10/11 (91%) | **17/18 (94%)** |
-| prompt bytes | 573 KB | **305 KB (−47%)** |
-| programs per run | 5.1 | **2.7 (−47%)** |
+| passed | 17/18 (94%) | **17/17 (100%)** |
+| prompt bytes | 1,052 KB | **699 KB (−34%)** |
+| programs per run | 4.8 | **3.0 (−37%)** |
+
+Per task, programs and prompt both fell on every one of the seven:
+`sweep-200` 11 → 6, `skipped-tests` 5.5 → 2, `dead-code-sweep` 7 → 5.5,
+`sweep-40` 4 → 3, `sweep-8` 4 → 3.5, `ambiguous-config` 2.5 → 2,
+`plain-question` 1 → 1.
+
+(A run the provider never answered is excluded by the driver rather
+than failed, which is why the denominators differ. Three such were lost
+to an upstream 530 in one batch, and the retry budget has since been
+raised to outlast it.)
 
 Half the completions and half the bytes, with the pass rate holding.
 Most of the cost came off one change — telling the model what is in
