@@ -4145,6 +4145,11 @@ mod tests {
                 EventPayload::Answer { .. } => "Answer",
                 EventPayload::Message(Message::Post { .. }) => "Post",
                 EventPayload::Message(Message::Turn { .. }) => "Turn",
+                EventPayload::Reply => "Reply",
+                EventPayload::Part { .. } => "Part",
+                EventPayload::ReplyEnd { .. } => "ReplyEnd",
+                EventPayload::Restart { .. } => "Restart",
+                EventPayload::Handback { .. } => "Handback",
                 EventPayload::Call(_) => "Call",
                 EventPayload::Result { .. } => "Result",
                 EventPayload::Return { .. } => "Return",
@@ -5997,6 +6002,11 @@ mod tests {
                     checked += 1;
                 }
                 _ => {}
+                            EventPayload::Reply
+                | EventPayload::Part { .. }
+                | EventPayload::ReplyEnd { .. }
+                | EventPayload::Restart { .. }
+                | EventPayload::Handback { .. } => Default::default(),
             }
         }
         assert_eq!(checked, 2, "two tells, two sites resolved");

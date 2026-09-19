@@ -615,6 +615,12 @@ fn print_session_event(event: &SessionEvent) {
                     Some(t) => println!("{head} compacted #{}: {t}", of.as_u64()),
                     None => println!("{head} compacted #{}: removed", of.as_u64()),
                 },
+                            // 28.B–C fill these in: nothing writes them yet.
+                EventPayload::Reply
+                | EventPayload::Part { .. }
+                | EventPayload::ReplyEnd { .. }
+                | EventPayload::Restart { .. }
+                | EventPayload::Handback { .. } => {}
             }
         }
     }

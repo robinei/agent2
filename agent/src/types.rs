@@ -32,6 +32,76 @@ impl Event {
 /// whether it renders to chat.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub enum EventPayload {
+    /// **A completion begins** (28.A). Parent: the owning agent's spine.
+    /// Renders to chat: as the assistant message its parts concatenate
+    /// to.
+    ///
+    /// Allocated *before* a byte arrives, which is what lets everything
+    /// in the reply name it and what records a generation that produced
+    /// nothing at all — an HTTP 530 used to leave no trace that anything
+    /// was attempted.
+    ///
+    /// It carries no author. A `Reply` is by definition the branch's
+    /// LLM, and the branch identifies the agent; a person handing the
+    /// branch a cell is [`Restart`](EventPayload::Restart), which is a
+    /// different act with none of the completion vocabulary attached.
+    Reply,
+
+    /// **One piece of a reply, verbatim** (28.A). Parent: the owning
+    /// agent's spine. Renders to chat: as part of the assistant message.
+    ///
+    /// The parts of a reply concatenate, byte for byte, to the
+    /// completion that produced them. That is the invariant the whole
+    /// design rests on: nothing has to be reassembled, because nothing
+    /// was taken apart.
+    Part {
+        /// The [`Reply`](EventPayload::Reply) this belongs to.
+        reply: EventId,
+        part: Part,
+    },
+
+    /// **The completion stopped arriving** (28.A), and why. Parent: the
+    /// owning agent's spine. Renders to chat: as a marker on the end of
+    /// the assistant message when `how` is not `Finished`.
+    ///
+    /// Distinct from the reply's [`Handback`](EventPayload::Handback):
+    /// the text stops when the provider is done, the *work* stops when
+    /// the last cell finishes — which can be much later, after a raise
+    /// that another reply answered.
+    ReplyEnd {
+        reply: EventId,
+        how: ReplyEnd,
+        #[serde(default)]
+        usage: crate::host::Usage,
+    },
+
+    /// **A person hands the branch one cell** (28.A) — the `e`, `v` and
+    /// answer gestures, `SessionCommand::Restart`. Parent: the owning
+    /// agent's spine. Renders to chat: as an assistant message, fenced.
+    ///
+    /// Not a `Reply`, because none of the completion vocabulary applies:
+    /// it does not stream, cannot be truncated, has no usage and no
+    /// reasoning. Modelling it as a reply with an author is what let the
+    /// two be confused — and they were, until 2026-09-19.
+    Restart { source: String },
+
+    /// **The reply paused, or ended** (28.A). Parent: the owning agent's
+    /// spine. Renders to chat: as the harness's report.
+    ///
+    /// A reply hands back **N times and ends once**, which
+    /// `Cause`'s own doc said and the type contradicted by calling them
+    /// all outcomes. `how` says which this is.
+    Handback {
+        reply: EventId,
+        how: Handback,
+        /// Byte offset into the reply where it happened (28.A: sites are
+        /// reply-absolute).
+        #[serde(default)]
+        site: u32,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        stack: Vec<String>,
+    },
+
     /// Chat event. Parent: the previous event on the owning agent's
     /// spine. Renders to chat: yes — a `Turn` is the assistant message,
     /// its `source` the bare program the model ran; the harness's report
@@ -422,6 +492,79 @@ pub enum Cause {
     /// disposition describes the raise that *opened* a scope, while this
     /// cause describes a decision that *closes* one.
     Abandoned,
+}
+
+/// One piece of a reply, exactly as it arrived (28.A).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub enum Part {
+    /// Reasoning. On the log because it arrived; never replayed to the
+    /// model, which is the renderer's business and not the log's.
+    ///
+    /// It is a part rather than a field so that a provider leaking its
+    /// thinking into the reply channel can be *recorded* as misrouted
+    /// rather than deleted — see `notebook::strip_leaked_reasoning`.
+    Thinking(String),
+    /// Everything outside a fence. Verbatim, whitespace included: the
+    /// concatenation invariant is false the moment this is trimmed.
+    Prose(String),
+    /// A fenced block that executes, **including its fences** — so the
+    /// parts still concatenate, and so a cell's offset in the reply is
+    /// the sum of the lengths before it.
+    Cell(String),
+}
+
+/// Why a completion stopped arriving (28.A).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub enum ReplyEnd {
+    /// The provider finished.
+    Finished,
+    /// It hit the token budget mid-reply. The parts that arrived stand;
+    /// the model is shown them and told they were cut off, rather than
+    /// having the whole reply discarded unread.
+    Truncated,
+    /// We stopped it — a trap in an earlier cell, or the person.
+    Interrupted,
+    /// It never arrived. A provider error, recorded so that a run which
+    /// reached no completion says so instead of looking like a run that
+    /// chose to do nothing.
+    Failed(String),
+}
+
+/// What a reply's run did when it handed back (28.A).
+///
+/// The first four are **pauses**: the frame is standing, the reply
+/// resumes once something decides. The last three end it.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub enum Handback {
+    Raised {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        payload: Option<serde_json::Value>,
+    },
+    Trapped {
+        kind: String,
+        message: String,
+        resumable: bool,
+    },
+    Posted { ids: Vec<EventId> },
+    /// A cell that would not compile. The reply is paused, not over: the
+    /// next one repairs it and the run carries on in the same frame.
+    CellFailed { message: String },
+
+    Completed,
+    Abandoned,
+    Interrupted,
+}
+
+impl Handback {
+    /// Whether the reply can still continue. Replaces
+    /// `Disposition`, which encoded the same fact in a second place.
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            Handback::Completed | Handback::Abandoned | Handback::Interrupted
+        )
+    }
 }
 
 /// Whether a raise pushed a handler frame onto the stack, or handed the

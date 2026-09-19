@@ -2096,6 +2096,12 @@ fn leaf_summary(tree: &Tree, leaf: EventId) -> String {
             Some(t) => format!("Compacted #{}: {t}", of.as_u64()),
             None => format!("Compacted #{}: removed", of.as_u64()),
         },
+        // 28.B–C fill these in: nothing writes them yet.
+        EventPayload::Reply
+        | EventPayload::Part { .. }
+        | EventPayload::ReplyEnd { .. }
+        | EventPayload::Restart { .. }
+        | EventPayload::Handback { .. } => String::new(),
     };
     crate::report::clip(&s, crate::report::PREVIEW_MAX_BYTES)
 }
@@ -2456,6 +2462,11 @@ mod tests {
                 EventPayload::Rename { .. } => "Rename",
                 EventPayload::Note { .. } => "Note",
                 EventPayload::Compacted { .. } => "Compacted",
+                            EventPayload::Reply
+                | EventPayload::Part { .. }
+                | EventPayload::ReplyEnd { .. }
+                | EventPayload::Restart { .. }
+                | EventPayload::Handback { .. } => Default::default(),
             });
             if matches!(event.payload, EventPayload::Agent { .. }) {
                 break;

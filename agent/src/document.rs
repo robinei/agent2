@@ -631,7 +631,7 @@ fn pending_line(
         // *own* log position (it shadows its target's row, not a row of
         // its own) — renders to chat: no.
         _ => None,
-    }
+            }
 }
 
 /// Render one branch's document: its system prompt, then its path

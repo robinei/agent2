@@ -88,7 +88,7 @@ impl ProgramView {
 /// The log's format version. Bump it when the event vocabulary changes
 /// in a way an older build would misread; nothing migrates, because a
 /// misread log is worse than a refused one.
-pub const LOG_VERSION: u64 = 1;
+pub const LOG_VERSION: u64 = 2;
 
 /// The log's first line: a version header, never an event.
 #[derive(Serialize, Deserialize)]
@@ -494,6 +494,13 @@ impl Tree {
             | EventPayload::Rename { .. }
             | EventPayload::Note { .. }
             | EventPayload::Compacted { .. } => {}
+            // 28.B–C fill these in: nothing writes them yet, so there
+            // is nothing here to read.
+            EventPayload::Reply
+            | EventPayload::Part { .. }
+            | EventPayload::ReplyEnd { .. }
+            | EventPayload::Restart { .. }
+            | EventPayload::Handback { .. } => {}
         }
     }
 

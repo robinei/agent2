@@ -608,6 +608,13 @@ impl ChatState {
             // A rename is a record: it changes the navigator, never the
             // transcript, and never wakes the branch.
             EventPayload::Rename { .. } => {}
+                    // 28.B–C fill these in: nothing writes them yet, so there
+            // is nothing here to read.
+            EventPayload::Reply
+            | EventPayload::Part { .. }
+            | EventPayload::ReplyEnd { .. }
+            | EventPayload::Restart { .. }
+            | EventPayload::Handback { .. } => {}
         }
         self.branch_depth.insert(
             branch,

@@ -456,7 +456,12 @@ fn pending_ask(events: &[host::SessionEvent]) -> Option<(host::BranchId, EventId
                 pending = None;
             }
             _ => {}
-        }
+                        EventPayload::Reply
+                | EventPayload::Part { .. }
+                | EventPayload::ReplyEnd { .. }
+                | EventPayload::Restart { .. }
+                | EventPayload::Handback { .. } => Default::default(),
+            }
     }
     pending
 }
