@@ -307,6 +307,10 @@ the document with every nameable row shadowed at once, and if that is
 still over the threshold, no handler can get under it. Asking is a
 completion spent on nothing.
 
+Same scenario with the guard: **0 fires in both runs**, the pass rate
+unchanged at 1/2, and the cost of that arm halved — 9.0 programs to
+4.5, 236 KB to 155 KB. Pure waste removed, nothing else moved.
+
 Worth keeping: **a bound on attempts is not a bound on a loop whose
 every round reports success.** The question a guard has to answer is
 whether the work can help, not how many times it has been tried.
