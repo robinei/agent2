@@ -4,7 +4,20 @@ use crate::vm::{VM, VMError, Value};
 // ── console implementations ──────────────────────────────────────────────────
 
 /// Maximum number of lines in the console buffer.
-const CONSOLE_CAP: usize = 256;
+///
+/// **Lines, and it means it.** Until 2026-09-19 the buffer held one
+/// entry per `console.log` *call*, so this capped calls: a single
+/// `console.log(file)` counted as one against 256 and a real
+/// `sweep-200` entry held 323 newlines in 4,094 bytes. Every bound
+/// downstream inherited the lie — the report's "last 20 lines" could
+/// be thousands. Now one line is one entry, so the cap here, the
+/// report's tail, and `history.fetch`'s array all mean lines.
+///
+/// Raised with the split, because a file dump that used one slot now
+/// uses hundreds and must not evict the run's own earlier output.
+/// Matches `report::CONSOLE_MAX_LINES`, the next bound out, so the two
+/// no longer disagree about what they are counting.
+const CONSOLE_CAP: usize = 2_000;
 /// Maximum bytes per line; longer lines are truncated with a trailing `…`.
 const CONSOLE_LINE_CAP: usize = 4096;
 
@@ -55,28 +68,75 @@ fn console_write(vm: &mut VM, args: Args, prefix: &str) -> Result<Value, VMError
         };
         line.push_str(&s);
     }
-    // Truncate long lines.
-    if line.len() > CONSOLE_LINE_CAP {
-        line.truncate(CONSOLE_LINE_CAP - 3);
-        line.push('…');
-    }
     let full = if prefix.is_empty() {
         line
     } else {
         format!("{prefix}{line}")
     };
-    // Ring-buffer logic.
-    if vm.console_lines.len() >= CONSOLE_CAP {
-        let dropped = vm.console_lines.len() - CONSOLE_CAP + 1;
-        vm.console_lines.drain(0..dropped);
-        vm.console_lines
-            .push(format!("[… {dropped} lines dropped]"));
+    // **One line per entry.** A call's output is split here rather than
+    // stored whole, so `console_lines` is what its name says and every
+    // bound over it counts the same thing the reader does. A trailing
+    // newline ends the last line; it does not start an empty one.
+    let text = full.strip_suffix('\n').unwrap_or(&full);
+    for line in text.split('\n') {
+        let mut line = line.to_owned();
+        if line.len() > CONSOLE_LINE_CAP {
+            line.truncate(CONSOLE_LINE_CAP - 3);
+            line.push('…');
+        }
+        // Ring-buffer logic.
+        if vm.console_lines.len() >= CONSOLE_CAP {
+            let dropped = vm.console_lines.len() - CONSOLE_CAP + 1;
+            vm.console_lines.drain(0..dropped);
+            vm.console_lines
+                .push(format!("[… {dropped} lines dropped]"));
+        }
+        vm.console_lines.push(line);
     }
-    vm.console_lines.push(full);
     Ok(Value::Undefined)
 }
 
 // ── tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod line_split_tests {
+    use crate::testutil;
+
+    fn console(src: &str) -> Vec<String> {
+        testutil::run_console(src)
+    }
+
+    /// **One line per entry.** A call that prints four lines makes four
+    /// entries, so the 2,000-line cap, the report's 20-line tail and
+    /// `history.fetch`'s array all count what the reader counts.
+    #[test]
+    fn one_call_printing_many_lines_stores_many_lines() {
+        assert_eq!(
+            console(r#"console.log("a\nb\nc\nd");"#),
+            vec!["a", "b", "c", "d"]
+        );
+    }
+
+    /// A trailing newline ends the last line rather than starting an
+    /// empty one — `ls` output would otherwise gain a blank entry, and
+    /// that blank was the stray line under `### it printed`.
+    #[test]
+    fn a_trailing_newline_does_not_add_an_empty_line() {
+        assert_eq!(console(r#"console.log("a\nb\n");"#), vec!["a", "b"]);
+    }
+
+    /// Blank lines *inside* the output are the program's own and stay.
+    #[test]
+    fn a_blank_line_inside_the_output_survives() {
+        assert_eq!(console(r#"console.log("a\n\nb");"#), vec!["a", "", "b"]);
+    }
+
+    /// Each call still starts its own line, so two calls never merge.
+    #[test]
+    fn separate_calls_stay_separate_lines() {
+        assert_eq!(console(r#"console.log("a"); console.log("b");"#), vec!["a", "b"]);
+    }
+}
 
 #[cfg(test)]
 mod tests {

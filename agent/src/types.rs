@@ -328,7 +328,19 @@ pub enum EventPayload {
     /// no — it is the faithful console for the log and the debugger panes
     /// (the completion/condition report carries only a clipped tail), so
     /// a finished program's console survives reload. Never sent to the LLM.
-    Console { lines: Vec<String> },
+    Console {
+        /// **One entry per line, and it means it.** Until 2026-09-19
+        /// this held one entry per `console.log` *call* — a real
+        /// `sweep-200` entry carried 323 newlines in 4,094 bytes — so
+        /// every bound over it counted calls while calling them lines:
+        /// a 256-"line" ring that a file dump spent one slot on, and a
+        /// report tail of "the last 20 lines" that could be thousands.
+        /// The split happens where the entry is formed
+        /// (`interp`'s `console_write`), so the VM buffer, this event,
+        /// the report's tail and `history.fetch`'s array all count the
+        /// same thing the reader does.
+        lines: Vec<String>,
+    },
 }
 
 /// A message that landed on this branch, with its body materialised.

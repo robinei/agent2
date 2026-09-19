@@ -116,6 +116,14 @@ pub fn run_ret_with_tools(
     vm.stack_value_to_json(&value, 0).expect("value to JSON")
 }
 
+/// Compile + run, returning the console buffer — one entry per line.
+pub fn run_console(src: &str) -> Vec<String> {
+    let prog = compile_ok(src);
+    let mut vm = VM::for_program(prog, serde_json::Value::Null).unwrap();
+    vm.step(u64::MAX).expect("runs cleanly");
+    vm.console_lines.clone()
+}
+
 /// Compile + run until a runtime `VMError` occurs. Panics on `Done` or
 /// any effect.
 pub fn run_runtime_err(src: &str) -> VMError {
