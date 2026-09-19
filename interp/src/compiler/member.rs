@@ -105,10 +105,9 @@ impl super::Compiler {
             ast::ChainElement::PrivateFieldExpression(m) => {
                 self.error(m.span.into(), "private fields are not supported")
             }
-            ast::ChainElement::TSNonNullExpression(e) => self.error(
-                e.span.into(),
-                "TypeScript non-null assertions are not supported",
-            ),
+            // `a?.b!` — a claim about a type, not a computation. Erased
+            // to its operand, as `expr.rs` erases the others.
+            ast::ChainElement::TSNonNullExpression(e) => self.compile_expr(&e.expression),
         }
     }
 }

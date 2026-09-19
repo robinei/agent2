@@ -59,7 +59,7 @@ pub struct Program {
 /// is the dialect's own surface. For test262 conformance (mostly non-strict
 /// scripts), use [`compile_for_test262`].
 pub fn compile(source: &str) -> Result<Program, Vec<Diagnostic>> {
-    compile_with(source, SourceType::mjs())
+    compile_with(source, SourceType::mjs().with_typescript(true))
 }
 
 /// Compile for a test262 test, selecting strict vs. non-strict script mode.
@@ -86,7 +86,7 @@ pub fn compile_for_test262(source: &str, strict: bool) -> Result<Program, Vec<Di
 /// than propagating a `Diagnostic` nobody there would act on.
 pub fn count_statements(source: &str) -> usize {
     let allocator = Allocator::default();
-    let ret = Parser::new(&allocator, source, SourceType::mjs())
+    let ret = Parser::new(&allocator, source, SourceType::mjs().with_typescript(true))
         .with_options(oxc_parser::ParseOptions {
             allow_return_outside_function: true,
             ..Default::default()

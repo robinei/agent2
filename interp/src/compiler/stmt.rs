@@ -152,6 +152,16 @@ impl super::Compiler {
             // Phase 13 Step 7a — plain class (constructor + methods + fields).
             ast::Statement::ClassDeclaration(c) => self.compile_class_decl(c),
 
+            // ── TypeScript that erases to nothing ────────────────────
+            // A `type` alias and an `interface` declare no value and
+            // emit no code: in TypeScript they are gone before the
+            // program runs, and here they are gone before it compiles.
+            // `enum` and `namespace` are deliberately *not* here —
+            // both create a real object at runtime, so erasing them
+            // would silently drop a binding the program then reads.
+            ast::Statement::TSTypeAliasDeclaration(_)
+            | ast::Statement::TSInterfaceDeclaration(_) => {}
+
             // Out of scope — informative errors.
             ast::Statement::LabeledStatement(s) => {
                 self.error(s.span.into(), "labeled statements are not supported")

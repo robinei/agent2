@@ -153,6 +153,18 @@ impl super::Compiler {
                 "`super` is only valid as `super(...)` or `super.method(...)` \
                  inside a derived class",
             ),
+            // ── TypeScript that erases to its operand ────────────────
+            // `e as T`, `e satisfies T`, `<T>e` and `e!` are all claims
+            // about a type and none of them is a computation: what runs
+            // is the expression inside. Erasing them here is what
+            // `tsc` does, and the alternative — refusing them — makes a
+            // paste from a typed codebase fail on a line that would
+            // have behaved identically with the annotation deleted.
+            ast::Expression::TSAsExpression(e) => self.compile_expr(&e.expression),
+            ast::Expression::TSSatisfiesExpression(e) => self.compile_expr(&e.expression),
+            ast::Expression::TSTypeAssertion(e) => self.compile_expr(&e.expression),
+            ast::Expression::TSNonNullExpression(e) => self.compile_expr(&e.expression),
+            ast::Expression::TSInstantiationExpression(e) => self.compile_expr(&e.expression),
             other => self.error(other.span().into(), "unsupported expression"),
         }
     }

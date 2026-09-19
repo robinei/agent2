@@ -667,6 +667,28 @@ impl Analyzer {
             ast::Expression::ParenthesizedExpression(p) => {
                 self.analyze_expr(&p.expression, scope, block_scopes, scopes);
             }
+            // **The TypeScript wrappers the compiler erases.** `expr.rs`
+            // drops `e as T`, `e satisfies T`, `<T>e`, `e!` and `f<T>`
+            // down to the expression inside, so this has to see through
+            // them too — an identifier the analyzer never visits is an
+            // identifier it never binds, and `(x as number)` compiled to
+            // a *global* lookup of `x` that threw at run time while the
+            // same line without the cast returned a value.
+            ast::Expression::TSAsExpression(e) => {
+                self.analyze_expr(&e.expression, scope, block_scopes, scopes);
+            }
+            ast::Expression::TSSatisfiesExpression(e) => {
+                self.analyze_expr(&e.expression, scope, block_scopes, scopes);
+            }
+            ast::Expression::TSTypeAssertion(e) => {
+                self.analyze_expr(&e.expression, scope, block_scopes, scopes);
+            }
+            ast::Expression::TSNonNullExpression(e) => {
+                self.analyze_expr(&e.expression, scope, block_scopes, scopes);
+            }
+            ast::Expression::TSInstantiationExpression(e) => {
+                self.analyze_expr(&e.expression, scope, block_scopes, scopes);
+            }
             ast::Expression::AwaitExpression(a) => {
                 self.analyze_expr(&a.argument, scope, block_scopes, scopes);
             }
@@ -908,6 +930,10 @@ impl Analyzer {
             ast::ChainElement::ComputedMemberExpression(m) => {
                 self.analyze_expr(&m.object, scope, block_scopes, scopes);
                 self.analyze_expr(&m.expression, scope, block_scopes, scopes);
+            }
+            // `a?.b!` — erased by `member.rs`, so seen through here.
+            ast::ChainElement::TSNonNullExpression(e) => {
+                self.analyze_expr(&e.expression, scope, block_scopes, scopes);
             }
             _ => {}
         }

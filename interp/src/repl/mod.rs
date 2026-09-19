@@ -230,7 +230,7 @@ impl ReplCore {
         self.remember_source(&full, prelude_at);
 
         let allocator = Allocator::default();
-        let ret = Parser::new(&allocator, &full, SourceType::mjs())
+        let ret = Parser::new(&allocator, &full, SourceType::mjs().with_typescript(true))
             .with_options(oxc_parser::ParseOptions {
                 allow_return_outside_function: true,
                 ..Default::default()
