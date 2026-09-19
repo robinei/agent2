@@ -6,13 +6,11 @@
 //! (`document::render`, over `&Tree`/`Spine`) rather than a tool-spec'd
 //! `LlmRequest` — there is no `tools` array on the wire, because the
 //! model's whole response *is* the program, not a pick from a function
-//! menu. `LlmTurn` shrinks to match: `source` is the bare program text
-//! (`Message::Turn.source`, the same field name, because a scripted or
-//! live completion and a logged turn are the same shape all the way
-//! through), plus `thinking` and `truncated` — the one bit
-//! `host/deepseek.rs` must set before this turn ever reaches a compiler,
-//! per `types.rs`'s `Cause::Truncated`: **never compile a truncated
-//! completion**.
+//! menu. `LlmTurn` shrinks to match: `source` is the reply's markdown,
+//! plus `thinking` and `truncated`. The log keeps that reply as the
+//! parts it decomposes into (28) — a `Reply`, its `Part`s and a
+//! `ReplyEnd` carrying `how` — so nothing here has to say twice what
+//! the model wrote.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};

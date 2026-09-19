@@ -723,14 +723,13 @@ pub fn cap_console(lines: &[String], event_hint: &str) -> Vec<String> {
     kept
 }
 
-/// One program run's slice of a branch's path: the turn that drove it,
-/// the outcome it produced, and the events in between.
+/// One handback's slice of a branch's path: the reply that drove it,
+/// the handback itself, and the events in between.
 struct Handback<'t> {
-    /// The program the driving `Turn` ran — read straight off
-    /// `Message::Turn.source`. Under code mode that *is* the whole turn,
-    /// so there is no longer a tool-call arguments blob to dig it out of.
+    /// The reply, verbatim — its parts concatenated (28), which is the
+    /// coordinate system every `site` on the path is an offset into.
     source: String,
-    /// The one outcome event: a `Return` or a `Condition`.
+    /// The `Handback` event this report is derived from.
     outcome: &'t Event,
     /// The `Console` logged with the outcome, if any, and its event id —
     /// which the tail names when it clips, so the rest is fetchable.
@@ -772,24 +771,10 @@ pub(crate) fn reply_source(path: &[&Event], reply_at: usize) -> String {
     out
 }
 
-/// Whether a payload is an outcome — the event a reply is answered by.
-/// **Every `Turn` has exactly one**, which is what lets every report
-/// derive from one event rather than from recomputed history: a program
-/// that runs to completion produces a `Return`, one that suspends or
-/// fails produces a `Condition`, and a turn that was itself a handler
-/// answering a post produces an `Answer`.
-fn is_outcome(payload: &EventPayload) -> bool {
-    matches!(
-        payload,
-        EventPayload::Handback { .. }
-    )
-}
-
-/// The outcome(s) a turn produced, in log order, ending before the next
-/// `Turn`. Under code mode a turn is one program with exactly one
-/// outcome, so in practice this returns at most one id — kept as a
-/// `Vec` rather than asserting that here, so a caller scanning a path
-/// never needs a special case at the boundary.
+/// The handback(s) a reply produced, in log order, ending before the
+/// next reply. A reply **pauses** any number of times and **ends**
+/// once (28), so this returns every one of them — a `Vec`, so a caller
+/// scanning a path never needs a special case at the boundary.
 pub fn outcomes_of_turn(tree: &Tree, leaf: EventId, turn: EventId) -> Vec<EventId> {
     let path = tree.path_events(leaf);
     let Some(at) = path.iter().position(|e| e.id == turn) else {
@@ -800,7 +785,7 @@ pub fn outcomes_of_turn(tree: &Tree, leaf: EventId, turn: EventId) -> Vec<EventI
         if matches!(event.payload, EventPayload::Reply | EventPayload::Restart) {
             break;
         }
-        if is_outcome(&event.payload) {
+        if matches!(event.payload, EventPayload::Handback { .. }) {
             out.push(event.id);
         }
     }
@@ -816,7 +801,7 @@ fn handback<'t>(tree: &'t Tree, leaf: EventId, outcome: EventId) -> Option<Handb
     // re-rendering the last one's rows.
     let previous_outcome = path[..at]
         .iter()
-        .rposition(|e| is_outcome(&e.payload))
+        .rposition(|e| matches!(e.payload, EventPayload::Handback { .. }))
         .map(|i| path[i].id.as_u64())
         .unwrap_or(0);
     // The turn this outcome belongs to: the nearest `Turn` above it.
@@ -831,7 +816,7 @@ fn handback<'t>(tree: &'t Tree, leaf: EventId, outcome: EventId) -> Option<Handb
     // before the next outcome.
     let (console, console_id) = path[at + 1..]
         .iter()
-        .take_while(|e| !is_outcome(&e.payload))
+        .take_while(|e| !matches!(e.payload, EventPayload::Handback { .. }))
         .find_map(|e| match &e.payload {
             EventPayload::Console { lines } => Some((lines.clone(), Some(e.id.as_u64()))),
             _ => None,
@@ -1288,7 +1273,7 @@ fn annotated_source(h: &Handback<'_>) -> String {
 /// any more (a `Turn` gets one `Post` back, full stop — 23_ONE_AGENT.md's
 /// substitution table), so what to say no longer depends on caller-
 /// tracked bookkeeping. It depends only on the log, derived fresh here
-/// (`is_outcome`, same as `handback`): did the fork point's last `Turn`
+/// (a `Handback`, same as `handback`): did the fork point's last reply
 /// already have its outcome by the time the fork was taken?
 ///
 /// - **already settled** (an ordinary fork point): a harness line naming
@@ -1313,7 +1298,7 @@ pub fn render_fork(tree: &Tree, leaf: EventId, fork: EventId) -> String {
         .rposition(|e| matches!(e.payload, EventPayload::Reply));
     // Mid-program iff that turn's outcome had not landed by the fork.
     let running =
-        turn_at.is_some_and(|ti| !path[ti + 1..fork_at].iter().any(|e| is_outcome(&e.payload)));
+        turn_at.is_some_and(|ti| !path[ti + 1..fork_at].iter().any(|e| matches!(e.payload, EventPayload::Handback { .. })));
 
     if !running {
         let point = at

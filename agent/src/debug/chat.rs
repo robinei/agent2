@@ -7,17 +7,20 @@
 //! leak into what this pane shows. Do not add imports from `crate::host`
 //! beyond the protocol types, and none from `interp`.
 //!
-//! **A turn is a program** (22_ONE_VOCABULARY.md): every logged
-//! `Message::Turn`, whoever authored it, opens one **block** keyed by its
-//! own event id — a `program: <status>` header (status tracked live from
-//! `ProgramStatus`) with the program's inner `Invoke`/`Send`/`Spawn`/
-//! `Fork` calls listed beneath as `⚙` lines. There is no separate
-//! `run_program`/`resume` split to fold together the way the old
-//! tool-call protocol needed: a handler program (a mind's answer to a
-//! `raise()`, LLM-authored or a `v`/rewrite gesture standing in for one)
-//! is a `Turn` in its own right, with its own id and its own block,
-//! nested under the program it is deliberating for by **depth** —
-//! `crate::tree::depth_after`'s fold over `Condition`/`Return`, replayed
+//! **A reply is a program** (22_ONE_VOCABULARY.md): every logged
+//! `Reply` — or `Restart`, a person taking the branch's turn — opens one
+//! **block** keyed by its own event id, a `program: <status>` header
+//! (status tracked live from `ProgramStatus`) whose source is the
+//! reply's cells, with its inner `Invoke`/`Send`/`Spawn`/`Fork` calls
+//! listed beneath as `⚙` lines. Its *prose* is not in that block: it
+//! reaches this pane as its own `Send`, rendered as markdown the way
+//! the person reads it. There is no separate `run_program`/`resume`
+//! split to fold together the way the old tool-call protocol needed: a
+//! handler program (a mind's answer to a `raise()`, LLM-authored or a
+//! `v`/rewrite gesture standing in for one) is a reply in its own
+//! right, with its own id and its own block, nested under the program
+//! it is deliberating for by **depth** —
+//! `crate::tree::depth_after`'s fold over `Handback`, replayed
 //! here from the same event stream `tree::programs_for` derives it from
 //! over the log, so the two can never silently disagree about how deep a
 //! program ran. The completion/condition report body is *not* inlined —
