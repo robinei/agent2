@@ -154,6 +154,42 @@ fn the_shipped_manifest_tells_the_truth_about_itself() {
     );
 }
 
+/// The opening listing: bounded, two deep, and quiet about build
+/// output.
+#[test]
+fn the_working_directory_listing_is_bounded_and_skips_noise() {
+    let dir = std::env::temp_dir().join(format!("agent2-listing-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("sub/deeper")).unwrap();
+    std::fs::create_dir_all(dir.join("node_modules/pkg")).unwrap();
+    std::fs::write(dir.join("app.py"), "").unwrap();
+    std::fs::write(dir.join("sub/mod.py"), "").unwrap();
+    std::fs::write(dir.join("sub/deeper/buried.py"), "").unwrap();
+    std::fs::write(dir.join("node_modules/pkg/index.js"), "").unwrap();
+
+    let out = listing(&dir);
+    assert!(out.contains("app.py"), "{out}");
+    assert!(out.contains("sub/"), "directories are marked: {out}");
+    assert!(out.contains("sub/mod.py"), "two levels deep: {out}");
+    assert!(!out.contains("buried.py"), "and not three: {out}");
+    assert!(!out.contains("node_modules"), "build noise is skipped: {out}");
+
+    // A big tree costs a fixed number of bytes and says that it stopped.
+    let big = dir.join("many");
+    std::fs::create_dir_all(&big).unwrap();
+    for i in 0..(LISTING_MAX_ENTRIES + 20) {
+        std::fs::write(big.join(format!("f{i}.txt")), "").unwrap();
+    }
+    let out = listing(&dir);
+    assert!(out.contains("… and more"), "{out}");
+    assert!(
+        out.lines().count() < LISTING_MAX_ENTRIES + 12,
+        "bounded: {} lines",
+        out.lines().count()
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Every shipped tool's description fits inside the clip above.
 ///
 /// The doc there says they all "fit comfortably", and `bash` did not:
@@ -354,11 +390,94 @@ pub fn full_card(registry: &crate::host::ToolRegistry) -> String {
 /// must not silently rewrite what an existing conversation was told.
 fn working_directory() -> String {
     match std::env::current_dir() {
-        Ok(dir) => format!("\n\nCurrent working directory: {}", dir.display()),
+        Ok(dir) => format!(
+            "\n\nCurrent working directory: {}{}",
+            dir.display(),
+            listing(&dir)
+        ),
         // Not worth failing a session over, and a wrong answer would be
         // worse than none.
         Err(_) => String::new(),
     }
+}
+
+/// How many entries the opening listing shows before it stops.
+const LISTING_MAX_ENTRIES: usize = 50;
+
+/// Noise every listing of a working tree has and nobody wants: build
+/// output and dependency trees, which are large, uninteresting, and the
+/// reason a naive `find .` comes back with ten thousand lines.
+const LISTING_SKIP: [&str; 9] = [
+    ".git",
+    "node_modules",
+    "target",
+    "__pycache__",
+    ".venv",
+    "venv",
+    "dist",
+    ".mypy_cache",
+    ".pytest_cache",
+];
+
+/// **What is in the working directory, two levels deep.**
+///
+/// Telling the model *where* it is fixed half of this; the measurement
+/// says the other half was still being paid. Across 96 kept runs, 23 —
+/// **a quarter** — spend their entire first program on `ls`, `find` or
+/// `pwd` and nothing else, which is a whole completion spent learning
+/// what a listing would have said. Two of them ran `find` over a depth
+/// of three and piped it through `head -200`.
+///
+/// Two levels because one is usually a list of directories and three is
+/// usually a flood. Bounded at [`LISTING_MAX_ENTRIES`] and honest when
+/// it stops, so a large tree costs a fixed number of bytes rather than
+/// however many files happen to be there.
+///
+/// Snapshotted at the agent's root with everything else here: it says
+/// what was there when the conversation started, and a session that
+/// changes the tree later reads it as history, which is what the rest
+/// of the record is.
+fn listing(dir: &std::path::Path) -> String {
+    fn walk(dir: &std::path::Path, prefix: &str, depth: usize, out: &mut Vec<String>) {
+        if depth == 0 || out.len() > LISTING_MAX_ENTRIES {
+            return;
+        }
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        let mut entries: Vec<_> = rd.flatten().collect();
+        entries.sort_by_key(|e| e.file_name());
+        for e in entries {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if LISTING_SKIP.contains(&name.as_str()) {
+                continue;
+            }
+            let is_dir = e.file_type().is_ok_and(|t| t.is_dir());
+            if out.len() >= LISTING_MAX_ENTRIES {
+                out.push(String::new());
+                return;
+            }
+            out.push(format!("{prefix}{name}{}", if is_dir { "/" } else { "" }));
+            if is_dir {
+                walk(&e.path(), &format!("{prefix}{name}/"), depth - 1, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(dir, "", 2, &mut out);
+    if out.is_empty() {
+        return String::new();
+    }
+    let truncated = out.last().is_some_and(|l| l.is_empty());
+    if truncated {
+        out.pop();
+    }
+    let more = if truncated {
+        "\n… and more — `bash` for the rest."
+    } else {
+        ""
+    };
+    format!("\n\nWhat is in it, two levels deep:\n\n```text\n{}\n```{more}", out.join("\n"))
 }
 
 /// A worked exemplar: a real user/assistant pair opening `messages`,
