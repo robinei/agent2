@@ -3077,7 +3077,10 @@ mod tests {
         assert!(
             tool_texts(&session)
                 .iter()
-                .any(|t| t.contains("appended: DATA")),
+                // Quoted, because a note renders as its JSON now: the
+                // row is the model's only evidence of what
+                // `history.fetch` will hand back (`note_display`).
+                .any(|t| t.contains(r#"appended: "DATA""#)),
             "{:?}",
             tool_texts(&session)
         );

@@ -565,9 +565,33 @@ fn delivered_tail(v: &serde_json::Value) -> String {
         serde_json::Value::Null => "ok".into(),
         serde_json::Value::Bool(_) | serde_json::Value::Number(_) => v.to_string(),
         serde_json::Value::String(s) if s.len() <= 24 => format!("{s:?}"),
+        // **The shape, never the contents.** A scalar row already
+        // shows its value; a structured one showed only a size, so
+        // `read_file(…) → ok, 31045 bytes` read as *a 31045-byte
+        // thing*. On 2026-09-19 a run fetched exactly that row and
+        // called `.slice(0, 2000)` on the `{ content, version }` it got
+        // back. Naming the keys is constant-size however big the value
+        // is, and it is what the row was already implying.
+        serde_json::Value::Object(map) => {
+            let mut keys: Vec<&str> = map.keys().take(SHAPE_MAX_KEYS).map(String::as_str).collect();
+            if map.len() > SHAPE_MAX_KEYS {
+                keys.push("…");
+            }
+            format!("ok, {{{}}}, {} bytes", keys.join(", "), v.to_string().len())
+        }
+        serde_json::Value::Array(items) => format!(
+            "ok, [{} item{}], {} bytes",
+            items.len(),
+            if items.len() == 1 { "" } else { "s" },
+            v.to_string().len()
+        ),
         other => format!("ok, {} bytes", other.to_string().len()),
     }
 }
+
+/// Keys named in a menu row's shape before it gives up and says `…`.
+/// A row is one line; a wide object must not make it three.
+const SHAPE_MAX_KEYS: usize = 5;
 
 // ── rendered messages ───────────────────────────────────────────────
 
@@ -1796,6 +1820,30 @@ mod tests {
         .render();
         assert!(rendered.contains(&long), "the row is not clipped");
         assert!(rendered.contains("- `[9]` appended:"), "{rendered}");
+    }
+
+    /// **A structured row names its shape.** Keys, never contents: a
+    /// row that said only `ok, 31045 bytes` read as *a 31045-byte
+    /// thing*, and on 2026-09-19 a run fetched one and called
+    /// `.slice(0, 2000)` on the `{ content, version }` it got back.
+    #[test]
+    fn a_structured_row_says_what_kind_of_thing_it_indexes() {
+        let file = json!({ "content": "x".repeat(4000), "version": "abc" });
+        let tail = delivered_tail(&file);
+        assert!(tail.starts_with("ok, {content, version}, "), "{tail}");
+        assert!(!tail.contains("xxxx"), "the contents stay out: {tail}");
+
+        assert!(delivered_tail(&json!([1, 2, 3])).starts_with("ok, [3 items], "));
+        assert!(delivered_tail(&json!([1])).starts_with("ok, [1 item], "));
+
+        // A wide object gives up rather than spilling onto three lines.
+        let wide = json!({"a":1,"b":2,"c":3,"d":4,"e":5,"f":6,"g":7});
+        assert!(delivered_tail(&wide).starts_with("ok, {a, b, c, d, e, …}, "));
+
+        // Scalars are unchanged — they already showed their value.
+        assert_eq!(delivered_tail(&json!(null)), "ok");
+        assert_eq!(delivered_tail(&json!(42)), "42");
+        assert_eq!(delivered_tail(&json!("short")), "\"short\"");
     }
 
     /// A menu row says a call arrived and how big its value is — never

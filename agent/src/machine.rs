@@ -3395,6 +3395,23 @@ pub(crate) fn note_text(value: &serde_json::Value) -> String {
     }
 }
 
+/// An appended value as the **model** reads it back: its JSON, always.
+///
+/// **What you see is what `fetch` hands you.** A note is the one row
+/// whose content is shown whole rather than indexed, so its rendering
+/// is the model's only evidence of what `history.fetch(id)` will
+/// return — and [`note_text`] renders a string bare, which makes
+/// `append("{\"a\": 1}")` and `append({ a: 1 })` identical on the page
+/// and different in the hand. Quoting costs a couple of characters and
+/// removes the guess: `appended: "a conclusion"` is a string,
+/// `appended: {"a":1}` is an object.
+///
+/// `note_text` stays as it is — `Outcome::appended` is contracted as
+/// "the note's own literal text" and the benchmark checkers read it.
+pub(crate) fn note_display(value: &serde_json::Value) -> String {
+    value.to_string()
+}
+
 fn json_arg(vm: &mut VM, json: &serde_json::Value) -> Value {
     vm.json_to_stack_value(json, 0).unwrap_or(Value::Null)
 }
@@ -3635,7 +3652,7 @@ pub(crate) fn menu_rows(
                     label: String::new(),
                     state: ArtifactState::Whole(format!(
                         "appended: {}",
-                        crate::document::escape_untrusted(&note_text(value))
+                        crate::document::escape_untrusted(&note_display(value))
                     )),
                 }),
                 _ => None,
@@ -5352,6 +5369,38 @@ mod tests {
             .expect("the second append");
         // An object, indexable — not a string anyone has to parse.
         assert_eq!(back, json!(["object", 3, "b"]));
+    }
+
+    /// **And the row says which it will be.** A note is shown whole,
+    /// so its rendering is the model's only evidence of what
+    /// `history.fetch` returns — and a string rendered bare made
+    /// `append("{\"a\":1}")` and `append({a:1})` identical on the page
+    /// and different in the hand (`note_display`).
+    #[test]
+    fn an_appended_row_renders_as_the_json_it_will_hand_back() {
+        for (program, row) in [
+            (
+                "history.append({ kept: 3, dead: [\"a\"] });",
+                r#"appended: {"kept":3,"dead":["a"]}"#,
+            ),
+            (
+                "history.append(\"a conclusion\");",
+                r#"appended: "a conclusion""#,
+            ),
+        ] {
+            let (mut tree, mut state) = setup();
+            state.kickoff(&mut tree).unwrap();
+            let out = state
+                .step(&mut tree, StepInput::LlmResponse(llm_program(program)))
+                .unwrap();
+            drain(&mut state, &mut tree, out);
+            let doc = crate::document::render(&tree, &state.spine, 64 * 1024);
+            let text: String = doc.messages.iter().map(|m| m.content.as_str()).collect();
+            assert!(text.contains(row), "wanted {row:?} in:\n{text}");
+            // No escaped quotes: the value is stored as a value now, so
+            // there is no JSON-inside-JSON to escape.
+            assert!(!text.contains(r#"\""#), "double-escaped:\n{text}");
+        }
     }
 
     /// A `Note` and a program's own source come back too — the three
