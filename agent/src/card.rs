@@ -127,6 +127,33 @@ pub fn active() -> &'static Card {
 /// fits comfortably inside this.
 const DESCRIPTION_MAX_BYTES: usize = 400;
 
+/// **The card teaches the glyphs the renderer emits.**
+///
+/// `card.md` is a file, so it cannot reference `BLOCK_ARROW` and
+/// `ARROW` the way the compaction directive now does. This is the
+/// substitute: rename a marker and the card stops describing what the
+/// model will see, which is precisely the failure the forgery guard
+/// and the console line cap were — a literal encoding another part's
+/// format, with nothing watching it.
+#[test]
+fn the_card_teaches_the_markers_the_document_uses() {
+    let card = &active().text;
+    let down = crate::document::BLOCK_ARROW;
+    let left = crate::document::ARROW.trim();
+    assert!(
+        card.contains(&format!("`{down} history[")),
+        "the card shows the block marker as it renders: {down}"
+    );
+    assert!(
+        card.contains(&format!("/* {left} history[")),
+        "and the call annotation as it renders: {left}"
+    );
+    assert!(
+        card.contains(&format!("Every `{down}` and `{left}`")),
+        "and says both were added by the harness"
+    );
+}
+
 /// The shipped manifest, as the model reads it — the two facts that
 /// were wrong in it, held.
 #[test]

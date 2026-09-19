@@ -1198,6 +1198,11 @@ pub(crate) fn compaction_message(
     unit: crate::types::Measure,
 ) -> String {
     let noun = unit.noun();
+    // Built from the constant rather than spelled out, because a
+    // directive that names a marker the renderer no longer emits is a
+    // lie told at the worst possible moment — see the forgery guard,
+    // which matched a row shape nothing emitted for the same reason.
+    let arrow = crate::document::BLOCK_ARROW;
     format!(
         "## STOP — THIS CONVERSATION IS FULL\n\n\
          {measured} {noun}s against a {limit}-{noun} budget. **The task above is not being \
@@ -1211,7 +1216,7 @@ pub(crate) fn compaction_message(
          `history.replace(id, text)` shows `text` in its place instead. Everything carrying \
          an id above can be named — a report, a note, a post, any single line of a \
          report's menu, and **any block of any reply you have written**, which is what the \
-         `↓ history[12]` line above a block is for. Anything else you name is simply \
+         `{arrow} history[12]` line above a block is for. Anything else you name is simply \
          skipped, and everything you name that does exist still applies.\n\n\
          Your own blocks are usually the cheapest thing to drop: a program that has \
          already run sits directly above the report saying what it did, and the report is \

@@ -396,7 +396,7 @@ fn annotate_history_calls(source: &str, cuts: Option<&Vec<Cut>>, blocks: &[(usiz
 /// A glyph the model does not reach for on its own is doing the work
 /// here, the same work `ARROW` does one line down; `card.md` says in
 /// words that neither was written by the model.
-const BLOCK_ARROW: &str = "↓";
+pub(crate) const BLOCK_ARROW: &str = "↓";
 
 /// The arrow every annotation carries, so it reads as something
 /// pointing *out* of the code at a row rather than as a comment
@@ -406,7 +406,7 @@ const BLOCK_ARROW: &str = "↓";
 /// it would not reach for on its own says the same thing at the place
 /// the confusion happens, which prose in a system prompt 16 KB earlier
 /// evidently does not.
-const ARROW: &str = " ←";
+pub(crate) const ARROW: &str = " ←";
 
 /// The span of an annotation the model wrote itself, immediately after
 /// `at` — so this pass can replace it rather than append beside it.
