@@ -177,6 +177,10 @@ pub struct ConditionReport {
     /// its artifacts instead of each one re-listing its predecessor's.
     /// The trailing line says how many exist in total and their id range.
     pub artifacts: Vec<Artifact>,
+    /// Rows this run appended that hold bytes already on the log — see
+    /// [`CompletionReport::copied_rows`], and [`copied_note`] for why
+    /// this is on both shapes.
+    pub copied_rows: Vec<(u64, u64)>,
 }
 
 impl ConditionReport {
@@ -201,6 +205,7 @@ impl ConditionReport {
         let rows: Vec<&Artifact> = self.artifacts.iter().collect();
         sections.extend(render_rows(&rows));
         sections.extend(render_console(&self.console, self.console_id));
+        sections.extend(copied_note(&self.copied_rows));
         sections.join("\n\n")
     }
 }
@@ -362,20 +367,9 @@ impl CompletionReport {
             ));
         }
 
-        if !self.copied_rows.is_empty() {
-            let pairs = self
-                .copied_rows
-                .iter()
-                .map(|(note, src)| format!("`[{note}]` holds the bytes of `[{src}]`"))
-                .collect::<Vec<_>>()
-                .join("; ");
-            out.push_str(&format!(
-                "\n\n### worth knowing\n\n{pairs}. A call's result is already kept — \
-                 `history.fetch(id)` hands it back whole, from the log, for nothing — so a \
-                 copy of it is a second charge on every turn from here for something you \
-                 already had. Keep the id. What is worth a row of its own is what you \
-                 concluded from those bytes."
-            ));
+        if let Some(note) = copied_note(&self.copied_rows) {
+            out.push_str("\n\n");
+            out.push_str(&note);
         }
 
         if self.wrote_without_verifying() {
@@ -1001,6 +995,32 @@ pub fn derive_report(tree: &Tree, leaf: EventId, outcome: EventId, budget: usize
     text
 }
 
+/// The "you copied a row" advisory, shared by both report shapes.
+///
+/// **On both, because the rows were added either way.** It lived only
+/// on the completion report at first, and the run that prompted it
+/// appended four copies in a program that ended in a `ReferenceError`
+/// — so the one report it would have helped was the one shape it did
+/// not appear on. The same mistake as `CellFailed` hiding the work a
+/// reply had already done, one field over.
+fn copied_note(rows: &[(u64, u64)]) -> Option<String> {
+    if rows.is_empty() {
+        return None;
+    }
+    let pairs = rows
+        .iter()
+        .map(|(note, src)| format!("`[{note}]` holds the bytes of `[{src}]`"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    Some(format!(
+        "### worth knowing\n\n{pairs}. A call's result is already kept — \
+         `history.fetch(id)` hands it back whole, from the log, for nothing — so a \
+         copy of it is a second charge on every turn from here for something you \
+         already had. Keep the id. What is worth a row of its own is what you \
+         concluded from those bytes."
+    ))
+}
+
 /// How long a string has to be before carrying it twice is worth a
 /// word. Shorter than a `read_file` of anything real, longer than any
 /// conclusion worth appending.
@@ -1131,6 +1151,7 @@ fn render_handback(h: &Handback<'_>, budget: usize) -> String {
                 console: h.console.clone(),
                 console_id: h.console_id,
                 artifacts,
+                copied_rows: copied_rows(h),
             }
             .render()
         }
@@ -1147,6 +1168,7 @@ fn render_handback(h: &Handback<'_>, budget: usize) -> String {
             console: h.console.clone(),
             console_id: h.console_id,
             artifacts: menu_since(h, h.previous_outcome),
+            copied_rows: copied_rows(h),
         }
         .render(),
     }
@@ -2208,6 +2230,7 @@ mod tests {
     fn what_section_is_bounded() {
         let report = ConditionReport {
             heading: RUN_HEADING,
+            copied_rows: Vec::new(),
             what: "w".repeat(10_000),
             whence: Whence::Stack(vec!["<root>".into()]),
             console: Vec::new(),
@@ -2278,6 +2301,7 @@ mod tests {
     fn a_menu_row_indexes_a_value_instead_of_replaying_it() {
         let report = ConditionReport {
             heading: RUN_HEADING,
+            copied_rows: Vec::new(),
             what: "boom".into(),
             whence: Whence::Stack(vec!["<root>".into()]),
             console: Vec::new(),
@@ -2301,6 +2325,7 @@ mod tests {
     fn a_failed_row_still_carries_its_reason() {
         let report = ConditionReport {
             heading: RUN_HEADING,
+            copied_rows: Vec::new(),
             what: "boom".into(),
             whence: Whence::Stack(vec!["<root>".into()]),
             console: Vec::new(),
