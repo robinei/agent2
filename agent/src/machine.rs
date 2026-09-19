@@ -619,14 +619,6 @@ enum SuspendCause {
     /// model wrote a cell that does not compile, and that is what the repair
     /// loop needs to see.
     CellCompileFailed(String),
-    /// `Transport::Notebook` only: the completion was cut off by the token
-    /// budget, after some cells had already run.
-    ///
-    /// The run ends here rather than with its `Return(0)`, so it has exactly
-    /// one terminal and that terminal says what happened. The effects of the
-    /// cells that closed stay in the log — which is the whole of D11's
-    /// "truncation becomes partial progress".
-    Truncated,
 }
 
 impl Runner {
@@ -839,26 +831,40 @@ impl Runner {
             .collect()
     }
 
-    /// The most recent `Turn` on this path whose run has logged an
-    /// outcome (`Return`/`Condition`) — regardless of `shown`. The two
+    /// The most recent reply on this path **that ran something** and
+    /// has since logged a `Handback` — regardless of `shown`. The two
     /// callers differ only in whether they apply that guard themselves:
     /// `needs_prompt` does (an already-shown outcome is not a fresh
     /// cause), `unrendered_cause` deliberately does not (reconciliation
     /// needs the fact independent of a `shown` a crash may have left
     /// pointing past it).
+    ///
+    /// **"That ran something" is what makes D4 work.** A reply with no
+    /// cells is an implicit `done()`: the model spoke and stopped, and
+    /// the branch rests. That used to fall out for free, because a
+    /// `Turn` was logged per *cell* and a cell-less reply logged none.
+    /// A `Reply` is logged unconditionally now, so the condition has to
+    /// be said out loud — and saying it is an improvement: the rule was
+    /// never "no Turn event", it was always "nothing ran".
     fn last_turn_outcome(&self, tree: &Tree) -> Option<EventId> {
         let segment = self.agent_segment(tree);
         let at = segment
             .iter()
             .rposition(|e| matches!(e.payload, EventPayload::Reply))?;
-        segment[at + 1..]
+        let tail = &segment[at + 1..];
+        let ran = tail.iter().any(|e| {
+            matches!(
+                e.payload,
+                EventPayload::Part {
+                    part: crate::types::Part::Cell(_),
+                    ..
+                }
+            )
+        });
+        (ran && tail
             .iter()
-            .any(|e| {
-                matches!(
-                    e.payload,
-                    EventPayload::Handback { .. }                 )
-            })
-            .then_some(segment[at].id)
+            .any(|e| matches!(e.payload, EventPayload::Handback { .. })))
+        .then_some(segment[at].id)
     }
 
     /// **Reconciliation's half of the trigger rule**: forget having shown
@@ -1143,11 +1149,14 @@ impl Runner {
         // tests drove *this* one, five bugs reached a live run through a
         // green suite.
         self.open_notebook_reply(tree, None, author)?;
-        let mut out = self.notebook_stream_chunk(tree, &source)?;
-        if let Some(more) = self.notebook_stream_end(tree, truncated, usage, thinking)? {
-            out.extend(more);
-        }
-        Ok(out)
+        // Recorded first, run second. The text is all here, so there is
+        // nothing to wait for, and ending the reply before driving it
+        // keeps `ReplyEnd` where it belongs — after the reply's own
+        // parts and before the effects of its cells.
+        self.notebook_feed(tree, &source)?;
+        Ok(self
+            .notebook_stream_end(tree, truncated, usage, thinking)?
+            .unwrap_or_default())
     }
 
     /// Continue a suspended program directly — the live half of a
@@ -1495,9 +1504,6 @@ impl Runner {
                                 SuspendCause::CellCompileFailed(report),
                                 out,
                             );
-                        }
-                        NotebookStep::Truncated => {
-                            return self.suspend(tree, SuspendCause::Truncated, out);
                         }
                     }
                 }
@@ -2611,13 +2617,6 @@ impl Runner {
                 };
                 (cause, site, ResumeWith::Trapped(e))
             }
-            // **Truncation is a fact about the text, not the program**
-            // (28): it goes on `ReplyEnd`, and the run simply stops
-            // where the reply did.
-            SuspendCause::Truncated => {
-                self.reply_ended = Some(ReplyEnd::Truncated);
-                (Handback::Interrupted, 0, ResumeWith::Continue)
-            }
             SuspendCause::CellCompileFailed(report) => {
                 // `ip` is parked on the failed cell's append position, which
                 // has no instruction yet — so there is no span to point at,
@@ -3501,19 +3500,32 @@ impl Runner {
         tree: &mut Tree,
         text: &str,
     ) -> io::Result<Vec<StepOutput>> {
+        self.notebook_feed(tree, text)?;
+        self.drive_notebook(tree)
+    }
+
+    /// Take text into the reply and record whatever parts it completed —
+    /// without running any of them.
+    ///
+    /// Split out from [`notebook_stream_chunk`](Self::notebook_stream_chunk)
+    /// so a reply that arrives **whole** can record itself before it
+    /// runs: its `ReplyEnd` is already known, and logging it after the
+    /// first cell's effects put the end of the reply after the end of
+    /// the run.
+    fn notebook_feed(&mut self, tree: &mut Tree, text: &str) -> io::Result<()> {
         let Phase::Running(run) = &mut self.phase else {
-            return Ok(Vec::new());
+            return Ok(());
         };
         let Some(notebook) = run.notebook.as_mut() else {
-            return Ok(Vec::new());
+            return Ok(());
         };
         let pieces = notebook.push_text(text);
         self.log_parts(tree, &pieces)?;
         let Phase::Running(run) = &mut self.phase else {
-            return Ok(Vec::new());
+            return Ok(());
         };
         let Some(notebook) = run.notebook.as_mut() else {
-            return Ok(Vec::new());
+            return Ok(());
         };
         // **From the notebook, not from the chunk.** `push_text` may drop a
         // span it has just been handed — a provider leaking its reasoning
@@ -3524,7 +3536,7 @@ impl Runner {
         // harm: the model's own mouth, as an example of how to write a
         // reply.
         self.streaming_reply = notebook.reply().to_owned();
-        self.drive_notebook(tree)
+        Ok(())
     }
 
     /// The completion has finished arriving: hand over the trailing prose and
@@ -3573,6 +3585,9 @@ impl Runner {
         // for a fence that was never coming. The reply is over either
         // way; whether its run can proceed is a separate question,
         // answered below.
+        if truncated {
+            self.reply_ended = Some(ReplyEnd::Truncated);
+        }
         let tail = match &mut self.phase {
             Phase::Running(run) | Phase::Suspended(run, _) => {
                 match run.notebook.as_mut() {
@@ -3625,7 +3640,6 @@ impl Runner {
             NotebookStep::Failed(report) => {
                 self.suspend(tree, SuspendCause::CellCompileFailed(report), out)
             }
-            NotebookStep::Truncated => self.suspend(tree, SuspendCause::Truncated, out),
         }
     }
 
@@ -3722,16 +3736,14 @@ impl Runner {
         if self.streaming_epoch.take().is_none() {
             return Ok(());
         }
-        // The reply as it actually arrived, taken from the notebook
-        // rather than from the final `LlmTurn`, whose `source` the
-        // streaming path never fills — the text came in as chunks.
-        let text = std::mem::take(&mut self.streaming_reply);
+        // The live buffer belongs to the reply that is ending; the
+        // text itself is already on the log, part by part.
+        self.streaming_reply.clear();
         // **Logged even when there is nothing to report.** A cancelled
         // generation has no usage, but "no event" and "no usage" must not
         // be the same state: that is what made a third of the arm's
         // completions invisible, and every per-reply metric was divided
         // by the wrong number.
-        let _ = text;
         if let Some(thinking) = thinking.filter(|t| !t.is_empty()) {
             tree.append(
                 &mut self.spine,
@@ -3808,9 +3820,6 @@ enum NotebookStep {
     Waiting,
     /// A cell did not compile; the report is the repair loop's.
     Failed(String),
-    /// The reply was cut off. The cells that ran stand; the run ends as
-    /// truncated rather than completed.
-    Truncated,
 }
 
 impl Runner {
@@ -3918,9 +3927,13 @@ impl Runner {
                     if !notebook.is_ended() {
                         return Ok(NotebookStep::Waiting);
                     }
-                    if notebook.was_truncated() {
-                        return Ok(NotebookStep::Truncated);
-                    }
+                    // **Truncation does not end the run** (28): it is
+                    // a fact about the text, recorded on `ReplyEnd`.
+                    // Every cell that arrived ran, so the run closes
+                    // the way any other reply's does — and the model
+                    // learns why its own words stop mid-sentence from
+                    // the marker the document renders there, not from
+                    // a second, differently-worded terminal.
                     if let Err(report) = notebook.close(&mut run.vm) {
                         return Ok(NotebookStep::Failed(report));
                     }
@@ -4197,15 +4210,34 @@ mod tests {
                 EventPayload::Handback { .. } => "Handback",
                 EventPayload::Call(_) => "Call",
                 EventPayload::Result { .. } => "Result",
-                EventPayload::Handback { .. } => "Return",
-                EventPayload::Handback { .. } => "Condition",
                 EventPayload::Console { .. } => "Console",
-                EventPayload::ReplyEnd { .. } => "Completion",
                 EventPayload::Rename { .. } => "Rename",
                 EventPayload::Note { .. } => "Note",
                 EventPayload::Compacted { .. } => "Compacted",
             })
             .collect()
+    }
+
+    /// The reply's parts and the calls that ran off them, each in their
+    /// own order — everything about a reply's log **except** where
+    /// `ReplyEnd` falls, which is the one thing that legitimately
+    /// depends on when the provider stopped talking.
+    fn parts_and_calls(state: &Runner, tree: &Tree) -> (Vec<String>, Vec<String>) {
+        let mut parts = Vec::new();
+        let mut calls = Vec::new();
+        for e in state.agent_segment(tree) {
+            match &e.payload {
+                EventPayload::Part { part, .. } => match part {
+                    crate::types::Part::Prose(t) | crate::types::Part::Cell(t) => {
+                        parts.push(t.clone())
+                    }
+                    crate::types::Part::Thinking(_) => {}
+                },
+                EventPayload::Call(c) => calls.push(format!("{c:?}")),
+                _ => {}
+            }
+        }
+        (parts, calls)
     }
 
     fn expect_request(outputs: &[StepOutput]) -> &LlmRequest {
@@ -4267,7 +4299,10 @@ mod tests {
             panic!("expected a Send");
         };
         let (site, site_end) = (*site as usize, *site_end as usize);
-        assert_eq!(&source[site..site_end], r#"tell("hello")"#);
+        // Reply-absolute (28): the site indexes the markdown the model
+        // wrote, fences and all, not the bare cell body.
+        let reply = format!("```js\n{source}\n```\n");
+        assert_eq!(&reply[site..site_end], r#"tell("hello")"#);
     }
     /// `history.append` is a settle-at-dispatch verb, so its span comes
     /// through `SettleCall` rather than `InvokeCall` — a path that
@@ -4291,8 +4326,9 @@ mod tests {
         let EventPayload::Note { site, site_end, .. } = &note.payload else {
             unreachable!()
         };
+        let reply = format!("```js\n{source}\n```\n");
         assert_eq!(
-            &source[*site as usize..*site_end as usize],
+            &reply[*site as usize..*site_end as usize],
             "history.append({ found: 3 })",
             "the span is the whole call"
         );
@@ -4386,7 +4422,7 @@ mod tests {
         assert!(report.contains("hi there"), "{report}");
         assert_eq!(
             payload_kinds(&state, &tree),
-            ["Agent", "Post", "Reply", "Part", "Note", "ReplyEnd", "Handback", "Console"]
+            ["Agent", "Post", "Reply", "Part", "ReplyEnd", "Note", "Handback", "Console"]
         );
     }
 
@@ -4501,8 +4537,8 @@ mod tests {
         assert!(state.is_idle());
         assert_eq!(
             payload_kinds(&state, &tree),
-            ["Agent", "Post", "Completion", "Call", "Return", "Console"],
-            "no Return, no Condition — nothing ran"
+            ["Agent", "Post", "Reply", "Part", "ReplyEnd", "Call", "Handback", "Console"],
+            "one reply, one part, and no cell in it"
         );
 
         let score = crate::score::score(&tree);
@@ -4522,7 +4558,7 @@ mod tests {
         assert!(report.contains("DID NOT RUN"), "{report}");
         assert_eq!(
             payload_kinds(&state, &tree),
-            ["Agent", "Reply", "Part", "Handback", "Console", "ReplyEnd"]
+            ["Agent", "Reply", "Part", "ReplyEnd", "Handback", "Console"]
         );
         // A cell that will not compile *suspends* the reply rather than
         // ending it: the condition is handed back and the next reply
@@ -4992,7 +5028,7 @@ mod tests {
         // menu be an index rather than a replay.
         assert_eq!(
             &payload_kinds(&state, &tree)[before..],
-            ["Reply", "Part", "Note", "ReplyEnd", "Handback", "Console"],
+            ["Reply", "Part", "ReplyEnd", "Note", "Handback", "Console"],
             "the fetch logged something of its own"
         );
     }
@@ -5015,7 +5051,7 @@ mod tests {
             .find(|e| matches!(e.payload, EventPayload::Note { .. }))
             .unwrap()
             .id;
-        let turn = segment
+        let reply = segment
             .iter()
             .find(|e| matches!(e.payload, EventPayload::Reply))
             .unwrap()
@@ -5024,7 +5060,7 @@ mod tests {
         let fetch = format!(
             "history.append([await fetch_history({}), await fetch_history({})]);",
             note.as_u64(),
-            turn.as_u64()
+            reply.as_u64()
         );
         let out = state
             .step(&mut tree, StepInput::LlmResponse(llm_program(&fetch)))
@@ -5045,7 +5081,9 @@ mod tests {
             })
             .unwrap();
         assert_eq!(returned[0], json!("the parser drops the last field"));
-        assert_eq!(returned[1], json!(format!("{src}\n")));
+        // A reply comes back as the markdown the model wrote — fences
+        // and all, because that is the row (28).
+        assert_eq!(returned[1], json!(format!("```js\n{src}\n```\n")));
     }
 
     /// **A call whose arguments cannot be represented does not happen.**
@@ -5729,14 +5767,14 @@ mod tests {
     // them, so a cell boundary never reaches `finish_program` and the
     // reply's own `Return(0)` does, once.
 
-    /// A three-cell reply, decomposed. **One completion is not one
-    /// `Turn`** (D15): the reply becomes its pieces in source order —
-    /// a `Send` for each prose segment, a `Turn` holding each cell's
-    /// own JavaScript — and it is still **one run** with one terminal
-    /// (D7), because the cells share a frame nothing unwinds between
-    /// them.
+    /// A three-cell reply, decomposed. **The reply is recorded, not
+    /// reassembled** (28): it becomes its pieces in source order — a
+    /// `Part::Prose` for each paragraph, a `Part::Cell` holding each
+    /// fenced block *with its fences* — and it is still **one run**
+    /// with one handback (D7), because the cells share a frame nothing
+    /// unwinds between them.
     #[test]
-    fn a_three_cell_reply_is_three_turns_one_run_and_one_outcome() {
+    fn a_three_cell_reply_is_three_cells_one_run_and_one_handback() {
         let (mut tree, mut state) = setup_under();
         user_post(&mut state, &mut tree, "go");
         let reply = "Reading the two files first.\n\n\
@@ -5756,9 +5794,9 @@ mod tests {
             .unwrap();
         drain(&mut state, &mut tree, out);
 
-        // Each cell's `Turn` holds that cell's JavaScript — which is
-        // what keeps `Turn.source` honest under this transport, and why
-        // D14's rename turned out not to be needed.
+        // Each `Part::Cell` holds the block the model wrote, fences
+        // included — that is what makes the parts concatenate back to
+        // the reply byte for byte.
         let sources: Vec<&str> = state
             .agent_segment(&tree)
             .iter()
@@ -5770,34 +5808,40 @@ mod tests {
         assert_eq!(
             sources,
             vec![
-                "let total = 1;\n",
-                "total = total + 41;\n",
-                "console.log(`total is ${total}`);\n",
+                "```js\nlet total = 1;\n```\n",
+                "```js\ntotal = total + 41;\n```\n",
+                "```js\nconsole.log(`total is ${total}`);\n```\n",
             ]
         );
 
         // Prose and cells interleave in source order: a paragraph, a
-        // cell, a paragraph, a cell, a paragraph, a cell — and one
-        // `Return` at the end, for the one run.
+        // cell, a paragraph, a cell, a paragraph, a cell. The whole
+        // reply arrived in one piece here, so every part is on the log
+        // before the first cell runs — see
+        // `chunk_boundaries_do_not_change_the_reply` for what that
+        // does and does not guarantee.
         assert_eq!(
             payload_kinds(&state, &tree),
             [
                 "Agent",
                 "Post", //
+                "Reply",
+                "Part", // "Reading the two files first."
+                "Part", // cell 0
+                "Part", // "Now the adjustment."
+                "Part", // cell 1
+                "Part", // "And the answer."
+                "Part", // cell 2
+                // The reply's cost, once. The whole text arrived
+                // before anything ran, so this is where it stopped.
+                "ReplyEnd",
+                "Call", // the three prose segments, as sends to the user
                 "Call",
-                "Turn", // "Reading the two files first." + cell 0
                 "Call",
-                "Turn", // "Now the adjustment."          + cell 1
-                "Call",
-                "Turn", // "And the answer."              + cell 2
-                // The reply's own bytes and cost, once, when the
-                // generation ends — which is after its cells have run,
-                // because every reply now takes the streaming path.
-                "Completion",
-                "Return",
+                "Handback",
                 "Console",
             ],
-            "three cells, three Turns, one Completion, one Return"
+            "three cells, six parts, one ReplyEnd, one Handback"
         );
 
         // And they really shared a scope.
@@ -5996,14 +6040,15 @@ mod tests {
         );
     }
 
-    /// **`Call::site` keeps its meaning exactly** (D1): an offset into
-    /// the owning `Turn`'s `source`. The owning `Turn` is now one cell,
-    /// so the absolute span the compiler emitted — absolute so the
-    /// analyzer's span-keyed tables do not collide across cells (D2) —
-    /// is rebased against that cell at log time. Nothing downstream
-    /// sees an absolute offset.
+    /// **`Call::site` keeps its meaning exactly**: an offset into the
+    /// reply the model wrote (28, "Sites"). The compiler emits it
+    /// against the parse buffer — the prelude, then the reply with
+    /// prose blanked and cells verbatim — so subtracting
+    /// `ReplCore::source_base()` once, at log time, makes it an offset
+    /// into the markdown itself. Nothing downstream sees a prelude
+    /// offset, and nothing has to work out which cell first.
     #[test]
-    fn every_call_site_resolves_into_its_own_cell() {
+    fn every_call_site_resolves_into_the_reply() {
         let (mut tree, mut state) = setup_under();
         user_post(&mut state, &mut tree, "go");
         let reply = "First I speak.\n\n\
@@ -6015,47 +6060,41 @@ mod tests {
             .unwrap();
         drain(&mut state, &mut tree, out);
 
-        // Walk the log keeping each `Turn`'s source beside the sends
-        // that follow it, which is exactly how a site is meant to be
-        // resolved.
-        let mut current: Option<String> = None;
+        // The reply, rebuilt from its parts exactly as a reader would:
+        // that is the string a site indexes into.
+        let mut rebuilt = String::new();
         let mut checked = 0;
         for event in state.agent_segment(&tree) {
             match &event.payload {
-                EventPayload::Part {
-                    part: crate::types::Part::Cell(source),
-                    ..
-                } => {
-                    current = Some(source.clone());
-                }
-                EventPayload::Call(Call::Send { site, site_end, .. }) => {
-                    let Some(source) = current.as_deref() else {
-                        // The reply's opening prose, logged before any
-                        // cell: synthetic, zero-width.
-                        assert_eq!((*site, *site_end), (0, 0));
-                        continue;
-                    };
-                    if (*site, *site_end) == (0, 0) {
-                        continue; // a prose segment between cells
+                EventPayload::Part { part, .. } => match part {
+                    crate::types::Part::Prose(t) | crate::types::Part::Cell(t) => {
+                        rebuilt.push_str(t)
                     }
-                    let sliced = &source[*site as usize..*site_end as usize];
+                    crate::types::Part::Thinking(_) => {}
+                },
+                EventPayload::Call(Call::Send { site, site_end, .. }) => {
+                    if (*site, *site_end) == (0, 0) {
+                        continue; // a prose segment: synthetic, zero-width
+                    }
+                    let sliced = &rebuilt[*site as usize..*site_end as usize];
                     assert!(
                         sliced.starts_with("tell(") && sliced.contains("cell"),
-                        "site sliced {sliced:?} out of {source:?}"
+                        "site sliced {sliced:?} out of {rebuilt:?}"
                     );
                     checked += 1;
                 }
                 _ => {}
             }
         }
+        assert_eq!(rebuilt, reply, "and the parts are the reply");
         assert_eq!(checked, 2, "two tells, two sites resolved");
     }
 
-    /// And the rebasing is real work, not a no-op: the second cell's
-    /// `tell` sits well into the markdown but near the start of its own
-    /// cell, and the site is the latter.
+    /// And the subtraction is real work, not a no-op in the other
+    /// direction either: the second cell's `tell` sits well into the
+    /// markdown, and the site says so — it is *not* cell-local.
     #[test]
-    fn a_site_is_cell_local_not_reply_absolute() {
+    fn a_site_is_reply_absolute_not_cell_local() {
         let (mut tree, mut state) = setup_under();
         user_post(&mut state, &mut tree, "go");
         let reply = "A fairly long opening paragraph, so the offsets differ.\n\n\
@@ -6072,17 +6111,18 @@ mod tests {
             .iter()
             .filter_map(|e| match &e.payload {
                 EventPayload::Call(Call::Send { site, site_end, .. }) if *site_end > 0 => {
-                    Some(*site)
+                    Some(*site as usize)
                 }
                 _ => None,
             })
             .next()
             .expect("the tell");
-        assert_eq!(site, 0, "the tell is the first thing in its own cell");
-        assert!(
-            reply.find("tell(\"second\")").unwrap() > 60,
-            "but it is far into the reply, so this was a real rebase"
+        assert_eq!(
+            site,
+            reply.find("tell(\"second\")").unwrap(),
+            "the site is where the tell is in the reply"
         );
+        assert!(site > 60, "and that is far from the start of its own cell");
     }
 
     /// **A reply with no cells rests the branch** (D4), and nothing was
@@ -6117,7 +6157,7 @@ mod tests {
             // any more — so it closes with an outcome like any other
             // reply, and rests because no `Turn` of its own was ever
             // logged for `last_turn_outcome` to find.
-            ["Agent", "Post", "Completion", "Call", "Return", "Console"],
+            ["Agent", "Post", "Reply", "Part", "ReplyEnd", "Call", "Handback", "Console"],
             "the prose is delivered and nothing ran"
         );
         let said = state
@@ -6267,7 +6307,7 @@ mod tests {
         let kinds = payload_kinds(&state, &tree);
         assert_eq!(
             kinds,
-            ["Agent", "Post", "Reply", "Part", "Call", "Part", "Call"],
+            ["Agent", "Post", "Reply", "Part", "Part", "Call", "Call"],
             "cell 0 ran while the reply was still open"
         );
         assert!(
@@ -6315,7 +6355,7 @@ mod tests {
         );
         assert_eq!(
             payload_kinds(&state, &tree),
-            ["Agent", "Post", "Reply", "Part", "Call", "Part", "Call"],
+            ["Agent", "Post", "Reply", "Part", "Part", "Call", "Call"],
             "the paragraph is delivered, then the cell runs and speaks"
         );
     }
@@ -6488,11 +6528,14 @@ mod tests {
             1,
             "one run, one terminal, even truncated: {causes:?}"
         );
-        // Truncation is a fact about the *text* (28): the handback says
-        // the run stopped, `ReplyEnd` says why the reply did.
+        // Truncation is a fact about the *text*, not about the program
+        // (28). Every cell that arrived ran to the end, so the run
+        // completed; it is `ReplyEnd` that says the reply was cut off,
+        // and the document renders that marker where the text stops so
+        // the model can see why it seems to end mid-sentence.
         assert!(
-            matches!(causes[0], crate::types::Handback::Interrupted),
-            "reported as partial, not completed: {causes:?}"
+            matches!(causes[0], crate::types::Handback::Completed),
+            "the cells that arrived all ran: {causes:?}"
         );
         assert!(
             tree.events.values().any(|e| matches!(
@@ -6506,35 +6549,37 @@ mod tests {
         );
     }
 
-    /// The whole reply arriving in one chunk is the same as arriving in
-    /// many: the splitter does not care where the chunk boundaries fell.
+    /// **What the provider's chunking may and may not change.**
+    ///
+    /// It may change the *interleaving*: a part is logged when it is
+    /// seen, and a call when it runs, so a reply that arrives whole has
+    /// all its parts on the log before its first cell executes, while a
+    /// reply that dribbles in line by line alternates. Both are honest
+    /// records of arrival order, and 28's worked log is the streamed
+    /// one.
+    ///
+    /// It may not change the reply. The parts are the same parts, in
+    /// the same order, concatenating to the same bytes — that is the
+    /// invariant the whole phase exists for — and the same calls run
+    /// off them.
     #[test]
-    fn chunk_boundaries_do_not_change_the_log() {
+    fn chunk_boundaries_do_not_change_the_reply() {
         let reply = "One.\n\n```js\nlet a = 1;\n```\n\nTwo.\n\n```js\na = 2;\n```\n\nThree.\n";
-        let whole = {
+        let run = |chunks: &[&str]| {
             let (mut tree, mut state) = setup_under();
             user_post(&mut state, &mut tree, "go");
             state.phase = Phase::AwaitingLlm;
-            stream_chunks(&mut state, &mut tree, &[reply]);
+            stream_chunks(&mut state, &mut tree, chunks);
             let out = state
                 .step(&mut tree, StepInput::LlmResponse(llm_program("")))
                 .unwrap();
             drain(&mut state, &mut tree, out);
-            payload_kinds(&state, &tree)
+            parts_and_calls(&state, &tree)
         };
-        let split = {
-            let (mut tree, mut state) = setup_under();
-            user_post(&mut state, &mut tree, "go");
-            state.phase = Phase::AwaitingLlm;
-            let chunks: Vec<&str> = reply.split_inclusive('\n').collect();
-            stream_chunks(&mut state, &mut tree, &chunks);
-            let out = state
-                .step(&mut tree, StepInput::LlmResponse(llm_program("")))
-                .unwrap();
-            drain(&mut state, &mut tree, out);
-            payload_kinds(&state, &tree)
-        };
+        let whole = run(&[reply]);
+        let split = run(&reply.split_inclusive('\n').collect::<Vec<_>>());
         assert_eq!(whole, split);
+        assert_eq!(whole.0.concat(), reply, "and the parts are the reply");
     }
 
     /// One `LlmTurn` carrying usage, for the transports that read it.
@@ -6582,12 +6627,18 @@ mod tests {
             .collect();
         assert_eq!(costs, vec![321], "one completion, one cost");
 
-        let turns = state
-            .agent_segment(&tree)
-            .iter()
-            .filter(|e| matches!(e.payload, EventPayload::Reply))
-            .count();
-        assert_eq!(turns, 3, "three cells, three Turns — and still one cost");
+        let (replies, cells) = state.agent_segment(&tree).iter().fold(
+            (0, 0),
+            |(r, c), e| match &e.payload {
+                EventPayload::Reply => (r + 1, c),
+                EventPayload::Part {
+                    part: crate::types::Part::Cell(_),
+                    ..
+                } => (r, c + 1),
+                _ => (r, c),
+            },
+        );
+        assert_eq!((replies, cells), (1, 3), "three cells, one reply, one cost");
     }
 
     /// The same through the *streaming* door, which is the one a real
@@ -7111,6 +7162,11 @@ mod tests {
     /// the branch's turn, a client that does not stream — goes through
     /// the same door and lands in the same place. There is no second
     /// implementation for it to diverge from.
+    ///
+    /// "The same place" is the parts and the calls. `ReplyEnd` sits
+    /// where the text stopped, which is before the first cell here and
+    /// after it when the cells were running as the text arrived — see
+    /// `chunk_boundaries_do_not_change_the_reply`.
     #[test]
     fn a_whole_reply_and_a_streamed_one_land_identically() {
         let reply = "Looking.\n\n```js\nlet n = 1;\n```\n\n```js\nconsole.log(n + 41);\n```\n";
@@ -7122,15 +7178,16 @@ mod tests {
                 .step(&mut tree, StepInput::LlmResponse(llm_program(reply)))
                 .unwrap();
             drain(&mut state, &mut tree, out);
-            payload_kinds(&state, &tree)
+            parts_and_calls(&state, &tree)
         };
         let streamed = {
             let (mut tree, mut state) = setup_under();
             user_post(&mut state, &mut tree, "go");
             stream_reply(&mut state, &mut tree, 1, reply);
-            payload_kinds(&state, &tree)
+            parts_and_calls(&state, &tree)
         };
         assert_eq!(whole, streamed);
+        assert_eq!(whole.0.concat(), reply);
     }
 
     /// **A handler's reply runs.** It streams while the branch is

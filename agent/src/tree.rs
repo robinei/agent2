@@ -1005,7 +1005,7 @@ impl Tree {
             let Some(turn) = path[start..]
                 .iter()
                 .rev()
-                .find(|e| matches!(e.payload, EventPayload::Reply))
+                .find(|e| matches!(e.payload, EventPayload::Reply | EventPayload::Restart))
             else {
                 continue;
             };

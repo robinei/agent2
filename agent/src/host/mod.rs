@@ -2233,12 +2233,15 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(sources.len(), 2, "one Turn per cell: {sources:?}");
+        assert_eq!(sources.len(), 2, "one part per cell: {sources:?}");
+        // **A cell part carries its fences** (28) — that is what makes
+        // the parts concatenate back to the reply — but it carries only
+        // its own cell, not the prose around it.
         assert!(
-            sources
-                .iter()
-                .all(|s| !s.contains("```") && !s.contains("Opening the file")),
-            "a Turn holds JavaScript, not markdown: {sources:?}"
+            sources.iter().all(|s| s.starts_with("```js\n")
+                && s.ends_with("```\n")
+                && !s.contains("Opening the file")),
+            "{sources:?}"
         );
 
         // Prose reached the person, and the cell's `tell` ran — so the
@@ -3805,7 +3808,7 @@ mod tests {
         assert_eq!(leaves[0].leaf, EventId::new(4));
         assert_eq!(leaves[0].agent, EventId::new(1));
         assert_eq!(leaves[0].open, 1);
-        assert_eq!(leaves[0].summary, "Condition: interrupted");
+        assert_eq!(leaves[0].summary, "Handback: interrupted");
     }
 
     #[test]
@@ -4208,7 +4211,7 @@ mod tests {
         );
         let kinds = kinds(session.tree(), root_leaf(&session));
         assert!(
-            kinds.ends_with(&["Turn", "Note", "Completion", "Return", "Console"]),
+            kinds.ends_with(&["Part", "Note", "ReplyEnd", "Handback", "Console"]),
             "the rewrite ran to completion and the branch went idle: {kinds:?}"
         );
         assert!(session.quiet());

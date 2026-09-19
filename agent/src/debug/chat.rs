@@ -417,8 +417,6 @@ impl ChatState {
                 });
             }
             EventPayload::Reply | EventPayload::Restart => {
-                self.streaming.retain(|(b, _)| *b != branch);
-                self.thinking_streaming.retain(|(b, _)| *b != branch);
                 // Every `Turn` is a program (22_ONE_VOCABULARY's "a turn
                 // is a program") — LLM-authored or a `Turn { author:
                 // User }` restart standing in for one (`e`/`v`, the
@@ -574,8 +572,20 @@ impl ChatState {
             // place a reloaded log has it. Live, it arrives as
             // `SessionEvent::Chunk { thinking: true }`; on reload that
             // buffer is gone and this is what is left.
-            // What the reply cost is accounting, never transcript.
+            // **Where the live text hands over to the logged text.**
+            // `SessionEvent::Chunk` streams the reply to the pane a
+            // delta at a time, independently of the log; the parts then
+            // arrive and fill in the header. Dropping the live buffer
+            // here — when the text stops — is what keeps the pane from
+            // showing both at once.
+            //
+            // It used to be dropped at the `Turn`, which was logged when
+            // a cell finished. A `Reply` is logged *before* a byte
+            // arrives (28), so doing it there cleared the buffer at the
+            // start of the reply and left every chunk after it standing
+            // beside the parts that repeat them.
             EventPayload::ReplyEnd { .. } => {
+                self.streaming.retain(|(b, _)| *b != branch);
                 self.thinking_streaming.retain(|(b, _)| *b != branch);
             }
             EventPayload::Compaction { .. } => {}
@@ -1377,11 +1387,27 @@ mod tests {
     /// A bare program `Turn` — every one opens its own block now
     /// (22_ONE_VOCABULARY's "a turn is a program"), so the source's
     /// actual content is irrelevant to these tests.
-    fn run_program(id: u64) -> SessionEvent {
-        ev(
-            id,
-            EventPayload::Restart,
-        )
+    /// A reply, its one cell and its end — three events, because the
+    /// live stream hands over to the logged text at `ReplyEnd` (28).
+    fn run_program(id: u64) -> [SessionEvent; 3] {
+        [
+            ev(id, EventPayload::Reply),
+            ev(
+                id + 500,
+                EventPayload::Part {
+                    reply: EventId::new(id),
+                    part: crate::types::Part::Cell("tell(\"hi\");\n".into()),
+                },
+            ),
+            ev(
+                id + 501,
+                EventPayload::ReplyEnd {
+                    reply: EventId::new(id),
+                    how: crate::types::ReplyEnd::Finished,
+                    usage: Default::default(),
+                },
+            ),
+        ]
     }
 
     fn invoke(id: u64, name: &str) -> SessionEvent {
@@ -1451,7 +1477,9 @@ mod tests {
         );
 
         // The logged assistant message replaces the stream.
-        chat.apply(&run_program(3));
+        for e in run_program(3) {
+            chat.apply(&e);
+        }
         let rows = chat.rows(None, 80);
         assert!(!rows.iter().any(|(k, _, _, _)| *k == ChatKind::Streaming));
         // A run_program renders as a status-titled block header.
@@ -1495,7 +1523,9 @@ mod tests {
                 exemplars: Vec::new(),
             },
         ));
-        chat.apply(&run_program(2));
+        for e in run_program(2) {
+            chat.apply(&e);
+        }
         chat.apply(&invoke(3, "fetch"));
         chat.apply(&invoke(4, "store"));
         // The `Result`s complete the rows already pushed at dispatch —
@@ -1620,7 +1650,9 @@ mod tests {
     fn a_completed_call_invalidates_only_its_own_cached_row() {
         let mut chat = ChatState::new();
         chat.apply(&agent_event());
-        chat.apply(&run_program(2));
+        for e in run_program(2) {
+            chat.apply(&e);
+        }
         chat.apply(&invoke(3, "fetch"));
 
         assert!(
@@ -1663,7 +1695,9 @@ mod tests {
                 exemplars: Vec::new(),
             },
         ));
-        chat.apply(&run_program(2));
+        for e in run_program(2) {
+            chat.apply(&e);
+        }
         chat.apply(&invoke(3, "wait_until"));
         chat.apply(&invoke(4, "fetch"));
         chat.apply(&settled(5, 3, serde_json::json!(null)));
@@ -1694,7 +1728,9 @@ mod tests {
                 exemplars: Vec::new(),
             },
         ));
-        chat.apply(&run_program(2));
+        for e in run_program(2) {
+            chat.apply(&e);
+        }
         chat.apply(&ev(
             3,
             EventPayload::Call(Call::Send {
@@ -1916,10 +1952,18 @@ mod tests {
                 exemplars: Vec::new(),
             },
         ));
+        chat.apply(&ev(2, EventPayload::Reply));
         chat.apply(&ev(
-            2,
+            4,
             EventPayload::Part {
-                reply: EventId::new(1),
+                reply: EventId::new(2),
+                part: crate::types::Part::Thinking("let me compute 6*7".into()),
+            },
+        ));
+        chat.apply(&ev(
+            5,
+            EventPayload::Part {
+                reply: EventId::new(2),
                 part: crate::types::Part::Cell("tell(\"user\", \"42\");".into()),
             },
         ));
@@ -1990,11 +2034,27 @@ mod tests {
                 .any(|(k, t, _, _)| *k == ChatKind::Streaming && t.contains("partial answer"))
         );
 
+        chat.apply(&ev(2, EventPayload::Reply));
         chat.apply(&ev(
-            2,
+            3,
             EventPayload::Part {
-                reply: EventId::new(1),
+                reply: EventId::new(2),
+                part: crate::types::Part::Thinking("done reasoning".into()),
+            },
+        ));
+        chat.apply(&ev(
+            4,
+            EventPayload::Part {
+                reply: EventId::new(2),
                 part: crate::types::Part::Cell("tell(\"user\", \"final answer\");".into()),
+            },
+        ));
+        chat.apply(&ev(
+            5,
+            EventPayload::ReplyEnd {
+                reply: EventId::new(2),
+                how: crate::types::ReplyEnd::Finished,
+                usage: Default::default(),
             },
         ));
         let rows = chat.rows(None, 80);
