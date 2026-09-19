@@ -284,6 +284,21 @@ pub struct CompletionReport {
     /// success. The fix belongs in the report, not in a new event — so
     /// the report counts them and says so.
     pub failed_calls: usize,
+    /// Rows this run appended whose bytes were already on the log, as
+    /// `(the note, what it copied)`.
+    ///
+    /// **72% of everything appended across 96 kept runs was already
+    /// there** — 79 KB carried twice, in 19 runs. The card says it in
+    /// bold ("Not the bytes of something you read") and the worked
+    /// example that broke the rule has been fixed, and a run on
+    /// 2026-09-20 still opened with `history.append({cargoToml:
+    /// cargoToml.content, lib: lib.content, fmt: fmt.content, …})` over
+    /// three files it had read in the same program. Prose in the card
+    /// is 16 KB from the decision; this is next to it.
+    ///
+    /// Exact byte equality only, and only for strings big enough to
+    /// matter, so there is nothing to be wrong about.
+    pub copied_rows: Vec<(u64, u64)>,
     /// Bytes of the longest `bash` command this run issued, when it was
     /// long enough to be a script rather than a pipeline. Zero
     /// otherwise. See `host::tools`'s command ceiling for why this is a
@@ -323,6 +338,22 @@ impl CompletionReport {
                  somewhere inside a heredoc. The 30s and 4MB limits apply to the whole \
                  script either way.",
                 self.long_bash
+            ));
+        }
+
+        if !self.copied_rows.is_empty() {
+            let pairs = self
+                .copied_rows
+                .iter()
+                .map(|(note, src)| format!("`[{note}]` holds the bytes of `[{src}]`"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            out.push_str(&format!(
+                "\n\n### worth knowing\n\n{pairs}. A call's result is already kept — \
+                 `history.fetch(id)` hands it back whole, from the log, for nothing — so a \
+                 copy of it is a second charge on every turn from here for something you \
+                 already had. Keep the id. What is worth a row of its own is what you \
+                 concluded from those bytes."
             ));
         }
 
@@ -943,6 +974,60 @@ pub fn derive_report(tree: &Tree, leaf: EventId, outcome: EventId, budget: usize
     text
 }
 
+/// How long a string has to be before carrying it twice is worth a
+/// word. Shorter than a `read_file` of anything real, longer than any
+/// conclusion worth appending.
+const COPY_MIN_BYTES: usize = 400;
+
+/// Notes this run appended that hold bytes already on the log — see
+/// [`CompletionReport::copied_rows`].
+///
+/// Exact equality on string leaves, so there is nothing to be wrong
+/// about: either those bytes are on the log twice or they are not. The
+/// earliest matching result wins, because that is the one whose id the
+/// model should have kept.
+fn copied_rows(h: &Handback<'_>) -> Vec<(u64, u64)> {
+    fn strings(v: &serde_json::Value, out: &mut Vec<String>) {
+        match v {
+            serde_json::Value::String(s) if s.len() >= COPY_MIN_BYTES => out.push(s.clone()),
+            serde_json::Value::Array(xs) => xs.iter().for_each(|x| strings(x, out)),
+            serde_json::Value::Object(m) => m.values().for_each(|x| strings(x, out)),
+            _ => {}
+        }
+    }
+    // Everything a result on this branch has already delivered, by the
+    // *call* id — which is the id a row advertises and a program reuses.
+    let mut delivered: Vec<(u64, Vec<String>)> = Vec::new();
+    for ev in h.path.iter() {
+        if let EventPayload::Result {
+            call,
+            outcome: crate::types::Outcome::Delivered(v),
+        } = &ev.payload
+        {
+            let mut found = Vec::new();
+            strings(v, &mut found);
+            if !found.is_empty() {
+                delivered.push((call.as_u64(), found));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for ev in &h.path[h.turn_at + 1..=h.outcome_at] {
+        let EventPayload::Note { value, .. } = &ev.payload else {
+            continue;
+        };
+        let mut mine = Vec::new();
+        strings(value, &mut mine);
+        if let Some((src, _)) = delivered
+            .iter()
+            .find(|(_, theirs)| mine.iter().any(|m| theirs.contains(m)))
+        {
+            out.push((ev.id.as_u64(), *src));
+        }
+    }
+    out
+}
+
 fn render_handback(h: &Handback<'_>, budget: usize) -> String {
     let _ = budget;
     let EventPayload::Handback {
@@ -956,6 +1041,7 @@ fn render_handback(h: &Handback<'_>, budget: usize) -> String {
             console: h.console.clone(),
             console_id: h.console_id,
             new_artifacts: menu_since(h, h.previous_outcome),
+            copied_rows: copied_rows(h),
             long_bash: h.path[h.turn_at + 1..=h.outcome_at]
                 .iter()
                 .filter_map(|e| match &e.payload {
@@ -1677,6 +1763,61 @@ mod tests {
         assert!(text.contains("1:8: cannot read property"), "{text}");
         assert!(text.contains("not resumable"), "{text}");
 
+        // **A copy of a result is a second charge for bytes already
+        // kept.** 72% of everything appended across 96 kept runs was
+        // already on the log; a run on 2026-09-20 opened with
+        // `history.append({lib: lib.content, …})` over files it had read
+        // in the same program.
+        let big = "x".repeat(600);
+        let mut tree = Tree::new(None);
+        let mut spine = tree
+            .start_agent(None, None, "root", None, "SYSTEM", Vec::new())
+            .unwrap();
+        let reply = tree.append(&mut spine, EventPayload::Reply).unwrap();
+        tree.append(&mut spine, EventPayload::Part {
+            reply,
+            part: crate::types::Part::Cell("…".into()),
+        })
+        .unwrap();
+        let call = tree
+            .append(&mut spine, EventPayload::Call(crate::types::Call::Invoke {
+                name: "read_file".into(),
+                args: json!(["a.rs"]),
+                site: 0,
+            }))
+            .unwrap();
+        tree.append(&mut spine, EventPayload::Result {
+            call,
+            outcome: crate::types::Outcome::Delivered(json!({"content": big, "version": "v1"})),
+        })
+        .unwrap();
+        let note = tree
+            .append(&mut spine, EventPayload::Note {
+                value: json!({ "lib": big, "note": "short and mine" }),
+                site: 0,
+                site_end: 0,
+            })
+            .unwrap();
+        let o = tree
+            .append(&mut spine, EventPayload::Handback {
+                reply,
+                how: crate::types::Handback::Completed,
+                site: 0,
+                stack: Vec::new(),
+            })
+            .unwrap();
+        let leaf = tree.list_leaves()[0].0;
+        let text = derive_report(&tree, leaf, o, 64 * 1024);
+        assert!(
+            text.contains(&format!(
+                "`[{}]` holds the bytes of `[{}]`",
+                note.as_u64(),
+                call.as_u64()
+            )),
+            "names both rows: {text}"
+        );
+        assert!(text.contains("Keep the id"), "{text}");
+
         // Compaction: the handler has to be told what it is being asked
         // for and how much, or it reads the report as an ordinary
         // interruption and carries on with the task — which is what a
@@ -1957,6 +2098,7 @@ mod tests {
             }],
             failed_calls: 0,
             long_bash: 0,
+            copied_rows: Vec::new(),
         }
         .render();
         assert!(rendered.contains(&long), "the row is not clipped");
@@ -2064,6 +2206,7 @@ mod tests {
             new_artifacts: artifacts,
             failed_calls: 0,
             long_bash: 0,
+            copied_rows: Vec::new(),
         }
         .render()
     }
@@ -2163,6 +2306,7 @@ mod tests {
             new_artifacts: Vec::new(),
             failed_calls: 0,
             long_bash: 0,
+            copied_rows: Vec::new(),
         }
         .render();
         assert_eq!(rendered, format!("{RUN_HEADING}\n\nIt completed."));
