@@ -129,6 +129,29 @@ It also never caught the case that motivated it, because that run wrote
 A report section that is wrong most of the time it appears is how a
 reader learns to skip that section.
 
+## The one that had a cause underneath it
+
+`history.append` carrying bytes already on the log is 72% of everything
+appended — and reading the run that did it showed the harness had left
+no other door.
+
+A `read_file` result renders as a menu row: an id and a size, not the
+content. To *see* a file a program prints it, and the printed section
+was capped at 20 lines. So a model that needed a 51-line file in front
+of it printed it, got "the last 20 of 51 lines", printed it again, and
+then appended it — which is the one thing that renders a value whole.
+
+The file was **1,299 bytes against a 4 KB budget**. The line cap was
+binding and the byte budget was not, and the doc on the byte budget
+describes this exact failure one constant over: a per-line clip that
+"made the channel useless for the thing programs actually reach for it
+to do".
+
+Worth holding on to: **a rule the model keeps breaking is worth reading
+as a route around something.** The card forbade the copy, the worked
+example was fixed, the report now names it — and none of that would
+have helped while looking at a file whole was impossible any other way.
+
 ## Where the bytes are
 
 Measured over 20 rendered documents:
