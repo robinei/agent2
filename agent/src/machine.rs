@@ -3663,7 +3663,15 @@ impl Runner {
             return Ok(Vec::new());
         };
         notebook.push_text(text);
-        self.streaming_reply.push_str(text);
+        // **From the notebook, not from the chunk.** `push_text` may drop a
+        // span it has just been handed — a provider leaking its reasoning
+        // into the reply channel (`Notebook::drop_leaked_reasoning`) — and
+        // this is the text that gets logged as `Completion.text` and
+        // replayed to the model as its own turn. Appending the raw chunk
+        // here would put the leak back in the one place it does the most
+        // harm: the model's own mouth, as an example of how to write a
+        // reply.
+        self.streaming_reply = notebook.reply().to_owned();
         self.drive_notebook(tree)
     }
 

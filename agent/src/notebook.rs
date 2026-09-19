@@ -110,9 +110,37 @@ impl Notebook {
     /// Cells named by the returned pieces are queued for compilation.
     pub fn push_text(&mut self, text: &str) -> Vec<Piece> {
         self.reply.push_str(text);
+        self.drop_leaked_reasoning();
         let pieces = self.stream.advance(&self.reply);
         self.queue(&pieces);
         pieces
+    }
+
+    /// **Reasoning the provider put in the wrong channel.**
+    ///
+    /// The API has two: `reasoning_content` is thinking, `content` is the
+    /// reply. Some providers leak the first into the second and close it
+    /// with a bare `</think>`. Measured 2026-09-18 at 1 completion in 74
+    /// against `opencode.ai/zen`, and it is not cosmetic — the leak in that
+    /// run carried a stray ` ``` `, which opened a quote block, which
+    /// swallowed the reply's third ```js block whole. The model wrote that
+    /// cell, the person saw it, and nothing ran it.
+    ///
+    /// So on seeing the closer, everything from the last piece handed out up
+    /// to and including the tag is dropped, and the scanner re-reads what is
+    /// left. The reply is rebuilt without the leak, which is what makes the
+    /// fence state come good.
+    ///
+    /// **Two things it deliberately will not do.** It never reaches behind
+    /// `consumed`: a cell already dispatched has run, and a prose segment
+    /// already emitted has reached the person, so neither can be unsaid — if
+    /// the tag turns up before that line the leak is kept and the reply is
+    /// merely ugly. And it leaves a *matched* `<think>`/`</think>` pair
+    /// alone — a model quoting the tags, not a provider emitting one. See
+    /// [`strip_leaked_reasoning`] for why the opener, and not the fence
+    /// around it, is what tells those apart.
+    fn drop_leaked_reasoning(&mut self) {
+        strip_leaked_reasoning(&mut self.reply, self.stream.consumed());
     }
 
     /// The completion is over: hand back the trailing prose, and let the run
@@ -308,6 +336,12 @@ impl Stream {
         &self.cells
     }
 
+    /// Bytes already handed out as pieces — the line behind which nothing
+    /// can be taken back (see `Notebook::drop_leaked_reasoning`).
+    pub fn consumed(&self) -> usize {
+        self.consumed
+    }
+
     /// Pieces that have become complete since the last call, given the reply
     /// as it stands now.
     ///
@@ -438,6 +472,44 @@ struct OpenFence {
     content_start: usize,
     /// Byte offset of the opening fence line's first character.
     outer_start: usize,
+}
+
+/// What a provider writes when it has been leaking its thinking into the
+/// reply channel and has stopped.
+const CLOSE_THINK: &str = "</think>";
+/// Its opener. Present only when the **model** wrote both: a provider
+/// leak has no opener to leak, the thinking before it having gone out on
+/// `reasoning_content` where it belonged.
+const OPEN_THINK: &str = "<think>";
+
+/// [`Notebook::drop_leaked_reasoning`]'s rule, over the two values it
+/// actually depends on: the reply so far, and the line behind which
+/// nothing can be taken back. A free function because that is the whole
+/// of it — no VM, no compiler, nothing a test has to stand up first.
+///
+/// **The discriminator is a missing opener, not a fence.** The first cut
+/// of this refused to strip a tag inside a fenced block, on the grounds
+/// that a model quoting `</think>` in a quoted block must not lose its
+/// reply. That guard defeated the fix outright, and the test said so:
+/// the live leak *contained a stray fence*, so the tag it closed with
+/// looked quoted by the very thing that made it worth repairing.
+///
+/// What separates the two is the opener. A model writing about these
+/// tags writes both; a provider emits only the closer. So a `<think>`
+/// earlier in the reply means quoting and nothing is touched, and a lone
+/// closer is an artefact.
+///
+/// Returns whether anything was dropped.
+fn strip_leaked_reasoning(reply: &mut String, from: usize) -> bool {
+    let Some(rel) = reply[from..].find(CLOSE_THINK) else {
+        return false;
+    };
+    let at = from + rel;
+    if reply[..at].contains(OPEN_THINK) {
+        return false; // a matched pair: the model is quoting them
+    }
+    reply.replace_range(from..at + CLOSE_THINK.len(), "");
+    true
 }
 
 /// Is this info string one that executes? Exactly `js`, `javascript`,
@@ -643,6 +715,97 @@ mod tests {
     fn javascript_spells_the_same_thing() {
         let md = "```javascript\ntell(\"hi\");\n```\n";
         assert_eq!(cells_of(md), vec!["tell(\"hi\");\n"]);
+    }
+
+    /// A reply as the streaming notebook sees it: text accumulates, the
+    /// leak repair runs on every push, and the scanner re-reads what is
+    /// left. Exactly `Notebook::push_text` without the VM under it.
+    struct Reply {
+        text: String,
+        stream: Stream,
+    }
+
+    impl Reply {
+        fn new() -> Self {
+            Reply { text: String::new(), stream: Stream::new() }
+        }
+        fn push(&mut self, chunk: &str) {
+            self.text.push_str(chunk);
+            strip_leaked_reasoning(&mut self.text, self.stream.consumed());
+            self.stream.advance(&self.text);
+        }
+        fn cells(&self) -> Vec<&str> {
+            self.stream.cells().iter().map(|c| c.slice(&self.text)).collect()
+        }
+    }
+
+    /// **The live shape, from the run it cost a cell.** A reply streams
+    /// two cells, then the provider leaks its thinking into the reply
+    /// channel — carrying a stray fence with it — and closes with
+    /// `</think>`. That stray fence opened a quote block, so the third
+    /// `js` block became its contents and never ran. Dropping the leak
+    /// puts the fence state back and the third cell is a cell again.
+    #[test]
+    fn a_leaked_reasoning_span_does_not_swallow_the_cell_after_it() {
+        let mut r = Reply::new();
+        r.push("First.\n\n```js\nconst a = 1;\n```\n");
+        r.push("Second.\n\n```js\nconst b = 2;\n```\n");
+        assert_eq!(r.cells().len(), 2, "two cells before the leak");
+        r.push("\n```\n\nI see output. We're writing, need continue.\n\nLet's run.</think>\n\n");
+        r.push("```js\nconst c = 3;\n```\n\nDone.\n");
+        assert_eq!(
+            r.cells(),
+            vec!["const a = 1;\n", "const b = 2;\n", "const c = 3;\n"],
+            "the cell after the leak is still a cell: {:?}",
+            r.text
+        );
+        assert!(
+            !r.text.contains("</think>") && !r.text.contains("I see output"),
+            "and the leak is gone from what gets logged and replayed: {:?}",
+            r.text
+        );
+    }
+
+    /// **A model quoting the tags is not a provider emitting one**, and
+    /// this is the false positive that would cost a whole reply. The
+    /// opener says which: a model writing about these tags writes both,
+    /// and a matched pair is left exactly alone.
+    #[test]
+    fn a_matched_pair_is_the_model_quoting_and_is_kept() {
+        let mut r = Reply::new();
+        r.push("The provider sends this:\n\n```text\n<think>…</think>\n```\n\n");
+        assert!(r.text.contains("</think>"), "quoted, not stripped: {:?}", r.text);
+        r.push("```js\nconst a = 1;\n```\n");
+        assert_eq!(r.cells(), vec!["const a = 1;\n"], "and the cell after it still runs");
+    }
+
+    /// Nothing already handed out is taken back. A cell that has been
+    /// dispatched has run and a prose segment that has been emitted has
+    /// reached the person, so a tag arriving behind that line leaves the
+    /// reply ugly rather than rewriting history.
+    #[test]
+    fn the_repair_never_reaches_behind_what_was_already_emitted() {
+        let mut r = Reply::new();
+        r.push("Before.\n\n```js\nconst a = 1;\n```\n");
+        let before = r.text.clone();
+        r.push("leaked thinking</think>\nafter\n");
+        assert!(
+            r.text.starts_with(&before),
+            "everything already emitted is untouched: {:?}",
+            r.text
+        );
+        assert!(!r.text.contains("leaked thinking"), "{:?}", r.text);
+        assert!(r.text.contains("after"), "{:?}", r.text);
+    }
+
+    /// No tag, no repair — the overwhelmingly common case pays nothing
+    /// and is changed in no way.
+    #[test]
+    fn an_ordinary_reply_is_untouched() {
+        let md = "Prose.\n\n```js\nconst a = 1;\n```\n\nMore.\n";
+        let mut text = md.to_owned();
+        assert!(!strip_leaked_reasoning(&mut text, 0));
+        assert_eq!(text, md);
     }
 
     /// D3: executing is what every turn does, so it is untagged;
