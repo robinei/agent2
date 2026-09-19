@@ -34,6 +34,24 @@ the write handed back — a message taken verbatim and a result field
 that was undocumented six hours earlier, in the same turn. That is what
 a report earning its place looks like.
 
+### Where it did not help
+
+The full suite at the end was 9/11 against a 14/15 baseline, on 42%
+fewer prompt bytes. Two runs account for the difference and neither is
+a regression in the harness:
+
+- `sweep-200` fetched a row it had appended as `{ app: … }` and called
+  `matchAll` on it. That is the copy-a-result habit biting a turn
+  later, as a shape confusion rather than as bytes — a good argument
+  for the advisory, and the message now names the key.
+- `ambiguous-config` read the file holding the ambiguity, then read the
+  README, then ran `git log` and `grep` against a fixture with no git
+  repo, then asked its question. Four programs where the checker allows
+  fewer. Exploring before asking is not wrong, and a card sentence
+  pushing models to ask sooner would buy this back by making them ask
+  when they should look. Left alone, and worth watching: it is the one
+  task where showing the directory may invite reading more of it.
+
 ## The method
 
 **Compare the model-facing surface against what the code does.** Every
