@@ -83,3 +83,33 @@ fn constructs_that_emit_code_are_still_refused() {
         assert!(interp::compile(src).is_err(), "{src} compiled and should not have");
     }
 }
+
+/// **`Edit` and `history` are compile-time builtin namespaces**
+/// (`BuiltinKind::Namespace`), resolved by name in `call.rs` — not
+/// objects a program declares or the host installs. The card describes
+/// them with `declare namespace`, which is why that shape had to stop
+/// being an error: a model echoing the block it reads most often must
+/// not break, and the echo must not shadow the real thing.
+#[test]
+fn the_builtin_namespaces_survive_their_own_declaration() {
+    assert_eq!(val(r#"return Edit.count("aaa", "a");"#), serde_json::json!(3));
+    assert_eq!(
+        val(r#"declare namespace Edit { function count(t: string, n: string): number }
+               return Edit.count("aaa", "a");"#),
+        serde_json::json!(3),
+        "the ambient declaration erases; the builtin is still there"
+    );
+    assert_eq!(
+        val(r#"const s: string = "a b"; return Edit.replaceOnce(s, "b", "c") as string;"#),
+        serde_json::json!("a c")
+    );
+    // `history` reaches the host rather than returning a value here, so
+    // this asserts only that the same echo still compiles.
+    assert!(
+        interp::compile(
+            r#"declare namespace history { function append(v: unknown): void }
+               history.append({ a: 1 });"#
+        )
+        .is_ok()
+    );
+}
