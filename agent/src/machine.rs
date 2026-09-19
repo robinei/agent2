@@ -476,6 +476,32 @@ fn decision_tag(v: &serde_json::Value) -> Option<&str> {
     v.get("__decision").and_then(|d| d.as_str())
 }
 
+/// What is known about the size of the next request, in tokens.
+///
+/// Three states and not an `Option`, because "no count yet" and "the
+/// count just stopped being true" call for opposite behaviour, and
+/// collapsing them cost a run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Counted {
+    /// No reply has reported a `prompt_tokens` yet — a fresh session,
+    /// or a provider that does not report usage at all. The byte
+    /// budget is the only signal there is, so it decides.
+    Never,
+    /// A count arrived, and then a compaction shrank the document out
+    /// from under it. There is nothing to test until the next reply
+    /// brings one, and **nothing is the right answer**: falling back to
+    /// bytes here is what turned one compaction into seven on the
+    /// sweep-200 run of 2026-09-19. Clearing the count made the next
+    /// check a byte check, the byte budget was the tighter of the two
+    /// and fired at once, committing that batch cleared the count
+    /// again — a loop that cost that run 121k prompt tokens against a
+    /// 92k baseline, with the counted prompt never once above 13,677
+    /// of its 43,008 threshold.
+    Stale,
+    /// The floor as of the last reply.
+    Floor(u64),
+}
+
 pub struct Runner {
     pub spine: Spine,
     /// The innermost `Agent` root above this branch's leaf — who the
@@ -551,7 +577,7 @@ pub struct Runner {
     /// construction, on every path at once — including the ones nobody
     /// remembered to add a reset to.
     streaming_epoch: Option<u64>,
-    /// What the provider counted the last request at, in tokens.
+    /// **How big the next request is, as far as counting can reach.**
     ///
     /// **Measured, never converted.** The document is sized in bytes
     /// and a context window is in tokens, and the obvious move — a
@@ -561,11 +587,23 @@ pub struct Runner {
     /// nearer 2 bytes per token than 4, and the guess is wrong in the
     /// direction that overflows.
     ///
-    /// No guess is needed. `usage.prompt` is the size of the request
-    /// that was just sent, counted by the thing that will reject it.
-    /// The only gap is one turn's growth, which is what the completion
-    /// reserve and the headroom are for.
-    last_prompt_tokens: Option<u64>,
+    /// No guess is needed for either half of this. `usage.prompt` is
+    /// the size of the request that was just sent, counted by the thing
+    /// that will reject it — and the same trailer counts the completion
+    /// that reply consisted of, which is in the document from now on.
+    /// So this is their sum, less the reasoning tokens, because
+    /// thinking is on the log and not in the document (`document.rs`
+    /// drops `Part::Thinking`). A provider that does not break
+    /// reasoning out reports it as zero and this over-counts, which is
+    /// the safe direction.
+    ///
+    /// **A floor, not the size.** What it cannot see is what the cells
+    /// added while the reply streamed — results, console, the report
+    /// built around them — because nothing counts those until the next
+    /// request is sent. That growth is what the headroom is for, and
+    /// the only bound on it is that a single turn can add a great deal
+    /// at once.
+    next_prompt_floor: Counted,
     /// Whether the suspension the branch is parked on **falsified the
     /// text still arriving**. See
     /// [`notebook_cancels_generation`](Self::notebook_cancels_generation);
@@ -791,7 +829,7 @@ impl Runner {
             last_vm: None,
             status_transitions: Vec::new(),
             streaming_epoch: None,
-            last_prompt_tokens: None,
+            next_prompt_floor: Counted::Never,
             pause_falsifies_the_rest: false,
             streaming_reply: String::new(),
             pending_decision: None,
@@ -3096,12 +3134,18 @@ impl Runner {
         let doc = crate::document::render(tree, &self.spine, budget);
         let rendered = crate::compaction::rendered_size(&doc);
         // **One trigger, and it is the counted one where it exists.**
-        // `usage.prompt` is the size of the request that was just sent,
-        // counted by the thing that will reject it. Against a
-        // configured window that is the whole decision: no tokenizer,
-        // no ratio, no guess about content this crate cannot see. The
-        // only gap is one turn's growth, which is what the completion
-        // reserve and the headroom are for.
+        // [`Runner::next_prompt_floor`] is two counted numbers added
+        // together — the prompt the provider charged for, and the part
+        // of the reply that survives into the document — so against a
+        // configured window it is the whole decision: no tokenizer, no
+        // ratio, no guess about content this crate cannot see.
+        //
+        // Checked here, which is after the cells have run and their
+        // reports have landed, so the *byte* path sees everything this
+        // turn added. The count cannot: usage arrives at the end of the
+        // stream and describes the request that started it. What the
+        // cells appended in between is the gap, and the headroom is
+        // what covers it.
         //
         // **And the byte budget does not get a vote once that holds.**
         // Running both means the tighter one decides, and the tighter
@@ -3115,12 +3159,17 @@ impl Runner {
         // The byte path stays for the two cases where there is nothing
         // to count against: no window configured, and no reply has
         // reported a `prompt_tokens` yet.
-        let (measured, limit, unit) = match (crate::host::context_tokens(), self.last_prompt_tokens)
+        let (measured, limit, unit) = match (crate::host::context_tokens(), self.next_prompt_floor)
         {
-            (Some(context), Some(tokens)) => {
+            (Some(context), Counted::Floor(tokens)) => {
                 let usable = context.saturating_sub(crate::host::completion_reserve());
                 (tokens as usize, usable, Measure::Tokens)
             }
+            // A window is configured and the count it is tested against
+            // is momentarily gone. Waiting for the next reply to bring
+            // one is the whole of the right answer here — see
+            // [`Counted::Stale`] for the run that proved it.
+            (Some(_), Counted::Stale) => return Ok(None),
             _ => (rendered, budget, Measure::Bytes),
         };
         if !crate::compaction::should_fire(measured, limit, headroom) {
@@ -3161,7 +3210,7 @@ impl Runner {
         // strength of it. Dropping it falls back to the byte check for
         // exactly one turn, which measures the real document, and the
         // next reply brings a count that does too.
-        self.last_prompt_tokens = None;
+        self.next_prompt_floor = Counted::Stale;
         let events = crate::compaction::compact(tree, &self.spine, &ops);
         let n = events.len();
         for event in events {
@@ -4153,7 +4202,12 @@ impl Runner {
         }
         let usage = usage.unwrap_or_default();
         if usage.prompt > 0 {
-            self.last_prompt_tokens = Some(usage.prompt);
+            // The reply itself lands in the document, so the request
+            // after this one carries both. A cancelled generation
+            // reports no usage at all and leaves the old floor standing
+            // rather than replacing it with zero.
+            let survives = usage.completion.saturating_sub(usage.reasoning);
+            self.next_prompt_floor = Counted::Floor(usage.prompt + survives);
         }
         tree.append(
             &mut self.spine,
@@ -5615,7 +5669,7 @@ mod tests {
         // usable = 8000, headroom 0.25 -> fires at 6000 counted tokens.
         let fires = |state: &mut Runner, tokens: u64, tree: &mut Tree| {
             state.compaction_requested = false;
-            state.last_prompt_tokens = Some(tokens);
+            state.next_prompt_floor = Counted::Floor(tokens);
             state
                 .compaction_if_needed(tree, 64 * 1024, 0.25)
                 .unwrap()
@@ -5635,17 +5689,25 @@ mod tests {
         // both would mean the byte budget decides every time, because
         // it is always the tighter of the two.
         state.compaction_requested = false;
-        state.last_prompt_tokens = Some(5_000);
+        state.next_prompt_floor = Counted::Floor(5_000);
         assert!(
             state.compaction_if_needed(&mut tree, 1, 0.25).unwrap().is_none(),
             "a counted prompt with room to spare overrides any byte budget"
         );
         // With no count to go on there is nothing to override it with,
         // so the byte budget is the trigger again.
-        state.last_prompt_tokens = None;
+        state.next_prompt_floor = Counted::Never;
         assert!(
             state.compaction_if_needed(&mut tree, 1, 0.25).unwrap().is_some(),
             "before the first reply reports a count, bytes are all there is"
+        );
+        // But a count that a commit has just invalidated is not the
+        // same as never having had one, and the byte budget must not
+        // step in for it — see `Counted::Stale`.
+        state.next_prompt_floor = Counted::Stale;
+        assert!(
+            state.compaction_if_needed(&mut tree, 1, 0.25).unwrap().is_none(),
+            "a stale count waits for a fresh one rather than handing the decision to bytes"
         );
         unsafe {
             std::env::remove_var("AGENT2_CONTEXT_TOKENS");
@@ -6320,7 +6382,7 @@ mod tests {
             .expect("a post to compact");
 
         state.compaction_if_needed(&mut tree, budget, 0.25).unwrap();
-        state.last_prompt_tokens = Some(60_000);
+        state.next_prompt_floor = Counted::Floor(60_000);
         let out = state
             .step(
                 &mut tree,
@@ -6333,7 +6395,8 @@ mod tests {
         drain(&mut state, &mut tree, out);
         assert!(!state.compaction_requested, "the request is closed");
         assert_eq!(
-            state.last_prompt_tokens, None,
+            state.next_prompt_floor,
+            Counted::Stale,
             "the count described the document this commit just shrank, \
              so it cannot be the evidence for compacting again"
         );
@@ -7621,6 +7684,42 @@ mod tests {
             }),
             ..llm_program(source)
         }
+    }
+
+    /// **The reply rides along with the count it arrived with.**
+    /// `usage.prompt` describes the request that was *sent*; by the
+    /// time it arrives the reply it paid for is already in the
+    /// document, and the request after this one carries both. Both
+    /// halves are counted numbers off the same trailer, so adding them
+    /// costs nothing and guesses nothing.
+    ///
+    /// Reasoning is the part that does not survive: `document.rs` drops
+    /// `Part::Thinking`, so those tokens are charged for once and never
+    /// sent again.
+    #[test]
+    fn the_measured_size_includes_the_reply_but_not_its_thinking() {
+        let (mut tree, mut state) = setup();
+        state.kickoff(&mut tree).unwrap();
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(LlmTurn {
+                    usage: Some(crate::host::Usage {
+                        prompt: 10_000,
+                        completion: 900,
+                        reasoning: 700,
+                        cached: 0,
+                    }),
+                    ..llm_program("tell(\"hi\");")
+                }),
+            )
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+        assert_eq!(
+            state.next_prompt_floor,
+            Counted::Floor(10_200),
+            "the prompt, plus the 200 tokens of it that were not thinking"
+        );
     }
 
     /// **A reply's cost is recorded exactly once, however many cells it
