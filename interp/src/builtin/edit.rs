@@ -42,8 +42,24 @@ fn edit_text(vm: &mut VM, args: &Args, who: &str) -> Result<RcStr, VMError> {
 /// eval runs trapped here, on `#[allow(dead_code)]`, which occurs four
 /// times in one file. Widening the needle to include the line beneath
 /// it is the fix, and nothing said so.
-fn ambiguous(n: usize, needle: &str) -> String {
-    match_count_error("replaceOnce", n, needle)
+fn ambiguous(n: usize, needle: &str, lines: &[usize]) -> String {
+    match_count_error("replaceOnce", n, needle, lines)
+}
+
+/// The 1-based line each byte offset falls on.
+///
+/// **Where the matches are is the half the advice was missing.**
+/// "Widen it with the surrounding text" tells a program what to do and
+/// not where to do it, so the next program re-reads the file and hunts
+/// for occurrences the failing call had already found. The offsets are
+/// in hand at the moment of the error; spending them is free, and
+/// `Edit.replaceLines(text, n, n, …)` takes a line number directly.
+fn lines_of(text: &str, offsets: impl Iterator<Item = usize>) -> Vec<usize> {
+    let mut starts: Vec<usize> = vec![0];
+    starts.extend(text.match_indices('\n').map(|(i, _)| i + 1));
+    offsets
+        .map(|off| starts.partition_point(|&s| s <= off))
+        .collect()
 }
 
 /// The same message for every needle-based edit, because the two ways
@@ -58,7 +74,7 @@ fn ambiguous(n: usize, needle: &str) -> String {
 /// indentation. The text was written from memory of what the file
 /// probably says. `applyEdits` had one message for both counts and so
 /// told a program to widen a needle that was not there at all.
-fn match_count_error(what: &str, n: usize, needle: &str) -> String {
+fn match_count_error(what: &str, n: usize, needle: &str, lines: &[usize]) -> String {
     let mut shown: String = needle.chars().take(50).collect();
     if shown.len() < needle.len() {
         shown.push('…');
@@ -70,9 +86,27 @@ fn match_count_error(what: &str, n: usize, needle: &str) -> String {
              out what you expect to be there."
         )
     } else {
+        // Four is enough to see the shape of the repetition; a
+        // hundred-match needle would otherwise push the rest of the
+        // report out of the way to say the same thing.
+        let mut where_ = lines
+            .iter()
+            .take(4)
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        if lines.len() > 4 {
+            where_.push_str(", …");
+        }
+        let at = if lines.is_empty() {
+            String::new()
+        } else {
+            format!(", at line{} {where_}", if lines.len() == 1 { "" } else { "s" })
+        };
         format!(
-            "{what} expected 1 match, found {n} of `{shown}` — widen it with the \
-             surrounding text (the line above or below) until it names one place"
+            "{what} expected 1 match, found {n} of `{shown}`{at} — widen it with the \
+             surrounding text (the line above or below) until it names one place, or name \
+             the line you mean with `Edit.replaceLines`"
         )
     }
 }
@@ -88,7 +122,8 @@ pub fn edit_replace_once(vm: &mut VM, args: Args) -> Result<Value, VMError> {
         let n = matches.len();
         if n != 1 {
             let shown = format!("{:?}", rx.compiled);
-            return Err(vm.fail(ErrorKind::ValueError, ambiguous(n, &shown)));
+            let lines = lines_of(text, matches.iter().map(|m| m.range.start));
+            return Err(vm.fail(ErrorKind::ValueError, ambiguous(n, &shown, &lines)));
         }
         let m = &matches[0];
         let mut out = String::with_capacity(text.len());
@@ -108,7 +143,8 @@ pub fn edit_replace_once(vm: &mut VM, args: Args) -> Result<Value, VMError> {
         let indices: Vec<_> = text.match_indices(old).collect();
         let n = indices.len();
         if n != 1 {
-            return Err(vm.fail(ErrorKind::ValueError, ambiguous(n, old)));
+            let lines = lines_of(text, indices.iter().map(|(i, _)| *i));
+            return Err(vm.fail(ErrorKind::ValueError, ambiguous(n, old, &lines)));
         }
         let (pos, _) = indices[0];
         let mut out = String::with_capacity(text.len());
@@ -578,7 +614,12 @@ pub fn edit_apply_edits(vm: &mut VM, args: Args) -> Result<Value, VMError> {
                 ErrorKind::ValueError,
                 format!(
                     "applyEdits edit[{i}]: {}",
-                    match_count_error("this edit's `old`", matches.len(), old)
+                    match_count_error(
+                        "this edit's `old`",
+                        matches.len(),
+                        old,
+                        &lines_of(text, matches.iter().copied())
+                    )
                 ),
             ));
         }
@@ -707,7 +748,7 @@ fn as_non_neg_usize(vm: &VM, val: &Value, label: &str) -> Result<usize, VMError>
 
 #[cfg(test)]
 mod match_count_tests {
-    use super::match_count_error;
+    use super::{lines_of, match_count_error};
 
     /// **The two ways to miss have different remedies**, and one
     /// message cannot carry both. Three of four `applyEdits` traps on
@@ -716,7 +757,7 @@ mod match_count_tests {
     /// something that was not in the file at all.
     #[test]
     fn a_missing_needle_and_an_ambiguous_one_advise_differently() {
-        let none = match_count_error("replaceOnce", 0, "fn trim()");
+        let none = match_count_error("replaceOnce", 0, "fn trim()", &[]);
         assert!(none.contains("found no match"), "{none}");
         assert!(
             none.contains("Copy it out of the content you read"),
@@ -727,19 +768,39 @@ mod match_count_tests {
             "wrong remedy for a missing needle: {none}"
         );
 
-        let many = match_count_error("replaceOnce", 4, "#[allow(dead_code)]");
+        let many = match_count_error("replaceOnce", 4, "#[allow(dead_code)]", &[3, 11, 19, 27]);
         assert!(many.contains("found 4"), "{many}");
         assert!(many.contains("widen it"), "{many}");
         assert!(
             !many.contains("Copy it out"),
             "wrong remedy for an ambiguous one: {many}"
         );
+        // **And where they are.** "Widen it" says what to do and not
+        // where; the offsets were in hand at the moment of the error,
+        // so the next program can name a line instead of re-reading the
+        // file to find what this call had already found.
+        assert!(many.contains("at lines 3, 11, 19, 27"), "{many}");
+        assert!(many.contains("replaceLines"), "and the verb that takes one: {many}");
+
+        // Five or more is still four and an ellipsis — one trap must
+        // not crowd out the report around it.
+        let lots = match_count_error("replaceOnce", 9, "x", &[1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        assert!(lots.contains("at lines 1, 2, 3, 4, …"), "{lots}");
+    }
+
+    /// Byte offsets become 1-based line numbers, including the first
+    /// line, which has no newline before it to count.
+    #[test]
+    fn offsets_become_line_numbers() {
+        let text = "aa\nbb\ncc\n";
+        assert_eq!(lines_of(text, [0usize, 3, 6].into_iter()), vec![1, 2, 3]);
+        assert_eq!(lines_of(text, [1usize].into_iter()), vec![1]);
     }
 
     /// Long needles are clipped so one trap cannot dominate a report.
     #[test]
     fn a_long_needle_is_clipped() {
-        let msg = match_count_error("replaceOnce", 0, &"x".repeat(400));
+        let msg = match_count_error("replaceOnce", 0, &"x".repeat(400), &[]);
         assert!(msg.contains('…'), "{msg}");
         assert!(msg.len() < 300, "{} bytes", msg.len());
     }
