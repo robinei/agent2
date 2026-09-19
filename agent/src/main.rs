@@ -397,8 +397,29 @@ fn run_session_headless(
     nav: SessionNav,
 ) -> Result<(), String> {
     let (tx, rx) = std::sync::mpsc::channel();
+    // **Whether anything ever ran**, decided by the printer because it
+    // is the one thing that sees every event. A headless `--real` run
+    // that produced no `Turn` did not do the job it was started for,
+    // and until now it said so only on stderr and then exited 0.
+    //
+    // Live 2026-09-19: the eval driver reported `agent exited 0 without
+    // writing a program` on four separate suites and the runs were read
+    // as a harness regression for an hour. The cause was a provider
+    // 530 — `Upstream response was not valid JSON` — printed to stderr,
+    // which the driver did not capture, under an exit code that said
+    // success. Two layers each dropped the one line that explained it.
+    let wrote_a_program = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let saw_a_program = std::sync::Arc::clone(&wrote_a_program);
     let printer = std::thread::spawn(move || {
         for event in rx {
+            if let SessionEvent::Event { event, .. } = &event
+                && matches!(
+                    event.payload,
+                    types::EventPayload::Message(types::Message::Turn { .. })
+                )
+            {
+                saw_a_program.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
             print_session_event(&event);
         }
     });
@@ -432,6 +453,16 @@ fn run_session_headless(
     };
     drop(session); // closes the event channel; the printer drains and exits
     printer.join().map_err(|_| "printer thread panicked")?;
+    // Only a `--real` run is held to this. A listing or a demo run is
+    // *supposed* to write no program, and `--turn`-less navigation has
+    // no completion to wait for.
+    if real && !listing && !wrote_a_program.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(
+            "no program was ever written — the run reached no completion. The reason is on \
+             stderr above, if the provider gave one."
+                .to_owned(),
+        );
+    }
     Ok(())
 }
 

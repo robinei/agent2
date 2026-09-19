@@ -436,11 +436,13 @@ def run_once(
                 timeout=timeout,
             )
             timed_out, rc, out = False, proc.returncode, proc.stdout
+            err = proc.stderr
         except subprocess.TimeoutExpired as e:
             # A timeout still has output worth keeping, and `proc` never
             # gets bound on this path — reading it below is how the
             # first kept run died.
             timed_out, rc, out = True, None, e.stdout or ""
+            err = e.stderr or ""
         wall = time.time() - started
 
         if agent == "pi":
@@ -468,10 +470,21 @@ def run_once(
             elif timed_out:
                 why = "no completion ever arrived before the timeout"
             else:
-                # Exited on its own without writing a program: the agent
-                # refused to start, which is a fault in how it was
-                # invoked rather than anything about the run.
-                why = f"agent exited {rc} without writing a program: {(out or '').strip()[-300:]}"
+                # Exited on its own without writing a program.
+                #
+                # **stderr, and stderr first.** This used to print
+                # `out` — stdout — which for this failure carries only
+                # the two events the run got as far as logging, and
+                # says nothing about why it stopped. Every reason the
+                # agent has goes to stderr: a bad invocation, a missing
+                # card, and above all a provider error, which is what
+                # this failure usually is. On 2026-09-19 four suites
+                # came back `agent exited 0 without writing a program`
+                # and were read as a harness regression for an hour;
+                # the answer was one discarded line, `deepseek http
+                # 530: Upstream response was not valid JSON`.
+                tail = (err or "").strip()[-400:] or (out or "").strip()[-300:]
+                why = f"agent exited {rc} without writing a program: {tail}"
             ok = None
             credit = 0.0
         else:
@@ -505,8 +518,12 @@ def run_once(
             shutil.copytree(sandbox, kept / "work", dirs_exist_ok=True)
             for record in list(logdir.glob("*.jsonl")):
                 shutil.copy2(record, kept / record.name)
+            # stderr as well as stdout: a kept run is for answering
+            # "what happened", and the answer to the commonest failure
+            # — no completion at all — is only ever on stderr.
             (kept / "verdict.txt").write_text(
-                f"pass={ok}  timed_out={timed_out}  exit={rc}\n{why}\n\nstdout:\n{out[-4000:]}\n"
+                f"pass={ok}  timed_out={timed_out}  exit={rc}\n{why}\n\n"
+                f"stderr:\n{(err or '')[-4000:]}\n\nstdout:\n{out[-4000:]}\n"
             )
 
     return {
