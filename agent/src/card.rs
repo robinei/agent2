@@ -465,12 +465,22 @@ const LISTING_SKIP: [&str; 9] = [
 /// changes the tree later reads it as history, which is what the rest
 /// of the record is.
 fn listing(dir: &std::path::Path) -> String {
-    fn walk(dir: &std::path::Path, prefix: &str, depth: usize, out: &mut Vec<String>) {
-        if depth == 0 || out.len() > LISTING_MAX_ENTRIES {
-            return;
-        }
+    // **Breadth-first, so a truncation costs detail rather than a
+    // whole subtree.** Depth-first spends the budget on whatever sorts
+    // first: a repo whose `app/` holds sixty files would show `app/`
+    // and nothing else, and the reader would not learn that `tests/`
+    // and `Makefile` exist at all. Every top-level name first, then
+    // what is inside them, means the shallowest facts — which are the
+    // ones a first program acts on — are the ones that survive.
+    fn level(
+        dir: &std::path::Path,
+        prefix: &str,
+        out: &mut Vec<String>,
+        cut: &mut bool,
+    ) -> Vec<(String, String)> {
+        let mut dirs = Vec::new();
         let Ok(rd) = std::fs::read_dir(dir) else {
-            return;
+            return dirs;
         };
         let mut entries: Vec<_> = rd.flatten().collect();
         entries.sort_by_key(|e| e.file_name());
@@ -479,25 +489,36 @@ fn listing(dir: &std::path::Path) -> String {
             if LISTING_SKIP.contains(&name.as_str()) {
                 continue;
             }
-            let is_dir = e.file_type().is_ok_and(|t| t.is_dir());
             if out.len() >= LISTING_MAX_ENTRIES {
-                out.push(String::new());
-                return;
+                *cut = true;
+                return dirs;
             }
+            let is_dir = e.file_type().is_ok_and(|t| t.is_dir());
             out.push(format!("{prefix}{name}{}", if is_dir { "/" } else { "" }));
             if is_dir {
-                walk(&e.path(), &format!("{prefix}{name}/"), depth - 1, out);
+                dirs.push((format!("{prefix}{name}/"), e.path().display().to_string()));
             }
         }
+        dirs
     }
     let mut out = Vec::new();
-    walk(dir, "", 2, &mut out);
+    let mut truncated = false;
+    for (prefix, path) in level(dir, "", &mut out, &mut truncated) {
+        if truncated {
+            break;
+        }
+        level(
+            std::path::Path::new(&path),
+            &prefix,
+            &mut out,
+            &mut truncated,
+        );
+    }
+    // Back into path order once the budget has been spent breadth-first,
+    // so what is shown reads as a tree rather than as two passes.
+    out.sort();
     if out.is_empty() {
         return String::new();
-    }
-    let truncated = out.last().is_some_and(|l| l.is_empty());
-    if truncated {
-        out.pop();
     }
     let more = if truncated {
         "\n… and more — `bash` for the rest."
