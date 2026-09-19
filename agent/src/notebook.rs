@@ -386,6 +386,11 @@ impl Stream {
             Some(i) => &reply[..i + 1],
             None => "",
         };
+        self.scan(reply, committed)
+    }
+
+    /// [`advance`](Self::advance) over an explicit committed prefix.
+    fn scan(&mut self, reply: &str, committed: &str) -> Vec<Piece> {
         self.cells = split_cells(committed);
         let mut out = Vec::new();
         while self.emitted_cells < self.cells.len() {
@@ -409,7 +414,19 @@ impl Stream {
     /// model may still be part-way through a sentence, or about to open
     /// another fence.
     pub fn finish(&mut self, reply: &str) -> Vec<Piece> {
-        let mut out = self.advance(reply);
+        // **The whole reply is committed now**, last line included.
+        // `advance` stops at the final newline because a line still
+        // being written may yet turn into a fence; here there is no
+        // "yet". A reply whose closing ``` is the last thing the
+        // provider sent — no trailing newline — used to come back as
+        // one prose piece spanning the entire reply, fences and all:
+        // the cell was never recognised, so the code never ran and the
+        // person was shown the source as if the model had only talked
+        // about it. Seen live on 2026-09-19.
+        //
+        // Safe because `split_cells` closes a cell only on a closing
+        // fence, so a reply truncated mid-block still yields no cell.
+        let mut out = self.scan(reply, reply);
         if let Some(text) = prose_between(reply, self.consumed, reply.len()) {
             out.push(Piece::Prose(text));
         }
@@ -1103,6 +1120,10 @@ three\n";
             "No cells at all.\n",
             "```js\nonly();\n```\n",
             "One.\n\n```js\nlet a = 1;\n```\n\nTwo.\n\n```js\na = 2;\n```\n\nThree.\n",
+            // No trailing newline: the provider's last token is the
+            // closing fence itself. See
+            // `a_reply_ending_on_its_closing_fence_still_has_a_cell`.
+            "Looking.\n\n```js\nlet a = 1;\n```",
         ];
         for reply in replies {
             let cells = split_cells(reply);
@@ -1124,6 +1145,39 @@ three\n";
                 "byte by byte: {reply:?}"
             );
         }
+    }
+
+    /// **A reply whose last token is its closing fence still has a
+    /// cell.** `advance` commits only to the final newline, because a
+    /// line still being written may yet turn into a fence — but when
+    /// the reply *ends*, there is no "yet", and `finish` has to say so.
+    ///
+    /// Seen live on 2026-09-19: the model wrote a paragraph and one
+    /// `js` block, the provider stopped on the closing ``` with no
+    /// newline after it, and the whole reply came back as a single
+    /// prose piece. The code never ran; the person was shown the
+    /// source as though the model had only talked about it.
+    #[test]
+    fn a_reply_ending_on_its_closing_fence_still_has_a_cell() {
+        let reply = "Looking first.\n\n```js\nconst x = await tools.bash(\"ls\");\n```";
+        for pieces in [Stream::new().finish(reply), pieces_byte_by_byte(reply)] {
+            assert!(
+                pieces.iter().any(|p| matches!(p, Piece::Cell(_))),
+                "the block is a cell, newline or not: {pieces:?}"
+            );
+        }
+    }
+
+    /// And a reply cut off *inside* a block is not one: the fence never
+    /// closed, so there is nothing to run, only text.
+    #[test]
+    fn a_reply_cut_off_inside_a_block_has_no_cell() {
+        let reply = "Looking first.\n\n```js\nconst x = await tools.bash(\"l";
+        let pieces = Stream::new().finish(reply);
+        assert!(
+            !pieces.iter().any(|p| matches!(p, Piece::Cell(_))),
+            "{pieces:?}"
+        );
     }
 
     /// A fence straddling chunk boundaries is still recognised exactly once,

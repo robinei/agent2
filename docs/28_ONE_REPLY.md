@@ -230,80 +230,107 @@ Each step ends green — `cargo test` passes and `cargo build` is
 warning-free — before the next begins. A step that cannot end green is
 reported, not worked around.
 
-### Step A — the vocabulary
+### Step A — the vocabulary  *(landed, `b1fafac`)*
 
 `types.rs` only, plus whatever mechanical changes the compiler demands.
 
-- [ ] `EventPayload` as above. `Message` collapses to `Post`.
-- [ ] `Handback` replaces `Cause` + `Return` + `Disposition`.
-- [ ] `Tree::open` refuses `version < 2` with a sentence naming this doc.
-- [ ] `cargo build` clean, `cargo test` green.
+- [x] `EventPayload` as above. `Message` collapses to `Post`.
+- [x] `Handback` replaces `Cause` + `Return` + `Disposition`.
+- [x] `Tree::open` refuses `version < 2` with a sentence naming this doc.
 
-**Acceptance:** `grep -c 'Message::Turn\|EventPayload::Return\|Disposition' agent/src/` is 0.
+### Steps B and C — writing and reading parts  *(landed, `33de575`,
+`5ed79db`)*
 
-### Step B — writing parts
+`machine.rs`, `notebook.rs`, `document.rs`, `report.rs`.
 
-`machine.rs` and `notebook.rs`.
-
-- [x] **B1 (landed, `734cf91`).** `prose_between` stops trimming; a test
-      asserts `parts.concat() == reply` over replies with leading,
-      trailing and inter-block whitespace, fed both whole and byte by
-      byte.
+- [x] **B1 (`734cf91`).** `prose_between` stops trimming; a test asserts
+      `parts.concat() == reply` over replies with leading, trailing and
+      inter-block whitespace, fed both whole and byte by byte.
 
       The invariant was false twice, and neither was visible while the
       trim ate the difference: prose arrived trimmed, and a closing
       fence was recognised **before its newline arrived**, so a streamed
       reply decomposed into different bytes from the same reply handed
       over whole. `Stream::advance` now commits only to complete lines.
-- [ ] `advance_notebook` logs `Part::Prose` / `Part::Cell` instead of
-      `Send{prose}` / `Turn`.
-- [ ] Thinking chunks log `Part::Thinking`.
-- [ ] Sites are reply-absolute; `rebase_site` deleted.
-- [ ] `ReplyEnd` carries `how` and `usage`; `finish_notebook_generation`
-      writes it.
-- [ ] `Handback` replaces the `Return`/`Condition` writes.
-- [ ] Effects carry `reply`.
+- [x] Parts are logged **as seen**, not as consumed. A reply that parks
+      on a raise still records everything that arrives afterwards — that
+      is what makes the concatenation hold for a reply whose run never
+      finished.
+- [x] Sites are reply-absolute: `rebase_site` subtracts the prelude and
+      nothing else.
+- [x] `ReplyEnd` carries `how` and `usage`.
+- [x] `Handback` replaces the `Return`/`Condition` writes.
+- [x] `notebook_replies`, `record_reply`, `covered` and the cut-shifting
+      loop are gone, along with `Transport`, `extract_program` and
+      `ChatRole::Tool`.
 
-**Acceptance:** a live single run's log, read by eye, is the shape in
-"A log" above.
-
-**B2 and C are one step, not two.** Tried and abandoned twice on
+**B2 and C were one step, not two.** Tried and abandoned twice on
 2026-09-19: sites cannot become reply-absolute while diagnostics still
 render against `Turn.source`, and `Restart` cannot become its own event
 while the notebook driver is what logs a cell — each needs a hack that
-the other step removes. 255 sites name `Message::Turn`, `Return`,
-`Condition` or `Cause`; they change together or not at all. Plan for one
-red stretch and do not look for a seam inside it.
+the other step removes. 255 sites named `Message::Turn`, `Return`,
+`Condition` or `Cause`; they changed together.
 
-### Step C — reading parts
+**What the phase decided that the plan had not.**
 
-`document.rs`.
+- **A cell-less reply rests the branch** (D4) had been falling out for
+  free — a `Turn` was logged per cell, so a cell-less reply logged
+  none. A `Reply` is logged unconditionally, so `last_turn_outcome` now
+  says "and something ran" out loud. The rule was never "no `Turn`
+  event"; it was always "nothing ran".
+- **Truncation is a fact about the text, not the program.**
+  `SuspendCause::Truncated` and `NotebookStep::Truncated` are gone: a
+  truncated reply closes its run like any other and `ReplyEnd` carries
+  the fact.
+- **A reply that arrives whole records itself before it runs**, so its
+  `ReplyEnd` lands after its own parts and before its cells' effects
+  rather than after the run's `Handback`.
+- **Chunking may change the interleaving** of parts and calls — a part
+  is logged when seen, a call when it runs — but not the reply. The
+  worked log above is the streamed shape; a reply handed over whole has
+  all its parts before its first call. Both are honest records of
+  arrival order, and the tests assert the parts and the calls, not the
+  weave.
 
-- [ ] `notebook_replies`, `record_reply`, `covered` and the cut-shifting
-      loop are deleted.
-- [ ] The assistant turn is the concatenation, with the marker.
-- [ ] `report.rs` derives from `Handback`; the console is found by
-      `reply`, not by position.
+### Step D — the followers  *(landed, `ccfe7d6`)*
 
-**Acceptance:** `agent document` on a fresh log renders the reply
-verbatim, and `grep -c 'notebook_replies\|record_reply' agent/src/` is 0.
+- [x] `programs_for` reads parts.
+- [x] `score`'s `round_trips` counts `Reply`.
+- [x] Compaction targets a reply by its `Reply` id — the document keys
+      the assistant message there, and naming a `Part` would ask to
+      compact half a sentence.
 
-### Step D — the followers
+### Step E — the cancellation rule  *(landed, `ccfe7d6`)*
 
-`tree.rs`, `score.rs`, `compaction.rs`, `debug/`.
+- [x] Cancel when the text that follows was written on a premise we now
+      know is false. `Trapped`/`CellFailed` cancel; `Raised`/`Posted` do
+      not.
+- [x] The card's `raise` sentence is true again.
+- [x] The truncation/interruption marker reaches the model.
 
-- [ ] `programs_for` reads parts.
-- [ ] `score`'s `round_trips` counts `Reply`.
-- [ ] Compaction targets a reply by its `Reply` id.
+Three defects the rule exposed, each invisible while any suspension
+cancelled:
 
-**Acceptance:** full suite green, zero warnings, and one live run per
-task that completes as before.
+- `notebook_feed` and `log_parts` guarded on `Phase::Running`, so text
+  arriving while a run was parked was dropped in silence. Under the new
+  rule that is the ordinary case, and the cells after a raise did not
+  exist by the time it was answered.
+- A cancelled generation recorded `ReplyEnd::Finished`. The variant
+  `Interrupted` existed, was rendered, and was never written — so the
+  model read its own last turn breaking off with nothing to explain it.
+- `Stream::finish` committed only to the last newline, like `advance`.
+  A reply whose final token was its closing ``` came back as **one
+  prose piece spanning the whole reply**: the cell was never
+  recognised, the code never ran, and the person was shown the source
+  as though the model had only talked about it. Seen live, 2026-09-19.
 
-### Step E — the cancellation rule
+### Open, not done here
 
-- [ ] `notebook_cancels_generation` splits by falsified-premise.
-- [ ] The card's `raise` sentence is true again.
-- [ ] The truncation/interruption marker reaches the model.
-
-**Acceptance:** a scripted test where a raise is answered and the cells
-after it run.
+A reply with **no parts at all** — the provider spent the whole budget
+on `reasoning_content` and returned empty `content` — rests the branch,
+because a reply with no cells does. That is silence, not an answer, and
+D4's own test draws exactly that distinction ("silence is a branch that
+produces nothing, and this one produced an answer"). Seen live on
+2026-09-19 with 17.6 KB of reasoning and no reply. Prompting again is
+probably right and risks a loop; neither is obvious enough to decide
+without a measurement.
