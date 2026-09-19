@@ -14,7 +14,9 @@
 //!
 //! **Recognition is strict, and the asymmetry is the reason** (25.1).
 //! A fence is three or more backticks at column 0; the info string is
-//! exactly `js` or `javascript` in lower case; a closing fence is at
+//! exactly `js`, `javascript`, `ts` or `typescript` in lower case (the
+//! compiler parses TypeScript and erases the types, so all four are the
+//! same program); a closing fence is at
 //! least as long as the one it closes. No tildes, no indented fences,
 //! nothing inside a list item or a block quote — all of which
 //! CommonMark permits and this does not. A strict subset is safe
@@ -438,12 +440,25 @@ struct OpenFence {
     outer_start: usize,
 }
 
-/// Is this info string one that executes? Exactly `js` or
-/// `javascript`, lower case (D3). Everything else — `text`, `rust`,
-/// `JS`, and a bare fence with no info string at all — is prose
+/// Is this info string one that executes? Exactly `js`, `javascript`,
+/// `ts` or `typescript`, lower case (D3). Everything else — `text`,
+/// `rust`, `JS`, and a bare fence with no info string at all — is prose
 /// quoting code, and is left for the person to read.
+///
+/// **`ts` runs because the compiler reads it.** `interp::compile`
+/// parses TypeScript and erases what erases, so a block tagged `ts` is
+/// the same program as the one tagged `js`; refusing it would mean a
+/// reply that silently did nothing, on a distinction the model cannot
+/// see the consequences of. The card says plainly that all four run and
+/// that JavaScript is preferred — nothing here checks a type, so an
+/// annotation is a comment that costs tokens.
+///
+/// The cost is real and accepted: a model working in a TypeScript
+/// codebase has an honest reason to *quote* TypeScript, and that quote
+/// now runs. The mitigation is the card, not the parser — a quoted
+/// block is `text` and always was.
 fn executes(info: &str) -> bool {
-    info == "js" || info == "javascript"
+    matches!(info, "js" | "javascript" | "ts" | "typescript")
 }
 
 /// Split a markdown reply into its executable cells, in source order.
@@ -631,15 +646,31 @@ mod tests {
     }
 
     /// D3: executing is what every turn does, so it is untagged;
-    /// quoting is the marked case. Anything that is not exactly `js`
-    /// or `javascript` is for the person to read.
+    /// quoting is the marked case. Anything that is not one of the four
+    /// dialect tags is for the person to read.
     #[test]
     fn a_non_executable_tag_is_not_a_cell() {
-        for tag in ["text", "rust", "python", "ts", "jsx"] {
+        for tag in ["text", "rust", "python", "jsx", "JS", "tsx"] {
             let md = format!("```{tag}\nconst x = 1;\n```\n");
             assert!(
                 split_cells(&md).is_empty(),
                 "```{tag} must not execute, but it produced a cell"
+            );
+        }
+    }
+
+    /// All four dialect tags run. `ts` and `typescript` reach the same
+    /// compiler as `js` — it parses TypeScript and erases the types —
+    /// so refusing them would have meant a reply that silently did
+    /// nothing on a distinction with no visible consequence.
+    #[test]
+    fn every_dialect_tag_is_a_cell() {
+        for tag in ["js", "javascript", "ts", "typescript"] {
+            let md = format!("```{tag}\nconst x: number = 1;\n```\n");
+            assert_eq!(
+                split_cells(&md).len(),
+                1,
+                "```{tag} must execute, but it produced no cell"
             );
         }
     }

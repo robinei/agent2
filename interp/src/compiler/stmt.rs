@@ -156,11 +156,40 @@ impl super::Compiler {
             // A `type` alias and an `interface` declare no value and
             // emit no code: in TypeScript they are gone before the
             // program runs, and here they are gone before it compiles.
-            // `enum` and `namespace` are deliberately *not* here —
-            // both create a real object at runtime, so erasing them
-            // would silently drop a binding the program then reads.
             ast::Statement::TSTypeAliasDeclaration(_)
-            | ast::Statement::TSInterfaceDeclaration(_) => {}
+            | ast::Statement::TSInterfaceDeclaration(_)
+            | ast::Statement::TSImportEqualsDeclaration(_) => {}
+
+            // **Ambient declarations describe; they do not run.** This
+            // is the shape the card itself is written in — `declare
+            // namespace history { function append(…): void }` and forty
+            // more like it — so refusing it would mean refusing the one
+            // block of code the model is shown most often. In
+            // TypeScript it compiles to nothing, and here it compiles
+            // to nothing.
+            ast::Statement::TSModuleDeclaration(m) if m.declare => {}
+            ast::Statement::TSEnumDeclaration(e) if e.declare => {}
+
+            // And the two that are **not** types. `enum` and a
+            // value-bearing `namespace` each build a real object at run
+            // time, so erasing them would silently drop a binding the
+            // program then reads — a `return E.A` against nothing.
+            // Refused, and refused by name: they reached the catch-all
+            // below until now and came back as "unsupported statement",
+            // which tells a reader neither what was wrong nor what to
+            // write instead.
+            ast::Statement::TSEnumDeclaration(e) => self.error(
+                e.span.into(),
+                "`enum` is not supported: it builds an object at run time rather than \
+                 erasing like a type. Use a plain object — `const E = { A: 0, B: 1 }` — \
+                 or the string values directly.",
+            ),
+            ast::Statement::TSModuleDeclaration(m) => self.error(
+                m.span.into(),
+                "`namespace` is not supported: its body builds an object at run time \
+                 rather than erasing like a type. Use a plain object literal, or just \
+                 declare the members at the top level.",
+            ),
 
             // Out of scope — informative errors.
             ast::Statement::LabeledStatement(s) => {

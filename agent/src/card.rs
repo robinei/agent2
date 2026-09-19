@@ -495,6 +495,38 @@ mod tests {
         }
     }
 
+    /// **A markdown card must not open a fence it does not close.**
+    /// Written while adding a paragraph to the notebook card that
+    /// began, at column 0, "```ts and ```typescript run as well" — which
+    /// is not a sentence about a fence, it *is* a fence, and everything
+    /// after it became the contents of a code block that never closed.
+    /// Nothing in the build would have said so; the card is a string.
+    ///
+    /// Only markdown cards are checked. A TypeScript card has no
+    /// fences and its prose lives in comments, where three backticks
+    /// are three backticks.
+    #[test]
+    fn a_markdown_card_balances_its_fences() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let cards = [dir.join("card/card.md"), dir.join("../evals/cards/notebook/card.md")];
+        for path in cards {
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue; // the eval cards do not ship with the binary
+            };
+            if text.starts_with("/**") {
+                continue; // a TypeScript document, not markdown
+            }
+            let opens = text.lines().filter(|l| l.starts_with("```")).count();
+            assert_eq!(
+                opens % 2,
+                0,
+                "{} has an unclosed fence: {} lines start with ```",
+                path.display(),
+                opens
+            );
+        }
+    }
+
     #[test]
     fn full_card_appends_the_manifest_after_the_card() {
         let full = full_card(&registry_with_tools());
