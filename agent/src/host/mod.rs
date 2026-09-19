@@ -3118,7 +3118,7 @@ mod tests {
     #[test]
     fn reply_settles_a_question_to_the_user() {
         let mut tree = tree_with_answered_root();
-        let mut spine = tree.spine_at(EventId::new(4));
+        let mut spine = tree.spine_at(EventId::new(7));
         let send = tree
             .append(
                 &mut spine,

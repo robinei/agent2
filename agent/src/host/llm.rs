@@ -154,7 +154,7 @@ pub fn scripted_answer(
     value: serde_json::Value,
 ) -> LlmTurn {
     scripted_program(&format!(
-        "answer({}, {value});",
+        "answer({}, {label:?}, {value});",
         question.as_u64()
     ))
 }

@@ -373,32 +373,42 @@ mod tests {
     #[test]
     fn the_provider_wait_is_measured_from_the_previous_outcome() {
         // t=0 the branch opens; the request goes out; the provider
-        // takes five seconds; then the reply's prose, its cell, and its
-        // outcome land in quick succession.
+        // takes five seconds to say anything; then the reply's prose,
+        // its two cells, its end and its outcome land in quick
+        // succession.
         let log = synthetic_log(&[
             (0, r#"{"Agent":{"charter":"c","system":"s"}}"#),
             (
                 10,
-                r#"{"Message":{"Post":{"from":"User","origin":{"Direct":{"text":"go","input":null,"options":[],"expects_reply":true}}}}}"#,
+                r#"{"Post":{"from":"User","origin":{"Direct":{"text":"go","input":null,"options":[],"expects_reply":true}}}}"#,
             ),
-            // Five seconds of generation, invisible in the log.
+            // Five seconds of generation, invisible in the log until
+            // the first token arrives and opens the reply.
+            (5_010, r#""Reply""#),
             (
-                5_010,
+                5_012,
+                r#"{"Part":{"reply":3,"part":{"Prose":"Looking now.\n\n"}}}"#,
+            ),
+            (
+                5_015,
                 r#"{"Call":{"Send":{"to":"User","text":"Looking now.","input":null,"options":[],"expects_reply":false,"site":0,"site_end":0}}}"#,
             ),
             (
                 5_020,
-                r#"{"Message":{"Turn":{"author":{"Agent":1},"source":"tell(\"hi\");"}}}"#,
+                r#"{"Part":{"reply":3,"part":{"Cell":"```js\ntell(\"hi\");\n```\n"}}}"#,
             ),
             (
                 5_030,
-                r#"{"Message":{"Turn":{"author":{"Agent":1},"source":"done();"}}}"#,
+                r#"{"Part":{"reply":3,"part":{"Cell":"```js\ndone();\n```\n"}}}"#,
             ),
             (
                 5_040,
-                r#"{"Completion":{"usage":{"prompt":10,"cached":0,"completion":20,"reasoning":0}}}"#,
+                r#"{"ReplyEnd":{"reply":3,"how":"Finished","usage":{"prompt":10,"cached":0,"completion":20,"reasoning":0}}}"#,
             ),
-            (5_050, r#"{"Return":{"value":null}}"#),
+            (
+                5_050,
+                r#"{"Handback":{"reply":3,"how":"Completed","site":0,"stack":[]}}"#,
+            ),
         ]);
         let tree = crate::open_tree_read_only(log.path().to_str().unwrap()).unwrap();
         let s = score(&tree);
@@ -406,48 +416,17 @@ mod tests {
         assert_eq!(s.programs, 1, "two cells, one round trip");
         assert_eq!(s.completion_out, 20);
         // The five seconds are the provider's, and they are charged
-        // once — not once per cell, and not lost to the prose.
+        // once — not once per cell, and not lost to the prose, which is
+        // logged mid-generation and would show a gap of nil.
         assert_eq!(
-            s.provider_ms, 5_020,
-            "the wait runs from the log's start to the reply's first Turn"
+            s.provider_ms, 5_010,
+            "the wait runs from the log's start to the reply opening"
         );
         assert!(
             s.exec_ms < 100,
             "and the rest is execution, not the whole run: {}",
             s.exec_ms
         );
-    }
-
-    /// The program transport is unmoved by the same change: its `Turn`
-    /// *is* the first event of its reply, so anchoring on the previous
-    /// outcome measures what anchoring on the previous event did.
-    #[test]
-    fn the_program_transports_wait_is_unchanged() {
-        let log = synthetic_log(&[
-            (0, r#"{"Agent":{"charter":"c","system":"s"}}"#),
-            (
-                10,
-                r#"{"Message":{"Post":{"from":"User","origin":{"Direct":{"text":"go","input":null,"options":[],"expects_reply":true}}}}}"#,
-            ),
-            (
-                3_010,
-                r#"{"Message":{"Turn":{"author":{"Agent":1},"source":"return 1;","usage":{"prompt":10,"cached":0,"completion":20,"reasoning":0}}}}"#,
-            ),
-            (3_020, r#"{"Return":{"value":1}}"#),
-            // A second completion, two seconds of it.
-            (
-                5_020,
-                r#"{"Message":{"Turn":{"author":{"Agent":1},"source":"done();","usage":{"prompt":10,"cached":0,"completion":5,"reasoning":0}}}}"#,
-            ),
-            (5_030, r#"{"Return":{"value":null}}"#),
-        ]);
-        let tree = crate::open_tree_read_only(log.path().to_str().unwrap()).unwrap();
-        let s = score(&tree);
-
-        assert_eq!(s.programs, 2, "two Turns, two round trips");
-        assert_eq!(s.completion_out, 25, "usage still rides on the Turn here");
-        // 3010 from the start, plus 2000 from the first outcome.
-        assert_eq!(s.provider_ms, 5_010);
     }
 
     /// Write a log with chosen timestamps and hand back the file.

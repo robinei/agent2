@@ -236,7 +236,6 @@ mod tests {
         let mut spine = tree
             .start_agent(None, None, "root", None, "CARD", Vec::new())
             .unwrap();
-        let agent = spine.leaf_id;
         tree.append(
             &mut spine,
             EventPayload::Post {
@@ -287,7 +286,6 @@ mod tests {
         let mut spine = tree
             .start_agent(None, None, "root", None, "CARD", Vec::new())
             .unwrap();
-        let agent = spine.leaf_id;
         tree.append(
             &mut spine,
             EventPayload::Post {

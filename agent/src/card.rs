@@ -702,9 +702,10 @@ mod tests {
     struct Ending {
         /// `done()` was called: the task is over.
         done: bool,
-        /// The program returned something for the next one to read.
-        /// `Value::Undefined` when it ran off the end.
-        returned: bool,
+        /// `history.append` was called: something was handed to the
+        /// reply after this one. A reply has no `return` (D5), so this
+        /// is the other way one can end on purpose.
+        appended: bool,
     }
 
     /// Drive one program on a bare VM: every call answered by
@@ -712,19 +713,15 @@ mod tests {
     /// Deliberately not the real machine — this checks the program
     /// against its tools, and wants no conversation around it.
     fn run_against_stubs(src: &str) -> Result<Ending, String> {
-        use interp::{StepResult, VM, Value};
+        use interp::{StepResult, VM};
         let program = interp::compile(src).map_err(|e| format!("{e:?}"))?;
         let mut vm = VM::for_program(program, serde_json::Value::Null)
             .map_err(|e| format!("could not start: {e:?}"))?;
         let mut done = false;
+        let mut appended = false;
         loop {
             match vm.step(u64::MAX).map_err(|e| format!("{e:?}"))? {
-                StepResult::Done { value, .. } => {
-                    return Ok(Ending {
-                        done,
-                        returned: !matches!(value, Value::Undefined),
-                    });
-                }
+                StepResult::Done { .. } => return Ok(Ending { done, appended }),
                 StepResult::Pending { calls } => {
                     for call in calls {
                         let result = stub_result(&call.name, &call.args);
@@ -742,6 +739,9 @@ mod tests {
                 StepResult::Settle { call } => {
                     if call.name == crate::machine::TOOL_DONE {
                         done = true;
+                    }
+                    if call.name == crate::machine::TOOL_APPEND_HISTORY {
+                        appended = true;
                     }
                     let result = stub_result(&call.name, &call.args);
                     let value = vm
@@ -782,7 +782,7 @@ mod tests {
             // order, in one scope — which is what the notebook driver
             // does with the real thing.
             let source = cells_of(&ex.assistant);
-            run_against_stubs(&source)
+            let ending = run_against_stubs(&source)
                 .unwrap_or_else(|e| panic!("exemplar for {:?} trapped: {e}", ex.user));
             // **The two endings a reply has.** `done()` says the task is
             // finished; `history.append` hands a finding to the reply
@@ -790,10 +790,11 @@ mod tests {
             // `return` to be the second of those any more, and an
             // exemplar that does neither demonstrates a reply that found
             // something and threw it away.
-            let ends = source.contains("done()");
-            let hands_on = source.contains("history.append");
+            //
+            // Read off the run, not off the text: a call inside a
+            // branch never taken is not an ending.
             assert!(
-                ends || hands_on,
+                ending.done || ending.appended,
                 "exemplar for {:?} neither finishes nor hands anything on",
                 ex.user
             );

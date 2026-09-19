@@ -555,24 +555,6 @@ mod tests {
         assert!(err.contains("rate limited"), "{err}");
     }
 
-    /// Builds an SSE stream from `serde_json::Value` events rather than
-    /// hand-spliced JSON text — `sse`'s `&[&str]` fixtures above read
-    /// well for a one-line delta, but a `tool_calls` fragment nests four
-    /// levels deep with a JSON-string-inside-a-JSON-string argument
-    /// value, where a single misplaced escape produces a fixture that
-    /// silently tests nothing (a parse error the code under test never
-    /// sees, since it's the test's own JSON that's malformed). Values
-    /// let `serde_json` own every brace and escape.
-    fn sse_values(events: &[serde_json::Value]) -> String {
-        let mut out = String::new();
-        for e in events {
-            out.push_str("data: ");
-            out.push_str(&e.to_string());
-            out.push_str("\n\n");
-        }
-        out.push_str("data: [DONE]\n\n");
-        out
-    }
 
 
 }

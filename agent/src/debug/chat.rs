@@ -592,9 +592,14 @@ impl ChatState {
             // A rename is a record: it changes the navigator, never the
             // transcript, and never wakes the branch.
             EventPayload::Rename { .. } => {}
-            // The reply's own text, arriving piece by piece: prose and
-            // cells append to the header this reply opened, thinking is
-            // a line of its own and is not part of what it said.
+            // The reply's own text, arriving piece by piece.
+            //
+            // **Only the cells.** A prose segment reaches this pane as
+            // its own `Call::Send { prose: true, to: User }`, rendered
+            // as markdown the way the person will read it; appending it
+            // here too put it on the screen twice, once more as the
+            // literal source of a program it is not part of. Thinking
+            // is a line of its own and is not part of what was said.
             EventPayload::Part { part, .. } => {
                 let program = self.program_stack.get(&branch).and_then(|s| s.last()).copied();
                 match part {
@@ -608,7 +613,8 @@ impl ChatState {
                         });
                     }
                     crate::types::Part::Thinking(_) => {}
-                    crate::types::Part::Prose(t) | crate::types::Part::Cell(t) => {
+                    crate::types::Part::Prose(_) => {}
+                    crate::types::Part::Cell(t) => {
                         if let Some(p) = program
                             && let Some(&row) = self.entry_index.get(&p)
                             && let Some(Entry::Header { source, .. }) = self.entries.get_mut(row)
@@ -773,6 +779,14 @@ impl ChatState {
                             RowDetail::Program(*program),
                             *program,
                         ));
+                        continue;
+                    }
+                    // **A reply with no cells has no program block.**
+                    // It spoke and stopped (D4); its prose is already
+                    // on the screen as its own rows, and a bare
+                    // "program: completed" over nothing is a header for
+                    // a thing that does not exist.
+                    if source.is_empty() {
                         continue;
                     }
                     let status = self

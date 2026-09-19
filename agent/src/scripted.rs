@@ -501,12 +501,21 @@ fn fold(session: host::Session, errors: Vec<String>) -> Outcome {
                     _ => {}
                 }
                 // An open scope, tracked as a stack rather than a
-                // tally: `Abandoned` closes the innermost one, and a
-                // `Return` (below) closes one by continuing. What is
-                // still on this stack when the log ends was never
-                // settled either way, and must not be read as a resume.
+                // tally: a pause pushes one and a terminal handback
+                // pops it. What is still on this stack when the log
+                // ends was never settled either way, and must not be
+                // read as a resume.
+                //
+                // **Only `Completed` closes a scope by continuing**,
+                // and that is what a resume is: the suspended program
+                // ran on to its own end. `Abandoned` and `Interrupted`
+                // close it by giving up.
                 if cause.is_terminal() {
-                    open_scopes.pop();
+                    if open_scopes.pop().is_some()
+                        && matches!(cause, crate::types::Handback::Completed)
+                    {
+                        resume_count += 1;
+                    }
                 } else {
                     open_scopes.push(e.id);
                 }
@@ -521,14 +530,6 @@ fn fold(session: host::Session, errors: Vec<String>) -> Outcome {
                         question,
                         answer: NO_SCRIPTED_ANSWER.to_owned(),
                     });
-                }
-            }
-            EventPayload::Handback { .. } => {
-                // The suspended program ran to completion, so whatever
-                // scope it was under was closed by continuing — that is
-                // a resume, whether or not anything was logged for it.
-                if open_scopes.pop().is_some() {
-                    resume_count += 1;
                 }
             }
             EventPayload::Note { text, .. } => appended.push(text.clone()),

@@ -3973,7 +3973,7 @@ mod tests {
     /// this replaced could not manage either (see `document::Transport`).
     fn setup_under() -> (Tree, Runner) {
         let mut tree = Tree::new(None);
-        let mut state = Runner::new_root(&mut tree, "you are a test agent", "").unwrap();
+        let state = Runner::new_root(&mut tree, "you are a test agent", "").unwrap();
         (tree, state)
     }
 
@@ -6919,7 +6919,6 @@ mod tests {
             .agent_segment(tree)
             .iter()
             .filter_map(|e| match &e.payload {
-                EventPayload::Part { part: crate::types::Part::Thinking(t), .. } => Some(t.clone()),
                 EventPayload::Part { part: crate::types::Part::Thinking(t), .. } => Some(t.clone()),
                 _ => None,
             })

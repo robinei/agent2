@@ -1741,13 +1741,12 @@ mod tests {
             )
         };
 
-        let turn;
         {
             let mut tree = open()?;
             let mut spine = tree.start_agent(None, None, "root", None, "", Vec::new())?;
             tree.append(&mut spine, user_msg("go"))?;
             let [reply, cell] = assistant_msg("history.append(1);");
-            turn = tree.append(&mut spine, reply)?;
+            tree.append(&mut spine, reply)?;
             tree.append(&mut spine, cell)?;
             tree.sync()?;
             // A step in progress: these are written but not yet synced.
