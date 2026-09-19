@@ -4607,7 +4607,7 @@ mod tests {
             .content
             .clone();
         assert!(
-            program.contains(&format!("/* history[{}] */", note.id.as_u64())),
+            program.contains(&format!("/* ← history[{}] */", note.id.as_u64())),
             "and the call points at the row it wrote: {program}"
         );
     }
@@ -4642,7 +4642,7 @@ mod tests {
             .content
             .clone();
         assert!(
-            program.contains("tell(/* snipped - history["),
+            program.contains("tell(/* ← snipped - history["),
             "the long literal tell became a reference: {program}"
         );
         assert!(
@@ -4650,7 +4650,7 @@ mod tests {
             "and its bytes are not in the document twice: {program}"
         );
         assert!(
-            program.contains("String(1)") && program.contains(") /* history["),
+            program.contains("String(1)") && program.contains(") /* ← history["),
             "the computed one keeps its construction and takes a reference: {program}"
         );
         let all: String = doc
@@ -7448,7 +7448,7 @@ mod tests {
             "the long literal should have been snipped:\n{shown}"
         );
         assert!(
-            shown.contains("snipped - history["),
+            shown.contains("← snipped - history["),
             "and replaced by its row:\n{shown}"
         );
         // Everything around it is intact: the prose, both fences, and

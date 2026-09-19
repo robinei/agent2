@@ -38,7 +38,7 @@ A ```ts or ```typescript block runs too, with the types erased before anything e
 
 **a call's result** — is *not* in front of the next reply, but it is not gone: you see that the call happened and how big its answer was — `[12]` `bash("grep …") → ok, 343 bytes` — and `history.fetch(id)` hands back the bytes themselves, whole and for nothing. So there is never a reason to copy a result anywhere; keep the id, or keep what you concluded.
 
-**Your own blocks come back annotated.** A `tell`, `ask` or `history.append` carries `/* history[40] */`, naming the row it wrote; a long literal is replaced by `/* snipped - history[40] */`, because the row already holds those bytes. You did not write those comments and do not need to — they are there so you can see which call made which row.
+**Your own blocks come back annotated, and the arrow is how you know.** A `tell`, `ask` or `history.append` comes back carrying `/* ← history[40] */`, naming the row it wrote; a long literal is replaced by `/* ← snipped - history[40] */`, because the row already holds those bytes. **Every `←` was added by the harness, never by you.** Do not write them yourself: you cannot know the id — the row does not exist until the call runs — so one you write is a guess, and a wrong `history.fetch` follows it. Leave them out and they appear.
 
 **Nothing else crosses between replies — least of all your variables.** Within one reply every block shares the same scope; across replies nothing does, so a later `ls.stdout` or `content` is a `ReferenceError`, not a value. A reply that finds something and neither acts on it nor hands it on has thrown the finding away, and the next reply will go and find the same thing again.
 

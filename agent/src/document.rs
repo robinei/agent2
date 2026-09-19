@@ -307,8 +307,8 @@ fn annotate_history_calls(source: &str, cuts: Option<&Vec<Cut>>) -> String {
     cuts.sort_by_key(|c| std::cmp::Reverse(c.start));
     let mut out = source.to_owned();
     for c in cuts {
-        let snipped = format!("/* snipped - history[{}] */", c.row);
-        let marked = format!(" /* history[{}] */", c.row);
+        let snipped = format!("/*{ARROW} snipped - history[{}] */", c.row);
+        let marked = format!(" /*{ARROW} history[{}] */", c.row);
         if c.literal && snipped.len() < c.end - c.start {
             // Keep the callee, so the call still reads as a call:
             // `const a = await ask(/* snipped - history[7] */)` has a
@@ -320,10 +320,63 @@ fn annotate_history_calls(source: &str, cuts: Option<&Vec<Cut>>) -> String {
                 .to_owned();
             out.replace_range(c.start..c.end, &format!("{callee}({snipped})"));
         } else {
+            // **Replace an imitated one, never sit beside it.** The
+            // model reads these in its own turns and writes them back:
+            // on a live run of 2026-09-19 it emitted
+            // `history.append(…); /* history[13] */` with four
+            // invented ids, and the pass below added the four real ones
+            // beside them — so every line came back doubly annotated,
+            // with a *wrong* id next to the true one that `fetch` would
+            // happily follow somewhere else. Worse, the doubled form is
+            // then the example it imitates next turn.
+            // Removed first, then ours goes where it always goes —
+            // so a line the model annotated and one it left alone come
+            // back identical. The span is after `c.end`, so cutting it
+            // cannot move the insertion point.
+            if let Some(span) = imitated_annotation(&out, c.end) {
+                out.replace_range(span, "");
+            }
             out.insert_str(c.end, &marked);
         }
     }
     out
+}
+
+/// The arrow every annotation carries, so it reads as something
+/// pointing *out* of the code at a row rather than as a comment
+/// somebody wrote in it.
+///
+/// The card says these are added for the model and not by it; a glyph
+/// it would not reach for on its own says the same thing at the place
+/// the confusion happens, which prose in a system prompt 16 KB earlier
+/// evidently does not.
+const ARROW: &str = " ←";
+
+/// The span of an annotation the model wrote itself, immediately after
+/// `at` — so this pass can replace it rather than append beside it.
+///
+/// **Only our exact shape**, optional arrow and all: a comment that
+/// merely mentions a row (`/* see history[9] for the listing */`) is
+/// something the model wrote *meaning* it, and rewriting that would
+/// destroy what it said.
+fn imitated_annotation(text: &str, at: usize) -> Option<std::ops::Range<usize>> {
+    let rest = text.get(at..)?;
+    let lead = rest.len() - rest.trim_start_matches([' ', '\t', ';']).len();
+    // The statement's own `;` is not the model's annotation and stays;
+    // the whitespace between it and the comment goes, or removing the
+    // comment leaves a trailing space behind.
+    let keep = rest[..lead].rfind(';').map_or(0, |i| i + 1);
+    let body = &rest[lead..];
+    if !body.starts_with("/*") {
+        return None;
+    }
+    let close = body.find("*/")? + 2;
+    let inner = body[2..close - 2].trim().trim_start_matches('←').trim();
+    let digits = inner
+        .strip_prefix("history[")
+        .and_then(|r| r.strip_suffix(']'))?;
+    (!digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()))
+        .then_some(at + keep..at + lead + close)
 }
 
 /// A replaced entry's line, `[id] … text`. `None` for a removed one,
@@ -784,9 +837,7 @@ pub(crate) fn render_with_lookup(
 /// Addressed to the model about its own turn, because that is whose
 /// turn it is: it spent the completion and wrote nothing, and the only
 /// way it can see that is if we say so here.
-pub const EMPTY_REPLY_NOTE: &str =
-    "— this reply arrived empty: the whole completion went to reasoning and \
-     nothing was written, so nothing ran —";
+pub const EMPTY_REPLY_NOTE: &str = "— this reply arrived empty: nothing was written, so nothing ran —";
 
 fn cut_off_note(how: &ReplyEnd) -> Option<&'static str> {
     match how {
@@ -1337,11 +1388,11 @@ mod tests {
             .content
             .clone();
         assert!(
-            program.contains(&format!("tell(/* snipped - history[{}] */)", a.as_u64())),
+            program.contains(&format!("tell(/* ← snipped - history[{}] */)", a.as_u64())),
             "the long literal is replaced by its row: {program}"
         );
         assert!(
-            program.contains("tell(\"x \" + y) /* history["),
+            program.contains("tell(\"x \" + y) /* ← history["),
             "the computed one keeps its construction and takes a reference: {program}"
         );
         assert!(
@@ -1352,6 +1403,50 @@ mod tests {
 
     /// A call shorter than the reference keeps its text — de-duplicating
     /// is not worth spending more bytes than it saves — but still takes
+    /// **An annotation the model wrote itself is replaced, not joined.**
+    ///
+    /// It reads these in its own turns and writes them back. On a live
+    /// run of 2026-09-19 it emitted `history.append(…); /* history[13] */`
+    /// with four invented ids, and the pass added the four real ones
+    /// beside them: every line came back doubly annotated, with a wrong
+    /// id next to the true one that `fetch` would follow somewhere
+    /// else — and the doubled form is then what it imitates next turn.
+    #[test]
+    fn an_imitated_annotation_is_replaced_by_the_real_one() {
+        let cuts = vec![Cut {
+            start: 0,
+            end: 19,
+            row: 30,
+            literal: false,
+        }];
+        // The model's own guess, in our shape and with the wrong id.
+        let source = "history.append(arg); /* history[13] */\n";
+        let out = annotate_history_calls(source, Some(&cuts));
+        assert_eq!(out, "history.append(arg) /* ← history[30] */;\n");
+        assert!(!out.contains("13"), "the invented id is gone: {out}");
+
+        // And the same once it has imitated the arrow too.
+        let source = "history.append(arg); /* ← history[13] */\n";
+        let out = annotate_history_calls(source, Some(&cuts));
+        assert_eq!(out, "history.append(arg) /* ← history[30] */;\n");
+    }
+
+    /// But a comment the model wrote *meaning* something is left
+    /// alone — rewriting it would destroy what it said.
+    #[test]
+    fn a_comment_that_merely_mentions_a_row_survives() {
+        let cuts = vec![Cut {
+            start: 0,
+            end: 19,
+            row: 30,
+            literal: false,
+        }];
+        let source = "history.append(arg); /* see history[9] for the listing */\n";
+        let out = annotate_history_calls(source, Some(&cuts));
+        assert!(out.contains("see history[9] for the listing"), "{out}");
+        assert!(out.contains("/* ← history[30] */"), "{out}");
+    }
+
     /// the reference, because the link from call to row is the point.
     #[test]
     fn a_short_call_keeps_its_text_and_still_takes_the_reference() {
@@ -1387,7 +1482,7 @@ mod tests {
             .content
             .clone();
         assert!(
-            program.contains("tell(\"ok\") /* history["),
+            program.contains("tell(\"ok\") /* ← history["),
             "text kept, reference added: {program}"
         );
     }
@@ -1511,7 +1606,7 @@ mod tests {
         let all: String = doc.messages.iter().map(|m| m.content.clone()).collect();
         assert!(
             all.contains(&format!(
-                "const a = await ask(/* snipped - history[{}] */)",
+                "const a = await ask(/* ← snipped - history[{}] */)",
                 q.as_u64()
             )),
             "{all}"
