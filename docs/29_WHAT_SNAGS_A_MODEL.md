@@ -213,6 +213,14 @@ And `Array.from(new Set(xs))` threw while `[...new Set(xs)]` worked —
 two spellings of one operation disagreeing, which a reader can only
 find by falling into it.
 
+**A message that names the value finds the bug it was hiding.** Twice
+in one night. `Array.from`'s "type error" hid the fact that it took no
+Set; when it started naming what it got, `Object.fromEntries needs an
+object; got a map` turned up in a live run within the hour — and a
+`Map` is a list of entries, so that refusal was a gap too. Fourteen
+further collection-interop cases were then probed and all passed, so
+that family is done.
+
 **What was left undone, and why.** Object getters, labelled
 break/continue, generators, `String.raw`, `structuredClone`, `BigInt`,
 `Object.groupBy`: **zero uses across 96 runs**. Closing them would be
