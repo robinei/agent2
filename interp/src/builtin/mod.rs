@@ -699,7 +699,7 @@ impl Args {
     fn array_receiver(&self, vm: &VM) -> Result<ArrayPtr, VMError> {
         match self.get(vm, 0) {
             Value::Array(p) => Ok(*p),
-            recv => Err(vm.method_receiver_error(recv)),
+            recv => Err(vm.method_receiver_error(recv, "an array")),
         }
     }
 
@@ -707,7 +707,7 @@ impl Args {
     fn map_receiver(&self, vm: &VM) -> Result<MapPtr, VMError> {
         match self.get(vm, 0) {
             Value::Map(p) => Ok(*p),
-            recv => Err(vm.method_receiver_error(recv)),
+            recv => Err(vm.method_receiver_error(recv, "a Map")),
         }
     }
 
@@ -715,7 +715,7 @@ impl Args {
     fn set_receiver(&self, vm: &VM) -> Result<SetPtr, VMError> {
         match self.get(vm, 0) {
             Value::Set(p) => Ok(*p),
-            recv => Err(vm.method_receiver_error(recv)),
+            recv => Err(vm.method_receiver_error(recv, "a Set")),
         }
     }
 
@@ -723,7 +723,7 @@ impl Args {
     fn str_receiver<'a>(&self, vm: &'a VM) -> Result<&'a str, VMError> {
         match self.get(vm, 0) {
             Value::String(s) => Ok(s.as_str()),
-            recv => Err(vm.method_receiver_error(recv)),
+            recv => Err(vm.method_receiver_error(recv, "a string")),
         }
     }
 
@@ -732,7 +732,7 @@ impl Args {
     fn string_receiver(&self, vm: &VM) -> Result<RcStr, VMError> {
         match self.get(vm, 0) {
             Value::String(s) => Ok(s.clone()),
-            recv => Err(vm.method_receiver_error(recv)),
+            recv => Err(vm.method_receiver_error(recv, "a string")),
         }
     }
 
@@ -740,7 +740,7 @@ impl Args {
     fn regexp_receiver<'a>(&self, vm: &'a VM) -> Result<&'a crate::vm::RcRegExp, VMError> {
         match self.get(vm, 0) {
             Value::RegExp(rx) => Ok(rx),
-            recv => Err(vm.method_receiver_error(recv)),
+            recv => Err(vm.method_receiver_error(recv, "a RegExp")),
         }
     }
 }

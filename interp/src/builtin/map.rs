@@ -115,7 +115,7 @@ pub fn map_set_has(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     match args.get(vm, 0) {
         Value::Map(_) => map_has(vm, args),
         Value::Set(_) => super::set_has(vm, args),
-        recv => Err(vm.method_receiver_error(recv)),
+        recv => Err(vm.method_receiver_error(recv, "a Map or a Set")),
     }
 }
 
@@ -123,7 +123,7 @@ pub fn map_set_delete(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     match args.get(vm, 0) {
         Value::Map(_) => map_delete(vm, args),
         Value::Set(_) => super::set_delete(vm, args),
-        recv => Err(vm.method_receiver_error(recv)),
+        recv => Err(vm.method_receiver_error(recv, "a Map or a Set")),
     }
 }
 
@@ -131,7 +131,7 @@ pub fn map_set_clear(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     match args.get(vm, 0) {
         Value::Map(_) => map_clear(vm, args),
         Value::Set(_) => super::set_clear(vm, args),
-        recv => Err(vm.method_receiver_error(recv)),
+        recv => Err(vm.method_receiver_error(recv, "a Map or a Set")),
     }
 }
 
@@ -147,7 +147,7 @@ pub fn map_set_keys(vm: &mut VM, args: Args) -> Result<Value, VMError> {
             let values: ThinVec<Value> = set.iter().map(|k| k.0.clone()).collect();
             Ok(vm.alloc_array(values))
         }
-        recv => Err(vm.method_receiver_error(recv)),
+        recv => Err(vm.method_receiver_error(recv, "a Map or a Set")),
     }
 }
 
@@ -155,7 +155,7 @@ pub fn map_set_values(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     match args.get(vm, 0) {
         Value::Map(_) => map_values(vm, args),
         Value::Set(_) => super::set_values(vm, args),
-        recv => Err(vm.method_receiver_error(recv)),
+        recv => Err(vm.method_receiver_error(recv, "a Map or a Set")),
     }
 }
 
@@ -176,7 +176,7 @@ pub fn map_set_entries(vm: &mut VM, args: Args) -> Result<Value, VMError> {
             }
             Ok(vm.alloc_array(result))
         }
-        recv => Err(vm.method_receiver_error(recv)),
+        recv => Err(vm.method_receiver_error(recv, "a Map or a Set")),
     }
 }
 

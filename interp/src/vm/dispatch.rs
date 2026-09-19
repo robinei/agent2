@@ -55,7 +55,7 @@ impl VM {
     /// otherwise (array length, object property count — never contents).
     /// Strings go through `preview` for its existing ~40-char clip, so a
     /// stray multi-KB string caught in a trap cannot bloat the report.
-    fn describe_operand(&self, v: &Value) -> String {
+    pub(crate) fn describe_operand(&self, v: &Value) -> String {
         match v {
             Value::Undefined => "undefined".to_string(),
             Value::Null => "null".to_string(),

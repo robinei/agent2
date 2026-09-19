@@ -44,6 +44,25 @@ fn arithmetic_and_operators() {
 // unable to tell what failed, so it discarded and restarted the program
 // instead of resuming past the trap.
 
+/// **A method on the wrong receiver names the receiver.** The builtins
+/// kept the placeholder this file's header is about long after
+/// `dispatch.rs` was brought under the rule: on 2026-09-19 a live run
+/// wrote `history.fetch(46).slice(0, 2000)` against a `{ content,
+/// version }` result and was told, in full, `in \`slice\`: type error`.
+/// It guessed `.content` and paid a round trip for the guess.
+#[test]
+fn a_method_on_the_wrong_receiver_says_what_it_got() {
+    let err = testutil::run_runtime_err(
+        "const row = { content: \"hi\", version: \"v1\" }; row.slice(0, 5);",
+    );
+    assert_eq!(err.kind, crate::vm::ErrorKind::TypeError);
+    assert_eq!(
+        err.message,
+        "in `slice`: expected a string, an array or an ArrayBuffer, \
+         got an object with 2 properties"
+    );
+}
+
 #[test]
 fn increment_non_number_names_the_variable_and_value() {
     // `++` on an object: TypeError, and the message says which local, what

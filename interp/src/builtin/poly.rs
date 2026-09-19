@@ -98,7 +98,7 @@ pub fn slice_poly(vm: &mut VM, args: Args) -> Result<Value, VMError> {
         Value::String(_) => str_slice(vm, args),
         Value::Array(_) => array_slice_builtin(vm, args),
         Value::ArrayBuffer(_) => crate::builtin::arraybuffer_slice(vm, args),
-        recv => Err(vm.method_receiver_error(recv)),
+        recv => Err(vm.method_receiver_error(recv, "a string, an array or an ArrayBuffer")),
     }
 }
 
@@ -106,7 +106,7 @@ pub fn includes_poly(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     match args.get(vm, 0) {
         Value::String(_) => str_includes(vm, args),
         Value::Array(_) => array_includes(vm, args),
-        recv => Err(vm.method_receiver_error(recv)),
+        recv => Err(vm.method_receiver_error(recv, "a string or an array")),
     }
 }
 
@@ -114,7 +114,7 @@ pub fn index_of_poly(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     match args.get(vm, 0) {
         Value::String(_) => str_index_of(vm, args),
         Value::Array(_) => array_index_of(vm, args),
-        recv => Err(vm.method_receiver_error(recv)),
+        recv => Err(vm.method_receiver_error(recv, "a string or an array")),
     }
 }
 
@@ -122,7 +122,7 @@ pub fn last_index_of_poly(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     match args.get(vm, 0) {
         Value::String(_) => str_last_index_of(vm, args),
         Value::Array(_) => array_last_index_of(vm, args),
-        recv => Err(vm.method_receiver_error(recv)),
+        recv => Err(vm.method_receiver_error(recv, "a string or an array")),
     }
 }
 
@@ -130,7 +130,7 @@ pub fn at_poly(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     match args.get(vm, 0) {
         Value::String(_) => str_at(vm, args),
         Value::Array(_) => array_at(vm, args),
-        recv => Err(vm.method_receiver_error(recv)),
+        recv => Err(vm.method_receiver_error(recv, "a string or an array")),
     }
 }
 
@@ -138,6 +138,6 @@ pub fn concat_poly(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     match args.get(vm, 0) {
         Value::String(_) => str_concat(vm, args),
         Value::Array(_) => array_concat(vm, args),
-        recv => Err(vm.method_receiver_error(recv)),
+        recv => Err(vm.method_receiver_error(recv, "a string or an array")),
     }
 }

@@ -95,6 +95,29 @@ impl VM {
     /// Construct an error at the current instruction pointer. Every runtime
     /// error site goes through this (or `fail_not_resumable` / the static
     /// `VMError::fail_at`) so `ip` and `resume` are captured consistently.
+    /// A type error that says what it wanted and what it got.
+    ///
+    /// **A trap the model cannot act on is a trap it restarts around.**
+    /// `compiler/tests/lang_basics.rs` pins the wording of the
+    /// `dispatch.rs` messages for exactly this reason, naming the live
+    /// incident of 2026-09-15 where a bare `"type error"` left a
+    /// program unable to tell what had failed. The builtins were never
+    /// brought under that rule and kept 44 of them — one of which,
+    /// `slice` on an object, is the whole of what a run on 2026-09-19
+    /// was told when it wrote `history.fetch(46).slice(0, 2000)`
+    /// against a `{ content, version }` result. It guessed right, and
+    /// paid a round trip to do it.
+    ///
+    /// `describe_operand` bounds what it prints — a structural summary
+    /// for objects and arrays, never their contents — so this is safe
+    /// on a multi-megabyte value.
+    pub fn type_error(&self, expected: &str, got: &Value) -> VMError {
+        self.fail(
+            ErrorKind::TypeError,
+            format!("expected {expected}, got {}", self.describe_operand(got)),
+        )
+    }
+
     pub fn fail(&self, kind: ErrorKind, msg: impl Into<String>) -> VMError {
         let resume = match kind {
             // Invariant violations: compiler bug or host misuse — never resume.
@@ -133,8 +156,37 @@ impl VM {
     /// builtin handler should never see an Object receiver. Every method-builtin
     /// receiver check routes its mismatch arm through here (directly or via the
     /// `Args::*_receiver` helpers).
-    pub(crate) fn method_receiver_error(&self, _recv: &Value) -> VMError {
-        self.fail(ErrorKind::TypeError, "type error")
+    /// A method called on something it does not work on.
+    ///
+    /// **It had the receiver all along and threw it away.** The
+    /// parameter was `_recv` and the message was the bare word "type
+    /// error", so `history.fetch(46).slice(0, 2000)` against a
+    /// `{ content, version }` result told a live run of 2026-09-19
+    /// exactly this and nothing else:
+    ///
+    /// ```text
+    /// in `slice`: type error
+    /// ```
+    ///
+    /// It guessed `.content`, guessed right, and paid a round trip for
+    /// it. `compiler/tests/lang_basics.rs` already pins the `dispatch.rs`
+    /// messages against precisely this regression — naming the live
+    /// incident of 2026-09-15, where a placeholder left a program
+    /// unable to tell what had failed and it restarted instead of
+    /// resuming. The builtins were never brought under that rule.
+    ///
+    /// The caller passes what the method *does* accept, because this
+    /// function serves thirty-six of them and cannot know.
+    /// `describe_operand` bounds what it prints — a structural summary,
+    /// never contents — so this is safe on a huge value.
+    pub(crate) fn method_receiver_error(&self, recv: &Value, accepts: &str) -> VMError {
+        self.fail(
+            ErrorKind::TypeError,
+            format!(
+                "expected {accepts}, got {}",
+                self.describe_operand(recv)
+            ),
+        )
     }
 
     /// Resume after a `Raise`: push the host-chosen result value (ip was

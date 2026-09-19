@@ -143,7 +143,7 @@ pub(crate) fn arraybuffer_slice(vm: &mut VM, args: Args) -> Result<Value, VMErro
     let recv = args.get(vm, 0);
     let buf_ptr = match recv {
         Value::ArrayBuffer(p) => *p,
-        _ => return Err(vm.method_receiver_error(recv)),
+        _ => return Err(vm.method_receiver_error(recv, "an ArrayBuffer")),
     };
     let buf = vm
         .buffers
@@ -479,7 +479,7 @@ pub(crate) fn dataview_ctor(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 fn dv_receiver(vm: &VM, args: &Args) -> Result<(BufferPtr, usize, usize), VMError> {
     let ptr = match args.get(vm, 0) {
         Value::DataView(p) => *p,
-        recv => return Err(vm.method_receiver_error(recv)),
+        recv => return Err(vm.method_receiver_error(recv, "a DataView")),
     };
     let dv = vm
         .data_views
@@ -757,7 +757,7 @@ macro_rules! ta_view {
 pub(crate) fn ta_subarray(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let ta_ptr = match args.get(vm, 0) {
         Value::TypedArray(p) => *p,
-        recv => return Err(vm.method_receiver_error(recv)),
+        recv => return Err(vm.method_receiver_error(recv, "a typed array")),
     };
     let (length, elem_size, kind, buf_ptr, byte_offset) = ta_view!(vm, ta_ptr);
     let begin = ta_clamp_index(args.get(vm, 1), length);
@@ -783,7 +783,7 @@ pub(crate) fn ta_subarray(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 pub(crate) fn ta_slice_ta(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let ta_ptr = match args.get(vm, 0) {
         Value::TypedArray(p) => *p,
-        recv => return Err(vm.method_receiver_error(recv)),
+        recv => return Err(vm.method_receiver_error(recv, "a typed array")),
     };
     let (length, elem_size, kind, buf_ptr, byte_offset) = ta_view!(vm, ta_ptr);
     let begin = ta_clamp_index(args.get(vm, 1), length);
@@ -813,7 +813,7 @@ pub(crate) fn ta_slice_ta(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 pub(crate) fn ta_set(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let ta_ptr = match args.get(vm, 0) {
         Value::TypedArray(p) => *p,
-        recv => return Err(vm.method_receiver_error(recv)),
+        recv => return Err(vm.method_receiver_error(recv, "a typed array")),
     };
     let (length, elem_size, kind, buf_ptr, byte_offset) = ta_view!(vm, ta_ptr);
     // ToInteger(offset); JS throws RangeError for a negative offset.
@@ -890,7 +890,7 @@ pub(crate) fn ta_set(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 pub(crate) fn ta_copywithin(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let ta_ptr = match args.get(vm, 0) {
         Value::TypedArray(p) => *p,
-        recv => return Err(vm.method_receiver_error(recv)),
+        recv => return Err(vm.method_receiver_error(recv, "a typed array")),
     };
     let (length, elem_size, _kind, buf_ptr, byte_offset) = ta_view!(vm, ta_ptr);
     let target = ta_clamp_index(args.get(vm, 1), length);
@@ -915,7 +915,7 @@ pub(crate) fn ta_copywithin(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 pub(crate) fn ta_at(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let ta_ptr = match args.get(vm, 0) {
         Value::TypedArray(p) => *p,
-        recv => return Err(vm.method_receiver_error(recv)),
+        recv => return Err(vm.method_receiver_error(recv, "a typed array")),
     };
     let idx = args.get(vm, 1).to_number().unwrap_or(0.0) as i64;
     let (length, elem_size, kind, buf_ptr, byte_offset) = ta_view!(vm, ta_ptr);
@@ -932,7 +932,7 @@ pub(crate) fn ta_at(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 pub(crate) fn ta_includes(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let ta_ptr = match args.get(vm, 0) {
         Value::TypedArray(p) => *p,
-        recv => return Err(vm.method_receiver_error(recv)),
+        recv => return Err(vm.method_receiver_error(recv, "a typed array")),
     };
     let needle = args.get(vm, 1).clone();
     let (length, elem_size, kind, buf_ptr, byte_offset) = ta_view!(vm, ta_ptr);
@@ -951,7 +951,7 @@ pub(crate) fn ta_includes(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 pub(crate) fn ta_index_of(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let ta_ptr = match args.get(vm, 0) {
         Value::TypedArray(p) => *p,
-        recv => return Err(vm.method_receiver_error(recv)),
+        recv => return Err(vm.method_receiver_error(recv, "a typed array")),
     };
     let needle = args.get(vm, 1).clone();
     let (length, elem_size, kind, buf_ptr, byte_offset) = ta_view!(vm, ta_ptr);
@@ -970,7 +970,7 @@ pub(crate) fn ta_index_of(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 pub(crate) fn ta_last_index_of(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let ta_ptr = match args.get(vm, 0) {
         Value::TypedArray(p) => *p,
-        recv => return Err(vm.method_receiver_error(recv)),
+        recv => return Err(vm.method_receiver_error(recv, "a typed array")),
     };
     let needle = args.get(vm, 1).clone();
     let (length, elem_size, kind, buf_ptr, byte_offset) = ta_view!(vm, ta_ptr);
@@ -1011,7 +1011,7 @@ pub(crate) fn ta_last_index_of(vm: &mut VM, args: Args) -> Result<Value, VMError
 pub(crate) fn ta_join(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let ta_ptr = match args.get(vm, 0) {
         Value::TypedArray(p) => *p,
-        recv => return Err(vm.method_receiver_error(recv)),
+        recv => return Err(vm.method_receiver_error(recv, "a typed array")),
     };
     let sep = match args.get(vm, 1) {
         Value::Undefined => ",".to_string(),
@@ -1034,7 +1034,7 @@ pub(crate) fn ta_join(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 pub(crate) fn ta_fill(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let ta_ptr = match args.get(vm, 0) {
         Value::TypedArray(p) => *p,
-        recv => return Err(vm.method_receiver_error(recv)),
+        recv => return Err(vm.method_receiver_error(recv, "a typed array")),
     };
     let f = args.get(vm, 1).to_number().unwrap_or(0.0);
     let (length, elem_size, kind, buf_ptr, byte_offset) = ta_view!(vm, ta_ptr);
@@ -1062,7 +1062,7 @@ pub(crate) fn ta_fill(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 pub(crate) fn ta_sort(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let ta_ptr = match args.get(vm, 0) {
         Value::TypedArray(p) => *p,
-        recv => return Err(vm.method_receiver_error(recv)),
+        recv => return Err(vm.method_receiver_error(recv, "a typed array")),
     };
     let (length, elem_size, kind, buf_ptr, byte_offset) = ta_view!(vm, ta_ptr);
 
@@ -1098,7 +1098,7 @@ pub(crate) fn ta_sort(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 pub(crate) fn ta_keys(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let ta_ptr = match args.get(vm, 0) {
         Value::TypedArray(p) => *p,
-        recv => return Err(vm.method_receiver_error(recv)),
+        recv => return Err(vm.method_receiver_error(recv, "a typed array")),
     };
     let length = vm
         .typed_arrays
@@ -1113,7 +1113,7 @@ pub(crate) fn ta_keys(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 pub(crate) fn ta_values(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let ta_ptr = match args.get(vm, 0) {
         Value::TypedArray(p) => *p,
-        recv => return Err(vm.method_receiver_error(recv)),
+        recv => return Err(vm.method_receiver_error(recv, "a typed array")),
     };
     let (length, elem_size, kind, buf_ptr, byte_offset) = ta_view!(vm, ta_ptr);
     let arr: thin_vec::ThinVec<Value> = (0..length)
@@ -1129,7 +1129,7 @@ pub(crate) fn ta_values(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 pub(crate) fn ta_entries(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let ta_ptr = match args.get(vm, 0) {
         Value::TypedArray(p) => *p,
-        recv => return Err(vm.method_receiver_error(recv)),
+        recv => return Err(vm.method_receiver_error(recv, "a typed array")),
     };
     let (length, elem_size, kind, buf_ptr, byte_offset) = ta_view!(vm, ta_ptr);
     let mut outer: thin_vec::ThinVec<Value> = thin_vec::ThinVec::new();
@@ -1146,7 +1146,7 @@ pub(crate) fn ta_entries(vm: &mut VM, args: Args) -> Result<Value, VMError> {
 pub(crate) fn ta_reverse(vm: &mut VM, args: Args) -> Result<Value, VMError> {
     let ta_ptr = match args.get(vm, 0) {
         Value::TypedArray(p) => *p,
-        recv => return Err(vm.method_receiver_error(recv)),
+        recv => return Err(vm.method_receiver_error(recv, "a typed array")),
     };
     let (length, elem_size, _kind, buf_ptr, byte_offset) = ta_view!(vm, ta_ptr);
     let buf = &mut vm.buffers[buf_ptr as usize];
