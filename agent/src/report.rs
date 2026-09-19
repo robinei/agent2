@@ -157,6 +157,12 @@ pub enum Whence {
 /// straight into [`what`](Self::what) by [`what_happened`] — the reader
 /// is writing a handler program, not choosing a tool schema.
 pub struct ConditionReport {
+    /// The heading this report opens with — [`RUN_HEADING`] for a run
+    /// that got somewhere, [`NO_RUN_HEADING`] for one that did not, and
+    /// [`PART_RUN_HEADING`] for the case that had no heading of its own
+    /// until now: a reply whose earlier blocks ran and whose next one
+    /// would not compile.
+    pub heading: &'static str,
     /// Rendered diagnostic: condition name + payload, or the trapped
     /// error with source line and caret — plus, inline, what
     /// `resume(value)` means here or why it doesn't apply.
@@ -175,7 +181,7 @@ pub struct ConditionReport {
 
 impl ConditionReport {
     pub fn render(&self) -> String {
-        let mut sections = vec![RUN_HEADING.to_owned(), clip(&self.what, WHAT_MAX_BYTES)];
+        let mut sections = vec![self.heading.to_owned(), clip(&self.what, WHAT_MAX_BYTES)];
         // `### where it stopped` earns its place only when it says
         // something the diagnostic did not. A trap's `what` already
         // carries the failing line with a caret under it, so a stack of
@@ -437,6 +443,12 @@ pub const RUN_HEADING: &str = "## RAN YOUR PROGRAM";
 /// either would be false in the one way that matters — nothing ran, so
 /// nothing below it is a consequence.
 pub const NO_RUN_HEADING: &str = "## YOUR PROGRAM DID NOT RUN";
+
+/// The heading for a reply whose earlier blocks ran and whose next one
+/// would not compile. Neither of the other two is true of it, and
+/// saying the nearer of the two wrong things cost a live run its task —
+/// see the `CellFailed` arm of [`render_handback`].
+pub const PART_RUN_HEADING: &str = "## YOUR PROGRAM RAN, THEN A BLOCK DID NOT COMPILE";
 
 /// Wrap text in a fence **long enough to survive its own content**.
 ///
@@ -1084,11 +1096,46 @@ fn render_handback(h: &Handback<'_>, budget: usize) -> String {
                 .count(),
         }
         .render(),
-        // A cell that would not compile built no VM, so there is no
-        // console, no rows and nothing for `what_happened` to annotate a
-        // stack or a reply against — the diagnostic is the whole report.
-        HandbackHow::CellFailed { message } => format!("{NO_RUN_HEADING}\n{message}"),
+        // **A cell that would not compile built no VM — and the cells
+        // before it in the same reply did.**
+        //
+        // This arm used to be the diagnostic and nothing else, under
+        // "YOUR PROGRAM DID NOT RUN", on the reasoning that a cell
+        // which does not compile has no console, no rows and no stack.
+        // True of that cell. The blocks of one reply are one program
+        // that pauses between them, so by the time the third one fails
+        // to compile the first two have run, made their calls and
+        // appended their rows — and the report threw all of it away
+        // and told the model nothing had happened.
+        //
+        // Live on 2026-09-20, `dead-code-sweep`: a reply read both
+        // source files, appended two rows holding them and ran a
+        // `cargo check`, then hit `\`lib\` is already declared` in a
+        // later block. Six rows on the log, and a 474-byte report
+        // saying the program did not run. The next reply started the
+        // task from the beginning — re-reading both files — and got it
+        // wrong.
+        HandbackHow::CellFailed { message } => {
+            let artifacts = menu_since(h, h.previous_outcome);
+            let ran_something = !artifacts.is_empty() || !h.console.is_empty();
+            ConditionReport {
+                heading: if ran_something {
+                    PART_RUN_HEADING
+                } else {
+                    NO_RUN_HEADING
+                },
+                what: message.clone(),
+                // The failing cell has no frames; its diagnostic
+                // already carries the line and the caret.
+                whence: Whence::Stack(Vec::new()),
+                console: h.console.clone(),
+                console_id: h.console_id,
+                artifacts,
+            }
+            .render()
+        }
         _ => ConditionReport {
+            heading: RUN_HEADING,
             what: what_happened(h, how, *site),
             // A post stopped the reply nowhere in particular: the useful
             // "where" is the whole reply with its progress marked, which
@@ -1631,6 +1678,68 @@ mod tests {
         (tree, outcome)
     }
 
+    /// **The blocks before the one that would not compile did run.**
+    /// A reply is one program that pauses between its blocks, so by the
+    /// time a later block fails to compile the earlier ones have made
+    /// their calls and appended their rows. Live on 2026-09-20 that
+    /// report was 474 bytes reading "YOUR PROGRAM DID NOT RUN", over
+    /// six rows on the log, and the next reply started the task again.
+    #[test]
+    fn a_reply_that_ran_and_then_failed_to_compile_says_what_ran() {
+        let mut tree = Tree::new(None);
+        let mut spine = tree
+            .start_agent(None, None, "root", None, "SYSTEM", Vec::new())
+            .unwrap();
+        let reply = tree.append(&mut spine, EventPayload::Reply).unwrap();
+        tree.append(&mut spine, EventPayload::Part {
+            reply,
+            part: crate::types::Part::Cell("await tools.read_file(\"a.rs\");".into()),
+        })
+        .unwrap();
+        let call = tree
+            .append(&mut spine, EventPayload::Call(crate::types::Call::Invoke {
+                name: "read_file".into(),
+                args: json!(["a.rs"]),
+                site: 0,
+            }))
+            .unwrap();
+        tree.append(&mut spine, EventPayload::Result {
+            call,
+            outcome: crate::types::Outcome::Delivered(
+                json!({"content": "fn main(){}", "version": "v"}),
+            ),
+        })
+        .unwrap();
+        let o = tree
+            .append(&mut spine, EventPayload::Handback {
+                reply,
+                how: HandbackHow::CellFailed {
+                    message: "12:7: `lib` is already declared".into(),
+                },
+                site: 0,
+                stack: Vec::new(),
+            })
+            .unwrap();
+        // The console is logged after the outcome it belongs to —
+        // `handback` finds it by that position.
+        tree.append(&mut spine, EventPayload::Console {
+            lines: vec!["read it".into()],
+        })
+        .unwrap();
+        let leaf = tree.list_leaves()[0].0;
+        let text = derive_report(&tree, leaf, o, 64 * 1024);
+        assert!(
+            text.starts_with(PART_RUN_HEADING),
+            "not the blunt heading: {text}"
+        );
+        assert!(text.contains("already declared"), "the diagnostic: {text}");
+        assert!(
+            text.contains(&format!("`[{}]`", call.as_u64())),
+            "and the row the earlier block added: {text}"
+        );
+        assert!(text.contains("read it"), "and what it printed: {text}");
+    }
+
     /// **A name that is gone says where it went.** Two of the eight
     /// `is not defined` traps across 96 kept runs were a variable the
     /// previous reply had bound — `tests` and `f`. The card says
@@ -1878,7 +1987,8 @@ mod tests {
         let text = derive_report(&tree, leaf, o, 64 * 1024);
         assert_eq!(
             text,
-            format!("{NO_RUN_HEADING}\ncompile error:\n1:5: unexpected token")
+            format!("{NO_RUN_HEADING}\n\ncompile error:\n1:5: unexpected token"),
+            "nothing ran, so the heading is still the blunt one"
         );
 
         // Interrupted: the run stopped and there is nothing to resume.
@@ -2096,6 +2206,7 @@ mod tests {
     #[test]
     fn what_section_is_bounded() {
         let report = ConditionReport {
+            heading: RUN_HEADING,
             what: "w".repeat(10_000),
             whence: Whence::Stack(vec!["<root>".into()]),
             console: Vec::new(),
@@ -2165,6 +2276,7 @@ mod tests {
     #[test]
     fn a_menu_row_indexes_a_value_instead_of_replaying_it() {
         let report = ConditionReport {
+            heading: RUN_HEADING,
             what: "boom".into(),
             whence: Whence::Stack(vec!["<root>".into()]),
             console: Vec::new(),
@@ -2187,6 +2299,7 @@ mod tests {
     #[test]
     fn a_failed_row_still_carries_its_reason() {
         let report = ConditionReport {
+            heading: RUN_HEADING,
             what: "boom".into(),
             whence: Whence::Stack(vec!["<root>".into()]),
             console: Vec::new(),
