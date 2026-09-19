@@ -1361,10 +1361,11 @@ fn what_happened(h: &Handback<'_>, cause: &HandbackHow, site: u32) -> String {
              next is a fresh program."
                 .to_owned()
         }
-            // Never reached: `render_handback` sends both of these
-        // elsewhere — a completed reply to `CompletionReport`, a cell
-        // that would not compile to its own one-line report, neither of
-        // which has a stack or a console to describe. Kept so this match
+        // Never reached: `render_handback` sends both of these
+        // elsewhere — a completed reply to `CompletionReport`, and a
+        // block that would not compile to a `ConditionReport` built
+        // around the diagnostic, because the blocks before it in the
+        // same reply did run and have rows to show. Kept so this match
         // stays exhaustive over `Handback` rather than letting a
         // wildcard hide a variant added later.
         HandbackHow::Completed => String::new(),
