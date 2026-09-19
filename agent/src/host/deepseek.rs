@@ -21,6 +21,7 @@
 //! tests run on string fixtures, never the network.
 
 use std::io::BufRead;
+use std::time::SystemTime;
 
 use crate::document::{ChatMessage, ChatRole, Document};
 use crate::host::llm::{Cancel, LlmChunk, LlmClient};
@@ -161,6 +162,9 @@ impl LlmClient for DeepSeekClient {
                 return Err("cancelled".into());
             }
             let last = attempt == MAX_ATTEMPTS;
+            // Both clocks, because the gap between them is the only way
+            // to see a suspend from in here. See `slept_since`.
+            let (started_mono, started_wall) = (std::time::Instant::now(), SystemTime::now());
             match self
                 .agent
                 .post(&url)
@@ -200,8 +204,18 @@ impl LlmClient for DeepSeekClient {
                 // half an hour of a branch doing nothing, where before
                 // this retry existed it was ten. Retrying a timeout
                 // costs the most and buys the least.
+                // **A timeout is not retried — unless the machine
+                // slept.** A queued request that is retried simply
+                // queues again, so the generous ten-minute bound exists
+                // to wait one out rather than to kill it. A socket the
+                // kernel tore down during a suspend is the opposite
+                // case: nothing is coming back on it, ever, and the
+                // request never reached the model. That is a hardware
+                // event, and the run should survive the lid closing.
                 Err(ureq::Error::Timeout(which)) => {
-                    return Err(format!("deepseek request timed out ({which})"));
+                    if last || !slept_since(started_mono, started_wall) {
+                        return Err(format!("deepseek request timed out ({which})"));
+                    }
                 }
                 Err(e) => {
                     if last {
@@ -222,6 +236,23 @@ impl LlmClient for DeepSeekClient {
 /// the observed fault cleared within seconds every time it was probed
 /// by hand.
 const MAX_ATTEMPTS: usize = 3;
+
+/// Whether the machine was suspended while this request was in flight.
+///
+/// **Two clocks disagree across a suspend, and that is the whole
+/// trick.** `Instant` is `CLOCK_MONOTONIC`, which does not advance
+/// while the machine is asleep; `SystemTime` is the wall clock, which
+/// does. So a request that ran for three monotonic minutes and sixteen
+/// wall minutes spent thirteen of them suspended — and the socket it
+/// was holding did not survive that.
+///
+/// The threshold is loose because the question is not "how long" but
+/// "did the machine stop": ordinary clock drift and NTP steps are
+/// seconds, a suspend worth noticing is minutes.
+fn slept_since(mono: std::time::Instant, wall: SystemTime) -> bool {
+    let wall_elapsed = wall.elapsed().unwrap_or_default();
+    wall_elapsed.saturating_sub(mono.elapsed()) > std::time::Duration::from_secs(60)
+}
 
 /// Whether an HTTP status is worth asking again about.
 ///
@@ -579,6 +610,22 @@ mod tests {
         assert_eq!(turn.thinking.as_deref(), Some("let me think"));
         assert!(!turn.truncated);
         assert_eq!(chunks, ["R:let me ", "R:think", "T:const x = ", "T:42;"]);
+    }
+
+    /// A suspend is two clocks disagreeing: monotonic time stops, wall
+    /// time does not. Ordinary drift is seconds and must not look like
+    /// one.
+    #[test]
+    fn a_suspend_is_visible_as_a_gap_between_the_clocks() {
+        use std::time::{Duration, Instant, SystemTime};
+        let now = Instant::now();
+        // Thirteen wall minutes against no monotonic time at all: the
+        // shape of the 2026-09-19 run that slept mid-request.
+        assert!(slept_since(now, SystemTime::now() - Duration::from_secs(13 * 60)));
+        // A slow request that really did run for those minutes is not.
+        assert!(!slept_since(now, SystemTime::now()));
+        // Nor is a few seconds of drift or an NTP step.
+        assert!(!slept_since(now, SystemTime::now() - Duration::from_secs(20)));
     }
 
     /// What is worth asking again about, and what is the request's own
