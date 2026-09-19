@@ -243,6 +243,15 @@ fn renders_a_line(payload: &EventPayload) -> bool {
 ///
 /// Asking only when asking can help is the guard that does not depend
 /// on counting attempts at all.
+///
+/// **Optimistic on purpose.** This shadows every nameable row,
+/// including the `Post` carrying the task — which the directive tells
+/// a handler is never a target. So the true floor is a little higher
+/// than this one, and the guard will occasionally allow a fire that
+/// cannot quite reach the threshold. That is the safe direction to be
+/// wrong in: the error is one ask, still bounded by
+/// `COMPACTION_ATTEMPTS`, against never asking on a document a handler
+/// could have saved.
 pub fn floor_size(tree: &Tree, spine: &Spine, budget: usize) -> usize {
     let all_gone: std::collections::HashMap<EventId, crate::tree::CompactedView> = tree
         .path_events(spine.leaf_id)
