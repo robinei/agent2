@@ -220,10 +220,24 @@ impl IncrementalAnalyzer {
                 // `refs`, `files`, `names` and `t`, all of them the
                 // second `const` of a name a previous fragment had
                 // already taken.
+                //
+                // **And it is not a naming collision.** Looked at
+                // again on 2026-09-20 with the failing line beside the
+                // binding it clashed with: four of four were the same
+                // statement written twice —
+                // `const f = await tools.read_file("helpers.py");`
+                // above and below. The caller is not running out of
+                // names, it is redoing work, and the binding it wants
+                // is still sitting there. So the remedy the message
+                // leads with is *use it*; renaming would keep the
+                // second read and hide the waste, which is also why
+                // this diagnostic is worth having rather than quietly
+                // shadowing.
                 message: format!(
                     "`{name}` is already declared — this code shares one scope with what \
-                     ran before it, so that name is taken. Use a different one, or assign \
-                     to it without `const`/`let`."
+                     ran before it, so `{name}` is still bound to whatever the earlier code \
+                     gave it. If that is the value you want, use it; it does not need \
+                     fetching twice. If you want a different one, give it a different name."
                 ),
                 kind: crate::diag::DiagKind::Semantic,
             });

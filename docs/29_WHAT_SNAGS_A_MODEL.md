@@ -324,14 +324,25 @@ The message now explains the scope. The card explains it in the
 preamble. Neither stops it, because both are read before the moment and
 the moment does not feel like one that needs them.
 
-**The option I did not take:** let a later block's `const` rebind the
-name, since the dialect is ours and "informed purely by what we find
-the model to act best on". The analyzer already shadows by default —
-the check exists specifically to stop it, because a closure made in an
-earlier block would go on pointing at the stranded slot. That trades a
-loud error for a silent one, which is the trade this codebase keeps
-refusing, and it is a language decision rather than a repair. It wants
-a person awake.
+**The option I nearly took, and should not have.** Let a later block's
+`const` rebind the name, since the dialect is ours and "informed purely
+by what we find the model to act best on". Then I put the failing line
+next to the binding it clashed with, in four runs at HEAD:
+
+```text
+first:  const f = await tools.read_file("helpers.py");
+again:  const f = await tools.read_file("helpers.py");
+```
+
+Four of four were the same statement written twice. It is not a naming
+collision — the model is redoing work, and the value it wants is still
+bound. Allowing the rebind would have made a wasted call silent, and
+the message's old advice ("use a different one") would have kept the
+second read while removing the complaint.
+
+So the error stays and the remedy it leads with changed: **use what you
+already have.** The card says a `const` in the first block is still
+bound in the second; the diagnostic is where that gets read.
 
 ## Compaction, forced
 
