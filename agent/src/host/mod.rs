@@ -140,14 +140,6 @@ pub(crate) fn completion_reserve() -> usize {
         .unwrap_or(DEFAULT_COMPLETION_RESERVE)
 }
 
-/// Bytes per token to assume before this session has measured any.
-///
-/// Measured across seven tasks, two providers and four models on
-/// 2026-09-19: 3.72 to 4.38, clustered on 4. It is only the starting
-/// point — [`Runner`] replaces it with the real ratio as soon as one
-/// request has come back with its `prompt_tokens`.
-pub const DEFAULT_BYTES_PER_TOKEN: f64 = 4.0;
-
 pub(crate) fn document_budget() -> usize {
     std::env::var("AGENT2_DOCUMENT_BUDGET")
         .ok()
@@ -1324,9 +1316,6 @@ impl Session {
                     if let Some(tail) = &request.tail {
                         doc = doc.with_tail(tail);
                     }
-                    // Half of the bytes-per-token measurement, taken
-                    // from the document that is actually going out.
-                    state.note_request_size(crate::compaction::rendered_size(&doc));
                     self.spawn_llm(branch, doc);
                 }
                 StepOutput::ToolCalls(calls) => self.spawn_tools(branch, calls),
