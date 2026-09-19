@@ -1075,6 +1075,49 @@ pub(crate) fn compaction_message(
 /// menu any more (DESIGN.md "The thesis": a suspension gets a handler
 /// *program*, not a pick off a schema list), so this is simply one more
 /// fact about what happened, stated where the reader is already looking.
+/// `X is not defined`, where `X` **was** defined — in a reply that has
+/// already ended.
+///
+/// The card says it ("Nothing else crosses between replies — least of
+/// all your variables") and a model reaching for `f` in this reply
+/// because it bound `f` in the last one is not reading the card at that
+/// moment; it is reading a report. Two of the eight `is not defined`
+/// traps across 96 kept runs were exactly this — `tests` and `f`, both
+/// bound one reply earlier.
+///
+/// **Only when it can be proved**, which is what keeps it free of false
+/// positives: the declaration has to be findable in an earlier reply's
+/// own source. A name that was never bound anywhere is an ordinary
+/// typo and gets the ordinary message.
+fn bound_in_an_earlier_reply(h: &Handback<'_>, message: &str) -> Option<String> {
+    let name = message.strip_suffix(" is not defined")?;
+    if name.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        return None;
+    }
+    let mut earlier = None;
+    for (at, ev) in h.path.iter().enumerate() {
+        if !matches!(ev.payload, EventPayload::Reply | EventPayload::Restart) {
+            continue;
+        }
+        if at >= h.turn_at {
+            break;
+        }
+        let src = reply_source(&h.path, at);
+        if ["const", "let", "var", "function"]
+            .iter()
+            .any(|kw| src.contains(&format!("{kw} {name}")))
+        {
+            earlier = Some(ev.id.as_u64());
+        }
+    }
+    let id = earlier?;
+    Some(format!(
+        "\n\n`{name}` was bound in an earlier reply — the one at `[{id}]` — and nothing \
+         crosses between replies but the record. Bind it again in this one, from what the \
+         rows above hand back."
+    ))
+}
+
 fn what_happened(h: &Handback<'_>, cause: &HandbackHow, site: u32) -> String {
     let source = &h.source;
     match cause {
@@ -1099,6 +1142,9 @@ fn what_happened(h: &Handback<'_>, cause: &HandbackHow, site: u32) -> String {
             message, resumable, ..
         } => {
             let mut what = diagnostic(source, site, message);
+            if let Some(line) = bound_in_an_earlier_reply(h, message) {
+                what.push_str(&line);
+            }
             what.push_str(if *resumable {
                 "\n\nresume(value) continues as if the failed operation had produced \
                  `value`."
@@ -1482,6 +1528,81 @@ mod tests {
         .unwrap();
         let outcome = tree.append(&mut spine, outcome).unwrap();
         (tree, outcome)
+    }
+
+    /// **A name that is gone says where it went.** Two of the eight
+    /// `is not defined` traps across 96 kept runs were a variable the
+    /// previous reply had bound — `tests` and `f`. The card says
+    /// nothing crosses between replies; the report is what the model is
+    /// reading at the moment it finds out.
+    #[test]
+    fn a_variable_from_a_finished_reply_is_named_as_such() {
+        let mut tree = Tree::new(None);
+        let mut spine = tree
+            .start_agent(None, None, "root", None, "SYSTEM", Vec::new())
+            .unwrap();
+        // The reply that bound it, then the one that reached for it.
+        let first = tree.append(&mut spine, EventPayload::Reply).unwrap();
+        tree.append(&mut spine, EventPayload::Part {
+            reply: first,
+            part: crate::types::Part::Cell("const f = await tools.read_file(\"a\");".into()),
+        })
+        .unwrap();
+        tree.append(&mut spine, EventPayload::Handback {
+            reply: first,
+            how: crate::types::Handback::Completed,
+            site: 0,
+            stack: Vec::new(),
+        })
+        .unwrap();
+        let second = tree.append(&mut spine, EventPayload::Reply).unwrap();
+        tree.append(&mut spine, EventPayload::Part {
+            reply: second,
+            part: crate::types::Part::Cell("console.log(f.content);".into()),
+        })
+        .unwrap();
+        let o = tree
+            .append(&mut spine, EventPayload::Handback {
+                reply: second,
+                how: HandbackHow::Trapped {
+                    kind: "ReferenceError".into(),
+                    message: "f is not defined".into(),
+                    resumable: true,
+                },
+                site: 12,
+                stack: Vec::new(),
+            })
+            .unwrap();
+        let leaf = tree.list_leaves()[0].0;
+        let text = derive_report(&tree, leaf, o, 64 * 1024);
+        assert!(text.contains("f is not defined"), "{text}");
+        assert!(
+            text.contains(&format!("the one at `[{}]`", first.as_u64())),
+            "names the reply that bound it: {text}"
+        );
+        assert!(text.contains("nothing crosses between replies"), "{text}");
+    }
+
+    /// And a name that was never bound anywhere is an ordinary typo,
+    /// which is what keeps the line above free of false positives.
+    #[test]
+    fn a_name_bound_nowhere_gets_the_ordinary_message() {
+        let (tree, o) = fixture(
+            "console.log(nope);",
+            condition(
+                HandbackHow::Trapped {
+                    kind: "ReferenceError".into(),
+                    message: "nope is not defined".into(),
+                    resumable: true,
+                },
+                0,
+                Vec::new(),
+            ),
+        );
+        let leaf = tree.list_leaves()[0].0;
+        let text = derive_report(&tree, leaf, o, 64 * 1024);
+        assert!(text.contains("nope is not defined"), "{text}");
+        assert!(!text.contains("earlier reply"), "{text}");
     }
 
     /// A `Condition` payload with `disposition: Pushed` — the ordinary
