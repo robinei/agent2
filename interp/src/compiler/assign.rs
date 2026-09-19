@@ -300,7 +300,12 @@ impl super::Compiler {
                 None
             }
             None => {
-                self.error(span, format!("assignment to undeclared variable `{name}`"));
+                self.error(span, format!(
+                        "assignment to undeclared variable `{name}` — there is no implicit \
+                         global here. Declare it with `let` (or `const` if it never changes), \
+                         and remember that a name bound in an earlier reply is not bound in \
+                         this one."
+                    ));
                 None
             }
         }
@@ -548,7 +553,12 @@ impl super::Compiler {
             None => {
                 self.error(
                     id_span,
-                    format!("assignment to undeclared variable `{name}`"),
+                    format!(
+                        "assignment to undeclared variable `{name}` — there is no implicit \
+                         global here. Declare it with `let` (or `const` if it never changes), \
+                         and remember that a name bound in an earlier reply is not bound in \
+                         this one."
+                    ),
                 );
                 self.emit(Instr::Pop(1), span);
             }
