@@ -301,9 +301,15 @@ mod tests {
             },
         )
         .unwrap();
+        let reply = tree.append(&mut spine, EventPayload::Restart).unwrap();
         tree.append(
             &mut spine,
-            EventPayload::Restart,
+            EventPayload::Part {
+                reply,
+                part: crate::types::Part::Cell(
+                    "```js\nawait tools.bash(\"cargo check --all-targets 2>&1\");\n```\n".into(),
+                ),
+            },
         )
         .unwrap();
         let call = tree
@@ -331,11 +337,11 @@ mod tests {
             .append(
                 &mut spine,
                 EventPayload::Handback {
-                reply: EventId::new(1),
-                how: crate::types::Handback::Completed,
-                site: 0,
-                stack: Vec::new(),
-            },
+                    reply,
+                    how: crate::types::Handback::Completed,
+                    site: 0,
+                    stack: Vec::new(),
+                },
             )
             .unwrap();
         (tree, spine, ret)

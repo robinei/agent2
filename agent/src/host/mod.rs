@@ -5240,7 +5240,10 @@ mod tests {
     /// is what the first of these two scripts does.
     #[test]
     fn an_agent_answering_a_choose_is_held_to_the_options() {
-        let question = 9;  // 8 before every reply gained a `Completion` row
+        // Same shape as `structured_answer_reaches_the_program`: the
+        // worker's one open question is #10 (28 made a reply three
+        // events, not one).
+        let question = 10;
         let (session, _) = run_routed(
             ToolRegistry::new(),
             [
@@ -5303,10 +5306,11 @@ mod tests {
     /// `finish_frame` could only produce a string. Closed.
     #[test]
     fn structured_answer_reaches_the_program() {
-        // Event ids are deterministic: Agent 1, Post 2, Turn 3, Spawn 4,
-        // Agent 5, Result 6, Send 7, Post 8 — so the worker's one open
-        // question is #8, which the assertion below guards.
-        let question = 9;  // 8 before every reply gained a `Completion` row
+        // Event ids are deterministic: Agent 1, Post 2, Reply 3, Part 4,
+        // Spawn 5, Agent 6, ReplyEnd 7, Result 8, Send 9, Post 10 — so
+        // the worker's one open question is #10, which the assertion
+        // below guards.
+        let question = 10;
         let (session, _) = run_routed(
             ToolRegistry::new(),
             [
@@ -5425,14 +5429,14 @@ mod tests {
     /// something else.
     #[test]
     fn upward_clarification_does_not_deadlock() {
-        // Ids are deterministic: Agent 1, Post 2, Turn 3, Spawn 4,
-        // Agent 5, Result 6, Send 7 (parent→child), Post 9 (on the
-        // child, answered once the child resumes), then the child's own
-        // Send upward and Post 12 on the parent. Every reply logs a
-        // `Completion` of its own, which is what moved these from 8 and
-        // 11 — a counted id is a hostage to the log's shape.
-        let child_question = 9;
-        let upward_question = 12;
+        // Ids are deterministic: Agent 1, Post 2, Reply 3, Part 4,
+        // Spawn 5, Agent 6, ReplyEnd 7, Result 8, Send 9 (parent→child),
+        // Post 10 (on the child, answered once the child resumes), then
+        // the child's own Send upward (13) and Post 14 on the parent. A
+        // counted id is a hostage to the log's shape, and 28 reshaped
+        // it: a reply is three events now, not one.
+        let child_question = 10;
+        let upward_question = 14;
         let (session, _) = run_routed(
             ToolRegistry::new(),
             [
@@ -5514,7 +5518,10 @@ mod tests {
         assert_eq!(appended(tree, child_leaf), json!("read PLAN.md"));
         assert_eq!(
             kinds(tree, child_leaf),
-            ["Agent", "Post", "Turn", "Call", "Completion", "Result", "Answer", "Note", "Return", "Console"],
+            [
+                "Agent", "Post", "Reply", "Part", "Call", "ReplyEnd", "Result", "Answer", "Note",
+                "Handback", "Console",
+            ],
         );
         // **C0a lands here.** The handler's `answer(...); return
         // resume();` is recognized as a decision about the *suspended*
@@ -5529,26 +5536,12 @@ mod tests {
         assert_eq!(
             kinds(tree, root_leaf(&session)),
             [
-                "Agent",
-                "Post",
-                "Turn",
-                "Call",
-                "Completion",
-                "Result",
-                "Call",
-                "Post",
-                "Condition",
-                "Console",
-                "Turn",
-                "Answer",
-                "Completion",
-                "Result",
-                "Note",
-                "Return",
-                "Console",
+                "Agent", "Post", "Reply", "Part", "Call", "ReplyEnd", "Result", "Call", "Post",
+                "Handback", "Console", "Reply", "Part", "Answer", "ReplyEnd", "Result", "Note",
+                "Handback", "Console",
             ]
         );
-        // Both #11 (the upward question) and #8 (the parent's original
+        // Both #14 (the upward question) and #10 (the parent's original
         // ask, now that the child explicitly answers it above) are
         // closed. The human's own kickoff (#2) stays open regardless, as
         // always (18_TARGETING: a bare reply answers nothing).
