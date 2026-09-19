@@ -69,10 +69,14 @@ pub fn outline_def() -> ToolDef {
             "maxItems": 1
         }),
         guidelines: vec![
-            "The `line` is an edit anchor, not just a fact: `Edit.replaceLines(text, line, line, …)` names one place exactly, where a string that looks distinctive often is not. A marker like `TODO(perf)` appears seven times in a small file; `parse_header` appears once, and outline says which line it is on.".into(),
+            "`start_line` is an edit anchor, not just a fact: `Edit.replaceLines(text, start_line, end_line, …)` names one place exactly, where a string that looks distinctive often is not. A marker like `TODO(perf)` appears seven times in a small file; `parse_header` appears once, and outline says which lines it spans.".into(),
         ],
         example: Some("const { items } = await tools.outline(path);".into()),
-        returns: Some("{ items: Array<{ name: string; kind: string; line: number }> }".into()),
+        returns: Some(
+            "{ items: Array<{ name: string; kind: string; start_line: number; end_line: number; \
+             signature?: string; attributes?: string[]; doc?: string }> }"
+                .into(),
+        ),
         handler: Box::new(|args| {
             let path = args
                 .get(0)
@@ -95,7 +99,18 @@ fn run_outline(source: &str, lang: &str) -> Result<Value, String> {
 
     let root = tree.root_node();
     let entries = collect_definitions(root, source, lang);
-    Ok(serde_json::to_value(entries).unwrap_or(json!([])))
+    // **An object, like every other tool.** This returned the bare
+    // array for a long time while its own `example` and `returns` both
+    // promised `{ items }` — so a model that read its declaration and
+    // wrote `outline.items` got `undefined`, and `.length` of that.
+    // Across 96 kept runs that was 11 of the 30 traps recorded and
+    // every single `.length of undefined` among them, on 21 calls: a
+    // 52% trap rate for the one tool in the set that did not return an
+    // object. The declaration was right about what the model wanted;
+    // it was the value that was the outlier.
+    Ok(json!({
+        "items": serde_json::to_value(entries).unwrap_or(json!([]))
+    }))
 }
 
 #[derive(serde::Serialize)]
@@ -462,7 +477,7 @@ mod tests {
         let (_dir, path) = temp_path_with_ext("rs");
         std::fs::write(&path, "fn hello() {}\nstruct Point {}\n").unwrap();
         let result = call_handler(&outline_def(), json!([path.to_str().unwrap()])).unwrap();
-        let arr = result.as_array().unwrap();
+        let arr = result["items"].as_array().unwrap();
         assert!(!arr.is_empty(), "expected non-empty outline");
         let kinds: Vec<&str> = arr.iter().map(|e| e["kind"].as_str().unwrap()).collect();
         assert!(
@@ -492,7 +507,7 @@ mod tests {
         )
         .unwrap();
         let result = call_handler(&outline_def(), json!([path.to_str().unwrap()])).unwrap();
-        let arr = result.as_array().unwrap();
+        let arr = result["items"].as_array().unwrap();
 
         let probe = arr.iter().find(|e| e["name"] == "probe").expect("probe");
         let attrs: Vec<&str> = probe["attributes"]

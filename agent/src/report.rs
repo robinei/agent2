@@ -329,9 +329,11 @@ impl CompletionReport {
         if self.wrote_without_verifying() {
             out.push_str(
                 "\n\n### worth knowing\n\nThis program wrote files but didn't check them. Don't report \
-                 success unverified — verify now (`parse_errors`, a re-read, or a `bash` \
-                 build/test). Next time, fold that check into the same program that \
-                 does the writing, not a separate one.",
+                 success unverified — run the thing that would fail (`bash` build/test, or \
+                 `parse_errors` on what you wrote). And read the `diff` the write handed \
+                 back: it says where the edit landed, for free, where re-reading the file \
+                 costs a call. Next time, fold the check into the same program that does \
+                 the writing, not a separate one.",
             );
         }
         out

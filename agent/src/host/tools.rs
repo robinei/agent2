@@ -319,10 +319,11 @@ fn replace_file_def() -> ToolDef {
         }),
         guidelines: vec![
             "Name the edit by text you have in hand — `Edit.replaceOnce` refuses an ambiguous one — rather than computing a line number and splicing.".into(),
-            "You will not see the result, so verify in this same program: read it back, or run the thing that would fail.".into(),
+            "`diff` comes back with the new version — the lines that actually changed. Read it: it is the cheap check that the edit landed where you meant, and it costs nothing where re-reading the file costs a call and its bytes. It is absent only when the write changed nothing.".into(),
+            "What the diff cannot tell you is whether the result *works*. Run the thing that would fail, in this same program.".into(),
         ],
-        example: Some("await tools.replace_file(p, Edit.replaceOnce(f.content, old, new), f.version);".into()),
-        returns: Some("{ version: string }".into()),
+        example: Some("const { diff } = await tools.replace_file(p, Edit.replaceOnce(f.content, old, new), f.version);".into()),
+        returns: Some("{ version: string; diff?: string }".into()),
         handler: Box::new(|args| {
             let path = args
                 .get(0)
