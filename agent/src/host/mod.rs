@@ -3011,14 +3011,15 @@ mod tests {
     fn trapped_error_rewrite_reuses_artifact_through_the_session() {
         let mut registry = ToolRegistry::new();
         registry.register(tool("fetch", |_| Ok(json!("DATA"))));
-        // Event ids are deterministic: Agent 1, Post 2, Turn 3, the fetch
-        // `Call` 4 — so the rewrite names `fetch_history(4)`, which is the
-        // call id the menu shows and which resolves to its `Result`.
+        // Event ids are deterministic: Agent 1, Post 2, Reply 3, Part 4,
+        // the fetch `Call` 5 — so the rewrite names `fetch_history(5)`,
+        // which is the call id the menu shows and which resolves to its
+        // `Result`.
         let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
         let llm = CapturingLlm {
             inner: ScriptedLlm::new([
                 scripted_program(r#"await tools.fetch("expensive"); const v = null; history.append(v.x);"#),
-                scripted_program("history.append(await fetch_history(4));"),
+                scripted_program("history.append(await fetch_history(5));"),
             ]),
             seen: std::sync::Arc::clone(&seen),
         };
@@ -3032,14 +3033,14 @@ mod tests {
         });
         let session = session.run();
 
-        // The fetch call really is #4 (guards the hardcoded id above).
+        // The fetch call really is #5 (guards the hardcoded id above).
         let fetch_invoke = session
             .tree()
             .events
             .values()
             .find(|e| matches!(&e.payload, EventPayload::Call(Call::Invoke { name, .. }) if name == "fetch"))
             .expect("the fetch Invoke");
-        assert_eq!(fetch_invoke.id.as_u64(), 4);
+        assert_eq!(fetch_invoke.id.as_u64(), 5);
 
         // The condition report rendered the trapped error and the menu —
         // a tail on the *second* request (the first carries no report,
@@ -3051,7 +3052,7 @@ mod tests {
             .map(|doc| doc.messages.last().unwrap().content.clone())
             .collect();
         assert!(
-            reports[1].contains("[4]") && reports[1].contains("fetch"),
+            reports[1].contains("[5]") && reports[1].contains("fetch"),
             "{}",
             reports[1]
         );
@@ -3318,15 +3319,20 @@ mod tests {
         });
         let session = session.run();
 
-        let condition = session
-            .tree()
-            .events
-            .values()
-            .find_map(|e| match &e.payload {
-                EventPayload::Handback { how, .. } => Some(how.clone()),
-                _ => None,
-            })
-            .expect("the off-menu reply raised a condition");
+        // The *first* handback on the log — the handler that follows
+        // logs one of its own, and `events` is a map, so "any handback"
+        // was a coin toss.
+        let condition = {
+            let tree = session.tree();
+            let mut ids: Vec<_> = tree.events.keys().copied().collect();
+            ids.sort();
+            ids.into_iter()
+                .find_map(|id| match &tree.events[&id].payload {
+                    EventPayload::Handback { how, .. } => Some(how.clone()),
+                    _ => None,
+                })
+                .expect("the off-menu reply raised a condition")
+        };
         let crate::types::Handback::Trapped {
             message, resumable, ..
         } = condition
@@ -4301,12 +4307,11 @@ mod tests {
                 (
                     "reads files",
                     // A bare turn answers nothing (18_TARGETING); the
-                    // worker's one open post is deterministically #8
-                    // (Agent 1, Post 2, Turn 3, Spawn 4, Agent 5, Result
-                    // 6, Send 7, Post 8).
+                    // worker's one open post is deterministically #10
+                    // (Agent 1, Post 2, Reply 3, Part 4, Spawn 5, Agent
+                    // 6, ReplyEnd 7, Result 8, Send 9, Post 10).
                     vec![scripted_answer(
-                        // 8 before every reply gained a `Completion` row.
-                        EventId::new(9),
+                        EventId::new(10),
                         "w1",
                         json!("PLAN.md, and it is 40 lines"),
                     )],
@@ -4631,12 +4636,10 @@ mod tests {
                     vec![scripted_program(
                         r#"const g = await spawn("helper");
                            // The post id root's `ask` creates on this
-                           // branch. It moved from 8 to 9 when every
-                           // reply gained a `Completion` row of its own
-                           // — a counted id in a fixture is a hostage to
-                           // the log's shape, and this is the only one
-                           // left.
-                           answer(9, "made a helper");
+                           // branch — a counted id in a fixture is a
+                           // hostage to the log's shape, and 28 reshaped
+                           // it again: a reply is three events now.
+                           answer(10, "made a helper");
                            history.append(g.agent);"#,
                     )],
                 ),
@@ -5900,17 +5903,15 @@ mod tests {
         // 5, not the raw decision object — see this test's own doc.
         assert_eq!(appended(session.tree(), leaf), json!(5));
 
-        // Every user-authored turn is logged as one.
+        // Every user-authored turn is logged as one — a `Restart`,
+        // which is its own event now (28): a person taking the branch's
+        // turn does not stream, cannot be truncated, has no usage and
+        // no reasoning, so none of the completion vocabulary applies.
         let user_turns: Vec<&crate::types::Event> = session
             .tree()
             .path_events(leaf)
             .into_iter()
-            .filter(|e| {
-                matches!(
-                    &e.payload,
-                    EventPayload::Reply
-                )
-            })
+            .filter(|e| matches!(&e.payload, EventPayload::Restart))
             .collect();
         assert_eq!(user_turns.len(), 1, "one user-authored turn");
 
