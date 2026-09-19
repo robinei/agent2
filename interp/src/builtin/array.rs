@@ -92,10 +92,11 @@ pub fn array_from(vm: &mut VM, args: Args) -> Result<Value, VMError> {
             let what = vm.describe_operand(&other.clone());
             Err(vm.fail(
                 ErrorKind::TypeError,
-                &format!(
+                format!(
                     "Array.from needs something to iterate — an array, a string, a Set, a \
                      Map, or an object with a `length`. Got {what}."
-                ),
+                )
+                .as_str(),
             ))
         }
     }
@@ -732,7 +733,6 @@ mod tests {
         );
     }
 
-    #[test]
     /// **The two spellings of one operation have to agree.**
     /// `[...new Set(xs)]` worked and `Array.from(new Set(xs))` threw
     /// "type error", so the commonest dedupe in the language failed
