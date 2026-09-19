@@ -1314,11 +1314,19 @@ impl Session {
                     // `Document` here and fold the tail in, matching
                     // `Runner::document`'s doc comment exactly
                     // (23_ONE_AGENT, mismatch (b)).
-                    let state = self.states.get(&branch).expect("live branch");
-                    let mut doc = state.document(&self.tree, document_budget());
+                    let state = self.states.get_mut(&branch).expect("live branch");
+                    // **The branch's budget, not the flat one.** It is
+                    // derived from the context window when one is
+                    // configured, and rendering to a different budget
+                    // here than compaction fires on would mean the
+                    // document sent is not the document measured.
+                    let mut doc = state.document(&self.tree, state.document_budget());
                     if let Some(tail) = &request.tail {
                         doc = doc.with_tail(tail);
                     }
+                    // Half of the bytes-per-token measurement, taken
+                    // from the document that is actually going out.
+                    state.note_request_size(crate::compaction::rendered_size(&doc));
                     self.spawn_llm(branch, doc);
                 }
                 StepOutput::ToolCalls(calls) => self.spawn_tools(branch, calls),

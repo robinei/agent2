@@ -569,6 +569,10 @@ pub struct Runner {
     /// Rendered size of the request now in flight, waiting for the
     /// token count that will come back with it.
     sent_bytes: Option<usize>,
+    /// The last request's `(bytes, prompt_tokens)`, both measured. The
+    /// budget is built from this rather than from the ratio alone —
+    /// see [`document_budget`](Self::document_budget).
+    last_prompt: Option<(usize, u64)>,
     /// Whether the suspension the branch is parked on **falsified the
     /// text still arriving**. See
     /// [`notebook_cancels_generation`](Self::notebook_cancels_generation);
@@ -796,6 +800,7 @@ impl Runner {
             streaming_epoch: None,
             bytes_per_token: crate::host::DEFAULT_BYTES_PER_TOKEN,
             sent_bytes: None,
+            last_prompt: None,
             pause_falsifies_the_rest: false,
             streaming_reply: String::new(),
             pending_decision: None,
@@ -3099,7 +3104,25 @@ impl Runner {
         }
         let doc = crate::document::render(tree, &self.spine, budget);
         let rendered = crate::compaction::rendered_size(&doc);
-        if !crate::compaction::should_fire(rendered, budget, headroom) {
+        // **The provider already counted the prompt.** Where a context
+        // window is configured, the trigger is that count against it —
+        // measured, not converted, with no ratio in the decision at
+        // all. `usage.prompt` is exactly the size of the request that
+        // was just sent, so the only thing standing between it and the
+        // truth is one turn's growth, which is what the reserve and the
+        // headroom are for.
+        //
+        // The byte budget below still governs *rendering*, because
+        // `document::render` clips in bytes; being approximate there
+        // costs a clipped report, not an overflowed context.
+        let over_context = match (crate::host::context_tokens(), self.last_prompt) {
+            (Some(context), Some((_, tokens))) => {
+                let usable = context.saturating_sub(crate::host::completion_reserve());
+                tokens as f64 >= usable as f64 * (1.0 - headroom)
+            }
+            _ => false,
+        };
+        if !over_context && !crate::compaction::should_fire(rendered, budget, headroom) {
             return Ok(None);
         }
         tree.append(
@@ -3163,7 +3186,37 @@ impl Runner {
             return crate::host::document_budget();
         };
         let usable = context.saturating_sub(crate::host::completion_reserve());
-        ((usable as f64) * self.bytes_per_token) as usize
+        match self.last_prompt {
+            // **Anchor on what was counted; estimate only the
+            // difference.** A ratio applied to the whole document is a
+            // guess about every byte in it, and the guess is wrong in
+            // the dangerous direction whenever the next reply brings
+            // content that tokenizes worse than the last one did — a
+            // file of hashes or minified source runs nearer 2 bytes per
+            // token than 4, and a budget built on 4 would admit twice
+            // what fits.
+            //
+            // The last prompt's token count is not a guess: the
+            // provider counted it. Only the bytes added since then are
+            // estimated, so a ratio that is off by half is off by half
+            // of *one turn's growth* rather than half of the context.
+            Some((bytes, tokens)) if (tokens as usize) < usable => {
+                bytes + ((usable - tokens as usize) as f64 * self.bytes_per_token) as usize
+            }
+            // Already at or past the window: render the smallest thing
+            // that still says something, and let compaction fire.
+            Some((_, _)) => (usable as f64 * self.bytes_per_token) as usize / 4,
+            // Nothing measured yet — the first request of a session.
+            None => (usable as f64 * self.bytes_per_token) as usize,
+        }
+    }
+
+    /// The size of the document the host is about to send — the other
+    /// half of the measurement arrives with this reply's `usage`.
+    /// Recorded by the host rather than here, because the host is what
+    /// renders the thing that actually goes out.
+    pub(crate) fn note_request_size(&mut self, bytes: usize) {
+        self.sent_bytes = Some(bytes);
     }
 
     /// Pair a reply's real `prompt_tokens` with the bytes that produced
@@ -3178,16 +3231,13 @@ impl Runner {
             return;
         }
         self.bytes_per_token = (bytes as f64 / tokens as f64).clamp(1.0, 12.0);
+        self.last_prompt = Some((bytes, tokens));
     }
 
     pub(crate) fn render_request(&mut self, tree: &Tree) -> StepOutput {
         // Everything logged so far is about to be shown. This is the one
         // place the mark moves.
         self.shown = self.spine.leaf_id.as_u64();
-        // Half of the bytes-per-token measurement: what we are about to
-        // send. The other half arrives with this reply's `usage`.
-        let doc = crate::document::render(tree, &self.spine, self.document_budget());
-        self.sent_bytes = Some(crate::compaction::rendered_size(&doc));
         StepOutput::LlmRequest(LlmRequest {
             tail: self.request_tail(tree),
         })
@@ -5599,6 +5649,40 @@ mod tests {
         // exercise.
         unsafe { std::env::set_var("AGENT2_CONTEXT_TOKENS", "32768") };
         assert!(state.document_budget() < expected);
+        unsafe {
+            std::env::remove_var("AGENT2_CONTEXT_TOKENS");
+            std::env::remove_var("AGENT2_COMPLETION_RESERVE");
+        }
+    }
+
+    /// **The trigger is the provider's own count, not a conversion.**
+    /// A document well under the byte budget can still be over the
+    /// context window, and only `usage.prompt` knows which.
+    #[test]
+    fn compaction_fires_on_the_counted_prompt_not_the_estimate() {
+        let (mut tree, mut state) = setup();
+        state.kickoff(&mut tree).unwrap();
+        unsafe {
+            std::env::set_var("AGENT2_CONTEXT_TOKENS", "10000");
+            std::env::set_var("AGENT2_COMPLETION_RESERVE", "2000");
+        }
+        // usable = 8000, headroom 0.25 -> fires at 6000 counted tokens.
+        let fires = |state: &mut Runner, tokens: u64, tree: &mut Tree| {
+            state.compaction_requested = false;
+            state.last_prompt = Some((1_000, tokens));
+            state
+                .compaction_if_needed(tree, 64 * 1024, 0.25)
+                .unwrap()
+                .is_some()
+        };
+        assert!(
+            !fires(&mut state, 5_000, &mut tree),
+            "1 KB of document, 5k tokens: nothing is tight"
+        );
+        assert!(
+            fires(&mut state, 7_000, &mut tree),
+            "1 KB of document and 7k counted tokens is still over the window"
+        );
         unsafe {
             std::env::remove_var("AGENT2_CONTEXT_TOKENS");
             std::env::remove_var("AGENT2_COMPLETION_RESERVE");
