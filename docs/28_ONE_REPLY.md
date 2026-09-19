@@ -238,9 +238,16 @@ reported, not worked around.
 
 `machine.rs` and `notebook.rs`.
 
-- [ ] `prose_between` stops trimming; a test asserts
-      `parts.concat() == reply` over a reply with leading, trailing and
-      inter-block whitespace.
+- [x] **B1 (landed, `734cf91`).** `prose_between` stops trimming; a test
+      asserts `parts.concat() == reply` over replies with leading,
+      trailing and inter-block whitespace, fed both whole and byte by
+      byte.
+
+      The invariant was false twice, and neither was visible while the
+      trim ate the difference: prose arrived trimmed, and a closing
+      fence was recognised **before its newline arrived**, so a streamed
+      reply decomposed into different bytes from the same reply handed
+      over whole. `Stream::advance` now commits only to complete lines.
 - [ ] `advance_notebook` logs `Part::Prose` / `Part::Cell` instead of
       `Send{prose}` / `Turn`.
 - [ ] Thinking chunks log `Part::Thinking`.
@@ -252,6 +259,14 @@ reported, not worked around.
 
 **Acceptance:** a live single run's log, read by eye, is the shape in
 "A log" above.
+
+**B2 and C are one step, not two.** Tried and abandoned twice on
+2026-09-19: sites cannot become reply-absolute while diagnostics still
+render against `Turn.source`, and `Restart` cannot become its own event
+while the notebook driver is what logs a cell — each needs a hack that
+the other step removes. 255 sites name `Message::Turn`, `Return`,
+`Condition` or `Cause`; they change together or not at all. Plan for one
+red stretch and do not look for a seam inside it.
 
 ### Step C — reading parts
 
