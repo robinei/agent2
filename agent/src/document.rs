@@ -1138,9 +1138,22 @@ fn worked_examples(exemplars: &[Exemplar], transport: Transport) -> Vec<ChatMess
         .iter()
         .enumerate()
         .flat_map(|(i, ex)| {
+            // **Shaped like a real one.** An example's request sits
+            // immediately before the conversation's own first user
+            // turn, and a user turn is `# NEW EVENTS` with the person's
+            // words as one row among whatever else arrived. Four
+            // requests in a different shape, in the position the model
+            // reads last before writing, teach a format the document
+            // then does not use. No `[id]`, though: an exemplar is
+            // preamble, not an event, and inventing one would be a
+            // reference to nothing (see this function's own doc).
             let request = ChatMessage::text(
                 ChatRole::User,
-                format!("[worked example, not this conversation] {}", ex.user),
+                format!(
+                    "{TURN_HEADING}\n\n*[worked example, not this conversation]*\n\nthe user \
+                     told you: {}",
+                    ex.user
+                ),
             );
             // Marked on **both** sides (both the request above and the
             // program below, whichever wire shape carries it). Only the
@@ -1152,7 +1165,16 @@ fn worked_examples(exemplars: &[Exemplar], transport: Transport) -> Vec<ChatMess
             // and single-purpose. That is a demonstration of the wrong
             // thing, delivered in the most persuasive position
             // available: its own mouth.
-            let program = format!("// [worked example]\n{}", ex.assistant);
+            // And marked in the reply's own syntax. Under the notebook
+            // transport a reply is markdown, so a leading `//` is not a
+            // comment at all — it is prose that looks like one, in the
+            // one turn the model imitates hardest. Under the program
+            // transport the reply *is* JavaScript and `//` is exactly
+            // right.
+            let program = match transport {
+                Transport::Notebook => format!("*[worked example]*\n\n{}", ex.assistant),
+                _ => format!("// [worked example]\n{}", ex.assistant),
+            };
             match transport {
                 Transport::Program | Transport::Notebook => {
                     vec![request, ChatMessage::text(ChatRole::Assistant, program)]
