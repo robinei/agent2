@@ -366,6 +366,20 @@ struct Run {
     /// `None` under every other transport, which is what keeps those paths
     /// byte-for-byte what they were.
     notebook: Option<crate::notebook::Notebook>,
+    /// How much of `vm.console_lines` has already been written to a
+    /// `Console` event.
+    ///
+    /// **A run can hand back more than once.** A `raise` logs its
+    /// `Console` and parks; the resumed tail logs another at the
+    /// terminal — and `console_lines` is never cleared, so the second
+    /// carried everything the first already had, and the second
+    /// report's `### it printed` replayed output the model had read a
+    /// reply earlier.
+    ///
+    /// Clamped on read: the buffer is a ring, and an overflow that
+    /// drops entries makes any stored index approximate. It says so
+    /// itself with `[… N lines dropped]`.
+    console_logged: usize,
 }
 
 /// Fuel for a slice driven by an arriving chunk rather than a `Tick`.
@@ -2720,11 +2734,18 @@ impl Runner {
         )?;
         // The console is a diagnostic stream, capped with an explicit
         // marker; the report carries only a bounded tail of it.
+        //
+        // **Only what this handback has not already logged.** A run
+        // that paused on a `raise` wrote a `Console` then, and
+        // `console_lines` is never cleared — so this one repeated
+        // everything the first already carried, and the report here
+        // replayed output the model read a reply earlier. See
+        // `Run::console_logged`.
         tree.append(
             &mut self.spine,
             EventPayload::Console {
                 lines: crate::report::cap_console(
-                    &run.vm.console_lines,
+                    &run.vm.console_lines[run.console_logged.min(run.vm.console_lines.len())..],
                     &format!("console event follows #{}", outcome.as_u64()),
                 ),
             },
@@ -2789,7 +2810,7 @@ impl Runner {
         cause: SuspendCause,
         out: Vec<StepOutput>,
     ) -> io::Result<Vec<StepOutput>> {
-        let Phase::Running(run) = std::mem::replace(&mut self.phase, Phase::Idle) else {
+        let Phase::Running(mut run) = std::mem::replace(&mut self.phase, Phase::Idle) else {
             unreachable!()
         };
 
@@ -2871,7 +2892,9 @@ impl Runner {
             .iter()
             .map(|f| f.name().to_owned())
             .collect();
-        let console = run.vm.console_lines.clone();
+        let console = run.vm.console_lines[run.console_logged.min(run.vm.console_lines.len())..]
+            .to_vec();
+        run.console_logged = run.vm.console_lines.len();
         let program_id = run.program_id;
         // A handover does not park: there is nothing to come back to,
         // and nothing will resume it --
@@ -4003,6 +4026,7 @@ impl Runner {
             _ => tree.append(&mut self.spine, EventPayload::Reply)?,
         };
         self.phase = Phase::Running(Run {
+            console_logged: 0,
             program_id: self.reply_id,
             vm,
             notebook: Some(notebook),
@@ -4401,6 +4425,7 @@ mod tests {
             match vm.step(FUEL).unwrap() {
                 StepResult::Settle { call } => {
                     state.phase = Phase::Running(Run {
+                        console_logged: 0,
                         program_id: state.spine.leaf_id,
                         vm,
                         notebook: None,
@@ -5453,6 +5478,41 @@ mod tests {
         assert_ne!(object, string, "the guess is back");
         assert_eq!(object, r#"appended: {"a":1}"#);
         assert_eq!(string, r#"appended: "{\"a\":1}""#);
+    }
+
+    /// **A resumed run does not replay what it already printed.**
+    /// `console_lines` is never cleared, so a `raise` logged its
+    /// console and the terminal after the resume logged the same
+    /// entries again — and the second report's `### it printed` showed
+    /// the model output it had read a reply earlier.
+    #[test]
+    fn a_resumed_run_logs_only_what_it_printed_since() {
+        let (mut tree, mut state) = setup_under();
+        user_post(&mut state, &mut tree, "go");
+        let reply = "```js\nconsole.log(\"before\");\nconst v = raise(\"which\");\n```\n\n```js\nconsole.log(\"after: \" + v);\n```\n";
+        let out = state
+            .step(&mut tree, StepInput::LlmResponse(llm_program(reply)))
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+        let out = state.resume(&mut tree, json!("that one")).unwrap();
+        drain(&mut state, &mut tree, out);
+
+        let consoles: Vec<Vec<String>> = state
+            .agent_segment(&tree)
+            .iter()
+            .filter_map(|e| match &e.payload {
+                EventPayload::Console { lines } => Some(lines.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            consoles,
+            vec![
+                vec!["before".to_owned()],
+                vec!["after: that one".to_owned()],
+            ],
+            "each handback logs its own output, not the run's whole history"
+        );
     }
 
     /// **A handback fetches as structure, not as Rust.** It used to
