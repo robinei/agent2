@@ -87,8 +87,10 @@ declare namespace history {
 
   Worth a row: **a conclusion you reached**. You write the next reply out of what is in front of you, so a row holds what you want to still be looking at then — the four paths that matter out of the two hundred you listed, never the two hundred. Every row is paid for again on every turn, until something compacts it.
 
-  **Not the bytes of something you read.** A result is already kept: its row names the call, and `history.fetch(id)` hands the content back whole, from the log, for nothing — so a program that needs those bytes fetches them. Copy them into a note instead and they sit in the record twice, charged on every turn, for nothing you could not have had free. To *look* at something once, `console.log` it. To keep what you made of it, append that. Keep an id, or a conclusion, never a copy. */
-  function append(value: unknown): void;
+  **Not the bytes of something you read.** A result is already kept: its row names the call, and `history.fetch(id)` hands the content back whole, from the log, for nothing — so a program that needs those bytes fetches them. Copy them into a note instead and they sit in the record twice, charged on every turn, for nothing you could not have had free. To *look* at something once, `console.log` it. To keep what you made of it, append that. Keep an id, or a conclusion, never a copy.
+
+  Hands back the new row's id, so a later call can name what you just wrote. */
+  function append(value: unknown): number;
   /** Read any entry back, whole, by its id — **what you get is what its row shows**. A call's row gives the tool's own result, the object its signature above describes: `read_file` hands back `{ content, version }`, not the text. A row shown as `"…"` is a string and a row shown as `{…}` is an object, so a note you appended comes back as whatever you appended. Entries that no longer show in the conversation too: `remove` takes them out of what you are shown, never off the log. */
   function fetch(id: number): unknown;
   /** Stop showing these entries — one id, or an inclusive range. For what you have finished with and will not need again: the listing you have already picked the four paths out of, the file you read one number from. Nothing is lost — `fetch` still answers for them — and the conversation stops carrying them. */
