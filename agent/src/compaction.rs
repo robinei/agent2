@@ -139,10 +139,28 @@ pub fn compact(tree: &Tree, spine: &Spine, ops: &[CompactionOp]) -> Vec<EventPay
     // It used to be refused as "not a row of the conversation", which
     // sent the model looking for ids that do not exist while the ones
     // in front of it were the right ones all along.
+    // **A row already compacted is not present.** It renders nothing,
+    // so there is nothing left for an op to remove — and re-removing it
+    // is not merely redundant, it is a loop: `machine.rs` resets its
+    // attempt counter on any `Compacted` event, so a batch that names
+    // only rows it already removed looks like progress and buys another
+    // round. Live on `Qwen3.8-27B`, 2026-09-20, with a budget tight
+    // enough to fire repeatedly: the first program removed #4, #5, #9
+    // and #12, the second named #9 and #12 again and was allowed to,
+    // and two more fired after that. The model was reading its own
+    // earlier compaction program out of the history and copying it.
+    let done: std::collections::HashSet<EventId> = tree
+        .path_events(spine.leaf_id)
+        .iter()
+        .filter_map(|e| match &e.payload {
+            EventPayload::Compacted { of, .. } => Some(*of),
+            _ => None,
+        })
+        .collect();
     let present: Vec<EventId> = tree
         .path_events(spine.leaf_id)
         .iter()
-        .filter(|e| renders_a_line(&e.payload))
+        .filter(|e| renders_a_line(&e.payload) && !done.contains(&e.id))
         .map(|e| e.id)
         .collect();
 
@@ -648,6 +666,30 @@ mod tests {
             .iter()
             .map(|m| m.content.as_str())
             .collect()
+    }
+
+    /// **Removing a row twice is not progress.** `machine.rs` resets
+    /// its attempt counter on any `Compacted` event, so a batch naming
+    /// only rows it has already removed would look like progress and
+    /// buy another compaction round — which is what `Qwen3.8-27B` did
+    /// live on 2026-09-20, copying its own earlier compaction program
+    /// out of the history four times.
+    #[test]
+    fn a_row_already_compacted_is_not_a_target_again() {
+        let (mut tree, mut spine, [first, cell, _]) = branch_with_three_blocks();
+        let ops = [CompactionOp::Remove {
+            from: first,
+            to: cell,
+        }];
+        let payloads = compact(&tree, &spine, &ops);
+        assert_eq!(payloads.len(), 2, "both blocks the first time");
+        for payload in payloads {
+            tree.append(&mut spine, payload).unwrap();
+        }
+        assert!(
+            compact(&tree, &spine, &ops).is_empty(),
+            "and nothing the second time — there is nothing left to remove"
+        );
     }
 
     /// **A block is a target of its own.** The cell goes and the prose
