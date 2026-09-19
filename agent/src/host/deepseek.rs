@@ -186,8 +186,23 @@ impl LlmClient for DeepSeekClient {
                         return Err(failed);
                     }
                 }
-                // No status at all: refused, reset, timed out. Nothing
-                // reached the model, so asking again is free of doubt.
+                // No status at all: refused, reset, resolved nowhere.
+                // Nothing reached the model, so asking again is free of
+                // doubt — **except on a timeout**, which is the one
+                // transport failure that is not fast.
+                //
+                // `timeout_recv_response` is ten minutes on purpose
+                // (see `new`): this endpoint *queues* under load rather
+                // than refusing, so a busy moment looks exactly like a
+                // dead socket and a tight bound killed two real runs
+                // mid-task. A queued request that is retried simply
+                // queues again — and three attempts at ten minutes is
+                // half an hour of a branch doing nothing, where before
+                // this retry existed it was ten. Retrying a timeout
+                // costs the most and buys the least.
+                Err(ureq::Error::Timeout(which)) => {
+                    return Err(format!("deepseek request timed out ({which})"));
+                }
                 Err(e) => {
                     if last {
                         return Err(format!("deepseek request failed: {e}"));
