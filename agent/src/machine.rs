@@ -3095,30 +3095,44 @@ impl Runner {
         }
         let doc = crate::document::render(tree, &self.spine, budget);
         let rendered = crate::compaction::rendered_size(&doc);
-        // **The provider already counted the prompt.** Where a context
-        // window is configured, the trigger is that count against it —
-        // measured, not converted, with no ratio in the decision at
-        // all. `usage.prompt` is exactly the size of the request that
-        // was just sent, so the only thing standing between it and the
-        // truth is one turn's growth, which is what the reserve and the
-        // headroom are for.
+        // **One trigger, and it is the counted one where it exists.**
+        // `usage.prompt` is the size of the request that was just sent,
+        // counted by the thing that will reject it. Against a
+        // configured window that is the whole decision: no tokenizer,
+        // no ratio, no guess about content this crate cannot see. The
+        // only gap is one turn's growth, which is what the completion
+        // reserve and the headroom are for.
         //
-        // The byte budget below still governs *rendering*, because
-        // `document::render` clips in bytes; being approximate there
-        // costs a clipped report, not an overflowed context.
-        let over_context = match (crate::host::context_tokens(), self.last_prompt_tokens) {
+        // **And the byte budget does not get a vote once that holds.**
+        // Running both means the tighter one decides, and the tighter
+        // one is the byte budget: the default 64 KB fires at 49,152
+        // rendered bytes, somewhere near 14k tokens, while a 64k-token
+        // window (less the reserve, less the headroom) allows about
+        // 43k. The count would simply never be reached. Measured on the
+        // 2026-09-19 hosted baseline, compaction fired once in 21 runs
+        // and it fired on bytes, at 54,905 of 65,536.
+        //
+        // The byte path stays for the two cases where there is nothing
+        // to count against: no window configured, and no reply has
+        // reported a `prompt_tokens` yet.
+        let (measured, limit, unit) = match (crate::host::context_tokens(), self.last_prompt_tokens)
+        {
             (Some(context), Some(tokens)) => {
                 let usable = context.saturating_sub(crate::host::completion_reserve());
-                tokens as f64 >= usable as f64 * (1.0 - headroom)
+                (tokens as usize, usable, Measure::Tokens)
             }
-            _ => false,
+            _ => (rendered, budget, Measure::Bytes),
         };
-        if !over_context && !crate::compaction::should_fire(rendered, budget, headroom) {
+        if !crate::compaction::should_fire(measured, limit, headroom) {
             return Ok(None);
         }
         tree.append(
             &mut self.spine,
-            EventPayload::Compaction { rendered, budget },
+            EventPayload::Compaction {
+                measured,
+                limit,
+                unit,
+            },
         )?;
         self.compaction_requested = true;
         self.phase = Phase::AwaitingLlm;
@@ -3138,6 +3152,16 @@ impl Runner {
         if ops.is_empty() {
             return Ok(0);
         }
+        // **The count this commit invalidates is the count that fired
+        // it.** `usage.prompt` describes the request that was sent, and
+        // the request that was just sent was the pre-compaction
+        // document — so leaving it in place would have
+        // `compaction_if_needed` read the old size off a document that
+        // has since shrunk and ask for a second handler on the
+        // strength of it. Dropping it falls back to the byte check for
+        // exactly one turn, which measures the real document, and the
+        // next reply brings a count that does too.
+        self.last_prompt_tokens = None;
         let events = crate::compaction::compact(tree, &self.spine, &ops);
         let n = events.len();
         for event in events {
@@ -3169,6 +3193,16 @@ impl Runner {
     /// its window is `compaction_if_needed`'s job, and it uses the
     /// provider's own token count rather than anything derived from
     /// this.
+    /// The byte budget `document::render` is called with.
+    ///
+    /// **It is the compaction fallback, not a render clip.** The
+    /// parameter is threaded through `render` → `report_line` →
+    /// `derive_report` → `render_handback`, where it meets
+    /// `let _ = budget;` and is discarded — nothing has been clipped by
+    /// it for some time. Its one live effect is
+    /// `compaction::should_fire`, and that only runs for a session with
+    /// no context window configured, or before the first reply has
+    /// reported a token count.
     pub(crate) fn document_budget(&self) -> usize {
         crate::host::document_budget()
     }
@@ -3192,9 +3226,11 @@ impl Runner {
             .iter()
             .rev()
             .find_map(|e| match &e.payload {
-                EventPayload::Compaction { rendered, budget } => {
-                    Some(crate::report::compaction_message(*rendered, *budget))
-                }
+                EventPayload::Compaction {
+                    measured,
+                    limit,
+                    unit,
+                } => Some(crate::report::compaction_message(*measured, *limit, *unit)),
                 _ => None,
             })
     }
@@ -5593,6 +5629,24 @@ mod tests {
             fires(&mut state, 7_000, &mut tree),
             "a small document can still be over the window; only the count knows"
         );
+        // And the reverse, which is the whole point of having one
+        // trigger: a byte budget this document is hugely over cannot
+        // fire anything while the count says there is room. Running
+        // both would mean the byte budget decides every time, because
+        // it is always the tighter of the two.
+        state.compaction_requested = false;
+        state.last_prompt_tokens = Some(5_000);
+        assert!(
+            state.compaction_if_needed(&mut tree, 1, 0.25).unwrap().is_none(),
+            "a counted prompt with room to spare overrides any byte budget"
+        );
+        // With no count to go on there is nothing to override it with,
+        // so the byte budget is the trigger again.
+        state.last_prompt_tokens = None;
+        assert!(
+            state.compaction_if_needed(&mut tree, 1, 0.25).unwrap().is_some(),
+            "before the first reply reports a count, bytes are all there is"
+        );
         unsafe {
             std::env::remove_var("AGENT2_CONTEXT_TOKENS");
             std::env::remove_var("AGENT2_COMPLETION_RESERVE");
@@ -6080,7 +6134,9 @@ mod tests {
             .events
             .values()
             .find_map(|e| match &e.payload {
-                EventPayload::Compaction { rendered, budget } => Some((*rendered, *budget)),
+                EventPayload::Compaction {
+                    measured, limit, ..
+                } => Some((*measured, *limit)),
                 _ => None,
             })
             .expect("a compaction request");
@@ -6264,6 +6320,7 @@ mod tests {
             .expect("a post to compact");
 
         state.compaction_if_needed(&mut tree, budget, 0.25).unwrap();
+        state.last_prompt_tokens = Some(60_000);
         let out = state
             .step(
                 &mut tree,
@@ -6275,6 +6332,11 @@ mod tests {
             .unwrap();
         drain(&mut state, &mut tree, out);
         assert!(!state.compaction_requested, "the request is closed");
+        assert_eq!(
+            state.last_prompt_tokens, None,
+            "the count described the document this commit just shrank, \
+             so it cannot be the evidence for compacting again"
+        );
         let compacted: Vec<_> = tree
             .events
             .values()

@@ -97,14 +97,24 @@ fn max_agent_depth() -> usize {
         .unwrap_or(DEFAULT_MAX_AGENT_DEPTH)
 }
 
-/// The byte budget `document::render`/`Runner::document` clip reports
-/// to. `document.rs`'s own doc says this "has to arrive as a parameter
-/// from whichever caller already tracks it" — deliberately not a field
-/// on `Runner` or `Spine` (branch state), because it is per-agent **host**
-/// configuration (23_ONE_AGENT, mismatch (b)): the same value for every
-/// branch today, following the `AGENT2_*`-override pattern the other
-/// host-tracked constants above already use, until a real per-agent
-/// override is needed. Overridable via `AGENT2_DOCUMENT_BUDGET`.
+/// The byte size a document may reach before compaction fires —
+/// **when there is no token count to go on.** With
+/// [`context_tokens`] set and a reply's `prompt_tokens` in hand,
+/// `machine.rs` decides on the count alone and never looks at this.
+///
+/// It travels as a parameter rather than as a field on `Runner` or
+/// `Spine`: `document.rs`'s own doc says it "has to arrive as a
+/// parameter from whichever caller already tracks it", because it is
+/// per-agent **host** configuration (23_ONE_AGENT, mismatch (b)) — the
+/// same value for every branch today, following the `AGENT2_*`-override
+/// pattern the other host-tracked constants above already use, until a
+/// real per-agent override is needed. Overridable via
+/// `AGENT2_DOCUMENT_BUDGET`.
+///
+/// It is threaded down to `render_handback`, where it meets
+/// `let _ = budget;`: despite the name it clips no report and never
+/// has in this phase. Its one live effect is
+/// `compaction::should_fire`.
 pub const DEFAULT_DOCUMENT_BUDGET: usize = 64 * 1024;
 
 /// The model's context window, in **tokens**, from
@@ -115,6 +125,12 @@ pub const DEFAULT_DOCUMENT_BUDGET: usize = 64 * 1024;
 /// which is about 16k tokens — a quarter of a 64k-token window, and
 /// half of a 32k one. The same constant was either wasteful or unsafe
 /// depending on a model nobody had told the harness about.
+///
+/// Set, and once one reply has reported a `prompt_tokens`, this is the
+/// **only** trigger: the byte budget stops being consulted rather than
+/// running alongside. Two triggers would mean the tighter one decides,
+/// and 64 KB is tighter than any window worth naming — the count would
+/// never be reached and the knob would do nothing.
 ///
 /// Unset keeps the flat byte budget, which is what every measurement
 /// to date was taken against.
@@ -2121,8 +2137,12 @@ fn leaf_summary(tree: &Tree, leaf: EventId) -> String {
             crate::types::Part::Prose(t) => format!("Prose: {} bytes", t.len()),
             crate::types::Part::Cell(t) => format!("Cell: {} bytes", t.len()),
         },
-        EventPayload::Compaction { rendered, budget } => {
-            format!("Compaction: {rendered} against {budget}")
+        EventPayload::Compaction {
+            measured,
+            limit,
+            unit,
+        } => {
+            format!("Compaction: {measured} against {limit} {}s", unit.noun())
         }
         EventPayload::Note { value, .. } => {
             format!("Note: {}", crate::machine::note_text(value))

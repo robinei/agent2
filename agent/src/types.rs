@@ -86,7 +86,16 @@ pub enum EventPayload {
     /// thing the harness did, and counting the attempts — which is all
     /// anyone reads it for — is not a reason to call it something it is
     /// not.
-    Compaction { rendered: usize, budget: usize },
+    ///
+    /// Carries the measurement **in the currency that decided**, so the
+    /// directive the model reads names the constraint that is actually
+    /// full. A token-triggered compaction reporting bytes would be
+    /// telling it a true number about the wrong thing.
+    Compaction {
+        measured: usize,
+        limit: usize,
+        unit: Measure,
+    },
 
     /// **A person hands the branch one cell** (28.A) — the `e`, `v` and
     /// answer gestures, `SessionCommand::Restart`. Parent: the owning
@@ -360,6 +369,29 @@ impl Post {
 }
 
 /// One piece of a reply, exactly as it arrived (28.A).
+/// What a size was measured in — see [`EventPayload::Compaction`].
+///
+/// Both are real limits and neither converts to the other: bytes are
+/// what this crate can count for itself, tokens are what the provider
+/// counts and the window is expressed in. Which one applies is a fact
+/// about the session's configuration, so it is recorded rather than
+/// inferred when the log is read back.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Measure {
+    Bytes,
+    Tokens,
+}
+
+impl Measure {
+    /// The word to put after a number, and before "budget".
+    pub fn noun(self) -> &'static str {
+        match self {
+            Measure::Bytes => "byte",
+            Measure::Tokens => "token",
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub enum Part {
     /// Reasoning. On the log because it arrived; never replayed to the

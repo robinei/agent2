@@ -573,8 +573,12 @@ fn print_session_event(event: &SessionEvent) {
                 // channel and no tool-call list beside it (23_ONE_AGENT.md's
                 // substitution table).
                 EventPayload::Reply => println!("{head} reply"),
-                EventPayload::Compaction { rendered, budget } => {
-                    println!("{head} compaction: {rendered} of {budget}")
+                EventPayload::Compaction {
+                    measured,
+                    limit,
+                    unit,
+                } => {
+                    println!("{head} compaction: {measured} of {limit} {}s", unit.noun())
                 }
                 EventPayload::Restart => println!("{head} restart"),
                 EventPayload::Part { part, .. } => match part {

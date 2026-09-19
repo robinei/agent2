@@ -1020,10 +1020,15 @@ fn render_handback(h: &Handback<'_>, budget: usize) -> String {
 /// written this week. So the register here is a stop, not a request:
 /// the run is *blocked*, and the only thing that unblocks it is a
 /// compaction program.
-pub(crate) fn compaction_message(rendered: usize, budget: usize) -> String {
+pub(crate) fn compaction_message(
+    measured: usize,
+    limit: usize,
+    unit: crate::types::Measure,
+) -> String {
+    let noun = unit.noun();
     format!(
         "## STOP — THIS CONVERSATION IS FULL\n\n\
-         {rendered} bytes against a {budget}-byte budget. **The task above is not being \
+         {measured} {noun}s against a {limit}-{noun} budget. **The task above is not being \
          worked on in this program.** No tool call, no answer and no continuation of it will \
          be accepted from here; the only thing that can happen next is that the history gets \
          smaller.\n\n\
@@ -1550,9 +1555,18 @@ mod tests {
         // interruption and carries on with the task — which is what a
         // live run did on 2026-09-16, answering the user's question
         // instead of compacting anything.
-        let text = compaction_message(60_555, 32_768);
-        assert!(text.contains("60555"), "says how big it is: {text}");
-        assert!(text.contains("32768"), "and what the budget is: {text}");
+        let text = compaction_message(60_555, 32_768, crate::types::Measure::Bytes);
+        assert!(text.contains("60555 bytes"), "says how big it is: {text}");
+        assert!(
+            text.contains("32768-byte budget"),
+            "and what the budget is: {text}"
+        );
+        // And when the count is what filled up, it says so in tokens —
+        // naming a byte budget that is not the binding constraint asks
+        // the handler to shrink against the wrong number.
+        let counted = compaction_message(43_100, 57_344, crate::types::Measure::Tokens);
+        assert!(counted.contains("43100 tokens"), "{counted}");
+        assert!(counted.contains("57344-token budget"), "{counted}");
         assert!(text.contains("compaction program"), "{text}");
         // Read as a request rather than a stop, this loses to the pull
         // of visible unfinished work — measured three times.
