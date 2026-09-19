@@ -182,6 +182,13 @@ like a row the harness wrote. It matched `^\[\d+\]`; rows have been
 dead shape and passed the live one, and had no test in either
 direction.
 
+A fifth: the retry budget. `backoff`'s doc says a cold model load
+"needs ten to twenty" seconds; five attempts of doubling from 400ms
+totals six. The test guarding it asserted the total was in
+`6_000..20_000` and passed at exactly 6,000 — the bottom of a range
+whose *upper* number is the case it is named for. Three eval runs were
+lost to an upstream 530 that outlasted it.
+
 That is the same failure as `RETURN_MAX_BYTES` and the console line
 cap, in a place where being out of date is a hole rather than a
 wart: **a constant or a pattern that encodes another part of the
