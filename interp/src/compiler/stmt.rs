@@ -192,9 +192,15 @@ impl super::Compiler {
             ),
 
             // Out of scope — informative errors.
-            ast::Statement::LabeledStatement(s) => {
-                self.error(s.span.into(), "labeled statements are not supported")
-            }
+            // A label is only ever reached for to break or continue an
+            // *outer* loop, so the message names the two ways to do
+            // that instead of stopping at "not supported".
+            ast::Statement::LabeledStatement(s) => self.error(
+                s.span.into(),
+                "a labelled statement is not supported, and so neither is `break`/`continue` \
+                 to a label. Lift the inner loop into a function and `return` from it, or \
+                 set a flag the outer loop tests.",
+            ),
             other => self.error(other.span().into(), "unsupported statement"),
         }
     }
