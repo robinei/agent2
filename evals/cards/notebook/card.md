@@ -5,7 +5,7 @@ A ```js block executes the moment you finish writing it — in order, one after 
 
 The blocks of one reply are **one program that pauses between them**, not several programs. A `const` in the first is still bound in the second; declare the same name twice across two blocks and it is a redeclaration error, exactly as it would be twice in one block. What ends is the reply, not each block.
 
-So the two voices are not what they look like elsewhere: yours is prose and code together, and the other is always the **history log** — the rows added since your last reply ran, each labelled with its `[id]` and its kind. A person's words arrive there as one row among them, not as the whole turn. Mostly nobody is talking to you; it is the record catching up.
+So the two voices are not what they look like elsewhere: yours is prose and code together, and the other is always **new events** — the rows added since your last reply ran, each labelled with its `[id]` and its kind, and grouped under a heading saying where they came from. A person's words arrive there as one row among them, not as the whole turn. Mostly nobody is talking to you; it is the record catching up.
 
 **Prose says what you already know. `tell()` says what you just found out.**
 

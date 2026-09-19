@@ -2723,7 +2723,7 @@ mod tests {
         // bare "returned: ...".
         let texts = tool_texts(&session);
         assert!(
-            texts[0].contains(r#"["slow","fast"]"#) && texts[0].contains("returned ["),
+            texts[0].contains(r#"["slow","fast"]"#) && texts[0].contains("returning `["),
             "{texts:?}"
         );
     }
@@ -3108,7 +3108,7 @@ mod tests {
         assert!(
             tool_texts(&session)
                 .iter()
-                .any(|t| t.contains(r#"returned"#) && t.contains(r#""DATA""#)),
+                .any(|t| t.contains("returning") && t.contains(r#""DATA""#)),
             "{:?}",
             tool_texts(&session)
         );
@@ -4247,7 +4247,7 @@ mod tests {
         // never ends.
         let all_tools = tool_texts(&session);
         assert!(
-            all_tools.iter().any(|t| t.contains("program completed")),
+            all_tools.iter().any(|t| t.contains("It completed")),
             "rewrite completed: {all_tools:?}"
         );
         let kinds = kinds(session.tree(), root_leaf(&session));
@@ -5746,9 +5746,11 @@ mod tests {
                     // The `answer` row above it is new: an `answer`
                     // renders whole now, the same as a `tell` or an
                     // `ask`, rather than not at all.
-                    "history log:\n[4] you answered #2: \"a1\"\n[harness] fork of branch #1 at \
-                 #4 — questions before this line are being handled there; do not redo its \
-                 work unless asked."
+                    // An `answer` needs no row of its own: it is the
+                    // answering turn's outcome, and `## YOU ANSWERED`
+                    // above already says what went where.
+                    "# NEW EVENTS\n\n[harness] fork of branch #1 at #4 — questions before \
+                 this line are being handled there; do not redo its work unless asked."
                         .to_owned(),
                 tool_calls: None,
                 tool_call_id: None,
@@ -6688,7 +6690,7 @@ mod tests {
         assert!(
             reports
                 .iter()
-                .any(|t| t.contains("program completed") && t.contains("returned [4]: 7")),
+                .any(|t| t.contains("It completed, returning `[4]`:\n\n7")),
             "{reports:?}"
         );
         assert_eq!(

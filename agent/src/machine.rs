@@ -3396,22 +3396,34 @@ pub(crate) fn settlement_of<'e>(segment: &[&'e Event], call: EventId) -> Option<
 pub(crate) fn menu_rows(
     segment: &[&Event],
     since: u64,
-    removed: &std::collections::HashSet<EventId>,
+    compacted: &std::collections::HashMap<EventId, Option<String>>,
 ) -> Vec<Artifact> {
     segment
         .iter()
         .filter(|e| e.id.as_u64() > since)
         // **A removed row is removed here too.** `document.rs` drops a
         // compacted row from the history log via its `CompactedView`
-        // shadow, but this menu had no compaction awareness at all — so
+        // shadow, but this list had no compaction awareness at all — so
         // a row the model deleted with `history.remove` vanished from
-        // the log and went on being advertised in the index beside it,
-        // which is the one place the card promises removal means
-        // removal. Only a *removal* is filtered: a `replace` leaves a
-        // row that still exists and is still worth fetching.
-        .filter(|e| !removed.contains(&e.id))
+        // the log and went on being advertised beside it, which is the
+        // one place the card promises removal means removal.
+        .filter(|e| !matches!(compacted.get(&e.id), Some(None)))
         .filter_map(|event| {
             let id = event.id.as_u64();
+            // **And a replaced row renders as its replacement.** It did
+            // not before, because the rows the model could shorten
+            // (notes, tells, asks) lived in `document.rs`, which honours
+            // a shadow, while this list held only calls, which nobody
+            // had tried to shorten. Now that they are one list, a
+            // `history.replace` that did not shrink the thing it named
+            // would be the same broken promise a `history.remove` was.
+            if let Some(Some(text)) = compacted.get(&event.id) {
+                return Some(Artifact {
+                    id,
+                    label: String::new(),
+                    state: ArtifactState::Whole(format!("… {text}")),
+                });
+            }
             match &event.payload {
                 // **A `tell` gets no row.** Its text is already in the
                 // document, verbatim, in the `tell(...)` call of the
@@ -3431,10 +3443,68 @@ pub(crate) fn menu_rows(
                 // commenting "show them for context", then "show full
                 // contents for inspection".
                 //
-                // An `ask` has no row here either: it renders whole as a
-                // row of its own, and which questions are still open is
-                // what `request_tail` says on every request.
-                EventPayload::Call(Call::Send { .. }) => None,
+                // **A prose segment leaves no row.** It is not something
+                // the branch *did* — it is part of what the branch
+                // *said*, and the assistant turn above already carries
+                // it verbatim. A row would print the same words a
+                // second time, in the other voice.
+                EventPayload::Call(Call::Send { prose: true, .. }) => None,
+                // **A `tell`, an `ask` and an `answer` are rows whose
+                // content is the row**, and they sit in this list
+                // rather than beside it. They used to render as loose
+                // lines in `document.rs` while the calls rendered in a
+                // menu here, so one run's doings were split across two
+                // lists with the outcome wedged between them — and the
+                // menu row a `tell` did get showed the first fifty
+                // characters of exactly the content the program had
+                // wanted to look at, which reads as "it is here, merely
+                // truncated". Measured 2026-09-17: 45% of programs read
+                // something, wrote nothing, carried nothing forward and
+                // did not finish; 140 of those 155 ended by telling the
+                // user. One run repeated a read-and-tell program five
+                // times, commenting "show them for context", then "show
+                // full contents for inspection".
+                //
+                // So: one row, whole, never a preview. Whole is also
+                // the only honest rendering — 87% of the 503 tells
+                // measured that day were computed, so the source shows
+                // `tell("--- " + f.content)` and not one byte of what
+                // was actually said.
+                EventPayload::Call(Call::Send {
+                    to,
+                    text,
+                    expects_reply,
+                    options,
+                    ..
+                }) => Some(Artifact {
+                    id,
+                    label: String::new(),
+                    state: ArtifactState::Whole(format!(
+                        "you {} {}: {}{}",
+                        if *expects_reply { "asked" } else { "told" },
+                        address_label(to),
+                        crate::document::escape_untrusted(text),
+                        // A `choose`'s options belong on its own row.
+                        // When the answer arrives it is one of these
+                        // strings and nothing else, and a row reading
+                        // `you asked user: 30s` two lines above `user
+                        // answered [12]: 5m` is unreadable without them
+                        // — the reader cannot tell a picked option from
+                        // prose.
+                        if options.is_empty() {
+                            String::new()
+                        } else {
+                            format!(
+                                " — pick one of: {}",
+                                options
+                                    .iter()
+                                    .map(|o| crate::document::escape_untrusted(o))
+                                    .collect::<Vec<_>>()
+                                    .join(" / ")
+                            )
+                        }
+                    )),
+                }),
                 // A row's label comes from the call *variant*; its value
                 // (or its absence) from the `Result`.
                 EventPayload::Call(call) => Some(Artifact {
@@ -3459,6 +3529,18 @@ pub(crate) fn menu_rows(
                     id,
                     label: "program result".into(),
                     state: ArtifactState::Delivered(value.clone()),
+                }),
+                // A `history.append` — the one channel that crosses
+                // between replies by design, so it belongs in the list
+                // of what this run put on the record, beside the calls
+                // that produced the values.
+                EventPayload::Note { text, .. } => Some(Artifact {
+                    id,
+                    label: String::new(),
+                    state: ArtifactState::Whole(format!(
+                        "note: {}",
+                        crate::document::escape_untrusted(text)
+                    )),
                 }),
                 _ => None,
             }

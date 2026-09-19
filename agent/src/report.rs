@@ -63,8 +63,6 @@ pub const CONSOLE_MAX_BYTES: usize = 256 * 1024;
 pub const CONSOLE_SECTION_MAX_BYTES: usize = RETURN_MAX_BYTES / 2;
 /// Artifact-menu entries shown (most recent kept; older ids stay valid).
 pub const MENU_MAX_ENTRIES: usize = 20;
-/// Max bytes of one arriving post quoted in a post-condition report.
-pub const POST_MAX_BYTES: usize = 1024;
 /// Max bytes of the annotated program source in a post-condition report.
 pub const ANNOTATED_SOURCE_MAX_BYTES: usize = 4096;
 /// Calls named on one annotated source line before it says "and N more".
@@ -107,6 +105,17 @@ pub enum ArtifactState {
     /// An `Invoke`/`Spawn` with no `Result`: issued, and whether it
     /// happened is not knowable from the log. Not re-attachable.
     PendingInvoke,
+    /// **The row's content is the row.** A note, a `tell`, an `ask`, an
+    /// `answer`: nothing was fetched and nothing came back, so there is
+    /// no "→ ok, 433 bytes" to print — the words are the whole fact, and
+    /// they render verbatim.
+    ///
+    /// These used to live in `document.rs` as loose lines above the
+    /// report while the calls lived in a menu below it, so one run's
+    /// doings were split across two lists in two places with the
+    /// outcome wedged between them. They are the same kind of fact —
+    /// a row this run added — so they are one list, in id order.
+    Whole(String),
 }
 
 /// The **where** section: where the program stopped.
@@ -150,28 +159,26 @@ pub struct ConditionReport {
 
 impl ConditionReport {
     pub fn render(&self) -> String {
-        let mut sections = vec![format!(
-            "## what happened\n{}",
-            clip(&self.what, WHAT_MAX_BYTES)
-        )];
-        // `## where` earns its place only when it says something the
-        // diagnostic did not. A trap's `what` already carries the
-        // failing line with a caret under it, so a stack of nothing but
-        // `<root>` is a heading, a newline and the word "root" spent to
-        // repeat it — the same empty scaffolding `Cause::Compaction`
-        // was carved out of this report for, four runs ago.
+        let mut sections = vec![RUN_HEADING.to_owned(), clip(&self.what, WHAT_MAX_BYTES)];
+        // `### where it stopped` earns its place only when it says
+        // something the diagnostic did not. A trap's `what` already
+        // carries the failing line with a caret under it, so a stack of
+        // nothing but `<root>` is a heading, a newline and the word
+        // "root" spent to repeat it — the same empty scaffolding
+        // `Cause::Compaction` was carved out of this report for, four
+        // runs ago.
         match &self.whence {
             Whence::Stack(stack) if !stack_is_bare(stack) => {
-                sections.push(format!("## where\n{}", render_stack(stack)));
+                sections.push(format!("### where it stopped\n{}", render_stack(stack)));
             }
             Whence::AnnotatedSource(source) => {
-                sections.push(format!("## where\n{source}"));
+                sections.push(format!("### where it stopped\n{}", fenced(source, "js")));
             }
             Whence::Stack(_) => {}
         }
+        let rows: Vec<&Artifact> = self.artifacts.iter().collect();
+        sections.extend(render_rows(&rows));
         sections.extend(render_console(&self.console, self.console_id));
-        let menu: Vec<&Artifact> = self.artifacts.iter().collect();
-        sections.extend(render_menu("new rows", &menu));
         sections.join("\n\n")
     }
 }
@@ -247,39 +254,42 @@ impl CompletionReport {
         // does not exist at all (D5) so the line could never say
         // anything else. A line that is always the same teaches the
         // reader to skip the block it heads.
-        let mut sections = vec![match (id, self.value.is_null()) {
-            (_, true) => "## program completed".to_owned(),
-            (Some(id), false) => format!("## program completed\nreturned [{id}]: {rendered}"),
-            (None, false) => format!("## program completed\nreturned: {rendered}"),
-        }];
-        sections.extend(render_console(&self.console, self.console_id));
-        // The `program result` row is left out of the menu on purpose:
+        let mut sections = vec![
+            RUN_HEADING.to_owned(),
+            match (id, self.value.is_null()) {
+                (_, true) => "It completed.".to_owned(),
+                (Some(id), false) => format!("It completed, returning `[{id}]`:\n\n{rendered}"),
+                (None, false) => format!("It completed, returning:\n\n{rendered}"),
+            },
+        ];
+        // The `program result` row is left out of the list on purpose:
         // the line above it *is* that row, whole when it fits and
-        // naming its own `fetch_history(id)` when `clip_answer` cuts
+        // naming its own `history.fetch(id)` when `clip_answer` cuts
         // it. Listing it again below said "→ ok, 343 bytes" about 343
         // bytes already printed in full — 129 such rows across the 23
         // runs measured on 2026-09-17, every one of them redundant.
-        let menu: Vec<&Artifact> = self
+        let rows: Vec<&Artifact> = self
             .new_artifacts
             .iter()
             .filter(|a| Some(a.id) != id)
             .collect();
-        sections.extend(render_menu("new rows", &menu));
+        sections.extend(render_rows(&rows));
+        sections.extend(render_console(&self.console, self.console_id));
         let mut out = sections.join("\n\n");
 
         if self.failed_calls > 0 {
             out.push_str(&format!(
-                "\n\n## calls that failed\n{} of this run's calls came back failed. If your \
+                "\n\n### calls that failed\n{} of this run's calls came back failed. If your \
                  result reflects that, say so; if the program swallowed them, this report \
                  is not the success it looks like. Each failure's reason is fetchable by \
-                 id from the menu above.",
+                 id from the rows above.",
                 self.failed_calls
             ));
         }
 
         if self.long_bash > 0 {
             out.push_str(&format!(
-                "\n\n## note\n\nThat was a {}-byte `bash` command — a script rather \
+                "\n\n### worth knowing\n\nThat was a {}-byte `bash` command — a script rather \
                  than a pipeline. It ran, and if it was the right tool then it was the \
                  right tool. Worth knowing for next time: the same logic written in the \
                  program keeps its values in variables you can use in the later calls \
@@ -292,7 +302,7 @@ impl CompletionReport {
 
         if self.wrote_without_verifying() {
             out.push_str(
-                "\n\n## note\n\nThis program wrote files but didn't check them. Don't report \
+                "\n\n### worth knowing\n\nThis program wrote files but didn't check them. Don't report \
                  success unverified — verify now (`parse_errors`, a re-read, or a `bash` \
                  build/test). Next time, fold that check into the same program that \
                  does the writing, not a separate one.",
@@ -349,6 +359,46 @@ fn looks_like_build(label: &str) -> bool {
 
 // ── section renderers (each enforces its own bound) ─────────────────
 
+/// **The heading every run reports under.** One phrase, whatever
+/// happened: a program that returned, one that raised, one that trapped
+/// and one that a post suspended are all *this reply's code, run* —
+/// what differs is the sentence under it, not the kind of thing being
+/// reported. The document has three heading levels and this is the
+/// middle one (`document.rs`'s `NEW EVENTS` is the turn, `###` below
+/// are the parts of the run), so nesting is readable from the markup
+/// alone rather than from having learned which of five `##` headings
+/// belong together.
+pub const RUN_HEADING: &str = "## RAN YOUR PROGRAM";
+
+/// A run that never reached a VM: a cell that would not compile, or a
+/// completion cut off mid-program. Saying `RAN YOUR PROGRAM` over
+/// either would be false in the one way that matters — nothing ran, so
+/// nothing below it is a consequence.
+pub const NO_RUN_HEADING: &str = "## YOUR PROGRAM DID NOT RUN";
+
+/// Wrap text in a fence **long enough to survive its own content**.
+///
+/// Console output is arbitrary bytes: in a live run on 2026-09-18 a
+/// program printed two Python files straight into the document, and
+/// nothing said where the output stopped and the next section began. A
+/// fence says it — and it is the convention the card already teaches
+/// (a block fenced anything but `js` is quoted, not run), so it costs
+/// the reader nothing new to learn.
+///
+/// The fence grows past the longest backtick run inside, which is what
+/// CommonMark requires and what keeps a printed markdown file from
+/// closing the block early.
+fn fenced(body: &str, tag: &str) -> String {
+    let longest = body
+        .as_bytes()
+        .split(|b| *b != b'`')
+        .map(<[u8]>::len)
+        .max()
+        .unwrap_or(0);
+    let fence = "`".repeat(longest.max(2) + 1);
+    format!("{fence}{tag}\n{body}\n{fence}")
+}
+
 fn render_stack(stack: &[String]) -> String {
     if stack.is_empty() {
         return "in (no live frames)".into();
@@ -394,32 +444,46 @@ fn render_console(lines: &[String], event: Option<u64>) -> Option<String> {
     // reader learns to skip, and this one heads the output the program
     // just produced.
     let mut out = if shown.len() == lines.len() {
-        "console:".to_owned()
+        "### it printed\n".to_owned()
     } else {
-        let mut out = format!("console (last {} of {} lines", shown.len(), lines.len());
+        let mut out = format!(
+            "### it printed\nThe last {} of {} lines",
+            shown.len(),
+            lines.len()
+        );
         // Only a clip names the id — an untruncated tail has nothing
         // behind it to fetch.
         if let Some(id) = event {
-            out.push_str(&format!(" — history.fetch({id}) for all of them"));
+            out.push_str(&format!("; `history.fetch({id})` for all of them"));
         }
-        out.push_str("):");
+        out.push_str(".\n");
         out
     };
-    for line in shown {
-        out.push('\n');
-        out.push_str(&clip(line, CONSOLE_SECTION_MAX_BYTES));
-    }
+    let body: Vec<String> = shown
+        .iter()
+        .map(|line| clip(line, CONSOLE_SECTION_MAX_BYTES))
+        .collect();
+    out.push_str(&fenced(&body.join("\n"), "text"));
     Some(out)
 }
 
-/// The menu of rows this run added. `None` when it added none — a
-/// heading advertising `fetch_history(id)` over the word `(none)` is an
+/// The rows this run added, in id order — its calls, its notes and the
+/// words it sent, one list. `None` when it added none: a heading
+/// advertising `history.fetch(id)` over the word `(none)` is an
 /// invitation to fetch nothing.
-fn render_menu(title: &str, artifacts: &[&Artifact]) -> Option<String> {
-    let mut out = format!("## {title} — fetch any of them with history.fetch(id)");
+fn render_rows(artifacts: &[&Artifact]) -> Option<String> {
+    render_row_list("### rows it added", artifacts)
+}
+
+/// [`render_rows`] under a caller's own heading — [`render_fork`] lists
+/// a branch's rows so far under one of its own, and the two must format
+/// a row identically or the same fact reads as two different kinds of
+/// thing depending on which report carried it.
+fn render_row_list(heading: &str, artifacts: &[&Artifact]) -> Option<String> {
     if artifacts.is_empty() {
         return None;
     }
+    let mut out = format!("{heading}\n`history.fetch(id)` for any of them.\n");
     let start = artifacts.len().saturating_sub(MENU_MAX_ENTRIES);
     if start > 0 {
         out.push_str(&format!(
@@ -456,8 +520,15 @@ fn render_menu(title: &str, artifacts: &[&Artifact]) -> Option<String> {
                 format!("pending — await history.fetch({})", a.id)
             }
             ArtifactState::PendingInvoke => "issued; no result recorded; may have happened".into(),
+            // The words *are* the row, so there is no `label → value`
+            // to draw: the label already says who said what, and an
+            // arrow after it would point at nothing.
+            ArtifactState::Whole(text) => {
+                out.push_str(&format!("\n- `[{}]` {}", a.id, text));
+                continue;
+            }
         };
-        out.push_str(&format!("\n[{}] {} → {}", a.id, a.label, tail));
+        out.push_str(&format!("\n- `[{}]` `{}` → {}", a.id, a.label, tail));
     }
     Some(out)
 }
@@ -900,8 +971,8 @@ fn render_handback(h: &Handback<'_>, budget: usize) -> String {
             // report. `Truncated` in particular must never reach the
             // compiler (types.rs's own rule), so the harness catches it
             // before a VM could exist to produce anything else.
-            Cause::CompileFailed { message } => message.clone(),
-            Cause::Truncated => TRUNCATED_MESSAGE.to_owned(),
+            Cause::CompileFailed { message } => format!("{NO_RUN_HEADING}\n{message}"),
+            Cause::Truncated => format!("{NO_RUN_HEADING}\n{TRUNCATED_MESSAGE}"),
             // Same reason, and the same absence of a VM: compaction is
             // raised by the harness on an idle branch, so there is no
             // stack, no console and no artifact menu — and wrapping it
@@ -1019,7 +1090,7 @@ fn answer_ack(
     let routed = match h.tree.events.get(&question).map(|e| &e.payload) {
         Some(EventPayload::Message(Message::Post { from, origin })) => match origin {
             Origin::Sent(send) => match h.tree.branch_of(*send) {
-                Some(branch) => format!("delivered to branch #{}", branch.as_u64()),
+                Some(branch) => format!("delivered to branch `[{}]`", branch.as_u64()),
                 None => "delivered to whoever sent it".to_owned(),
             },
             // The user has no branch and no program, so there is nothing
@@ -1029,10 +1100,10 @@ fn answer_ack(
                 _ => "read where it sits".to_owned(),
             },
         },
-        _ => format!("#{id} is not a post"),
+        _ => format!("[{id}] is not a post"),
     };
     format!(
-        "## answered\n#{id} — {routed}\n\nvalue: {}",
+        "## YOU ANSWERED\n`[{id}]` — {routed}\n\nvalue: {}",
         clip_answer(&value.to_string(), budget, None)
     )
 }
@@ -1082,37 +1153,48 @@ fn what_happened(h: &Handback<'_>, cause: &Cause, site: u32) -> String {
         // gets when someone speaks to it. What happened **is** the
         // message — author-labelled, and marked with what it owes you.
         Cause::Posted { ids } => {
-            let mut what = String::from(
-                "Someone spoke to you while your program was running. It is paused at \
-                 its last fuel slice; nothing was lost.\n",
-            );
-            for id in ids {
-                let Some(EventPayload::Message(post)) = h.tree.events.get(id).map(|e| &e.payload)
-                else {
-                    continue;
-                };
-                let Message::Post { from, origin } = h.tree.resolve(post) else {
-                    continue;
-                };
-                // *asks you* versus *tells you*: what it owes, which is
-                // the difference between `ask` and `tell` and the only
-                // thing the model has to decide about differently.
-                let owed = match origin.direct() {
-                    Some((_, _, true)) => "asks you",
-                    _ => "tells you",
-                };
-                what.push_str(&format!(
-                    "\n{} — {}\n{}\n",
-                    author_label(from),
-                    owed,
-                    clip(&render_post(*id, from, &origin), POST_MAX_BYTES),
-                ));
-            }
-            what.push_str(
-                "\nresume() continues the program from where it stopped — nothing here \
-                 asked for a value.",
-            );
-            what.trim_end().to_owned()
+            // **The messages themselves are not repeated here.** They
+            // arrive as rows of their own, in the same user turn, a few
+            // lines above — `document.rs` renders every `Post` that way
+            // whether it suspended a program or not. Printing the
+            // bodies again under `what happened` put the same words in
+            // the same message twice, which is how a reader learns that
+            // one of the two copies is decoration. What this owes the
+            // reader is the *fact*: which rows did it, and what a
+            // resume means.
+            let named = ids
+                .iter()
+                .filter_map(|id| {
+                    let EventPayload::Message(post) = &h.tree.events.get(id)?.payload else {
+                        return None;
+                    };
+                    let Message::Post { from, origin } = h.tree.resolve(post) else {
+                        return None;
+                    };
+                    // *asked* versus *told*: what it owes, which is the
+                    // difference between `ask` and `tell` and the only
+                    // thing the model has to decide about differently.
+                    let owed = match origin.direct() {
+                        Some((_, _, true)) => "asked",
+                        _ => "told",
+                    };
+                    Some(format!(
+                        "`[{}]`, where {} {} you",
+                        id.as_u64(),
+                        author_label(from),
+                        owed
+                    ))
+                })
+                .collect::<Vec<_>>();
+            format!(
+                "It is paused at its last fuel slice, because someone spoke to you while it \
+                 was running: {}. Nothing was lost.\n\n`resume()` continues it from where \
+                 it stopped — nothing here asked for a value.",
+                match named.len() {
+                    0 => "see the rows above".to_owned(),
+                    _ => named.join(", "),
+                }
+            )
         }
         Cause::Interrupted => {
             "This program was interrupted before completing — the process died and the VM \
@@ -1186,16 +1268,18 @@ fn menu_since(h: &Handback<'_>, since: u64) -> Vec<Artifact> {
     // The whole path, not the segment: a row is compacted *after* it is
     // logged, so the `Compacted` event that removes it routinely sits
     // past `outcome_at`.
-    crate::machine::menu_rows(&segment, since, &removed_rows(&h.path))
+    crate::machine::menu_rows(&segment, since, &compacted_rows(&h.path))
 }
 
-/// Rows a `Compacted` event removed outright — `text: None`, which
-/// `document.rs` renders as nothing at all. A `replace` is absent here
-/// on purpose: that row still exists and is still worth an index entry.
-fn removed_rows(path: &[&Event]) -> std::collections::HashSet<EventId> {
+/// What a `Compacted` event did to each row it names: `None` removed it
+/// outright, `Some(text)` stood something shorter in its place. Both
+/// are honoured by [`crate::machine::menu_rows`] — a removed row is not
+/// listed, a replaced one lists its replacement — so the one place the
+/// card promises removal means removal is the same list it advertises.
+fn compacted_rows(path: &[&Event]) -> std::collections::HashMap<EventId, Option<String>> {
     path.iter()
         .filter_map(|e| match &e.payload {
-            EventPayload::Compacted { of, text } if text.is_none() => Some(*of),
+            EventPayload::Compacted { of, text } => Some((*of, text.clone())),
             _ => None,
         })
         .collect()
@@ -1371,14 +1455,14 @@ pub fn render_fork(tree: &Tree, leaf: EventId, fork: EventId) -> String {
         .rposition(|e| matches!(e.payload, EventPayload::Agent { .. }))
         .unwrap_or(0);
     let segment: Vec<&Event> = path[start..fork_at].to_vec();
-    let artifacts = crate::machine::menu_rows(&segment, 0, &removed_rows(&path));
+    let artifacts = crate::machine::menu_rows(&segment, 0, &compacted_rows(&path));
     let menu: Vec<&Artifact> = artifacts.iter().collect();
     let head = format!(
         "program {program} is running on branch {branch}, not here. This fork inherited \
          its history and its artifacts; the run itself stayed there, so nothing you do \
          here disturbs it."
     );
-    match render_menu("rows so far", &menu) {
+    match render_row_list("### rows so far", &menu) {
         Some(m) => format!("{head}\n\n{m}"),
         None => head,
     }
@@ -1465,9 +1549,9 @@ mod tests {
         let (tree, o) = fixture("return 1;", EventPayload::Return { value: json!(1) });
         let leaf = tree.list_leaves()[0].0;
         let text = derive_report(&tree, leaf, o, 64 * 1024);
-        assert!(text.starts_with("## program completed"), "{text}");
+        assert!(text.starts_with(RUN_HEADING), "{text}");
         assert!(
-            text.contains(&format!("returned [{}]: 1", o.as_u64())),
+            text.contains(&format!("returning `[{}]`:\n\n1", o.as_u64())),
             "{text}"
         );
 
@@ -1540,7 +1624,7 @@ mod tests {
         // And it is the whole report: no VM ran, so the condition
         // scaffolding around it ("## where", an empty artifact menu)
         // is noise that framed a directive as a post-mortem.
-        assert!(!text.contains("## where"), "{text}");
+        assert!(!text.contains("### where it stopped"), "{text}");
         assert!(!text.contains("new rows"), "{text}");
         assert!(text.contains("history.remove"), "names the verbs: {text}");
         assert!(text.contains("history.replace"), "{text}");
@@ -1559,7 +1643,10 @@ mod tests {
         );
         let leaf = tree.list_leaves()[0].0;
         let text = derive_report(&tree, leaf, o, 64 * 1024);
-        assert_eq!(text, "compile error:\n1:5: unexpected token");
+        assert_eq!(
+            text,
+            format!("{NO_RUN_HEADING}\ncompile error:\n1:5: unexpected token")
+        );
 
         // Truncated: hit its token budget mid-program, discarded unread
         // — never compiled (types.rs's own rule), so this too has no
@@ -1617,8 +1704,8 @@ mod tests {
             [o]
         );
         let text = derive_report(&tree, leaf, o, 64 * 1024);
-        assert!(text.starts_with("## answered"), "{text}");
-        assert!(text.contains(&format!("#{}", post.as_u64())), "{text}");
+        assert!(text.starts_with("## YOU ANSWERED"), "{text}");
+        assert!(text.contains(&format!("[{}]", post.as_u64())), "{text}");
         assert!(
             text.contains("read inline by the user"),
             "the user has no branch to deliver to: {text}"
@@ -1735,7 +1822,10 @@ mod tests {
         let mut lines: Vec<String> = (0..30).map(|i| format!("line {i}")).collect();
         lines.push("y".repeat(1000));
         let rendered = render_console(&lines, None).expect("lines present");
-        assert!(rendered.starts_with("console (last 20 of 31 lines):"));
+        assert!(
+            rendered.starts_with("### it printed\nThe last 20 of 31 lines"),
+            "{rendered}"
+        );
         assert!(!rendered.contains("line 0"), "older lines dropped");
         assert!(rendered.contains("line 11"), "tail kept");
         assert!(
@@ -1772,7 +1862,7 @@ mod tests {
             .map(|i| artifact(i, &format!("tool_{i}([])"), json!(i)))
             .collect();
         let menu: Vec<&Artifact> = artifacts.iter().collect();
-        let rendered = render_menu("artifacts", &menu).expect("25 rows");
+        let rendered = render_row_list("### artifacts", &menu).expect("25 rows");
         assert!(rendered.contains("(5 older rows omitted; their ids stay fetchable)"));
         assert!(!rendered.contains("[5]"), "old entries gone");
         assert!(rendered.contains("[6]") && rendered.contains("[25]"));
@@ -1793,19 +1883,19 @@ mod tests {
             ),
         ];
         let menu: Vec<&Artifact> = rows.iter().collect();
-        let rendered = render_menu("artifacts", &menu).expect("three rows");
+        let rendered = render_row_list("### artifacts", &menu).expect("three rows");
         assert!(
-            rendered.contains("[11] ask(#3, \"which file?\") → pending — await history.fetch(11)"),
+            rendered.contains("- `[11]` `ask(#3, \"which file?\")` → pending — await history.fetch(11)"),
             "{rendered}"
         );
         assert!(
             rendered.contains(
-                "[12] send_email([\"…\"]) → issued; no result recorded; may have happened"
+                "- `[12]` `send_email([\"…\"])` → issued; no result recorded; may have happened"
             ),
             "{rendered}"
         );
         assert!(
-            rendered.contains("[13] fetch([\"x\"]) → failed: host is down"),
+            rendered.contains("- `[13]` `fetch([\"x\"])` → failed: host is down"),
             "{rendered}"
         );
     }
@@ -1829,7 +1919,7 @@ mod tests {
             artifacts: Vec::new(),
         };
         let rendered = report.render();
-        let what = rendered.split("\n\n## where").next().unwrap();
+        let what = rendered.split("\n\n### where it stopped").next().unwrap();
         assert!(what.len() < WHAT_MAX_BYTES + 100);
         assert!(what.contains("[truncated; 10000 bytes total]"));
     }
@@ -1851,8 +1941,11 @@ mod tests {
             long_bash: 0,
         };
         let rendered = report.render();
-        let line = rendered.lines().nth(1).unwrap();
-        assert_eq!(line, r#"returned [9]: "hello""#, "{line}");
+        assert!(
+            rendered.starts_with(&format!("{RUN_HEADING}\n\nIt completed, returning `[9]`:")),
+            "{rendered}"
+        );
+        assert!(rendered.contains(r#""hello""#), "{rendered}");
     }
 
     /// **The return value arrives whole.** It is the one generous thing
@@ -1876,8 +1969,8 @@ mod tests {
             long_bash: 0,
         };
         let rendered = report.render();
-        let line = rendered.lines().nth(1).unwrap();
-        assert!(line.starts_with("returned [9]: "), "{}", &line[..60]);
+        let line = rendered.lines().last().unwrap();
+        assert!(line.starts_with(r#""zzz"#), "{}", &line[..60]);
         assert!(
             line.contains(&"z".repeat(5_000)),
             "clipped: {}",
@@ -1902,7 +1995,7 @@ mod tests {
             long_bash: 0,
         };
         let rendered = report.render();
-        let line = rendered.lines().nth(1).unwrap();
+        let line = rendered.lines().last().unwrap();
         assert!(line.len() < RETURN_MAX_BYTES + 100, "{}", line.len());
         assert!(
             line.contains("history.fetch(9)"),
@@ -1925,7 +2018,7 @@ mod tests {
             artifacts: vec![artifact(7, "fetch([\"big\"])", json!("b".repeat(9000)))],
         };
         let rendered = report.render();
-        let menu_line = rendered.lines().find(|l| l.starts_with("[7]")).unwrap();
+        let menu_line = rendered.lines().find(|l| l.starts_with("- `[7]`")).unwrap();
         assert!(!menu_line.contains("bbbb"), "value replayed: {menu_line}");
         assert!(
             menu_line.contains("9002 bytes"),
@@ -1953,7 +2046,7 @@ mod tests {
         let line = report
             .render()
             .lines()
-            .find(|l| l.starts_with("[7]"))
+            .find(|l| l.starts_with("- `[7]`"))
             .unwrap()
             .to_owned();
         assert!(line.contains("no such file or directory"), "{line}");
@@ -2009,7 +2102,7 @@ mod tests {
                 json!({ "version": "b" }),
             ),
         ]);
-        assert!(rendered.contains("## note"), "{rendered}");
+        assert!(rendered.contains("### worth knowing"), "{rendered}");
         assert!(rendered.contains("wrote files but didn't check them"));
     }
 
@@ -2031,7 +2124,7 @@ mod tests {
                 verify,
             ]);
             assert!(
-                !rendered.contains("## note"),
+                !rendered.contains("### worth knowing"),
                 "unexpected nudge: {rendered}"
             );
         }
@@ -2045,7 +2138,7 @@ mod tests {
             artifact(4, "bash([\"mkdir -p /x\"])", json!({ "status": 0 })),
             artifact(5, "read_file([\"/x/a.js\"])", json!({ "content": "…" })),
         ]);
-        assert!(!rendered.contains("## note"), "{rendered}");
+        assert!(!rendered.contains("### worth knowing"), "{rendered}");
     }
 
     /// A derived branch label is the post's bare words — no `[#id]`, no
@@ -2062,7 +2155,7 @@ mod tests {
     fn the_console_counts_lines_only_when_it_dropped_some() {
         let short: Vec<String> = vec!["one".into(), "two".into()];
         let rendered = render_console(&short, Some(9)).expect("two lines");
-        assert!(rendered.starts_with("console:"), "{rendered}");
+        assert!(rendered.starts_with("### it printed\n```text"), "{rendered}");
         assert!(!rendered.contains("of 2 lines"), "no phantom clip: {rendered}");
         assert!(!rendered.contains("history.fetch"), "nothing behind it: {rendered}");
 
@@ -2094,12 +2187,15 @@ mod tests {
         };
         let with_value = report(json!(7));
         let rendered = with_value.render();
-        assert!(rendered.contains("returned"), "a real value still shows: {rendered}");
+        assert!(
+            rendered.contains("returning"),
+            "a real value still shows: {rendered}"
+        );
 
         let empty = report(json!(null));
         let rendered = empty.render();
         assert!(
-            rendered.starts_with("## program completed"),
+            rendered.starts_with(&format!("{RUN_HEADING}\n\nIt completed.")),
             "still says it completed: {rendered}"
         );
         assert!(
@@ -2153,14 +2249,19 @@ mod tests {
             ),
         ];
         let path: Vec<&Event> = owned.iter().collect();
-        let removed = removed_rows(&path);
-        assert_eq!(removed.len(), 1, "a replace is not a removal: {removed:?}");
+        let shadows = compacted_rows(&path);
+        assert_eq!(shadows.len(), 2, "both kinds are carried: {shadows:?}");
 
-        let rows = crate::machine::menu_rows(&path, 0, &removed);
+        let rows = crate::machine::menu_rows(&path, 0, &shadows);
         let ids: Vec<u64> = rows.iter().map(|a| a.id).collect();
         assert!(!ids.contains(&5), "the removed row is gone: {ids:?}");
         assert!(ids.contains(&6), "a replaced row stays fetchable: {ids:?}");
         assert!(ids.contains(&7), "an untouched row stays: {ids:?}");
+        let replaced = rows.iter().find(|a| a.id == 6).unwrap();
+        assert!(
+            matches!(&replaced.state, ArtifactState::Whole(t) if t == "… kept, shortened"),
+            "a replaced row shows its replacement, not what it replaced"
+        );
     }
 
     #[test]

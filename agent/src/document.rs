@@ -256,7 +256,7 @@ impl Document {
 /// (no line of ordinary text starts `[7]`), and it is the whole
 /// defence — the card states the rule once and it never needs to
 /// change per caller.
-fn escape_untrusted(text: &str) -> String {
+pub(crate) fn escape_untrusted(text: &str) -> String {
     // Specifically `[<digits>]`, matching the real event-id shape — not
     // any bracketed text. `[TODO] fix this` is ordinary content and
     // must not pay an escaping cost that only real ids need.
@@ -621,7 +621,7 @@ fn compacted_line(id: EventId, shadow: &CompactedView) -> Option<String> {
     shadow
         .text
         .as_deref()
-        .map(|text| format!("[{}] … {}", id.as_u64(), text))
+        .map(|text| format!("`[{}]` … {}", id.as_u64(), text))
 }
 
 /// A compacted **program**'s rendered turn: still valid JavaScript,
@@ -707,7 +707,7 @@ fn pending_line(
                 .map(|(t, _, r)| (t, r))
                 .unwrap_or(("", false));
             Some(format!(
-                "[{}] {} {} you: {}",
+                "`[{}]` {} {} you: {}",
                 event.id.as_u64(),
                 author_label(tree, *from),
                 if wants_reply { "asked" } else { "told" },
@@ -737,108 +737,21 @@ fn pending_line(
                 return None;
             };
             Some(format!(
-                "[{}] {} answered #{}: {}",
+                "`[{}]` {} answered `[{}]`: {}",
                 event.id.as_u64(),
                 crate::machine::address_label(to),
                 call.as_u64(),
                 escape_untrusted(&value.to_string())
             ))
         }
-        EventPayload::Note { text, .. } => Some(format!(
-            "[{}] note: {}",
-            event.id.as_u64(),
-            escape_untrusted(text)
-        )),
-        // **A `tell` renders whole, and it is the same bytes the person
-        // read.** Not a menu row with a preview: that showed the first
-        // fifty characters of what the program had said and nothing
-        // more, which is the one rendering guaranteed to mislead — the
-        // card promises `tell` reaches "the person, and only the
-        // person", while a truncated echo of it sits in the
-        // conversation looking like it half-arrived. A run on
-        // 2026-09-17 repeated a read-and-tell program five times
-        // against that preview, commenting "show them for context",
-        // then "show full contents for inspection".
-        //
-        // Whole rather than clipped, on `CompletionReport`'s own rule
-        // for the return value (27.7): the author of the text and the
-        // reader of the report are the same mind one turn apart, and
-        // the author picked these words deliberately. It also has to be
-        // whole to be *true* — 87% of the 503 tells measured that day
-        // were computed, so the source shows `tell("--- " + f.content)`
-        // and not one byte of what was actually said.
-        //
-        // This is the expensive choice and deliberately so: those 503
-        // tells were 491 KB against 142 KB of program text, a mean of
-        // 976 bytes each. A tell that costs nothing to make is what let
-        // a sentence to a person become a file dump; paying for it in
-        // the same context that reads it is the only feedback the model
-        // gets, and `history.remove` is how it settles the bill.
-        // An `ask` is a `tell` that expects an answer back, and an
-        // `answer` is the reply to one. All three are the same act —
-        // words crossing between this branch and someone else — so all
-        // three render the same way: whole, as a row of their own. An
-        // `ask` used to render as an elided menu preview and an
-        // `answer` as nothing at all, which left the program that made
-        // it holding the only full copy.
-        EventPayload::Call(Call::Send {
-            to,
-            text,
-            expects_reply: true,
-            options,
-            ..
-        }) => Some(format!(
-            "[{}] you asked {}: {}{}",
-            event.id.as_u64(),
-            crate::machine::address_label(to),
-            escape_untrusted(text),
-            // A `choose`'s options belong on its own row. When the
-            // answer arrives it is one of these strings and nothing
-            // else, and a row reading `you asked user: 30s` two lines
-            // above `user answered #12: 5m` is unreadable without them
-            // — the reader cannot tell a picked option from prose.
-            if options.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    " — pick one of: {}",
-                    options
-                        .iter()
-                        .map(|o| escape_untrusted(o))
-                        .collect::<Vec<_>>()
-                        .join(" / ")
-                )
-            }
-        )),
-        EventPayload::Answer { question, value } => Some(format!(
-            "[{}] you answered #{}: {}",
-            event.id.as_u64(),
-            question.as_u64(),
-            escape_untrusted(&value.to_string())
-        )),
-        // **A prose segment leaves no row.** It is not something the
-        // branch *did* — it is part of what the branch *said*, and the
-        // assistant turn above already carries it verbatim. A row would
-        // print the same words a second time, in the other voice.
-        EventPayload::Call(Call::Send { prose: true, .. }) => None,
-        EventPayload::Call(Call::Send {
-            to,
-            text,
-            expects_reply: false,
-            ..
-        }) => Some(format!(
-            // `to`, with an arrow, because the parenthesis a `post` uses
-            // names its *author* — `[2] post (user): …` is the person
-            // speaking — and `[6] tell (user): …` in the next row meant
-            // the opposite, the person being spoken to. Two rows, the
-            // same punctuation, reversed direction, in a message that is
-            // itself in the user role: the one thing a reader has to get
-            // right here is who said it.
-            "[{}] you told {}: {}",
-            event.id.as_u64(),
-            crate::machine::address_label(to),
-            escape_untrusted(text)
-        )),
+        // **A note, a `tell`, an `ask` and an `answer` are not
+        // rendered here.** They are rows the *run* added, so they
+        // belong in the run's own list of what it did
+        // (`machine::menu_rows`, under `report.rs`'s `### rows it
+        // added`) rather than as loose lines above the report. Until
+        // 2026-09-19 they were here and the calls were there, so one
+        // program's doings arrived as two lists in two places with the
+        // outcome wedged between them.
         // Renders to chat as a harness line (`types.rs`'s own doc
         // comment on `Fork`) — `report::render_fork` already carries the
         // real logic (settled vs. mid-program fork point, which branch
@@ -996,6 +909,10 @@ pub(crate) fn render_with_lookup(
     // modes) and again under `Transport::Program`, which never opens a
     // call at all.
     let mut open_call: Option<String> = None;
+    // Whether the open block has already reported a run, so an arrival
+    // after it gets a heading rather than trailing off the run's last
+    // section. Cleared by that heading and by every flush.
+    let mut ran = false;
 
     for ev in tree.path_events(leaf) {
         if let EventPayload::Agent { .. } = ev.payload {
@@ -1030,6 +947,7 @@ pub(crate) fn render_with_lookup(
                 // side of it merge into one user message — no empty
                 // message, and never two assistant turns in a row.
                 if let Some(content) = content {
+                    ran = false;
                     messages.push(flush_pending(&mut pending, transport, &mut open_call));
                     let (assistant, call_id) = assistant_turn(transport, ev.id, content);
                     messages.push(assistant);
@@ -1056,10 +974,23 @@ pub(crate) fn render_with_lookup(
             EventPayload::Return { .. } | EventPayload::Condition { .. } => {
                 if let Some(line) = report_line(tree, leaf, ev.id, budget, compacted) {
                     pending.push(line);
+                    ran = true;
                 }
             }
             _ => {
                 if let Some(line) = pending_line(tree, leaf, ev, compacted) {
+                    // **An arrival after a run needs a heading of its
+                    // own.** Without one it sits under whichever `###`
+                    // the run block ended on — `it printed`, usually —
+                    // and reads as more of that section's output. Only
+                    // after a run: an arrival that opens the block is
+                    // the block's subject, and a heading over a single
+                    // line saying what the line already says is the
+                    // scaffolding this format exists to remove.
+                    if ran {
+                        pending.push(ARRIVAL_HEADING.to_owned());
+                        ran = false;
+                    }
                     pending.push(line);
                 }
             }
@@ -1117,6 +1048,24 @@ fn assistant_turn(
     }
 }
 
+/// **The user turn's own heading.** A message in the user role holds
+/// whatever the log gained since the last reply: a person's words, the
+/// model's own `tell`s, its notes, its program's report. Read without a
+/// label, a kilobyte of the model's own prose arriving in the user role
+/// looks like somebody saying it.
+///
+/// Markdown, and shouted, for the same reason the reply itself is
+/// markdown: the document has one syntax now, and this is its outermost
+/// heading. `report.rs`'s `## RAN YOUR PROGRAM` nests under it and the
+/// `###` sections nest under that, so the structure of a turn is
+/// readable from the markup rather than from having learned which
+/// headings group with which.
+pub const TURN_HEADING: &str = "# NEW EVENTS";
+
+/// What arrivals render under once a run has already been reported in
+/// the same turn — see the call site for why only then.
+pub const ARRIVAL_HEADING: &str = "## MESSAGES";
+
 /// Close out `pending` into the one message that answers whatever
 /// precedes it, and clear both `pending` and `open_call` for the next
 /// block. The first block ever (before any turn — `open_call` still
@@ -1130,17 +1079,10 @@ fn flush_pending(
     transport: Transport,
     open_call: &mut Option<String>,
 ) -> ChatMessage {
-    // **Named, because the role does not name it.** A message in the
-    // user role holds whatever the log gained since the last program:
-    // a person's words, the model's own `tell`s rendered whole, its
-    // notes, its program's report. Read without a label, a kilobyte of
-    // the model's own prose arriving in the user role looks like
-    // somebody saying it. Two words, once per turn, against a card
-    // sentence 13 KB earlier that says the same thing in general.
     let content = if pending.is_empty() {
         String::new()
     } else {
-        format!("history log:\n{}", pending.join("\n"))
+        format!("{TURN_HEADING}\n\n{}", pending.join("\n\n"))
     };
     pending.clear();
     match (transport, open_call.take()) {
@@ -1806,13 +1748,22 @@ mod tests {
             },
         )
         .unwrap();
+        // The run has to end for its rows to be reported: they are the
+        // run's own list now, not loose lines beside it.
+        tree.append(
+            &mut spine,
+            EventPayload::Return {
+                value: serde_json::Value::Null,
+            },
+        )
+        .unwrap();
 
         let doc = render(&tree, &spine, 64 * 1024, Transport::Program);
         let all: String = doc.messages.iter().map(|m| m.content.clone()).collect();
         assert!(all.contains("user asked you: which one?"), "{all}");
         assert!(all.contains("you asked user: 30 or 240?"), "{all}");
         assert!(
-            all.contains(&format!("user answered #{}: \"30\"", q.as_u64())),
+            all.contains(&format!("user answered `[{}]`: \"30\"", q.as_u64())),
             "the answer names the question it settles: {all}"
         );
     }
@@ -1846,6 +1797,15 @@ mod tests {
                 }),
             )
             .unwrap();
+        // The run has to end for its rows to be reported: they are the
+        // run's own list now, not loose lines beside it.
+        tree.append(
+            &mut spine,
+            EventPayload::Return {
+                value: serde_json::Value::Null,
+            },
+        )
+        .unwrap();
 
         let doc = render(&tree, &spine, 64 * 1024, Transport::Program);
         let all: String = doc.messages.iter().map(|m| m.content.clone()).collect();
@@ -1857,7 +1817,7 @@ mod tests {
             "{all}"
         );
         assert!(
-            all.contains(&format!("[{}] you asked user: is 240 still right for request_timeout_seconds, or did we settle on the old 30?", q.as_u64())),
+            all.contains(&format!("`[{}]` you asked user: is 240 still right for request_timeout_seconds, or did we settle on the old 30?", q.as_u64())),
             "and the question itself renders whole, as its own row: {all}"
         );
     }
@@ -1903,7 +1863,7 @@ mod tests {
         let doc = render(&tree, &spine, 64 * 1024, Transport::Program);
         let after: String = doc.messages.iter().map(|m| m.content.clone()).collect();
         assert!(
-            after.contains(&format!("[{}] … the finding", note.as_u64())),
+            after.contains(&format!("`[{}]` … the finding", note.as_u64())),
             "a replacement says it stands in for more: {after}"
         );
     }
