@@ -42,7 +42,27 @@ pub const PAYLOAD_MAX_BYTES: usize = 1024;
 pub const STACK_MAX_FRAMES: usize = 8;
 /// Console lines quoted in a report (tail — the latest output before the
 /// stop). The `Console` event itself keeps more; see [`CONSOLE_MAX_LINES`].
-pub const CONSOLE_TAIL_LINES: usize = 20;
+///
+/// **A backstop, not the budget.** [`CONSOLE_SECTION_MAX_BYTES`] is the
+/// real bound, and the note on it describes exactly this failure one
+/// constant over: a clip that made the channel useless for what
+/// programs reach for it to do, so the model routed around it. This was
+/// 20, which binds long before 4 KB does — a 51-line Python file is
+/// well inside the byte budget and came back as "the last 20 of 51
+/// lines".
+///
+/// Live on 2026-09-20, and it cost the run its task. The model said
+/// "I need the full files first — the earlier run only showed the
+/// tail", printed them again, got the tail again, and then wrote
+/// `history.append({ code, tests })` over both files — because
+/// appending was the only way left to put a file in front of itself.
+/// That is the copy the card forbids, produced by the harness leaving
+/// no other door.
+///
+/// 200 with a 4 KB budget means bytes bind first for anything that
+/// reads like code (~40 bytes a line), and the line cap only catches a
+/// chatty loop printing something very short very often.
+pub const CONSOLE_TAIL_LINES: usize = 200;
 /// Lines a logged `Console` keeps. It is a **diagnostic stream, not
 /// data** — a chatty loop can write megabytes — so it is capped with an
 /// explicit truncation marker, and the program's own `return` is the
@@ -1974,19 +1994,33 @@ mod tests {
     /// program useless for the thing programs reach for it to do.
     #[test]
     fn console_keeps_recent_output_whole_within_a_total_budget() {
+        // **A file-sized print arrives whole.** 31 lines and a
+        // kilobyte is well inside the budget, and the line cap used to
+        // cut it to 20 anyway — which is what made a model append a
+        // file to look at it.
         let mut lines: Vec<String> = (0..30).map(|i| format!("line {i}")).collect();
         lines.push("y".repeat(1000));
         let rendered = render_console(&lines, None).expect("lines present");
-        assert!(
-            rendered.starts_with("### it printed\nThe last 20 of 31 lines"),
-            "{rendered}"
+        assert_eq!(
+            rendered.lines().next(),
+            Some("### it printed"),
+            "nothing was clipped, so nothing announces a clip: {rendered}"
         );
-        assert!(!rendered.contains("line 0"), "older lines dropped");
-        assert!(rendered.contains("line 11"), "tail kept");
+        assert!(rendered.contains("line 0"), "the whole print: {rendered}");
         assert!(
             rendered.contains(&"y".repeat(1000)),
             "a 1000-byte line is well inside the budget and survives whole"
         );
+
+        // And bytes are what bind when something really is too big.
+        let fat: Vec<String> = (0..10).map(|i| format!("{i}{}", "z".repeat(900))).collect();
+        let rendered = render_console(&fat, Some(7)).expect("lines present");
+        assert!(
+            rendered.contains("of 10 lines; `history.fetch(7)` for all of them"),
+            "a clip names the id to fetch: {rendered}"
+        );
+        assert!(!rendered.contains("0zzz"), "the oldest goes first: {rendered}");
+        assert!(rendered.contains("9zzz"), "the newest survives: {rendered}");
 
         // Past the budget, the oldest of the tail goes rather than every
         // line losing its end.
