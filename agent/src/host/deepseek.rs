@@ -279,10 +279,21 @@ impl LlmClient for DeepSeekClient {
 }
 
 /// How many times a request is sent before the failure is the
-/// caller's. Three: one for the ordinary case, and two more because
-/// the observed fault cleared within seconds every time it was probed
-/// by hand.
-const MAX_ATTEMPTS: usize = 5;
+/// caller's.
+///
+/// **Seven, because the doubling has to reach what the waits are
+/// for.** [`backoff`] says a local server answering 503 while it loads
+/// a model off disk "needs ten to twenty" seconds; five attempts
+/// totals six, so it never got there, and the number said three while
+/// the constant said five. Seven reaches 25.2s — 0.4, 0.8, 1.6, 3.2,
+/// 6.4, 12.8 — which covers a cold model load and a proxy wobble both.
+///
+/// It costs nothing when nothing is wrong: no attempt after the first
+/// happens unless one has already failed. Measured on 2026-09-20,
+/// three eval runs were lost to an upstream 530 that outlasted six
+/// seconds of retries, two of them on `plain-question`, which is one
+/// request long.
+const MAX_ATTEMPTS: usize = 7;
 
 /// Whether the machine was suspended while this request was in flight.
 ///
@@ -311,7 +322,8 @@ fn retryable(status: u16) -> bool {
     status == 408 || status == 429 || (500..600).contains(&status)
 }
 
-/// How long to wait before attempt `n + 1`: 0.4s, 0.8s, 1.6s, 3.2s.
+/// How long to wait before attempt `n + 1`: 0.4s, 0.8s, 1.6s, 3.2s,
+/// 6.4s, 12.8s — 25.2s across [`MAX_ATTEMPTS`].
 ///
 /// **Two faults with very different clocks.** A proxy's 530 clears in
 /// about a second, so the first waits are short. A local server
@@ -848,8 +860,16 @@ mod tests {
         let waits: Vec<u128> = (1..MAX_ATTEMPTS).map(|n| backoff(n).as_millis()).collect();
         assert!(waits.windows(2).all(|w| w[1] > w[0]), "grows: {waits:?}");
         assert!(waits[0] <= 500, "the first retry is quick: {waits:?}");
+        // **The upper number in that sentence is the bar.** This
+        // asserted `6_000..20_000` and passed at exactly 6,000 — the
+        // bottom of a range whose own doc says a cold load takes ten to
+        // twenty seconds, so the budget it guarded never reached the
+        // case it was named for.
         let total: u128 = waits.iter().sum();
-        assert!((6_000..20_000).contains(&total), "{total}ms: {waits:?}");
+        assert!(
+            (20_000..60_000).contains(&total),
+            "the budget has to outlast a twenty-second load: {total}ms: {waits:?}"
+        );
     }
 
     #[test]
