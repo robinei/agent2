@@ -3618,11 +3618,20 @@ pub(crate) fn menu_rows(
                 // between replies by design, so it belongs in the list
                 // of what this run put on the record, beside the calls
                 // that produced the values.
+                //
+                // **`appended:`, because that is the verb it wrote.**
+                // The model calls `history.append` and used to read the
+                // row back as `note:`, leaving it to infer from
+                // position and content that the two were the same
+                // thing. One thing, one name, wherever it is spoken —
+                // and the model-facing direction is the one that
+                // matters. `EventPayload::Note` keeps its name; nobody
+                // outside this file sees it.
                 EventPayload::Note { text, .. } => Some(Artifact {
                     id,
                     label: String::new(),
                     state: ArtifactState::Whole(format!(
-                        "note: {}",
+                        "appended: {}",
                         crate::document::escape_untrusted(text)
                     )),
                 }),

@@ -544,7 +544,7 @@ impl ChatState {
                     branch,
                     id,
                     kind: ChatKind::Marker,
-                    text: format!("note: {text}"),
+                    text: format!("appended: {text}"),
                     program: None,
                 });
             }

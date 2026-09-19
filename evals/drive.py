@@ -899,7 +899,17 @@ def main():
     p.add_argument("--out", type=Path, help="write the aggregate here as JSON")
     p.add_argument("--list", action="store_true")
     p.add_argument("--verify-only", action="store_true", help="check the checkers, run nothing")
-    p.add_argument("--keep", type=Path, help="keep each run's sandbox and log under here")
+    p.add_argument(
+        "--keep",
+        type=Path,
+        help="keep each run's sandbox and log under here (default: a dated "
+        "directory under $TMPDIR)",
+    )
+    p.add_argument(
+        "--no-keep",
+        action="store_true",
+        help="throw the sandbox and log away when the run ends",
+    )
     p.add_argument("--compare", nargs=2, type=Path, metavar=("BEFORE", "AFTER"))
     p.add_argument(
         "--pool",
@@ -986,6 +996,21 @@ def main():
     # program with the CPU idle — so they overlap. Serial, the suite is
     # paced by the slowest queue in the provider rather than by anything
     # being measured.
+    # **Kept by default.** Every diagnosis worth having this week came
+    # from opening a failing run's log — the fence that swallowed a
+    # cell, the ANSI escapes that broke a regex, the reply that arrived
+    # empty, the caret pointing into the prelude. The one failure of
+    # 2026-09-19 that went undiagnosed is the one run nobody passed
+    # `--keep` for, and by the time it mattered the sandbox was gone.
+    # Disk is cheaper than a rerun, and a rerun is not even the same
+    # run.
+    if args.no_keep:
+        args.keep = None
+    elif args.keep is None:
+        args.keep = Path(tempfile.gettempdir()) / time.strftime("agent2-evals/%Y%m%d-%H%M%S")
+    if args.keep is not None:
+        print(f"keeping runs under {args.keep}")
+
     before = fingerprint(args.card)
     work = [(task, i) for task in usable for i in range(args.repeat)]
     printing = threading.Lock()

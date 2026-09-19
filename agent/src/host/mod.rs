@@ -2688,7 +2688,7 @@ mod tests {
         // next reply as the row it appended, not as a return value.
         let texts = tool_texts(&session);
         assert!(
-            texts[0].contains(r#"note: ["slow","fast"]"#),
+            texts[0].contains(r#"appended: ["slow","fast"]"#),
             "{texts:?}"
         );
     }
@@ -3076,7 +3076,7 @@ mod tests {
         assert!(
             tool_texts(&session)
                 .iter()
-                .any(|t| t.contains("note: DATA")),
+                .any(|t| t.contains("appended: DATA")),
             "{:?}",
             tool_texts(&session)
         );

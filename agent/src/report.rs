@@ -1788,14 +1788,14 @@ mod tests {
             new_artifacts: vec![Artifact {
                 id: 9,
                 label: String::new(),
-                state: ArtifactState::Whole(format!("note: {long}")),
+                state: ArtifactState::Whole(format!("appended: {long}")),
             }],
             failed_calls: 0,
             long_bash: 0,
         }
         .render();
         assert!(rendered.contains(&long), "the row is not clipped");
-        assert!(rendered.contains("- `[9]` note:"), "{rendered}");
+        assert!(rendered.contains("- `[9]` appended:"), "{rendered}");
     }
 
     /// A menu row says a call arrived and how big its value is — never
