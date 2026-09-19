@@ -180,7 +180,11 @@ fn doc_comment(def: &crate::host::ToolDef) -> String {
     out
 }
 
-pub fn tool_manifest(registry: &crate::host::ToolRegistry) -> String {
+/// The tool declarations, framed to match the card they are appended
+/// to — see the comment at the splice below for why `markdown` is read
+/// off the card's own first bytes rather than passed down from a
+/// transport.
+pub fn tool_manifest(registry: &crate::host::ToolRegistry, markdown: bool) -> String {
     let mut manifest = String::new();
     let mut tools: Vec<_> = registry.iter().collect();
     if tools.is_empty() {
@@ -192,7 +196,25 @@ pub fn tool_manifest(registry: &crate::host::ToolRegistry) -> String {
     // thing the `tools.` prefix reliably signals — that these are this
     // session's configured capabilities — would be missing from the
     // only place the model reads their names.
-    manifest.push_str("\n\ndeclare namespace tools {");
+    // **A card is framed the way its own model writes.** Under the
+    // notebook transport the reply is markdown with code in blocks, so
+    // the card is too and the manifest is a fenced `ts` block under a
+    // heading. Under the program transport the reply is bare
+    // JavaScript and nothing else — the card says so in as many words —
+    // so the card is a TypeScript document and the manifest is
+    // declarations spliced onto the end of it, fenced by nothing.
+    //
+    // Which it is, is a fact about the card, so it is read off the
+    // card: a TypeScript document opens `/**`, and a markdown one does
+    // not. No transport parameter reaches here and none should — the
+    // card directory is chosen by the caller, and a manifest framed
+    // one way against a card written the other is a contradiction the
+    // model has to resolve for us.
+    if markdown {
+        manifest.push_str("\n\n## This session\'s tools\n\n```ts\ndeclare namespace tools {");
+    } else {
+        manifest.push_str("\n\ndeclare namespace tools {");
+    }
     for def in tools {
         let items = def
             .input_schema
@@ -227,7 +249,7 @@ pub fn tool_manifest(registry: &crate::host::ToolRegistry) -> String {
             returns,
         ));
     }
-    manifest.push_str("}\n");
+    manifest.push_str(if markdown { "}\n```\n" } else { "}\n" });
     manifest
 }
 
@@ -238,10 +260,13 @@ pub fn tool_manifest(registry: &crate::host::ToolRegistry) -> String {
 /// immutable cache prefix, and a later card edit or registry change must
 /// not alter an existing conversation's prompt out from under it.
 pub fn full_card(registry: &crate::host::ToolRegistry) -> String {
+    let card = active();
+    let text = &card.text;
+    let markdown = !text.starts_with("/**");
     format!(
         "{}{}{}",
-        active().text,
-        tool_manifest(registry),
+        text,
+        tool_manifest(registry, markdown),
         working_directory()
     )
 }
@@ -346,7 +371,7 @@ mod tests {
     /// English sentence.
     #[test]
     fn tool_manifest_is_generated_from_schemas() {
-        let manifest = tool_manifest(&registry_with_tools());
+        let manifest = tool_manifest(&registry_with_tools(), false);
         assert!(
             manifest.contains(
                 "function fetch_page(url: string, timeoutMs?: number): \
@@ -381,7 +406,7 @@ mod tests {
             returns: Some("{ depth: number }".into()),
             handler: Box::new(|_| Ok(json!(null))),
         });
-        let m = tool_manifest(&registry);
+        let m = tool_manifest(&registry, false);
         assert!(m.contains("   * Dig a hole."), "{m}");
         assert!(m.contains("   * - Mind the cables."), "{m}");
         assert!(m.contains("   * - Backfill when done."), "{m}");
@@ -397,7 +422,7 @@ mod tests {
     /// around one sentence is noise.
     #[test]
     fn a_tool_with_only_a_description_gets_a_one_line_comment() {
-        let m = tool_manifest(&registry_with_tools());
+        let m = tool_manifest(&registry_with_tools(), false);
         assert!(m.contains("  /** No names, no return type. */"), "{m}");
     }
 
@@ -406,11 +431,68 @@ mod tests {
     /// one that describes it thinly, and `argN: unknown` is honest.
     #[test]
     fn a_tool_without_names_or_a_return_type_still_renders() {
-        let manifest = tool_manifest(&registry_with_tools());
+        let manifest = tool_manifest(&registry_with_tools(), false);
         assert!(
             manifest.contains("function bare(arg0: Record<string, unknown>): Promise<unknown>;"),
             "{manifest}"
         );
+    }
+
+    /// **A card is framed the way its own model writes**, and the
+    /// manifest follows the card rather than a flag of its own. The
+    /// shipped card is a TypeScript document — "no prose, no code
+    /// fence" is its first line — so its tools are bare declarations
+    /// spliced onto the end. A markdown card (the notebook transport's,
+    /// where the reply is markdown with code in blocks) gets a heading
+    /// and a `ts` fence instead, because a bare `declare namespace`
+    /// dropped on the end of a markdown document is the one place the
+    /// prompt would contradict the format it is asking for.
+    #[test]
+    fn the_manifest_is_framed_like_the_card_it_follows() {
+        let bare = tool_manifest(&registry_with_tools(), false);
+        assert!(bare.starts_with("\n\ndeclare namespace tools {"), "{bare}");
+        assert!(!bare.contains("```"), "{bare}");
+
+        let fenced = tool_manifest(&registry_with_tools(), true);
+        assert!(fenced.contains("## This session\'s tools"), "{fenced}");
+        assert!(fenced.contains("```ts\ndeclare namespace tools {"), "{fenced}");
+        assert!(fenced.trim_end().ends_with("```"), "{fenced}");
+
+        // Both carry the same declarations: the framing is the only
+        // difference, so a card cannot lose a tool by being markdown.
+        assert_eq!(
+            bare.matches("  function ").count(),
+            fenced.matches("  function ").count()
+        );
+    }
+
+    /// The two shipped card directories, each framed its own way. This
+    /// reads the files rather than trusting the rule, because the rule
+    /// is a one-line prefix test and the thing it must not do is
+    /// silently pick the wrong framing for a card someone edits later.
+    #[test]
+    fn the_shipped_cards_declare_which_kind_they_are() {
+        let program = include_str!("../card/card.md");
+        assert!(
+            program.starts_with("/**"),
+            "the program card is a TypeScript document"
+        );
+        let notebook = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../evals/cards/notebook/card.md"),
+        );
+        // Only asserted when the eval cards are present — the binary
+        // ships without them.
+        if let Ok(notebook) = notebook {
+            assert!(
+                !notebook.starts_with("/**"),
+                "the notebook card is markdown"
+            );
+            assert!(
+                notebook.contains("\n```ts\n"),
+                "and its declarations live in a fence"
+            );
+        }
     }
 
     #[test]
