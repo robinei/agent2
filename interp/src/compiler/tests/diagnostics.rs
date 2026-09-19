@@ -114,6 +114,20 @@ fn switch_continue_outside_loop_errors() {
     assert!(compile("switch (1) { case 1: continue; }").is_err());
 }
 
+/// **The one a model actually reaches for.** A live run on 2026-09-20
+/// wrote ``tools.bash(String.raw`…`)`` to keep backslashes literal in a
+/// shell command — a good instinct, and a tagged template, which this
+/// does not compile. "unsupported expression" over a heredoc names
+/// neither the construct nor the way round it.
+#[test]
+fn a_tagged_template_names_itself_and_the_way_round_it() {
+    let errs = compile("const s = String.raw`a\\nb`;").expect_err("should fail");
+    let msg = &errs[0].message;
+    assert!(msg.contains("tagged template"), "{msg}");
+    assert!(msg.contains("String.raw"), "{msg}");
+    assert!(msg.contains("doubled"), "and what to write: {msg}");
+}
+
 #[test]
 fn labeled_statement_is_rejected() {
     let errs = compile("outer: while (true) break outer;").expect_err("should fail");

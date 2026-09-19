@@ -165,6 +165,18 @@ impl super::Compiler {
             ast::Expression::TSTypeAssertion(e) => self.compile_expr(&e.expression),
             ast::Expression::TSNonNullExpression(e) => self.compile_expr(&e.expression),
             ast::Expression::TSInstantiationExpression(e) => self.compile_expr(&e.expression),
+            // **The one a model actually reaches for.** A live run on
+            // 2026-09-20 wrote ``tools.bash(String.raw`…`)`` to keep
+            // backslashes literal in a shell command, which is a good
+            // instinct and a tagged template, which this does not
+            // compile. "unsupported expression" over a heredoc names
+            // neither the construct nor the way round it.
+            ast::Expression::TaggedTemplateExpression(e) => self.error(
+                e.span.into(),
+                "a tagged template is not supported. `String.raw` is the usual reason to \
+                 want one: write the text as an ordinary string with each backslash \
+                 doubled, or build it with `+` so there is no escape to keep.",
+            ),
             other => self.error(other.span().into(), "unsupported expression"),
         }
     }
