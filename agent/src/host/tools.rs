@@ -502,6 +502,13 @@ fn run_bash(command: &str, timeout: Duration) -> Result<serde_json::Value, Strin
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        // **Nothing downstream is a terminal.** See `strip_ansi`.
+        .env("NO_COLOR", "1")
+        .env("TERM", "dumb")
+        .env("PYTHON_COLORS", "0")
+        .env("CLICOLOR", "0")
+        .env("CLICOLOR_FORCE", "0")
+        .env_remove("FORCE_COLOR")
         .spawn()
         .map_err(|e| format!("spawning bash: {e}"))?;
 
@@ -619,13 +626,73 @@ fn run_bash(command: &str, timeout: Duration) -> Result<serde_json::Value, Strin
 
     let mut result = json!({
         "status": code,
-        "stdout": String::from_utf8_lossy(&stdout),
-        "stderr": String::from_utf8_lossy(&stderr),
+        "stdout": strip_ansi(&String::from_utf8_lossy(&stdout)),
+        "stderr": strip_ansi(&String::from_utf8_lossy(&stderr)),
     });
     if out_trunc || err_trunc {
         result["truncated"] = json!(true);
     }
     Ok(result)
+}
+
+/// Terminal escape sequences out of captured output.
+///
+/// **Nothing downstream of this tool is a terminal.** The output goes
+/// to a JavaScript program that matches on it and to a document the
+/// model reads; in both places an escape is invisible punctuation that
+/// breaks a match for no reason anyone can see.
+///
+/// Measured 2026-09-19. A run wrote exactly the right program — probe
+/// the tests with the skips removed, keep the ones that pass — and
+/// matched `/test_\w+ \(.+\) \.\.\. ok/` against
+/// `test_base_rate (…) ... \x1b[32mok\x1b[0m`. The set came back empty,
+/// the file was written back byte-identical, and the model reported
+/// "un-skipped (none)" in good faith. Nothing in the console it was
+/// shown next would have told it why: the escapes render as colour, or
+/// as nothing.
+///
+/// The `NO_COLOR`/`TERM=dumb` environment above asks tools not to emit
+/// these; this is what makes it true of the ones that do anyway. Both,
+/// because the environment is the polite request and this is the
+/// guarantee.
+///
+/// CSI sequences (`ESC [ … final`) and the two-byte escapes around
+/// them. Deliberately not a full terminal emulator: no cursor
+/// movement is replayed, nothing is reflowed. A byte that is not
+/// display control is kept.
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            // CSI: parameter and intermediate bytes, then a final in
+            // `@`–`~`.
+            Some('[') => {
+                for c in chars.by_ref() {
+                    if ('\u{40}'..='\u{7e}').contains(&c) {
+                        break;
+                    }
+                }
+            }
+            // OSC: runs to BEL or ST (`ESC \`).
+            Some(']') => {
+                let mut prev_esc = false;
+                for c in chars.by_ref() {
+                    if c == '\u{7}' || (prev_esc && c == '\\') {
+                        break;
+                    }
+                    prev_esc = c == '\u{1b}';
+                }
+            }
+            // A bare two-byte escape, or a trailing lone ESC.
+            Some(_) | None => {}
+        }
+    }
+    out
 }
 
 /// bash's own complaint, appended to a rejection so the program is told
@@ -923,6 +990,61 @@ mod tests {
     fn bash(args: serde_json::Value) -> Result<serde_json::Value, String> {
         let _cwd = PROCESS_CWD.lock().unwrap_or_else(|e| e.into_inner());
         (bash_def().handler)(args)
+    }
+
+    /// **The exact failure this was written for.** A colourised
+    /// `unittest -v` line, matched by the regex a live run actually
+    /// used. Before the strip the set came back empty and the run
+    /// silently changed nothing.
+    #[test]
+    fn a_colourised_line_matches_the_pattern_a_program_would_write() {
+        let raw = "test_base_rate (m.T.test_base_rate) ... \u{1b}[32mok\u{1b}[0m\n\
+                   test_total_world (m.T.test_total_world) ... \u{1b}[31mFAIL\u{1b}[0m\n";
+        let clean = strip_ansi(raw);
+        assert_eq!(
+            clean,
+            "test_base_rate (m.T.test_base_rate) ... ok\n\
+             test_total_world (m.T.test_total_world) ... FAIL\n"
+        );
+    }
+
+    /// Nothing that is not display control is touched — including the
+    /// brackets, dots and backslashes that look like escapes.
+    #[test]
+    fn strip_ansi_leaves_ordinary_text_alone() {
+        for text in [
+            "plain",
+            "a[32mb",
+            "path\\to\\file [ok] (1.2s) 100%",
+            "",
+            "unicode: é — ✓",
+        ] {
+            assert_eq!(strip_ansi(text), text);
+        }
+    }
+
+    /// Hyperlinks and title-setting are OSC, which ends at BEL or at
+    /// `ESC \\` rather than at a letter.
+    #[test]
+    fn strip_ansi_takes_osc_sequences_whole() {
+        assert_eq!(strip_ansi("a\u{1b}]0;my title\u{7}b"), "ab");
+        assert_eq!(strip_ansi("a\u{1b}]8;;http://x\u{1b}\\b"), "ab");
+    }
+
+    /// A truncated stream can end mid-escape; that must not eat the
+    /// rest of the output or panic.
+    #[test]
+    fn strip_ansi_survives_a_cut_off_escape() {
+        assert_eq!(strip_ansi("ok\u{1b}"), "ok");
+        assert_eq!(strip_ansi("ok\u{1b}["), "ok");
+        assert_eq!(strip_ansi("ok\u{1b}[32"), "ok");
+    }
+
+    /// End to end through the tool itself, not just the helper.
+    #[test]
+    fn bash_output_reaches_the_program_without_escapes() {
+        let out = bash(json!(["printf 'a\\033[31mred\\033[0mb\\n'"])).unwrap();
+        assert_eq!(out["stdout"].as_str().unwrap(), "aredb\n");
     }
 
     #[test]
