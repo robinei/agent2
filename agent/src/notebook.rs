@@ -282,12 +282,33 @@ fn render_cell_diags(buffer: &str, diags: &[interp::Diagnostic]) -> String {
 /// them belong to neither and are stored nowhere.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Piece {
-    /// Text to send the person, trimmed of the blank lines that separated it
-    /// from the fences around it. Never empty — an empty segment is dropped
-    /// rather than logged as a message with nothing in it.
+    /// Text between two fences, **verbatim** — every byte, including the
+    /// blank lines that separated it from them.
+    ///
+    /// It used to arrive trimmed, which is fine for sending to a person
+    /// and fatal for the log: 28's whole design rests on the parts of a
+    /// reply concatenating, byte for byte, back to the completion that
+    /// produced them, and a trim makes that false on the first blank
+    /// line. What to *show* someone is the renderer's business;
+    /// [`Piece::visible`] is where the trim lives now.
     Prose(String),
     /// An executable cell, by index into the reply's cells.
     Cell(usize),
+}
+
+impl Piece {
+    /// A prose piece as a person should see it: trimmed. `None` when
+    /// there is nothing but whitespace, which is a piece worth logging
+    /// and not worth sending.
+    pub fn visible(&self) -> Option<&str> {
+        match self {
+            Piece::Prose(text) => {
+                let t = text.trim();
+                (!t.is_empty()).then_some(t)
+            }
+            Piece::Cell(_) => None,
+        }
+    }
 }
 
 /// The streaming splitter: hands back each piece of a reply **the moment it
@@ -349,7 +370,19 @@ impl Stream {
     /// newest chunk: a fence can straddle a chunk boundary, and the only way
     /// to be sure of a piece is to look at the whole thing.
     pub fn advance(&mut self, reply: &str) -> Vec<Piece> {
-        self.cells = split_cells(reply);
+        // **Only complete lines.** A fence is a line, and
+        // `split_inclusive` hands back the last one *without* its
+        // newline when the buffer stops mid-line — so a closing fence
+        // seen before its newline arrives ends the cell one byte early,
+        // and that byte then turns up at the head of the next prose
+        // piece. Streamed and batched then decompose the same reply into
+        // different bytes, which the concatenation invariant (28)
+        // forbids and the old `trim` used to hide.
+        let committed = match reply.rfind('\n') {
+            Some(i) => &reply[..i + 1],
+            None => "",
+        };
+        self.cells = split_cells(committed);
         let mut out = Vec::new();
         while self.emitted_cells < self.cells.len() {
             let cell = self.cells[self.emitted_cells];
@@ -388,11 +421,7 @@ impl Stream {
 /// it is markdown punctuation rather than part of the message. An all-blank
 /// gap between two adjacent cells is not a message at all.
 fn prose_between(reply: &str, start: usize, end: usize) -> Option<String> {
-    if start >= end {
-        return None;
-    }
-    let text = reply[start..end].trim();
-    (!text.is_empty()).then(|| text.to_string())
+    (start < end).then(|| reply[start..end].to_owned())
 }
 
 /// What a cell should write instead of a top-level `return` (D5, 25.3).
@@ -1008,9 +1037,9 @@ three\n";
         assert_eq!(
             pieces,
             vec![
-                Piece::Prose("Both files claim to own the retry policy.".into()),
+                Piece::Prose("Both files claim to own the retry policy.\n\n".into()),
                 Piece::Cell(0),
-                Piece::Prose("`retry.rs` is the newer of the two.".into()),
+                Piece::Prose("\n`retry.rs` is the newer of the two.\n\n".into()),
                 Piece::Cell(1),
             ]
         );
@@ -1031,7 +1060,7 @@ three\n";
         let pieces = stream.advance("Some prose first.\n\n```js\nconst a = 1;\n```\n");
         assert_eq!(
             pieces,
-            vec![Piece::Prose("Some prose first.".into()), Piece::Cell(0)]
+            vec![Piece::Prose("Some prose first.\n\n".into()), Piece::Cell(0)]
         );
         // And it is not handed out a second time.
         assert!(
@@ -1050,8 +1079,47 @@ three\n";
         assert_eq!(stream.advance(reply), vec![Piece::Cell(0)]);
         assert_eq!(
             stream.finish(reply),
-            vec![Piece::Prose("That is everything.".into())]
+            vec![Piece::Prose("\nThat is everything.\n".into())]
         );
+    }
+
+    /// **The invariant 28 rests on: the pieces of a reply concatenate,
+    /// byte for byte, back to the reply.**
+    ///
+    /// Nothing has to be reassembled because nothing was taken apart —
+    /// but only while this holds. It was false twice on the way here: a
+    /// `trim` on every prose piece, and a closing fence recognised
+    /// before its newline arrived, which made a *streamed* reply
+    /// decompose differently from the same bytes handed over whole.
+    #[test]
+    fn the_pieces_concatenate_back_to_the_reply() {
+        let replies = [
+            "\n\n  Leading blank lines.\n\n```js\nlet a = 1;\n```\n\n\nTrailing.   \n\n",
+            "```js\nlet a = 1;\n```\n```js\nlet b = 2;\n```\n",
+            "No cells at all.\n",
+            "```js\nonly();\n```\n",
+            "One.\n\n```js\nlet a = 1;\n```\n\nTwo.\n\n```js\na = 2;\n```\n\nThree.\n",
+        ];
+        for reply in replies {
+            let cells = split_cells(reply);
+            let rebuilt = |pieces: &[Piece]| -> String {
+                pieces
+                    .iter()
+                    .map(|p| match p {
+                        Piece::Prose(t) => t.clone(),
+                        Piece::Cell(i) => reply[cells[*i].outer_start..cells[*i].outer_end]
+                            .to_owned(),
+                    })
+                    .collect()
+            };
+            let mut whole = Stream::new();
+            assert_eq!(rebuilt(&whole.finish(reply)), reply, "whole: {reply:?}");
+            assert_eq!(
+                rebuilt(&pieces_byte_by_byte(reply)),
+                reply,
+                "byte by byte: {reply:?}"
+            );
+        }
     }
 
     /// A fence straddling chunk boundaries is still recognised exactly once,
@@ -1063,13 +1131,20 @@ three\n";
         assert_eq!(pieces_byte_by_byte(reply), whole.finish(reply));
     }
 
-    /// Two adjacent cells with only blank space between them produce no
-    /// prose piece: an empty message is not a message.
+    /// Two adjacent cells with only blank space between them still
+    /// produce a prose piece — the bytes are on the log, because the
+    /// parts must concatenate — but it is not a *message*: `visible()`
+    /// is `None` and nobody is sent an empty line.
     #[test]
     fn nothing_but_whitespace_between_cells_is_not_a_message() {
         let reply = "```js\nlet a = 1;\n```\n\n```js\na = 2;\n```\n";
         let mut stream = Stream::new();
-        assert_eq!(stream.finish(reply), vec![Piece::Cell(0), Piece::Cell(1)]);
+        let pieces = stream.finish(reply);
+        assert_eq!(
+            pieces,
+            vec![Piece::Cell(0), Piece::Prose("\n".into()), Piece::Cell(1)]
+        );
+        assert_eq!(pieces[1].visible(), None, "whitespace is not a message");
     }
 
     /// A reply with no cells is all prose, delivered when it ends (D4).
@@ -1081,7 +1156,7 @@ three\n";
         assert_eq!(
             stream.finish(reply),
             vec![Piece::Prose(
-                "The retry policy already lives in `retry.rs`.".into()
+                "The retry policy already lives in `retry.rs`.\n".into()
             )]
         );
     }
@@ -1100,7 +1175,7 @@ three\n";
                 Piece::Cell(0),
                 // The prose after the closed cell still lands; the
                 // unterminated fence and its contents do not.
-                Piece::Prose("Next I will\n\n```js\nawait tools.read_fi".into()),
+                Piece::Prose("\nNext I will\n\n```js\nawait tools.read_fi".into()),
             ]
         );
         assert_eq!(stream.cells().len(), 1);
@@ -1119,7 +1194,7 @@ three\n";
         };
         assert!(text.starts_with("# Findings"));
         assert!(text.contains("\n\n- one\n- two\n\n"));
-        assert!(text.ends_with("And the conclusion."));
+        assert!(text.ends_with("And the conclusion.\n"), "verbatim: {text:?}");
         assert_eq!(pieces.len(), 1);
     }
 

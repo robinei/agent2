@@ -3820,7 +3820,15 @@ impl Runner {
                 unreachable!("advance_notebook with no notebook");
             };
             match notebook.take_piece() {
-                Some(crate::notebook::Piece::Prose(text)) => {
+                Some(piece @ crate::notebook::Piece::Prose(_)) => {
+                    // **Verbatim on the log, trimmed to the person.** The
+                    // piece carries every byte so the reply can be put
+                    // back together exactly (28); what someone reads is
+                    // the same text without the blank lines that
+                    // separated it from the fences.
+                    let Some(text) = piece.visible().map(str::to_owned) else {
+                        continue;
+                    };
                     let send = tree.append(
                         &mut self.spine,
                         EventPayload::Call(Call::Send {
