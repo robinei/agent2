@@ -43,6 +43,7 @@ pub struct DeepSeekClient {
     /// Pinned reasoning level, sent as `reasoning_effort`. `None` leaves
     /// the field off and lets the API choose.
     effort: Option<String>,
+    max_tokens: Option<u32>,
     agent: ureq::Agent,
     // Stable for the client's lifetime (one per session): the "OpenCode
     // Go" endpoint requires `x-opencode-session` to route a conversation
@@ -78,14 +79,36 @@ impl DeepSeekClient {
         let base_url =
             std::env::var("DEEPSEEK_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.into());
         let thinking = std::env::var("DEEPSEEK_NO_THINKING").is_err();
+        let max_tokens = std::env::var("DEEPSEEK_MAX_TOKENS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|n| *n > 0);
         let effort = std::env::var("DEEPSEEK_REASONING_EFFORT")
             .ok()
             .or_else(|| Some(DEFAULT_EFFORT.to_owned()));
-        Ok(Self::new(api_key, model, base_url, thinking).with_effort(effort))
+        Ok(Self::new(api_key, model, base_url, thinking)
+            .with_effort(effort)
+            .with_max_tokens(max_tokens))
     }
 
     /// Pin the reasoning level (builder form, so `new`'s signature is
     /// untouched for its existing callers).
+    /// A ceiling on the completion, from `DEEPSEEK_MAX_TOKENS`.
+    ///
+    /// **Unset by default, and that is right for a hosted provider**,
+    /// whose own ceiling is generous and whose replies legitimately run
+    /// to thousands of tokens. A local server is the other case: its
+    /// default can be small enough that a reasoning model spends the
+    /// whole budget thinking and returns empty `content` with
+    /// `finish_reason: length`. That failure is survivable — the branch
+    /// is asked again with a marker saying the reply arrived empty —
+    /// but surviving it every turn is not a plan, and the server's own
+    /// documentation says to send this.
+    pub fn with_max_tokens(mut self, max_tokens: Option<u32>) -> Self {
+        self.max_tokens = max_tokens;
+        self
+    }
+
     pub fn with_effort(mut self, effort: Option<String>) -> Self {
         self.effort = effort;
         self
@@ -121,6 +144,7 @@ impl DeepSeekClient {
             base_url,
             thinking,
             effort: None,
+            max_tokens: None,
             agent: config.into(),
             session_id: uuid::Uuid::new_v4().to_string(),
         }
@@ -145,6 +169,7 @@ impl LlmClient for DeepSeekClient {
             &self.model,
             self.thinking,
             self.effort.as_deref(),
+            self.max_tokens,
         );
         // **Retried only before a single byte has been streamed.**
         // Everything below this loop hands chunks straight to the
@@ -257,7 +282,7 @@ impl LlmClient for DeepSeekClient {
 /// caller's. Three: one for the ordinary case, and two more because
 /// the observed fault cleared within seconds every time it was probed
 /// by hand.
-const MAX_ATTEMPTS: usize = 3;
+const MAX_ATTEMPTS: usize = 5;
 
 /// Whether the machine was suspended while this request was in flight.
 ///
@@ -286,9 +311,15 @@ fn retryable(status: u16) -> bool {
     status == 408 || status == 429 || (500..600).contains(&status)
 }
 
-/// How long to wait before attempt `n + 1`. Short on purpose — this is
-/// in front of a person or an eval run, and the fault it is for clears
-/// in about a second.
+/// How long to wait before attempt `n + 1`: 0.4s, 0.8s, 1.6s, 3.2s.
+///
+/// **Two faults with very different clocks.** A proxy's 530 clears in
+/// about a second, so the first waits are short. A local server
+/// answering 503 while it loads a model off disk needs ten to twenty,
+/// and three fast attempts spent the whole budget in 1.2s and gave up
+/// before it had finished reading the weights. Doubling covers both
+/// without making the common case slow: nothing waits at all unless
+/// something has already failed.
 fn backoff(attempt: usize) -> std::time::Duration {
     std::time::Duration::from_millis(400 * (1 << (attempt - 1)) as u64)
 }
@@ -315,6 +346,7 @@ fn request_body(
     model: &str,
     thinking: bool,
     effort: Option<&str>,
+    max_tokens: Option<u32>,
 ) -> serde_json::Value {
     let messages: Vec<serde_json::Value> = request.messages.iter().map(message_json).collect();
     let mut body = serde_json::json!({
@@ -328,6 +360,9 @@ fn request_body(
         // unavailable from this provider at all.
         "stream_options": { "include_usage": true },
     });
+    if let Some(n) = max_tokens {
+        body["max_tokens"] = serde_json::json!(n);
+    }
     if !thinking {
         // Exactly what `pi` sends to disable on this provider, so
         // "both off" is the same request on both sides.
@@ -549,7 +584,7 @@ mod tests {
             msg(ChatRole::Assistant, "return 1;"),
             msg(ChatRole::User, "## program completed"),
         ]);
-        let body = request_body(&request, "deepseek-v4-pro", true, None);
+        let body = request_body(&request, "deepseek-v4-pro", true, None, None);
 
         assert_eq!(body["model"], "deepseek-v4-pro");
         assert_eq!(body["stream"], true);
@@ -587,6 +622,7 @@ mod tests {
             "deepseek-v4-flash",
             true,
             Some("medium"),
+            None,
         );
         assert_eq!(body["reasoning_effort"], json!("medium"));
         // The level needs the enable flag beside it; alone it is a
@@ -599,8 +635,22 @@ mod tests {
             "deepseek-v4-flash",
             true,
             None,
+            None,
         );
         assert!(body.get("reasoning_effort").is_none());
+    }
+
+    /// **Unset means unsent.** A hosted provider's own ceiling is
+    /// generous and its replies legitimately run to thousands of
+    /// tokens, so a default here would truncate real work. A local
+    /// server is the other case and says to send one.
+    #[test]
+    fn max_tokens_is_sent_only_when_asked_for() {
+        let request = doc(vec![]);
+        let without = request_body(&request, "m", true, None, None);
+        assert!(without.get("max_tokens").is_none());
+        let with = request_body(&request, "m", true, None, Some(4096));
+        assert_eq!(with["max_tokens"], json!(4096));
     }
 
     #[test]
@@ -610,6 +660,7 @@ mod tests {
             &request,
             "deepseek-v4-flash",
             false,
+            None,
             None,
         );
         assert_eq!(body["thinking"], json!({ "type": "disabled" }));
@@ -785,17 +836,20 @@ mod tests {
         }
     }
 
-    /// Backoff grows and stays short: this sits in front of a person,
-    /// or an eval run being timed.
+    /// The budget has to cover two faults with different clocks: a
+    /// proxy's 530, which clears in about a second, and a local
+    /// server's 503 while it loads a model off disk, which takes ten to
+    /// twenty.
     ///
     /// Only `MAX_ATTEMPTS - 1` waits ever happen — the last attempt
-    /// returns its failure rather than sleeping on it — so that is what
-    /// the total is measured over.
+    /// returns its failure rather than sleeping on it.
     #[test]
-    fn the_whole_retry_budget_is_about_a_second() {
+    fn the_retry_budget_covers_a_cold_model_load() {
         let waits: Vec<u128> = (1..MAX_ATTEMPTS).map(|n| backoff(n).as_millis()).collect();
         assert!(waits.windows(2).all(|w| w[1] > w[0]), "grows: {waits:?}");
-        assert!(waits.iter().sum::<u128>() <= 1_500, "{waits:?}");
+        assert!(waits[0] <= 500, "the first retry is quick: {waits:?}");
+        let total: u128 = waits.iter().sum();
+        assert!((6_000..20_000).contains(&total), "{total}ms: {waits:?}");
     }
 
     #[test]
