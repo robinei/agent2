@@ -162,6 +162,47 @@ const ABSENT: &str = "No one is attached to this session right now; a question t
 /// `run_program(source)` / "a plain reply"), none of which exist as
 /// distinguished choices anymore. There is exactly one thing to say:
 /// nothing was lost, and the next program is whatever the model writes.
+/// Woken after a reply that arrived with no text at all — see
+/// [`Runner::stopped_short`].
+const EMPTY_REPLY_NOTICE: &str = "Your last reply arrived empty: the whole completion went to \
+     reasoning and nothing was written, so nothing ran and nobody was told anything. Write the \
+     reply this time — prose for what you are about to do, a ```js block for the doing.";
+
+/// Woken after a reply that wrote a tool call in another harness's
+/// syntax — see [`Runner::stopped_short`].
+const FOREIGN_TOOL_CALL_NOTICE: &str = "Your last reply contained a tool call in a syntax this \
+     harness does not read — `<tool_call>`, `<function=…>` or similar. It was not parsed. It \
+     reached the person as literal text, the call never happened, and nothing ran. **Code here \
+     runs only inside a fenced ```js block**: write `await tools.bash(\"…\")` in one, and the \
+     block executes as you finish it. Write the block now; the work you meant to do is still \
+     undone.";
+
+/// Woken after a reply that carried on the branch's own work and then
+/// ran nothing — see [`Runner::stopped_short`].
+const STOPPED_SHORT_NOTICE: &str = "Your last reply ran nothing, and nobody had asked you \
+     anything — so the work stopped where it was rather than finishing. If the task really is \
+     done, say so with `done()` inside a ```js block. Otherwise carry on from where you left \
+     off.";
+
+/// Whether this reply tried to call a tool in another harness's syntax.
+///
+/// Deliberately a short list of shapes that are **actions**, not prose:
+/// a model quoting one of these in a sentence would be a false
+/// positive, and the cost of that is one extra turn, against a run
+/// silently abandoning its task.
+fn foreign_tool_call(text: &str) -> bool {
+    const SHAPES: [&str; 7] = [
+        "<tool_call>",
+        "<function=",
+        "<function_call",
+        "<parameter=",
+        "<invoke name=",
+        "[TOOL_REQUEST]",
+        "\"tool_calls\"",
+    ];
+    SHAPES.iter().any(|shape| text.contains(shape))
+}
+
 const INTERRUPT_NOTICE: &str = "The user interrupted your program. It is paused at its last fuel slice — nothing \
      is lost, every completed call is already an artifact — and what happens next is \
      whatever program you write.";
@@ -637,6 +678,13 @@ struct ReplyShape {
     spoke: bool,
     /// Its run has logged a terminal or a pause.
     handed_back: bool,
+    /// The reply's own text — prose and cells, as written.
+    text: String,
+    /// A `Post` landed between the previous reply and this one, so this
+    /// reply is an **answer**. Without one it is a continuation of the
+    /// branch's own work, and a continuation that runs nothing has
+    /// stopped that work rather than finished it.
+    answering: bool,
 }
 
 impl Runner {
@@ -831,10 +879,11 @@ impl Runner {
         if !self.unseen_posts(tree).is_empty() {
             return true;
         }
-        // **A reply that said nothing is not a rest.** Ask once more;
-        // `empty_reply_deserves_another_ask` is what keeps that from
-        // becoming a loop.
-        if self.empty_reply_deserves_another_ask(tree) {
+        // **A reply that stopped short is not a rest.** The note
+        // itself is logged by `prompt_if_needed`, which is where the
+        // branch has a `&mut Tree` to log it into; this only has to
+        // agree that there is one.
+        if self.stopped_short(tree).is_some() {
             return true;
         }
         // The crash-recovery clause, `shown`-guarded like everything
@@ -878,25 +927,33 @@ impl Runner {
     fn replies(&self, tree: &Tree) -> Vec<ReplyShape> {
         let segment = self.agent_segment(tree);
         let mut out: Vec<ReplyShape> = Vec::new();
+        let mut posted_since = false;
         for event in &segment {
             match &event.payload {
-                EventPayload::Reply | EventPayload::Restart => out.push(ReplyShape {
-                    id: event.id,
-                    ran: false,
-                    spoke: false,
-                    handed_back: false,
-                }),
+                EventPayload::Reply | EventPayload::Restart => {
+                    out.push(ReplyShape {
+                        id: event.id,
+                        ran: false,
+                        spoke: false,
+                        handed_back: false,
+                        text: String::new(),
+                        answering: std::mem::take(&mut posted_since),
+                    });
+                }
+                EventPayload::Post { .. } => posted_since = true,
                 EventPayload::Part { part, .. } => {
                     if let Some(last) = out.last_mut() {
                         match part {
-                            crate::types::Part::Cell(_) => {
+                            crate::types::Part::Cell(t) => {
                                 last.ran = true;
                                 last.spoke = true;
+                                last.text.push_str(t);
                             }
-                            crate::types::Part::Prose(t) if !t.trim().is_empty() => {
-                                last.spoke = true
+                            crate::types::Part::Prose(t) => {
+                                last.spoke |= !t.trim().is_empty();
+                                last.text.push_str(t);
                             }
-                            _ => {}
+                            crate::types::Part::Thinking(_) => {}
                         }
                     }
                 }
@@ -924,23 +981,59 @@ impl Runner {
         (last.ran && last.handed_back).then_some(last.id)
     }
 
-    /// Whether the branch should be asked again because its last reply
-    /// **said nothing at all** — and how many times in a row that has
-    /// now happened, so the answer can stop being yes.
+    /// **The last reply stopped short of doing anything**, and the one
+    /// line that says so — the harness note the branch is woken with.
+    /// `None` when the reply ended on purpose and the branch should
+    /// rest.
     ///
-    /// **Bounded at one retry.** An empty completion is usually a
-    /// provider hiccup and a second ask gets a real reply; two in a row
-    /// is a branch that cannot speak, and asking a third time is a loop
-    /// that bills for itself. After that the branch rests with the
-    /// empty turns on the log, where a person can see them.
-    fn empty_reply_deserves_another_ask(&self, tree: &Tree) -> bool {
+    /// D4 says a reply with no cells is an implicit `done()`: the model
+    /// said its piece and the next thing to happen is whatever the
+    /// person says. That is right for an **answer** and wrong for the
+    /// two cases below, which the card already distinguishes in prose
+    /// ("it is the wrong one for a task you meant to carry on with,
+    /// where a reply that ends without running anything has stopped the
+    /// work without saying so") and which the harness did not:
+    ///
+    /// - **A tool call in someone else's syntax.** Measured on
+    ///   `qwen3.8-flash`, 2026-09-19: it wrote `<tool_call><function=bash>…`
+    ///   as prose in four runs out of four, once with the task's whole
+    ///   answer in it. That is not an answer, it is an action that
+    ///   missed. A card sentence forbidding it was tried first and
+    ///   ignored 3/3 — the model complied on one reply and drifted back
+    ///   on the next — so it is said here instead, where it arrives at
+    ///   the moment of the mistake rather than 16 KB earlier.
+    /// - **A continuation that ran nothing.** No post prompted this
+    ///   reply, so nobody asked it anything; it was carrying on its own
+    ///   work and stopped without a `done()`.
+    ///
+    /// A reply that *was* answering a post and ran nothing is left
+    /// alone. That is `plain-question`'s whole shape, and a follow-up
+    /// answered in prose mid-task is the same shape.
+    ///
+    /// **Bounded at one retry**, counting every trailing reply that ran
+    /// nothing: twice in a row is a branch that cannot do this, and a
+    /// third ask is a loop that bills for itself.
+    fn stopped_short(&self, tree: &Tree) -> Option<String> {
         let replies = self.replies(tree);
-        let trailing_empty = replies
+        let last = replies.last()?;
+        if last.ran || !last.handed_back {
+            return None;
+        }
+        let trailing = replies
             .iter()
             .rev()
-            .take_while(|r| !r.spoke && r.handed_back)
+            .take_while(|r| !r.ran && r.handed_back)
             .count();
-        trailing_empty == 1
+        if trailing != 1 {
+            return None;
+        }
+        if !last.spoke {
+            return Some(EMPTY_REPLY_NOTICE.to_owned());
+        }
+        if foreign_tool_call(&last.text) {
+            return Some(FOREIGN_TOOL_CALL_NOTICE.to_owned());
+        }
+        (!last.answering).then(|| STOPPED_SHORT_NOTICE.to_owned())
     }
 
     /// **Reconciliation's half of the trigger rule**: forget having shown
@@ -2815,6 +2908,21 @@ impl Runner {
     fn prompt_if_needed(&mut self, tree: &mut Tree) -> io::Result<Vec<StepOutput>> {
         if !self.needs_prompt(tree) {
             return Ok(Vec::new());
+        }
+        // **Say why, before asking again.** A reply that stopped short
+        // gets woken with a harness post naming what went wrong, so the
+        // next one is written against the mistake rather than repeating
+        // it blind. Logged here because this is the one door an idle
+        // branch re-enters its LLM through, and the only place with a
+        // `&mut Tree` to log into.
+        if let Some(text) = self.stopped_short(tree) {
+            let origin = Origin::Direct {
+                text,
+                input: serde_json::Value::Null,
+                options: Vec::new(),
+                expects_reply: false,
+            };
+            self.deliver(tree, Author::Harness, origin)?;
         }
         // Checked before the request is built, not after: a document
         // over budget is over budget *for this request*, and the whole
@@ -6372,6 +6480,155 @@ mod tests {
             .content
             .clone();
         assert_eq!(assistant, crate::document::EMPTY_REPLY_NOTE);
+    }
+
+    /// **A tool call in another harness's syntax is an action that
+    /// missed, not an answer.** Measured on `qwen3.8-flash`: it wrote
+    /// `<tool_call><function=bash>…` as prose in four runs out of four,
+    /// once carrying the task's entire answer. The reply *spoke*, so
+    /// D4 rested the branch and the work was abandoned with the answer
+    /// sitting in the transcript.
+    #[test]
+    fn a_reply_that_wrote_a_foreign_tool_call_is_told_so_and_asked_again() {
+        let (mut tree, mut state) = setup_under();
+        user_post(&mut state, &mut tree, "go");
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(crate::host::scripted_markdown(
+                    "Let me look at what's here.\n\n                     <tool_call>\n<function=bash>\n<parameter=command>\nls -la\n                     </parameter>\n</function>\n</tool_call>",
+                )),
+            )
+            .unwrap();
+        let settled = drain(&mut state, &mut tree, out);
+        assert!(
+            settled
+                .iter()
+                .any(|o| matches!(o, StepOutput::LlmRequest(_))),
+            "the work is not finished: {settled:?}"
+        );
+        // And it is *told* why, in the channel it demonstrably reads.
+        let notice = state
+            .agent_segment(&tree)
+            .iter()
+            .filter_map(|e| match &e.payload {
+                EventPayload::Post {
+                    from: Author::Harness,
+                    origin,
+                } => origin.direct().map(|(t, _, _)| t.to_owned()),
+                _ => None,
+            })
+            .next_back()
+            .expect("a harness notice");
+        assert!(notice.contains("```js"), "{notice}");
+    }
+
+    /// **But a prose answer is still an answer.** A reply that ran
+    /// nothing because it was answering a post rests, exactly as D4
+    /// says — `plain-question`'s whole shape, and a follow-up answered
+    /// mid-task is the same shape.
+    #[test]
+    fn a_prose_answer_to_a_post_rests_even_after_cells_have_run() {
+        let (mut tree, mut state) = setup_under();
+        user_post(&mut state, &mut tree, "go");
+        // A first reply that really does run something, and rests — so
+        // the post below is one the branch is actually shown, rather
+        // than one that arrives while a request is already out.
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(llm_program("let a = 1; done();")),
+            )
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+        assert!(state.is_idle(), "done() rests");
+
+        // Then the person asks a question, and it is answered in prose.
+        user_post(&mut state, &mut tree, "what does that mean?");
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(crate::host::scripted_markdown(
+                    "It means the total is one.\n",
+                )),
+            )
+            .unwrap();
+        let settled = drain(&mut state, &mut tree, out);
+        assert!(
+            !settled
+                .iter()
+                .any(|o| matches!(o, StepOutput::LlmRequest(_))),
+            "answering is not stopping short: {settled:?}"
+        );
+        assert!(state.is_idle());
+    }
+
+    /// **A continuation that ran nothing did stop short.** Nobody asked
+    /// it anything; it was carrying on its own work and ended without a
+    /// `done()`.
+    #[test]
+    fn a_continuation_that_ran_nothing_is_asked_again() {
+        let (mut tree, mut state) = setup_under();
+        user_post(&mut state, &mut tree, "go");
+        let out = state
+            .step(&mut tree, StepInput::LlmResponse(llm_program("let a = 1;")))
+            .unwrap();
+        drain(&mut state, &mut tree, out);
+
+        // No post in between: this reply continues the branch's own work.
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(crate::host::scripted_markdown(
+                    "Next I will fix the config.\n",
+                )),
+            )
+            .unwrap();
+        let settled = drain(&mut state, &mut tree, out);
+        assert!(
+            settled
+                .iter()
+                .any(|o| matches!(o, StepOutput::LlmRequest(_))),
+            "announcing work is not doing it: {settled:?}"
+        );
+
+        // Bounded: a second one in a row rests.
+        let out = state
+            .step(
+                &mut tree,
+                StepInput::LlmResponse(crate::host::scripted_markdown("Still thinking.\n")),
+            )
+            .unwrap();
+        let settled = drain(&mut state, &mut tree, out);
+        assert!(
+            !settled
+                .iter()
+                .any(|o| matches!(o, StepOutput::LlmRequest(_))),
+            "twice in a row rests: {settled:?}"
+        );
+    }
+
+    #[test]
+    fn a_foreign_tool_call_is_recognised_by_shape_not_by_guesswork() {
+        for text in [
+            "<tool_call>\n<function=bash>",
+            "ok <function=read_file> ok",
+            "<parameter=command>",
+            "<invoke name=\"bash\">",
+            "[TOOL_REQUEST]",
+            "{\"tool_calls\": []}",
+        ] {
+            assert!(foreign_tool_call(text), "{text:?}");
+        }
+        for text in [
+            "```js\nawait tools.bash(\"ls\");\n```",
+            "the function signature is f(x)",
+            "a < b and c > d",
+            "I called the tool and it worked",
+            "",
+        ] {
+            assert!(!foreign_tool_call(text), "{text:?}");
+        }
     }
 
     /// A cell that does not compile stops the run — but the cells
