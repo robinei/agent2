@@ -176,11 +176,19 @@ pub fn compact(tree: &Tree, spine: &Spine, ops: &[CompactionOp]) -> Vec<EventPay
 /// check. An `Agent` (the card and the worked examples it carries), a
 /// `Result` and a `Console` render inside something else or not at all,
 /// so naming one is a no-op rather than an error.
+///
+/// **A reply is named by its `Reply`** (or its `Restart`), not by any
+/// of the parts it is made of (28). The parts are pieces of one
+/// message; the document keys that message on the id the reply opened
+/// with, so that is the id an op has to be allowed to say. Naming a
+/// `Part` or a `ReplyEnd` would ask to compact half a sentence.
 fn renders_a_line(payload: &EventPayload) -> bool {
     matches!(
         payload,
         EventPayload::Post { .. }
             | EventPayload::Note { .. }
+            | EventPayload::Reply
+            | EventPayload::Restart
             | EventPayload::Handback { .. }
             | EventPayload::Call(_)
             | EventPayload::Fork { .. }
@@ -281,7 +289,7 @@ mod tests {
     /// A branch whose program made one call with a big result, so the
     /// completion report around its `Return` is the largest thing in
     /// the document — the shape every real run has.
-    fn branch_with_a_report() -> (Tree, Spine, EventId) {
+    fn branch_with_a_report() -> (Tree, Spine, EventId, EventId) {
         let mut tree = Tree::new(None);
         let mut spine = tree
             .start_agent(None, None, "root", None, "CARD", Vec::new())
@@ -342,7 +350,7 @@ mod tests {
                 },
             )
             .unwrap();
-        (tree, spine, ret)
+        (tree, spine, reply, ret)
     }
 
     /// **The completion report is a row.** Until 27.3 this arm of
@@ -354,7 +362,7 @@ mod tests {
     /// nothing. Two live compaction programs hit exactly that.
     #[test]
     fn compacting_a_return_removes_the_report_rendered_around_it() {
-        let (tree, spine, ret) = branch_with_a_report();
+        let (tree, spine, _reply, ret) = branch_with_a_report();
         let before = rendered_size(&render(&tree, &spine, 4096));
         let ops = [CompactionOp::Remove { from: ret, to: ret }];
         let events = compact(&tree, &spine, &ops);
@@ -362,7 +370,7 @@ mod tests {
 
         // Apply it and render again — the report's own words are gone
         // and the document is materially smaller.
-        let (mut tree, mut spine, _) = branch_with_a_report();
+        let (mut tree, mut spine, _, _) = branch_with_a_report();
         for payload in events {
             tree.append(&mut spine, payload).unwrap();
         }
@@ -377,7 +385,7 @@ mod tests {
         // The report is small here *because of 27.2*: a menu row no
         // longer replays its result, so the 3 KB of stdout above was
         // already an `ok, N bytes`. On a real run the menu is the bulk.
-        let (fresh, fresh_spine, fresh_ret) = branch_with_a_report();
+        let (fresh, fresh_spine, _, fresh_ret) = branch_with_a_report();
         let report = crate::report::derive_report(&fresh, fresh_spine.leaf_id, fresh_ret, 4096);
         assert!(
             before - after >= report.len() - 64,
@@ -424,7 +432,7 @@ mod tests {
     /// showed it were the right ones all along.
     #[test]
     fn a_call_is_addressable_because_its_line_is_its_menu_row() {
-        let (tree, spine, ret) = branch_with_a_report();
+        let (tree, spine, _reply, ret) = branch_with_a_report();
         let call = tree
             .path_events(spine.leaf_id)
             .iter()
@@ -576,6 +584,46 @@ mod tests {
         );
         assert!(
             tree.events.contains_key(&note),
+            "but the log still has it, so fetch still answers"
+        );
+    }
+
+    /// **A reply is one target, whatever it is made of** (28). The
+    /// document builds the assistant message out of a `Reply`, its
+    /// `Part`s and its `ReplyEnd`, but it keys that message on the
+    /// `Reply` — so that is the id a compaction op names, and naming it
+    /// removes the whole reply, cells and all.
+    #[test]
+    fn compacting_a_reply_removes_the_whole_reply() {
+        let (mut tree, mut spine, reply, _) = branch_with_a_report();
+        let before: String = render(&tree, &spine, 64 * 1024)
+            .messages
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect();
+        assert!(before.contains("cargo check --all-targets"), "{before}");
+
+        let ops = [CompactionOp::Remove {
+            from: reply,
+            to: reply,
+        }];
+        let payloads = compact(&tree, &spine, &ops);
+        assert_eq!(payloads.len(), 1, "the reply is nameable");
+        for payload in payloads {
+            tree.append(&mut spine, payload).unwrap();
+        }
+
+        let after: String = render(&tree, &spine, 64 * 1024)
+            .messages
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect();
+        assert!(
+            !after.contains("```js"),
+            "the reply's own cell is gone: {after}"
+        );
+        assert!(
+            tree.events.contains_key(&reply),
             "but the log still has it, so fetch still answers"
         );
     }

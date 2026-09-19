@@ -496,6 +496,12 @@ pub struct Runner {
     /// construction, on every path at once — including the ones nobody
     /// remembered to add a reset to.
     streaming_epoch: Option<u64>,
+    /// Whether the suspension the branch is parked on **falsified the
+    /// text still arriving**. See
+    /// [`notebook_cancels_generation`](Self::notebook_cancels_generation);
+    /// set wherever a run parks, because that is the one place the
+    /// cause is in hand.
+    pause_falsifies_the_rest: bool,
     /// The reply this generation has produced so far, verbatim.
     ///
     /// **Kept here rather than read off the run**, because the run does
@@ -696,6 +702,7 @@ impl Runner {
             last_vm: None,
             status_transitions: Vec::new(),
             streaming_epoch: None,
+            pause_falsifies_the_rest: false,
             streaming_reply: String::new(),
             pending_decision: None,
             reply_id: EventId::new(1),
@@ -2637,6 +2644,10 @@ impl Runner {
             }
         };
 
+        self.pause_falsifies_the_rest = matches!(
+            cause,
+            Handback::Trapped { .. } | Handback::CellFailed { .. }
+        );
         let stack: Vec<String> = run
             .vm
             .frames()
@@ -3504,6 +3515,14 @@ impl Runner {
         self.drive_notebook(tree)
     }
 
+    /// The run this branch holds, running or parked.
+    fn run_mut(&mut self) -> Option<&mut Run> {
+        match &mut self.phase {
+            Phase::Running(run) | Phase::Suspended(run, _) => Some(run),
+            _ => None,
+        }
+    }
+
     /// Take text into the reply and record whatever parts it completed —
     /// without running any of them.
     ///
@@ -3513,7 +3532,12 @@ impl Runner {
     /// first cell's effects put the end of the reply after the end of
     /// the run.
     fn notebook_feed(&mut self, tree: &mut Tree, text: &str) -> io::Result<()> {
-        let Phase::Running(run) = &mut self.phase else {
+        // **Suspended counts.** A raise or an arriving post parks the
+        // run while the reply keeps being written (28's cancellation
+        // rule: neither falsifies what follows), and text dropped here
+        // is text the log can never concatenate back — the cells after
+        // the raise would simply not exist when it was answered.
+        let Some(run) = self.run_mut() else {
             return Ok(());
         };
         let Some(notebook) = run.notebook.as_mut() else {
@@ -3521,7 +3545,7 @@ impl Runner {
         };
         let pieces = notebook.push_text(text);
         self.log_parts(tree, &pieces)?;
-        let Phase::Running(run) = &mut self.phase else {
+        let Some(run) = self.run_mut() else {
             return Ok(());
         };
         let Some(notebook) = run.notebook.as_mut() else {
@@ -3771,7 +3795,7 @@ impl Runner {
     fn log_parts(&mut self, tree: &mut Tree, pieces: &[crate::notebook::Piece]) -> io::Result<()> {
         let reply = self.reply_id;
         let outer: Vec<Part> = {
-            let Phase::Running(run) = &self.phase else {
+            let (Phase::Running(run) | Phase::Suspended(run, _)) = &self.phase else {
                 return Ok(());
             };
             let Some(nb) = run.notebook.as_ref() else {
@@ -3793,21 +3817,42 @@ impl Runner {
 
     /// The generation ended some way other than a completion arriving —
     /// cancelled, superseded, errored, interrupted. The reply is over.
+    ///
+    /// **And says so.** The text stops mid-sentence, and a reply whose
+    /// `ReplyEnd` reads `Finished` gives the model no reason for that —
+    /// it reads its own last turn breaking off and has to invent one.
+    /// `Interrupted` renders as a marker where the text stops.
     pub fn notebook_generation_ended(&mut self, tree: &mut Tree) -> io::Result<()> {
+        if self.streaming_epoch.is_some() {
+            self.reply_ended.get_or_insert(ReplyEnd::Interrupted);
+        }
         self.finish_notebook_generation(tree, None, None)
     }
 
-    /// Whether a suspension or completion should cancel the generation still
-    /// in flight (D11).
+    /// Whether a suspension should cancel the generation still in
+    /// flight.
     ///
-    /// **A trap or a `raise` should; `done()` should not.** A suspension parks
-    /// the VM, so no later cell can run until a handler resumes it — every
-    /// token still being generated is waste. `done()` stops nothing (D8): the
-    /// later cells still run, and the prose the model is still writing is very
-    /// often the answer the person asked for, so cutting it off would truncate
-    /// the reply mid-sentence.
+    /// **Cancel when the text that follows was written on a premise we
+    /// now know is false** (28). That is one sentence, and it decides
+    /// every case:
+    ///
+    /// - `Trapped`, `CellFailed` — cancel. Everything the model wrote
+    ///   after that block assumed the block succeeded.
+    /// - `Raised`, `Posted` — keep streaming. The model knew it was
+    ///   asking; a message arriving falsifies nothing it wrote. The
+    ///   cells after the raise run when the answer lands.
+    /// - `done()` — parks nothing at all, so it never reaches here.
+    ///
+    /// The rule used to be "any suspension cancels", which contradicted
+    /// the card — *"the blocks after this one do not run until it is
+    /// answered"*, not *"are never written"* — and made the semantics
+    /// depend on **provider speed**: if the later fences had already
+    /// streamed they ran, and if not they had never been written. Same
+    /// reply, same model, different behaviour.
     pub fn notebook_cancels_generation(&self) -> bool {
-        self.streaming_epoch.is_some() && matches!(self.phase, Phase::Suspended(..))
+        self.streaming_epoch.is_some()
+            && matches!(self.phase, Phase::Suspended(..))
+            && self.pause_falsifies_the_rest
     }
 }
 
@@ -6430,15 +6475,83 @@ mod tests {
         assert_eq!(text, reply, "verbatim, prose and fences included");
     }
 
+    /// **A raise does not** (28). The model knew it was asking; the
+    /// cells it wrote after the raise were not written on a premise the
+    /// raise falsified, and the card promises they run once it is
+    /// answered — *"the blocks after this one do not run until it is
+    /// answered"*, not *"are never written"*.
+    ///
+    /// Cancelling here also made the semantics depend on provider
+    /// speed: the same reply ran its later cells or lost them
+    /// altogether depending on whether they had streamed in yet.
     #[test]
-    fn a_raise_in_a_cell_asks_for_the_generation_to_be_cancelled() {
+    fn a_raise_in_a_cell_lets_the_generation_finish() {
         let (mut tree, mut state) = setup_under();
         user_post(&mut state, &mut tree, "go");
         state.phase = Phase::AwaitingLlm;
 
         stream_chunks(&mut state, &mut tree, &["```js\nraise(\"which\");\n```\n"]);
         assert!(matches!(state.phase, Phase::Suspended(..)));
-        assert!(state.notebook_cancels_generation());
+        assert!(
+            !state.notebook_cancels_generation(),
+            "the rest of the reply is still worth having"
+        );
+
+        // The rest arrives while the run is parked, and lands on the
+        // log as parts of the same reply…
+        stream_chunks(
+            &mut state,
+            &mut tree,
+            &["\n```js\nconsole.log(\"after the raise\");\n```\n"],
+        );
+        state
+            .notebook_stream_end(&mut tree, false, None, None)
+            .unwrap();
+        assert!(
+            matches!(state.phase, Phase::Suspended(..)),
+            "still parked: the reply ended, the run did not"
+        );
+
+        // …and runs when the raise is answered.
+        let out = state.resume(&mut tree, json!("that one")).unwrap();
+        drain(&mut state, &mut tree, out);
+        let consoles: Vec<String> = state
+            .agent_segment(&tree)
+            .iter()
+            .filter_map(|e| match &e.payload {
+                EventPayload::Console { lines } => Some(lines.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert_eq!(consoles, vec!["after the raise"]);
+    }
+
+    /// A post arriving is the same: it parks the run (rule B), and
+    /// falsifies nothing the model wrote.
+    #[test]
+    fn a_post_arriving_lets_the_generation_finish() {
+        let (mut tree, mut state) = setup_under();
+        user_post(&mut state, &mut tree, "go");
+        state.phase = Phase::AwaitingLlm;
+        stream_chunks(
+            &mut state,
+            &mut tree,
+            &["```js\nawait tools.slow();\n```\n"],
+        );
+        // A post the branch has not been shown, logged mid-run: the
+        // next fuel slice parks on it.
+        user_post(&mut state, &mut tree, "one more thing");
+        let _ = state.step(&mut tree, StepInput::Tick { fuel: TICK_FUEL })
+            .unwrap();
+        assert!(
+            matches!(state.phase, Phase::Suspended(..)),
+            "the post parked the run"
+        );
+        assert!(
+            !state.notebook_cancels_generation(),
+            "a message arriving falsifies nothing the model wrote"
+        );
     }
 
     /// **But `done()` does not** (D8, D11). It stops nothing: the later

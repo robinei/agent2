@@ -773,7 +773,7 @@ fn cut_off_note(how: &ReplyEnd) -> Option<&'static str> {
     match how {
         ReplyEnd::Finished => None,
         ReplyEnd::Truncated => Some("\n\n— cut off here: the reply hit its token budget —"),
-        ReplyEnd::Interrupted => Some("\n\n— cut off here: the block above stopped the run —"),
+        ReplyEnd::Interrupted => Some("\n\n— cut off here: the rest of the reply was not read —"),
         ReplyEnd::Failed(_) => Some("\n\n— nothing arrived: the provider failed —"),
     }
 }
@@ -1029,6 +1029,60 @@ mod tests {
                 options: Vec::new(),
                 expects_reply: true,
             },
+        }
+    }
+
+    /// **A reply that stopped early says so, where it stopped** (28).
+    /// The model reads its own last turn back; without a marker it
+    /// breaks off mid-sentence for no reason it can see, and the most
+    /// natural reading is that it chose to.
+    #[test]
+    fn a_reply_cut_off_carries_its_marker_into_the_document() {
+        for (how, want) in [
+            (crate::types::ReplyEnd::Truncated, "token budget"),
+            (
+                crate::types::ReplyEnd::Interrupted,
+                "the rest of the reply was not read",
+            ),
+        ] {
+            let mut tree = Tree::new(None);
+            let mut spine = tree
+                .start_agent(None, None, "root", None, "CARD", Vec::new())
+                .unwrap();
+            tree.append(&mut spine, user_post("hello")).unwrap();
+            let reply = tree.append(&mut spine, EventPayload::Reply).unwrap();
+            tree.append(
+                &mut spine,
+                EventPayload::Part {
+                    reply,
+                    part: Part::Prose("Looking at the first of the two".into()),
+                },
+            )
+            .unwrap();
+            tree.append(
+                &mut spine,
+                EventPayload::ReplyEnd {
+                    reply,
+                    how,
+                    usage: Default::default(),
+                },
+            )
+            .unwrap();
+
+            let assistant = render(&tree, &spine, 64 * 1024)
+                .conversation()
+                .iter()
+                .find(|m| m.role == ChatRole::Assistant)
+                .map(|m| m.content.clone())
+                .expect("the reply renders");
+            assert!(
+                assistant.starts_with("Looking at the first of the two"),
+                "verbatim first: {assistant}"
+            );
+            assert!(
+                assistant.contains(want),
+                "and then the marker: {assistant}"
+            );
         }
     }
 
