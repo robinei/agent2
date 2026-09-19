@@ -206,7 +206,6 @@ fn print_document(log: Option<&str>) -> Result<(), String> {
         &tree,
         &tree.spine_at(leaf),
         64 * 1024,
-        document::configured_transport(),
     );
 
     let total: usize = doc.messages.iter().map(|m| m.content.len()).sum();

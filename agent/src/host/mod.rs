@@ -134,19 +134,6 @@ pub(crate) fn compaction_headroom() -> f64 {
         .unwrap_or(DEFAULT_COMPACTION_HEADROOM)
 }
 
-/// How many parse-repair round trips a single completion gets before a
-/// parse failure is let through to become a real, terminal
-/// `Cause::CompileFailed`. Ported from the deleted POC's repair loop
-/// (`codemode/runner.rs`'s `take_program`, 23_ONE_AGENT A5): live evidence
-/// (2026-09-14) found a genuinely well-engineered ~80-line program lose
-/// an entire task to one unbalanced paren the compiler already named
-/// exactly — a slip at least as mechanically fixable as any runtime trap,
-/// and this loop is what gives the model the chance to fix it instead of
-/// losing the run outright. Small on purpose: a program that still won't
-/// parse after this many corrections is not a typo any more, and the
-/// ordinary `Cause::CompileFailed` path (an artifact menu, a rewrite) is
-/// the more honest next step than retrying silently forever.
-const MAX_REPAIR_ATTEMPTS: u32 = 3;
 
 /// A counting semaphore (std-only) bounding concurrent LLM completions.
 /// LLM worker threads block in `acquire` until a permit frees; the
@@ -1361,7 +1348,7 @@ impl Session {
     /// handler's decision (the disposition a `Cause::Truncated` condition
     /// needs to log), which this loop has no visibility into and must
     /// not guess at.
-    fn on_llm_response(&mut self, branch: BranchId, mut message: LlmTurn) -> io::Result<()> {
+    fn on_llm_response(&mut self, branch: BranchId, message: LlmTurn) -> io::Result<()> {
         // The no-fence rule, applied **once, here**, before anything reads
         // `source`: models wrap programs in ```js fences often enough that
         // the POC grew `fence.rs` for it and validated the need live. This
@@ -1377,45 +1364,7 @@ impl Session {
         // would fail on the prose and send every turn into the repair loop.
         // A notebook's cells are compiled one at a time, by the driver, and
         // a cell that does not compile is reported as itself.
-        let notebook = self
-            .states
-            .get(&branch)
-            .map(|s| s.transport())
-            .unwrap_or_default()
-            == crate::document::Transport::Notebook;
-        if !notebook {
-            message.source = crate::document::extract_program(&message.source);
-        }
-        if !notebook
-            && !message.truncated
-            && let Err(diagnostics) = interp::compile(&message.source)
-        {
-            let attempts = self.repair_attempts.entry(branch).or_insert(0);
-            *attempts += 1;
-            if *attempts <= MAX_REPAIR_ATTEMPTS
-                && let Some(state) = self.states.get(&branch)
-            {
-                let rendered = diagnostics
-                    .iter()
-                    .map(|d| d.render(&message.source))
-                    .collect::<Vec<_>>()
-                    .join("\n\n");
-                let repair = format!(
-                    "the previous response did not parse as JavaScript:\n{rendered}\n\n\
-                     reply again with corrected source — the whole response is \
-                     parsed as JavaScript, nothing else."
-                );
-                let doc = state
-                    .document(&self.tree, document_budget())
-                    .with_tail(&repair);
-                self.spawn_llm(branch, doc);
-                return Ok(());
-            }
-            // Attempts exhausted, or the branch vanished mid-retry: fall
-            // through and let `step_branch` log the real, terminal
-            // `Cause::CompileFailed` — it alone has the VM stack context
-            // (disposition, artifact menu) this loop cannot fabricate.
-        }
+
         self.repair_attempts.remove(&branch);
         self.step_branch(branch, StepInput::LlmResponse(message))
     }
@@ -2267,8 +2216,7 @@ mod tests {
         session
             .states
             .get_mut(&branch)
-            .expect("conversation branch")
-            .set_transport(crate::document::Transport::Notebook);
+            .expect("conversation branch");
         session.handle().send(SessionCommand::UserTurn {
             branch,
             text: "go".into(),
@@ -2378,8 +2326,7 @@ mod tests {
         session
             .states
             .get_mut(&branch)
-            .expect("conversation branch")
-            .set_transport(crate::document::Transport::Notebook);
+            .expect("conversation branch");
         session.handle().send(SessionCommand::UserTurn {
             branch,
             text: "go".into(),
@@ -2443,7 +2390,10 @@ mod tests {
         (session, events)
     }
 
-    /// The value a branch's program returned — the `Return` on its path.
+    /// The value on this branch's `Return` — always null under a
+    /// notebook reply (D5: there is no `return`), which is exactly what
+    /// the tests that still call this are *about*: that completing
+    /// without saying anything still logs a terminal.
     fn returned(tree: &Tree, leaf: EventId) -> serde_json::Value {
         tree.path_events(leaf)
             .iter()
@@ -2453,6 +2403,27 @@ mod tests {
                 _ => None,
             })
             .expect("a Return on this branch")
+    }
+
+    /// The value this branch's last `history.append` handed forward.
+    ///
+    /// **The replacement for `returned`.** A reply has no `return` (D5):
+    /// what crosses to the next one goes through `history.append`, so a
+    /// test asking "what did the program produce" asks the log for its
+    /// last `Note`. Every fixture that used to end `return x;` ends
+    /// `history.append(x);` now, and this reads it back.
+    fn appended(tree: &Tree, leaf: EventId) -> serde_json::Value {
+        tree.path_events(leaf)
+            .iter()
+            .rev()
+            .find_map(|e| match &e.payload {
+                EventPayload::Note { text, .. } => Some(
+                    serde_json::from_str(text)
+                        .unwrap_or_else(|_| serde_json::Value::String(text.clone())),
+                ),
+                _ => None,
+            })
+            .expect("a history.append on this branch")
     }
 
     /// Every `Agent` root in the log, by charter.
@@ -2571,7 +2542,7 @@ mod tests {
             [
                 "Agent", "Post", "Turn",
                 // Calls are logged at dispatch, their results at landing.
-                "Call", "Call", "Result", "Result", "Return", "Console",
+                "Call", "Call", "Completion", "Result", "Result", "Note", "Return", "Console",
             ]
         );
         // Both fan-out results landed (order is completion order).
@@ -2665,8 +2636,8 @@ mod tests {
         let seen = seen.lock().unwrap();
         let system = &seen.first().expect("a request").messages[0].content;
         assert!(
-            system.starts_with("/**"),
-            "the card opens as a .d.ts: {}",
+            system.starts_with("Your reply is **markdown**"),
+            "the card opens as the markdown document it is: {}",
             &system[..40]
         );
         assert!(system.contains("function fetch_page("), "{system}");
@@ -2692,7 +2663,7 @@ mod tests {
         let script = vec![
             scripted_program(
                 "const s = tools.slow(); const f = tools.fast(); \
-                 const r = [await s, await f]; done(); return r;",
+                 const r = [await s, await f]; done(); history.append(r);",
             ),
             scripted_text("done"),
         ];
@@ -2718,12 +2689,11 @@ mod tests {
             [&json!("fast"), &json!("slow")],
             "inbox arrival order is the logged resolution order"
         );
-        // The program still saw its own await order. The return value
-        // renders beside its own fetch id ("returned [#N]: ..."), not a
-        // bare "returned: ...".
+        // The program still saw its own await order — and it reaches the
+        // next reply as the row it appended, not as a return value.
         let texts = tool_texts(&session);
         assert!(
-            texts[0].contains(r#"["slow","fast"]"#) && texts[0].contains("returning `["),
+            texts[0].contains(r#"note: ["slow","fast"]"#),
             "{texts:?}"
         );
     }
@@ -2811,8 +2781,8 @@ mod tests {
         // there is exactly one.
         let script = vec![
             scripted_program(
-                r#"try { const r = await tools.big(); done(); return r; }
-                   catch (e) { done(); return "rejected: " + e; }"#,
+                r#"try { const r = await tools.big(); done(); history.append(r); }
+                   catch (e) { done(); history.append("rejected: " + e); }"#,
             ),
             scripted_text("done"),
         ];
@@ -2847,11 +2817,14 @@ mod tests {
             .events
             .values()
             .find_map(|e| match &e.payload {
-                EventPayload::Return { value } => value.as_str().map(str::to_owned),
+                EventPayload::Note { text, .. } => Some(text.clone()),
                 _ => None,
             })
             .unwrap();
-        assert!(program_result.starts_with("rejected: result too large"));
+        assert!(
+            program_result.starts_with("rejected: result too large"),
+            "{program_result}"
+        );
     }
 
     /// M2, half of it: `raise` with a payload prompts the moment a run
@@ -2876,7 +2849,7 @@ mod tests {
     #[test]
     fn raise_sends_the_condition_report_as_a_one_shot_prompt() {
         let script = vec![scripted_program(
-            r#"const x = raise("need_value", { why: "no default" }); return x + 1;"#,
+            r#"const x = raise("need_value", { why: "no default" }); history.append(x + 1);"#,
         )];
         let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
         let llm = CapturingLlm {
@@ -2944,7 +2917,7 @@ mod tests {
     /// for its block's id (the `run_program` Assistant event).
     #[test]
     fn program_status_runs_then_completes() {
-        let script = vec![scripted_program("return 1 + 1;"), scripted_text("done")];
+        let script = vec![scripted_program("history.append(1 + 1);"), scripted_text("done")];
         let (session, events) = run_session(ToolRegistry::new(), script, "go");
         let program = run_program_id(session.tree());
         assert_eq!(
@@ -2969,7 +2942,7 @@ mod tests {
     #[test]
     fn program_status_tracks_raise_and_resume() {
         let script = vec![
-            scripted_program(r#"const x = raise("need", null); return x;"#),
+            scripted_program(r#"const x = raise("need", null); history.append(x);"#),
             scripted_resume(json!(7)),
         ];
         let (session, events) = run_session(ToolRegistry::new(), script, "go");
@@ -2981,11 +2954,13 @@ mod tests {
                 ProgramStatus::Suspended,
                 ProgramStatus::Running,
                 ProgramStatus::Completed,
-            ]
+            ],
+            "kinds: {:?}",
+            kinds(session.tree(), root_leaf(&session))
         );
         // The raise expression really did resolve to 7, not to the raw
         // decision object — the resumed VM carried on and returned it.
-        assert_eq!(returned(session.tree(), root_leaf(&session)), json!(7));
+        assert_eq!(appended(session.tree(), root_leaf(&session)), json!(7));
     }
 
     /// Step 2 (decision 4): the first event after an agent's `Agent`
@@ -3047,8 +3022,8 @@ mod tests {
         let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
         let llm = CapturingLlm {
             inner: ScriptedLlm::new([
-                scripted_program(r#"await tools.fetch("expensive"); const v = null; return v.x;"#),
-                scripted_program("return await fetch_history(4);"),
+                scripted_program(r#"await tools.fetch("expensive"); const v = null; history.append(v.x);"#),
+                scripted_program("history.append(await fetch_history(4));"),
             ]),
             seen: std::sync::Arc::clone(&seen),
         };
@@ -3098,17 +3073,14 @@ mod tests {
             fetch_invokes, 1,
             "fetch must not be repeated by the rewrite"
         );
-        // The rewrite's own completion returned the reused value. Unlike
-        // the trapped condition's report above, this one **is** a
-        // genuine depth-0 `Return` — nothing suspended it — so it is
-        // visible in the log itself, and `tool_texts` (not
-        // `CapturingLlm`: nothing ever prompts a third completion to
-        // carry it as a tail, since finishing does not by itself invite
-        // one) is what a later render would actually fold it through.
+        // The rewrite handed the reused value on. A reply has no
+        // `return`, so what a later render folds through is the row it
+        // appended — which is the point of the test either way: the
+        // value came back from the log rather than from a second fetch.
         assert!(
             tool_texts(&session)
                 .iter()
-                .any(|t| t.contains("returning") && t.contains(r#""DATA""#)),
+                .any(|t| t.contains("note: DATA")),
             "{:?}",
             tool_texts(&session)
         );
@@ -3218,7 +3190,7 @@ mod tests {
             ToolRegistry::new(),
             vec![scripted_program(
                 r#"const a = await ask("user", "continue?");
-                   return "got: " + a;"#,
+                   history.append("got: " + a);"#,
             )],
             "go",
         );
@@ -3246,7 +3218,12 @@ mod tests {
             .events
             .values()
             .find_map(|e| match &e.payload {
-                EventPayload::Return { value } => Some(value.clone()),
+                // A reply has no `return`: what it handed forward is its
+                // last `history.append`.
+                EventPayload::Note { text, .. } => Some(
+                    serde_json::from_str::<serde_json::Value>(text)
+                        .unwrap_or_else(|_| serde_json::Value::String(text.clone())),
+                ),
                 _ => None,
             });
         assert_eq!(
@@ -3268,7 +3245,7 @@ mod tests {
             ToolRegistry::new(),
             vec![scripted_program(
                 r#"const p = await choose("user", "which?", ["A", "B"]);
-                   return "picked: " + p;"#,
+                   history.append("picked: " + p);"#,
             )],
             "go",
         );
@@ -3291,7 +3268,12 @@ mod tests {
             .events
             .values()
             .find_map(|e| match &e.payload {
-                EventPayload::Return { value } => Some(value.clone()),
+                // A reply has no `return`: what it handed forward is its
+                // last `history.append`.
+                EventPayload::Note { text, .. } => Some(
+                    serde_json::from_str::<serde_json::Value>(text)
+                        .unwrap_or_else(|_| serde_json::Value::String(text.clone())),
+                ),
                 _ => None,
             });
         assert_eq!(
@@ -3318,12 +3300,12 @@ mod tests {
             vec![
                 scripted_program(
                     r#"const p = await choose("user", "which?", ["A", "B"]);
-                       return "picked: " + p;"#,
+                       history.append("picked: " + p);"#,
                 ),
                 // The handler. It sees the words in its condition
                 // report and maps them onto an option itself — the
                 // judgement the harness deliberately refused to make.
-                scripted_program(r#"return resume("B");"#),
+                scripted_program(r#"history.append(resume("B"));"#),
             ],
             "go",
         );
@@ -3371,7 +3353,12 @@ mod tests {
             .events
             .values()
             .find_map(|e| match &e.payload {
-                EventPayload::Return { value } => Some(value.clone()),
+                // A reply has no `return`: what it handed forward is its
+                // last `history.append`.
+                EventPayload::Note { text, .. } => Some(
+                    serde_json::from_str::<serde_json::Value>(text)
+                        .unwrap_or_else(|_| serde_json::Value::String(text.clone())),
+                ),
                 _ => None,
             });
         assert_eq!(
@@ -3395,7 +3382,7 @@ mod tests {
         let (session, _e) = run_session(
             crate::host::tools::real_registry(),
             vec![scripted_program(
-                r#"const x = await tools.read_file("/nonexistent/deeply/nested/path/that/is/not/there.txt"); return x;"#,
+                r#"const x = await tools.read_file("/nonexistent/deeply/nested/path/that/is/not/there.txt"); history.append(x);"#,
             )],
             "go",
         );
@@ -3449,9 +3436,7 @@ mod tests {
         // either, so it never manufactured one here.
         assert_eq!(
             kinds(tree, root_leaf(&session)),
-            [
-                "Agent", "Post", "Turn", "Call", "Return", "Console", "Result"
-            ]
+            ["Agent", "Post", "Turn", "Call", "Completion", "Return", "Console", "Result"]
         );
 
         // The one `Post` on this branch is the user's own kickoff.
@@ -3966,7 +3951,7 @@ mod tests {
                 // `finish_program`: completing no longer rests by
                 // default, so the helper for "say it and stop" has to
                 // say so) — the literal source is what renders here.
-                "tell(\"user\", \"forked done\"); done();"
+                "tell(\"user\", \"forked done\"); done();\n"
             ]
         );
         // The fork's id was announced, and both branches are live.
@@ -4197,7 +4182,7 @@ mod tests {
             tree,
             "ignored",
             ToolRegistry::new(),
-            Box::new(ScriptedLlm::new(vec![scripted_program("return 999;")])),
+            Box::new(ScriptedLlm::new(vec![scripted_program("history.append(999);")])),
             tx,
         )
         .expect("opens the interrupted log");
@@ -4252,7 +4237,7 @@ mod tests {
         );
         let kinds = kinds(session.tree(), root_leaf(&session));
         assert!(
-            kinds.ends_with(&["Turn", "Return", "Console"]),
+            kinds.ends_with(&["Turn", "Note", "Completion", "Return", "Console"]),
             "the rewrite ran to completion and the branch went idle: {kinds:?}"
         );
         assert!(session.quiet());
@@ -4314,7 +4299,8 @@ mod tests {
                     // (Agent 1, Post 2, Turn 3, Spawn 4, Agent 5, Result
                     // 6, Send 7, Post 8).
                     vec![scripted_answer(
-                        EventId::new(8),
+                        // 8 before every reply gained a `Completion` row.
+                        EventId::new(9),
                         "w1",
                         json!("PLAN.md, and it is 40 lines"),
                     )],
@@ -4327,14 +4313,14 @@ mod tests {
                         // (`machine.rs`'s `finish_program`) and consume
                         // the leftover `scripted_text("done")` below as
                         // its own next turn, which would log a second,
-                        // unrelated `Return` and break `returned()`'s
+                        // unrelated `Return` and break `appended()`'s
                         // "the last one on this path" reading of the
                         // answer this test actually checks.
                         scripted_program(
                             r#"const w = await spawn("reads files");
                                const value = await ask(w.agent, "which file?");
                                done();
-                               return value;"#,
+                               history.append(value);"#,
                         ),
                         scripted_text("done"),
                     ],
@@ -4409,7 +4395,7 @@ mod tests {
         );
 
         // …and the program got the answer, whole.
-        assert_eq!(returned(tree, root_leaf(&session)), value);
+        assert_eq!(appended(tree, root_leaf(&session)), value);
 
         // The agent's own root is a child of the `Spawn` that made it.
         let spawn = tree
@@ -4445,7 +4431,7 @@ mod tests {
                     vec![
                         scripted_program(
                             r#"const w = await spawn("takes notes");
-                               return await tell(w.agent, "fyi: skip the cache");"#,
+                               history.append(await tell(w.agent, "fyi: skip the cache"));"#,
                         ),
                         scripted_text("told them"),
                     ],
@@ -4465,9 +4451,7 @@ mod tests {
         // surprise.
         assert_eq!(
             kinds(tree, worker_leaf),
-            [
-                "Agent", "Post", "Turn", "Call", "Return", "Console", "Result"
-            ]
+            ["Agent", "Post", "Turn", "Call", "Completion", "Return", "Console", "Result"]
         );
         assert!(
             tree.spine_at(worker_leaf).context().open.is_empty(),
@@ -4550,11 +4534,11 @@ mod tests {
                         r#"const names = ["alpha", "beta", "gamma"];
                            const made = await Promise.all(
                              names.map(n => spawn("worker " + n)));
-                           return made.map(m => m.agent);"#,
+                           history.append(made.map(m => m.agent));"#,
                     ),
                     // A different program, a fresh VM: the handles above
                     // are gone, and the workers are found by query.
-                    scripted_program("return list_agents({ deep: false });"),
+                    scripted_program("history.append(list_agents({ deep: false }));"),
                 ],
             )],
         );
@@ -4574,7 +4558,7 @@ mod tests {
         let session = drain(session);
         let tree = session.tree();
         // The *last* `Return` on the branch is the second program's.
-        let rows: Vec<serde_json::Value> = returned(tree, root_leaf(&session))
+        let rows: Vec<serde_json::Value> = appended(tree, root_leaf(&session))
             .as_array()
             .unwrap()
             .clone();
@@ -4640,8 +4624,14 @@ mod tests {
                     // test is actually about.
                     vec![scripted_program(
                         r#"const g = await spawn("helper");
-                           answer(8, "w2", "made a helper");
-                           return g.agent;"#,
+                           // The post id root's `ask` creates on this
+                           // branch. It moved from 8 to 9 when every
+                           // reply gained a `Completion` row of its own
+                           // — a counted id in a fixture is a hostage to
+                           // the log's shape, and this is the only one
+                           // left.
+                           answer(9, "made a helper");
+                           history.append(g.agent);"#,
                     )],
                 ),
                 (
@@ -4656,15 +4646,15 @@ mod tests {
                     vec![scripted_program(
                         r#"const w = await spawn("worker");
                            await ask(w.agent, "make a helper");
-                           return { direct: list_agents({ deep: false }),
-                                     deep: list_agents() };"#,
+                           history.append({ direct: list_agents({ deep: false }),
+                                     deep: list_agents() });"#,
                     )],
                 ),
             ],
             "delegate a delegation",
         );
         let tree = session.tree();
-        let listing = returned(tree, root_leaf(&session));
+        let listing = appended(tree, root_leaf(&session));
         // `agents()` rows are identified by `charter` here, not `name`:
         // `spawn(charter)` — the bare verb, per its own doc in
         // `machine.rs` (`TOOL_SPAWN`) — has no way to set a name, only
@@ -4863,7 +4853,7 @@ mod tests {
             // no caller here wants (`broadcast_is_promise_all_over_
             // agents`'s own comment: "one program, not two").
             Ok(scripted_program(&format!(
-                "answer({}, {}, {}); done();",
+                "answer({}, {}, {}); done();\n",
                 id,
                 json!("answer"),
                 json!(value)
@@ -4901,14 +4891,14 @@ mod tests {
                                tell(child, "make one of your own");
                                done();"#,
                         ),
-                        scripted_program("return list_agents();"),
+                        scripted_program("history.append(list_agents());"),
                     ],
                 ),
                 (
                     "worker",
-                    vec![scripted_program("spawn(\"grandchild\"); done();")],
+                    vec![scripted_program("spawn(\"grandchild\"); done();\n")],
                 ),
-                ("grandchild", vec![scripted_program("done();")]),
+                ("grandchild", vec![scripted_program("done();\n")]),
             ],
         );
         let h = session.handle();
@@ -4926,7 +4916,7 @@ mod tests {
         });
         let session = drain(session);
         let tree = session.tree();
-        let rows = returned(tree, root_leaf(&session));
+        let rows = appended(tree, root_leaf(&session));
         let rows = rows.as_array().expect("an array of rows");
         let mut charters: Vec<&str> = rows
             .iter()
@@ -4969,8 +4959,8 @@ mod tests {
                 r#"await Promise.all(["a", "b", "c"].map(n =>
                      spawn("worker " + n)));
                    const rows = list_agents();
-                   return await Promise.all(
-                     rows.map(r => ask(r.branch, "status?")));"#,
+                   history.append(await Promise.all(
+                     rows.map(r => ask(r.branch, "status?"))));"#,
             )]),
             charters: vec![
                 ("worker a", Mutex::new(VecDeque::from(["a: ok"]))),
@@ -4993,7 +4983,7 @@ mod tests {
         });
         let session = session.run();
         let tree = session.tree();
-        let mut answers: Vec<String> = returned(tree, root_leaf(&session))
+        let mut answers: Vec<String> = appended(tree, root_leaf(&session))
             .as_array()
             .unwrap()
             .iter()
@@ -5012,7 +5002,7 @@ mod tests {
             let leaf = session.state(agent).unwrap().spine.leaf_id;
             assert_eq!(
                 kinds(tree, leaf),
-                ["Agent", "Post", "Turn", "Answer", "Return", "Console"]
+                ["Agent", "Post", "Turn", "Answer", "Completion", "Return", "Console"]
             );
         }
     }
@@ -5048,7 +5038,7 @@ mod tests {
             [(
                 "test agent",
                 vec![scripted_program(
-                    r#"return await ask(null, "which one did you mean?");"#,
+                    r#"history.append(await ask(null, "which one did you mean?"));"#,
                 )],
             )],
             "do the thing",
@@ -5095,13 +5085,13 @@ mod tests {
             [
                 (
                     "needs guidance",
-                    vec![scripted_program(r#"return await ask(null, "which one?");"#)],
+                    vec![scripted_program(r#"history.append(await ask(null, "which one?"));"#)],
                 ),
                 (
                     "test agent",
                     vec![scripted_program(
                         r#"const w = await spawn("needs guidance");
-                           return await ask(w.agent, "pick one");"#,
+                           history.append(await ask(w.agent, "pick one"));"#,
                     )],
                 ),
             ],
@@ -5186,8 +5176,8 @@ mod tests {
             Box::new(RoutedLlm::new([(
                 "test agent",
                 vec![scripted_program(&format!(
-                    r#"try {{ return await ask({}, "hi"); }}
-                           catch (e) {{ return "refused: " + e; }}"#,
+                    r#"try {{ history.append(await ask({}, "hi")); }}
+                           catch (e) {{ history.append("refused: " + e); }}"#,
                     worker_id.as_u64()
                 ))],
             )])),
@@ -5202,7 +5192,7 @@ mod tests {
         while session.pump_one() {}
         drop(rx);
 
-        let refused = returned(session.tree(), root_leaf(&session));
+        let refused = appended(session.tree(), root_leaf(&session));
         let text = refused.as_str().expect("a rejected call is catchable");
         assert!(text.contains("2 live branches"), "{text}");
         assert!(text.contains("address one of them"), "{text}");
@@ -5247,7 +5237,7 @@ mod tests {
     /// is what the first of these two scripts does.
     #[test]
     fn an_agent_answering_a_choose_is_held_to_the_options() {
-        let question = 8;
+        let question = 9;  // 8 before every reply gained a `Completion` row
         let (session, _) = run_routed(
             ToolRegistry::new(),
             [
@@ -5268,7 +5258,7 @@ mod tests {
                             r#"const w = await spawn("counts things");
                                const v = await choose(w.agent, "how many?", ["small", "big"]);
                                done();
-                               return v;"#,
+                               history.append(v);"#,
                         ),
                         scripted_text("done"),
                     ],
@@ -5305,7 +5295,7 @@ mod tests {
             .filter(|k| *k == "Answer")
             .collect();
         assert_eq!(answers.len(), 1, "{:?}", kinds(tree, worker_leaf));
-        assert_eq!(returned(tree, root_leaf(&session)), json!("big"));
+        assert_eq!(appended(tree, root_leaf(&session)), json!("big"));
     }
 
     /// **program** as an object, not as prose it would have to parse.
@@ -5316,7 +5306,7 @@ mod tests {
         // Event ids are deterministic: Agent 1, Post 2, Turn 3, Spawn 4,
         // Agent 5, Result 6, Send 7, Post 8 — so the worker's one open
         // question is #8, which the assertion below guards.
-        let question = 8;
+        let question = 9;  // 8 before every reply gained a `Completion` row
         let (session, _) = run_routed(
             ToolRegistry::new(),
             [
@@ -5346,7 +5336,7 @@ mod tests {
                             r#"const w = await spawn("counts things");
                                const v = await ask(w.agent, "how many?");
                                done();
-                               return [typeof v, v.files, v.bytes];"#,
+                               history.append([typeof v, v.files, v.bytes]);"#,
                         ),
                         scripted_text("structured"),
                     ],
@@ -5371,7 +5361,7 @@ mod tests {
 
         // An object, indexable — never a string the program must parse.
         assert_eq!(
-            returned(tree, root_leaf(&session)),
+            appended(tree, root_leaf(&session)),
             json!(["object", 3, 1200])
         );
         // `answer(...)` is a bare-global call like any other, settled
@@ -5382,7 +5372,7 @@ mod tests {
         // pointless completion.
         assert_eq!(
             kinds(tree, worker_leaf),
-            ["Agent", "Post", "Turn", "Answer", "Return", "Console"]
+            ["Agent", "Post", "Turn", "Answer", "Completion", "Return", "Console"]
         );
         assert!(tree.spine_at(worker_leaf).context().open.is_empty());
     }
@@ -5436,11 +5426,13 @@ mod tests {
     #[test]
     fn upward_clarification_does_not_deadlock() {
         // Ids are deterministic: Agent 1, Post 2, Turn 3, Spawn 4,
-        // Agent 5, Result 6, Send 7 (parent→child), Post 8 (on the
-        // child, answered once the child resumes), Turn 9, Send 10
-        // (child→parent), Post 11 (on the parent, answered).
-        let child_question = 8;
-        let upward_question = 11;
+        // Agent 5, Result 6, Send 7 (parent→child), Post 9 (on the
+        // child, answered once the child resumes), then the child's own
+        // Send upward and Post 12 on the parent. Every reply logs a
+        // `Completion` of its own, which is what moved these from 8 and
+        // 11 — a counted id is a hostage to the log's shape.
+        let child_question = 9;
+        let upward_question = 12;
         let (session, _) = run_routed(
             ToolRegistry::new(),
             [
@@ -5459,7 +5451,7 @@ mod tests {
                     vec![scripted_program(&format!(
                         r#"const path = await ask(null, "which file?");
                            answer({child_question}, "w1", "read " + path);
-                           return "read " + path;"#
+                           history.append("read " + path);"#
                     ))],
                 ),
                 (
@@ -5467,7 +5459,7 @@ mod tests {
                     vec![
                         scripted_program(
                             r#"const w = await spawn("needs a path");
-                               return await ask(w.agent, "read the plan");"#,
+                               history.append(await ask(w.agent, "read the plan"));"#,
                         ),
                         // The post-condition report's first move: answer
                         // and carry on, in one program — `answer(...)`
@@ -5482,7 +5474,7 @@ mod tests {
                         // VM — it never becomes anyone's `Return` value.
                         scripted_program(&format!(
                             r#"answer({upward_question}, "w1", "PLAN.md");
-                               return resume();"#
+                               history.append(resume());"#
                         )),
                     ],
                 ),
@@ -5519,12 +5511,10 @@ mod tests {
         // The child's own program completed cleanly once answered —
         // point 2 is what stops that value from reaching the parent's
         // program too, so this test no longer checks that it does.
-        assert_eq!(returned(tree, child_leaf), json!("read PLAN.md"));
+        assert_eq!(appended(tree, child_leaf), json!("read PLAN.md"));
         assert_eq!(
             kinds(tree, child_leaf),
-            [
-                "Agent", "Post", "Turn", "Call", "Result", "Answer", "Return", "Console"
-            ],
+            ["Agent", "Post", "Turn", "Call", "Completion", "Result", "Answer", "Note", "Return", "Console"],
         );
         // **C0a lands here.** The handler's `answer(...); return
         // resume();` is recognized as a decision about the *suspended*
@@ -5535,7 +5525,7 @@ mod tests {
         // explicitly answers #8 above) delivers the value — so the
         // parent's own `Return` is the ask's real result, the same
         // value the child returned.
-        assert_eq!(returned(tree, root_leaf(&session)), json!("read PLAN.md"));
+        assert_eq!(appended(tree, root_leaf(&session)), json!("read PLAN.md"));
         assert_eq!(
             kinds(tree, root_leaf(&session)),
             [
@@ -5543,28 +5533,19 @@ mod tests {
                 "Post",
                 "Turn",
                 "Call",
+                "Completion",
                 "Result",
                 "Call",
                 "Post",
                 "Condition",
                 "Console",
-                // The handler's own `Turn` (`answer(...); return
-                // resume();`) — no `Condition`/`Return` of its own
-                // follows it: `Runner::resume`'s own doc is explicit
-                // that a decision says nothing new, and this `Turn`
-                // together with its `Answer` fold at the raise's nested
-                // depth (`Disposition::Pushed` from the `Condition`
-                // above), invisible to any future request, exactly like
-                // a handler's aside should be.
                 "Turn",
                 "Answer",
-                // The parent's *original* run picks back up from here —
-                // same program, same `Turn` as above on the log (no new
-                // one gets logged for a resume) — and its call to the
-                // child finally settles.
+                "Completion",
                 "Result",
+                "Note",
                 "Return",
-                "Console"
+                "Console",
             ]
         );
         // Both #11 (the upward question) and #8 (the parent's original
@@ -5662,11 +5643,11 @@ mod tests {
         // the literal source carries it too.
         assert_eq!(
             texts(a),
-            ["q", "to A", "tell(\"user\", \"A answers\"); done();"]
+            ["q", "to A", "tell(\"user\", \"A answers\"); done();\n"]
         );
         assert_eq!(
             texts(b),
-            ["q", "to B", "tell(\"user\", \"B answers\"); done();"]
+            ["q", "to B", "tell(\"user\", \"B answers\"); done();\n"]
         );
 
         let events: Vec<SessionEvent> = rx.try_iter().collect();
@@ -5708,9 +5689,7 @@ mod tests {
         let kinds = kinds(session.tree(), session.state(fork).unwrap().spine.leaf_id);
         assert_eq!(
             kinds,
-            [
-                "Agent", "Post", "Fork", "Post", "Turn", "Call", "Return", "Console", "Result"
-            ],
+            ["Agent", "Post", "Fork", "Post", "Turn", "Call", "Completion", "Return", "Console", "Result"],
             "the fork diverged at #2, before the original's reply — the reply itself is a real \
              tell() call under code mode, not call-free prose, but (C0b) an unawaited tell's own \
              settlement is never a rule-C surprise, so nothing trails it: {kinds:?}"
@@ -5736,7 +5715,6 @@ mod tests {
             session.tree(),
             &state.spine,
             DEFAULT_DOCUMENT_BUDGET,
-            crate::document::Transport::Program,
         );
         assert_eq!(
             doc.messages.last(),
@@ -5752,8 +5730,6 @@ mod tests {
                     "# NEW EVENTS\n\n[harness] fork of branch #1 at #4 — questions before \
                  this line are being handled there; do not redo its work unless asked."
                         .to_owned(),
-                tool_calls: None,
-                tool_call_id: None,
             }),
             "{doc:?}"
         );
@@ -5817,9 +5793,7 @@ mod tests {
         let kinds = kinds(session.tree(), root_leaf(&session));
         assert_eq!(
             kinds,
-            [
-                "Agent", "Post", "Post", "Turn", "Call", "Return", "Console", "Result"
-            ],
+            ["Agent", "Post", "Post", "Turn", "Call", "Completion", "Return", "Console", "Result"],
             "one turn, a bare reply — it answers neither open post (18_TARGETING), but under \
              code mode that reply is still a real tell() call, not call-free prose; (C0b) its \
              own unawaited settlement is never a rule-C surprise, so nothing trails it: \
@@ -5915,7 +5889,7 @@ mod tests {
     fn user_resumes_and_user_rewrites() {
         let (mut session, _rx) = open(
             tree_with_answered_root(),
-            vec![scripted_program("return raise('need', {}) + 1;")],
+            vec![scripted_program("history.append(raise('need', {}) + 1);")],
         );
         let h = session.handle();
         let branch = session.conversation_branch();
@@ -5934,14 +5908,14 @@ mod tests {
         // own synthesis, per `protocol.rs`'s `Restart` doc).
         h.send(SessionCommand::Restart {
             branch,
-            source: "return resume(4);".into(),
+            source: "history.append(resume(4));".into(),
         });
         for _ in 0..12 {
             session.pump_one();
         }
         let leaf = session.state(branch).unwrap().spine.leaf_id;
         // 5, not the raw decision object — see this test's own doc.
-        assert_eq!(returned(session.tree(), leaf), json!(5));
+        assert_eq!(appended(session.tree(), leaf), json!(5));
 
         // Every user-authored turn is logged as one.
         let user_turns: Vec<&crate::types::Event> = session
@@ -5965,13 +5939,13 @@ mod tests {
         // (the `e` gesture: paste a rewrite verbatim).
         h.send(SessionCommand::Restart {
             branch,
-            source: "return 'rewritten';".into(),
+            source: "history.append('rewritten');".into(),
         });
         for _ in 0..12 {
             session.pump_one();
         }
         let leaf = session.state(branch).unwrap().spine.leaf_id;
-        assert_eq!(returned(session.tree(), leaf), json!("rewritten"));
+        assert_eq!(appended(session.tree(), leaf), json!("rewritten"));
     }
 
     /// A fork inherits a pre-fork question as history, not as an
@@ -5988,7 +5962,7 @@ mod tests {
         let (mut session, rx) = open(
             tree_with_open_root(),
             vec![
-                scripted_program(r#"return await ask("user", "which one?");"#),
+                scripted_program(r#"history.append(await ask("user", "which one?"));"#),
                 scripted_text("explored"),
                 scripted_text("noted"),
             ],
@@ -6067,7 +6041,7 @@ mod tests {
                     vec![scripted_program(
                         r#"const w = await spawn("worker");
                            await tell(w.agent, "fyi");
-                           return await ask(null, "which file?");"#,
+                           history.append(await ask(null, "which file?"));"#,
                     )],
                 ),
                 ("worker", vec![scripted_text("noted")]),
@@ -6164,7 +6138,7 @@ mod tests {
     #[test]
     fn unawaited_tell_produces_no_post_and_no_extra_wake() {
         let script = vec![scripted_program(
-            r#"tell("user", "fire and forget"); return 1;"#,
+            r#"tell("user", "fire and forget"); history.append(1);"#,
         )];
         let (session, events) = run_session(ToolRegistry::new(), script, "go");
         let leaf = root_leaf(&session);
@@ -6176,11 +6150,9 @@ mod tests {
         // the only one on the branch.
         assert_eq!(
             kinds(tree, leaf),
-            [
-                "Agent", "Post", "Turn", "Call", "Return", "Console", "Result"
-            ]
+            ["Agent", "Post", "Turn", "Note", "Call", "Completion", "Return", "Console", "Result"]
         );
-        assert_eq!(returned(tree, leaf), json!(1));
+        assert_eq!(appended(tree, leaf), json!(1));
         assert!(
             !tree.path_events(leaf).iter().any(|e| matches!(
                 &e.payload,
@@ -6232,7 +6204,7 @@ mod tests {
             "test agent",
             registry,
             Box::new(ScriptedLlm::new(vec![
-                scripted_program("return await tools.slow();"),
+                scripted_program("history.append(await tools.slow());"),
                 // The rewrite's completion report prompts this…
                 scripted_text("moved on"),
                 // …and the harness post prompts this.
@@ -6375,7 +6347,7 @@ mod tests {
             &mut root,
             EventPayload::Message(Message::Turn {
                 author: Author::Agent(EventId::new(1)),
-                source: "return await ask(w, \"q\");".into(),
+                source: "history.append(await ask(w, \"q\"));".into(),
                 thinking: None,
                 usage: None,
             }),
@@ -6543,7 +6515,7 @@ mod tests {
         // return value ever synthesized.
         assert_eq!(
             kinds(session.tree(), worker.spine.leaf_id),
-            ["Agent", "Post", "Turn", "Answer", "Return", "Console"],
+            ["Agent", "Post", "Turn", "Answer", "Completion", "Return", "Console"],
             "the lost post was appended, and the worker answered it"
         );
         assert_eq!(
@@ -6717,7 +6689,7 @@ mod tests {
             &mut root,
             EventPayload::Message(Message::Turn {
                 author: Author::Agent(EventId::new(1)),
-                source: "await tools.send_email(); return await ask(\"user\", \"which one?\");"
+                source: "await tools.send_email(); history.append(await ask(\"user\", \"which one?\"));"
                     .into(),
                 thinking: None,
                 usage: None,
@@ -6818,7 +6790,7 @@ mod tests {
             &mut worker,
             EventPayload::Message(Message::Turn {
                 author: Author::Agent(EventId::new(5)),
-                source: "return await ask(null, \"which one?\");".into(),
+                source: "history.append(await ask(null, \"which one?\"));".into(),
                 thinking: None,
                 usage: None,
             }),
@@ -6855,7 +6827,7 @@ mod tests {
                 (
                     "root",
                     vec![scripted_program(
-                        r#"return await ask("user", "anything else?");"#,
+                        r#"history.append(await ask("user", "anything else?"));"#,
                     )],
                 ),
                 // The child re-attaches to the call it already made,
@@ -6865,7 +6837,7 @@ mod tests {
                 (
                     "worker",
                     vec![scripted_program(&format!(
-                        "return await fetch_history({});",
+                        "history.append(await fetch_history({}));",
                         send.as_u64()
                     ))],
                 ),
@@ -6922,6 +6894,6 @@ mod tests {
         // the rewritten program got what the dead VM was waiting for.
         assert_eq!(settled(tree, send), Some(json!("the second one")));
         let worker_leaf = session.state(EventId::new(5)).unwrap().spine.leaf_id;
-        assert_eq!(returned(tree, worker_leaf), json!("the second one"));
+        assert_eq!(appended(tree, worker_leaf), json!("the second one"));
     }
 }

@@ -1302,7 +1302,6 @@ fn multi_turn_continuity_check(outcome: &Outcome, _dir: &Path) -> Result<(), Str
         tree,
         &spine,
         host::DEFAULT_DOCUMENT_BUDGET,
-        crate::document::configured_transport(),
     );
     let seen = doc
         .messages
@@ -1547,7 +1546,7 @@ pub(crate) mod tests {
              } else { \
                  tell(\"user\", pb.p95_ms > pb.baseline_p95_ms * 1.05 ? 'hold — regression per report b' : 'safe to deploy'); \
              }",
-                "return resume(false);",
+                "history.append(resume(false));",
             ],
         );
         assert_eq!(outcome.raise_count, 1);
@@ -1632,7 +1631,7 @@ pub(crate) mod tests {
              const b = await tools.read_file('bench/report-b.json'); \
              await raise('conflicting_benchmarks', {}); \
              tell(\"user\", 'noted the conflict — next: decide the verdict');",
-                "return resume(null);",
+                "history.append(resume(null));",
             ],
         );
         assert!((BENCHMARK_CONFLICT_GATE.check)(&outcome, sandbox.path()).is_err());
@@ -1803,7 +1802,7 @@ pub(crate) mod tests {
              } else { \
                  tell(\"user\", 'held pending sign-off'); \
              }",
-                "return resume(true);",
+                "history.append(resume(true));",
             ],
         );
         (DESTRUCTIVE_MIGRATION_GATE.check)(&outcome, sandbox.path()).unwrap();
@@ -1923,7 +1922,7 @@ pub(crate) mod tests {
                 // round 1: an unrelated runtime trap, not a raise()
                 "const policy = await tools.read_file('migrations/POLICY.md'); null.explode();",
                 // round 2 (handler): nothing useful to resume into — abandon
-                "return abandon();",
+                "history.append(abandon());",
                 // round 3: a fresh, disconnected attempt that just deletes it
                 "const sql = await tools.read_file('migrations/003_drop_legacy.sh'); \
              const r = await tools.bash('./migrations/003_drop_legacy.sh'); \
@@ -2010,7 +2009,7 @@ pub(crate) mod tests {
             // per `ResumeWith::Continue`'s own doc: nothing asked for a
             // value here, so this just lets the paused program carry on
             // to its own `tell()` once the real sleep actually finishes.
-            host::scripted_program("return resume(null);"),
+            host::scripted_program("history.append(resume(null));"),
         ]);
         let (tx, rx) = std::sync::mpsc::channel();
         let mut session = host::Session::new(

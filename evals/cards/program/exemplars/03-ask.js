@@ -1,7 +1,5 @@
-Which way this should go is not mine to guess, and it is a closed choice — the answer is one of three things I can name.
-
-```js
 const f = await tools.read_file("PATH");
+// Not mine to guess, and a closed choice: the answer is one of these.
 const pick = await choose("user", "QUESTION?", ["A", "B", "leave it"]);
 if (pick === "leave it") {
   tell("left PATH alone.");
@@ -10,4 +8,3 @@ if (pick === "leave it") {
   tell(`PATH says ${pick} now.`);
 }
 done();
-```

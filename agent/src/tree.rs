@@ -1212,7 +1212,7 @@ mod tests {
             let mut tree = open()?;
             let mut spine = tree.start_agent(None, None, "root", None, "", Vec::new())?;
             agent = spine.leaf_id; // the Agent id is the agent id
-            tree.append(&mut spine, assistant_msg("console.log('hi'); return 42;"))?;
+            tree.append(&mut spine, assistant_msg("console.log('hi'); history.append(42);"))?;
             let bash = tree.append(
                 &mut spine,
                 EventPayload::Call(Call::Invoke {
@@ -1252,7 +1252,7 @@ mod tests {
         assert_eq!(progs.len(), 1);
         let p = &progs[0];
         assert_eq!(p.id, EventId::new(agent.as_u64() + 1)); // the run_program assistant event
-        assert!(p.source.contains("return 42"));
+        assert!(p.source.contains("history.append(42)"), "{}", p.source);
         assert_eq!(p.invokes.len(), 1);
         assert_eq!(p.invokes[0].name, "bash");
         assert_eq!(p.result, Some(json!(42)));
@@ -1285,7 +1285,7 @@ mod tests {
             "a reopened log says how the run ended"
         );
 
-        tree.append(&mut spine, assistant_msg("return resume(null);"))?; // continues the same program
+        tree.append(&mut spine, assistant_msg("history.append(resume(null));"))?; // continues the same program
         tree.append(&mut spine, returned(json!("done")))?; // second handback
         tree.append(
             &mut spine,
@@ -1300,7 +1300,7 @@ mod tests {
         // addressable by its own id"). The raiser (`progs[0]`) stays
         // `Suspended` — the log never says anything more about it once
         // the handler's `resume(...)` takes over — and the handler
-        // (`progs[1]`, "return resume(null);") is the one that carries
+        // (`progs[1]`, "history.append(resume(null));") is the one that carries
         // the eventual completion: its `Return`/`Console` are the next
         // events on the spine, with no further `Turn` in between.
         let progs = tree.programs_for(agent, leaf);

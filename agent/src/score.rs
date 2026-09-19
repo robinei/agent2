@@ -222,12 +222,8 @@ pub fn score(tree: &Tree) -> Score {
                 // asked for: the spine ending at the event before it.
                 if let Some(parent) = e.parent_id {
                     let spine = tree.spine_at(parent);
-                    let doc = crate::document::render(
-                        tree,
-                        &spine,
-                        crate::host::DEFAULT_DOCUMENT_BUDGET,
-                        crate::document::configured_transport(),
-                    );
+                    let doc =
+                        crate::document::render(tree, &spine, crate::host::DEFAULT_DOCUMENT_BUDGET);
                     s.prompt_bytes += doc.messages.iter().map(|m| m.content.len()).sum::<usize>();
                 }
                 s.program_lengths.push(interp::count_statements(source));

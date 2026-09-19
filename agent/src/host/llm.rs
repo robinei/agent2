@@ -90,33 +90,45 @@ impl ScriptedLlm {
     }
 }
 
-/// A scripted assistant turn: the bare program `source`, exactly what a
-/// real completion's whole response would be — no call id, no tool name,
-/// because there is no tool-call wrapper left to name (23_ONE_AGENT's
-/// substitution: the model's whole response *is* `Turn { source }`).
+/// A scripted assistant turn from JavaScript: a reply whose whole
+/// content is one cell.
+///
+/// **A reply is markdown now, and a fixture may write either.** Given
+/// bare JavaScript this wraps it in a `js` fence, which is what the
+/// model would have written and what the notebook driver reads. Given
+/// markdown — anything already containing a fence — it is passed
+/// through untouched, so a fixture that means to test prose, several
+/// cells, or a cell-less reply says so directly.
+///
+/// The wrapping is here rather than in a hundred fixtures because the
+/// fixtures are about what the *program* does; which syntax carried it
+/// is this function's business.
 pub fn scripted_program(source: &str) -> LlmTurn {
+    let source = if source.contains("```") || source.is_empty() {
+        source.to_owned()
+    } else {
+        format!("```js\n{source}\n```\n")
+    };
     LlmTurn {
         usage: None,
-        source: source.into(),
+        source,
         thinking: None,
         truncated: false,
         reply: None,
     }
 }
 
-/// A scripted `Transport::RunProgram` completion: prose beside a
-/// program (`source` non-empty — the "run it, then keep going" shape),
-/// or prose with no call at all (`source` empty — the "that was the
-/// final answer" shape). `Transport::Program` never sets `LlmTurn.reply`
-/// (its own doc comment), so `scripted_program` above, unchanged, is
-/// still every existing call site's helper; this is the one
-/// `Transport::RunProgram`'s two completion shapes need and
-/// `scripted_program` alone cannot express.
-#[cfg(test)]
-pub fn scripted_reply(reply: &str, source: &str) -> LlmTurn {
+/// A scripted reply **verbatim** — markdown, prose, fences and all.
+/// For the fixtures that are about the reply's shape rather than its
+/// program: a reply with no cell, one with two, one whose prose matters.
+#[allow(dead_code)]
+pub fn scripted_markdown(markdown: &str) -> LlmTurn {
     LlmTurn {
-        reply: Some(reply.to_owned()),
-        ..scripted_program(source)
+        usage: None,
+        source: markdown.to_owned(),
+        thinking: None,
+        truncated: false,
+        reply: None,
     }
 }
 
@@ -128,11 +140,11 @@ pub fn scripted_reply(reply: &str, source: &str) -> LlmTurn {
 /// restart").
 #[allow(dead_code)]
 pub fn scripted_resume(value: serde_json::Value) -> LlmTurn {
-    scripted_program(&format!("return resume({value});"))
+    scripted_program(&format!("history.append(resume({value}));"))
 }
 
 /// A scripted handler turn that discharges an open `ask()` by the
-/// question's own id, `answer(question, label, value)`, and leaves the
+/// question's own id, `answer(question, value)`, and leaves the
 /// raising program alone — the restart that binds explicitly rather than
 /// supplying a `resume` value.
 #[cfg(test)]
@@ -142,9 +154,8 @@ pub fn scripted_answer(
     value: serde_json::Value,
 ) -> LlmTurn {
     scripted_program(&format!(
-        "answer({}, {}, {value});",
-        question.as_u64(),
-        serde_json::json!(label)
+        "answer({}, {value});",
+        question.as_u64()
     ))
 }
 
@@ -262,7 +273,6 @@ impl LlmClient for RoutedLlm {
             .iter()
             .flat_map(|m| {
                 std::iter::once(m.content.clone())
-                    .chain(m.tool_calls.iter().flatten().map(|c| c.source.clone()))
             })
             .collect::<Vec<_>>()
             .join("\n");

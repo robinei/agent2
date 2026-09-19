@@ -2890,7 +2890,7 @@ mod tests {
         let mut chat = ChatState::new();
         chat.apply(&agent_event());
         chat.set_show_cells(true);
-        chat.apply(&cell(2, "tell(\"hi\");\ndone();"));
+        chat.apply(&cell(2, "tell(\"hi\");\ndone();\n"));
         assert_eq!(code_rows(&chat), vec!["tell(\"hi\");", "done();"]);
     }
 

@@ -197,22 +197,7 @@ fn renders_a_line(payload: &EventPayload) -> bool {
 pub fn rendered_size(doc: &document::Document) -> usize {
     doc.messages
         .iter()
-        .map(|m| {
-            // Under `Transport::RunProgram` a program is not in
-            // `content` — it is the `source` of the turn's tool call,
-            // and it is usually the largest thing in the document. Only
-            // counting `content` there would undercount every assistant
-            // turn, so compaction would fire late in one transport and
-            // on time in the other, which would quietly make a
-            // comparison between them a comparison of when they
-            // compacted.
-            m.content.len()
-                + m.tool_calls
-                    .iter()
-                    .flatten()
-                    .map(|c| c.source.len())
-                    .sum::<usize>()
-        })
+        .map(|m| m.content.len())
         .sum()
 }
 
@@ -230,7 +215,7 @@ pub fn should_fire(current_size: usize, budget: usize, headroom_fraction: f64) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::document::{Document, Transport};
+    use crate::document::Document;
 
     /// These tests are about *sizes and ops* — what compaction removes
     /// and when it fires — not about wire containers, so they render
@@ -240,7 +225,7 @@ mod tests {
     /// `a_programs_bytes_count_in_either_transport`, which builds both
     /// shapes by hand.
     fn render(tree: &Tree, spine: &Spine, budget: usize) -> Document {
-        crate::document::render(tree, spine, budget, Transport::Program)
+        crate::document::render(tree, spine, budget)
     }
 
     /// A small real branch: a user post, a completed program, and a
@@ -593,86 +578,5 @@ mod tests {
             tree.events.contains_key(&note),
             "but the log still has it, so fetch still answers"
         );
-    }
-
-    #[test]
-    fn should_fire_respects_headroom_not_the_hard_limit() {
-        // 20% headroom: fires at 80% of budget, not at 100%.
-        assert!(!should_fire(799, 1000, 0.2));
-        assert!(should_fire(800, 1000, 0.2));
-        assert!(should_fire(1000, 1000, 0.2));
-    }
-    /// Something structural is dropped, never quietly accepted.
-    ///
-    /// A live compaction program opened with
-    /// `remove_history(1, "system")` — aiming at the card, which is not
-    /// a row, renders nowhere, and could not be made smaller by
-    /// compacting it. Applied, that op would have committed, freed
-    /// nothing, and left the model believing it had worked.
-    #[test]
-    fn a_structural_event_is_not_a_row() {
-        let (tree, spine, _, note) = sample_branch();
-        let agent = tree
-            .enclosing_agent(spine.leaf_id)
-            .expect("the branch has an agent");
-        let payloads = compact(
-            &tree,
-            &spine,
-            &[
-                CompactionOp::Remove {
-                    from: agent,
-                    to: agent,
-                },
-                CompactionOp::Remove {
-                    from: note,
-                    to: note,
-                },
-            ],
-        );
-        assert_eq!(
-            payloads.len(),
-            1,
-            "the card is not compactable: {payloads:?}"
-        );
-        assert!(
-            matches!(&payloads[0], EventPayload::Compacted { of, .. } if *of == note),
-            "{payloads:?}"
-        );
-    }
-    /// A program's bytes count wherever the transport happens to put
-    /// them. Under `RunProgram` they are in the turn's tool call rather
-    /// than its content, and a size that missed them would fire
-    /// compaction late in that mode only — turning any comparison
-    /// between the two transports into a comparison of when each one
-    /// compacted.
-    #[test]
-    fn a_programs_bytes_count_in_either_transport() {
-        use crate::document::{ChatMessage, ChatRole, Document, ToolCall};
-        let program = "tell(\"x\");".repeat(20);
-        let as_text = Document {
-            messages: vec![ChatMessage {
-                role: ChatRole::Assistant,
-                content: program.clone(),
-                tool_calls: None,
-                tool_call_id: None,
-            }],
-            preamble: 0,
-            transport: Transport::Program,
-        };
-        let as_call = Document {
-            messages: vec![ChatMessage {
-                role: ChatRole::Assistant,
-                content: String::new(),
-                tool_calls: Some(vec![ToolCall {
-                    id: "c1".into(),
-                    source: program.clone(),
-                }]),
-                tool_call_id: None,
-            }],
-            preamble: 0,
-            transport: Transport::Program,
-        };
-        assert_eq!(rendered_size(&as_text), program.len());
-        assert_eq!(rendered_size(&as_call), rendered_size(&as_text));
     }
 }

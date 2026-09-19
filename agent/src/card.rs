@@ -466,45 +466,31 @@ mod tests {
         );
     }
 
-    /// The two shipped card directories, each framed its own way. This
-    /// reads the files rather than trusting the rule, because the rule
-    /// is a one-line prefix test and the thing it must not do is
-    /// silently pick the wrong framing for a card someone edits later.
+    /// The shipped card is markdown; the frozen program-transport card
+    /// under `evals/cards/program/` is a TypeScript document, and stays
+    /// one — its own first line says the reply is JavaScript and nothing
+    /// else. Which framing the generated tool manifest takes is read off
+    /// the card's first bytes, so this reads the files rather than
+    /// trusting the rule.
     #[test]
-    fn the_shipped_cards_declare_which_kind_they_are() {
-        let program = include_str!("../card/card.md");
-        assert!(
-            program.starts_with("/**"),
-            "the program card is a TypeScript document"
-        );
-        let notebook = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../evals/cards/notebook/card.md"),
+    fn the_shipped_card_is_markdown_and_the_frozen_one_is_not() {
+        let shipped = include_str!("../card/card.md");
+        assert!(!shipped.starts_with("/**"), "the shipped card is markdown");
+        assert!(shipped.contains("\n```ts\n"), "its declarations live in a fence");
+
+        let frozen = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../evals/cards/program/card.md"),
         );
         // Only asserted when the eval cards are present — the binary
         // ships without them.
-        if let Ok(notebook) = notebook {
+        if let Ok(frozen) = frozen {
             assert!(
-                !notebook.starts_with("/**"),
-                "the notebook card is markdown"
-            );
-            assert!(
-                notebook.contains("\n```ts\n"),
-                "and its declarations live in a fence"
+                frozen.starts_with("/**"),
+                "the frozen program card is a TypeScript document"
             );
         }
     }
 
-    /// **A markdown card must not open a fence it does not close.**
-    /// Written while adding a paragraph to the notebook card that
-    /// began, at column 0, "```ts and ```typescript run as well" — which
-    /// is not a sentence about a fence, it *is* a fence, and everything
-    /// after it became the contents of a code block that never closed.
-    /// Nothing in the build would have said so; the card is a string.
-    ///
-    /// Only markdown cards are checked. A TypeScript card has no
-    /// fences and its prose lives in comments, where three backticks
-    /// are three backticks.
     #[test]
     fn a_markdown_card_balances_its_fences() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -544,7 +530,7 @@ mod tests {
         // `card()` shows up as a diff review must look at, not a byte
         // count that silently drifts. Comparing full text (not just a
         // hash) so the diff itself is legible in a failure message.
-        const EXPECTED_LEN: usize = 13713;
+        const EXPECTED_LEN: usize = 14642;
         assert_eq!(
             card().len(),
             EXPECTED_LEN,
@@ -610,31 +596,44 @@ mod tests {
 
     #[test]
     fn the_card_states_the_response_rule_and_the_ending_rule() {
-        // What the whole reply is, and that nothing may surround it.
-        assert!(card().contains("no code fence"), "{}", card());
+        // What a reply is, and which of its blocks run.
         assert!(
-            card().contains("entire reply is a JavaScript program"),
+            card().contains("Your reply is **markdown**, and the code blocks in it run."),
             "{}",
             card()
         );
+        assert!(card().contains("is quoted, not run"), "{}", card());
         // And the two halves of the ending, which 27.1 inverted: a
         // program finishing is not the task finishing.
         assert!(card().contains("done()"), "{}", card());
         assert!(
-            card().contains("not trying to finish the task in one program"),
+            card().contains("not trying to finish the task in one reply"),
             "{}",
             card()
         );
     }
 
+    /// An exemplar's cells, in order, in one scope — what the notebook
+    /// driver hands the compiler.
+    fn cells_of(reply: &str) -> String {
+        crate::notebook::split_cells(reply)
+            .iter()
+            .map(|c| c.slice(reply))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     #[test]
-    fn the_exemplars_assistant_turn_is_valid_javascript() {
-        // The one thing in this file that must actually compile: each
-        // exemplar's assistant turn is exactly what a real completion
-        // would need to parse (Step B1's own rule for an assistant
-        // turn), so it is held to the same standard here.
+    fn the_exemplars_cells_are_valid_javascript() {
+        // The one thing in this file that must actually compile. An
+        // exemplar's assistant turn is a *reply* — markdown, with the
+        // program in fenced cells — so what is held to the compiler is
+        // what the notebook driver would hand it: the cells, in order,
+        // in one scope.
         for ex in &exemplars() {
-            interp::compile(&ex.assistant)
+            let cells = crate::notebook::split_cells(&ex.assistant);
+            assert!(!cells.is_empty(), "an exemplar with no cell: {}", ex.user);
+            interp::compile(&cells_of(&ex.assistant))
                 .unwrap_or_else(|e| panic!("seed exemplar does not parse: {e:?}"));
         }
     }
@@ -655,7 +654,7 @@ mod tests {
     #[test]
     fn the_exemplars_run_to_completion_against_stub_tools() {
         for ex in &exemplars() {
-            run_against_stubs(&ex.assistant)
+            run_against_stubs(&cells_of(&ex.assistant))
                 .unwrap_or_else(|e| panic!("exemplar for {:?} trapped: {e}", ex.user));
         }
     }
@@ -772,28 +771,30 @@ mod tests {
     /// runs off the end does not stop — the next one is written — so
     /// falling off the end is no longer an ending at all, and an
     /// exemplar that did it would be teaching the accident the whole
-    /// change exists to prevent. Each one either calls `done()`,
-    /// because its task is finished, or returns the thing the next
-    /// program continues from.
-    ///
-    /// Not both: `done()` rests the branch, so a value returned beside
-    /// it is read by nobody, and writing one says the author expected
-    /// something to come next.
+    /// change exists to prevent. Each one either calls `done()`, because
+    /// its task is finished, or `history.append`s the thing the next
+    /// reply continues from.
     #[test]
     fn every_exemplar_ends_on_purpose() {
         for ex in &exemplars() {
-            let ending = run_against_stubs(&ex.assistant)
+            // An exemplar is a *reply*: markdown, with its program in
+            // fenced cells. Running it means running its cells, in
+            // order, in one scope — which is what the notebook driver
+            // does with the real thing.
+            let source = cells_of(&ex.assistant);
+            run_against_stubs(&source)
                 .unwrap_or_else(|e| panic!("exemplar for {:?} trapped: {e}", ex.user));
+            // **The two endings a reply has.** `done()` says the task is
+            // finished; `history.append` hands a finding to the reply
+            // after this one and rests the branch (D4). There is no
+            // `return` to be the second of those any more, and an
+            // exemplar that does neither demonstrates a reply that found
+            // something and threw it away.
+            let ends = source.contains("done()");
+            let hands_on = source.contains("history.append");
             assert!(
-                ending.done || ending.returned,
-                "exemplar for {:?} runs off the end — under automatic \
-                 continuation that is not an ending",
-                ex.user
-            );
-            assert!(
-                !(ending.done && ending.returned),
-                "exemplar for {:?} calls done() *and* returns a value — \
-                 nothing will read the value",
+                ends || hands_on,
+                "exemplar for {:?} neither finishes nor hands anything on",
                 ex.user
             );
         }
@@ -966,8 +967,11 @@ mod tests {
             "the first ends a finished task: {}",
             ex[0].assistant
         );
+        // **`history.append`, not `return`.** A reply has no return
+        // (D5): what the second exemplar demonstrates is handing a
+        // finding on to the next reply and *not* ending the task.
         assert!(
-            ex[1].assistant.contains("return") && !ex[1].assistant.contains("done()"),
+            ex[1].assistant.contains("history.append") && !ex[1].assistant.contains("done()"),
             "the second hands on and does not stop: {}",
             ex[1].assistant
         );
@@ -1065,10 +1069,13 @@ mod tests {
         }
         // Short enough to be a shape rather than a technique to copy —
         // a live run on 2026-09-17 reproduced a long exemplar verbatim,
-        // invented names and all, into a repo that had none of them.
+        // invented names and all, into a repo that had none of them. The
+        // cap counts the whole reply now, prose and fences included, so
+        // it is larger than the 400 it was when an exemplar was bare
+        // JavaScript; the code inside is no longer than it was.
         for e in &ex {
             assert!(
-                e.assistant.len() < 400,
+                e.assistant.len() < 700,
                 "an exemplar long enough to copy: {} bytes",
                 e.assistant.len()
             );

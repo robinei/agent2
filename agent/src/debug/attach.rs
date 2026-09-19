@@ -142,7 +142,7 @@ pub enum KeyAction {
 pub enum ExplicitMode {
     /// `r` — `Rename { branch, name }`.
     Rename,
-    /// `v` — `Restart { branch, source: "return resume(<value>);" }`; the
+    /// `v` — `Restart { branch, source: "history.append(resume(<value>));" }`; the
     /// text is parsed as JSON, falling back to a bare string, and
     /// spliced into the synthesized program — what's shown in the pane
     /// is exactly what runs (22_ONE_VOCABULARY's `UserCall` collapse).
@@ -252,12 +252,9 @@ pub struct AttachedApp {
 impl AttachedApp {
     pub fn new(root: BranchId) -> Self {
         let mut chat = ChatState::new();
-        // A `Turn` is a **cell** only under this transport; under the
-        // others it is a whole program, whose source belongs to the
-        // source pane rather than inline in the transcript (D13).
-        chat.set_show_cells(
-            crate::document::configured_transport() == crate::document::Transport::Notebook,
-        );
+        // A `Turn` is a cell of a reply, shown inline in the transcript
+        // (D13).
+        chat.set_show_cells(true);
         AttachedApp {
             chat,
             view: View::Chat,
@@ -1121,7 +1118,7 @@ fn resolve_submit_mode(mode: ExplicitMode, branch: BranchId, text: String) -> Se
                 serde_json::from_str(&text).unwrap_or_else(|_| serde_json::Value::String(text));
             SessionCommand::Restart {
                 branch,
-                source: format!("return resume({value});"),
+                source: format!("history.append(resume({value}));"),
             }
         }
         // `e` is unchanged in spirit: the pasted text *is* the program.
@@ -2612,7 +2609,7 @@ fn condition_line(cause: &Cause) -> String {
 mod tests {
     use super::*;
     use crate::host::{
-        ScriptedLlm, ToolDef, ToolRegistry, run_demo, scripted_program, scripted_text,
+        ScriptedLlm, ToolDef, ToolRegistry, run_demo, scripted_markdown, scripted_program, scripted_text,
     };
     use crate::types::{EventId, Tree};
     use serde_json::json;
@@ -2778,14 +2775,14 @@ mod tests {
             resolve_submit_mode(ExplicitMode::ResumeWithValue, branch, "5".into()),
             SessionCommand::Restart {
                 branch,
-                source: "return resume(5);".into(),
+                source: "history.append(resume(5));".into(),
             }
         );
         assert_eq!(
             resolve_submit_mode(ExplicitMode::ResumeWithValue, branch, "not json".into()),
             SessionCommand::Restart {
                 branch,
-                source: "return resume(\"not json\");".into(),
+                source: "history.append(resume(\"not json\"));".into(),
             },
             "a non-JSON value falls back to a bare string"
         );
@@ -3576,7 +3573,7 @@ mod tests {
             Tree::new(None),
             "say hi",
             ToolRegistry::new(),
-            Box::new(ScriptedLlm::new([scripted_text(
+            Box::new(ScriptedLlm::new([scripted_markdown(
                 "| Name | Role |\n|------|------|\n| Ada | Engineer |",
             )])),
             tx,
@@ -3771,7 +3768,7 @@ mod tests {
             Tree::new(None),
             "say hi",
             ToolRegistry::new(),
-            Box::new(ScriptedLlm::new([scripted_text("# Heading\nplain text")])),
+            Box::new(ScriptedLlm::new([scripted_markdown("# Heading\nplain text")])),
             tx,
         )
         .unwrap();
@@ -3840,7 +3837,7 @@ mod tests {
             Tree::new(None),
             "say hi",
             ToolRegistry::new(),
-            Box::new(ScriptedLlm::new([scripted_text(
+            Box::new(ScriptedLlm::new([scripted_markdown(
                 "plain line\n```\ncode line\n```",
             )])),
             tx,
@@ -3900,7 +3897,7 @@ mod tests {
             Tree::new(None),
             "say hi",
             ToolRegistry::new(),
-            Box::new(ScriptedLlm::new([scripted_text(
+            Box::new(ScriptedLlm::new([scripted_markdown(
                 "| Name | Role |\n|------|------|\n| Ada | Engineer |",
             )])),
             tx,
@@ -4353,10 +4350,10 @@ mod tests {
         let script = vec![
             scripted_program(
                 r#"const w = await spawn("child worker");
-                   return await ask(w.agent, "child task");"#,
+                   history.append(await ask(w.agent, "child task"));"#,
             ),
-            scripted_program("return await tools.slow();"),
-            scripted_program(r#"return answer(8, "child", "done");"#),
+            scripted_program("history.append(await tools.slow());"),
+            scripted_program(r#"history.append(answer(8, "child", "done"));"#),
         ];
         let (tx, _rx) = channel();
         let mut session = Session::new(

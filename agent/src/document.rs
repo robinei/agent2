@@ -6,12 +6,13 @@
 //! snapshotted system prompt, `Spine::context`, plus its path) into a
 //! role-delimited chat [`Document`] — the transport-agnostic shape
 //! `host/mod.rs` hands to `spawn_llm`, which now takes a `Document`
-//! directly rather than `machine::LlmRequest`. [`extract_program`] is
-//! the other direction: turning a raw completion back into program
-//! source before it is compiled and logged as a `Turn`. Both belong
-//! here because both are "the document" in the broad sense — what goes
-//! out, and what comes back — and neither talks to a model or a network
-//! on its own.
+//! directly rather than `machine::LlmRequest`.
+//!
+//! There is no longer a second direction. Turning a raw completion back
+//! into program source was `extract_program`, and it existed because a
+//! reply *was* a program and might arrive wrapped in a stray fence.
+//! A reply is markdown now: `notebook.rs` reads the fences as structure
+//! rather than stripping them as noise.
 //!
 //! **This is a request builder over `&Tree`, not a stored log of its
 //! own.** The POC's `document.rs` rendered a private row vector — a
@@ -35,173 +36,40 @@ pub enum ChatRole {
     System,
     User,
     Assistant,
-    /// `Transport::RunProgram` only: the harness's answer to a
-    /// `run_program` tool call, in the role the wire format requires
-    /// immediately after a tool-calling assistant turn. `render` never
-    /// produces this role under `Transport::Program` — see
-    /// `flush_pending`.
-    Tool,
-}
-
-/// A `run_program` call, as carried on an assistant [`ChatMessage`]
-/// under `Transport::RunProgram`. One call per turn: code mode never
-/// offers a menu of functions to choose from (`host/deepseek.rs`'s own
-/// doc comment), so there is nothing here to disambiguate by name —
-/// `id` exists only to pair this call with the `Tool`-role message that
-/// answers it, the way the wire format requires.
-#[derive(Clone, Debug, PartialEq)]
-pub struct ToolCall {
-    pub id: String,
-    pub source: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ChatMessage {
     pub role: ChatRole,
     pub content: String,
-    /// `Transport::RunProgram` only: the call this assistant turn makes
-    /// instead of sending the program as bare `content`. Always `None`
-    /// under `Transport::Program` and on every non-`Assistant` message,
-    /// so `host/deepseek.rs`'s `message_json` omits the wire field
-    /// entirely and a `Transport::Program` request body is unchanged
-    /// byte-for-byte from before this type grew the field.
-    pub tool_calls: Option<Vec<ToolCall>>,
-    /// `Transport::RunProgram` only: on a `Tool`-role message, the id of
-    /// the call (`tool_calls` above, on the preceding assistant turn)
-    /// this is the result of. `None` everywhere else.
-    pub tool_call_id: Option<String>,
 }
 
 impl ChatMessage {
-    /// A plain message with neither tool field set — every message
-    /// `Transport::Program` ever produces, and most of what
-    /// `Transport::RunProgram` produces too (its `System`/`User`
-    /// messages are identical to `Program`'s; only its assistant turns
-    /// and their tool answers carry the two fields above).
     fn text(role: ChatRole, content: impl Into<String>) -> Self {
         ChatMessage {
             role,
             content: content.into(),
-            tool_calls: None,
-            tool_call_id: None,
         }
     }
 }
 
-/// Which container carries the model's program on the wire.
-/// [`Transport::Program`] (default) sends the model's entire response
-/// text as the program itself — no `tools` array, no function-calling
-/// wrapper, per `host/deepseek.rs`'s own doc comment on why code mode
-/// has neither. [`Transport::RunProgram`] instead advertises a single
-/// `run_program(source)` tool and reads the program back out of the
-/// resulting call, so the same wire round-trip looks like an ordinary
-/// tool-calling completion to anything watching the transport (a proxy,
-/// a provider's own logging) that only understands that shape.
-///
-/// Chosen once per process from `AGENT2_TRANSPORT`
-/// ([`configured_transport`]) and then **passed as a value** — into
-/// [`render`], recorded on the [`Document`] it produces, and read back
-/// off that document by `host/deepseek.rs`. It is not re-read from the
-/// environment anywhere downstream, which is what makes it impossible
-/// for one request to be *rendered* under one container and *sent*
-/// under the other.
-///
-/// It used to be an ambient `AGENT2_*` lookup on every call, like
-/// `host/mod.rs`'s `document_budget`/`compaction_headroom`. That is a
-/// safe idiom for a value only ever *read*; this one had to vary per
-/// test, and the only way to vary a process-global from a test is to
-/// write the environment variable, which Rust 2024 makes `unsafe`
-/// precisely because it is undefined behaviour once any other thread is
-/// running. `cargo test` runs one thread per core, so those writes
-/// raced every concurrent test that rendered a document — most of the
-/// suite. The visible symptom was
-/// `program_mode_renders_an_assistant_turn_as_plain_text` asserting an
-/// *empty* assistant message, because the other transport had moved the
-/// program into a tool call and left `content` blank.
-///
-/// Threading the value fixes that at the source rather than by
-/// serialising the suite: a test names the transport it means, in an
-/// argument, and nothing global moves.
-///
-/// The event log is identical in shape either way: same `Turn`/`Call`/
-/// `Result`/`Condition` payloads, same `Message::Turn.source` — only
-/// this module's rendering and `host/deepseek.rs`'s wire-facing code
-/// branch on it at all.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Transport {
-    #[default]
-    Program,
-    RunProgram,
-    /// Phase 25: the completion is **markdown containing executable code
-    /// blocks**. Prose is prose and reaches the person as it streams; the
-    /// ```js cells are one compilation that pauses at each block, sharing a
-    /// frame and a scope (`docs/25_NOTEBOOK.md`).
-    Notebook,
-}
-
-pub const DEFAULT_TRANSPORT: Transport = Transport::Program;
-
-/// The process's transport, read from `AGENT2_TRANSPORT` **once** and
-/// cached. This is the process entry point for the setting: real
-/// callers (`main.rs`, the session loop, `score.rs`) ask here and then
-/// pass the answer down as a value.
-///
-/// Once, not per call, and that is the whole point. A per-call read is
-/// a process-global that anything can observe mid-render, so varying it
-/// in a test meant writing the environment variable underneath every
-/// other running test — UB under threads, and the cause of a real race
-/// across this suite (see [`Transport`]).
-/// A `OnceLock` makes the environment a *start-up* input: it is read
-/// before any document exists, and no later read can disagree with an
-/// earlier one. Tests never come here at all; they name a [`Transport`]
-/// directly.
-///
-/// An unset or unrecognized value falls back to [`DEFAULT_TRANSPORT`],
-/// the same "garbage in, quiet default" rule the other `AGENT2_*`
-/// readers use (`llm_concurrency`'s `filter(|n| *n >= 1)`,
-/// `compaction_headroom`'s open-interval filter) rather than a run
-/// failing to start over a typo'd env var.
-pub fn configured_transport() -> Transport {
-    static CONFIGURED: std::sync::OnceLock<Transport> = std::sync::OnceLock::new();
-    *CONFIGURED.get_or_init(|| match std::env::var("AGENT2_TRANSPORT").as_deref() {
-        Ok("run_program") => Transport::RunProgram,
-        Ok("notebook") => Transport::Notebook,
-        _ => DEFAULT_TRANSPORT,
-    })
-}
-
-/// A rendered request, transport-agnostic (Part A: "the document is
-/// the interface"). `messages[0]` is always the card, in `System`
-/// (Step A1: "the card goes in `system`").
+/// A rendered request (Part A: "the document is the interface").
+/// `messages[0]` is always the card, in `System` (Step A1: "the card
+/// goes in `system`").
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct Document {
     pub messages: Vec<ChatMessage>,
     /// How many leading messages are preamble — the system message plus
     /// the worked-example turns. Recorded when the document is built,
     /// because it is a fact about *this* document and nothing else can
-    /// recover it: it depends on the agent's snapshotted exemplars and
-    /// on the transport, and [`conversation`] used to re-derive it by
-    /// calling `worked_examples()` against today's card and whatever
-    /// transport happened to be configured when it was asked. Slicing
-    /// with a number computed from the wrong card — or the wrong
-    /// container — is how a caller silently reads the tail of the
-    /// preamble as the first real turn.
+    /// recover it: it depends on the agent's snapshotted exemplars, and
+    /// [`conversation`] used to re-derive it by calling
+    /// `worked_examples()` against *today's* card. Slicing with a number
+    /// computed from the wrong card is how a caller silently reads the
+    /// tail of the preamble as the first real turn.
     ///
     /// [`conversation`]: Document::conversation
     pub preamble: usize,
-    /// Which container this document was rendered for. Recorded for the
-    /// same reason as `preamble`, and in fact it is *why* `preamble`
-    /// varies: a `RunProgram` exemplar renders three rows where a
-    /// `Program` one renders two.
-    ///
-    /// `host/deepseek.rs` reads it here rather than asking the
-    /// environment again on its way to the wire. Those were once two
-    /// independent reads of one global, held in agreement only by a
-    /// comment promising they "can never drift onto different values
-    /// mid-session" — a promise nothing enforced. Carrying the value on
-    /// the document makes the request and the wire format it is sent
-    /// under the same fact, so there is nothing left to keep in sync.
-    pub transport: Transport,
 }
 
 impl Document {
@@ -211,7 +79,7 @@ impl Document {
     /// on the wire.
     ///
     /// The preamble is a prefix whose length depends on the agent's own
-    /// snapshotted exemplars and on the transport, so it is *recorded*
+    /// snapshotted exemplars, so it is *recorded*
     /// rather than recomputed — positional indexing into `messages` is
     /// a latent break in anything that means "the first real turn."
     pub fn conversation(&self) -> &[ChatMessage] {
@@ -839,7 +707,7 @@ fn pending_line(
 /// for it — every depth-0 program's own outcome auto-populates the
 /// pending turn before the next `Turn` can appear, by construction of
 /// this fold, so "two programs adjacent" is no longer representable.
-pub fn render(tree: &Tree, spine: &Spine, budget: usize, transport: Transport) -> Document {
+pub fn render(tree: &Tree, spine: &Spine, budget: usize) -> Document {
     let leaf = spine.leaf_id;
     let agent = tree
         .enclosing_agent(leaf)
@@ -852,7 +720,6 @@ pub fn render(tree: &Tree, spine: &Spine, budget: usize, transport: Transport) -
         context,
         budget,
         &tree.compacted_lookup(leaf),
-        transport,
     )
 }
 
@@ -880,10 +747,9 @@ pub(crate) fn render_with_lookup(
     context: &Context,
     budget: usize,
     compacted: &HashMap<EventId, CompactedView>,
-    transport: Transport,
 ) -> Document {
     let mut messages = vec![ChatMessage::text(ChatRole::System, context.system.clone())];
-    messages.extend(worked_examples(&context.exemplars, transport));
+    messages.extend(worked_examples(&context.exemplars));
     let preamble = messages.len();
     let cuts = told_literal_cuts(tree, agent, leaf);
     // Under `Transport::Notebook` a reply is N cell `Turn`s and one
@@ -891,11 +757,7 @@ pub(crate) fn render_with_lookup(
     // actually generated, so the assistant turn replays them rather
     // than being rebuilt out of its pieces. Empty on every other
     // transport, where a `Turn` already *is* the completion.
-    let (replies, covered) = if transport == Transport::Notebook {
-        notebook_replies(tree, leaf, agent, &cuts, compacted)
-    } else {
-        (HashMap::new(), HashSet::new())
-    };
+    let (replies, covered) = notebook_replies(tree, leaf, agent, &cuts, compacted);
     let mut pending: Vec<String> = Vec::new();
     let mut cur_agent: Option<EventId> = None;
     // `Transport::RunProgram` only: the id of the most recent turn's
@@ -908,7 +770,6 @@ pub(crate) fn render_with_lookup(
     // block, whatever led up to it, still renders as `User` in both
     // modes) and again under `Transport::Program`, which never opens a
     // call at all.
-    let mut open_call: Option<String> = None;
     // Whether the open block has already reported a run, so an arrival
     // after it gets a heading rather than trailing off the run's last
     // section. Cleared by that heading and by every flush.
@@ -948,10 +809,8 @@ pub(crate) fn render_with_lookup(
                 // message, and never two assistant turns in a row.
                 if let Some(content) = content {
                     ran = false;
-                    messages.push(flush_pending(&mut pending, transport, &mut open_call));
-                    let (assistant, call_id) = assistant_turn(transport, ev.id, content);
-                    messages.push(assistant);
-                    open_call = call_id;
+                    messages.push(flush_pending(&mut pending));
+                    messages.push(assistant_turn(ev.id, content));
                 }
             }
             // A compaction directive is the one condition that does not
@@ -998,14 +857,10 @@ pub(crate) fn render_with_lookup(
     }
 
     if !pending.is_empty() {
-        messages.push(flush_pending(&mut pending, transport, &mut open_call));
+        messages.push(flush_pending(&mut pending));
     }
 
-    Document {
-        messages,
-        preamble,
-        transport,
-    }
+    Document { messages, preamble }
 }
 
 /// The assistant's own turn, in whichever shape `transport` wants.
@@ -1017,35 +872,9 @@ pub(crate) fn render_with_lookup(
 /// (`Message::Turn` has a `source` field and no other), so there is
 /// nothing truthful to replay there.
 ///
-/// Returns the id of the call the next pending block should answer —
-/// `Some` only for `RunProgram`, threaded back into `open_call` by the
-/// caller so [`flush_pending`] knows what it is closing.
-fn assistant_turn(
-    transport: Transport,
-    id: EventId,
-    source: String,
-) -> (ChatMessage, Option<String>) {
-    match transport {
-        // Notebook's completion is the model's whole response text, as
-        // Program's is — markdown rather than bare JS, but the same plain
-        // assistant message either way.
-        Transport::Program | Transport::Notebook => {
-            (ChatMessage::text(ChatRole::Assistant, source), None)
-        }
-        Transport::RunProgram => {
-            let call_id = format!("call_{}", id.as_u64());
-            let message = ChatMessage {
-                role: ChatRole::Assistant,
-                content: String::new(),
-                tool_calls: Some(vec![ToolCall {
-                    id: call_id.clone(),
-                    source,
-                }]),
-                tool_call_id: None,
-            };
-            (message, Some(call_id))
-        }
-    }
+fn assistant_turn(id: EventId, source: String) -> ChatMessage {
+    let _ = id;
+    ChatMessage::text(ChatRole::Assistant, source)
 }
 
 /// **The user turn's own heading.** A message in the user role holds
@@ -1074,26 +903,14 @@ pub const ARRIVAL_HEADING: &str = "## MESSAGES";
 /// A later block under `Transport::RunProgram` instead answers the
 /// still-open call as a `Tool`-role message — see `assistant_turn` and
 /// `open_call`'s own doc comment above.
-fn flush_pending(
-    pending: &mut Vec<String>,
-    transport: Transport,
-    open_call: &mut Option<String>,
-) -> ChatMessage {
+fn flush_pending(pending: &mut Vec<String>) -> ChatMessage {
     let content = if pending.is_empty() {
         String::new()
     } else {
         format!("{TURN_HEADING}\n\n{}", pending.join("\n\n"))
     };
     pending.clear();
-    match (transport, open_call.take()) {
-        (Transport::RunProgram, Some(id)) => ChatMessage {
-            role: ChatRole::Tool,
-            content,
-            tool_calls: None,
-            tool_call_id: Some(id),
-        },
-        _ => ChatMessage::text(ChatRole::User, content),
-    }
+    ChatMessage::text(ChatRole::User, content)
 }
 
 /// The card's worked examples, as **real alternating turns** ahead of
@@ -1133,11 +950,11 @@ fn flush_pending(
 /// there is nothing truthful to report. `card::seed_exemplars()` itself
 /// — the FILES this reads from — is untouched by which transport is
 /// active; only this rendering is.
-fn worked_examples(exemplars: &[Exemplar], transport: Transport) -> Vec<ChatMessage> {
+fn worked_examples(exemplars: &[Exemplar]) -> Vec<ChatMessage> {
     exemplars
         .iter()
         .enumerate()
-        .flat_map(|(i, ex)| {
+        .flat_map(|(_i, ex)| {
             // **Shaped like a real one.** An example's request sits
             // immediately before the conversation's own first user
             // turn, and a user turn is `# NEW EVENTS` with the person's
@@ -1171,121 +988,11 @@ fn worked_examples(exemplars: &[Exemplar], transport: Transport) -> Vec<ChatMess
             // one turn the model imitates hardest. Under the program
             // transport the reply *is* JavaScript and `//` is exactly
             // right.
-            let program = match transport {
-                Transport::Notebook => format!("*[worked example]*\n\n{}", ex.assistant),
-                _ => format!("// [worked example]\n{}", ex.assistant),
-            };
-            match transport {
-                Transport::Program | Transport::Notebook => {
-                    vec![request, ChatMessage::text(ChatRole::Assistant, program)]
-                }
-                Transport::RunProgram => {
-                    let call_id = format!("call_example_{i}");
-                    let assistant = ChatMessage {
-                        role: ChatRole::Assistant,
-                        content: String::new(),
-                        tool_calls: Some(vec![ToolCall {
-                            id: call_id.clone(),
-                            source: program,
-                        }]),
-                        tool_call_id: None,
-                    };
-                    let result = ChatMessage {
-                        role: ChatRole::Tool,
-                        content: "[worked example] ok".to_owned(),
-                        tool_calls: None,
-                        tool_call_id: Some(call_id),
-                    };
-                    vec![request, assistant, result]
-                }
-            }
+            let program = format!("*[worked example]*\n\n{}", ex.assistant);
+            vec![request, ChatMessage::text(ChatRole::Assistant, program)]
         })
         .collect()
 }
-
-/// Strip a single leading/trailing code fence if the **whole** trimmed
-/// completion is wrapped in one — never a fence appearing mid-text,
-/// which is left alone per phase 20 doc Step A1: "reserve the
-/// parse-failure condition for genuine syntax errors."
-///
-/// The card states absolutely that a completion is only ever valid
-/// JavaScript — no fence, no surrounding prose. That is self-enforcing
-/// (a completion that doesn't parse is already a condition with a
-/// handler), but a model habitually wraps its answer in a ```javascript
-/// fence anyway. `extract_program` tolerates exactly that one habit,
-/// silently, and nothing else: it does not hunt for prose, does not try
-/// to salvage a program buried in an explanation, and does not
-/// advertise the leniency anywhere the model can see it.
-///
-/// Recognizes an optional language tag on the opening fence
-/// (```javascript, ```js, or bare ```) and requires a matching closing
-/// ``` as the last non-blank line, so a program that legitimately
-/// contains a ``` in a string or comment is not mis-stripped.
-/// A provider's own control tokens, arriving as *text* in the
-/// completion and then compiled as if the model had written them.
-///
-/// Observed 2026-09-17: a run died on `compile error: 1:1: Unexpected
-/// token` with `<｜｜DSML｜｜ calls>` as the offending source — DeepSeek's
-/// tool-call delimiter, leaked into the content stream. The model did
-/// not write it, the program was otherwise fine, and the whole run was
-/// lost to a trap it could not have avoided or understood.
-///
-/// Stripped rather than handled further up because this is the one
-/// place that decides what counts as the program's source, and because
-/// the alternative — teaching the card about a provider's framing — is
-/// exactly the sort of thing the model should never have to know.
-///
-/// Deliberately narrow: only tokens delimited by the full-width bars
-/// `｜` (U+FF5C), which no ordinary program contains and which are how
-/// this family of tokens is spelled. A broad "strip anything in angle
-/// brackets" rule would eat `a < b && c > d`.
-fn strip_control_tokens(raw: &str) -> String {
-    if !raw.contains('\u{ff5c}') {
-        return raw.to_owned();
-    }
-    let mut out = String::with_capacity(raw.len());
-    let mut rest = raw;
-    while let Some(start) = rest.find('<') {
-        let Some(end_rel) = rest[start..].find('>') else {
-            break;
-        };
-        let end = start + end_rel + 1;
-        if rest[start..end].contains('\u{ff5c}') {
-            out.push_str(&rest[..start]);
-            rest = &rest[end..];
-        } else {
-            out.push_str(&rest[..end]);
-            rest = &rest[end..];
-        }
-    }
-    out.push_str(rest);
-    out
-}
-
-pub fn extract_program(raw: &str) -> String {
-    let raw = strip_control_tokens(raw);
-    let raw = raw.as_str();
-    let trimmed = raw.trim();
-    let Some(after_open) = trimmed.strip_prefix("```") else {
-        return raw.to_owned();
-    };
-    // The rest of the opening fence line is a language tag (or
-    // nothing) — skip to the first newline.
-    let Some(nl) = after_open.find('\n') else {
-        return raw.to_owned();
-    };
-    let tag = after_open[..nl].trim();
-    if !(tag.is_empty() || tag.eq_ignore_ascii_case("javascript") || tag.eq_ignore_ascii_case("js"))
-    {
-        return raw.to_owned();
-    }
-    let body = &after_open[nl + 1..];
-    let Some(body) = body.strip_suffix("```") else {
-        return raw.to_owned();
-    };
-    body.trim_end_matches('\n').to_owned()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1326,7 +1033,7 @@ mod tests {
         )
         .unwrap();
 
-        let doc = render(&tree, &spine, 4096, Transport::Program);
+        let doc = render(&tree, &spine, 4096);
         let text: String = doc.messages.iter().map(|m| m.content.clone()).collect();
         assert!(
             text.contains("the user turn this branch was born with"),
@@ -1341,87 +1048,6 @@ mod tests {
             "and the conversation starts exactly after it"
         );
     }
-
-    // --- extract_program (folded in from the deleted fence.rs) ---
-
-    /// **A provider's control token is not the model's program.** A run
-    /// on 2026-09-17 was lost to `compile error: 1:1: Unexpected token`
-    /// whose source was `<｜｜DSML｜｜ calls>` — DeepSeek's tool-call
-    /// delimiter arriving as content. Nothing the model could have
-    /// avoided, and nothing it should have to know about.
-    #[test]
-    fn a_leaked_control_token_is_not_compiled_as_source() {
-        assert_eq!(
-            extract_program("<｜｜DSML｜｜ calls>tell(\"hi\");"),
-            "tell(\"hi\");"
-        );
-        assert_eq!(
-            extract_program("tell(\"hi\");<｜tool▁calls▁end｜>"),
-            "tell(\"hi\");"
-        );
-    }
-
-    /// Narrow on purpose: a comparison is not a control token.
-    #[test]
-    fn ordinary_angle_brackets_survive() {
-        let src = "if (a < b && c > d) { tell(\"x\"); }";
-        assert_eq!(extract_program(src), src);
-        let generic = "const xs = [1, 2]; if (xs.length < 3) done();";
-        assert_eq!(extract_program(generic), generic);
-    }
-
-    #[test]
-    fn no_fence_is_returned_unchanged() {
-        assert_eq!(extract_program("const x = 1;"), "const x = 1;");
-    }
-
-    #[test]
-    fn a_stray_javascript_fence_is_stripped_silently() {
-        assert_eq!(
-            extract_program("```javascript\nconst x = 1;\n```"),
-            "const x = 1;"
-        );
-    }
-
-    #[test]
-    fn a_bare_fence_with_no_language_tag_is_stripped() {
-        assert_eq!(extract_program("```\nconst x = 1;\n```"), "const x = 1;");
-    }
-
-    #[test]
-    fn js_tag_is_also_recognized() {
-        assert_eq!(extract_program("```js\nconst x = 1;\n```"), "const x = 1;");
-    }
-
-    #[test]
-    fn a_fence_appearing_mid_text_is_left_alone() {
-        // Not wrapped end-to-end — this is a genuine syntax error to
-        // report as a trap, not something to salvage.
-        let raw = "const s = \"```\";\ntell(s);";
-        assert_eq!(extract_program(raw), raw);
-    }
-
-    #[test]
-    fn an_unmatched_opening_fence_is_left_alone() {
-        let raw = "```javascript\nconst x = 1;";
-        assert_eq!(extract_program(raw), raw);
-    }
-
-    #[test]
-    fn a_fence_with_an_unrecognized_tag_is_left_alone() {
-        let raw = "```python\nx = 1\n```";
-        assert_eq!(extract_program(raw), raw);
-    }
-
-    #[test]
-    fn surrounding_whitespace_is_tolerated() {
-        assert_eq!(
-            extract_program("  \n```javascript\nconst x = 1;\n```\n  "),
-            "const x = 1;"
-        );
-    }
-
-    // --- render, over a real Tree ---
 
     fn turn(source: &str) -> EventPayload {
         EventPayload::Message(Message::Turn {
@@ -1456,7 +1082,7 @@ mod tests {
             .start_agent(None, None, "root", None, "CARD", Vec::new())
             .unwrap();
         tree.append(&mut spine, user_post("hello")).unwrap();
-        tree.append(&mut spine, turn("tell('hi'); return 1;"))
+        tree.append(&mut spine, turn("tell('hi'); history.append(1);"))
             .unwrap();
         tree.append(
             &mut spine,
@@ -1466,7 +1092,7 @@ mod tests {
         )
         .unwrap();
 
-        let doc = render(&tree, &spine, 64 * 1024, Transport::Program);
+        let doc = render(&tree, &spine, 64 * 1024);
         assert_eq!(doc.messages[0].role, ChatRole::System);
         assert_eq!(doc.messages[0].content, "CARD");
         let conv = doc.conversation();
@@ -1474,7 +1100,7 @@ mod tests {
         assert_eq!(conv[0].role, ChatRole::User);
         assert!(conv[0].content.contains("hello"));
         assert_eq!(conv[1].role, ChatRole::Assistant);
-        assert_eq!(conv[1].content, "tell('hi'); return 1;");
+        assert_eq!(conv[1].content, "tell('hi'); history.append(1);");
         assert_eq!(conv[2].role, ChatRole::User);
     }
 
@@ -1510,7 +1136,7 @@ mod tests {
         )
         .unwrap();
         // The handler: its own Turn and Return, both at depth 1.
-        tree.append(&mut spine, turn("return resume(1);")).unwrap();
+        tree.append(&mut spine, turn("history.append(resume(1));")).unwrap();
         tree.append(
             &mut spine,
             EventPayload::Return {
@@ -1527,14 +1153,14 @@ mod tests {
         )
         .unwrap();
 
-        let doc = render(&tree, &spine, 64 * 1024, Transport::Program);
+        let doc = render(&tree, &spine, 64 * 1024);
         let conv = doc.conversation();
         // user("go") / assistant(raise) / user(the raise's own report,
         // which is what the model was prompted with) / assistant(the
         // decision it wrote back) / user(both returns).
         assert_eq!(conv.len(), 5, "{doc:?}");
         assert_eq!(conv[1].content, "raise('x');");
-        assert_eq!(conv[3].content, "return resume(1);");
+        assert_eq!(conv[3].content, "history.append(resume(1));");
         assert!(
             !conv[2].content.is_empty(),
             "a condition that suspended the program renders its report, \
@@ -1588,7 +1214,7 @@ mod tests {
         )
         .unwrap();
 
-        let doc = render(&tree, &spine, 64 * 1024, Transport::Program);
+        let doc = render(&tree, &spine, 64 * 1024);
         let conv = doc.conversation();
         assert_eq!(
             conv.iter()
@@ -1658,7 +1284,7 @@ mod tests {
         )
         .unwrap();
 
-        let doc = render(&tree, &spine, 64 * 1024, Transport::Program);
+        let doc = render(&tree, &spine, 64 * 1024);
         let program = doc
             .conversation()
             .iter()
@@ -1706,7 +1332,7 @@ mod tests {
             }),
         )
         .unwrap();
-        let doc = render(&tree, &spine, 64 * 1024, Transport::Program);
+        let doc = render(&tree, &spine, 64 * 1024);
         let program = doc
             .conversation()
             .iter()
@@ -1780,7 +1406,7 @@ mod tests {
         )
         .unwrap();
 
-        let doc = render(&tree, &spine, 64 * 1024, Transport::Program);
+        let doc = render(&tree, &spine, 64 * 1024);
         let all: String = doc.messages.iter().map(|m| m.content.clone()).collect();
         assert!(all.contains("user asked you: which one?"), "{all}");
         assert!(all.contains("you asked user: 30 or 240?"), "{all}");
@@ -1829,7 +1455,7 @@ mod tests {
         )
         .unwrap();
 
-        let doc = render(&tree, &spine, 64 * 1024, Transport::Program);
+        let doc = render(&tree, &spine, 64 * 1024);
         let all: String = doc.messages.iter().map(|m| m.content.clone()).collect();
         assert!(
             all.contains(&format!(
@@ -1867,7 +1493,7 @@ mod tests {
             )
             .unwrap();
         tree.append(&mut spine, turn("1;")).unwrap();
-        let doc = render(&tree, &spine, 64 * 1024, Transport::Program);
+        let doc = render(&tree, &spine, 64 * 1024);
         let before: String = doc.messages.iter().map(|m| m.content.clone()).collect();
         assert!(
             !before.contains('…'),
@@ -1882,7 +1508,7 @@ mod tests {
             },
         )
         .unwrap();
-        let doc = render(&tree, &spine, 64 * 1024, Transport::Program);
+        let doc = render(&tree, &spine, 64 * 1024);
         let after: String = doc.messages.iter().map(|m| m.content.clone()).collect();
         assert!(
             after.contains(&format!("`[{}]` … the finding", note.as_u64())),
@@ -1918,7 +1544,7 @@ mod tests {
             .unwrap();
             tree.append(&mut spine, EventPayload::Compacted { of: program, text })
                 .unwrap();
-            render(&tree, &spine, 64 * 1024, Transport::Program)
+            render(&tree, &spine, 64 * 1024)
         };
 
         let replaced = build(Some("did the arithmetic".into()));
@@ -1962,13 +1588,13 @@ mod tests {
     /// restore: the transport is an argument, so two of these tests can
     /// run side by side on different threads and neither can see the
     /// other's choice.
-    fn sample_document(transport: Transport) -> Document {
+    fn sample_document() -> Document {
         let mut tree = Tree::new(None);
         let mut spine = tree
             .start_agent(None, None, "root", None, "CARD", Vec::new())
             .unwrap();
         tree.append(&mut spine, user_post("hello")).unwrap();
-        tree.append(&mut spine, turn("tell('hi'); return 1;"))
+        tree.append(&mut spine, turn("tell('hi'); history.append(1);"))
             .unwrap();
         tree.append(
             &mut spine,
@@ -1977,136 +1603,21 @@ mod tests {
             },
         )
         .unwrap();
-        render(&tree, &spine, 64 * 1024, transport)
+        render(&tree, &spine, 64 * 1024)
     }
 
-    /// Pins today's shape: the model's whole response rides bare in
-    /// `content`, no tool wrapper, and the report that follows it is an
-    /// ordinary `User` message — [`render`]'s behaviour before this
-    /// transport switch existed, and what `Transport::Program` must
-    /// still produce byte-for-byte now that a second mode exists beside
-    /// it.
+/// One transport, so an assistant turn is the model's reply verbatim
+    /// and the harness's report is a plain `User` message beside it. This
+    /// was three tests contrasting two containers; what survived the
+    /// removal of the second is the assertion that was never about the
+    /// contrast — that a turn and its report occupy the two roles, in
+    /// that order, with nothing wrapped around either.
     #[test]
-    fn program_mode_renders_an_assistant_turn_as_plain_text() {
-        // `conversation()` slices at the preamble length this document
-        // recorded when it was built, and that length is transport-
-        // dependent (a `RunProgram` exemplar renders three rows, a
-        // `Program` one two). It is read off `doc` itself, so there is
-        // no window in which it could be sliced at the other mode's
-        // length — which is exactly what an ambient transport used to
-        // make possible.
-        let doc = sample_document(Transport::Program);
+    fn a_turn_is_a_plain_assistant_message_and_its_report_a_plain_user_one() {
+        let doc = sample_document();
         let conv = doc.conversation();
         assert_eq!(conv[1].role, ChatRole::Assistant);
-        assert_eq!(conv[1].content, "tell('hi'); return 1;");
-        assert!(
-            conv[1].tool_calls.is_none(),
-            "Transport::Program never wraps a turn in a tool call: {conv:?}"
-        );
-        assert_eq!(
-            conv[2].role,
-            ChatRole::User,
-            "the report stays a plain User message under Transport::Program"
-        );
-    }
-
-    /// `Transport::RunProgram`'s whole point: the same turn now arrives
-    /// as a `run_program` call (its `source` the program, unchanged),
-    /// and the report that follows answers that call in the `Tool` role
-    /// — never a `User` message, per the wire format's own rule that a
-    /// tool-calling assistant turn must be answered before anything else
-    /// follows it.
-    #[test]
-    fn run_program_mode_renders_an_assistant_turn_as_a_tool_call() {
-        let doc = sample_document(Transport::RunProgram);
-        let conv = doc.conversation();
-        assert_eq!(conv[1].role, ChatRole::Assistant);
-        let calls = conv[1]
-            .tool_calls
-            .as_ref()
-            .expect("Transport::RunProgram wraps the turn in a run_program call");
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].source, "tell('hi'); return 1;");
-        assert_eq!(
-            conv[2].role,
-            ChatRole::Tool,
-            "the report answers the call under Transport::RunProgram: {conv:?}"
-        );
-        assert_eq!(conv[2].tool_call_id.as_deref(), Some(calls[0].id.as_str()));
-    }
-
-    /// **The point of the exercise.** Two transports, one branch: the
-    /// actual program and report text a model would see must be
-    /// identical whichever container carries it, so a later comparison
-    /// between the two measures the container and nothing else. Strict
-    /// on purpose — this reads the payload back out of whichever field
-    /// each transport put it in (`content` under `Program`, a lone
-    /// `tool_calls[0].source` under `RunProgram`) and demands the two
-    /// sequences match exactly, row for row.
-    #[test]
-    fn both_modes_carry_the_same_content() {
-        fn build() -> (Tree, Spine) {
-            let mut tree = Tree::new(None);
-            let mut spine = tree
-                .start_agent(None, None, "root", None, "CARD", Vec::new())
-                .unwrap();
-            tree.append(&mut spine, user_post("hello")).unwrap();
-            tree.append(&mut spine, turn("tell('hi'); return 1;"))
-                .unwrap();
-            tree.append(
-                &mut spine,
-                EventPayload::Return {
-                    value: serde_json::json!(1),
-                },
-            )
-            .unwrap();
-            tree.append(&mut spine, user_post("again")).unwrap();
-            tree.append(&mut spine, turn("return 2;")).unwrap();
-            tree.append(
-                &mut spine,
-                EventPayload::Return {
-                    value: serde_json::json!(2),
-                },
-            )
-            .unwrap();
-            (tree, spine)
-        }
-
-        fn payload(m: &ChatMessage) -> String {
-            match &m.tool_calls {
-                Some(calls) => {
-                    assert_eq!(calls.len(), 1, "run_program is the only tool on offer");
-                    calls[0].source.clone()
-                }
-                None => m.content.clone(),
-            }
-        }
-
-        let (program_tree, program_spine) = build();
-        let (rp_tree, rp_spine) = build();
-        // Each document carries the transport it was rendered under, so
-        // `.conversation()` slices each at its own preamble length and
-        // the two can simply be built one after the other.
-        let program_content: Vec<String> =
-            render(&program_tree, &program_spine, 64 * 1024, Transport::Program)
-                .conversation()
-                .iter()
-                .map(payload)
-                .collect();
-        let rp_content: Vec<String> = render(&rp_tree, &rp_spine, 64 * 1024, Transport::RunProgram)
-            .conversation()
-            .iter()
-            .map(payload)
-            .collect();
-
-        assert_eq!(
-            program_content.len(),
-            rp_content.len(),
-            "RunProgram must not merge or drop a row to make the text line up by accident"
-        );
-        assert_eq!(
-            program_content, rp_content,
-            "the two transports must carry identical content — only the container differs"
-        );
+        assert_eq!(conv[1].content, "tell('hi'); history.append(1);");
+        assert_eq!(conv[2].role, ChatRole::User, "{conv:?}");
     }
 }
