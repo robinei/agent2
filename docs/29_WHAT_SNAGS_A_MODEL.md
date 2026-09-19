@@ -242,6 +242,34 @@ as a route around something.** The card forbade the copy, the worked
 example was fixed, the report now names it — and none of that would
 have helped while looking at a file whole was impossible any other way.
 
+## What is left, and the one decision I did not make
+
+Traps after the night, over 58 runs: twelve, all singletons, and not
+one `.length of undefined` where there had been eleven. The largest
+remaining class is the one the notebook model creates:
+
+    `r` is already declared — this code shares one scope with what ran
+    before it, so that name is taken.
+
+Four of the twelve tonight; six of thirty in the baseline. Consistently
+a fifth to a quarter of everything that traps, and it is not a mistake
+in the ordinary sense — a model writing `const r = await tools.bash(…)`
+in its second block is treating a block as a step, which is what a
+block looks like.
+
+The message now explains the scope. The card explains it in the
+preamble. Neither stops it, because both are read before the moment and
+the moment does not feel like one that needs them.
+
+**The option I did not take:** let a later block's `const` rebind the
+name, since the dialect is ours and "informed purely by what we find
+the model to act best on". The analyzer already shadows by default —
+the check exists specifically to stop it, because a closure made in an
+earlier block would go on pointing at the stranded slot. That trades a
+loud error for a silent one, which is the trade this codebase keeps
+refusing, and it is a language decision rather than a repair. It wants
+a person awake.
+
 ## Where the bytes are
 
 Measured over 20 rendered documents:
